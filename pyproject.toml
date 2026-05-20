@@ -12,6 +12,9 @@ authors = [{ name = "agenttalk contributors" }]
 license = { text = "MIT" }
 dependencies = []
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
 [project.scripts]
 agenttalk = "agenttalk.cli:main"
 
