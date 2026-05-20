@@ -16,7 +16,7 @@ on session end.
 
 ```powershell
 # one-time install (anywhere)
-git clone https://github.com/<your-user>/agenttalk.git
+git clone https://github.com/zoolok17/agenttalk.git
 python -m pip install -e .\agenttalk
 agenttalk install-skills         # copies skill files into ~/.claude/commands and ~/.codex/skills
 
@@ -78,7 +78,7 @@ interrupt whenever you want.
 ## Install
 
 ```powershell
-git clone https://github.com/<your-user>/agenttalk.git
+git clone https://github.com/zoolok17/agenttalk.git
 python -m pip install -e .\agenttalk
 ```
 
