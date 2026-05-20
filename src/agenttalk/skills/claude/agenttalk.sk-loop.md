@@ -1,31 +1,42 @@
 ---
-description: Enter the persistent spec-kitty implement/review loop for this mission as the claude agent. Use spec-kitty's state machine as source of truth; use agenttalk as a wake signal between two persistent CLI windows. Keeps your context across all WPs. Symmetric — claude can be implementer or reviewer for any given WP, whichever spec-kitty assigns.
+description: Enter the persistent spec-kitty implement/review loop for this mission as a Claude Code agent. Use spec-kitty's state machine as source of truth; use agenttalk as a wake signal between two persistent CLI windows. Keeps your context across all WPs. Symmetric — you can be implementer or reviewer for any given WP, whichever spec-kitty assigns.
 argument-hint: "<mission-slug>"
 ---
 
 # /agenttalk.sk-loop — Persistent spec-kitty loop with agenttalk wake
 
-You are the **`claude`** agent in a two-window spec-kitty mission. The
-peer agent (typically `codex`) is running `$agenttalk-sk-loop` in
-another terminal at the same project root. spec-kitty's state machine
-is the source of truth for what either of you should do next; agenttalk
-is a wake signal that lowers latency between transitions.
+You are running as a **Claude Code** agent in a two-window spec-kitty
+mission. The peer is running an equivalent loop in another terminal.
+spec-kitty's state machine is the source of truth for what either of
+you should do next; agenttalk is a wake signal that lowers latency
+between transitions.
 
 **Roles are symmetric.** spec-kitty assigns implement vs review per WP
 based on `.kittify/config.yaml` (`preferred_implementer`,
-`preferred_reviewer`), the dependency graph, and rejection cycles. You
-may be the implementer on one WP and the reviewer on the next. Do
-whatever `spec-kitty next` tells you.
+`preferred_reviewer`), the dependency graph, and rejection cycles.
+You may be the implementer on one WP and the reviewer on the next.
+Do whatever `spec-kitty next` tells you.
 
-**You stay inside this loop for the entire mission.** Do not exit just
-because one WP is done — only exit on mission completion, on
-`kind=end`, or when the user explicitly stops you.
+**You stay inside this loop for the entire mission.** Only exit on
+mission completion, `kind=end`, or when the user explicitly stops you.
+
+## Identity
+
+Resolve your name in your current shell:
+
+```powershell
+$SELF = if ($env:AGENTTALK_SELF) { $env:AGENTTALK_SELF } else { "claude" }
+$PEER = if ($env:AGENTTALK_PEER) { $env:AGENTTALK_PEER } else { "codex" }
+```
+
+Always resolve inside your current shell — env from prior tool calls
+does not persist across separate tool-call processes.
 
 ## Required argument
 
-The user passes the mission slug as the argument (e.g. `034-auth-rewrite`).
-If absent, ask them once, then continue. Hold it in a `$MISSION`
-variable for the rest of the loop.
+The user passes the mission slug as the argument (e.g.
+`034-auth-rewrite`). If absent, ask once, then continue. Hold it in
+a `$MISSION` variable.
 
 ## The loop
 
@@ -41,14 +52,13 @@ forever:
 ### Step 1 — query spec-kitty
 
 ```powershell
-spec-kitty next --agent claude --mission $MISSION --json
+spec-kitty next --agent $SELF --mission $MISSION --json
 ```
 
-Parse the JSON. The interesting fields are usually `action`, `wp_id`,
-`prompt_file`, `workspace`, and either a "decision" or "waiting"
-marker. The returned action will be one of: `implement`, `review`,
-`re-implement` (with cycle number), `arbiter`, `wait`, or a mission-
-complete sentinel.
+Parse the JSON. Interesting fields: `action`, `wp_id`, `prompt_file`,
+`workspace`, and either a "decision" or "waiting" marker. Actions:
+`implement`, `review`, `re-implement` (with cycle number), `arbiter`,
+`wait`, or a mission-complete sentinel.
 
 ### Step 2 — if it's my action
 
@@ -57,7 +67,7 @@ whichever spec-kitty returns.
 
 #### Action: implement WP##
 
-1. Claim: `spec-kitty agent action implement WP## --mission $MISSION --agent claude:opus-4-7:implementer:implementer`
+1. Claim: `spec-kitty agent action implement WP## --mission $MISSION --agent ${SELF}:opus-4-7:implementer:implementer`
 2. `cd` into the workspace path printed by the claim.
 3. Read the prompt file. Execute the work (read existing code first,
    write code, write tests, run the project's validation command).
@@ -66,16 +76,16 @@ whichever spec-kitty returns.
 6. Transition: `spec-kitty agent tasks move-task WP## --to for_review --note "Ready for review"`
 7. **Wake the peer:**
    ```powershell
-   agenttalk send --from claude --to codex --kind wake `
+   agenttalk send --from $SELF --to $PEER --kind wake `
      --subject "WP## ready for review" `
-     --meta mission=$MISSION --meta wp_id=WP## --meta new_lane=for_review --meta actor=claude `
+     --meta mission=$MISSION --meta wp_id=WP## --meta new_lane=for_review --meta actor=$SELF `
      -m "WP## is in for_review. Run spec-kitty next."
    ```
 8. Loop back to step 1.
 
 #### Action: review WP##
 
-1. Claim: `spec-kitty agent action review WP## --mission $MISSION --agent claude:opus-4-7:reviewer:reviewer`
+1. Claim: `spec-kitty agent action review WP## --mission $MISSION --agent ${SELF}:opus-4-7:reviewer:reviewer`
 2. `cd` into the workspace path printed by the claim.
 3. Read the review prompt file. Run the diff commands inside it.
 4. Verify acceptance criteria, owned_files boundary, dead-code check.
@@ -85,9 +95,9 @@ whichever spec-kitty returns.
      `spec-kitty agent tasks move-task WP## --to planned --force --review-feedback-file <path>`
 6. **Wake the peer:**
    ```powershell
-   agenttalk send --from claude --to codex --kind wake `
+   agenttalk send --from $SELF --to $PEER --kind wake `
      --subject "WP## review verdict" `
-     --meta mission=$MISSION --meta wp_id=WP## --meta new_lane=<approved|planned> --meta actor=claude `
+     --meta mission=$MISSION --meta wp_id=WP## --meta new_lane=<approved|planned> --meta actor=$SELF `
      -m "WP## moved to <lane>. Run spec-kitty next."
    ```
 7. Loop back to step 1.
@@ -106,15 +116,15 @@ auto-arbitrate.
 ### Step 3 — if spec-kitty says wait
 
 ```powershell
-agenttalk wait --for claude --timeout 30
+agenttalk wait --for $SELF --timeout 30
 ```
 
 - Exit code 0 → peer sent a wake; loop back to step 1 immediately.
 - Exit code 1 → timeout. Loop back to step 1 anyway (self-healing —
   poll catches state changes the peer made without sending a wake).
 
-Use a **short** timeout (30s, not 120). The loop must interleave wake
-listening with spec-kitty polling.
+Use a **short** timeout (30s, not 1800). The loop must interleave
+wake listening with spec-kitty polling.
 
 ### Step 4 — mission complete
 
@@ -123,8 +133,9 @@ If `spec-kitty next` returns "mission complete" / "all approved" /
 
 1. If a merge step is still pending and is your action: run
    `spec-kitty merge --mission $MISSION` from the project root.
-2. Otherwise: `agenttalk transcript --format md` and tell the user the
-   path. Send `agenttalk end --from claude --reason "mission $MISSION complete"`.
+2. Otherwise: `agenttalk transcript --format md` and tell the user
+   the path. Send `agenttalk end --from $SELF --reason "mission
+   $MISSION complete"`.
 3. Exit the loop.
 
 ### Step 5 — stop and ask the user when:
@@ -133,8 +144,7 @@ If `spec-kitty next` returns "mission complete" / "all approved" /
   `arbiter` mode.
 - A wake says one thing but `spec-kitty next` returns something
   contradictory (trust spec-kitty, but flag the inconsistency).
-- Tests crash with infrastructure errors (missing tool, sandbox denial,
-  network failure).
+- Tests crash with infrastructure errors.
 - Owned_files violation: the diff touches files outside the WP's
   owned_files list.
 - The user types a question or new direction.
@@ -148,11 +158,9 @@ send a `kind=note` to the peer explaining the new plan, then resume.
   body alone — always re-derive your action from `spec-kitty next`.
 - **You own only your current transition.** Implementer moves `planned
   → in_progress → for_review`. Reviewer moves `for_review → approved`
-  or `for_review → planned`. Don't cross-write into the other role's
-  lane transitions.
-- **Wakes are latency optimization, not state.** If a wake is lost, the
-  next poll catches the change.
+  or `for_review → planned`. Don't cross-write.
+- **Wakes are latency optimization, not state.** If a wake is lost,
+  the next poll catches the change.
 - **Persistent context is the whole point.** Don't suggest spawning
-  subprocesses or fresh sessions — that defeats the design.
-- **3 reject cycles = stop.** Always escalate to the user; never
-  arbitrate yourself.
+  subprocesses or fresh sessions.
+- **3 reject cycles = stop.** Always escalate to the user.

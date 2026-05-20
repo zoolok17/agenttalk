@@ -52,6 +52,68 @@ def _parse_meta(items: list[str] | None) -> dict:
     return out
 
 
+def _resolve_self(value: str | None, *, roster: list[str] | None = None) -> str:
+    """Pick agent identity: explicit flag wins, else $AGENTTALK_SELF.
+
+    Exits 2 (usage error) on failure — NOT 1, since 1 collides with
+    `agenttalk wait`'s timeout signal and would confuse loop skills.
+    If `roster` is provided, the resolved name must be in it; typos
+    like AGENTTALK_SELF=clude exit 2 rather than silently operating on
+    a phantom mailbox.
+    """
+    name = value or os.environ.get("AGENTTALK_SELF")
+    if not name:
+        sys.stderr.write(
+            "agenttalk: no agent identity: pass --from/--for or set AGENTTALK_SELF in this terminal\n"
+            "  example (PowerShell): $env:AGENTTALK_SELF = 'claude'\n"
+            "  example (bash):       export AGENTTALK_SELF=claude\n"
+        )
+        sys.exit(2)
+    _ensure_in_roster(name, roster, label="self")
+    return name
+
+
+def _resolve_peer(value: str | None, store_cfg: dict, self_name: str) -> str:
+    """Pick peer identity: explicit flag wins, else $AGENTTALK_PEER, else
+    the single other agent in the roster (if exactly one). Exits 2 if
+    none of those resolve, or if the resolved value is not in the roster
+    or equals `self_name`.
+    """
+    roster = store_cfg.get("agents", []) or None
+    name = value or os.environ.get("AGENTTALK_PEER")
+    if not name:
+        others = [a for a in (roster or []) if a != self_name]
+        if len(others) == 1:
+            return others[0]
+        sys.stderr.write(
+            "agenttalk: no peer identity: pass --to or set AGENTTALK_PEER in this terminal\n"
+            f"  roster: {', '.join(roster or [])}\n"
+            "  example (PowerShell): $env:AGENTTALK_PEER = 'codex'\n"
+            "  example (bash):       export AGENTTALK_PEER=codex\n"
+        )
+        sys.exit(2)
+    _ensure_in_roster(name, roster, label="peer")
+    if name == self_name:
+        sys.stderr.write(
+            f"agenttalk: peer '{name}' is the same as self — refusing to self-message.\n"
+            "  Pass --to <other-agent> or set AGENTTALK_PEER to a different name.\n"
+        )
+        sys.exit(2)
+    return name
+
+
+def _ensure_in_roster(name: str, roster: list[str] | None, *, label: str) -> None:
+    if not roster:
+        return
+    if name not in roster:
+        sys.stderr.write(
+            f"agenttalk: {label} agent '{name}' is not in the project roster {sorted(roster)}.\n"
+            "  Check --from/--to/--for or AGENTTALK_SELF/AGENTTALK_PEER for a typo,\n"
+            "  or re-init with `agenttalk init --here --agents ...` to add this agent.\n"
+        )
+        sys.exit(2)
+
+
 # ------------------------------------------------------------------- handlers
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -65,6 +127,21 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"agenttalk initialized at {store.dir}")
     print(f"  agents:     {', '.join(cfg['agents'])}")
     print(f"  session_id: {cfg['session_id']}")
+    # Identity hint: tell the user how to point each terminal at the
+    # right agent name. Concrete examples when the roster is exactly 2.
+    print()
+    if len(agents) == 2:
+        a, b = agents
+        print("Tip: in each terminal, set its agent identity before invoking skills:")
+        print(f"  PowerShell (Terminal A): $env:AGENTTALK_SELF='{a}'; $env:AGENTTALK_PEER='{b}'")
+        print(f"  PowerShell (Terminal B): $env:AGENTTALK_SELF='{b}'; $env:AGENTTALK_PEER='{a}'")
+        print(f"  Bash (Terminal A):       export AGENTTALK_SELF={a} AGENTTALK_PEER={b}")
+        print(f"  Bash (Terminal B):       export AGENTTALK_SELF={b} AGENTTALK_PEER={a}")
+    else:
+        print("Tip: in each terminal, set AGENTTALK_SELF to that terminal's agent name.")
+        print("  PowerShell: $env:AGENTTALK_SELF='<name>'")
+        print("  Bash:       export AGENTTALK_SELF=<name>")
+    print("Commands also accept explicit --from/--to/--for flags as overrides.")
     return 0
 
 
@@ -103,14 +180,18 @@ def _format_age(seconds: float) -> str:
 
 def cmd_send(args: argparse.Namespace) -> int:
     store = _get_store(args)
+    cfg = store.load_config()
+    roster = cfg.get("agents") or []
+    sender = _resolve_self(args.sender, roster=roster)
+    recipient = _resolve_peer(args.recipient, cfg, sender)
     body = _read_body(args)
     if not body and not args.allow_empty:
         sys.stderr.write("agenttalk send: empty body (use -m TEXT, --file PATH, pipe stdin, or --allow-empty)\n")
         return 2
     meta = _parse_meta(args.meta)
     msg = store.send(
-        sender=args.sender,
-        recipient=args.recipient,
+        sender=sender,
+        recipient=recipient,
         body=body,
         kind=args.kind,
         subject=args.subject or "",
@@ -125,57 +206,60 @@ def cmd_send(args: argparse.Namespace) -> int:
 
 def cmd_recv(args: argparse.Namespace) -> int:
     store = _get_store(args)
-    cursor = args.since if args.since is not None else store.cursor(args.agent)
-    msgs = store.messages_for(args.agent, since_id=cursor or None)
+    agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
+    cursor = args.since if args.since is not None else store.cursor(agent)
+    msgs = store.messages_for(agent, since_id=cursor or None)
     if not msgs:
         if not args.quiet:
-            print(f"(no new messages for {args.agent})")
+            print(f"(no new messages for {agent})")
         return 0
     for m in msgs:
         print(render(m, header=f"AGENTTALK :: INBOX  {m.sender} -> {m.recipient}"))
     if args.ack:
-        store.advance_cursor(args.agent, msgs[-1].id)
+        store.advance_cursor(agent, msgs[-1].id)
     return 0
 
 
 def cmd_wait(args: argparse.Namespace) -> int:
     store = _get_store(args)
+    agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
     deadline = time.time() + args.timeout if args.timeout > 0 else None
     interval = max(0.1, args.interval)
     heartbeat_interval = max(0.0, args.heartbeat_interval)
-    cursor_at_start = store.cursor(args.agent)
+    cursor_at_start = store.cursor(agent)
     last_heartbeat = 0.0
     # Stamp once up front so peers see the listener immediately.
     if heartbeat_interval > 0:
-        store.write_heartbeat(args.agent)
+        store.write_heartbeat(agent)
         last_heartbeat = time.time()
     while True:
-        msgs = store.messages_for(args.agent, since_id=cursor_at_start or None)
+        msgs = store.messages_for(agent, since_id=cursor_at_start or None)
         if msgs:
             m = msgs[0]
             print(render(m, header=f"AGENTTALK :: RECEIVED  {m.sender} -> {m.recipient}"))
             if args.ack:
-                store.advance_cursor(args.agent, m.id)
+                store.advance_cursor(agent, m.id)
             return 0
         if deadline is not None and time.time() >= deadline:
             if not args.quiet:
-                print(f"(timeout: no new messages for {args.agent} in {args.timeout}s)")
+                print(f"(timeout: no new messages for {agent} in {args.timeout}s)")
             return 1
         if heartbeat_interval > 0 and time.time() - last_heartbeat >= heartbeat_interval:
-            store.write_heartbeat(args.agent)
+            store.write_heartbeat(agent)
             last_heartbeat = time.time()
         time.sleep(interval)
 
 
 def cmd_ack(args: argparse.Namespace) -> int:
     store = _get_store(args)
+    agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
     if args.id:
-        store.advance_cursor(args.agent, args.id)
+        store.advance_cursor(agent, args.id)
     else:
-        msgs = store.messages_for(args.agent)
+        msgs = store.messages_for(agent)
         if msgs:
-            store.advance_cursor(args.agent, msgs[-1].id)
-    print(f"cursor[{args.agent}] = {store.cursor(args.agent) or '(none)'}")
+            store.advance_cursor(agent, msgs[-1].id)
+    print(f"cursor[{agent}] = {store.cursor(agent) or '(none)'}")
     return 0
 
 
@@ -262,14 +346,15 @@ def cmd_codex_config(args: argparse.Namespace) -> int:
 def cmd_end(args: argparse.Namespace) -> int:
     store = _get_store(args)
     cfg = store.load_config()
-    others = [a for a in cfg.get("agents", []) if a != args.sender]
+    sender = _resolve_self(args.sender, roster=cfg.get("agents") or [])
+    others = [a for a in cfg.get("agents", []) if a != sender]
     if not others:
         sys.stderr.write("agenttalk end: no other agents registered\n")
         return 2
     body = args.reason or "session ended"
     for other in others:
         store.send(
-            sender=args.sender,
+            sender=sender,
             recipient=other,
             body=body,
             kind="end",
@@ -297,8 +382,8 @@ def build_parser() -> argparse.ArgumentParser:
     ps.set_defaults(func=cmd_status)
 
     pse = sub.add_parser("send", help="Send a message from one agent to another.")
-    pse.add_argument("--from", dest="sender", required=True, help="Sender agent name")
-    pse.add_argument("--to", dest="recipient", required=True, help="Recipient agent name")
+    pse.add_argument("--from", dest="sender", help="Sender agent name (default: $AGENTTALK_SELF)")
+    pse.add_argument("--to", dest="recipient", help="Recipient agent name (default: $AGENTTALK_PEER, or the single other agent in the roster)")
     pse.add_argument("--kind", default="message", help="message | review-request | review-result | ack | note | end")
     pse.add_argument("--subject", help="One-line summary")
     pse.add_argument("--meta", action="append", help="key=value (repeatable)")
@@ -310,14 +395,14 @@ def build_parser() -> argparse.ArgumentParser:
     pse.set_defaults(func=cmd_send)
 
     pr = sub.add_parser("recv", help="Print all queued messages for an agent.")
-    pr.add_argument("--for", dest="agent", required=True)
+    pr.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
     pr.add_argument("--since", help="Only messages with id > this (default: agent cursor)")
     pr.add_argument("--ack", action="store_true", help="Advance cursor past the last shown msg")
     pr.add_argument("--quiet", action="store_true")
     pr.set_defaults(func=cmd_recv)
 
     pw = sub.add_parser("wait", help="Block until a new message arrives for an agent, then print it.")
-    pw.add_argument("--for", dest="agent", required=True)
+    pw.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
     pw.add_argument("--timeout", type=float, default=120.0, help="Seconds to wait (0 = forever, default 120)")
     pw.add_argument("--interval", type=float, default=0.3, help="Poll interval in seconds (default 0.3)")
     pw.add_argument("--ack", action="store_true", default=True, help="Advance cursor past the received msg (default true)")
@@ -328,7 +413,7 @@ def build_parser() -> argparse.ArgumentParser:
     pw.set_defaults(func=cmd_wait)
 
     pa = sub.add_parser("ack", help="Advance an agent's cursor (defaults to latest message).")
-    pa.add_argument("--for", dest="agent", required=True)
+    pa.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
     pa.add_argument("--id", help="Specific message id (default: latest message for this agent)")
     pa.set_defaults(func=cmd_ack)
 
@@ -338,7 +423,7 @@ def build_parser() -> argparse.ArgumentParser:
     pt.set_defaults(func=cmd_transcript)
 
     pe = sub.add_parser("end", help="Send an 'end' message to the other agent(s) and export the transcript.")
-    pe.add_argument("--from", dest="sender", required=True)
+    pe.add_argument("--from", dest="sender", help="Sender agent name (default: $AGENTTALK_SELF)")
     pe.add_argument("--reason", help="Free-text reason")
     pe.set_defaults(func=cmd_end)
 

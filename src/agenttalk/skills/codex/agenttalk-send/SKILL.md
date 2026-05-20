@@ -1,57 +1,74 @@
 ---
 name: agenttalk-send
-description: Send a single message to the other agent (typically Claude Code) over the project's local agenttalk message bus. Use this when the user asks Codex to "ping Claude", "tell the other agent", "send to claude", or otherwise wants a one-shot note that does not require waiting for a reply. Requires `agenttalk init` to have been run in the project (look for a `.agenttalk/` dir).
+description: Send a single message to the peer agent over agenttalk. Use this when the user asks to "ping the other agent" or "send to <name>" and the request does not require waiting for a reply. Requires `agenttalk init` in the project root.
 ---
 
-# agenttalk-send — Send a message to the other agent
+# agenttalk-send — Send a message to the peer agent (codex side)
 
-You are operating as the **`codex`** agent. The other agent (typically
-`claude`) is running in another terminal in the same project. Messages
-are exchanged via the `agenttalk` CLI, backed by `.agenttalk/` in the
-project root.
+You are running as a **Codex** agent. Your peer (typically a Claude
+Code, but could be another Codex) is in another terminal in the same
+project. Messages flow via `agenttalk`, backed by `.agenttalk/` in
+the project root.
+
+## Identity
+
+Resolve your name and the peer's in your current shell:
+
+```bash
+SELF="${AGENTTALK_SELF:-codex}"
+PEER="${AGENTTALK_PEER:-claude}"
+```
+
+If the user is running two Codexes (or any same-kind pair), they will
+have set distinct `AGENTTALK_SELF` / `AGENTTALK_PEER` per terminal.
+Always resolve inside your current shell — env from prior tool calls
+does not persist.
 
 ## When to trigger
 
-Trigger this skill when the user asks Codex to send, ping, message, or
-notify the other agent — and the request does not require waiting for a
-reply before continuing.
+When the user asks Codex to send, ping, message, or notify the peer —
+and the request does not require waiting for a reply before
+continuing.
 
-If the user wants a request/response (e.g. "ask claude to fix X then
-wait"), use the `agenttalk-handoff` skill instead. If the user wants
-Codex to act as the passive reviewer for a Claude-led implementation,
-use `agenttalk-listen`.
+For request/response (e.g. "ask claude to fix X then wait"), use
+`agenttalk-handoff`. To act as a passive listener, use
+`agenttalk-listen`.
+
+**Do NOT use this skill to coordinate splitting implementation work**
+(e.g., "I'll do the frontend, you do the backend") without first
+asking the user. See `$agenttalk-handoff` and `$agenttalk-listen` for
+the full split-work rules; the short version is: don't split outside
+a spec-kitty mission without user approval, and when a split is
+approved, every piece MUST be cross-reviewed via `$agenttalk-handoff`.
 
 ## Prerequisites
 
-1. Verify there is a `.agenttalk/` directory in the project root.
-   Otherwise tell the user `agenttalk init --here --agents claude,codex`
-   is needed first.
-2. Confirm `agenttalk --help` runs. If the command is missing, install
-   it: `python -m pip install -e <path-to-agenttalk>` (the user knows
-   the path; ask if unsure).
+1. Verify `.agenttalk/` exists in the project root. Otherwise tell
+   the user `agenttalk init --here --agents <self>,<peer>` is needed.
+2. Confirm `agenttalk --help` runs. If missing, install:
+   `python -m pip install -e <path-to-agenttalk>`.
 
 ## Procedure
 
-Send the message:
-
 ```bash
-agenttalk send --from codex --to claude --kind <kind> --subject "<one line>" -m "<body>"
+SELF="${AGENTTALK_SELF:-codex}"
+PEER="${AGENTTALK_PEER:-claude}"
+agenttalk send --from "$SELF" --to "$PEER" --kind <kind> \
+  --subject "<one line>" -m "<body>"
 ```
 
 - `--kind` defaults to `message`. Use `note`, `question`, or
   `review-result` (with `--meta status=approved|rejected`) when
   appropriate.
-- Pass structured payload via `--meta key=value` (repeatable).
-- The CLI prints the rendered message. You do not need to repeat it.
+- `--meta key=value` is repeatable for structured payload.
+- The CLI prints the rendered message — do not repeat it.
 
 After sending, return control to the user with a one-line summary
-including the message id from the CLI output. Do **not** call
-`agenttalk wait` from this skill — that is the job of `agenttalk-listen`
-or `agenttalk-handoff`.
+including the message id. Do **not** call `agenttalk wait` from this
+skill — that is `agenttalk-listen` or `agenttalk-handoff`.
 
 ## Do not
 
-- Do not send `--kind end` from this skill. The user should explicitly
-  ask to end the session, after which run
-  `agenttalk end --from codex --reason "..."`.
+- Do not send `--kind end`. The user should explicitly ask to end the
+  session, after which run `agenttalk end --from "$SELF" --reason "..."`.
 - Do not modify project files; this skill only sends a message.

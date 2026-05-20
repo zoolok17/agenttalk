@@ -175,6 +175,95 @@ loop) and writes `transcript-<session_id>.md` under
 
 ---
 
+## Agent identity (and running two of the same kind)
+
+Agent names are arbitrary strings. The default pair is `claude` and
+`codex`, but you can run two Claudes (or two Codexes) by giving them
+distinct names — useful if you don't have subscriptions to both tools.
+
+Each terminal declares which agent it is via env vars:
+
+```powershell
+# Terminal A
+$env:AGENTTALK_SELF = 'claude-a'
+$env:AGENTTALK_PEER = 'claude-b'
+
+# Terminal B
+$env:AGENTTALK_SELF = 'claude-b'
+$env:AGENTTALK_PEER = 'claude-a'
+```
+
+```bash
+# Terminal A
+export AGENTTALK_SELF=claude-a AGENTTALK_PEER=claude-b
+
+# Terminal B
+export AGENTTALK_SELF=claude-b AGENTTALK_PEER=claude-a
+```
+
+Initialize with matching names:
+
+```powershell
+agenttalk init --here --agents claude-a,claude-b
+```
+
+All `agenttalk` commands accept `--from`/`--to`/`--for` flags as
+overrides. If the flags are absent, the CLI uses the env vars; if
+**both** are absent the CLI exits with a clear error pointing you at
+either the flag or the env var. The CLI does NOT silently assume
+`claude`/`codex` — those defaults live only in the bundled skill
+files (so an LLM running `/agenttalk.send` without env set still
+works for the canonical pair).
+
+The CLI also validates the resolved name against the roster: a typo
+like `AGENTTALK_SELF=claud` exits 2 rather than silently operating
+on a phantom mailbox. And it rejects self-mail (`SELF == PEER`).
+
+`agenttalk init` prints concrete env-setup commands at the end of its
+output (for 2-agent rosters), so you can copy-paste straight into each
+terminal.
+
+### Env caveat for LLM tool-call contexts
+
+When you set `AGENTTALK_SELF` in your terminal profile or your shell
+RC, every child process inherits it — including `agenttalk`
+subprocesses spawned by the LLM, so things "just work".
+
+But env vars set INSIDE an LLM tool call (e.g., `$env:AGENTTALK_SELF =
+'claude-a'` in one PowerShell tool call) may NOT persist into the next
+tool call, because each tool call is often a fresh shell process. The
+bundled skill files resolve identity inside each tool call's shell, so
+this is transparent in practice — but if you write your own
+automation, set env in the parent shell or pass explicit
+`--from`/`--to`/`--for` flags.
+
+---
+
+## Splitting implementation work between agents
+
+Outside a spec-kitty mission, the skills tell each agent **not to
+split implementation work with the peer without first asking you**.
+The user invoked them to do a task; the peer is for review or specific
+delegated subtasks, not for unilaterally carving up the work.
+
+When you DO want them to split (e.g., "Claude does the frontend, Codex
+does the backend"):
+
+1. Say so explicitly. Each agent confirms the ownership boundaries via
+   a `kind=note` message.
+2. **Every implemented piece is then cross-reviewed** — the
+   implementer of one chunk sends `kind=review-request` to the peer,
+   who reviews read-only and replies with `kind=review-result`. This
+   is mandatory in the skill bodies, not optional.
+3. The implementer of each piece fixes their own blockers. Reviews
+   never silently patch peer code.
+
+In a spec-kitty mission, ignore the above — spec-kitty's state machine
+assigns implement/review per WP, and the sk-loop skills do the right
+thing automatically.
+
+---
+
 ## Cost notes — listen mode is not free
 
 > All numbers below are **rough estimates as of 2026-05**. Model pricing
