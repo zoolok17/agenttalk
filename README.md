@@ -175,6 +175,56 @@ loop) and writes `transcript-<session_id>.md` under
 
 ---
 
+## Cost notes — listen mode is not free
+
+> All numbers below are **rough estimates as of 2026-05**. Model pricing
+> changes; treat these as order-of-magnitude guidance, not invoices.
+
+`agenttalk wait` itself uses no model tokens — it's a Python subprocess
+polling the filesystem. But every time the subprocess returns to the
+LLM (either with a real message OR after the timeout fires), the agent
+re-reads the conversation context and decides what to do. That's the
+token cost driver.
+
+### Order-of-magnitude estimates
+
+Assuming a 30k-token conversation context and Claude Opus 4.7 pricing
+(~$15/M input, ~$75/M output; cached reads ~$1.50/M):
+
+| Mode | Wait timeout | Idle wake-ups / hour | Per-agent idle cost |
+| --- | --- | --- | --- |
+| `/agenttalk.listen` (default 1800s) | 30 min | ~2 | ~$0.90/hour (cache cold each wake) |
+| `/agenttalk.sk-loop` (30s) | 30 sec | ~120 | ~$5/hour (cached, within 5 min TTL) |
+
+Two agents listening in parallel → roughly double. Real messages are
+handled immediately regardless of timeout (the subprocess returns the
+instant a message file lands), so the table is **idle cost only**;
+actual conversation rounds add their own per-message cost.
+
+Codex has its own pricing model but the same architecture applies — a
+short wait timeout means more idle wake-ups, each re-reading the
+conversation. Configure accordingly.
+
+### Why sk-loop pays more
+
+The sk-loop's short timeout is doing real work: every cycle it ALSO
+re-runs `spec-kitty next` to self-heal cases where the peer changed
+state without sending a wake. Pure listen has no such second source,
+so the long timeout is free observability.
+
+### Reducing cost further
+
+- `agenttalk wait --heartbeat-interval 0` disables heartbeat writes
+  (saves trivial disk IO; no token impact).
+- `agenttalk wait --timeout 0` blocks forever. Cheaper still — only
+  real messages wake the LLM. Tradeoff: no safety-net liveness loop
+  if the subprocess hangs.
+- For long idle periods, just have the agent exit the loop and tell
+  you when you're ready to resume. The `kind=end` message gracefully
+  stops the other side.
+
+---
+
 ## CLI reference
 
 | Command | What it does |
