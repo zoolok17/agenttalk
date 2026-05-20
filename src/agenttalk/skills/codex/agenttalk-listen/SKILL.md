@@ -17,17 +17,22 @@ the user explicitly stops you.
 ## The loop
 
 ```bash
-agenttalk wait --for codex --timeout 30
+agenttalk wait --for codex --timeout 1800
 ```
 
 - exit 0: a message was received and printed. Classify and handle it,
   then loop back.
-- exit 1: timeout (no new messages in 30s). Loop back immediately. Do
-  NOT return control to the user just because the poll window expired.
+- exit 1: timeout (no new messages in 30 min). Loop back immediately
+  as a liveness safety net. Do NOT return control to the user just
+  because the poll window expired.
 
-Use a **short** timeout (30s, not 120). The short window lets you
-interleave handling of incoming messages with waiting for replies to
-requests you've sent.
+Use a **long** timeout (1800s). The `agenttalk wait` subprocess polls
+the filesystem internally (~0.3s) so real messages still return
+immediately; only the *idle* case gets cheaper. Each premature return
+to the LLM costs tokens to re-read your conversation context, so
+short timeouts in pure listen mode are pure waste. sk-loop uses a
+short timeout because it also polls `spec-kitty next` — pure listen
+has no other source to interleave with.
 
 ## Message classification
 
@@ -84,14 +89,6 @@ review it. Procedure:
      - **Verification performed** — commands you ran, output checks
      - **Residual risks / scope limits**
      - If `approved`, state explicitly "no blocking findings".
-
-## When two requests collide
-
-If a `review-request` arrives while you are waiting for a
-`review-result` to one of YOUR own requests:
-- Handle the OLDER `request_id` (or older message timestamp) first.
-- After replying, resume waiting for your own outstanding result.
-- Deterministic ordering avoids both sides blocking forever.
 
 ## When to break the loop and ask the human
 
