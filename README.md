@@ -116,62 +116,62 @@ This creates `.agenttalk/` with:
   sessions/            markdown/jsonl transcripts written by `agenttalk end`
 ```
 
-The Claude-side slash commands (`agenttalk.send`, `agenttalk.listen`,
-`agenttalk.handoff`) live globally under `~/.claude/commands/*.md` —
-plain markdown files with a `description:` frontmatter, one file per
-command. Claude Code does **not** read `.agents/skills/` (that's a
-spec-kitty internal convention).
-
-The Codex-side skills (`agenttalk-send`, `agenttalk-listen`,
-`agenttalk-handoff`) live globally under `~/.codex/skills/<name>/SKILL.md`
-— folder-per-skill with `name`+`description` frontmatter. Different
-convention from Claude Code's, same payload.
-
-Install once in either tool's global skill dir and every project sees them.
+Slash commands are installed globally (one-time, not per project) via
+`agenttalk install-skills` — see the [Install](#install) section.
 
 ---
 
-## The daily workflow
+## Workflows
 
-Open **two terminals** at the project root:
+Open **two terminals** at the project root, one for each agent.
 
-1. **Terminal A — Claude Code.** Tell it what to build.
-2. **Terminal B — Codex.** Type:
-   `$agenttalk-listen` (it enters a wait/respond/wait loop as `codex`).
-   Codex skills use `$name` syntax; Claude Code uses `/name`.
+### Spec-kitty missions — `sk-loop` (recommended)
 
-Claude implements, then sends a review request:
+If you're running a spec-kitty mission, the persistent loop drives the
+implement → review cycle automatically using `spec-kitty next` as the
+state machine and a tiny `kind=wake` message for low-latency handoff.
 
 ```text
-/agenttalk.handoff --to codex --kind review-request --subject "WP01 — message store"
+Terminal A (Claude):   /agenttalk.sk-loop <mission-slug>
+Terminal B (Codex):    $agenttalk-sk-loop <mission-slug>
 ```
 
-Behind the scenes Claude runs:
+Both windows stay alive for the whole mission, accumulating full
+context across every WP. Roles are symmetric — spec-kitty assigns
+implement vs review per WP based on your `.kittify/config.yaml`.
 
-```powershell
-agenttalk send --from claude --to codex --kind review-request --subject "WP01" -m "Please review WP01..."
-agenttalk wait --for claude --timeout 600
+### Ad-hoc cross-agent collaboration — `listen` + `handoff`
+
+When agents are working together outside a spec-kitty mission (organic
+work split, second opinions, cross-reviews of each other's work):
+
+```text
+Terminal A (Claude):   /agenttalk.listen          (passive: wait for peer)
+Terminal B (Codex):    $agenttalk-listen          (passive: wait for peer)
 ```
 
-In Terminal B, Codex's `wait` returns with the message. It runs the
-spec-kitty review per `.agents/skills/spec-kitty.review/SKILL.md`, then
-sends a reply:
+Either side, when they finish a chunk and want it reviewed:
 
-```powershell
-agenttalk send --from codex --to claude --kind review-result --meta status=approved -m "..."
+```text
+/agenttalk.handoff       (Claude)  — bundles send + wait
+$agenttalk-handoff       (Codex)
 ```
 
-Claude's `wait` returns, it reads the reply, and continues. Both
-terminals show both halves of the exchange.
+The handoff includes structured meta — `request_id`, `base_sha`,
+`head_sha` — and a body template (Goal / Files changed / How to verify
+/ Focus areas / Known caveats). The receiver mode-detects: if the
+meta has a `mission` or `wp_id`, it runs the spec-kitty review path;
+otherwise it does an ad-hoc cross-review of the named scope.
 
-When you're done:
+### Ending the session
 
 ```powershell
 agenttalk end --from claude --reason "feature shipped"
 ```
 
-This sends an `end` message to the other agent (breaking its listen loop)
-and writes `transcript-<session_id>.md` under `.agenttalk/sessions/`.
+This sends an `end` message to the other agent (breaking its listen
+loop) and writes `transcript-<session_id>.md` under
+`.agenttalk/sessions/`.
 
 ---
 
