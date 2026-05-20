@@ -6,6 +6,7 @@ import argparse
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agenttalk.display import render
@@ -75,10 +76,29 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"session_id: {cfg.get('session_id')}")
     print(f"agents:     {', '.join(cfg.get('agents', []))}")
     print(f"messages:   {len(msgs)}")
+    now = datetime.now(timezone.utc)
     for a in cfg.get("agents", []):
         unread = len(store.unread_for(a))
-        print(f"  {a:<10} cursor={store.cursor(a) or '(none)':<32} unread={unread}")
+        hb = store.read_heartbeat(a)
+        if hb is None:
+            seen = "(no heartbeat)"
+        else:
+            age_s = (now - hb).total_seconds()
+            seen = f"last_seen={_format_age(age_s)}"
+            if age_s > 60:
+                seen += " (stale)"
+        print(f"  {a:<10} cursor={store.cursor(a) or '(none)':<32} unread={unread:<3} {seen}")
     return 0
+
+
+def _format_age(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)}s ago"
+    if seconds < 3600:
+        return f"{int(seconds / 60)}min ago"
+    if seconds < 86400:
+        return f"{int(seconds / 3600)}h ago"
+    return f"{int(seconds / 86400)}d ago"
 
 
 def cmd_send(args: argparse.Namespace) -> int:
@@ -122,7 +142,13 @@ def cmd_wait(args: argparse.Namespace) -> int:
     store = _get_store(args)
     deadline = time.time() + args.timeout if args.timeout > 0 else None
     interval = max(0.1, args.interval)
+    heartbeat_interval = max(0.0, args.heartbeat_interval)
     cursor_at_start = store.cursor(args.agent)
+    last_heartbeat = 0.0
+    # Stamp once up front so peers see the listener immediately.
+    if heartbeat_interval > 0:
+        store.write_heartbeat(args.agent)
+        last_heartbeat = time.time()
     while True:
         msgs = store.messages_for(args.agent, since_id=cursor_at_start or None)
         if msgs:
@@ -135,6 +161,9 @@ def cmd_wait(args: argparse.Namespace) -> int:
             if not args.quiet:
                 print(f"(timeout: no new messages for {args.agent} in {args.timeout}s)")
             return 1
+        if heartbeat_interval > 0 and time.time() - last_heartbeat >= heartbeat_interval:
+            store.write_heartbeat(args.agent)
+            last_heartbeat = time.time()
         time.sleep(interval)
 
 
@@ -294,6 +323,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw.add_argument("--ack", action="store_true", default=True, help="Advance cursor past the received msg (default true)")
     pw.add_argument("--no-ack", dest="ack", action="store_false")
     pw.add_argument("--quiet", action="store_true")
+    pw.add_argument("--heartbeat-interval", type=float, default=10.0,
+                    help="Seconds between heartbeat stamps in .agenttalk/state/<agent>.heartbeat (0 = off, default 10)")
     pw.set_defaults(func=cmd_wait)
 
     pa = sub.add_parser("ack", help="Advance an agent's cursor (defaults to latest message).")

@@ -171,6 +171,42 @@ class Store:
         if msg_id > cur:
             self.set_cursor(agent, msg_id)
 
+    # ----------------------------------------------------------- heartbeats
+
+    def write_heartbeat(self, agent: str) -> None:
+        """Stamp .agenttalk/state/<agent>.heartbeat with the current ISO timestamp.
+
+        Called periodically by `agenttalk wait` so peers can see whether
+        someone is actively listening. Pure observability — never required
+        for correctness.
+        """
+        p = self.state_dir / f"{agent}.heartbeat"
+        _atomic_write_text(p, _now_iso())
+
+    def read_heartbeat(self, agent: str) -> datetime | None:
+        """Return the parsed heartbeat timestamp, or None if absent/unreadable."""
+        p = self.state_dir / f"{agent}.heartbeat"
+        if not p.exists():
+            return None
+        try:
+            raw = p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not raw:
+            return None
+        # Accept either trailing Z or +00:00 form
+        normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        try:
+            dt = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        # Heartbeat is observability only — reject any timezone-less file
+        # so a malformed write can't crash `status` via naive vs aware
+        # datetime subtraction.
+        if dt.tzinfo is None:
+            return None
+        return dt
+
 
 # --------------------------------------------------------- helpers (module)
 
