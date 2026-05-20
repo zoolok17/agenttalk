@@ -12,6 +12,7 @@ from agenttalk.display import render
 from agenttalk.store import Message, Store, find_root
 from agenttalk import transcript as tx
 from agenttalk import codex_config as cxc
+from agenttalk import install_skills as iskl
 
 
 # --------------------------------------------------------------------- utils
@@ -157,6 +158,49 @@ def cmd_transcript(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_install_skills(args: argparse.Namespace) -> int:
+    claude = not args.codex_only
+    codex = not args.claude_only
+    if not claude and not codex:
+        sys.stderr.write("agenttalk install-skills: nothing to do (both sides excluded)\n")
+        return 2
+
+    claude_dir = Path(args.claude_dir) if args.claude_dir else None
+    codex_dir = Path(args.codex_dir) if args.codex_dir else None
+
+    res = iskl.install(
+        claude=claude,
+        codex=codex,
+        claude_dir=claude_dir,
+        codex_dir=codex_dir,
+        force=args.force,
+        dry_run=args.dry_run,
+    )
+
+    for a in res.actions:
+        marker = {
+            "copied": "+",
+            "unchanged": "=",
+            "skipped": "!",
+            "would-copy": "?",
+            "would-overwrite": "?",
+        }.get(a.status, " ")
+        print(f"  {marker} {a.status:<16} {a.dst}")
+
+    counts = res.counts()
+    summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+    print(f"\nagenttalk install-skills: {summary or 'no actions'}")
+
+    if counts.get("skipped"):
+        print(
+            "\nSome targets differ from the bundled version and were not overwritten.\n"
+            "Re-run with --force to replace them, or diff manually first."
+        )
+    if not args.dry_run and counts.get("copied"):
+        print("Restart Claude Code / Codex to pick up the new skill files.")
+    return 0
+
+
 def cmd_codex_config(args: argparse.Namespace) -> int:
     project_dir = Path(args.project).resolve() if args.project else Path.cwd().resolve()
     config_path = Path(args.config_path) if args.config_path else cxc.default_config_path()
@@ -266,6 +310,18 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--from", dest="sender", required=True)
     pe.add_argument("--reason", help="Free-text reason")
     pe.set_defaults(func=cmd_end)
+
+    pis = sub.add_parser(
+        "install-skills",
+        help="Copy bundled agenttalk skill files to ~/.claude/commands/ and ~/.codex/skills/.",
+    )
+    pis.add_argument("--claude-only", action="store_true", help="Install only Claude-side skills")
+    pis.add_argument("--codex-only", action="store_true", help="Install only Codex-side skills")
+    pis.add_argument("--claude-dir", help="Override Claude commands dir (default: ~/.claude/commands)")
+    pis.add_argument("--codex-dir", help="Override Codex skills dir (default: ~/.codex/skills)")
+    pis.add_argument("--force", action="store_true", help="Overwrite existing files even if they differ from bundled")
+    pis.add_argument("--dry-run", action="store_true", help="Show what would happen without writing")
+    pis.set_defaults(func=cmd_install_skills)
 
     pc = sub.add_parser(
         "codex-config",

@@ -15,11 +15,14 @@ on session end.
 ## TL;DR — getting started
 
 ```powershell
-# one-time, anywhere
-python -m pip install -e D:\Projects\claude\agenttalk
+# one-time install (anywhere)
+git clone https://github.com/<your-user>/agenttalk.git
+python -m pip install -e .\agenttalk
+agenttalk install-skills         # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
 agenttalk init --here --agents claude,codex
+agenttalk codex-config --enable   # lets Codex call agenttalk from its sandbox
 ```
 
 Open two terminals at the project root:
@@ -75,10 +78,23 @@ interrupt whenever you want.
 ## Install
 
 ```powershell
-python -m pip install -e D:\Projects\claude\agenttalk
+git clone https://github.com/<your-user>/agenttalk.git
+python -m pip install -e .\agenttalk
 ```
 
-This puts an `agenttalk` script on your PATH.
+This puts an `agenttalk` script on your PATH. The package is stdlib-only
+(no third-party deps) and requires Python 3.10+.
+
+If you also want Codex to call agenttalk from inside its sandbox, run
+this once per project root:
+
+```powershell
+agenttalk codex-config --enable
+```
+
+It writes a per-project block to `~/.codex/config.toml` granting
+`approval_policy = "never"` and `sandbox_mode = "workspace-write"` for
+that project only. Reverse it with `agenttalk codex-config --disable`.
 
 ---
 
@@ -171,6 +187,8 @@ and writes `transcript-<session_id>.md` under `.agenttalk/sessions/`.
 | `agenttalk ack --for A [--id ID]` | Manually move an agent's cursor forward. |
 | `agenttalk transcript [--format md\|jsonl] [--out PATH]` | Export the full conversation. |
 | `agenttalk end --from A [--reason ...]` | Notify the other agent(s) and write the transcript. |
+| `agenttalk install-skills [--claude-only\|--codex-only] [--force] [--dry-run]` | Copy bundled skill files to `~/.claude/commands/` and `~/.codex/skills/`. Idempotent — preserves your local edits unless `--force`. |
+| `agenttalk codex-config [--enable\|--disable\|--status]` | Manage per-project sandbox/trust block in `~/.codex/config.toml` so Codex can call agenttalk from inside its sandbox. |
 
 Message `--kind` values are free-form, but the skills assume:
 
