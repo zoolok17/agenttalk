@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agenttalk"
+version = "0.1.0"
+description = "File-backed message bus that lets two coding-agent CLIs (Claude Code and Codex) collaborate on the same project."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "agenttalk contributors" }]
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+agenttalk = "agenttalk.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agenttalk"]

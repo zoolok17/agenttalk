@@ -1,0 +1,43 @@
+# Added by Spec Kitty CLI (auto-managed)
+.claude/
+.codex/
+.vibe/
+.opencode/
+.windsurf/
+.gemini/
+.cursor/
+.qwen/
+.kilocode/
+.augment/
+.roo/
+.amazonq/
+.kiro/
+.agent/
+.github/copilot/
+.kittify/.dashboard
+.kittify/charter/context-state.json
+.kittify/charter/directives.yaml
+.kittify/charter/governance.yaml
+.kittify/charter/metadata.yaml
+.kittify/charter/references.yaml
+.kittify/dossiers/
+.kittify/events/
+.kittify/merge-state.json
+.kittify/missions/__pycache__/
+.kittify/runtime/
+.kittify/workspaces/
+
+# spec-kitty installs slash-command skills here; they belong to spec-kitty,
+# not this repo, and are reinstalled by `spec-kitty init`.
+.agents/skills/spec-kitty.*/
+
+# agenttalk runtime store (per-machine conversation state).
+# The whole dir is created by `agenttalk init` on first use.
+.agenttalk/
+
+# Python build artifacts
+__pycache__/
+*.egg-info/
+build/
+dist/
+
