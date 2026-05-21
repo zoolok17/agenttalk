@@ -42,8 +42,9 @@ remains the source of truth for state; agenttalk is just a wake signal.
 
 ### For ad-hoc cross-agent messaging (not spec-kitty)
 
-- **Terminal A (Claude).** `/agenttalk.handoff` (send + block on reply)
-  or `/agenttalk.send` (fire and forget).
+- **Terminal A (Claude).** `/agenttalk.handoff` (send + block on reply),
+  `/agenttalk.consult` (confer with peer before answering you), or
+  `/agenttalk.send` (fire and forget).
 - **Terminal B (Codex).** `$agenttalk-listen` (wait/respond loop).
 
 Both terminals show every message as it flies past. When you're done:
@@ -268,6 +269,44 @@ does the backend"):
 In a spec-kitty mission, ignore the above — spec-kitty's state machine
 assigns implement/review per WP, and the sk-loop skills do the right
 thing automatically.
+
+---
+
+## Pre-answer consults — letting agents confer before responding
+
+Sometimes you ask one agent a question and you want the other to
+pressure-test the draft answer before it lands. The `/agenttalk.consult`
+(`$agenttalk-consult` on Codex) skill does exactly that:
+
+1. The receiving agent drafts an answer in private.
+2. Sends the draft + its uncertainty to the peer via `kind=question`
+   with `meta.consult=true`.
+3. The peer reads it, critiques (blocking objections, missing
+   assumptions, alternative recommendation), and replies with `agree
+   / disagree / qualified-agree`.
+4. The receiving agent synthesizes a concise final answer naming
+   agreement, disagreement, and its recommendation. The peer never
+   answers you directly and never modifies files.
+
+When agents auto-trigger it (per the bundled skill bodies):
+
+- **Always:** when you explicitly ask ("ask codex", "discuss first",
+  "get a second opinion").
+- **Default:** high-impact ambiguous calls — architecture,
+  requirements, security tradeoffs, data-loss risk, irreversible
+  workflow decisions, expensive implementation direction.
+- **Skipped:** trivial questions, syntax, status updates, bounded
+  reviews (those use `/agenttalk.handoff`), or anything the agent is
+  confident about that you haven't asked for a second opinion on.
+
+The freshness check (heartbeat older than ~5 min) suppresses the
+consult and the agent tells you the peer wasn't listening so it
+answered on its own. Default consult wait is 180 s, much shorter
+than work-item handoffs — consults are interactive.
+
+Cost: each consult is a full round-trip, so latency and tokens roughly
+double for that exchange. Worth it for real decisions, wasteful for
+trivia — the skill bodies have explicit guidance on when to fire.
 
 ---
 

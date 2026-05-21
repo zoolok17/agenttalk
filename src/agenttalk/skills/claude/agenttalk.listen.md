@@ -72,7 +72,7 @@ other source to interleave with.
 | --- | --- |
 | `review-request` | Mode-detect (see "Review request handling" below). |
 | `review-result`  | Verdict on a request **you** sent. Match by `meta.request_id`. Act on verdict. |
-| `question`       | Answer directly via `agenttalk send --from $SELF --to $PEER --kind message -m "<answer>"`. |
+| `question`       | If `meta.consult=true`, follow "Consult handling" below. Otherwise answer directly via `agenttalk send --from $SELF --to $PEER --kind message -m "<answer>"`. |
 | `wake`           | State-change signal (typically from sk-loop). Re-derive your action from the authoritative source (e.g. `spec-kitty next`). Never act on the wake body alone. |
 | `message` / `note` | Acknowledge with a one-line reply only if it asks for one. |
 | `end`            | Exit the loop. Run `agenttalk transcript --format md` and surface the path. |
@@ -115,6 +115,33 @@ review it.
    - Body: Findings (ordered by severity, with file/line refs),
      Verification performed, Residual risks. If approved, state
      explicitly "no blocking findings".
+
+## Consult handling
+
+When you receive `kind=question` with `meta.consult=true`, the peer
+is asking you to pressure-test their draft answer to a user question
+(see `/agenttalk.consult` for the sender's side).
+
+Procedure:
+1. Read the body: it should contain `## User question / constraints`,
+   `## My draft answer`, `## What I'm uncertain about`, `## Requested
+   response shape`.
+2. **Attack the draft, don't endorse it.** Look for:
+   - Blocking objections (correctness, security, data-loss).
+   - Missing assumptions.
+   - A meaningfully different recommendation.
+3. Reply with `kind=message` (NOT `kind=question` — that would loop):
+   ```powershell
+   agenttalk send --from $SELF --to $PEER --kind message `
+     --subject "consult reply" `
+     --meta request_id=<echoed> --meta consult=true --meta round=<echoed> `
+     -m "<your critique>"
+   ```
+4. End your reply with one of: `agree`, `disagree`, `qualified-agree`.
+5. **Do NOT modify project files.** Consult is advisory.
+6. **Do NOT answer the user directly.** The initiating agent owns
+   the final answer.
+7. **Do NOT start your own consult in return.** That's a loop.
 
 ## When to break the loop and ask the human
 
