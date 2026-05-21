@@ -41,3 +41,7 @@ __pycache__/
 build/
 dist/
 
+
+# Per-release scratch release-note files (kept out of the repo per
+# the v0.4.0 review feedback — they're for GitHub release pages only)
+/.release-notes-*.md

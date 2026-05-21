@@ -17,6 +17,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import string
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -51,6 +52,13 @@ KNOWN_KINDS = frozenset({
 # would let `"claude\n"` slip through into a state filename.
 _AGENT_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 
+# Session IDs are used as filesystem path components under
+# .agenttalk/archived/<session_id>/, so they need the same kind of
+# guard rail as agent names. Accept both the old format
+# (YYYYMMDDTHHMMSSZ) and the new format (YYYYMMDDTHHMMSS-XXXXZ with
+# a random suffix) so old configs from 0.3.x still validate.
+_SESSION_ID_RE = re.compile(r"\A[0-9]{8}T[0-9]{6}(-[A-Za-z0-9]{4})?Z\Z")
+
 
 def validate_agent_name(name: str) -> str:
     """Return ``name`` if it's a safe agent identifier, else raise ValueError.
@@ -73,6 +81,26 @@ def validate_agent_name(name: str) -> str:
             f"or digit, max 64 chars)"
         )
     return name
+
+
+def validate_session_id(session_id: str) -> str:
+    """Return ``session_id`` if it's a safe filesystem-path fragment.
+
+    `reset --archive` writes to ``.agenttalk/archived/<session_id>/``,
+    so a corrupted config with ``session_id="../escaped"`` could
+    archive outside the archive root. This validator rejects anything
+    that isn't a generated session id (old or new format).
+    """
+    if not isinstance(session_id, str):
+        raise ValueError(
+            f"session_id must be a string, got {type(session_id).__name__}"
+        )
+    if not _SESSION_ID_RE.match(session_id):
+        raise ValueError(
+            f"session_id {session_id!r} is not a safe identifier "
+            f"(expected YYYYMMDDTHHMMSSZ or YYYYMMDDTHHMMSS-XXXXZ)"
+        )
+    return session_id
 
 
 def validate_agent_roster(names: list[str]) -> list[str]:
@@ -244,6 +272,90 @@ class Store:
                 _atomic_write_text(cur, "")
         return cfg
 
+    def reset(self, *, archive: bool = False) -> tuple[dict, Path | None]:
+        """Clear active bus state (messages, cursors, heartbeats);
+        start a new session.
+
+        ``init --force`` rewrites the config but intentionally keeps
+        state. When the user really wants a clean slate they call
+        this explicitly.
+
+        Default behavior:
+        - **deletes** ``messages/`` and ``state/`` (active bus state)
+        - **preserves** ``sessions/`` (historical transcript exports
+          — those are user-visible artifacts, not active bus state)
+        - bumps ``session_id``
+
+        With ``archive=True``:
+        - **moves** ``messages/``, ``state/``, AND ``sessions/`` into
+          ``.agenttalk/archived/<old_session_id>/`` so the full prior
+          session is recoverable.
+
+        Returns ``(new_config, archive_path_or_None)``.
+        """
+        if not self.initialized():
+            raise FileNotFoundError(
+                f"agenttalk not initialized in {self.root}. Nothing to reset."
+            )
+        cfg = self.load_config()  # validates session_id format
+        old_session_id = cfg.get("session_id", "unknown")
+
+        archive_path: Path | None = None
+        if archive:
+            # Archive everything including past transcripts
+            archive_path = self._archive_session(
+                old_session_id, subdirs=("messages", "state", "sessions"),
+            )
+        else:
+            # Default delete: messages + state only. sessions/ holds
+            # exported transcripts (a user-visible artifact) — keep them.
+            for sub in (self.messages_dir, self.state_dir):
+                if sub.exists():
+                    shutil.rmtree(sub)
+
+        # Recreate active-state dirs + cursor files so the bus is
+        # immediately usable
+        for d in (self.messages_dir, self.state_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        cfg["session_id"] = _new_session_id()
+        cfg["created_at"] = _now_iso()
+        _atomic_write_text(self.config_path, json.dumps(cfg, indent=2))
+
+        for a in cfg.get("agents", []):
+            cur = self.state_dir / f"{a}.cursor"
+            if not cur.exists():
+                _atomic_write_text(cur, "")
+        return cfg, archive_path
+
+    def _archive_session(self, session_id: str,
+                         subdirs: tuple[str, ...] = ("messages", "state", "sessions")) -> Path:
+        """Move named subdirs into archived/<session_id>/.
+
+        Validates ``session_id`` as a safe path fragment before
+        constructing the archive path, so a corrupt
+        ``config.json[session_id]`` cannot escape ``archived/``.
+
+        Uses ``shutil.move`` (same-filesystem rename) so the operation
+        is fast even on large message dirs. The archive is read-only
+        once moved — agenttalk never writes into ``archived/``.
+        """
+        validate_session_id(session_id)  # fail-closed against traversal
+        archive_dir = self.dir / "archived" / session_id
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for sub in subdirs:
+            src = self.dir / sub
+            if src.exists():
+                dst = archive_dir / sub
+                # If a previous archive collision exists, move into a
+                # sub-subdir tagged with a timestamp to never destroy
+                # archived data.
+                if dst.exists():
+                    dst = archive_dir / f"{sub}.{_now_iso().replace(':', '-')}"
+                shutil.move(str(src), str(dst))
+        return archive_dir
+
     def load_config(self) -> dict:
         if not self.config_path.exists():
             raise FileNotFoundError(
@@ -264,6 +376,17 @@ class Store:
                 f"corrupt config at {self.config_path}: {e}. "
                 f"Re-init with `agenttalk init --here --agents ...`."
             )
+        # session_id is interpolated into archive paths, so reject
+        # corrupt values at load time rather than crashing in reset.
+        sid = cfg.get("session_id")
+        if sid is not None:
+            try:
+                validate_session_id(sid)
+            except ValueError as e:
+                raise ValueError(
+                    f"corrupt config at {self.config_path}: {e}. "
+                    f"Re-init with `agenttalk init --here --agents ... --force`."
+                )
         return cfg
 
     # --------------------------------------------------------------- writing
@@ -477,7 +600,13 @@ def _new_id() -> str:
 
 
 def _new_session_id() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    """Return a unique session identifier. Includes a random suffix
+    so two calls in the same second (e.g. init then reset) get
+    distinct IDs — otherwise `archived/<session_id>/` collides.
+    """
+    base = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    suffix = "".join(secrets.choice(_ID_ALPHABET) for _ in range(4))
+    return f"{base}-{suffix}Z"
 
 
 def find_root(start: Path | None = None) -> Path:

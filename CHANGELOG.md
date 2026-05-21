@@ -5,6 +5,61 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-21
+
+Second slice of the v0.2.0-review roadmap. Adds explicit session
+lifecycle (`agenttalk reset` / `reset --archive`) and clarifies
+what `init --force` actually does.
+
+### Added
+
+- **`agenttalk reset [--archive]`** — clears **active bus state**
+  (messages, cursors, heartbeats) and bumps `session_id`.
+  **Preserves the config (roster) AND historical transcripts under
+  `.agenttalk/sessions/`** — exported transcripts are user-visible
+  artifacts, not active bus state. With `--archive`, instead moves
+  everything (messages + state + sessions) into
+  `.agenttalk/archived/<old_session_id>/` so the entire prior
+  session is recoverable. Closes the v0.2.0 review's "no clean
+  lifecycle around old messages" gap. Session IDs are now
+  validated as safe filesystem-path fragments at config-load time,
+  so a corrupt config can't smuggle a `..\\escaped` path through
+  to `--archive`.
+- **`Store.reset(archive=False) -> (cfg, archive_path | None)`**
+  and **`Store._archive_session(session_id) -> Path`** as the
+  underlying mechanism. Same-filesystem `shutil.move` so even
+  large message dirs archive instantly. Collision-safe: a second
+  archive into the same `session_id` writes timestamped sub-dirs
+  rather than overwriting.
+
+### Changed
+
+- **`agenttalk init --force` semantics clarified.** Previously
+  ambiguous about whether `--force` cleared in-flight messages.
+  The help text now spells out: it rewrites `config.json` only;
+  state (`messages/`, `state/`, `sessions/`) is preserved. Users
+  who want a clean slate are pointed at `agenttalk reset`.
+- **`Store._new_session_id()` now includes a 4-char random
+  suffix.** The old `YYYYMMDDTHHMMSSZ` format collided when two
+  session boundaries fell in the same second (init then reset).
+  New format: `YYYYMMDDTHHMMSS-XXXXZ`. Filename-safe; transcript
+  paths stay unique.
+
+### Tests
+
+- 208 passing (was 184 in 0.3.0). New file `tests/test_reset.py`
+  covers: state clearance, session-id rotation, archive
+  preservation (including transcripts under `--archive`),
+  transcript preservation by default, double-archive collision
+  safety, empty cursor recreation, uninitialized-store error, CLI
+  default vs `--archive`, exit-2 on uninitialized, the explicit
+  `init --force does NOT clear` guarantee, the `init --help` text
+  mentions `agenttalk reset`, the session-id traversal regression
+  (corrupt config rejected at load time), parametrized rejection
+  of 7 unsafe session-id forms, and parametrized acceptance of
+  both old (`YYYYMMDDTHHMMSSZ`) and new (`YYYYMMDDTHHMMSS-XXXXZ`)
+  formats for backwards-compat.
+
 ## [0.3.0] — 2026-05-21
 
 First slice of the v0.2.0-review feature wave. Adds two new
@@ -268,6 +323,7 @@ pre-answer consult primitive.
 - Atomic JSON-per-message writes; per-agent cursors; markdown +
   JSONL transcript export.
 
+[0.4.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.4.0
 [0.3.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.3.0
 [0.2.1]: https://github.com/zoolok17/agenttalk/releases/tag/v0.2.1
 [0.2.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.2.0

@@ -443,6 +443,19 @@ def cmd_codex_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reset(args: argparse.Namespace) -> int:
+    """Clear messages/cursors/heartbeats and start a fresh session."""
+    store = _get_store(args)
+    cfg, archive_path = store.reset(archive=args.archive)
+    if archive_path is not None:
+        print(f"archived previous session to: {archive_path}")
+    else:
+        print("previous session deleted (no archive — pass --archive to keep it)")
+    print(f"new session_id: {cfg['session_id']}")
+    print(f"roster:         {', '.join(cfg.get('agents', []))}")
+    return 0
+
+
 def cmd_end(args: argparse.Namespace) -> int:
     store = _get_store(args)
     cfg = store.load_config()
@@ -476,7 +489,10 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--agents", default="claude,codex", help="Comma-separated agent names (default: claude,codex)")
     pi.add_argument("--path", help="Directory to init (default: CWD)")
     pi.add_argument("--here", action="store_true", help="(alias for --path .)")
-    pi.add_argument("--force", action="store_true", help="Overwrite existing config")
+    pi.add_argument("--force", action="store_true",
+                    help="Overwrite existing config.json (roster, session_id). "
+                         "Does NOT clear messages/cursors/heartbeats — use "
+                         "`agenttalk reset` for a clean slate.")
     pi.set_defaults(func=cmd_init)
 
     ps = sub.add_parser("status", help="Show roster, message count, per-agent cursor + unread.")
@@ -532,6 +548,20 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--from", dest="sender", help="Sender agent name (default: $AGENTTALK_SELF)")
     pe.add_argument("--reason", help="Free-text reason")
     pe.set_defaults(func=cmd_end)
+
+    prst = sub.add_parser(
+        "reset",
+        help="Clear active bus state (messages + cursors + heartbeats); "
+             "preserves historical transcripts in .agenttalk/sessions/. "
+             "Preserves config (roster). Use --archive to move EVERYTHING "
+             "(messages + state + sessions) under "
+             ".agenttalk/archived/<session_id>/ instead.",
+    )
+    prst.add_argument("--archive", action="store_true",
+                      help="Move old messages/state/sessions to "
+                           ".agenttalk/archived/<session_id>/ instead of "
+                           "deleting active state.")
+    prst.set_defaults(func=cmd_reset)
 
     pd = sub.add_parser(
         "doctor",
