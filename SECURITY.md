@@ -1,6 +1,6 @@
 # Security policy & threat model
 
-> Last updated: 2026-05-21 (v0.5.1)
+> Last updated: 2026-05-21 (v0.6.0)
 
 agenttalk is a small file-backed message bus. The trust model is
 local: if you can write to a project's `.agenttalk/` directory, you
@@ -43,10 +43,17 @@ Inside that boundary:
 - Prompt-injection payloads placed inside message bodies by
   any of the above.
 
-If your threat model includes any of these, agenttalk in its current
-form is the wrong tool. Future versions may add opt-in HMAC
-signatures (see "Roadmap" below) but those are explicitly out of
-scope for v0.2.x.
+If your threat model includes **another local user with project-dir
+write access but no per-user key-dir access**, see the "Delivered in
+0.6.0" section below — optional HMAC signatures defend exactly that
+case (enable via `agenttalk hmac-init`).
+
+For **same OS user** attackers and shared/network-mounted
+`.agenttalk/` dirs where the attacker can also read your per-user
+config dir, agenttalk in its current form is the wrong tool. Crypto
+without a key store outside the attacker's reach creates false
+confidence, so we deliberately do not promise more than the threat
+model supports.
 
 ---
 
@@ -68,6 +75,8 @@ scope for v0.2.x.
 | `tail` rendering forged/tampered messages as normal output | Tail validates per-roster before render; invalid messages surface as stderr `INVALID` warnings, never body-rendered. | 0.5.0 |
 | Skill-body drift between Claude and Codex sides | `test_skill_lint.py` asserts every required policy substring on both sides. | 0.3.0 |
 | CI catches regression of any of the above | GHA workflow runs ruff/bandit/semgrep/pip-audit/gitleaks/CodeQL/zizmor on every push + PR + weekly. | 0.5.1 |
+| Forged `kind=end` / `wake` / `review-result` from a local attacker with project-dir write but no per-user key access | Optional HMAC-SHA256 signatures (run `agenttalk hmac-init` once to enable; delete the key file to disable). Enforcement anchored to the per-user key file at a PATH-DERIVED project_id — neither the policy nor the project identity can be tampered with via `.agenttalk/config.json` edits. Signed messages verified at read time; failures surface in `status` / `doctor`. | 0.6.0 |
+| GHA workflow actions can be silently replaced upstream | All third-party actions hash-pinned by commit SHA; dependabot auto-bumps weekly. zizmor now voting. | 0.6.0 |
 
 ---
 
@@ -111,21 +120,34 @@ do what is cheaper and more honest.
    raw agent names must not feed state filenames; messages must
    go through `Store.send()`; never `exec`/`eval` a message body.
 
-### Still planned (0.6.0+)
+### Delivered in 0.6.0
 
-5. **`kind=end` extra restrictions.** Beyond the
-   sender-must-be-roster-valid check that already applies via
-   schema validation, planned: confirm the end is addressed to
-   self in an active conversation. A forged `end` in an unrelated
-   message stream should not terminate a listener.
-6. **Optional HMAC signatures.** Only worth doing if the threat
-   model expands beyond same-user local trust. Detailed below
-   under "Roadmap".
-7. **Tighten zizmor + hash-pin GHA actions.** v0.5.1 ships zizmor
-   as non-voting because tag-pinned actions (`actions/checkout@v4`
-   etc.) trigger its default `unpinned-uses` audit. Follow-up
-   patch will either hash-pin actions or supply a tuned zizmor
-   config so the job can vote.
+5. **Optional HMAC-SHA256 signatures.** Stdlib (`hmac` +
+   `hashlib`). Key lives at `~/.config/agenttalk/keys/<project_id>.key`
+   (POSIX) or `%LOCALAPPDATA%\agenttalk\keys\<project_id>.key`
+   (Windows). Enforcement is anchored to the per-user key file's
+   **existence**, not to a config flag in attacker-writable
+   `.agenttalk/config.json`. Run `agenttalk hmac-init` once to
+   enable; delete the key file to disable. The verifier mirrors:
+   if the key exists, every inbound message must verify. Failures
+   surface in `agenttalk status` / `status --json` / `doctor`.
+   Closes the `kind=end` forgery scenario (S-1) AND every other
+   forgery class for projects that opt in.
+6. **GHA actions hash-pinned + zizmor voting.** All third-party
+   actions in `.github/workflows/*.yml` are pinned by commit SHA
+   with a trailing `# vX` comment for dependabot. The zizmor job
+   no longer needs `continue-on-error` — it votes. Added
+   `.github/dependabot.yml` to keep the SHAs current weekly.
+
+### Still planned (0.7.0+)
+
+7. **Optional UI** (read-only local web dashboard). Tracked
+   separately from security work.
+8. **Replay / reordering / deletion defenses.** HMAC proves
+   origin of message bytes but does NOT defend against an
+   attacker who can delete or reorder files. A hash-chain
+   across message IDs anchored outside `.agenttalk/` would help.
+   Not in scope yet.
 
 ### Roadmap detail: optional HMAC signatures (0.6.0+ if needed)
 
@@ -186,10 +208,11 @@ listener's skill body interprets `kind=end` as a graceful shutdown.
 **Mitigation today (0.3.0+):** `Store.messages_for` validates
 sender against the current roster and rejects unknown kinds —
 this stops a third-party forgery (`from: nobody`) and any
-unrecognized kind, but a valid-roster peer COULD still write a
-forged `kind=end`. **Still planned (0.6.0+):** also confirm the
-end is addressed to self in an active conversation, so an `end`
-from prior message history can't terminate a fresh listener.
+unrecognized kind. **0.6.0+ with HMAC enabled:** an attacker
+who can write into `.agenttalk/` but can't read the per-user
+key file cannot produce a signed `kind=end`. The forged message
+is silently skipped on read alongside any other failed-signature
+message. See "Roadmap detail: optional HMAC signatures" below.
 
 ### S-2: Prompt injection in message body
 

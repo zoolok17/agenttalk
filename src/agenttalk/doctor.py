@@ -17,6 +17,7 @@ from pathlib import Path
 from agenttalk import __version__
 from agenttalk import codex_config as cxc
 from agenttalk import install_skills as iskl
+from agenttalk import signing as _signing
 from agenttalk.store import Store, find_root
 
 
@@ -76,6 +77,7 @@ def run(project_root: Path | None = None) -> Report:
     if store.initialized():
         report.checks.extend(_check_skills())
         report.checks.append(_check_codex_config(root))
+        report.checks.append(_check_hmac(store, root))
         report.checks.extend(_check_heartbeats(store))
     return report
 
@@ -202,6 +204,45 @@ def _check_codex_config(project_root: Path) -> Check:
         name="codex_config",
         status="ok",
         details="per-project block present with all three managed keys",
+    )
+
+
+def _check_hmac(store: Store, project_root: Path) -> Check:
+    """Verify HMAC signing setup.
+
+    Both the project_id (path-derived) and the enforcement signal
+    (per-user key file's existence) live OUTSIDE attacker-writable
+    ``.agenttalk/`` — neither can be tampered with via config edits.
+    If the key file exists for this project's path-derived ID, this
+    check reports its health; otherwise signing is reported as
+    disabled.
+    """
+    project_id = store.project_id()  # always returns (path-derived)
+    health = _signing.inspect_key(project_id, project_root)
+    if not health.exists:
+        return Check(
+            name="hmac", status="ok",
+            details=f"disabled (no key file at {health.path}; run `agenttalk hmac-init` to enable)",
+        )
+    if not health.readable:
+        return Check(
+            name="hmac", status="error",
+            details=f"key file at {health.path} is not readable by this process",
+        )
+    if health.in_project_dir:
+        return Check(
+            name="hmac", status="error",
+            details=f"key file is INSIDE the project at {health.path}",
+            fix="move it under the per-user keys dir (defeats the threat model otherwise)",
+        )
+    if health.mode_warning:
+        return Check(
+            name="hmac", status="warn",
+            details=health.mode_warning,
+        )
+    return Check(
+        name="hmac", status="ok",
+        details=f"enabled · key at {health.path}",
     )
 
 

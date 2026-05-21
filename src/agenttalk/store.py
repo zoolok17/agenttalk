@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agenttalk._atomic import write_text as _atomic_write_text
+from agenttalk import signing as _signing
 
 DIRNAME = ".agenttalk"
 _ID_ALPHABET = string.ascii_letters + string.digits
@@ -262,6 +263,10 @@ class Store:
             "agents": agents,
             "created_at": _now_iso(),
             "session_id": _new_session_id(),
+            # NOTE: no project_id in config.json. The HMAC key file
+            # is addressed by `signing.project_id_for_root(self.root)`,
+            # a path-derived hash that an attacker writing into
+            # .agenttalk/ cannot influence. See SECURITY.md.
         }
         _atomic_write_text(self.config_path, json.dumps(cfg, indent=2))
         for a in agents:
@@ -389,6 +394,59 @@ class Store:
 
     # --------------------------------------------------------------- writing
 
+    def project_id(self) -> str:
+        """Path-derived project identifier (not stored in config).
+
+        Always returns a value (depends only on ``self.root``, never
+        on anything inside ``.agenttalk/``). See
+        ``signing.project_id_for_root`` for why this isn't UUID-in-
+        config.json anymore.
+        """
+        return _signing.project_id_for_root(self.root)
+
+    def signing_enforced(self) -> bool:
+        """True iff HMAC signatures are enforced for this project.
+
+        Anchored to the EXISTENCE of the per-user key file at the
+        PATH-DERIVED ``project_id``. Both the project_id and the key
+        file's presence are decided OUTSIDE attacker-writable
+        ``.agenttalk/``: the ID is derived from ``self.root`` (which
+        ``find_root()`` resolves before the bus even looks at
+        config), and the key file lives under the per-user keys dir.
+
+        Closes both v0.6.0 iter-1 (config flag bypass) and iter-2
+        (config-stored project_id bypass).
+        """
+        try:
+            return _signing.resolve_key_path(self.project_id()).exists()
+        except (OSError, ValueError):
+            return False
+
+    # Legacy: 0.6.0-iter-1 wrote a ``require_signatures`` field AND
+    # a ``project_id`` field in config.json. Both are ignored by
+    # the verify path now (they're inside attacker-writable state).
+    # ``agenttalk status`` surfaces a NOTE so users with upgraded
+    # configs see the fields have no effect.
+    def legacy_require_signatures_flag(self) -> bool | None:
+        try:
+            cfg = self.load_config()
+        except (ValueError, OSError, FileNotFoundError):
+            return None
+        if "require_signatures" not in cfg:
+            return None
+        return bool(cfg["require_signatures"])
+
+    def legacy_config_project_id(self) -> str | None:
+        """Returns the (deprecated, ignored) project_id from
+        config.json if a 0.6.0-iter-1 config wrote one. The verify
+        path no longer consults this field; ``status`` surfaces it
+        so users of upgraded configs see it's not load-bearing."""
+        try:
+            cfg = self.load_config()
+        except (ValueError, OSError, FileNotFoundError):
+            return None
+        return cfg.get("project_id")
+
     def send(
         self,
         *,
@@ -398,6 +456,7 @@ class Store:
         kind: str = "message",
         subject: str = "",
         meta: dict | None = None,
+        sign: bool | None = None,
     ) -> Message:
         if not self.initialized():
             raise FileNotFoundError("agenttalk not initialized; run `agenttalk init`.")
@@ -425,6 +484,22 @@ class Store:
             body=body,
             meta=meta or {},
         )
+        # Resolve signing policy: explicit kwarg > "key file exists"
+        # rule. Default (sign=None + no key file) = no signature.
+        if sign is None:
+            sign = self.signing_enforced()
+        if sign:
+            project_id = self.project_id()
+            try:
+                key = _signing.load_key(project_id)
+            except FileNotFoundError as e:
+                raise ValueError(
+                    f"cannot sign: {e}. Run `agenttalk hmac-init`."
+                ) from e
+            signed_dict = _signing.sign_message(
+                msg.to_dict(), key, key_id=project_id,
+            )
+            msg = Message.from_dict(signed_dict)
         path = self.messages_dir / f"{msg.id}.json"
         _atomic_write_text(path, json.dumps(msg.to_dict(), indent=2, ensure_ascii=False))
         return msg
@@ -483,17 +558,24 @@ class Store:
 
     def list_invalid_messages(self) -> list[tuple[str, str]]:
         """Return [(id_or_stem, reason)] for every message file that
-        failed (JSON parse, missing fields, wrong types, OR
-        schema/roster validation). Surfaces what `messages_for()`
-        silently skipped — so tampering is visible rather than
-        invisible. Used by `agenttalk status` and `agenttalk doctor`.
+        failed parse, schema, roster, OR signature validation.
+        Surfaces everything ``messages_for()`` silently skipped so
+        tampering is visible rather than invisible. Used by
+        ``agenttalk status`` and ``agenttalk doctor``.
         """
         try:
             cfg = self.load_config()
         except (ValueError, OSError, FileNotFoundError):
-            roster = []
-        else:
-            roster = cfg.get("agents", []) or []
+            cfg = {}
+        roster = cfg.get("agents", []) or []
+        require_sig = self.signing_enforced()
+        project_id = self.project_id() if require_sig else None
+        key: bytes | None = None
+        if require_sig:
+            try:
+                key = _signing.load_key(project_id)
+            except (FileNotFoundError, OSError, ValueError):
+                key = None
         valid, parse_failures = self._scan_messages()
         out = list(parse_failures)
         for m in valid:
@@ -501,20 +583,43 @@ class Store:
                 m.validate(roster)
             except ValueError as e:
                 out.append((m.id, str(e)))
+                continue
+            if require_sig:
+                if key is None:
+                    out.append((m.id, "signatures enforced but no key file is loadable"))
+                    continue
+                try:
+                    _signing.verify_message(
+                        m.to_dict(), key, expected_key_id=project_id,
+                    )
+                except ValueError as e:
+                    out.append((m.id, str(e)))
         return out
 
     def messages_for(self, agent: str, *, since_id: str | None = None) -> list[Message]:
         """Return validated messages addressed to ``agent``.
 
-        Silently skips messages that fail schema/roster validation so
-        callers (wait, recv) never act on malformed input. Use
-        ``list_invalid_messages()`` to see what was skipped.
+        Silently skips messages that fail schema/roster validation —
+        and, when ``signing_enforced()`` is true (i.e. a per-user HMAC
+        key file exists for this project), silently skips messages
+        missing a valid HMAC signature. Callers (wait, recv) never act
+        on unverified input. Use ``list_invalid_messages()`` to see
+        what was skipped.
         """
         try:
             cfg = self.load_config()
             roster = cfg.get("agents", []) or []
         except (ValueError, OSError, FileNotFoundError):
+            cfg = {}
             roster = []
+        require_sig = self.signing_enforced()
+        project_id = self.project_id() if require_sig else None
+        key: bytes | None = None
+        if require_sig:
+            try:
+                key = _signing.load_key(project_id)
+            except (FileNotFoundError, OSError, ValueError):
+                key = None  # key vanished between check and load — refuse
         valid, _ = self._scan_messages()
         msgs: list[Message] = []
         for m in valid:
@@ -524,6 +629,15 @@ class Store:
                 m.validate(roster)
             except ValueError:
                 continue
+            if require_sig:
+                if key is None:
+                    continue  # policy on but no key — refuse everything
+                try:
+                    _signing.verify_message(
+                        m.to_dict(), key, expected_key_id=project_id,
+                    )
+                except ValueError:
+                    continue
             if since_id and m.id <= since_id:
                 continue
             msgs.append(m)

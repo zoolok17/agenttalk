@@ -5,6 +5,137 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-05-21
+
+Security release. Closes the `kind=end` forgery scenario and the
+zizmor follow-up from 0.5.1.
+
+### Added
+
+- **Optional HMAC-SHA256 message signatures.** Stdlib-only
+  (`hmac` + `hashlib`). Key lives in the per-user config dir
+  (`~/.config/agenttalk/keys/<project_id>.key` on POSIX,
+  `%LOCALAPPDATA%\agenttalk\keys\<project_id>.key` on Windows) —
+  outside `.agenttalk/` so an attacker with project-dir read
+  CANNOT also read the key. **Enforcement is anchored to the
+  per-user key file's existence at a PATH-DERIVED `project_id`
+  (SHA-256 of the absolute project root path)**, NOT to any field
+  in attacker-writable `.agenttalk/config.json`. The iter-1
+  review caught that a `require_signatures` config flag was
+  bypassable by editing config.json; the iter-2 review caught
+  that a config-stored `project_id` was bypassable the same way.
+  After iter-2, **nothing inside `.agenttalk/` is load-bearing
+  for signature enforcement** — both the project identity and the
+  policy live outside the project dir. To enable: `agenttalk
+  hmac-init`. To disable: delete the key file. Tradeoff: moving
+  the project dir changes its path-derived `project_id`, so you
+  re-run `hmac-init` at the new location (documented in
+  SECURITY.md). Wire format pinned by a golden test
+  (`tests/test_signing.py::test_canonical_payload_format_is_stable`)
+  and documented in `src/agenttalk/signing.py`. Defaults OFF
+  (zero-setup path unchanged from 0.5.x).
+- **`agenttalk hmac-init [--force]`** — bootstrap the project's
+  signing key. Writes mode 0600 on POSIX. Activates enforcement
+  on both send AND verify sides — there is no separate "enable"
+  flag.
+- **`agenttalk status` / `status --json`** — surfaces `project_id`
+  (path-derived), `signing_enforced` (key-file presence), and —
+  when enforced — `hmac_key` health (path / exists / readable /
+  mode warning / in-project-dir warning). Legacy
+  `require_signatures` and `project_id` fields in config.json
+  from upgraded 0.6.0-iter-1/2 configs are surfaced with a NOTE
+  that they're ignored (kept for diagnosability).
+- **`agenttalk doctor`** — new `hmac` check, ok/warn/error with
+  remediation hints (no project_id, key file inside project,
+  permissive mode, unreadable, etc). Reports `disabled` when no
+  key file exists (the OK default).
+- **`.github/workflows/*.yml`** — every third-party action now
+  hash-pinned (`actions/checkout@<sha>  # v4` etc.); `# vX`
+  comment kept dependabot-friendly.
+- **`.github/dependabot.yml`** — weekly auto-bumps for GHA SHAs
+  and dev-dep security updates.
+
+### Changed
+
+- **zizmor now votes** in CI (was non-voting in 0.5.1). All
+  third-party actions are hash-pinned so the `unpinned-uses`
+  default policy is satisfied. Workflow-level permissions stay
+  read-only; CodeQL grants itself `security-events: write` at
+  job level.
+- **`Store.project_id()` is path-derived.** SHA-256 of the
+  absolute project root path; not stored in config. The iter-2
+  review found that a UUID stored in config.json could be
+  tampered with to disable enforcement; the iter-3 design moves
+  project identity entirely outside `.agenttalk/`. Existing 0.5.x
+  configs continue to work unsigned; enabling signatures on any
+  project (new or existing) is just `agenttalk hmac-init` — no
+  config edits, no flags. Tradeoff: moving the project dir
+  changes its `project_id`, so the key file must be regenerated
+  at the new location. Documented in SECURITY.md.
+- **`agenttalk tail` now validates HMAC** before rendering
+  message bodies (iter-1 review caught that tail bypassed
+  signature verification and rendered forged bodies as normal
+  output). Forged-signature / unsigned-when-required / missing-
+  key messages now surface as `TAIL INVALID` warnings on stderr;
+  the body is never rendered.
+- **`Message.from_dict` vs `Message.from_raw`** distinction kept;
+  signature ops live in `agenttalk.signing` so `Message` stays a
+  pure data layer per Codex's design feedback.
+
+### Security
+
+This is the first release that actually defends against an
+adversarial *other local user with project-dir write access*.
+Earlier releases were honest about that being out of scope; 0.6.0
+makes it opt-in. **Limits documented in SECURITY.md:** HMAC does
+NOT defend against the same OS user (they can read the key
+anywhere it's stored), does NOT solve replay / deletion /
+reordering / cursor tampering (those need a hash chain anchored
+outside `.agenttalk/`, tracked for later), and does NOT validate
+timestamps for freshness (clock skew would create avoidable
+failure modes).
+
+### Tests
+
+- 258 passing + 2 skipped (POSIX mode-bit tests skipped on
+  Windows). Up from 227 in 0.5.2. Coverage includes canonical
+  payload golden test, sign/verify round-trip, every failure
+  mode (missing/wrong-version/wrong-key/tampered-body/wrong-key-
+  id), key file I/O + mode 0600 enforcement, key health
+  inspection (missing/secure/in-project-dir/loose-mode), Store
+  integration (sign-on-send, verify-on-read, unsigned-rejected-
+  when-key-exists, forged-signature-rejected, valid-signature-
+  accepted, zero-setup backwards-compat). Two iter-2 regression
+  tests are critical: the config-tamper bypass repro (config
+  edit cannot disable enforcement) and the tail-bypass repro
+  (tail uses the same verifier as messages_for).
+
+### Notes for upgraders
+
+- **Existing projects:** zero change required. Without a key file
+  for this project, enforcement is off; old configs work
+  unchanged. (Note: 0.5.x's path-relative install instructions
+  and 0.6.0's path-derived project_id mean that moving a project
+  directory changes its identity. If you upgrade in place and
+  don't move the dir, nothing changes for you.)
+- **To enable signatures on a fresh project:**
+  ```
+  agenttalk init --here --agents claude,codex
+  agenttalk hmac-init
+  ```
+  Enforcement activates as soon as the key file exists.
+- **To enable on an existing project:** just `agenttalk hmac-init`.
+  No config edits, no flags. The project_id is derived from the
+  absolute project root path. There is no `require_signatures`
+  flag in 0.6.0 — earlier iter-1 designs had one but Codex's
+  review found it was attacker-writable and therefore useless;
+  the key file's existence at the path-derived ID is the policy
+  anchor. (iter-2 review also caught that a config-stored
+  project_id had the same bypass; both are now removed.)
+- **Skill bodies are unchanged** in this release. Existing
+  installs of the bundled slash commands don't need
+  `agenttalk install-skills --force`.
+
 ## [0.5.2] — 2026-05-21
 
 Tag-hygiene patch. v0.5.1 introduced ruff in CI but the
@@ -442,6 +573,7 @@ pre-answer consult primitive.
 - Atomic JSON-per-message writes; per-agent cursors; markdown +
   JSONL transcript export.
 
+[0.6.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.6.0
 [0.5.2]: https://github.com/zoolok17/agenttalk/releases/tag/v0.5.2
 [0.5.1]: https://github.com/zoolok17/agenttalk/releases/tag/v0.5.1
 [0.5.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.5.0

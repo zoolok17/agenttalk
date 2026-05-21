@@ -20,6 +20,7 @@ from agenttalk import transcript as tx
 from agenttalk import codex_config as cxc
 from agenttalk import doctor as dr
 from agenttalk import install_skills as iskl
+from agenttalk import signing as _signing
 
 
 # --------------------------------------------------------------------- utils
@@ -197,14 +198,23 @@ def _gather_status(store: Store) -> dict:
             "stale": stale,
         })
     invalid = store.list_invalid_messages()
-    return {
+    signing_enforced = store.signing_enforced()
+    # project_id is path-derived; surfaces here for diagnostics
+    project_id = store.project_id()
+    payload = {
         "root": str(store.root),
         "session_id": cfg.get("session_id"),
+        "project_id": project_id,
+        "signing_enforced": signing_enforced,
         "message_count": len(msgs),
         "invalid_messages": [{"id": mid, "reason": reason} for mid, reason in invalid],
         "agents": agents,
         "stale_threshold_seconds": STALE_THRESHOLD_SECONDS,
     }
+    if signing_enforced:
+        health = _signing.inspect_key(project_id, store.root)
+        payload["hmac_key"] = health.to_dict()
+    return payload
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -218,6 +228,25 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"session_id: {payload['session_id']}")
     print(f"agents:     {', '.join(a['name'] for a in payload['agents'])}")
     print(f"messages:   {payload['message_count']}")
+    if payload["signing_enforced"]:
+        hk = payload.get("hmac_key") or {}
+        status_label = "OK" if hk.get("exists") and hk.get("readable") and not hk.get("mode_warning") else "PROBLEM"
+        print(f"hmac:       enforced · key {status_label} ({hk.get('path', '?')})")
+        if hk.get("mode_warning"):
+            print(f"  warning:  {hk['mode_warning']}")
+        if hk.get("in_project_dir"):
+            print("  warning:  key file is INSIDE the project — defeats the defense;")
+            print("            move it under ~/.config/agenttalk/keys/")
+    legacy_flag = store.legacy_require_signatures_flag()
+    legacy_pid = store.legacy_config_project_id()
+    if legacy_flag is not None or legacy_pid is not None:
+        print("hmac:       NOTE: legacy fields in config.json are IGNORED")
+        print("            (enforcement is anchored to the per-user key file at the")
+        print("             PATH-DERIVED project_id, not to anything in config.json).")
+        if legacy_flag is not None:
+            print(f"            legacy require_signatures = {legacy_flag}")
+        if legacy_pid is not None:
+            print(f"            legacy project_id = {legacy_pid}")
     if payload["invalid_messages"]:
         n = len(payload["invalid_messages"])
         print(f"INVALID:    {n} message{'s' if n != 1 else ''} failed schema/roster validation "
@@ -370,6 +399,47 @@ def _render_doctor_human(report) -> None:
     print(f"overall: {report.overall.upper()}")
 
 
+def cmd_hmac_init(args: argparse.Namespace) -> int:
+    """Generate the HMAC signing key for this project.
+
+    The key file's existence at the conventional per-user path
+    AT THE PATH-DERIVED project_id automatically activates
+    signature enforcement on both send and verify — there's no
+    config flag to flip, AND no config-stored project_id, because
+    anything in .agenttalk/config.json is attacker-writable.
+    To disable enforcement later, delete the key file.
+    """
+    store = _get_store(args)
+    project_id = store.project_id()  # always returns a value (path-derived)
+    try:
+        # No --key-file flag: the override path must be set via
+        # AGENTTALK_HMAC_KEY_FILE if you need to change locations,
+        # so every command (send/recv/wait/status/doctor) finds the
+        # same key without an extra plumbing layer.
+        path = _signing.init_key(project_id, force=args.force)
+    except FileExistsError as e:
+        sys.stderr.write(f"agenttalk hmac-init: {e}\n")
+        return 2
+    print(f"agenttalk: HMAC key written to {path}")
+    print(f"  project_id: {project_id}")
+    if os.name != "nt":
+        print("  file mode:  0600 (user-readable only)")
+    else:
+        print("  reminder:   on Windows, ensure the per-user keys dir is")
+        print("              NOT inherited by other accounts on this box.")
+    print()
+    print("Signature enforcement is now ACTIVE for this project:")
+    print("  - Outbound messages from `agenttalk send` are signed automatically.")
+    print("  - Inbound messages without a valid signature are silently skipped")
+    print("    (visible in `agenttalk status` and `agenttalk doctor`).")
+    print("To disable enforcement, delete the key file at the path above.")
+    if os.environ.get("AGENTTALK_HMAC_KEY_FILE"):
+        print()
+        print("Note: AGENTTALK_HMAC_KEY_FILE is set in this env; every command")
+        print("MUST run with the same env value or they'll look at the default path.")
+    return 0
+
+
 def cmd_install_skills(args: argparse.Namespace) -> int:
     claude = not args.codex_only
     codex = not args.claude_only
@@ -502,6 +572,17 @@ def cmd_tail(args: argparse.Namespace) -> int:
     store = _get_store(args)
     cfg = store.load_config()
     roster = cfg.get("agents") or []
+    # Mirror the HMAC enforcement that messages_for applies, so a
+    # tampered or unsigned message never gets rendered with its
+    # body in tail's output — only as a body-free INVALID warning.
+    require_sig = store.signing_enforced()
+    project_id = store.project_id() if require_sig else None
+    sig_key: bytes | None = None
+    if require_sig:
+        try:
+            sig_key = _signing.load_key(project_id)
+        except (FileNotFoundError, OSError, ValueError):
+            sig_key = None
     seen: set[str] = set()
     if not args.from_start:
         # Treat existing messages as already-seen so we only show new ones.
@@ -516,7 +597,7 @@ def cmd_tail(args: argparse.Namespace) -> int:
     try:
         while True:
             valid, invalid = store._scan_messages()
-            # Render valid messages (subject to roster validation)
+            # Render valid messages (subject to roster + signature validation)
             for m in valid:
                 if m.id in seen:
                     continue
@@ -530,6 +611,22 @@ def cmd_tail(args: argparse.Namespace) -> int:
                         f"AGENTTALK :: TAIL INVALID  id={m.id}  reason={e}\n"
                     )
                     continue
+                if require_sig:
+                    if sig_key is None:
+                        sys.stderr.write(
+                            f"AGENTTALK :: TAIL INVALID  id={m.id}  "
+                            f"reason=signatures enforced but no key file loadable\n"
+                        )
+                        continue
+                    try:
+                        _signing.verify_message(
+                            m.to_dict(), sig_key, expected_key_id=project_id,
+                        )
+                    except ValueError as e:
+                        sys.stderr.write(
+                            f"AGENTTALK :: TAIL INVALID  id={m.id}  reason={e}\n"
+                        )
+                        continue
                 print(render(m, header=f"AGENTTALK :: TAIL  {m.sender} -> {m.recipient}"))
             # Surface parse/construction failures as warnings too
             for mid, reason in invalid:
@@ -712,6 +809,19 @@ def build_parser() -> argparse.ArgumentParser:
     pd.add_argument("--json", action="store_true",
                     help="Emit structured JSON instead of human-readable text.")
     pd.set_defaults(func=cmd_doctor)
+
+    ph = sub.add_parser(
+        "hmac-init",
+        help="Generate the HMAC signing key for this project. "
+             "Stored outside .agenttalk/ (in the per-user config dir) so "
+             "another local user with project-dir access cannot read it. "
+             "Existence of the key automatically activates enforcement; "
+             "to disable, delete the key file.",
+    )
+    ph.add_argument("--force", action="store_true",
+                    help="Overwrite an existing key. Every message signed with "
+                         "the old key becomes unverifiable.")
+    ph.set_defaults(func=cmd_hmac_init)
 
     pis = sub.add_parser(
         "install-skills",

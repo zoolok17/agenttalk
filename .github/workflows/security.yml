@@ -18,6 +18,11 @@ on:
 permissions:
   contents: read
 
+# Third-party actions are hash-pinned (per zizmor `unpinned-uses`
+# / OWASP CI/CD recommendations). The `# vX` trailing comment is
+# human-readable and dependabot-friendly — dependabot auto-bumps
+# the SHA while keeping the comment in sync.
+
 jobs:
 
   # --------------------------------------------------------------- ruff S
@@ -25,8 +30,8 @@ jobs:
     name: ruff (lint + security S-rules)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: '3.12'
       - name: Install ruff
@@ -41,8 +46,8 @@ jobs:
     name: bandit (security AST scan)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: '3.12'
       - run: pip install 'bandit>=1.7'
@@ -54,8 +59,8 @@ jobs:
     name: pip-audit (CVE check on deps)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: '3.12'
       - run: pip install -e ".[dev]"
@@ -74,10 +79,10 @@ jobs:
     name: gitleaks (secret scan)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           fetch-depth: 0  # full history for secret detection
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc  # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -88,7 +93,7 @@ jobs:
     container:
       image: returntocorp/semgrep
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       - name: Run semgrep with local rules
         run: |
           semgrep scan \
@@ -108,28 +113,25 @@ jobs:
       actions: read
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: github/codeql-action/init@v3
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: github/codeql-action/init@78ed0c7291d93e40c51b085850dc669a4c3ab73b  # v3
         with:
           languages: python
           queries: security-extended
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@78ed0c7291d93e40c51b085850dc669a4c3ab73b  # v3
 
   # ------------------------------------------------------------ zizmor
   # Audits the GHA workflow files themselves for common security
   # missteps (unpinned actions, workflow injection, broad
-  # permissions). Non-voting initially: zizmor's default policy
-  # (`unpinned-uses` requires hash-pinning) is stricter than our
-  # tag-pinning baseline. First CI run surfaces findings; we tune
-  # `--config` (or hash-pin) in a follow-up patch.
+  # permissions). Voting as of 0.6.0 — all third-party actions
+  # are now hash-pinned (above) so `unpinned-uses` is satisfied.
   zizmor:
     name: zizmor (GHA workflow security)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: '3.12'
       - run: pip install 'zizmor>=1.20'
-      - run: zizmor --no-exit-codes .github/workflows
+      - run: zizmor .github/workflows
