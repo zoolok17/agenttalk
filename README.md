@@ -62,16 +62,21 @@ transcript under `.agenttalk/sessions/`.
 
 The usual cross-agent workflow is:
 
-1. You ask Claude to implement a feature.
-2. You copy the diff into Codex and ask for a review.
-3. You copy Codex's review back into Claude.
+1. You ask one agent to implement a feature.
+2. You copy the diff into the other agent and ask for a review.
+3. You copy the review back into the first.
 4. Repeat.
 
-`agenttalk` removes the copy/paste. Claude implements, then runs
-`/agenttalk.handoff` to ping Codex. Codex (in listen mode) wakes, reviews
-the work, and replies. Claude wakes on the reply and either ships or
-iterates. Both terminals display every message. You stay in the loop and
-interrupt whenever you want.
+`agenttalk` removes the copy/paste. The implementer runs
+`/agenttalk.handoff` to ping the peer. The peer (in listen mode) wakes,
+reviews the work, and replies. The implementer wakes on the reply and
+either ships or iterates. Both terminals display every message. You stay
+in the loop and interrupt whenever you want.
+
+Which agent plays implementer vs. reviewer is your call — agenttalk is
+symmetric. Claude-implements-Codex-reviews and Codex-implements-Claude-
+reviews are equally supported; in a spec-kitty mission, spec-kitty
+assigns the part per WP and the sk-loop skills follow.
 
 ---
 
