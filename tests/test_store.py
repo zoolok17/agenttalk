@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import json
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from agenttalk.store import (
-    Message,
     Store,
     find_root,
     validate_agent_name,

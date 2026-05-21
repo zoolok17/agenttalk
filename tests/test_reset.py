@@ -83,7 +83,7 @@ def test_reset_bumps_session_id(store_root: Path) -> None:
 
 def test_reset_with_archive_preserves_old_state(store_root: Path) -> None:
     s = Store(store_root)
-    msg = s.send(sender="alpha", recipient="beta", body="archived me")
+    s.send(sender="alpha", recipient="beta", body="archived me")
     old_session = s.load_config()["session_id"]
     cfg, archive_path = s.reset(archive=True)
     assert archive_path is not None

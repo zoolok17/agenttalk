@@ -5,6 +5,28 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] — 2026-05-21
+
+Tag-hygiene patch. v0.5.1 introduced ruff in CI but the
+auto-fixes for six test files (removing unused imports, dropping
+an unused variable) landed on disk but weren't staged into the
+release commit. CI on the v0.5.1 tag would have failed ruff. This
+patch commits those cleanups so the tagged tree matches the
+local-clean baseline.
+
+### Fixed
+
+- `tests/conftest.py`, `tests/test_codex_config.py`,
+  `tests/test_reply_tail.py`, `tests/test_reset.py`,
+  `tests/test_skill_lint.py`, `tests/test_store.py`: dropped
+  unused imports (`os`, `json`) and an unused assignment that
+  ruff F401/F841 had flagged in 0.5.1 but the v0.5.1 commit
+  missed staging.
+
+No behavior changes. 227 tests still pass. Ruff `check src tests`
+now reports `All checks passed!` against the *committed* tree
+(matching the v0.5.1 promise).
+
 ## [0.5.1] — 2026-05-21
 
 Tooling-only patch. No behavior changes; closes the "CI scanner
@@ -420,6 +442,7 @@ pre-answer consult primitive.
 - Atomic JSON-per-message writes; per-agent cursors; markdown +
   JSONL transcript export.
 
+[0.5.2]: https://github.com/zoolok17/agenttalk/releases/tag/v0.5.2
 [0.5.1]: https://github.com/zoolok17/agenttalk/releases/tag/v0.5.1
 [0.5.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.5.0
 [0.4.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.4.0

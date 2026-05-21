@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from agenttalk.codex_config import (
     disable_project,

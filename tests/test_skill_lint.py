@@ -10,7 +10,6 @@ asserts both sides carry the same policy invariants.
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
 import pytest
 
