@@ -114,11 +114,11 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-      - uses: github/codeql-action/init@78ed0c7291d93e40c51b085850dc669a4c3ab73b  # v3
+      - uses: github/codeql-action/init@458d36d7d4f47d0dd16ca424c1d3cda0060f1360  # v3
         with:
           languages: python
           queries: security-extended
-      - uses: github/codeql-action/analyze@78ed0c7291d93e40c51b085850dc669a4c3ab73b  # v3
+      - uses: github/codeql-action/analyze@458d36d7d4f47d0dd16ca424c1d3cda0060f1360  # v3
 
   # ------------------------------------------------------------ zizmor
   # Audits the GHA workflow files themselves for common security
