@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agenttalk"
-version = "0.5.0"
+version = "0.5.1"
 description = "File-backed message bus that lets two coding-agent CLIs (Claude Code and Codex) collaborate on the same project."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,6 +14,34 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "build>=1.2"]
+security = [
+    "ruff>=0.6",
+    "bandit>=1.7",
+    "pip-audit>=2.7",
+]
+
+[tool.ruff]
+# 120 is generous-but-not-permissive; lets multi-line user-facing
+# error strings stay one line each without sacrificing readability.
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+# Keep the lint surface tight: errors, syntax, comprehensions,
+# bugbear, security (S). Tune as warnings show up.
+select = ["E", "F", "B", "S", "C4"]
+ignore = [
+    "S101",  # assert in tests — pytest convention
+    "S603",  # subprocess without shell=False — we never use subprocess
+    "S607",  # partial-path subprocess calls — same
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "S101",  # asserts are the point in tests
+    "S105",  # hardcoded "test passwords" used as message bodies
+    "S106",
+]
 
 [project.scripts]
 agenttalk = "agenttalk.cli:main"

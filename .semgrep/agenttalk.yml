@@ -1,0 +1,97 @@
+rules:
+
+  # ----------------------------------------------------------------------
+  # Project-specific invariant: agent names MUST pass validate_agent_name
+  # before being used as filesystem path components. Bypassing this is
+  # exactly the path-traversal class fixed in 0.2.1.
+  # ----------------------------------------------------------------------
+  - id: agenttalk-no-raw-agent-name-in-filename
+    languages: [python]
+    severity: ERROR
+    message: |
+      An agent name is being interpolated into a filesystem path
+      (`state/<agent>.cursor`, `state/<agent>.heartbeat`, etc.)
+      without going through validate_agent_name() first. This is
+      the path-traversal class fixed in v0.2.1 — see SECURITY.md.
+      Validate the name first, or use a Store method that validates
+      for you.
+    patterns:
+      - pattern-either:
+          - pattern: f"...{$NAME}.cursor"
+          - pattern: f"...{$NAME}.heartbeat"
+      - pattern-not-inside: |
+          def validate_agent_name(...):
+              ...
+      - pattern-not-inside: |
+          class Store:
+              ...
+              def write_heartbeat(...):
+                  ...
+      - pattern-not-inside: |
+          class Store:
+              ...
+              def read_heartbeat(...):
+                  ...
+      - pattern-not-inside: |
+          class Store:
+              ...
+              def cursor(...):
+                  ...
+      - pattern-not-inside: |
+          class Store:
+              ...
+              def set_cursor(...):
+                  ...
+
+  # ----------------------------------------------------------------------
+  # Project-specific invariant: messages must go through Store.send,
+  # never written directly to .agenttalk/messages/. The Store applies
+  # KNOWN_KINDS + roster + atomic-write guarantees; bypassing it is the
+  # forgery pathway we explicitly call out in SECURITY.md.
+  # ----------------------------------------------------------------------
+  - id: agenttalk-no-direct-message-write
+    languages: [python]
+    severity: WARNING
+    message: |
+      Writing directly into `.agenttalk/messages/` bypasses
+      `Store.send()`'s schema + atomic-write guarantees. Use
+      `Store.send(sender=..., recipient=..., body=..., kind=...)`
+      instead so KNOWN_KINDS, roster validation, and atomic
+      write all apply.
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $PATH.write_text(...)
+          - pattern: |
+              open($PATH, "w")
+      - metavariable-regex:
+          metavariable: $PATH
+          regex: .*messages.*
+      - pattern-not-inside: |
+          class Store:
+              ...
+      - pattern-not-inside: |
+          def _hand_write_message(...):
+              ...
+
+  # ----------------------------------------------------------------------
+  # Listen / consult / handoff skill bodies must instruct agents to
+  # treat message bodies as untrusted data. Any Python code that calls
+  # exec/eval on a message body is a hard fail.
+  # ----------------------------------------------------------------------
+  - id: agenttalk-no-exec-on-message-body
+    languages: [python]
+    severity: ERROR
+    message: |
+      Calling exec() / eval() on a message body would execute
+      untrusted input as code — the exact threat model called out
+      in SECURITY.md. Don't.
+    patterns:
+      - pattern-either:
+          - pattern: exec($MSG.body)
+          - pattern: eval($MSG.body)
+          - pattern: exec($BODY)
+          - pattern: eval($BODY)
+      - metavariable-regex:
+          metavariable: $BODY
+          regex: .*body.*

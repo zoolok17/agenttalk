@@ -5,6 +5,61 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — 2026-05-21
+
+Tooling-only patch. No behavior changes; closes the "CI scanner
+integration" track from the v0.2.0 review report.
+
+### Added
+
+- **GitHub Actions workflows.**
+  - `.github/workflows/security.yml` — runs the full security
+    scanner stack on every push to master, PR, and a weekly
+    schedule: ruff (with `S` rules), bandit, pip-audit, gitleaks,
+    semgrep (registry + custom local rules), CodeQL
+    `security-extended`, and zizmor (GHA workflow audit).
+  - `.github/workflows/tests.yml` — pytest matrix across Python
+    3.10–3.13 on ubuntu/windows/macos.
+- **Custom semgrep rules** at `.semgrep/agenttalk.yml` enforcing
+  agenttalk-specific invariants:
+  - Raw agent names must not be interpolated into state filenames
+    without `validate_agent_name()`. (The class of bug fixed in
+    0.2.1; semgrep flags it before it ships.)
+  - Messages must go through `Store.send()`, not direct file
+    writes into `.agenttalk/messages/`. (Bypasses the KNOWN_KINDS
+    + atomic-write guarantees.)
+  - `exec()` / `eval()` on a message body is a hard fail (the
+    explicit prompt-injection threat called out in SECURITY.md).
+- **Ruff configuration** in `pyproject.toml`. Line length 120;
+  rules `E F B S C4` selected. Per-file ignores for tests
+  (asserts + literal "passwords" used as message bodies).
+- **New optional dependency group:** `[security]` installs ruff,
+  bandit, and pip-audit for local pre-commit-style runs.
+
+### Changed
+
+- Several small style cleanups across `src/agenttalk/` and
+  `tests/` to satisfy the new lint baseline. No behavior
+  changes — `Message.from_raw` field loop variable renamed
+  (`field` shadowed an import), exception chains use
+  `raise ... from e`, and a few long lines were wrapped.
+
+### Tests
+
+- Still 227 passing.
+- Bandit run produces 0 issues at all severity levels.
+- Ruff `check src tests` produces 0 errors.
+- pip-audit runs against `pip freeze --exclude-editable` from
+  a fresh `pip install -e ".[dev]"` env. First CI run will be
+  the ground truth for the dev-dep CVE set.
+
+### Notes
+
+- Scanners run in CI only. There are no new runtime dependencies;
+  the agenttalk package remains stdlib-only.
+- `SECURITY.md` updated: "CI scanner integration" moved from
+  "Still planned" into "Delivered in 0.5.1".
+
 ## [0.5.0] — 2026-05-21
 
 Third slice of the v0.2.0-review roadmap. Adds two ergonomic
@@ -365,6 +420,7 @@ pre-answer consult primitive.
 - Atomic JSON-per-message writes; per-agent cursors; markdown +
   JSONL transcript export.
 
+[0.5.1]: https://github.com/zoolok17/agenttalk/releases/tag/v0.5.1
 [0.5.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.5.0
 [0.4.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.4.0
 [0.3.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.3.0

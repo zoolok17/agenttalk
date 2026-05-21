@@ -262,7 +262,6 @@ def enable_project(config_path: Path, project_dir: Path) -> Result:
         action = "updated"
     else:
         start, end = section
-        block = lines[start:end]
         existing: dict[str, int] = {}  # key -> absolute line index
         for idx in range(start + 1, end):
             kv = _parse_kv(lines[idx])
@@ -364,7 +363,7 @@ def status(config_path: Path, project_dir: Path) -> dict:
         "config_exists": config_path.exists(),
         "project_dir": project_key,
         "section_present": False,
-        "keys": {k: None for k in MANAGED_KEYS},
+        "keys": dict.fromkeys(MANAGED_KEYS),
     }
     if not config_path.exists():
         return result

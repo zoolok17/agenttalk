@@ -12,7 +12,6 @@ from pathlib import Path
 from agenttalk import __version__
 from agenttalk.display import render
 from agenttalk.store import (
-    Message,
     Store,
     find_root,
     validate_agent_name,
@@ -584,7 +583,10 @@ def cmd_end(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------- parser
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="agenttalk", description="File-backed message bus for two agent CLIs.")
+    p = argparse.ArgumentParser(
+        prog="agenttalk",
+        description="File-backed message bus for two agent CLIs.",
+    )
     p.add_argument("--version", action="version", version=f"agenttalk {__version__}")
     p.add_argument("--root", help="Project root (default: walk up from CWD looking for .agenttalk/)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -606,7 +608,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     pse = sub.add_parser("send", help="Send a message from one agent to another.")
     pse.add_argument("--from", dest="sender", help="Sender agent name (default: $AGENTTALK_SELF)")
-    pse.add_argument("--to", dest="recipient", help="Recipient agent name (default: $AGENTTALK_PEER, or the single other agent in the roster)")
+    pse.add_argument("--to", dest="recipient",
+                     help="Recipient agent name "
+                          "(default: $AGENTTALK_PEER, or the single other agent in the roster)")
     pse.add_argument("--kind", default="message",
                      help="Message kind. Known: message, note, question, "
                           "review-request, review-result, wake, end. "
@@ -631,7 +635,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
     pw.add_argument("--timeout", type=float, default=120.0, help="Seconds to wait (0 = forever, default 120)")
     pw.add_argument("--interval", type=float, default=0.3, help="Poll interval in seconds (default 0.3)")
-    pw.add_argument("--ack", action="store_true", default=True, help="Advance cursor past the received msg (default true)")
+    pw.add_argument("--ack", action="store_true", default=True,
+                    help="Advance cursor past the received msg (default true)")
     pw.add_argument("--no-ack", dest="ack", action="store_false")
     pw.add_argument("--quiet", action="store_true")
     pw.add_argument("--heartbeat-interval", type=float, default=10.0,
@@ -716,17 +721,21 @@ def build_parser() -> argparse.ArgumentParser:
     pis.add_argument("--codex-only", action="store_true", help="Install only Codex-side skills")
     pis.add_argument("--claude-dir", help="Override Claude commands dir (default: ~/.claude/commands)")
     pis.add_argument("--codex-dir", help="Override Codex skills dir (default: ~/.codex/skills)")
-    pis.add_argument("--force", action="store_true", help="Overwrite existing files even if they differ from bundled")
+    pis.add_argument("--force", action="store_true",
+                     help="Overwrite existing files even if they differ from bundled")
     pis.add_argument("--dry-run", action="store_true", help="Show what would happen without writing")
     pis.set_defaults(func=cmd_install_skills)
 
     pc = sub.add_parser(
         "codex-config",
-        help="Manage the per-project block in ~/.codex/config.toml so Codex can call agenttalk from inside its sandbox.",
+        help="Manage the per-project block in ~/.codex/config.toml "
+             "so Codex can call agenttalk from inside its sandbox.",
     )
     grp = pc.add_mutually_exclusive_group()
-    grp.add_argument("--enable", action="store_true", default=True, help="Add/update approval_policy and sandbox_mode (default)")
-    grp.add_argument("--disable", action="store_true", help="Remove approval_policy and sandbox_mode (keeps trust_level)")
+    grp.add_argument("--enable", action="store_true", default=True,
+                     help="Add/update approval_policy and sandbox_mode (default)")
+    grp.add_argument("--disable", action="store_true",
+                     help="Remove approval_policy and sandbox_mode (keeps trust_level)")
     grp.add_argument("--status", action="store_true", help="Show current state of the project block")
     pc.add_argument("--project", help="Project dir to enable/disable (default: CWD)")
     pc.add_argument("--config-path", help="Codex config path (default: ~/.codex/config.toml)")

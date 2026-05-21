@@ -12,16 +12,16 @@ from agenttalk import transcript as tx
 
 
 def _make_msg(**overrides) -> Message:
-    base = dict(
-        id="20260521-120000-000000-AAAA",
-        ts="2026-05-21T12:00:00.000000Z",
-        sender="alpha",
-        recipient="beta",
-        kind="message",
-        subject="",
-        body="hello",
-        meta={},
-    )
+    base = {
+        "id": "20260521-120000-000000-AAAA",
+        "ts": "2026-05-21T12:00:00.000000Z",
+        "sender": "alpha",
+        "recipient": "beta",
+        "kind": "message",
+        "subject": "",
+        "body": "hello",
+        "meta": {},
+    }
     base.update(overrides)
     return Message(**base)
 
@@ -129,7 +129,7 @@ def test_export_jsonl_writes_to_default_session_path(
     path = tx.export(s, fmt="jsonl")
     assert path.exists()
     assert path.suffix == ".jsonl"
-    lines = [l for l in path.read_text(encoding="utf-8").split("\n") if l]
+    lines = [ln for ln in path.read_text(encoding="utf-8").split("\n") if ln]
     assert len(lines) == 1
     assert json.loads(lines[0])["body"] == "one"
 

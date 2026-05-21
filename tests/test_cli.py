@@ -381,7 +381,7 @@ def test_transcript_jsonl_format(
     _run(["transcript", "--format", "jsonl"], store_root)
     path = Path(capsys.readouterr().out.strip())
     assert path.suffix == ".jsonl"
-    lines = [l for l in path.read_text(encoding="utf-8").split("\n") if l]
+    lines = [ln for ln in path.read_text(encoding="utf-8").split("\n") if ln]
     assert len(lines) == 1
     assert _json.loads(lines[0])["body"] == "one"
 

@@ -14,7 +14,6 @@ microsecond. Lexicographic order == chronological order.
 from __future__ import annotations
 
 import json
-import os
 import re
 import secrets
 import shutil
@@ -22,7 +21,6 @@ import string
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
 
 from agenttalk._atomic import write_text as _atomic_write_text
 
@@ -180,20 +178,20 @@ class Message:
             raise ValueError(
                 f"top-level value must be a JSON object, got {type(data).__name__}"
             )
-        for field in ("id", "ts"):
-            if field not in data:
-                raise ValueError(f"missing required field {field!r}")
-        for field in ("id", "ts"):
-            if not isinstance(data[field], str) or not data[field]:
+        for fname in ("id", "ts"):
+            if fname not in data:
+                raise ValueError(f"missing required field {fname!r}")
+        for fname in ("id", "ts"):
+            if not isinstance(data[fname], str) or not data[fname]:
                 raise ValueError(
-                    f"field {field!r} must be a non-empty string, "
-                    f"got {type(data[field]).__name__}"
+                    f"field {fname!r} must be a non-empty string, "
+                    f"got {type(data[fname]).__name__}"
                 )
-        for field in ("kind", "subject", "body"):
-            if field in data and not isinstance(data[field], str):
+        for fname in ("kind", "subject", "body"):
+            if fname in data and not isinstance(data[fname], str):
                 raise ValueError(
-                    f"field {field!r} must be a string if present, "
-                    f"got {type(data[field]).__name__}"
+                    f"field {fname!r} must be a string if present, "
+                    f"got {type(data[fname]).__name__}"
                 )
         sender = data.get("from", data.get("sender"))
         recipient = data.get("to", data.get("recipient"))
@@ -375,7 +373,7 @@ class Store:
             raise ValueError(
                 f"corrupt config at {self.config_path}: {e}. "
                 f"Re-init with `agenttalk init --here --agents ...`."
-            )
+            ) from e
         # session_id is interpolated into archive paths, so reject
         # corrupt values at load time rather than crashing in reset.
         sid = cfg.get("session_id")
@@ -386,7 +384,7 @@ class Store:
                 raise ValueError(
                     f"corrupt config at {self.config_path}: {e}. "
                     f"Re-init with `agenttalk init --here --agents ... --force`."
-                )
+                ) from e
         return cfg
 
     # --------------------------------------------------------------- writing

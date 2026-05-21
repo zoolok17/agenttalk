@@ -7,16 +7,16 @@ from agenttalk.store import Message
 
 
 def _make_msg(**overrides) -> Message:
-    base = dict(
-        id="20260521-120000-000000-AAAA",
-        ts="2026-05-21T12:00:00.000000Z",
-        sender="alpha",
-        recipient="beta",
-        kind="message",
-        subject="",
-        body="hello",
-        meta={},
-    )
+    base = {
+        "id": "20260521-120000-000000-AAAA",
+        "ts": "2026-05-21T12:00:00.000000Z",
+        "sender": "alpha",
+        "recipient": "beta",
+        "kind": "message",
+        "subject": "",
+        "body": "hello",
+        "meta": {},
+    }
     base.update(overrides)
     return Message(**base)
 
@@ -28,8 +28,8 @@ def test_render_basic_message_has_all_expected_lines() -> None:
     assert lines[0] == "=" * 72
     assert lines[-1] == "=" * 72
     # Required fields
-    assert any("id      " in l for l in lines)
-    assert any("at      " in l for l in lines)
+    assert any("id      " in ln for ln in lines)
+    assert any("at      " in ln for ln in lines)
     assert "hello" in out
 
 

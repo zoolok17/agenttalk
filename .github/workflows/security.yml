@@ -1,0 +1,135 @@
+name: security
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    # Weekly catch-up so newly disclosed CVEs in dev deps surface
+    # even when the repo is quiet.
+    - cron: '17 9 * * 1'  # Monday 09:17 UTC
+  workflow_dispatch:
+
+# Default workflow permissions: read-only. Jobs that need write
+# access (e.g. CodeQL SARIF upload) grant themselves the minimum
+# required at the job level. zizmor's `excessive-permissions`
+# audit prefers this pattern.
+permissions:
+  contents: read
+
+jobs:
+
+  # --------------------------------------------------------------- ruff S
+  ruff:
+    name: ruff (lint + security S-rules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install ruff
+        run: pip install 'ruff>=0.6'
+      - name: Run ruff
+        run: ruff check src tests
+
+  # --------------------------------------------------------------- bandit
+  # Overlaps with ruff S-rules; we run both for defense-in-depth
+  # (each catches things the other misses or scores differently).
+  bandit:
+    name: bandit (security AST scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install 'bandit>=1.7'
+      - name: Run bandit
+        run: bandit -r src -x src/agenttalk/skills
+
+  # ---------------------------------------------------------- pip-audit
+  pip-audit:
+    name: pip-audit (CVE check on deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -e ".[dev]"
+      - run: pip install 'pip-audit>=2.7'
+      - name: Generate audit-requirements.txt from frozen env
+        # Auditing pip's dry-run output is unreliable (format isn't
+        # `name==version`). Install for real and audit the resulting
+        # frozen environment — same set CI actually uses.
+        run: pip freeze --exclude-editable > audit-requirements.txt
+      - run: cat audit-requirements.txt
+      - name: Audit dev deps against PyPI advisory db
+        run: pip-audit --strict --requirement audit-requirements.txt
+
+  # ----------------------------------------------------------- gitleaks
+  gitleaks:
+    name: gitleaks (secret scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for secret detection
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ----------------------------------------------------------- semgrep
+  semgrep:
+    name: semgrep (registry + agenttalk-specific rules)
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run semgrep with local rules
+        run: |
+          semgrep scan \
+            --config=p/python \
+            --config=p/security-audit \
+            --config=.semgrep/agenttalk.yml \
+            --error \
+            --strict
+
+  # ------------------------------------------------------------ CodeQL
+  codeql:
+    name: codeql (security-extended)
+    runs-on: ubuntu-latest
+    permissions:
+      # SARIF upload requires write here — granted only on this job.
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: security-extended
+      - uses: github/codeql-action/analyze@v3
+
+  # ------------------------------------------------------------ zizmor
+  # Audits the GHA workflow files themselves for common security
+  # missteps (unpinned actions, workflow injection, broad
+  # permissions). Non-voting initially: zizmor's default policy
+  # (`unpinned-uses` requires hash-pinning) is stricter than our
+  # tag-pinning baseline. First CI run surfaces findings; we tune
+  # `--config` (or hash-pin) in a follow-up patch.
+  zizmor:
+    name: zizmor (GHA workflow security)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install 'zizmor>=1.20'
+      - run: zizmor --no-exit-codes .github/workflows
