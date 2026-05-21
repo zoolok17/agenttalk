@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agenttalk import __version__
 from agenttalk.display import render
 from agenttalk.store import Message, Store, find_root
 from agenttalk import transcript as tx
@@ -368,6 +369,7 @@ def cmd_end(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="agenttalk", description="File-backed message bus for two agent CLIs.")
+    p.add_argument("--version", action="version", version=f"agenttalk {__version__}")
     p.add_argument("--root", help="Project root (default: walk up from CWD looking for .agenttalk/)")
     sub = p.add_subparsers(dest="cmd", required=True)
 

@@ -15,11 +15,9 @@ on session end.
 ## TL;DR — getting started
 
 ```powershell
-# one-time install
-git clone https://github.com/zoolok17/agenttalk.git
-cd agenttalk
-python -m pip install -e .
-agenttalk install-skills         # copies skill files into ~/.claude/commands and ~/.codex/skills
+# one-time install (canonical, tag-pinned)
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.2.0"
+agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
 agenttalk init --here --agents claude,codex
@@ -79,19 +77,29 @@ interrupt whenever you want.
 
 ## Install
 
+**End users (canonical, tag-pinned):**
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.2.0"
+```
+
+Pin to a specific tag so you control upgrades. Replace `v0.2.0` with
+whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
+Check what you have with `agenttalk --version`.
+
+**Contributors (editable clone):**
+
 ```powershell
 git clone https://github.com/zoolok17/agenttalk.git
 cd agenttalk
-python -m pip install -e .
+python -m pip install -e ".[dev]"   # includes pytest + build
 ```
 
-This puts an `agenttalk` script on your PATH. The package is stdlib-only
-(no third-party deps) and requires Python 3.10+.
+The editable install means code changes are picked up live without
+re-running pip.
 
-> If you already have the repo cloned and want to install from a
-> different working directory, use `python -m pip install -e <full-path-to-clone>`
-> instead. The bare `pip install -e .\agenttalk` form only works when
-> your CWD is the parent of the clone.
+Either path puts an `agenttalk` script on your PATH. The package is
+stdlib-only (no third-party runtime deps) and requires Python 3.10+.
 
 If you also want Codex to call agenttalk from inside its sandbox, run
 this once per project root:

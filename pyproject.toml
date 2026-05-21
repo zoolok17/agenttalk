@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agenttalk"
-version = "0.1.0"
+version = "0.2.0"
 description = "File-backed message bus that lets two coding-agent CLIs (Claude Code and Codex) collaborate on the same project."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,7 +13,7 @@ license = { text = "MIT" }
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "build>=1.2"]
 
 [project.scripts]
 agenttalk = "agenttalk.cli:main"
