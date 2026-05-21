@@ -5,6 +5,61 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-05-21
+
+Adds a read-only local web dashboard so the message log can be
+browsed in a real browser instead of being limited to terminal
+output. No write actions; no new runtime dependencies (stdlib
+`http.server` + `html` + `json`).
+
+### Added
+
+- **`agenttalk serve` — read-only local web dashboard.** Starts
+  a small HTTP server (default `http://127.0.0.1:8765/`) that
+  renders the roster, signing status, message list, and per-
+  message detail pages. **Loopback-only by design** — the only
+  accepted `--host` values are `127.0.0.1`, `::1`, and
+  `localhost`; there is no flag to expose the dashboard
+  elsewhere. SSH-tunnel `localhost:<port>` if you need to view
+  it from another machine. All HTML output is escaped, a strict
+  `Content-Security-Policy` blocks inline JS, and only
+  `GET`/`HEAD` are allowed.
+- **JSON endpoints for scripting.** `/api/status` mirrors the
+  same data `agenttalk status --json` reports plus `hmac_key`
+  health and `invalid_messages`. `/api/messages` returns every
+  validated message; `/api/messages/<id>` returns one.
+- **Tests:** `tests/test_web.py` (20 tests) covering the index
+  render, JSON endpoints, message detail, POST/PUT/DELETE
+  rejection, path-traversal handling on `/messages/<id>`, HTML
+  body escaping (defense against an LLM smuggling JS via a
+  message body), refusal to bind any non-loopback host,
+  per-request loopback peer check on **every** HTTP method
+  (not just GET — closes a method-skip information leak), IPv6
+  URL bracketing (`http://[::1]:port/`), response security
+  headers, and parity-with-`recv`/`tail` checks: messages with
+  unknown `kind`, out-of-roster sender/recipient, or bad HMAC
+  signatures do NOT render and instead surface under
+  `/api/status.invalid_messages`.
+
+### Security
+
+- The dashboard treats message bodies as untrusted: every body
+  is escaped via `html.escape` AND the page sets
+  `Content-Security-Policy: default-src 'none'; style-src
+  'unsafe-inline'; img-src 'none'; frame-ancestors 'none'` so
+  even if an escape were ever missed, inline JS would not run.
+- The dashboard reuses `Store.messages_for`'s validation surface
+  (schema, roster, kind, and HMAC when `signing_enforced()`).
+  Messages that fail any of these checks do not appear in
+  `/api/messages` or `/messages/<id>` — they surface under
+  `/api/status.invalid_messages`, matching the
+  `recv`/`tail`/`doctor` invariant.
+- The per-request loopback-peer check runs before EVERY HTTP
+  method. Earlier dashboard iterations let POST/PUT/DELETE/PATCH
+  skip the check and return 405 without the peer gate, which let
+  a non-loopback probe distinguish "server present" from "you
+  are blocked." Both now collapse to 403.
+
 ## [0.6.0] — 2026-05-21
 
 Security release. Closes the `kind=end` forgery scenario and the

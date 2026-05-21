@@ -656,6 +656,29 @@ def cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Start the read-only local web dashboard."""
+    from agenttalk import web as _web
+    store = _get_store(args)
+    try:
+        srv = _web.make_server(store, args.host, args.port, quiet=args.quiet)
+    except ValueError as e:
+        sys.stderr.write(f"agenttalk serve: {e}\n")
+        return 2
+    actual_port = srv.server_address[1]
+    url = _web._format_url(args.host, actual_port)
+    sys.stderr.write(f"agenttalk: serving read-only dashboard at {url}\n")
+    sys.stderr.write("           (Ctrl-C to stop)\n")
+    sys.stderr.flush()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        sys.stderr.write("\nagenttalk: dashboard stopped\n")
+    finally:
+        srv.server_close()
+    return 0
+
+
 def cmd_end(args: argparse.Namespace) -> int:
     store = _get_store(args)
     cfg = store.load_config()
@@ -787,6 +810,24 @@ def build_parser() -> argparse.ArgumentParser:
     pt2.add_argument("--timeout", type=float, default=0,
                      help="Exit after N seconds (default: 0 = run until Ctrl-C)")
     pt2.set_defaults(func=cmd_tail)
+
+    psv = sub.add_parser(
+        "serve",
+        help="Start a read-only local web dashboard on http://127.0.0.1:8765/ "
+             "to browse the message log in a real browser. Loopback-only by "
+             "design — there is no flag to expose it elsewhere. If you need "
+             "to view it from another machine, SSH-tunnel localhost:<port>.",
+    )
+    psv.add_argument("--host", default="127.0.0.1",
+                     help="Bind address. Only loopback values are accepted: "
+                          "127.0.0.1 (default), ::1, or localhost.")
+    psv.add_argument("--port", type=int, default=8765,
+                     help="TCP port (default: 8765; pass 0 for an OS-chosen ephemeral port)")
+    psv.add_argument("--quiet", action="store_true", default=True,
+                     help="Suppress per-request access logs (default: true)")
+    psv.add_argument("--access-log", dest="quiet", action="store_false",
+                     help="Print per-request access logs to stderr")
+    psv.set_defaults(func=cmd_serve)
 
     prst = sub.add_parser(
         "reset",

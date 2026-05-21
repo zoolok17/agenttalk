@@ -22,6 +22,11 @@ permissions:
 # / OWASP CI/CD recommendations). The `# vX` trailing comment is
 # human-readable and dependabot-friendly — dependabot auto-bumps
 # the SHA while keeping the comment in sync.
+#
+# Every actions/checkout sets `persist-credentials: false` (zizmor
+# `artipacked`): the default writes GITHUB_TOKEN to the local git
+# config, which can leak via uploaded artifacts. None of these jobs
+# push back to the repo, so the credential is just dead weight.
 
 jobs:
 
@@ -31,6 +36,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: '3.12'
@@ -47,6 +54,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: '3.12'
@@ -60,6 +69,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: '3.12'
@@ -82,18 +93,29 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           fetch-depth: 0  # full history for secret detection
+          persist-credentials: false
       - uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc  # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ----------------------------------------------------------- semgrep
+  # pip-installs semgrep rather than using the `returntocorp/semgrep`
+  # container, because (a) every other job in this file installs its
+  # tool via pip — matches the project's "minimal, auditable CI"
+  # tenet — and (b) zizmor's `unpinned-images` audit (HIGH) requires
+  # container images to be pinned by digest, which is a maintenance
+  # burden semgrep itself doesn't impose since it's pure Python.
   semgrep:
     name: semgrep (registry + agenttalk-specific rules)
     runs-on: ubuntu-latest
-    container:
-      image: returntocorp/semgrep
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.12'
+      - run: pip install 'semgrep>=1.80'
       - name: Run semgrep with local rules
         run: |
           semgrep scan \
@@ -114,6 +136,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
       - uses: github/codeql-action/init@78ed0c7291d93e40c51b085850dc669a4c3ab73b  # v3
         with:
           languages: python
@@ -130,6 +154,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: '3.12'

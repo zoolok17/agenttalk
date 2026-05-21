@@ -1,6 +1,6 @@
 # Security policy & threat model
 
-> Last updated: 2026-05-21 (v0.6.0)
+> Last updated: 2026-05-21 (v0.7.0)
 
 agenttalk is a small file-backed message bus. The trust model is
 local: if you can write to a project's `.agenttalk/` directory, you
@@ -139,10 +139,30 @@ do what is cheaper and more honest.
    no longer needs `continue-on-error` — it votes. Added
    `.github/dependabot.yml` to keep the SHAs current weekly.
 
-### Still planned (0.7.0+)
+### Delivered in 0.7.0
 
-7. **Optional UI** (read-only local web dashboard). Tracked
-   separately from security work.
+7. **Read-only local web dashboard** (`agenttalk serve`).
+   **Loopback-only by design** — accepted `--host` values are
+   `127.0.0.1`, `::1`, and `localhost`, and there is no flag to
+   bind anywhere else. If you need to view the dashboard from
+   another machine, SSH-tunnel `localhost:<port>` from that
+   machine; do not try to expose the bind directly. Only
+   `GET`/`HEAD` are dispatched (write methods return 405); the
+   per-request loopback-peer check runs before EVERY method, so
+   a non-loopback probe cannot distinguish "server present" from
+   "you are blocked" via method-skip side channels. Every
+   message body is passed through `html.escape` before render
+   and a strict `Content-Security-Policy` (`default-src 'none';
+   style-src 'unsafe-inline'`) blocks inline JS as a second
+   layer. The dashboard reuses the same validation surface
+   (schema/roster/kind/HMAC) as `recv`/`tail`/`status`, so a
+   forged on-disk message that names an unknown `kind` or an
+   out-of-roster sender/recipient, or that fails HMAC
+   verification when signing is enforced, is NOT rendered —
+   it shows up under `/api/status.invalid_messages` instead.
+
+### Still planned (0.8.0+)
+
 8. **Replay / reordering / deletion defenses.** HMAC proves
    origin of message bytes but does NOT defend against an
    attacker who can delete or reorder files. A hash-chain

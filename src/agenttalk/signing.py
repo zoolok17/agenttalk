@@ -151,17 +151,23 @@ def _write_key_file(path: Path, key: bytes) -> None:
     from agenttalk._atomic import write_text as _atomic_write_text
     path.parent.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
-        # Tighten parent dir to user-only before writing
+        # 0o700 (RWX owner, no access for group/other) is INTENTIONAL:
+        # the HMAC defense rests on the keys dir being unreadable by
+        # other local users. semgrep's heuristic suggests 0o644 which
+        # would make the keys world-readable and defeat the defense.
         try:
-            os.chmod(path.parent, 0o700)
+            os.chmod(path.parent, 0o700)  # nosemgrep
         except OSError:
             pass
     # Write hex-encoded (one line, trailing newline) for human
     # inspection. The on-wire signature is over the *raw* bytes.
     _atomic_write_text(path, key.hex() + "\n")
     if os.name != "nt":
+        # 0o600 — owner read/write only. Same reasoning as the parent
+        # dir above: semgrep's "wider is better" suggestion would
+        # break the security model.
         try:
-            os.chmod(path, 0o600)
+            os.chmod(path, 0o600)  # nosemgrep
         except OSError:
             pass
 
