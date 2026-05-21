@@ -16,7 +16,7 @@ on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.2.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.2.1"
 agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
@@ -80,10 +80,10 @@ interrupt whenever you want.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.2.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.2.1"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.2.0` with
+Pin to a specific tag so you control upgrades. Replace `v0.2.1` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
@@ -193,9 +193,16 @@ loop) and writes `transcript-<session_id>.md` under
 
 ## Agent identity (and running two of the same kind)
 
-Agent names are arbitrary strings. The default pair is `claude` and
-`codex`, but you can run two Claudes (or two Codexes) by giving them
-distinct names — useful if you don't have subscriptions to both tools.
+Agent names are **safe identifiers** — alphanumeric plus dot,
+underscore, or hyphen, starting with an alphanumeric, max 64 chars.
+This restriction exists because names are interpolated into
+`.agenttalk/state/<name>.cursor` (and similar) filenames; anything
+that could escape that directory (path separators, `..`, leading
+punctuation, quotes, whitespace) is rejected.
+
+The default pair is `claude` and `codex`, but you can run two Claudes
+(or two Codexes) by giving them distinct names like `claude-a` /
+`claude-b` — useful if you don't have subscriptions to both tools.
 
 Each terminal declares which agent it is via env vars:
 
@@ -391,6 +398,18 @@ Message `--kind` values are free-form, but the skills assume:
 - `question` — needs a reply before the other side proceeds
 - `note` — informational
 - `end` — terminate the listen loop on the other side
+
+### Exit codes
+
+Stable across releases — skill bodies and external automation can
+rely on these:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success. For `wait`: a message was received. |
+| `1` | Reserved for `agenttalk wait` timeout (no new messages within `--timeout`). Loop skills should treat this as "keep waiting", not as an error. |
+| `2` | Usage error: missing/invalid identity (`--from`/`--to`/`--for` or `AGENTTALK_SELF`/`AGENTTALK_PEER`), unsafe agent name, identity not in roster, self-mail attempt, malformed `--meta`, corrupt config, missing `.agenttalk/`. Always prints a remediation hint to stderr. |
+| `130` | `SIGINT` (Ctrl-C). |
 
 ---
 

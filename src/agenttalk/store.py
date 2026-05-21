@@ -15,16 +15,77 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import string
-import tempfile
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+from agenttalk._atomic import write_text as _atomic_write_text
+
 DIRNAME = ".agenttalk"
 _ID_ALPHABET = string.ascii_letters + string.digits
+
+# Agent names are interpolated directly into filesystem paths
+# (cursors, heartbeats), so they must be portable identifiers — not
+# arbitrary user input. Allow alphanumerics plus dot / underscore /
+# hyphen, must start with an alphanumeric, max 64 chars. Note: we
+# deliberately use `\A...\Z` rather than `^...$` because Python's
+# `$` anchor matches immediately before a trailing newline, which
+# would let `"claude\n"` slip through into a state filename.
+_AGENT_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+
+
+def validate_agent_name(name: str) -> str:
+    """Return ``name`` if it's a safe agent identifier, else raise ValueError.
+
+    Safe identifier: alphanumeric + dot/underscore/dash, starts with
+    alphanumeric, 1–64 chars. Rejects path separators, ``..``, leading
+    punctuation, whitespace (including trailing newlines/CRLF — a
+    real bite that the `$` anchor would have missed), quotes, and
+    anything else that could escape ``.agenttalk/state/`` when
+    interpolated into a filename.
+    """
+    if not isinstance(name, str):
+        raise ValueError(f"agent name must be a string, got {type(name).__name__}")
+    if not name:
+        raise ValueError("agent name cannot be empty")
+    if not _AGENT_NAME_RE.match(name):
+        raise ValueError(
+            f"agent name {name!r} is not a safe identifier "
+            f"(allowed: alphanumeric plus . _ -, must start with a letter "
+            f"or digit, max 64 chars)"
+        )
+    return name
+
+
+def validate_agent_roster(names: list[str]) -> list[str]:
+    """Validate each name AND check uniqueness across the roster.
+
+    Uniqueness is **case-insensitive** because agent names are used as
+    filename stems on filesystems that are case-insensitive by default
+    (NTFS, default macOS). Without this, `--agents Alpha,alpha` would
+    create one shared `Alpha.cursor` file with two logical owners.
+    """
+    seen: dict[str, str] = {}  # casefolded -> original
+    for n in names:
+        validate_agent_name(n)
+        key = n.casefold()
+        if key in seen:
+            other = seen[key]
+            if other == n:
+                raise ValueError(
+                    f"agent name {n!r} appears more than once in the roster"
+                )
+            raise ValueError(
+                f"agent names {other!r} and {n!r} only differ by case; on "
+                f"case-insensitive filesystems they would alias the same "
+                f"state files. Pick distinct names."
+            )
+        seen[key] = n
+    return names
 
 
 @dataclass
@@ -73,6 +134,7 @@ class Store:
         return self.config_path.exists()
 
     def init(self, agents: list[str], *, force: bool = False) -> dict:
+        validate_agent_roster(agents)
         if self.initialized() and not force:
             return self.load_config()
         for d in (self.messages_dir, self.state_dir, self.sessions_dir):
@@ -94,7 +156,22 @@ class Store:
             raise FileNotFoundError(
                 f"agenttalk not initialized in {self.root}. Run `agenttalk init` first."
             )
-        return json.loads(self.config_path.read_text(encoding="utf-8"))
+        cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+        # Validate roster on load so a malformed config can't smuggle
+        # unsafe names through to downstream filename interpolation.
+        agents = cfg.get("agents")
+        if not isinstance(agents, list):
+            raise ValueError(
+                f"corrupt config at {self.config_path}: 'agents' must be a list"
+            )
+        try:
+            validate_agent_roster(agents)
+        except ValueError as e:
+            raise ValueError(
+                f"corrupt config at {self.config_path}: {e}. "
+                f"Re-init with `agenttalk init --here --agents ...`."
+            )
+        return cfg
 
     # --------------------------------------------------------------- writing
 
@@ -222,22 +299,6 @@ def _new_id() -> str:
 
 def _new_session_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Write atomically via temp file + os.replace (atomic on Windows and POSIX)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text)
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
 
 
 def find_root(start: Path | None = None) -> Path:

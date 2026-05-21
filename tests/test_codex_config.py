@@ -177,3 +177,91 @@ def test_disable_on_missing_section_is_noop(tmp_path: Path) -> None:
     project.mkdir()
     res = disable_project(cfg, project)
     assert res.action == "no-op"
+
+
+# -------------------------------------------------- TOML quoting / escaping
+
+def test_enable_quotes_apostrophe_path_as_basic_string(tmp_path: Path) -> None:
+    """Regression: paths containing a single quote (e.g. `Bob's Repo`)
+    were written as `[projects.'.../Bob's Repo']`, producing invalid
+    TOML. Now they must be emitted as basic strings with proper
+    escapes.
+    """
+    cfg = tmp_path / "config.toml"
+    project = tmp_path / "Bob's Repo"
+    project.mkdir()
+    res = enable_project(cfg, project)
+    assert res.action == "created"
+    text = cfg.read_text(encoding="utf-8")
+    # Must use double-quoted basic string, not invalid literal
+    assert "[projects.\"" in text
+    assert "Bob's Repo" in text
+    # And re-enabling must be idempotent (the parser must round-trip).
+    # Re-read the file after the second call before counting, since
+    # the on-disk content is what users (and Codex) actually see.
+    res2 = enable_project(cfg, project)
+    assert res2.action == "unchanged"
+    text_after = cfg.read_text(encoding="utf-8")
+    assert text_after.count("[projects.") == 1
+
+
+def test_enable_escapes_backslashes_in_basic_string_paths(tmp_path: Path) -> None:
+    """When emitting a basic string (because the path contains a
+    single quote), backslashes must be escaped per TOML basic-string
+    rules so re-parsing recovers the original path.
+    """
+    cfg = tmp_path / "config.toml"
+    project = tmp_path / "weird's-dir"
+    project.mkdir()
+    enable_project(cfg, project)
+    text = cfg.read_text(encoding="utf-8")
+    # On Windows the path contains backslashes; on POSIX it doesn't.
+    # Either way, idempotent re-enable must round-trip cleanly.
+    res2 = enable_project(cfg, project)
+    assert res2.action == "unchanged", (
+        f"non-idempotent — text was {text!r}"
+    )
+
+
+# -------------------------------------------------- atomic write contract
+
+def test_all_write_sites_use_atomic_write(tmp_path: Path, monkeypatch) -> None:
+    """codex_config writes the user's GLOBAL Codex config; a crash
+    must never leave a half-written file. After the fix, ALL three
+    write paths (create, update, disable) must go through
+    agenttalk._atomic.write_text (temp-file + os.replace).
+    """
+    from agenttalk import codex_config
+    calls: list[tuple[str, str]] = []  # (action, path)
+    original = codex_config._atomic_write_text
+
+    def spy(path, text, **kwargs):
+        calls.append((str(path), text[:40]))
+        return original(path, text, **kwargs)
+
+    monkeypatch.setattr(codex_config, "_atomic_write_text", spy)
+    cfg = tmp_path / "config.toml"
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    # Path 1: enable on missing config (create)
+    enable_project(cfg, project)
+    create_calls = len(calls)
+    assert create_calls >= 1, "enable_project (create) must call atomic write"
+
+    # Path 2: enable that mutates an existing section (update)
+    # Pre-populate a section that's missing one managed key so enable
+    # has work to do, forcing the update write path.
+    cfg.write_text(
+        "[projects.'" + str(project.resolve()).replace('\\', '\\\\') + "']\n"
+        "trust_level = \"trusted\"\n",
+        encoding="utf-8",
+    )
+    calls.clear()
+    enable_project(cfg, project)
+    assert len(calls) >= 1, "enable_project (update) must call atomic write"
+
+    # Path 3: disable that removes managed keys
+    calls.clear()
+    disable_project(cfg, project)
+    assert len(calls) >= 1, "disable_project must call atomic write"

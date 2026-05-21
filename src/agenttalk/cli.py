@@ -11,7 +11,12 @@ from pathlib import Path
 
 from agenttalk import __version__
 from agenttalk.display import render
-from agenttalk.store import Message, Store, find_root
+from agenttalk.store import (
+    Message,
+    Store,
+    find_root,
+    validate_agent_name,
+)
 from agenttalk import transcript as tx
 from agenttalk import codex_config as cxc
 from agenttalk import install_skills as iskl
@@ -47,7 +52,10 @@ def _parse_meta(items: list[str] | None) -> dict:
     out: dict = {}
     for item in items or []:
         if "=" not in item:
-            raise SystemExit(f"--meta expects key=value, got {item!r}")
+            # Raise ValueError so main() converts to exit 2 (usage error).
+            # Earlier code used SystemExit(str) which exits 1 — that
+            # collides with `agenttalk wait`'s timeout signal.
+            raise ValueError(f"--meta expects key=value, got {item!r}")
         k, v = item.split("=", 1)
         out[k.strip()] = v.strip()
     return out
@@ -60,7 +68,9 @@ def _resolve_self(value: str | None, *, roster: list[str] | None = None) -> str:
     `agenttalk wait`'s timeout signal and would confuse loop skills.
     If `roster` is provided, the resolved name must be in it; typos
     like AGENTTALK_SELF=clude exit 2 rather than silently operating on
-    a phantom mailbox.
+    a phantom mailbox. Names are also shape-validated (no path
+    separators, no `..`, etc.) so a malicious env var can't smuggle
+    a phantom mailbox at a different filesystem location.
     """
     name = value or os.environ.get("AGENTTALK_SELF")
     if not name:
@@ -69,6 +79,11 @@ def _resolve_self(value: str | None, *, roster: list[str] | None = None) -> str:
             "  example (PowerShell): $env:AGENTTALK_SELF = 'claude'\n"
             "  example (bash):       export AGENTTALK_SELF=claude\n"
         )
+        sys.exit(2)
+    try:
+        validate_agent_name(name)
+    except ValueError as e:
+        sys.stderr.write(f"agenttalk: {e}\n")
         sys.exit(2)
     _ensure_in_roster(name, roster, label="self")
     return name
@@ -92,6 +107,11 @@ def _resolve_peer(value: str | None, store_cfg: dict, self_name: str) -> str:
             "  example (PowerShell): $env:AGENTTALK_PEER = 'codex'\n"
             "  example (bash):       export AGENTTALK_PEER=codex\n"
         )
+        sys.exit(2)
+    try:
+        validate_agent_name(name)
+    except ValueError as e:
+        sys.stderr.write(f"agenttalk: {e}\n")
         sys.exit(2)
     _ensure_in_roster(name, roster, label="peer")
     if name == self_name:
@@ -124,6 +144,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     if len(agents) < 2:
         sys.stderr.write("agenttalk init: need at least two agents (e.g. --agents claude,codex)\n")
         return 2
+    # store.init() validates the roster (safe names + uniqueness) and
+    # raises ValueError on bad input; main() converts that to exit 2.
     cfg = store.init(agents, force=args.force)
     print(f"agenttalk initialized at {store.dir}")
     print(f"  agents:     {', '.join(cfg['agents'])}")

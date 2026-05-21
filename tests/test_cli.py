@@ -21,15 +21,22 @@ def _run(argv: list[str], root: Path) -> int:
     return cli.main(["--root", str(root), *argv])
 
 
-def _run_expect_exit(argv: list[str], root: Path, code: int) -> SystemExit:
-    """Run main() and assert it raises SystemExit with the given code.
-    Returns the exception so the caller can inspect anything else."""
-    with pytest.raises(SystemExit) as excinfo:
-        cli.main(["--root", str(root), *argv])
-    assert excinfo.value.code == code, (
-        f"expected SystemExit({code}), got {excinfo.value.code!r}"
-    )
-    return excinfo.value
+def _run_expect_exit(argv: list[str], root: Path, code: int) -> None:
+    """Run main() and assert it exits with the given code.
+
+    Handles both error paths: `sys.exit(N)` raises SystemExit, while
+    `raise ValueError(...)` is caught in main() and returned as an
+    integer. Either way, the wrapper script (`sys.exit(main())`) ends
+    up with the same OS-level exit code, so the test treats them
+    equivalently.
+    """
+    try:
+        rc = cli.main(["--root", str(root), *argv])
+    except SystemExit as e:
+        actual = 0 if e.code is None else int(e.code)
+    else:
+        actual = int(rc)
+    assert actual == code, f"expected exit code {code}, got {actual}"
 
 
 # ----------------------------------------------------- init: hint emission
@@ -154,6 +161,68 @@ def test_wait_exits_2_before_loop_on_unknown_self(
         2,
     )
     assert not (store_root / ".agenttalk" / "state" / "typo.heartbeat").exists()
+
+
+def test_invalid_meta_exits_2_not_1(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Regression: --meta without `=` used to raise SystemExit(str),
+    which exits 1 — that collides with `agenttalk wait`'s timeout
+    signal and would confuse the sk-loop. Must exit 2 instead.
+    """
+    _run_expect_exit(
+        ["send", "--from", "alpha", "--to", "beta", "-m", "x", "--meta", "bad_no_equals"],
+        store_root,
+        2,
+    )
+    err = capsys.readouterr().err
+    assert "--meta expects key=value" in err
+
+
+def test_init_rejects_path_traversal_in_agent_name(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Regression for the v0.2.0 review blocker: path-like agent names
+    must not be allowed to escape .agenttalk/state/ during init."""
+    _run_expect_exit(
+        ["init", "--path", str(tmp_path), "--agents", "alpha,..\\..\\outside"],
+        tmp_path,
+        2,
+    )
+    err = capsys.readouterr().err
+    assert "not a safe identifier" in err
+    # And no escaped file was created
+    assert not (tmp_path.parent / "outside.cursor").exists()
+    assert not (tmp_path / "outside.cursor").exists()
+
+
+def test_init_rejects_duplicate_agents(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    _run_expect_exit(
+        ["init", "--path", str(tmp_path), "--agents", "alpha,alpha"],
+        tmp_path,
+        2,
+    )
+    err = capsys.readouterr().err
+    assert "more than once" in err
+
+
+def test_unsafe_env_self_exits_2(
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A malicious AGENTTALK_SELF env var (e.g. ../outside) must be
+    rejected with exit 2 before any filesystem interpolation, even if
+    it would also fail the roster check later."""
+    monkeypatch.setenv("AGENTTALK_SELF", "../outside")
+    _run_expect_exit(["recv"], store_root, 2)
+    err = capsys.readouterr().err
+    assert "not a safe identifier" in err
 
 
 # ----------------------------------------------------- recv / status flow

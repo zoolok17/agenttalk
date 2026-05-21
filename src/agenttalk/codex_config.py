@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agenttalk._atomic import write_text as _atomic_write_text
+
 
 MANAGED_KEYS = ("trust_level", "approval_policy", "sandbox_mode")
 TARGET_VALUES = {
@@ -28,6 +30,31 @@ TARGET_VALUES = {
 
 def default_config_path() -> Path:
     return Path.home() / ".codex" / "config.toml"
+
+
+def _toml_quote_key(s: str) -> str:
+    """Render a string as a TOML table-key quoted segment.
+
+    Prefer a literal string (single-quoted) when safe, since Windows
+    paths look cleanest unescaped. Fall back to a basic string
+    (double-quoted) when the value contains a single quote or any
+    control character that's illegal in literal strings.
+    """
+    # TOML literal strings forbid single quotes, newlines, and most
+    # control characters. If the path is "clean", use the literal form.
+    if "'" not in s and not any(c in s for c in "\r\n\t\b\f\x00"):
+        return f"'{s}'"
+    # Otherwise emit a basic string with TOML escapes.
+    escaped = (
+        s.replace("\\", "\\\\")
+         .replace('"', '\\"')
+         .replace("\b", "\\b")
+         .replace("\t", "\\t")
+         .replace("\n", "\\n")
+         .replace("\f", "\\f")
+         .replace("\r", "\\r")
+    )
+    return f'"{escaped}"'
 
 
 @dataclass
@@ -47,7 +74,7 @@ def _normalize_path(p: Path) -> str:
 
 
 def _section_header(project_dir: str) -> str:
-    return f"[projects.'{project_dir}']"
+    return f"[projects.{_toml_quote_key(project_dir)}]"
 
 
 def _unquote_toml_key(raw: str) -> str | None:
@@ -203,9 +230,8 @@ def enable_project(config_path: Path, project_dir: Path) -> Result:
     config_path = config_path.expanduser()
 
     if not config_path.exists():
-        config_path.parent.mkdir(parents=True, exist_ok=True)
         body = _render_block(project_key)
-        config_path.write_text(body, encoding="utf-8")
+        _atomic_write_text(config_path, body)
         return Result(
             action="created",
             config_path=config_path,
@@ -276,7 +302,7 @@ def enable_project(config_path: Path, project_dir: Path) -> Result:
 
     if trailing_newline:
         lines.append("")
-    config_path.write_text(newline.join(lines), encoding="utf-8")
+    _atomic_write_text(config_path, newline.join(lines), newline=newline)
     return Result(action=action, config_path=config_path, project_dir=project_key, changes=changes)
 
 
@@ -324,7 +350,7 @@ def disable_project(config_path: Path, project_dir: Path) -> Result:
     lines[start:end] = new_block
     if trailing_newline:
         lines.append("")
-    config_path.write_text(newline.join(lines), encoding="utf-8")
+    _atomic_write_text(config_path, newline.join(lines), newline=newline)
     return Result(action="removed", config_path=config_path, project_dir=project_key,
                   changes=removed)
 

@@ -5,6 +5,75 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-05-21
+
+Patch release driven by the v0.2.0 cross-agent code review (see
+[`docs/reviews/v0.2.0.md`](docs/reviews/v0.2.0.md)). Closes one
+security blocker plus three quality issues that landed in the same
+review pass.
+
+### Security
+
+- **Agent names are now validated against a safe-identifier
+  pattern** (`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`). Before, names
+  were interpolated directly into filesystem paths like
+  `.agenttalk/state/<name>.cursor`, so a name containing `..`,
+  `/`, or `\` could escape `.agenttalk/state/` and write
+  arbitrary files inside the project root. `agenttalk init` and
+  every identity-resolution path (`--from`/`--to`/`--for` flags,
+  env vars, on-disk config) now reject unsafe names with exit 2.
+  Duplicate names in the roster are also rejected.
+
+### Fixed
+
+- **`--meta bad_value_without_equals` now exits 2** instead of 1.
+  The old `SystemExit(str)` form exited 1, which collides with
+  `agenttalk wait`'s timeout signal and could confuse loop skills.
+- **`agenttalk codex-config` writes are now atomic.** The
+  user-global `~/.codex/config.toml` was being written with a
+  plain `Path.write_text()` — a crash mid-write could truncate
+  a file that controls every Codex project. Now uses the same
+  temp-file + `os.replace` helper as the message store.
+- **`agenttalk codex-config` now handles project paths containing
+  apostrophes.** A path like `D:\Code\Bob's Repo` previously
+  emitted invalid TOML (`[projects.'...Bob's Repo']`). The
+  section-key renderer now uses a TOML basic string with proper
+  escaping when the path contains a single quote.
+
+### Changed
+
+- `agenttalk._atomic.write_text` factored out of `store.py` as a
+  shared helper; `codex_config.py` now uses it.
+- `Store.load_config()` validates the on-disk roster on read, so a
+  malformed `config.json` (wrong types, unsafe names) errors out
+  with a clear message instead of cryptic downstream tracebacks.
+- README: agent-identity section now documents the safe-identifier
+  rule; CLI reference gained an Exit Codes table.
+
+### Tests
+
+- New tests cover: the safe-identifier pattern (parametrized over
+  valid + invalid names, including trailing-newline cases that the
+  Python `$` anchor would have missed), exact- and case-insensitive
+  duplicate-roster rejection, load-time corrupt-config detection,
+  the path-traversal regression (Codex's review repro), invalid-
+  `--meta` exit code, apostrophe-path TOML emission, idempotent
+  round-trip through the new TOML quote helper, and the
+  codex_config atomic-write contract across all three call sites.
+- Total suite: 93 tests, all passing.
+
+### Docs
+
+- `SECURITY.md` added: trust model, threat scenarios with expected
+  behavior under the current model, planned 0.3.x product-level
+  hardening, recommended CI scanner stack, and a clear statement of
+  what `agenttalk` does NOT defend against (same-OS-user attacker,
+  shared filesystems, prompt injection in message bodies).
+  Synthesizes the cross-agent security consult done via
+  `/agenttalk.consult` on the same day.
+- `docs/reviews/v0.2.0.md` added: the v0.2.0 review report that
+  drove this patch.
+
 ## [0.2.0] — 2026-05-21
 
 First tagged release. Builds out the message bus into a full
@@ -111,4 +180,5 @@ pre-answer consult primitive.
 - Atomic JSON-per-message writes; per-agent cursors; markdown +
   JSONL transcript export.
 
+[0.2.1]: https://github.com/zoolok17/agenttalk/releases/tag/v0.2.1
 [0.2.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.2.0
