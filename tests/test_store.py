@@ -76,6 +76,23 @@ def test_messages_ids_are_lexicographic(store: Store) -> None:
     assert ids == sorted(ids)
 
 
+def test_new_id_is_strictly_monotonic_under_load() -> None:
+    """v0.7.1 regression: on fast hardware two _new_id() calls land
+    in the same microsecond; the random 4-char suffix is NOT
+    monotonic, so two messages would have ids that lexicographically
+    sort opposite to send order — breaking the messages_for/dashboard
+    chronology invariant. Force the timestamp to be strictly greater
+    than the previous one per process to close it."""
+    from agenttalk.store import _new_id
+    ids = [_new_id() for _ in range(2000)]
+    assert ids == sorted(ids), (
+        "ids were not strictly monotonic under tight-loop generation; "
+        "messages_for and the web dashboard would reorder same-microsecond "
+        "messages relative to send order"
+    )
+    assert len(set(ids)) == len(ids), "duplicate ids generated"
+
+
 # ------------------------------------------------------------ recv / cursor
 
 def test_recv_returns_messages_for_agent(store: Store) -> None:

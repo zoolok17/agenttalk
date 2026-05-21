@@ -8,7 +8,10 @@ Layout under <root>/.agenttalk/:
 
 Message id format: ``YYYYMMDD-HHMMSS-uuuuuu-XXXX`` where the suffix is a
 4-char random tag to avoid collisions when two messages land in the same
-microsecond. Lexicographic order == chronological order.
+microsecond from different processes (the two agents). Within one process
+the timestamp portion is forced monotonic by ``_new_id`` (see the function
+docstring) so lexicographic order equals send order for any one writer —
+the invariant ``messages_for`` / dashboard rendering relies on.
 """
 
 from __future__ import annotations
@@ -18,8 +21,9 @@ import re
 import secrets
 import shutil
 import string
+import threading
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agenttalk._atomic import write_text as _atomic_write_text
@@ -712,8 +716,31 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
+_id_lock = threading.Lock()
+_last_id_dt: datetime | None = None
+
+
 def _new_id() -> str:
-    now = datetime.now(timezone.utc)
+    """Return a fresh message id, monotonic within this process.
+
+    Format: ``YYYYMMDD-HHMMSS-uuuuuu-XXXX``. The timestamp is forced
+    strictly greater than the previous id issued by this process, so
+    lexicographic order matches send order for any single writer —
+    the invariant the bus and dashboard rely on for chronology
+    (``messages_for`` sorts by id; on fast hardware two ``send()``
+    calls can land in the same microsecond, and the random suffix
+    alone does not preserve order).
+
+    Cross-process collisions (two agents writing the same
+    microsecond) are still handled by the 4-char random suffix —
+    each process tracks its own ``_last_id_dt``.
+    """
+    global _last_id_dt
+    with _id_lock:
+        now = datetime.now(timezone.utc)
+        if _last_id_dt is not None and now <= _last_id_dt:
+            now = _last_id_dt + timedelta(microseconds=1)
+        _last_id_dt = now
     suffix = "".join(secrets.choice(_ID_ALPHABET) for _ in range(4))
     return now.strftime("%Y%m%d-%H%M%S-%f") + "-" + suffix
 

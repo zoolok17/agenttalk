@@ -5,6 +5,34 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] — 2026-05-21
+
+Patch release. Fixes a chronology bug in message id generation
+that surfaced as a flaky test in CI on fast hardware after the
+0.7.0 release.
+
+### Fixed
+
+- **`_new_id` is now strictly monotonic within a process.** The
+  format ``YYYYMMDD-HHMMSS-uuuuuu-XXXX`` documented
+  lexicographic-equals-chronological order, but the random
+  4-char suffix did not preserve order when two messages landed
+  in the same microsecond. ``messages_for`` and the new web
+  dashboard sort by id to display chronological order, so the
+  bug could surface two same-microsecond messages in send-
+  reversed order (visible in ``recv``, ``tail``, and
+  ``/messages``). Fix: per-process monotonic clock — if a new
+  call would tie or go backwards relative to the last issued
+  id, the timestamp is bumped by 1µs. Cross-process collisions
+  (two agents writing the same microsecond) are still handled
+  by the random suffix; each process tracks its own last id.
+
+### Added
+
+- ``test_new_id_is_strictly_monotonic_under_load`` (tight-loop
+  regression test, 2000 calls) that pins the invariant against
+  future fast-hardware regressions.
+
 ## [0.7.0] — 2026-05-21
 
 Adds a read-only local web dashboard so the message log can be
