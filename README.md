@@ -15,9 +15,10 @@ on session end.
 ## TL;DR — getting started
 
 ```powershell
-# one-time install (anywhere)
+# one-time install
 git clone https://github.com/zoolok17/agenttalk.git
-python -m pip install -e .\agenttalk
+cd agenttalk
+python -m pip install -e .
 agenttalk install-skills         # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
@@ -79,11 +80,17 @@ interrupt whenever you want.
 
 ```powershell
 git clone https://github.com/zoolok17/agenttalk.git
-python -m pip install -e .\agenttalk
+cd agenttalk
+python -m pip install -e .
 ```
 
 This puts an `agenttalk` script on your PATH. The package is stdlib-only
 (no third-party deps) and requires Python 3.10+.
+
+> If you already have the repo cloned and want to install from a
+> different working directory, use `python -m pip install -e <full-path-to-clone>`
+> instead. The bare `pip install -e .\agenttalk` form only works when
+> your CWD is the parent of the clone.
 
 If you also want Codex to call agenttalk from inside its sandbox, run
 this once per project root:
