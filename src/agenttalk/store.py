@@ -534,6 +534,13 @@ class Store:
     def unread_for(self, agent: str) -> list[Message]:
         return self.messages_for(agent, since_id=self.cursor(agent))
 
+    def last_received_for(self, agent: str) -> Message | None:
+        """Return the most recent valid message addressed to ``agent``,
+        or ``None`` if the inbox is empty. Used by ``agenttalk reply``
+        to auto-derive the peer + correlate ``request_id``."""
+        msgs = self.messages_for(agent)
+        return msgs[-1] if msgs else None
+
     def cursor(self, agent: str) -> str:
         p = self.state_dir / f"{agent}.cursor"
         if not p.exists():

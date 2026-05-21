@@ -443,6 +443,110 @@ def cmd_codex_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reply(args: argparse.Namespace) -> int:
+    """Reply to the most recent received message.
+
+    Auto-derives recipient (= sender of the last message) and echoes
+    `request_id` from the original meta so the peer's handoff/consult
+    flow can correlate the reply. Other meta keys are NOT echoed —
+    explicit pass via `--meta` is the only way to attach more.
+    """
+    store = _get_store(args)
+    cfg = store.load_config()
+    roster = cfg.get("agents") or []
+    sender = _resolve_self(args.sender, roster=roster)
+    last = store.last_received_for(sender)
+    if last is None:
+        sys.stderr.write(
+            f"agenttalk reply: no messages in {sender}'s inbox to reply to. "
+            f"Use `agenttalk send` to start a new thread.\n"
+        )
+        return 2
+    body = _read_body(args)
+    if not body and not args.allow_empty:
+        sys.stderr.write("agenttalk reply: empty body (use -m TEXT, --file PATH, pipe stdin, or --allow-empty)\n")
+        return 2
+    meta = _parse_meta(args.meta)
+    # Auto-echo request_id for correlation. Explicit --meta wins.
+    if "request_id" not in meta and "request_id" in (last.meta or {}):
+        meta["request_id"] = last.meta["request_id"]
+    msg = store.send(
+        sender=sender,
+        recipient=last.sender,
+        body=body,
+        kind=args.kind,
+        subject=args.subject or "",
+        meta=meta,
+    )
+    if not args.quiet:
+        print(render(msg, header=f"AGENTTALK :: REPLY  {msg.sender} -> {msg.recipient}"))
+    return 0
+
+
+def cmd_tail(args: argparse.Namespace) -> int:
+    """Stream messages as they arrive — passive monitor mode.
+
+    Unlike `wait` and `recv`, `tail` never advances any agent's
+    cursor and never writes a heartbeat, so a third terminal can
+    watch the bus without interfering with the two active agents.
+
+    By default starts with messages from now forward; pass
+    `--from-start` to replay everything in the store first.
+
+    Invalid messages (forged/tampered/corrupt — those that
+    `messages_for()` would skip) are shown as a single-line
+    WARNING with the id + reason, NOT rendered with their body.
+    This preserves tail's forensic value without piping an
+    untrusted body into the operator's terminal as if it were a
+    normal message.
+    """
+    store = _get_store(args)
+    cfg = store.load_config()
+    roster = cfg.get("agents") or []
+    seen: set[str] = set()
+    if not args.from_start:
+        # Treat existing messages as already-seen so we only show new ones.
+        # Use _scan_messages so we cover BOTH valid and invalid up to "now".
+        valid, invalid = store._scan_messages()
+        for m in valid:
+            seen.add(m.id)
+        for mid, _ in invalid:
+            seen.add(mid)
+    interval = max(0.1, args.interval)
+    deadline = time.time() + args.timeout if args.timeout > 0 else None
+    try:
+        while True:
+            valid, invalid = store._scan_messages()
+            # Render valid messages (subject to roster validation)
+            for m in valid:
+                if m.id in seen:
+                    continue
+                seen.add(m.id)
+                try:
+                    m.validate(roster)
+                except ValueError as e:
+                    # Valid shape but failed roster/kind check — surface
+                    # as a warning, never render the body.
+                    sys.stderr.write(
+                        f"AGENTTALK :: TAIL INVALID  id={m.id}  reason={e}\n"
+                    )
+                    continue
+                print(render(m, header=f"AGENTTALK :: TAIL  {m.sender} -> {m.recipient}"))
+            # Surface parse/construction failures as warnings too
+            for mid, reason in invalid:
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                sys.stderr.write(
+                    f"AGENTTALK :: TAIL INVALID  id={mid}  reason={reason}\n"
+                )
+            if deadline is not None and time.time() >= deadline:
+                return 0
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return 0
+
+
 def cmd_reset(args: argparse.Namespace) -> int:
     """Clear messages/cursors/heartbeats and start a fresh session."""
     store = _get_store(args)
@@ -548,6 +652,39 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--from", dest="sender", help="Sender agent name (default: $AGENTTALK_SELF)")
     pe.add_argument("--reason", help="Free-text reason")
     pe.set_defaults(func=cmd_end)
+
+    prpl = sub.add_parser(
+        "reply",
+        help="Reply to the most recent received message. Auto-derives "
+             "recipient (= sender of last message) and echoes request_id "
+             "for correlation. Use --meta to override / extend defaults.",
+    )
+    prpl.add_argument("--from", dest="sender",
+                      help="Sender agent name (default: $AGENTTALK_SELF)")
+    prpl.add_argument("--kind", default="message",
+                      help="Message kind (default: message; see `agenttalk send --help`)")
+    prpl.add_argument("--subject", help="One-line summary")
+    prpl.add_argument("--meta", action="append",
+                      help="key=value (repeatable); request_id is auto-echoed if not set")
+    prpl.add_argument("-m", "--message", help="Body text (else --file or stdin)")
+    prpl.add_argument("--file", help="Read body from this file path")
+    prpl.add_argument("--allow-empty", action="store_true")
+    prpl.add_argument("--quiet", action="store_true")
+    prpl.set_defaults(func=cmd_reply)
+
+    pt2 = sub.add_parser(
+        "tail",
+        help="Passive monitor: stream all messages as they arrive. "
+             "Does NOT advance cursors or write heartbeats — safe to run "
+             "in a third terminal alongside two active agents.",
+    )
+    pt2.add_argument("--from-start", action="store_true",
+                     help="Also replay all existing messages in the store before tailing.")
+    pt2.add_argument("--interval", type=float, default=0.5,
+                     help="Poll interval in seconds (default: 0.5)")
+    pt2.add_argument("--timeout", type=float, default=0,
+                     help="Exit after N seconds (default: 0 = run until Ctrl-C)")
+    pt2.set_defaults(func=cmd_tail)
 
     prst = sub.add_parser(
         "reset",

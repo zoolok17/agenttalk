@@ -5,6 +5,48 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-05-21
+
+Third slice of the v0.2.0-review roadmap. Adds two ergonomic
+commands that close the gap between the existing primitives.
+
+### Added
+
+- **`agenttalk reply`** — reply to the most recent received message.
+  Auto-derives the recipient (= sender of the last message) and
+  auto-echoes `request_id` from the original meta so the peer's
+  `wait`-then-match logic works without the agent manually
+  threading the correlation token. Explicit `--meta request_id=...`
+  wins over auto-echo. Kind defaults to `message` (the safe
+  no-op default) rather than auto-promoting to `review-result`.
+  Resolves the v0.2.0-review "agenttalk reply" item.
+- **`agenttalk tail`** — passive monitor mode. Streams every
+  message as it arrives, using the same display renderer as
+  `wait`/`recv`, **without** advancing any cursor or writing any
+  heartbeat. Safe to run in a third terminal alongside two active
+  agents — they don't see tail as a listener. `--from-start`
+  replays the entire store first; `--timeout N` exits after N
+  seconds (default 0 = run until Ctrl-C). Resolves the v0.2.0-
+  review "agenttalk tail/watch" item.
+- **`Store.last_received_for(agent) -> Message | None`** — the
+  underlying primitive for `reply`. Honors schema/roster
+  validation: a tampered message that `messages_for()` would
+  filter is never returned as "the last message".
+
+### Tests
+
+- 227 passing (was 208 in 0.4.0). New file `tests/test_reply_tail.py`
+  covers: reply auto-derives recipient, auto-echoes request_id,
+  explicit meta wins, empty inbox exits 2, kind defaults to
+  message, explicit kind wins, env-driven self, unknown kind
+  rejected; tail streams only new by default, --from-start
+  replays, never advances cursors, never writes heartbeats, exits
+  0 on timeout, picks up messages injected during the run, NEVER
+  renders forged/unknown-kind message bodies (surfaces them as
+  INVALID warnings on stderr), surfaces unparseable-JSON warnings
+  too; last_received_for returns most recent, returns None on
+  empty, skips invalid messages.
+
 ## [0.4.0] — 2026-05-21
 
 Second slice of the v0.2.0-review roadmap. Adds explicit session
@@ -323,6 +365,7 @@ pre-answer consult primitive.
 - Atomic JSON-per-message writes; per-agent cursors; markdown +
   JSONL transcript export.
 
+[0.5.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.5.0
 [0.4.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.4.0
 [0.3.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.3.0
 [0.2.1]: https://github.com/zoolok17/agenttalk/releases/tag/v0.2.1
