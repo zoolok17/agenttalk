@@ -28,6 +28,20 @@ from agenttalk._atomic import write_text as _atomic_write_text
 DIRNAME = ".agenttalk"
 _ID_ALPHABET = string.ascii_letters + string.digits
 
+# Known message kinds. Receivers should silently skip anything else
+# rather than letting an unfamiliar kind smuggle through to the LLM
+# as a fresh instruction surface. New kinds must be added here AND
+# documented in the skill bodies + CHANGELOG.
+KNOWN_KINDS = frozenset({
+    "message",
+    "note",
+    "question",
+    "review-request",
+    "review-result",
+    "wake",
+    "end",
+})
+
 # Agent names are interpolated directly into filesystem paths
 # (cursors, heartbeats), so they must be portable identifiers — not
 # arbitrary user input. Allow alphanumerics plus dot / underscore /
@@ -107,6 +121,13 @@ class Message:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Message":
+        """Construct from a trusted dict.
+
+        For untrusted on-disk JSON, prefer ``Message.from_raw()`` —
+        it does strict schema validation before construction, so a
+        malformed file can't smuggle a numeric `id` or missing `ts`
+        into the Store and crash downstream callers.
+        """
         return cls(
             id=data["id"],
             ts=data["ts"],
@@ -117,6 +138,78 @@ class Message:
             body=data.get("body", ""),
             meta=data.get("meta", {}) or {},
         )
+
+    @classmethod
+    def from_raw(cls, data) -> "Message":
+        """Strict construction from untrusted JSON.
+
+        Raises ``ValueError`` with a human-readable reason for any
+        shape/type/missing-field failure. The single entry point from
+        ``.agenttalk/messages/*.json`` files into the in-memory bus
+        — see ``Store.all_messages()``.
+        """
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"top-level value must be a JSON object, got {type(data).__name__}"
+            )
+        for field in ("id", "ts"):
+            if field not in data:
+                raise ValueError(f"missing required field {field!r}")
+        for field in ("id", "ts"):
+            if not isinstance(data[field], str) or not data[field]:
+                raise ValueError(
+                    f"field {field!r} must be a non-empty string, "
+                    f"got {type(data[field]).__name__}"
+                )
+        for field in ("kind", "subject", "body"):
+            if field in data and not isinstance(data[field], str):
+                raise ValueError(
+                    f"field {field!r} must be a string if present, "
+                    f"got {type(data[field]).__name__}"
+                )
+        sender = data.get("from", data.get("sender"))
+        recipient = data.get("to", data.get("recipient"))
+        if not isinstance(sender, str) or not sender:
+            raise ValueError("field 'from' must be a non-empty string")
+        if not isinstance(recipient, str) or not recipient:
+            raise ValueError("field 'to' must be a non-empty string")
+        if "meta" in data and not isinstance(data["meta"], dict):
+            raise ValueError(
+                f"field 'meta' must be a dict, got {type(data['meta']).__name__}"
+            )
+        return cls.from_dict(data)
+
+    def validate(self, roster: list[str]) -> None:
+        """Raise ValueError if this message fails schema/roster checks.
+
+        Strict schema validation has two purposes:
+        1. Data integrity: catches bugs and disk corruption (a
+           message file with the wrong shape never gets handled).
+        2. Reducing the attack surface: unknown kinds can't smuggle
+           an unfamiliar verb into the LLM's instruction set.
+
+        This does NOT defend against an attacker who can write
+        well-formed messages — that's a signing problem (see
+        SECURITY.md). It does mean such an attacker has to pick from
+        the known-kind vocabulary, which is small and well-understood.
+        """
+        if self.kind not in KNOWN_KINDS:
+            raise ValueError(
+                f"unknown kind {self.kind!r} (known: {sorted(KNOWN_KINDS)})"
+            )
+        if not isinstance(self.body, str):
+            raise ValueError(f"body must be a string, got {type(self.body).__name__}")
+        if not isinstance(self.meta, dict):
+            raise ValueError(f"meta must be a dict, got {type(self.meta).__name__}")
+        if roster:
+            if self.sender not in roster:
+                raise ValueError(
+                    f"sender {self.sender!r} not in roster {sorted(roster)}"
+                )
+            if self.recipient not in roster:
+                raise ValueError(
+                    f"recipient {self.recipient!r} not in roster {sorted(roster)}"
+                )
 
 
 class Store:
@@ -193,6 +286,14 @@ class Store:
             raise ValueError(f"sender '{sender}' not in registered agents {sorted(agents)}")
         if agents and recipient not in agents:
             raise ValueError(f"recipient '{recipient}' not in registered agents {sorted(agents)}")
+        # Reject unknown kinds at WRITE time so the sender sees an
+        # immediate error rather than a silent receive-side skip.
+        # Without this, `agenttalk send --kind typo` would exit 0 +
+        # the message would be invisible to the peer's wait/recv.
+        if kind not in KNOWN_KINDS:
+            raise ValueError(
+                f"unknown kind {kind!r} (allowed: {sorted(KNOWN_KINDS)})"
+            )
         msg = Message(
             id=_new_id(),
             ts=_now_iso(),
@@ -209,24 +310,102 @@ class Store:
 
     # --------------------------------------------------------------- reading
 
-    def all_messages(self) -> list[Message]:
+    def _scan_messages(self) -> tuple[list[Message], list[tuple[str, str]]]:
+        """Read every file in messages/ once, separating valid messages
+        from invalid ones. Returns (valid, invalid) where invalid is
+        [(file_stem_or_id, reason)].
+
+        This is the canonical read path — never construct a Message
+        from disk JSON without going through here. Catches JSON
+        parse errors, shape/type errors, and missing fields *before*
+        downstream callers can crash on `data["id"]` or compare a
+        numeric id against a string cursor.
+        """
+        valid: list[Message] = []
+        invalid: list[tuple[str, str]] = []
         if not self.messages_dir.exists():
-            return []
-        out: list[Message] = []
+            return valid, invalid
         for p in sorted(self.messages_dir.iterdir()):
             if p.suffix != ".json":
                 continue
             try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
+                text = p.read_text(encoding="utf-8")
+            except OSError as e:
+                invalid.append((p.stem, f"cannot read file: {e}"))
                 continue
-            out.append(Message.from_dict(data))
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as e:
+                invalid.append((p.stem, f"invalid JSON: {e}"))
+                continue
+            try:
+                msg = Message.from_raw(data)
+            except ValueError as e:
+                ident = data.get("id") if isinstance(data, dict) else None
+                if not isinstance(ident, str) or not ident:
+                    ident = p.stem
+                invalid.append((ident, str(e)))
+                continue
+            valid.append(msg)
+        return valid, invalid
+
+    def all_messages(self) -> list[Message]:
+        """Return all parseable + schema-valid messages.
+
+        Roster validation is applied in ``messages_for``; this method
+        returns everything that constructed cleanly, so transcript
+        export still sees messages from old sessions whose agents are
+        no longer in the current roster.
+        """
+        valid, _ = self._scan_messages()
+        return valid
+
+    def list_invalid_messages(self) -> list[tuple[str, str]]:
+        """Return [(id_or_stem, reason)] for every message file that
+        failed (JSON parse, missing fields, wrong types, OR
+        schema/roster validation). Surfaces what `messages_for()`
+        silently skipped — so tampering is visible rather than
+        invisible. Used by `agenttalk status` and `agenttalk doctor`.
+        """
+        try:
+            cfg = self.load_config()
+        except (ValueError, OSError, FileNotFoundError):
+            roster = []
+        else:
+            roster = cfg.get("agents", []) or []
+        valid, parse_failures = self._scan_messages()
+        out = list(parse_failures)
+        for m in valid:
+            try:
+                m.validate(roster)
+            except ValueError as e:
+                out.append((m.id, str(e)))
         return out
 
     def messages_for(self, agent: str, *, since_id: str | None = None) -> list[Message]:
-        msgs = [m for m in self.all_messages() if m.recipient == agent]
-        if since_id:
-            msgs = [m for m in msgs if m.id > since_id]
+        """Return validated messages addressed to ``agent``.
+
+        Silently skips messages that fail schema/roster validation so
+        callers (wait, recv) never act on malformed input. Use
+        ``list_invalid_messages()`` to see what was skipped.
+        """
+        try:
+            cfg = self.load_config()
+            roster = cfg.get("agents", []) or []
+        except (ValueError, OSError, FileNotFoundError):
+            roster = []
+        valid, _ = self._scan_messages()
+        msgs: list[Message] = []
+        for m in valid:
+            if m.recipient != agent:
+                continue
+            try:
+                m.validate(roster)
+            except ValueError:
+                continue
+            if since_id and m.id <= since_id:
+                continue
+            msgs.append(m)
         return msgs
 
     def unread_for(self, agent: str) -> list[Message]:

@@ -5,6 +5,94 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-05-21
+
+First slice of the v0.2.0-review feature wave. Adds two new
+commands, product-level message-schema hardening, structured-output
+support for automation, and a substantial test-coverage backfill.
+
+### Added
+
+- **`agenttalk status --json`** — structured output for the consult
+  freshness check and any external automation. Schema:
+  `{root, session_id, message_count, invalid_messages[], agents[],
+  stale_threshold_seconds}`; each agent entry exposes `cursor`,
+  `unread`, `heartbeat` (ISO 8601 or null), `last_seen_seconds`,
+  and `stale` (bool or null).
+- **`agenttalk doctor`** — single-command health check. Reports:
+  is the store initialized, are bundled skills installed and in
+  sync with the bundled package, is the per-project Codex sandbox
+  block configured, and is each agent's heartbeat fresh. Each check
+  carries `ok / warn / error` plus a one-line remediation hint.
+  Supports `--json` for the same payload. Per the global exit-code
+  contract, exit 2 on any error; warnings exit 0 with the warning
+  state visible in output. (Exit 1 stays reserved for `agenttalk
+  wait` timeout.)
+- **Message-schema validation on read.** New `KNOWN_KINDS`
+  vocabulary; `Message.from_raw(data)` strictly validates raw JSON
+  before constructing a Message (catches missing/wrong-type id, ts,
+  from, to, kind, subject, body, meta — including the `meta=[]`
+  truthy-coercion bug and non-dict roots); `Message.validate(roster)`
+  enforces known kind + roster membership. `Store.messages_for()`
+  silently skips invalid messages so a forged file with an unknown
+  kind cannot smuggle a fresh instruction surface into the listener.
+  `Store.list_invalid_messages()` returns every parse failure
+  alongside every schema/roster failure so tampering and disk
+  corruption are visible rather than silently swallowed; `agenttalk
+  status` shows the count and points users at `status --json` for
+  per-message details.
+- **Send-time kind validation.** `Store.send()` rejects unknown
+  kinds at write time — without this, a `--kind typo` would exit 0
+  with the message silently undeliverable on the receive side.
+- **Skill-body untrusted-input guidance.** listen, sk-loop, and
+  consult skill bodies (both sides) now carry explicit prompt-
+  injection-resistance rules: message bodies are data the LLM is
+  asked to read, not instructions the LLM is asked to follow;
+  state transitions must derive from validated metadata + repo
+  reading, never from body prose alone.
+- **Consult skill uses `status --json`** for the heartbeat
+  freshness check instead of parsing the human-formatted output —
+  the JSON contract is the stable one.
+
+### Tests
+
+- Suite grew from 93 to 184. New coverage: `status --json` schema,
+  `doctor` for every check category (uninitialized / fresh / stale
+  / missing heartbeat / out-of-sync skills / missing codex-config
+  block), message-schema validation (each rejection reason
+  individually + the read-time silent-skip), `transcript.py`
+  markdown + jsonl + unicode + export round-trip, `display.py`
+  rendering with kind/subject/meta/empty-body/multiline/unicode
+  cases, `cmd_end` (sends `kind=end` + writes transcript),
+  `cmd_transcript` (md + jsonl), `cmd_wait` (already-queued
+  message, timeout, heartbeat write, --ack vs --no-ack cursor
+  behavior), `agenttalk --version`. Also a new skill-body lint
+  asserting every required policy substring appears in both the
+  Claude- and Codex-side skill bodies, catching cross-side drift.
+
+### Changed
+
+- `Store.messages_for()` now silently skips messages that fail
+  schema/roster validation. `Store.all_messages()` returns only
+  messages that survived strict raw-JSON construction; parse
+  failures and construction failures are surfaced separately via
+  `Store.list_invalid_messages()` (consumed by `agenttalk status`
+  and `agenttalk status --json`).
+- README + SECURITY.md updated to mention the new commands and
+  the schema-validation behavior. README's `--kind` documentation
+  also updated: kinds are now a fixed vocabulary (KNOWN_KINDS), not
+  free-form; adding a new kind requires updating that constant.
+
+### Security
+
+This is a *data-integrity* hardening pass, not a cryptographic
+one. Schema validation catches malformed or out-of-vocabulary
+messages, but cannot defend against an attacker who writes
+well-formed messages — that requires signing and is tracked for
+0.4.0+ as opt-in HMAC (see `SECURITY.md`). The skill-body
+prompt-injection guidance is the procedural counterpart and
+applies regardless of whether crypto is later added.
+
 ## [0.2.1] — 2026-05-21
 
 Patch release driven by the v0.2.0 cross-agent code review (see
@@ -180,5 +268,6 @@ pre-answer consult primitive.
 - Atomic JSON-per-message writes; per-agent cursors; markdown +
   JSONL transcript export.
 
+[0.3.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.3.0
 [0.2.1]: https://github.com/zoolok17/agenttalk/releases/tag/v0.2.1
 [0.2.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.2.0

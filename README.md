@@ -16,7 +16,7 @@ on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.2.1"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.3.0"
 agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
@@ -80,10 +80,10 @@ interrupt whenever you want.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.2.1"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.3.0"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.2.1` with
+Pin to a specific tag so you control upgrades. Replace `v0.3.0` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
@@ -389,15 +389,26 @@ so the long timeout is free observability.
 | `agenttalk end --from A [--reason ...]` | Notify the other agent(s) and write the transcript. |
 | `agenttalk install-skills [--claude-only\|--codex-only] [--force] [--dry-run]` | Copy bundled skill files to `~/.claude/commands/` and `~/.codex/skills/`. Idempotent — preserves your local edits unless `--force`. |
 | `agenttalk codex-config [--enable\|--disable\|--status]` | Manage per-project sandbox/trust block in `~/.codex/config.toml` so Codex can call agenttalk from inside its sandbox. |
+| `agenttalk doctor [--json]` | Health check: store initialized, skills installed + in sync, Codex sandbox block configured, heartbeats fresh. Per the global exit-code contract, exit 2 on any error; warnings exit 0 with the warning state visible in output. |
+| `agenttalk status --json` | Structured status output for automation (consult freshness, external tooling). Same data as plain `status` plus `invalid_messages[]` for any messages that fail schema/roster validation. |
+| `agenttalk --version` | Print the installed version. |
 
-Message `--kind` values are free-form, but the skills assume:
+Message `--kind` values are validated against a fixed vocabulary
+(`store.KNOWN_KINDS`); unknown kinds are rejected at write time so a
+typo can't produce a "sent" message the receiver will silently skip:
 
 - `message` — generic chat
-- `review-request` — "please review this WP"
-- `review-result` — "I reviewed; here's my verdict" (use `--meta status=approved|rejected`)
-- `question` — needs a reply before the other side proceeds
 - `note` — informational
+- `question` — needs a reply before the other side proceeds
+- `review-request` — "please review this scope"
+- `review-result` — "I reviewed; here's my verdict" (use `--meta status=approved|rejected`)
+- `wake` — state-change signal for sk-loop (low-latency peer wake)
 - `end` — terminate the listen loop on the other side
+
+Adding a new kind requires updating `KNOWN_KINDS` in
+`src/agenttalk/store.py` *and* documenting it here + in the skill
+bodies. Receivers silently skip messages with unknown kinds (see
+`SECURITY.md`).
 
 ### Exit codes
 

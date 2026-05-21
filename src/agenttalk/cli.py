@@ -19,6 +19,7 @@ from agenttalk.store import (
 )
 from agenttalk import transcript as tx
 from agenttalk import codex_config as cxc
+from agenttalk import doctor as dr
 from agenttalk import install_skills as iskl
 
 
@@ -168,26 +169,69 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_status(args: argparse.Namespace) -> int:
-    store = _get_store(args)
+STALE_THRESHOLD_SECONDS = 60.0
+
+
+def _gather_status(store: Store) -> dict:
+    """Build the structured status payload shared by both output modes."""
     cfg = store.load_config()
     msgs = store.all_messages()
-    print(f"root:       {store.root}")
-    print(f"session_id: {cfg.get('session_id')}")
-    print(f"agents:     {', '.join(cfg.get('agents', []))}")
-    print(f"messages:   {len(msgs)}")
     now = datetime.now(timezone.utc)
+    agents = []
     for a in cfg.get("agents", []):
-        unread = len(store.unread_for(a))
         hb = store.read_heartbeat(a)
         if hb is None:
+            heartbeat_iso: str | None = None
+            last_seen_s: float | None = None
+            stale: bool | None = None
+        else:
+            heartbeat_iso = hb.isoformat().replace("+00:00", "Z")
+            last_seen_s = (now - hb).total_seconds()
+            stale = last_seen_s > STALE_THRESHOLD_SECONDS
+        agents.append({
+            "name": a,
+            "cursor": store.cursor(a) or None,
+            "unread": len(store.unread_for(a)),
+            "heartbeat": heartbeat_iso,
+            "last_seen_seconds": (round(last_seen_s, 3)
+                                  if last_seen_s is not None else None),
+            "stale": stale,
+        })
+    invalid = store.list_invalid_messages()
+    return {
+        "root": str(store.root),
+        "session_id": cfg.get("session_id"),
+        "message_count": len(msgs),
+        "invalid_messages": [{"id": mid, "reason": reason} for mid, reason in invalid],
+        "agents": agents,
+        "stale_threshold_seconds": STALE_THRESHOLD_SECONDS,
+    }
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    import json as _json
+    store = _get_store(args)
+    payload = _gather_status(store)
+    if args.json:
+        print(_json.dumps(payload, indent=2))
+        return 0
+    print(f"root:       {payload['root']}")
+    print(f"session_id: {payload['session_id']}")
+    print(f"agents:     {', '.join(a['name'] for a in payload['agents'])}")
+    print(f"messages:   {payload['message_count']}")
+    if payload["invalid_messages"]:
+        n = len(payload["invalid_messages"])
+        print(f"INVALID:    {n} message{'s' if n != 1 else ''} failed schema/roster validation "
+              f"(see `agenttalk status --json` for details under invalid_messages[])")
+    for a in payload["agents"]:
+        cursor = a["cursor"] or "(none)"
+        if a["heartbeat"] is None:
             seen = "(no heartbeat)"
         else:
-            age_s = (now - hb).total_seconds()
-            seen = f"last_seen={_format_age(age_s)}"
-            if age_s > 60:
+            seen = f"last_seen={_format_age(a['last_seen_seconds'])}"
+            if a["stale"]:
                 seen += " (stale)"
-        print(f"  {a:<10} cursor={store.cursor(a) or '(none)':<32} unread={unread:<3} {seen}")
+        print(f"  {a['name']:<10} cursor={cursor:<32} unread={a['unread']:<3} {seen}")
     return 0
 
 
@@ -292,6 +336,39 @@ def cmd_transcript(args: argparse.Namespace) -> int:
     path = tx.export(store, fmt=args.format, out=out)
     print(str(path))
     return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Health check: did the user wire everything up correctly?"""
+    import json as _json
+    root = Path(args.root).resolve() if getattr(args, "root", None) else None
+    report = dr.run(root)
+    if args.json:
+        print(_json.dumps(report.to_dict(), indent=2))
+    else:
+        _render_doctor_human(report)
+    # Exit codes respect the global contract documented in the README:
+    # 0 = success (incl. warnings — they're informational),
+    # 2 = error (the user needs to fix something). Exit 1 is reserved
+    # for `agenttalk wait` timeout per the published contract.
+    if report.overall == "error":
+        return 2
+    return 0
+
+
+def _render_doctor_human(report) -> None:
+    print(f"agenttalk doctor — {report.project_root}")
+    print(f"  agenttalk version  {report.agenttalk_version}")
+    print(f"  python version     {report.python_version}")
+    print()
+    badge = {"ok": "ok  ", "warn": "warn", "error": "FAIL"}
+    width = max((len(c.name) for c in report.checks), default=0)
+    for c in report.checks:
+        print(f"  [{badge[c.status]}] {c.name:<{width}}  {c.details}")
+        if c.fix and c.status != "ok":
+            print(f"           {' ' * width}  fix: {c.fix}")
+    print()
+    print(f"overall: {report.overall.upper()}")
 
 
 def cmd_install_skills(args: argparse.Namespace) -> int:
@@ -403,12 +480,17 @@ def build_parser() -> argparse.ArgumentParser:
     pi.set_defaults(func=cmd_init)
 
     ps = sub.add_parser("status", help="Show roster, message count, per-agent cursor + unread.")
+    ps.add_argument("--json", action="store_true",
+                    help="Emit structured JSON instead of human-readable text.")
     ps.set_defaults(func=cmd_status)
 
     pse = sub.add_parser("send", help="Send a message from one agent to another.")
     pse.add_argument("--from", dest="sender", help="Sender agent name (default: $AGENTTALK_SELF)")
     pse.add_argument("--to", dest="recipient", help="Recipient agent name (default: $AGENTTALK_PEER, or the single other agent in the roster)")
-    pse.add_argument("--kind", default="message", help="message | review-request | review-result | ack | note | end")
+    pse.add_argument("--kind", default="message",
+                     help="Message kind. Known: message, note, question, "
+                          "review-request, review-result, wake, end. "
+                          "Unknown kinds are rejected at write time.")
     pse.add_argument("--subject", help="One-line summary")
     pse.add_argument("--meta", action="append", help="key=value (repeatable)")
     pse.add_argument("-m", "--message", help="Body text (else --file or stdin)")
@@ -450,6 +532,14 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--from", dest="sender", help="Sender agent name (default: $AGENTTALK_SELF)")
     pe.add_argument("--reason", help="Free-text reason")
     pe.set_defaults(func=cmd_end)
+
+    pd = sub.add_parser(
+        "doctor",
+        help="Run health checks (init state, skill install freshness, codex-config, heartbeats).",
+    )
+    pd.add_argument("--json", action="store_true",
+                    help="Emit structured JSON instead of human-readable text.")
+    pd.set_defaults(func=cmd_doctor)
 
     pis = sub.add_parser(
         "install-skills",
