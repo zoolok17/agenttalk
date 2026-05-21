@@ -16,7 +16,7 @@ on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.7.1"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.7.2"
 agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
@@ -80,10 +80,10 @@ interrupt whenever you want.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.7.1"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.7.2"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.7.1` with
+Pin to a specific tag so you control upgrades. Replace `v0.7.2` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 

@@ -459,6 +459,11 @@ def cmd_install_skills(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
     )
 
+    tails = {
+        "would-skip": "  (differs; local edits preserved)",
+        "would-overwrite": "  (differs; --force would overwrite)",
+        "would-copy": "  (target absent; --dry-run sees fresh-install path)",
+    }
     for a in res.actions:
         marker = {
             "copied": "+",
@@ -466,8 +471,10 @@ def cmd_install_skills(args: argparse.Namespace) -> int:
             "skipped": "!",
             "would-copy": "?",
             "would-overwrite": "?",
+            "would-skip": "?",
         }.get(a.status, " ")
-        print(f"  {marker} {a.status:<16} {a.dst}")
+        tail = tails.get(a.status, "")
+        print(f"  {marker} {a.status:<16} {a.dst}{tail}")
 
     counts = res.counts()
     summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
@@ -476,7 +483,14 @@ def cmd_install_skills(args: argparse.Namespace) -> int:
     if counts.get("skipped"):
         print(
             "\nSome targets differ from the bundled version and were not overwritten.\n"
-            "Re-run with --force to replace them, or diff manually first."
+            "Inspect first with `agenttalk install-skills --dry-run --force` (no writes),\n"
+            "then re-run with `--force` to replace them, or diff manually first."
+        )
+    if counts.get("would-skip"):
+        print(
+            "\nDry run: targets marked `would-skip` differ from the bundled version\n"
+            "and would be left alone in a normal run. Re-run with `--dry-run --force`\n"
+            "to preview which files `--force` would overwrite."
         )
     if not args.dry_run and counts.get("copied"):
         print("Restart Claude Code / Codex to pick up the new skill files.")

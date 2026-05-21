@@ -27,6 +27,7 @@ class Check:
     status: str          # "ok" | "warn" | "error"
     details: str = ""
     fix: str = ""        # one-line remediation hint, optional
+    data: dict | None = None  # optional structured payload (JSON only)
 
 
 @dataclass
@@ -52,7 +53,8 @@ class Report:
             "overall": self.overall,
             "checks": [
                 {"name": c.name, "status": c.status,
-                 "details": c.details, "fix": c.fix or None}
+                 "details": c.details, "fix": c.fix or None,
+                 "data": c.data}
                 for c in self.checks
             ],
         }
@@ -147,24 +149,45 @@ def _compare_skill_side(name: str, side: str, target: Path) -> Check:
         except OSError:
             differs.append(dst.name)
     total = len(pairs)
+    side_flag = " --claude-only" if side == "claude" else " --codex-only"
     if missing:
         return Check(
             name=name,
             status="error",
-            details=f"{len(missing)}/{total} missing under {target}",
-            fix=f"run `agenttalk install-skills{' --claude-only' if side == 'claude' else ' --codex-only'}`",
+            details=(
+                f"{len(missing)}/{total} missing under {target}"
+                f" ({', '.join(missing)})"
+            ),
+            fix=f"run `agenttalk install-skills{side_flag}`",
+            data={"target": str(target), "missing": missing, "differs": differs,
+                  "total": total},
         )
     if differs:
         return Check(
             name=name,
             status="warn",
-            details=f"{len(differs)}/{total} differ from bundled version under {target}",
-            fix="run `agenttalk install-skills --force` to overwrite (preserves nothing)",
+            details=(
+                f"{len(differs)}/{total} differ from bundled version under {target}"
+                f" ({', '.join(differs)})"
+            ),
+            # Lead the user to inspect first, then overwrite. The
+            # previous fix line jumped straight to --force, which
+            # destroys any local edits without warning. --dry-run
+            # --force is a no-write preview of what --force would do.
+            fix=(
+                f"inspect with `agenttalk install-skills{side_flag} --dry-run --force`, "
+                f"then overwrite with `agenttalk install-skills{side_flag} --force` "
+                f"(local edits will be lost)"
+            ),
+            data={"target": str(target), "missing": missing, "differs": differs,
+                  "total": total},
         )
     return Check(
         name=name,
         status="ok",
         details=f"{total}/{total} in sync at {target}",
+        data={"target": str(target), "missing": [], "differs": [],
+              "total": total},
     )
 
 

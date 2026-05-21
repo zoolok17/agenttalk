@@ -90,6 +90,50 @@ def test_dry_run_writes_nothing(tmp_path: Path) -> None:
     assert not codex_dir.exists()
 
 
+def test_dry_run_reports_would_skip_when_target_differs_no_force(
+    tmp_path: Path,
+) -> None:
+    """v0.7.2 regression: --dry-run used to collapse to "skipped"
+    for differing targets, which made --dry-run output identical
+    to a real run and looked like a broken flag. It must now
+    surface as "would-skip" so users can see at a glance that
+    --dry-run did report intent."""
+    claude_dir = tmp_path / "claude"
+    codex_dir = tmp_path / "codex"
+    install(claude_dir=claude_dir, codex_dir=codex_dir)
+    target = claude_dir / "agenttalk.send.md"
+    target.write_text("user local edits\n", encoding="utf-8")
+    res = install(claude_dir=claude_dir, codex_dir=codex_dir, dry_run=True)
+    counts = res.counts()
+    assert counts.get("would-skip") == 1
+    assert counts.get("unchanged") == 9
+    # And the file is untouched, of course.
+    assert target.read_text(encoding="utf-8") == "user local edits\n"
+
+
+def test_dry_run_with_force_reports_would_overwrite_no_writes(
+    tmp_path: Path,
+) -> None:
+    """v0.7.2: --dry-run --force previews exactly what --force
+    would do without writing. The user's recommended path is
+    "dry-run --force first, then --force"."""
+    claude_dir = tmp_path / "claude"
+    codex_dir = tmp_path / "codex"
+    install(claude_dir=claude_dir, codex_dir=codex_dir)
+    target = claude_dir / "agenttalk.send.md"
+    target.write_text("user local edits\n", encoding="utf-8")
+    res = install(
+        claude_dir=claude_dir, codex_dir=codex_dir,
+        force=True, dry_run=True,
+    )
+    counts = res.counts()
+    assert counts.get("would-overwrite") == 1
+    assert counts.get("unchanged") == 9
+    assert target.read_text(encoding="utf-8") == "user local edits\n", (
+        "--dry-run --force must not write anything"
+    )
+
+
 def test_claude_only_skips_codex(tmp_path: Path) -> None:
     claude_dir = tmp_path / "claude"
     codex_dir = tmp_path / "codex"

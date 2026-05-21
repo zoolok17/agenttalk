@@ -5,6 +5,53 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] — 2026-05-22
+
+Patch release. UX cleanup for the upgrade path: surfaces drift
+between bundled and installed skill files better and makes
+`install-skills --dry-run` actually look like a dry run.
+
+### Fixed
+
+- **`agenttalk install-skills --dry-run` is now visibly
+  different from a normal run.** Previously, a target that
+  differed from the bundled version reported `skipped` in both
+  real and dry-run modes, which made `--dry-run` look broken
+  (same wall of `! skipped` lines as a real run). Dry runs now
+  emit `would-skip` (target differs, `--force` not set, would
+  not write) and `would-overwrite` (target differs, `--force`
+  set, would overwrite). Each output line carries a short tail
+  explaining the state, e.g.
+  `? would-skip … (differs; local edits preserved)`.
+- **`agenttalk install-skills --dry-run --force` previews
+  `--force`** without writing — the recommended path before
+  destroying local edits is now "dry-run --force first, then
+  `--force`".
+
+### Changed
+
+- **`agenttalk doctor` skill-drift output is now actionable.**
+  The existing `claude_skills` / `codex_skills` warn check now:
+  - Names the differing files in the human-readable `details`
+    (was just `N/total differ from bundled`), so you don't
+    have to re-run `install-skills` to find out which.
+  - Leads the `fix` hint with `--dry-run --force` (preview)
+    before suggesting the destructive `--force` step. Previously
+    jumped straight to `--force`, which destroys local edits
+    without warning.
+  - Carries a per-check `data` payload in `doctor --json`
+    (`{"target": "...", "missing": [...], "differs": [...],
+    "total": N}`) so loops and scripts can act on drift without
+    re-parsing the human output.
+
+### Added
+
+- Three regression tests:
+  - `test_dry_run_reports_would_skip_when_target_differs_no_force`
+  - `test_dry_run_with_force_reports_would_overwrite_no_writes`
+  - Doctor: extends the existing drift test to pin the new
+    file-naming + `--dry-run --force` hint + JSON `data` payload.
+
 ## [0.7.1] — 2026-05-21
 
 Patch release. Fixes a chronology bug in message id generation

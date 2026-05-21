@@ -32,7 +32,13 @@ def default_codex_dir() -> Path:
 class FileAction:
     src: Path
     dst: Path
-    status: str  # "would-copy" | "copied" | "unchanged" | "skipped" | "would-overwrite"
+    # "copied"          — wrote a new or overwritten file
+    # "unchanged"       — target byte-identical to source, no write
+    # "skipped"         — target differs, --force not set, no write
+    # "would-copy"      — dry-run: target absent, would write
+    # "would-overwrite" — dry-run: target differs AND --force, would write
+    # "would-skip"      — dry-run: target differs, --force NOT set, would NOT write
+    status: str
 
 
 @dataclass
@@ -119,7 +125,16 @@ def _plan_one(src: Path, dst: Path, *, force: bool, dry_run: bool) -> FileAction
         if same:
             return FileAction(src=src, dst=dst, status="unchanged")
         if not force:
-            return FileAction(src=src, dst=dst, status="skipped")
+            # Target differs but we're not allowed to overwrite. In a
+            # real run this is `skipped` (nothing happens); in a dry
+            # run report it as `would-skip` so the output is visibly
+            # different from a non-dry-run — the previous code
+            # collapsed both to "skipped" which made `--dry-run` look
+            # broken (identical output to a normal run).
+            return FileAction(
+                src=src, dst=dst,
+                status="would-skip" if dry_run else "skipped",
+            )
         if dry_run:
             return FileAction(src=src, dst=dst, status="would-overwrite")
         _copy(src, dst)

@@ -85,6 +85,21 @@ def test_doctor_skill_check_warns_when_target_differs(
     by_name = {c.name: c for c in report.checks}
     assert by_name["claude_skills"].status == "warn"
     assert "differ" in by_name["claude_skills"].details
+    # v0.7.2: details name the file(s) so the user doesn't have to
+    # re-run install-skills just to find out which.
+    assert "agenttalk.send.md" in by_name["claude_skills"].details
+    # v0.7.2: fix hint leads with --dry-run --force (preview) before
+    # the destructive --force step.
+    fix = by_name["claude_skills"].fix
+    assert "--dry-run" in fix and "--force" in fix
+    # v0.7.2: per-file payload available in JSON for scripting/loops.
+    data = by_name["claude_skills"].data
+    assert data is not None
+    assert data["differs"] == ["agenttalk.send.md"]
+    assert data["missing"] == []
+    # claude side ships 5 skill files (consult, handoff, listen, send,
+    # sk-loop). 1 differs (we mutated send), 4 are unchanged.
+    assert data["total"] == 5
     assert by_name["codex_skills"].status == "ok"
 
 
