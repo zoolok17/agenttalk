@@ -5,6 +5,77 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-05-22
+
+Minor release. Fixes a real-world sharp edge: a peer's reply landed
+~12 s after `agenttalk wait` timed out at 240 s, so the reply was
+lost to the waiter even though it was already on disk. Adds two
+mechanisms — a small post-timeout grace window for clock-jitter
+cases, and a new `composing` control kind so a peer drafting a long
+reply can keep the waiter's deadline alive on demand.
+
+### Added
+
+- **`composing` message kind.** New control-plane kind that the
+  peer can send while drafting a long reply. `agenttalk wait`
+  consumes each fresh composing ping as a deadline-extension signal
+  (`--composing-extend SECONDS`, default 120 s; hard cap 1800 s
+  total per wait) and does NOT surface composings as a returned
+  reply. `agenttalk recv` hides composings from its default view
+  (`--include-control` opts back in). Old receivers on
+  ≤ 0.7.2 silently drop the unknown kind, so the feature degrades
+  gracefully across mixed versions.
+- **`agenttalk composing --to <peer>` subcommand.** One-line helper
+  for the most common composing-ping flow. Same write path as
+  `send`: validated, optionally HMAC-signed, logged in the
+  transcript and dashboard. Use periodically while drafting:
+  ```powershell
+  agenttalk composing --from $SELF --to $PEER -m "still drafting"
+  ```
+- **`agenttalk wait --grace SECONDS` (default 2.0).** Post-timeout
+  grace window: when the deadline fires, sleep this long and do
+  ONE final inbox scan before exiting 1. Catches replies that
+  landed in the last fraction of a second before the deadline.
+  `--grace 0` reproduces the pre-0.8.0 hard-edge behavior.
+- **`agenttalk wait --composing-extend SECONDS` (default 120.0).**
+  Per-composing-ping deadline extension, capped at 1800 s total
+  per wait. `--composing-extend 0` disables extension while still
+  consuming composings (they don't surface as replies).
+- **`agenttalk recv --include-control`.** Surfaces control-plane
+  kinds (currently just `composing`) in the inbox view. Useful for
+  debugging deadline extensions or auditing what the peer pinged.
+- **sk-loop skill update.** Both Claude and Codex sk-loop skills
+  gained two patterns:
+  - **Cycle-2+ example request:** if the reviewer's feedback is
+    ambiguous, the implementer sends a `question` asking for a
+    concrete sketch BEFORE guessing into another rejection. Uses
+    the existing `question` kind — no new bus surface.
+  - **Composing pings during long replies:** the drafting agent
+    sends `agenttalk composing` every ~2 min so the peer's wait
+    doesn't expire mid-reply.
+
+### Changed
+
+- **`Store.last_received_for(agent)` now skips `CONTROL_KINDS`** by
+  default, so `agenttalk reply` auto-correlates to the most recent
+  real message rather than to a stale composing ping. The kept-out
+  set is configurable via a new keyword argument.
+- **`agenttalk send --kind`** help text now lists `composing` as a
+  known kind and points to the dedicated `composing` subcommand as
+  the preferred entry point.
+
+### Tests
+
+- 10 new tests in `tests/test_cli.py` covering: post-timeout grace
+  returns a late message; `--grace 0` preserves pre-0.8.0 behavior;
+  composing extends the deadline and is not returned as a reply;
+  `--composing-extend 0` disables extension but still consumes the
+  ping; duplicate composings counted only once (no runaway loop);
+  the `composing` subcommand writes the right kind + body; `recv`
+  hides composings by default; `--include-control` surfaces them;
+  `--ack` advances past a hidden composing so a stale ping can't
+  pin a cursor forever.
+
 ## [0.7.2] — 2026-05-22
 
 Patch release. UX cleanup for the upgrade path: surfaces drift

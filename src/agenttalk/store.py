@@ -44,7 +44,18 @@ KNOWN_KINDS = frozenset({
     "review-result",
     "wake",
     "end",
+    # Control-plane kind: peer is still drafting a real reply. Receivers
+    # treat these as a deadline-extension signal in `agenttalk wait` —
+    # they do not surface as a returned reply. Added in 0.8.0 to fix
+    # "reply landed seconds after wait timed out" sharp-edge.
+    "composing",
 })
+
+# Kinds the bus uses to signal flow control rather than carry agent
+# content. They are still persisted (so transcripts and the dashboard
+# can show them for audit), but `agenttalk wait` does not return them
+# as a reply and `agenttalk recv` filters them out of the default view.
+CONTROL_KINDS = frozenset({"composing"})
 
 # Agent names are interpolated directly into filesystem paths
 # (cursors, heartbeats), so they must be portable identifiers — not
@@ -650,12 +661,24 @@ class Store:
     def unread_for(self, agent: str) -> list[Message]:
         return self.messages_for(agent, since_id=self.cursor(agent))
 
-    def last_received_for(self, agent: str) -> Message | None:
-        """Return the most recent valid message addressed to ``agent``,
+    def last_received_for(
+        self,
+        agent: str,
+        *,
+        exclude_kinds: frozenset[str] = CONTROL_KINDS,
+    ) -> Message | None:
+        """Return the most recent valid non-control message addressed to ``agent``,
         or ``None`` if the inbox is empty. Used by ``agenttalk reply``
-        to auto-derive the peer + correlate ``request_id``."""
+        to auto-derive the peer + correlate ``request_id``. Control
+        kinds (``composing``) are excluded by default so a flurry of
+        "still drafting" pings doesn't cause `reply` to correlate to
+        a placeholder instead of the real prior message."""
         msgs = self.messages_for(agent)
-        return msgs[-1] if msgs else None
+        for m in reversed(msgs):
+            if m.kind in exclude_kinds:
+                continue
+            return m
+        return None
 
     def cursor(self, agent: str) -> str:
         p = self.state_dir / f"{agent}.cursor"

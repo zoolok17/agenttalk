@@ -8,6 +8,7 @@ capture stderr/stdout via capsys.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -463,6 +464,290 @@ def test_wait_no_ack_keeps_message_unread(
     s = Store(store_root)
     assert s.cursor("beta") == ""
     assert len(s.unread_for("beta")) == 1
+
+
+# ----------------------------------------- cmd_wait: composing + post-timeout grace
+
+def test_wait_post_timeout_grace_returns_late_message(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A real reply landing during the post-timeout grace window is still
+    delivered with exit 0, not lost to exit 1. Regression for the
+    "reply landed 12s after wait timed out" report that motivated 0.8.0."""
+    import threading
+    from agenttalk.store import Store
+
+    s = Store(store_root)
+
+    def _inject_after_deadline() -> None:
+        # 1s timeout, message lands at ~1.3s, grace window is 2s wide
+        # so the post-timeout scan catches it.
+        time.sleep(1.3)
+        s.send(sender="alpha", recipient="beta",
+               body="just barely in time", kind="message")
+
+    t = threading.Thread(target=_inject_after_deadline, daemon=True)
+    t.start()
+    try:
+        rc = _run(["wait", "--for", "beta", "--timeout", "1",
+                   "--grace", "2",
+                   "--heartbeat-interval", "0"], store_root)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "RECEIVED" in out
+        assert "just barely in time" in out
+    finally:
+        t.join(timeout=5)
+
+
+def test_wait_grace_zero_returns_immediately_on_deadline(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """--grace 0 reproduces the pre-0.8.0 hard-edge behavior: deadline
+    fires, wait exits 1 with no post-scan."""
+    rc = _run(["wait", "--for", "beta", "--timeout", "0.3",
+               "--grace", "0",
+               "--heartbeat-interval", "0", "--quiet"], store_root)
+    assert rc == 1
+
+
+def test_wait_composing_extends_deadline_and_returns_real_reply(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A `composing` ping resets the waiter's clock without being
+    returned as a reply; the subsequent real message is what `wait`
+    surfaces."""
+    import threading
+    from agenttalk.store import Store
+
+    s = Store(store_root)
+
+    def _inject() -> None:
+        # composing arrives at 0.4s (extends 0.5s deadline by another 2s)
+        time.sleep(0.4)
+        s.send(sender="alpha", recipient="beta",
+               body="hold on", kind="composing")
+        # real reply arrives at 1.2s — would have timed out at 0.5s + grace
+        # without the composing extension.
+        time.sleep(0.8)
+        s.send(sender="alpha", recipient="beta",
+               body="here's the real answer", kind="message")
+
+    t = threading.Thread(target=_inject, daemon=True)
+    t.start()
+    try:
+        rc = _run(["wait", "--for", "beta", "--timeout", "0.5",
+                   "--grace", "0",
+                   "--composing-extend", "2",
+                   "--heartbeat-interval", "0"], store_root)
+        assert rc == 0
+        out = capsys.readouterr().out
+        # The composing log line + the real reply, NOT the composing body
+        # as a "received" payload.
+        assert "composing from alpha" in out
+        assert "RECEIVED" in out
+        assert "here's the real answer" in out
+        assert "hold on" not in out  # composing body never surfaced
+    finally:
+        t.join(timeout=5)
+
+
+def test_wait_composing_extension_disabled_with_zero(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """--composing-extend 0 means composing pings are still consumed
+    (won't surface as replies) but don't extend the deadline."""
+    import threading
+    from agenttalk.store import Store
+
+    s = Store(store_root)
+
+    def _inject() -> None:
+        time.sleep(0.2)
+        s.send(sender="alpha", recipient="beta",
+               body="hold on", kind="composing")
+
+    t = threading.Thread(target=_inject, daemon=True)
+    t.start()
+    try:
+        rc = _run(["wait", "--for", "beta", "--timeout", "0.5",
+                   "--grace", "0",
+                   "--composing-extend", "0",
+                   "--heartbeat-interval", "0", "--quiet"], store_root)
+        assert rc == 1  # timed out — no extension, no real reply
+    finally:
+        t.join(timeout=5)
+
+
+def test_wait_duplicate_composing_counted_only_once(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """The same composing message id must extend the deadline only on
+    its first appearance — the wait loop re-scans the inbox on every
+    poll iteration, so we must dedupe by id."""
+    # Pre-write a composing so the very first scan sees it.
+    store.send(sender="alpha", recipient="beta",
+               body="hold on", kind="composing")
+    capsys.readouterr()
+    # Deadline 0.5s + one extension of 0.5s = 1.0s effective.
+    # If the same composing extended on every poll iteration (every 0.1s),
+    # the wait would never time out. With dedup, it times out around 1.0s.
+    started = time.time()
+    rc = _run(["wait", "--for", "beta", "--timeout", "0.5",
+               "--grace", "0",
+               "--composing-extend", "0.5",
+               "--interval", "0.1",
+               "--heartbeat-interval", "0"], store_root)
+    elapsed = time.time() - started
+    assert rc == 1
+    # Should land between ~1.0s (one extension) and ~2.5s (slack for CI).
+    # Critically, NOT > 5s (which would indicate runaway extension).
+    assert elapsed < 4.0, f"wait extended runaway: {elapsed:.2f}s"
+
+
+def test_wait_consumed_composing_does_not_extend_subsequent_wait(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A composing ping consumed in one wait must not survive to extend
+    the NEXT wait — the on-disk cursor advances past it under --ack
+    (the default). Regression for Codex's iter-1 BLOCKER #2:
+    "single stale composing makes every later wait pay the extension
+    again, contradicting the recv --ack rationale that stale control
+    pings should not pin the cursor."
+    """
+    # One stale composing in the inbox.
+    store.send(sender="alpha", recipient="beta",
+               body="hold on", kind="composing")
+    capsys.readouterr()
+    # First wait — short timeout, short extension. The composing gets
+    # consumed for extension AND the cursor advances past it.
+    rc1 = _run(["wait", "--for", "beta", "--timeout", "0.2",
+                "--grace", "0",
+                "--composing-extend", "0.5",
+                "--heartbeat-interval", "0", "--quiet"], store_root)
+    assert rc1 == 1
+    assert Store(store_root).cursor("beta") != ""
+    # Second wait — same stale composing, but cursor is now past it.
+    # If the bug existed, this would also extend by ~0.5s; the assertion
+    # is "elapsed near the raw 0.2s timeout, not near 0.7s".
+    started = time.time()
+    rc2 = _run(["wait", "--for", "beta", "--timeout", "0.2",
+                "--grace", "0",
+                "--composing-extend", "0.5",
+                "--heartbeat-interval", "0", "--quiet"], store_root)
+    elapsed = time.time() - started
+    assert rc2 == 1
+    assert elapsed < 0.5, (
+        f"second wait re-extended on a stale composing: {elapsed:.2f}s "
+        f"(expected ~0.2s)"
+    )
+
+
+def test_wait_no_ack_leaves_consumed_composings_in_place(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """`--no-ack` documents that the user wants the cursor untouched.
+    Under --no-ack, a consumed composing is intentionally NOT
+    cursor-advanced — symmetric with how --no-ack treats real
+    messages. This pins the tradeoff as a deliberate choice."""
+    store.send(sender="alpha", recipient="beta",
+               body="hold on", kind="composing")
+    capsys.readouterr()
+    rc = _run(["wait", "--for", "beta", "--timeout", "0.2",
+               "--grace", "0",
+               "--composing-extend", "0.5",
+               "--heartbeat-interval", "0", "--no-ack", "--quiet"], store_root)
+    assert rc == 1
+    assert Store(store_root).cursor("beta") == ""
+
+
+# ------------------------------------------------------------- cmd_composing
+
+def test_composing_subcommand_writes_composing_kind(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    from agenttalk.store import Store
+    rc = _run(["composing", "--from", "alpha", "--to", "beta",
+               "-m", "still drafting"], store_root)
+    assert rc == 0
+    msgs = Store(store_root).all_messages()
+    assert len(msgs) == 1
+    assert msgs[0].kind == "composing"
+    assert msgs[0].sender == "alpha"
+    assert msgs[0].recipient == "beta"
+    assert msgs[0].body == "still drafting"
+
+
+def test_composing_subcommand_default_body(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    rc = _run(["composing", "--from", "alpha", "--to", "beta"], store_root)
+    assert rc == 0
+    msgs = Store(store_root).all_messages()
+    assert msgs[0].body.startswith("still drafting")
+
+
+# ------------------------------------------------------------- cmd_recv: control filter
+
+def test_recv_hides_composing_by_default(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """composing kind is wait-only flow control; recv should not surface
+    it (or count it as a "new message") by default."""
+    from agenttalk.store import Store
+    s = Store(store_root)
+    s.send(sender="alpha", recipient="beta",
+           body="still drafting", kind="composing")
+    capsys.readouterr()
+    rc = _run(["recv", "--for", "beta"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no new messages" in out
+    assert "still drafting" not in out
+
+
+def test_recv_include_control_shows_composing(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    from agenttalk.store import Store
+    s = Store(store_root)
+    s.send(sender="alpha", recipient="beta",
+           body="still drafting", kind="composing")
+    capsys.readouterr()
+    rc = _run(["recv", "--for", "beta", "--include-control"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "still drafting" in out
+
+
+def test_recv_ack_advances_past_composing_even_when_hidden(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A stale composing ping shouldn't pin the cursor forever — --ack
+    advances past it even though the visible view was empty."""
+    from agenttalk.store import Store
+    s = Store(store_root)
+    msg = s.send(sender="alpha", recipient="beta",
+                 body="ping", kind="composing")
+    capsys.readouterr()
+    rc = _run(["recv", "--for", "beta", "--ack"], store_root)
+    assert rc == 0
+    assert Store(store_root).cursor("beta") == msg.id
 
 
 # ----------------------------------------------------------- agenttalk --version

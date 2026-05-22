@@ -16,7 +16,7 @@ on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.7.2"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.8.0"
 agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
@@ -85,10 +85,10 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.7.2"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.8.0"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.7.2` with
+Pin to a specific tag so you control upgrades. Replace `v0.8.0` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
@@ -387,8 +387,9 @@ so the long timeout is free observability.
 | `agenttalk init [--here] [--agents A,B]` | Create `.agenttalk/` in the current dir. |
 | `agenttalk status` | Show roster, per-agent cursor, unread count. |
 | `agenttalk send --from A --to B [--kind K] [--subject S] [--meta k=v] -m "body"` | Drop a message into the bus. Body can come from `-m`, `--file`, or stdin. |
-| `agenttalk recv --for A [--ack]` | Print all queued messages for an agent. |
-| `agenttalk wait --for A [--timeout 120] [--no-ack]` | Block until a new message arrives, print it, advance the cursor. |
+| `agenttalk recv --for A [--ack] [--include-control]` | Print all queued messages for an agent. Hides `composing` pings by default; `--include-control` surfaces them. |
+| `agenttalk wait --for A [--timeout 120] [--no-ack] [--grace 2] [--composing-extend 120]` | Block until a new message arrives, print it, advance the cursor. `--grace` does one final inbox scan after the deadline (catches replies that landed in the last fraction of a second). `--composing-extend` lengthens the deadline by N seconds for each `composing` ping the peer sends (capped at 1800 s total). |
+| `agenttalk composing --from A --to B [-m "still drafting"]` | Send a `composing` ping so the peer's `wait` extends its deadline. Use periodically while you draft a long reply. The peer's `wait` consumes these as deadline-extension signals — they do NOT surface as a returned reply. |
 | `agenttalk ack --for A [--id ID]` | Manually move an agent's cursor forward. |
 | `agenttalk transcript [--format md\|jsonl] [--out PATH]` | Export the full conversation. |
 | `agenttalk end --from A [--reason ...]` | Notify the other agent(s) and write the transcript. |
@@ -414,6 +415,7 @@ typo can't produce a "sent" message the receiver will silently skip:
 - `review-result` — "I reviewed; here's my verdict" (use `--meta status=approved|rejected`)
 - `wake` — state-change signal for sk-loop (low-latency peer wake)
 - `end` — terminate the listen loop on the other side
+- `composing` — control-plane: "I'm still drafting a real reply, hold the line." Consumed by `agenttalk wait` as a deadline-extension signal; never returned as a reply. Hidden from `recv` by default. Send via `agenttalk composing` (preferred) or `send --kind composing`.
 
 Adding a new kind requires updating `KNOWN_KINDS` in
 `src/agenttalk/store.py` *and* documenting it here + in the skill

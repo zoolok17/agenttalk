@@ -12,6 +12,7 @@ from pathlib import Path
 from agenttalk import __version__
 from agenttalk.display import render
 from agenttalk.store import (
+    CONTROL_KINDS,
     Store,
     find_root,
     validate_agent_name,
@@ -21,6 +22,12 @@ from agenttalk import codex_config as cxc
 from agenttalk import doctor as dr
 from agenttalk import install_skills as iskl
 from agenttalk import signing as _signing
+
+# Hard ceiling on cumulative deadline extension from `composing` pings,
+# regardless of how many arrive. Prevents a misbehaving (or stuck) peer
+# from holding a waiter forever. 30 min was picked to comfortably cover
+# long substantive review cycles without being effectively infinite.
+_COMPOSING_MAX_EXTEND_SECONDS = 1800.0
 
 
 # --------------------------------------------------------------------- utils
@@ -299,16 +306,52 @@ def cmd_send(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_composing(args: argparse.Namespace) -> int:
+    """Send a 'composing' control ping so the peer's `agenttalk wait` extends.
+
+    Cheap one-liner the agent can run periodically while drafting a long
+    reply. Same write path as ``send``: validated, optionally HMAC-signed,
+    appears in the transcript and dashboard like any other message — but
+    `wait` consumes it as a deadline-extension signal rather than as a
+    reply, and `recv` hides it from the default inbox view.
+    """
+    store = _get_store(args)
+    cfg = store.load_config()
+    roster = cfg.get("agents") or []
+    sender = _resolve_self(args.sender, roster=roster)
+    recipient = _resolve_peer(args.recipient, cfg, sender)
+    body = args.message or "still drafting — please hold the line"
+    meta = _parse_meta(args.meta)
+    msg = store.send(
+        sender=sender,
+        recipient=recipient,
+        body=body,
+        kind="composing",
+        subject=args.subject or "composing",
+        meta=meta,
+    )
+    if not args.quiet:
+        print(f"(composing ping sent: {sender} -> {recipient}; id={msg.id})")
+    return 0
+
+
 def cmd_recv(args: argparse.Namespace) -> int:
     store = _get_store(args)
     agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
     cursor = args.since if args.since is not None else store.cursor(agent)
     msgs = store.messages_for(agent, since_id=cursor or None)
-    if not msgs:
+    # Hide control-plane kinds (composing) from the default view — they
+    # are wait-loop signals, not agent content. --include-control opts
+    # back in for debugging. --ack still advances past them regardless,
+    # so a stale composing can't pin a cursor forever.
+    visible = msgs if args.include_control else [m for m in msgs if m.kind not in CONTROL_KINDS]
+    if not visible:
         if not args.quiet:
             print(f"(no new messages for {agent})")
+        if args.ack and msgs:
+            store.advance_cursor(agent, msgs[-1].id)
         return 0
-    for m in msgs:
+    for m in visible:
         print(render(m, header=f"AGENTTALK :: INBOX  {m.sender} -> {m.recipient}"))
     if args.ack:
         store.advance_cursor(agent, msgs[-1].id)
@@ -321,24 +364,74 @@ def cmd_wait(args: argparse.Namespace) -> int:
     deadline = time.time() + args.timeout if args.timeout > 0 else None
     interval = max(0.1, args.interval)
     heartbeat_interval = max(0.0, args.heartbeat_interval)
+    grace = max(0.0, args.grace)
+    composing_extend = max(0.0, args.composing_extend)
     cursor_at_start = store.cursor(agent)
     last_heartbeat = 0.0
+    seen_composing: set[str] = set()
+    total_extended = 0.0
+    grace_used = False
     # Stamp once up front so peers see the listener immediately.
     if heartbeat_interval > 0:
         store.write_heartbeat(agent)
         last_heartbeat = time.time()
     while True:
         msgs = store.messages_for(agent, since_id=cursor_at_start or None)
-        if msgs:
-            m = msgs[0]
+        for m in msgs:
+            if m.kind in CONTROL_KINDS:
+                # Today the only control kind is `composing`; keep the
+                # branch keyed on m.kind so future control kinds slot in
+                # without another rewrite of the wait loop.
+                if m.kind != "composing" or m.id in seen_composing:
+                    continue
+                seen_composing.add(m.id)
+                # Persistent ack of consumed control messages. The
+                # in-process `seen_composing` set dedupes within ONE
+                # wait call, but without advancing the on-disk cursor
+                # the same stale composing would re-extend every
+                # subsequent wait. With --no-ack we honor the user's
+                # "don't touch my cursor" intent, which means
+                # --no-ack callers DO pay the stale-ping cost on the
+                # next wait — documented tradeoff, same as for real
+                # messages under --no-ack.
+                if args.ack:
+                    store.advance_cursor(agent, m.id)
+                if (
+                    deadline is not None
+                    and composing_extend > 0
+                    and total_extended < _COMPOSING_MAX_EXTEND_SECONDS
+                ):
+                    amount = min(
+                        composing_extend,
+                        _COMPOSING_MAX_EXTEND_SECONDS - total_extended,
+                    )
+                    deadline += amount
+                    total_extended += amount
+                    grace_used = False  # fresh activity — re-arm grace
+                    if not args.quiet:
+                        print(
+                            f"(composing from {m.sender}: "
+                            f"deadline extended by {amount:.0f}s, "
+                            f"+{total_extended:.0f}s total)"
+                        )
+                continue
+            # First real (non-control) message — surface and return.
             print(render(m, header=f"AGENTTALK :: RECEIVED  {m.sender} -> {m.recipient}"))
             if args.ack:
                 store.advance_cursor(agent, m.id)
             return 0
         if deadline is not None and time.time() >= deadline:
-            if not args.quiet:
-                print(f"(timeout: no new messages for {agent} in {args.timeout}s)")
-            return 1
+            if grace_used or grace <= 0:
+                if not args.quiet:
+                    suffix = f" + {total_extended:.0f}s extended" if total_extended else ""
+                    print(f"(timeout: no new messages for {agent} in {args.timeout}s{suffix})")
+                return 1
+            # Post-timeout grace: one short sleep + one more inbox scan
+            # before failing. Catches the "reply landed seconds after
+            # the deadline" race that motivated 0.8.0.
+            grace_used = True
+            time.sleep(grace)
+            continue
         if heartbeat_interval > 0 and time.time() - last_heartbeat >= heartbeat_interval:
             store.write_heartbeat(agent)
             last_heartbeat = time.time()
@@ -747,8 +840,9 @@ def build_parser() -> argparse.ArgumentParser:
                           "(default: $AGENTTALK_PEER, or the single other agent in the roster)")
     pse.add_argument("--kind", default="message",
                      help="Message kind. Known: message, note, question, "
-                          "review-request, review-result, wake, end. "
-                          "Unknown kinds are rejected at write time.")
+                          "review-request, review-result, wake, end, composing. "
+                          "Unknown kinds are rejected at write time. Prefer the "
+                          "`agenttalk composing` subcommand over `send --kind composing`.")
     pse.add_argument("--subject", help="One-line summary")
     pse.add_argument("--meta", action="append", help="key=value (repeatable)")
     pse.add_argument("-m", "--message", help="Body text (else --file or stdin)")
@@ -758,11 +852,36 @@ def build_parser() -> argparse.ArgumentParser:
     pse.add_argument("--quiet", action="store_true")
     pse.set_defaults(func=cmd_send)
 
+    pcomp = sub.add_parser(
+        "composing",
+        help="Send a 'composing' ping to the peer to extend their `wait` "
+             "deadline. Use periodically while drafting a long reply so a "
+             "240s default timeout doesn't fire mid-thought.",
+    )
+    pcomp.add_argument("--from", dest="sender",
+                       help="Sender agent name (default: $AGENTTALK_SELF)")
+    pcomp.add_argument("--to", dest="recipient",
+                       help="Recipient agent name (default: $AGENTTALK_PEER, "
+                            "or the single other agent in the roster)")
+    pcomp.add_argument("--subject",
+                       help="One-line summary (default: 'composing')")
+    pcomp.add_argument("--meta", action="append",
+                       help="key=value (repeatable); e.g. request_id=<id> to "
+                            "correlate with the pending request")
+    pcomp.add_argument("-m", "--message",
+                       help="Body text (default: 'still drafting — please hold "
+                            "the line')")
+    pcomp.add_argument("--quiet", action="store_true")
+    pcomp.set_defaults(func=cmd_composing)
+
     pr = sub.add_parser("recv", help="Print all queued messages for an agent.")
     pr.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
     pr.add_argument("--since", help="Only messages with id > this (default: agent cursor)")
     pr.add_argument("--ack", action="store_true", help="Advance cursor past the last shown msg")
     pr.add_argument("--quiet", action="store_true")
+    pr.add_argument("--include-control", action="store_true",
+                    help="Also surface control-plane kinds ('composing') that the "
+                         "default view hides. Useful for debugging wait extensions.")
     pr.set_defaults(func=cmd_recv)
 
     pw = sub.add_parser("wait", help="Block until a new message arrives for an agent, then print it.")
@@ -775,6 +894,14 @@ def build_parser() -> argparse.ArgumentParser:
     pw.add_argument("--quiet", action="store_true")
     pw.add_argument("--heartbeat-interval", type=float, default=10.0,
                     help="Seconds between heartbeat stamps in .agenttalk/state/<agent>.heartbeat (0 = off, default 10)")
+    pw.add_argument("--grace", type=float, default=2.0,
+                    help="Seconds of post-timeout grace: after the deadline fires, "
+                         "sleep this long and do ONE more inbox scan before exiting 1. "
+                         "Catches replies that landed just past the deadline. (default 2.0, 0 = off)")
+    pw.add_argument("--composing-extend", type=float, default=120.0,
+                    help="Seconds to extend the deadline for each fresh 'composing' "
+                         "ping from the peer. Capped at 1800s total per wait. "
+                         "(default 120, 0 = off)")
     pw.set_defaults(func=cmd_wait)
 
     pa = sub.add_parser("ack", help="Advance an agent's cursor (defaults to latest message).")

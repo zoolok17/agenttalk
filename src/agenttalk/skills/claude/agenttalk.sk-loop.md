@@ -105,8 +105,25 @@ whichever spec-kitty returns.
 #### Action: re-implement WP## (cycle N)
 
 Same as implement, but the prompt file now includes the previous
-reviewer's feedback. Address every blocker. On the 3rd cycle, surface
-to the user before another round.
+reviewer's feedback. Address every blocker.
+
+- **Cycle 2+ — ask for an example before re-implementing.** If the
+  reviewer's feedback is ambiguous ("be more idiomatic", "tighter
+  abstraction"), under-specified ("handle the error case better"),
+  or you genuinely can't picture the shape they want, send a
+  `question` first instead of guessing into another rejection:
+  ```powershell
+  agenttalk send --from $SELF --to $PEER --kind question `
+    --subject "WP## cycle N: request example" `
+    --meta mission=$MISSION --meta wp_id=WP## --meta round=$N `
+    -m "Reviewer feedback says <quote>. Can you sketch the shape
+       you expect — a signature, a 5-line diff, a one-paragraph
+       contract? Trying to avoid a wasted cycle on guesswork."
+  agenttalk wait --for $SELF --timeout 600
+  ```
+  This is asking for clarification — not asking the reviewer to do
+  the work. After the reply, re-implement.
+- **Cycle 3:** Surface to the user before another round.
 
 #### Action: arbiter WP##
 
@@ -125,6 +142,28 @@ agenttalk wait --for $SELF --timeout 30
 
 Use a **short** timeout (30s, not 1800). The loop must interleave
 wake listening with spec-kitty polling.
+
+### Step 3.5 — keep the peer's `wait` alive while you draft a long reply
+
+When you're the one composing a substantive reply — a review with
+multiple findings, a sketched example, a multi-paragraph
+re-implementation outline — your peer is blocked in `agenttalk wait`
+with a finite timeout (240s in the consult/handoff skills). If your
+reply takes longer than that to write, their wait fires and the
+reply lands in an empty inbox.
+
+Send a `composing` ping every ~2 min while drafting:
+
+```powershell
+agenttalk composing --from $SELF --to $PEER `
+  --meta mission=$MISSION --meta wp_id=WP## `
+  -m "still drafting cycle-N review notes"
+```
+
+The peer's `wait` consumes these as deadline-extension signals
+(default +120s each, capped at +30 min total) and does NOT surface
+them as a reply. They keep listening; you finish drafting; you send
+the real reply.
 
 ### Step 4 — mission complete
 
