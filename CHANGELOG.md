@@ -5,6 +5,68 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-05-24
+
+Minor release. Fixes the issue #5 coordination hiccup (jointly
+reported by Claude + Codex): a two-agent **soft deadlock** where each
+agent waited on the other. Root cause was discoverability — `recv` is
+a non-consuming *peek*, but its name implies consumption, so one agent
+never advanced its cursor (`unread` climbed to 30) and hand-rolled
+fragile timestamp polling instead of using the built-in cursor. This
+release makes the consume path obvious, makes the stall visible, and
+tightens request↔result correlation.
+
+### Added
+
+- **`agenttalk drain --for <agent>`.** The single obvious "consume my
+  inbox" verb: prints all unread AND advances the cursor to the newest
+  message. Mechanically identical to `recv --ack` (shares the exact
+  code path) and advances past hidden control messages too. Use this
+  instead of hand-rolled polling.
+- **`recv` peek hint.** Plain `recv` (no `--ack`, no `--since`, not
+  `--quiet`) that prints messages now emits a one-line stderr hint that
+  the cursor did NOT move and points at `drain` / `recv --ack`.
+  Suppressed for `--ack` (consuming), `--since` (deliberate history
+  inspection), and `--quiet`.
+- **Mutual-wait / soft-deadlock detection.** `agenttalk wait` now
+  writes an observational `.waiting` marker (pid, since, cursor,
+  timeout, epoch deadline) while blocking and clears it on exit
+  (message, timeout, or interrupt). `agenttalk status` flags a
+  **soft-deadlock** when two or more agents are blocked in `wait`
+  simultaneously, and warns when any agent has **unread but a
+  never-set cursor**. The marker is strictly observational — like the
+  heartbeat, nothing about delivery or correctness depends on it, and
+  orphaned markers from crashed shells are detected as stale via
+  heartbeat age + the recorded deadline.
+- **Auto-correlation for review-requests.** `agenttalk send --kind
+  review-request` (and `reply --kind review-request`) now mints a
+  `request_id` into `meta` when one isn't supplied, and prints it.
+  `review-result` without a `request_id` emits a soft stderr warning
+  (exit code unchanged) so request↔result threading is enforced by
+  convention without breaking mixed-version peers.
+
+### Changed
+
+- `agenttalk status --json` gains a top-level `warnings` array and
+  per-agent `waiting` / `waiting_stale` fields. All pre-existing keys
+  are preserved (additive change — existing consumers keep working).
+- README + skill bodies document the cursor / `--ack` / `--since`
+  mental model in one place: **`recv` peeks, `drain` (or `recv --ack`)
+  consumes, `wait` consumes one real message, `--since` inspects
+  history without moving the cursor.**
+- Reconciled `pyproject.toml` version (was stale at 0.7.2) with the
+  package `__version__`; both are now 0.9.0.
+
+### Tests
+
+- Added coverage for `drain` (consume-to-newest, hidden-control-only
+  advance, `--include-control`, `--quiet`), the `recv` hint
+  (fires/suppressed matrix), `.waiting` marker lifecycle (written
+  mid-wait, cleared on message + timeout), `status` warnings
+  (never-acked unread, live soft-deadlock, stale-marker exclusion,
+  JSON schema), and request_id autogen + soft missing-result warning
+  across both `send` and `reply`.
+
 ## [0.8.0] — 2026-05-22
 
 Minor release. Fixes a real-world sharp edge: a peer's reply landed

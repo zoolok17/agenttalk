@@ -764,3 +764,373 @@ def test_version_flag_prints_current_version(
     out = capsys.readouterr().out
     assert __version__ in out
     assert "agenttalk" in out
+
+
+# ============================================================ issue #5: v0.9.0
+# recv footgun + drain + .waiting markers + status warnings + request_id
+# ---------------------------------------------------------------------------
+
+# ----------------------------------------------------------- drain command
+
+def test_drain_consumes_and_advances_to_newest(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """`drain` prints all unread AND moves the cursor to the newest id —
+    the single 'consume my inbox' verb issue #5 found missing."""
+    _run(["send", "--from", "alpha", "--to", "beta", "-m", "one"], store_root)
+    m2 = store.send(sender="alpha", recipient="beta", body="two", kind="message")
+    capsys.readouterr()
+    rc = _run(["drain", "--for", "beta"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "one" in out and "two" in out
+    assert store.cursor("beta") == m2.id
+    # A second drain has nothing left to consume.
+    rc = _run(["drain", "--for", "beta"], store_root)
+    assert rc == 0
+    assert "no new messages" in capsys.readouterr().out
+
+
+def test_drain_advances_past_hidden_control_only_unread(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """When the only unread is a hidden composing ping, drain still moves
+    the cursor past it (clears stale-control backlog) even though the
+    visible output is empty."""
+    cmp_msg = store.send(sender="alpha", recipient="beta",
+                         body="hold on", kind="composing")
+    capsys.readouterr()
+    rc = _run(["drain", "--for", "beta"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no new messages" in out  # composing hidden from view
+    assert "hold on" not in out
+    assert store.cursor("beta") == cmp_msg.id  # but cursor advanced past it
+
+
+def test_drain_include_control_shows_composing(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """--include-control surfaces the otherwise-hidden composing body."""
+    store.send(sender="alpha", recipient="beta", body="hold on", kind="composing")
+    capsys.readouterr()
+    rc = _run(["drain", "--for", "beta", "--include-control"], store_root)
+    assert rc == 0
+    assert "hold on" in capsys.readouterr().out
+
+
+def test_drain_quiet_suppresses_empty_notice_but_still_acks(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    cmp_msg = store.send(sender="alpha", recipient="beta",
+                         body="hold on", kind="composing")
+    capsys.readouterr()
+    rc = _run(["drain", "--for", "beta", "--quiet"], store_root)
+    assert rc == 0
+    assert capsys.readouterr().out == ""
+    assert store.cursor("beta") == cmp_msg.id
+
+
+# ----------------------------------------------------------- recv hint
+
+def test_recv_hint_fires_on_plain_peek(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Plain `recv` (no --ack, no --since) that shows messages nudges the
+    user toward the consuming verbs — and leaves the cursor untouched."""
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+    capsys.readouterr()
+    rc = _run(["recv", "--for", "beta"], store_root)
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "one" in captured.out
+    assert "hint:" in captured.err
+    assert "drain" in captured.err
+    assert store.cursor("beta") == ""  # peek did not move the cursor
+
+
+def test_recv_hint_suppressed_with_ack(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+    capsys.readouterr()
+    rc = _run(["recv", "--for", "beta", "--ack"], store_root)
+    assert rc == 0
+    assert "hint:" not in capsys.readouterr().err
+
+
+def test_recv_hint_suppressed_with_since(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Explicit --since is deliberate history inspection; don't nag."""
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+    capsys.readouterr()
+    rc = _run(["recv", "--for", "beta", "--since", ""], store_root)
+    assert rc == 0
+    assert "hint:" not in capsys.readouterr().err
+
+
+def test_recv_hint_suppressed_when_quiet(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+    capsys.readouterr()
+    rc = _run(["recv", "--for", "beta", "--quiet"], store_root)
+    assert rc == 0
+    assert "hint:" not in capsys.readouterr().err
+
+
+def test_recv_hint_absent_when_nothing_visible(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    capsys.readouterr()
+    rc = _run(["recv", "--for", "beta"], store_root)
+    assert rc == 0
+    assert "hint:" not in capsys.readouterr().err
+
+
+# ----------------------------------------------------- .waiting markers
+
+def test_wait_writes_and_clears_waiting_marker_on_message(
+    store_root: Path,
+) -> None:
+    """`wait` stamps .waiting while blocking and clears it once a real
+    message is delivered."""
+    import threading
+
+    s = Store(store_root)
+    saw_marker: dict = {}
+
+    def _inject() -> None:
+        time.sleep(0.4)
+        saw_marker["mid_wait"] = s.read_waiting("beta")
+        s.send(sender="alpha", recipient="beta", body="hi", kind="message")
+
+    t = threading.Thread(target=_inject, daemon=True)
+    t.start()
+    try:
+        rc = _run(["wait", "--for", "beta", "--timeout", "3",
+                   "--heartbeat-interval", "0", "--quiet"], store_root)
+        assert rc == 0
+    finally:
+        t.join(timeout=5)
+    assert saw_marker["mid_wait"] is not None
+    assert saw_marker["mid_wait"]["agent"] == "beta"
+    assert "pid" in saw_marker["mid_wait"]
+    assert s.read_waiting("beta") is None  # cleared on exit
+
+
+def test_wait_clears_waiting_marker_on_timeout(
+    store_root: Path,
+) -> None:
+    s = Store(store_root)
+    rc = _run(["wait", "--for", "beta", "--timeout", "0.3", "--grace", "0",
+               "--heartbeat-interval", "0", "--quiet"], store_root)
+    assert rc == 1
+    assert s.read_waiting("beta") is None
+
+
+# ------------------------------------------------- status actionable warnings
+
+def test_status_warns_never_acked_unread(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """An agent with unread but cursor=(none) is flagged as never-acked."""
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+    capsys.readouterr()
+    rc = _run(["status"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "WARN" in out
+    assert "never acked" in out
+    assert "drain --for beta" in out
+
+
+def test_status_json_exposes_warnings_and_waiting_keys(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """JSON gains `warnings` (top level) and `waiting`/`waiting_stale`
+    (per agent) without dropping any pre-existing agent fields."""
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+    capsys.readouterr()
+    rc = _run(["status", "--json"], store_root)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "warnings" in payload
+    assert any("never acked" in w for w in payload["warnings"])
+    for a in payload["agents"]:
+        # additive only — old consumers still find these
+        assert "cursor" in a and "unread" in a and "stale" in a
+        assert "waiting" in a and "waiting_stale" in a
+        assert a["waiting"] is None  # nobody is waiting in this test
+
+
+def test_status_detects_soft_deadlock_between_two_waiters(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Two live waiters at once = soft-deadlock; status names both and
+    points at the remedy. We simulate live waits by writing fresh
+    heartbeats + waiting markers directly (no real blocking)."""
+    now_epoch = time.time()
+    for name in ("alpha", "beta"):
+        s_path = store.state_dir / f"{name}.heartbeat"
+        from datetime import datetime, timezone
+        s_path.write_text(
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            encoding="utf-8",
+        )
+        store.write_waiting(name, {
+            "agent": name, "pid": 1234, "since": "now",
+            "cursor_at_start": "", "timeout_seconds": 120.0,
+            "deadline_epoch": now_epoch + 120,
+        })
+    capsys.readouterr()
+    rc = _run(["status"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "soft-deadlock" in out
+    assert "alpha" in out and "beta" in out
+
+
+def test_status_ignores_stale_waiting_marker_for_deadlock(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A waiting marker whose deadline has long passed (orphan from a
+    crashed shell, no heartbeat) must NOT count toward a soft-deadlock."""
+    for name in ("alpha", "beta"):
+        store.write_waiting(name, {
+            "agent": name, "pid": 1234, "since": "old",
+            "cursor_at_start": "", "timeout_seconds": 1.0,
+            "deadline_epoch": time.time() - 10_000,
+        })
+    capsys.readouterr()
+    rc = _run(["status"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "soft-deadlock" not in out
+    # And the per-agent line marks the marker stale.
+    assert "waiting(stale)" in out
+
+
+# ----------------------------------------------------- request_id correlation
+
+def test_send_review_request_autogenerates_request_id(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A review-request with no explicit request_id gets one minted +
+    printed, so the peer's review-result has something to echo."""
+    rc = _run(["send", "--from", "alpha", "--to", "beta",
+               "--kind", "review-request", "-m", "please review"], store_root)
+    assert rc == 0
+    assert "auto request_id" in capsys.readouterr().out
+    msgs = store.messages_for("beta")
+    assert msgs[-1].meta.get("request_id", "").startswith("rq-")
+
+
+def test_send_review_request_preserves_explicit_request_id(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    rc = _run(["send", "--from", "alpha", "--to", "beta",
+               "--kind", "review-request", "--meta", "request_id=mine-123",
+               "-m", "please review"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "auto request_id" not in out
+    assert store.messages_for("beta")[-1].meta["request_id"] == "mine-123"
+
+
+def test_send_review_result_without_request_id_warns_soft(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Missing request_id on a review-result is a soft stderr warning,
+    exit still 0 (don't break mixed-version peers)."""
+    rc = _run(["send", "--from", "alpha", "--to", "beta",
+               "--kind", "review-result", "-m", "looks good"], store_root)
+    assert rc == 0
+    assert "no request_id" in capsys.readouterr().err
+
+
+def test_reply_review_request_autogenerates_request_id(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A reply that is itself a fresh review-request (no id to echo from
+    the original) mints one too."""
+    store.send(sender="alpha", recipient="beta", body="ping", kind="message")
+    capsys.readouterr()
+    rc = _run(["reply", "--from", "beta", "--kind", "review-request",
+               "-m", "now review my counter-work"], store_root)
+    assert rc == 0
+    assert "auto request_id" in capsys.readouterr().out
+    assert store.messages_for("alpha")[-1].meta.get("request_id", "").startswith("rq-")
+
+
+def test_reply_review_request_does_not_inherit_original_request_id(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Regression (issue #5 / Codex R5 blocker): a reply that is itself a
+    review-request opens a NEW correlation thread, so it must MINT a fresh
+    request_id rather than echo the request_id of the message it replies
+    to — otherwise two distinct request/result pairs alias each other."""
+    # alpha sends a review-request that already carries a request_id.
+    _run(["send", "--from", "alpha", "--to", "beta",
+          "--kind", "review-request", "--meta", "request_id=orig-123",
+          "-m", "review my work"], store_root)
+    capsys.readouterr()
+    # beta hands back a COUNTER review-request via reply.
+    rc = _run(["reply", "--from", "beta", "--kind", "review-request",
+               "-m", "ok, now review mine"], store_root)
+    assert rc == 0
+    new_rid = store.messages_for("alpha")[-1].meta.get("request_id", "")
+    assert new_rid != "orig-123"      # did NOT inherit the original id
+    assert new_rid.startswith("rq-")  # minted a fresh one
+
+
+def test_reply_review_result_still_echoes_request_id(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Counterpart to the above: a review-RESULT reply MUST still echo the
+    original request_id so the verdict correlates to the open request."""
+    _run(["send", "--from", "alpha", "--to", "beta",
+          "--kind", "review-request", "--meta", "request_id=orig-456",
+          "-m", "review my work"], store_root)
+    capsys.readouterr()
+    rc = _run(["reply", "--from", "beta", "--kind", "review-result",
+               "--meta", "status=approved", "-m", "looks good"], store_root)
+    assert rc == 0
+    assert store.messages_for("alpha")[-1].meta.get("request_id") == "orig-456"

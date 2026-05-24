@@ -197,6 +197,13 @@ the new plan, then resume.
   → in_progress → for_review`. Reviewer moves `for_review → approved`
   or `for_review → planned`. Don't cross-write.
 - **Wakes are latency optimization, not state.**
+- **Never hand-roll inbox polling.** `agenttalk wait` consumes the next
+  real message and advances your cursor; `agenttalk drain --for $SELF`
+  consumes everything unread at once. Do NOT compare message timestamps
+  against a baseline to detect "new" activity — that's how both agents
+  end up waiting on each other (a soft-deadlock). If you suspect a
+  stall, run `agenttalk status`: it flags never-acked unread and warns
+  when both agents are blocked in `wait` at the same time.
 - **Persistent context is the whole point.** Don't suggest spawning
   subprocesses or fresh sessions.
 - **3 reject cycles = stop.** Always escalate to the user.

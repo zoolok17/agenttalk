@@ -16,7 +16,7 @@ on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.8.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.9.0"
 agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
@@ -85,10 +85,10 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.8.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.9.0"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.8.0` with
+Pin to a specific tag so you control upgrades. Replace `v0.9.0` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
@@ -385,9 +385,10 @@ so the long timeout is free observability.
 | Command | What it does |
 | --- | --- |
 | `agenttalk init [--here] [--agents A,B]` | Create `.agenttalk/` in the current dir. |
-| `agenttalk status` | Show roster, per-agent cursor, unread count. |
-| `agenttalk send --from A --to B [--kind K] [--subject S] [--meta k=v] -m "body"` | Drop a message into the bus. Body can come from `-m`, `--file`, or stdin. |
-| `agenttalk recv --for A [--ack] [--include-control]` | Print all queued messages for an agent. Hides `composing` pings by default; `--include-control` surfaces them. |
+| `agenttalk status` | Show roster, per-agent cursor, unread count, and **actionable warnings**: never-acked unread (cursor still `(none)`) and soft-deadlocks (two+ agents blocked in `wait` at once). |
+| `agenttalk send --from A --to B [--kind K] [--subject S] [--meta k=v] -m "body"` | Drop a message into the bus. Body can come from `-m`, `--file`, or stdin. A `review-request` without `--meta request_id=...` gets one minted + printed; a `review-result` without one warns (soft, exit 0). |
+| `agenttalk recv --for A [--ack] [--since ID] [--include-control]` | **Peek** at queued messages — does NOT move the cursor unless `--ack`. Plain `recv` that prints messages emits a hint pointing at `drain`. Hides `composing` pings by default; `--include-control` surfaces them. |
+| `agenttalk drain --for A [--include-control]` | **Consume**: print all unread AND advance the cursor to newest, in one shot. Same path as `recv --ack`. Use this instead of hand-rolled timestamp polling. |
 | `agenttalk wait --for A [--timeout 120] [--no-ack] [--grace 2] [--composing-extend 120]` | Block until a new message arrives, print it, advance the cursor. `--grace` does one final inbox scan after the deadline (catches replies that landed in the last fraction of a second). `--composing-extend` lengthens the deadline by N seconds for each `composing` ping the peer sends (capped at 1800 s total). |
 | `agenttalk composing --from A --to B [-m "still drafting"]` | Send a `composing` ping so the peer's `wait` extends its deadline. Use periodically while you draft a long reply. The peer's `wait` consumes these as deadline-extension signals — they do NOT surface as a returned reply. |
 | `agenttalk ack --for A [--id ID]` | Manually move an agent's cursor forward. |
@@ -395,14 +396,35 @@ so the long timeout is free observability.
 | `agenttalk end --from A [--reason ...]` | Notify the other agent(s) and write the transcript. |
 | `agenttalk reset [--archive]` | Clear **active bus state** (messages + cursors + heartbeats); preserves historical transcripts under `.agenttalk/sessions/` so past exports aren't lost. Bumps `session_id`. With `--archive`, instead moves **everything** (messages + state + sessions) under `.agenttalk/archived/<old_session>/`. Preserves config (roster) either way. |
 | `agenttalk hmac-init [--force]` | Generate the HMAC signing key for this project. Stored outside `.agenttalk/` (per-user config dir). The key's existence at the path-derived per-user location automatically activates signature enforcement — there's no config flag to flip. Override the default key path with `AGENTTALK_HMAC_KEY_FILE`. See `SECURITY.md`. |
-| `agenttalk reply [--from A] [--kind K] [--subject S] [--meta k=v] -m "body"` | Reply to the most recent received message. Auto-derives recipient (= sender of last message) and echoes `request_id` from the original meta for correlation. Explicit `--meta request_id=...` wins. |
+| `agenttalk reply [--from A] [--kind K] [--subject S] [--meta k=v] -m "body"` | Reply to the most recent received message. Auto-derives recipient (= sender of last message) and echoes `request_id` from the original meta for correlation. Explicit `--meta request_id=...` wins. A reply that is itself a `review-request` mints a fresh `request_id` if none was echoed. |
 | `agenttalk tail [--from-start] [--interval S] [--timeout S]` | Passive monitor: stream all messages as they arrive. Does **not** advance cursors or write heartbeats — safe to run in a third terminal alongside two active agents. `--from-start` replays existing messages first. |
 | `agenttalk serve [--port P] [--host H] [--access-log]` | Start a **read-only** local web dashboard at `http://127.0.0.1:8765/` for browsing the message log in a real browser. **Loopback-only by design** — only `127.0.0.1`, `::1`, and `localhost` are accepted; there is no flag to expose it elsewhere (SSH-tunnel `localhost:<port>` from another machine if needed). HTML output is escaped, strict CSP, `GET`/`HEAD` only, peer-IP check on every method. JSON at `/api/status` and `/api/messages` for scripting. See `SECURITY.md`. |
 | `agenttalk install-skills [--claude-only\|--codex-only] [--force] [--dry-run]` | Copy bundled skill files to `~/.claude/commands/` and `~/.codex/skills/`. Idempotent — preserves your local edits unless `--force`. |
 | `agenttalk codex-config [--enable\|--disable\|--status]` | Manage per-project sandbox/trust block in `~/.codex/config.toml` so Codex can call agenttalk from inside its sandbox. |
 | `agenttalk doctor [--json]` | Health check: store initialized, skills installed + in sync, Codex sandbox block configured, heartbeats fresh. Per the global exit-code contract, exit 2 on any error; warnings exit 0 with the warning state visible in output. |
-| `agenttalk status --json` | Structured status output for automation (consult freshness, external tooling). Same data as plain `status` plus `invalid_messages[]` for any messages that fail schema/roster validation. |
+| `agenttalk status --json` | Structured status output for automation (consult freshness, external tooling). Same data as plain `status` plus `invalid_messages[]` for messages that fail schema/roster validation, a top-level `warnings[]` array, and per-agent `waiting` / `waiting_stale` fields (additive — existing keys unchanged). |
 | `agenttalk --version` | Print the installed version. |
+
+### Reading the inbox: peek vs consume
+
+A single rule prevents the cursor footgun that caused a two-agent
+deadlock in practice (issue #5):
+
+- **`recv` peeks.** It prints what's queued but does **not** move your
+  cursor, so the same messages re-print every call and `unread` climbs.
+  Good for a quick look; never build polling on top of it.
+- **`drain` (or `recv --ack`) consumes.** It prints unread *and*
+  advances the cursor to newest. This is the "I've read these, don't
+  show them again" operation.
+- **`wait` consumes one real message.** It blocks, returns the next
+  real message, and advances the cursor past it (`--no-ack` to opt out).
+- **`--since ID` inspects history** without touching the cursor.
+
+If you ever find yourself comparing message timestamps to a baseline to
+detect "new" activity, stop — that's the footgun. Use `drain` / the
+cursor instead. `agenttalk status` will warn if an agent has unread
+with a never-set cursor, and flag a soft-deadlock if both agents are
+blocked in `wait` at the same time.
 
 Message `--kind` values are validated against a fixed vocabulary
 (`store.KNOWN_KINDS`); unknown kinds are rejected at write time so a

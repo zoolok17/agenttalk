@@ -732,6 +732,60 @@ class Store:
             return None
         return dt
 
+    # ------------------------------------------------------ waiting markers
+    #
+    # The `.waiting` file is written by `agenttalk wait` while it is
+    # actively blocking, and removed when it stops (message received,
+    # timeout, or interrupt). Like the heartbeat, it is STRICTLY
+    # observational: `status` reads it to detect "both agents are
+    # blocked on each other" soft-deadlocks. Nothing about message
+    # delivery, cursor movement, or replies depends on it. A stale file
+    # left behind by a crashed shell is expected and handled at read
+    # time (status cross-checks heartbeat age + the recorded deadline).
+
+    def write_waiting(self, agent: str, info: dict) -> None:
+        """Stamp .agenttalk/state/<agent>.waiting with a JSON liveness record.
+
+        Overwrites any existing marker (a fresh `wait` supersedes a
+        stale one). Best-effort: callers treat any write failure as
+        non-fatal since this is observability-only.
+        """
+        p = self.state_dir / f"{agent}.waiting"
+        _atomic_write_text(p, json.dumps(info, ensure_ascii=False))
+
+    def read_waiting(self, agent: str) -> dict | None:
+        """Return the parsed waiting record, or None if absent/corrupt.
+
+        Never raises — a malformed or partially written marker reads as
+        None so `status` degrades to "not waiting" rather than crashing.
+        """
+        p = self.state_dir / f"{agent}.waiting"
+        if not p.exists():
+            return None
+        try:
+            raw = p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return data
+
+    def clear_waiting(self, agent: str) -> None:
+        """Remove the waiting marker if present. Best-effort, never raises."""
+        p = self.state_dir / f"{agent}.waiting"
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
 
 # --------------------------------------------------------- helpers (module)
 

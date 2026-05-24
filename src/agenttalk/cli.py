@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -67,6 +69,40 @@ def _parse_meta(items: list[str] | None) -> dict:
         k, v = item.split("=", 1)
         out[k.strip()] = v.strip()
     return out
+
+
+def _maybe_autogen_request_id(kind: str, meta: dict, *, quiet: bool) -> None:
+    """For review-requests, mint a `request_id` into ``meta`` if absent.
+
+    Closes the correlation gap from issue #5: a review-request with no
+    request_id leaves the peer's review-result with nothing to echo, so
+    request↔result can't be matched programmatically. Explicit
+    ``--meta request_id=...`` always wins (we only fill a missing one).
+    Prints the generated id in non-quiet mode so the sender knows what
+    to expect echoed back. Applies to any review-request caller (send
+    AND reply --kind review-request).
+    """
+    if kind != "review-request" or "request_id" in meta:
+        return
+    meta["request_id"] = "rq-" + uuid.uuid4().hex[:12]
+    if not quiet:
+        print(f"(auto request_id: {meta['request_id']})")
+
+
+def _warn_missing_request_id(kind: str, meta: dict) -> None:
+    """Soft stderr warning when a review-result carries no request_id.
+
+    Stays a warning (exit code unchanged) on purpose: a hard error
+    would break mixed-version peers and any review-result responding to
+    a pre-#5 request that never had an id to echo.
+    """
+    if kind == "review-result" and "request_id" not in meta:
+        sys.stderr.write(
+            "agenttalk: warning: review-result has no request_id to correlate "
+            "with an open review-request.\n"
+            "  Pass --meta request_id=<id>, or use `agenttalk reply` which "
+            "auto-echoes the original request_id.\n"
+        )
 
 
 def _resolve_self(value: str | None, *, roster: list[str] | None = None) -> str:
@@ -195,6 +231,24 @@ def _gather_status(store: Store) -> dict:
             heartbeat_iso = hb.isoformat().replace("+00:00", "Z")
             last_seen_s = (now - hb).total_seconds()
             stale = last_seen_s > STALE_THRESHOLD_SECONDS
+        waiting = store.read_waiting(a)
+        # Decide whether a waiting marker reflects a LIVE wait or an
+        # orphan from a crashed shell. Fresh heartbeat ⇒ live. Stale
+        # heartbeat ⇒ orphan. No heartbeat (e.g. --heartbeat-interval 0)
+        # ⇒ fall back to the recorded epoch deadline: a bounded wait
+        # can't outlive its own deadline (+ a stale-threshold margin).
+        if waiting is None:
+            waiting_stale: bool | None = None
+        elif stale is False:
+            waiting_stale = False
+        elif stale is True:
+            waiting_stale = True
+        else:
+            dl = waiting.get("deadline_epoch")
+            waiting_stale = bool(
+                isinstance(dl, (int, float))
+                and time.time() > dl + STALE_THRESHOLD_SECONDS
+            )
         agents.append({
             "name": a,
             "cursor": store.cursor(a) or None,
@@ -203,6 +257,8 @@ def _gather_status(store: Store) -> dict:
             "last_seen_seconds": (round(last_seen_s, 3)
                                   if last_seen_s is not None else None),
             "stale": stale,
+            "waiting": waiting,
+            "waiting_stale": waiting_stale,
         })
     invalid = store.list_invalid_messages()
     signing_enforced = store.signing_enforced()
@@ -217,6 +273,7 @@ def _gather_status(store: Store) -> dict:
         "invalid_messages": [{"id": mid, "reason": reason} for mid, reason in invalid],
         "agents": agents,
         "stale_threshold_seconds": STALE_THRESHOLD_SECONDS,
+        "warnings": _status_warnings(agents),
     }
     if signing_enforced:
         health = _signing.inspect_key(project_id, store.root)
@@ -224,12 +281,54 @@ def _gather_status(store: Store) -> dict:
     return payload
 
 
+def _status_warnings(agents: list[dict]) -> list[str]:
+    """Actionable diagnostics derived from the per-agent status rows.
+
+    Two issue-#5 footguns made visible:
+    1. An agent with unread but a never-set cursor — it has been reading
+       with plain `recv` (or not at all) and its read state is a lie.
+    2. A soft-deadlock: two or more agents blocked in `wait` at the same
+       time. In normal flow exactly one waits while the other works, so
+       simultaneous live waiters means nobody is going to send next.
+    """
+    warnings: list[str] = []
+    for a in agents:
+        if a["unread"] > 0 and not a["cursor"]:
+            n = a["unread"]
+            warnings.append(
+                f"{a['name']}: {n} unread but cursor=(none) — never acked. "
+                f"It is likely peeking with `recv`; run "
+                f"`agenttalk drain --for {a['name']}` to consume + advance."
+            )
+    live_waiters = sorted(
+        (a["name"] for a in agents if a["waiting"] and not a["waiting_stale"])
+    )
+    if len(live_waiters) >= 2:
+        with_unread = sorted(
+            a["name"] for a in agents
+            if a["waiting"] and not a["waiting_stale"] and a["unread"] > 0
+        )
+        msg = (
+            f"soft-deadlock: {', '.join(live_waiters)} are all blocked in "
+            f"`wait` simultaneously — nobody is positioned to send next."
+        )
+        if with_unread:
+            verb = "has" if len(with_unread) == 1 else "have"
+            msg += (
+                f" {', '.join(with_unread)} already {verb} unread waiting: "
+                f"run `agenttalk drain --for <agent>`, then reply."
+            )
+        else:
+            msg += " Whoever owes the next reply should send it."
+        warnings.append(msg)
+    return warnings
+
+
 def cmd_status(args: argparse.Namespace) -> int:
-    import json as _json
     store = _get_store(args)
     payload = _gather_status(store)
     if args.json:
-        print(_json.dumps(payload, indent=2))
+        print(json.dumps(payload, indent=2))
         return 0
     print(f"root:       {payload['root']}")
     print(f"session_id: {payload['session_id']}")
@@ -266,7 +365,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             seen = f"last_seen={_format_age(a['last_seen_seconds'])}"
             if a["stale"]:
                 seen += " (stale)"
+        if a.get("waiting"):
+            seen += " waiting(stale)" if a.get("waiting_stale") else " waiting"
         print(f"  {a['name']:<10} cursor={cursor:<32} unread={a['unread']:<3} {seen}")
+    for w in payload.get("warnings", []):
+        print(f"WARN:       {w}")
     return 0
 
 
@@ -291,6 +394,8 @@ def cmd_send(args: argparse.Namespace) -> int:
         sys.stderr.write("agenttalk send: empty body (use -m TEXT, --file PATH, pipe stdin, or --allow-empty)\n")
         return 2
     meta = _parse_meta(args.meta)
+    _maybe_autogen_request_id(args.kind, meta, quiet=args.quiet)
+    _warn_missing_request_id(args.kind, meta)
     msg = store.send(
         sender=sender,
         recipient=recipient,
@@ -335,27 +440,114 @@ def cmd_composing(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_recv(args: argparse.Namespace) -> int:
-    store = _get_store(args)
-    agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
-    cursor = args.since if args.since is not None else store.cursor(agent)
+def _do_recv(
+    store: Store,
+    agent: str,
+    *,
+    since: str | None,
+    ack: bool,
+    include_control: bool,
+    quiet: bool,
+    emit_hint: bool,
+) -> int:
+    """Shared inbox-print path behind both `recv` and `drain`.
+
+    `drain` is exactly `recv --ack` with the hint suppressed, so the
+    two can never diverge (issue #5 constraint). `--ack` advances the
+    cursor past the newest message INCLUDING hidden control-plane kinds
+    (composing) even when nothing visible was printed — that's what
+    lets `drain` clear a stale-control/cursor backlog.
+    """
+    cursor = since if since is not None else store.cursor(agent)
     msgs = store.messages_for(agent, since_id=cursor or None)
     # Hide control-plane kinds (composing) from the default view — they
     # are wait-loop signals, not agent content. --include-control opts
-    # back in for debugging. --ack still advances past them regardless,
-    # so a stale composing can't pin a cursor forever.
-    visible = msgs if args.include_control else [m for m in msgs if m.kind not in CONTROL_KINDS]
+    # back in for debugging.
+    visible = msgs if include_control else [m for m in msgs if m.kind not in CONTROL_KINDS]
     if not visible:
-        if not args.quiet:
+        if not quiet:
             print(f"(no new messages for {agent})")
-        if args.ack and msgs:
+        if ack and msgs:
             store.advance_cursor(agent, msgs[-1].id)
         return 0
     for m in visible:
         print(render(m, header=f"AGENTTALK :: INBOX  {m.sender} -> {m.recipient}"))
-    if args.ack:
+    if ack:
         store.advance_cursor(agent, msgs[-1].id)
+    elif emit_hint and not quiet:
+        # Default recv only PEEKS — the cursor did not move, so these
+        # same messages re-print on the next call and `unread` climbs
+        # unbounded (the issue #5 footgun). Nudge toward the consuming
+        # verbs. Suppressed when --since is used (intentional history
+        # inspection) and when --ack already consumed.
+        sys.stderr.write(
+            f"hint: recv only peeks — cursor[{agent}] did NOT move. "
+            f"Use `agenttalk drain --for {agent}` (or `recv --ack`) to "
+            f"consume + advance.\n"
+        )
     return 0
+
+
+def cmd_recv(args: argparse.Namespace) -> int:
+    store = _get_store(args)
+    agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
+    return _do_recv(
+        store,
+        agent,
+        since=args.since,
+        ack=args.ack,
+        include_control=args.include_control,
+        quiet=args.quiet,
+        # Only nudge for the plain inspecting recv. Explicit --since is
+        # deliberate history browsing, so don't nag there.
+        emit_hint=args.since is None,
+    )
+
+
+def cmd_drain(args: argparse.Namespace) -> int:
+    """Print all unread for an agent AND advance the cursor to newest.
+
+    The single obvious "consume my inbox" verb that issue #5 found
+    missing. Mechanically identical to `recv --ack`: shares `_do_recv`
+    with ack forced on, so it advances past hidden control messages too.
+    """
+    store = _get_store(args)
+    agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
+    return _do_recv(
+        store,
+        agent,
+        since=None,  # drain always consumes from the cursor forward
+        ack=True,
+        include_control=args.include_control,
+        quiet=args.quiet,
+        emit_hint=False,  # drain IS the remedy; never hint
+    )
+
+
+def _write_waiting_marker(
+    store: Store, agent: str, *, cursor_at_start: str, timeout: float,
+    deadline: float | None,
+) -> None:
+    """Best-effort write of the observational `.waiting` marker.
+
+    Records who is blocked, since when, on what cursor, and (for a
+    bounded wait) the current epoch deadline so `status` can tell a
+    live wait from an orphaned file left by a crashed shell. Any write
+    failure is swallowed — this is diagnostics, never correctness.
+    """
+    try:
+        store.write_waiting(agent, {
+            "agent": agent,
+            "pid": os.getpid(),
+            "since": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "cursor_at_start": cursor_at_start or "",
+            "timeout_seconds": timeout,
+            # epoch seconds; None when --timeout 0 (waits forever). Updated
+            # in place when composing pings push the deadline out.
+            "deadline_epoch": deadline,
+        })
+    except OSError:
+        pass
 
 
 def cmd_wait(args: argparse.Namespace) -> int:
@@ -375,67 +567,86 @@ def cmd_wait(args: argparse.Namespace) -> int:
     if heartbeat_interval > 0:
         store.write_heartbeat(agent)
         last_heartbeat = time.time()
-    while True:
-        msgs = store.messages_for(agent, since_id=cursor_at_start or None)
-        for m in msgs:
-            if m.kind in CONTROL_KINDS:
-                # Today the only control kind is `composing`; keep the
-                # branch keyed on m.kind so future control kinds slot in
-                # without another rewrite of the wait loop.
-                if m.kind != "composing" or m.id in seen_composing:
+    # Observational waiting marker: lets `status` flag two agents that
+    # are blocked on each other (issue #5 soft-deadlock). Cleared in the
+    # finally below so a normal exit (message/timeout) never leaves it,
+    # and a crashed shell's orphan is detectable via heartbeat/deadline.
+    _write_waiting_marker(
+        store, agent, cursor_at_start=cursor_at_start,
+        timeout=args.timeout, deadline=deadline,
+    )
+    try:
+        while True:
+            msgs = store.messages_for(agent, since_id=cursor_at_start or None)
+            for m in msgs:
+                if m.kind in CONTROL_KINDS:
+                    # Today the only control kind is `composing`; keep the
+                    # branch keyed on m.kind so future control kinds slot in
+                    # without another rewrite of the wait loop.
+                    if m.kind != "composing" or m.id in seen_composing:
+                        continue
+                    seen_composing.add(m.id)
+                    # Persistent ack of consumed control messages. The
+                    # in-process `seen_composing` set dedupes within ONE
+                    # wait call, but without advancing the on-disk cursor
+                    # the same stale composing would re-extend every
+                    # subsequent wait. With --no-ack we honor the user's
+                    # "don't touch my cursor" intent, which means
+                    # --no-ack callers DO pay the stale-ping cost on the
+                    # next wait — documented tradeoff, same as for real
+                    # messages under --no-ack.
+                    if args.ack:
+                        store.advance_cursor(agent, m.id)
+                    if (
+                        deadline is not None
+                        and composing_extend > 0
+                        and total_extended < _COMPOSING_MAX_EXTEND_SECONDS
+                    ):
+                        amount = min(
+                            composing_extend,
+                            _COMPOSING_MAX_EXTEND_SECONDS - total_extended,
+                        )
+                        deadline += amount
+                        total_extended += amount
+                        grace_used = False  # fresh activity — re-arm grace
+                        # Keep the marker's deadline honest so status
+                        # doesn't call a composing-extended wait stale.
+                        _write_waiting_marker(
+                            store, agent, cursor_at_start=cursor_at_start,
+                            timeout=args.timeout, deadline=deadline,
+                        )
+                        if not args.quiet:
+                            print(
+                                f"(composing from {m.sender}: "
+                                f"deadline extended by {amount:.0f}s, "
+                                f"+{total_extended:.0f}s total)"
+                            )
                     continue
-                seen_composing.add(m.id)
-                # Persistent ack of consumed control messages. The
-                # in-process `seen_composing` set dedupes within ONE
-                # wait call, but without advancing the on-disk cursor
-                # the same stale composing would re-extend every
-                # subsequent wait. With --no-ack we honor the user's
-                # "don't touch my cursor" intent, which means
-                # --no-ack callers DO pay the stale-ping cost on the
-                # next wait — documented tradeoff, same as for real
-                # messages under --no-ack.
+                # First real (non-control) message — surface and return.
+                print(render(m, header=f"AGENTTALK :: RECEIVED  {m.sender} -> {m.recipient}"))
                 if args.ack:
                     store.advance_cursor(agent, m.id)
-                if (
-                    deadline is not None
-                    and composing_extend > 0
-                    and total_extended < _COMPOSING_MAX_EXTEND_SECONDS
-                ):
-                    amount = min(
-                        composing_extend,
-                        _COMPOSING_MAX_EXTEND_SECONDS - total_extended,
-                    )
-                    deadline += amount
-                    total_extended += amount
-                    grace_used = False  # fresh activity — re-arm grace
+                return 0
+            if deadline is not None and time.time() >= deadline:
+                if grace_used or grace <= 0:
                     if not args.quiet:
-                        print(
-                            f"(composing from {m.sender}: "
-                            f"deadline extended by {amount:.0f}s, "
-                            f"+{total_extended:.0f}s total)"
-                        )
+                        suffix = f" + {total_extended:.0f}s extended" if total_extended else ""
+                        print(f"(timeout: no new messages for {agent} in {args.timeout}s{suffix})")
+                    return 1
+                # Post-timeout grace: one short sleep + one more inbox scan
+                # before failing. Catches the "reply landed seconds after
+                # the deadline" race that motivated 0.8.0.
+                grace_used = True
+                time.sleep(grace)
                 continue
-            # First real (non-control) message — surface and return.
-            print(render(m, header=f"AGENTTALK :: RECEIVED  {m.sender} -> {m.recipient}"))
-            if args.ack:
-                store.advance_cursor(agent, m.id)
-            return 0
-        if deadline is not None and time.time() >= deadline:
-            if grace_used or grace <= 0:
-                if not args.quiet:
-                    suffix = f" + {total_extended:.0f}s extended" if total_extended else ""
-                    print(f"(timeout: no new messages for {agent} in {args.timeout}s{suffix})")
-                return 1
-            # Post-timeout grace: one short sleep + one more inbox scan
-            # before failing. Catches the "reply landed seconds after
-            # the deadline" race that motivated 0.8.0.
-            grace_used = True
-            time.sleep(grace)
-            continue
-        if heartbeat_interval > 0 and time.time() - last_heartbeat >= heartbeat_interval:
-            store.write_heartbeat(agent)
-            last_heartbeat = time.time()
-        time.sleep(interval)
+            if heartbeat_interval > 0 and time.time() - last_heartbeat >= heartbeat_interval:
+                store.write_heartbeat(agent)
+                last_heartbeat = time.time()
+            time.sleep(interval)
+    finally:
+        # Always retract the marker — message received, timeout, or the
+        # KeyboardInterrupt that main() catches one frame up. Best-effort.
+        store.clear_waiting(agent)
 
 
 def cmd_ack(args: argparse.Namespace) -> int:
@@ -461,11 +672,10 @@ def cmd_transcript(args: argparse.Namespace) -> int:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Health check: did the user wire everything up correctly?"""
-    import json as _json
     root = Path(args.root).resolve() if getattr(args, "root", None) else None
     report = dr.run(root)
     if args.json:
-        print(_json.dumps(report.to_dict(), indent=2))
+        print(json.dumps(report.to_dict(), indent=2))
     else:
         _render_doctor_human(report)
     # Exit codes respect the global contract documented in the README:
@@ -644,8 +854,20 @@ def cmd_reply(args: argparse.Namespace) -> int:
         return 2
     meta = _parse_meta(args.meta)
     # Auto-echo request_id for correlation. Explicit --meta wins.
-    if "request_id" not in meta and "request_id" in (last.meta or {}):
+    # EXCEPTION: a reply that is ITSELF a review-request opens a NEW
+    # correlation thread (a counter-review), so it must NOT inherit the
+    # prior message's request_id — doing so would alias two distinct
+    # request/result pairs and make later results ambiguous. For that
+    # case we skip the echo and let _maybe_autogen_request_id mint a
+    # fresh id below (unless the user passed an explicit --meta one).
+    if (
+        args.kind != "review-request"
+        and "request_id" not in meta
+        and "request_id" in (last.meta or {})
+    ):
         meta["request_id"] = last.meta["request_id"]
+    _maybe_autogen_request_id(args.kind, meta, quiet=args.quiet)
+    _warn_missing_request_id(args.kind, meta)
     msg = store.send(
         sender=sender,
         recipient=last.sender,
@@ -883,6 +1105,19 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Also surface control-plane kinds ('composing') that the "
                          "default view hides. Useful for debugging wait extensions.")
     pr.set_defaults(func=cmd_recv)
+
+    pdr = sub.add_parser(
+        "drain",
+        help="Consume the inbox: print all unread for an agent AND advance "
+             "the cursor to the newest message. Equivalent to `recv --ack`, "
+             "but unmissable — use this instead of hand-rolled polling.",
+    )
+    pdr.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
+    pdr.add_argument("--quiet", action="store_true")
+    pdr.add_argument("--include-control", action="store_true",
+                     help="Also surface control-plane kinds ('composing') that the "
+                          "default view hides. The cursor advances past them either way.")
+    pdr.set_defaults(func=cmd_drain)
 
     pw = sub.add_parser("wait", help="Block until a new message arrives for an agent, then print it.")
     pw.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
