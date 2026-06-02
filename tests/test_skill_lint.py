@@ -16,6 +16,17 @@ import pytest
 from agenttalk.install_skills import SKILLS_ROOT
 
 
+def _normalize(text: str) -> str:
+    """Collapse all whitespace runs to single spaces.
+
+    Required-content checks must survive line-wrapping: a skill body may
+    wrap "Always resolve inside your current shell" across a newline, and
+    a raw substring test would then spuriously fail. Normalizing both the
+    body and the probe makes the lint care about content, not layout.
+    """
+    return re.sub(r"\s+", " ", text)
+
+
 # ----------------------------------------------- per-skill required content
 
 # (filename_under_claude, codex_subdir, required_substrings)
@@ -55,6 +66,15 @@ SKILL_INVARIANTS = [
         "--in-reply-to",                   # counter links to prior proposal
         "agenttalk threads --for",         # before-stopping thread check
         "Split-work guard",                # proposals are not a split backdoor
+    ]),
+    ("agenttalk.lead.md", "agenttalk-lead", [
+        "AGENTTALK_SELF",                  # identity preamble
+        "Always resolve inside your current shell",
+        "Never spawn",                     # never supervise/launch processes
+        "Do not duplicate spec-kitty",     # no competing assignment machine
+        "No second task-state machine",    # threads + human are the state
+        "agenttalk threads --for",         # tracks dispatched work
+        "agenttalk broadcast",             # fan-out for group input
     ]),
     ("agenttalk.consult.md", "agenttalk-consult", [
         "AGENTTALK_SELF",
@@ -102,10 +122,10 @@ def test_required_content_present_on_both_sides(
     """Every required substring must appear in BOTH the Claude- and
     Codex-side skill body. Drift between the two is what this test
     primarily exists to catch."""
-    claude_body = (SKILLS_ROOT / "claude" / fname).read_text(encoding="utf-8")
-    codex_body = (SKILLS_ROOT / "codex" / subdir / "SKILL.md").read_text(encoding="utf-8")
-    claude_missing = [s for s in required if s not in claude_body]
-    codex_missing = [s for s in required if s not in codex_body]
+    claude_body = _normalize((SKILLS_ROOT / "claude" / fname).read_text(encoding="utf-8"))
+    codex_body = _normalize((SKILLS_ROOT / "codex" / subdir / "SKILL.md").read_text(encoding="utf-8"))
+    claude_missing = [s for s in required if _normalize(s) not in claude_body]
+    codex_missing = [s for s in required if _normalize(s) not in codex_body]
     msg = []
     if claude_missing:
         msg.append(f"Claude {fname} missing: {claude_missing}")

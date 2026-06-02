@@ -153,6 +153,73 @@ def validate_agent_roster(names: list[str]) -> list[str]:
     return names
 
 
+# Group names share the agent-name safety rule (interpolated nowhere
+# dangerous today, but kept portable), with one reservation: "all" is the
+# implicit whole-roster audience and may not be redefined.
+_RESERVED_GROUP_NAMES = frozenset({"all"})
+
+
+def validate_group_name(name: str) -> str:
+    """Return ``name`` if it's a safe, non-reserved group identifier."""
+    if not isinstance(name, str) or not name:
+        raise ValueError("group name must be a non-empty string")
+    if name.casefold() in _RESERVED_GROUP_NAMES:
+        raise ValueError(
+            f"group name {name!r} is reserved ('all' is the implicit "
+            f"whole-roster audience)"
+        )
+    if not _AGENT_NAME_RE.match(name):
+        raise ValueError(
+            f"group name {name!r} is not a safe identifier "
+            f"(allowed: alphanumeric plus . _ -, must start with a letter "
+            f"or digit, max 64 chars)"
+        )
+    return name
+
+
+def validate_groups(groups: dict, roster: list[str]) -> dict:
+    """Validate a ``{group: [members]}`` map against the roster.
+
+    Every group name must be safe + non-reserved, every value a list, and
+    every member must be in the roster (so a broadcast can never fan out
+    to a phantom mailbox).
+    """
+    if not isinstance(groups, dict):
+        raise ValueError(f"'groups' must be a dict, got {type(groups).__name__}")
+    rset = set(roster)
+    for gname, members in groups.items():
+        validate_group_name(gname)
+        if not isinstance(members, list):
+            raise ValueError(f"group {gname!r} members must be a list")
+        for m in members:
+            if not isinstance(m, str):
+                raise ValueError(f"group {gname!r} member must be a string")
+            # Fail CLOSED even on an empty roster: a config with no agents
+            # has no valid group members, so any member reference is bogus.
+            if m not in rset:
+                raise ValueError(
+                    f"group {gname!r} member {m!r} is not in the roster {sorted(rset)}"
+                )
+    return groups
+
+
+def validate_roles(roles: dict, roster: list[str]) -> dict:
+    """Validate a ``{agent: role}`` map: keys in roster, values bounded strings."""
+    if not isinstance(roles, dict):
+        raise ValueError(f"'roles' must be a dict, got {type(roles).__name__}")
+    rset = set(roster)
+    for agent, role in roles.items():
+        if agent not in rset:  # fail closed even on an empty roster
+            raise ValueError(f"role key {agent!r} is not in the roster {sorted(rset)}")
+        if not isinstance(role, str) or not role:
+            raise ValueError(f"role for {agent!r} must be a non-empty string")
+        if len(role) > 64 or not role.isprintable():
+            raise ValueError(
+                f"role for {agent!r} must be a printable string of at most 64 chars"
+            )
+    return roles
+
+
 @dataclass
 class Message:
     id: str
@@ -414,6 +481,136 @@ class Store:
                     f"corrupt config at {self.config_path}: {e}. "
                     f"Re-init with `agenttalk init --here --agents ... --force`."
                 ) from e
+        # Optional team metadata (added in 0.11.0). Absent OR explicit null
+        # ⇒ pair behavior (matches the `(... or {})` accessors). Validate
+        # fail-closed so a corrupt groups/roles map can't fan a broadcast
+        # out to a phantom mailbox or crash the roster view.
+        if cfg.get("groups") is not None:
+            try:
+                validate_groups(cfg["groups"], agents)
+            except ValueError as e:
+                raise ValueError(f"corrupt config at {self.config_path}: {e}.") from e
+        if cfg.get("roles") is not None:
+            try:
+                validate_roles(cfg["roles"], agents)
+            except ValueError as e:
+                raise ValueError(f"corrupt config at {self.config_path}: {e}.") from e
+        return cfg
+
+    # ------------------------------------------------------- team / roster
+
+    def _write_config(self, cfg: dict) -> None:
+        _atomic_write_text(self.config_path, json.dumps(cfg, indent=2))
+
+    def groups(self) -> dict:
+        """Return the ``{group: [members]}`` map ({} if none defined)."""
+        return self.load_config().get("groups", {}) or {}
+
+    def roles(self) -> dict:
+        """Return the ``{agent: role}`` map ({} if none defined)."""
+        return self.load_config().get("roles", {}) or {}
+
+    def resolve_audience(self, target: str, *, exclude: str | None = None) -> list[str]:
+        """Resolve a broadcast target to a concrete recipient list.
+
+        ``target`` is either ``"all"`` (the whole roster) or a defined
+        group name. ``exclude`` drops one member (the sender). Raises
+        ``ValueError`` for an unknown group so a typo can't silently
+        broadcast to nobody.
+        """
+        cfg = self.load_config()
+        roster = cfg.get("agents", []) or []
+        if isinstance(target, str) and target.casefold() == "all":
+            members = list(roster)
+        else:
+            groups = cfg.get("groups", {}) or {}
+            if target not in groups:
+                raise ValueError(
+                    f"unknown group {target!r} (known: {sorted(groups)} + 'all')"
+                )
+            members = list(groups[target])
+        # De-dupe (preserve order) and drop the sender.
+        seen: set[str] = set()
+        out: list[str] = []
+        for m in members:
+            if m != exclude and m not in seen:
+                seen.add(m)
+                out.append(m)
+        return out
+
+    def add_agent(self, name: str, *, role: str | None = None,
+                  groups: list[str] | None = None) -> dict:
+        """Add an agent to the roster (idempotent) and optionally set its
+        role / group memberships. A deliberate local admin op — NOT a
+        security boundary and NOT process supervision."""
+        validate_agent_name(name)
+        cfg = self.load_config()
+        roster = list(cfg.get("agents", []))
+        is_new = name not in roster
+        if is_new:
+            validate_agent_roster(roster + [name])  # case-insensitive uniqueness
+            roster.append(name)
+            cfg["agents"] = roster
+        if role is not None:
+            roles = cfg.setdefault("roles", {})
+            roles[name] = role
+            validate_roles(roles, roster)
+        if groups:
+            g = cfg.setdefault("groups", {})
+            for gn in groups:
+                validate_group_name(gn)
+                members = g.setdefault(gn, [])
+                if name not in members:
+                    members.append(name)
+            validate_groups(g, roster)
+        # All validation passed — only now perform side effects, so a bad
+        # role/group never orphans a freshly-written cursor file.
+        self._write_config(cfg)
+        if is_new:
+            cur = self.state_dir / f"{name}.cursor"
+            if not cur.exists():
+                _atomic_write_text(cur, "")
+        return cfg
+
+    def remove_agent(self, name: str) -> dict:
+        """Remove an agent from the roster, its role, and all group
+        memberships. Leaves its cursor/messages as historical record."""
+        cfg = self.load_config()
+        roster = list(cfg.get("agents", []))
+        if name in roster:
+            roster.remove(name)
+            cfg["agents"] = roster
+        if isinstance(cfg.get("roles"), dict):
+            cfg["roles"].pop(name, None)
+        if isinstance(cfg.get("groups"), dict):
+            for members in cfg["groups"].values():
+                if name in members:
+                    members.remove(name)
+        self._write_config(cfg)
+        return cfg
+
+    def set_role(self, name: str, role: str) -> dict:
+        cfg = self.load_config()
+        roster = cfg.get("agents", []) or []
+        if name not in roster:
+            raise ValueError(f"agent {name!r} is not in the roster {sorted(roster)}")
+        roles = cfg.setdefault("roles", {})
+        roles[name] = role
+        validate_roles(roles, roster)
+        self._write_config(cfg)
+        return cfg
+
+    def set_group(self, group: str, members: list[str]) -> dict:
+        cfg = self.load_config()
+        roster = cfg.get("agents", []) or []
+        validate_group_name(group)
+        for m in members:
+            if m not in roster:
+                raise ValueError(f"group member {m!r} is not in the roster {sorted(roster)}")
+        groups = cfg.setdefault("groups", {})
+        groups[group] = list(dict.fromkeys(members))  # de-dupe, preserve order
+        validate_groups(groups, roster)
+        self._write_config(cfg)
         return cfg
 
     # --------------------------------------------------------------- writing

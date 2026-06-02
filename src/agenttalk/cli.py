@@ -243,6 +243,7 @@ OPEN_OUTBOUND_STALE_SECONDS = 600.0
 def _gather_status(store: Store) -> dict:
     """Build the structured status payload shared by both output modes."""
     cfg = store.load_config()
+    roles = cfg.get("roles", {}) or {}
     msgs = store.all_messages()
     now = datetime.now(timezone.utc)
     agents = []
@@ -276,6 +277,7 @@ def _gather_status(store: Store) -> dict:
             )
         agents.append({
             "name": a,
+            "role": roles.get(a),
             "cursor": store.cursor(a) or None,
             "unread": len(store.unread_for(a)),
             "heartbeat": heartbeat_iso,
@@ -384,10 +386,14 @@ def _thread_warnings(store: Store, cfg: dict) -> list[str]:
         ]
         if stale:
             t0 = stale[0]
+            if t0.is_broadcast:
+                who = f"{len(t0.pending)}/{len(t0.audience)} ({', '.join(t0.pending)})"
+            else:
+                who = t0.peer
             out.append(
                 f"{a}: outbound {t0.opener_kind} {t0.request_id} still "
-                f"awaiting {t0.peer} after {_format_age(t0.age_seconds)} — "
-                f"peer may have missed it; check `agenttalk threads --for {a}`."
+                f"awaiting {who} after {_format_age(t0.age_seconds)} — "
+                f"check `agenttalk threads --for {a}`."
             )
     return out
 
@@ -435,9 +441,14 @@ def cmd_threads(args: argparse.Namespace) -> int:
         age = _format_age(t.age_seconds) if t.age_seconds is not None else "?"
         flag = " (unread)" if t.unread else ""
         subj = f'  "{t.subject}"' if t.subject else ""
+        bcast = ""
+        if t.is_broadcast:
+            bcast = f"  responded={len(t.responded)}/{len(t.audience)}"
+            if t.pending:
+                bcast += f" pending=[{', '.join(t.pending)}]"
         print(
             f"  [{label.get(t.state, t.state)}] {t.request_id:<16} "
-            f"{t.opener_kind:<15} peer={t.peer:<10} age={age:<8}{subj}{flag}"
+            f"{t.opener_kind:<15} peer={t.peer:<10} age={age:<8}{subj}{flag}{bcast}"
         )
     return 0
 
@@ -485,7 +496,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                 seen += " (stale)"
         if a.get("waiting"):
             seen += " waiting(stale)" if a.get("waiting_stale") else " waiting"
-        print(f"  {a['name']:<10} cursor={cursor:<32} unread={a['unread']:<3} {seen}")
+        role = f" role={a['role']}" if a.get("role") else ""
+        print(f"  {a['name']:<10}{role} cursor={cursor:<32} unread={a['unread']:<3} {seen}")
     for w in payload.get("warnings", []):
         print(f"WARN:       {w}")
     return 0
@@ -604,6 +616,143 @@ def cmd_propose(args: argparse.Namespace) -> int:
         # Print the correlation id (the "proposal id"), not the message
         # id — that's the token a counter references via --in-reply-to.
         print(msg.meta.get("request_id", msg.id))
+    return 0
+
+
+def cmd_broadcast(args: argparse.Namespace) -> int:
+    """Send one message to a whole group (or `--all`) via fan-out.
+
+    Resolves the audience to concrete recipients and writes ONE
+    point-to-point message per member (excluding the sender), all sharing
+    a `b-` `broadcast_id` and an `audience` label. The per-agent
+    mailbox/cursor model is untouched — each member just receives their
+    own copy. `--kind question` creates a tracked obligation per
+    recipient (the "everyone please weigh in" pattern), visible as a
+    multi-party thread in `agenttalk threads`; `note`/`message` are FYI
+    fan-out with no obligation. "Reply-all" is just another broadcast.
+    """
+    store = _get_store(args)
+    cfg = store.load_config()
+    roster = cfg.get("agents") or []
+    sender = _resolve_self(args.sender, roster=roster)
+    target = "all" if args.all else args.to_group
+    try:
+        recipients = store.resolve_audience(target, exclude=sender)
+    except ValueError as e:
+        sys.stderr.write(f"agenttalk broadcast: {e}\n")
+        return 2
+    if not recipients:
+        sys.stderr.write(
+            f"agenttalk broadcast: audience '{target}' has no recipients "
+            f"besides {sender}.\n"
+        )
+        return 2
+    body = _read_body(args)
+    if not body and not args.allow_empty:
+        sys.stderr.write(
+            "agenttalk broadcast: empty body (use -m TEXT, --file PATH, pipe "
+            "stdin, or --allow-empty)\n"
+        )
+        return 2
+    meta_base = _parse_meta(args.meta)
+    # broadcast OWNS the correlation id: request_id and broadcast_id are
+    # always the SAME value, so the id we print is exactly what recipients
+    # echo with `reply --to-request`. Pop any user-supplied keys (a stale
+    # request_id would otherwise desync the thread from the printed id) and
+    # reject a conflicting pair.
+    supplied_bid = meta_base.pop("broadcast_id", None)
+    supplied_rid = meta_base.pop("request_id", None)
+    if supplied_bid and supplied_rid and supplied_bid != supplied_rid:
+        sys.stderr.write(
+            "agenttalk broadcast: --meta request_id and --meta broadcast_id "
+            "must be the same value (a broadcast uses one correlation id).\n"
+        )
+        return 2
+    bid = supplied_bid or supplied_rid or ("b-" + uuid.uuid4().hex[:12])
+    audience_label = "all" if args.all else target
+    sent: list = []
+    for r in recipients:
+        meta = dict(meta_base)
+        # Reuse request_id as the correlation token (so existing
+        # reply/threads machinery works) AND tag the broadcast so thread
+        # derivation switches to its multi-party view. Both keys are
+        # force-set to the one id — never setdefault (issue: a supplied
+        # request_id could split the thread key from the printed id).
+        meta["request_id"] = bid
+        meta["broadcast_id"] = bid
+        meta["audience"] = audience_label
+        msg = store.send(
+            sender=sender, recipient=r, body=body,
+            kind=args.kind, subject=args.subject or "", meta=meta,
+        )
+        sent.append(msg)
+    if not args.quiet:
+        print(
+            f"(broadcast {bid} [{args.kind}] {sender} -> @{audience_label}: "
+            f"{len(sent)} recipient{'s' if len(sent) != 1 else ''}: "
+            f"{', '.join(recipients)})"
+        )
+    if args.print_id:
+        print(bid)
+    return 0
+
+
+def cmd_roster(args: argparse.Namespace) -> int:
+    """View or manage the roster, roles, and groups.
+
+    `roster` (no subcommand) shows the team; `add` / `remove` /
+    `set-role` / `set-group` are deliberate local admin ops (not a
+    security boundary, not process supervision).
+    """
+    store = _get_store(args)
+    action = getattr(args, "roster_cmd", None)
+    if action == "add":
+        store.add_agent(args.name, role=getattr(args, "role", None),
+                        groups=getattr(args, "group", None))
+        print(f"roster: added {args.name}")
+        return 0
+    if action == "remove":
+        store.remove_agent(args.name)
+        print(f"roster: removed {args.name}")
+        return 0
+    if action == "set-role":
+        store.set_role(args.name, args.role)
+        print(f"roster: {args.name} role={args.role}")
+        return 0
+    if action == "set-group":
+        members = [m.strip() for m in args.members.split(",") if m.strip()]
+        store.set_group(args.group, members)
+        print(f"roster: group '{args.group}' = {', '.join(members) or '(empty)'}")
+        return 0
+
+    # show
+    cfg = store.load_config()
+    roster = cfg.get("agents", []) or []
+    roles = cfg.get("roles", {}) or {}
+    groups = cfg.get("groups", {}) or {}
+    self_name = os.environ.get("AGENTTALK_SELF")
+    if self_name not in roster:
+        self_name = None
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "agents": roster,
+            "roles": roles,
+            "groups": groups,
+            "self": self_name,
+        }, indent=2))
+        return 0
+    print(f"roster ({len(roster)} agent{'s' if len(roster) != 1 else ''}):")
+    for a in roster:
+        you = " (you)" if a == self_name else ""
+        role = roles.get(a) or "-"
+        member_of = [g for g, ms in groups.items() if a in ms]
+        gl = ", ".join(member_of) if member_of else "-"
+        print(f"  {a}{you}  role={role}  groups=[{gl}]")
+    if groups:
+        print("groups:")
+        for g, ms in groups.items():
+            print(f"  @{g}: {', '.join(ms) or '(empty)'}")
+    print(f"  @all: {', '.join(roster)}  (implicit)")
     return 0
 
 
@@ -1289,6 +1438,35 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Emit the structured contract for skills to parse.")
     pth.set_defaults(func=cmd_threads)
 
+    proster = sub.add_parser(
+        "roster",
+        help="View or manage the agent roster, roles, and groups. With no "
+             "subcommand, shows the team (roles + group memberships + who "
+             "you are). `add`/`remove`/`set-role`/`set-group` are deliberate "
+             "local admin ops.",
+    )
+    proster.add_argument("--json", action="store_true",
+                         help="(show) machine-readable roster/roles/groups.")
+    proster.set_defaults(func=cmd_roster, roster_cmd=None)
+    rsub = proster.add_subparsers(dest="roster_cmd")
+    r_add = rsub.add_parser("add", help="Add an agent (idempotent).")
+    r_add.add_argument("name")
+    r_add.add_argument("--role", help="Role label (e.g. implementer, reviewer, lead).")
+    r_add.add_argument("--group", action="append",
+                       help="Add the agent to this group (repeatable).")
+    r_add.set_defaults(func=cmd_roster)
+    r_rm = rsub.add_parser("remove", help="Remove an agent from roster/roles/groups.")
+    r_rm.add_argument("name")
+    r_rm.set_defaults(func=cmd_roster)
+    r_sr = rsub.add_parser("set-role", help="Set an agent's role.")
+    r_sr.add_argument("name")
+    r_sr.add_argument("role")
+    r_sr.set_defaults(func=cmd_roster)
+    r_sg = rsub.add_parser("set-group", help="Define a group's membership.")
+    r_sg.add_argument("group")
+    r_sg.add_argument("members", help="Comma-separated agent names.")
+    r_sg.set_defaults(func=cmd_roster)
+
     pse = sub.add_parser("send", help="Send a message from one agent to another.")
     pse.add_argument("--from", dest="sender", help="Sender agent name (default: $AGENTTALK_SELF)")
     pse.add_argument("--to", dest="recipient",
@@ -1358,6 +1536,34 @@ def build_parser() -> argparse.ArgumentParser:
                            "on its own line — the token a counter references.")
     ppro.add_argument("--quiet", action="store_true")
     ppro.set_defaults(func=cmd_propose)
+
+    pbc = sub.add_parser(
+        "broadcast",
+        help="Send one message to a whole group (or --all) via fan-out — "
+             "one point-to-point copy per member sharing a `b-` broadcast_id. "
+             "`--kind question` is the 'everyone please weigh in' pattern "
+             "(tracked per recipient in `agenttalk threads`); note/message "
+             "are FYI. Reply-all is just another broadcast.",
+    )
+    pbc.add_argument("--from", dest="sender",
+                     help="Sender agent name (default: $AGENTTALK_SELF)")
+    bgrp = pbc.add_mutually_exclusive_group(required=True)
+    bgrp.add_argument("--to-group", dest="to_group", help="Target group name.")
+    bgrp.add_argument("--all", action="store_true",
+                      help="Target the whole roster (implicit group).")
+    pbc.add_argument("--kind", default="message",
+                     choices=["message", "note", "question"],
+                     help="Broadcast kind (default: message). Use `question` "
+                          "when you want everyone to respond.")
+    pbc.add_argument("--subject", help="One-line summary.")
+    pbc.add_argument("--meta", action="append", help="key=value (repeatable).")
+    pbc.add_argument("-m", "--message", help="Body text (else --file or stdin).")
+    pbc.add_argument("--file", help="Read body from this file path.")
+    pbc.add_argument("--allow-empty", action="store_true")
+    pbc.add_argument("--print-id", action="store_true",
+                     help="Print the broadcast_id on its own line.")
+    pbc.add_argument("--quiet", action="store_true")
+    pbc.set_defaults(func=cmd_broadcast)
 
     pr = sub.add_parser("recv", help="Print all queued messages for an agent.")
     pr.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")

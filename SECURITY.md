@@ -1,6 +1,6 @@
 # Security policy & threat model
 
-> Last updated: 2026-05-21 (v0.7.0)
+> Last updated: 2026-06-02 (v0.11.0)
 
 agenttalk is a small file-backed message bus. The trust model is
 local: if you can write to a project's `.agenttalk/` directory, you
@@ -21,13 +21,13 @@ exploit details before a fix is shipped.
 
 ## Trust model
 
-agenttalk is designed for **two coding agents running on the same
-machine, owned by the same OS user, sharing one project directory**.
-That's the trust boundary.
+agenttalk is designed for **two or more coding agents running on the
+same machine, owned by the same OS user, sharing one project
+directory**. That's the trust boundary.
 
 Inside that boundary:
 
-- Both agents are trusted to read and write `.agenttalk/`.
+- All rostered agents are trusted to read and write `.agenttalk/`.
 - The human user is trusted; the agents are running as them.
 - `.agenttalk/messages/<id>.json` files are append-only by
   convention (the bus never rewrites them), but the filesystem
@@ -38,7 +38,7 @@ Inside that boundary:
 - Another process / user on the same machine with write access to
   the project directory.
 - A shared / network-mounted `.agenttalk/` directory.
-- A malicious peer agent inside the trust boundary.
+- A malicious peer or team member inside the trust boundary.
 - A malicious user editing `.agenttalk/messages/*.json` by hand.
 - Prompt-injection payloads placed inside message bodies by
   any of the above.
@@ -55,6 +55,33 @@ without a key store outside the attacker's reach creates false
 confidence, so we deliberately do not promise more than the threat
 model supports.
 
+### Multi-agent teams, roles, and groups
+
+The v0.11.0 team features broaden routing, not the trust boundary.
+Agent names, roles, and groups are coordination metadata:
+
+- Agent names identify mailboxes and transcript entries.
+- Roles such as `implementer`, `reviewer`, or `lead` are ergonomic
+  labels shown by roster/status output; they are not authorization.
+- Groups are validated roster subsets used by `agenttalk broadcast`.
+  `all` is implicit and reserved.
+- Roster and group admin commands are deliberate local configuration
+  changes. They do not prove that a worker process exists, is healthy,
+  or is controlled by a different human.
+
+Broadcast is fan-out. A broadcast writes one ordinary point-to-point
+message per recipient with a shared `broadcast_id` / `request_id`.
+There is no shared private channel, and broadcast does not change the
+cursor or message validation model.
+
+Optional HMAC signatures still use the project key model. They protect
+against non-participants who can write into `.agenttalk/` but cannot
+read the per-user key file. They do **not** provide per-agent crypto
+identity among trusted participants: any participant with the project
+key is inside the same local trust boundary. Per-agent signing keys or
+authorization policy would be a future feature with a different threat
+model.
+
 ---
 
 ## What's protected today
@@ -65,6 +92,7 @@ model supports.
 | Case-only-aliased agent state on NTFS (`Alpha` vs `alpha`) | `validate_agent_roster()` rejects case-fold duplicates. | 0.2.1 |
 | Half-written user-global Codex config on crash | `codex_config` writes via temp-file + `os.replace` atomic helper. | 0.2.1 |
 | Malformed `.agenttalk/config.json` smuggling unsafe names | `Store.load_config()` re-validates the roster on read. | 0.2.1 |
+| Malformed team metadata smuggling unsafe group names or out-of-roster members | Config load validates `roles` and `groups`; group members must be in the roster and `all` is reserved. | 0.11.0 |
 | TOML injection in Codex config (`Bob's Repo` path) | TOML quote helper falls back to basic strings with proper escaping. | 0.2.1 |
 | Exit-code collision between usage errors and `wait` timeouts | All usage errors exit 2; only `wait` timeout exits 1. | 0.2.1 |
 | Forged / unknown-kind messages reaching the listener | `Message.from_raw` + `Message.validate(roster)`; `Store.messages_for` skips invalid; `Store.list_invalid_messages` surfaces them. | 0.3.0 |
@@ -161,13 +189,19 @@ do what is cheaper and more honest.
    verification when signing is enforced, is NOT rendered —
    it shows up under `/api/status.invalid_messages` instead.
 
-### Still planned (0.8.0+)
+### Still planned
 
 8. **Replay / reordering / deletion defenses.** HMAC proves
    origin of message bytes but does NOT defend against an
    attacker who can delete or reorder files. A hash-chain
    across message IDs anchored outside `.agenttalk/` would help.
    Not in scope yet.
+9. **Per-agent crypto identity / authorization.** The v0.11.0 team
+   surface gives agents unique names, roles, and groups, but the
+   optional signing model remains project-key based. If agenttalk ever
+   needs to treat one rostered participant as less trusted than
+   another, it will need per-agent keys and explicit authorization
+   semantics.
 
 ### Roadmap detail: optional HMAC signatures (0.6.0+ if needed)
 

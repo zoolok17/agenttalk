@@ -1,40 +1,49 @@
 ---
-description: Send a single message to the peer agent over agenttalk. Use for short pings that do not require waiting for a reply.
+description: Send a single message to a named agent, or broadcast a note/question to a group, over agenttalk. Use for short pings that do not require waiting for a reply.
 ---
 
-# /agenttalk.send — Send a message to the peer agent
+# /agenttalk.send - Send a message to a named agent or group
 
-You are running as a **Claude Code** agent. Your peer (typically a
-Codex, but could be another Claude) is running in a separate terminal.
+You are running as a **Claude Code** agent. Other agents are in
+separate terminals in the same project. Messages flow via `agenttalk`,
+backed by `.agenttalk/` in the project root.
 
 ## Identity
 
 Before invoking any `agenttalk` command, resolve your name and the
-peer's. Env vars set by the user win; otherwise fall back to the
-defaults appropriate for the Claude side:
+default peer's. Env vars set by the user win; otherwise fall back to
+the defaults appropriate for the Claude side:
 
 ```powershell
 $SELF = if ($env:AGENTTALK_SELF) { $env:AGENTTALK_SELF } else { "claude" }
 $PEER = if ($env:AGENTTALK_PEER) { $env:AGENTTALK_PEER } else { "codex" }
 ```
 
-If the user is running two Claudes (or any same-kind pair), they will
-have set distinct `AGENTTALK_SELF` / `AGENTTALK_PEER` per terminal.
-Always resolve inside your current shell — env from prior tool calls
-does not persist.
+`PEER` is only the compatibility default for the canonical two-agent
+pair. In a roster with more than two agents, inspect `agenttalk roster`
+and use an explicit `--to <agent>`, `--to-group <group>`, or `--all`.
+If the user is running two Claudes (or any same-kind team), they will
+have set distinct `AGENTTALK_SELF` per terminal and may set
+`AGENTTALK_PEER` only for the default point-to-point partner. Always
+resolve inside your current shell - env from prior tool calls does
+not persist.
 
 ## When to use this skill
 
-- You want to tell the peer something but do not need a reply before
-  continuing (e.g. "FYI starting WP02", "I rebased onto main").
+- You want to tell a named agent something but do not need a reply
+  before continuing (e.g. "FYI starting WP02", "I rebased onto main").
+- You want to broadcast a note or question to a named group or to
+  `--all`.
 - For request/response patterns where you must wait, use
   `/agenttalk.handoff` instead.
 
 For true fire-and-forget traffic, use `kind=message` or `kind=note`.
-`kind=question` opens a tracked `q-` request thread; use it only when
-the peer really owes an answer, and tell the user the question is now
-pending. If the answer is needed before you continue, use
-`/agenttalk.handoff` instead.
+`kind=question` opens a tracked `q-` request thread for point-to-point
+sends. `agenttalk broadcast --kind question` opens a tracked
+broadcast thread with one obligation per recipient. Use either only
+when the recipient(s) really owe an answer, and tell the user the
+question is now pending. If the answer is needed before you continue,
+use `/agenttalk.handoff` instead.
 
 **Do NOT use this skill to coordinate splitting implementation work**
 (e.g., "I'll do the frontend, you do the backend") without first
@@ -45,28 +54,43 @@ approved, every piece MUST be cross-reviewed via `/agenttalk.handoff`.
 
 ## Procedure
 
-1. Parse the user-invocation text for the message body. If absent, ask
-   the user concisely for the body.
+1. Parse the user-invocation text for the message body and target. If
+   the body is absent, ask the user concisely for it. If the roster
+   has more than two agents and the target/group is absent, ask for
+   the target instead of guessing.
 2. Resolve `$SELF` and `$PEER` as above.
-3. Send:
+3. For point-to-point, send:
    ```powershell
-   agenttalk send --from $SELF --to $PEER --kind <kind> --subject "<one-line>" -m "<body>"
+   $TARGET = "<agent-name-or-$PEER>"
+   agenttalk send --from $SELF --to $TARGET --kind <kind> --subject "<one-line>" -m "<body>"
    ```
-4. `--kind` values: `message` (default), `note`, `question`,
-   `review-request`, `review-result`, `proposal`, `proposal-response`.
-   Use `note` for informational fire-and-forget and `question` for a
-   tracked question. Prefer `/agenttalk.propose` over raw
-   `send --kind proposal`. Use `--meta key=value` for any structured
-   payload.
-5. The CLI prints the rendered message — do not repeat it.
-6. Do not wait for a reply. Return control to the user, mentioning the
-   message id in one short line. If you sent `kind=question`, also
-   mention that it is tracked by `agenttalk threads` until answered.
+4. For broadcast, send:
+   ```powershell
+   agenttalk broadcast --from $SELF --to-group <group> --kind <message|note|question> `
+     --subject "<one-line>" -m "<body>"
+   # or:
+   agenttalk broadcast --from $SELF --all --kind <message|note|question> `
+     --subject "<one-line>" -m "<body>"
+   ```
+5. `--kind` values for point-to-point sends: `message` (default),
+   `note`, `question`, `review-request`, `review-result`, `proposal`,
+   `proposal-response`. Use `note` for informational fire-and-forget
+   and `question` for a tracked question. Prefer
+   `/agenttalk.propose` over raw `send --kind proposal`. Use
+   `--meta key=value` for structured payload.
+6. Broadcast supports `message`, `note`, and `question`. It fans out
+   one message per recipient, excluding the sender, and prints a
+   shared `broadcast_id` / `request_id`.
+7. The CLI prints the rendered message - do not repeat it.
+8. Do not wait for a reply. Return control to the user, mentioning the
+   message id or broadcast id in one short line. If you sent
+   `kind=question`, also mention that it is tracked by
+   `agenttalk threads` until answered.
 
 ## Constraints
 
-- The peer must be in the roster. Check with `agenttalk status`. If
-  not, run `agenttalk init --here --agents <self>,<peer> --force` and
-  tell the user what you did.
+- The target agent or group must be in the roster. Check with
+  `agenttalk roster`. Add agents or groups with explicit roster admin
+  commands only when the user asks for that setup.
 - Never send `--kind end` from this skill. Use `agenttalk end --from
   $SELF` directly only when the user has confirmed the session is over.

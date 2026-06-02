@@ -1,14 +1,16 @@
 # agenttalk
 
-A small file-backed message bus that lets two coding-agent CLIs — **Claude
-Code** and **Codex** — work on the same project and message each other
-directly. Built for the spec-driven workflow where one agent implements and
-the other reviews.
+A small file-backed message bus that lets coding-agent CLIs — **Claude
+Code**, **Codex**, or several named instances of either — work on the
+same project and message each other directly. Built for the spec-driven
+workflow where one agent implements and another reviews, and now able
+to model named teams with roles, groups, broadcast fan-out, and an
+optional lead role.
 
-The two agents share a project-local `.agenttalk/` directory; every message
-becomes a small JSON file. Each CLI runs in its own terminal window so you
-see the full conversation as it happens. A markdown transcript is exported
-on session end.
+Agents share a project-local `.agenttalk/` directory; every message
+becomes a small JSON file. Each CLI runs in its own terminal window so
+you see the full conversation as it happens. A markdown transcript is
+exported on session end.
 
 ---
 
@@ -16,7 +18,7 @@ on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.9.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.11.0"
 agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
@@ -24,7 +26,7 @@ agenttalk init --here --agents claude,codex
 agenttalk codex-config --enable   # lets Codex call agenttalk from its sandbox
 ```
 
-Open two terminals at the project root:
+Open one terminal per active agent at the project root:
 
 ### For spec-kitty missions (the canonical workflow)
 
@@ -43,19 +45,36 @@ remains the source of truth for state; agenttalk is just a wake signal.
 - **Terminal A (Claude).** `/agenttalk.handoff` (send + block on reply),
   `/agenttalk.consult` (confer with peer before answering you),
   `/agenttalk.propose` (ask the peer to accept/reject/counter a
-  concrete solution), or `/agenttalk.send` (fire and forget).
+  concrete solution), `/agenttalk.lead` (coordinate a named team), or
+  `/agenttalk.send` (fire and forget).
 - **Terminal B (Codex).** `$agenttalk-listen` (wait/respond loop).
 
 Both terminals show every message as it flies past. When you're done:
 `agenttalk end --from claude --reason "done"` writes a markdown
 transcript under `.agenttalk/sessions/`.
 
+For a team, initialize with unique names and then add roles/groups:
+
+```powershell
+agenttalk init --here --agents claude-dev,codex-dev,claude-rev,codex-rev,claude-lead
+agenttalk roster set-role claude-dev implementer
+agenttalk roster set-role codex-rev reviewer
+agenttalk roster set-group devs claude-dev,codex-dev
+agenttalk roster set-group reviewers claude-rev,codex-rev
+agenttalk roster --json
+```
+
+Use role-suffixed names for clarity. The default `claude,codex` pair
+remains valid and needs no roles or groups.
+
 > **Naming convention:** Claude Code uses dotted skill names
 > (`agenttalk.send`, `agenttalk.listen`, `agenttalk.handoff`,
-> `agenttalk.consult`, `agenttalk.propose`, `agenttalk.sk-loop`) and
+> `agenttalk.consult`, `agenttalk.propose`, `agenttalk.lead`,
+> `agenttalk.sk-loop`) and
 > Codex uses hyphenated names
 > (`agenttalk-send`, `agenttalk-listen`, `agenttalk-handoff`,
-> `agenttalk-consult`, `agenttalk-propose`, `agenttalk-sk-loop`).
+> `agenttalk-consult`, `agenttalk-propose`, `agenttalk-lead`,
+> `agenttalk-sk-loop`).
 > Behaviour is identical; only the slash-command spelling differs.
 
 ---
@@ -87,10 +106,10 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.9.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.11.0"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.9.0` with
+Pin to a specific tag so you control upgrades. Replace `v0.11.0` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
@@ -146,7 +165,7 @@ Slash commands are installed globally (one-time, not per project) via
 
 ## Workflows
 
-Open **two terminals** at the project root, one for each agent.
+Open one terminal per active agent at the project root.
 
 ### Spec-kitty missions — `sk-loop` (recommended)
 
@@ -169,8 +188,8 @@ When agents are working together outside a spec-kitty mission (organic
 work split, second opinions, cross-reviews of each other's work):
 
 ```text
-Terminal A (Claude):   /agenttalk.listen          (passive: wait for peer)
-Terminal B (Codex):    $agenttalk-listen          (passive: wait for peer)
+Terminal A (Claude):   /agenttalk.listen          (passive: wait for messages)
+Terminal B (Codex):    $agenttalk-listen          (passive: wait for messages)
 ```
 
 Either side, when they finish a chunk and want it reviewed:
@@ -188,8 +207,8 @@ otherwise it does an ad-hoc cross-review of the named scope.
 
 ### First-class proposals — `propose`
 
-Use proposals when you want the peer to decide on a concrete solution
-before either agent proceeds:
+Use proposals when you want a named agent to decide on a concrete
+solution before either agent proceeds:
 
 ```text
 Terminal A (Claude):   /agenttalk.propose
@@ -208,7 +227,7 @@ proposal id unless `--quiet`. The proposal body should contain:
 ## Decision requested
 ```
 
-The peer responds with:
+The target responds with:
 
 ```powershell
 agenttalk reply --kind proposal-response --meta status=accepted -m "..."
@@ -220,6 +239,83 @@ fresh proposal with `agenttalk propose --in-reply-to <old-request-id>`.
 Proposals do **not** bypass the split-work rule: if a proposal assigns
 implementation ownership outside spec-kitty, the agents must ask you
 first, and every implemented piece still needs a read-only cross-review.
+
+### Teams, groups, and the fresh-review workflow
+
+Use unique names when several agents are active in the same project.
+The common team pattern is:
+
+```text
+claude-dev   implementation Claude
+codex-dev    implementation Codex
+claude-rev   fresh-review Claude
+codex-rev    fresh-review Codex
+claude-lead  optional coordinator
+```
+
+Roles are informational labels shown by `agenttalk roster` and
+`agenttalk status`; groups are named subsets used by broadcast:
+
+```powershell
+agenttalk roster add claude-rev --role reviewer --group reviewers
+agenttalk roster set-role codex-dev implementer
+agenttalk roster set-group devs claude-dev,codex-dev
+agenttalk roster set-group reviewers claude-rev,codex-rev
+agenttalk roster
+```
+
+The original `claude,codex` pair still works. In a team, each terminal
+sets `AGENTTALK_SELF` to its unique name. `AGENTTALK_PEER` is only a
+default point-to-point partner; skills ask for or infer an explicit
+target when more than one agent could receive a message.
+
+For fresh review, send implementation handoffs to a reviewer that did
+not write the code:
+
+```powershell
+agenttalk send --from claude-dev --to codex-rev --kind review-request `
+  --meta request_id=rq-... --meta base_sha=<sha> --meta head_sha=<sha> `
+  -m "<Goal / Files changed / How to verify / Focus areas>"
+```
+
+### Broadcast and groups
+
+`agenttalk broadcast` fans out one message per recipient. It does not
+create a shared channel and it does not alter per-agent cursors:
+
+```powershell
+agenttalk broadcast --from claude-lead --to-group reviewers --kind question `
+  --subject "API naming check" `
+  -m "Please answer with approve / concern and one sentence of rationale."
+```
+
+The command mints a `broadcast_id` like `b-...` and stores it as both
+`meta.broadcast_id` and `meta.request_id` on each recipient copy.
+Recipients answer the sender with:
+
+```powershell
+agenttalk reply --to-request b-... -m "concern: ..."
+```
+
+Broadcast `message` and `note` are FYI fan-out. Broadcast `question`
+is tracked by `agenttalk threads`: the sender sees responded/pending
+recipients, and each recipient sees an owed inbound question until
+they reply. There is no special reply-all primitive in this release;
+a follow-up to the same audience is a new `agenttalk broadcast`.
+
+### Lead role
+
+The bundled `/agenttalk.lead` and `$agenttalk-lead` skills describe a
+human-facing coordinator role. A lead can decompose work, send
+point-to-point assignments, broadcast questions to groups, track
+pending responses with `agenttalk threads`, and report the result to
+you.
+
+The lead does **not** spawn worker processes. Start each worker in its
+own terminal or use a thin external launcher. The lead also does not
+replace spec-kitty: inside a spec-kitty mission, `spec-kitty next`
+assigns WPs and lanes, while the lead only coordinates around that
+state.
 
 ### Ending the session
 
@@ -233,7 +329,7 @@ loop) and writes `transcript-<session_id>.md` under
 
 ---
 
-## Agent identity (and running two of the same kind)
+## Agent identity, roles, and groups
 
 Agent names are **safe identifiers** — alphanumeric plus dot,
 underscore, or hyphen, starting with an alphanumeric, max 64 chars.
@@ -242,11 +338,17 @@ This restriction exists because names are interpolated into
 that could escape that directory (path separators, `..`, leading
 punctuation, quotes, whitespace) is rejected.
 
-The default pair is `claude` and `codex`, but you can run two Claudes
-(or two Codexes) by giving them distinct names like `claude-a` /
-`claude-b` — useful if you don't have subscriptions to both tools.
+The default pair is `claude` and `codex`, but you can run two Claudes,
+two Codexes, or a larger team by giving every participant a distinct
+name like `claude-dev`, `codex-dev`, `claude-rev`, and `codex-rev`.
+Role-suffixed names make transcripts and thread output easier to
+scan.
 
-Each terminal declares which agent it is via env vars:
+Each terminal declares which agent it is via env vars. In a two-agent
+pair, `AGENTTALK_PEER` can name the default recipient. In a larger
+team, set `AGENTTALK_SELF` in every terminal and pass explicit
+`--to <agent>`, `--to-group <group>`, or `--all` when the recipient is
+not obvious:
 
 ```powershell
 # Terminal A
@@ -272,6 +374,19 @@ Initialize with matching names:
 agenttalk init --here --agents claude-a,claude-b
 ```
 
+For team metadata, use roster admin commands:
+
+```powershell
+agenttalk roster add claude-rev --role reviewer --group reviewers
+agenttalk roster add codex-rev --role reviewer --group reviewers
+agenttalk roster set-role claude-dev implementer
+agenttalk roster set-group devs claude-dev,codex-dev
+agenttalk roster --json
+```
+
+`all` is an implicit reserved group containing the whole roster. Roles
+are informational; groups are used by broadcast fan-out.
+
 All `agenttalk` commands accept `--from`/`--to`/`--for` flags as
 overrides. If the flags are absent, the CLI uses the env vars; if
 **both** are absent the CLI exits with a clear error pointing you at
@@ -285,8 +400,9 @@ like `AGENTTALK_SELF=claud` exits 2 rather than silently operating
 on a phantom mailbox. And it rejects self-mail (`SELF == PEER`).
 
 `agenttalk init` prints concrete env-setup commands at the end of its
-output (for 2-agent rosters), so you can copy-paste straight into each
-terminal.
+output for 2-agent rosters. For larger teams, use `agenttalk roster`
+as the source of truth and set each terminal's `AGENTTALK_SELF`
+explicitly.
 
 ### Env caveat for LLM tool-call contexts
 
@@ -391,10 +507,11 @@ Assuming a 30k-token conversation context and Claude Opus 4.7 pricing
 | `/agenttalk.listen` (default 1800s) | 30 min | ~2 | ~$0.90/hour (cache cold each wake) |
 | `/agenttalk.sk-loop` (30s) | 30 sec | ~120 | ~$5/hour (cached, within 5 min TTL) |
 
-Two agents listening in parallel → roughly double. Real messages are
-handled immediately regardless of timeout (the subprocess returns the
-instant a message file lands), so the table is **idle cost only**;
-actual conversation rounds add their own per-message cost.
+Two agents listening in parallel roughly double that idle cost; N
+agents roughly multiply it by N. Real messages are handled immediately
+regardless of timeout (the subprocess returns the instant a message
+file lands), so the table is **idle cost only**; actual conversation
+rounds add their own per-message cost.
 
 Codex has its own pricing model but the same architecture applies — a
 short wait timeout means more idle wake-ups, each re-reading the
@@ -425,9 +542,12 @@ so the long timeout is free observability.
 | Command | What it does |
 | --- | --- |
 | `agenttalk init [--here] [--agents A,B]` | Create `.agenttalk/` in the current dir. |
+| `agenttalk roster [--json]` | Show agents, roles, group memberships, and the resolved current identity. |
+| `agenttalk roster add <name> [--role R] [--group G]...` / `remove <name>` / `set-role <name> <role>` / `set-group <group> <a,b,c>` | Deliberate roster/group admin operations. Groups are validated roster subsets; `all` is implicit and reserved. |
 | `agenttalk status` | Show roster, per-agent cursor, unread count, and **actionable warnings**: never-acked unread, soft-deadlocks, unconsumed correlated replies, and stale outbound threads. |
 | `agenttalk threads [--for A] [--all] [--json]` | Derive request/reply thread state from validated messages. Default view shows actionable rows only (`reply-waiting`, `owed-inbound`, `open-outbound`); `--all` includes `closed`. |
 | `agenttalk send --from A --to B [--kind K] [--subject S] [--meta k=v] -m "body"` | Drop a message into the bus. Body can come from `-m`, `--file`, or stdin. `review-request`, `question`, and `proposal` without `--meta request_id=...` get one minted + printed; `review-result` and `proposal-response` without one warn (soft, exit 0). |
+| `agenttalk broadcast --from A (--to-group G \| --all) [--kind message\|note\|question] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| stdin) [--print-id] [--quiet]` | Fan out one message per recipient, excluding the sender. Mints `broadcast_id=b-...`, stores it as `meta.broadcast_id` and `meta.request_id`, and prints the recipient list unless quiet. |
 | `agenttalk propose [--from A] [--to B] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| stdin) [--in-reply-to ID] [--print-id] [--quiet]` | Send a first-class `proposal`. Auto-mints `meta.request_id=pp-...` if absent and prints `(proposal id: pp-...)` unless quiet. `--in-reply-to` sets `meta.in_reply_to` for counters. |
 | `agenttalk recv --for A [--ack] [--since ID] [--include-control]` | **Peek** at queued messages — does NOT move the cursor unless `--ack`. Plain `recv` that prints messages emits a hint pointing at `drain`. Hides `composing` pings by default; `--include-control` surfaces them. |
 | `agenttalk drain --for A [--include-control]` | **Consume**: print all unread AND advance the cursor to newest, in one shot. Same path as `recv --ack`. Use this instead of hand-rolled timestamp polling. |
@@ -435,7 +555,7 @@ so the long timeout is free observability.
 | `agenttalk composing --from A --to B [-m "still drafting"]` | Send a `composing` ping so the peer's `wait` extends its deadline. Use periodically while you draft a long reply. The peer's `wait` consumes these as deadline-extension signals — they do NOT surface as a returned reply. |
 | `agenttalk ack --for A [--id ID]` | Manually move an agent's cursor forward. |
 | `agenttalk transcript [--format md\|jsonl] [--out PATH]` | Export the full conversation. |
-| `agenttalk end --from A [--reason ...]` | Notify the other agent(s) and write the transcript. |
+| `agenttalk end --from A [--reason ...]` | Notify the other agent(s) and write the transcript. In a team, sends `end` to every other roster member. |
 | `agenttalk reset [--archive]` | Clear **active bus state** (messages + cursors + heartbeats); preserves historical transcripts under `.agenttalk/sessions/` so past exports aren't lost. Bumps `session_id`. With `--archive`, instead moves **everything** (messages + state + sessions) under `.agenttalk/archived/<old_session>/`. Preserves config (roster) either way. |
 | `agenttalk hmac-init [--force]` | Generate the HMAC signing key for this project. Stored outside `.agenttalk/` (per-user config dir). The key's existence at the path-derived per-user location automatically activates signature enforcement — there's no config flag to flip. Override the default key path with `AGENTTALK_HMAC_KEY_FILE`. See `SECURITY.md`. |
 | `agenttalk reply [--from A] [--to-id MSG_ID \| --to-request REQUEST_ID] [--kind K] [--subject S] [--meta k=v] -m "body"` | Reply to the most recent received message, or anchor to a specific received message/thread. Auto-derives recipient and echoes the anchor's `request_id`; explicit `--meta request_id=...` wins. A reply that opens a new thread (`review-request` or `proposal`) mints a fresh id instead of echoing. |
@@ -485,6 +605,13 @@ Expected responses:
 - `question` -> a non-control `message` or `note` with the same
   `request_id`
 
+Broadcast questions use the same `request_id` for every fan-out copy
+and also carry `meta.broadcast_id` plus `meta.audience`. From the
+broadcaster's perspective, the thread stays open until every recipient
+has responded and those responses have been consumed. From a
+recipient's perspective, their copy is an owed inbound question until
+they answer it with `agenttalk reply --to-request <b-id> ...`.
+
 Thread states from `--for A`'s perspective:
 - `reply-waiting`: a correlated response addressed to `A` is newer
   than `A`'s cursor; consume it with `drain` or `wait`.
@@ -493,6 +620,9 @@ Thread states from `--for A`'s perspective:
   bounced the ball back.
 - `open-outbound`: the ball is on the peer; `A`'s opener has no
   response, or `A` sent `needs-info` and is awaiting the peer's info.
+- Broadcast `open-outbound`: the broadcaster is waiting on one or
+  more pending recipients. Output shows responded/pending counts and
+  names.
 - `closed`: a terminal correlated response exists (`approved`,
   `rejected`, `accepted`, plain question answer, or
   `proposal-response status=countered` for that proposal thread).
@@ -559,14 +689,18 @@ rely on these:
 
 ---
 
-## How "both terminals see the message" works
+## How terminals see messages
 
-There is no broadcast channel. Each `send` writes the message file
-**and** prints the rendered message to the sender's stdout. The receiver's
-`wait` (running in the other terminal) picks up the same file and prints
-it on the other side. So both terminals show both halves of the
-exchange — and the full conversation is on disk in `.agenttalk/messages/`
-as the source of truth.
+Each `send` writes the message file **and** prints the rendered message
+to the sender's stdout. The receiver's `wait` (running in another
+terminal) picks up the same file and prints it on that side. So both
+terminals show both halves of the exchange - and the full conversation
+is on disk in `.agenttalk/messages/` as the source of truth.
+
+Broadcast is fan-out, not a shared channel. `agenttalk broadcast`
+writes one ordinary message per recipient, all with the same
+`broadcast_id` / `request_id`. Existing per-agent cursors and `wait`
+behavior stay unchanged.
 
 The transcript exporter walks `messages/` in id order (which is
 chronological) and renders it as markdown.

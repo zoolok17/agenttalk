@@ -29,12 +29,16 @@ def _msg(
     status: str | None = None,
     subject: str = "",
     ts: datetime | None = None,
+    audience: str | None = None,
 ) -> Message:
     meta: dict = {}
     if rid is not None:
         meta["request_id"] = rid
     if status is not None:
         meta["status"] = status
+    if audience is not None:
+        meta["audience"] = audience
+        meta["broadcast_id"] = rid
     when = (ts or _BASE).isoformat().replace("+00:00", "Z")
     # ids are zero-padded so lexicographic order == intended order
     return Message(
@@ -237,6 +241,93 @@ def test_actionable_sorted_before_closed_and_stale_first() -> None:
 def test_counts_has_all_keys() -> None:
     c = counts([])
     assert c == {"reply-waiting": 0, "owed-inbound": 0, "open-outbound": 0, "closed": 0}
+
+
+# ----------------------------------------- multi-party broadcast threads
+
+def _broadcast(bid, sender, members, *, kind="question", start="001"):
+    """Build the fan-out opener copies for a broadcast."""
+    out = []
+    n = int(start)
+    for m in members:
+        out.append(_msg(f"{n:03d}", sender, m, kind, rid=bid,
+                        audience="reviewers", subject="review WP7"))
+        n += 1
+    return out, n
+
+
+def test_broadcast_broadcaster_and_member_views() -> None:
+    msgs, _ = _broadcast("b-1", "lead", ["dev1", "dev2"])
+    # Broadcaster sees one multi-party thread, nobody responded yet.
+    L = derive_threads(msgs, agent="lead", cursor="", now=_BASE)
+    assert len(L) == 1
+    t = L[0]
+    assert t.is_broadcast and t.role == "opener" and t.state == "open-outbound"
+    assert t.peer == "@reviewers"
+    assert t.audience == ["dev1", "dev2"]
+    assert t.responded == [] and t.pending == ["dev1", "dev2"]
+    # A member owes a reply.
+    d1 = derive_threads(msgs, agent="dev1", cursor="", now=_BASE)
+    assert d1[0].is_broadcast and d1[0].state == "owed-inbound" and d1[0].peer == "lead"
+
+
+def test_broadcast_partial_then_full_responses() -> None:
+    msgs, nxt = _broadcast("b-1", "lead", ["dev1", "dev2"])
+    msgs.append(_msg(f"{nxt:03d}", "dev1", "lead", "message", rid="b-1"))  # dev1 replies
+    # Before lead consumes dev1's reply: reply-waiting, 1 of 2, dev2 pending.
+    L = derive_threads(msgs, agent="lead", cursor="", now=_BASE)
+    assert L[0].state == "reply-waiting"
+    assert L[0].responded == ["dev1"] and L[0].pending == ["dev2"]
+    # After consuming, still open-outbound (dev2 outstanding).
+    L2 = derive_threads(msgs, agent="lead", cursor=f"{nxt:03d}", now=_BASE)
+    assert L2[0].state == "open-outbound" and L2[0].pending == ["dev2"]
+    # dev1's own slice is closed; dev2 still owes.
+    assert derive_threads(msgs, agent="dev1", cursor=f"{nxt:03d}")[0].state == "closed"
+    assert derive_threads(msgs, agent="dev2", cursor="")[0].state == "owed-inbound"
+    # dev2 replies too → fully closed for the broadcaster.
+    msgs.append(_msg(f"{nxt + 1:03d}", "dev2", "lead", "message", rid="b-1"))
+    done = derive_threads(msgs, agent="lead", cursor=f"{nxt + 1:03d}", now=_BASE)
+    assert done[0].state == "closed"
+    assert done[0].responded == ["dev1", "dev2"] and done[0].pending == []
+
+
+def test_note_broadcast_is_not_tracked() -> None:
+    """A note/message broadcast is FYI fan-out — no obligation, no thread."""
+    msgs, _ = _broadcast("b-9", "lead", ["dev1", "dev2"], kind="note")
+    assert derive_threads(msgs, agent="lead", cursor="") == []
+    assert derive_threads(msgs, agent="dev1", cursor="") == []
+
+
+def test_broadcast_excludes_non_participant() -> None:
+    msgs, _ = _broadcast("b-1", "lead", ["dev1", "dev2"])
+    assert derive_threads(msgs, agent="outsider", cursor="") == []
+
+
+def test_broadcast_open_outbound_age_from_broadcast_not_partial_reply() -> None:
+    """Regression: a half-answered broadcast that then goes silent must still
+    age from the original ask, so the stale-thread warning can fire — not
+    reset to 'time since the last reply'."""
+    old = _BASE - timedelta(days=10)
+    recent = _BASE - timedelta(seconds=5)
+    msgs = [
+        _msg("001", "lead", "dev1", "question", rid="b-1", audience="all", ts=old),
+        _msg("002", "lead", "dev2", "question", rid="b-1", audience="all", ts=old),
+        _msg("003", "dev1", "lead", "message", rid="b-1", ts=recent),  # dev1 replied
+    ]
+    # lead consumed dev1's reply; dev2 silent → open-outbound.
+    t = derive_threads(msgs, agent="lead", cursor="003", now=_BASE)[0]
+    assert t.state == "open-outbound" and t.pending == ["dev2"]
+    assert t.age_seconds > 9 * 86400      # ~10 days, NOT ~5 seconds
+    assert t.last_msg_id in ("001", "002")  # an opener, not the reply
+
+
+def test_broadcast_member_closed_last_is_own_reply() -> None:
+    msgs, nxt = _broadcast("b-1", "lead", ["dev1", "dev2"])
+    reply_id = f"{nxt:03d}"
+    msgs.append(_msg(reply_id, "dev1", "lead", "message", rid="b-1"))
+    t = derive_threads(msgs, agent="dev1", cursor=reply_id, now=_BASE)[0]
+    assert t.state == "closed"
+    assert t.last_msg_id == reply_id  # my reply, not the original opener
 
 
 # --------------------------------------- store-level: validated input only

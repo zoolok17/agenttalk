@@ -37,6 +37,7 @@ def test_bundled_skills_exist_in_package() -> None:
     assert claude_files == [
         "agenttalk.consult.md",
         "agenttalk.handoff.md",
+        "agenttalk.lead.md",
         "agenttalk.listen.md",
         "agenttalk.propose.md",
         "agenttalk.send.md",
@@ -46,6 +47,7 @@ def test_bundled_skills_exist_in_package() -> None:
     assert codex_subdirs == [
         "agenttalk-consult",
         "agenttalk-handoff",
+        "agenttalk-lead",
         "agenttalk-listen",
         "agenttalk-propose",
         "agenttalk-send",

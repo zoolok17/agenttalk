@@ -5,6 +5,53 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] — 2026-06-02
+
+Adds the multi-agent team surface: roster roles/groups, broadcast
+fan-out, multi-party thread tracking, and lead skills. This release is
+designed around named local participants rather than process
+supervision: agenttalk remains the file-backed bus, while humans or
+external launchers start worker windows.
+
+### Added
+
+- **Roster roles and groups.** New `agenttalk roster` command shows
+  agents, roles, group memberships, and resolved identity. Admin
+  subcommands add/remove agents, set roles, and set named groups. The
+  implicit `all` group is reserved.
+- **Broadcast fan-out.** New `agenttalk broadcast --to-group <group>`
+  / `--all` writes one message per recipient, excluding the sender.
+  Broadcast `message`/`note` are FYI fan-out; broadcast `question`
+  tracks one response obligation per recipient by reusing
+  `meta.request_id` with a `b-...` broadcast id.
+- **Multi-party thread state.** `agenttalk threads` recognizes
+  broadcast questions, showing responded/pending recipients for the
+  broadcaster and owed-inbound state for each recipient until they
+  reply with `agenttalk reply --to-request <b-id>`.
+- **Lead skills.** Added `/agenttalk.lead` for Claude Code and
+  `$agenttalk-lead` for Codex. The lead coordinates named agents and
+  groups using point-to-point sends, broadcast questions, and thread
+  tracking. It never spawns worker processes and does not duplicate
+  spec-kitty.
+
+### Changed
+
+- Bundled send/listen/handoff/consult/propose/sk-loop skills now
+  generalize from a hardwired `SELF`/`PEER` pair to named targets and
+  groups while preserving the `claude`/`codex` defaults.
+- Listen skills document broadcast fan-out handling: answer broadcast
+  questions back to the sender on the shared request id; do not
+  reply-all unless explicitly asked.
+- README documents team setup, fresh-review naming, broadcast/groups,
+  and the lead role. SECURITY.md documents that roles/groups are
+  routing metadata, not authorization boundaries.
+
+### Security
+
+- Team support does not change the trust model: rostered participants
+  are still inside the same local trust boundary. Optional HMAC remains
+  project-key based and does not provide per-agent crypto identity.
+
 ## [0.10.0] — 2026-06-02
 
 Adds three coordination features developed jointly by Claude Code and
@@ -894,6 +941,13 @@ pre-answer consult primitive.
 - Atomic JSON-per-message writes; per-agent cursors; markdown +
   JSONL transcript export.
 
+[0.11.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.11.0
+[0.10.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.10.0
+[0.9.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.9.0
+[0.8.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.8.0
+[0.7.2]: https://github.com/zoolok17/agenttalk/releases/tag/v0.7.2
+[0.7.1]: https://github.com/zoolok17/agenttalk/releases/tag/v0.7.1
+[0.7.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.7.0
 [0.6.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.6.0
 [0.5.2]: https://github.com/zoolok17/agenttalk/releases/tag/v0.5.2
 [0.5.1]: https://github.com/zoolok17/agenttalk/releases/tag/v0.5.1

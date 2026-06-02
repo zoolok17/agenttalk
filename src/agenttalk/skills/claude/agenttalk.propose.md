@@ -1,29 +1,36 @@
 ---
-description: Send a concrete proposal to the peer agent over agenttalk and wait for an accept, reject, or counter response. Use when Claude should propose a specific design, plan, scope, or decision for peer agreement before proceeding.
+description: Send a concrete proposal to a named agent over agenttalk and wait for an accept, reject, or counter response. Use when Claude should propose a specific design, plan, scope, or decision for agreement before proceeding.
 ---
 
 # /agenttalk.propose - Propose a concrete solution
 
-You are running as a **Claude Code** agent. Your peer is in another
-terminal. Use this command when you need the peer to decide on a
-specific proposal, not when you merely need an open-ended answer.
+You are running as a **Claude Code** agent. Use this command when you
+need a named agent to decide on a specific proposal, not when you
+merely need an open-ended answer.
 
 `proposal` is for "I recommend this concrete solution; accept, reject,
 or counter it." Use `question` for open questions, `review-request`
 for already-implemented work, and `/agenttalk.consult` for
 pressure-testing a draft answer to the user.
 
+Proposals are point-to-point. If a whole group needs awareness, send a
+follow-up `agenttalk broadcast --kind note`; do not treat a broadcast
+as a multi-party acceptance protocol.
+
 ## Identity
 
-Resolve your name and the peer's in your current shell:
+Resolve your name and default peer in your current shell:
 
 ```powershell
 $SELF = if ($env:AGENTTALK_SELF) { $env:AGENTTALK_SELF } else { "claude" }
 $PEER = if ($env:AGENTTALK_PEER) { $env:AGENTTALK_PEER } else { "codex" }
 ```
 
-Always resolve inside your current shell - env from prior tool calls
-does not persist across separate tool-call processes.
+`PEER` is the default decision target for the canonical two-agent
+pair. In a larger roster, use `agenttalk roster` and choose a specific
+agent such as `codex-lead`, `codex-rev`, or the named owner. Always
+resolve inside your current shell - env from prior tool calls does
+not persist across separate tool-call processes.
 
 ## Split-work guard
 
@@ -34,10 +41,17 @@ approved the split, state the ownership boundary in the proposal or a
 separate `kind=note`, and every implemented piece still needs a
 `kind=review-request` cross-review before the work is called done.
 
+This rule applies equally in a team roster: a proposal can lock the
+plan, but it cannot silently make a named agent, role, or group own
+implementation work.
+
 ## Procedure
 
 1. Resolve `$SELF` and `$PEER`.
-2. Build the proposal body:
+2. Choose `$TARGET`. Use `$PEER` for the default pair; otherwise pick
+   the named decision-maker from `agenttalk roster`. If the user did
+   not name a target and several agents could decide, ask.
+3. Build the proposal body:
    ```text
    ## Problem
    <what needs a decision>
@@ -54,20 +68,21 @@ separate `kind=note`, and every implemented piece still needs a
    ## Decision requested
    <accepted / rejected / countered, and what each means>
    ```
-3. Send:
+4. Send:
    ```powershell
-   agenttalk propose --from $SELF --to $PEER `
+   $TARGET = if ($env:AGENTTALK_PEER) { $env:AGENTTALK_PEER } else { "codex" }
+   agenttalk propose --from $SELF --to $TARGET `
      --subject "<one-line decision>" `
      -m $body
    ```
    The command writes `kind=proposal`, auto-mints
    `meta.request_id=pp-...` if absent, and prints the proposal id
    unless `--quiet`.
-4. Wait for the response:
+5. Wait for the response:
    ```powershell
    agenttalk wait --for $SELF --timeout 600
    ```
-5. Match the response by `meta.request_id`.
+6. Match the response by `meta.request_id`.
    - `proposal-response status=accepted`: proceed with the decision.
    - `proposal-response status=rejected`: do not proceed; either revise
      or ask the user.
@@ -92,7 +107,7 @@ To counter a proposal you received:
    ```
 2. Send the counter as a fresh proposal:
    ```powershell
-   agenttalk propose --from $SELF --to $PEER `
+   agenttalk propose --from $SELF --to $TARGET `
      --in-reply-to <old-request-id> `
      --subject "<counter proposal>" `
      -m $body

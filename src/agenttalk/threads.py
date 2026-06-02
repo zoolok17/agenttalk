@@ -25,7 +25,7 @@ unsigned response could falsely close a real open thread even though
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from agenttalk.store import Message
@@ -99,9 +99,14 @@ class Thread:
     age_seconds: float | None
     last_msg_id: str
     unread: bool
+    # Broadcast (multi-party) fields — populated only when is_broadcast.
+    is_broadcast: bool = False
+    audience: list[str] = field(default_factory=list)
+    responded: list[str] = field(default_factory=list)
+    pending: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "request_id": self.request_id,
             "opener_kind": self.opener_kind,
             "subject": self.subject,
@@ -113,6 +118,13 @@ class Thread:
             "last_msg_id": self.last_msg_id,
             "unread": self.unread,
         }
+        # Keep pairwise output byte-identical; only broadcasts add fields.
+        if self.is_broadcast:
+            d["is_broadcast"] = True
+            d["audience"] = self.audience
+            d["responded"] = self.responded
+            d["pending"] = self.pending
+        return d
 
 
 def _parse_ts(ts: str) -> datetime | None:
@@ -127,6 +139,97 @@ def _parse_ts(ts: str) -> datetime | None:
     if dt.tzinfo is None:
         return None
     return dt
+
+
+def _derive_broadcast(
+    rid: str,
+    group: list[Message],
+    openers: list[Message],
+    *,
+    agent: str,
+    cursor: str,
+    now: datetime,
+) -> Thread | None:
+    """Derive the multi-party thread for a broadcast (fan-out) correlation.
+
+    ``openers`` are the per-recipient copies the broadcaster fanned out
+    (same sender, distinct recipients, all carrying ``meta.audience``).
+    A response is a message/note from an audience member back to the
+    broadcaster echoing ``rid``. Returns ``None`` if ``agent`` is neither
+    the broadcaster nor an audience member.
+    """
+    sender = openers[0].sender
+    audience = sorted({m.recipient for m in openers})
+    opener_kind = openers[0].kind
+    audience_label = (openers[0].meta or {}).get("audience") or "all"
+    first_opener_id = min(m.id for m in openers)
+
+    responded: set[str] = set()
+    responses: list[Message] = []
+    for m in group:
+        if m.id <= first_opener_id:
+            continue
+        if (m.kind in ("message", "note")
+                and m.sender in audience and m.recipient == sender):
+            responded.add(m.sender)
+            responses.append(m)
+    pending = [a for a in audience if a not in responded]
+
+    if agent == sender:
+        role, peer = "opener", f"@{audience_label}"
+        unconsumed = any(m.recipient == sender and m.id > cursor for m in responses)
+        if unconsumed:
+            state = "reply-waiting"
+            last = group[-1]
+        elif pending:
+            state = "open-outbound"
+            # Age from the BROADCAST itself (oldest opener), not the latest
+            # partial reply — otherwise a half-answered broadcast whose
+            # remaining members go silent would never trip the stale-thread
+            # warning (its age would reset on every reply received).
+            last = min(openers, key=lambda m: m.id)
+        else:
+            state = "closed"
+            last = group[-1]
+        unread = any(m.recipient == sender and m.id > cursor for m in group)
+    elif agent in audience:
+        role, peer = "responder", sender
+        # The broadcast question addressed to me is an opener, not a
+        # response — so it's owed-inbound until I reply, then closed.
+        state = "closed" if agent in responded else "owed-inbound"
+        # `last` spans both my inbound copy AND my own reply (which is
+        # addressed to the sender, not me) so a closed thread's age/id
+        # reflect my answer, not the original ask. `unread` stays
+        # inbound-only.
+        mine_in = [m for m in group if m.recipient == agent]
+        mine_all = [
+            m for m in group
+            if m.recipient == agent or (m.sender == agent and m.recipient == sender)
+        ]
+        last = mine_all[-1] if mine_all else group[-1]
+        unread = any(m.id > cursor for m in mine_in)
+    else:
+        return None  # not my thread
+
+    ts = _parse_ts(last.ts)
+    age = (now - ts).total_seconds() if ts is not None else None
+    return Thread(
+        request_id=rid,
+        opener_kind=opener_kind,
+        subject=openers[0].subject or "",
+        opener_sender=sender,
+        opener_recipient=audience_label,
+        peer=peer,
+        role=role,
+        state=state,
+        age_seconds=age,
+        last_msg_id=last.id,
+        unread=unread,
+        is_broadcast=True,
+        audience=audience,
+        responded=sorted(responded),
+        pending=pending,
+    )
 
 
 def derive_threads(
@@ -157,6 +260,19 @@ def derive_threads(
     threads: list[Thread] = []
     for rid, group in groups.items():
         group.sort(key=lambda m: m.id)
+        # Broadcast (multi-party) thread: opener-kind copies tagged with an
+        # audience. Handled separately from the 1:1 pairwise path below.
+        bcast_openers = [
+            m for m in group
+            if m.kind in OPENER_KINDS and (m.meta or {}).get("audience")
+        ]
+        if bcast_openers:
+            t = _derive_broadcast(
+                rid, group, bcast_openers, agent=agent, cursor=cursor, now=now,
+            )
+            if t is not None:
+                threads.append(t)
+            continue
         opener = next((m for m in group if m.kind in OPENER_KINDS), None)
         if opener is None:
             # Orphan responses (opener in an archived/older session, or a
