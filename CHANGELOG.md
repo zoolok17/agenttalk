@@ -5,7 +5,12 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.0] — 2026-06-02
+
+Adds three coordination features developed jointly by Claude Code and
+Codex over agenttalk itself (collaborative design, a split
+implementation, and cross-review in both directions): thread tracking,
+first-class proposals, and anchored replies.
 
 ### Added
 
@@ -14,7 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   messages only. Default output shows actionable rows
   (`reply-waiting`, `owed-inbound`, `open-outbound`); `--all` includes
   `closed`. `--json` provides stable `threads[]` and `counts` fields
-  for skill automation.
+  for skill automation. State is computed by a chronological
+  ball-passing replay, so the review `needs-info` round-trip
+  (reviewer → requester → reviewer) and the multi-round consult
+  convention (a follow-up reusing the original `request_id`) are
+  tracked correctly rather than getting stuck.
 - **First-class proposals.** New `proposal` and `proposal-response`
   message kinds, plus `agenttalk propose`, support accept/reject/counter
   decision flow. Proposal correlation reuses `meta.request_id` with a
@@ -41,6 +50,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `agenttalk threads --for <agent>` before declaring work done or going
   idle, document proposal/proposal-response handling, and explicitly
   state that proposals cannot bypass user approval for split work.
+- The `send` skills (both sides) now frame `question` as a tracked
+  `q-` thread (steering true fire-and-forget pings to
+  `message`/`note`) and list the new proposal kinds, pointing at
+  `agenttalk propose` as the intended entry point.
+
+### Internal
+
+- New `Store.valid_messages()` exposes the roster- and
+  signature-validated message set (all recipients) that thread
+  derivation consumes, so a forged or unsigned response can never
+  falsely close a real thread. `messages_for` is refactored on top of
+  the shared `_validated_messages()` gate.
 
 ## [0.9.0] — 2026-05-24
 
