@@ -502,6 +502,22 @@ class Store:
     def _write_config(self, cfg: dict) -> None:
         _atomic_write_text(self.config_path, json.dumps(cfg, indent=2))
 
+    @staticmethod
+    def _cfg_dict(cfg: dict, key: str) -> dict:
+        """Return cfg[key] as a dict, coercing absent/null to a fresh {}.
+
+        ``load_config`` accepts an explicit ``"groups": null`` / ``"roles":
+        null`` (treated as 'none defined'), but ``dict.setdefault`` would
+        return that ``None`` and the next item assignment would raise
+        ``TypeError``. Mutators go through here so a null-valued config is
+        upgraded in place rather than crashing.
+        """
+        v = cfg.get(key)
+        if not isinstance(v, dict):
+            v = {}
+            cfg[key] = v
+        return v
+
     def groups(self) -> dict:
         """Return the ``{group: [members]}`` map ({} if none defined)."""
         return self.load_config().get("groups", {}) or {}
@@ -552,11 +568,11 @@ class Store:
             roster.append(name)
             cfg["agents"] = roster
         if role is not None:
-            roles = cfg.setdefault("roles", {})
+            roles = self._cfg_dict(cfg, "roles")
             roles[name] = role
             validate_roles(roles, roster)
         if groups:
-            g = cfg.setdefault("groups", {})
+            g = self._cfg_dict(cfg, "groups")
             for gn in groups:
                 validate_group_name(gn)
                 members = g.setdefault(gn, [])
@@ -594,7 +610,7 @@ class Store:
         roster = cfg.get("agents", []) or []
         if name not in roster:
             raise ValueError(f"agent {name!r} is not in the roster {sorted(roster)}")
-        roles = cfg.setdefault("roles", {})
+        roles = self._cfg_dict(cfg, "roles")
         roles[name] = role
         validate_roles(roles, roster)
         self._write_config(cfg)
@@ -607,7 +623,7 @@ class Store:
         for m in members:
             if m not in roster:
                 raise ValueError(f"group member {m!r} is not in the roster {sorted(roster)}")
-        groups = cfg.setdefault("groups", {})
+        groups = self._cfg_dict(cfg, "groups")
         groups[group] = list(dict.fromkeys(members))  # de-dupe, preserve order
         validate_groups(groups, roster)
         self._write_config(cfg)

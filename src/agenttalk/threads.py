@@ -260,11 +260,16 @@ def derive_threads(
     threads: list[Thread] = []
     for rid, group in groups.items():
         group.sort(key=lambda m: m.id)
-        # Broadcast (multi-party) thread: opener-kind copies tagged with an
-        # audience. Handled separately from the 1:1 pairwise path below.
+        # Broadcast (multi-party) thread: question copies carrying a
+        # broadcast_id. Gate PRECISELY — `agenttalk broadcast` only ever
+        # fans out questions (message/note broadcasts aren't openers) and
+        # always sets broadcast_id, so this matches real broadcasts and
+        # nothing else. Keying on `audience` alone would misroute a plain
+        # `send --kind review-request --meta audience=...` into the
+        # multi-party path (where a review-result wouldn't close it).
         bcast_openers = [
             m for m in group
-            if m.kind in OPENER_KINDS and (m.meta or {}).get("audience")
+            if m.kind == "question" and (m.meta or {}).get("broadcast_id")
         ]
         if bcast_openers:
             t = _derive_broadcast(

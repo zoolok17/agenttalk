@@ -260,6 +260,24 @@ def test_broadcast_conflicting_request_and_broadcast_id_errors(tmp_path: Path) -
     )
 
 
+def test_roster_mutators_tolerate_null_groups_roles(tmp_path: Path) -> None:
+    """Fresh-review finding: an explicit `groups:null`/`roles:null` config
+    loads fine, but the mutators used to `setdefault` → None → TypeError."""
+    root = _team(tmp_path, ["a", "b"])
+    cfg_path = root / ".agenttalk" / "config.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["roles"] = None
+    cfg["groups"] = None
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+    store = Store(root)
+    store.set_role("a", "lead")          # must not raise TypeError
+    store.set_group("g", ["a", "b"])
+    store.add_agent("c", role="reviewer", groups=["g"])
+    out = store.load_config()
+    assert out["roles"]["a"] == "lead" and out["roles"]["c"] == "reviewer"
+    assert "a" in out["groups"]["g"] and "c" in out["groups"]["g"]
+
+
 # ---------------------------------------------- review-fix regressions
 
 def test_validators_fail_closed_on_empty_roster() -> None:

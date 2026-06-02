@@ -5,6 +5,28 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1] — 2026-06-02
+
+Patch release from the fresh-reviewer experiment: Claude Code and
+Codex each spawned a fresh sub-agent with no prior context to review
+the v0.11.0 multi-agent release, then compared findings.
+
+### Fixed
+
+- **Broadcast thread detection is now stricter.** `agenttalk threads`
+  no longer treats any opener carrying free-form `meta.audience` as a
+  broadcast. A normal point-to-point `question`, `review-request`, or
+  `proposal` with a stray `--meta audience=...` now stays on the
+  pairwise path, so its expected response kind can close the thread.
+  Broadcast derivation requires `kind=question` plus
+  `meta.broadcast_id`, which the `agenttalk broadcast` command always
+  sets.
+- **Roster mutators tolerate null team maps.** A config containing
+  explicit `groups: null` or `roles: null` no longer crashes roster
+  admin operations with a `TypeError`. `roster set-role`, `set-group`,
+  and `add --role/--group` now coerce null or absent team maps to an
+  empty map before mutation.
+
 ## [0.11.0] — 2026-06-02
 
 Adds the multi-agent team surface: roster roles/groups, broadcast
@@ -941,6 +963,7 @@ pre-answer consult primitive.
 - Atomic JSON-per-message writes; per-agent cursors; markdown +
   JSONL transcript export.
 
+[0.11.1]: https://github.com/zoolok17/agenttalk/releases/tag/v0.11.1
 [0.11.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.11.0
 [0.10.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.10.0
 [0.9.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.9.0

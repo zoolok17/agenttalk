@@ -1,3 +1,3 @@
 """agenttalk: file-backed message bus for two coding-agent CLIs."""
 
-__version__ = "0.11.0"
+__version__ = "0.11.1"

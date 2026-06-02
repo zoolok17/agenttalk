@@ -291,6 +291,21 @@ def test_broadcast_partial_then_full_responses() -> None:
     assert done[0].responded == ["dev1", "dev2"] and done[0].pending == []
 
 
+def test_question_with_stray_audience_but_no_broadcast_id_is_pairwise() -> None:
+    """Fresh-review finding: detection must require broadcast_id, not just
+    audience — else a plain `send --kind question --meta audience=foo` (or a
+    review-request carrying audience) gets misrouted into the multi-party
+    path where its real response kind can't close it."""
+    m = Message(
+        id="001", ts=_BASE.isoformat().replace("+00:00", "Z"),
+        sender="alpha", recipient="beta", kind="question",
+        subject="", body="x", meta={"request_id": "q1", "audience": "foo"},
+    )
+    rows = derive_threads([m], agent="alpha", cursor="", now=_BASE)
+    assert rows[0].is_broadcast is False        # pairwise, not broadcast
+    assert rows[0].state == "open-outbound"
+
+
 def test_note_broadcast_is_not_tracked() -> None:
     """A note/message broadcast is FYI fan-out — no obligation, no thread."""
     msgs, _ = _broadcast("b-9", "lead", ["dev1", "dev2"], kind="note")
