@@ -30,7 +30,8 @@ does not persist across separate tool-call processes.
 **Outside spec-kitty, do NOT split implementation work with the peer
 without first asking the user.** The user invoked you to do a task;
 the peer is for review or specific delegated subtasks, not for
-unilaterally carving up the work.
+unilaterally carving up the work. Do not use `kind=proposal` or
+`$agenttalk-propose` to route around this rule.
 
 If the user explicitly approves a split:
 
@@ -121,7 +122,8 @@ reviews, or `0` for no timeout.
 
 If `wait` times out: tell the user and ask whether to keep waiting or
 check `agenttalk status` to see whether the peer's `last_seen` is
-fresh.
+fresh. Also run `agenttalk threads --for "$SELF"`; if your correlated
+reply is already `reply-waiting`, consume it before asking the user.
 
 ### 5. Act on the reply
 
@@ -135,12 +137,23 @@ Match it by `meta.request_id`:
 If ambiguous or asks for a decision only the human can make,
 **stop and ask the user**.
 
+Before declaring the handoff handled, run:
+
+```bash
+agenttalk threads --for "$SELF"
+```
+
+Resolve any `reply-waiting` or `owed-inbound` rows. If multiple
+threads are open, use `agenttalk reply --to-id <message_id>` or
+`--to-request <request_id>` so the reply echoes the intended
+`request_id`.
+
 ## When you might receive a request while waiting
 
-If your own request is outstanding and an incoming
-`kind=review-request` arrives, handle the OLDER `request_id` (or
-earlier message timestamp) first to avoid both sides blocking each
-other.
+If your own request is outstanding and an incoming `kind=review-request`
+or `kind=proposal` arrives, handle the older or more urgent thread
+first to avoid both sides blocking each other. `agenttalk threads --for
+"$SELF"` is the authoritative view of what is owed.
 
 ## Constraints
 

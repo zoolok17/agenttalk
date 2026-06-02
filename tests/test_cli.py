@@ -1134,3 +1134,209 @@ def test_reply_review_result_still_echoes_request_id(
                "--meta", "status=approved", "-m", "looks good"], store_root)
     assert rc == 0
     assert store.messages_for("alpha")[-1].meta.get("request_id") == "orig-456"
+
+
+# ============================ 0.10.0: proposals ============================
+
+def test_propose_mints_pp_id_and_proposal_kind(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    rc = _run(["propose", "--from", "alpha", "--to", "beta",
+               "--subject", "use X", "-m", "## Problem\nneed X"], store_root)
+    assert rc == 0
+    msg = store.messages_for("beta")[-1]
+    assert msg.kind == "proposal"
+    assert msg.meta.get("request_id", "").startswith("pp-")
+
+
+def test_propose_print_id_outputs_request_id(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    rc = _run(["propose", "--from", "alpha", "--to", "beta",
+               "-m", "do X", "--print-id", "--quiet"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out.strip()
+    # --quiet suppresses the render + the "(proposal id: ...)" line, so the
+    # only stdout is the bare correlation id for capture.
+    assert out.startswith("pp-")
+    assert store.messages_for("beta")[-1].meta["request_id"] == out
+
+
+def test_propose_in_reply_to_sets_meta(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    rc = _run(["propose", "--from", "alpha", "--to", "beta",
+               "--in-reply-to", "pp-old123", "-m", "counter"], store_root)
+    assert rc == 0
+    assert store.messages_for("beta")[-1].meta.get("in_reply_to") == "pp-old123"
+
+
+def test_propose_empty_body_errors(store_root: Path) -> None:
+    _run_expect_exit(["propose", "--from", "alpha", "--to", "beta"], store_root, 2)
+
+
+def test_send_question_autogen_q_request_id(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    rc = _run(["send", "--from", "alpha", "--to", "beta",
+               "--kind", "question", "-m", "what now?"], store_root)
+    assert rc == 0
+    assert store.messages_for("beta")[-1].meta.get("request_id", "").startswith("q-")
+
+
+def test_reply_proposal_response_echoes_request_id(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    _run(["propose", "--from", "alpha", "--to", "beta",
+          "--meta", "request_id=pp-abc", "-m", "do X"], store_root)
+    capsys.readouterr()
+    rc = _run(["reply", "--from", "beta", "--kind", "proposal-response",
+               "--meta", "status=accepted", "-m", "agreed"], store_root)
+    assert rc == 0
+    resp = store.messages_for("alpha")[-1]
+    assert resp.kind == "proposal-response"
+    assert resp.meta.get("request_id") == "pp-abc"
+    assert resp.meta.get("status") == "accepted"
+
+
+def test_reply_counter_proposal_opens_fresh_thread(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """A reply whose own kind is `proposal` (a counter) must NOT inherit the
+    anchored proposal's request_id — it opens a new thread."""
+    _run(["propose", "--from", "alpha", "--to", "beta",
+          "--meta", "request_id=pp-abc", "-m", "do X"], store_root)
+    capsys.readouterr()
+    rc = _run(["reply", "--from", "beta", "--kind", "proposal",
+               "-m", "do Y instead"], store_root)
+    assert rc == 0
+    new_rid = store.messages_for("alpha")[-1].meta.get("request_id", "")
+    assert new_rid != "pp-abc"
+    assert new_rid.startswith("pp-")
+
+
+def test_proposal_response_missing_request_id_warns(
+    store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    rc = _run(["send", "--from", "beta", "--to", "alpha",
+               "--kind", "proposal-response", "--meta", "status=accepted",
+               "-m", "ok"], store_root)
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "proposal-response has no request_id" in err
+
+
+# ====================== 0.10.0: anchored reply ============================
+
+def test_reply_to_id_anchors_specific_message(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    # Two threads open toward alpha, each from a different peer-side msg.
+    _run(["send", "--from", "beta", "--to", "alpha", "--kind", "review-request",
+          "--meta", "request_id=first", "-m", "thread one"], store_root)
+    first_id = store.messages_for("alpha")[0].id
+    _run(["send", "--from", "beta", "--to", "alpha", "--kind", "question",
+          "--meta", "request_id=second", "-m", "thread two"], store_root)
+    capsys.readouterr()
+    # Anchor explicitly to the FIRST (older) message, not the most recent.
+    rc = _run(["reply", "--from", "alpha", "--to-id", first_id,
+               "--kind", "review-result", "--meta", "status=approved",
+               "-m", "verdict for thread one"], store_root)
+    assert rc == 0
+    reply = store.messages_for("beta")[-1]
+    assert reply.meta.get("request_id") == "first"  # echoed the anchor's id
+    assert reply.recipient == "beta"
+
+
+def test_reply_to_id_not_found_errors(store_root: Path) -> None:
+    _run_expect_exit(
+        ["reply", "--from", "alpha", "--to-id", "nope-404", "-m", "x"],
+        store_root, 2,
+    )
+
+
+def test_reply_to_id_and_to_request_are_mutually_exclusive(store_root: Path) -> None:
+    # Supplying both anchors must be a usage error, not a silent pick.
+    _run_expect_exit(
+        ["reply", "--from", "alpha", "--to-id", "x", "--to-request", "y", "-m", "z"],
+        store_root, 2,
+    )
+
+
+def test_propose_no_longer_accepts_allow_empty(store_root: Path) -> None:
+    # --allow-empty was removed from propose (a proposal must have a body).
+    _run_expect_exit(
+        ["propose", "--from", "alpha", "--to", "beta", "--allow-empty"],
+        store_root, 2,
+    )
+
+
+def test_reply_to_request_anchors_by_request_id(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    _run(["send", "--from", "beta", "--to", "alpha", "--kind", "review-request",
+          "--meta", "request_id=first", "-m", "thread one"], store_root)
+    _run(["send", "--from", "beta", "--to", "alpha", "--kind", "question",
+          "--meta", "request_id=second", "-m", "thread two"], store_root)
+    capsys.readouterr()
+    rc = _run(["reply", "--from", "alpha", "--to-request", "first",
+               "--kind", "review-result", "--meta", "status=approved",
+               "-m", "verdict"], store_root)
+    assert rc == 0
+    assert store.messages_for("beta")[-1].meta.get("request_id") == "first"
+
+
+# ============================ 0.10.0: threads =============================
+
+def test_threads_json_open_outbound(
+    store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    _run(["propose", "--from", "alpha", "--to", "beta",
+          "--meta", "request_id=pp-1", "-m", "do X", "--quiet"], store_root)
+    capsys.readouterr()
+    rc = _run(["threads", "--for", "alpha", "--json"], store_root)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["agent"] == "alpha"
+    assert payload["counts"]["open-outbound"] == 1
+    assert payload["threads"][0]["request_id"] == "pp-1"
+    assert payload["threads"][0]["state"] == "open-outbound"
+
+
+def test_threads_default_hides_closed_all_shows(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    _run(["propose", "--from", "alpha", "--to", "beta",
+          "--meta", "request_id=pp-1", "-m", "do X", "--quiet"], store_root)
+    _run(["reply", "--from", "beta", "--kind", "proposal-response",
+          "--meta", "status=accepted", "-m", "ok"], store_root)
+    # alpha consumes the verdict so the thread is closed for them.
+    _run(["drain", "--for", "alpha", "--quiet"], store_root)
+    capsys.readouterr()
+    # default: no actionable rows
+    _run(["threads", "--for", "alpha", "--json"], store_root)
+    default = json.loads(capsys.readouterr().out)
+    assert default["threads"] == []
+    assert default["counts"]["closed"] == 1
+    # --all: the closed thread shows
+    _run(["threads", "--for", "alpha", "--all", "--json"], store_root)
+    allrows = json.loads(capsys.readouterr().out)
+    assert len(allrows["threads"]) == 1
+    assert allrows["threads"][0]["state"] == "closed"
+
+
+def test_status_warns_about_unconsumed_reply(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    _run(["propose", "--from", "alpha", "--to", "beta",
+          "--meta", "request_id=pp-1", "-m", "do X", "--quiet"], store_root)
+    _run(["reply", "--from", "beta", "--kind", "proposal-response",
+          "--meta", "status=accepted", "-m", "ok"], store_root)
+    capsys.readouterr()
+    _run(["status", "--json"], store_root)
+    payload = json.loads(capsys.readouterr().out)
+    warnings = " ".join(payload["warnings"])
+    # alpha has an unconsumed proposal-response sitting in the inbox.
+    assert "unconsumed response" in warnings
+    assert "pp-1" in warnings
+

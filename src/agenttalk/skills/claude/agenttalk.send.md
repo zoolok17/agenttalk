@@ -30,6 +30,12 @@ does not persist.
 - For request/response patterns where you must wait, use
   `/agenttalk.handoff` instead.
 
+For true fire-and-forget traffic, use `kind=message` or `kind=note`.
+`kind=question` opens a tracked `q-` request thread; use it only when
+the peer really owes an answer, and tell the user the question is now
+pending. If the answer is needed before you continue, use
+`/agenttalk.handoff` instead.
+
 **Do NOT use this skill to coordinate splitting implementation work**
 (e.g., "I'll do the frontend, you do the backend") without first
 asking the user. See `/agenttalk.handoff` and `/agenttalk.listen` for
@@ -47,11 +53,15 @@ approved, every piece MUST be cross-reviewed via `/agenttalk.handoff`.
    agenttalk send --from $SELF --to $PEER --kind <kind> --subject "<one-line>" -m "<body>"
    ```
 4. `--kind` values: `message` (default), `note`, `question`,
-   `review-request`, `review-result`. Use `--meta key=value` for any
-   structured payload.
+   `review-request`, `review-result`, `proposal`, `proposal-response`.
+   Use `note` for informational fire-and-forget and `question` for a
+   tracked question. Prefer `/agenttalk.propose` over raw
+   `send --kind proposal`. Use `--meta key=value` for any structured
+   payload.
 5. The CLI prints the rendered message — do not repeat it.
 6. Do not wait for a reply. Return control to the user, mentioning the
-   message id in one short line.
+   message id in one short line. If you sent `kind=question`, also
+   mention that it is tracked by `agenttalk threads` until answered.
 
 ## Constraints
 

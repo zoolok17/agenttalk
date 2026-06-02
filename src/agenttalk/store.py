@@ -42,6 +42,15 @@ KNOWN_KINDS = frozenset({
     "question",
     "review-request",
     "review-result",
+    # Proposal pair: one agent proposes a concrete solution/approach and
+    # the peer accepts / rejects / counters. Distinct from `question`
+    # (open-ended) and `review-request` (review of work already done).
+    # Correlated via meta.request_id like the review pair (the `propose`
+    # command mints a `pp-` id); a `proposal-response` carries
+    # meta.status=accepted|rejected|countered. A counter is a fresh
+    # `proposal` with meta.in_reply_to=<old request_id>. Added in 0.10.0.
+    "proposal",
+    "proposal-response",
     "wake",
     "end",
     # Control-plane kind: peer is still drafting a real reply. Receivers
@@ -611,21 +620,32 @@ class Store:
                     out.append((m.id, str(e)))
         return out
 
-    def messages_for(self, agent: str, *, since_id: str | None = None) -> list[Message]:
-        """Return validated messages addressed to ``agent``.
+    def valid_messages(self) -> list[Message]:
+        """Return every roster- AND signature-valid message, ALL recipients.
 
-        Silently skips messages that fail schema/roster validation —
-        and, when ``signing_enforced()`` is true (i.e. a per-user HMAC
-        key file exists for this project), silently skips messages
-        missing a valid HMAC signature. Callers (wait, recv) never act
-        on unverified input. Use ``list_invalid_messages()`` to see
-        what was skipped.
+        Same trust gate as ``messages_for`` (schema + roster + — when
+        ``signing_enforced()`` — HMAC signature) but WITHOUT the
+        single-recipient filter. This is the input thread derivation
+        (``agenttalk threads`` / status warnings) must use: deriving
+        from ``all_messages()`` instead would let a forged or unsigned
+        ``review-result`` / ``proposal-response`` falsely close a real
+        open thread even though ``wait`` / ``recv`` would have skipped
+        it. Sorted by id (chronological).
+        """
+        return self._validated_messages()
+
+    def _validated_messages(self) -> list[Message]:
+        """Shared trust gate behind ``messages_for`` and ``valid_messages``.
+
+        Applies schema/roster validation and (when enforced) HMAC
+        signature verification to every scanned message, returning the
+        survivors in id order. No recipient/since filtering — callers
+        layer that on top.
         """
         try:
             cfg = self.load_config()
             roster = cfg.get("agents", []) or []
         except (ValueError, OSError, FileNotFoundError):
-            cfg = {}
             roster = []
         require_sig = self.signing_enforced()
         project_id = self.project_id() if require_sig else None
@@ -636,10 +656,8 @@ class Store:
             except (FileNotFoundError, OSError, ValueError):
                 key = None  # key vanished between check and load — refuse
         valid, _ = self._scan_messages()
-        msgs: list[Message] = []
+        out: list[Message] = []
         for m in valid:
-            if m.recipient != agent:
-                continue
             try:
                 m.validate(roster)
             except ValueError:
@@ -653,6 +671,23 @@ class Store:
                     )
                 except ValueError:
                     continue
+            out.append(m)
+        return out
+
+    def messages_for(self, agent: str, *, since_id: str | None = None) -> list[Message]:
+        """Return validated messages addressed to ``agent``.
+
+        Silently skips messages that fail schema/roster validation —
+        and, when ``signing_enforced()`` is true (i.e. a per-user HMAC
+        key file exists for this project), silently skips messages
+        missing a valid HMAC signature. Callers (wait, recv) never act
+        on unverified input. Use ``list_invalid_messages()`` to see
+        what was skipped.
+        """
+        msgs: list[Message] = []
+        for m in self._validated_messages():
+            if m.recipient != agent:
+                continue
             if since_id and m.id <= since_id:
                 continue
             msgs.append(m)

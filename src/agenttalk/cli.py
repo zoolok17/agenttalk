@@ -24,6 +24,7 @@ from agenttalk import codex_config as cxc
 from agenttalk import doctor as dr
 from agenttalk import install_skills as iskl
 from agenttalk import signing as _signing
+from agenttalk import threads as th
 
 # Hard ceiling on cumulative deadline extension from `composing` pings,
 # regardless of how many arrive. Prevents a misbehaving (or stuck) peer
@@ -71,37 +72,57 @@ def _parse_meta(items: list[str] | None) -> dict:
     return out
 
 
-def _maybe_autogen_request_id(kind: str, meta: dict, *, quiet: bool) -> None:
-    """For review-requests, mint a `request_id` into ``meta`` if absent.
+# Kinds that OPEN a trackable thread get a request_id auto-minted if the
+# caller didn't pass one, so `agenttalk threads` can correlate the reply.
+# Distinct prefixes make the id self-describing in logs/transcripts.
+_AUTOGEN_REQUEST_ID_PREFIX = {
+    "review-request": "rq-",
+    "question": "q-",
+    "proposal": "pp-",
+}
 
-    Closes the correlation gap from issue #5: a review-request with no
-    request_id leaves the peer's review-result with nothing to echo, so
-    request↔result can't be matched programmatically. Explicit
+# A response kind -> the opener kind it is meant to correlate with. Used
+# only for the soft missing-request_id warning.
+_RESPONSE_TO_OPENER = {
+    "review-result": "review-request",
+    "proposal-response": "proposal",
+}
+
+
+def _maybe_autogen_request_id(kind: str, meta: dict, *, quiet: bool) -> None:
+    """Mint a `request_id` into ``meta`` for thread-opening kinds if absent.
+
+    Originally closed the review-request correlation gap (issue #5); as
+    of 0.10.0 it also covers `question` and `proposal` so every thread
+    `agenttalk threads` should track is correlatable. Explicit
     ``--meta request_id=...`` always wins (we only fill a missing one).
     Prints the generated id in non-quiet mode so the sender knows what
-    to expect echoed back. Applies to any review-request caller (send
-    AND reply --kind review-request).
+    to expect echoed back.
     """
-    if kind != "review-request" or "request_id" in meta:
+    prefix = _AUTOGEN_REQUEST_ID_PREFIX.get(kind)
+    if prefix is None or "request_id" in meta:
         return
-    meta["request_id"] = "rq-" + uuid.uuid4().hex[:12]
+    meta["request_id"] = prefix + uuid.uuid4().hex[:12]
     if not quiet:
-        print(f"(auto request_id: {meta['request_id']})")
+        label = "proposal id" if kind == "proposal" else "auto request_id"
+        print(f"({label}: {meta['request_id']})")
 
 
 def _warn_missing_request_id(kind: str, meta: dict) -> None:
-    """Soft stderr warning when a review-result carries no request_id.
+    """Soft stderr warning when a response carries no request_id.
 
     Stays a warning (exit code unchanged) on purpose: a hard error
-    would break mixed-version peers and any review-result responding to
-    a pre-#5 request that never had an id to echo.
+    would break mixed-version peers and any response answering a
+    pre-correlation request that never had an id to echo. Covers both
+    `review-result` and `proposal-response`.
     """
-    if kind == "review-result" and "request_id" not in meta:
+    opener = _RESPONSE_TO_OPENER.get(kind)
+    if opener is not None and "request_id" not in meta:
         sys.stderr.write(
-            "agenttalk: warning: review-result has no request_id to correlate "
-            "with an open review-request.\n"
-            "  Pass --meta request_id=<id>, or use `agenttalk reply` which "
-            "auto-echoes the original request_id.\n"
+            f"agenttalk: warning: {kind} has no request_id to correlate "
+            f"with an open {opener}.\n"
+            f"  Pass --meta request_id=<id>, or use `agenttalk reply` which "
+            f"auto-echoes the original request_id.\n"
         )
 
 
@@ -214,6 +235,10 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 STALE_THRESHOLD_SECONDS = 60.0
 
+# An outbound request still unanswered after this long is surfaced as a
+# status warning — the peer may have missed it, or you forgot to wait.
+OPEN_OUTBOUND_STALE_SECONDS = 600.0
+
 
 def _gather_status(store: Store) -> dict:
     """Build the structured status payload shared by both output modes."""
@@ -273,7 +298,7 @@ def _gather_status(store: Store) -> dict:
         "invalid_messages": [{"id": mid, "reason": reason} for mid, reason in invalid],
         "agents": agents,
         "stale_threshold_seconds": STALE_THRESHOLD_SECONDS,
-        "warnings": _status_warnings(agents),
+        "warnings": _status_warnings(agents) + _thread_warnings(store, cfg),
     }
     if signing_enforced:
         health = _signing.inspect_key(project_id, store.root)
@@ -322,6 +347,99 @@ def _status_warnings(agents: list[dict]) -> list[str]:
             msg += " Whoever owes the next reply should send it."
         warnings.append(msg)
     return warnings
+
+
+def _thread_warnings(store: Store, cfg: dict) -> list[str]:
+    """Thread-correlation warnings shared with `agenttalk threads`.
+
+    Derived from the SAME validated message set + derivation as the
+    `threads` command (one source of truth — no drift). Surfaces the two
+    "forgot to check if the reviewer replied" footguns per agent:
+      1. a correlated response is sitting unread in the inbox; and
+      2. an outbound request has gone unanswered past the stale window.
+    """
+    roster = cfg.get("agents", []) or []
+    try:
+        msgs = store.valid_messages()
+    except (ValueError, OSError, FileNotFoundError):
+        return []
+    now = datetime.now(timezone.utc)
+    out: list[str] = []
+    for a in roster:
+        rows = th.derive_threads(msgs, agent=a, cursor=store.cursor(a), now=now)
+        waiting = [t for t in rows if t.state == "reply-waiting"]
+        if waiting:
+            ids = ", ".join(t.request_id for t in waiting[:3])
+            more = "" if len(waiting) <= 3 else f" (+{len(waiting) - 3} more)"
+            out.append(
+                f"{a}: {len(waiting)} unconsumed response(s) in inbox "
+                f"[{ids}{more}] — run `agenttalk drain --for {a}` then act "
+                f"(see `agenttalk threads --for {a}`)."
+            )
+        stale = [
+            t for t in rows
+            if t.state == "open-outbound"
+            and t.age_seconds is not None
+            and t.age_seconds > OPEN_OUTBOUND_STALE_SECONDS
+        ]
+        if stale:
+            t0 = stale[0]
+            out.append(
+                f"{a}: outbound {t0.opener_kind} {t0.request_id} still "
+                f"awaiting {t0.peer} after {_format_age(t0.age_seconds)} — "
+                f"peer may have missed it; check `agenttalk threads --for {a}`."
+            )
+    return out
+
+
+def cmd_threads(args: argparse.Namespace) -> int:
+    """Show open request/reply threads from one agent's perspective.
+
+    The "did the reviewer ever respond?" answer. Derives every
+    correlated thread (review-request/review-result,
+    proposal/proposal-response, question/answer) from validated
+    messages and labels each with a single actionable state. Default
+    view hides closed threads; `--all` includes them. `--json` emits the
+    stable structured contract for skills to parse.
+    """
+    store = _get_store(args)
+    cfg = store.load_config()
+    agent = _resolve_self(args.agent, roster=cfg.get("agents") or [])
+    all_rows = th.derive_threads(
+        store.valid_messages(), agent=agent, cursor=store.cursor(agent),
+    )
+    cnts = th.counts(all_rows)
+    shown = all_rows if args.all else [t for t in all_rows if t.state in th.ACTIONABLE_STATES]
+
+    if args.json:
+        print(json.dumps({
+            "agent": agent,
+            "threads": [t.to_dict() for t in shown],
+            "counts": cnts,
+        }, indent=2))
+        return 0
+
+    summary = " ".join(f"{k}={v}" for k, v in cnts.items())
+    print(f"threads for {agent}:  ({summary})")
+    if not shown:
+        scope = "threads" if args.all else "actionable threads"
+        print(f"  (no {scope})")
+        return 0
+    label = {
+        "reply-waiting": "REPLY-WAITING",
+        "owed-inbound": "OWED-INBOUND ",
+        "open-outbound": "OPEN-OUTBOUND",
+        "closed": "closed       ",
+    }
+    for t in shown:
+        age = _format_age(t.age_seconds) if t.age_seconds is not None else "?"
+        flag = " (unread)" if t.unread else ""
+        subj = f'  "{t.subject}"' if t.subject else ""
+        print(
+            f"  [{label.get(t.state, t.state)}] {t.request_id:<16} "
+            f"{t.opener_kind:<15} peer={t.peer:<10} age={age:<8}{subj}{flag}"
+        )
+    return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -437,6 +555,55 @@ def cmd_composing(args: argparse.Namespace) -> int:
     )
     if not args.quiet:
         print(f"(composing ping sent: {sender} -> {recipient}; id={msg.id})")
+    return 0
+
+
+def cmd_propose(args: argparse.Namespace) -> int:
+    """Send a `proposal`: a concrete solution/approach for the peer to
+    accept / reject / counter.
+
+    Distinct from `question` (open-ended) and `review-request` (review
+    of existing work). Auto-mints a `pp-` request_id so the peer's
+    `proposal-response` can be correlated by `agenttalk threads`. The
+    peer replies with `agenttalk reply --kind proposal-response --meta
+    status=accepted|rejected|countered`; a counter is a fresh proposal
+    sent with `--in-reply-to <this id>`.
+    """
+    store = _get_store(args)
+    cfg = store.load_config()
+    roster = cfg.get("agents") or []
+    sender = _resolve_self(args.sender, roster=roster)
+    recipient = _resolve_peer(args.recipient, cfg, sender)
+    body = _read_body(args)
+    if not body:
+        # A proposal with no body is meaningless and would still open a
+        # tracked thread, so — unlike send/reply — there is no
+        # --allow-empty escape hatch here.
+        sys.stderr.write(
+            "agenttalk propose: empty body (use -m TEXT, --file PATH, or pipe "
+            "stdin).\n"
+            "  A proposal should state: Problem / Proposed solution / "
+            "Alternatives considered / Tradeoffs / Decision requested.\n"
+        )
+        return 2
+    meta = _parse_meta(args.meta)
+    if args.in_reply_to:
+        meta.setdefault("in_reply_to", args.in_reply_to)
+    _maybe_autogen_request_id("proposal", meta, quiet=args.quiet)
+    msg = store.send(
+        sender=sender,
+        recipient=recipient,
+        body=body,
+        kind="proposal",
+        subject=args.subject or "",
+        meta=meta,
+    )
+    if not args.quiet:
+        print(render(msg, header=f"AGENTTALK :: PROPOSAL  {msg.sender} -> {msg.recipient}"))
+    if args.print_id:
+        # Print the correlation id (the "proposal id"), not the message
+        # id — that's the token a counter references via --in-reply-to.
+        print(msg.meta.get("request_id", msg.id))
     return 0
 
 
@@ -829,24 +996,73 @@ def cmd_codex_config(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_reply(args: argparse.Namespace) -> int:
-    """Reply to the most recent received message.
+def _resolve_reply_anchor(
+    store: Store, sender: str, args: argparse.Namespace,
+) -> tuple[object | None, str | None]:
+    """Pick the message a `reply` is anchored to.
 
-    Auto-derives recipient (= sender of the last message) and echoes
-    `request_id` from the original meta so the peer's handoff/consult
-    flow can correlate the reply. Other meta keys are NOT echoed —
-    explicit pass via `--meta` is the only way to attach more.
+    With multiple threads open at once, "reply to the most recent
+    message" is a footgun — you can echo the wrong thread's request_id
+    and corrupt correlation. The explicit anchors fix that:
+
+    - ``--to-id <message_id>``: the specific received message with that
+      id. It MUST be addressed to ``sender`` (validated inbox only) —
+      you can't reply to a message that wasn't sent to you.
+    - ``--to-request <request_id>``: the latest non-control received
+      message in that correlation thread.
+    - neither: the most recent received non-control message (legacy).
+
+    Returns ``(message, None)`` on success or ``(None, reason)`` so the
+    caller can emit a precise error.
+    """
+    inbox = store.messages_for(sender)  # validated + addressed to me
+    to_id = getattr(args, "to_id", None)
+    to_request = getattr(args, "to_request", None)
+    if to_id:
+        for m in inbox:
+            if m.id == to_id:
+                return m, None
+        return None, (
+            f"--to-id {to_id} not found: no validated message with that id "
+            f"is addressed to {sender}."
+        )
+    if to_request:
+        matches = [
+            m for m in inbox
+            if (m.meta or {}).get("request_id") == to_request
+            and m.kind not in CONTROL_KINDS
+        ]
+        if matches:
+            return matches[-1], None
+        return None, (
+            f"--to-request {to_request}: no validated message addressed to "
+            f"{sender} carries that request_id."
+        )
+    last = store.last_received_for(sender)
+    if last is None:
+        return None, (
+            f"no messages in {sender}'s inbox to reply to. Use `agenttalk "
+            f"send` to start a new thread."
+        )
+    return last, None
+
+
+def cmd_reply(args: argparse.Namespace) -> int:
+    """Reply to a received message (the most recent, or an explicit anchor).
+
+    Auto-derives recipient (= sender of the anchored message) and echoes
+    its `request_id` so the peer's handoff/consult/proposal flow can
+    correlate the reply. Use `--to-id` / `--to-request` to anchor to a
+    specific thread when several are open. Other meta keys are NOT
+    echoed — explicit pass via `--meta` is the only way to attach more.
     """
     store = _get_store(args)
     cfg = store.load_config()
     roster = cfg.get("agents") or []
     sender = _resolve_self(args.sender, roster=roster)
-    last = store.last_received_for(sender)
-    if last is None:
-        sys.stderr.write(
-            f"agenttalk reply: no messages in {sender}'s inbox to reply to. "
-            f"Use `agenttalk send` to start a new thread.\n"
-        )
+    anchor, err = _resolve_reply_anchor(store, sender, args)
+    if anchor is None:
+        sys.stderr.write(f"agenttalk reply: {err}\n")
         return 2
     body = _read_body(args)
     if not body and not args.allow_empty:
@@ -854,23 +1070,24 @@ def cmd_reply(args: argparse.Namespace) -> int:
         return 2
     meta = _parse_meta(args.meta)
     # Auto-echo request_id for correlation. Explicit --meta wins.
-    # EXCEPTION: a reply that is ITSELF a review-request opens a NEW
-    # correlation thread (a counter-review), so it must NOT inherit the
-    # prior message's request_id — doing so would alias two distinct
-    # request/result pairs and make later results ambiguous. For that
-    # case we skip the echo and let _maybe_autogen_request_id mint a
-    # fresh id below (unless the user passed an explicit --meta one).
+    # EXCEPTION: a reply that is ITSELF a thread-opening kind
+    # (review-request = counter-review; proposal = counter-proposal)
+    # opens a NEW correlation thread, so it must NOT inherit the anchor's
+    # request_id — doing so would alias two distinct request/response
+    # pairs and make later responses ambiguous. For those we skip the
+    # echo and let _maybe_autogen_request_id mint a fresh id below
+    # (unless the user passed an explicit --meta one).
     if (
-        args.kind != "review-request"
+        args.kind not in ("review-request", "proposal")
         and "request_id" not in meta
-        and "request_id" in (last.meta or {})
+        and "request_id" in (anchor.meta or {})
     ):
-        meta["request_id"] = last.meta["request_id"]
+        meta["request_id"] = anchor.meta["request_id"]
     _maybe_autogen_request_id(args.kind, meta, quiet=args.quiet)
     _warn_missing_request_id(args.kind, meta)
     msg = store.send(
         sender=sender,
-        recipient=last.sender,
+        recipient=anchor.sender,
         body=body,
         kind=args.kind,
         subject=args.subject or "",
@@ -1055,6 +1272,23 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Emit structured JSON instead of human-readable text.")
     ps.set_defaults(func=cmd_status)
 
+    pth = sub.add_parser(
+        "threads",
+        help="Show open request/reply threads from an agent's perspective — "
+             "the 'did the reviewer ever respond?' answer. Each thread gets "
+             "one state: reply-waiting (unconsumed response in your inbox), "
+             "owed-inbound (peer is waiting on you), open-outbound (you're "
+             "waiting on the peer), or closed. Run it before declaring work "
+             "done or going idle.",
+    )
+    pth.add_argument("--for", dest="agent",
+                     help="Agent name (default: $AGENTTALK_SELF)")
+    pth.add_argument("--all", action="store_true",
+                     help="Include closed threads (default: actionable only).")
+    pth.add_argument("--json", action="store_true",
+                     help="Emit the structured contract for skills to parse.")
+    pth.set_defaults(func=cmd_threads)
+
     pse = sub.add_parser("send", help="Send a message from one agent to another.")
     pse.add_argument("--from", dest="sender", help="Sender agent name (default: $AGENTTALK_SELF)")
     pse.add_argument("--to", dest="recipient",
@@ -1062,9 +1296,11 @@ def build_parser() -> argparse.ArgumentParser:
                           "(default: $AGENTTALK_PEER, or the single other agent in the roster)")
     pse.add_argument("--kind", default="message",
                      help="Message kind. Known: message, note, question, "
-                          "review-request, review-result, wake, end, composing. "
+                          "review-request, review-result, proposal, "
+                          "proposal-response, wake, end, composing. "
                           "Unknown kinds are rejected at write time. Prefer the "
-                          "`agenttalk composing` subcommand over `send --kind composing`.")
+                          "`agenttalk propose`/`composing` subcommands over "
+                          "`send --kind proposal`/`composing`.")
     pse.add_argument("--subject", help="One-line summary")
     pse.add_argument("--meta", action="append", help="key=value (repeatable)")
     pse.add_argument("-m", "--message", help="Body text (else --file or stdin)")
@@ -1095,6 +1331,33 @@ def build_parser() -> argparse.ArgumentParser:
                             "the line')")
     pcomp.add_argument("--quiet", action="store_true")
     pcomp.set_defaults(func=cmd_composing)
+
+    ppro = sub.add_parser(
+        "propose",
+        help="Propose a concrete solution for the peer to accept / reject / "
+             "counter. Auto-mints a `pp-` correlation id so the response is "
+             "trackable by `agenttalk threads`. Peer replies with `reply "
+             "--kind proposal-response --meta status=accepted|rejected|"
+             "countered`; a counter is a fresh `propose --in-reply-to <id>`.",
+    )
+    ppro.add_argument("--from", dest="sender",
+                      help="Sender agent name (default: $AGENTTALK_SELF)")
+    ppro.add_argument("--to", dest="recipient",
+                      help="Recipient agent name (default: $AGENTTALK_PEER, "
+                           "or the single other agent in the roster)")
+    ppro.add_argument("--subject", help="One-line summary")
+    ppro.add_argument("--meta", action="append", help="key=value (repeatable)")
+    ppro.add_argument("-m", "--message", help="Body text (else --file or stdin)")
+    ppro.add_argument("--file", help="Read body from this file path")
+    ppro.add_argument("--in-reply-to", dest="in_reply_to",
+                      help="request_id of a prior proposal this one counters "
+                           "(sets meta.in_reply_to; the prior proposal should "
+                           "also get a proposal-response status=countered).")
+    ppro.add_argument("--print-id", action="store_true",
+                      help="Print the proposal's correlation id (request_id) "
+                           "on its own line — the token a counter references.")
+    ppro.add_argument("--quiet", action="store_true")
+    ppro.set_defaults(func=cmd_propose)
 
     pr = sub.add_parser("recv", help="Print all queued messages for an agent.")
     pr.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
@@ -1162,6 +1425,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prpl.add_argument("--from", dest="sender",
                       help="Sender agent name (default: $AGENTTALK_SELF)")
+    # --to-id and --to-request are two ways to name ONE anchor; allowing
+    # both would silently pick one and defeat the point of anchoring.
+    anchor_grp = prpl.add_mutually_exclusive_group()
+    anchor_grp.add_argument("--to-id", dest="to_id",
+                            help="Anchor to a SPECIFIC received message id "
+                                 "instead of the most recent (must be addressed "
+                                 "to you). Use when several threads are open so "
+                                 "you echo the right request_id.")
+    anchor_grp.add_argument("--to-request", dest="to_request",
+                            help="Anchor to the latest received message in this "
+                                 "correlation thread (by request_id).")
     prpl.add_argument("--kind", default="message",
                       help="Message kind (default: message; see `agenttalk send --help`)")
     prpl.add_argument("--subject", help="One-line summary")

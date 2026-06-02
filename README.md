@@ -41,8 +41,9 @@ remains the source of truth for state; agenttalk is just a wake signal.
 ### For ad-hoc cross-agent messaging (not spec-kitty)
 
 - **Terminal A (Claude).** `/agenttalk.handoff` (send + block on reply),
-  `/agenttalk.consult` (confer with peer before answering you), or
-  `/agenttalk.send` (fire and forget).
+  `/agenttalk.consult` (confer with peer before answering you),
+  `/agenttalk.propose` (ask the peer to accept/reject/counter a
+  concrete solution), or `/agenttalk.send` (fire and forget).
 - **Terminal B (Codex).** `$agenttalk-listen` (wait/respond loop).
 
 Both terminals show every message as it flies past. When you're done:
@@ -51,10 +52,11 @@ transcript under `.agenttalk/sessions/`.
 
 > **Naming convention:** Claude Code uses dotted skill names
 > (`agenttalk.send`, `agenttalk.listen`, `agenttalk.handoff`,
-> `agenttalk.sk-loop`) and Codex uses hyphenated names
+> `agenttalk.consult`, `agenttalk.propose`, `agenttalk.sk-loop`) and
+> Codex uses hyphenated names
 > (`agenttalk-send`, `agenttalk-listen`, `agenttalk-handoff`,
-> `agenttalk-sk-loop`). Behaviour is identical; only the slash-command
-> spelling differs.
+> `agenttalk-consult`, `agenttalk-propose`, `agenttalk-sk-loop`).
+> Behaviour is identical; only the slash-command spelling differs.
 
 ---
 
@@ -184,6 +186,41 @@ The handoff includes structured meta — `request_id`, `base_sha`,
 meta has a `mission` or `wp_id`, it runs the spec-kitty review path;
 otherwise it does an ad-hoc cross-review of the named scope.
 
+### First-class proposals — `propose`
+
+Use proposals when you want the peer to decide on a concrete solution
+before either agent proceeds:
+
+```text
+Terminal A (Claude):   /agenttalk.propose
+Terminal B (Codex):    $agenttalk-propose
+```
+
+The CLI command is `agenttalk propose`. It writes `kind=proposal`,
+auto-mints `meta.request_id=pp-...` if missing, and prints the
+proposal id unless `--quiet`. The proposal body should contain:
+
+```text
+## Problem
+## Proposed solution
+## Alternatives considered
+## Tradeoffs
+## Decision requested
+```
+
+The peer responds with:
+
+```powershell
+agenttalk reply --kind proposal-response --meta status=accepted -m "..."
+```
+
+Use `status=rejected` or `status=countered` instead when appropriate.
+A counter closes the old proposal with `status=countered`, then opens a
+fresh proposal with `agenttalk propose --in-reply-to <old-request-id>`.
+Proposals do **not** bypass the split-work rule: if a proposal assigns
+implementation ownership outside spec-kitty, the agents must ask you
+first, and every implemented piece still needs a read-only cross-review.
+
 ### Ending the session
 
 ```powershell
@@ -273,6 +310,9 @@ Outside a spec-kitty mission, the skills tell each agent **not to
 split implementation work with the peer without first asking you**.
 The user invoked them to do a task; the peer is for review or specific
 delegated subtasks, not for unilaterally carving up the work.
+First-class proposals follow the same rule: a `kind=proposal` can
+recommend a concrete plan, but it cannot assign ownership between
+agents unless you have approved that split.
 
 When you DO want them to split (e.g., "Claude does the frontend, Codex
 does the backend"):
@@ -385,8 +425,10 @@ so the long timeout is free observability.
 | Command | What it does |
 | --- | --- |
 | `agenttalk init [--here] [--agents A,B]` | Create `.agenttalk/` in the current dir. |
-| `agenttalk status` | Show roster, per-agent cursor, unread count, and **actionable warnings**: never-acked unread (cursor still `(none)`) and soft-deadlocks (two+ agents blocked in `wait` at once). |
-| `agenttalk send --from A --to B [--kind K] [--subject S] [--meta k=v] -m "body"` | Drop a message into the bus. Body can come from `-m`, `--file`, or stdin. A `review-request` without `--meta request_id=...` gets one minted + printed; a `review-result` without one warns (soft, exit 0). |
+| `agenttalk status` | Show roster, per-agent cursor, unread count, and **actionable warnings**: never-acked unread, soft-deadlocks, unconsumed correlated replies, and stale outbound threads. |
+| `agenttalk threads [--for A] [--all] [--json]` | Derive request/reply thread state from validated messages. Default view shows actionable rows only (`reply-waiting`, `owed-inbound`, `open-outbound`); `--all` includes `closed`. |
+| `agenttalk send --from A --to B [--kind K] [--subject S] [--meta k=v] -m "body"` | Drop a message into the bus. Body can come from `-m`, `--file`, or stdin. `review-request`, `question`, and `proposal` without `--meta request_id=...` get one minted + printed; `review-result` and `proposal-response` without one warn (soft, exit 0). |
+| `agenttalk propose [--from A] [--to B] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| stdin) [--in-reply-to ID] [--print-id] [--quiet]` | Send a first-class `proposal`. Auto-mints `meta.request_id=pp-...` if absent and prints `(proposal id: pp-...)` unless quiet. `--in-reply-to` sets `meta.in_reply_to` for counters. |
 | `agenttalk recv --for A [--ack] [--since ID] [--include-control]` | **Peek** at queued messages — does NOT move the cursor unless `--ack`. Plain `recv` that prints messages emits a hint pointing at `drain`. Hides `composing` pings by default; `--include-control` surfaces them. |
 | `agenttalk drain --for A [--include-control]` | **Consume**: print all unread AND advance the cursor to newest, in one shot. Same path as `recv --ack`. Use this instead of hand-rolled timestamp polling. |
 | `agenttalk wait --for A [--timeout 120] [--no-ack] [--grace 2] [--composing-extend 120]` | Block until a new message arrives, print it, advance the cursor. `--grace` does one final inbox scan after the deadline (catches replies that landed in the last fraction of a second). `--composing-extend` lengthens the deadline by N seconds for each `composing` ping the peer sends (capped at 1800 s total). |
@@ -396,13 +438,13 @@ so the long timeout is free observability.
 | `agenttalk end --from A [--reason ...]` | Notify the other agent(s) and write the transcript. |
 | `agenttalk reset [--archive]` | Clear **active bus state** (messages + cursors + heartbeats); preserves historical transcripts under `.agenttalk/sessions/` so past exports aren't lost. Bumps `session_id`. With `--archive`, instead moves **everything** (messages + state + sessions) under `.agenttalk/archived/<old_session>/`. Preserves config (roster) either way. |
 | `agenttalk hmac-init [--force]` | Generate the HMAC signing key for this project. Stored outside `.agenttalk/` (per-user config dir). The key's existence at the path-derived per-user location automatically activates signature enforcement — there's no config flag to flip. Override the default key path with `AGENTTALK_HMAC_KEY_FILE`. See `SECURITY.md`. |
-| `agenttalk reply [--from A] [--kind K] [--subject S] [--meta k=v] -m "body"` | Reply to the most recent received message. Auto-derives recipient (= sender of last message) and echoes `request_id` from the original meta for correlation. Explicit `--meta request_id=...` wins. A reply that is itself a `review-request` mints a fresh `request_id` if none was echoed. |
+| `agenttalk reply [--from A] [--to-id MSG_ID \| --to-request REQUEST_ID] [--kind K] [--subject S] [--meta k=v] -m "body"` | Reply to the most recent received message, or anchor to a specific received message/thread. Auto-derives recipient and echoes the anchor's `request_id`; explicit `--meta request_id=...` wins. A reply that opens a new thread (`review-request` or `proposal`) mints a fresh id instead of echoing. |
 | `agenttalk tail [--from-start] [--interval S] [--timeout S]` | Passive monitor: stream all messages as they arrive. Does **not** advance cursors or write heartbeats — safe to run in a third terminal alongside two active agents. `--from-start` replays existing messages first. |
 | `agenttalk serve [--port P] [--host H] [--access-log]` | Start a **read-only** local web dashboard at `http://127.0.0.1:8765/` for browsing the message log in a real browser. **Loopback-only by design** — only `127.0.0.1`, `::1`, and `localhost` are accepted; there is no flag to expose it elsewhere (SSH-tunnel `localhost:<port>` from another machine if needed). HTML output is escaped, strict CSP, `GET`/`HEAD` only, peer-IP check on every method. JSON at `/api/status` and `/api/messages` for scripting. See `SECURITY.md`. |
 | `agenttalk install-skills [--claude-only\|--codex-only] [--force] [--dry-run]` | Copy bundled skill files to `~/.claude/commands/` and `~/.codex/skills/`. Idempotent — preserves your local edits unless `--force`. |
 | `agenttalk codex-config [--enable\|--disable\|--status]` | Manage per-project sandbox/trust block in `~/.codex/config.toml` so Codex can call agenttalk from inside its sandbox. |
 | `agenttalk doctor [--json]` | Health check: store initialized, skills installed + in sync, Codex sandbox block configured, heartbeats fresh. Per the global exit-code contract, exit 2 on any error; warnings exit 0 with the warning state visible in output. |
-| `agenttalk status --json` | Structured status output for automation (consult freshness, external tooling). Same data as plain `status` plus `invalid_messages[]` for messages that fail schema/roster validation, a top-level `warnings[]` array, and per-agent `waiting` / `waiting_stale` fields (additive — existing keys unchanged). |
+| `agenttalk status --json` | Structured status output for automation (consult freshness, external tooling). Same data as plain `status` plus `invalid_messages[]`, `warnings[]`, per-agent `waiting` / `waiting_stale`, and thread-derived warning state (additive — existing keys unchanged). |
 | `agenttalk --version` | Print the installed version. |
 
 ### Reading the inbox: peek vs consume
@@ -426,6 +468,63 @@ cursor instead. `agenttalk status` will warn if an agent has unread
 with a never-set cursor, and flag a soft-deadlock if both agents are
 blocked in `wait` at the same time.
 
+### Tracking request/reply threads
+
+`agenttalk threads --for A` derives open request/reply state from
+validated messages only. It tracks messages that carry
+`meta.request_id`.
+
+Openers:
+- `review-request`
+- `question`
+- `proposal`
+
+Expected responses:
+- `review-request` -> `review-result`
+- `proposal` -> `proposal-response`
+- `question` -> a non-control `message` or `note` with the same
+  `request_id`
+
+Thread states from `--for A`'s perspective:
+- `reply-waiting`: a correlated response addressed to `A` is newer
+  than `A`'s cursor; consume it with `drain` or `wait`.
+- `owed-inbound`: the ball is on `A`; either the peer's opener has no
+  response from `A`, or a consumed `review-result status=needs-info`
+  bounced the ball back.
+- `open-outbound`: the ball is on the peer; `A`'s opener has no
+  response, or `A` sent `needs-info` and is awaiting the peer's info.
+- `closed`: a terminal correlated response exists (`approved`,
+  `rejected`, `accepted`, plain question answer, or
+  `proposal-response status=countered` for that proposal thread).
+
+Default output shows only actionable rows. `--all` includes closed
+threads. `--json` emits:
+
+```json
+{
+  "agent": "<me>",
+  "threads": [
+    {
+      "request_id": "rq-...",
+      "opener_kind": "review-request",
+      "subject": "WP ready",
+      "peer": "claude",
+      "role": "opener",
+      "state": "open-outbound",
+      "age_seconds": 42,
+      "last_msg_id": "20260602-...",
+      "unread": false
+    }
+  ],
+  "counts": {
+    "reply-waiting": 0,
+    "owed-inbound": 0,
+    "open-outbound": 1,
+    "closed": 0
+  }
+}
+```
+
 Message `--kind` values are validated against a fixed vocabulary
 (`store.KNOWN_KINDS`); unknown kinds are rejected at write time so a
 typo can't produce a "sent" message the receiver will silently skip:
@@ -434,7 +533,9 @@ typo can't produce a "sent" message the receiver will silently skip:
 - `note` — informational
 - `question` — needs a reply before the other side proceeds
 - `review-request` — "please review this scope"
-- `review-result` — "I reviewed; here's my verdict" (use `--meta status=approved|rejected`)
+- `review-result` — "I reviewed; here's my verdict" (use `--meta status=approved|rejected|needs-info`)
+- `proposal` — "I propose this concrete solution; accept, reject, or counter"
+- `proposal-response` — verdict on a proposal (use `--meta status=accepted|rejected|countered`)
 - `wake` — state-change signal for sk-loop (low-latency peer wake)
 - `end` — terminate the listen loop on the other side
 - `composing` — control-plane: "I'm still drafting a real reply, hold the line." Consumed by `agenttalk wait` as a deadline-extension signal; never returned as a reply. Hidden from `recv` by default. Send via `agenttalk composing` (preferred) or `send --kind composing`.

@@ -106,6 +106,7 @@ pre { background: #f7f7f7; padding: 1em; border: 1px solid #e0e0e0;
        background: #eee; font-size: 0.85em; margin-right: 4px; }
 .tag-end { background: #fde2e2; }
 .tag-review-request, .tag-review-result { background: #e2ecfd; }
+.tag-proposal, .tag-proposal-response { background: #e6f7ea; }
 .tag-question, .tag-wake { background: #fdf3e2; }
 .invalid { color: #b00; }
 .muted { color: #666; font-size: 0.9em; }

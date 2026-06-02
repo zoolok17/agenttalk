@@ -30,6 +30,12 @@ When the user asks Codex to send, ping, message, or notify the peer —
 and the request does not require waiting for a reply before
 continuing.
 
+For true fire-and-forget traffic, use `kind=message` or `kind=note`.
+`kind=question` opens a tracked `q-` request thread; use it only when
+the peer really owes an answer, and tell the user the question is now
+pending. If the answer is needed before you continue, use
+`agenttalk-handoff` instead.
+
 For request/response (e.g. "ask claude to fix X then wait"), use
 `agenttalk-handoff`. To act as a passive listener, use
 `agenttalk-listen`.
@@ -57,15 +63,20 @@ agenttalk send --from "$SELF" --to "$PEER" --kind <kind> \
   --subject "<one line>" -m "<body>"
 ```
 
-- `--kind` defaults to `message`. Use `note`, `question`, or
-  `review-result` (with `--meta status=approved|rejected`) when
-  appropriate.
+- `--kind` defaults to `message`. Use `note` for informational
+  fire-and-forget, `question` for a tracked question, `review-request`
+  / `review-result` for review flows, and `proposal` /
+  `proposal-response` only when you are deliberately using the
+  proposal protocol. Prefer `$agenttalk-propose` over raw
+  `send --kind proposal`.
 - `--meta key=value` is repeatable for structured payload.
 - The CLI prints the rendered message — do not repeat it.
 
 After sending, return control to the user with a one-line summary
-including the message id. Do **not** call `agenttalk wait` from this
-skill — that is `agenttalk-listen` or `agenttalk-handoff`.
+including the message id. If you sent `kind=question`, also mention
+that it is tracked by `agenttalk threads` until answered. Do **not**
+call `agenttalk wait` from this skill — that is `agenttalk-listen` or
+`agenttalk-handoff`.
 
 ## Do not
 

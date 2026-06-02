@@ -5,6 +5,43 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Thread tracking.** New `agenttalk threads [--for A] [--all]
+  [--json]` command derives request/reply state from validated
+  messages only. Default output shows actionable rows
+  (`reply-waiting`, `owed-inbound`, `open-outbound`); `--all` includes
+  `closed`. `--json` provides stable `threads[]` and `counts` fields
+  for skill automation.
+- **First-class proposals.** New `proposal` and `proposal-response`
+  message kinds, plus `agenttalk propose`, support accept/reject/counter
+  decision flow. Proposal correlation reuses `meta.request_id` with a
+  `pp-` prefix; counters close the old proposal with
+  `proposal-response status=countered` and open a fresh proposal with
+  `--in-reply-to <old-request-id>`.
+- **Anchored replies.** `agenttalk reply --to-id <message_id>` and
+  `--to-request <request_id>` anchor a response to a specific received
+  message or thread, avoiding accidental correlation to the latest
+  unrelated inbox message.
+- **Bundled proposal skills.** Added `/agenttalk.propose` for Claude
+  Code and `$agenttalk-propose` for Codex.
+
+### Changed
+
+- `review-request`, `question`, and `proposal` now auto-mint
+  `meta.request_id` when absent (`rq-`, `q-`, and `pp-` prefixes).
+  Missing `request_id` warnings now cover both `review-result` and
+  `proposal-response`.
+- `agenttalk status` warnings now include unconsumed correlated replies
+  and stale outbound threads, derived from the same thread helper as
+  `agenttalk threads`.
+- Bundled listen, handoff, and sk-loop skills now require
+  `agenttalk threads --for <agent>` before declaring work done or going
+  idle, document proposal/proposal-response handling, and explicitly
+  state that proposals cannot bypass user approval for split work.
+
 ## [0.9.0] — 2026-05-24
 
 Minor release. Fixes the issue #5 coordination hiccup (jointly

@@ -7,6 +7,25 @@ from pathlib import Path
 from agenttalk.install_skills import SKILLS_ROOT, install
 
 
+def _bundled_claude_count() -> int:
+    return len(list((SKILLS_ROOT / "claude").glob("*.md")))
+
+
+def _bundled_codex_count() -> int:
+    return len([
+        d for d in (SKILLS_ROOT / "codex").iterdir()
+        if d.is_dir() and (d / "SKILL.md").is_file()
+    ])
+
+
+def _bundled_total() -> int:
+    """Total bundled skill files. Derived from the source so adding a
+    skill (e.g. agenttalk.propose) doesn't require touching a magic
+    number in every count assertion — while still catching a real
+    bundled→installed mismatch."""
+    return _bundled_claude_count() + _bundled_codex_count()
+
+
 def test_bundled_skills_exist_in_package() -> None:
     """The bundled source dir must contain the canonical skill files;
     without them install-skills is a no-op and the README lies."""
@@ -19,6 +38,7 @@ def test_bundled_skills_exist_in_package() -> None:
         "agenttalk.consult.md",
         "agenttalk.handoff.md",
         "agenttalk.listen.md",
+        "agenttalk.propose.md",
         "agenttalk.send.md",
         "agenttalk.sk-loop.md",
     ]
@@ -27,6 +47,7 @@ def test_bundled_skills_exist_in_package() -> None:
         "agenttalk-consult",
         "agenttalk-handoff",
         "agenttalk-listen",
+        "agenttalk-propose",
         "agenttalk-send",
         "agenttalk-sk-loop",
     ]
@@ -39,7 +60,7 @@ def test_fresh_install_copies_all_files(tmp_path: Path) -> None:
     codex_dir = tmp_path / "codex"
     res = install(claude_dir=claude_dir, codex_dir=codex_dir)
     counts = res.counts()
-    assert counts.get("copied") == 10
+    assert counts.get("copied") == _bundled_total()
     # Layout
     assert (claude_dir / "agenttalk.send.md").is_file()
     assert (claude_dir / "agenttalk.consult.md").is_file()
@@ -52,7 +73,7 @@ def test_second_install_is_unchanged(tmp_path: Path) -> None:
     codex_dir = tmp_path / "codex"
     install(claude_dir=claude_dir, codex_dir=codex_dir)
     res = install(claude_dir=claude_dir, codex_dir=codex_dir)
-    assert res.counts().get("unchanged") == 10
+    assert res.counts().get("unchanged") == _bundled_total()
 
 
 def test_existing_modified_target_is_skipped_without_force(tmp_path: Path) -> None:
@@ -65,7 +86,7 @@ def test_existing_modified_target_is_skipped_without_force(tmp_path: Path) -> No
     res = install(claude_dir=claude_dir, codex_dir=codex_dir)
     counts = res.counts()
     assert counts.get("skipped") == 1
-    assert counts.get("unchanged") == 9
+    assert counts.get("unchanged") == _bundled_total() - 1
     # Confirm we didn't overwrite the user's edit
     assert target.read_text(encoding="utf-8") == "user local edits\n"
 
@@ -78,14 +99,14 @@ def test_force_overwrites_differing_targets(tmp_path: Path) -> None:
     target.write_text("user local edits\n", encoding="utf-8")
     res = install(claude_dir=claude_dir, codex_dir=codex_dir, force=True)
     assert res.counts().get("copied") == 1
-    assert res.counts().get("unchanged") == 9
+    assert res.counts().get("unchanged") == _bundled_total() - 1
 
 
 def test_dry_run_writes_nothing(tmp_path: Path) -> None:
     claude_dir = tmp_path / "claude"
     codex_dir = tmp_path / "codex"
     res = install(claude_dir=claude_dir, codex_dir=codex_dir, dry_run=True)
-    assert res.counts().get("would-copy") == 10
+    assert res.counts().get("would-copy") == _bundled_total()
     assert not claude_dir.exists()
     assert not codex_dir.exists()
 
@@ -106,7 +127,7 @@ def test_dry_run_reports_would_skip_when_target_differs_no_force(
     res = install(claude_dir=claude_dir, codex_dir=codex_dir, dry_run=True)
     counts = res.counts()
     assert counts.get("would-skip") == 1
-    assert counts.get("unchanged") == 9
+    assert counts.get("unchanged") == _bundled_total() - 1
     # And the file is untouched, of course.
     assert target.read_text(encoding="utf-8") == "user local edits\n"
 
@@ -128,7 +149,7 @@ def test_dry_run_with_force_reports_would_overwrite_no_writes(
     )
     counts = res.counts()
     assert counts.get("would-overwrite") == 1
-    assert counts.get("unchanged") == 9
+    assert counts.get("unchanged") == _bundled_total() - 1
     assert target.read_text(encoding="utf-8") == "user local edits\n", (
         "--dry-run --force must not write anything"
     )
@@ -139,7 +160,7 @@ def test_claude_only_skips_codex(tmp_path: Path) -> None:
     codex_dir = tmp_path / "codex"
     res = install(claude=True, codex=False, claude_dir=claude_dir, codex_dir=codex_dir)
     counts = res.counts()
-    assert counts.get("copied") == 5
+    assert counts.get("copied") == _bundled_claude_count()
     assert claude_dir.is_dir()
     assert not codex_dir.exists()
 

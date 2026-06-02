@@ -128,6 +128,18 @@ auto-arbitrate.
 
 ### Step 3 — if spec-kitty says wait
 
+Before blocking, check for non-wake obligations:
+
+```bash
+agenttalk threads --for "$SELF"
+```
+
+Resolve any `reply-waiting` or `owed-inbound` rows first. For
+proposals, respond with `proposal-response status=accepted|rejected|countered`;
+for review requests, follow the review workflow; for questions, answer
+inside the same `request_id` thread. Use `reply --to-id` or
+`--to-request` when multiple threads are open.
+
 ```bash
 agenttalk wait --for "$SELF" --timeout 30
 ```
@@ -165,10 +177,13 @@ If `spec-kitty next` returns mission complete:
 
 1. If a merge step is still pending and is your action: run
    `spec-kitty merge --mission "$MISSION"` from the project root.
-2. Otherwise: `agenttalk transcript --format md` and tell the user
+2. Otherwise: run `agenttalk threads --for "$SELF"` and resolve any
+   `reply-waiting` or `owed-inbound` rows before calling the session
+   done.
+3. Then: `agenttalk transcript --format md` and tell the user
    the path. Send `agenttalk end --from "$SELF" --reason "mission
    $MISSION complete"`.
-3. Exit the loop.
+4. Exit the loop.
 
 ### Step 5 — stop and ask the user when:
 
@@ -204,6 +219,13 @@ the new plan, then resume.
   end up waiting on each other (a soft-deadlock). If you suspect a
   stall, run `agenttalk status`: it flags never-acked unread and warns
   when both agents are blocked in `wait` at the same time.
+- **Before going idle or declaring done, run `agenttalk threads --for
+  "$SELF"`.** Resolve `reply-waiting` and `owed-inbound` rows so open
+  reviews, questions, and proposals are not left unread.
+- **Proposals do not override spec-kitty or user approval.** A
+  `kind=proposal` can discuss a concrete decision, but outside
+  spec-kitty it cannot assign implementation ownership without user
+  approval, and inside spec-kitty it never replaces `spec-kitty next`.
 - **Persistent context is the whole point.** Don't suggest spawning
   subprocesses or fresh sessions.
 - **3 reject cycles = stop.** Always escalate to the user.

@@ -97,9 +97,12 @@ def test_doctor_skill_check_warns_when_target_differs(
     assert data is not None
     assert data["differs"] == ["agenttalk.send.md"]
     assert data["missing"] == []
-    # claude side ships 5 skill files (consult, handoff, listen, send,
-    # sk-loop). 1 differs (we mutated send), 4 are unchanged.
-    assert data["total"] == 5
+    # claude side ships consult, handoff, listen, propose, send, sk-loop;
+    # 1 differs (we mutated send), the rest are unchanged. Derive the
+    # total from the bundled source so adding a skill doesn't break this.
+    from agenttalk.install_skills import SKILLS_ROOT
+    bundled_claude = len(list((SKILLS_ROOT / "claude").glob("*.md")))
+    assert data["total"] == bundled_claude
     assert by_name["codex_skills"].status == "ok"
 
 
