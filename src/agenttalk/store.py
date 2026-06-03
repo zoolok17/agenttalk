@@ -1034,6 +1034,103 @@ class Store:
         except OSError:
             pass
 
+    # ------------------------------------------------------- thread state
+    #
+    # Per-(agent, request_id) state for SCOPED thread work, kept separate
+    # from the single global per-agent cursor. Two distinct notions:
+    #   seen_msg_id — the newest message on this thread a SCOPED wait has
+    #                 returned to the agent. Lets `wait --to-request` make
+    #                 progress (don't re-return the same message) WITHOUT
+    #                 consuming the global cursor, so unrelated inbox
+    #                 traffic stays unread for a later `drain`. "Seen by a
+    #                 scoped wait" is NOT "handled".
+    #   closed      — the agent has explicitly closed the thread (manual
+    #                 `ack --to-request`). ONLY this clears an owed/
+    #                 actionable thread in `threads`/`sync`; seen_msg_id
+    #                 alone never does — so a restart after a scoped wait
+    #                 displayed a message but before the agent acted still
+    #                 surfaces the thread as actionable. (0.12.0)
+
+    def read_threadstate(self, agent: str) -> dict:
+        """Return ``{request_id: {seen_msg_id, closed, ...}}`` for ``agent``.
+
+        Never raises — a missing/corrupt/partially-written file reads as
+        ``{}`` (degrade to "no scoped state", same as a fresh agent).
+        """
+        p = self.state_dir / f"{agent}.threadstate.json"
+        if not p.exists():
+            return {}
+        try:
+            raw = p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return {}
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_threadstate(self, agent: str, data: dict) -> None:
+        p = self.state_dir / f"{agent}.threadstate.json"
+        _atomic_write_text(p, json.dumps(data, indent=2, ensure_ascii=False))
+
+    def thread_seen(self, agent: str, request_id: str) -> str:
+        """The newest msg id a scoped wait has returned to ``agent`` on this
+        thread (``""`` if none)."""
+        entry = self.read_threadstate(agent).get(request_id)
+        if isinstance(entry, dict):
+            sid = entry.get("seen_msg_id")
+            return sid if isinstance(sid, str) else ""
+        return ""
+
+    def mark_thread_seen(self, agent: str, request_id: str, msg_id: str) -> None:
+        """Advance ``seen_msg_id`` (monotonic) — used by `wait --to-request`.
+        Does NOT set ``closed``: seeing a message is not handling it."""
+        data = self.read_threadstate(agent)
+        entry = data.get(request_id)
+        if not isinstance(entry, dict):
+            entry = {}
+        cur = entry.get("seen_msg_id")
+        if not isinstance(cur, str) or msg_id > cur:
+            entry["seen_msg_id"] = msg_id
+            entry.setdefault("closed", False)
+            data[request_id] = entry
+            self._write_threadstate(agent, data)
+
+    def close_thread(self, agent: str, request_id: str, *,
+                     seen_msg_id: str | None = None,
+                     reason: str = "manual") -> None:
+        """Explicitly close a thread for ``agent`` (`ack --to-request`).
+
+        Sets ``closed=true`` — the only thing that clears an owed/
+        actionable thread in derivation — and advances ``seen_msg_id`` to
+        ``seen_msg_id`` (the latest matching id at ack time) if newer.
+        """
+        data = self.read_threadstate(agent)
+        entry = data.get(request_id)
+        if not isinstance(entry, dict):
+            entry = {}
+        if seen_msg_id is not None:
+            cur = entry.get("seen_msg_id")
+            if not isinstance(cur, str) or seen_msg_id > cur:
+                entry["seen_msg_id"] = seen_msg_id
+        entry["closed"] = True
+        entry["closed_at"] = _now_iso()
+        entry["closed_reason"] = reason
+        data[request_id] = entry
+        self._write_threadstate(agent, data)
+
+    def thread_closed(self, agent: str, request_id: str) -> bool:
+        """True iff ``agent`` has explicitly closed this thread.
+
+        Strict identity (``is True``) so a malformed non-boolean ``closed``
+        value in a hand-edited threadstate can't accidentally close a
+        thread."""
+        entry = self.read_threadstate(agent).get(request_id)
+        return isinstance(entry, dict) and entry.get("closed") is True
+
 
 # --------------------------------------------------------- helpers (module)
 

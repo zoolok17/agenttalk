@@ -351,6 +351,14 @@ def _status_warnings(agents: list[dict]) -> list[str]:
     return warnings
 
 
+def _closed_rids(store: Store, agent: str) -> set[str]:
+    """request_ids ``agent`` has explicitly closed via `ack --to-request`."""
+    return {
+        rid for rid, e in store.read_threadstate(agent).items()
+        if isinstance(e, dict) and e.get("closed") is True
+    }
+
+
 def _thread_warnings(store: Store, cfg: dict) -> list[str]:
     """Thread-correlation warnings shared with `agenttalk threads`.
 
@@ -368,7 +376,8 @@ def _thread_warnings(store: Store, cfg: dict) -> list[str]:
     now = datetime.now(timezone.utc)
     out: list[str] = []
     for a in roster:
-        rows = th.derive_threads(msgs, agent=a, cursor=store.cursor(a), now=now)
+        rows = th.derive_threads(msgs, agent=a, cursor=store.cursor(a), now=now,
+                                 closed_rids=_closed_rids(store, a))
         waiting = [t for t in rows if t.state == "reply-waiting"]
         if waiting:
             ids = ", ".join(t.request_id for t in waiting[:3])
@@ -413,6 +422,7 @@ def cmd_threads(args: argparse.Namespace) -> int:
     agent = _resolve_self(args.agent, roster=cfg.get("agents") or [])
     all_rows = th.derive_threads(
         store.valid_messages(), agent=agent, cursor=store.cursor(agent),
+        closed_rids=_closed_rids(store, agent),
     )
     cnts = th.counts(all_rows)
     shown = all_rows if args.all else [t for t in all_rows if t.state in th.ACTIONABLE_STATES]
@@ -866,9 +876,113 @@ def _write_waiting_marker(
         pass
 
 
+def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
+    """Block until a message on ONE thread (request_id) arrives — ignoring
+    unrelated traffic — and return only that match.
+
+    NON-CONSUMING: advances only the per-thread `seen_msg_id` pointer
+    (so a wait->process->wait loop progresses), NEVER the global cursor —
+    so unrelated inbox traffic stays unread for a later `drain`. `closed`
+    is untouched: seeing a message is not handling it (use `ack
+    --to-request` to close). Kills the "wake on any message" churn that
+    was the top friction in the 4-agent run.
+    """
+    rid = args.to_request
+    kind_filter = getattr(args, "kind", None)
+    deadline = time.time() + args.timeout if args.timeout > 0 else None
+    interval = max(0.1, args.interval)
+    heartbeat_interval = max(0.0, args.heartbeat_interval)
+    grace = max(0.0, args.grace)
+    composing_extend = max(0.0, args.composing_extend)
+    last_heartbeat = 0.0
+    seen_composing: set[str] = set()
+    total_extended = 0.0
+    grace_used = False
+    # Snapshot the newest inbox id NOW. Only composings that arrive AFTER
+    # this (the peer drafting DURING this wait) may extend the deadline.
+    # A scoped wait never advances the global cursor, so a stale unread
+    # composing would otherwise be re-seen by every future scoped wait and
+    # re-extend it indefinitely (Codex review of review-012-001).
+    baseline = max((m.id for m in store.messages_for(agent)), default="")
+    if heartbeat_interval > 0:
+        store.write_heartbeat(agent)
+        last_heartbeat = time.time()
+    _write_waiting_marker(
+        store, agent, cursor_at_start=store.thread_seen(agent, rid),
+        timeout=args.timeout, deadline=deadline,
+    )
+    try:
+        while True:
+            seen = store.thread_seen(agent, rid)
+            match = None
+            for m in store.messages_for(agent):
+                if m.kind in CONTROL_KINDS:
+                    # A composing extends the deadline ONLY if it is fresh for
+                    # this wait (id > baseline) AND not bound to a different
+                    # thread (uncorrelated, or correlated to this rid) — so
+                    # stale or unrelated control traffic can't stretch a
+                    # targeted wait. Never counts as the thread match.
+                    comp_rid = (m.meta or {}).get("request_id")
+                    if (m.kind == "composing" and m.id > baseline
+                            and comp_rid in (None, rid)
+                            and m.id not in seen_composing):
+                        seen_composing.add(m.id)
+                        if (deadline is not None and composing_extend > 0
+                                and total_extended < _COMPOSING_MAX_EXTEND_SECONDS):
+                            amount = min(composing_extend,
+                                         _COMPOSING_MAX_EXTEND_SECONDS - total_extended)
+                            deadline += amount
+                            total_extended += amount
+                            grace_used = False
+                            _write_waiting_marker(
+                                store, agent, cursor_at_start=seen,
+                                timeout=args.timeout, deadline=deadline,
+                            )
+                            if not args.quiet:
+                                print(f"(composing from {m.sender}: deadline "
+                                      f"extended by {amount:.0f}s, +{total_extended:.0f}s total)")
+                    continue
+                if (m.meta or {}).get("request_id") != rid:
+                    continue
+                if kind_filter and m.kind != kind_filter:
+                    continue
+                if m.id <= seen:
+                    continue
+                match = m
+                break
+            if match is not None:
+                print(render(match, header=f"AGENTTALK :: RECEIVED (thread {rid})  "
+                                           f"{match.sender} -> {match.recipient}"))
+                store.mark_thread_seen(agent, rid, match.id)  # thread pointer only
+                return 0
+            if deadline is not None and time.time() >= deadline:
+                if grace_used or grace <= 0:
+                    if not args.quiet:
+                        suffix = f" + {total_extended:.0f}s extended" if total_extended else ""
+                        print(f"(timeout: no new messages on thread {rid} for "
+                              f"{agent} in {args.timeout}s{suffix})")
+                    return 1
+                grace_used = True
+                time.sleep(grace)
+                continue
+            if heartbeat_interval > 0 and time.time() - last_heartbeat >= heartbeat_interval:
+                store.write_heartbeat(agent)
+                last_heartbeat = time.time()
+            time.sleep(interval)
+    finally:
+        store.clear_waiting(agent)
+
+
 def cmd_wait(args: argparse.Namespace) -> int:
     store = _get_store(args)
     agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
+    # Scoped wait: --to-request scopes to one thread (--kind optionally
+    # refines it). --kind without --to-request is a usage error.
+    if getattr(args, "kind", None) and not getattr(args, "to_request", None):
+        sys.stderr.write("agenttalk wait: --kind requires --to-request <id>\n")
+        return 2
+    if getattr(args, "to_request", None):
+        return _scoped_wait(store, agent, args)
     deadline = time.time() + args.timeout if args.timeout > 0 else None
     interval = max(0.1, args.interval)
     heartbeat_interval = max(0.0, args.heartbeat_interval)
@@ -968,6 +1082,20 @@ def cmd_wait(args: argparse.Namespace) -> int:
 def cmd_ack(args: argparse.Namespace) -> int:
     store = _get_store(args)
     agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
+    # Explicit thread closure (the manual escape hatch + the way to close
+    # an off-contract/handled thread). Does NOT touch the global cursor.
+    if getattr(args, "to_request", None):
+        rid = args.to_request
+        matches = [m for m in store.messages_for(agent)
+                   if (m.meta or {}).get("request_id") == rid]
+        seen = matches[-1].id if matches else None
+        store.close_thread(agent, rid, seen_msg_id=seen, reason="manual")
+        if matches:
+            print(f"thread[{agent}:{rid}] closed")
+        else:
+            print(f"thread[{agent}:{rid}] closed (note: no messages found for "
+                  f"request_id {rid} — recorded closure anyway)")
+        return 0
     if args.id:
         store.advance_cursor(agent, args.id)
     else:
@@ -975,6 +1103,122 @@ def cmd_ack(args: argparse.Namespace) -> int:
         if msgs:
             store.advance_cursor(agent, msgs[-1].id)
     print(f"cursor[{agent}] = {store.cursor(agent) or '(none)'}")
+    return 0
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Rejoin digest: what an agent needs to catch up after a restart.
+
+    Summarizes identity + roster, actionable request threads (with who
+    owes whom, age, and a deterministic next-action hint), the last
+    terminal decision per thread, and recent unread FYI traffic kept
+    SEPARATE from owed work. Pure derivation (+ threadstate); no writes.
+    Fixes the production "restart leaves agents behind / asserts stale
+    state" gap. Hints are deterministic commands only — never a plan.
+    """
+    store = _get_store(args)
+    cfg = store.load_config()
+    roster = cfg.get("agents") or []
+    agent = _resolve_self(args.agent, roster=roster)
+    msgs = store.valid_messages()
+    cursor = store.cursor(agent)
+    closed = _closed_rids(store, agent)
+    rows = th.derive_threads(msgs, agent=agent, cursor=cursor, closed_rids=closed)
+    actionable = [t for t in rows if t.state in th.ACTIONABLE_STATES]
+
+    # Per-thread last terminal decision (review-result / proposal-response).
+    by_rid: dict[str, list] = {}
+    for m in msgs:
+        rid = (m.meta or {}).get("request_id")
+        if isinstance(rid, str) and rid:
+            by_rid.setdefault(rid, []).append(m)
+
+    def _last_decision(rid: str):
+        for m in reversed(by_rid.get(rid, [])):
+            if m.kind in ("review-result", "proposal-response"):
+                return {"kind": m.kind, "status": (m.meta or {}).get("status"),
+                        "by": m.sender}
+        return None
+
+    # owe: who must act next. "read" (not "you") for reply-waiting — a
+    # reply already landed; the next move is to CONSUME it, not fire off
+    # another message (which would invite ping-pong).
+    _owe = {"owed-inbound": "you", "reply-waiting": "read", "open-outbound": "peer"}
+
+    def _hint(t) -> str:
+        if t.state == "reply-waiting":
+            return f"agenttalk drain --for {agent}   # a reply landed — read it first"
+        if t.state == "owed-inbound":
+            return f"agenttalk reply --to-request {t.request_id}   # you owe a response"
+        if t.state == "open-outbound":
+            return f"agenttalk wait --to-request {t.request_id}    # awaiting {t.peer}"
+        return ""
+
+    thread_payload = []
+    for t in actionable:
+        d = t.to_dict()
+        d["owe"] = _owe.get(t.state, "-")
+        d["last_decision"] = _last_decision(t.request_id)
+        d["hint"] = _hint(t)
+        thread_payload.append(d)
+
+    # Unread FYI: messages addressed to me, newer than my cursor, that are
+    # NOT part of an actionable thread — kept separate from owed work.
+    actionable_rids = {t.request_id for t in actionable}
+    fyi = []
+    for m in store.messages_for(agent, since_id=cursor or None):
+        if m.kind in CONTROL_KINDS:
+            continue
+        if (m.meta or {}).get("request_id") in actionable_rids:
+            continue
+        fyi.append({"id": m.id, "from": m.sender, "kind": m.kind,
+                    "subject": m.subject or "",
+                    "broadcast": bool((m.meta or {}).get("broadcast_id"))})
+    fyi = fyi[-10:]  # recent only
+
+    payload = {
+        "agent": agent,
+        "roster": roster,
+        "roles": cfg.get("roles", {}) or {},
+        "groups": cfg.get("groups", {}) or {},
+        "counts": th.counts(rows),
+        "threads": thread_payload,
+        "unread_fyi": fyi,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print(f"sync for {agent}  (you are {agent})")
+    role = (cfg.get("roles", {}) or {}).get(agent)
+    member_of = [g for g, ms in (cfg.get("groups", {}) or {}).items() if agent in ms]
+    if role or member_of:
+        print(f"  role={role or '-'}  groups=[{', '.join(member_of) or '-'}]")
+    print(f"  roster: {', '.join(roster)}")
+    c = payload["counts"]
+    print(f"  threads: reply-waiting={c['reply-waiting']} owed-inbound={c['owed-inbound']} "
+          f"open-outbound={c['open-outbound']} closed={c['closed']}")
+    if thread_payload:
+        print("actionable threads (owe / hint):")
+        for d in thread_payload:
+            age = _format_age(d["age_seconds"]) if d["age_seconds"] is not None else "?"
+            dec = ""
+            if d["last_decision"]:
+                ld = d["last_decision"]
+                dec = f"  last={ld['kind']}={ld.get('status') or '?'}"
+            subj = f' "{d["subject"]}"' if d["subject"] else ""
+            print(f"  [{d['state']}] {d['request_id']}  {d['opener_kind']}  "
+                  f"peer={d['peer']}  owe={d['owe']}  age={age}{subj}{dec}")
+            print(f"      -> {d['hint']}")
+    else:
+        print("  (no actionable threads — you're caught up)")
+    if fyi:
+        print(f"unread FYI (not owed work; {len(fyi)} recent):")
+        for f in fyi:
+            tag = "broadcast " if f["broadcast"] else ""
+            subj = f' "{f["subject"]}"' if f["subject"] else ""
+            print(f"  {f['id']}  {tag}{f['kind']} from {f['from']}{subj}")
+        print(f"  (consume with `agenttalk drain --for {agent}`)")
     return 0
 
 
@@ -1606,12 +1850,41 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Seconds to extend the deadline for each fresh 'composing' "
                          "ping from the peer. Capped at 1800s total per wait. "
                          "(default 120, 0 = off)")
+    pw.add_argument("--to-request", dest="to_request",
+                    help="SCOPED wait: wake only on a message with this "
+                         "request_id; ignore (and leave unread) all other "
+                         "traffic. Non-consuming — advances only the per-thread "
+                         "pointer, never the global cursor. Close the thread "
+                         "with `ack --to-request`.")
+    pw.add_argument("--kind",
+                    help="With --to-request: further restrict the scoped wait "
+                         "to this message kind. Note: the per-thread pointer "
+                         "still advances to the matched message, so earlier "
+                         "OTHER-kind messages on that thread are skipped — run "
+                         "an unfiltered `wait --to-request` or `drain` first if "
+                         "you need them.")
     pw.set_defaults(func=cmd_wait)
 
-    pa = sub.add_parser("ack", help="Advance an agent's cursor (defaults to latest message).")
+    pa = sub.add_parser("ack", help="Advance an agent's cursor, OR close a thread (--to-request).")
     pa.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
     pa.add_argument("--id", help="Specific message id (default: latest message for this agent)")
+    pa.add_argument("--to-request", dest="to_request",
+                    help="Explicitly CLOSE this request thread for the agent "
+                         "(manual closure / escape hatch). Does not touch the "
+                         "global cursor.")
     pa.set_defaults(func=cmd_ack)
+
+    psync = sub.add_parser(
+        "sync",
+        help="Rejoin digest: identity + roster, actionable request threads "
+             "(who owes whom, age, next-action hint), last decision per "
+             "thread, and recent unread FYI traffic kept separate from owed "
+             "work. Run it on restart/rejoin before acting.",
+    )
+    psync.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
+    psync.add_argument("--json", action="store_true",
+                       help="Emit the structured digest for skills to parse.")
+    psync.set_defaults(func=cmd_sync)
 
     pt = sub.add_parser("transcript", help="Export the full conversation.")
     pt.add_argument("--format", choices=["md", "jsonl"], default="md")

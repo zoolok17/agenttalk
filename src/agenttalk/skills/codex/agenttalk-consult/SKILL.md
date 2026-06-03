@@ -118,12 +118,13 @@ agenttalk send --from "$SELF" --to "$TARGET" --kind question \
   --subject "consult: <one-line summary>" \
   --meta request_id="$REQ_ID" --meta consult=true --meta round=1 \
   -m "$BODY"
-agenttalk wait --for "$SELF" --timeout 180
+agenttalk wait --for "$SELF" --to-request "$REQ_ID" --kind message --timeout 180
 ```
 
 Use a **short** consult timeout (180s, not 600/1800). Consults are
 interactive - if the target isn't responding within 3 min, they're
-probably not at the keyboard.
+probably not at the keyboard. The scoped wait ignores unrelated
+traffic and does not advance your global cursor.
 
 If `wait` times out: tell the user "the named peer didn't respond in
 3 min; answering on my own", then give your draft answer.

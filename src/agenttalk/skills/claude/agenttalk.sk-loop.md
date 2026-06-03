@@ -37,6 +37,10 @@ the sk-loop for broader coordination. Always resolve inside your
 current shell - env from prior tool calls does not persist across
 separate tool-call processes.
 
+On start or rejoin, run `agenttalk sync --for $SELF` before acting.
+Use it to recover open non-wake obligations and recent terminal
+decisions, but still derive WP state from `spec-kitty next`.
+
 ## Required argument
 
 The user passes the mission slug as the argument (e.g.
@@ -118,13 +122,14 @@ reviewer's feedback. Address every blocker.
   or you genuinely can't picture the shape they want, send a
   `question` first instead of guessing into another rejection:
   ```powershell
+  $reqId = "q-$MISSION-WP##-cycle-$N"
   agenttalk send --from $SELF --to $PEER --kind question `
     --subject "WP## cycle N: request example" `
-    --meta mission=$MISSION --meta wp_id=WP## --meta round=$N `
+    --meta request_id=$reqId --meta mission=$MISSION --meta wp_id=WP## --meta round=$N `
     -m "Reviewer feedback says <quote>. Can you sketch the shape
        you expect - a signature, a 5-line diff, a one-paragraph
        contract? Trying to avoid a wasted cycle on guesswork."
-  agenttalk wait --for $SELF --timeout 600
+  agenttalk wait --for $SELF --to-request $reqId --timeout 600
   ```
   This is asking for clarification - not asking the reviewer to do
   the work. After the reply, re-implement.
@@ -140,6 +145,7 @@ auto-arbitrate.
 Before blocking, check for non-wake obligations:
 
 ```powershell
+agenttalk sync --for $SELF
 agenttalk threads --for $SELF
 ```
 
@@ -237,11 +243,13 @@ implements or reviews; the lead coordinates around that state.
   cross-write.
 - **Wakes are latency optimization, not state.** If a wake is lost,
   the next poll catches the change.
-- **Never hand-roll inbox polling.** `agenttalk wait` consumes the next
-  real message and advances your cursor; `agenttalk drain --for $SELF`
-  consumes everything unread at once. Do NOT compare message
-  timestamps against a baseline to detect new activity. If you suspect
-  a stall, run `agenttalk status`.
+- **Never hand-roll inbox polling.** Plain `agenttalk wait` consumes
+  the next real message and advances your global cursor;
+  `agenttalk wait --to-request <id>` advances only thread-local
+  `seen_msg_id`; `agenttalk drain --for $SELF` consumes everything
+  unread at once. Do NOT compare message timestamps against a baseline
+  to detect new activity. If you suspect a stall, run `agenttalk
+  status` or `agenttalk sync --for $SELF`.
 - **Before going idle or declaring done, run `agenttalk threads --for
   $SELF`.** Resolve `reply-waiting` and `owed-inbound` rows so open
   reviews, questions, broadcast questions, and proposals are not left

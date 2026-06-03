@@ -18,7 +18,7 @@ exported on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.11.1"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.12.0"
 agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
@@ -48,6 +48,16 @@ remains the source of truth for state; agenttalk is just a wake signal.
   concrete solution), `/agenttalk.lead` (coordinate a named team), or
   `/agenttalk.send` (fire and forget).
 - **Terminal B (Codex).** `$agenttalk-listen` (wait/respond loop).
+
+On restart or rejoin, run `agenttalk sync --for <agent>` before
+acting. It summarizes roster identity, open request threads, recent
+unread FYI traffic, terminal decisions, and deterministic next-action
+hints. For a known thread, use a scoped wait to wake only on that
+thread without advancing the global inbox cursor:
+
+```powershell
+agenttalk wait --for <agent> --to-request <request-id>
+```
 
 Both terminals show every message as it flies past. When you're done:
 `agenttalk end --from claude --reason "done"` writes a markdown
@@ -106,10 +116,10 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.11.1"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.12.0"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.11.1` with
+Pin to a specific tag so you control upgrades. Replace `v0.12.0` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
@@ -154,7 +164,8 @@ This creates `.agenttalk/` with:
 .agenttalk/
   config.json          session + agent roster
   messages/<id>.json   one file per message (chronologically sorted)
-  state/<agent>.cursor last message id each agent has acknowledged
+  state/<agent>.cursor last message id each agent has globally acknowledged
+  state/<agent>.threadstate.json per-request seen/closed state for scoped waits
   sessions/            markdown/jsonl transcripts written by `agenttalk end`
 ```
 
@@ -546,14 +557,15 @@ so the long timeout is free observability.
 | `agenttalk roster add <name> [--role R] [--group G]...` / `remove <name>` / `set-role <name> <role>` / `set-group <group> <a,b,c>` | Deliberate roster/group admin operations. Groups are validated roster subsets; `all` is implicit and reserved. |
 | `agenttalk status` | Show roster, per-agent cursor, unread count, and **actionable warnings**: never-acked unread, soft-deadlocks, unconsumed correlated replies, and stale outbound threads. |
 | `agenttalk threads [--for A] [--all] [--json]` | Derive request/reply thread state from validated messages. Default view shows actionable rows only (`reply-waiting`, `owed-inbound`, `open-outbound`); `--all` includes `closed`. |
+| `agenttalk sync --for A [--json]` | Rejoin digest: show identity, roster, actionable threads grouped by request id, terminal decisions, recent unread non-action messages, and deterministic next-action hints. Pure derivation; no cursor or threadstate writes. |
 | `agenttalk send --from A --to B [--kind K] [--subject S] [--meta k=v] -m "body"` | Drop a message into the bus. Body can come from `-m`, `--file`, or stdin. `review-request`, `question`, and `proposal` without `--meta request_id=...` get one minted + printed; `review-result` and `proposal-response` without one warn (soft, exit 0). |
 | `agenttalk broadcast --from A (--to-group G \| --all) [--kind message\|note\|question] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| stdin) [--print-id] [--quiet]` | Fan out one message per recipient, excluding the sender. Mints `broadcast_id=b-...`, stores it as `meta.broadcast_id` and `meta.request_id`, and prints the recipient list unless quiet. |
 | `agenttalk propose [--from A] [--to B] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| stdin) [--in-reply-to ID] [--print-id] [--quiet]` | Send a first-class `proposal`. Auto-mints `meta.request_id=pp-...` if absent and prints `(proposal id: pp-...)` unless quiet. `--in-reply-to` sets `meta.in_reply_to` for counters. |
 | `agenttalk recv --for A [--ack] [--since ID] [--include-control]` | **Peek** at queued messages — does NOT move the cursor unless `--ack`. Plain `recv` that prints messages emits a hint pointing at `drain`. Hides `composing` pings by default; `--include-control` surfaces them. |
 | `agenttalk drain --for A [--include-control]` | **Consume**: print all unread AND advance the cursor to newest, in one shot. Same path as `recv --ack`. Use this instead of hand-rolled timestamp polling. |
-| `agenttalk wait --for A [--timeout 120] [--no-ack] [--grace 2] [--composing-extend 120]` | Block until a new message arrives, print it, advance the cursor. `--grace` does one final inbox scan after the deadline (catches replies that landed in the last fraction of a second). `--composing-extend` lengthens the deadline by N seconds for each `composing` ping the peer sends (capped at 1800 s total). |
+| `agenttalk wait --for A [--to-request RID] [--kind K] [--timeout 120] [--no-ack] [--grace 2] [--composing-extend 120]` | Plain wait blocks until a new real message arrives, prints it, and advances the global cursor unless `--no-ack`. Scoped wait (`--to-request` and/or `--kind`) returns only matching addressed messages, advances only the per-thread `seen_msg_id`, and never advances the global cursor. |
 | `agenttalk composing --from A --to B [-m "still drafting"]` | Send a `composing` ping so the peer's `wait` extends its deadline. Use periodically while you draft a long reply. The peer's `wait` consumes these as deadline-extension signals — they do NOT surface as a returned reply. |
-| `agenttalk ack --for A [--id ID]` | Manually move an agent's cursor forward. |
+| `agenttalk ack --for A [--id ID] [--to-request RID]` | Without `--to-request`, manually move an agent's global cursor forward. With `--to-request`, manually close that request thread for A and record the latest seen matching message without touching the global cursor. |
 | `agenttalk transcript [--format md\|jsonl] [--out PATH]` | Export the full conversation. |
 | `agenttalk end --from A [--reason ...]` | Notify the other agent(s) and write the transcript. In a team, sends `end` to every other roster member. |
 | `agenttalk reset [--archive]` | Clear **active bus state** (messages + cursors + heartbeats); preserves historical transcripts under `.agenttalk/sessions/` so past exports aren't lost. Bumps `session_id`. With `--archive`, instead moves **everything** (messages + state + sessions) under `.agenttalk/archived/<old_session>/`. Preserves config (roster) either way. |
@@ -566,6 +578,21 @@ so the long timeout is free observability.
 | `agenttalk doctor [--json]` | Health check: store initialized, skills installed + in sync, Codex sandbox block configured, heartbeats fresh. Per the global exit-code contract, exit 2 on any error; warnings exit 0 with the warning state visible in output. |
 | `agenttalk status --json` | Structured status output for automation (consult freshness, external tooling). Same data as plain `status` plus `invalid_messages[]`, `warnings[]`, per-agent `waiting` / `waiting_stale`, and thread-derived warning state (additive — existing keys unchanged). |
 | `agenttalk --version` | Print the installed version. |
+
+### Rejoining a session with `sync`
+
+Use `agenttalk sync --for A` before an agent acts after a restart,
+context compaction, or long idle period. It is read-only: it derives a
+digest from roster data, validated messages, global cursor state, and
+per-thread `threadstate.json`, but does not acknowledge anything.
+
+The digest separates actionable thread work from recent FYI traffic.
+It groups request/reply threads by `request_id`, shows whether `A`
+owes action or is waiting on someone else, includes recent terminal
+results such as `review-result` and `proposal-response`, and prints
+deterministic command hints such as `reply --to-request`,
+`wait --to-request`, `ack --to-request`, or `drain` when the next
+step is mechanically knowable. Use `--json` for automation.
 
 ### Reading the inbox: peek vs consume
 
@@ -580,7 +607,15 @@ deadlock in practice (issue #5):
   show them again" operation.
 - **`wait` consumes one real message.** It blocks, returns the next
   real message, and advances the cursor past it (`--no-ack` to opt out).
+- **Scoped `wait` is thread-local.** `wait --to-request <id>` and
+  `wait --kind <kind>` return only matching addressed messages. They
+  advance only the per-thread `seen_msg_id` pointer so the same scoped
+  wait can progress, but they do not advance the global cursor or
+  mark the thread handled.
 - **`--since ID` inspects history** without touching the cursor.
+- **`ack --to-request <id>` closes a handled thread manually.** It is
+  the escape hatch for off-contract replies or already-handled work
+  and does not advance the global cursor.
 
 If you ever find yourself comparing message timestamps to a baseline to
 detect "new" activity, stop — that's the footgun. Use `drain` / the
@@ -602,8 +637,8 @@ Openers:
 Expected responses:
 - `review-request` -> `review-result`
 - `proposal` -> `proposal-response`
-- `question` -> a non-control `message` or `note` with the same
-  `request_id`
+- `question` -> any non-control response from the expected
+  counterparty with the same `request_id`
 
 Broadcast questions use the same `request_id` for every fan-out copy
 and also carry `meta.broadcast_id` plus `meta.audience`. From the
@@ -612,9 +647,18 @@ has responded and those responses have been consumed. From a
 recipient's perspective, their copy is an owed inbound question until
 they answer it with `agenttalk reply --to-request <b-id> ...`.
 
+`agenttalk ack --for A --to-request <request_id>` is a manual closure
+override for A's view of a handled thread. It records the latest seen
+matching message in `.agenttalk/state/<agent>.threadstate.json` and
+marks the thread closed without advancing A's global cursor. This is
+useful when a response was semantically handled but did not match the
+strict review/proposal response kind, or when an agent has already
+handled a thread after a restart.
+
 Thread states from `--for A`'s perspective:
 - `reply-waiting`: a correlated response addressed to `A` is newer
-  than `A`'s cursor; consume it with `drain` or `wait`.
+  than `A`'s cursor or scoped thread state; consume it with `drain`,
+  plain `wait`, or targeted `wait --to-request <id>`.
 - `owed-inbound`: the ball is on `A`; either the peer's opener has no
   response from `A`, or a consumed `review-result status=needs-info`
   bounced the ball back.
@@ -624,7 +668,7 @@ Thread states from `--for A`'s perspective:
   more pending recipients. Output shows responded/pending counts and
   names.
 - `closed`: a terminal correlated response exists (`approved`,
-  `rejected`, `accepted`, plain question answer, or
+  `rejected`, `accepted`, any non-control question answer, or
   `proposal-response status=countered` for that proposal thread).
 
 Default output shows only actionable rows. `--all` includes closed
@@ -699,8 +743,9 @@ is on disk in `.agenttalk/messages/` as the source of truth.
 
 Broadcast is fan-out, not a shared channel. `agenttalk broadcast`
 writes one ordinary message per recipient, all with the same
-`broadcast_id` / `request_id`. Existing per-agent cursors and `wait`
-behavior stay unchanged.
+`broadcast_id` / `request_id`. Broadcast does not alter per-agent
+cursors; recipients read it through the same global or scoped wait
+paths as any other addressed message.
 
 The transcript exporter walks `messages/` in id order (which is
 chronological) and renders it as markdown.
@@ -713,8 +758,11 @@ chronological) and renders it as markdown.
   restarts.
 - **No append contention.** One JSON file per message, written atomically
   via temp-file + `os.replace` (atomic on NTFS and POSIX).
-- **Cursor-per-agent, not per-message.** Reading is just "list messages
-  newer than my cursor"; ack moves the cursor.
+- **Global cursor plus per-thread state.** Plain inbox reading lists
+  messages newer than the agent's global cursor; global ack moves that
+  cursor. Scoped waits use additive per-thread `seen_msg_id` /
+  `closed` state so an agent can work one request without consuming
+  unrelated inbox traffic.
 - **Polling, not watchers.** `wait` polls every 0.3s. Good enough for
   human-paced agent collaboration, works identically on Windows and
   POSIX, no extra dependencies.

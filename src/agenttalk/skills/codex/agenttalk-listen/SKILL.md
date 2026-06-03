@@ -28,6 +28,20 @@ is owed; do not assume every message comes from one peer. Always
 resolve inside your current shell - env from prior tool calls does
 not persist across separate tool-call processes.
 
+## Rejoin bootstrap
+
+Before acting after a restart, context compaction, or long idle period,
+run:
+
+```bash
+agenttalk sync --for "$SELF"
+```
+
+Use the digest to recover identity, roster, open request threads,
+recent FYI traffic, terminal decisions, and deterministic next-action
+hints. Derive state from repo/operator sources and validated metadata,
+not stale prose from an older message body.
+
 ## Splitting implementation work with the peer
 
 **If the peer proposes (or asks you to coordinate) a split of
@@ -54,6 +68,17 @@ already assigns implement/review responsibilities per WP.
 ```bash
 agenttalk wait --for "$SELF" --timeout 1800
 ```
+
+If you are waiting for a known request thread, prefer a scoped wait:
+
+```bash
+agenttalk wait --for "$SELF" --to-request <request_id> --timeout 1800
+```
+
+Scoped wait returns only matching addressed messages, advances only the
+thread-local `seen_msg_id`, and does not advance the global inbox
+cursor. Unrelated traffic remains unread for `sync`, `threads`, or
+`drain`.
 
 - exit 0: a message was received and printed. Classify and handle it,
   then run `agenttalk threads --for "$SELF"` and resolve anything
@@ -210,12 +235,20 @@ Before declaring work done, returning control to the user, or going
 idle after handling a message, run:
 
 ```bash
+agenttalk sync --for "$SELF"
 agenttalk threads --for "$SELF"
 ```
 
 Resolve any `reply-waiting` or `owed-inbound` rows. If an
 `open-outbound` row is stale, either keep waiting intentionally, send
 a follow-up, or tell the user the target has not answered yet.
+When you have already handled a thread but it remains actionable
+because the response was off-contract or ambiguous, close your local
+view explicitly:
+
+```bash
+agenttalk ack --for "$SELF" --to-request <request_id>
+```
 
 ## When to break the loop and ask the human
 

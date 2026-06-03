@@ -70,17 +70,21 @@ implementation work.
 4. Send:
    ```bash
    TARGET="${AGENTTALK_PEER:-claude}"
+   REQ_ID="pp-$(uuidgen 2>/dev/null || python -c 'import uuid; print(uuid.uuid4())')"
    agenttalk propose --from "$SELF" --to "$TARGET" \
      --subject "<one-line decision>" \
+     --meta request_id="$REQ_ID" \
      -m "$BODY"
    ```
    The command writes `kind=proposal`, auto-mints
-   `meta.request_id=pp-...` if absent, and prints the proposal id
-   unless `--quiet`.
+   `meta.request_id=pp-...` if absent. Passing `REQ_ID` explicitly
+   lets the wait below target the proposal thread.
 5. Wait for the response:
    ```bash
-   agenttalk wait --for "$SELF" --timeout 600
+   agenttalk wait --for "$SELF" --to-request "$REQ_ID" --kind proposal-response --timeout 600
    ```
+   The scoped wait ignores unrelated traffic and does not advance your
+   global cursor.
 6. Match the response by `meta.request_id`.
    - `proposal-response status=accepted`: proceed with the decision.
    - `proposal-response status=rejected`: do not proceed; either revise
@@ -89,9 +93,11 @@ implementation work.
      closed, then read the fresh counter proposal linked by
      `meta.in_reply_to` or `meta.counter_request_id`.
 
-If an unrelated message arrives while waiting, handle the older or more
-urgent thread first. Use `agenttalk threads --for "$SELF"` to see open
-obligations, and use `agenttalk reply --to-id <message_id>` or
+Scoped wait intentionally ignores unrelated traffic. If the proposal
+stalls or you suspect another urgent thread is waiting on you, run
+`agenttalk sync --for "$SELF"` and `agenttalk threads --for "$SELF"`.
+Handle the older or more urgent thread first, then resume the scoped
+wait for your proposal. Use `agenttalk reply --to-id <message_id>` or
 `--to-request <request_id>` when replying inside a specific thread.
 
 ## Countering a proposal
@@ -117,6 +123,7 @@ To counter a proposal you received:
 Before declaring the decision handled or going idle, run:
 
 ```bash
+agenttalk sync --for "$SELF"
 agenttalk threads --for "$SELF"
 ```
 

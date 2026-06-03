@@ -143,16 +143,18 @@ agenttalk send --from $SELF --to $TARGET --kind review-request `
   --meta request_id=$reqId `
   --meta base_sha=<sha> --meta head_sha=<sha> `
   -m $body
-agenttalk wait --for $SELF --timeout 600
+agenttalk wait --for $SELF --to-request $reqId --kind review-result --timeout 600
 ```
 
 Default 10-minute timeout. Extend with `--timeout 1800` for big
-reviews, or `0` for no timeout.
+reviews, or `0` for no timeout. The scoped wait ignores unrelated
+traffic and does not advance your global cursor.
 
 If `wait` times out: tell the user and ask whether to keep waiting or
 check `agenttalk status` to see whether the target's `last_seen` is
-fresh. Also run `agenttalk threads --for $SELF`; if your correlated
-reply is already `reply-waiting`, consume it before asking the user.
+fresh. Also run `agenttalk sync --for $SELF` and `agenttalk threads
+--for $SELF`; if your correlated reply is already actionable, handle
+it before asking the user.
 
 ### 6. Act on the reply
 
@@ -169,6 +171,7 @@ make, **stop and ask the user**.
 Before declaring the handoff handled, run:
 
 ```powershell
+agenttalk sync --for $SELF
 agenttalk threads --for $SELF
 ```
 
@@ -179,11 +182,12 @@ threads are open, use `agenttalk reply --to-id <message_id>` or
 
 ## When you might receive a request while waiting
 
-If your own request is outstanding and an incoming `kind=review-request`
-or `kind=proposal` arrives, handle the older or more urgent thread
-first to avoid both sides blocking each other. `agenttalk threads --for
-$SELF` is the authoritative view of what is owed. After replying,
-resume waiting for your own result.
+Scoped wait intentionally ignores unrelated traffic. If your own
+request is outstanding but you suspect another urgent thread may be
+waiting on you, run `agenttalk sync --for $SELF` and `agenttalk
+threads --for $SELF`. Handle the older or more urgent thread first to
+avoid both sides blocking each other, then resume the scoped wait for
+your request.
 
 ## Constraints
 

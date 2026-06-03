@@ -318,6 +318,42 @@ def test_broadcast_excludes_non_participant() -> None:
     assert derive_threads(msgs, agent="outsider", cursor="") == []
 
 
+# ------------------------------------ 0.12.0: closed override + question closure
+
+def test_closed_rids_override_forces_closed() -> None:
+    msgs = [_msg("001", "alpha", "beta", "review-request", rid="r1")]
+    # beta normally owes a review-result.
+    assert derive_threads(msgs, agent="beta", cursor="")[0].state == "owed-inbound"
+    # beta explicitly closed r1 (ack --to-request) → reported closed.
+    closed = derive_threads(msgs, agent="beta", cursor="", closed_rids={"r1"})
+    assert closed[0].state == "closed"
+
+
+def test_closed_rids_override_forces_broadcast_closed() -> None:
+    msgs, _ = _broadcast("b-1", "lead", ["dev1", "dev2"])
+    assert derive_threads(msgs, agent="lead", cursor="")[0].state == "open-outbound"
+    closed = derive_threads(msgs, agent="lead", cursor="", closed_rids={"b-1"})
+    assert closed[0].state == "closed"
+
+
+def test_review_result_closes_a_question() -> None:
+    """0.12.0: a question is open-ended — any non-control reply from the
+    asked party closes it, including a review-result (the production bug)."""
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="q1"),
+        _msg("002", "beta", "alpha", "review-result", rid="q1", status="approved"),
+    ]
+    assert derive_threads(msgs, agent="alpha", cursor="002")[0].state == "closed"
+
+
+def test_broadcast_question_member_review_result_counts() -> None:
+    msgs, nxt = _broadcast("b-1", "lead", ["dev1", "dev2"])
+    msgs.append(_msg(f"{nxt:03d}", "dev1", "lead", "review-result",
+                     rid="b-1", status="approved"))
+    t = derive_threads(msgs, agent="lead", cursor=f"{nxt:03d}")[0]
+    assert "dev1" in t.responded and t.pending == ["dev2"]
+
+
 def test_broadcast_open_outbound_age_from_broadcast_not_partial_reply() -> None:
     """Regression: a half-answered broadcast that then goes silent must still
     age from the original ask, so the stale-thread warning can fire — not

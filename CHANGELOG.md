@@ -5,6 +5,53 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-06-03
+
+Coordination recovery release from the first four-agent production
+retro. The goal is to make restarts and busy team inboxes recoverable:
+agents can rejoin with a digest, wait on one known thread without
+consuming unrelated traffic, and manually close handled threads when
+the strict request/response contract was not enough.
+
+### Added
+
+- **Scoped wait.** `agenttalk wait --for A --to-request RID` and
+  optional `--kind K` return only matching addressed messages. Scoped
+  waits advance only the per-thread `seen_msg_id` pointer and never
+  advance the global inbox cursor, so unrelated traffic stays unread.
+- **Per-agent threadstate.** `.agenttalk/state/<agent>.threadstate.json`
+  stores per-request `seen_msg_id` and `closed` state used by scoped
+  waits and manual closure. This is additive and leaves existing
+  cursor files backward-compatible.
+- **Explicit thread closure.** `agenttalk ack --for A --to-request RID`
+  manually marks a handled request thread closed for that agent
+  without touching the global cursor.
+- **Rejoin digest.** `agenttalk sync --for A [--json]` summarizes
+  identity, roster, actionable request threads, terminal decisions,
+  recent unread non-action traffic, and deterministic next-action
+  hints for restart/context recovery.
+
+### Changed
+
+- **Question closure is broader.** Question-style threads, including
+  broadcast questions, close when the expected counterparty sends any
+  non-control response with the same `request_id`. Review requests
+  still require `review-result`, and proposals still require
+  `proposal-response`.
+- **Bundled skills now use scoped waits for known threads.** Handoff,
+  consult, propose, listen, sk-loop, and lead docs teach
+  `wait --to-request`, `sync --for`, and `ack --to-request` so agents
+  do not wake on unrelated traffic or assert stale state after a
+  restart.
+- README documents the new global-cursor vs per-thread-state mental
+  model, sync workflow, and 0.12.0 CLI surface.
+
+### Security
+
+- No trust-model change. The new threadstate is local coordination
+  metadata inside the existing `.agenttalk/` state directory; message
+  validation and optional HMAC behavior are unchanged.
+
 ## [0.11.1] — 2026-06-02
 
 Patch release from the fresh-reviewer experiment: Claude Code and
@@ -963,6 +1010,7 @@ pre-answer consult primitive.
 - Atomic JSON-per-message writes; per-agent cursors; markdown +
   JSONL transcript export.
 
+[0.12.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.12.0
 [0.11.1]: https://github.com/zoolok17/agenttalk/releases/tag/v0.11.1
 [0.11.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.11.0
 [0.10.0]: https://github.com/zoolok17/agenttalk/releases/tag/v0.10.0

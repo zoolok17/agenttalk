@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from agenttalk.store import Message
+from agenttalk.store import CONTROL_KINDS, Message
 
 # Kinds that OPEN a trackable thread, mapped to the kind(s) that COUNT
 # as the peer's response. A response only closes (or bounces) a thread
@@ -80,8 +80,12 @@ def _classify_event(opener_kind: str, m: Message, requester: str, responder: str
             return ("terminal", None)        # accepted/rejected/countered all close
         return None
     if opener_kind == "question":
-        if m.kind in ("message", "note") and m.sender == responder and m.recipient == requester:
-            return ("terminal", None)        # first answer closes it
+        # A question is open-ended: ANY non-control response from the asked
+        # party closes it, regardless of kind. (0.12.0 — fixes the
+        # production case where a `review-result` was the real answer to a
+        # broadcast question but a strict message/note check left it owed.)
+        if m.kind not in CONTROL_KINDS and m.sender == responder and m.recipient == requester:
+            return ("terminal", None)
         return None
     return None
 
@@ -149,14 +153,17 @@ def _derive_broadcast(
     agent: str,
     cursor: str,
     now: datetime,
+    forced_closed: bool = False,
 ) -> Thread | None:
     """Derive the multi-party thread for a broadcast (fan-out) correlation.
 
     ``openers`` are the per-recipient copies the broadcaster fanned out
     (same sender, distinct recipients, all carrying ``meta.audience``).
-    A response is a message/note from an audience member back to the
-    broadcaster echoing ``rid``. Returns ``None`` if ``agent`` is neither
-    the broadcaster nor an audience member.
+    A response is any non-control message from an audience member back to
+    the broadcaster echoing ``rid``. ``forced_closed`` (the agent
+    explicitly ack'd the thread) overrides the computed state to
+    ``closed``. Returns ``None`` if ``agent`` is neither the broadcaster
+    nor an audience member.
     """
     sender = openers[0].sender
     audience = sorted({m.recipient for m in openers})
@@ -169,7 +176,9 @@ def _derive_broadcast(
     for m in group:
         if m.id <= first_opener_id:
             continue
-        if (m.kind in ("message", "note")
+        # A broadcast question is open-ended: any non-control reply from a
+        # member counts as that member responding (e.g. a review-result).
+        if (m.kind not in CONTROL_KINDS
                 and m.sender in audience and m.recipient == sender):
             responded.add(m.sender)
             responses.append(m)
@@ -211,6 +220,9 @@ def _derive_broadcast(
     else:
         return None  # not my thread
 
+    if forced_closed:
+        state = "closed"  # explicit ack --to-request override
+
     ts = _parse_ts(last.ts)
     age = (now - ts).total_seconds() if ts is not None else None
     return Thread(
@@ -238,16 +250,22 @@ def derive_threads(
     agent: str,
     cursor: str,
     now: datetime | None = None,
+    closed_rids: set[str] | None = None,
 ) -> list[Thread]:
     """Return one :class:`Thread` per correlated request_id involving ``agent``.
 
     ``messages`` MUST be the roster+signature-validated set
     (``Store.valid_messages()``). ``cursor`` is ``agent``'s ack cursor,
-    used to decide ``reply-waiting`` / ``unread``. Threads where ``agent``
-    is neither the opener's sender nor recipient are omitted.
+    used to decide ``reply-waiting`` / ``unread``. ``closed_rids`` are
+    request_ids ``agent`` has explicitly closed (``ack --to-request``):
+    those threads report ``closed`` regardless of derived state — the
+    manual escape hatch for off-contract / already-handled threads.
+    Threads where ``agent`` is neither the opener's sender nor recipient
+    are omitted.
     """
     now = now or datetime.now(timezone.utc)
     cursor = cursor or ""
+    closed_rids = closed_rids or set()
 
     # Group by correlation id. Messages without a request_id are
     # untracked by design (you can't correlate what was never tagged).
@@ -274,6 +292,7 @@ def derive_threads(
         if bcast_openers:
             t = _derive_broadcast(
                 rid, group, bcast_openers, agent=agent, cursor=cursor, now=now,
+                forced_closed=(rid in closed_rids),
             )
             if t is not None:
                 threads.append(t)
@@ -338,6 +357,8 @@ def derive_threads(
             state = "owed-inbound"
         else:
             state = "open-outbound"
+        if rid in closed_rids:
+            state = "closed"  # explicit ack --to-request override
 
         last = group[-1]
         ts = _parse_ts(last.ts)
