@@ -2,11 +2,55 @@
 
 Carry-forward notes for the next session / next machine: what production
 use validated, what hurt, and the ranked backlog to address it. Built from
-the Claude Code + Codex collaboration that shipped 0.10.0–0.12.0, **plus a
+the Claude Code + Codex collaboration that shipped 0.10.0–0.12.1, **plus a
 retro from the first real four-agent run (2026-06-03).**
 
-> Current release: **v0.12.0** (`master`). See `CHANGELOG.md` for history
+> Current release: **v0.12.1** (`master`). See `CHANGELOG.md` for history
 > and `SECURITY.md` for the trust model.
+
+---
+
+## Phased plan for the remaining backlog
+
+Sequenced jointly by Claude + Codex. **Do we need more agents? No** — the
+codebase is small and tightly coupled (`cli`/`store`/`threads`); more
+parallel implementers create file-contention + coordination overhead, and
+multi-agent runs are fragile around restarts/shared state (per the retro).
+Keep the proven model: **Claude implements (Python/tests), Codex reviews +
+docs, spawn fresh-eyes reviewers on demand.** The only "extra" agents worth
+it are **short-lived specialists, spawned on demand** — a Windows/invocation
+fresh reviewer for #7/#10, a security/RFC reviewer for the identity phase —
+not standing agents. The full team topology (dev pair + review pair + lead)
+is for a larger *parallelizable* project with separate cwds and a
+non-implementing lead; overkill for this small serial backlog.
+
+### Phase 1 — `0.13.0` "workflow safety + Windows robustness" (quick, low-risk)
+Order matters (shared "resolved-recipient" model; docs first):
+1. **#10 skill-docs / identity bootstrap** — `--root` ordering, `AGENTTALK_SELF`
+   per-shell, here-strings, a `roster → status → sync` bootstrap snippet,
+   lead-vs-reviewer authority. *(Codex)*
+2. **#7 body robustness** (`--body-file -`, here-strings default on Windows,
+   structured paths) **+ #6 `reply --dry-run` + routing docs** — together.
+   *(Claude code + Codex docs)*
+3. **#8 `whoami` / `doctor` upgrades.** *(Claude)*
+   Also: document the no-reply-all rule; make `--dry-run` expose enough
+   routing detail to design reply-all next.
+
+### Phase 2 — `0.14.0` "team ops"
+4. **#9 safe rename** — `--drain-check` + alias/forwarding; **never rewrite
+   history** (mutating old messages breaks HMAC, cursors, threadstate, and
+   thread derivation). Prefer the drain-old → accept-as-old → reannounce path.
+5. **#11 reply-all primitive + broadcast atomicity** — atomicity = preflight +
+   a batch manifest + staged writes + explicit partial-failure surfacing,
+   **not** true rollback (multi-file atomicity isn't available on local FS).
+
+### Phase 3 — `0.15.0` "trust": per-agent identity / authz (the gate)
+The architectural boundary before extending beyond a trusted-local team.
+**Start the threat-model / RFC before the coding release.** Real risks to
+design for: key lifecycle / rotation / revocation, key↔roster-identity
+mapping, signature scope + canonicalization, unsigned-legacy handling,
+replay, group/lead authorization policy, compromised-agent behavior.
+Implement last; nothing else depends on it.
 
 ---
 
