@@ -28,6 +28,12 @@ have set distinct `AGENTTALK_SELF` per terminal and may set
 resolve inside your current shell - env from prior tool calls does
 not persist.
 
+If `.agenttalk/` is not under the current directory, pass `--root
+<path>` before the subcommand on every invocation, for example
+`agenttalk --root <path> send --from $SELF --to $PEER ...`. Do not
+write `agenttalk send --root ...`; global options must precede the
+subcommand.
+
 ## When to use this skill
 
 - You want to tell a named agent something but do not need a reply
@@ -62,15 +68,21 @@ approved, every piece MUST be cross-reviewed via `/agenttalk.handoff`.
 3. For point-to-point, send:
    ```powershell
    $TARGET = "<agent-name-or-$PEER>"
-   agenttalk send --from $SELF --to $TARGET --kind <kind> --subject "<one-line>" -m "<body>"
+   @'
+<body>
+'@ | agenttalk send --from $SELF --to $TARGET --kind <kind> --subject "<one-line>" --file -
    ```
 4. For broadcast, send:
    ```powershell
-   agenttalk broadcast --from $SELF --to-group <group> --kind <message|note|question> `
-     --subject "<one-line>" -m "<body>"
+   @'
+<body>
+'@ | agenttalk broadcast --from $SELF --to-group <group> --kind <message|note|question> `
+     --subject "<one-line>" --file -
    # or:
-   agenttalk broadcast --from $SELF --all --kind <message|note|question> `
-     --subject "<one-line>" -m "<body>"
+   @'
+<body>
+'@ | agenttalk broadcast --from $SELF --all --kind <message|note|question> `
+     --subject "<one-line>" --file -
    ```
 5. `--kind` values for point-to-point sends: `message` (default),
    `note`, `question`, `review-request`, `review-result`, `proposal`,
@@ -78,6 +90,10 @@ approved, every piece MUST be cross-reviewed via `/agenttalk.handoff`.
    and `question` for a tracked question. Prefer
    `/agenttalk.propose` over raw `send --kind proposal`. Use
    `--meta key=value` for structured payload.
+   Avoid inline `-m "<body>"` for multi-line text, apostrophes,
+   backslashes, or Windows paths. Pipe a here-string to `--file -`, or
+   use `--file <path>` for saved text. Put machine-readable paths and
+   roots in `--meta key=value`, not only in prose.
 6. Broadcast supports `message`, `note`, and `question`. It fans out
    one message per recipient, excluding the sender, and prints a
    shared `broadcast_id` / `request_id`.

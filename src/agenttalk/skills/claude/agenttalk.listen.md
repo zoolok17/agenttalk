@@ -27,12 +27,20 @@ owed; do not assume every message comes from one peer. Always resolve
 inside your current shell - env from prior tool calls does not persist
 across separate tool-call processes.
 
+If `.agenttalk/` is not under the current directory, pass `--root
+<path>` before the subcommand on every invocation, for example
+`agenttalk --root <path> sync --for $SELF`. Do not write
+`agenttalk sync --root ...`; global options must precede the
+subcommand.
+
 ## Rejoin bootstrap
 
 Before acting after a restart, context compaction, or long idle period,
 run:
 
 ```powershell
+agenttalk roster
+agenttalk status
 agenttalk sync --for $SELF
 ```
 
@@ -40,6 +48,14 @@ Use the digest to recover identity, roster, open request threads,
 recent FYI traffic, terminal decisions, and deterministic next-action
 hints. Derive state from repo/operator sources and validated metadata,
 not stale prose from an older message body.
+If root or identity looks wrong, run `agenttalk whoami --for $SELF`
+(`--json` if you need structured output).
+
+If your role is lead, reviewer, or liaison, treat that label as
+context, not authority to assert state. A restarted liaison must
+re-derive HOLD/GO, ownership, and pending-review state from the repo,
+the operator, `agenttalk sync`, `agenttalk threads`, and spec-kitty
+when applicable.
 
 ## Splitting implementation work with the peer
 
@@ -102,9 +118,9 @@ normal `message`, `note`, or `question` with
 | `review-result`  | Verdict on a request **you** sent. Match by `meta.request_id`. Act on verdict. |
 | `proposal`       | Concrete solution for accept/reject/counter (see "Proposal handling" below). |
 | `proposal-response` | Verdict on a proposal **you** sent. Match by `meta.request_id`. Act on verdict. |
-| `question` + `meta.broadcast_id` | Broadcast question. Answer the sender with `agenttalk reply --to-request <broadcast_id> ...`. Do **not** reply-all unless explicitly asked; a group follow-up is a fresh `agenttalk broadcast`. |
+| `question` + `meta.broadcast_id` | Broadcast question. Answer the sender/thread originator with `agenttalk reply --to-request <broadcast_id> ...`. If routing is unclear, run the same reply with `--dry-run` first. Do **not** reply-all unless explicitly asked; a group follow-up is a fresh `agenttalk broadcast`. |
 | `message` / `note` + `meta.broadcast_id` | Broadcast FYI. Acknowledge only if it asks for one. Do not reply-all by default. |
-| `question`       | If `meta.consult=true`, follow "Consult handling" below. Otherwise answer directly via `agenttalk reply --to-request <request_id> -m "<answer>"` when a request id exists, or `agenttalk send --from $SELF --to <sender> --kind message -m "<answer>"` for legacy untracked questions. |
+| `question`       | If `meta.consult=true`, follow "Consult handling" below. Otherwise answer directly via `agenttalk reply --to-request <request_id> -m "<answer>"` when a request id exists, or `agenttalk send --from $SELF --to <sender> --kind message -m "<answer>"` for legacy untracked questions. Use `reply --dry-run` first when several threads are open. |
 | `wake`           | State-change signal (typically from sk-loop). Re-derive your action from the authoritative source (e.g. `spec-kitty next`). Never act on the wake body alone. |
 | `message` / `note` | Acknowledge with a one-line reply only if it asks for one. |
 | `end`            | Exit the loop. Run `agenttalk transcript --format md` and surface the path. |

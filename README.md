@@ -18,7 +18,7 @@ exported on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.12.1"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.13.0"
 agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
@@ -49,11 +49,18 @@ remains the source of truth for state; agenttalk is just a wake signal.
   `/agenttalk.send` (fire and forget).
 - **Terminal B (Codex).** `$agenttalk-listen` (wait/respond loop).
 
-On restart or rejoin, run `agenttalk sync --for <agent>` before
-acting. It summarizes roster identity, open request threads, recent
-unread FYI traffic, terminal decisions, and deterministic next-action
-hints. For a known thread, use a scoped wait to wake only on that
-thread without advancing the global inbox cursor:
+On restart or rejoin, confirm identity and inbox state before acting:
+
+```powershell
+agenttalk roster
+agenttalk status
+agenttalk sync --for <agent>
+```
+
+`sync` summarizes roster identity, open request threads, recent unread
+FYI traffic, terminal decisions, and deterministic next-action hints.
+For a known thread, use a scoped wait to wake only on that thread
+without advancing the global inbox cursor:
 
 ```powershell
 agenttalk wait --for <agent> --to-request <request-id>
@@ -116,10 +123,10 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.12.1"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.13.0"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.12.1` with
+Pin to a specific tag so you control upgrades. Replace `v0.13.0` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
@@ -316,6 +323,26 @@ recipients, and each recipient sees an owed inbound question until
 they reply. There is no special reply-all primitive in this release;
 a follow-up to the same audience is a new `agenttalk broadcast`.
 
+### Reply routing and dry-run
+
+`agenttalk reply` resolves an anchor from `--to-id`, `--to-request`,
+or the most recent received message for the sender. It replies to the
+anchor's sender and echoes the anchor's `request_id` unless you
+explicitly set another `request_id`. For broadcast threads, the anchor
+sender is the thread originator, not every recipient and not
+necessarily the agent who later needs second-hand context.
+
+Use `--dry-run` before sending when several threads are open or when
+broadcast routing is easy to misread:
+
+```powershell
+agenttalk reply --from codex-rev --to-request b-... --kind message --dry-run
+```
+
+Dry-run resolves `--to-id`, `--to-request`, or the last received
+message, prints the would-be recipient, request id, and kind, and
+sends nothing.
+
 ### Lead role
 
 The bundled `/agenttalk.lead` and `$agenttalk-lead` skills describe a
@@ -329,6 +356,14 @@ own terminal or use a thin external launcher. The lead also does not
 replace spec-kitty: inside a spec-kitty mission, `spec-kitty next`
 assigns WPs and lanes, while the lead only coordinates around that
 state.
+
+A lead is a coordinator, not an authority boundary. A reviewer reports
+findings; an implementer changes their owned files; spec-kitty or the
+human decides lane state. A "liaison" is only the current contact for
+a thread or workstream. After a restart, a lead, reviewer, or liaison
+must re-derive state from the repository, the operator, `agenttalk
+sync`, `agenttalk threads`, and (inside spec-kitty) `spec-kitty next`;
+do not assert stale HOLD/GO decisions from prose in an old message.
 
 ### Ending the session
 
@@ -412,6 +447,16 @@ The CLI also validates the resolved name against the roster: a typo
 like `AGENTTALK_SELF=claud` exits 2 rather than silently operating
 on a phantom mailbox. And it rejects self-mail (`SELF == PEER`).
 
+When your `.agenttalk/` directory is not under the current working
+directory, pass `--root` as a **global option before the subcommand**:
+
+```powershell
+agenttalk --root D:\Projects\example sync --for claude-dev
+```
+
+Do not put it after the subcommand (`agenttalk sync --root ...`);
+subcommands do not parse global options there.
+
 `agenttalk init` prints concrete env-setup commands at the end of its
 output for 2-agent rosters. For larger teams, use `agenttalk roster`
 as the source of truth and set each terminal's `AGENTTALK_SELF`
@@ -430,6 +475,44 @@ bundled skill files resolve identity inside each tool call's shell, so
 this is transparent in practice — but if you write your own
 automation, set env in the parent shell or pass explicit
 `--from`/`--to`/`--for` flags.
+
+### Windows-safe command bodies
+
+Inline `-m "..."` is fine for short text, but it is fragile for
+multi-line bodies, apostrophes, backslashes, and Windows paths. Prefer
+`--file <path>` for saved text, or pipe a here-string to `--file -`
+for stdin on body-bearing commands such as `send`, `reply`,
+`propose`, and `broadcast`:
+
+```powershell
+@'
+## Goal
+Review the changed files.
+
+## Path
+D:\Projects\example\src\agenttalk
+'@ | agenttalk send --from claude-dev --to codex-rev --kind review-request `
+  --meta request_id=rq-docs-001 `
+  --meta root=D:\Projects\example `
+  --file -
+```
+
+For commands where you deliberately use `-m`, put the body in a
+here-string variable first:
+
+```powershell
+$body = @'
+short but path-heavy body: D:\Projects\example\src
+'@
+
+agenttalk reply --from codex-rev --to-request rq-docs-001 `
+  -m $body
+```
+
+Use `--meta key=value` for machine-readable roots, paths, request ids,
+and routing data; keep prose bodies for human context. That prevents
+backslash/control-character mangling from turning paths into different
+strings.
 
 ---
 
@@ -557,12 +640,13 @@ so the long timeout is free observability.
 | `agenttalk init [--here] [--agents A,B]` | Create `.agenttalk/` in the current dir. |
 | `agenttalk roster [--json]` | Show agents, roles, group memberships, and the resolved current identity. |
 | `agenttalk roster add <name> [--role R] [--group G]...` / `remove <name>` / `set-role <name> <role>` / `set-group <group> <a,b,c>` | Deliberate roster/group admin operations. Groups are validated roster subsets; `all` is implicit and reserved. |
+| `agenttalk whoami [--for A] [--json]` | Show effective root, resolved self and peer, roster membership, role/groups, unread count, and owed-thread count. Warns when identity is unresolved or not in the roster, which is often a wrong `--root` or env issue. |
 | `agenttalk status` | Show roster, per-agent cursor, unread count, and **actionable warnings**: never-acked unread, soft-deadlocks, unconsumed correlated replies, and stale outbound threads. |
 | `agenttalk threads [--for A] [--all] [--json]` | Derive request/reply thread state from validated messages. Default view shows actionable rows only (`reply-waiting`, `owed-inbound`, `open-outbound`); `--all` includes `closed`. |
 | `agenttalk sync --for A [--json]` | Rejoin digest: show identity, roster, actionable threads grouped by request id, terminal decisions, recent unread non-action messages, and deterministic next-action hints. Pure derivation; no cursor or threadstate writes. |
-| `agenttalk send --from A --to B [--kind K] [--subject S] [--meta k=v] -m "body"` | Drop a message into the bus. Body can come from `-m`, `--file`, or stdin. `review-request`, `question`, and `proposal` without `--meta request_id=...` get one minted + printed; `review-result` and `proposal-response` without one warn (soft, exit 0). |
-| `agenttalk broadcast --from A (--to-group G \| --all) [--kind message\|note\|question] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| stdin) [--print-id] [--quiet]` | Fan out one message per recipient, excluding the sender. Mints `broadcast_id=b-...`, stores it as `meta.broadcast_id` and `meta.request_id`, and prints the recipient list unless quiet. |
-| `agenttalk propose [--from A] [--to B] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| stdin) [--in-reply-to ID] [--print-id] [--quiet]` | Send a first-class `proposal`. Auto-mints `meta.request_id=pp-...` if absent and prints `(proposal id: pp-...)` unless quiet. `--in-reply-to` sets `meta.in_reply_to` for counters. |
+| `agenttalk send --from A --to B [--kind K] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -)` | Drop a message into the bus. `--file -` reads the body from stdin. `review-request`, `question`, and `proposal` without `--meta request_id=...` get one minted + printed; `review-result` and `proposal-response` without one warn (soft, exit 0). |
+| `agenttalk broadcast --from A (--to-group G \| --all) [--kind message\|note\|question] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--print-id] [--quiet]` | Fan out one message per recipient, excluding the sender. Mints `broadcast_id=b-...`, stores it as `meta.broadcast_id` and `meta.request_id`, and prints the recipient list unless quiet. |
+| `agenttalk propose [--from A] [--to B] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--in-reply-to ID] [--print-id] [--quiet]` | Send a first-class `proposal`. Auto-mints `meta.request_id=pp-...` if absent and prints `(proposal id: pp-...)` unless quiet. `--in-reply-to` sets `meta.in_reply_to` for counters. |
 | `agenttalk recv --for A [--ack] [--since ID] [--include-control]` | **Peek** at queued messages — does NOT move the cursor unless `--ack`. Plain `recv` that prints messages emits a hint pointing at `drain`. Hides `composing` pings by default; `--include-control` surfaces them. |
 | `agenttalk drain --for A [--include-control]` | **Consume**: print all unread AND advance the cursor to newest, in one shot. Same path as `recv --ack`. Use this instead of hand-rolled timestamp polling. |
 | `agenttalk wait --for A [--to-request RID] [--kind K] [--timeout 120] [--no-ack] [--grace 2] [--composing-extend 120]` | Plain wait blocks until a new real message arrives, prints it, and advances the global cursor unless `--no-ack`. Scoped wait (`--to-request` and/or `--kind`) returns only matching addressed messages, advances only the per-thread `seen_msg_id`, and never advances the global cursor. |
@@ -572,7 +656,7 @@ so the long timeout is free observability.
 | `agenttalk end --from A [--reason ...]` | Notify the other agent(s) and write the transcript. In a team, sends `end` to every other roster member. |
 | `agenttalk reset [--archive]` | Clear **active bus state** (messages + cursors + heartbeats); preserves historical transcripts under `.agenttalk/sessions/` so past exports aren't lost. Bumps `session_id`. With `--archive`, instead moves **everything** (messages + state + sessions) under `.agenttalk/archived/<old_session>/`. Preserves config (roster) either way. |
 | `agenttalk hmac-init [--force]` | Generate the HMAC signing key for this project. Stored outside `.agenttalk/` (per-user config dir). The key's existence at the path-derived per-user location automatically activates signature enforcement — there's no config flag to flip. Override the default key path with `AGENTTALK_HMAC_KEY_FILE`. See `SECURITY.md`. |
-| `agenttalk reply [--from A] [--to-id MSG_ID \| --to-request REQUEST_ID] [--kind K] [--subject S] [--meta k=v] -m "body"` | Reply to the most recent received message, or anchor to a specific received message/thread. Auto-derives recipient and echoes the anchor's `request_id`; explicit `--meta request_id=...` wins. A reply that opens a new thread (`review-request` or `proposal`) mints a fresh id instead of echoing. |
+| `agenttalk reply [--from A] [--to-id MSG_ID \| --to-request REQUEST_ID] [--kind K] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--dry-run]` | Reply to the most recent received message, or anchor to a specific received message/thread. Auto-derives recipient and echoes the anchor's `request_id`; explicit `--meta request_id=...` wins. `--dry-run` prints the resolved recipient, request id, and kind without sending. A reply that opens a new thread (`review-request` or `proposal`) mints a fresh id instead of echoing. |
 | `agenttalk tail [--from-start] [--interval S] [--timeout S]` | Passive monitor: stream all messages as they arrive. Does **not** advance cursors or write heartbeats — safe to run in a third terminal alongside two active agents. `--from-start` replays existing messages first. |
 | `agenttalk serve [--port P] [--host H] [--access-log]` | Start a **read-only** local web dashboard at `http://127.0.0.1:8765/` for browsing the message log in a real browser. **Loopback-only by design** — only `127.0.0.1`, `::1`, and `localhost` are accepted; there is no flag to expose it elsewhere (SSH-tunnel `localhost:<port>` from another machine if needed). HTML output is escaped, strict CSP, `GET`/`HEAD` only, peer-IP check on every method. JSON at `/api/status` and `/api/messages` for scripting. See `SECURITY.md`. |
 | `agenttalk install-skills [--claude-only\|--codex-only] [--force] [--dry-run]` | Copy bundled skill files to `~/.claude/commands/` and `~/.codex/skills/`. Idempotent — preserves your local edits unless `--force`. |

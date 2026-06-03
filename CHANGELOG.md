@@ -5,6 +5,46 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-06-03
+
+Workflow-safety and Windows-ergonomics release for the remaining
+production-retro rough edges: safer reply routing, robust body input,
+and explicit identity diagnostics before agents act after a restart.
+
+### Added
+
+- **Reply dry-run.** `agenttalk reply --dry-run` resolves the reply
+  anchor (`--to-id`, `--to-request`, or last received message), prints
+  the would-be recipient, echoed `request_id`, and kind, then exits
+  without sending. This makes broadcast/thread-originator routing
+  inspectable before a reply is committed.
+- **stdin body files.** `--file -` now reads the body from stdin across
+  `send`, `reply`, `propose`, and `broadcast`, giving Windows users a
+  reliable here-string-friendly path for multi-line text, apostrophes,
+  backslashes, and paths.
+- **Identity diagnostics.** `agenttalk whoami [--for A] [--json]`
+  reports the effective root, resolved self and peer, roster
+  membership, role/groups, unread count, and owed-thread count. It
+  warns when identity is unset or the resolved agent is not in the
+  roster, which usually points to a misplaced `--root` or env typo.
+
+### Changed
+
+- Bundled skills and README now teach the safer restart bootstrap:
+  `agenttalk roster` -> `agenttalk status` -> `agenttalk sync --for A`
+  before acting after a restart, context compaction, or long idle
+  period.
+- Invocation docs now emphasize that `--root <path>` is a global
+  option and must precede the subcommand, and that env vars set inside
+  one LLM tool-call shell may not persist into the next call.
+- Windows body guidance now defaults to here-strings piped to
+  `--file -`, with machine-readable roots, paths, request ids, and
+  routing data carried in `--meta key=value` rather than prose alone.
+- Lead/reviewer/liaison guidance now states the authority boundary:
+  re-derive HOLD/GO, ownership, and pending-review state from the
+  repository, operator, `sync`, `threads`, and spec-kitty when
+  applicable, not from stale message-body prose after a restart.
+
 ## [0.12.1] - 2026-06-03
 
 ### Fixed

@@ -50,8 +50,14 @@ def _get_store(args: argparse.Namespace, *, must_exist: bool = True) -> Store:
 def _read_body(args: argparse.Namespace) -> str:
     if getattr(args, "message", None):
         return args.message
-    if getattr(args, "file", None):
-        return Path(args.file).read_text(encoding="utf-8")
+    f = getattr(args, "file", None)
+    if f:
+        # `--file -` reads the body from stdin — the reliable way to pass a
+        # body on Windows (a here-string piped in), where inline `-m`
+        # mangles backslashes / apostrophes / control chars.
+        if f == "-":
+            return sys.stdin.read()
+        return Path(f).read_text(encoding="utf-8")
     if not sys.stdin.isatty():
         data = sys.stdin.read()
         if data:
@@ -1230,6 +1236,66 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_whoami(args: argparse.Namespace) -> int:
+    """Diagnostic identity view: effective root, resolved self/peer, roster
+    membership + role/groups, and unread/owed counts.
+
+    Lenient by design (never hard-exits on an unresolved identity — it's a
+    'where am I / who am I' check), and warns on the common footguns: a
+    misplaced `--root` (self not in the roster), or `AGENTTALK_SELF` unset.
+    """
+    store = _get_store(args)
+    cfg = store.load_config()
+    roster = cfg.get("agents") or []
+    roles = cfg.get("roles", {}) or {}
+    groups = cfg.get("groups", {}) or {}
+    self_name = args.agent or os.environ.get("AGENTTALK_SELF")
+    in_roster = bool(self_name and self_name in roster)
+    peer = os.environ.get("AGENTTALK_PEER")
+    if not peer and self_name:
+        others = [a for a in roster if a != self_name]
+        peer = others[0] if len(others) == 1 else None
+
+    role = member_of = unread = owed = None
+    if in_roster:
+        role = roles.get(self_name)
+        member_of = [g for g, ms in groups.items() if self_name in ms]
+        unread = len(store.unread_for(self_name))
+        rows = th.derive_threads(
+            store.valid_messages(), agent=self_name, cursor=store.cursor(self_name),
+            closed_rids=_closed_rids(store, self_name),
+        )
+        owed = sum(1 for t in rows if t.state in ("owed-inbound", "reply-waiting"))
+
+    warnings: list[str] = []
+    if not self_name:
+        warnings.append("identity unresolved — set $AGENTTALK_SELF in this shell "
+                        "or pass --for <agent>.")
+    elif not in_roster:
+        warnings.append(f"self '{self_name}' is NOT in the roster {sorted(roster)} "
+                        f"— wrong --root, or a typo? (root above)")
+
+    if args.json:
+        print(json.dumps({
+            "root": str(store.root), "self": self_name, "self_in_roster": in_roster,
+            "peer": peer, "role": role, "groups": member_of or [],
+            "roster": roster, "unread": unread, "owed": owed, "warnings": warnings,
+        }, indent=2))
+        return 0
+    print(f"root:   {store.root}")
+    tag = (" (in roster)" if in_roster else " (NOT in roster!)") if self_name else ""
+    print(f"self:   {self_name or '(unresolved)'}{tag}")
+    if peer:
+        print(f"peer:   {peer}")
+    if in_roster:
+        print(f"role:   {role or '-'}   groups=[{', '.join(member_of) or '-'}]")
+        print(f"unread: {unread}   owed (you must act): {owed}")
+    print(f"roster: {', '.join(roster)}")
+    for w in warnings:
+        print(f"WARN:   {w}")
+    return 0
+
+
 def cmd_transcript(args: argparse.Namespace) -> int:
     store = _get_store(args)
     out = Path(args.out).resolve() if args.out else None
@@ -1465,10 +1531,16 @@ def cmd_reply(args: argparse.Namespace) -> int:
     if anchor is None:
         sys.stderr.write(f"agenttalk reply: {err}\n")
         return 2
-    body = _read_body(args)
-    if not body and not args.allow_empty:
-        sys.stderr.write("agenttalk reply: empty body (use -m TEXT, --file PATH, pipe stdin, or --allow-empty)\n")
-        return 2
+    dry = getattr(args, "dry_run", False)
+    # --dry-run only resolves routing (recipient + request_id + kind) and
+    # sends nothing, so it must NOT require a body. Skip the body read +
+    # empty-body check entirely in that case.
+    body = ""
+    if not dry:
+        body = _read_body(args)
+        if not body and not args.allow_empty:
+            sys.stderr.write("agenttalk reply: empty body (use -m TEXT, --file PATH, pipe stdin, or --allow-empty)\n")
+            return 2
     meta = _parse_meta(args.meta)
     # Auto-echo request_id for correlation. Explicit --meta wins.
     # EXCEPTION: a reply that is ITSELF a thread-opening kind
@@ -1486,6 +1558,15 @@ def cmd_reply(args: argparse.Namespace) -> int:
         meta["request_id"] = anchor.meta["request_id"]
     _maybe_autogen_request_id(args.kind, meta, quiet=args.quiet)
     _warn_missing_request_id(args.kind, meta)
+    if dry:
+        # Resolve-and-show without sending — guards against echoing the
+        # wrong request_id when multiple threads are open. The reply routes
+        # to the ANCHOR's sender, which for a broadcast is the thread
+        # originator (who may not be the agent that needs the answer).
+        rid = meta.get("request_id", "(none)")
+        print(f"(dry-run) reply {sender} -> {anchor.sender}  thread={rid}  "
+              f"kind={args.kind}; nothing sent.")
+        return 0
     msg = store.send(
         sender=sender,
         recipient=anchor.sender,
@@ -1734,7 +1815,7 @@ def build_parser() -> argparse.ArgumentParser:
     pse.add_argument("--subject", help="One-line summary")
     pse.add_argument("--meta", action="append", help="key=value (repeatable)")
     pse.add_argument("-m", "--message", help="Body text (else --file or stdin)")
-    pse.add_argument("--file", help="Read body from this file path")
+    pse.add_argument("--file", help="Read body from this file path ('-' = stdin)")
     pse.add_argument("--allow-empty", action="store_true")
     pse.add_argument("--print-id", action="store_true", help="Print the new message id on its own line")
     pse.add_argument("--quiet", action="store_true")
@@ -1778,7 +1859,7 @@ def build_parser() -> argparse.ArgumentParser:
     ppro.add_argument("--subject", help="One-line summary")
     ppro.add_argument("--meta", action="append", help="key=value (repeatable)")
     ppro.add_argument("-m", "--message", help="Body text (else --file or stdin)")
-    ppro.add_argument("--file", help="Read body from this file path")
+    ppro.add_argument("--file", help="Read body from this file path ('-' = stdin)")
     ppro.add_argument("--in-reply-to", dest="in_reply_to",
                       help="request_id of a prior proposal this one counters "
                            "(sets meta.in_reply_to; the prior proposal should "
@@ -1810,7 +1891,7 @@ def build_parser() -> argparse.ArgumentParser:
     pbc.add_argument("--subject", help="One-line summary.")
     pbc.add_argument("--meta", action="append", help="key=value (repeatable).")
     pbc.add_argument("-m", "--message", help="Body text (else --file or stdin).")
-    pbc.add_argument("--file", help="Read body from this file path.")
+    pbc.add_argument("--file", help="Read body from this file path ('-' = stdin).")
     pbc.add_argument("--allow-empty", action="store_true")
     pbc.add_argument("--print-id", action="store_true",
                      help="Print the broadcast_id on its own line.")
@@ -1897,6 +1978,16 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Emit the structured digest for skills to parse.")
     psync.set_defaults(func=cmd_sync)
 
+    pwho = sub.add_parser(
+        "whoami",
+        help="Diagnostic: effective --root, resolved self/peer, roster "
+             "membership + role/groups, and unread/owed counts. Warns on a "
+             "misplaced --root (self not in roster) or an unset identity.",
+    )
+    pwho.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
+    pwho.add_argument("--json", action="store_true")
+    pwho.set_defaults(func=cmd_whoami)
+
     pt = sub.add_parser("transcript", help="Export the full conversation.")
     pt.add_argument("--format", choices=["md", "jsonl"], default="md")
     pt.add_argument("--out", help="Output path (default: .agenttalk/sessions/transcript-<session>.<ext>)")
@@ -1932,8 +2023,12 @@ def build_parser() -> argparse.ArgumentParser:
     prpl.add_argument("--meta", action="append",
                       help="key=value (repeatable); request_id is auto-echoed if not set")
     prpl.add_argument("-m", "--message", help="Body text (else --file or stdin)")
-    prpl.add_argument("--file", help="Read body from this file path")
+    prpl.add_argument("--file", help="Read body from this file path ('-' = stdin)")
     prpl.add_argument("--allow-empty", action="store_true")
+    prpl.add_argument("--dry-run", action="store_true",
+                      help="Resolve and print the recipient + echoed request_id "
+                           "+ kind WITHOUT sending. Use it to confirm a reply "
+                           "routes to the intended thread when several are open.")
     prpl.add_argument("--quiet", action="store_true")
     prpl.set_defaults(func=cmd_reply)
 

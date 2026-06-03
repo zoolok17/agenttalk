@@ -1340,3 +1340,52 @@ def test_status_warns_about_unconsumed_reply(
     assert "unconsumed response" in warnings
     assert "pp-1" in warnings
 
+
+# ======================== 0.13.0: ergonomics (#6/#7/#8) ====================
+
+def test_reply_dry_run_resolves_without_sending(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    _run(["send", "--from", "beta", "--to", "alpha", "--kind", "review-request",
+          "--meta", "request_id=r1", "-m", "review"], store_root)
+    before = len(list((store_root / ".agenttalk" / "messages").glob("*.json")))
+    capsys.readouterr()
+    # No body on purpose: --dry-run must NOT require one (it sends nothing).
+    rc = _run(["reply", "--from", "alpha", "--dry-run", "--kind", "review-result",
+               "--meta", "status=approved"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "dry-run" in out and "r1" in out and "-> beta" in out
+    after = len(list((store_root / ".agenttalk" / "messages").glob("*.json")))
+    assert after == before  # nothing was sent
+
+
+def test_file_dash_reads_body_from_stdin(
+    store: Store, store_root: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    monkeypatch.setattr("sys.stdin", io.StringIO("body via stdin\n"))
+    rc = _run(["send", "--from", "alpha", "--to", "beta", "--kind", "note",
+               "--file", "-", "--quiet"], store_root)
+    assert rc == 0
+    assert store.messages_for("beta")[-1].body == "body via stdin\n"
+
+
+def test_whoami_json_shows_identity_and_warns_off_roster(
+    store_root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    monkeypatch.setenv("AGENTTALK_SELF", "alpha")
+    capsys.readouterr()
+    _run(["whoami", "--json"], store_root)
+    p = json.loads(capsys.readouterr().out)
+    assert p["self"] == "alpha" and p["self_in_roster"] is True
+    assert p["peer"] == "beta" and p["root"]
+    # a self not in the roster (likely wrong --root) warns
+    monkeypatch.setenv("AGENTTALK_SELF", "ghost")
+    capsys.readouterr()
+    _run(["whoami", "--json"], store_root)
+    p2 = json.loads(capsys.readouterr().out)
+    assert p2["self_in_roster"] is False
+    assert any("NOT in the roster" in w for w in p2["warnings"])
+
+

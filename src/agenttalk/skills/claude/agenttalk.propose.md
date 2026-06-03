@@ -32,6 +32,12 @@ agent such as `codex-lead`, `codex-rev`, or the named owner. Always
 resolve inside your current shell - env from prior tool calls does
 not persist across separate tool-call processes.
 
+If `.agenttalk/` is not under the current directory, pass `--root
+<path>` before the subcommand on every invocation, for example
+`agenttalk --root <path> propose --from $SELF --to $PEER ...`. Do not
+write `agenttalk propose --root ...`; global options must precede the
+subcommand.
+
 ## Split-work guard
 
 A proposal must not become a backdoor for splitting implementation

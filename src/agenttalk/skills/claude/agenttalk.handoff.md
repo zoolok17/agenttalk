@@ -32,6 +32,12 @@ consultant explicitly, e.g. `claude-rev` or `codex-rev`. Always
 resolve inside your current shell - env from prior tool calls does not
 persist across separate tool-call processes.
 
+If `.agenttalk/` is not under the current directory, pass `--root
+<path>` before the subcommand on every invocation, for example
+`agenttalk --root <path> send --from $SELF --to $PEER ...`. Do not
+write `agenttalk send --root ...`; global options must precede the
+subcommand.
+
 ## Splitting implementation work with the peer
 
 **Outside spec-kitty, do NOT split implementation work with the peer
