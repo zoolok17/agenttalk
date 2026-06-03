@@ -5,6 +5,28 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] - 2026-06-03
+
+### Fixed
+
+- **Scoped wait respects global consumption.** `agenttalk wait --to-request`
+  no longer re-delivers a message already consumed through the global cursor
+  by `drain` or plain `wait`. Scoped delivery now starts at
+  `max(per-thread seen_msg_id, global cursor)`, so after draining and answering
+  a needs-info request it awaits the next reply instead of re-showing the old
+  one. Scoped wait remains non-consuming and advances only the per-thread
+  pointer.
+
+### Documentation
+
+- Clarified the global-cursor vs per-thread-state model: `reply-waiting`
+  derives from the global cursor; `threadstate.json` is created lazily by
+  `wait --to-request` and `ack --to-request`, not at init; `ack --to-request`
+  closure is permanent, and a re-ask needs a fresh `request_id`. SECURITY notes
+  threadstate tampering has the same denial-of-service profile as cursor
+  tampering. ROADMAP now reflects that 0.12.0 delivered the first three
+  production-retro items.
+
 ## [0.12.0] - 2026-06-03
 
 Coordination recovery release from the first four-agent production

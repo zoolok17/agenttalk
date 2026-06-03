@@ -18,7 +18,7 @@ exported on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.12.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.12.1"
 agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
@@ -116,10 +116,10 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.12.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.12.1"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.12.0` with
+Pin to a specific tag so you control upgrades. Replace `v0.12.1` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
@@ -165,7 +165,9 @@ This creates `.agenttalk/` with:
   config.json          session + agent roster
   messages/<id>.json   one file per message (chronologically sorted)
   state/<agent>.cursor last message id each agent has globally acknowledged
-  state/<agent>.threadstate.json per-request seen/closed state for scoped waits
+  state/<agent>.threadstate.json per-request seen/closed state for scoped
+                       waits (created lazily on first `wait --to-request` /
+                       `ack --to-request`, not at init)
   sessions/            markdown/jsonl transcripts written by `agenttalk end`
 ```
 
@@ -657,8 +659,8 @@ handled a thread after a restart.
 
 Thread states from `--for A`'s perspective:
 - `reply-waiting`: a correlated response addressed to `A` is newer
-  than `A`'s cursor or scoped thread state; consume it with `drain`,
-  plain `wait`, or targeted `wait --to-request <id>`.
+  than `A`'s global cursor; consume it with `drain`, plain `wait`,
+  or targeted `wait --to-request <id>`.
 - `owed-inbound`: the ball is on `A`; either the peer's opener has no
   response from `A`, or a consumed `review-result status=needs-info`
   bounced the ball back.

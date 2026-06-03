@@ -108,6 +108,24 @@ def test_scoped_wait_ignores_stale_composing(store: Store, store_root: Path) -> 
     assert elapsed < 2.0, f"stale composing extended the scoped wait ({elapsed:.1f}s)"
 
 
+def test_scoped_wait_does_not_redeliver_globally_consumed(store: Store, store_root: Path) -> None:
+    """Regression (final review): a message already consumed via the GLOBAL
+    cursor (drain/plain wait) must NOT be re-delivered by a scoped wait —
+    else after draining+answering a needs-info, `wait --to-request` would
+    re-show the old needs-info instead of awaiting the next reply."""
+    import time as _t
+    store.send(sender="beta", recipient="alpha", kind="review-result",
+               body="needs-info", meta={"request_id": "r1", "status": "needs-info"})
+    _run(["drain", "--for", "alpha", "--quiet"], store_root)  # global cursor advances past it
+    assert store.cursor("alpha") != ""
+    t0 = _t.monotonic()
+    rc = _run(["wait", "--for", "alpha", "--to-request", "r1", "--timeout", "0.2",
+               "--grace", "0", "--interval", "0.05", "--quiet"], store_root)
+    elapsed = _t.monotonic() - t0
+    assert rc == 1, "scoped wait re-delivered an already-drained message"
+    assert elapsed < 2.0
+
+
 # ------------------------------------------------ ack --to-request (closure)
 
 def test_ack_to_request_closes_thread(store: Store, store_root: Path) -> None:

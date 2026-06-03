@@ -2,24 +2,29 @@
 
 Carry-forward notes for the next session / next machine: what production
 use validated, what hurt, and the ranked backlog to address it. Built from
-the Claude Code + Codex collaboration that shipped 0.10.0–0.11.1, **plus a
+the Claude Code + Codex collaboration that shipped 0.10.0–0.12.0, **plus a
 retro from the first real four-agent run (2026-06-03).**
 
-> Current release: **v0.11.1** (`master`). See `CHANGELOG.md` for history
+> Current release: **v0.12.0** (`master`). See `CHANGELOG.md` for history
 > and `SECURITY.md` for the trust model.
 
 ---
 
 ## Where things stand
 
-- **0.11.1 is a clean stopping point.** The multi-agent surface (roster
-  roles/groups, broadcast fan-out, multi-party threads, lead skills) is
-  shipped, dogfooded, and now **validated in production**.
+- **The production retro's top-3 asks shipped in 0.12.0** (coordination
+  recovery): scoped non-consuming `wait --to-request`, the `sync` rejoin
+  digest, and explicit `ack --to-request` closure. Items 1–3 of the backlog
+  below are **DELIVERED** — kept here only as a record; the live backlog is
+  items 4–9 (tracked as GitHub issues #6–#11).
+- **0.12.0 is a clean stopping point.** The multi-agent surface (roster
+  roles/groups, broadcast fan-out, multi-party threads, lead skills) plus
+  coordination recovery is shipped, dogfooded, and **validated in production**.
 - **Production headline (2026-06-03):** a genuinely nontrivial **four-agent**
   review+implement loop (`codex-dev`, `codex-rev`, `claude-rev`, lead) ran a
   real project through **two crashes/restarts without losing work**. The
-  structure held; **every weak spot is ergonomic** — `wait` scoping, closure
-  semantics, and restart recovery — not structural.
+  structure held; **every weak spot was ergonomic** — `wait` scoping, closure
+  semantics, and restart recovery — not structural, and those are now fixed.
 
 ---
 
@@ -80,21 +85,23 @@ on its pinned `--root`.
 
 ## Prioritized backlog (production-ranked)
 
-**★ = the two unanimous, highest-value asks.**
+### ✅ Delivered in 0.12.0 (the production retro's top-3)
 
-1. **★ Scoped `wait`** — `wait --to-request <id>` / `--only-request <id>` /
-   `--kind <k>`. Return only on the message you're actually waiting for;
-   ignore (don't consume) unrelated traffic. Kills the stale-wakeup churn —
-   the run's #1 time sink.
-2. **★ Rejoin digest** — `agenttalk sync --for <agent>`: roster, unread
-   grouped by `request_id`, owed threads, last-N broadcasts, last decision
-   per thread, and a recommended next action. Fixes the restart-behind-state
-   problem (agents coming back and asserting stale state).
-3. **Explicit closure** — `agenttalk ack --to-request <id>`, **and/or** count
-   *any* reply echoing a `request_id` as satisfying `owed-inbound` regardless
-   of `kind`. (Directly fixes friction #3 and supersedes the earlier-noted
-   "counter-ask via `--kind question` not counted" edge — see threads.py
-   `_derive_broadcast`/`_classify_event`.)
+1. **★ Scoped `wait`** — `wait --to-request <id>` (`--kind <k>` refines it).
+   Returns only the targeted thread; non-consuming (advances only the
+   per-thread `seen_msg_id`, never the global cursor, and floors delivery at
+   the global cursor so already-drained messages aren't re-shown). Killed the
+   run's #1 time sink.
+2. **★ Rejoin digest** — `agenttalk sync --for <agent> [--json]`: identity,
+   roster, actionable threads (who-owes-whom + deterministic hints), last
+   decision per thread, unread FYI kept separate from owed work.
+3. **Explicit closure** — `agenttalk ack --to-request <id>` (manual closure;
+   permanent — a re-ask needs a fresh request_id), **plus** broadened
+   question-closure (any non-control reply from the counterparty closes a
+   question, incl. a broadcast question; review/proposal stay strict).
+
+### Live backlog (deferred — GitHub issues #6–#11)
+
 4. **Reply safety** — `reply --dry-run` showing the resolved recipient +
    `request_id` before sending; document **thread-originator-vs-asker
    routing** (a broadcast reply goes to the thread originator, who may not be

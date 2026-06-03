@@ -1,6 +1,6 @@
 # Security policy & threat model
 
-> Last updated: 2026-06-02 (v0.11.0)
+> Last updated: 2026-06-03 (v0.12.0)
 
 agenttalk is a small file-backed message bus. The trust model is
 local: if you can write to a project's `.agenttalk/` directory, you
@@ -289,6 +289,11 @@ guidance and catches drift in CI.
 An attacker overwrites `.agenttalk/state/claude.cursor` with the
 latest message ID. The agent's next `wait` skips all unread
 messages.
+
+The same denial-of-service profile applies to
+`.agenttalk/state/<agent>.threadstate.json`: tampering with
+`seen_msg_id` or `closed` can hide, re-show, or locally close thread
+work, but it does not create a new instruction-execution path.
 
 **Mitigation today:** none.
 **Planned:** lower priority; cursor tampering is a denial-of-service

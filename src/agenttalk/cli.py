@@ -913,7 +913,15 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
     )
     try:
         while True:
-            seen = store.thread_seen(agent, rid)
+            # Floor delivery at BOTH the per-thread seen pointer AND the
+            # global cursor: a message already consumed globally (a `drain`
+            # or plain `wait` advanced the cursor past it) must NOT be
+            # re-surfaced by a scoped wait — otherwise, e.g., after draining
+            # and answering a needs-info, `wait --to-request` would re-show
+            # that old needs-info instead of awaiting the next reply. On a
+            # match we still advance ONLY the thread pointer (never the
+            # global cursor), so scoped wait stays non-consuming.
+            floor = max(store.thread_seen(agent, rid), store.cursor(agent))
             match = None
             for m in store.messages_for(agent):
                 if m.kind in CONTROL_KINDS:
@@ -935,7 +943,7 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
                             total_extended += amount
                             grace_used = False
                             _write_waiting_marker(
-                                store, agent, cursor_at_start=seen,
+                                store, agent, cursor_at_start=floor,
                                 timeout=args.timeout, deadline=deadline,
                             )
                             if not args.quiet:
@@ -946,7 +954,7 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
                     continue
                 if kind_filter and m.kind != kind_filter:
                     continue
-                if m.id <= seen:
+                if m.id <= floor:
                     continue
                 match = m
                 break
@@ -1871,7 +1879,10 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--to-request", dest="to_request",
                     help="Explicitly CLOSE this request thread for the agent "
                          "(manual closure / escape hatch). Does not touch the "
-                         "global cursor.")
+                         "global cursor. Permanent: a later message on the same "
+                         "request_id won't re-open the thread in `threads` (it's "
+                         "still delivered by drain/wait/sync) — a fresh exchange "
+                         "needs a new request_id.")
     pa.set_defaults(func=cmd_ack)
 
     psync = sub.add_parser(
