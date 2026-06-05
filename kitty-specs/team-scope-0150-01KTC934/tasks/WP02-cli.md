@@ -24,6 +24,8 @@ subtasks:
 - T009
 - T010
 - T011
+agent: "claude"
+shell_pid: "52048"
 history:
 - date: '2026-06-05T16:40:00Z'
   event: created
@@ -123,3 +125,7 @@ returned elsewhere); additivity (quarantined only when >0 - check the
 no-feature store shape test); FR-006 refusal correctness for needs-info
 threads (review-request anchor mid-ping-pong must still refuse NA);
 fault-injection realism; reply request_id echo untouched (v0.9.0 trap).
+
+## Activity Log
+
+- 2026-06-05T16:52:42Z – claude – shell_pid=52048 – Started implementation via action command
