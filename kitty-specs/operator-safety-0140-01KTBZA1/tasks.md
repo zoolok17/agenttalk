@@ -41,11 +41,11 @@ half, T014, and the #14 lines of T022–T024. Everything else stands alone.
 | T019 | e2e: rescind race — send→rescind→wake/check→abort (#12) | WP04 | | [D] |
 | T020 | e2e: liaison flow — escalate→bucket→answer→closed + refusals (#18) | WP04 | | [D] |
 | T021 | e2e: backward-compat sweep (NFR-001, mixed-version store) | WP04 | | [D] |
-| T022 | skills: Claude-side updates (7 files) | WP05 | [P] |
-| T023 | skills: Codex-side updates (7 files) | WP05 | [P] |
-| T024 | docs: README + SECURITY | WP05 | [P] |
-| T025 | release prep: CHANGELOG 0.14.0 + version bumps | WP05 | |
-| T026 | gate: full suite + quickstart smoke-walk + skill-lint | WP05 | |
+| T022 | skills: Claude-side updates (7 files) | WP05 | [D] |
+| T023 | skills: Codex-side updates (7 files) | WP05 | [D] |
+| T024 | docs: README + SECURITY | WP05 | [D] |
+| T025 | release prep: CHANGELOG 0.14.0 + version bumps | WP05 | | [D] |
+| T026 | gate: full suite + quickstart smoke-walk + skill-lint | WP05 | | [D] |
 
 ## Work Packages
 
@@ -118,11 +118,11 @@ half, T014, and the #14 lines of T022–T024. Everything else stands alone.
 **Priority**: P1 — ships the release. **Dependencies**: WP04 (transitively everything — docs must describe what actually landed, incl. whether #14 made it).
 **Independent test**: `pytest` (full suite incl. skill-lint) green; quickstart.md walks clean against the built CLI.
 
-- [ ] T022 skills: Claude-side updates (WP05)
-- [ ] T023 skills: Codex-side updates (WP05)
-- [ ] T024 docs: README + SECURITY (WP05)
-- [ ] T025 release prep: CHANGELOG + version bumps (WP05)
-- [ ] T026 gate: full suite + quickstart smoke-walk + skill-lint (WP05)
+- [x] T022 skills: Claude-side updates (WP05)
+- [x] T023 skills: Codex-side updates (WP05)
+- [x] T024 docs: README + SECURITY (WP05)
+- [x] T025 release prep: CHANGELOG + version bumps (WP05)
+- [x] T026 gate: full suite + quickstart smoke-walk + skill-lint (WP05)
 
 **Risks**: skill drift between the two CLI flavors (test_skill_lint guards structure, not semantics — cross-review covers semantics); tag/push/Release-object steps are NOT in this WP: they require explicit operator authorization per house rules.
 
