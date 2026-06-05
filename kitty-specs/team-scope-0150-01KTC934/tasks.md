@@ -26,10 +26,10 @@ Feature traceability per-subtask (#15/#16/#17).
 | T011 | tests: test_cli for T006-T010 incl. fault injection | WP02 | | [D] |
 | T012 | doctor: store-hygiene check (invalid + quarantined) (#17) | WP03 | | [D] |
 | T013 | tests: test_doctor (environment-pinned - the CI lesson) | WP03 | | [D] |
-| T014 | e2e: role routing + post-send freeze (SC 1) | WP04 | |
-| T015 | e2e: NA lifecycle both perspectives (SC 2) | WP04 | |
-| T016 | e2e: fault-injected partial fan-out at k=first/mid/last + warning lifecycle (SC 3) | WP04 | |
-| T017 | e2e: prune byte-identity sweep + strict-additivity gates (SC 4 / NFR-001) | WP04 | |
+| T014 | e2e: role routing + post-send freeze (SC 1) | WP04 | | [D] |
+| T015 | e2e: NA lifecycle both perspectives (SC 2) | WP04 | | [D] |
+| T016 | e2e: fault-injected partial fan-out at k=first/mid/last + warning lifecycle (SC 3) | WP04 | | [D] |
+| T017 | e2e: prune byte-identity sweep + strict-additivity gates (SC 4 / NFR-001) | WP04 | | [D] |
 | T018 | skills: both flavors - NA-not-placeholder-ack, --to-role preference, exit-5 handling, prune discipline | WP05 | [P] |
 | T019 | docs: README rows/sections + SECURITY notes | WP05 | [P] |
 | T020 | release prep: CHANGELOG 0.15.0 + version bumps | WP05 | |
@@ -87,10 +87,10 @@ Feature traceability per-subtask (#15/#16/#17).
 **Priority**: P1. **Dependencies**: WP02, WP03.
 **Independent test**: `pytest tests/test_coordination.py` green.
 
-- [ ] T014 e2e: role routing + freeze (WP04)
-- [ ] T015 e2e: NA lifecycle (WP04)
-- [ ] T016 e2e: partial fan-out injection (WP04)
-- [ ] T017 e2e: prune byte-identity + additivity gates (WP04)
+- [x] T014 e2e: role routing + freeze (WP04)
+- [x] T015 e2e: NA lifecycle (WP04)
+- [x] T016 e2e: partial fan-out injection (WP04)
+- [x] T017 e2e: prune byte-identity + additivity gates (WP04)
 
 **Risks**: fault injection must target Store.send deterministically (monkeypatch at position k), no timing dependence.
 
