@@ -20,12 +20,12 @@ half, T014, and the #14 lines of T022–T024. Everything else stands alone.
 
 | ID | Description | WP | Parallel |
 |----|-------------|----|----------|
-| T001 | store: `rescind` kind + send-validation helper (+ web.py kind gate) (#12) | WP01 | |
-| T002 | store: `AGENTTALK_ROOT` precedence + upward multi-store scan helper (#13) | WP01 | |
-| T003 | store: operator_facing accessors (#18) + reply-in-flight marker helpers (#14) | WP01 | |
-| T004 | threads: `closed-superseded` derivation per D2 (#12) | WP01 | |
-| T005 | threads: escalation row surfacing (needs_operator, operator_state) (#18) | WP01 | |
-| T006 | tests: new tests/test_store.py + test_threads.py extensions | WP01 | |
+| T001 | store: `rescind` kind + send-validation helper (+ web.py kind gate) (#12) | WP01 | | [D] |
+| T002 | store: `AGENTTALK_ROOT` precedence + upward multi-store scan helper (#13) | WP01 | | [D] |
+| T003 | store: operator_facing accessors (#18) + reply-in-flight marker helpers (#14) | WP01 | | [D] |
+| T004 | threads: `closed-superseded` derivation per D2 (#12) | WP01 | | [D] |
+| T005 | threads: escalation row surfacing (needs_operator, operator_state) (#18) | WP01 | | [D] |
+| T006 | tests: new tests/test_store.py + test_threads.py extensions | WP01 | | [D] |
 | T007 | cli: `cmd_rescind` (#12) | WP02 | |
 | T008 | cli: `cmd_check` with exit 0/3/4 (#12) | WP02 | |
 | T009 | cli: scoped-wait rescind wake, exit 3 (#12) | WP02 | |
@@ -56,12 +56,12 @@ half, T014, and the #14 lines of T022–T024. Everything else stands alone.
 **Priority**: P0 — everything depends on it. **Dependencies**: none.
 **Independent test**: `pytest tests/test_store.py tests/test_threads.py` green; no CLI behavior changed yet (cli.py untouched).
 
-- [ ] T001 store: rescind kind + send-validation helper (+ web.py kind gate) (WP01)
-- [ ] T002 store: AGENTTALK_ROOT precedence + upward multi-store scan helper (WP01)
-- [ ] T003 store: operator_facing accessors + reply-in-flight marker helpers (WP01)
-- [ ] T004 threads: closed-superseded derivation per D2 (WP01)
-- [ ] T005 threads: escalation row surfacing (WP01)
-- [ ] T006 tests: test_store.py (new) + test_threads.py extensions (WP01)
+- [x] T001 store: rescind kind + send-validation helper (+ web.py kind gate) (WP01)
+- [x] T002 store: AGENTTALK_ROOT precedence + upward multi-store scan helper (WP01)
+- [x] T003 store: operator_facing accessors + reply-in-flight marker helpers (WP01)
+- [x] T004 threads: closed-superseded derivation per D2 (WP01)
+- [x] T005 threads: escalation row surfacing (WP01)
+- [x] T006 tests: test_store.py (new) + test_threads.py extensions (WP01)
 
 **Risks**: D2 ordering subtleties (pinned target_msg_id, requester-only, precedence vs manual ack closure); regression risk in derive_threads replay — the existing test_threads suite is the guard rail.
 
