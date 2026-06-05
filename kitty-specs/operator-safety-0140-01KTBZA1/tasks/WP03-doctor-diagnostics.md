@@ -134,3 +134,4 @@ doctor and whoami (whoami is WP02's — flag mismatches, don't fix here).
 - 2026-06-05T14:56:14Z – claude – shell_pid=348 – Started implementation via action command
 - 2026-06-05T14:59:53Z – claude – shell_pid=348 – Doctor diagnostics complete; full suite green
 - 2026-06-05T15:08:04Z – claude – shell_pid=348 – Moved to planned
+- 2026-06-05T15:12:45Z – claude – shell_pid=348 – Review passed: root-first doctor contract fixed on human and JSON surfaces; targeted and full pytest suites passed.
