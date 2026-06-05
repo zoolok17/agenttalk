@@ -14,6 +14,8 @@ subtasks:
 - T024
 - T025
 - T026
+agent: "claude"
+shell_pid: "71908"
 history:
 - date: '2026-06-05T13:34:21Z'
   event: created
@@ -161,3 +163,7 @@ exit-code table consistency with data-model §7, skill parity across
 flavors (pick two files and diff semantics line by line), and the
 honest-limit phrasing for turn-cost (skills must not promise turn-free
 waits).
+
+## Activity Log
+
+- 2026-06-05T15:30:26Z – claude – shell_pid=71908 – Started implementation via action command
