@@ -1,12 +1,12 @@
 {
-  "event_count": 18,
-  "last_event_id": "01KTCD67RCD9V2CZJGFWHGRYNR",
-  "materialized_at": "2026-06-05T17:27:13.420866+00:00",
+  "event_count": 19,
+  "last_event_id": "01KTCDHP1QRMR3Q6ZVFHYS1TE5",
+  "materialized_at": "2026-06-05T17:33:28.503402+00:00",
   "mission_number": "",
   "mission_slug": "team-scope-0150-01KTC934",
   "mission_type": "software-dev",
   "summary": {
-    "approved": 2,
+    "approved": 3,
     "blocked": 0,
     "canceled": 0,
     "claimed": 0,
@@ -14,7 +14,7 @@
     "for_review": 0,
     "in_progress": 0,
     "in_review": 0,
-    "planned": 3
+    "planned": 2
   },
   "work_packages": {
     "WP01": {
@@ -33,10 +33,10 @@
     },
     "WP03": {
       "actor": "user",
-      "force_count": 2,
-      "lane": "planned",
-      "last_event_id": "01KTCD67RCD9V2CZJGFWHGRYNR",
-      "last_transition_at": "2026-06-05T17:27:13.420866+00:00"
+      "force_count": 3,
+      "lane": "approved",
+      "last_event_id": "01KTCDHP1QRMR3Q6ZVFHYS1TE5",
+      "last_transition_at": "2026-06-05T17:33:28.503402+00:00"
     },
     "WP04": {
       "actor": "finalize-tasks",
