@@ -121,13 +121,54 @@ contract unchanged (NFR-004) — a caller that already treats 3 as "do not act"
 behaves correctly without knowing about epochs. The distinction surfaces in the
 message text / JSON `reason`, not a new code.
 
-**Absent `epoch_at_send` under `--epoch`**: reported as current for the epoch
-dimension *only if* there is also no barrier; if a barrier exists and the opener
-predates epochs (absent), the JSON notes `epoch="unknown-pre-epoch"` and the
-human text advises re-ask for irreversible actions (RFC line 407–409). It does
-NOT hard-fail to exit 3 on absent alone, because absent legitimately means
-"older client, epoch indeterminate" — the contract is advisory there, matching
-the RFC.
+**Absent `epoch_at_send` under `--epoch` (REVISED per Codex B1)**: if NO barrier
+exists, absent is current (exit 0). If a barrier EXISTS and the opener predates
+epochs (absent), `check --epoch` returns **exit 3** (`epoch="unknown-pre-epoch"`,
+do-not-act), NOT a passing exit 0. Rationale: `check` is the last executable
+safety point before an irreversible action (RFC 401–405) and automation gates on
+the exit code; "old requests must be re-asked under the current barrier for
+irreversible actions" (RFC 407–409) is only enforceable if the exit code says
+do-not-act. An advisory note at exit 0 would let an exit-code-gated caller act on
+a pre-epoch request after an epoch boundary — exactly the crossing the barrier
+exists to prevent. (My first draft made this exit-0-advisory; Codex correctly
+rejected it.)
+
+## D7 — Non-rebindable guard covers `add_agent`, not only rename (Codex B2)
+
+The tombstone non-rebindability (FR-002) must be enforced at EVERY write path
+that introduces an active name — `add_agent` / `roster add` as well as
+`rename_agent`. The existing `add_agent` only validates the active roster, so
+without an explicit guard `roster add <retired-name>` would write a config that
+puts a name in both `agents` and `retired` (then `load_config` fail-closes on the
+NEXT read — too late, and a poor UX). Fix: `add_agent` refuses a name present in
+`known_agents()` (active ∪ retired) with a tombstone-aware error. A
+`remove --force` name leaves no tombstone, so it remains re-addable — that is the
+intended distinction and must be tested explicitly.
+
+## D8 — Broadcast epoch snapshot, one per logical broadcast (Codex B3)
+
+`send()` stamps `epoch_at_send = current_epoch()` per call for point-to-point
+openers. But broadcast openers fan out to N per-recipient copies in a loop; a
+barrier landing mid-loop would split one `broadcast_id` across two epochs. Fix:
+the broadcast path computes `current_epoch()` ONCE before fan-out and passes that
+explicit `epoch_at_send` into every copy's frozen meta. `send()`'s
+don't-overwrite-a-supplied-value rule keeps it intact, and `--resume` rebuilds
+from the frozen copies with the original stamp. Test: all copies of one
+`broadcast_id` share one stamp even when a barrier is fired between copies.
+
+## D9 — Retired forwarding forwards a SPECIFIC request (Codex B4)
+
+The RFC's "forward a retired identity's outstanding obligation" implies there IS
+an identified obligation. My first contract had `roster forward <retired>
+--to <live>` with no request id — that can only mint a generic note, not forward
+an owed thread. Fix (option a of Codex's two): require `--to-request <rid>`,
+validate the thread is genuinely owed to/from `<retired>`, and emit an ordinary
+message to `<live>` carrying `meta.forwarded_from` + `meta.forwarded_request_id`
+(+ `meta.forward.hop=1`). The sender is an explicit `--from` (must be active) or
+the `operator_facing` identity — NEVER the target by default (a forward should
+not look like it came from the agent receiving it). Second hop refused (a source
+request already carrying forward meta cannot be forwarded again); active-source
+and non-owed-request refused. See data-model §3b.
 
 ## D6 — `next_owner` / `next_action`: derived, read-only, additive
 

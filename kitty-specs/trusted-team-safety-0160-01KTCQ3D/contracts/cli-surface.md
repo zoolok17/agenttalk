@@ -51,16 +51,22 @@ agenttalk roster remove <name> [--force]
 ## roster forward (optional, single-hop retired forwarding)
 
 ```
-agenttalk roster forward <retired-name> --to <live-agent> [--reason <text>]
+agenttalk roster forward <retired-name> --to <live-agent> --to-request <rid> [--from <agent>] [--reason <text>]
 ```
-- Records, in transcript-visible meta, that an outstanding obligation owed to a
-  retired identity is redirected to a live agent — a single explicit hop.
-- Emits an ordinary message (`kind=note`) from the operator/liaison context with
-  `meta.forward={"from_retired": <retired-name>, "to": <live-agent>,
-  "hop": 1}` so the redirect is auditable.
-- Refuses (exit 2) if `<retired-name>` is not a retired tombstone, if `<to>` is
-  not active, or if the source is itself being forwarded (multi-hop: a message
-  whose own opener already carries `meta.forward` cannot be forwarded again).
+- Forwards a SPECIFIC outstanding request (`--to-request <rid>`) owed to/from a
+  retired identity to a live agent — a single explicit hop (B4, Codex review).
+- Emits an ordinary message (`kind=note`) to `<live-agent>` carrying
+  `meta.forwarded_from=<retired-name>`, `meta.forwarded_request_id=<rid>`, and
+  `meta.forward={"hop":1}` so the redirect is auditable and links to the owed
+  thread.
+- **Sender**: an explicit `--from` (must be active) or, if omitted, the
+  `operator_facing` identity. NEVER the target by default — a forward must not
+  look like it originated from the agent receiving it. If neither is available,
+  refuse (exit 2) asking for `--from`.
+- Refuses (exit 2) if `<retired-name>` is not a retired tombstone; if
+  `<live-agent>` is not active; if `<rid>` is not a real thread owed to/from
+  `<retired-name>`; or if the source request already carries forward meta
+  (second hop forbidden).
 
 ## barrier bump
 
@@ -76,6 +82,13 @@ agenttalk barrier bump --from <agent> --scope global -m "<reason>"
   refused, exit 2 — scopes are reserved, not a workflow engine).
 - Any active member may bump (documented global-stall lever; trusted-team only).
 
+**Broadcast epoch snapshot (B3, Codex review)**: when a broadcast opener (e.g.
+`broadcast --kind question`) fans out, the broadcast path MUST snapshot
+`current_epoch()` once before fan-out and pass that explicit `epoch_at_send` into
+every recipient copy's frozen meta — so all copies of one `broadcast_id` share
+one epoch stamp even if a barrier lands mid-fan-out, and `--resume` preserves it.
+Point-to-point openers keep the per-`send()` stamp.
+
 ## check --epoch
 
 ```
@@ -84,9 +97,12 @@ agenttalk check --for <agent> --to-request <rid> --epoch [--json]
 - Extends the existing `check` (#12). Without `--epoch`: unchanged (rescind-only,
   exit 0/3/4). With `--epoch`: ALSO compares the request's `epoch_at_send` to
   `current_epoch()`.
-- Exit codes (see data-model §4): 0 current, 3 superseded-OR-previous-epoch,
-  4 unknown. Human/JSON text distinguishes rescinded vs previous-epoch vs
-  unknown-pre-epoch.
+- Exit codes (see data-model §4): 0 current, 3 superseded-OR-previous-epoch-OR-
+  unknown-pre-epoch-with-barrier, 4 unknown rid. Human/JSON text distinguishes
+  rescinded vs previous-epoch vs unknown-pre-epoch.
+- **B1 (Codex review)**: an ABSENT `epoch_at_send` with a barrier present is
+  exit **3** (do-not-act, `unknown-pre-epoch`), NOT a passing exit 0 — automation
+  gates on the exit code. Absent with NO barrier is exit 0 (current).
 - Read-only: no cursor/heartbeat/threadstate writes (same as 0.14.0 `check`).
 
 ## threads --json / sync --json (changed output)

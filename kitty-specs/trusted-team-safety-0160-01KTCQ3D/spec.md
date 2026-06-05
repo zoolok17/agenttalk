@@ -120,7 +120,17 @@ guarantees are explicitly deferred to later RFC phases (B/C/D).
   suppressed barrier would have said otherwise). This is documented as a
   trusted-team limitation, not a defended attack.
 - Renaming to a name that is already an active identity, or to a retired
-  tombstone: refused with a clear error.
+  tombstone: refused with a clear error. Likewise `roster add <retired-name>`
+  is refused (non-rebindable applies to add, not only rename).
+- `check --epoch` on a pre-0.16.0 opener (`epoch_at_send` absent) when a barrier
+  exists: reported do-not-act (exit 3, `unknown-pre-epoch`), because the opener
+  predates epochs and must be re-asked for irreversible actions. With NO barrier,
+  absent is fine (exit 0).
+- A broadcast opener fanned out across N recipient copies: all copies of one
+  `broadcast_id` carry the SAME `epoch_at_send` (snapshotted once before fan-out),
+  even if a barrier lands mid-fan-out; `--resume` preserves that stamp.
+- Retired forwarding without `--to-request`, or for a request not owed to/from
+  the retired identity: refused.
 - `--drain-check` with outstanding obligations: refused, listing what is owed.
 - Forwarding attempted more than one hop, or from an active (non-retired)
   identity: refused (single-hop, retired-only).
@@ -134,17 +144,17 @@ guarantees are explicitly deferred to later RFC phases (B/C/D).
 | ID | Requirement | Status |
 |----|-------------|--------|
 | FR-001 | The system SHALL maintain an identity registry in `config.json` recording, for each identity, at minimum its name and lifecycle state (active or retired). | Draft |
-| FR-002 | Retiring an identity SHALL record a permanent tombstone; a retired name SHALL NOT be re-bindable to a new active identity by any registry operation. | Draft |
+| FR-002 | Retiring an identity SHALL record a permanent tombstone; a retired name SHALL NOT be re-bindable to a new active identity by ANY registry operation — explicitly including `roster add` / `add_agent` and `roster rename <_> <retired>`, not only rename. (A `remove --force` name leaves no tombstone and therefore remains re-addable; that is the documented distinction from retire.) | Draft |
 | FR-003 | The system SHALL provide `roster retire <name>`, which transitions an active identity to retired and reports success/failure with a clear message. | Draft |
 | FR-004 | A retired identity SHALL be refused as the `--from` of a `send` (and any send-equivalent), with the documented usage exit code and a tombstone explanation. | Draft |
 | FR-005 | The system SHALL provide `roster rename <old> <new> --drain-check`, which refuses when work is owed to or from `<old>`, and otherwise retires `<old>` and registers `<new>` as a new active identity. | Draft |
 | FR-006 | After a rename or retirement, all historical messages authored by the old/retired identity SHALL remain valid and attributable (history is never rewritten). | Draft |
 | FR-007 | `roster remove <name>` SHALL be refused by default with a hint directing the operator to `roster retire`; an explicit force override SHALL allow removal while warning that historical readability for that identity may break. | Draft |
-| FR-008 | The system SHALL support optional, explicit, single-hop forwarding of a retired identity's outstanding obligation to a live agent, recording the forwarding in transcript-visible meta; multi-hop or active-identity forwarding SHALL be refused. | Draft |
+| FR-008 | The system SHALL support optional, explicit, single-hop forwarding of a SPECIFIC outstanding request (identified by `--to-request <rid>`) owed to/from a retired identity, by emitting an ordinary message to a live agent carrying transcript-visible meta (`forwarded_from`, `forwarded_request_id`). The sender SHALL be an explicit `--from` or the operator-facing identity — never the target by default. Forwarding a request not owed to/from the retired identity, forwarding from an active (non-retired) identity, or a second hop SHALL be refused. | Draft |
 | FR-009 | The system SHALL allow any active roster member to fire a global barrier, recorded as an ordinary message (no new message kind) carrying barrier meta. | Draft |
 | FR-010 | The global epoch id SHALL be the message id of the latest validated global barrier event; there SHALL be no separate epoch counter. | Draft |
 | FR-011 | Tracked request openers minted by an epoch-aware client SHALL automatically carry `epoch_at_send`: the current global epoch id when a barrier exists, or `null` when no barrier has fired yet. The key SHALL be absent only on openers written by pre-0.16.0 clients. (Deliberate, documented exception to the general absent-not-null convention — `null` is a meaningful state, "epoch-aware sender, no barrier yet", distinct from absent, which means "pre-epoch opener" and is checkable only for thread-local rescind.) | Draft |
-| FR-012 | The system SHALL provide `check --to-request <rid> --epoch`, reporting whether the request's `epoch_at_send` matches the current global epoch (current) or is older (previous epoch / stale), exiting with the documented currentness codes. | Draft |
+| FR-012 | The system SHALL provide `check --to-request <rid> --epoch`, reporting whether the request's `epoch_at_send` matches the current global epoch (current, exit 0) or is older / indeterminate (exit 3, do-not-act). "Older" includes `null` once a barrier exists; "indeterminate" includes an ABSENT `epoch_at_send` when a barrier exists (a pre-epoch opener that must be re-asked for irreversible actions) — this maps to exit 3, NOT a passing exit 0, because automation gates on the exit code. With no barrier in history, the epoch dimension is current (exit 0). | Draft |
 | FR-013 | With no barrier in history, `check --epoch` SHALL report the request as current. | Draft |
 | FR-014 | `threads --json` and `sync --json` SHALL include read-only `next_owner` and `next_action` fields on open threads where derivable, and SHALL omit them where not derivable. | Draft |
 | FR-015 | `next_owner` / `next_action` SHALL be derived from thread state only; they SHALL NOT be settable by senders and SHALL NOT alter delivery, unread, or thread-closure behavior. | Draft |

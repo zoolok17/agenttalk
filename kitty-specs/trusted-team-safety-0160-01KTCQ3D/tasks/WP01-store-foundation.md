@@ -138,6 +138,11 @@ from it is refused (tested in T004).
    - in ONE config write: retire `old` with `renamed_to=new`, add `new` as active,
      and **carry over** `old`'s role, group memberships, and `operator_facing`
      designation to `new` (so rename doesn't silently drop the liaison bit).
+   - **B2 (Codex review)**: add the SAME non-rebindable guard to `add_agent` —
+     refuse a name already in `known_agents()` (active OR retired) with a
+     tombstone-aware error, at WRITE time. Do not rely on `load_config`
+     fail-closing on the next read. (A `remove --force` name has no tombstone, so
+     it stays re-addable — intended; cover both in T007.)
 3. `_drain_check(name)` helper → returns a list of open thread descriptors that
    owe work to/from `name` (derive via `agenttalk.threads.derive_threads` over
    `valid_messages()`, filtering non-terminal threads involving `name`). Used by
@@ -167,25 +172,32 @@ remove without force raises; with force removes and signals the warning.
 **Validation**: `send(sender=<retired>)` raises with a tombstone-specific message;
 `send(recipient=<retired>)` likewise.
 
-### T005 — single-hop retired forwarding (library)
-**Purpose**: Record a one-hop redirect of a retired identity's obligation to a
-live agent, auditable in transcript meta (FR-008).
+### T005 — single-hop retired forwarding (library) — B4 revised
+**Purpose**: Forward a SPECIFIC owed request from a retired identity to a live
+agent, auditable in transcript meta (FR-008). See data-model §3b, research D9.
 
 **Steps**:
-1. Add `forward_retired(retired_name, to_agent, *, reason=None)`:
+1. Add `forward_retired(retired_name, to_agent, request_id, *, from_agent=None,
+   reason=None)`:
    - require `retired_name` ∈ `retired_agents()` (else `ValueError`);
    - require `to_agent` ∈ `active_agents()` (else `ValueError`);
-   - emit ONE ordinary message via `send()` from a sensible context (sender =
-     `to_agent` or the operator-facing agent if set; document the choice),
-     `kind="note"`, with `meta.forward={"from_retired":retired_name,
-     "to":to_agent,"hop":1}` and audit-prose body;
-   - refuse a second hop: if the source obligation's opener already carries
-     `meta.forward`, raise (multi-hop forbidden). (For Phase A, enforcing "single
-     hop" can be: refuse forwarding FROM an agent that is active — only retired
-     tombstones are valid sources — which structurally prevents chains.)
+   - require `request_id` resolves to a real thread **owed to/from**
+     `retired_name` (derive via the lazily-imported `threads.derive_threads`
+     over `valid_messages()`; refuse if no such owed thread) — this is what makes
+     it *forwarding an obligation*, not a generic note;
+   - **sender resolution**: `from_agent` if given (must be active); else
+     `operator_facing()` if set; else raise asking for an explicit `--from`.
+     NEVER default the sender to `to_agent`.
+   - emit ONE ordinary message via `send()` (`kind="note"`) to `to_agent` with
+     `meta.forwarded_from=retired_name`, `meta.forwarded_request_id=request_id`,
+     `meta.forward={"hop":1}`, and audit-prose body;
+   - refuse a second hop: if the source request's opener already carries
+     `meta.forward` / `meta.forwarded_from`, raise (multi-hop forbidden).
 
-**Validation**: forwarding from a retired name to a live agent emits the meta;
-forwarding from an active name, or to a retired target, is refused.
+**Validation**: forwarding a genuinely-owed request from a retired name to a live
+agent emits the linked meta with the right sender; forwarding from an active
+identity, to a retired target, for a non-owed request, without `--from`/liaison,
+or a second hop, is each refused.
 
 ### T006 — epoch primitive: `current_epoch()` + `epoch_at_send` stamping
 **Purpose**: The global epoch and automatic opener stamping (research **D1/D2**,
@@ -219,14 +231,19 @@ Cover, at minimum:
 - `retire_agent`: removes from active, adds tombstone, drops role/group/liaison.
 - `rename_agent`: carries role+liaison; refuses `new` already-known (active OR
   retired — both cases); refuses `old` not active.
+- **B2**: `add_agent`/`roster add` refuses a retired tombstone name at write time
+  (config never written with the name in both `agents` and `retired`); a
+  force-removed name (no tombstone) IS re-addable.
 - `_drain_check` returns owed threads (construct a small fixture with an open
   review-request) and is empty when none.
 - `remove_agent(force=False)` raises with the retire hint; `force=True` removes
   and signals the warning; retired name remains non-rebindable but force-removed
   name is re-addable.
 - retired-send refusal (sender and recipient) with the tombstone-specific message.
-- `forward_retired`: happy path emits `meta.forward`; refuses active source /
-  retired target / second hop.
+- `forward_retired` (B4): forwarding a genuinely-owed `request_id` emits
+  `meta.forwarded_from` + `meta.forwarded_request_id` with the resolved sender
+  (`--from`/liaison, never the target); refuses non-owed request / active source /
+  retired target / missing sender / second hop.
 - `current_epoch()`: None with no barrier; returns latest barrier id by id-order
   with multiple barriers.
 - `epoch_at_send` three-state in `send()` (absent for non-openers, null pre-

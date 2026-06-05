@@ -76,9 +76,11 @@ argparse with four actions (mirror the existing roster action dispatch):
    - call `store.remove_agent(name, force=args.force)`;
    - on the no-force refusal, print the retire hint to stderr + **exit 2**;
    - on force, print the history-breakage WARNING + succeed (exit 0).
-4. `roster forward <retired> --to <live> [--reason]` →
-   `store.forward_retired(...)`; print the auditable redirect; invalid
-   source/target/second-hop → **exit 2**.
+4. `roster forward <retired> --to <live> --to-request <rid> [--from <agent>]
+   [--reason]` (B4) → `store.forward_retired(retired, to_agent=live,
+   request_id=rid, from_agent=args.from_agent, reason=...)`; print the auditable
+   redirect (names the forwarded request + the resolved sender); invalid
+   source/target, non-owed `<rid>`, missing sender, or second-hop → **exit 2**.
 
 ### T013 — `barrier bump`
 **Reference**: contracts §"barrier bump". Add a new top-level `barrier` command
@@ -96,6 +98,15 @@ agenttalk barrier bump --from <agent> --scope global -m "<reason>"
 - Print the new epoch id (= the returned message `id`). `--json` →
   `{"epoch":"<id>","scope":"global"}`.
 
+**B3 (Codex review) — broadcast epoch snapshot**: in the existing `broadcast`
+fan-out path (cli.py ~1223), when the broadcast kind is an opener
+(`OPENER_KINDS`), compute `store.current_epoch()` ONCE before the fan-out loop
+and pass that explicit `epoch_at_send` into every recipient copy's (frozen) meta,
+so all copies of one `broadcast_id` share one stamp even if a barrier lands
+mid-loop, and `--resume` preserves it. (`send()` won't overwrite a supplied
+value.) Add a test that all copies of one `broadcast_id` carry the same
+`epoch_at_send`. Non-opener broadcasts are unaffected (no stamp).
+
 ### T014 — `check --epoch`
 **Reference**: contracts §"check --epoch", data-model §4, research D5. Extend
 `cmd_check` + argparse with an `--epoch` flag. Without it: unchanged. With it,
@@ -107,9 +118,11 @@ ALSO evaluate the epoch dimension on the resolved thread row:
   - `epoch_at_send == current_epoch` → `current`, exit 0;
   - `epoch_at_send` present but older than `current_epoch` (incl. `null` when a
     barrier exists) → `previous-epoch`, **exit 3**;
-  - `epoch_at_send` ABSENT but a barrier exists → exit 0, human text advises
-    "opener predates epochs; re-ask for irreversible actions", JSON
-    `epoch:"unknown-pre-epoch"`.
+  - **B1 (Codex review)**: `epoch_at_send` ABSENT but a barrier exists →
+    **exit 3** (do-not-act), human text "opener predates epochs; re-ask under the
+    current barrier for irreversible actions", JSON `epoch:"unknown-pre-epoch"`
+    with the `current_epoch` id. NOT a passing exit 0 — automation gates on the
+    exit code, so a pre-epoch opener must fail closed once an epoch exists.
 - JSON: add an `epoch` object alongside existing keys (additive); non-`--epoch`
   output unchanged. Stay read-only (no cursor/threadstate writes — like 0.14.0).
 
@@ -128,11 +141,15 @@ fields to any non-thread JSON.
 Cover each subcommand's behavior + exit codes:
 - `roster retire`/`rename`/`remove`/`forward` happy paths and refusals (exit 2):
   rename `--drain-check` blocks on owed work; remove no-force hint vs `--force`
-  warning; forward invalid source/target.
+  warning; `forward` requires `--to-request` and refuses a non-owed rid / active
+  source / missing sender (B4).
 - `barrier bump`: emits the `meta.barrier` message, prints epoch id; bad `--scope`
   exit 2; retired `--from` exit 2.
-- `check --epoch`: current (0), previous-epoch (3), unknown-pre-epoch (0 + note),
-  unknown rid (4), and still-superseded-by-rescind (3) all behave per contract.
+- broadcast epoch snapshot (B3): all copies of one `broadcast_id` opener share one
+  `epoch_at_send` even with a barrier fired mid-fan-out.
+- `check --epoch`: current (0), previous-epoch (3), **unknown-pre-epoch with a
+  barrier → exit 3** (B1), unknown-pre-epoch with NO barrier → 0, unknown rid (4),
+  and still-superseded-by-rescind (3) all behave per contract.
 - `threads --json` / `sync --json` include `next_owner`/`next_action` where
   derivable and omit them on terminal threads; non-JSON output unchanged columns.
 

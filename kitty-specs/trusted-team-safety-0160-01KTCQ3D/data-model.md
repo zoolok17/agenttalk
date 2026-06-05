@@ -95,8 +95,42 @@ Stamped automatically in `Store.send()` when `kind in OPENER_KINDS`:
 - Value = `current_epoch()` result at send time (the latest barrier id, or
   `None`→serialized as JSON `null`).
 - Never overwritten if a caller already supplied `epoch_at_send` (explicit
-  caller intent wins — but no normal path supplies it; this is just defensive).
+  caller intent wins). This is load-bearing for B3 below.
 - Non-opener kinds never get the key.
+
+**B3 (Codex review) — one epoch snapshot per logical broadcast**: a broadcast
+opener (e.g. `broadcast --kind question`) fans out to N recipient copies in a
+loop. If `send()` re-evaluated `current_epoch()` per copy, a barrier landing
+mid-loop would give copies of the SAME `broadcast_id` different `epoch_at_send`
+values. Fix: the broadcast path snapshots `store.current_epoch()` ONCE before
+fan-out and passes that explicit `epoch_at_send` into every copy's (frozen) meta;
+`send()`'s "don't overwrite a supplied value" rule then leaves it intact, and
+`--resume` reconstructs from the frozen copies with the original stamp. All
+copies of one `broadcast_id` therefore share one epoch stamp. (Point-to-point
+openers keep the simple per-`send()` stamp — there is only one message.)
+
+## 3b. Retired forwarding meta (B4 — Codex review)
+
+`roster forward <retired> --to <live> --to-request <rid> [--from <agent>]
+[--reason]` forwards a SPECIFIC owed request, not a generic note:
+```jsonc
+{
+  "from": "claude",            // explicit --from, or the operator_facing identity; NEVER the target by default
+  "to": "claude",              // the live target (--to)
+  "kind": "note",
+  "body": "<reason / audit prose>",
+  "meta": {
+    "forwarded_from": "codex",                  // the retired identity
+    "forwarded_request_id": "<rid>",            // the owed request being redirected
+    "forward": { "hop": 1 }
+  }
+}
+```
+Validation: `<retired>` ∈ retired tombstones; `<live>` active; `<rid>` is a real
+thread owed to/from `<retired>` (derive via threads); refuse if the source
+request already carries `meta.forward`/`meta.forwarded_from` (second hop) or if
+`<from>` is not active. Sender resolution: `--from` if given (must be active),
+else `operator_facing()` if set, else refuse asking for `--from`.
 
 ## 4. `check --epoch` result
 
@@ -105,9 +139,15 @@ Stamped automatically in `Store.send()` when `kind in OPENER_KINDS`:
 | no superseding rescind; `epoch_at_send == current_epoch()` | 0 | `current` | `"current"` |
 | no superseding rescind; no barrier exists at all | 0 | `current` | `"current"` |
 | `epoch_at_send` older than `current_epoch()` (incl. `null` when a barrier exists) | 3 | `previous-epoch` | `"previous-epoch"` with `current_epoch` id |
+| `epoch_at_send` ABSENT AND a barrier exists (pre-epoch opener) | **3** | `do not act — opener predates epochs; re-ask under the current barrier for irreversible actions` | `"unknown-pre-epoch"` with `current_epoch` id |
 | valid requester rescind supersedes (existing) | 3 | `superseded` | n/a (rescind block) |
-| `epoch_at_send` absent AND a barrier exists | 0 | `current` + advisory note "opener predates epochs; re-ask for irreversible actions" | `"unknown-pre-epoch"` |
 | unknown thread | 4 | `unknown` | — |
+
+**B1 (Codex review)**: absent `epoch_at_send` + barrier present is exit **3**,
+NOT a passing exit 0. `check` is the last executable safety point before an
+irreversible action and automation gates on the exit code, so a pre-epoch opener
+must fail closed (do-not-act) once an epoch boundary exists. With NO barrier at
+all, absent is genuinely current (exit 0).
 
 JSON output for `--epoch` adds an `epoch` object alongside the existing
 `request_id`/`state`/`rescind` keys — additive; non-`--epoch` `check` output is
