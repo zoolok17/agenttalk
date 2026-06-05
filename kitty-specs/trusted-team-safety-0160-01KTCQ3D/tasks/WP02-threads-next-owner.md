@@ -14,6 +14,8 @@ subtasks:
 - T009
 - T010
 - T011
+agent: "claude"
+shell_pid: "16400"
 history:
 - date: '2026-06-05T20:35:00Z'
   event: created
@@ -131,3 +133,7 @@ Implement command: `spec-kitty agent action implement WP02 --agent claude`
   exactly the non-responder set, not all recipients.
 - Confirm `next_action` only ever takes values the code actually produces (closed
   vocabulary; no speculative `act-or-rescind` leaking out unused).
+
+## Activity Log
+
+- 2026-06-05T20:59:47Z – claude – shell_pid=16400 – Started implementation via action command
