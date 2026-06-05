@@ -135,3 +135,4 @@ assumptions (anything that would flake on a slow CI box).
 - 2026-06-05T15:12:49Z – claude – shell_pid=16804 – Started implementation via action command
 - 2026-06-05T15:16:56Z – claude – shell_pid=16804 – Release-gate e2e green; success criteria 1/3/5 mapped to passing tests
 - 2026-06-05T15:21:40Z – claude – shell_pid=16804 – Moved to planned
+- 2026-06-05T15:30:16Z – claude – shell_pid=16804 – Review passed: WP04 release-gate assertions hardened; narrow WP02 whoami addendum accepted; targeted and full pytest suites passed.
