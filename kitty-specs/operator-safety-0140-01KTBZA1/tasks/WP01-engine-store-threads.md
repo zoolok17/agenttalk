@@ -18,7 +18,8 @@ subtasks:
 - T004
 - T005
 - T006
-shell_pid: '31044'
+shell_pid: "31044"
+agent: "claude"
 history:
 - date: '2026-06-05T13:34:21Z'
   event: created
@@ -267,3 +268,7 @@ broadcast openers, NFR-001 (diff the test files — existing bodies must be
 unmodified), C-003/C-004 regression (CONTROL_KINDS literal, marker
 corruption degradation), env-var single-source rule (grep for stray
 AGENTTALK_ROOT reads outside find_root).
+
+## Activity Log
+
+- 2026-06-05T13:47:44Z – claude – shell_pid=31044 – Assigned agent via action command
