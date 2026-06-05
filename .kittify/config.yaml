@@ -5,3 +5,8 @@ agents:
   - claude
   - codex
   auto_commit: true
+project:
+  uuid: 30658b01-3c52-49cb-84e6-e6d22d0c6440
+  slug: agenttalk
+  node_id: 93b77909d4ec
+  build_id: 92cdb786-f792-4bd7-9276-8c365f0f48c6

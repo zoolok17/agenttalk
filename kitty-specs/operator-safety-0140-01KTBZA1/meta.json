@@ -1,10 +1,12 @@
 {
-  "created_at": "2026-06-05T13:24:38.208587+00:00",
-  "friendly_name": "operator safety 0140",
+  "created_at": "2026-06-05T15:24:38.208587+02:00",
+  "friendly_name": "0.14.0 Operator Safety",
   "mission_id": "01KTBZA1CK11D8PWKH5GCVCGHS",
   "mission_number": null,
   "mission_slug": "operator-safety-0140-01KTBZA1",
   "mission_type": "software-dev",
   "slug": "operator-safety-0140-01KTBZA1",
-  "target_branch": "master"
+  "target_branch": "master",
+  "source_description": "Implement GitHub issues #12 (rescind/supersede + check), #13 (root hardening), #18 (operator liaison), #14 (intent-to-reply, slip candidate) per ROADMAP.md Phase 2 and the 2026-06-05 joint Claude/Codex design consults.",
+  "vcs": "git"
 }
