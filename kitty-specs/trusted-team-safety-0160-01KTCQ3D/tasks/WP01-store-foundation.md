@@ -282,3 +282,4 @@ Implement command: `spec-kitty agent action implement WP01 --agent claude`
 ## Activity Log
 
 - 2026-06-05T20:45:32Z – claude – shell_pid=53772 – Assigned agent via action command
+- 2026-06-05T20:56:43Z – claude – shell_pid=53772 – WP01 store foundation: registry/retirement/epoch; 27 tests; full suite green (571 pass)
