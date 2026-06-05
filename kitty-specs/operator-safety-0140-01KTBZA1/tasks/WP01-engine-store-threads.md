@@ -275,3 +275,4 @@ AGENTTALK_ROOT reads outside find_root).
 - 2026-06-05T13:47:44Z – claude – shell_pid=31044 – Assigned agent via action command
 - 2026-06-05T14:03:19Z – claude – shell_pid=31044 – Engine foundations ready: full suite green in lane worktree (456 passed, 2 skipped); conftest ownership recorded in WP frontmatter on master
 - 2026-06-05T14:14:53Z – claude – shell_pid=31044 – Moved to planned
+- 2026-06-05T14:20:07Z – claude – shell_pid=31044 – Moved to planned
