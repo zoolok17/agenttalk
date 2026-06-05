@@ -1,108 +1,54 @@
-# Implementation Plan: [FEATURE]
-*Path: [templates/plan-template.md](templates/plan-template.md)*
+# Implementation Plan: 0.15.0 Team Scope
 
+**Branch**: `master` | **Date**: 2026-06-05 | **Spec**: [spec.md](spec.md)
 
-**Branch**: `[###-feature-name]` | **Date**: [DATE] | **Spec**: [link]
-**Input**: Feature specification from `/kitty-specs/[###-feature-name]/spec.md`
-
-**Note**: This template is filled in by the `/spec-kitty.plan` command. See `src/specify_cli/missions/software-dev/command-templates/plan.md` for the execution workflow.
-
-The planner will not begin until all planning questions have been answered—capture those answers in this document before progressing to later phases.
+No open planning questions: designs were settled in the published issue
+bodies (#15/#16/#17, themselves cross-reviewed) and the 0.14.0 codebase
+is freshly known (same maintainer pair, same constraints).
 
 ## Summary
 
-[Extract from feature spec: primary requirement + technical approach from research]
+Close the team-scale friction cluster: role-scoped broadcast audiences
+with honest not-applicable replies (#15), broadcast delivery accounting
+(#16), and recoverable quarantine of invalid messages (#17). All
+additive on the 0.14.0 store/derivation model.
 
 ## Technical Context
 
-<!--
-  ACTION REQUIRED: Replace the content in this section with the technical details
-  for the project. The structure here is presented in advisory capacity to guide
-  the iteration process.
--->
-
-**Language/Version**: [e.g., Python 3.11, Swift 5.9, Rust 1.75 or NEEDS CLARIFICATION]  
-**Primary Dependencies**: [e.g., FastAPI, UIKit, LLVM or NEEDS CLARIFICATION]  
-**Storage**: [if applicable, e.g., PostgreSQL, CoreData, files or N/A]  
-**Testing**: [Project-specific test approach or NEEDS CLARIFICATION]
-**Target Platform**: [e.g., Linux server, iOS 15+, WASM or NEEDS CLARIFICATION]
-**Project Type**: [single/web/mobile - determines source structure]  
-**Performance Goals**: [domain-specific, e.g., 1000 req/s, 10k lines/sec, 60 fps or NEEDS CLARIFICATION]  
-**Constraints**: [domain-specific, e.g., <200ms p95, <100MB memory, offline-capable or NEEDS CLARIFICATION]  
-**Scale/Scope**: [domain-specific, e.g., 10k users, 1M LOC, 50 screens or NEEDS CLARIFICATION]
+**Language/Version**: Python 3.10+ (CI matrix 3.10-3.13 x 3 OSes), stdlib only
+**Storage**: existing file-backed store; NEW `.agenttalk/quarantine/` dir (outside messages_dir, invisible to scanning by construction)
+**Testing**: pytest, in-process cli.main pattern; dev-install + PYTHONPATH-in-worktree gotchas apply; **CI gate before tag (NFR-005)**
+**Target Platform**: Windows-first, POSIX-portable
+**Performance**: prune 10k messages <= 10 s (single scan + N moves; no quadratic)
+**Constraints**: C-001..C-009 (spec); exit 5 = partial fan-out (new, documented; 0/1/2/3/4/130 untouched)
+**Scale**: rosters <= ~8, stores <= ~10k messages
 
 ## Charter Check
 
-*GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
+Skipped - no charter exists. C-tables + SECURITY.md trust model are the gates.
 
-[Gates determined based on charter file]
-
-## Project Structure
-
-### Documentation (this feature)
+## Structure (all additive, module-layered like 0.14.0)
 
 ```
-kitty-specs/[###-feature]/
-├── plan.md              # This file (/spec-kitty.plan command output)
-├── research.md          # Phase 0 output (/spec-kitty.plan command)
-├── data-model.md        # Phase 1 output (/spec-kitty.plan command)
-├── quickstart.md        # Phase 1 output (/spec-kitty.plan command)
-├── contracts/           # Phase 1 output (/spec-kitty.plan command)
-└── tasks.md             # Phase 2 output (/spec-kitty.tasks command - NOT created by /spec-kitty.plan)
+src/agenttalk/
+  store.py    resolve_role_audience, quarantine machinery (list+move),
+              batch helpers; NO config-derivation coupling (C-004)
+  threads.py  responded_na tracking (broadcast) + na_response label (pairwise)
+  cli.py      broadcast --to-role + freeze meta + batch_total + exit-5
+              partial-failure manifest; reply --na (+ FR-006 refusal);
+              prune command; status/doctor wiring + incomplete-batch warning
+  doctor.py   quarantine/invalid counts check
+tests/        test_store, test_threads, test_teams, test_cli,
+              test_doctor, test_coordination (e2e gates)
 ```
 
-### Source Code (repository root)
-<!--
-  ACTION REQUIRED: Replace the placeholder tree below with the concrete layout
-  for this feature. Delete unused options and expand the chosen structure with
-  real paths (e.g., apps/admin, packages/something). The delivered plan must
-  not include Option labels.
--->
+## WP ordering (dependency truth for /spec-kitty.tasks)
 
-```
-# [REMOVE IF UNUSED] Option 1: Single project (DEFAULT)
-src/
-├── models/
-├── services/
-├── cli/
-└── lib/
+1. WP01 engine (store+threads+unit tests) — no deps
+2. WP02 CLI surface (cli.py+test_cli) — deps WP01
+3. WP03 doctor (doctor.py+test_doctor) — deps WP02
+4. WP04 e2e gates (test_coordination) — deps WP02, WP03
+5. WP05 skills/docs/release prep — deps WP04
 
-tests/
-├── contract/
-├── integration/
-└── unit/
-
-# [REMOVE IF UNUSED] Option 2: Web application (when "frontend" + "backend" detected)
-backend/
-├── src/
-│   ├── models/
-│   ├── services/
-│   └── api/
-└── tests/
-
-frontend/
-├── src/
-│   ├── components/
-│   ├── pages/
-│   └── services/
-└── tests/
-
-# [REMOVE IF UNUSED] Option 3: Mobile + API (when "iOS/Android" detected)
-api/
-└── [same as backend above]
-
-ios/ or android/
-└── [platform-specific structure: feature modules, UI flows, platform tests]
-```
-
-**Structure Decision**: [Document the selected structure and reference the real
-directories captured above]
-
-## Complexity Tracking
-
-*Fill ONLY if Charter Check has violations that must be justified*
-
-| Violation | Why Needed | Simpler Alternative Rejected Because |
-|-----------|------------|-------------------------------------|
-| [e.g., 4th project] | [current need] | [why 3 projects insufficient] |
-| [e.g., Repository pattern] | [specific problem] | [why direct DB access insufficient] |
+Single lane, serial; per-WP Codex review (C-008); fresh-eyes + CI gate
+before tag.
