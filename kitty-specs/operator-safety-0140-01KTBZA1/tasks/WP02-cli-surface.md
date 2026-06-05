@@ -259,3 +259,4 @@ outputs), composing sugar not touching the comp_rid wait gate.
 
 - 2026-06-05T14:24:21Z – claude – shell_pid=32384 – Started implementation via action command
 - 2026-06-05T14:38:51Z – claude – shell_pid=32384 – CLI surface complete incl. #14 (stayed observational - no slip needed); 482 passed
+- 2026-06-05T14:47:03Z – claude – shell_pid=32384 – Moved to planned
