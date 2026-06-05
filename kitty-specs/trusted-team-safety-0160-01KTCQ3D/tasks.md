@@ -44,12 +44,12 @@ depends on both. WP04 depends on WP01 + WP03.
 | T009 | derivation function (state → action/owner) per research D6 | WP02 | [D] |
 | T010 | wire derivation into `derive_threads` | WP02 | [D] |
 | T011 | tests in `test_threads.py` | WP02 | [D] |
-| T012 | `roster retire`/`rename`/`remove`/`forward` subcommands + argparse | WP03 | |
-| T013 | `barrier bump` command | WP03 | |
-| T014 | `check --epoch` extension | WP03 | |
-| T015 | `threads`/`sync --json` `next_owner`/`next_action` surfacing | WP03 | |
-| T016 | `test_cli.py` — command behavior + exit codes | WP03 | |
-| T017 | `test_coordination.py` — barrier→epoch_at_send→check e2e | WP03 | |
+| T012 | `roster retire`/`rename`/`remove`/`forward` subcommands + argparse | WP03 | | [D] |
+| T013 | `barrier bump` command | WP03 | | [D] |
+| T014 | `check --epoch` extension | WP03 | | [D] |
+| T015 | `threads`/`sync --json` `next_owner`/`next_action` surfacing | WP03 | | [D] |
+| T016 | `test_cli.py` — command behavior + exit codes | WP03 | | [D] |
+| T017 | `test_coordination.py` — barrier→epoch_at_send→check e2e | WP03 | | [D] |
 | T018 | doctor registry hygiene check | WP04 | |
 | T019 | `test_doctor.py` | WP04 | |
 | T020 | README updates (new commands + operator workflow) | WP04 | |
@@ -108,12 +108,12 @@ coordination test.
 each subcommand's behavior and exit codes, plus the barrier→epoch_at_send→
 `check --epoch` end-to-end flow.
 
-- [ ] T012 `roster retire`/`rename`/`remove`/`forward` subcommands + argparse (WP03)
-- [ ] T013 `barrier bump` command (WP03)
-- [ ] T014 `check --epoch` extension (WP03)
-- [ ] T015 `threads`/`sync --json` `next_owner`/`next_action` surfacing (WP03)
-- [ ] T016 `test_cli.py` — command behavior + exit codes (WP03)
-- [ ] T017 `test_coordination.py` — barrier→epoch_at_send→check e2e (WP03)
+- [x] T012 `roster retire`/`rename`/`remove`/`forward` subcommands + argparse (WP03)
+- [x] T013 `barrier bump` command (WP03)
+- [x] T014 `check --epoch` extension (WP03)
+- [x] T015 `threads`/`sync --json` `next_owner`/`next_action` surfacing (WP03)
+- [x] T016 `test_cli.py` — command behavior + exit codes (WP03)
+- [x] T017 `test_coordination.py` — barrier→epoch_at_send→check e2e (WP03)
 
 **Dependencies**: WP01, WP02. **Risks**: largest WP (single cli.py owner). Keep
 each subtask thin by delegating mechanics to the WP01/WP02 library methods;
