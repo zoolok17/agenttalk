@@ -169,3 +169,4 @@ waits).
 - 2026-06-05T15:30:26Z – claude – shell_pid=71908 – Started implementation via action command
 - 2026-06-05T15:37:21Z – claude – shell_pid=71908 – Release-ready; gate green; awaiting Codex + fresh-eyes reviews
 - 2026-06-05T15:44:10Z – claude – shell_pid=71908 – Moved to planned
+- 2026-06-05T15:47:20Z – claude – shell_pid=71908 – Review passed: WP05 lead escalation blocker fixed; skill gates and full suite passed.
