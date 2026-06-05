@@ -145,12 +145,16 @@ before relying on any of it for a safety-critical transition:
   writer who edits `config.json` can still rewrite the roster. This is
   routing/lifecycle metadata, not an authenticated authority. Retiring
   is non-rebindable *by every registry operation* (`add`, `rename`, and
-  `init --force`, which preserves tombstones and refuses a colliding
-  roster), and history is validated against the **known** roster (active
-  ∪ retired) so a tombstone's past messages never become "invalid" — but
-  none of that is a cryptographic guarantee. (Deleting the `.agenttalk/`
-  directory wholesale is the only way to clear tombstones; that is a
-  deliberate total reset, not a silent rebind.)
+  `init --force`, which reads the existing tombstones defensively from
+  the raw config — even a validation-failed one — preserves them, and
+  refuses a colliding roster), and history is validated against the
+  **known** roster (active ∪ retired) so a tombstone's past messages
+  never become "invalid" — but none of that is a cryptographic
+  guarantee. A config damaged beyond JSON-parseability, or wholesale
+  deletion of `.agenttalk/`, drops tombstones — but an attacker who can
+  do either can already rewrite `config.json` outright (the registry is
+  no more trustworthy than the roster). No supported command silently
+  rebinds a tombstone.
 - **A retired identity cannot run read-only verbs against itself.** Once
   retired, `threads`/`sync`/`drain --for <retired>` exit 2 (the name is
   no longer in the active roster). Inspect owed work BEFORE retiring

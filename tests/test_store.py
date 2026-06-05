@@ -917,3 +917,30 @@ def test_init_force_preserves_tombstones_and_refuses_rebind(tmp_path: Path) -> N
     # and gamma is still non-rebindable afterward
     with pytest.raises(ValueError, match="retired tombstone"):
         Store(tmp_path).add_agent("gamma")
+
+
+def test_init_force_preserves_tombstone_from_validation_failed_config(tmp_path: Path) -> None:
+    # Codex review of the fresh-eyes fix: a tombstone PRESENT in a
+    # validation-FAILED config (the retired name also re-added to `agents`)
+    # must still be preserved + protected — init --force must not drop it.
+    import json as _json
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    s.retire_agent("beta")
+    # corrupt: put beta back into active agents while keeping the tombstone
+    cfgp = tmp_path / ".agenttalk" / "config.json"
+    cfg = _json.loads(cfgp.read_text(encoding="utf-8"))
+    cfg["agents"] = ["alpha", "beta"]              # now active∩retired overlap
+    cfgp.write_text(_json.dumps(cfg), encoding="utf-8")
+    # the config is now validation-failed
+    with pytest.raises(ValueError):
+        s.load_config()
+    # force re-init that re-binds beta is REFUSED (tombstone read defensively)
+    with pytest.raises(ValueError, match="retired tombstone"):
+        s.init(["alpha", "beta"], force=True)
+    # a non-colliding force re-init preserves the beta tombstone + yields a
+    # loadable config
+    cfg2 = s.init(["alpha", "gamma"], force=True)
+    assert "beta" in [e["name"] for e in cfg2.get("retired", [])]
+    assert "beta" not in cfg2["agents"]
+    Store(tmp_path).load_config()                  # no longer corrupt

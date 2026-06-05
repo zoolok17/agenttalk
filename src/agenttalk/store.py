@@ -425,12 +425,49 @@ class Store:
         # can't silently resurrect a retired identity (fresh-eyes review). If
         # the old config is unreadable (the documented force-recovery case),
         # there is nothing safe to carry forward.
+        # Read the existing tombstones DEFENSIVELY from the raw config JSON —
+        # NOT via load_config(), which fails on any corruption. A tombstone that
+        # is PRESENT but in a validation-failed config (e.g. an attacker put the
+        # retired name back into `agents`) must still be preserved + protected,
+        # else `init --force` becomes a tombstone-clearing bypass (Codex review
+        # of the fresh-eyes fix). Each carried entry is sanitized to a clean,
+        # re-validatable tombstone; only a config damaged beyond JSON-parse has
+        # nothing recoverable to carry.
         retired_carry: list = []
         if self.initialized():
             try:
-                retired_carry = self.load_config().get("retired") or []
+                raw = json.loads(self.config_path.read_text(encoding="utf-8"))
             except (ValueError, OSError):
-                retired_carry = []
+                raw = None
+            raw_list = raw.get("retired") if isinstance(raw, dict) else None
+            if isinstance(raw_list, list):
+                seen_keys: set[str] = set()
+                for e in raw_list:
+                    name = e.get("name") if isinstance(e, dict) else None
+                    if not (isinstance(name, str) and name):
+                        continue
+                    try:
+                        validate_agent_name(name)
+                    except ValueError:
+                        continue  # drop an unsafe tombstone name
+                    if name.casefold() in seen_keys:
+                        continue  # drop a duplicate tombstone
+                    seen_keys.add(name.casefold())
+                    rn = e.get("renamed_to")
+                    if rn is not None:
+                        try:
+                            validate_agent_name(rn)
+                        except (ValueError, TypeError):
+                            rn = None  # drop an unsafe successor pointer
+                    retired_carry.append({
+                        "name": name,
+                        "retired_at": (e.get("retired_at")
+                                       if isinstance(e.get("retired_at"), str)
+                                       else _now_iso()),
+                        "renamed_to": rn,
+                        "reason": (e.get("reason")
+                                   if isinstance(e.get("reason"), str) else None),
+                    })
         if retired_carry:
             tomb_keys = {
                 e["name"].casefold() for e in retired_carry
