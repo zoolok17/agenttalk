@@ -1,10 +1,12 @@
 {
   "created_at": "2026-06-05T16:15:39.807957+00:00",
-  "friendly_name": "team scope 0150",
+  "friendly_name": "0.15.0 Team Scope",
   "mission_id": "01KTC9344QAN739M36XRR8N6W8",
   "mission_number": null,
   "mission_slug": "team-scope-0150-01KTC934",
   "mission_type": "software-dev",
   "slug": "team-scope-0150-01KTC934",
-  "target_branch": "master"
+  "source_description": "Implement GitHub issues #15 (role-scoped audiences + reply --na), #16 (broadcast preflight/manifest/partial-failure), #17 (prune --invalid quarantine) per ROADMAP Phase 2b.",
+  "target_branch": "master",
+  "vcs": "git"
 }
