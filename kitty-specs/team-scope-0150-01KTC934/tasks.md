@@ -13,11 +13,11 @@ Feature traceability per-subtask (#15/#16/#17).
 
 | ID | Description | WP | Parallel |
 |----|-------------|----|----------|
-| T001 | store: resolve_role_audience (#15) | WP01 | |
-| T002 | store: quarantine machinery - shared-gate paths + move w/ collision suffix (#17) | WP01 | |
-| T003 | threads: responded_na + na_response labels; batch/audience passthrough fields (#15/#16) | WP01 | |
-| T004 | tests: store role resolution + quarantine matrix | WP01 | |
-| T005 | tests: threads NA labels + freeze independence + batch fields | WP01 | |
+| T001 | store: resolve_role_audience (#15) | WP01 | | [D] |
+| T002 | store: quarantine machinery - shared-gate paths + move w/ collision suffix (#17) | WP01 | | [D] |
+| T003 | threads: responded_na + na_response labels; batch/audience passthrough fields (#15/#16) | WP01 | | [D] |
+| T004 | tests: store role resolution + quarantine matrix | WP01 | | [D] |
+| T005 | tests: threads NA labels + freeze independence + batch fields | WP01 | | [D] |
 | T006 | cli: broadcast --to-role + frozen-audience meta (#15) | WP02 | |
 | T007 | cli: broadcast partial-failure manifest + exit 5 (#16) | WP02 | |
 | T008 | cli: reply --na + FR-006 refusal (#15) | WP02 | |
@@ -44,11 +44,11 @@ Feature traceability per-subtask (#15/#16/#17).
 **Priority**: P0. **Dependencies**: none.
 **Independent test**: `pytest tests/test_store.py tests/test_threads.py tests/test_teams.py` green; cli.py untouched.
 
-- [ ] T001 store: resolve_role_audience (WP01)
-- [ ] T002 store: quarantine machinery (WP01)
-- [ ] T003 threads: NA labels + batch/audience passthrough (WP01)
-- [ ] T004 tests: store matrix (WP01)
-- [ ] T005 tests: threads labels/freeze/batch (WP01)
+- [x] T001 store: resolve_role_audience (WP01)
+- [x] T002 store: quarantine machinery (WP01)
+- [x] T003 threads: NA labels + batch/audience passthrough (WP01)
+- [x] T004 tests: store matrix (WP01)
+- [x] T005 tests: threads labels/freeze/batch (WP01)
 
 **Risks**: quarantine selection drift (killed by sharing the literal gate walk); NA labeling must not alter closure mechanics.
 
