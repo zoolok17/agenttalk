@@ -153,10 +153,10 @@ JSON output for `--epoch` adds an `epoch` object alongside the existing
 `request_id`/`state`/`rescind` keys — additive; non-`--epoch` `check` output is
 unchanged.
 
-## 5. `next_owner` / `next_action` (ThreadRow, threads.py)
+## 5. `next_owner` / `next_action` (`Thread`, threads.py)
 
-Two optional fields on `ThreadRow`, included in `to_dict()` (hence
-`threads --json` / `sync --json`) only when derivable:
+Two optional fields on the `Thread` dataclass. They surface in
+`threads --json` / `sync --json` only when derivable:
 ```jsonc
 {
   "request_id": "...", "state": "owed-inbound",
@@ -164,16 +164,23 @@ Two optional fields on `ThreadRow`, included in `to_dict()` (hence
   "next_action": "reply"
 }
 ```
-- `next_action` ∈ `{"reply", "await-reply", "act-or-rescind", "answer-operator"}`
-  or omitted.
+- `next_action` ∈ `{"reply", "read-reply", "await-reply", "answer-operator"}`
+  or omitted (closed vocabulary — only values actually produced; `act-or-rescind`
+  was dropped).
 - `next_owner` is an agent name (or, for an outstanding broadcast, the list of
   non-responders) or omitted.
-- Derivation table: see `research.md` D6. Pure function of `state`,
-  `needs_operator`, `operator_state`, and (for broadcasts) the responded set.
+- Derivation table: see `research.md` D6 (note `reply-waiting` = an unread reply
+  for self → `read-reply`/self; `open-outbound` = awaiting the peer →
+  `await-reply`/peer). Pure function of `state`, `needs_operator`,
+  `operator_state`, and (for broadcasts) the `pending` set.
 - Terminal threads (`closed`, `closed-superseded`) omit both.
+- **Surfacing split (WP02/WP03)**: `Thread.to_dict()` does NOT emit these — they
+  appear on every open thread and would change the baseline JSON shape. WP02
+  derives them onto the `Thread`; WP03's CLI `threads`/`sync --json` injects them
+  into the row dict and updates the 0.15.0 additivity gates.
 - **Read-only invariant**: no `send`/CLI path accepts a `next_owner`/`next_action`
   input; they never influence delivery, unread counts, or thread closure
-  (FR-015). Enforced by construction (derived in `to_dict`, no setter).
+  (FR-015). Enforced by construction (derived post-pass, no setter).
 
 ## State transitions (retirement lifecycle)
 

@@ -170,35 +170,43 @@ not look like it came from the agent receiving it). Second hop refused (a source
 request already carrying forward meta cannot be forwarded again); active-source
 and non-owed-request refused. See data-model §3b.
 
-## D6 — `next_owner` / `next_action`: derived, read-only, additive
+## D6 — `next_owner` / `next_action`: derived, read-only (REVISED)
 
-**Decision**: Add two optional fields to `ThreadRow` (threads.py), derived purely
-from existing thread `state`:
-- `next_owner`: the agent who owes the next move — for `reply-waiting` it's the
-  *other* party (you're waiting on them); for `owed-inbound` it's `self`; for
-  `open-outbound` broadcast it's the set of non-responders (or the single owed
-  recipient); `null`/omitted for terminal (`closed`/`closed-superseded`).
-- `next_action`: a small controlled vocabulary describing the move:
-  `"reply"` | `"await-reply"` | `"act-or-rescind"` | `"answer-operator"` |
-  `null`.
+**Decision**: Add two optional fields to the `Thread` dataclass (threads.py),
+derived purely from existing thread fields:
+- `next_owner`: the agent who owes the next move (an agent name, or for an
+  outstanding broadcast the list of non-responders); omitted for terminal
+  (`closed`/`closed-superseded`).
+- `next_action`: a closed vocabulary of the values actually produced:
+  `"reply"` | `"read-reply"` | `"await-reply"` | `"answer-operator"`.
 
-Surfaced in `threads --json` and `sync --json` only where derivable; omitted
-otherwise. Never settable by senders; never affects delivery, unread, or
-closure (FR-015).
+**Surfacing (revised — see WP02/WP03 split)**: `Thread.to_dict()` does NOT emit
+these. They appear on EVERY open thread (not feature-gated like the 0.15.0
+keys), so emitting from `to_dict` would change the baseline thread JSON shape
+and trip the 0.15.0 additivity gates. WP02 derives the fields onto the `Thread`;
+WP03's CLI layer (`threads`/`sync --json`) injects them into the row dict and
+updates the additivity gates. Never settable by senders; never affects delivery,
+unread, or closure (FR-015).
 
-**Rationale**: This directly addresses the band's soft-deadlock pain (a tool can
-see who owes the next move) without making the bus a workflow engine — the
-fields are a *projection* of state already computed, not new state. Keeping the
-vocabulary tiny and closed avoids vocabulary creep.
+**Rationale**: Addresses the band's soft-deadlock pain (a tool can see who owes
+the next move) without making the bus a workflow engine — a *projection* of
+state already computed. Tiny, closed vocabulary.
 
-**Mapping (state → next_action / next_owner)**:
-| thread state | next_action | next_owner |
+**Mapping (REVISED to match the real state semantics)**. Note: in
+`derive_threads`, `reply-waiting` means a reply addressed to `self` is sitting
+UNREAD (the ball is back with self — NOT awaiting the peer), while `open-outbound`
+means `self` is waiting on the peer. The first draft had these inverted.
+| thread state (from `self`'s view) | next_action | next_owner |
 |---|---|---|
 | `owed-inbound` (you owe a reply) | `reply` | self |
-| `owed-inbound` + needs_operator + operator pending | `answer-operator` | liaison/self |
-| `reply-waiting` (you await them) | `await-reply` | the peer |
-| `open-outbound` (broadcast, members owe) | `await-reply` | non-responders |
+| needs_operator + operator_state == pending | `answer-operator` | self |
+| `reply-waiting` (a reply to you is unread) | `read-reply` | self |
+| `open-outbound` pairwise (you await the peer) | `await-reply` | the peer |
+| `open-outbound` broadcast (members still owe) | `await-reply` | non-responders |
 | `closed` / `closed-superseded` | (omitted) | (omitted) |
+
+`act-or-rescind` was dropped from the vocabulary — no current state produces it,
+and the vocabulary stays closed to values actually emitted.
 
 ## Inherited constraints (from RFC / prior releases — not re-litigated)
 

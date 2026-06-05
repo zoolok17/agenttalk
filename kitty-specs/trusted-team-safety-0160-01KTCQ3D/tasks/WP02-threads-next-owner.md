@@ -80,40 +80,44 @@ must NEVER affect delivery, unread counts, or thread closure.
 `_derive_next(row_state, *, self_agent, peer, needs_operator, operator_state,
 non_responders) -> tuple[str|None, str|list[str]|None]` returning:
 
-| state | next_action | next_owner |
+CRITICAL — match the REAL state semantics (the first-draft table inverted
+`reply-waiting`/`open-outbound`): in `derive_threads`, `reply-waiting` means a
+reply addressed to `self` is sitting UNREAD (ball back with self), while
+`open-outbound` means `self` is waiting on the peer.
+
+| state (from `self`'s view) | next_action | next_owner |
 |---|---|---|
-| `owed-inbound` + needs_operator + operator_state=="pending" | `answer-operator` | the liaison if known else `self_agent` |
+| needs_operator + operator_state=="pending" | `answer-operator` | `self_agent` |
 | `owed-inbound` (you owe a reply) | `reply` | `self_agent` |
-| `reply-waiting` (you await them) | `await-reply` | the peer |
-| `open-outbound` (broadcast, members still owe) | `await-reply` | list of non-responders |
+| `reply-waiting` (a reply to you is unread) | `read-reply` | `self_agent` |
+| `open-outbound` pairwise (you await the peer) | `await-reply` | the peer |
+| `open-outbound` broadcast (members still owe) | `await-reply` | non-responders |
 | `closed` / `closed-superseded` | `None` | `None` |
 
-- For the single-peer point-to-point case, "peer" is the other party on the
-  thread (the non-self participant). For broadcast `open-outbound`, `next_owner`
-  is the list of recipients who have not yet responded (you already track the
-  responded set — reuse it; do not recompute from scratch).
-- `act-or-rescind`: reserve this value for a future state if you find a thread
-  where the owner should act-or-rescind; if no current state maps to it, do NOT
-  emit it (keep the vocabulary closed to values you actually produce). Document
-  in a comment which values are currently produced.
+- A post-pass over the assembled `threads` list (covers pairwise AND broadcast)
+  is the cleanest call site — `_derive_next(t, agent)` reads off the `Thread`.
+  For broadcast `open-outbound`, `next_owner` is the `pending` list (reuse it).
+- `act-or-rescind` is DROPPED — no current state produces it; keep the
+  vocabulary closed to values actually emitted (`reply`/`read-reply`/
+  `await-reply`/`answer-operator`).
 
 ### T010 — wire into `derive_threads`
-**Steps**: At the point each `ThreadRow` is constructed (where `state`,
-`operator_state`, responded set, and the self/peer identities are in scope), call
-`_derive_next(...)` and set `next_owner`/`next_action`. Terminal rows get
-`None`/`None` (omitted by `to_dict`). Do not reorder rows or change any other
-field.
+**Steps**: In a post-pass over the assembled `threads` list (before the final
+sort), call `_derive_next(t, agent)` and set `t.next_action`/`t.next_owner`.
+Terminal rows get `None`/`None`. Do not reorder rows or change any other field.
 
 ### T011 — tests (`tests/test_threads.py`)
 Cover:
 - `owed-inbound` → `next_action="reply"`, `next_owner=self`.
-- `reply-waiting` → `next_action="await-reply"`, `next_owner=peer`.
+- `reply-waiting` (unread reply for self) → `next_action="read-reply"`,
+  `next_owner=self`.
+- `open-outbound` pairwise → `next_action="await-reply"`, `next_owner=peer`.
 - operator-pending escalation → `next_action="answer-operator"`.
 - broadcast `open-outbound` with partial responses → `next_owner` = exactly the
   non-responders (order-stable), `next_action="await-reply"`.
-- `closed` and `closed-superseded` → both fields omitted from `to_dict`.
-- additivity: a row with the fields omitted serializes byte-identically to the
-  0.15.0 shape for that row (no stray `null`s); existing keys unchanged.
+- `closed` / `closed-superseded` → both fields `None`.
+- shape-stability: `to_dict()` NEVER emits `next_*` (open AND closed rows) — the
+  surfacing is WP03's job, so the 0.15.0 additivity gates stay green here.
 
 ## Branch Strategy
 
