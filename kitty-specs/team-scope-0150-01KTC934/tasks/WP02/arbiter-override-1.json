@@ -1,0 +1,13 @@
+{
+  "arbiter": "operator",
+  "category": "custom",
+  "checklist": {
+    "is_correct_context": true,
+    "is_environmental": false,
+    "is_in_scope": true,
+    "is_pre_existing": false,
+    "should_follow_on": false
+  },
+  "decided_at": "2026-06-05T17:20:40.216154+00:00",
+  "explanation": "Review passed: WP02 --resume and --na fixes verified; tests/test_cli, full suite, and ruff passed."
+}
