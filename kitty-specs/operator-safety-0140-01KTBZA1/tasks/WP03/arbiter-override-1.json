@@ -1,0 +1,13 @@
+{
+  "arbiter": "operator",
+  "category": "custom",
+  "checklist": {
+    "is_correct_context": true,
+    "is_environmental": false,
+    "is_in_scope": true,
+    "is_pre_existing": false,
+    "should_follow_on": false
+  },
+  "decided_at": "2026-06-05T15:12:45.160196+00:00",
+  "explanation": "Review passed: root-first doctor contract fixed on human and JSON surfaces; targeted and full pytest suites passed."
+}
