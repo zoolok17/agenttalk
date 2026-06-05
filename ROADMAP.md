@@ -6,7 +6,7 @@ the Claude Code + Codex collaboration that shipped 0.10.0–0.13.0, the first
 four-agent production retro (2026-06-03), **and the band's consolidated
 second retro (2026-06-05), which reprioritized everything below.**
 
-> Current release: **v0.13.0** (`master`). See `CHANGELOG.md` for history
+> Current release: **v0.14.0** (`master`). See `CHANGELOG.md` for history
 > and `SECURITY.md` for the trust model.
 
 ---
@@ -23,7 +23,11 @@ Shipped #6 (`reply --dry-run`), #7 (`--file -` stdin bodies), #8
 (`whoami`), #10 (skill-doc / identity-bootstrap fixes). All four issues
 closed. Kept here as a record only.
 
-### Phase 2 — `0.14.0` "operator safety" (the band's #1 and #7)
+### ✅ Phase 2 — `0.14.0` "operator safety" — DELIVERED 2026-06-05
+Shipped #12 (rescind + check gate), #13 (root hardening), #18 (operator
+liaison), AND #14 (intent-to-reply — the slip clause was not needed). All
+four issues closed. Built as spec-kitty mission `operator-safety-0140`
+(5 WPs, Codex per-WP review + fresh-eyes pre-release review). Record:
 1. **Rescind/supersede + currentness check** (#12) — first-class
    `rescind` kind (KNOWN_KINDS, *not* CONTROL_KINDS), `closed-superseded`
    thread state, scoped-wait "request rescinded" wake, `sync`/`threads`
