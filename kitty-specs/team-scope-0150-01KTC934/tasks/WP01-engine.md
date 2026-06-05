@@ -126,3 +126,4 @@ diff); to_dict additivity (absent-not-null).
 
 - 2026-06-05T16:39:22Z – unknown – shell_pid=71028 – Engine green: 520 passed
 - 2026-06-05T16:46:20Z – unknown – shell_pid=71028 – Moved to planned
+- 2026-06-05T16:52:38Z – unknown – shell_pid=71028 – Review passed: WP01 quarantine path-pairing fix verified; targeted/full suites and ruff passed.
