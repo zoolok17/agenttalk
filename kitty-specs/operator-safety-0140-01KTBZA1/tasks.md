@@ -26,15 +26,15 @@ half, T014, and the #14 lines of T022–T024. Everything else stands alone.
 | T004 | threads: `closed-superseded` derivation per D2 (#12) | WP01 | | [D] |
 | T005 | threads: escalation row surfacing (needs_operator, operator_state) (#18) | WP01 | | [D] |
 | T006 | tests: new tests/test_store.py + test_threads.py extensions | WP01 | | [D] |
-| T007 | cli: `cmd_rescind` (#12) | WP02 | |
-| T008 | cli: `cmd_check` with exit 0/3/4 (#12) | WP02 | |
-| T009 | cli: scoped-wait rescind wake, exit 3 (#12) | WP02 | |
-| T010 | cli: display layer — superseded rows, escalation bucket, reply-in-flight, status warnings (#12/#18/#14) | WP02 | |
-| T011 | cli: `init` up-tree guard + AGENTTALK_ROOT wiring + whoami root-first (#13) | WP02 | |
-| T012 | cli: `roster set-operator-facing` + roster/whoami display (#18) | WP02 | |
-| T013 | cli: `cmd_escalate` + refusal matrix (#18) | WP02 | |
-| T014 | cli: `composing --to-request` sugar (#14, slip-droppable) | WP02 | |
-| T015 | tests: test_cli.py extensions for T007–T014 | WP02 | |
+| T007 | cli: `cmd_rescind` (#12) | WP02 | | [D] |
+| T008 | cli: `cmd_check` with exit 0/3/4 (#12) | WP02 | | [D] |
+| T009 | cli: scoped-wait rescind wake, exit 3 (#12) | WP02 | | [D] |
+| T010 | cli: display layer — superseded rows, escalation bucket, reply-in-flight, status warnings (#12/#18/#14) | WP02 | | [D] |
+| T011 | cli: `init` up-tree guard + AGENTTALK_ROOT wiring + whoami root-first (#13) | WP02 | | [D] |
+| T012 | cli: `roster set-operator-facing` + roster/whoami display (#18) | WP02 | | [D] |
+| T013 | cli: `cmd_escalate` + refusal matrix (#18) | WP02 | | [D] |
+| T014 | cli: `composing --to-request` sugar (#14, slip-droppable) | WP02 | | [D] |
+| T015 | tests: test_cli.py extensions for T007–T014 | WP02 | | [D] |
 | T016 | doctor: multi-store detection + root-first output (#13) | WP03 | |
 | T017 | doctor: liaison diagnostics (#18) | WP03 | |
 | T018 | tests: test_doctor.py extensions | WP03 | |
@@ -73,15 +73,15 @@ half, T014, and the #14 lines of T022–T024. Everything else stands alone.
 **Independent test**: quickstart.md sections 1–5 pass end-to-end by hand; `pytest tests/test_cli.py` green.
 **Size note**: 9 subtasks — at the upper bound deliberately: `cli.py` has single-WP ownership (disjointness constraint), and splitting would violate it. Mitigation: subtasks are strictly independent argparse/command units; reviewer reviews per-subtask.
 
-- [ ] T007 cli: cmd_rescind (WP02)
-- [ ] T008 cli: cmd_check exit 0/3/4 (WP02)
-- [ ] T009 cli: scoped-wait rescind wake exit 3 (WP02)
-- [ ] T010 cli: display layer — superseded/escalations/reply-in-flight/status warnings (WP02)
-- [ ] T011 cli: init up-tree guard + AGENTTALK_ROOT wiring + whoami root-first (WP02)
-- [ ] T012 cli: roster set-operator-facing + display (WP02)
-- [ ] T013 cli: cmd_escalate + refusal matrix (WP02)
-- [ ] T014 cli: composing --to-request sugar (WP02, #14 slip-droppable)
-- [ ] T015 tests: test_cli.py extensions for T007–T014 (WP02)
+- [x] T007 cli: cmd_rescind (WP02)
+- [x] T008 cli: cmd_check exit 0/3/4 (WP02)
+- [x] T009 cli: scoped-wait rescind wake exit 3 (WP02)
+- [x] T010 cli: display layer — superseded/escalations/reply-in-flight/status warnings (WP02)
+- [x] T011 cli: init up-tree guard + AGENTTALK_ROOT wiring + whoami root-first (WP02)
+- [x] T012 cli: roster set-operator-facing + display (WP02)
+- [x] T013 cli: cmd_escalate + refusal matrix (WP02)
+- [x] T014 cli: composing --to-request sugar (WP02, #14 slip-droppable)
+- [x] T015 tests: test_cli.py extensions for T007–T014 (WP02)
 
 **Risks**: exit-code contract regressions (C-005); `wait` exit 1 must stay timeout-exclusive; request_id autogen/echo logic must not regress (v0.9.0 aliasing bug — see research.md baseline table).
 
