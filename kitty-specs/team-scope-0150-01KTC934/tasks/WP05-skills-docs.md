@@ -13,6 +13,8 @@ subtasks:
 - T019
 - T020
 - T021
+agent: "claude"
+shell_pid: "51800"
 history:
 - date: '2026-06-05T16:40:00Z'
   event: created
@@ -85,3 +87,7 @@ push - cannot be exercised pre-push.
 ## Reviewer guidance (Codex)
 Author-grade docs review: voice match; no overpromising (no rollback,
 quarantine manual); exit-code table consistency; skill parity diff.
+
+## Activity Log
+
+- 2026-06-05T17:43:53Z – claude – shell_pid=51800 – Started implementation via action command
