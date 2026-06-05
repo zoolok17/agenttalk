@@ -40,10 +40,10 @@ depends on both. WP04 depends on WP01 + WP03.
 | T005 | single-hop retired forwarding library support | WP01 | | [D] |
 | T006 | `current_epoch()` + `epoch_at_send` stamping in `send()` for `OPENER_KINDS` | WP01 | | [D] |
 | T007 | tests in `test_store.py` | WP01 | | [D] |
-| T008 | `next_owner`/`next_action` fields on `ThreadRow` + `to_dict` | WP02 | [P] |
-| T009 | derivation function (state → action/owner) per research D6 | WP02 | [P] |
-| T010 | wire derivation into `derive_threads` | WP02 | [P] |
-| T011 | tests in `test_threads.py` | WP02 | [P] |
+| T008 | `next_owner`/`next_action` fields on `ThreadRow` + `to_dict` | WP02 | [D] |
+| T009 | derivation function (state → action/owner) per research D6 | WP02 | [D] |
+| T010 | wire derivation into `derive_threads` | WP02 | [D] |
+| T011 | tests in `test_threads.py` | WP02 | [D] |
 | T012 | `roster retire`/`rename`/`remove`/`forward` subcommands + argparse | WP03 | |
 | T013 | `barrier bump` command | WP03 | |
 | T014 | `check --epoch` extension | WP03 | |
@@ -89,10 +89,10 @@ later pick them up). Library-only; CLI wiring is WP03/T015.
 **Independent test**: `pytest tests/test_threads.py` covers the state→action/owner
 table including terminal-omission and broadcast non-responders.
 
-- [ ] T008 `next_owner`/`next_action` fields on `ThreadRow` + `to_dict` (WP02)
-- [ ] T009 derivation function (state → action/owner) per research D6 (WP02)
-- [ ] T010 wire derivation into `derive_threads` (WP02)
-- [ ] T011 tests in `test_threads.py` (WP02)
+- [x] T008 `next_owner`/`next_action` fields on `ThreadRow` + `to_dict` (WP02)
+- [x] T009 derivation function (state → action/owner) per research D6 (WP02)
+- [x] T010 wire derivation into `derive_threads` (WP02)
+- [x] T011 tests in `test_threads.py` (WP02)
 
 **Dependencies**: none. **Risks**: must not alter existing `to_dict` keys or
 thread ordering (additive only).
