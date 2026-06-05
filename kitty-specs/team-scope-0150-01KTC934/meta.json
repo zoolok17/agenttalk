@@ -1,0 +1,10 @@
+{
+  "created_at": "2026-06-05T16:15:39.807957+00:00",
+  "friendly_name": "team scope 0150",
+  "mission_id": "01KTC9344QAN739M36XRR8N6W8",
+  "mission_number": null,
+  "mission_slug": "team-scope-0150-01KTC934",
+  "mission_type": "software-dev",
+  "slug": "team-scope-0150-01KTC934",
+  "target_branch": "master"
+}
