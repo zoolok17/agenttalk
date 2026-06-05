@@ -17,6 +17,8 @@ subtasks:
 - T020
 - T021
 - T022
+agent: "claude"
+shell_pid: "44536"
 history:
 - date: '2026-06-05T20:35:00Z'
   event: created
@@ -140,3 +142,7 @@ Implement command: `spec-kitty agent action implement WP04 --agent claude`
 - Confirm no overclaim: nothing in README/SECURITY implies malicious-peer authz,
   per-agent crypto, or deletion defense.
 - Confirm the version bump is consistent across `__init__.py` + `pyproject.toml`.
+
+## Activity Log
+
+- 2026-06-05T21:43:52Z – claude – shell_pid=44536 – Started implementation via action command
