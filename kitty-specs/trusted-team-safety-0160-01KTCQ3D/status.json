@@ -1,0 +1,49 @@
+{
+  "event_count": 4,
+  "last_event_id": "01KTCQXT59VD83HV5JM5TV1D2R",
+  "materialized_at": "2026-06-05T20:34:51.689552+00:00",
+  "mission_number": "",
+  "mission_slug": "trusted-team-safety-0160-01KTCQ3D",
+  "mission_type": "software-dev",
+  "summary": {
+    "approved": 0,
+    "blocked": 0,
+    "canceled": 0,
+    "claimed": 0,
+    "done": 0,
+    "for_review": 0,
+    "in_progress": 0,
+    "in_review": 0,
+    "planned": 4
+  },
+  "work_packages": {
+    "WP01": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTCQXSYVP3Y3KEX14V5KX374",
+      "last_transition_at": "2026-06-05T20:34:51.483815+00:00"
+    },
+    "WP02": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTCQXT3H3ND5J8XKTXZ4XR33",
+      "last_transition_at": "2026-06-05T20:34:51.633848+00:00"
+    },
+    "WP03": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTCQXT4D5YDQFX8FMTSQBJWE",
+      "last_transition_at": "2026-06-05T20:34:51.661152+00:00"
+    },
+    "WP04": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTCQXT59VD83HV5JM5TV1D2R",
+      "last_transition_at": "2026-06-05T20:34:51.689552+00:00"
+    }
+  }
+}
