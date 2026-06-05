@@ -27,7 +27,8 @@ subtasks:
 - T005
 - T006
 - T007
-shell_pid: '53772'
+shell_pid: "53772"
+agent: "claude"
 history:
 - date: '2026-06-05T20:35:00Z'
   event: created
@@ -277,3 +278,7 @@ Implement command: `spec-kitty agent action implement WP01 --agent claude`
   and the case-insensitive uniqueness spans active ∪ retired.
 - Confirm `epoch_at_send` is genuinely three-state and only on `OPENER_KINDS`.
 - Confirm retire/rename/forward write ONLY `config.json` (grep for message writes).
+
+## Activity Log
+
+- 2026-06-05T20:45:32Z – claude – shell_pid=53772 – Assigned agent via action command
