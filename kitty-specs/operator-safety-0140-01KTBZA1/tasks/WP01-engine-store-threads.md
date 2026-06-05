@@ -28,6 +28,7 @@ authoritative_surface: src/agenttalk/
 execution_mode: code_change
 owned_files:
 - src/agenttalk/store.py
+- tests/conftest.py
 - src/agenttalk/threads.py
 - src/agenttalk/web.py
 - tests/test_store.py
