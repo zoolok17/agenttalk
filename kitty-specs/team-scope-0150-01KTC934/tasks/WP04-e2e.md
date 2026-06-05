@@ -17,6 +17,8 @@ subtasks:
 - T015
 - T016
 - T017
+agent: "claude"
+shell_pid: "3956"
 history:
 - date: '2026-06-05T16:40:00Z'
   event: created
@@ -84,3 +86,7 @@ Attack: does T016 prove ORDER-independence of the failure position?
 Are the additivity gates set-equality (not presence checks)? Is the
 freeze test actually structural (roles changed AFTER send, derivation
 output compared exactly)?
+
+## Activity Log
+
+- 2026-06-05T17:34:05Z – claude – shell_pid=3956 – Started implementation via action command
