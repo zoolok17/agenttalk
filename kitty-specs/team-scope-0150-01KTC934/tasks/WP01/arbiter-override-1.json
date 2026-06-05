@@ -1,0 +1,13 @@
+{
+  "arbiter": "operator",
+  "category": "custom",
+  "checklist": {
+    "is_correct_context": true,
+    "is_environmental": false,
+    "is_in_scope": true,
+    "is_pre_existing": false,
+    "should_follow_on": false
+  },
+  "decided_at": "2026-06-05T16:52:38.465184+00:00",
+  "explanation": "Review passed: WP01 quarantine path-pairing fix verified; targeted/full suites and ruff passed."
+}
