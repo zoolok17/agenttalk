@@ -24,6 +24,8 @@ subtasks:
 - T015
 - T016
 - T017
+agent: "claude"
+shell_pid: "54736"
 history:
 - date: '2026-06-05T20:35:00Z'
   event: created
@@ -194,3 +196,7 @@ Implement command: `spec-kitty agent action implement WP03 --agent claude`
   epoch, and that `--scope` rejects non-global.
 - Confirm `rename --drain-check` does NOT mutate config when it refuses.
 - Confirm the json `next_*` surfacing is additive and absent on terminal threads.
+
+## Activity Log
+
+- 2026-06-05T21:21:12Z – claude – shell_pid=54736 – Started implementation via action command

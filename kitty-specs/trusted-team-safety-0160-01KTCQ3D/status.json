@@ -1,7 +1,7 @@
 {
-  "event_count": 12,
-  "last_event_id": "01KTCT9W5X48Z5AF82QNXWJ8Y5",
-  "materialized_at": "2026-06-05T21:16:24.125805+00:00",
+  "event_count": 14,
+  "last_event_id": "01KTCTJNSJ31Y03C7JPGRFRT6V",
+  "materialized_at": "2026-06-05T21:21:12.498180+00:00",
   "mission_number": "",
   "mission_slug": "trusted-team-safety-0160-01KTCQ3D",
   "mission_type": "software-dev",
@@ -12,9 +12,9 @@
     "claimed": 0,
     "done": 0,
     "for_review": 1,
-    "in_progress": 0,
+    "in_progress": 1,
     "in_review": 0,
-    "planned": 2
+    "planned": 1
   },
   "work_packages": {
     "WP01": {
@@ -32,11 +32,11 @@
       "last_transition_at": "2026-06-05T21:16:08.540016+00:00"
     },
     "WP03": {
-      "actor": "finalize-tasks",
+      "actor": "claude",
       "force_count": 1,
-      "lane": "planned",
-      "last_event_id": "01KTCQXT4D5YDQFX8FMTSQBJWE",
-      "last_transition_at": "2026-06-05T20:34:51.661152+00:00"
+      "lane": "in_progress",
+      "last_event_id": "01KTCTJNSJ31Y03C7JPGRFRT6V",
+      "last_transition_at": "2026-06-05T21:21:12.498180+00:00"
     },
     "WP04": {
       "actor": "finalize-tasks",
