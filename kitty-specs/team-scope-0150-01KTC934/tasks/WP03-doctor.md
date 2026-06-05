@@ -11,6 +11,8 @@ branch_strategy: Planning artifacts for this feature were generated on master. D
 subtasks:
 - T012
 - T013
+agent: "claude"
+shell_pid: "72768"
 history:
 - date: '2026-06-05T16:40:00Z'
   event: created
@@ -61,3 +63,7 @@ untouched.
 Attack: remediation order (--dry-run FIRST - the install-skills --force
 lesson pattern); counts must come from the shared store methods, not a
 re-implemented scan.
+
+## Activity Log
+
+- 2026-06-05T17:20:59Z – claude – shell_pid=72768 – Started implementation via action command
