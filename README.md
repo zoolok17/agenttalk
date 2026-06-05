@@ -18,7 +18,7 @@ exported on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.13.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.14.0"
 agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
@@ -123,10 +123,10 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.13.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.14.0"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.13.0` with
+Pin to a specific tag so you control upgrades. Replace `v0.14.0` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
