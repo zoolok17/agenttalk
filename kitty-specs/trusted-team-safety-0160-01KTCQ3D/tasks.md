@@ -33,13 +33,13 @@ depends on both. WP04 depends on WP01 + WP03.
 
 | ID | Description | WP | Parallel |
 |----|-------------|----|----------|
-| T001 | `retired` registry shape + fail-closed validation in `load_config` | WP01 | |
-| T002 | `active_agents`/`retired_agents`/`known_agents`; history validation uses known roster | WP01 | |
-| T003 | `retire_agent`, `rename_agent` (+ `_drain_check` helper), `remove_agent` refusal/force | WP01 | |
-| T004 | retired-send refusal in `send()` (active-roster guard) | WP01 | |
-| T005 | single-hop retired forwarding library support | WP01 | |
-| T006 | `current_epoch()` + `epoch_at_send` stamping in `send()` for `OPENER_KINDS` | WP01 | |
-| T007 | tests in `test_store.py` | WP01 | |
+| T001 | `retired` registry shape + fail-closed validation in `load_config` | WP01 | | [D] |
+| T002 | `active_agents`/`retired_agents`/`known_agents`; history validation uses known roster | WP01 | | [D] |
+| T003 | `retire_agent`, `rename_agent` (+ `_drain_check` helper), `remove_agent` refusal/force | WP01 | | [D] |
+| T004 | retired-send refusal in `send()` (active-roster guard) | WP01 | | [D] |
+| T005 | single-hop retired forwarding library support | WP01 | | [D] |
+| T006 | `current_epoch()` + `epoch_at_send` stamping in `send()` for `OPENER_KINDS` | WP01 | | [D] |
+| T007 | tests in `test_store.py` | WP01 | | [D] |
 | T008 | `next_owner`/`next_action` fields on `ThreadRow` + `to_dict` | WP02 | [P] |
 | T009 | derivation function (state → action/owner) per research D6 | WP02 | [P] |
 | T010 | wire derivation into `derive_threads` | WP02 | [P] |
@@ -68,13 +68,13 @@ refusal, and the epoch primitive (`current_epoch()` + `epoch_at_send` stamping).
 retire/rename/remove/force, retired-send refusal, known-vs-active roster,
 forwarding, `current_epoch()`, and `epoch_at_send` three-state.
 
-- [ ] T001 `retired` registry shape + fail-closed validation in `load_config` (WP01)
-- [ ] T002 `active_agents`/`retired_agents`/`known_agents`; history validation uses known roster (WP01)
-- [ ] T003 `retire_agent`, `rename_agent` (+ `_drain_check`), `remove_agent` refusal/force (WP01)
-- [ ] T004 retired-send refusal in `send()` (active-roster guard) (WP01)
-- [ ] T005 single-hop retired forwarding library support (WP01)
-- [ ] T006 `current_epoch()` + `epoch_at_send` stamping in `send()` for `OPENER_KINDS` (WP01)
-- [ ] T007 tests in `test_store.py` (WP01)
+- [x] T001 `retired` registry shape + fail-closed validation in `load_config` (WP01)
+- [x] T002 `active_agents`/`retired_agents`/`known_agents`; history validation uses known roster (WP01)
+- [x] T003 `retire_agent`, `rename_agent` (+ `_drain_check`), `remove_agent` refusal/force (WP01)
+- [x] T004 retired-send refusal in `send()` (active-roster guard) (WP01)
+- [x] T005 single-hop retired forwarding library support (WP01)
+- [x] T006 `current_epoch()` + `epoch_at_send` stamping in `send()` for `OPENER_KINDS` (WP01)
+- [x] T007 tests in `test_store.py` (WP01)
 
 **Dependencies**: none. **Risks**: T002 touches `Message.validate`/history
 validation — the highest-risk refactor; a mistake invalidates history. Heavy
