@@ -898,3 +898,22 @@ def test_epoch_at_send_respects_supplied_value(tmp_path: Path) -> None:
                subject="r", body="x",
                meta={"request_id": "rb", "epoch_at_send": "PINNED"})
     assert o.meta["epoch_at_send"] == "PINNED"
+
+
+def test_init_force_preserves_tombstones_and_refuses_rebind(tmp_path: Path) -> None:
+    # fresh-eyes BLOCKER: init --force must NOT silently resurrect a retired
+    # tombstone (FR-002 / SC-003). It preserves `retired` and refuses a roster
+    # that collides with a tombstone.
+    s = Store(tmp_path)
+    s.init(["alpha", "beta", "gamma"])
+    s.retire_agent("gamma")
+    # re-binding gamma via init --force is refused (case-insensitive)
+    with pytest.raises(ValueError, match="retired tombstone"):
+        s.init(["alpha", "GAMMA"], force=True)
+    # a force re-init with a non-colliding roster preserves the tombstone
+    cfg = s.init(["alpha", "delta"], force=True)
+    assert "gamma" in [e["name"] for e in cfg.get("retired", [])]
+    assert "gamma" not in cfg["agents"]
+    # and gamma is still non-rebindable afterward
+    with pytest.raises(ValueError, match="retired tombstone"):
+        Store(tmp_path).add_agent("gamma")

@@ -144,10 +144,20 @@ before relying on any of it for a safety-critical transition:
   team* (history stays valid, a name is never silently reused), but a
   writer who edits `config.json` can still rewrite the roster. This is
   routing/lifecycle metadata, not an authenticated authority. Retiring
-  is non-rebindable *by every registry operation* (`add`, `rename`), and
-  history is validated against the **known** roster (active ∪ retired) so
-  a tombstone's past messages never become "invalid" — but none of that
-  is a cryptographic guarantee.
+  is non-rebindable *by every registry operation* (`add`, `rename`, and
+  `init --force`, which preserves tombstones and refuses a colliding
+  roster), and history is validated against the **known** roster (active
+  ∪ retired) so a tombstone's past messages never become "invalid" — but
+  none of that is a cryptographic guarantee. (Deleting the `.agenttalk/`
+  directory wholesale is the only way to clear tombstones; that is a
+  deliberate total reset, not a silent rebind.)
+- **A retired identity cannot run read-only verbs against itself.** Once
+  retired, `threads`/`sync`/`drain --for <retired>` exit 2 (the name is
+  no longer in the active roster). Inspect owed work BEFORE retiring
+  (`roster rename --drain-check`, or `threads --for <name>` while still
+  active); `roster forward --to-request <rid>` still redirects a known
+  owed request afterward. Allowing read-only inspection by a retired
+  name is a candidate follow-up — a usability gap, not a safety one.
 - **`check --epoch` fails OPEN against barrier suppression.** The global
   epoch is the message id of the latest *surviving validated* barrier. A
   writer who deletes, quarantines, or withholds a barrier makes

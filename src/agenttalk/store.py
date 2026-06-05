@@ -418,6 +418,32 @@ class Store:
         validate_agent_roster(agents)
         if self.initialized() and not force:
             return self.load_config()
+        # #19: retired tombstones are PERMANENT and non-rebindable (FR-002) —
+        # by EVERY registry operation, including `init --force`. Preserve the
+        # existing `retired` list across a force re-init and refuse a new roster
+        # that collides (case-insensitively) with a tombstone, so `init --force`
+        # can't silently resurrect a retired identity (fresh-eyes review). If
+        # the old config is unreadable (the documented force-recovery case),
+        # there is nothing safe to carry forward.
+        retired_carry: list = []
+        if self.initialized():
+            try:
+                retired_carry = self.load_config().get("retired") or []
+            except (ValueError, OSError):
+                retired_carry = []
+        if retired_carry:
+            tomb_keys = {
+                e["name"].casefold() for e in retired_carry
+                if isinstance(e, dict) and isinstance(e.get("name"), str)
+            }
+            clash = sorted({a for a in agents if a.casefold() in tomb_keys})
+            if clash:
+                raise ValueError(
+                    f"cannot init with {clash}: still a retired tombstone — "
+                    f"tombstones are permanent and non-rebindable (#19). Pick "
+                    f"different names, or remove the .agenttalk/ directory "
+                    f"entirely to start fully fresh."
+                )
         for d in (self.messages_dir, self.state_dir, self.sessions_dir):
             d.mkdir(parents=True, exist_ok=True)
         cfg = {
@@ -429,6 +455,8 @@ class Store:
             # a path-derived hash that an attacker writing into
             # .agenttalk/ cannot influence. See SECURITY.md.
         }
+        if retired_carry:
+            cfg["retired"] = retired_carry  # tombstones survive a force re-init
         _atomic_write_text(self.config_path, json.dumps(cfg, indent=2))
         for a in agents:
             cur = self.state_dir / f"{a}.cursor"
