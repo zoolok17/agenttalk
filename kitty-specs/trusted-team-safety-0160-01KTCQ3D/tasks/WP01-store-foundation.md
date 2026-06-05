@@ -153,14 +153,19 @@ from it is refused (tested in T004).
    the CLI `rename --drain-check`. Keep it a pure query (no writes).
    - NOTE: `store.py` must not import `threads` at module top (threads imports
      store). Import `threads` lazily *inside* the method.
-4. `remove_agent(name, *, force=False)`: change the existing `remove_agent` to
-   require `force=True`. Without force, raise a dedicated exception/`ValueError`
-   carrying the retire hint (the CLI turns this into exit 2 + hint text). With
-   force, perform the existing removal (no tombstone — name stays re-addable) and
-   return a marker the CLI uses to print the history-breakage warning.
+4. `remove_agent(name)`: **leave the existing store primitive mechanical** —
+   it removes the name from agents/roles/groups (no tombstone), so the name
+   stays re-addable. The refuse-without-`--force` policy + the retire hint +
+   the history-breakage warning are FR-007, **mapped to WP03 (the CLI layer)**
+   where the `--force` flag lives. Rationale: the refusal is operator-UX policy,
+   not a store invariant; keeping the primitive mechanical avoids breaking
+   existing `remove` tests and puts the flag and its policy in one place. (This
+   is a deliberate change from an earlier draft that put `force=False` in the
+   store; agreed with the reviewer.)
 
 **Validation**: rename carries role/liaison; `new` already-known is refused;
-remove without force raises; with force removes and signals the warning.
+`remove_agent` removes mechanically and the force-removed (no-tombstone) name is
+re-addable; the no-`--force` refusal is exercised in WP03's CLI tests.
 
 ### T004 — retired-send refusal
 **Purpose**: A tombstone cannot send or be sent to (FR-004).
@@ -240,9 +245,9 @@ Cover, at minimum:
   force-removed name (no tombstone) IS re-addable.
 - `_drain_check` returns owed threads (construct a small fixture with an open
   review-request) and is empty when none.
-- `remove_agent(force=False)` raises with the retire hint; `force=True` removes
-  and signals the warning; retired name remains non-rebindable but force-removed
-  name is re-addable.
+- `remove_agent(name)` removes mechanically (no tombstone); the force-removed
+  name is re-addable (the no-`--force` refusal + hint live in WP03's CLI tests,
+  per FR-007). A retired name remains non-rebindable.
 - retired-send refusal (sender and recipient) with the tombstone-specific message.
 - `forward_retired` (B4): forwarding a genuinely-owed `request_id` emits
   `meta.forwarded_from` + `meta.forwarded_request_id` with the resolved sender
