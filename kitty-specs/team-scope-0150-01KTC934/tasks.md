@@ -24,8 +24,8 @@ Feature traceability per-subtask (#15/#16/#17).
 | T009 | cli: prune command (#17) | WP02 | | [D] |
 | T010 | cli: displays + warnings (n/a markers, quarantined count, incomplete-batch) | WP02 | | [D] |
 | T011 | tests: test_cli for T006-T010 incl. fault injection | WP02 | | [D] |
-| T012 | doctor: store-hygiene check (invalid + quarantined) (#17) | WP03 | |
-| T013 | tests: test_doctor (environment-pinned - the CI lesson) | WP03 | |
+| T012 | doctor: store-hygiene check (invalid + quarantined) (#17) | WP03 | | [D] |
+| T013 | tests: test_doctor (environment-pinned - the CI lesson) | WP03 | | [D] |
 | T014 | e2e: role routing + post-send freeze (SC 1) | WP04 | |
 | T015 | e2e: NA lifecycle both perspectives (SC 2) | WP04 | |
 | T016 | e2e: fault-injected partial fan-out at k=first/mid/last + warning lifecycle (SC 3) | WP04 | |
@@ -75,8 +75,8 @@ Feature traceability per-subtask (#15/#16/#17).
 **Priority**: P1. **Dependencies**: WP02.
 **Independent test**: `pytest tests/test_doctor.py` green on an UNPINNED-free design (env pinned in tests).
 
-- [ ] T012 doctor: store-hygiene check (WP03)
-- [ ] T013 tests: test_doctor env-pinned (WP03)
+- [x] T012 doctor: store-hygiene check (WP03)
+- [x] T013 tests: test_doctor env-pinned (WP03)
 
 **Risks**: the 0.14.0 CI lesson - never assert doctor exit codes on an unpinned host.
 
