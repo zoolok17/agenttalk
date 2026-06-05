@@ -18,7 +18,7 @@ exported on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.14.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.15.0"
 agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
@@ -123,10 +123,10 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.14.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.15.0"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.14.0` with
+Pin to a specific tag so you control upgrades. Replace `v0.15.0` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
@@ -645,7 +645,7 @@ so the long timeout is free observability.
 | `agenttalk threads [--for A] [--all] [--json]` | Derive request/reply thread state from validated messages. Default view shows actionable rows only (`reply-waiting`, `owed-inbound`, `open-outbound`); `--all` includes `closed`. |
 | `agenttalk sync --for A [--json]` | Rejoin digest: show identity, roster, actionable threads grouped by request id, terminal decisions, recent unread non-action messages, and deterministic next-action hints. Pure derivation; no cursor or threadstate writes. |
 | `agenttalk send --from A --to B [--kind K] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -)` | Drop a message into the bus. `--file -` reads the body from stdin. `review-request`, `question`, and `proposal` without `--meta request_id=...` get one minted + printed; `review-result` and `proposal-response` without one warn (soft, exit 0). |
-| `agenttalk broadcast --from A (--to-group G \| --all) [--kind message\|note\|question] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--print-id] [--quiet]` | Fan out one message per recipient, excluding the sender. Mints `broadcast_id=b-...`, stores it as `meta.broadcast_id` and `meta.request_id`, and prints the recipient list unless quiet. |
+| `agenttalk broadcast --from A (--to-group G \| --all) [--kind message\|note\|question] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--print-id] [--quiet]` | Fan out one message per recipient, excluding the sender. Mints `broadcast_id=b-...`, stores it as `meta.broadcast_id` and `meta.request_id`, and prints the recipient list unless quiet. 0.15.0: `--to-role <role>` targets every member holding a role (frozen into each copy at send time); a PARTIAL fan-out exits **5** with a delivered/missed manifest — recover with `--resume <bid>` or rescind. |
 | `agenttalk propose [--from A] [--to B] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--in-reply-to ID] [--print-id] [--quiet]` | Send a first-class `proposal`. Auto-mints `meta.request_id=pp-...` if absent and prints `(proposal id: pp-...)` unless quiet. `--in-reply-to` sets `meta.in_reply_to` for counters. |
 | `agenttalk recv --for A [--ack] [--since ID] [--include-control]` | **Peek** at queued messages — does NOT move the cursor unless `--ack`. Plain `recv` that prints messages emits a hint pointing at `drain`. Hides `composing` pings by default; `--include-control` surfaces them. |
 | `agenttalk drain --for A [--include-control]` | **Consume**: print all unread AND advance the cursor to newest, in one shot. Same path as `recv --ack`. Use this instead of hand-rolled timestamp polling. |
@@ -656,11 +656,12 @@ so the long timeout is free observability.
 | `agenttalk check --for A --to-request RID [--json]` | **Pre-action currentness gate** (0.14.0): prints `current`/`superseded`/`unknown`, exits 0/3/4. Run it immediately before any irreversible action tied to a request — exit 3 is a hard stop. Read-only; a local `ack` never masks a rescind. |
 | `agenttalk escalate --from A (-m TEXT \| --file -) [--to X]` | Route an operator question to the **operator-facing agent** (0.14.0). Mints an `esc-` request_id (printed as `request_id=<id>`), refuses loudly when no liaison is configured. |
 | `agenttalk roster set-operator-facing <name>` / `--clear` | Designate the ONE agent the human operator talks to directly (0.14.0). Advisory routing metadata, single slot — "two liaisons" is unrepresentable. |
+| `agenttalk prune --invalid [--dry-run] [--json]` | Quarantine invalid message files into `.agenttalk/quarantine/` (0.15.0) — move-only and **recoverable** (restore = move the file back); the selection is exactly what status reports as INVALID; valid files untouched by construction. |
 | `agenttalk transcript [--format md\|jsonl] [--out PATH]` | Export the full conversation. |
 | `agenttalk end --from A [--reason ...]` | Notify the other agent(s) and write the transcript. In a team, sends `end` to every other roster member. |
 | `agenttalk reset [--archive]` | Clear **active bus state** (messages + cursors + heartbeats); preserves historical transcripts under `.agenttalk/sessions/` so past exports aren't lost. Bumps `session_id`. With `--archive`, instead moves **everything** (messages + state + sessions) under `.agenttalk/archived/<old_session>/`. Preserves config (roster) either way. |
 | `agenttalk hmac-init [--force]` | Generate the HMAC signing key for this project. Stored outside `.agenttalk/` (per-user config dir). The key's existence at the path-derived per-user location automatically activates signature enforcement — there's no config flag to flip. Override the default key path with `AGENTTALK_HMAC_KEY_FILE`. See `SECURITY.md`. |
-| `agenttalk reply [--from A] [--to-id MSG_ID \| --to-request REQUEST_ID] [--kind K] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--dry-run]` | Reply to the most recent received message, or anchor to a specific received message/thread. Auto-derives recipient and echoes the anchor's `request_id`; explicit `--meta request_id=...` wins. `--dry-run` prints the resolved recipient, request id, and kind without sending. A reply that opens a new thread (`review-request` or `proposal`) mints a fresh id instead of echoing. |
+| `agenttalk reply [--from A] [--to-id MSG_ID \| --to-request REQUEST_ID] [--kind K] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--dry-run]` | Reply to the most recent received message, or anchor to a specific received message/thread. Auto-derives recipient and echoes the anchor's `request_id`; explicit `--meta request_id=...` wins. `--dry-run` prints the resolved recipient, request id, and kind without sending. A reply that opens a new thread (`review-request` or `proposal`) mints a fresh id instead of echoing. 0.15.0: `--na` sends a not-applicable response — closes your obligation, displayed as (n/a); refused on review-request/proposal threads. |
 | `agenttalk tail [--from-start] [--interval S] [--timeout S]` | Passive monitor: stream all messages as they arrive. Does **not** advance cursors or write heartbeats — safe to run in a third terminal alongside two active agents. `--from-start` replays existing messages first. |
 | `agenttalk serve [--port P] [--host H] [--access-log]` | Start a **read-only** local web dashboard at `http://127.0.0.1:8765/` for browsing the message log in a real browser. **Loopback-only by design** — only `127.0.0.1`, `::1`, and `localhost` are accepted; there is no flag to expose it elsewhere (SSH-tunnel `localhost:<port>` from another machine if needed). HTML output is escaped, strict CSP, `GET`/`HEAD` only, peer-IP check on every method. JSON at `/api/status` and `/api/messages` for scripting. See `SECURITY.md`. |
 | `agenttalk install-skills [--claude-only\|--codex-only] [--force] [--dry-run]` | Copy bundled skill files to `~/.claude/commands/` and `~/.codex/skills/`. Idempotent — preserves your local edits unless `--force`. |
@@ -869,6 +870,42 @@ the path and leads with `root:` — as does `whoami`. Pin the root per
 shell with `$env:AGENTTALK_ROOT = '<project root>'` and every window
 agrees by construction.
 
+### Role audiences and honest n/a replies (0.15.0)
+
+`agenttalk broadcast --to-role reviewer --kind question -m "fresh eyes?"`
+fans out to every roster member whose ROLE is `reviewer` — no
+hand-curated group needed. The audience is **frozen into each copy at
+send time** (`audience_kind`/`audience_resolved`/`batch_total` meta):
+change the roles map afterwards and historical obligations do not move,
+because thread derivation only ever reads the copies themselves.
+
+When a broadcast question genuinely does not concern you,
+`agenttalk reply --to-request <bid> --na` closes your obligation with a
+structured not-applicable response. The asker sees `na=[you]` instead of
+mistaking it for a substantive answer — and nobody placeholder-acks or
+goes silent. NA is refused on review-request/proposal threads (those
+contracts need `review-result` / `proposal-response`).
+
+### Broadcast delivery accounting (0.15.0)
+
+Fan-out has no multi-file atomicity on a local filesystem, so agenttalk
+is honest instead: every copy carries the batch facts, and a mid-batch
+failure prints `delivered=[...]` / `missed=[...]` and exits **5**.
+Recovery is one command — `agenttalk broadcast --resume <bid>` re-sends
+the missing copies from the frozen originals (broadcaster-only) — or
+rescind the thread to void it. Until resolved, `status` warns
+`incomplete fan-out` naming the missed members.
+
+### Quarantine — recoverable store hygiene (0.15.0)
+
+`agenttalk prune --invalid` moves every file the INVALID report names
+into `.agenttalk/quarantine/`. Move-only: never overwritten (collisions
+get a timestamp suffix), never deleted by the tool, restore = move the
+file back into `messages/`. Selection is the SAME validation gate walk
+status/doctor use, path-paired at scan time, so a valid file can never
+be selected. Use `--dry-run` to inspect first; `doctor` shows
+invalid/quarantined counts.
+
 ### Exit codes
 
 Stable across releases — skill bodies and external automation can
@@ -886,7 +923,7 @@ rely on these:
 
 0.14.0 additions: **3** = the request was superseded/rescinded
 (`check`, and a scoped `wait --to-request` waking on a rescind);
-**4** = unknown request id (`check`). Exit 1 remains *exclusively* the
+**4** = unknown request id (`check`); **5** = PARTIAL broadcast fan-out (0.15.0 — some copies written, some failed; see the delivered/missed manifest). Exit 1 remains *exclusively* the
 `wait` timeout; 2 remains usage/refusal.
 
 ## How terminals see messages

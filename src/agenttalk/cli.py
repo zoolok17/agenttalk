@@ -372,6 +372,7 @@ def _gather_status(store: Store) -> dict:
             row["operator_facing"] = True  # additive: absent unless set
         agents.append(row)
     invalid = store.list_invalid_messages()
+    quarantined = store.quarantined_count()
     signing_enforced = store.signing_enforced()
     # project_id is path-derived; surfaces here for diagnostics
     project_id = store.project_id()
@@ -386,6 +387,8 @@ def _gather_status(store: Store) -> dict:
         "stale_threshold_seconds": STALE_THRESHOLD_SECONDS,
         "warnings": _status_warnings(agents) + _thread_warnings(store, cfg),
     }
+    if quarantined:
+        payload["quarantined"] = quarantined  # additive: absent when zero
     if signing_enforced:
         health = _signing.inspect_key(project_id, store.root)
         payload["hmac_key"] = health.to_dict()
@@ -516,6 +519,32 @@ def _thread_warnings(store: Store, cfg: dict) -> list[str]:
         if any(t.needs_operator and t.operator_state == "pending"
                and t.role == "opener" for t in rows):
             pending_escalations_exist = True
+        # Incomplete fan-out (#16, 0.15.0): a broadcaster row whose frozen
+        # batch_total exceeds the copies actually on disk means a partial
+        # fan-out survived (crash/exit-5 without re-send). Warn ONCE per
+        # batch (broadcaster perspective only), name the missed members
+        # from the frozen audience_resolved, and suppress once the thread
+        # is rescinded (closed-superseded) - rescind is a valid resolution.
+        for trow in rows:
+            if (trow.is_broadcast and trow.role == "opener"
+                    and trow.batch_total is not None
+                    and len(trow.audience) < trow.batch_total
+                    and trow.state != "closed-superseded"):
+                planned: list[str] = []
+                for m in msgs:
+                    if ((m.meta or {}).get("broadcast_id") == trow.request_id
+                            and (m.meta or {}).get("audience_resolved")):
+                        planned = [x for x in
+                                   (m.meta or {})["audience_resolved"].split(",") if x]
+                        break
+                missed = [x for x in planned if x not in trow.audience]
+                out.append(
+                    f"{a}: incomplete fan-out {trow.request_id} - "
+                    f"{len(trow.audience)}/{trow.batch_total} copies exist"
+                    + (f", missed: {', '.join(missed)}" if missed else "")
+                    + f". Recover with `agenttalk broadcast --from {a} "
+                      f"--resume {trow.request_id}`, or rescind the thread."
+                )
     if pending_escalations_exist and liaison is None:
         out.append(
             "operator escalations are pending but NO operator-facing agent "
@@ -587,6 +616,10 @@ def cmd_threads(args: argparse.Namespace) -> int:
         extra = ""
         if t.state == "closed-superseded":
             extra = f"  rescinded-by={t.rescinded_by}"
+        if t.is_broadcast and t.responded_na:
+            extra += f"  na=[{', '.join(t.responded_na)}]"
+        if t.na_response:
+            extra += "  (n/a)"
         if t.needs_operator:
             extra += f"  operator={t.operator_state}"
         if t.state == "open-outbound" and _reply_in_flight(store, t):
@@ -630,7 +663,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     if payload["invalid_messages"]:
         n = len(payload["invalid_messages"])
         print(f"INVALID:    {n} message{'s' if n != 1 else ''} failed schema/roster validation "
-              f"(see `agenttalk status --json` for details under invalid_messages[])")
+              f"(see `agenttalk status --json` for details under invalid_messages[]; "
+              f"`agenttalk prune --invalid --dry-run` to inspect)")
+    if payload.get("quarantined"):
+        print(f"quarantined: {payload['quarantined']} file(s) in .agenttalk/quarantine/ (recoverable)")
     for a in payload["agents"]:
         cursor = a["cursor"] or "(none)"
         if a["heartbeat"] is None:
@@ -876,6 +912,43 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prune(args: argparse.Namespace) -> int:
+    """Quarantine invalid message files (#17, 0.15.0).
+
+    Move-only and recoverable: files go to `.agenttalk/quarantine/`
+    (collision-suffixed, never overwritten, never deleted by the tool);
+    restore = move the file back into messages/ by hand. The selection
+    is exactly what status/doctor report as INVALID — same gate walk,
+    path-paired at scan time. Valid files are untouched by construction.
+    """
+    store = _get_store(args)
+    if not getattr(args, "invalid", False):
+        sys.stderr.write(
+            "agenttalk prune: pass --invalid (the only selector today; "
+            "future selectors are reserved).\n"
+        )
+        return 2
+    records = store.quarantine_invalid(dry_run=args.dry_run)
+    if args.json:
+        print(json.dumps({
+            "selected": records,
+            "moved": ([] if args.dry_run
+                      else [r["to"] for r in records if r.get("to")]),
+            "dry_run": bool(args.dry_run),
+        }, indent=2))
+        return 0
+    if not records:
+        print("nothing to prune — no invalid messages.")
+        return 0
+    verb = "would move" if args.dry_run else "moved"
+    if not args.quiet:
+        for r in records:
+            print(f"  {r['id']}  {verb} -> {r['to']}   ({r['reason']})")
+    print(f"({len(records)} file(s) {verb}; quarantine is recoverable — "
+          f"restore by moving the file back into messages/)")
+    return 0
+
+
 def cmd_escalate(args: argparse.Namespace) -> int:
     """Route an operator-input question to the operator-facing agent (#18).
 
@@ -1015,12 +1088,100 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     cfg = store.load_config()
     roster = cfg.get("agents") or []
     sender = _resolve_self(args.sender, roster=roster)
-    target = "all" if args.all else args.to_group
-    try:
-        recipients = store.resolve_audience(target, exclude=sender)
-    except ValueError as e:
-        sys.stderr.write(f"agenttalk broadcast: {e}\n")
+    # --resume <bid> (#16, 0.15.0): the one-command recovery for a partial
+    # fan-out. Reconstructs the batch from the FROZEN copies themselves
+    # (kind, subject, body, and every frozen meta key come from an
+    # existing copy - the plan was sealed at first send) and writes only
+    # the missing copies. Broadcaster-only.
+    resume = getattr(args, "resume", None)
+    if resume:
+        if (args.message or getattr(args, "file", None) or args.subject
+                or args.kind != "message" or args.meta):
+            sys.stderr.write(
+                "agenttalk broadcast: --resume re-sends the ORIGINAL frozen "
+                "copies - it takes no body/subject/kind/meta overrides.\n")
+            return 2
+        copies = [m for m in store.valid_messages()
+                  if (m.meta or {}).get("broadcast_id") == resume]
+        if not copies:
+            sys.stderr.write(
+                f"agenttalk broadcast: no broadcast {resume!r} is visible - "
+                f"check the id (`agenttalk threads --for {sender}`).\n")
+            return 2
+        proto = copies[0]
+        if proto.sender != sender:
+            sys.stderr.write(
+                f"agenttalk broadcast: only the broadcaster "
+                f"({proto.sender!r}) may resume batch {resume!r}.\n")
+            return 2
+        resolved = [x for x in
+                    ((proto.meta or {}).get("audience_resolved") or "").split(",") if x]
+        if not resolved:
+            sys.stderr.write(
+                f"agenttalk broadcast: batch {resume!r} carries no frozen "
+                f"audience (pre-0.15.0 broadcast) - re-send by hand with "
+                f"--meta request_id/broadcast_id/audience set.\n")
+            return 2
+        existing = {m.recipient for m in copies}
+        missed = [r for r in resolved if r not in existing]
+        if not missed:
+            print(f"(batch {resume} complete - nothing to resume)")
+            return 0
+        sent_resume: list = []
+        failure: Exception | None = None
+        for r in missed:
+            try:
+                msg = store.send(
+                    sender=sender, recipient=r, body=proto.body,
+                    kind=proto.kind, subject=proto.subject,
+                    meta=dict(proto.meta or {}),
+                )
+            except Exception as e:  # noqa: BLE001 - account every failure
+                failure = e
+                break
+            sent_resume.append(msg)
+        if failure is not None:
+            delivered = sorted(existing | {m.recipient for m in sent_resume})
+            still_missed = [r for r in resolved if r not in delivered]
+            if getattr(args, "json", False):
+                print(json.dumps({"batch_id": resume, "delivered": delivered,
+                                  "missed": still_missed}, indent=2))
+            else:
+                print(f"delivered=[{', '.join(delivered)}]")
+                print(f"missed=[{', '.join(still_missed)}]")
+            sys.stderr.write(
+                f"agenttalk broadcast: resume of {resume} STILL partial - "
+                f"copy for {still_missed[0]!r} failed: {failure}\n")
+            return 5
+        if not args.quiet:
+            print(f"(batch {resume} resumed: {len(sent_resume)} missing "
+                  f"cop{'ies' if len(sent_resume) != 1 else 'y'} sent: "
+                  f"{', '.join(m.recipient for m in sent_resume)})")
+        return 0
+    # Audience resolution: role targets (#15, 0.15.0) resolve via the
+    # roles map; groups/all via the existing resolver. Explicit flags —
+    # never an implicit fallback from one map to the other (a role/group
+    # name collision must stay unambiguous).
+    to_role = getattr(args, "to_role", None)
+    if to_role is not None and not to_role.strip():
+        sys.stderr.write("agenttalk broadcast: --to-role needs a role name.\n")
         return 2
+    if to_role:
+        target = to_role
+        audience_kind = "role"
+        try:
+            recipients = store.resolve_role_audience(to_role, exclude=sender)
+        except ValueError as e:
+            sys.stderr.write(f"agenttalk broadcast: {e}\n")
+            return 2
+    else:
+        target = "all" if args.all else args.to_group
+        audience_kind = "all" if args.all else "group"
+        try:
+            recipients = store.resolve_audience(target, exclude=sender)
+        except ValueError as e:
+            sys.stderr.write(f"agenttalk broadcast: {e}\n")
+            return 2
     if not recipients:
         sys.stderr.write(
             f"agenttalk broadcast: audience '{target}' has no recipients "
@@ -1051,6 +1212,14 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     bid = supplied_bid or supplied_rid or ("b-" + uuid.uuid4().hex[:12])
     audience_label = "all" if args.all else target
     sent: list = []
+    # Delivery accounting (#16, 0.15.0): every copy freezes the fan-out
+    # facts at send time (audience kind/label/members + batch_total) —
+    # display/audit/incompleteness data, never an obligation source
+    # (derivation stays opener-copy-based). The loop is wrapped so a
+    # mid-fan-out failure reports EXACTLY who got the message and who
+    # did not (exit 5) instead of dying silently partway — there is no
+    # multi-file atomicity on a local FS, so honesty replaces rollback.
+    failure: Exception | None = None
     for r in recipients:
         meta = dict(meta_base)
         # Reuse request_id as the correlation token (so existing
@@ -1061,11 +1230,47 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         meta["request_id"] = bid
         meta["broadcast_id"] = bid
         meta["audience"] = audience_label
-        msg = store.send(
-            sender=sender, recipient=r, body=body,
-            kind=args.kind, subject=args.subject or "", meta=meta,
-        )
+        meta["audience_kind"] = audience_kind
+        if audience_kind == "role":
+            meta["audience_role"] = target
+        meta["audience_resolved"] = ",".join(recipients)
+        meta["batch_total"] = str(len(recipients))
+        try:
+            msg = store.send(
+                sender=sender, recipient=r, body=body,
+                kind=args.kind, subject=args.subject or "", meta=meta,
+            )
+        except Exception as e:  # noqa: BLE001 — any failure must be accounted
+            failure = e
+            break
         sent.append(msg)
+    if failure is not None:
+        delivered = [m.recipient for m in sent]
+        missed = [r for r in recipients if r not in delivered]
+        if getattr(args, "json", False):
+            print(json.dumps({"batch_id": bid, "delivered": delivered,
+                              "missed": missed}, indent=2))
+        else:
+            print(f"delivered=[{', '.join(delivered)}]")
+            print(f"missed=[{', '.join(missed)}]")
+        if delivered:
+            sys.stderr.write(
+                f"agenttalk broadcast: PARTIAL fan-out — copy for "
+                f"{missed[0]!r} failed: {failure}\n"
+                f"  Recover with `agenttalk broadcast --from {sender} "
+                f"--resume {bid}` (re-sends the missing frozen copies), or "
+                f"rescind the thread (`agenttalk rescind --to-request {bid}`).\n"
+            )
+        else:
+            # Zero copies landed: there is nothing on disk to resume or
+            # rescind (fresh-eyes 0.15.0 note 1) — the only recovery is
+            # re-running the broadcast itself.
+            sys.stderr.write(
+                f"agenttalk broadcast: fan-out failed before ANY copy was "
+                f"written ({failure}) — nothing to resume; re-run the "
+                f"broadcast.\n"
+            )
+        return 5
     if not args.quiet:
         print(
             f"(broadcast {bid} [{args.kind}] {sender} -> @{audience_label}: "
@@ -2019,17 +2224,53 @@ def cmd_reply(args: argparse.Namespace) -> int:
     if anchor is None:
         sys.stderr.write(f"agenttalk reply: {err}\n")
         return 2
+    # --na (#15, 0.15.0): a structured not-applicable response — closes
+    # the obligation like any answer, displayed distinctly so the asker
+    # never mistakes "not my role" for a substantive reply. Question
+    # threads only: review-request/proposal contracts require their
+    # typed responses (FR-006).
+    na = getattr(args, "na", False)
+    # args.kind defaults to None so an EXPLICIT --kind (even
+    # `--kind message`) is distinguishable - the WP02 review repro.
+    kind = args.kind or "message"
+    if na:
+        if args.kind is not None:
+            sys.stderr.write(
+                "agenttalk reply: --na and --kind are mutually exclusive "
+                "(an NA response is always kind=message).\n")
+            return 2
+        anchor_rid = (anchor.meta or {}).get("request_id")
+        opener_kind = None
+        if isinstance(anchor_rid, str) and anchor_rid:
+            row = _thread_row_for(store, sender, anchor_rid)
+            opener_kind = row.opener_kind if row is not None else None
+        else:
+            opener_kind = anchor.kind if anchor.kind in ("review-request", "proposal") else None
+        if opener_kind in ("review-request", "proposal"):
+            sys.stderr.write(
+                f"agenttalk reply: --na is not valid on a {opener_kind} "
+                f"thread — this thread needs a typed response: "
+                f"{'review-result' if opener_kind == 'review-request' else 'proposal-response'}.\n")
+            return 2
     dry = getattr(args, "dry_run", False)
     # --dry-run only resolves routing (recipient + request_id + kind) and
     # sends nothing, so it must NOT require a body. Skip the body read +
     # empty-body check entirely in that case.
     body = ""
     if not dry:
-        body = _read_body(args)
+        if na and not (getattr(args, "message", None) or getattr(args, "file", None)):
+            # NA is the one reply whose body may default — and it must
+            # never fall into the implicit stdin sniff (the 0.14.0
+            # rescind lesson: a bare command must not block on stdin).
+            body = "n/a"
+        else:
+            body = _read_body(args)
         if not body and not args.allow_empty:
             sys.stderr.write("agenttalk reply: empty body (use -m TEXT, --file PATH, pipe stdin, or --allow-empty)\n")
             return 2
     meta = _parse_meta(args.meta)
+    if na:
+        meta["response"] = "not-applicable"  # the display discriminator
     # Auto-echo request_id for correlation. Explicit --meta wins.
     # EXCEPTION: a reply that is ITSELF a thread-opening kind
     # (review-request = counter-review; proposal = counter-proposal)
@@ -2039,13 +2280,13 @@ def cmd_reply(args: argparse.Namespace) -> int:
     # echo and let _maybe_autogen_request_id mint a fresh id below
     # (unless the user passed an explicit --meta one).
     if (
-        args.kind not in ("review-request", "proposal")
+        kind not in ("review-request", "proposal")
         and "request_id" not in meta
         and "request_id" in (anchor.meta or {})
     ):
         meta["request_id"] = anchor.meta["request_id"]
-    _maybe_autogen_request_id(args.kind, meta, quiet=args.quiet)
-    _warn_missing_request_id(args.kind, meta)
+    _maybe_autogen_request_id(kind, meta, quiet=args.quiet)
+    _warn_missing_request_id(kind, meta)
     if dry:
         # Resolve-and-show without sending — guards against echoing the
         # wrong request_id when multiple threads are open. The reply routes
@@ -2053,13 +2294,13 @@ def cmd_reply(args: argparse.Namespace) -> int:
         # originator (who may not be the agent that needs the answer).
         rid = meta.get("request_id", "(none)")
         print(f"(dry-run) reply {sender} -> {anchor.sender}  thread={rid}  "
-              f"kind={args.kind}; nothing sent.")
+              f"kind={kind}; nothing sent.")
         return 0
     msg = store.send(
         sender=sender,
         recipient=anchor.sender,
         body=body,
-        kind=args.kind,
+        kind=kind,
         subject=args.subject or "",
         meta=meta,
     )
@@ -2395,6 +2636,25 @@ def build_parser() -> argparse.ArgumentParser:
                       help='{"request_id", "state", "rescind"} — stable contract.')
     pchk.set_defaults(func=cmd_check)
 
+    pprn = sub.add_parser(
+        "prune",
+        help="Quarantine invalid message files: move everything the "
+             "INVALID report names into .agenttalk/quarantine/ "
+             "(recoverable - restore by moving the file back; never "
+             "overwritten, never deleted). --dry-run lists without "
+             "moving. Valid files are untouched by construction.",
+    )
+    pprn.add_argument("--invalid", action="store_true",
+                      help="Select validation-failing files (required - "
+                           "the only selector today).")
+    pprn.add_argument("--dry-run", dest="dry_run", action="store_true",
+                      help="List what would move; move nothing.")
+    pprn.add_argument("--json", action="store_true",
+                      help='{"selected", "moved", "dry_run"} - stable contract.')
+    pprn.add_argument("--quiet", action="store_true",
+                      help="Summary line only.")
+    pprn.set_defaults(func=cmd_prune)
+
     pesc = sub.add_parser(
         "escalate",
         help="Route an operator-input question to the operator-facing agent "
@@ -2457,8 +2717,19 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Sender agent name (default: $AGENTTALK_SELF)")
     bgrp = pbc.add_mutually_exclusive_group(required=True)
     bgrp.add_argument("--to-group", dest="to_group", help="Target group name.")
+    bgrp.add_argument("--to-role", dest="to_role",
+                      help="Target every roster member holding this ROLE "
+                           "(resolved from the roles map at send time and "
+                           "frozen into each copy's meta - later role "
+                           "changes never alter historical obligations). "
+                           "Unknown/empty role refuses loudly.")
     bgrp.add_argument("--all", action="store_true",
                       help="Target the whole roster (implicit group).")
+    bgrp.add_argument("--resume", dest="resume",
+                      help="Recover a PARTIAL fan-out: re-send the missing "
+                           "frozen copies of this batch id (kind/subject/"
+                           "body/meta come from the original copies). "
+                           "Broadcaster-only; takes no body/kind overrides.")
     pbc.add_argument("--kind", default="message",
                      choices=["message", "note", "question"],
                      help="Broadcast kind (default: message). Use `question` "
@@ -2470,6 +2741,9 @@ def build_parser() -> argparse.ArgumentParser:
     pbc.add_argument("--allow-empty", action="store_true")
     pbc.add_argument("--print-id", action="store_true",
                      help="Print the broadcast_id on its own line.")
+    pbc.add_argument("--json", action="store_true",
+                     help="On PARTIAL fan-out failure (exit 5), emit the "
+                          "delivered/missed manifest as JSON.")
     pbc.add_argument("--quiet", action="store_true")
     pbc.set_defaults(func=cmd_broadcast)
 
@@ -2594,7 +2868,7 @@ def build_parser() -> argparse.ArgumentParser:
     anchor_grp.add_argument("--to-request", dest="to_request",
                             help="Anchor to the latest received message in this "
                                  "correlation thread (by request_id).")
-    prpl.add_argument("--kind", default="message",
+    prpl.add_argument("--kind", default=None,
                       help="Message kind (default: message; see `agenttalk send --help`)")
     prpl.add_argument("--subject", help="One-line summary")
     prpl.add_argument("--meta", action="append",
@@ -2602,6 +2876,14 @@ def build_parser() -> argparse.ArgumentParser:
     prpl.add_argument("-m", "--message", help="Body text (else --file or stdin)")
     prpl.add_argument("--file", help="Read body from this file path ('-' = stdin)")
     prpl.add_argument("--allow-empty", action="store_true")
+    prpl.add_argument("--na", action="store_true",
+                      help="Not-applicable response (0.15.0): closes your "
+                           "obligation on a question thread, displayed as "
+                           "(n/a) so the asker never mistakes it for a "
+                           "substantive answer. Body optional (defaults to "
+                           "'n/a'). Refused on review-request/proposal "
+                           "threads - those need typed responses. Mutually "
+                           "exclusive with --kind.")
     prpl.add_argument("--dry-run", action="store_true",
                       help="Resolve and print the recipient + echoed request_id "
                            "+ kind WITHOUT sending. Use it to confirm a reply "

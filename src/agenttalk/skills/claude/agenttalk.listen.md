@@ -282,6 +282,20 @@ Escalations arrive as ordinary `question` messages carrying
 `meta.needs_operator=true` — if you are the liaison, handle them with the
 single-voice rule above instead of the generic question flow.
 
+### Team-scope contracts (0.15.0)
+
+- **Not-applicable beats placeholder acks (0.15.0).** A broadcast
+  question that does not concern your role gets
+  `agenttalk reply --to-request <bid> --na` — it closes your obligation
+  and shows the asker "(n/a)" instead of a fake answer. Never
+  placeholder-ack, never go silent. (Refused on review-request/proposal
+  threads — those need their typed responses.)
+- **Store hygiene (0.15.0).** When `status`/`doctor` report INVALID
+  messages: `agenttalk prune --invalid --dry-run` to inspect, then run
+  it without `--dry-run` to quarantine. Quarantine is RECOVERABLE
+  (restore = move the file back into messages/); never hand-delete
+  message files.
+
 ## Thread hygiene
 
 Before declaring work done, returning control to the user, or going

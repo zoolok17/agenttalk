@@ -116,6 +116,21 @@ for those.
   aborted. Exit 4 = unknown id: treat as stale and re-confirm with the
   counterparty. Only exit 0 (current) clears you to act.
 
+- **Role audiences + delivery accounting (0.15.0).** Prefer
+  `broadcast --to-role <role>` over hand-curated groups when roles
+  exist — the audience freezes into each copy at send time, so later
+  roster changes never rewrite history. A broadcast exiting **5** was a
+  PARTIAL fan-out: recover with `agenttalk broadcast --from $SELF
+  --resume <bid>` (re-sends the missing frozen copies) or rescind the
+  thread (terminal - do not --resume a batch you rescinded); check
+  `agenttalk status` for `incomplete fan-out` warnings after any
+  broadcast.
+- **Store hygiene (0.15.0).** When `status`/`doctor` report INVALID
+  messages: `agenttalk prune --invalid --dry-run` to inspect, then run
+  it without `--dry-run` to quarantine. Quarantine is RECOVERABLE
+  (restore = move the file back into messages/); never hand-delete
+  message files.
+
 ## Procedure
 
 1. Inspect the team:

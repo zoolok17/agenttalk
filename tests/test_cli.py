@@ -1844,3 +1844,333 @@ def test_composing_to_request_allows_needs_info_requester(store_root: Path) -> N
             for p in (store_root / ".agenttalk" / "messages").glob("*.json")]
     comp = next(m for m in msgs if m["kind"] == "composing")
     assert comp["to"] == "beta"
+
+
+# ======================================================================
+# 0.15.0 CLI surface (WP02): --to-role / exit 5 / reply --na / prune
+# ======================================================================
+
+def _role_root(tmp_path: Path) -> Path:
+    root = _team_root(tmp_path, "lead,rev-a,rev-b,impl-c")
+    for a, r in (("rev-a", "reviewer"), ("rev-b", "reviewer"),
+                 ("impl-c", "implementer")):
+        assert _run(["roster", "set-role", a, r], root) == 0
+    return root
+
+
+def _msgs_on_disk(root: Path) -> list[dict]:
+    return [json.loads(p.read_text(encoding="utf-8"))
+            for p in (root / ".agenttalk" / "messages").glob("*.json")]
+
+
+# -------------------------------------------------- --to-role (T006)
+
+def test_broadcast_to_role_routes_and_freezes(tmp_path: Path) -> None:
+    root = _role_root(tmp_path)
+    rc = _run(["broadcast", "--from", "lead", "--to-role", "reviewer",
+               "--kind", "question", "-m", "fresh eyes?", "--quiet"], root)
+    assert rc == 0
+    copies = [m for m in _msgs_on_disk(root) if m["kind"] == "question"]
+    assert sorted(m["to"] for m in copies) == ["rev-a", "rev-b"]
+    for m in copies:
+        assert m["meta"]["audience_kind"] == "role"
+        assert m["meta"]["audience_role"] == "reviewer"
+        assert m["meta"]["audience_resolved"] == "rev-a,rev-b"
+        assert m["meta"]["batch_total"] == "2"
+    # the implementer neither receives nor owes
+    s = Store(root)
+    assert s.messages_for("impl-c") == []
+
+
+def test_broadcast_to_role_refusals(tmp_path: Path, capsys) -> None:
+    root = _role_root(tmp_path)
+    _run_expect_exit(["broadcast", "--from", "lead", "--to-role", "ghost",
+                      "-m", "x", "--quiet"], root, 2)
+    assert "reviewer" in capsys.readouterr().err  # known roles named
+    # sender is the only member of the role -> empty after exclusion
+    assert _run(["roster", "set-role", "lead", "lonely"], root) == 0
+    _run_expect_exit(["broadcast", "--from", "lead", "--to-role", "lonely",
+                      "-m", "x", "--quiet"], root, 2)
+    assert "no members besides" in capsys.readouterr().err
+
+
+def test_broadcast_group_copies_also_freeze(tmp_path: Path) -> None:
+    root = _role_root(tmp_path)
+    assert _run(["roster", "set-group", "pair", "rev-a,impl-c"], root) == 0
+    assert _run(["broadcast", "--from", "lead", "--to-group", "pair",
+                 "-m", "fyi", "--quiet"], root) == 0
+    copies = [m for m in _msgs_on_disk(root) if m["meta"].get("broadcast_id")]
+    assert all(m["meta"]["audience_kind"] == "group" for m in copies)
+    assert all(m["meta"]["batch_total"] == "2" for m in copies)
+    assert all("audience_role" not in m["meta"] for m in copies)
+
+
+# --------------------------------------------- partial fan-out (T007)
+
+def _fail_at(store_cls, k: int):
+    """Monkeypatch helper: make the k-th (1-based) Store.send call raise."""
+    calls = {"n": 0}
+    original = store_cls.send
+
+    def wrapper(self, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == k:
+            raise OSError("disk full (injected)")
+        return original(self, **kwargs)
+
+    return wrapper
+
+
+def test_broadcast_partial_failure_exit5_manifest(tmp_path: Path, capsys,
+                                                  monkeypatch) -> None:
+    root = _role_root(tmp_path)
+    monkeypatch.setattr(Store, "send", _fail_at(Store, 2))
+    rc = _run(["broadcast", "--from", "lead", "--to-role", "reviewer",
+               "--kind", "question", "-m", "x", "--quiet"], root)
+    assert rc == 5
+    captured = capsys.readouterr()
+    assert "delivered=[rev-a]" in captured.out
+    assert "missed=[rev-b]" in captured.out
+    assert "--resume" in captured.err             # the one-command recovery
+    assert "rescind" in captured.err
+    monkeypatch.undo()
+    # exactly one copy on disk
+    assert len([m for m in _msgs_on_disk(root) if m["kind"] == "question"]) == 1
+
+
+def test_broadcast_partial_failure_json_manifest(tmp_path: Path, capsys,
+                                                 monkeypatch) -> None:
+    root = _role_root(tmp_path)
+    monkeypatch.setattr(Store, "send", _fail_at(Store, 1))  # zero delivered
+    capsys.readouterr()  # flush roster-setup output before parsing JSON
+    rc = _run(["broadcast", "--from", "lead", "--to-role", "reviewer",
+               "-m", "x", "--json", "--quiet"], root)
+    assert rc == 5
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["delivered"] == []
+    assert payload["missed"] == ["rev-a", "rev-b"]
+    assert payload["batch_id"].startswith("b-")
+
+
+def test_incomplete_batch_warning_lifecycle(tmp_path: Path, capsys,
+                                            monkeypatch) -> None:
+    root = _role_root(tmp_path)
+    monkeypatch.setattr(Store, "send", _fail_at(Store, 2))
+    capsys.readouterr()
+    rc = _run(["broadcast", "--from", "lead", "--to-role", "reviewer",
+               "--kind", "question", "-m", "x", "--quiet"], root)
+    assert rc == 5
+    # recover the bid from the delivered copy on disk
+    bid = next(m["meta"]["broadcast_id"] for m in _msgs_on_disk(root)
+               if m["meta"].get("broadcast_id"))
+    monkeypatch.undo()
+    capsys.readouterr()
+    assert _run(["status", "--json"], root) == 0
+    warnings = json.loads(capsys.readouterr().out)["warnings"]
+    hit = [w for w in warnings if "incomplete fan-out" in w]
+    assert len(hit) == 1
+    assert "rev-b" in hit[0]            # missed member named
+    # resolution path A: follow the PRINTED remediation - one command
+    assert _run(["broadcast", "--from", "lead", "--resume", bid,
+                 "--quiet"], root) == 0
+    capsys.readouterr()
+    assert _run(["status", "--json"], root) == 0
+    warnings = json.loads(capsys.readouterr().out)["warnings"]
+    assert not [w for w in warnings if "incomplete fan-out" in w]
+    # ...and the recovered member actually OWES the thread now
+    assert _run(["threads", "--for", "rev-b", "--json"], root) == 0
+    # (flush handled by next readouterr)
+    rows = json.loads(capsys.readouterr().out)["threads"]
+    row = next(r for r in rows if r["request_id"] == bid)
+    assert row["state"] == "owed-inbound"
+
+
+def test_incomplete_batch_warning_suppressed_by_rescind(tmp_path: Path, capsys,
+                                                        monkeypatch) -> None:
+    root = _role_root(tmp_path)
+    monkeypatch.setattr(Store, "send", _fail_at(Store, 2))
+    assert _run(["broadcast", "--from", "lead", "--to-role", "reviewer",
+                 "--kind", "question", "-m", "x", "--quiet"], root) == 5
+    monkeypatch.undo()
+    bid = next(m["meta"]["broadcast_id"] for m in _msgs_on_disk(root)
+               if m["meta"].get("broadcast_id"))
+    assert _run(["rescind", "--from", "lead", "--to-request", bid,
+                 "--quiet"], root) == 0
+    capsys.readouterr()
+    assert _run(["status", "--json"], root) == 0
+    warnings = json.loads(capsys.readouterr().out)["warnings"]
+    assert not [w for w in warnings if "incomplete fan-out" in w]
+
+
+# ------------------------------------------------------ reply --na (T008)
+
+def test_reply_na_closes_with_label(tmp_path: Path, capsys) -> None:
+    root = _role_root(tmp_path)
+    assert _run(["broadcast", "--from", "lead", "--to-role", "reviewer",
+                 "--kind", "question", "--meta", "request_id=b-na1",
+                 "-m", "thoughts?", "--quiet"], root) == 0
+    rc = _run(["reply", "--from", "rev-b", "--to-request", "b-na1", "--na",
+               "--quiet"], root)
+    assert rc == 0
+    msgs = _msgs_on_disk(root)
+    na = next(m for m in msgs if m["meta"].get("response") == "not-applicable")
+    assert na["kind"] == "message" and na["body"] == "n/a"
+    capsys.readouterr()
+    assert _run(["threads", "--for", "lead", "--json"], root) == 0
+    row = next(t for t in json.loads(capsys.readouterr().out)["threads"]
+               if t["request_id"] == "b-na1")
+    assert row["responded_na"] == ["rev-b"]
+    assert "rev-b" in row["responded"]
+    assert row["pending"] == ["rev-a"]
+
+
+def test_reply_na_refusals(tmp_path: Path, capsys) -> None:
+    root = _role_root(tmp_path)
+    # review-request thread -> typed response required (FR-006)
+    assert _run(["send", "--from", "lead", "--to", "rev-a",
+                 "--kind", "review-request", "--meta", "request_id=rq-x",
+                 "-m", "review", "--quiet"], root) == 0
+    _run_expect_exit(["reply", "--from", "rev-a", "--to-request", "rq-x",
+                      "--na", "--quiet"], root, 2)
+    assert "review-result" in capsys.readouterr().err
+    # proposal thread
+    assert _run(["send", "--from", "lead", "--to", "rev-a",
+                 "--kind", "proposal", "--meta", "request_id=pp-x",
+                 "-m", "plan", "--quiet"], root) == 0
+    _run_expect_exit(["reply", "--from", "rev-a", "--to-request", "pp-x",
+                      "--na", "--quiet"], root, 2)
+    assert "proposal-response" in capsys.readouterr().err
+    # --kind conflict
+    assert _run(["send", "--from", "lead", "--to", "rev-a",
+                 "--kind", "question", "--meta", "request_id=q-x",
+                 "-m", "q", "--quiet"], root) == 0
+    _run_expect_exit(["reply", "--from", "rev-a", "--to-request", "q-x",
+                      "--na", "--kind", "note", "--quiet"], root, 2)
+    assert "mutually exclusive" in capsys.readouterr().err
+
+
+def test_reply_na_pairwise_question_with_body(tmp_path: Path, capsys) -> None:
+    root = _role_root(tmp_path)
+    assert _run(["send", "--from", "lead", "--to", "impl-c",
+                 "--kind", "question", "--meta", "request_id=q-p",
+                 "-m", "deploy steps?", "--quiet"], root) == 0
+    assert _run(["reply", "--from", "impl-c", "--to-request", "q-p", "--na",
+                 "-m", "reviewer territory - not my lane", "--quiet"], root) == 0
+    # consume the answer: an unread reply is (correctly) reply-waiting
+    assert _run(["drain", "--for", "lead", "--quiet"], root) == 0
+    capsys.readouterr()
+    assert _run(["threads", "--for", "lead", "--all", "--json"], root) == 0
+    row = next(t for t in json.loads(capsys.readouterr().out)["threads"]
+               if t["request_id"] == "q-p")
+    assert row["state"] == "closed"
+    assert row["na_response"] is True
+
+
+# ----------------------------------------------------------- prune (T009)
+
+def test_prune_flow_and_json(store_root: Path, capsys) -> None:
+    (store_root / ".agenttalk" / "messages" / "junk.json").write_text(
+        "{not json", encoding="utf-8")
+    # bare prune refuses
+    _run_expect_exit(["prune"], store_root, 2)
+    # dry run lists, moves nothing
+    capsys.readouterr()
+    assert _run(["prune", "--invalid", "--dry-run", "--json"], store_root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert len(payload["selected"]) == 1 and payload["moved"] == []
+    assert (store_root / ".agenttalk" / "messages" / "junk.json").exists()
+    # real run moves
+    capsys.readouterr()
+    assert _run(["prune", "--invalid", "--json"], store_root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload["moved"]) == 1
+    assert not (store_root / ".agenttalk" / "messages" / "junk.json").exists()
+    # zero invalid -> friendly no-op
+    capsys.readouterr()
+    assert _run(["prune", "--invalid"], store_root) == 0
+    assert "nothing to prune" in capsys.readouterr().out
+
+
+def test_status_quarantined_count_additive(store_root: Path, capsys) -> None:
+    capsys.readouterr()
+    assert _run(["status", "--json"], store_root) == 0
+    assert "quarantined" not in json.loads(capsys.readouterr().out)  # absent at 0
+    (store_root / ".agenttalk" / "messages" / "junk.json").write_text(
+        "{not json", encoding="utf-8")
+    assert _run(["prune", "--invalid", "--quiet"], store_root) == 0
+    capsys.readouterr()
+    assert _run(["status", "--json"], store_root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["quarantined"] == 1
+    assert payload["invalid_messages"] == []
+
+
+# ------------------------------------------- additivity + exit codes
+
+def test_no_feature_store_emits_no_new_keys_0150(store_root: Path, capsys) -> None:
+    _send_q(store_root, "alpha", "beta", "q-plain")
+    capsys.readouterr()
+    assert _run(["threads", "--for", "alpha", "--json"], store_root) == 0
+    row = json.loads(capsys.readouterr().out)["threads"][0]
+    for k in ("responded_na", "na_response", "batch_total", "audience_kind"):
+        assert k not in row
+    assert _run(["status", "--json"], store_root) == 0
+    assert "quarantined" not in json.loads(capsys.readouterr().out)
+
+
+def test_reply_na_explicit_kind_message_conflicts(tmp_path: Path, capsys) -> None:
+    # WP02 review blocker 2: even `--kind message` is an explicit --kind.
+    root = _role_root(tmp_path)
+    assert _run(["send", "--from", "lead", "--to", "rev-a",
+                 "--kind", "question", "--meta", "request_id=q-k",
+                 "-m", "q", "--quiet"], root) == 0
+    _run_expect_exit(["reply", "--from", "rev-a", "--to-request", "q-k",
+                      "--na", "--kind", "message", "--quiet"], root, 2)
+    assert "mutually exclusive" in capsys.readouterr().err
+
+
+def test_broadcast_resume_edge_cases(tmp_path: Path, capsys) -> None:
+    root = _role_root(tmp_path)
+    # unknown bid
+    _run_expect_exit(["broadcast", "--from", "lead", "--resume", "b-ghost",
+                      "--quiet"], root, 2)
+    # complete batch -> friendly no-op
+    assert _run(["broadcast", "--from", "lead", "--to-role", "reviewer",
+                 "--kind", "question", "--meta", "request_id=b-full",
+                 "-m", "x", "--quiet"], root) == 0
+    capsys.readouterr()
+    assert _run(["broadcast", "--from", "lead", "--resume", "b-full"], root) == 0
+    assert "nothing to resume" in capsys.readouterr().out
+    # non-broadcaster refused
+    _run_expect_exit(["broadcast", "--from", "rev-a", "--resume", "b-full",
+                      "--quiet"], root, 2)
+    # overrides refused
+    _run_expect_exit(["broadcast", "--from", "lead", "--resume", "b-full",
+                      "-m", "new body", "--quiet"], root, 2)
+
+
+def test_zero_delivered_fanout_advises_rerun_not_resume(tmp_path: Path, capsys,
+                                                        monkeypatch) -> None:
+    # fresh-eyes 0.15.0 note 1: nothing on disk -> resume/rescind advice
+    # would be un-actionable; advise re-running instead.
+    root = _role_root(tmp_path)
+    monkeypatch.setattr(Store, "send", _fail_at(Store, 1))
+    capsys.readouterr()
+    rc = _run(["broadcast", "--from", "lead", "--to-role", "reviewer",
+               "-m", "x", "--quiet"], root)
+    assert rc == 5
+    err = capsys.readouterr().err
+    assert "re-run the" in err
+    assert "--resume" not in err
+
+
+def test_to_role_empty_string_role_shaped_error(tmp_path: Path, capsys) -> None:
+    # fresh-eyes 0.15.0 note 2: explicit empty role must not fall into
+    # the group branch.
+    root = _role_root(tmp_path)
+    _run_expect_exit(["broadcast", "--from", "lead", "--to-role", "",
+                      "-m", "x", "--quiet"], root, 2)
+    err = capsys.readouterr().err
+    assert "--to-role" in err
+    assert "group" not in err

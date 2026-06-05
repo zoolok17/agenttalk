@@ -4,6 +4,7 @@ closure, and the `sync` rejoin digest."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time as _time
@@ -479,3 +480,223 @@ def test_backcompat_marker_and_config_tolerance(tmp_path: Path, capsys) -> None:
     from agenttalk import doctor as _doctor
     report = _doctor.run(root)
     assert report.overall in ("ok", "warn", "error")  # i.e. it RAN
+
+
+# ======================================================================
+# 0.15.0 e2e gates (WP04): role routing, NA lifecycle, fan-out
+# accounting, prune byte-identity
+# ======================================================================
+
+def _ageless(payload: dict) -> dict:
+    """Strip wall-clock-dependent fields for snapshot equality."""
+    out = json.loads(json.dumps(payload))
+    for row in out.get("threads", []):
+        row.pop("age_seconds", None)
+    return out
+
+
+def _roles_team(tmp_path: Path) -> Path:
+    root = _init_team(tmp_path, "lead,rev-a,rev-b,impl-c")
+    for a, r in (("rev-a", "reviewer"), ("rev-b", "reviewer"),
+                 ("impl-c", "implementer")):
+        assert _run(["roster", "set-role", a, r], root) == 0
+    return root
+
+
+# ----------------------------- T014: role routing + freeze (SC 1)
+
+def test_role_routing_and_post_send_freeze(tmp_path: Path, capsys) -> None:
+    root = _roles_team(tmp_path)
+    assert _run(["broadcast", "--from", "lead", "--to-role", "reviewer",
+                 "--kind", "question", "--meta", "request_id=b-r1",
+                 "-m", "fresh eyes?", "--quiet"], root) == 0
+    # exactly the reviewers; the implementer sees NOTHING
+    s = Store(root)
+    assert sorted(m.recipient for m in s.valid_messages()
+                  if m.meta.get("broadcast_id") == "b-r1") == ["rev-a", "rev-b"]
+    impl = _json_of(["threads", "--for", "impl-c", "--all", "--json"], root, capsys)
+    assert all(t["request_id"] != "b-r1" for t in impl["threads"])
+    # frozen meta on every copy
+    for m in s.valid_messages():
+        if m.meta.get("broadcast_id") == "b-r1":
+            assert m.meta["audience_kind"] == "role"
+            assert m.meta["audience_role"] == "reviewer"
+            assert m.meta["audience_resolved"] == "rev-a,rev-b"
+            assert m.meta["batch_total"] == "2"
+    # snapshot derivation, change roles AFTER send, snapshot again
+    before = _json_of(["threads", "--for", "lead", "--all", "--json"], root, capsys)
+    assert _run(["roster", "set-role", "rev-b", "implementer"], root) == 0
+    assert _run(["roster", "set-role", "impl-c", "reviewer"], root) == 0
+    after = _json_of(["threads", "--for", "lead", "--all", "--json"], root, capsys)
+    assert _ageless(before) == _ageless(after)   # zero historical drift (SC 1)
+    row = next(t for t in after["threads"] if t["request_id"] == "b-r1")
+    assert sorted(row["pending"]) == ["rev-a", "rev-b"]
+    # unknown role still refuses with the known set named
+    capsys.readouterr()
+    _run_expect_exit(["broadcast", "--from", "lead", "--to-role", "ghost",
+                      "-m", "x", "--quiet"], root, 2)
+    assert "reviewer" in capsys.readouterr().err
+
+
+# --------------------------------- T015: NA lifecycle (SC 2)
+
+def test_na_lifecycle_both_perspectives(tmp_path: Path, capsys) -> None:
+    root = _roles_team(tmp_path)
+    assert _run(["broadcast", "--from", "lead", "--to-role", "reviewer",
+                 "--kind", "question", "--meta", "request_id=b-na",
+                 "-m", "thoughts?", "--quiet"], root) == 0
+    assert _run(["reply", "--from", "rev-b", "--to-request", "b-na", "--na",
+                 "--quiet"], root) == 0
+    # broadcaster: responded includes rev-b, marked n/a; rev-a pending
+    rows = _json_of(["threads", "--for", "lead", "--json"], root, capsys)
+    row = next(t for t in rows["threads"] if t["request_id"] == "b-na")
+    assert row["responded_na"] == ["rev-b"]
+    assert "rev-b" in row["responded"] and row["pending"] == ["rev-a"]
+    # human view shows the marker
+    capsys.readouterr()
+    assert _run(["threads", "--for", "lead"], root) == 0
+    assert "na=[rev-b]" in capsys.readouterr().out
+    # the NA replier is closed; never mistaken for substantive
+    member = _json_of(["threads", "--for", "rev-b", "--all", "--json"], root, capsys)
+    mrow = next(t for t in member["threads"] if t["request_id"] == "b-na")
+    assert mrow["state"] == "closed"
+    # FR-006 e2e: NA on a review-request refuses with the typed hint
+    assert _run(["send", "--from", "lead", "--to", "rev-a",
+                 "--kind", "review-request", "--meta", "request_id=rq-na",
+                 "-m", "review", "--quiet"], root) == 0
+    capsys.readouterr()
+    _run_expect_exit(["reply", "--from", "rev-a", "--to-request", "rq-na",
+                      "--na", "--quiet"], root, 2)
+    assert "review-result" in capsys.readouterr().err
+
+
+# ----------------------- T016: partial fan-out accounting (SC 3)
+
+def _fail_at_e2e(k: int):
+    calls = {"n": 0}
+    original = Store.send
+
+    def wrapper(self, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == k:
+            raise OSError("disk full (injected)")
+        return original(self, **kwargs)
+
+    return wrapper
+
+
+@pytest.mark.parametrize("k,delivered,missed", [
+    (1, [], ["rev-a", "rev-b", "impl-c"]),       # first
+    (2, ["rev-a"], ["rev-b", "impl-c"]),         # mid
+    (3, ["rev-a", "rev-b"], ["impl-c"]),         # last
+])
+def test_partial_fanout_position_independent(tmp_path: Path, capsys,
+                                             monkeypatch, k, delivered, missed) -> None:
+    root = _init_team(tmp_path, "lead,rev-a,rev-b,impl-c")
+    monkeypatch.setattr(Store, "send", _fail_at_e2e(k))
+    capsys.readouterr()
+    rc = _run(["broadcast", "--from", "lead", "--all", "--kind", "question",
+               "--meta", "request_id=b-f", "-m", "x", "--quiet"], root)
+    assert rc == 5
+    out = capsys.readouterr().out
+    assert f"delivered=[{', '.join(delivered)}]" in out
+    assert f"missed=[{', '.join(missed)}]" in out
+    monkeypatch.undo()
+    s = Store(root)
+    assert len([m for m in s.valid_messages()
+                if m.meta.get("broadcast_id") == "b-f"]) == k - 1
+
+
+def test_partial_fanout_warning_then_resume_then_clear(tmp_path: Path, capsys,
+                                                       monkeypatch) -> None:
+    root = _roles_team(tmp_path)
+    monkeypatch.setattr(Store, "send", _fail_at_e2e(2))
+    assert _run(["broadcast", "--from", "lead", "--to-role", "reviewer",
+                 "--kind", "question", "--meta", "request_id=b-w",
+                 "-m", "x", "--quiet"], root) == 5
+    monkeypatch.undo()
+    status = _json_of(["status", "--json"], root, capsys)
+    hit = [w for w in status["warnings"] if "incomplete fan-out" in w]
+    assert len(hit) == 1 and "rev-b" in hit[0] and "--resume" in hit[0]
+    # follow the printed remediation
+    assert _run(["broadcast", "--from", "lead", "--resume", "b-w",
+                 "--quiet"], root) == 0
+    status = _json_of(["status", "--json"], root, capsys)
+    assert not [w for w in status["warnings"] if "incomplete fan-out" in w]
+    # the recovered member owes
+    rows = _json_of(["threads", "--for", "rev-b", "--json"], root, capsys)
+    assert next(t for t in rows["threads"]
+                if t["request_id"] == "b-w")["state"] == "owed-inbound"
+
+
+# --------------------- T017: prune byte-identity + additivity (SC 4)
+
+def test_prune_byte_identity_sweep(tmp_path: Path, capsys) -> None:
+    root = _init_team(tmp_path, "alpha,beta")
+    # valid traffic incl. an open thread
+    _run(["send", "--from", "alpha", "--to", "beta", "--kind", "question",
+          "--meta", "request_id=q-keep", "-m", "keep", "--quiet"], root)
+    _run(["send", "--from", "beta", "--to", "alpha", "--kind", "message",
+          "--meta", "request_id=q-keep", "-m", "answer", "--quiet"], root)
+    # invalid debris
+    mdir = root / ".agenttalk" / "messages"
+    for i in range(5):
+        (mdir / f"junk{i}.json").write_text("{not json", encoding="utf-8")
+    threads_before = _json_of(["threads", "--for", "alpha", "--all", "--json"],
+                              root, capsys)
+    hashes_before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                     for p in mdir.glob("*.json") if not p.name.startswith("junk")}
+    state_before = {p.name: p.read_bytes()
+                    for p in (root / ".agenttalk" / "state").iterdir() if p.is_file()}
+    assert _run(["prune", "--invalid", "--quiet"], root) == 0
+    status = _json_of(["status", "--json"], root, capsys)
+    assert status["invalid_messages"] == []
+    assert status["quarantined"] == 5
+    qdir = root / ".agenttalk" / "quarantine"
+    assert sum(1 for p in qdir.iterdir() if p.is_file()) == 5
+    hashes_after = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                    for p in mdir.glob("*.json")}
+    assert hashes_after == hashes_before        # valid files byte-identical
+    state_after = {p.name: p.read_bytes()
+                   for p in (root / ".agenttalk" / "state").iterdir() if p.is_file()}
+    assert state_after == state_before          # cursors/threadstate untouched
+    threads_after = _json_of(["threads", "--for", "alpha", "--all", "--json"],
+                             root, capsys)
+    assert _ageless(threads_after) == _ageless(threads_before)  # derivation identical
+
+
+def test_additivity_gates_extended_0150(tmp_path: Path, capsys) -> None:
+    # 0.14.0-style strict set-equality, extended with the 0.15.0 keys.
+    root = _init_team(tmp_path, "alpha,beta")
+    _run(["send", "--from", "alpha", "--to", "beta", "--kind", "question",
+          "--meta", "request_id=q-old", "-m", "hello", "--quiet"], root)
+    rows = _json_of(["threads", "--for", "alpha", "--all", "--json"], root, capsys)
+    assert set(rows["threads"][0]) == _PRE_014_THREAD_KEYS  # nothing new leaked
+    status = _json_of(["status", "--json"], root, capsys)
+    assert "quarantined" not in status
+    assert set(status) == {"root", "session_id", "project_id",
+                           "signing_enforced", "message_count",
+                           "invalid_messages", "agents",
+                           "stale_threshold_seconds", "warnings"}
+
+
+def test_partial_fanout_warning_suppressed_by_rescind_e2e(tmp_path: Path, capsys,
+                                                          monkeypatch) -> None:
+    # T016 alternate resolution: rescinding the bid suppresses the
+    # incomplete-fan-out warning (the batch is void, not incomplete).
+    root = _roles_team(tmp_path)
+    monkeypatch.setattr(Store, "send", _fail_at_e2e(2))
+    assert _run(["broadcast", "--from", "lead", "--to-role", "reviewer",
+                 "--kind", "question", "--meta", "request_id=b-void",
+                 "-m", "x", "--quiet"], root) == 5
+    monkeypatch.undo()
+    status = _json_of(["status", "--json"], root, capsys)
+    assert [w for w in status["warnings"] if "incomplete fan-out" in w]
+    assert _run(["rescind", "--from", "lead", "--to-request", "b-void",
+                 "-m", "voiding the partial batch", "--quiet"], root) == 0
+    status = _json_of(["status", "--json"], root, capsys)
+    assert not [w for w in status["warnings"] if "incomplete fan-out" in w]
+    # and the delivered member sees the thread superseded, not pending
+    rows = _json_of(["threads", "--for", "rev-a", "--all", "--json"], root, capsys)
+    assert next(t for t in rows["threads"]
+                if t["request_id"] == "b-void")["state"] == "closed-superseded"

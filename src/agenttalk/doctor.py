@@ -85,6 +85,7 @@ def run(project_root: Path | None = None) -> Report:
     report.checks.append(_check_multi_store(root))
     if store.initialized():
         report.checks.append(_check_operator_facing(store))
+        report.checks.append(_check_store_hygiene(store))
         report.checks.extend(_check_skills())
         report.checks.append(_check_codex_config(root))
         report.checks.append(_check_hmac(store, root))
@@ -204,6 +205,42 @@ def _check_operator_facing(store: Store) -> Check:
         status="ok",
         details=f"liaison: {resolved}",
     )
+
+
+def _check_store_hygiene(store: Store) -> Check:
+    """Store debris visibility (0.15.0, #17): invalid + quarantined counts.
+
+    Counts come from the SAME store methods every other surface uses
+    (list_invalid_messages / quarantined_count) - never a re-implemented
+    scan. Quarantine is recoverable, so its count is informational; only
+    live invalid files draw a warn, with the inspect-first remediation
+    (--dry-run before the move - the install-skills --force lesson).
+    """
+    invalid = len(store.list_invalid_messages())
+    quarantined = store.quarantined_count()
+    data = {"invalid": invalid, "quarantined": quarantined}
+    if invalid:
+        details = f"{invalid} INVALID message file(s) in messages/"
+        if quarantined:
+            details += f" (+{quarantined} already quarantined)"
+        return Check(
+            name="store_hygiene",
+            status="warn",
+            details=details,
+            fix=("inspect with `agenttalk prune --invalid --dry-run`, then "
+                 "run it without --dry-run to quarantine (recoverable - "
+                 "restore by moving the file back into messages/)"),
+            data=data,
+        )
+    if quarantined:
+        return Check(
+            name="store_hygiene",
+            status="ok",
+            details=(f"clean; {quarantined} quarantined file(s) held in "
+                     f".agenttalk/quarantine/ (recoverable)"),
+            data=data,
+        )
+    return Check(name="store_hygiene", status="ok", details="clean", data=data)
 
 
 def _check_init(store: Store) -> Check:

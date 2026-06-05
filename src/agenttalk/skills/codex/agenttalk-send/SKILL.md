@@ -131,3 +131,10 @@ Do **not** call `agenttalk wait` from this skill - that is
   blocked scoped waiter with exit 3 and flips the thread to
   closed-superseded for every participant. A re-ask after a rescind needs
   a FRESH request_id.
+
+- **Not-applicable beats placeholder acks (0.15.0).** A broadcast
+  question that does not concern your role gets
+  `agenttalk reply --to-request <bid> --na` — it closes your obligation
+  and shows the asker "(n/a)" instead of a fake answer. Never
+  placeholder-ack, never go silent. (Refused on review-request/proposal
+  threads — those need their typed responses.)

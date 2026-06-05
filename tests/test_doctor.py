@@ -318,3 +318,52 @@ def test_doctor_json_cli_first_key_is_root(
     # json.dumps preserves insertion order: the first emitted key is the root
     first_key = out.splitlines()[1].strip().split(":")[0].strip('" ')
     assert first_key == "project_root"
+
+
+# ------------------------------------------- store hygiene (0.15.0, T012)
+
+def test_store_hygiene_states(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    # clean
+    c = doctor._check_store_hygiene(s)
+    assert c.status == "ok" and c.data == {"invalid": 0, "quarantined": 0}
+    # invalid present: warn, --dry-run named FIRST in the fix
+    (tmp_path / ".agenttalk" / "messages" / "junk.json").write_text(
+        "{not json", encoding="utf-8")
+    c = doctor._check_store_hygiene(s)
+    assert c.status == "warn"
+    assert c.fix.index("--dry-run") < c.fix.index("quarantine (recoverable")
+    assert c.data["invalid"] == 1
+    # quarantined only: ok + informational count
+    s.quarantine_invalid()
+    c = doctor._check_store_hygiene(s)
+    assert c.status == "ok"
+    assert c.data == {"invalid": 0, "quarantined": 1}
+    assert "recoverable" in c.details
+    # NOTE: no doctor EXIT-CODE assertions on an unpinned host (the
+    # 0.14.0 red-matrix CI lesson) - this test pins nothing because it
+    # asserts check objects, never process exits.
+
+
+def test_store_hygiene_wired_into_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    Store(tmp_path).init(["alpha", "beta"])
+    monkeypatch.chdir(tmp_path)
+    names = [c.name for c in doctor.run(tmp_path).checks]
+    assert "store_hygiene" in names
+
+
+def test_store_hygiene_combined_invalid_and_quarantined(tmp_path: Path) -> None:
+    # the "both" state from the WP matrix: live invalid AND quarantined
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    (tmp_path / ".agenttalk" / "messages" / "first.json").write_text(
+        "{not json", encoding="utf-8")
+    s.quarantine_invalid()
+    (tmp_path / ".agenttalk" / "messages" / "second.json").write_text(
+        "{also not json", encoding="utf-8")
+    c = doctor._check_store_hygiene(s)
+    assert c.status == "warn"                      # live invalid dominates
+    assert c.data == {"invalid": 1, "quarantined": 1}
+    assert "already quarantined" in c.details      # both facts surfaced
+    assert "--dry-run" in c.fix

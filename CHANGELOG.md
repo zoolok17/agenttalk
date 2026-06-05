@@ -5,6 +5,59 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-06-05
+
+Team-scope release: the remaining friction cluster from the four-agent
+production band. Reviewer-only questions stop obligating non-reviewers
+(and the placeholder-ack workaround dies honestly), broadcast fan-out
+stops failing silently partway, and the 562-INVALID-files class of
+store debris becomes recoverable quarantine.
+
+### Added
+
+- **Role-scoped audiences.** `agenttalk broadcast --to-role <role>`
+  targets every roster member holding a role (sibling resolver — no
+  role/group fallback ambiguity; unknown/empty roles refuse loudly
+  naming the known set). Every fan-out copy now freezes its audience
+  facts at send time (`audience_kind`, `audience_resolved`,
+  `batch_total`, `audience_role` for role targets): later roster
+  changes never alter historical obligations.
+- **Not-applicable replies.** `agenttalk reply --na` closes your
+  obligation on a question thread with a structured n/a response,
+  displayed distinctly (`na=[...]` / `(n/a)`) for both perspectives.
+  Refused on review-request/proposal threads (typed responses
+  required); mutually exclusive with --kind; default body without
+  stdin sniffing.
+- **Broadcast delivery accounting.** A mid-batch failure prints a
+  `delivered=[...]` / `missed=[...]` manifest (human and `--json`) and
+  exits **5** (new documented code). `agenttalk broadcast --resume
+  <bid>` re-sends the missing copies from the frozen originals
+  (broadcaster-only, no overrides, accountable itself). `status` warns
+  `incomplete fan-out` naming the missed members until resumed or
+  rescinded.
+- **Quarantine.** `agenttalk prune --invalid [--dry-run] [--json]`
+  moves validation-failing files to `.agenttalk/quarantine/` —
+  move-only, collision-suffixed, recoverable; selection is the exact
+  INVALID gate walk, path-paired at scan time so valid files are
+  unselectable by construction. `status` gains a `quarantined` count;
+  `doctor` gains a store-hygiene check (inspect-first remediation).
+
+### Changed
+
+- `threads`/`sync` display n/a responders and frozen batch facts
+  (additive keys: `responded_na`, `na_response`, `batch_total`,
+  `audience_kind`). Bundled skills (both CLIs) teach: reply --na
+  instead of placeholder acks; prefer --to-role; recover exit-5
+  batches with --resume or rescind; prune with --dry-run first.
+
+### Security
+
+- No trust-model change. Quarantine selection is path-paired (an
+  embedded-id collision cannot move a valid file — regression-tested);
+  frozen audience/batch meta is untrusted display data (obligations
+  derive from the validated copies); `--na` is an ordinary validated
+  reply. See SECURITY.md.
+
 ## [0.14.0] - 2026-06-05
 
 Operator-safety release, from the four-agent production band's second

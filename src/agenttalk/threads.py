@@ -129,6 +129,17 @@ class Thread:
     # the pending bucket without fabricating an operator answer.
     needs_operator: bool = False
     operator_state: str | None = None   # "pending" | "answered" | "closed"
+    # Team-scope labels (0.15.0, #15/#16) — pure labeling, additive:
+    # responded_na: broadcast members whose closing reply was marked
+    # not-applicable (subset of `responded`); na_response: the pairwise
+    # thread's terminal reply was not-applicable; batch_total /
+    # audience_kind: frozen fan-out facts passed through from the opener
+    # meta for display + the incomplete-batch warning. Obligation
+    # derivation is untouched — it stays opener-copy-based (C-004).
+    responded_na: list[str] = field(default_factory=list)
+    na_response: bool = False
+    batch_total: int | None = None
+    audience_kind: str | None = None
 
     def to_dict(self) -> dict:
         d = {
@@ -161,7 +172,22 @@ class Thread:
         if self.needs_operator:
             d["needs_operator"] = True
             d["operator_state"] = self.operator_state
+        # Additive (0.15.0): NA labels + frozen fan-out facts — emitted
+        # only when present so pre-0.15 shapes stay byte-identical.
+        if self.responded_na:
+            d["responded_na"] = self.responded_na
+        if self.na_response:
+            d["na_response"] = True
+        if self.batch_total is not None:
+            d["batch_total"] = self.batch_total
+        if self.audience_kind is not None:
+            d["audience_kind"] = self.audience_kind
         return d
+
+
+def _is_na(m: Message) -> bool:
+    """True when a message is marked not-applicable (#15)."""
+    return (m.meta or {}).get("response") == "not-applicable"
 
 
 def _find_superseding_rescind(
@@ -236,6 +262,7 @@ def _derive_broadcast(
     first_opener_id = min(m.id for m in openers)
 
     responded: set[str] = set()
+    responded_na: set[str] = set()
     responses: list[Message] = []
     for m in group:
         if m.id <= first_opener_id:
@@ -248,8 +275,23 @@ def _derive_broadcast(
         if (m.kind not in CONTROL_KINDS and m.kind != "rescind"
                 and m.sender in audience and m.recipient == sender):
             responded.add(m.sender)
+            if _is_na(m):
+                # NA closes like any answer; the label (#15) lets the
+                # broadcaster distinguish "answered" from "not my role".
+                responded_na.add(m.sender)
             responses.append(m)
     pending = [a for a in audience if a not in responded]
+
+    # Frozen fan-out facts (0.15.0, #16) — display/warning passthrough
+    # only; obligations above derive from the COPIES, never this meta.
+    opener_meta = openers[0].meta or {}
+    try:
+        batch_total = int(opener_meta.get("batch_total", ""))
+    except (TypeError, ValueError):
+        batch_total = None
+    audience_kind = opener_meta.get("audience_kind")
+    if not isinstance(audience_kind, str) or not audience_kind:
+        audience_kind = None
 
     # Supersession (D2): only the broadcaster (the thread's requester)
     # can rescind its own fan-out; doing so closes the whole thread for
@@ -325,6 +367,9 @@ def _derive_broadcast(
         rescinded_by=superseding.sender if superseding else None,
         rescind_at=superseding.ts if superseding else None,
         rescind_reason=(superseding.body or "") if superseding else None,
+        responded_na=sorted(responded_na),
+        batch_total=batch_total,
+        audience_kind=audience_kind,
     )
 
 
@@ -400,6 +445,7 @@ def derive_threads(
         # told to wait while the answer sits unread in their inbox.
         ball: str | None = responder
         terminal = False
+        terminal_msg: Message | None = None  # the event that closed it (0.15.0 NA label)
         events: list[Message] = []  # post-opener messages that moved the thread
         for m in group:
             if m.id <= opener.id:
@@ -415,7 +461,7 @@ def derive_threads(
                 events.append(m)
                 kind_, who = ev
                 if kind_ == "terminal":
-                    terminal, ball = True, None
+                    terminal, ball, terminal_msg = True, None, m
                 else:
                     terminal, ball = False, who
                 continue
@@ -429,7 +475,7 @@ def derive_threads(
                 and m.sender == requester
                 and m.recipient == responder
             ):
-                terminal, ball = False, responder
+                terminal, ball, terminal_msg = False, responder, None
                 events.append(m)
 
         # reply-waiting: an unconsumed thread *event* addressed to me (a
@@ -505,6 +551,9 @@ def derive_threads(
             rescind_reason=(superseding.body or "") if superseding else None,
             needs_operator=needs_op,
             operator_state=op_state,
+            # NA label (#15): the reply that closed this thread was marked
+            # not-applicable. Labeling only — closure mechanics unchanged.
+            na_response=bool(terminal_msg is not None and _is_na(terminal_msg)),
         ))
 
     # Stable, useful ordering: actionable first (by the ACTIONABLE_STATES

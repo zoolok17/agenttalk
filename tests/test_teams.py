@@ -318,3 +318,46 @@ def test_status_json_includes_role(tmp_path: Path, capsys: pytest.CaptureFixture
     payload = json.loads(capsys.readouterr().out)
     dev = next(a for a in payload["agents"] if a["name"] == "claude-dev")
     assert dev["role"] == "implementer"
+
+
+# ======================================================================
+# 0.15.0 role audiences (WP01, #15)
+# ======================================================================
+
+def test_resolve_role_audience_happy_order_dedupe(tmp_path: Path) -> None:
+    root = _team(tmp_path, TEAM)  # claude-dev, codex-dev, claude-rev, codex-rev
+    store = Store(root)
+    store.set_role("claude-rev", "reviewer")
+    store.set_role("codex-rev", "reviewer")
+    store.set_role("claude-dev", "implementer")
+    # roster order preserved
+    assert store.resolve_role_audience("reviewer") == ["claude-rev", "codex-rev"]
+    # sender excluded
+    assert store.resolve_role_audience("reviewer", exclude="claude-rev") == ["codex-rev"]
+
+
+def test_resolve_role_audience_unknown_role_names_known(tmp_path: Path) -> None:
+    import pytest
+    root = _team(tmp_path, TEAM)
+    store = Store(root)
+    store.set_role("claude-rev", "reviewer")
+    with pytest.raises(ValueError) as ei:
+        store.resolve_role_audience("ghost")
+    assert "reviewer" in str(ei.value)  # known roles are named
+
+
+def test_resolve_role_audience_empty_after_exclude(tmp_path: Path) -> None:
+    import pytest
+    root = _team(tmp_path, TEAM)
+    store = Store(root)
+    store.set_role("claude-rev", "reviewer")
+    with pytest.raises(ValueError, match="no members besides"):
+        store.resolve_role_audience("reviewer", exclude="claude-rev")
+
+
+def test_resolve_role_audience_no_roles_at_all(tmp_path: Path) -> None:
+    import pytest
+    root = _team(tmp_path, TEAM)
+    store = Store(root)
+    with pytest.raises(ValueError, match="unknown role"):
+        store.resolve_role_audience("reviewer")

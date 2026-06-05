@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -494,3 +495,119 @@ def test_composing_intent_stale_constant_matches_cap() -> None:
     # wait loop's cumulative composing-extension cap.
     from agenttalk import cli
     assert COMPOSING_INTENT_STALE_SECONDS == cli._COMPOSING_MAX_EXTEND_SECONDS
+
+
+# ======================================================================
+# 0.15.0 quarantine (WP01, #17)
+# ======================================================================
+
+def _seed_invalid(store: Store, name: str, payload: str) -> Path:
+    p = store.messages_dir / name
+    p.write_text(payload, encoding="utf-8")
+    return p
+
+
+def _valid_state_fingerprint(store: Store) -> dict:
+    out = {}
+    for p in sorted(store.messages_dir.glob("*.json")):
+        out[p.name] = hashlib.sha256(p.read_bytes()).hexdigest()
+    for p in sorted(store.state_dir.iterdir()):
+        if p.is_file():
+            out["state/" + p.name] = hashlib.sha256(p.read_bytes()).hexdigest()
+    return out
+
+
+def test_quarantine_selection_equals_invalid_report(store: Store) -> None:
+    store.send(sender="alpha", recipient="beta", body="valid one")
+    _seed_invalid(store, "20990101-000000-000000-AAAA.json",
+                  '{"id": "20990101-000000-000000-AAAA", "ts": "2026-01-01T00:00:00Z", '
+                  '"from": "ghost", "to": "beta", "kind": "message", "subject": "", '
+                  '"body": "x", "meta": {}}')   # out-of-roster sender
+    _seed_invalid(store, "garbage.json", "{not json")
+    report_ids = {i for i, _ in store.list_invalid_messages()}
+    path_ids = {ident for _, ident, _ in store.list_invalid_message_paths()}
+    assert path_ids == report_ids  # FR-011 lockstep by construction
+    assert len(report_ids) == 2
+
+
+def test_quarantine_dry_run_moves_nothing(store: Store) -> None:
+    _seed_invalid(store, "garbage.json", "{not json")
+    before = _valid_state_fingerprint(store)
+    records = store.quarantine_invalid(dry_run=True)
+    assert len(records) == 1
+    assert records[0]["to"] is not None
+    assert _valid_state_fingerprint(store) == before
+    assert store.quarantined_count() == 0
+
+
+def test_quarantine_moves_exactly_invalid_and_valid_untouched(store: Store) -> None:
+    m = store.send(sender="alpha", recipient="beta", body="keep me")
+    _seed_invalid(store, "garbage.json", "{not json")
+    _seed_invalid(store, "20990101-000000-000000-BBBB.json",
+                  '{"id": "20990101-000000-000000-BBBB", "ts": "2026-01-01T00:00:00Z", '
+                  '"from": "ghost", "to": "beta", "kind": "message", "subject": "", '
+                  '"body": "x", "meta": {}}')
+    valid_before = {p.name: p.read_bytes() for p in store.messages_dir.glob("*.json")
+                    if p.stem == m.id}
+    records = store.quarantine_invalid()
+    moved = [r for r in records if r["to"]]
+    assert len(moved) == 2
+    assert store.quarantined_count() == 2
+    assert store.list_invalid_messages() == []           # report empty after
+    # valid file byte-identical, still delivered
+    valid_after = {p.name: p.read_bytes() for p in store.messages_dir.glob("*.json")}
+    assert valid_after == valid_before
+    assert [x.body for x in store.messages_for("beta")] == ["keep me"]
+
+
+def test_quarantine_collision_never_overwrites(store: Store) -> None:
+    _seed_invalid(store, "garbage.json", "{not json v1")
+    store.quarantine_invalid()
+    _seed_invalid(store, "garbage.json", "{not json v2")  # same name reappears
+    store.quarantine_invalid()
+    files = [p for p in store.quarantine_dir.iterdir() if p.is_file()]
+    assert len(files) == 2  # suffixed, not overwritten
+    contents = sorted(p.read_text(encoding="utf-8") for p in files)
+    assert contents == ["{not json v1", "{not json v2"]
+
+
+def test_quarantine_zero_invalid_noop(store: Store) -> None:
+    assert store.quarantine_invalid() == []
+    assert store.quarantined_count() == 0
+    assert not store.quarantine_dir.exists()  # not even created
+
+
+def test_quarantined_files_invisible_to_scanning(store: Store) -> None:
+    _seed_invalid(store, "garbage.json", "{not json")
+    store.quarantine_invalid()
+    # scanning surfaces: all_messages, valid_messages, invalid report
+    assert store.list_invalid_messages() == []
+    assert all("garbage" not in m.id for m in store.all_messages())
+
+
+def test_quarantine_embedded_id_collision_moves_invalid_only(store: Store) -> None:
+    """Codex WP01 review repro: an INVALID file whose embedded id equals a
+    VALID file's stem must never cause the valid file to be moved."""
+    # valid file named aaa.json with id aaa (hand-built but fully valid)
+    valid = store.messages_dir / "aaa.json"
+    valid.write_text(
+        '{"id": "aaa", "ts": "2026-01-01T00:00:00Z", "from": "alpha", '
+        '"to": "beta", "kind": "message", "subject": "", "body": "keep", '
+        '"meta": {}}', encoding="utf-8")
+    valid_bytes = valid.read_bytes()
+    # invalid file zzz.json EMBEDDING id aaa (unknown kind -> invalid)
+    bad = store.messages_dir / "zzz.json"
+    bad.write_text(
+        '{"id": "aaa", "ts": "2026-01-01T00:00:00Z", "from": "alpha", '
+        '"to": "beta", "kind": "not-a-kind", "subject": "", "body": "x", '
+        '"meta": {}}', encoding="utf-8")
+    # selection resolves the verdict to ITS file, not the colliding stem
+    sel = {str(p): ident for p, ident, _ in store.list_invalid_message_paths()}
+    assert str(bad) in sel and sel[str(bad)] == "aaa"
+    assert str(valid) not in sel
+    records = store.quarantine_invalid()
+    assert len(records) == 1
+    assert records[0]["from"] == str(bad)
+    assert not bad.exists()                      # invalid moved
+    assert valid.read_bytes() == valid_bytes     # valid byte-identical
+    assert store.quarantined_count() == 1

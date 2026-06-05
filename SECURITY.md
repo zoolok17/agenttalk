@@ -111,6 +111,24 @@ trust model:
   observational**, with the same tamper profile as heartbeat/waiting
   markers: corrupting it degrades displays, never delivery or validity.
 
+### Quarantine, frozen audiences, and batch facts (0.15.0)
+
+- **Quarantine moves are recoverable and selection-safe.** `prune
+  --invalid` selects via the exact validation gate walk that the INVALID
+  report uses, path-paired at scan time — an embedded id colliding with
+  another file's stem cannot misdirect a move (regression-tested). The
+  tool never deletes or overwrites; restoring is a manual file move. No
+  new trust surface: quarantined files were already excluded from every
+  read path.
+- **Frozen audience/batch meta is untrusted display data** like all
+  meta: obligations are always derived from the per-recipient copies in
+  the validated log, never from `audience_resolved`/`batch_total`
+  prose. Forging them can mislabel a warning, not create or destroy an
+  obligation.
+- **`--na` is an ordinary validated reply** with a display label; it
+  closes a question exactly like any answer and cannot close
+  review/proposal contracts.
+
 ## What's protected today
 
 | Concern | Mitigation | Landed |

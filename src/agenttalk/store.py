@@ -577,6 +577,39 @@ class Store:
                 out.append(m)
         return out
 
+    def resolve_role_audience(self, role: str, *, exclude: str | None = None) -> list[str]:
+        """Resolve a ROLE to its concrete member list (0.15.0, #15).
+
+        A deliberate sibling of :meth:`resolve_audience`, not an overload:
+        roles and groups are distinct config maps with distinct semantics,
+        and overloading one resolver would create exactly the role/group
+        name-collision ambiguity the spec forbids. Members are returned in
+        roster order, de-duped, with ``exclude`` (the sender) dropped.
+        Raises ``ValueError`` for an unknown role (naming the known ones)
+        or an audience that is empty after exclusion — a typo must never
+        silently broadcast to nobody.
+        """
+        cfg = self.load_config()
+        roster = cfg.get("agents", []) or []
+        roles = cfg.get("roles", {}) or {}
+        known = sorted(set(roles.values()))
+        if role not in known:
+            raise ValueError(
+                f"unknown role {role!r} (known roles: {known or '(none assigned)'})"
+            )
+        seen: set[str] = set()
+        out: list[str] = []
+        for a in roster:  # roster order, like groups
+            if roles.get(a) == role and a != exclude and a not in seen:
+                seen.add(a)
+                out.append(a)
+        if not out:
+            raise ValueError(
+                f"role {role!r} has no members besides {exclude!r} — "
+                f"nobody would receive this broadcast"
+            )
+        return out
+
     def add_agent(self, name: str, *, role: str | None = None,
                   groups: list[str] | None = None) -> dict:
         """Add an agent to the roster (idempotent) and optionally set its
@@ -820,6 +853,46 @@ class Store:
 
     # --------------------------------------------------------------- reading
 
+    def _scan_messages_with_paths(
+        self,
+    ) -> tuple[list[tuple[Message, Path]], list[tuple[Path, str, str]]]:
+        """The canonical disk walk, keeping each verdict paired with ITS file.
+
+        Returns ``(valid, invalid)`` where valid is ``[(Message, path)]``
+        and invalid is ``[(path, ident, reason)]``. Pairing the verdict
+        with the source path at scan time is what makes quarantine safe:
+        an ident is NOT a file identity (an invalid file may embed an id
+        that collides with another file's stem — Codex WP01 review
+        repro), so any after-the-fact ident→path mapping can misresolve.
+        """
+        valid: list[tuple[Message, Path]] = []
+        invalid: list[tuple[Path, str, str]] = []
+        if not self.messages_dir.exists():
+            return valid, invalid
+        for p in sorted(self.messages_dir.iterdir()):
+            if p.suffix != ".json":
+                continue
+            try:
+                text = p.read_text(encoding="utf-8")
+            except OSError as e:
+                invalid.append((p, p.stem, f"cannot read file: {e}"))
+                continue
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as e:
+                invalid.append((p, p.stem, f"invalid JSON: {e}"))
+                continue
+            try:
+                msg = Message.from_raw(data)
+            except ValueError as e:
+                ident = data.get("id") if isinstance(data, dict) else None
+                if not isinstance(ident, str) or not ident:
+                    ident = p.stem
+                invalid.append((p, ident, str(e)))
+                continue
+            valid.append((msg, p))
+        return valid, invalid
+
     def _scan_messages(self) -> tuple[list[Message], list[tuple[str, str]]]:
         """Read every file in messages/ once, separating valid messages
         from invalid ones. Returns (valid, invalid) where invalid is
@@ -829,35 +902,13 @@ class Store:
         from disk JSON without going through here. Catches JSON
         parse errors, shape/type errors, and missing fields *before*
         downstream callers can crash on `data["id"]` or compare a
-        numeric id against a string cursor.
+        numeric id against a string cursor. (Since 0.15.0 this is a
+        projection of ``_scan_messages_with_paths`` — one walk, one
+        gate set.)
         """
-        valid: list[Message] = []
-        invalid: list[tuple[str, str]] = []
-        if not self.messages_dir.exists():
-            return valid, invalid
-        for p in sorted(self.messages_dir.iterdir()):
-            if p.suffix != ".json":
-                continue
-            try:
-                text = p.read_text(encoding="utf-8")
-            except OSError as e:
-                invalid.append((p.stem, f"cannot read file: {e}"))
-                continue
-            try:
-                data = json.loads(text)
-            except json.JSONDecodeError as e:
-                invalid.append((p.stem, f"invalid JSON: {e}"))
-                continue
-            try:
-                msg = Message.from_raw(data)
-            except ValueError as e:
-                ident = data.get("id") if isinstance(data, dict) else None
-                if not isinstance(ident, str) or not ident:
-                    ident = p.stem
-                invalid.append((ident, str(e)))
-                continue
-            valid.append(msg)
-        return valid, invalid
+        valid_p, invalid_p = self._scan_messages_with_paths()
+        return ([m for m, _ in valid_p],
+                [(ident, reason) for _, ident, reason in invalid_p])
 
     def all_messages(self) -> list[Message]:
         """Return all parseable + schema-valid messages.
@@ -870,12 +921,15 @@ class Store:
         valid, _ = self._scan_messages()
         return valid
 
-    def list_invalid_messages(self) -> list[tuple[str, str]]:
-        """Return [(id_or_stem, reason)] for every message file that
-        failed parse, schema, roster, OR signature validation.
-        Surfaces everything ``messages_for()`` silently skipped so
-        tampering is visible rather than invisible. Used by
-        ``agenttalk status`` and ``agenttalk doctor``.
+    def _invalid_file_entries(self) -> list[tuple[Path, str, str]]:
+        """ONE path-aware walk over the FULL gate set (parse + schema +
+        roster + signature). Returns ``[(path, ident, reason)]``.
+
+        Both the invalid REPORT (`list_invalid_messages`) and the
+        quarantine SELECTION (`list_invalid_message_paths`) are pure
+        projections of this list — FR-011 lockstep by construction, and
+        every verdict is paired with its own source file at scan time
+        (an ident can collide across files; a path cannot).
         """
         try:
             cfg = self.load_config()
@@ -890,25 +944,96 @@ class Store:
                 key = _signing.load_key(project_id)
             except (FileNotFoundError, OSError, ValueError):
                 key = None
-        valid, parse_failures = self._scan_messages()
-        out = list(parse_failures)
-        for m in valid:
+        valid_p, parse_failures = self._scan_messages_with_paths()
+        out: list[tuple[Path, str, str]] = list(parse_failures)
+        for m, p in valid_p:
             try:
                 m.validate(roster)
             except ValueError as e:
-                out.append((m.id, str(e)))
+                out.append((p, m.id, str(e)))
                 continue
             if require_sig:
                 if key is None:
-                    out.append((m.id, "signatures enforced but no key file is loadable"))
+                    out.append((p, m.id,
+                                "signatures enforced but no key file is loadable"))
                     continue
                 try:
                     _signing.verify_message(
                         m.to_dict(), key, expected_key_id=project_id,
                     )
                 except ValueError as e:
-                    out.append((m.id, str(e)))
+                    out.append((p, m.id, str(e)))
         return out
+
+    def list_invalid_messages(self) -> list[tuple[str, str]]:
+        """Return [(id_or_stem, reason)] for every message file that
+        failed parse, schema, roster, OR signature validation.
+        Surfaces everything ``messages_for()`` silently skipped so
+        tampering is visible rather than invisible. Used by
+        ``agenttalk status`` and ``agenttalk doctor``. (Projection of
+        ``_invalid_file_entries`` since 0.15.0.)
+        """
+        return [(ident, reason) for _, ident, reason in self._invalid_file_entries()]
+
+    # ----------------------------------------------------- quarantine (#17)
+    #
+    # `prune --invalid` MOVES validation-failing message files into
+    # `.agenttalk/quarantine/` — recoverable (restore = move the file
+    # back into messages/ by hand), never overwritten, never deleted by
+    # the tool. The selection is DRIVEN BY `list_invalid_messages` (the
+    # exact ids status/doctor report — FR-011 lockstep by construction),
+    # resolved to concrete files. The quarantine dir is a sibling of
+    # messages/, so message scanning can never see quarantined files.
+    # Safety was established in the 0.14.0 cycle: thread derivation is a
+    # pure function of valid messages, cursors are id strings with no
+    # contiguity requirement, and HMAC is per-message with no chain —
+    # moving invalid files cannot affect any valid-message behavior.
+
+    @property
+    def quarantine_dir(self) -> Path:
+        return self.dir / "quarantine"
+
+    def quarantined_count(self) -> int:
+        """Number of files currently held in quarantine (0 if none)."""
+        if not self.quarantine_dir.is_dir():
+            return 0
+        return sum(1 for p in self.quarantine_dir.iterdir() if p.is_file())
+
+    def list_invalid_message_paths(self) -> list[tuple[Path, str, str]]:
+        """The invalid selection WITH file identity: ``[(path, ident, reason)]``.
+
+        A pure projection of the same single gate walk that powers
+        ``list_invalid_messages`` — each verdict was paired with its own
+        source file at scan time, so an embedded id colliding with
+        another file's stem can never misresolve (Codex WP01 review
+        repro: valid ``aaa.json`` + invalid ``zzz.json`` embedding id
+        ``aaa`` must select ``zzz.json``).
+        """
+        return self._invalid_file_entries()
+
+    def quarantine_invalid(self, *, dry_run: bool = False) -> list[dict]:
+        """Move (or, with ``dry_run``, plan to move) invalid files to quarantine.
+
+        Returns one record per selected file:
+        ``{"id", "reason", "from", "to"}``. Collisions in the quarantine
+        dir get a timestamp suffix (the ``_archive_session`` precedent):
+        the tool NEVER overwrites and NEVER deletes. Valid files are
+        untouched by construction — the selection is the path-paired
+        gate walk itself, never an ident lookup.
+        """
+        records: list[dict] = []
+        for src, ident, reason in self.list_invalid_message_paths():
+            dst = self.quarantine_dir / src.name
+            if dst.exists():
+                dst = self.quarantine_dir / (
+                    f"{src.name}.{_now_iso().replace(':', '-')}"
+                )
+            records.append({"id": ident, "reason": reason,
+                            "from": str(src), "to": str(dst)})
+            if not dry_run:
+                self.quarantine_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dst))
+        return records
 
     def valid_messages(self) -> list[Message]:
         """Return every roster- AND signature-valid message, ALL recipients.

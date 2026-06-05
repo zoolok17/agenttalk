@@ -652,3 +652,102 @@ def test_escalation_acked_is_closed_not_answered() -> None:
                        closed_rids={"esc-1"})[0]
     assert t.state == "closed"
     assert t.operator_state == "closed"
+
+
+# ======================================================================
+# 0.15.0 NA labels + frozen fan-out facts (WP01, #15/#16)
+# ======================================================================
+
+def _na(mid: str, sender: str, recipient: str, rid: str) -> "Message":
+    m = _msg(mid, sender, recipient, "message", rid=rid)
+    m.meta["response"] = "not-applicable"
+    return m
+
+
+def test_broadcast_responded_na_both_perspectives() -> None:
+    msgs = [
+        _msg("001", "lead", "w1", "question", rid="b1", audience="all"),
+        _msg("002", "lead", "w2", "question", rid="b1", audience="all"),
+        _na("003", "w1", "lead", "b1"),
+        _msg("004", "w2", "lead", "message", rid="b1"),  # substantive
+    ]
+    t = derive_threads(msgs, agent="lead", cursor="004", now=_BASE)[0]
+    assert t.responded == ["w1", "w2"]
+    assert t.responded_na == ["w1"]
+    assert t.to_dict()["responded_na"] == ["w1"]
+    # member perspective: closure unchanged (NA is a label, not mechanics)
+    t1 = derive_threads(msgs, agent="w1", cursor="004", now=_BASE)[0]
+    assert t1.state == "closed"
+
+
+def test_pairwise_na_response_label() -> None:
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="q1"),
+        _na("002", "beta", "alpha", "q1"),
+    ]
+    t = derive_threads(msgs, agent="alpha", cursor="002", now=_BASE)[0]
+    assert t.state == "closed"          # mechanics unchanged
+    assert t.na_response is True
+    assert t.to_dict()["na_response"] is True
+    # a substantive answer does NOT carry the label
+    msgs2 = [
+        _msg("001", "alpha", "beta", "question", rid="q2"),
+        _msg("002", "beta", "alpha", "message", rid="q2"),
+    ]
+    t2 = derive_threads(msgs2, agent="alpha", cursor="002", now=_BASE)[0]
+    assert t2.na_response is False
+    assert "na_response" not in t2.to_dict()
+
+
+def test_na_label_cleared_by_reask() -> None:
+    # reopened thread: the OLD NA terminal must not label the new round
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="q1"),
+        _na("002", "beta", "alpha", "q1"),
+        _msg("003", "alpha", "beta", "question", rid="q1"),  # re-ask
+    ]
+    t = derive_threads(msgs, agent="alpha", cursor="003", now=_BASE)[0]
+    assert t.state == "open-outbound"
+    assert t.na_response is False
+
+
+def test_batch_and_audience_kind_passthrough() -> None:
+    msgs = [
+        _msg("001", "lead", "w1", "question", rid="b1", audience="reviewer"),
+        _msg("002", "lead", "w2", "question", rid="b1", audience="reviewer"),
+    ]
+    for m in msgs:
+        m.meta["batch_total"] = "3"          # one copy missing!
+        m.meta["audience_kind"] = "role"
+    t = derive_threads(msgs, agent="lead", cursor="", now=_BASE)[0]
+    assert t.batch_total == 3
+    assert t.audience_kind == "role"
+    d = t.to_dict()
+    assert d["batch_total"] == 3 and d["audience_kind"] == "role"
+    # garbage batch_total degrades to None (absent in dict)
+    for m in msgs:
+        m.meta["batch_total"] = "many"
+    t2 = derive_threads(msgs, agent="lead", cursor="", now=_BASE)[0]
+    assert t2.batch_total is None
+    assert "batch_total" not in t2.to_dict()
+
+
+def test_freeze_independence_roles_change_after_send() -> None:
+    # C-004 structural guard: derivation reads MESSAGES only; there is no
+    # config argument to drift. Same message set -> identical output, by
+    # signature. (The e2e WP re-proves this through the CLI.)
+    msgs = [
+        _msg("001", "lead", "w1", "question", rid="b1", audience="reviewer"),
+        _msg("002", "lead", "w2", "question", rid="b1", audience="reviewer"),
+    ]
+    a = derive_threads(msgs, agent="lead", cursor="", now=_BASE)[0].to_dict()
+    b = derive_threads(msgs, agent="lead", cursor="", now=_BASE)[0].to_dict()
+    assert a == b
+    assert sorted(a["pending"]) == ["w1", "w2"]
+
+
+def test_plain_threads_emit_no_new_keys() -> None:
+    msgs = [_msg("001", "alpha", "beta", "question", rid="q1")]
+    d = derive_threads(msgs, agent="alpha", cursor="", now=_BASE)[0].to_dict()
+    for k in ("responded_na", "na_response", "batch_total", "audience_kind"):
+        assert k not in d
