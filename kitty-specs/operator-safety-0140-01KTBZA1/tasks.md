@@ -38,9 +38,9 @@ half, T014, and the #14 lines of T022–T024. Everything else stands alone.
 | T016 | doctor: multi-store detection + root-first output (#13) | WP03 | | [D] |
 | T017 | doctor: liaison diagnostics (#18) | WP03 | | [D] |
 | T018 | tests: test_doctor.py extensions | WP03 | | [D] |
-| T019 | e2e: rescind race — send→rescind→wake/check→abort (#12) | WP04 | |
-| T020 | e2e: liaison flow — escalate→bucket→answer→closed + refusals (#18) | WP04 | |
-| T021 | e2e: backward-compat sweep (NFR-001, mixed-version store) | WP04 | |
+| T019 | e2e: rescind race — send→rescind→wake/check→abort (#12) | WP04 | | [D] |
+| T020 | e2e: liaison flow — escalate→bucket→answer→closed + refusals (#18) | WP04 | | [D] |
+| T021 | e2e: backward-compat sweep (NFR-001, mixed-version store) | WP04 | | [D] |
 | T022 | skills: Claude-side updates (7 files) | WP05 | [P] |
 | T023 | skills: Codex-side updates (7 files) | WP05 | [P] |
 | T024 | docs: README + SECURITY | WP05 | [P] |
@@ -105,9 +105,9 @@ half, T014, and the #14 lines of T022–T024. Everything else stands alone.
 **Priority**: P1 — release gate. **Dependencies**: WP02, WP03.
 **Independent test**: `pytest tests/test_coordination.py` green; success criteria 1–3 of spec.md demonstrably hold.
 
-- [ ] T019 e2e: rescind race (WP04)
-- [ ] T020 e2e: liaison flow + refusals (WP04)
-- [ ] T021 e2e: backward-compat sweep (WP04)
+- [x] T019 e2e: rescind race (WP04)
+- [x] T020 e2e: liaison flow + refusals (WP04)
+- [x] T021 e2e: backward-compat sweep (WP04)
 
 **Risks**: timing flakiness in wait-based tests — use the suite's existing short-poll patterns, never sleeps near the timeout boundary.
 
