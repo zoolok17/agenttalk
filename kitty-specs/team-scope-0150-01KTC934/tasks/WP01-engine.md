@@ -125,3 +125,4 @@ diff); to_dict additivity (absent-not-null).
 ## Activity Log
 
 - 2026-06-05T16:39:22Z – unknown – shell_pid=71028 – Engine green: 520 passed
+- 2026-06-05T16:46:20Z – unknown – shell_pid=71028 – Moved to planned
