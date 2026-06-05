@@ -1,0 +1,13 @@
+{
+  "arbiter": "operator",
+  "category": "custom",
+  "checklist": {
+    "is_correct_context": true,
+    "is_environmental": false,
+    "is_in_scope": true,
+    "is_pre_existing": false,
+    "should_follow_on": false
+  },
+  "decided_at": "2026-06-05T15:30:16.317072+00:00",
+  "explanation": "Review passed: WP04 release-gate assertions hardened; narrow WP02 whoami addendum accepted; targeted and full pytest suites passed."
+}
