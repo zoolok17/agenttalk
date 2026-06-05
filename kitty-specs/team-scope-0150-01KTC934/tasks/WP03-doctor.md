@@ -67,3 +67,4 @@ re-implemented scan.
 ## Activity Log
 
 - 2026-06-05T17:20:59Z – claude – shell_pid=72768 – Started implementation via action command
+- 2026-06-05T17:27:13Z – claude – shell_pid=72768 – Moved to planned
