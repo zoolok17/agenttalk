@@ -1,10 +1,12 @@
 {
   "created_at": "2026-06-05T20:20:28.117331+00:00",
-  "friendly_name": "trusted team safety 0160",
+  "friendly_name": "Trusted-Team Safety 0.16.0",
   "mission_id": "01KTCQ3D90TVWS0301PS389CT9",
   "mission_number": null,
   "mission_slug": "trusted-team-safety-0160-01KTCQ3D",
   "mission_type": "software-dev",
   "slug": "trusted-team-safety-0160-01KTCQ3D",
-  "target_branch": "master"
+  "source_description": "Phase A of the #19 identity/authz RFC (docs/rfc-identity-authz.md): trusted-team identity registry with non-rebindable retired tombstones, safe rename/retire, meta-marked global barriers with message-id epochs, check --epoch, and read-only next-owner/next-action fields. Trusted-team safety only; no malicious-peer authz.",
+  "target_branch": "master",
+  "vcs": "git"
 }
