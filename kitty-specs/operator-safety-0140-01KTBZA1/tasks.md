@@ -35,9 +35,9 @@ half, T014, and the #14 lines of T022–T024. Everything else stands alone.
 | T013 | cli: `cmd_escalate` + refusal matrix (#18) | WP02 | | [D] |
 | T014 | cli: `composing --to-request` sugar (#14, slip-droppable) | WP02 | | [D] |
 | T015 | tests: test_cli.py extensions for T007–T014 | WP02 | | [D] |
-| T016 | doctor: multi-store detection + root-first output (#13) | WP03 | |
-| T017 | doctor: liaison diagnostics (#18) | WP03 | |
-| T018 | tests: test_doctor.py extensions | WP03 | |
+| T016 | doctor: multi-store detection + root-first output (#13) | WP03 | | [D] |
+| T017 | doctor: liaison diagnostics (#18) | WP03 | | [D] |
+| T018 | tests: test_doctor.py extensions | WP03 | | [D] |
 | T019 | e2e: rescind race — send→rescind→wake/check→abort (#12) | WP04 | |
 | T020 | e2e: liaison flow — escalate→bucket→answer→closed + refusals (#18) | WP04 | |
 | T021 | e2e: backward-compat sweep (NFR-001, mixed-version store) | WP04 | |
@@ -92,9 +92,9 @@ half, T014, and the #14 lines of T022–T024. Everything else stands alone.
 **Priority**: P1. **Dependencies**: WP02 (the engine's scan helper and operator_facing accessor arrive transitively).
 **Independent test**: `pytest tests/test_doctor.py` green; quickstart section 3 doctor lines pass.
 
-- [ ] T016 doctor: multi-store detection + root-first output (WP03)
-- [ ] T017 doctor: liaison diagnostics (WP03)
-- [ ] T018 tests: test_doctor.py extensions (WP03)
+- [x] T016 doctor: multi-store detection + root-first output (WP03)
+- [x] T017 doctor: liaison diagnostics (WP03)
+- [x] T018 tests: test_doctor.py extensions (WP03)
 
 **Risks**: doctor/cli boundary — `cmd_doctor` wiring lives in cli.py (WP02 ownership); WP03 changes must stay inside doctor.py's check/run functions.
 
