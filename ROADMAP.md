@@ -36,29 +36,38 @@ closed. Kept here as a record only.
    mechanism is two `init`s + the upward root walk, *not* silent store
    creation — verified), `doctor` multi-store detection, `AGENTTALK_ROOT`
    env var, resolved root printed first in `whoami`/`doctor`.
-3. **Intent-to-reply sugar** (#14) — `composing --to-request RID` +
+3. **Operator liaison** (#18, promoted 2026-06-05 on operator demand) —
+   `roster set-operator-facing <agent>` (advisory, independent of
+   `role=lead`; recommended setup: lead == the exactly-one liaison),
+   zero/multiple WARNs in `doctor`/`sync`, and an explicit
+   **`agenttalk escalate`** helper: resolves the liaison, forces the
+   `request_id`, **refuses (exit 2) on an ambiguous liaison set** unless
+   `--to` overrides. No new kind — existing kinds + `needs_operator=true`
+   meta; closure = any non-control correlated liaison reply to the
+   requester. Liaison gets an "operator-input needed" bucket in
+   `sync`/`threads`; no new threadstate. Lead skill becomes the
+   operator's single voice; worker skills escalate instead of asking
+   their own window's human.
+4. **Intent-to-reply sugar** (#14) — `composing --to-request RID` +
    reply-in-flight visibility in `threads`/`sync` + stale-warning
    suppression. Ships in 0.14.0 **only if it stays observational and
    small** (the mechanics are ~80% built: scoped wait already honors
-   request_id-tagged composing).
+   request_id-tagged composing). **First slip candidate** if the
+   release gets heavy now that #18 is promoted in.
 
 ### Phase 2b — `0.14.x`/`0.15.0` "team scope"
-4. **Role-scoped audiences + not-applicable replies** (#15) —
+5. **Role-scoped audiences + not-applicable replies** (#15) —
    `broadcast --to-role` with the audience **frozen into fan-out meta at
    send time** (never live-plumb roles into derivation; history must not
    drift), plus `reply --na` (structured meta on a normal message — it
    already closes the obligation today; a first-class kind only if that
    proves too weak).
-5. **Broadcast preflight + manifest + partial-failure surfacing** (#16) —
+6. **Broadcast preflight + manifest + partial-failure surfacing** (#16) —
    same release as role audiences (they expand fan-out usage).
-6. **Invalid-message quarantine** (#17) — `prune --invalid` →
+7. **Invalid-message quarantine** (#17) — `prune --invalid` →
    `.agenttalk/quarantine/`; recoverable, never hard-delete; verified
    safe by construction (pure-function derivation, id-string cursors,
    per-message HMAC).
-7. **operator_facing roster bit — advisory** (#18) — metadata + loud
-   zero-or-multiple diagnostics in `doctor`/`sync`. The bus cannot
-   enforce what a human sees; a half-enforced bit is worse than honest
-   convention.
 
 ### Phase 3 — "trust": per-agent identity / authz RFC (#19)
 **Design starts during the 0.14.0 cycle** (Codex drafts, Claude
@@ -115,7 +124,9 @@ scope, replay, authorization policy, compromised-agent behavior):
 2. **Role-scoped audiences + not-applicable replies** — placeholder acks
    on reviewer-only threads; ack avoided out of fear. → #15.
 3. **Enforced operator_facing** — single-voice liaison decayed across
-   restarts. → #18 (advisory + diagnostics; enforcement question → #19).
+   restarts. → #18 (advisory + escalate helper; **promoted to 0.14.0**
+   2026-06-05 when the operator demanded it directly; enforcement
+   question → #19).
 4. **Intent-to-reply markers** — reduce crossing/duplicate sends. → #14.
 5. **Turn-free wait timeouts** — idle wait/poll loops burn turns/context
    across four windows. → mitigations only (see "honest scope" below).
