@@ -283,20 +283,37 @@ def test_doctor_json_root_is_first_key(tmp_path: Path) -> None:
     assert next(iter(d)) == "project_root"
 
 
-def test_doctor_human_output_first_line_is_root(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+def test_doctor_human_output_first_line_is_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Doctor's EXIT CODE reflects host-environment health (installed
+    # skills, codex config), which varies by machine — CI runners have
+    # none of it. These tests assert the OUTPUT CONTRACT, so they pin the
+    # environment to a deterministic broken-skills state (rc == 2) and
+    # assert the root-first shape regardless. (v0.14.0 CI regression: the
+    # original assertion `rc == 0` only held on hosts with skills
+    # installed.)
     from agenttalk import cli
+    from agenttalk import install_skills as iskl
+    monkeypatch.setattr(iskl, "default_claude_dir", lambda: tmp_path / "no-claude")
+    monkeypatch.setattr(iskl, "default_codex_dir", lambda: tmp_path / "no-codex")
     Store(tmp_path).init(["alpha", "beta"])
     rc = cli.main(["--root", str(tmp_path), "doctor"])
-    assert rc == 0
+    assert rc == 2  # deterministic: skills missing -> overall error
     first_line = capsys.readouterr().out.splitlines()[0]
     assert first_line == f"root: {tmp_path.resolve()}"
 
 
-def test_doctor_json_cli_first_key_is_root(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+def test_doctor_json_cli_first_key_is_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from agenttalk import cli
+    from agenttalk import install_skills as iskl
+    monkeypatch.setattr(iskl, "default_claude_dir", lambda: tmp_path / "no-claude")
+    monkeypatch.setattr(iskl, "default_codex_dir", lambda: tmp_path / "no-codex")
     Store(tmp_path).init(["alpha", "beta"])
     rc = cli.main(["--root", str(tmp_path), "doctor", "--json"])
-    assert rc == 0
+    assert rc == 2  # deterministic: skills missing -> overall error
     out = capsys.readouterr().out
     # json.dumps preserves insertion order: the first emitted key is the root
     first_key = out.splitlines()[1].strip().split(":")[0].strip('" ')
