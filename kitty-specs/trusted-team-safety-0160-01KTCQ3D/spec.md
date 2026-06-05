@@ -91,9 +91,9 @@ guarantees are explicitly deferred to later RFC phases (B/C/D).
 
 - Firing a barrier produces a normal message (no new kind) that appears in
   `recv`/transcript and whose own message id is the epoch id.
-- A tracked opener sent after a barrier carries `epoch_at_send` == that barrier
-  id; an opener sent when no barrier has ever fired omits `epoch_at_send`
-  entirely (absent, not null).
+- A tracked opener minted by an epoch-aware client after a barrier carries
+  `epoch_at_send` == that barrier id; one minted when no barrier has fired yet
+  carries `epoch_at_send` == `null`; a pre-0.16.0 opener omits the key entirely.
 - `check --to-request <rid> --epoch` exits with the documented currentness code
   and prints current vs. previous-epoch status; with no barrier in history it
   reports current.
@@ -143,7 +143,7 @@ guarantees are explicitly deferred to later RFC phases (B/C/D).
 | FR-008 | The system SHALL support optional, explicit, single-hop forwarding of a retired identity's outstanding obligation to a live agent, recording the forwarding in transcript-visible meta; multi-hop or active-identity forwarding SHALL be refused. | Draft |
 | FR-009 | The system SHALL allow any active roster member to fire a global barrier, recorded as an ordinary message (no new message kind) carrying barrier meta. | Draft |
 | FR-010 | The global epoch id SHALL be the message id of the latest validated global barrier event; there SHALL be no separate epoch counter. | Draft |
-| FR-011 | Tracked request openers sent after at least one barrier exists SHALL automatically carry `epoch_at_send` equal to the current global epoch id; openers sent when no barrier has ever fired SHALL omit `epoch_at_send` (absent, not null). | Draft |
+| FR-011 | Tracked request openers minted by an epoch-aware client SHALL automatically carry `epoch_at_send`: the current global epoch id when a barrier exists, or `null` when no barrier has fired yet. The key SHALL be absent only on openers written by pre-0.16.0 clients. (Deliberate, documented exception to the general absent-not-null convention — `null` is a meaningful state, "epoch-aware sender, no barrier yet", distinct from absent, which means "pre-epoch opener" and is checkable only for thread-local rescind.) | Draft |
 | FR-012 | The system SHALL provide `check --to-request <rid> --epoch`, reporting whether the request's `epoch_at_send` matches the current global epoch (current) or is older (previous epoch / stale), exiting with the documented currentness codes. | Draft |
 | FR-013 | With no barrier in history, `check --epoch` SHALL report the request as current. | Draft |
 | FR-014 | `threads --json` and `sync --json` SHALL include read-only `next_owner` and `next_action` fields on open threads where derivable, and SHALL omit them where not derivable. | Draft |
@@ -155,7 +155,7 @@ guarantees are explicitly deferred to later RFC phases (B/C/D).
 | ID | Requirement | Threshold | Status |
 |----|-------------|-----------|--------|
 | NFR-001 | Runtime dependencies SHALL remain Python standard library only. | Zero non-stdlib runtime imports added. | Draft |
-| NFR-002 | All new message/JSON fields SHALL be strictly additive: absent (not null) when the feature is unused, and pre-existing keys unchanged. | A 0.15.0 store and 0.15.0-shaped messages validate and render unchanged under 0.16.0. | Draft |
+| NFR-002 | All new message/JSON fields SHALL be strictly additive: absent (not null) when the feature is unused, and pre-existing keys unchanged. The sole, documented exception is `epoch_at_send`, where `null` is a meaningful stamped value (see FR-011). | A 0.15.0 store and 0.15.0-shaped messages validate and render unchanged under 0.16.0. | Draft |
 | NFR-003 | Message history SHALL remain immutable: no operation in this release edits, rewrites, or deletes existing message files. | No code path mutates an existing message file; rename/retire touch only `config.json`. | Draft |
 | NFR-004 | The exit-code contract SHALL be preserved and extended only additively; existing codes keep their meaning. | New currentness/refusal outcomes map onto the documented code contract without changing existing codes. | Draft |
 | NFR-005 | The full CI matrix (py3.10–3.13 × 3 OSes) SHALL be green before any release tag. | `gh run watch` shows all matrix jobs passing before tagging. | Draft |
@@ -191,7 +191,8 @@ guarantees are explicitly deferred to later RFC phases (B/C/D).
   (`meta.barrier = {version, scope: "global", type: "epoch-bump"}`). Its message
   id is the global epoch id.
 - **Epoch stamp (`epoch_at_send`)**: the global epoch id recorded automatically
-  on a tracked opener at send time; absent when no barrier has ever fired.
+  on a tracked opener at send time by an epoch-aware client; `null` when no
+  barrier has fired yet; absent only on pre-0.16.0 openers (three-state).
 - **Next-owner / next-action hint**: read-only, state-derived fields on open
   threads in `threads --json` / `sync --json` indicating who owes the next move
   and what kind of move it is.
