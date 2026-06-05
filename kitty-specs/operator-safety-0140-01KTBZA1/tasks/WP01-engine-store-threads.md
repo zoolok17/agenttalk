@@ -211,10 +211,12 @@ logic (FR-014/015, data-model §2).
 **Steps**:
 1. A thread whose opener carries `meta.needs_operator == "true"` gets two
    additive row fields: `needs_operator: true` and
-   `operator_state: "pending" | "answered"` — answered exactly when the
-   existing question-closure already marks it closed (any non-control
-   correlated reply from the liaison to the requester; threads.py:82-88).
-   No new closure rule — this is labeling, not mechanics (C-007).
+   `operator_state: "pending" | "answered" | "closed"` — answered exactly
+   when the existing question-closure marks it closed via the liaison's
+   non-control correlated reply (threads.py:82-88); "closed" when the
+   thread went terminal WITHOUT such a reply (manual ack or supersession,
+   amended in review round 2 — leaves the bucket without fabricating an
+   answer, FR-014). No new closure rule — labeling, not mechanics (C-007).
 2. Both perspectives: liaison sees pending escalations among owed-inbound
    (WP02 buckets them); requester sees its escalation open-outbound with
    the same labels.

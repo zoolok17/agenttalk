@@ -39,28 +39,40 @@ closed-superseded   (terminal; re-ask requires a fresh request_id,
                      same rule as manual ack closure)
 ```
 
-Precedence: `closed` (manual ack, existing) and `closed-superseded` are
-both terminal; if both apply, the earlier-deciding event wins for the
-`closed_reason`, state remains terminal either way. Existing closure
-paths are untouched.
+Precedence (amended in WP01 review round 2): `closed` (manual ack,
+existing) and `closed-superseded` are both terminal. A per-agent manual
+ack always keeps its `closed` label — supersession overrides *derived*
+states only, never an explicit ack; existing closure paths are
+untouched. The non-acking party still derives `closed-superseded`, and
+the `check` gate computes supersession from the log, unaffected by view
+labels. (Derivation has no ack-timing information — `closed_rids` is a
+set — so "earlier decider wins" is unimplementable without a signature
+change; ack-always-keeps-its-label is the deterministic rule.)
 
-### Escalation pending/answered (derived, no new threadstate)
+### Escalation pending/answered/closed (derived, no new threadstate)
 
 An escalation is an ordinary tracked question thread where the opener
-carries `meta.needs_operator="true"`:
+carries `meta.needs_operator="true"`. `operator_state` is three-valued
+(amended in WP01 review round 2):
 
 ```
-pending-operator   (opener sent; no qualifying reply yet)
-        │
-        │  liaison sends any non-control reply with the same request_id
-        │  to the requester           (optionally meta.operator_answer)
-        ▼
-answered           (ordinary question closure — reuses existing rule)
+pending    (opener sent; no qualifying reply yet)
+   │
+   │  liaison sends any non-control reply with the same request_id
+   │  to the requester               (optionally meta.operator_answer)
+   ▼
+answered   (ordinary question closure — reuses existing rule; FR-014)
+
+   │  alternative exits from pending: manual ack or supersession —
+   │  terminal WITHOUT a liaison answer
+   ▼
+closed     (leaves the pending bucket; never fabricates an answer that
+            did not happen)
 ```
 
-Display only: the liaison's views bucket `pending-operator` threads
-separately; the requester sees its escalation as open-outbound until
-answered. No new fields in `threadstate.json`.
+Display only: the liaison's views bucket `operator_state == "pending"`
+threads separately; the requester sees its escalation as open-outbound
+until terminal. No new fields in `threadstate.json`.
 
 ## 3. Roster: operator_facing designation (#18)
 
@@ -147,7 +159,7 @@ filesystem root when more than one exists.
 ## 8. JSON output additions (all additive)
 
 - `threads --json`: `state` may be `"closed-superseded"`; escalation rows
-  carry `"needs_operator": true` and `"operator_state": "pending"|"answered"`;
+  carry `"needs_operator": true` and `"operator_state": "pending"|"answered"|"closed"`;
   reply-in-flight rows carry `"reply_in_flight": true`.
 - `sync --json`: new `escalations` array for the liaison; rescinded
   threads flagged in the existing actionable/terminal sections.
