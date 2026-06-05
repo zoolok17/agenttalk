@@ -60,13 +60,18 @@ must NEVER affect delivery, unread counts, or thread closure.
 
 ## Subtasks
 
-### T008 — fields on `ThreadRow` + conditional `to_dict`
+### T008 — fields on `Thread` (NOT emitted by `to_dict`)
 **Steps**:
 1. Add `next_owner: str | list[str] | None = None` and
-   `next_action: str | None = None` to the `ThreadRow` dataclass (defaults keep
-   them absent).
-2. In `to_dict()`, include `next_owner` / `next_action` ONLY when non-None
-   (mirror the existing `if self.responded_na:` style — absent, not null).
+   `next_action: str | None = None` to the `Thread` dataclass (defaults absent).
+2. **`to_dict()` does NOT emit them** (revised decision). Unlike the 0.15.0 keys
+   (`responded_na` etc., emitted only when a feature is used), `next_*` appear
+   on EVERY open thread, so emitting them from `to_dict` changes the baseline
+   thread JSON shape and trips the 0.15.0 additivity gates in
+   `test_coordination.py` (a WP03-owned file). Surfacing into `threads`/`sync
+   --json` is therefore done at the CLI layer in **WP03/T015**, which owns +
+   updates those additivity tests. WP02 keeps `to_dict` shape-stable; WP03 reads
+   `t.next_owner` / `t.next_action` off the `Thread` and injects them.
 
 ### T009 — derivation function
 **Purpose**: Map state → `(next_action, next_owner)` per research D6.

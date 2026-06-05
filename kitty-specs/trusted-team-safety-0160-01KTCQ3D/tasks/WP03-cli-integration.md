@@ -130,12 +130,22 @@ ALSO evaluate the epoch dimension on the resolved thread row:
 > real id (treat absent-epoch-at-send-value `None` as "older than any barrier").
 
 ### T015 — `threads` / `sync --json` next_owner / next_action surfacing
-**Steps**: The WP02 fields are already in `ThreadRow.to_dict()`. Confirm the
-`threads --json` and `sync --json` code paths serialize via `to_dict()` so the
-new keys appear automatically; if either path hand-builds a dict, add the two
-keys conditionally (only when present). Optionally add a compact `next:` hint to
-the human (non-JSON) output WITHOUT changing existing columns. Do not add the
-fields to any non-thread JSON.
+**Steps** (revised — WP02 deliberately does NOT emit these from `Thread.to_dict`,
+since they appear on every open thread and would change the baseline shape;
+surfacing + the additivity-gate update are WP03's job):
+1. In the `threads --json` and `sync --json` CLI paths, after building each row
+   dict via `t.to_dict()`, inject the two keys FROM THE `Thread` object when
+   present: `if t.next_action is not None: d["next_action"] = t.next_action;
+   if t.next_owner is not None: d["next_owner"] = t.next_owner`. Conditional →
+   terminal threads omit both.
+2. Optionally add a compact `next:` hint to the human (non-JSON) output WITHOUT
+   changing existing columns. Do not add the fields to any non-thread JSON.
+3. **Update the 0.15.0 additivity gates** in `tests/test_coordination.py`
+   (`test_backcompat_json_shapes_without_new_features`,
+   `test_additivity_gates_extended_0150`): an OPEN pre-feature thread now
+   legitimately carries `next_action`/`next_owner` (they are universal, not
+   feature-gated). Update the expected key sets accordingly; a CLOSED thread
+   still omits them. Document in-test why these two keys are baseline-on-open.
 
 ### T016 — `tests/test_cli.py`
 Cover each subcommand's behavior + exit codes:
