@@ -1600,7 +1600,7 @@ def test_escalate_refusal_matrix(tmp_path: Path, capsys) -> None:
     assert "operator channel" in capsys.readouterr().err
     # configured liaison gone from roster
     assert _run(["roster", "set-operator-facing", "w2"], root) == 0
-    assert _run(["roster", "remove", "w2"], root) == 0
+    assert _run(["roster", "remove", "w2", "--force"], root) == 0  # #19: --force
     capsys.readouterr()
     _run_expect_exit(["escalate", "--from", "w1", "-m", "ping"], root, 2)
     assert "not in" in capsys.readouterr().err
@@ -2174,3 +2174,162 @@ def test_to_role_empty_string_role_shaped_error(tmp_path: Path, capsys) -> None:
     err = capsys.readouterr().err
     assert "--to-role" in err
     assert "group" not in err
+
+
+# ===================================================== #19 Phase A (WP03/T016)
+# Roster retire/rename/remove/forward, barrier bump, check --epoch, json next_*.
+
+def _epoch_team(tmp_path: Path) -> Path:
+    return _team_root(tmp_path, "alpha,beta,gamma")
+
+
+def test_roster_retire_and_refusals(tmp_path: Path, capsys) -> None:
+    root = _epoch_team(tmp_path)
+    assert _run(["roster", "retire", "gamma", "--reason", "left"], root) == 0
+    assert "tombstone" in capsys.readouterr().out
+    # already retired -> exit 2
+    _run_expect_exit(["roster", "retire", "gamma"], root, 2)
+    # retired identity cannot send (FR-004) with a tombstone-specific message
+    _run_expect_exit(["send", "--from", "gamma", "--to", "alpha", "-m", "hi"], root, 2)
+    assert "retired" in capsys.readouterr().err
+
+
+def test_roster_retire_json(tmp_path: Path, capsys) -> None:
+    # contract: `roster retire --json` returns the updated {"retired": [...]} slice.
+    root = _epoch_team(tmp_path)
+    capsys.readouterr()
+    assert _run(["roster", "retire", "gamma", "--reason", "left", "--json"], root) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert [e["name"] for e in out["retired"]] == ["gamma"]
+    assert out["retired"][0]["reason"] == "left"
+
+
+def test_roster_rename_carryover_and_drain_check(tmp_path: Path, capsys) -> None:
+    root = _epoch_team(tmp_path)
+    assert _run(["roster", "set-role", "gamma", "reviewer"], root) == 0
+    assert _run(["roster", "set-operator-facing", "gamma"], root) == 0
+    capsys.readouterr()
+    assert _run(["roster", "rename", "gamma", "gamma-rev"], root) == 0
+    cfg = Store(root).load_config()
+    assert "gamma-rev" in cfg["agents"] and "gamma" not in cfg["agents"]
+    assert cfg["roles"]["gamma-rev"] == "reviewer"
+    assert cfg["operator_facing"] == "gamma-rev"
+    # non-rebindable: cannot rename to a tombstone
+    _run_expect_exit(["roster", "rename", "alpha", "gamma"], root, 2)
+
+
+def test_roster_rename_drain_check_blocks(tmp_path: Path, capsys) -> None:
+    root = _epoch_team(tmp_path)
+    # an open review-request owed to gamma
+    assert _run(["send", "--from", "alpha", "--to", "gamma",
+                 "--kind", "review-request", "--meta", "request_id=r1",
+                 "-m", "review", "--quiet"], root) == 0
+    capsys.readouterr()
+    _run_expect_exit(["roster", "rename", "gamma", "gx", "--drain-check"], root, 2)
+    assert "open thread" in capsys.readouterr().err
+    # gamma was NOT renamed
+    assert "gamma" in Store(root).load_config()["agents"]
+
+
+def test_roster_remove_force_gate(tmp_path: Path, capsys) -> None:
+    root = _epoch_team(tmp_path)
+    _run_expect_exit(["roster", "remove", "gamma"], root, 2)
+    assert "roster retire" in capsys.readouterr().err
+    assert _run(["roster", "remove", "gamma", "--force"], root) == 0
+    assert "FAIL roster validation" in capsys.readouterr().err
+    assert "gamma" not in Store(root).load_config()["agents"]
+
+
+def test_roster_forward(tmp_path: Path, capsys) -> None:
+    root = _epoch_team(tmp_path)
+    assert _run(["send", "--from", "alpha", "--to", "gamma",
+                 "--kind", "review-request", "--meta", "request_id=rf",
+                 "-m", "review", "--quiet"], root) == 0
+    assert _run(["roster", "retire", "gamma"], root) == 0
+    capsys.readouterr()
+    assert _run(["roster", "forward", "gamma", "--to", "beta",
+                 "--to-request", "rf", "--from", "alpha"], root) == 0
+    assert "forwarded" in capsys.readouterr().out
+    # second hop refused
+    _run_expect_exit(["roster", "forward", "gamma", "--to", "beta",
+                      "--to-request", "rf", "--from", "alpha"], root, 2)
+
+
+def test_barrier_bump(tmp_path: Path, capsys) -> None:
+    root = _epoch_team(tmp_path)
+    capsys.readouterr()  # flush init output before reading the JSON
+    assert _run(["barrier", "bump", "--from", "alpha", "--scope", "global",
+                 "-m", "void", "--json"], root) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["scope"] == "global" and out["epoch"]
+    # bad scope -> exit 2
+    _run_expect_exit(["barrier", "bump", "--from", "alpha", "--scope", "local",
+                      "-m", "x"], root, 2)
+    # retired bumper -> exit 2
+    assert _run(["roster", "retire", "gamma"], root) == 0
+    _run_expect_exit(["barrier", "bump", "--from", "gamma", "--scope", "global",
+                      "-m", "x"], root, 2)
+
+
+def _open_req(root: Path, rid: str) -> None:
+    _run(["send", "--from", "alpha", "--to", "beta", "--kind", "review-request",
+          "--meta", f"request_id={rid}", "-m", "x", "--quiet"], root)
+
+
+def test_check_epoch_states(tmp_path: Path, capsys) -> None:
+    root = _epoch_team(tmp_path)
+    # no barrier yet -> current
+    _open_req(root, "r1")
+    assert _run(["check", "--for", "beta", "--to-request", "r1", "--epoch"], root) == 0
+    # fire barrier, open a NEW request under it -> current
+    assert _run(["barrier", "bump", "--from", "alpha", "--scope", "global",
+                 "-m", "e1"], root) == 0
+    _open_req(root, "r2")
+    assert _run(["check", "--for", "beta", "--to-request", "r2", "--epoch"], root) == 0
+    # r1 predates the barrier (epoch_at_send null) -> previous-epoch, exit 3
+    _run_expect_exit(["check", "--for", "beta", "--to-request", "r1", "--epoch"], root, 3)
+    # a second barrier makes r2 previous-epoch too
+    assert _run(["barrier", "bump", "--from", "beta", "--scope", "global",
+                 "-m", "e2"], root) == 0
+    _run_expect_exit(["check", "--for", "beta", "--to-request", "r2", "--epoch"], root, 3)
+    # unknown rid -> exit 4
+    _run_expect_exit(["check", "--for", "beta", "--to-request", "nope", "--epoch"], root, 4)
+
+
+def test_check_epoch_json_shape(tmp_path: Path, capsys) -> None:
+    root = _epoch_team(tmp_path)
+    _open_req(root, "r1")
+    assert _run(["barrier", "bump", "--from", "alpha", "--scope", "global",
+                 "-m", "e"], root) == 0
+    capsys.readouterr()
+    _run_expect_exit(["check", "--for", "beta", "--to-request", "r1",
+                      "--epoch", "--json"], root, 3)
+    out = json.loads(capsys.readouterr().out)
+    assert out["state"] == "current"          # rescind dimension unchanged
+    assert out["epoch"]["state"] == "previous-epoch"
+    # non --epoch check stays byte-shape stable (no 'epoch' key)
+    _run(["check", "--for", "beta", "--to-request", "r1", "--json"], root)
+    out2 = json.loads(capsys.readouterr().out)
+    assert "epoch" not in out2
+
+
+def test_threads_json_next_fields(tmp_path: Path, capsys) -> None:
+    root = _epoch_team(tmp_path)
+    _open_req(root, "r1")
+    rows = _run_json(["threads", "--for", "beta", "--all", "--json"], root, capsys)
+    row = [r for r in rows["threads"] if r["request_id"] == "r1"][0]
+    assert row["next_action"] == "reply" and row["next_owner"] == "beta"
+    # closed thread omits next_*
+    _run(["reply", "--to-request", "r1", "--from", "beta",
+          "--kind", "review-result", "--meta", "status=approved",
+          "-m", "lgtm"], root)
+    _run(["ack", "--for", "beta", "--to-request", "r1"], root)
+    rows = _run_json(["threads", "--for", "beta", "--all", "--json"], root, capsys)
+    row = [r for r in rows["threads"] if r["request_id"] == "r1"][0]
+    assert "next_action" not in row and "next_owner" not in row
+
+
+def _run_json(argv: list[str], root: Path, capsys) -> dict:
+    capsys.readouterr()
+    assert _run(argv, root) == 0
+    return json.loads(capsys.readouterr().out)

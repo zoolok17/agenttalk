@@ -129,6 +129,51 @@ trust model:
   closes a question exactly like any answer and cannot close
   review/proposal contracts.
 
+### Identity registry, epochs, and trusted-team safety (0.16.0)
+
+0.16.0 is **Phase A** of the identity/authz RFC
+(`docs/rfc-identity-authz.md`). It is **trusted-team safety, NOT
+authorization**. It assumes every roster member is cooperative and
+non-malicious. It does **not** defend against a local peer that forges
+sends, edits `config.json`, or deletes message files. Read these limits
+before relying on any of it for a safety-critical transition:
+
+- **The identity registry is config metadata, no more trustworthy than
+  the roster.** Retired tombstones live in `config.json`, which is
+  attacker-writable. They make rename/retire *safe for a cooperating
+  team* (history stays valid, a name is never silently reused), but a
+  writer who edits `config.json` can still rewrite the roster. This is
+  routing/lifecycle metadata, not an authenticated authority. Retiring
+  is non-rebindable *by every registry operation* (`add`, `rename`), and
+  history is validated against the **known** roster (active ∪ retired) so
+  a tombstone's past messages never become "invalid" — but none of that
+  is a cryptographic guarantee.
+- **`check --epoch` fails OPEN against barrier suppression.** The global
+  epoch is the message id of the latest *surviving validated* barrier. A
+  writer who deletes, quarantines, or withholds a barrier makes
+  `check --epoch` read the previous one and possibly pass. HMAC proves
+  message bytes, not message *presence*. So `check --epoch` is a
+  trusted-team correctness check, not a malicious-peer control. (It does
+  fail *closed* on the exit code for the cases it can see: a request that
+  predates the latest surviving barrier, or a pre-epoch opener once any
+  barrier exists, returns exit 3 — do not act.) Real presence hardening
+  (a hash chain / external checkpoint) is deferred to RFC Phase D.
+- **Any active member may bump the global epoch.** Pre-authz, this is a
+  deliberate global-stall lever: a looping or careless agent can stale
+  every high-risk request. Acceptable only under the current
+  rostered-equals-trusted model; Phase C makes bump authority
+  policy-bound.
+- **`epoch_at_send` is intentionally three-state.** Absent = a pre-0.16
+  opener (epoch-indeterminate; re-ask for irreversible actions); `null` =
+  an epoch-aware opener sent before any barrier (and correctly goes stale
+  once one fires); a barrier id = stamped. This is the one deliberate
+  exception to the project's absent-not-null additivity convention,
+  because `null` here is a meaningful state, not "feature unused".
+- **`operator_facing` and `next_owner`/`next_action` remain advisory.**
+  The liaison bit is routing metadata; the next-owner hint is a read-only
+  projection of thread state. Neither authorizes anything or is enforced
+  by the bus.
+
 ## What's protected today
 
 | Concern | Mitigation | Landed |

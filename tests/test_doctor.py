@@ -367,3 +367,58 @@ def test_store_hygiene_combined_invalid_and_quarantined(tmp_path: Path) -> None:
     assert c.data == {"invalid": 1, "quarantined": 1}
     assert "already quarantined" in c.details      # both facts surfaced
     assert "--dry-run" in c.fix
+
+
+# ===================================================== #19 Phase A (WP04/T019)
+# Identity registry hygiene check.
+
+def _find(report, name):
+    return next(c for c in report.checks if c.name == name)
+
+
+def test_identity_registry_ok_with_no_retired(tmp_path: Path) -> None:
+    Store(tmp_path).init(["alpha", "beta"])
+    c = _find(doctor.run(tmp_path), "identity_registry")
+    assert c.status == "ok"
+    assert c.data == {"active": 2, "retired": 0}
+
+
+def test_identity_registry_counts_after_retire_and_rename(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta", "gamma"])
+    s.retire_agent("gamma")                 # tombstone, renamed_to=None
+    s.rename_agent("beta", "beta2")         # tombstone beta->beta2 (in roster)
+    c = _find(doctor.run(tmp_path), "identity_registry")
+    assert c.status == "ok"                 # beta2 IS active -> lineage resolves
+    assert c.data["active"] == 2 and c.data["retired"] == 2
+
+
+def test_identity_registry_warns_on_dangling_lineage(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    s.rename_agent("beta", "beta2")         # beta -> beta2 (active)
+    s.remove_agent("beta2")                 # force-remove beta2: lineage dangles
+    c = _find(doctor.run(tmp_path), "identity_registry")
+    assert c.status == "warn"
+    assert "dangling" in c.details and "beta->beta2" in c.details
+    assert c.data["dangling"] == ["beta->beta2"]
+
+
+def test_doctor_does_not_crash_on_active_retired_overlap(tmp_path: Path) -> None:
+    # #19 / Codex WP04: a corrupt config (a name in BOTH agents and retired)
+    # makes load_config raise. doctor must REPORT it (init check error), not
+    # crash — config-dependent checks are gated on the init check.
+    import json as _json
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    cfgp = tmp_path / ".agenttalk" / "config.json"
+    cfg = _json.loads(cfgp.read_text(encoding="utf-8"))
+    cfg["retired"] = [{"name": "beta", "retired_at": "2026-01-01T00:00:00Z",
+                       "renamed_to": None, "reason": None}]  # beta is ALSO active
+    cfgp.write_text(_json.dumps(cfg), encoding="utf-8")
+    report = doctor.run(tmp_path)                 # must NOT raise
+    assert report.overall == "error"
+    init = _find(report, "store.initialized")
+    assert init.status == "error" and "BOTH" in init.details
+    # the config-dependent checks were skipped (no crash)
+    assert not any(c.name == "identity_registry" for c in report.checks)

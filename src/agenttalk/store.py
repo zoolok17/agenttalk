@@ -243,6 +243,53 @@ def validate_roles(roles: dict, roster: list[str]) -> dict:
     return roles
 
 
+def validate_retired(retired: object, active_roster: list[str]) -> list:
+    """Validate the ``retired`` registry (0.16.0, #19 Phase A).
+
+    A list of tombstone objects, one per retired identity:
+    ``{"name", "retired_at", "renamed_to": str|None, "reason": str|None}``.
+    Fail-closed so a corrupt registry can't put a name in both the active
+    roster and the tombstone list (an identity is active XOR retired), smuggle
+    an unsafe name into filename interpolation, or duplicate a tombstone. The
+    disjointness + uniqueness checks are **case-insensitive** for the same
+    filesystem-aliasing reason as ``validate_agent_roster``: a retired name must
+    be unrepresentable as a new active identity (FR-002 non-rebindable).
+    """
+    if not isinstance(retired, list):
+        raise ValueError(f"'retired' must be a list, got {type(retired).__name__}")
+    active_keys = {a.casefold() for a in active_roster}
+    seen: dict[str, str] = {}
+    for e in retired:
+        if not isinstance(e, dict):
+            raise ValueError(
+                f"each 'retired' entry must be an object, got {type(e).__name__}"
+            )
+        name = e.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("a 'retired' entry's 'name' must be a non-empty string")
+        validate_agent_name(name)
+        rn = e.get("renamed_to")
+        if rn is not None:
+            if not isinstance(rn, str) or not rn:
+                raise ValueError(
+                    f"retired {name!r}: 'renamed_to' must be a non-empty string or null"
+                )
+            validate_agent_name(rn)
+        key = name.casefold()
+        if key in active_keys:
+            raise ValueError(
+                f"identity {name!r} is in BOTH the active roster and 'retired' "
+                f"(an identity is active XOR retired, never both)"
+            )
+        if key in seen:
+            raise ValueError(
+                f"retired identity {name!r} (or a case-variant {seen[key]!r}) "
+                f"appears more than once — duplicate tombstone"
+            )
+        seen[key] = name
+    return retired
+
+
 @dataclass
 class Message:
     id: str
@@ -518,6 +565,14 @@ class Store:
                 validate_roles(cfg["roles"], agents)
             except ValueError as e:
                 raise ValueError(f"corrupt config at {self.config_path}: {e}.") from e
+        # Identity registry tombstones (0.16.0, #19 Phase A). Absent OR null ⇒
+        # no retirements (full 0.15.0 behavior). Validated fail-closed so a
+        # corrupt registry can't alias an active name or smuggle an unsafe one.
+        if cfg.get("retired") is not None:
+            try:
+                validate_retired(cfg["retired"], agents)
+            except ValueError as e:
+                raise ValueError(f"corrupt config at {self.config_path}: {e}.") from e
         return cfg
 
     # ------------------------------------------------------- team / roster
@@ -548,6 +603,47 @@ class Store:
     def roles(self) -> dict:
         """Return the ``{agent: role}`` map ({} if none defined)."""
         return self.load_config().get("roles", {}) or {}
+
+    # ----------------------------------------------- identity registry (0.16.0)
+    #
+    # Two roster VIEWS that deliberately diverge (#19 Phase A, RFC §"Identity
+    # Registry"). The ACTIVE roster (`agents`) is the set of sendable
+    # identities; SEND and audience resolution use it. The KNOWN roster
+    # (active ∪ retired tombstones) is what HISTORY validation uses, so a
+    # message authored by a now-retired identity stays valid forever (FR-006,
+    # immutable history) even though that identity can no longer send (FR-004).
+
+    @staticmethod
+    def _retired_names(cfg: dict) -> list[str]:
+        out: list[str] = []
+        for e in cfg.get("retired") or []:
+            if isinstance(e, dict) and isinstance(e.get("name"), str) and e["name"]:
+                out.append(e["name"])
+        return out
+
+    @staticmethod
+    def _known_roster(cfg: dict) -> list[str]:
+        """Active ∪ retired, active first, de-duped (case-sensitively — the
+        case-insensitive non-rebindable guard lives in the mutators)."""
+        seen: set[str] = set()
+        out: list[str] = []
+        for n in list(cfg.get("agents", []) or []) + Store._retired_names(cfg):
+            if n not in seen:
+                seen.add(n)
+                out.append(n)
+        return out
+
+    def active_agents(self) -> list[str]:
+        """The sendable roster (``config['agents']``)."""
+        return list(self.load_config().get("agents", []) or [])
+
+    def retired_agents(self) -> list[str]:
+        """Retired tombstone names (permanent, non-rebindable)."""
+        return self._retired_names(self.load_config())
+
+    def known_agents(self) -> list[str]:
+        """Active ∪ retired — the roster HISTORY is validated against."""
+        return self._known_roster(self.load_config())
 
     def resolve_audience(self, target: str, *, exclude: str | None = None) -> list[str]:
         """Resolve a broadcast target to a concrete recipient list.
@@ -620,6 +716,18 @@ class Store:
         roster = list(cfg.get("agents", []))
         is_new = name not in roster
         if is_new:
+            # B2 (#19 Phase A): a retired tombstone is permanent and
+            # non-rebindable (FR-002). Refuse at WRITE time — do not rely on
+            # load_config fail-closing on the next read (that writes a bad
+            # config first and gives a confusing error later). Case-insensitive,
+            # because a tombstone must be unrepresentable as a new active name.
+            retired_keys = {r.casefold(): r for r in self._retired_names(cfg)}
+            if name.casefold() in retired_keys:
+                raise ValueError(
+                    f"agent name {name!r} is a retired tombstone "
+                    f"({retired_keys[name.casefold()]!r}) and cannot be re-bound; "
+                    f"tombstones are permanent (#19). Pick a different name."
+                )
             validate_agent_roster(roster + [name])  # case-insensitive uniqueness
             roster.append(name)
             cfg["agents"] = roster
@@ -739,6 +847,247 @@ class Store:
         self._write_config(cfg)
         return cfg
 
+    # ----------------------------------------- retirement / rename (0.16.0 #19)
+    #
+    # Retire = move an active identity to a PERMANENT tombstone. It can no
+    # longer send (FR-004), its name can never be re-bound (FR-002), but its
+    # historical messages stay valid (FR-006, validated against the KNOWN
+    # roster). Rename = retire(old -> new) + add(new), carrying over old's
+    # role / groups / liaison bit. Every op touches ONLY config.json — history
+    # is immutable (no message file is ever edited).
+
+    @staticmethod
+    def _strip_identity(cfg: dict, name: str) -> None:
+        """Remove ``name`` from the active roster, roles, groups, and the
+        operator_facing slot — in place. Shared by retire/rename. Never touches
+        message files."""
+        roster = list(cfg.get("agents", []) or [])
+        if name in roster:
+            roster.remove(name)
+            cfg["agents"] = roster
+        if isinstance(cfg.get("roles"), dict):
+            cfg["roles"].pop(name, None)
+        if isinstance(cfg.get("groups"), dict):
+            for members in cfg["groups"].values():
+                if name in members:
+                    members.remove(name)
+        if cfg.get("operator_facing") == name:
+            cfg.pop("operator_facing", None)
+
+    def retire_agent(self, name: str, *, reason: str | None = None,
+                     renamed_to: str | None = None) -> dict:
+        """Retire an active identity to a permanent tombstone (FR-002/003/004).
+
+        ``renamed_to`` links a rename's tombstone to its successor (set by
+        :meth:`rename_agent`). Refuses a name that is not currently active.
+        """
+        cfg = self.load_config()
+        active = cfg.get("agents", []) or []
+        if name not in active:
+            if name in self._retired_names(cfg):
+                raise ValueError(f"identity {name!r} is already retired")
+            raise ValueError(
+                f"cannot retire {name!r}: not in the active roster {sorted(active)}"
+            )
+        self._strip_identity(cfg, name)
+        retired = cfg.get("retired")
+        if not isinstance(retired, list):
+            retired = []
+        retired.append({
+            "name": name,
+            "retired_at": _now_iso(),
+            "renamed_to": renamed_to,
+            "reason": reason,
+        })
+        cfg["retired"] = retired
+        validate_retired(retired, cfg.get("agents", []) or [])  # fail before write
+        self._write_config(cfg)
+        return cfg
+
+    def rename_agent(self, old: str, new: str, *, reason: str | None = None) -> dict:
+        """Safe rename = retire ``old`` (tombstone, ``renamed_to=new``) + add
+        ``new`` as a new active identity, carrying over ``old``'s role, group
+        memberships, and operator_facing bit. One atomic config write. History
+        referencing ``old`` stays valid; ``old`` is non-rebindable (FR-002/005/006).
+        """
+        validate_agent_name(new)
+        cfg = self.load_config()
+        active = cfg.get("agents", []) or []
+        if old not in active:
+            raise ValueError(
+                f"cannot rename {old!r}: not in the active roster {sorted(active)}"
+            )
+        # Non-rebindable: `new` must not collide (case-insensitively) with ANY
+        # known identity — active or a retired tombstone.
+        known_keys = {k.casefold(): k for k in self._known_roster(cfg)}
+        if new.casefold() in known_keys:
+            clash = known_keys[new.casefold()]
+            is_tomb = new.casefold() in {r.casefold() for r in self._retired_names(cfg)}
+            where = "a retired tombstone" if is_tomb else "already an active identity"
+            raise ValueError(
+                f"cannot rename {old!r} to {new!r}: {clash!r} is {where}; "
+                f"identities are non-rebindable (#19)"
+            )
+        # Snapshot old's role / group memberships / liaison BEFORE stripping.
+        old_role = (cfg.get("roles") or {}).get(old)
+        old_groups = [g for g, members in (cfg.get("groups") or {}).items()
+                      if old in members]
+        was_liaison = cfg.get("operator_facing") == old
+        # Retire old -> tombstone(renamed_to=new), then activate new + carryover.
+        self._strip_identity(cfg, old)
+        retired = cfg.get("retired")
+        if not isinstance(retired, list):
+            retired = []
+        retired.append({
+            "name": old,
+            "retired_at": _now_iso(),
+            "renamed_to": new,
+            "reason": reason,
+        })
+        cfg["retired"] = retired
+        roster = list(cfg.get("agents", []) or [])
+        roster.append(new)
+        cfg["agents"] = roster
+        if old_role is not None:
+            self._cfg_dict(cfg, "roles")[new] = old_role
+        if old_groups:
+            g = self._cfg_dict(cfg, "groups")
+            for gn in old_groups:
+                members = g.setdefault(gn, [])
+                if new not in members:
+                    members.append(new)
+        if was_liaison:
+            cfg["operator_facing"] = new
+        # Validate the WHOLE resulting config before writing (fail-closed).
+        validate_agent_roster(roster)
+        validate_retired(retired, roster)
+        if cfg.get("roles"):
+            validate_roles(cfg["roles"], roster)
+        if cfg.get("groups"):
+            validate_groups(cfg["groups"], roster)
+        self._write_config(cfg)
+        cur = self.state_dir / f"{new}.cursor"
+        if not cur.exists():
+            _atomic_write_text(cur, "")
+        return cfg
+
+    def _drain_check(self, name: str) -> list[dict]:
+        """Open (non-terminal) threads still owing work to/from ``name``.
+
+        Pure query used by ``roster rename --drain-check``. ``threads`` imports
+        ``store``, so import it lazily to avoid a cycle. Uses ``name``'s real
+        cursor + ack-closed set so an already-acked thread does not block a
+        rename. Returns thread row dicts (empty ⇒ safe to rename).
+        """
+        from agenttalk import threads as _threads  # lazy: avoid import cycle
+        ts = self.read_threadstate(name)
+        closed = {rid for rid, e in ts.items()
+                  if isinstance(e, dict) and e.get("closed") is True}
+        rows = _threads.derive_threads(
+            self.valid_messages(), agent=name,
+            cursor=self.cursor(name), closed_rids=closed,
+        )
+        owed: list[dict] = []
+        for t in rows:
+            if t.state in ("closed", "closed-superseded"):
+                continue
+            owed.append(t.to_dict())
+        return owed
+
+    def _open_thread_for(self, agent: str, request_id: str):
+        """The non-terminal thread row ``request_id`` for ``agent``, or None.
+
+        Returns None if the thread is unknown, not involving ``agent``, or
+        already terminal (closed / closed-superseded). Used to gate forwarding
+        on a genuinely *owed/open* obligation (lazy threads import — cycle)."""
+        from agenttalk import threads as _threads
+        ts = self.read_threadstate(agent)
+        closed = {rid for rid, e in ts.items()
+                  if isinstance(e, dict) and e.get("closed") is True}
+        rows = _threads.derive_threads(
+            self.valid_messages(), agent=agent,
+            cursor=self.cursor(agent), closed_rids=closed,
+        )
+        for t in rows:
+            if t.request_id == request_id:
+                return None if t.state in ("closed", "closed-superseded") else t
+        return None
+
+    def _already_forwarded(self, request_id: str) -> bool:
+        """True if any valid message already forwarded ``request_id`` (the
+        forward note carries ``meta.forwarded_request_id``). Enforces single
+        hop: a request can be forwarded at most once."""
+        for m in self.valid_messages():
+            if (m.meta or {}).get("forwarded_request_id") == request_id:
+                return True
+        return False
+
+    def forward_retired(self, retired_name: str, to_agent: str, request_id: str,
+                        *, from_agent: str | None = None,
+                        reason: str | None = None) -> "Message":
+        """Forward a SPECIFIC owed/open request from a retired identity to a
+        live agent — one explicit hop (FR-008, B4). Emits an ordinary ``note``
+        to ``to_agent`` carrying ``meta.forwarded_from`` +
+        ``meta.forwarded_request_id``. Sender is ``from_agent`` (active) or the
+        operator_facing identity — NEVER ``to_agent`` by default. Refuses a
+        non-retired source, a non-active target, a request that is not a
+        currently-open thread owed to/from the retired identity, a missing
+        sender, or a second forward of the same request.
+        """
+        cfg = self.load_config()
+        if retired_name not in self._retired_names(cfg):
+            raise ValueError(
+                f"cannot forward from {retired_name!r}: it is not a retired "
+                f"identity (only retired tombstones can be forwarded)"
+            )
+        active = cfg.get("agents", []) or []
+        if to_agent not in active:
+            raise ValueError(
+                f"cannot forward to {to_agent!r}: not in the active roster {sorted(active)}"
+            )
+        liaison = cfg.get("operator_facing")
+        sender = from_agent or (liaison if liaison in active else None)
+        if not sender:
+            raise ValueError(
+                "retired forwarding needs an explicit --from (active) sender; "
+                "no operator_facing identity is set to default to"
+            )
+        if sender not in active:
+            raise ValueError(
+                f"forward sender {sender!r} is not an active identity {sorted(active)}"
+            )
+        if sender == to_agent:
+            raise ValueError(
+                "forward sender must not be the target (a forward must not look "
+                "like it came from the agent receiving it)"
+            )
+        # Single hop: a request may be forwarded at most once (Codex WP01 B2).
+        if self._already_forwarded(request_id):
+            raise ValueError(
+                f"request {request_id!r} was already forwarded; second hop forbidden"
+            )
+        # Must be a CURRENTLY-OPEN thread owed to/from the retired identity — a
+        # closed/answered request has no obligation to forward (Codex WP01 B1).
+        if self._open_thread_for(retired_name, request_id) is None:
+            raise ValueError(
+                f"request {request_id!r} is not an open thread owed to/from "
+                f"{retired_name!r} — nothing to forward"
+            )
+        body = reason or (
+            f"{retired_name} is retired; forwarding request {request_id} "
+            f"to {to_agent}."
+        )
+        return self.send(
+            sender=sender, recipient=to_agent, kind="note",
+            subject=f"forwarded from {retired_name}",
+            body=body,
+            meta={
+                "forwarded_from": retired_name,
+                "forwarded_request_id": request_id,
+                "forward": {"hop": 1},
+            },
+        )
+
     # --------------------------------------------------------------- writing
 
     def project_id(self) -> str:
@@ -809,9 +1158,23 @@ class Store:
             raise FileNotFoundError("agenttalk not initialized; run `agenttalk init`.")
         cfg = self.load_config()
         agents = set(cfg.get("agents", []))
+        # A retired identity (#19) is removed from the ACTIVE roster, so it
+        # already fails this membership check — but give it a tombstone-specific
+        # message rather than a confusing "not in registered agents" (FR-004).
+        retired = set(self._retired_names(cfg))
         if agents and sender not in agents:
+            if sender in retired:
+                raise ValueError(
+                    f"sender '{sender}' is retired (a tombstone) and cannot "
+                    f"send; tombstones are permanent (#19). See `agenttalk roster`."
+                )
             raise ValueError(f"sender '{sender}' not in registered agents {sorted(agents)}")
         if agents and recipient not in agents:
+            if recipient in retired:
+                raise ValueError(
+                    f"recipient '{recipient}' is retired (a tombstone) and cannot "
+                    f"receive new messages (#19). See `agenttalk roster`."
+                )
             raise ValueError(f"recipient '{recipient}' not in registered agents {sorted(agents)}")
         # Reject unknown kinds at WRITE time so the sender sees an
         # immediate error rather than a silent receive-side skip.
@@ -821,6 +1184,15 @@ class Store:
             raise ValueError(
                 f"unknown kind {kind!r} (allowed: {sorted(KNOWN_KINDS)})"
             )
+        # Epoch stamping (#19 Phase A): a tracked opener automatically records
+        # the global epoch at send time. Three-state: an epoch-aware client
+        # ALWAYS writes the key (barrier id, or null when no barrier has fired
+        # yet); a pre-0.16.0 client never ran this code, so the key is absent.
+        # A caller that already supplied `epoch_at_send` wins (broadcast
+        # snapshots one epoch for the whole fan-out — B3).
+        meta = dict(meta or {})
+        if kind in OPENER_KINDS and "epoch_at_send" not in meta:
+            meta["epoch_at_send"] = self.current_epoch()
         msg = Message(
             id=_new_id(),
             ts=_now_iso(),
@@ -935,7 +1307,10 @@ class Store:
             cfg = self.load_config()
         except (ValueError, OSError, FileNotFoundError):
             cfg = {}
-        roster = cfg.get("agents", []) or []
+        # D3 (#19): history is validated against the KNOWN roster (active ∪
+        # retired) so a message from a now-retired identity stays valid — a
+        # tombstone must not turn its own past messages into "invalid" debris.
+        roster = self._known_roster(cfg)
         require_sig = self.signing_enforced()
         project_id = self.project_id() if require_sig else None
         key: bytes | None = None
@@ -1059,7 +1434,9 @@ class Store:
         """
         try:
             cfg = self.load_config()
-            roster = cfg.get("agents", []) or []
+            # D3 (#19): validate history against the KNOWN roster (active ∪
+            # retired) so a retired identity's past messages stay valid.
+            roster = self._known_roster(cfg)
         except (ValueError, OSError, FileNotFoundError):
             roster = []
         require_sig = self.signing_enforced()
@@ -1088,6 +1465,33 @@ class Store:
                     continue
             out.append(m)
         return out
+
+    def current_epoch(self) -> str | None:
+        """The global epoch id = the message id of the latest validated global
+        barrier event, or ``None`` if no barrier has fired (#19 Phase A, RFC
+        §"Global Epochs And Send-Time Barriers").
+
+        A barrier is an ordinary message carrying
+        ``meta.barrier={"version","scope":"global","type"}`` — NO new kind, so
+        old clients see a normal note. Visibility is by store-scan, not inbox
+        delivery: a single self-addressed barrier is globally authoritative
+        because this scans the WHOLE validated log (every recipient). "Latest"
+        is by deterministic message-id order (not real time). A malformed
+        ``meta.barrier`` is ignored (never counts, never crashes).
+
+        This FAILS OPEN against suppression: a writer who deletes/withholds a
+        barrier makes this read the latest *surviving* one. HMAC proves bytes,
+        not presence — Phase A is trusted-team correctness, not a malicious-peer
+        control (see SECURITY.md).
+        """
+        latest: str | None = None
+        for m in self.valid_messages():
+            b = (m.meta or {}).get("barrier")
+            if (isinstance(b, dict) and b.get("scope") == "global"
+                    and "version" in b and "type" in b):
+                if latest is None or m.id > latest:
+                    latest = m.id
+        return latest
 
     def messages_for(self, agent: str, *, since_id: str | None = None) -> list[Message]:
         """Return validated messages addressed to ``agent``.

@@ -6,7 +6,7 @@ the Claude Code + Codex collaboration that shipped 0.10.0–0.13.0, the first
 four-agent production retro (2026-06-03), **and the band's consolidated
 second retro (2026-06-05), which reprioritized everything below.**
 
-> Current release: **v0.15.0** (`master`). See `CHANGELOG.md` for history
+> Current release: **v0.16.0** (`master`). See `CHANGELOG.md` for history
 > and `SECURITY.md` for the trust model.
 
 ---
@@ -79,25 +79,36 @@ Record:
    per-message HMAC).
 
 ### Phase 3 — "trust": per-agent identity / authz RFC (#19)
-**Design starts during the 0.14.0 cycle** (Codex drafts, Claude
-critiques, fresh-eyes security reviewer on the draft); implementation
-0.15.0 at the earliest. Scope now explicitly includes, beyond the
-original threat model (key lifecycle, key↔roster mapping, signature
-scope, replay, authorization policy, compromised-agent behavior):
-- **global epochs / send-time barriers** — the deep end of supersession;
-  the bus's first machine-checkable cross-message ordering rule;
-- **retired identities / safe rename** — #9 folds in here (a retired
-  identity must preserve historical validation; `send --to <old>`
-  hard-fails with a hint; forwarding only as explicit opt-in; never
-  rewrite history);
-- **what operator_facing can mean** without real authz;
-- **tool-visible next-action/owner on open threads** (the soft-deadlock
-  follow-up) — explored without making the bus a workflow engine.
+RFC committed (`docs/rfc-identity-authz.md`); **Phase A delivered as
+`0.16.0`** (see below). Phases B/C/D remain: B is the operator-gated
+stdlib-crypto fork (stay stdlib-only / external signer / relax), C is
+real authz, D is replay/deletion hardening.
+
+#### ✅ Phase 3a (RFC Phase A) — `0.16.0` "trusted-team safety" — DELIVERED 2026-06-05
+Mission `trusted-team-safety-0160` (spec-kitty, 4 WPs, single serial
+lane; Claude implements, Codex per-WP review, CI matrix gate). Shipped:
+- **identity registry** in `config.json` with permanent non-rebindable
+  tombstones; history validated against the KNOWN roster (active ∪
+  retired) so a retired identity's past messages stay valid;
+- **`roster retire` / `rename --drain-check` / `remove [--force]` /
+  `forward --to-request`** — #9 safe-rename folds in here (retirement,
+  not rewrite); `remove` refuses by default with a retire hint;
+- **global epochs / send-time barriers** — `barrier bump`, epoch id =
+  the barrier message id, auto `epoch_at_send` (three-state), `check
+  --epoch` (fails closed on the exit code, fails open vs suppression —
+  documented);
+- **tool-visible `next_owner` / `next_action`** on open threads (the
+  soft-deadlock follow-up) — a pure read-only state projection;
+- **honest docs** — SECURITY.md states trusted-team-not-authz,
+  fail-open-vs-suppression, registry-no-more-trustworthy-than-roster.
+
+Still in later RFC phases (NOT in 0.16.0): per-agent crypto, policy
+permissions, hash-chain replay defense, enforceable `operator_facing`.
 
 ### Demoted / deferred
-- **#9 safe rename** — stays open as the feature ask; design folds into
-  the RFC (#19). Interim: documented drain-old → accept-as-old →
-  re-announce pattern.
+- **#9 safe rename** — ✅ DELIVERED in 0.16.0 as `roster rename
+  --drain-check` / `retire` (retirement-not-rewrite, non-rebindable
+  tombstones, history preserved). Closes the original ask.
 - **#11 reply-all** — deferred; role-scoped audiences + `reply --na` may
   dissolve most of the need. Revisit with production evidence after #15.
   Preserved design notes: participant set = opener + original recipients

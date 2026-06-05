@@ -77,14 +77,21 @@ def run(project_root: Path | None = None) -> Report:
     )
 
     store = Store(root)
-    report.checks.append(_check_init(store))
+    init_check = _check_init(store)
+    report.checks.append(init_check)
     # Multi-store detection runs UNCONDITIONALLY (not gated on an
     # initialized store): the split-brain layout (#13) is most dangerous
     # exactly when the user is confused about which store they're on —
     # including when the resolved root has no store at all.
     report.checks.append(_check_multi_store(root))
-    if store.initialized():
+    # Config-dependent checks are gated on a LOADABLE config: `_check_init`
+    # already reports a corrupt config as an `error` (e.g. an active∩retired
+    # overlap, #19), so running these would just re-raise the same
+    # ValueError and crash `doctor` instead of returning a report. The init
+    # error IS the registry-hygiene finding for that case.
+    if store.initialized() and init_check.status != "error":
         report.checks.append(_check_operator_facing(store))
+        report.checks.append(_check_identity_registry(store))
         report.checks.append(_check_store_hygiene(store))
         report.checks.extend(_check_skills())
         report.checks.append(_check_codex_config(root))
@@ -205,6 +212,45 @@ def _check_operator_facing(store: Store) -> Check:
         status="ok",
         details=f"liaison: {resolved}",
     )
+
+
+def _check_identity_registry(store: Store) -> Check:
+    """Identity registry health (#19 Phase A). Reports active/retired counts and
+    flags a dangling rename lineage. Trusted-team metadata only — advisory,
+    never an authorization boundary (config.json is no more trustworthy than the
+    roster). load_config already fail-closes on an active∩retired overlap or an
+    unsafe name, so a corrupt registry shows up as the init check erroring; this
+    check assumes a loadable config and surfaces the softer findings."""
+    cfg = store.load_config()
+    active = cfg.get("agents", []) or []
+    retired = store._retired_names(cfg)
+    data = {"active": len(active), "retired": len(retired)}
+    if not retired:
+        return Check(name="identity_registry", status="ok",
+                     details=f"{len(active)} active, 0 retired", data=data)
+    # Dangling lineage: a renamed_to that points at neither an active identity
+    # nor another tombstone. Not an error — the tombstone is still valid and its
+    # history stays readable; the named successor is simply absent (e.g. later
+    # force-removed). WARN so an operator notices.
+    known = set(active) | set(retired)
+    dangling = []
+    for e in cfg.get("retired") or []:
+        rn = e.get("renamed_to") if isinstance(e, dict) else None
+        if isinstance(rn, str) and rn and rn not in known:
+            dangling.append(f"{e.get('name')}->{rn}")
+    if dangling:
+        return Check(
+            name="identity_registry", status="warn",
+            details=(f"{len(active)} active, {len(retired)} retired; dangling "
+                     f"rename lineage: {', '.join(dangling)} (successor not in "
+                     f"the roster)"),
+            fix="informational — the tombstone stays valid; the successor is absent",
+            data={**data, "dangling": dangling})
+    return Check(
+        name="identity_registry", status="ok",
+        details=(f"{len(active)} active, {len(retired)} retired "
+                 f"(tombstones permanent; history stays valid)"),
+        data=data)
 
 
 def _check_store_hygiene(store: Store) -> Check:

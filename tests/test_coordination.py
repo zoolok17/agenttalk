@@ -394,6 +394,12 @@ def test_liaison_single_channel_invariant(tmp_path: Path, capsys) -> None:
 _PRE_014_THREAD_KEYS = {"request_id", "opener_kind", "subject", "peer", "role",
                         "state", "age_seconds", "last_msg_id", "unread"}
 
+# #19 Phase A: next_action / next_owner are UNIVERSAL on open threads (a pure
+# state projection — NOT feature-gated like responded_na etc.), so an OPEN
+# thread row carries them as baseline. They are surfaced by the CLI layer
+# (WP03), not Thread.to_dict; a CLOSED/terminal thread still omits them.
+_OPEN_THREAD_KEYS = _PRE_014_THREAD_KEYS | {"next_action", "next_owner"}
+
 
 def test_backcompat_json_shapes_without_new_features(tmp_path: Path, capsys) -> None:
     """A store driven only by pre-0.14.0 operations: every pre-existing
@@ -404,7 +410,10 @@ def test_backcompat_json_shapes_without_new_features(tmp_path: Path, capsys) -> 
     rows = _json_of(["threads", "--for", "alpha", "--all", "--json"], root, capsys)
     assert set(rows) == {"agent", "threads", "counts"}
     row = rows["threads"][0]
-    assert set(row) == _PRE_014_THREAD_KEYS
+    # The q-old thread is OPEN (alpha's open-outbound question) -> carries the
+    # universal next_action/next_owner hint; no OTHER new key leaks.
+    assert set(row) == _OPEN_THREAD_KEYS
+    assert row["next_action"] == "await-reply" and row["next_owner"] == "beta"
     # counts: the ONE documented always-present addition (WP01 NFR-001
     # carve-out, approved review round 3) - everything else unchanged.
     assert set(rows["counts"]) == {"reply-waiting", "owed-inbound",
@@ -671,7 +680,8 @@ def test_additivity_gates_extended_0150(tmp_path: Path, capsys) -> None:
     _run(["send", "--from", "alpha", "--to", "beta", "--kind", "question",
           "--meta", "request_id=q-old", "-m", "hello", "--quiet"], root)
     rows = _json_of(["threads", "--for", "alpha", "--all", "--json"], root, capsys)
-    assert set(rows["threads"][0]) == _PRE_014_THREAD_KEYS  # nothing new leaked
+    # open thread -> baseline + universal next_* hint; nothing else leaks.
+    assert set(rows["threads"][0]) == _OPEN_THREAD_KEYS
     status = _json_of(["status", "--json"], root, capsys)
     assert "quarantined" not in status
     assert set(status) == {"root", "session_id", "project_id",
@@ -700,3 +710,63 @@ def test_partial_fanout_warning_suppressed_by_rescind_e2e(tmp_path: Path, capsys
     rows = _json_of(["threads", "--for", "rev-a", "--all", "--json"], root, capsys)
     assert next(t for t in rows["threads"]
                 if t["request_id"] == "b-void")["state"] == "closed-superseded"
+
+
+# ===================================================== #19 Phase A (WP03/T017)
+# End-to-end: barrier -> epoch_at_send -> check --epoch; broadcast snapshot.
+
+def _opener_epoch(root: Path, rid: str):
+    """The epoch_at_send recorded on the opener for `rid` (sentinel-free:
+    returns the value, or raises if the opener is missing)."""
+    for m in Store(root).valid_messages():
+        if m.meta.get("request_id") == rid and m.kind in ("review-request",
+                                                           "question", "proposal"):
+            return m.meta.get("epoch_at_send", "__absent__")
+    raise AssertionError(f"no opener for {rid}")
+
+
+def test_epoch_e2e_barrier_stamp_and_check(tmp_path: Path, capsys) -> None:
+    root = _init_team(tmp_path, "alpha,beta")
+    # no barrier: opener has epoch_at_send == None (three-state null)
+    _run(["send", "--from", "alpha", "--to", "beta", "--kind", "review-request",
+          "--meta", "request_id=r0", "-m", "x", "--quiet"], root)
+    assert _opener_epoch(root, "r0") is None
+    assert _run(["check", "--for", "beta", "--to-request", "r0", "--epoch"], root) == 0
+
+    # fire a barrier; a NEW opener is stamped with the barrier id
+    b1 = _json_of(["barrier", "bump", "--from", "alpha", "--scope", "global",
+                   "-m", "e1", "--json"], root, capsys)["epoch"]
+    _run(["send", "--from", "alpha", "--to", "beta", "--kind", "review-request",
+          "--meta", "request_id=r1", "-m", "x", "--quiet"], root)
+    assert _opener_epoch(root, "r1") == b1
+    assert _run(["check", "--for", "beta", "--to-request", "r1", "--epoch"], root) == 0
+
+    # r0 (null stamp) is now older than the barrier -> previous-epoch (exit 3)
+    _run_expect_exit(["check", "--for", "beta", "--to-request", "r0", "--epoch"], root, 3)
+
+    # a second barrier makes r1 previous-epoch too
+    _run(["barrier", "bump", "--from", "beta", "--scope", "global", "-m", "e2"], root)
+    _run_expect_exit(["check", "--for", "beta", "--to-request", "r1", "--epoch"], root, 3)
+
+
+def test_broadcast_opener_shares_one_epoch_stamp(tmp_path: Path, capsys) -> None:
+    # B3: every copy of one broadcast_id opener carries the SAME epoch_at_send,
+    # snapshotted once before fan-out.
+    root = _init_team(tmp_path, "alpha,beta,gamma")
+    b = _json_of(["barrier", "bump", "--from", "alpha", "--scope", "global",
+                  "-m", "e", "--json"], root, capsys)["epoch"]
+    assert _run(["broadcast", "--from", "alpha", "--all", "--kind", "question",
+                 "--meta", "request_id=bq", "-m", "all?", "--quiet"], root) == 0
+    stamps = {m.recipient: m.meta.get("epoch_at_send")
+              for m in Store(root).valid_messages()
+              if m.meta.get("broadcast_id") == "bq" and m.sender == "alpha"}
+    assert set(stamps) == {"beta", "gamma"}
+    assert set(stamps.values()) == {b}          # one shared stamp
+
+
+def test_no_barrier_check_epoch_is_current(tmp_path: Path, capsys) -> None:
+    root = _init_team(tmp_path, "alpha,beta")
+    _run(["send", "--from", "alpha", "--to", "beta", "--kind", "review-request",
+          "--meta", "request_id=r", "-m", "x", "--quiet"], root)
+    # with no barrier in history, --epoch reports current (exit 0)
+    assert _run(["check", "--for", "beta", "--to-request", "r", "--epoch"], root) == 0

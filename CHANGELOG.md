@@ -5,6 +5,63 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-06-05
+
+Trusted-team safety release: Phase A of the identity/authz RFC
+(`docs/rfc-identity-authz.md`). Identity becomes a first-class registry
+with permanent tombstones, rename/retire stop rewriting history, a
+lightweight global-epoch barrier plus `check --epoch` give the team a
+clean "void the previous run" boundary, and open threads expose who owes
+the next move. **This is trusted-team safety, not authorization** — it
+assumes a cooperative roster and does NOT defend against a local peer
+that forges sends, edits `config.json`, or deletes messages (see
+SECURITY.md; later RFC phases B/C/D add real authz and replay hardening).
+
+### Added
+
+- **Identity registry + retirement.** A `retired` list in `config.json`
+  records permanent, non-rebindable tombstones. `agenttalk roster
+  retire <name>` retires an agent (it can no longer send; its name can
+  never be re-bound; its history stays valid). `roster rename <old>
+  <new> [--drain-check]` is retirement-not-rewrite: it tombstones `<old>`
+  (`renamed_to=<new>`), activates `<new>`, and carries over role / group
+  / operator-facing; `--drain-check` refuses while work is owed to/from
+  `<old>`. `roster remove` now refuses by default with a retire hint;
+  `--force` removes anyway and warns that historical readability breaks
+  (no tombstone — the name stays re-addable). Optional `roster forward
+  <retired> --to <live> --to-request <rid>` redirects a single owed
+  request, transcript-visible (`meta.forwarded_from` /
+  `forwarded_request_id`), single hop only.
+- **Global epoch barriers.** `agenttalk barrier bump --from <agent>
+  --scope global -m "<reason>"` fires one ordinary meta-marked message
+  (no new kind) whose message id becomes the global epoch. Any active
+  member may bump (a deliberate trusted-team global-stall lever).
+  Tracked openers automatically record `epoch_at_send` (three-state:
+  absent on pre-0.16 openers, `null` when no barrier has fired yet, the
+  barrier id once one has).
+- **`check --epoch`.** Extends the pre-action gate with the epoch
+  dimension: exit 0 current, exit 3 when the request predates the latest
+  barrier (previous-epoch, or a pre-epoch opener that must be re-asked).
+  Fails closed on the exit code so automation gating on it is safe.
+  Fails OPEN against barrier *suppression* (a deleted barrier) — trusted
+  team only, documented.
+- **Tool-visible next move.** `threads --json` / `sync --json` open
+  threads now carry read-only `next_owner` / `next_action`
+  (`reply` / `read-reply` / `await-reply` / `answer-operator`), a pure
+  projection of thread state — never settable, never affecting delivery
+  or closure. Terminal threads omit them.
+- **Doctor.** A new `identity_registry` check reports active/retired
+  counts and flags a dangling rename lineage.
+
+### Notes
+
+- Strictly additive over 0.15.0: a store with no retirements, no
+  barriers, and no epoch-aware openers behaves exactly as 0.15.0. New
+  message-meta keys are ignored by old readers. The one deliberate
+  absent-vs-null exception is `epoch_at_send` (see SECURITY.md).
+- Broadcast openers snapshot the epoch once before fan-out, so every
+  copy of one `broadcast_id` shares a single `epoch_at_send`.
+
 ## [0.15.0] - 2026-06-05
 
 Team-scope release: the remaining friction cluster from the four-agent

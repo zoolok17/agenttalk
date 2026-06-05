@@ -18,7 +18,7 @@ exported on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.15.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.16.0"
 agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
@@ -123,10 +123,10 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.15.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.16.0"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.15.0` with
+Pin to a specific tag so you control upgrades. Replace `v0.16.0` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
@@ -639,10 +639,12 @@ so the long timeout is free observability.
 | --- | --- |
 | `agenttalk init [--here] [--agents A,B]` | Create `.agenttalk/` in the current dir. Refuses to create a **nested store** when one exists up-tree (0.14.0) — `--force` for a deliberate sandbox. |
 | `agenttalk roster [--json]` | Show agents, roles, group memberships, and the resolved current identity. |
-| `agenttalk roster add <name> [--role R] [--group G]...` / `remove <name>` / `set-role <name> <role>` / `set-group <group> <a,b,c>` | Deliberate roster/group admin operations. Groups are validated roster subsets; `all` is implicit and reserved. |
+| `agenttalk roster add <name> [--role R] [--group G]...` / `remove <name> [--force]` / `set-role <name> <role>` / `set-group <group> <a,b,c>` | Deliberate roster/group admin operations. Groups are validated roster subsets; `all` is implicit and reserved. 0.16.0: `add` refuses a retired-tombstone name; `remove` is refused by default with a retire hint — `--force` removes anyway and warns that history-read breaks (no tombstone — re-addable). |
+| `agenttalk roster retire <name> [--reason R]` / `rename <old> <new> [--drain-check] [--reason R]` / `forward <retired> --to <live> --to-request RID [--from A]` | Identity lifecycle (0.16.0, #19). `retire` makes a **permanent tombstone** (can't send, name never re-bound, history stays valid). `rename` = retire `<old>`→tombstone + add `<new>`, carrying over role/group/operator-facing; `--drain-check` refuses while work is owed to/from `<old>`. `forward` redirects a single owed request to a live agent, transcript-visible. |
+| `agenttalk barrier bump --from A --scope global [-m REASON] [--json]` | Fire a **global epoch barrier** (0.16.0, #19): one meta-marked message whose id becomes the new epoch, marking everything before it as a previous epoch. Any active member may bump (trusted-team global-stall lever). Tracked openers after it record `epoch_at_send` automatically. |
 | `agenttalk whoami [--for A] [--json]` | Show effective root, resolved self and peer, roster membership, role/groups, unread count, and owed-thread count. Warns when identity is unresolved or not in the roster, which is often a wrong `--root` or env issue. |
 | `agenttalk status` | Show roster, per-agent cursor, unread count, and **actionable warnings**: never-acked unread, soft-deadlocks, unconsumed correlated replies, and stale outbound threads. |
-| `agenttalk threads [--for A] [--all] [--json]` | Derive request/reply thread state from validated messages. Default view shows actionable rows only (`reply-waiting`, `owed-inbound`, `open-outbound`); `--all` includes `closed`. |
+| `agenttalk threads [--for A] [--all] [--json]` | Derive request/reply thread state from validated messages. Default view shows actionable rows only (`reply-waiting`, `owed-inbound`, `open-outbound`); `--all` includes `closed`. 0.16.0: open rows in `--json` carry read-only `next_owner` / `next_action` (`reply`/`read-reply`/`await-reply`/`answer-operator`) — who owes the next move, a pure projection of state. |
 | `agenttalk sync --for A [--json]` | Rejoin digest: show identity, roster, actionable threads grouped by request id, terminal decisions, recent unread non-action messages, and deterministic next-action hints. Pure derivation; no cursor or threadstate writes. |
 | `agenttalk send --from A --to B [--kind K] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -)` | Drop a message into the bus. `--file -` reads the body from stdin. `review-request`, `question`, and `proposal` without `--meta request_id=...` get one minted + printed; `review-result` and `proposal-response` without one warn (soft, exit 0). |
 | `agenttalk broadcast --from A (--to-group G \| --all) [--kind message\|note\|question] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--print-id] [--quiet]` | Fan out one message per recipient, excluding the sender. Mints `broadcast_id=b-...`, stores it as `meta.broadcast_id` and `meta.request_id`, and prints the recipient list unless quiet. 0.15.0: `--to-role <role>` targets every member holding a role (frozen into each copy at send time); a PARTIAL fan-out exits **5** with a delivered/missed manifest — recover with `--resume <bid>` or rescind. |
@@ -653,7 +655,7 @@ so the long timeout is free observability.
 | `agenttalk composing --from A [--to-request RID] [-m "still drafting"]` | Send a `composing` ping so the peer's `wait` extends its deadline. Use periodically while you draft a long reply. The peer's `wait` consumes these as deadline-extension signals — they do NOT surface as a returned reply. With `--to-request` (0.14.0) the peer is derived from the thread, and a **reply-in-flight** marker shows up in their `threads`/`sync`. |
 | `agenttalk ack --for A [--id ID] [--to-request RID]` | Without `--to-request`, manually move an agent's global cursor forward. With `--to-request`, manually close that request thread for A and record the latest seen matching message without touching the global cursor. |
 | `agenttalk rescind --from A --to-request RID [--to-id MSG] [-m REASON]` | Mark a tracked request you opened as **no-longer-current** (0.14.0). Transcript-visible; the thread becomes `closed-superseded`, a peer blocked in `wait --to-request` wakes with exit 3, and `check` reports superseded. Requester-only. Prefer this over a prose "ignore my last message". |
-| `agenttalk check --for A --to-request RID [--json]` | **Pre-action currentness gate** (0.14.0): prints `current`/`superseded`/`unknown`, exits 0/3/4. Run it immediately before any irreversible action tied to a request — exit 3 is a hard stop. Read-only; a local `ack` never masks a rescind. |
+| `agenttalk check --for A --to-request RID [--epoch] [--json]` | **Pre-action currentness gate** (0.14.0): prints `current`/`superseded`/`unknown`, exits 0/3/4. Run it immediately before any irreversible action tied to a request — exit 3 is a hard stop. Read-only; a local `ack` never masks a rescind. 0.16.0 `--epoch` also checks the global epoch: exit **3** if the request predates the latest barrier (previous-epoch, or a pre-epoch opener to re-ask). Adds an additive `epoch` object to `--json`. |
 | `agenttalk escalate --from A (-m TEXT \| --file -) [--to X]` | Route an operator question to the **operator-facing agent** (0.14.0). Mints an `esc-` request_id (printed as `request_id=<id>`), refuses loudly when no liaison is configured. |
 | `agenttalk roster set-operator-facing <name>` / `--clear` | Designate the ONE agent the human operator talks to directly (0.14.0). Advisory routing metadata, single slot — "two liaisons" is unrepresentable. |
 | `agenttalk prune --invalid [--dry-run] [--json]` | Quarantine invalid message files into `.agenttalk/quarantine/` (0.15.0) — move-only and **recoverable** (restore = move the file back); the selection is exactly what status reports as INVALID; valid files untouched by construction. |

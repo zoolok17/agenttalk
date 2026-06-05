@@ -140,6 +140,14 @@ class Thread:
     na_response: bool = False
     batch_total: int | None = None
     audience_kind: str | None = None
+    # Read-only "who owes the next move" hint (0.16.0, #19 Phase A, FR-014/015).
+    # A PURE projection of the derived state — never sender-settable, never
+    # affects delivery/unread/closure. `next_owner` is an agent name, or (for an
+    # outstanding broadcast) the list of non-responders. Omitted on terminal
+    # threads. `next_action` is a closed vocabulary of the values actually
+    # produced by `_derive_next`: reply | read-reply | await-reply | answer-operator.
+    next_owner: str | list[str] | None = None
+    next_action: str | None = None
 
     def to_dict(self) -> dict:
         d = {
@@ -182,12 +190,53 @@ class Thread:
             d["batch_total"] = self.batch_total
         if self.audience_kind is not None:
             d["audience_kind"] = self.audience_kind
+        # NOTE (0.16.0, #19): next_owner / next_action are derived onto the
+        # Thread object (see `_derive_next`) but are deliberately NOT emitted
+        # here. They appear on EVERY open thread, so emitting them from to_dict
+        # would change the baseline thread JSON shape. Surfacing into
+        # `threads`/`sync --json` is done at the CLI layer (WP03/T015), which
+        # also owns the additivity gate tests — keeping the shape change in one
+        # place. Read `t.next_owner` / `t.next_action` off the Thread directly.
         return d
 
 
 def _is_na(m: Message) -> bool:
     """True when a message is marked not-applicable (#15)."""
     return (m.meta or {}).get("response") == "not-applicable"
+
+
+def _derive_next(t: "Thread", agent: str) -> tuple[str | None, object]:
+    """Map a derived thread to ``(next_action, next_owner)`` — who owes the next
+    move and what it is (0.16.0, #19 Phase A, FR-014/015).
+
+    A PURE projection of already-computed fields (``state``, ``needs_operator``,
+    ``operator_state``, ``peer``, broadcast ``pending``); it never reads
+    sender-supplied input and never affects delivery/unread/closure. Terminal
+    threads owe nothing → ``(None, None)``.
+
+    Note the state semantics (see ``derive_threads``): ``reply-waiting`` means a
+    reply addressed to ``agent`` is sitting UNREAD — the ball is back with
+    ``agent`` — whereas ``open-outbound`` means ``agent`` is waiting on the peer.
+
+    Produced ``next_action`` vocabulary (closed set — only these are emitted):
+    ``reply`` | ``read-reply`` | ``await-reply`` | ``answer-operator``.
+    """
+    if t.state in ("closed", "closed-superseded"):
+        return None, None
+    # An open operator escalation dominates: `agent` must get the operator's
+    # answer before the thread can progress.
+    if t.needs_operator and t.operator_state == "pending":
+        return "answer-operator", agent
+    if t.state == "owed-inbound":
+        return "reply", agent
+    if t.state == "reply-waiting":
+        # a reply to `agent` is unread — the ball is back with self
+        return "read-reply", agent
+    if t.state == "open-outbound":
+        if t.is_broadcast:
+            return "await-reply", (list(t.pending) if t.pending else None)
+        return "await-reply", t.peer
+    return None, None
 
 
 def _find_superseding_rescind(
@@ -555,6 +604,12 @@ def derive_threads(
             # not-applicable. Labeling only — closure mechanics unchanged.
             na_response=bool(terminal_msg is not None and _is_na(terminal_msg)),
         ))
+
+    # Read-only next-owner / next-action hint (#19 Phase A): a post-pass over
+    # the assembled rows (covers pairwise AND broadcast) — a pure projection of
+    # state, so it cannot affect any derivation above.
+    for t in threads:
+        t.next_action, t.next_owner = _derive_next(t, agent)
 
     # Stable, useful ordering: actionable first (by the ACTIONABLE_STATES
     # order), then terminal (closed / closed-superseded share a rank);

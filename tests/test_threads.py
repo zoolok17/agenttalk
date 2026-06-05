@@ -751,3 +751,77 @@ def test_plain_threads_emit_no_new_keys() -> None:
     d = derive_threads(msgs, agent="alpha", cursor="", now=_BASE)[0].to_dict()
     for k in ("responded_na", "na_response", "batch_total", "audience_kind"):
         assert k not in d
+
+
+# ===================================================== #19 Phase A (WP02)
+# Read-only next_owner / next_action derivation.
+
+def test_next_owed_inbound_is_self_reply() -> None:
+    msgs = [_msg("001", "alpha", "beta", "review-request", rid="r1")]
+    b = derive_threads(msgs, agent="beta", cursor="", now=_BASE)[0]
+    assert b.next_action == "reply" and b.next_owner == "beta"
+    # Surfacing into JSON is the CLI's job (WP03); to_dict stays shape-stable.
+    assert "next_action" not in b.to_dict()
+
+
+def test_next_open_outbound_is_await_peer() -> None:
+    msgs = [_msg("001", "alpha", "beta", "review-request", rid="r1")]
+    a = derive_threads(msgs, agent="alpha", cursor="", now=_BASE)[0]
+    assert a.state == "open-outbound"
+    assert a.next_action == "await-reply" and a.next_owner == "beta"
+
+
+def test_next_reply_waiting_is_self_read() -> None:
+    msgs = [
+        _msg("001", "alpha", "beta", "review-request", rid="r1"),
+        _msg("002", "beta", "alpha", "review-result", rid="r1", status="approved"),
+    ]
+    a = derive_threads(msgs, agent="alpha", cursor="", now=_BASE)[0]
+    assert a.state == "reply-waiting"
+    assert a.next_action == "read-reply" and a.next_owner == "alpha"
+
+
+def test_next_omitted_on_closed_thread() -> None:
+    msgs = [
+        _msg("001", "alpha", "beta", "review-request", rid="r1"),
+        _msg("002", "beta", "alpha", "review-result", rid="r1", status="approved"),
+    ]
+    # consumed by alpha (cursor past the verdict) -> closed
+    a = derive_threads(msgs, agent="alpha", cursor="002", now=_BASE)[0]
+    assert a.state == "closed"
+    assert a.next_action is None and a.next_owner is None
+
+
+def test_next_answer_operator_when_escalation_pending() -> None:
+    opener = _msg("001", "alpha", "beta", "question", rid="r1")
+    opener.meta["needs_operator"] = True
+    b = derive_threads([opener], agent="beta", cursor="", now=_BASE)[0]
+    assert b.needs_operator and b.operator_state == "pending"
+    assert b.next_action == "answer-operator" and b.next_owner == "beta"
+
+
+def test_next_broadcast_open_outbound_lists_non_responders() -> None:
+    # alpha broadcasts to beta + gamma; beta answers AND alpha has consumed
+    # that reply (cursor past it) -> gamma still owes -> open-outbound.
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="b1", audience="all"),
+        _msg("002", "alpha", "gamma", "question", rid="b1", audience="all"),
+        _msg("003", "beta", "alpha", "message", rid="b1"),
+    ]
+    a = derive_threads(msgs, agent="alpha", cursor="003", now=_BASE)[0]
+    assert a.is_broadcast and a.state == "open-outbound"
+    assert a.next_action == "await-reply"
+    assert a.next_owner == ["gamma"]          # exactly the non-responder
+
+
+def test_to_dict_never_emits_next_fields() -> None:
+    # to_dict() stays shape-stable for ALL thread states — next_* live on the
+    # Thread object and are surfaced into JSON by the CLI layer (WP03), not
+    # here. This keeps the 0.15.0 additivity gates green at the library layer.
+    open_msgs = [_msg("001", "alpha", "beta", "review-request", rid="r1")]
+    closed_msgs = open_msgs + [
+        _msg("002", "beta", "alpha", "review-result", rid="r1", status="approved"),
+    ]
+    for msgs, cur in ((open_msgs, ""), (closed_msgs, "002")):
+        d = derive_threads(msgs, agent="alpha", cursor=cur, now=_BASE)[0].to_dict()
+        assert "next_action" not in d and "next_owner" not in d

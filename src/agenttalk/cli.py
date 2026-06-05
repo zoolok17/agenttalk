@@ -16,6 +16,7 @@ from agenttalk.display import render
 from agenttalk.store import (
     COMPOSING_INTENT_STALE_SECONDS,
     CONTROL_KINDS,
+    OPENER_KINDS,
     Store,
     find_root,
     find_stores_upward,
@@ -555,6 +556,20 @@ def _thread_warnings(store: Store, cfg: dict) -> list[str]:
     return out
 
 
+def _inject_next(d: dict, t) -> None:
+    """Add next_action / next_owner to a thread row dict when derivable (#19).
+
+    These are derived onto the Thread (WP02) but deliberately NOT emitted by
+    Thread.to_dict() — they appear on every open thread, so emitting them there
+    would change the baseline JSON shape and trip the 0.15.0 additivity gates.
+    Surfacing is done here, at the CLI layer, conditionally (terminal threads
+    omit both)."""
+    if getattr(t, "next_action", None) is not None:
+        d["next_action"] = t.next_action
+    if getattr(t, "next_owner", None) is not None:
+        d["next_owner"] = t.next_owner
+
+
 def cmd_threads(args: argparse.Namespace) -> int:
     """Show open request/reply threads from one agent's perspective.
 
@@ -583,6 +598,10 @@ def cmd_threads(args: argparse.Namespace) -> int:
             # additive, and only meaningful while you're the one waiting.
             if t.state == "open-outbound" and _reply_in_flight(store, t):
                 d["reply_in_flight"] = True
+            # next-owner / next-action hint (#19 Phase A): derived onto the
+            # Thread by WP02; surfaced HERE (not in to_dict, which stays
+            # shape-stable). Conditional → terminal threads omit both.
+            _inject_next(d, t)
             out_rows.append(d)
         print(json.dumps({
             "agent": agent,
@@ -699,7 +718,22 @@ def cmd_send(args: argparse.Namespace) -> int:
     store = _get_store(args)
     cfg = store.load_config()
     roster = cfg.get("agents") or []
+    # #19 FR-004: give a tombstone-specific explanation before the generic
+    # "not in roster" path. A retired identity is removed from the active
+    # roster, so it would otherwise just look like an unknown agent.
+    retired = set(store._retired_names(cfg))
+    cand = args.sender or os.environ.get("AGENTTALK_SELF")
+    if cand in retired:
+        sys.stderr.write(
+            f"agenttalk send: {cand!r} is retired (a tombstone) and cannot "
+            f"send (#19). Its history stays valid; see `agenttalk roster`.\n")
+        return 2
     sender = _resolve_self(args.sender, roster=roster)
+    if args.recipient in retired:
+        sys.stderr.write(
+            f"agenttalk send: {args.recipient!r} is retired (a tombstone) and "
+            f"cannot receive new messages (#19). See `agenttalk roster`.\n")
+        return 2
     recipient = _resolve_peer(args.recipient, cfg, sender)
     body = _read_body(args)
     if not body and not args.allow_empty:
@@ -859,6 +893,36 @@ def cmd_rescind(args: argparse.Namespace) -> int:
     return 0
 
 
+_EPOCH_ABSENT = object()  # sentinel: opener has NO epoch_at_send key (pre-0.16)
+
+
+def _epoch_verdict(store: Store, rid: str) -> tuple[str, str | None, int]:
+    """The epoch dimension of `check --epoch` (#19 Phase A, B1).
+
+    Returns ``(epoch_state, current_epoch_id, exit_code)``:
+      - no barrier exists at all            -> ("current", None, 0)
+      - epoch_at_send == current epoch      -> ("current", <id>, 0)
+      - epoch_at_send older / null          -> ("previous-epoch", <id>, 3)
+      - epoch_at_send ABSENT + barrier exists-> ("unknown-pre-epoch", <id>, 3)
+    `null`/None sorts older than any real id. An absent stamp (a pre-0.16 opener)
+    with a live barrier fails CLOSED (exit 3) — automation gates on the exit code
+    and a pre-epoch opener must be re-asked for irreversible actions.
+    """
+    current = store.current_epoch()
+    if current is None:
+        return "current", None, 0
+    ea: object = _EPOCH_ABSENT
+    for m in store.valid_messages():
+        if m.kind in OPENER_KINDS and (m.meta or {}).get("request_id") == rid:
+            ea = (m.meta or {}).get("epoch_at_send", _EPOCH_ABSENT)
+            break
+    if ea is _EPOCH_ABSENT:
+        return "unknown-pre-epoch", current, 3
+    if ea == current:
+        return "current", current, 0
+    return "previous-epoch", current, 3
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """The pre-action currentness gate (#12): current | superseded | unknown.
 
@@ -904,12 +968,36 @@ def cmd_check(args: argparse.Namespace) -> int:
                 print(f"  reason: {row.rescind_reason}")
             print("  do NOT act on this request — a fresh exchange needs a new request_id.")
         return 3
+    # Rescind dimension is current. With --epoch, ALSO check the global epoch
+    # (#19). The top-level "state" keeps its rescind meaning (current); the
+    # epoch dimension is reported in the additive "epoch" object and can drive
+    # exit 3 on its own (data-model §4).
+    epoch_obj = None
+    exit_code = 0
+    if getattr(args, "epoch", False):
+        epoch_state, cur_epoch, exit_code = _epoch_verdict(store, rid)
+        epoch_obj = {"state": epoch_state, "current_epoch": cur_epoch}
     if args.json:
-        print(json.dumps({"request_id": rid, "state": "current",
-                          "rescind": None}, indent=2))
+        out = {"request_id": rid, "state": "current", "rescind": None}
+        if epoch_obj is not None:
+            out["epoch"] = epoch_obj
+        print(json.dumps(out, indent=2))
     else:
-        print(f"current     {rid}")
-    return 0
+        if exit_code == 0:
+            print(f"current     {rid}")
+            if epoch_obj is not None:
+                print(f"  epoch: current ({epoch_obj['current_epoch'] or 'no barrier'})")
+        elif epoch_obj["state"] == "previous-epoch":
+            print(f"previous-epoch  {rid}")
+            print(f"  this request predates the current global epoch "
+                  f"({epoch_obj['current_epoch']}) — do NOT act on it; re-ask "
+                  f"under the current barrier for irreversible actions.")
+        else:  # unknown-pre-epoch
+            print(f"pre-epoch   {rid}")
+            print(f"  this opener predates epochs (no epoch_at_send) and a "
+                  f"barrier exists ({epoch_obj['current_epoch']}) — do NOT act; "
+                  f"re-ask under the current barrier for irreversible actions.")
+    return exit_code
 
 
 def cmd_prune(args: argparse.Namespace) -> int:
@@ -1220,6 +1308,11 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     # did not (exit 5) instead of dying silently partway — there is no
     # multi-file atomicity on a local FS, so honesty replaces rollback.
     failure: Exception | None = None
+    # B3 (#19): snapshot the global epoch ONCE for the whole fan-out, so every
+    # copy of this broadcast_id shares one epoch_at_send even if a barrier lands
+    # mid-loop (send() leaves a supplied value intact; --resume preserves it
+    # from the frozen copies). Only opener kinds carry an epoch stamp.
+    epoch_snapshot = store.current_epoch() if args.kind in OPENER_KINDS else None
     for r in recipients:
         meta = dict(meta_base)
         # Reuse request_id as the correlation token (so existing
@@ -1235,6 +1328,10 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
             meta["audience_role"] = target
         meta["audience_resolved"] = ",".join(recipients)
         meta["batch_total"] = str(len(recipients))
+        if args.kind in OPENER_KINDS:
+            # one epoch for the whole batch (B3); pre-set so send() does not
+            # recompute current_epoch() per copy.
+            meta["epoch_at_send"] = epoch_snapshot
         try:
             msg = store.send(
                 sender=sender, recipient=r, body=body,
@@ -1282,6 +1379,44 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_barrier(args: argparse.Namespace) -> int:
+    """Fire a global epoch barrier (#19 Phase A, RFC §"Global Epochs").
+
+    A barrier is ONE ordinary, self-addressed `kind=message` carrying
+    `meta.barrier={version,scope:global,type:epoch-bump}` — NOT a new kind, NOT
+    a fan-out — whose message id becomes the new global epoch. Any ACTIVE
+    roster member may bump (a deliberate trusted-team global-stall lever);
+    `_resolve_self` already refuses a retired/unknown sender with exit 2.
+    Agents then run `check --to-request <rid> --epoch` before acting on
+    anything opened before this point.
+    """
+    store = _get_store(args)
+    action = getattr(args, "barrier_cmd", None)
+    if action != "bump":
+        sys.stderr.write("agenttalk barrier: the only action is `bump`.\n")
+        return 2
+    scope = getattr(args, "scope", "global") or "global"
+    if scope != "global":
+        sys.stderr.write(
+            f"agenttalk barrier bump: --scope must be 'global' in this release "
+            f"(got {scope!r}); other scopes are reserved.\n")
+        return 2
+    sender = _resolve_self(getattr(args, "from_agent", None),
+                           roster=store.load_config().get("agents") or [])
+    msg = store.send(
+        sender=sender, recipient=sender, kind="message",
+        subject="epoch bump", body=getattr(args, "message", None) or "",
+        meta={"barrier": {"version": 1, "scope": "global", "type": "epoch-bump"}},
+    )
+    if getattr(args, "json", False):
+        print(json.dumps({"epoch": msg.id, "scope": "global"}, indent=2))
+    else:
+        print(f"barrier: global epoch bumped — new epoch id {msg.id}")
+        print("  run `agenttalk check --to-request <rid> --epoch` before acting "
+              "on anything opened before this point.")
+    return 0
+
+
 def cmd_roster(args: argparse.Namespace) -> int:
     """View or manage the roster, roles, and groups.
 
@@ -1297,8 +1432,62 @@ def cmd_roster(args: argparse.Namespace) -> int:
         print(f"roster: added {args.name}")
         return 0
     if action == "remove":
+        # FR-007: refuse by default with a retire hint; --force removes
+        # mechanically (no tombstone) and warns about history-read breakage.
+        # The store primitive stays mechanical; this is the policy/UX layer.
+        if not getattr(args, "force", False):
+            sys.stderr.write(
+                f"agenttalk roster remove: removing {args.name!r} breaks "
+                f"historical readability for its messages. Use "
+                f"`agenttalk roster retire {args.name}` to keep history valid "
+                f"(recommended), or pass --force to remove anyway.\n")
+            return 2
         store.remove_agent(args.name)
+        sys.stderr.write(
+            f"WARNING: removed {args.name!r} with --force; its historical "
+            f"messages will now FAIL roster validation (no tombstone kept). "
+            f"`roster retire` is the safe alternative.\n")
         print(f"roster: removed {args.name}")
+        return 0
+    if action == "retire":
+        # #19 Phase A: permanent tombstone. ValueError (not active / already
+        # retired) -> exit 2 via main().
+        cfg2 = store.retire_agent(args.name, reason=getattr(args, "reason", None))
+        if getattr(args, "json", False):
+            print(json.dumps({"retired": cfg2.get("retired", [])}, indent=2))
+            return 0
+        print(f"roster: retired {args.name} — permanent tombstone; its name "
+              f"cannot be re-bound and its history stays valid.")
+        return 0
+    if action == "rename":
+        old, new = args.old, args.new
+        if getattr(args, "drain_check", False):
+            owed = store._drain_check(old)
+            if owed:
+                sys.stderr.write(
+                    f"agenttalk roster rename: {old!r} still has "
+                    f"{len(owed)} open thread(s) owed to/from it:\n")
+                for r in owed:
+                    sys.stderr.write(
+                        f"  {r.get('request_id')}  {r.get('state')}  "
+                        f"(peer {r.get('peer')})\n")
+                sys.stderr.write(
+                    "drain them, or omit --drain-check to rename anyway.\n")
+                return 2
+        store.rename_agent(old, new, reason=getattr(args, "reason", None))
+        print(f"roster: renamed {old} -> {new} ({old} is now a tombstone; "
+              f"role / groups / operator-facing carried over to {new}).")
+        return 0
+    if action == "forward":
+        # B4: forward a specific owed request from a retired identity to a live
+        # agent. ValueError (not retired / not active / not owed / second hop /
+        # missing sender) -> exit 2 via main().
+        msg = store.forward_retired(
+            args.name, args.to, args.to_request,
+            from_agent=getattr(args, "from_agent", None),
+            reason=getattr(args, "reason", None))
+        print(f"roster: forwarded {args.name}'s request {args.to_request} "
+              f"to {args.to} (sender {msg.sender}; note {msg.id}).")
         return 0
     if action == "set-role":
         store.set_role(args.name, args.role)
@@ -1808,6 +1997,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         d["owe"] = _owe.get(t.state, "-")
         d["last_decision"] = _last_decision(t.request_id)
         d["hint"] = _hint(t)
+        _inject_next(d, t)  # #19 next-owner / next-action hint (CLI-surfaced)
         thread_payload.append(d)
 
     # Unread FYI: messages addressed to me, newer than my cursor, that are
@@ -2521,9 +2711,50 @@ def build_parser() -> argparse.ArgumentParser:
     r_add.add_argument("--group", action="append",
                        help="Add the agent to this group (repeatable).")
     r_add.set_defaults(func=cmd_roster)
-    r_rm = rsub.add_parser("remove", help="Remove an agent from roster/roles/groups.")
+    r_rm = rsub.add_parser(
+        "remove",
+        help="Remove an agent (refused by default — use `retire` to keep "
+             "history valid; --force removes anyway and breaks historical "
+             "readability for that agent's messages).")
     r_rm.add_argument("name")
+    r_rm.add_argument("--force", action="store_true",
+                      help="Remove despite history-read breakage (no tombstone; "
+                           "the name stays re-addable).")
     r_rm.set_defaults(func=cmd_roster)
+    r_ret = rsub.add_parser(
+        "retire",
+        help="Retire an agent to a PERMANENT tombstone (#19): it can no longer "
+             "send, its name can never be re-bound, but its history stays valid. "
+             "The safe alternative to `remove`.")
+    r_ret.add_argument("name")
+    r_ret.add_argument("--reason", help="Optional audit note.")
+    r_ret.add_argument("--json", action="store_true",
+                       help='Emit the updated registry slice {"retired": [...]}.')
+    r_ret.set_defaults(func=cmd_roster)
+    r_ren = rsub.add_parser(
+        "rename",
+        help="Safe rename = retire <old> (tombstone -> <new>) + add <new>, "
+             "carrying over role/groups/operator-facing. History stays valid; "
+             "<old> is non-rebindable.")
+    r_ren.add_argument("old")
+    r_ren.add_argument("new")
+    r_ren.add_argument("--drain-check", action="store_true",
+                       help="Refuse if any open thread is owed to/from <old>.")
+    r_ren.add_argument("--reason", help="Optional audit note.")
+    r_ren.set_defaults(func=cmd_roster)
+    r_fwd = rsub.add_parser(
+        "forward",
+        help="Forward a specific owed request from a retired identity to a live "
+             "agent (single hop; transcript-visible).")
+    r_fwd.add_argument("name", help="The retired identity to forward from.")
+    r_fwd.add_argument("--to", required=True, help="The live agent to forward to.")
+    r_fwd.add_argument("--to-request", required=True,
+                       help="The request_id owed to/from the retired identity.")
+    r_fwd.add_argument("--from", dest="from_agent",
+                       help="Sender of the forward note (active; defaults to the "
+                            "operator-facing identity). Never the target.")
+    r_fwd.add_argument("--reason", help="Optional audit note / body.")
+    r_fwd.set_defaults(func=cmd_roster)
     r_sr = rsub.add_parser("set-role", help="Set an agent's role.")
     r_sr.add_argument("name")
     r_sr.add_argument("role")
@@ -2632,9 +2863,32 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Agent name (default: $AGENTTALK_SELF)")
     pchk.add_argument("--to-request", dest="to_request", required=True,
                       help="request_id to check.")
+    pchk.add_argument("--epoch", action="store_true",
+                      help="Also check the global epoch (#19): exit 3 if the "
+                           "request predates the latest barrier (stale / "
+                           "previous-epoch / pre-epoch). Run before irreversible "
+                           "actions after an epoch boundary.")
     pchk.add_argument("--json", action="store_true",
                       help='{"request_id", "state", "rescind"} — stable contract.')
     pchk.set_defaults(func=cmd_check)
+
+    pbar = sub.add_parser(
+        "barrier",
+        help="Fire a global epoch barrier (#19): marks everything before it as "
+             "a previous epoch. `barrier bump --from <agent> --scope global "
+             "-m <reason>`. Any active member may bump (trusted-team only).",
+    )
+    barsub = pbar.add_subparsers(dest="barrier_cmd")
+    pbar_bump = barsub.add_parser("bump", help="Bump the global epoch.")
+    pbar_bump.add_argument("--from", dest="from_agent",
+                           help="Bumping agent (active; default $AGENTTALK_SELF).")
+    pbar_bump.add_argument("--scope", default="global",
+                           help="Only 'global' in this release (reserved).")
+    pbar_bump.add_argument("-m", "--message", help="Audit reason (body).")
+    pbar_bump.add_argument("--json", action="store_true",
+                           help='{"epoch", "scope"}.')
+    pbar_bump.set_defaults(func=cmd_barrier)
+    pbar.set_defaults(func=cmd_barrier, barrier_cmd=None)
 
     pprn = sub.add_parser(
         "prune",

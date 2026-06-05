@@ -20,6 +20,7 @@ from agenttalk.store import (
     validate_agent_name,
     validate_agent_roster,
     validate_rescind,
+    validate_retired,
 )
 
 
@@ -611,3 +612,289 @@ def test_quarantine_embedded_id_collision_moves_invalid_only(store: Store) -> No
     assert not bad.exists()                      # invalid moved
     assert valid.read_bytes() == valid_bytes     # valid byte-identical
     assert store.quarantined_count() == 1
+
+
+# ============================================================= #19 Phase A
+# Identity registry, retirement & epoch store layer (WP01).
+
+def _store3(tmp_path: Path) -> Store:
+    """A fresh 3-agent store (alpha, beta, gamma)."""
+    s = Store(tmp_path)
+    s.init(["alpha", "beta", "gamma"])
+    return s
+
+
+def _opener(store: Store, sender: str, recipient: str, rid: str):
+    return store.send(sender=sender, recipient=recipient, kind="review-request",
+                      subject="r", body="please review", meta={"request_id": rid})
+
+
+# --- T001: retired registry validation ------------------------------------
+
+def test_validate_retired_accepts_well_formed() -> None:
+    validate_retired(
+        [{"name": "codex", "retired_at": "2026-01-01T00:00:00Z",
+          "renamed_to": "codex-rev", "reason": "renamed"}],
+        ["claude", "codex-rev"],
+    )
+
+
+def test_validate_retired_rejects_overlap_with_active() -> None:
+    with pytest.raises(ValueError, match="active XOR retired"):
+        validate_retired([{"name": "alpha"}], ["alpha", "beta"])
+
+
+def test_validate_retired_rejects_duplicate_tombstone() -> None:
+    with pytest.raises(ValueError, match="duplicate tombstone"):
+        validate_retired([{"name": "x"}, {"name": "X"}], [])  # case-variant dup
+
+
+def test_validate_retired_rejects_unsafe_name_and_renamed_to() -> None:
+    with pytest.raises(ValueError):
+        validate_retired([{"name": "../escape"}], [])
+    with pytest.raises(ValueError):
+        validate_retired([{"name": "ok", "renamed_to": "../bad"}], [])
+
+
+def test_load_config_rejects_corrupt_retired(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    cfg = s.load_config()
+    cfg["retired"] = [{"name": "alpha"}]  # alpha is active -> overlap
+    s._write_config(cfg)
+    with pytest.raises(ValueError, match="corrupt config"):
+        s.load_config()
+
+
+# --- T002: active / retired / known roster + history validation -----------
+
+def test_roster_views_and_history_validation(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    _opener(s, "gamma", "alpha", "rid-hist")          # gamma authored history
+    s.retire_agent("gamma")
+    assert "gamma" not in s.active_agents()
+    assert "gamma" in s.retired_agents()
+    assert "gamma" in s.known_agents()
+    # gamma's historical opener still validates (known roster), not quarantined
+    rids = {(m.meta or {}).get("request_id") for m in s.valid_messages()}
+    assert "rid-hist" in rids
+    assert s.quarantined_count() == 0
+    assert not s.list_invalid_messages()
+
+
+# --- T003: retire / rename ------------------------------------------------
+
+def test_retire_agent_drops_role_group_liaison(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    s.set_role("gamma", "reviewer")
+    s.set_group("revs", ["gamma"])
+    s.set_operator_facing("gamma")
+    s.retire_agent("gamma", reason="left")
+    cfg = s.load_config()
+    assert "gamma" not in cfg["agents"]
+    assert cfg["roles"].get("gamma") is None
+    assert "gamma" not in cfg["groups"].get("revs", [])
+    assert cfg.get("operator_facing") is None
+    tomb = [e for e in cfg["retired"] if e["name"] == "gamma"][0]
+    assert tomb["renamed_to"] is None and tomb["reason"] == "left"
+
+
+def test_retire_agent_refuses_unknown_or_already_retired(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    with pytest.raises(ValueError, match="not in the active roster"):
+        s.retire_agent("nobody")
+    s.retire_agent("gamma")
+    with pytest.raises(ValueError, match="already retired"):
+        s.retire_agent("gamma")
+
+
+def test_rename_agent_carries_role_and_liaison(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    s.set_role("gamma", "reviewer")
+    s.set_group("revs", ["gamma"])
+    s.set_operator_facing("gamma")
+    s.rename_agent("gamma", "gamma-rev", reason="role split")
+    cfg = s.load_config()
+    assert "gamma-rev" in cfg["agents"] and "gamma" not in cfg["agents"]
+    assert cfg["roles"]["gamma-rev"] == "reviewer"
+    assert "gamma-rev" in cfg["groups"]["revs"]
+    assert cfg["operator_facing"] == "gamma-rev"
+    tomb = [e for e in cfg["retired"] if e["name"] == "gamma"][0]
+    assert tomb["renamed_to"] == "gamma-rev"
+    # new identity got a cursor file
+    assert (s.state_dir / "gamma-rev.cursor").exists()
+
+
+def test_rename_refuses_old_not_active_or_new_already_known(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    with pytest.raises(ValueError, match="not in the active roster"):
+        s.rename_agent("nobody", "x")
+    with pytest.raises(ValueError, match="already an active identity"):
+        s.rename_agent("gamma", "alpha")
+    s.retire_agent("beta")
+    with pytest.raises(ValueError, match="retired tombstone"):
+        s.rename_agent("gamma", "beta")        # non-rebindable to a tombstone
+
+
+# --- B2: add_agent / non-rebindable guard ---------------------------------
+
+def test_add_agent_refuses_retired_tombstone(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    s.retire_agent("gamma")
+    with pytest.raises(ValueError, match="retired tombstone"):
+        s.add_agent("gamma")
+    with pytest.raises(ValueError, match="retired tombstone"):
+        s.add_agent("GAMMA")                   # case-insensitive
+    # config never got a name in both lists
+    cfg = s.load_config()
+    assert "gamma" not in cfg["agents"]
+
+
+def test_force_removed_name_is_re_addable(tmp_path: Path) -> None:
+    # remove_agent leaves NO tombstone, so the name stays re-addable (the
+    # documented distinction from retire). The CLI gates --force; the store
+    # primitive removes mechanically.
+    s = _store3(tmp_path)
+    s.remove_agent("gamma")
+    assert "gamma" not in s.active_agents()
+    assert "gamma" not in s.retired_agents()
+    s.add_agent("gamma")                       # no tombstone -> allowed
+    assert "gamma" in s.active_agents()
+
+
+# --- T003: _drain_check ---------------------------------------------------
+
+def test_drain_check_reports_owed_then_empty(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    _opener(s, "alpha", "gamma", "rid-owed")   # gamma owes a review-result
+    owed = s._drain_check("gamma")
+    assert any(r["request_id"] == "rid-owed" for r in owed)
+    # alpha gets its review-result -> thread closes -> no longer owed
+    s.send(sender="gamma", recipient="alpha", kind="review-result",
+           subject="r", body="lgtm",
+           meta={"request_id": "rid-owed", "status": "approved"})
+    assert s._drain_check("gamma") == []
+
+
+# --- T004: retired-send refusal -------------------------------------------
+
+def test_retired_cannot_send_or_receive(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    s.retire_agent("gamma")
+    with pytest.raises(ValueError, match="retired .*cannot send"):
+        s.send(sender="gamma", recipient="alpha", body="hi")
+    with pytest.raises(ValueError, match="retired .*cannot receive"):
+        s.send(sender="alpha", recipient="gamma", body="hi")
+
+
+# --- T005: single-hop retired forwarding (B4) -----------------------------
+
+def test_forward_retired_happy_path(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    _opener(s, "alpha", "gamma", "rid-fwd")    # owed to/from gamma
+    s.retire_agent("gamma")
+    msg = s.forward_retired("gamma", "beta", "rid-fwd", from_agent="alpha",
+                            reason="gamma left")
+    assert msg.kind == "note" and msg.recipient == "beta" and msg.sender == "alpha"
+    assert msg.meta["forwarded_from"] == "gamma"
+    assert msg.meta["forwarded_request_id"] == "rid-fwd"
+    assert msg.meta["forward"]["hop"] == 1
+
+
+def test_forward_retired_uses_liaison_when_no_from(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    _opener(s, "beta", "gamma", "rid-l")
+    s.set_operator_facing("alpha")
+    s.retire_agent("gamma")
+    msg = s.forward_retired("gamma", "beta", "rid-l")
+    assert msg.sender == "alpha"               # operator_facing default
+
+
+def test_forward_retired_refusals(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    _opener(s, "alpha", "gamma", "rid-x")
+    # active source refused
+    with pytest.raises(ValueError, match="not a retired identity"):
+        s.forward_retired("gamma", "beta", "rid-x", from_agent="alpha")
+    s.retire_agent("gamma")
+    # non-owed request refused (gamma is not a participant in rid-other)
+    _opener(s, "alpha", "beta", "rid-other")
+    with pytest.raises(ValueError, match="owed to/from"):
+        s.forward_retired("gamma", "beta", "rid-other", from_agent="alpha")
+    # missing sender (no --from, no liaison) refused
+    with pytest.raises(ValueError, match="explicit --from"):
+        s.forward_retired("gamma", "beta", "rid-x")
+    # target must be active
+    with pytest.raises(ValueError, match="not in the active roster"):
+        s.forward_retired("gamma", "nobody", "rid-x", from_agent="alpha")
+
+
+def test_forward_retired_refuses_closed_thread(tmp_path: Path) -> None:
+    # Codex WP01 B1: a request that is no longer outstanding cannot be
+    # forwarded — there is no obligation to redirect.
+    s = _store3(tmp_path)
+    _opener(s, "alpha", "gamma", "rid-done")
+    s.send(sender="gamma", recipient="alpha", kind="review-result",
+           subject="r", body="lgtm",
+           meta={"request_id": "rid-done", "status": "approved"})
+    s.retire_agent("gamma")
+    with pytest.raises(ValueError, match="not an open thread"):
+        s.forward_retired("gamma", "beta", "rid-done", from_agent="alpha")
+
+
+def test_forward_retired_refuses_second_hop(tmp_path: Path) -> None:
+    # Codex WP01 B2: a request may be forwarded at most once.
+    s = _store3(tmp_path)
+    _opener(s, "alpha", "gamma", "rid-once")
+    s.retire_agent("gamma")
+    s.forward_retired("gamma", "beta", "rid-once", from_agent="alpha")
+    with pytest.raises(ValueError, match="already forwarded"):
+        s.forward_retired("gamma", "beta", "rid-once", from_agent="alpha")
+
+
+# --- T006: current_epoch + epoch_at_send three-state ----------------------
+
+def _barrier(store: Store, sender: str = "alpha"):
+    return store.send(sender=sender, recipient=sender, kind="message",
+                      subject="epoch bump", body="void prior run",
+                      meta={"barrier": {"version": 1, "scope": "global",
+                                        "type": "epoch-bump"}})
+
+
+def test_current_epoch_none_then_latest(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    assert s.current_epoch() is None
+    b1 = _barrier(s)
+    assert s.current_epoch() == b1.id
+    b2 = _barrier(s, "beta")
+    assert s.current_epoch() == b2.id          # latest by id order
+
+
+def test_current_epoch_ignores_malformed_barrier(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    s.send(sender="alpha", recipient="alpha", kind="message", body="x",
+           meta={"barrier": {"scope": "local"}})   # not global / no version
+    assert s.current_epoch() is None
+
+
+def test_epoch_at_send_three_state(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    # non-opener -> no key
+    note = s.send(sender="alpha", recipient="beta", kind="note", body="hi")
+    assert "epoch_at_send" not in note.meta
+    # opener, no barrier yet -> null (key present, value None)
+    o1 = _opener(s, "alpha", "beta", "r1")
+    assert "epoch_at_send" in o1.meta and o1.meta["epoch_at_send"] is None
+    # opener after a barrier -> stamped with the barrier id
+    b = _barrier(s)
+    o2 = _opener(s, "alpha", "beta", "r2")
+    assert o2.meta["epoch_at_send"] == b.id
+
+
+def test_epoch_at_send_respects_supplied_value(tmp_path: Path) -> None:
+    # B3 precondition: a caller-supplied epoch_at_send is NOT overwritten.
+    s = _store3(tmp_path)
+    _barrier(s)
+    o = s.send(sender="alpha", recipient="beta", kind="review-request",
+               subject="r", body="x",
+               meta={"request_id": "rb", "epoch_at_send": "PINNED"})
+    assert o.meta["epoch_at_send"] == "PINNED"

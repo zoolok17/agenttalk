@@ -157,7 +157,10 @@ def test_roster_add_remove_via_cli(tmp_path: Path, capsys: pytest.CaptureFixture
     cfg = Store(root).load_config()
     assert "c" in cfg["agents"] and cfg["roles"]["c"] == "reviewer"
     assert cfg["groups"]["revs"] == ["c"]
-    assert _run(["roster", "remove", "c"], root) == 0
+    # #19 FR-007: bare remove is refused with a retire hint; --force removes.
+    assert _run(["roster", "remove", "c"], root) == 2
+    assert "c" in Store(root).load_config()["agents"]
+    assert _run(["roster", "remove", "c", "--force"], root) == 0
     assert "c" not in Store(root).load_config()["agents"]
 
 
