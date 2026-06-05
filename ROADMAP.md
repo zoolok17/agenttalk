@@ -6,7 +6,7 @@ the Claude Code + Codex collaboration that shipped 0.10.0–0.13.0, the first
 four-agent production retro (2026-06-03), **and the band's consolidated
 second retro (2026-06-05), which reprioritized everything below.**
 
-> Current release: **v0.14.0** (`master`). See `CHANGELOG.md` for history
+> Current release: **v0.15.0** (`master`). See `CHANGELOG.md` for history
 > and `SECURITY.md` for the trust model.
 
 ---
@@ -59,7 +59,12 @@ four issues closed. Built as spec-kitty mission `operator-safety-0140`
    request_id-tagged composing). **First slip candidate** if the
    release gets heavy now that #18 is promoted in.
 
-### Phase 2b — `0.14.x`/`0.15.0` "team scope"
+### ✅ Phase 2b — `0.15.0` "team scope" — DELIVERED 2026-06-05
+Shipped #15 (role audiences + reply --na), #16 (delivery accounting
++ broadcast --resume), #17 (recoverable quarantine). All three issues
+closed. Mission `team-scope-0150` (5 WPs, 7 Codex review rounds,
+fresh-eyes APPROVE + notes fixed, CI matrix green BEFORE tagging).
+Record:
 5. **Role-scoped audiences + not-applicable replies** (#15) —
    `broadcast --to-role` with the audience **frozen into fan-out meta at
    send time** (never live-plumb roles into derivation; history must not
