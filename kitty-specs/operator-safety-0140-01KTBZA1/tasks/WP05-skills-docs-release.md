@@ -167,3 +167,4 @@ waits).
 ## Activity Log
 
 - 2026-06-05T15:30:26Z – claude – shell_pid=71908 – Started implementation via action command
+- 2026-06-05T15:37:21Z – claude – shell_pid=71908 – Release-ready; gate green; awaiting Codex + fresh-eyes reviews
