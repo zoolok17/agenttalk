@@ -201,3 +201,4 @@ Implement command: `spec-kitty agent action implement WP03 --agent claude`
 ## Activity Log
 
 - 2026-06-05T21:21:12Z – claude – shell_pid=54736 – Started implementation via action command
+- 2026-06-05T21:40:58Z – claude – shell_pid=54736 – CLI integration: roster/barrier/check --epoch/json next_*; 12 tests; suite 592 pass
