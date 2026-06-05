@@ -14,6 +14,8 @@ subtasks:
 - T016
 - T017
 - T018
+agent: "claude"
+shell_pid: "348"
 history:
 - date: '2026-06-05T13:34:21Z'
   event: created
@@ -126,3 +128,7 @@ setups (the deliberate `init --force` case — is the message fair?), the
 escalation-traffic scan cost on big stores (must be one pass), wording
 that could read as enforcement, root-first ordering consistency between
 doctor and whoami (whoami is WP02's — flag mismatches, don't fix here).
+
+## Activity Log
+
+- 2026-06-05T14:56:14Z – claude – shell_pid=348 – Started implementation via action command
