@@ -30,10 +30,10 @@ Feature traceability per-subtask (#15/#16/#17).
 | T015 | e2e: NA lifecycle both perspectives (SC 2) | WP04 | | [D] |
 | T016 | e2e: fault-injected partial fan-out at k=first/mid/last + warning lifecycle (SC 3) | WP04 | | [D] |
 | T017 | e2e: prune byte-identity sweep + strict-additivity gates (SC 4 / NFR-001) | WP04 | | [D] |
-| T018 | skills: both flavors - NA-not-placeholder-ack, --to-role preference, exit-5 handling, prune discipline | WP05 | [P] |
-| T019 | docs: README rows/sections + SECURITY notes | WP05 | [P] |
-| T020 | release prep: CHANGELOG 0.15.0 + version bumps | WP05 | |
-| T021 | gate: full suite + quickstart walk + CI-gate notes | WP05 | |
+| T018 | skills: both flavors - NA-not-placeholder-ack, --to-role preference, exit-5 handling, prune discipline | WP05 | [D] |
+| T019 | docs: README rows/sections + SECURITY notes | WP05 | [D] |
+| T020 | release prep: CHANGELOG 0.15.0 + version bumps | WP05 | | [D] |
+| T021 | gate: full suite + quickstart walk + CI-gate notes | WP05 | | [D] |
 
 ## Work Packages
 
@@ -101,10 +101,10 @@ Feature traceability per-subtask (#15/#16/#17).
 **Priority**: P1. **Dependencies**: WP04.
 **Independent test**: full suite incl. skill-lint green; quickstart walks clean.
 
-- [ ] T018 skills: both flavors (WP05)
-- [ ] T019 docs: README + SECURITY (WP05)
-- [ ] T020 release prep: CHANGELOG + versions (WP05)
-- [ ] T021 gate: suite + quickstart + CI notes (WP05)
+- [x] T018 skills: both flavors (WP05)
+- [x] T019 docs: README + SECURITY (WP05)
+- [x] T020 release prep: CHANGELOG + versions (WP05)
+- [x] T021 gate: suite + quickstart + CI notes (WP05)
 
 **Risks**: skill flavor parity; no overpromising (quarantine is manual+recoverable, fan-out has no rollback).
 
