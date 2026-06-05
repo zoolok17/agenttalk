@@ -2,73 +2,151 @@
 
 Carry-forward notes for the next session / next machine: what production
 use validated, what hurt, and the ranked backlog to address it. Built from
-the Claude Code + Codex collaboration that shipped 0.10.0–0.12.1, **plus a
-retro from the first real four-agent run (2026-06-03).**
+the Claude Code + Codex collaboration that shipped 0.10.0–0.13.0, the first
+four-agent production retro (2026-06-03), **and the band's consolidated
+second retro (2026-06-05), which reprioritized everything below.**
 
-> Current release: **v0.12.1** (`master`). See `CHANGELOG.md` for history
+> Current release: **v0.13.0** (`master`). See `CHANGELOG.md` for history
 > and `SECURITY.md` for the trust model.
 
 ---
 
-## Phased plan for the remaining backlog
+## Phased plan (reprioritized 2026-06-05)
 
-Sequenced jointly by Claude + Codex. **Do we need more agents? No** — the
-codebase is small and tightly coupled (`cli`/`store`/`threads`); more
-parallel implementers create file-contention + coordination overhead, and
-multi-agent runs are fragile around restarts/shared state (per the retro).
-Keep the proven model: **Claude implements (Python/tests), Codex reviews +
-docs, spawn fresh-eyes reviewers on demand.** The only "extra" agents worth
-it are **short-lived specialists, spawned on demand** — a Windows/invocation
-fresh reviewer for #7/#10, a security/RFC reviewer for the identity phase —
-not standing agents. The full team topology (dev pair + review pair + lead)
-is for a larger *parallelizable* project with separate cwds and a
-non-implementing lead; overkill for this small serial backlog.
+Sequenced jointly by Claude + Codex against the band's evidence. The
+serial model stands: **Claude implements (Python/tests), Codex reviews +
+docs, fresh-eyes reviewers spawned on demand** — production explicitly
+confirmed more standing agents are not worth the coordination overhead.
 
-### Phase 1 — `0.13.0` "workflow safety + Windows robustness" (quick, low-risk)
-Order matters (shared "resolved-recipient" model; docs first):
-1. **#10 skill-docs / identity bootstrap** — `--root` ordering, `AGENTTALK_SELF`
-   per-shell, here-strings, a `roster → status → sync` bootstrap snippet,
-   lead-vs-reviewer authority. *(Codex)*
-2. **#7 body robustness** (`--body-file -`, here-strings default on Windows,
-   structured paths) **+ #6 `reply --dry-run` + routing docs** — together.
-   *(Claude code + Codex docs)*
-3. **#8 `whoami` / `doctor` upgrades.** *(Claude)*
-   Also: document the no-reply-all rule; make `--dry-run` expose enough
-   routing detail to design reply-all next.
+### ✅ Phase 1 — `0.13.0` "workflow safety + Windows robustness" — DELIVERED 2026-06-03
+Shipped #6 (`reply --dry-run`), #7 (`--file -` stdin bodies), #8
+(`whoami`), #10 (skill-doc / identity-bootstrap fixes). All four issues
+closed. Kept here as a record only.
 
-### Phase 2 — `0.14.0` "team ops"
-4. **#9 safe rename** — `--drain-check` + alias/forwarding; **never rewrite
-   history** (mutating old messages breaks HMAC, cursors, threadstate, and
-   thread derivation). Prefer the drain-old → accept-as-old → reannounce path.
-5. **#11 reply-all primitive + broadcast atomicity** — atomicity = preflight +
-   a batch manifest + staged writes + explicit partial-failure surfacing,
-   **not** true rollback (multi-file atomicity isn't available on local FS).
+### Phase 2 — `0.14.0` "operator safety" (the band's #1 and #7)
+1. **Rescind/supersede + currentness check** (#12) — first-class
+   `rescind` kind (KNOWN_KINDS, *not* CONTROL_KINDS), `closed-superseded`
+   thread state, scoped-wait "request rescinded" wake, `sync`/`threads`
+   flags, and `agenttalk check --to-request RID` → current | superseded |
+   stale as the executable pre-action barrier. Generic primitive only —
+   HOLD/VOID conventions stay in skills/governance, per the band's own
+   unanimous line. Global epochs/send-time barriers explicitly deferred
+   to the RFC (#19).
+2. **Root hardening** (#13) — nested-`init` guard (the real split-brain
+   mechanism is two `init`s + the upward root walk, *not* silent store
+   creation — verified), `doctor` multi-store detection, `AGENTTALK_ROOT`
+   env var, resolved root printed first in `whoami`/`doctor`.
+3. **Intent-to-reply sugar** (#14) — `composing --to-request RID` +
+   reply-in-flight visibility in `threads`/`sync` + stale-warning
+   suppression. Ships in 0.14.0 **only if it stays observational and
+   small** (the mechanics are ~80% built: scoped wait already honors
+   request_id-tagged composing).
 
-### Phase 3 — `0.15.0` "trust": per-agent identity / authz (the gate)
-The architectural boundary before extending beyond a trusted-local team.
-**Start the threat-model / RFC before the coding release.** Real risks to
-design for: key lifecycle / rotation / revocation, key↔roster-identity
-mapping, signature scope + canonicalization, unsigned-legacy handling,
-replay, group/lead authorization policy, compromised-agent behavior.
-Implement last; nothing else depends on it.
+### Phase 2b — `0.14.x`/`0.15.0` "team scope"
+4. **Role-scoped audiences + not-applicable replies** (#15) —
+   `broadcast --to-role` with the audience **frozen into fan-out meta at
+   send time** (never live-plumb roles into derivation; history must not
+   drift), plus `reply --na` (structured meta on a normal message — it
+   already closes the obligation today; a first-class kind only if that
+   proves too weak).
+5. **Broadcast preflight + manifest + partial-failure surfacing** (#16) —
+   same release as role audiences (they expand fan-out usage).
+6. **Invalid-message quarantine** (#17) — `prune --invalid` →
+   `.agenttalk/quarantine/`; recoverable, never hard-delete; verified
+   safe by construction (pure-function derivation, id-string cursors,
+   per-message HMAC).
+7. **operator_facing roster bit — advisory** (#18) — metadata + loud
+   zero-or-multiple diagnostics in `doctor`/`sync`. The bus cannot
+   enforce what a human sees; a half-enforced bit is worse than honest
+   convention.
+
+### Phase 3 — "trust": per-agent identity / authz RFC (#19)
+**Design starts during the 0.14.0 cycle** (Codex drafts, Claude
+critiques, fresh-eyes security reviewer on the draft); implementation
+0.15.0 at the earliest. Scope now explicitly includes, beyond the
+original threat model (key lifecycle, key↔roster mapping, signature
+scope, replay, authorization policy, compromised-agent behavior):
+- **global epochs / send-time barriers** — the deep end of supersession;
+  the bus's first machine-checkable cross-message ordering rule;
+- **retired identities / safe rename** — #9 folds in here (a retired
+  identity must preserve historical validation; `send --to <old>`
+  hard-fails with a hint; forwarding only as explicit opt-in; never
+  rewrite history);
+- **what operator_facing can mean** without real authz;
+- **tool-visible next-action/owner on open threads** (the soft-deadlock
+  follow-up) — explored without making the bus a workflow engine.
+
+### Demoted / deferred
+- **#9 safe rename** — stays open as the feature ask; design folds into
+  the RFC (#19). Interim: documented drain-old → accept-as-old →
+  re-announce pattern.
+- **#11 reply-all** — deferred; role-scoped audiences + `reply --na` may
+  dissolve most of the need. Revisit with production evidence after #15.
+  Preserved design notes: participant set = opener + original recipients
+  − self; complete `reply --dry-run --all` preflight; v1 restricted to
+  non-question follow-ups.
 
 ---
 
 ## Where things stand
 
-- **The production retro's top-3 asks shipped in 0.12.0** (coordination
-  recovery): scoped non-consuming `wait --to-request`, the `sync` rejoin
-  digest, and explicit `ack --to-request` closure. Items 1–3 of the backlog
-  below are **DELIVERED** — kept here only as a record; the live backlog is
-  items 4–9 (tracked as GitHub issues #6–#11).
-- **0.12.0 is a clean stopping point.** The multi-agent surface (roster
-  roles/groups, broadcast fan-out, multi-party threads, lead skills) plus
-  coordination recovery is shipped, dogfooded, and **validated in production**.
-- **Production headline (2026-06-03):** a genuinely nontrivial **four-agent**
-  review+implement loop (`codex-dev`, `codex-rev`, `claude-rev`, lead) ran a
-  real project through **two crashes/restarts without losing work**. The
-  structure held; **every weak spot was ergonomic** — `wait` scoping, closure
-  semantics, and restart recovery — not structural, and those are now fixed.
+- **0.13.0 shipped the whole Phase-1 ergonomics wave** (#6/#7/#8/#10
+  closed) the same day the band's first retro landed — much of their
+  friction list is a **version-skew report**: the quoting tax and part of
+  the --root pain are fixed by upgrading the fleet to v0.13.0 and
+  re-running `install-skills`. That upgrade is the standing first
+  remediation before any new code.
+- **The second retro (2026-06-05) reset priorities**: supersession and
+  root hardening jumped to the top; rename and reply-all dropped off the
+  production wishlist entirely.
+- The four-agent topology itself keeps holding: verdict cadence,
+  transcript-as-provenance (a VOID + ratified replacement handled purely
+  from the record), and measured cross-AI complementarity (Codex-side
+  catches skew schema/mechanics, Claude-side skew statistical/governance;
+  five real catches in one cycle, two money-path).
+
+---
+
+## Production signal — second retro (2026-06-05, all four agents)
+
+### Consolidated wishlist (their priority order)
+1. **Supersession/barriers** — a launch HOLD and the fire message
+   crossed; voided run. Four crossings in one day. → #12.
+2. **Role-scoped audiences + not-applicable replies** — placeholder acks
+   on reviewer-only threads; ack avoided out of fear. → #15.
+3. **Enforced operator_facing** — single-voice liaison decayed across
+   restarts. → #18 (advisory + diagnostics; enforcement question → #19).
+4. **Intent-to-reply markers** — reduce crossing/duplicate sends. → #14.
+5. **Turn-free wait timeouts** — idle wait/poll loops burn turns/context
+   across four windows. → mitigations only (see "honest scope" below).
+6. **--body-file** — already shipped (0.13.0 `--file -`); upgrade.
+7. **Persistent root/identity config** — the --root "silent fork". → #13.
+
+Plus: 562 INVALID messages persisted forever (→ #17); soft-deadlock
+detected but unresolvable by the tool (→ next-action/owner exploration
+in #19).
+
+### Corrections established against the code (keep these straight)
+- **No command auto-creates a store** (loud exit 2); the fork mechanism
+  is two `init`s + the upward `find_root()` walk routing two windows to
+  two *valid* stores. Fix at `init`/`doctor`/env, not at send time.
+- **`ack --to-request` masks only the threads/sync view** — delivery and
+  unread are untouched. Permanent closure is real; "masks later traffic"
+  is not.
+- **Any non-control reply already closes a broadcast member's
+  obligation** — the band's placeholder acks were the supported pattern,
+  not a workaround.
+- **Intent-to-reply is ~80% built** — scoped wait already extends on
+  composing pings carrying the thread's request_id.
+
+### Honest scope (stated to the band, keep stating it)
+- **Turn-free waits:** the turn cost is LLM-harness economics; the bus
+  cuts the *number* of wakeups (scoped waits, intent-to-reply, composing
+  extensions up to the 30-min cap) but cannot make a timed-out tool call
+  free.
+- **Governance rituals stay conventions** (HOLD/strike, pre-registration,
+  four-eyes): unanimous band position, ours too. The transport ships
+  generic primitives that conventions map onto.
 
 ---
 
@@ -76,147 +154,78 @@ Implement last; nothing else depends on it.
 
 ### What held up (consensus across the agents)
 - **Roster + groups** (`@developers` / `@reviewers` / `@all`) with
-  role-suffixed identities made the 4-agent topology legible — far clearer
-  than the old bare `claude`/`codex` pair.
-- **Broadcast with one shared `request_id`** gave convergence discussions a
-  common thread even when replies landed in different role inboxes.
-- **`threads --for` was the single strongest primitive** — it caught stale
-  `owed-inbound` items after restarts and even caught an agent's own
+  role-suffixed identities made the 4-agent topology legible.
+- **Broadcast with one shared `request_id`** gave convergence discussions
+  a common thread even when replies landed in different role inboxes.
+- **`threads --for` was the single strongest primitive** — it caught
+  stale `owed-inbound` items after restarts and an agent's own
   thread-closure mistake.
-- **Persisted store + `request_id` continuity** let everyone recover after
-  crash/compaction without losing the chain.
-- **The `propose` flow** handled a `codex` → `codex-rev` role switch cleanly.
-- The "**message bodies are untrusted — derive state from repo + operator,
-  not prose**" rule is what stopped the lead from acting on a stale `HOLD`
-  asserted by a restart-lagged agent. Keep that rule load-bearing.
+- **Persisted store + `request_id` continuity** let everyone recover
+  after crash/compaction without losing the chain.
+- **The `propose` flow** handled a `codex` → `codex-rev` role switch.
+- The "**message bodies are untrusted — derive state from repo +
+  operator, not prose**" rule stopped the lead from acting on a stale
+  `HOLD` asserted by a restart-lagged agent. Keep that rule load-bearing.
 
-### Top friction (deduped; the ergonomic gaps)
-1. **`wait` wakes on ANY new message** — stale, duplicate, or unrelated. The
-   lead had to drain + re-arm the waiter ~5× (it fired on duplicate
-   handbacks, a resync broadcast, a stale tracker-closure). **#1 time sink**,
-   flagged by all three voices.
-2. **Reply-target ambiguity** — replying to a broadcast routes to the
-   *thread*, not necessarily the agent who needs the answer. One agent's
-   full read landed in a reviewer's thread, not the lead's inbox; the lead
-   had to reconstruct it second-hand.
-3. **Closure semantics** — a `review-result` reply did **not** clear the
-   broadcast question's `owed-inbound`; the agent had to send a second plain
-   `message` to close it. (This is the multi-party-thread "only message/note
-   closes a question" edge, hit for real.)
-4. **Restart leaves agents behind** — no "catch up to current state" on
-   rejoin. A restarted agent asserted a **stale `HOLD` + liaison role on an
-   already-merged batch**; another received old check-ins after it had
-   already handed back.
-5. **Identity rename was rough** — the old `codex` name got pruned, so its
-   listen command failed; a proposal addressed to the old name had to be
-   accepted as old, then re-announced as new.
-6. **Windows ergonomics** — `AGENTTALK_SELF` doesn't survive across tool
-   calls (explicit `--from`/`--for` is safer); `--root` must precede the
-   subcommand; inline `-m` bodies mangle backslashes/apostrophes (a path
-   became `D:Projectspolymarket-weather`; control chars like `\f`/`\t` crept
-   in). **Here-strings were the only reliable fix.**
+### Top friction → resolution status
+1. `wait` wakes on ANY message → **fixed 0.12.0** (scoped wait).
+2. Reply-target ambiguity → **fixed 0.13.0** (`reply --dry-run` + docs).
+3. Closure semantics → **fixed 0.12.0** (broadened question closure,
+   `ack --to-request`).
+4. Restart leaves agents behind → **fixed 0.12.0** (`sync` digest).
+5. Identity rename was rough → **#9, design in RFC (#19)**.
+6. Windows ergonomics → **fixed 0.13.0** (`--file -`, docs); remaining
+   root pain → **#13**.
 
 ### Meta-theme
-The restart-lag/stale-`HOLD`/silence problems and the separate
-"prompt-mirroring" issue (both Claude windows sharing one cwd/project dir)
-are the same underlying theme: **multi-agent runs are fragile around
-restarts and shared state.** The backlog below (esp. scoped wait + rejoin
-digest) plus a **separate-cwd-per-window** launch convention address most
-of it. Coordination itself is unaffected by the cwd fix — agenttalk stays
-on its pinned `--root`.
-
----
-
-## Prioritized backlog (production-ranked)
-
-### ✅ Delivered in 0.12.0 (the production retro's top-3)
-
-1. **★ Scoped `wait`** — `wait --to-request <id>` (`--kind <k>` refines it).
-   Returns only the targeted thread; non-consuming (advances only the
-   per-thread `seen_msg_id`, never the global cursor, and floors delivery at
-   the global cursor so already-drained messages aren't re-shown). Killed the
-   run's #1 time sink.
-2. **★ Rejoin digest** — `agenttalk sync --for <agent> [--json]`: identity,
-   roster, actionable threads (who-owes-whom + deterministic hints), last
-   decision per thread, unread FYI kept separate from owed work.
-3. **Explicit closure** — `agenttalk ack --to-request <id>` (manual closure;
-   permanent — a re-ask needs a fresh request_id), **plus** broadened
-   question-closure (any non-control reply from the counterparty closes a
-   question, incl. a broadcast question; review/proposal stay strict).
-
-### Live backlog (deferred — GitHub issues #6–#11)
-
-4. **Reply safety** — `reply --dry-run` showing the resolved recipient +
-   `request_id` before sending; document **thread-originator-vs-asker
-   routing** (a broadcast reply goes to the thread originator, who may not be
-   the agent that needs the answer).
-5. **Body robustness** — support `--body-file -` (stdin); make **here-strings
-   the documented default on Windows**; carry paths/root as structured
-   metadata, not in prose, so backslash/control-char mangling can't corrupt
-   them.
-6. **`whoami` / `doctor` upgrades** — show effective `--root`, self, peer,
-   roster membership, and unread/owed counts; warn when `--root` is
-   misplaced (a common Windows footgun).
-7. **Safe rename** — `agenttalk rename --from <old> --to <new> --drain-check`,
-   or at minimum document the **drain-old → accept-as-old → re-announce-as-new**
-   pattern so a rename mid-run doesn't strand the old mailbox.
-8. **Skill-doc fixes** — `--root` precedes the subcommand; `AGENTTALK_SELF`
-   is per-shell (prefer explicit flags); here-strings on Windows; an
-   **identity bootstrap snippet** (`roster` → `status` → `wait`); and state
-   **lead-vs-reviewer authority + liaison rules up front** (role ambiguity is
-   what let a restarted agent assert a stale liaison `HOLD`).
-9. **Reply-all primitive** — so discussion follow-ups don't fragment into new
-   `request_id`s. (Previously noted; production confirms the need.)
-
-### Suggested sequencing
-Items **1–3** give the biggest relief and are mostly additive
-(`wait`/`sync`/`ack` flags + a thread-closure tweak). **4–6** are ergonomic
-guardrails. **7–9** are larger or behavioral and can follow. None require
-the per-agent-identity work below.
+Multi-agent runs are fragile around restarts and shared state. Scoped
+wait + sync + the separate-cwd-per-window convention addressed most of
+it; the 2026-06-05 retro narrowed the residue to supersession (#12) and
+root hardening (#13).
 
 ---
 
 ## Larger design boundary (longer-term): per-agent identity / authz
 
 Roles and groups are **routing metadata, not a trust boundary** (see
-`SECURITY.md`). Optional HMAC is **project-key based**, so `from=<agent>` is
-a by-convention identity among trusted local participants, not a
+`SECURITY.md`). Optional HMAC is **project-key based**, so `from=<agent>`
+is a by-convention identity among trusted local participants, not a
 cryptographic one. **This is the gate to cross before extending agenttalk
-beyond a fully-trusted local team** (remote/less-trusted workers, a lead
-delegating to agents it doesn't fully trust). Per-agent signing keys + an
-authorization policy is a distinct feature with a different threat model —
-design it deliberately. Not urgent for the current trusted-team use; the
-ergonomic backlog above is what production is actually asking for.
-
-Also still open from the build (lower priority): **fan-out is not
-transactional** — `broadcast` writes one message per recipient in a loop; a
-mid-loop failure leaves a partial fan-out with no rollback.
+beyond a fully-trusted local team.** The RFC (#19) is the vehicle; scope
+above. Not urgent for the current trusted-team use; the operator-safety
+backlog is what production is actually asking for.
 
 ---
 
 ## Operational notes (lessons from build + production)
 
+### Fleet upgrade discipline (new, 2026-06-05)
+Production friction reports must be read against the version the fleet
+actually runs. The band's quoting-tax and bootstrap pain reproduced a
+pre-0.13.0 surface a day after 0.13.0 shipped. Before acting on field
+feedback: `agenttalk --version` on every window, upgrade, re-run
+`install-skills`, re-test, then triage what remains.
+
 ### Separate cwd per window (shared-state fix)
 Launch each agent's CLI window **in its own working directory** and keep
 agenttalk pointed at the pinned `--root`. Sharing one cwd/project dir
 between two Claude windows caused prompt-mirroring. Coordination is
-unaffected by this — the bus is addressed by `--root`, not cwd.
+unaffected — the bus is addressed by `--root`, not cwd.
 
-### Windows invocation (until the body-robustness fixes land)
+### Windows invocation
 - Prefer explicit `--from`/`--for` over relying on `AGENTTALK_SELF` (env
   doesn't persist across separate tool-call shells).
 - `--root <path>` must come **before** the subcommand.
-- Use **here-strings** for message bodies — inline `-m` mangles backslashes,
-  apostrophes, and control chars on Windows.
+- Pipe **here-strings to `--file -`** for message bodies (0.13.0+);
+  carry paths/roots/request ids in `--meta key=value`, not prose.
 
 ### Fresh-review ritual asymmetry
 Spawning a fresh, context-free sub-agent to review works on both sides
-(Claude via the `Agent` tool; Codex via `spawn_agent`) and earned its keep —
-it caught a crash and a routing bug the build + adversarial workflow +
-cross-review all missed. **But environments differ:** the Claude-side fresh
-agent could run the test suite; the Codex-side one had **no Python in its
-sandbox** (diff/static review only). Lean on the Claude-side reviewer for
-anything that must *execute*.
+(Claude via the `Agent` tool; Codex via `spawn_agent`) and earned its
+keep. **But environments differ:** the Claude-side fresh agent could run
+the test suite; the Codex-side one had **no Python in its sandbox**
+(diff/static review only). Lean on the Claude-side reviewer for anything
+that must *execute*.
 
 ### Release ritual (don't repeat the tags-vs-Releases miss)
 `git push --tags` creates **tags**; the GitHub **Releases page** shows
@@ -259,7 +268,7 @@ gh release create vX.Y.Z --verify-tag --latest \
 
 ---
 
-*Notes jointly developed by Claude Code and Codex (0.10.0–0.11.1), plus the
-first four-agent production retro (2026-06-03: codex-dev, codex-rev, and the
-lead view; claude-rev's input timed out and is folded in where it would have
-echoed consensus).*
+*Notes jointly developed by Claude Code and Codex (0.10.0–0.13.0), the
+first four-agent production retro (2026-06-03), and the band's
+consolidated second retro (2026-06-05: lead, codex-dev, codex-rev,
+claude-rev — all four attributed).*
