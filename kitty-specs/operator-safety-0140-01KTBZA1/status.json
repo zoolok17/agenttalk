@@ -1,12 +1,12 @@
 {
-  "event_count": 15,
-  "last_event_id": "01KTC40YPYF9487T4Y5BM1RSFQ",
-  "materialized_at": "2026-06-05T14:47:03.134672+00:00",
+  "event_count": 16,
+  "last_event_id": "01KTC4HPW8XK10KS4ZPEWK9FZF",
+  "materialized_at": "2026-06-05T14:56:12.168965+00:00",
   "mission_number": "",
   "mission_slug": "operator-safety-0140-01KTBZA1",
   "mission_type": "software-dev",
   "summary": {
-    "approved": 1,
+    "approved": 2,
     "blocked": 0,
     "canceled": 0,
     "claimed": 0,
@@ -14,7 +14,7 @@
     "for_review": 0,
     "in_progress": 0,
     "in_review": 0,
-    "planned": 4
+    "planned": 3
   },
   "work_packages": {
     "WP01": {
@@ -26,10 +26,10 @@
     },
     "WP02": {
       "actor": "user",
-      "force_count": 2,
-      "lane": "planned",
-      "last_event_id": "01KTC40YPYF9487T4Y5BM1RSFQ",
-      "last_transition_at": "2026-06-05T14:47:03.134672+00:00"
+      "force_count": 3,
+      "lane": "approved",
+      "last_event_id": "01KTC4HPW8XK10KS4ZPEWK9FZF",
+      "last_transition_at": "2026-06-05T14:56:12.168965+00:00"
     },
     "WP03": {
       "actor": "finalize-tasks",
