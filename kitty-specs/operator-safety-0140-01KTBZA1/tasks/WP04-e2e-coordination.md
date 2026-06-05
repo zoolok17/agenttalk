@@ -16,6 +16,8 @@ subtasks:
 - T019
 - T020
 - T021
+agent: "claude"
+shell_pid: "16804"
 history:
 - date: '2026-06-05T13:34:21Z'
   event: created
@@ -127,3 +129,7 @@ arrival-ordering)? Is T021's strict-additivity assertion robust to
 incidental dict-ordering changes? Are refusal-matrix tests asserting
 remediation hints, not just exit codes? Hunt for hidden timing
 assumptions (anything that would flake on a slow CI box).
+
+## Activity Log
+
+- 2026-06-05T15:12:49Z – claude – shell_pid=16804 – Started implementation via action command
