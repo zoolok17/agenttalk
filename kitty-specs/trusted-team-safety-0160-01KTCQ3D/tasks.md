@@ -50,11 +50,11 @@ depends on both. WP04 depends on WP01 + WP03.
 | T015 | `threads`/`sync --json` `next_owner`/`next_action` surfacing | WP03 | | [D] |
 | T016 | `test_cli.py` — command behavior + exit codes | WP03 | | [D] |
 | T017 | `test_coordination.py` — barrier→epoch_at_send→check e2e | WP03 | | [D] |
-| T018 | doctor registry hygiene check | WP04 | |
-| T019 | `test_doctor.py` | WP04 | |
-| T020 | README updates (new commands + operator workflow) | WP04 | |
-| T021 | SECURITY.md honesty (trusted-team boundary, fail-open, epoch three-state) | WP04 | |
-| T022 | version bump 0.15.0→0.16.0 + CHANGELOG + ROADMAP Phase A delivered | WP04 | |
+| T018 | doctor registry hygiene check | WP04 | | [D] |
+| T019 | `test_doctor.py` | WP04 | | [D] |
+| T020 | README updates (new commands + operator workflow) | WP04 | | [D] |
+| T021 | SECURITY.md honesty (trusted-team boundary, fail-open, epoch three-state) | WP04 | | [D] |
+| T022 | version bump 0.15.0→0.16.0 + CHANGELOG + ROADMAP Phase A delivered | WP04 | | [D] |
 
 ---
 
@@ -128,11 +128,11 @@ three-state); version bump and release notes.
 **Independent test**: `pytest tests/test_doctor.py`; docs reviewed for the
 required honesty statements; `agenttalk --version` reports 0.16.0.
 
-- [ ] T018 doctor registry hygiene check (WP04)
-- [ ] T019 `test_doctor.py` (WP04)
-- [ ] T020 README updates (new commands + operator workflow) (WP04)
-- [ ] T021 SECURITY.md honesty (trusted-team boundary, fail-open, epoch three-state) (WP04)
-- [ ] T022 version bump 0.15.0→0.16.0 + CHANGELOG + ROADMAP Phase A delivered (WP04)
+- [x] T018 doctor registry hygiene check (WP04)
+- [x] T019 `test_doctor.py` (WP04)
+- [x] T020 README updates (new commands + operator workflow) (WP04)
+- [x] T021 SECURITY.md honesty (trusted-team boundary, fail-open, epoch three-state) (WP04)
+- [x] T022 version bump 0.15.0→0.16.0 + CHANGELOG + ROADMAP Phase A delivered (WP04)
 
 **Dependencies**: WP01, WP03. **Risks**: docs must not overclaim — the
 trusted-team/not-authz boundary (FR-016) is the whole point of Phase A honesty.
