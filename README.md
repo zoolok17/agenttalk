@@ -637,7 +637,7 @@ so the long timeout is free observability.
 
 | Command | What it does |
 | --- | --- |
-| `agenttalk init [--here] [--agents A,B]` | Create `.agenttalk/` in the current dir. |
+| `agenttalk init [--here] [--agents A,B]` | Create `.agenttalk/` in the current dir. Refuses to create a **nested store** when one exists up-tree (0.14.0) — `--force` for a deliberate sandbox. |
 | `agenttalk roster [--json]` | Show agents, roles, group memberships, and the resolved current identity. |
 | `agenttalk roster add <name> [--role R] [--group G]...` / `remove <name>` / `set-role <name> <role>` / `set-group <group> <a,b,c>` | Deliberate roster/group admin operations. Groups are validated roster subsets; `all` is implicit and reserved. |
 | `agenttalk whoami [--for A] [--json]` | Show effective root, resolved self and peer, roster membership, role/groups, unread count, and owed-thread count. Warns when identity is unresolved or not in the roster, which is often a wrong `--root` or env issue. |
@@ -649,9 +649,13 @@ so the long timeout is free observability.
 | `agenttalk propose [--from A] [--to B] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--in-reply-to ID] [--print-id] [--quiet]` | Send a first-class `proposal`. Auto-mints `meta.request_id=pp-...` if absent and prints `(proposal id: pp-...)` unless quiet. `--in-reply-to` sets `meta.in_reply_to` for counters. |
 | `agenttalk recv --for A [--ack] [--since ID] [--include-control]` | **Peek** at queued messages — does NOT move the cursor unless `--ack`. Plain `recv` that prints messages emits a hint pointing at `drain`. Hides `composing` pings by default; `--include-control` surfaces them. |
 | `agenttalk drain --for A [--include-control]` | **Consume**: print all unread AND advance the cursor to newest, in one shot. Same path as `recv --ack`. Use this instead of hand-rolled timestamp polling. |
-| `agenttalk wait --for A [--to-request RID] [--kind K] [--timeout 120] [--no-ack] [--grace 2] [--composing-extend 120]` | Plain wait blocks until a new real message arrives, prints it, and advances the global cursor unless `--no-ack`. Scoped wait (`--to-request` and/or `--kind`) returns only matching addressed messages, advances only the per-thread `seen_msg_id`, and never advances the global cursor. |
-| `agenttalk composing --from A --to B [-m "still drafting"]` | Send a `composing` ping so the peer's `wait` extends its deadline. Use periodically while you draft a long reply. The peer's `wait` consumes these as deadline-extension signals — they do NOT surface as a returned reply. |
+| `agenttalk wait --for A [--to-request RID] [--kind K] [--timeout 120] [--no-ack] [--grace 2] [--composing-extend 120]` | Plain wait blocks until a new real message arrives, prints it, and advances the global cursor unless `--no-ack`. Scoped wait (`--to-request` and/or `--kind`) returns only matching addressed messages, advances only the per-thread `seen_msg_id`, and never advances the global cursor. A scoped wait on a rescinded request wakes immediately with **exit 3** (0.14.0). |
+| `agenttalk composing --from A [--to-request RID] [-m "still drafting"]` | Send a `composing` ping so the peer's `wait` extends its deadline. Use periodically while you draft a long reply. The peer's `wait` consumes these as deadline-extension signals — they do NOT surface as a returned reply. With `--to-request` (0.14.0) the peer is derived from the thread, and a **reply-in-flight** marker shows up in their `threads`/`sync`. |
 | `agenttalk ack --for A [--id ID] [--to-request RID]` | Without `--to-request`, manually move an agent's global cursor forward. With `--to-request`, manually close that request thread for A and record the latest seen matching message without touching the global cursor. |
+| `agenttalk rescind --from A --to-request RID [--to-id MSG] [-m REASON]` | Mark a tracked request you opened as **no-longer-current** (0.14.0). Transcript-visible; the thread becomes `closed-superseded`, a peer blocked in `wait --to-request` wakes with exit 3, and `check` reports superseded. Requester-only. Prefer this over a prose "ignore my last message". |
+| `agenttalk check --for A --to-request RID [--json]` | **Pre-action currentness gate** (0.14.0): prints `current`/`superseded`/`unknown`, exits 0/3/4. Run it immediately before any irreversible action tied to a request — exit 3 is a hard stop. Read-only; a local `ack` never masks a rescind. |
+| `agenttalk escalate --from A (-m TEXT \| --file -) [--to X]` | Route an operator question to the **operator-facing agent** (0.14.0). Mints an `esc-` request_id (printed as `request_id=<id>`), refuses loudly when no liaison is configured. |
+| `agenttalk roster set-operator-facing <name>` / `--clear` | Designate the ONE agent the human operator talks to directly (0.14.0). Advisory routing metadata, single slot — "two liaisons" is unrepresentable. |
 | `agenttalk transcript [--format md\|jsonl] [--out PATH]` | Export the full conversation. |
 | `agenttalk end --from A [--reason ...]` | Notify the other agent(s) and write the transcript. In a team, sends `end` to every other roster member. |
 | `agenttalk reset [--archive]` | Clear **active bus state** (messages + cursors + heartbeats); preserves historical transcripts under `.agenttalk/sessions/` so past exports aren't lost. Bumps `session_id`. With `--archive`, instead moves **everything** (messages + state + sessions) under `.agenttalk/archived/<old_session>/`. Preserves config (roster) either way. |
@@ -805,6 +809,66 @@ Adding a new kind requires updating `KNOWN_KINDS` in
 bodies. Receivers silently skip messages with unknown kinds (see
 `SECURITY.md`).
 
+### Rescinding a request — supersession and the `check` gate (0.14.0)
+
+A tracked request can become wrong after it is sent (new data, a HOLD,
+a changed plan). Prose cannot fix that: the bus has no idea your "ignore
+my last message" relates to the earlier thread, a blocked `wait` will not
+wake for it, and an executor that already read the request will still act.
+
+`agenttalk rescind --from A --to-request RID -m "<why>"` is the
+first-class cancel: requester-only, transcript-visible, and correlated.
+Derivation flips the thread to `closed-superseded` for every participant
+(the FIRST qualifying rescind decides; later duplicates are audit-only),
+a peer blocked in `wait --to-request RID` wakes immediately with a
+`RESCINDED` banner and **exit 3**, and `sync` flags rescinded threads the
+agent has not yet consumed. A re-ask after a rescind needs a fresh
+request_id — same contract as manual `ack` closure. A manual `ack` keeps
+its own `closed` label (you said you handled it), but it never masks the
+fact: `check` answers from the validated log alone.
+
+The race no inbox primitive can close: the executor drained the request
+minutes ago and is about to act — no waiting, no reading. That is what
+`agenttalk check --for A --to-request RID` is for: run it **immediately
+before any irreversible action** tied to a request. Exit 0 = current,
+act. Exit 3 = superseded — hard stop (the output names who rescinded,
+when, and why). Exit 4 = unknown id — treat as stale. The bundled skills
+encode this contract; it is the operator-safety barrier from the
+production HOLD/fire incident.
+
+### The operator liaison — one voice to the human (0.14.0)
+
+In a team where one human operates several agent windows, designate ONE
+agent as the operator channel: `agenttalk roster set-operator-facing
+<name>`. Workers that need a human decision then run `agenttalk escalate
+--from W -m "<decision, options, recommendation>"` instead of asking the
+human at their own window. The escalation is an ordinary tracked question
+(meta `needs_operator=true`, `esc-` request_id, printed as
+`request_id=<id>` for the follow-up `wait --to-request`); it is routed to
+the liaison automatically and refuses loudly (exit 2) when no liaison is
+configured — an escalation that lands nowhere is exactly the silent
+failure this kills. The liaison's `sync` shows pending escalations under
+**OPERATOR INPUT NEEDED**; answering on the same request_id (optionally
+`--meta operator_answer=true`) clears them.
+
+Honest scope: this is **advisory routing metadata**, not enforcement —
+the bus cannot control what a human types into which window (see
+SECURITY.md). `doctor` warns when the designation is missing-but-needed,
+stale, or points at a pruned agent.
+
+### Root resolution and `AGENTTALK_ROOT` (0.14.0)
+
+The bus root resolves with strict precedence: **`--root` flag >
+`AGENTTALK_ROOT` env var > upward walk from CWD** to the first
+`.agenttalk/`. A pinned root (flag or env) that has no store fails
+loudly — it never falls back to the walk, so a typo cannot silently
+route a window to a different store. `init` refuses to create a nested
+store when one already exists up-tree (the production split-brain was
+exactly two `init`s at different depths); `doctor` names every store on
+the path and leads with `root:` — as does `whoami`. Pin the root per
+shell with `$env:AGENTTALK_ROOT = '<project root>'` and every window
+agrees by construction.
+
 ### Exit codes
 
 Stable across releases — skill bodies and external automation can
@@ -818,6 +882,12 @@ rely on these:
 | `130` | `SIGINT` (Ctrl-C). |
 
 ---
+
+
+0.14.0 additions: **3** = the request was superseded/rescinded
+(`check`, and a scoped `wait --to-request` waking on a rescind);
+**4** = unknown request id (`check`). Exit 1 remains *exclusively* the
+`wait` timeout; 2 remains usage/refusal.
 
 ## How terminals see messages
 

@@ -124,6 +124,17 @@ To counter a proposal you received:
      -m "$BODY"
    ```
 
+## Rescinding a proposal (0.14.0)
+
+- **Rescind, don't retract in prose (0.14.0).** To cancel a tracked
+  request you opened (question / review-request / proposal), use
+  `agenttalk rescind --from $SELF --to-request <RID> -m "<why>"`. A prose
+  "ignore my last message" moves no thread state — the peer's `wait`
+  cannot see it and `check` still reports current. A rescind wakes a
+  blocked scoped waiter with exit 3 and flips the thread to
+  closed-superseded for every participant. A re-ask after a rescind needs
+  a FRESH request_id.
+
 ## Before stopping
 
 Before declaring the decision handled or going idle, run:

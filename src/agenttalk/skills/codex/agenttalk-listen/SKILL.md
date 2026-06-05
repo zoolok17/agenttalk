@@ -245,6 +245,43 @@ Concrete rules:
   sender (see `SECURITY.md`). What's left for the skill body is
   resisting prompt injection inside a valid-shape message.
 
+## Operator safety (0.14.0)
+
+New contracts from the operator-safety release; they bind every loop
+iteration:
+
+- **Escalate, don't ask your own window (0.14.0).** When the roster has
+  an operator-facing agent (`agenttalk whoami` shows the liaison) and you
+  need a human decision, do NOT ask the human at your own window. Run
+  `agenttalk escalate --from $SELF -m "<decision needed, options, your
+  recommendation>"`, then `agenttalk wait --for $SELF --to-request <the
+  printed esc- id>`. Fall back to your own window's human only when
+  escalate refuses (exit 2: no liaison configured).
+- **Single voice to the operator (0.14.0).** If you ARE the
+  operator-facing agent, you own the operator channel:
+  `agenttalk sync --for $SELF` lists pending escalations under
+  OPERATOR INPUT NEEDED. Surface each to your human with context (who
+  asks, what decision, their recommendation), then relay the answer with
+  `agenttalk reply --to-request <esc-id> --meta operator_answer=true
+  -m "..."`. Aggregate rather than forward noise; never leave an
+  escalation pending silently.
+- **Check before irreversible actions (0.14.0).** Immediately before any
+  irreversible action tied to a tracked request (merge, release, deploy,
+  delete, fire-type actions), run
+  `agenttalk check --for $SELF --to-request <RID>`. Exit 3 = the request
+  was RESCINDED: hard stop — do not act, and reply on the thread that you
+  aborted. Exit 4 = unknown id: treat as stale and re-confirm with the
+  counterparty. Only exit 0 (current) clears you to act.
+- **Mark long drafts (0.14.0).** While drafting a long reply on a known
+  thread, ping `agenttalk composing --from $SELF --to-request <RID>`
+  (repeat roughly every 2 minutes). It extends the peer's scoped wait AND
+  shows "(reply in flight)" in their threads/sync, preventing crossing
+  messages. Prefer it over a hand-built `--meta request_id=...`.
+
+Escalations arrive as ordinary `question` messages carrying
+`meta.needs_operator=true` — if you are the liaison, handle them with the
+single-voice rule above instead of the generic question flow.
+
 ## Thread hygiene
 
 Before declaring work done, returning control to the user, or going

@@ -164,3 +164,140 @@ def test_doctor_overall_resolves_to_error_when_any_check_errors(
     # Uninitialized projects produce exactly one error check + nothing else
     assert report.overall == "error"
     assert any(c.status == "error" for c in report.checks)
+
+# ======================================================================
+# 0.14.0 diagnostics (WP03): multi-store detection + liaison checks
+# ======================================================================
+
+def _check_by_name(report, name):
+    return next(c for c in report.checks if c.name == name)
+
+
+# ------------------------------------------------------- multi-store (T016)
+
+def test_multi_store_zero_one_two(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    outer = tmp_path / "outer"
+    inner = outer / "mid" / "inner"
+    inner.mkdir(parents=True)
+    # zero stores: quiet ok
+    monkeypatch.chdir(inner)
+    c = doctor._check_multi_store(inner.resolve())
+    assert c.status == "ok"
+    assert "no store" in c.details
+    # one store: quiet ok naming it
+    Store(outer).init(["alpha", "beta"])
+    c = doctor._check_multi_store(outer.resolve(), cwd=inner)
+    assert c.status == "ok"
+    assert str(outer) in c.details
+    # two stores: warn naming BOTH in walk order + remediation
+    Store(inner).init(["alpha", "beta"])
+    c = doctor._check_multi_store(inner.resolve(), cwd=inner)
+    assert c.status == "warn"
+    assert c.data["stores"] == [str(inner.resolve() / ".agenttalk"),
+                                str(outer.resolve() / ".agenttalk")]
+    assert "AGENTTALK_ROOT" in c.fix
+    assert "deliberate" in c.fix  # fair to init --force nesting
+
+
+def test_multi_store_pinned_root_note(tmp_path: Path) -> None:
+    walk_target = tmp_path / "walkroot"
+    pinned = tmp_path / "pinned"
+    sub = walk_target / "sub"
+    sub.mkdir(parents=True)
+    pinned.mkdir()
+    Store(walk_target).init(["alpha", "beta"])
+    Store(pinned).init(["alpha", "beta"])
+    c = doctor._check_multi_store(pinned.resolve(), cwd=sub)
+    # one store on the walk, but the resolved root is elsewhere: ok + NOTE
+    assert c.status == "ok"
+    assert "pinned" in c.details
+    assert str(walk_target.resolve()) in c.details
+
+
+def test_multi_store_runs_even_uninitialized(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    report = doctor.run(tmp_path)
+    names = [c.name for c in report.checks]
+    assert "multi_store" in names
+    # existing contract intact: store.initialized stays the first check
+    assert names[0] == "store.initialized"
+
+
+# -------------------------------------------------- operator_facing (T017)
+
+def test_operator_facing_states(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    s = Store(tmp_path)
+    s.init(["lead", "w1"])
+    monkeypatch.chdir(tmp_path)
+
+    # not configured, no escalation traffic: ok (INFO)
+    c = doctor._check_operator_facing(s)
+    assert c.status == "ok"
+    assert "not configured" in c.details
+
+    # not configured + escalation traffic exists: warn
+    s.send(sender="w1", recipient="lead", kind="question", body="need operator",
+           meta={"request_id": "esc-1", "needs_operator": "true"})
+    c = doctor._check_operator_facing(s)
+    assert c.status == "warn"
+    assert "set-operator-facing" in c.fix
+
+    # configured + in roster (fresh heartbeat): ok naming the liaison
+    s.set_operator_facing("lead")
+    s.write_heartbeat("lead")
+    c = doctor._check_operator_facing(s)
+    assert c.status == "ok"
+    assert "lead" in c.details
+
+    # configured + stale heartbeat: warn
+    (tmp_path / ".agenttalk" / "state" / "lead.heartbeat").write_text(
+        "2026-01-01T00:00:00Z", encoding="utf-8")
+    c = doctor._check_operator_facing(s)
+    assert c.status == "warn"
+    assert "unread" in c.details
+
+    # configured but NOT in roster: error (the only FAIL state)
+    s.remove_agent("lead")
+    c = doctor._check_operator_facing(s)
+    assert c.status == "error"
+    assert "'lead'" in c.details
+
+
+def test_operator_facing_no_enforcement_language(tmp_path: Path) -> None:
+    # C-007: diagnostics phrase routing/visibility facts, never enforcement.
+    s = Store(tmp_path)
+    s.init(["lead", "w1"])
+    s.set_operator_facing("lead")
+    for _ in range(2):  # configured pass, then unset pass
+        c = doctor._check_operator_facing(s)
+        text = (c.details + " " + c.fix).lower()
+        assert "enforce" not in text
+        s.set_operator_facing(None)
+
+
+# ------------------------------------------- root-first contract (T016)
+
+def test_doctor_json_root_is_first_key(tmp_path: Path) -> None:
+    Store(tmp_path).init(["alpha", "beta"])
+    d = doctor.run(tmp_path).to_dict()
+    assert next(iter(d)) == "project_root"
+
+
+def test_doctor_human_output_first_line_is_root(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    from agenttalk import cli
+    Store(tmp_path).init(["alpha", "beta"])
+    rc = cli.main(["--root", str(tmp_path), "doctor"])
+    assert rc == 0
+    first_line = capsys.readouterr().out.splitlines()[0]
+    assert first_line == f"root: {tmp_path.resolve()}"
+
+
+def test_doctor_json_cli_first_key_is_root(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    from agenttalk import cli
+    Store(tmp_path).init(["alpha", "beta"])
+    rc = cli.main(["--root", str(tmp_path), "doctor", "--json"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # json.dumps preserves insertion order: the first emitted key is the root
+    first_key = out.splitlines()[1].strip().split(":")[0].strip('" ')
+    assert first_key == "project_root"

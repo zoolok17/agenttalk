@@ -1389,3 +1389,458 @@ def test_whoami_json_shows_identity_and_warns_off_roster(
     assert any("NOT in the roster" in w for w in p2["warnings"])
 
 
+
+
+# ======================================================================
+# 0.14.0 CLI surface (WP02): rescind / check / wait-wake / escalate /
+# init guard / operator-facing / composing sugar / display additions
+# ======================================================================
+
+def _send_q(root: Path, sender: str, recipient: str, rid: str, body: str = "q") -> None:
+    rc = _run(["send", "--from", sender, "--to", recipient, "--kind", "question",
+               "--meta", f"request_id={rid}", "-m", body, "--quiet"], root)
+    assert rc == 0
+
+
+def _team_root(tmp_path: Path, agents: str = "lead,w1,w2") -> Path:
+    rc = cli.main(["init", "--path", str(tmp_path), "--agents", agents])
+    assert rc == 0
+    return tmp_path
+
+
+# ----------------------------------------------------------- rescind (T007)
+
+def test_rescind_happy_path_and_thread_state(store_root: Path, capsys) -> None:
+    _send_q(store_root, "alpha", "beta", "q-1", "fire the launch")
+    rc = _run(["rescind", "--from", "alpha", "--to-request", "q-1",
+               "-m", "new data - hold"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "RESCIND" in out
+    data = json.loads(_threads_json(store_root, "alpha"))
+    row = next(t for t in data["threads"] if t["request_id"] == "q-1")
+    assert row["state"] == "closed-superseded"
+    assert row["rescind"]["by"] == "alpha"
+    assert row["rescind"]["reason"] == "new data - hold"
+
+
+def _threads_json(root: Path, agent: str) -> str:
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = _run(["threads", "--for", agent, "--all", "--json"], root)
+    assert rc == 0
+    return buf.getvalue()
+
+
+def test_rescind_refusal_matrix(store_root: Path) -> None:
+    _send_q(store_root, "alpha", "beta", "q-1")
+    # non-requester
+    _run_expect_exit(["rescind", "--from", "beta", "--to-request", "q-1"],
+                     store_root, 2)
+    # unknown rid
+    _run_expect_exit(["rescind", "--from", "alpha", "--to-request", "q-nope"],
+                     store_root, 2)
+    # bad --to-id
+    _run_expect_exit(["rescind", "--from", "alpha", "--to-request", "q-1",
+                      "--to-id", "20990101-000000-000000-XXXX"], store_root, 2)
+
+
+def test_rescind_already_superseded_is_idempotent_audit(store_root: Path, capsys) -> None:
+    _send_q(store_root, "alpha", "beta", "q-1")
+    assert _run(["rescind", "--from", "alpha", "--to-request", "q-1",
+                 "-m", "first", "--quiet"], store_root) == 0
+    rc = _run(["rescind", "--from", "alpha", "--to-request", "q-1",
+               "-m", "second", "--quiet"], store_root)
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "already superseded" in err
+    # first rescind remains the decider
+    row = next(t for t in json.loads(_threads_json(store_root, "alpha"))["threads"]
+               if t["request_id"] == "q-1")
+    assert row["rescind"]["reason"] == "first"
+
+
+def test_rescind_broadcast_fans_to_all_recipients(tmp_path: Path) -> None:
+    root = _team_root(tmp_path)
+    for r in ("w1", "w2"):
+        rc = _run(["send", "--from", "lead", "--to", r, "--kind", "question",
+                   "--meta", "request_id=b-1", "--meta", "broadcast_id=b-1",
+                   "--meta", "audience=all", "-m", "status?", "--quiet"], root)
+        assert rc == 0
+    assert _run(["rescind", "--from", "lead", "--to-request", "b-1",
+                 "--quiet"], root) == 0
+    msgs = [json.loads(p.read_text(encoding="utf-8"))
+            for p in (root / ".agenttalk" / "messages").glob("*.json")]
+    rescinds = [m for m in msgs if m["kind"] == "rescind"]
+    assert sorted(m["to"] for m in rescinds) == ["w1", "w2"]
+    assert all(m["meta"]["request_id"] == "b-1" for m in rescinds)
+
+
+# ------------------------------------------------------------- check (T008)
+
+def test_check_exit_codes_and_json(store_root: Path, capsys) -> None:
+    _send_q(store_root, "alpha", "beta", "q-1")
+    assert _run(["check", "--for", "beta", "--to-request", "q-1"], store_root) == 0
+    assert "current" in capsys.readouterr().out
+    _run_expect_exit(["check", "--for", "beta", "--to-request", "q-ghost"],
+                     store_root, 4)
+    assert _run(["rescind", "--from", "alpha", "--to-request", "q-1",
+                 "-m", "hold", "--quiet"], store_root) == 0
+    capsys.readouterr()
+    rc = _run(["check", "--for", "beta", "--to-request", "q-1", "--json"], store_root)
+    assert rc == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["state"] == "superseded"
+    assert payload["rescind"]["by"] == "alpha"
+    assert payload["rescind"]["reason"] == "hold"
+
+
+def test_check_is_read_only(store_root: Path) -> None:
+    _send_q(store_root, "alpha", "beta", "q-1")
+    state_dir = store_root / ".agenttalk" / "state"
+    before = {p.name: p.read_bytes() for p in state_dir.iterdir()}
+    assert _run(["check", "--for", "beta", "--to-request", "q-1"], store_root) == 0
+    after = {p.name: p.read_bytes() for p in state_dir.iterdir()}
+    assert before == after
+
+
+def test_check_not_masked_by_local_ack(store_root: Path) -> None:
+    # The barrier rule: a local ack closes the VIEW, never the fact.
+    _send_q(store_root, "alpha", "beta", "q-1")
+    assert _run(["rescind", "--from", "alpha", "--to-request", "q-1",
+                 "--quiet"], store_root) == 0
+    assert _run(["ack", "--for", "beta", "--to-request", "q-1"], store_root) == 0
+    rc = _run(["check", "--for", "beta", "--to-request", "q-1"], store_root)
+    assert rc == 3
+
+
+# ------------------------------------------------- scoped-wait wake (T009)
+
+def test_scoped_wait_wakes_rescinded_immediately(store_root: Path, capsys) -> None:
+    _send_q(store_root, "alpha", "beta", "q-1")
+    assert _run(["rescind", "--from", "alpha", "--to-request", "q-1",
+                 "-m", "hold", "--quiet"], store_root) == 0
+    t0 = time.time()
+    rc = _run(["wait", "--for", "beta", "--to-request", "q-1",
+               "--timeout", "30", "--heartbeat-interval", "0"], store_root)
+    assert rc == 3
+    assert time.time() - t0 < 5  # immediate, not a timeout
+    out = capsys.readouterr().out
+    assert "RESCINDED" in out
+    assert "hold" in out
+
+
+def test_scoped_wait_rescind_beats_kind_filter(store_root: Path) -> None:
+    _send_q(store_root, "alpha", "beta", "q-1")
+    assert _run(["rescind", "--from", "alpha", "--to-request", "q-1",
+                 "--quiet"], store_root) == 0
+    rc = _run(["wait", "--for", "beta", "--to-request", "q-1",
+               "--kind", "review-result", "--timeout", "30",
+               "--heartbeat-interval", "0"], store_root)
+    assert rc == 3
+
+
+def test_scoped_wait_timeout_stays_exit_1(store_root: Path) -> None:
+    # C-005: exit 1 remains timeout-exclusive on a live (non-rescinded) thread.
+    _send_q(store_root, "alpha", "beta", "q-1")
+    rc = _run(["wait", "--for", "alpha", "--to-request", "q-1",
+               "--timeout", "0.3", "--grace", "0",
+               "--heartbeat-interval", "0"], store_root)
+    assert rc == 1
+
+
+def test_scoped_wait_does_not_consume_on_rescind_wake(store_root: Path) -> None:
+    _send_q(store_root, "alpha", "beta", "q-1")
+    assert _run(["rescind", "--from", "alpha", "--to-request", "q-1",
+                 "--quiet"], store_root) == 0
+    s = Store(store_root)
+    cursor_before = s.cursor("beta")
+    rc = _run(["wait", "--for", "beta", "--to-request", "q-1",
+               "--timeout", "30", "--heartbeat-interval", "0"], store_root)
+    assert rc == 3
+    assert s.cursor("beta") == cursor_before  # delivery untouched
+    assert len(s.unread_for("beta")) >= 2     # question + rescind still unread
+
+
+# ---------------------------------------------------------- escalate (T013)
+
+def test_escalate_routes_to_liaison_and_prints_rid(tmp_path: Path, capsys) -> None:
+    root = _team_root(tmp_path)
+    assert _run(["roster", "set-operator-facing", "lead"], root) == 0
+    capsys.readouterr()
+    rc = _run(["escalate", "--from", "w1", "-m", "Deploy today or tomorrow?"], root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    rid_lines = [ln for ln in out.splitlines() if ln.startswith("request_id=")]
+    assert len(rid_lines) == 1
+    rid = rid_lines[0].split("=", 1)[1]
+    assert rid.startswith("esc-")
+    msgs = [json.loads(p.read_text(encoding="utf-8"))
+            for p in (root / ".agenttalk" / "messages").glob("*.json")]
+    esc = next(m for m in msgs if m["meta"].get("needs_operator") == "true")
+    assert esc["to"] == "lead"
+    assert esc["kind"] == "question"
+    assert esc["meta"]["request_id"] == rid
+
+
+def test_escalate_refusal_matrix(tmp_path: Path, capsys) -> None:
+    root = _team_root(tmp_path)
+    # no liaison configured
+    _run_expect_exit(["escalate", "--from", "w1", "-m", "ping"], root, 2)
+    assert "set-operator-facing" in capsys.readouterr().err
+    # --to override works without a liaison
+    assert _run(["escalate", "--from", "w1", "--to", "lead", "-m", "ping",
+                 "--quiet"], root) == 0
+    # liaison self-escalation refused
+    assert _run(["roster", "set-operator-facing", "lead"], root) == 0
+    capsys.readouterr()
+    _run_expect_exit(["escalate", "--from", "lead", "-m", "self"], root, 2)
+    assert "operator channel" in capsys.readouterr().err
+    # configured liaison gone from roster
+    assert _run(["roster", "set-operator-facing", "w2"], root) == 0
+    assert _run(["roster", "remove", "w2"], root) == 0
+    capsys.readouterr()
+    _run_expect_exit(["escalate", "--from", "w1", "-m", "ping"], root, 2)
+    assert "not in" in capsys.readouterr().err
+    # empty body
+    _run_expect_exit(["escalate", "--from", "w1"], root, 2)
+
+
+def test_escalation_lifecycle_in_sync_bucket(tmp_path: Path, capsys) -> None:
+    root = _team_root(tmp_path)
+    assert _run(["roster", "set-operator-facing", "lead"], root) == 0
+    assert _run(["escalate", "--from", "w1", "-m", "Need a decision",
+                 "--quiet"], root) == 0
+    capsys.readouterr()
+    assert _run(["sync", "--for", "lead", "--json"], root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload["escalations"]) == 1
+    rid = payload["escalations"][0]["request_id"]
+    assert payload["escalations"][0]["operator_state"] == "pending"
+    # liaison answers -> bucket empties
+    assert _run(["send", "--from", "lead", "--to", "w1", "--kind", "message",
+                 "--meta", f"request_id={rid}",
+                 "--meta", "operator_answer=true",
+                 "-m", "Operator says: tomorrow.", "--quiet"], root) == 0
+    capsys.readouterr()
+    assert _run(["sync", "--for", "lead", "--json"], root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["escalations"] == []
+    # requester sees answered
+    row = next(t for t in json.loads(_threads_json(root, "w1"))["threads"]
+               if t["request_id"] == rid)
+    assert row["operator_state"] == "answered"
+
+
+def test_sync_escalations_key_only_for_liaison(tmp_path: Path, capsys) -> None:
+    root = _team_root(tmp_path)
+    assert _run(["roster", "set-operator-facing", "lead"], root) == 0
+    assert _run(["escalate", "--from", "w1", "-m", "x", "--quiet"], root) == 0
+    capsys.readouterr()
+    assert _run(["sync", "--for", "w2", "--json"], root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "escalations" not in payload
+
+
+# -------------------------------------------------------- init guard (T011)
+
+def test_init_refuses_nested_store(store_root: Path, capsys) -> None:
+    sub = store_root / "nested" / "deeper"
+    sub.mkdir(parents=True)
+    rc = cli.main(["init", "--path", str(sub), "--agents", "a,b"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "up-tree" in err
+    assert "--force" in err
+    assert not (sub / ".agenttalk").exists()
+
+
+def test_init_force_allows_deliberate_nesting(store_root: Path) -> None:
+    sub = store_root / "sandbox"
+    sub.mkdir()
+    rc = cli.main(["init", "--path", str(sub), "--agents", "a,b", "--force"])
+    assert rc == 0
+    assert (sub / ".agenttalk").is_dir()
+
+
+def test_init_reinit_at_same_root_unchanged(store_root: Path) -> None:
+    # A store at the target itself keeps the idempotent re-init behavior.
+    rc = cli.main(["init", "--path", str(store_root), "--agents", "alpha,beta"])
+    assert rc == 0
+
+
+# --------------------------------------- roster set-operator-facing (T012)
+
+def test_set_operator_facing_roundtrip_and_displays(tmp_path: Path, capsys) -> None:
+    root = _team_root(tmp_path)
+    assert _run(["roster", "set-operator-facing", "lead"], root) == 0
+    capsys.readouterr()
+    assert _run(["roster"], root) == 0
+    assert "[operator-facing]" in capsys.readouterr().out
+    assert _run(["roster", "--json"], root) == 0
+    assert json.loads(capsys.readouterr().out)["operator_facing"] == "lead"
+    assert _run(["whoami", "--for", "lead", "--json"], root) == 0
+    w = json.loads(capsys.readouterr().out)
+    assert w["operator_facing"] is True and w["liaison"] == "lead"
+    assert _run(["status", "--json"], root) == 0
+    srow = next(a for a in json.loads(capsys.readouterr().out)["agents"]
+                if a["name"] == "lead")
+    assert srow["operator_facing"] is True
+    # clear
+    assert _run(["roster", "set-operator-facing", "--clear"], root) == 0
+    capsys.readouterr()
+    assert _run(["roster", "--json"], root) == 0
+    assert json.loads(capsys.readouterr().out)["operator_facing"] is None
+
+
+def test_set_operator_facing_refusals(tmp_path: Path) -> None:
+    root = _team_root(tmp_path)
+    _run_expect_exit(["roster", "set-operator-facing", "ghost"], root, 2)
+    _run_expect_exit(["roster", "set-operator-facing"], root, 2)
+    _run_expect_exit(["roster", "set-operator-facing", "lead", "--clear"], root, 2)
+
+
+# ------------------------------------------------- composing sugar (T014)
+
+def test_composing_to_request_sets_meta_and_marker(store_root: Path) -> None:
+    _send_q(store_root, "alpha", "beta", "q-1")
+    rc = _run(["composing", "--from", "beta", "--to", "alpha",
+               "--to-request", "q-1", "--quiet"], store_root)
+    assert rc == 0
+    s = Store(store_root)
+    intent = s.read_composing_intent("beta")
+    assert "q-1" in intent["threads"]
+    assert intent["threads"]["q-1"]["peer"] == "alpha"
+    msgs = [json.loads(p.read_text(encoding="utf-8"))
+            for p in (store_root / ".agenttalk" / "messages").glob("*.json")]
+    comp = next(m for m in msgs if m["kind"] == "composing")
+    assert comp["meta"]["request_id"] == "q-1"
+
+
+def test_composing_to_request_refusals(store_root: Path) -> None:
+    _send_q(store_root, "alpha", "beta", "q-1")
+    # unknown rid
+    _run_expect_exit(["composing", "--from", "beta", "--to", "alpha",
+                      "--to-request", "q-ghost", "--quiet"], store_root, 2)
+    # conflicting explicit meta
+    _run_expect_exit(["composing", "--from", "beta", "--to", "alpha",
+                      "--to-request", "q-1", "--meta", "request_id=q-other",
+                      "--quiet"], store_root, 2)
+    # closed thread
+    assert _run(["send", "--from", "beta", "--to", "alpha", "--kind", "message",
+                 "--meta", "request_id=q-1", "-m", "answer", "--quiet"],
+                store_root) == 0
+    _run_expect_exit(["composing", "--from", "beta", "--to", "alpha",
+                      "--to-request", "q-1", "--quiet"], store_root, 2)
+
+
+def test_reply_in_flight_annotation_and_stale_suppression(store_root: Path, capsys) -> None:
+    _send_q(store_root, "alpha", "beta", "q-1")
+    assert _run(["composing", "--from", "beta", "--to", "alpha",
+                 "--to-request", "q-1", "--quiet"], store_root) == 0
+    capsys.readouterr()
+    assert _run(["threads", "--for", "alpha", "--json"], store_root) == 0
+    row = next(t for t in json.loads(capsys.readouterr().out)["threads"]
+               if t["request_id"] == "q-1")
+    assert row.get("reply_in_flight") is True
+
+
+# ------------------------------------------------ display additivity (NFR-001)
+
+def test_json_outputs_have_no_new_keys_without_new_features(store_root: Path, capsys) -> None:
+    # A store using only pre-0.14.0 surface: every new key must be ABSENT
+    # (strict additivity), not null.
+    _send_q(store_root, "alpha", "beta", "q-plain")
+    capsys.readouterr()
+    assert _run(["threads", "--for", "alpha", "--json"], store_root) == 0
+    row = json.loads(capsys.readouterr().out)["threads"][0]
+    for key in ("rescind", "needs_operator", "operator_state", "reply_in_flight"):
+        assert key not in row
+    assert _run(["sync", "--for", "alpha", "--json"], store_root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "rescinded" not in payload
+    assert "escalations" not in payload
+    assert _run(["status", "--json"], store_root) == 0
+    for a in json.loads(capsys.readouterr().out)["agents"]:
+        assert "operator_facing" not in a
+
+
+def test_sync_flags_unconsumed_rescind(store_root: Path, capsys) -> None:
+    _send_q(store_root, "alpha", "beta", "q-1")
+    assert _run(["rescind", "--from", "alpha", "--to-request", "q-1",
+                 "-m", "hold", "--quiet"], store_root) == 0
+    capsys.readouterr()
+    assert _run(["sync", "--for", "beta", "--json"], store_root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload["rescinded"]) == 1
+    assert payload["rescinded"][0]["request_id"] == "q-1"
+    # after draining (rescind consumed), the flag stops nagging
+    assert _run(["drain", "--for", "beta", "--quiet"], store_root) == 0
+    capsys.readouterr()
+    assert _run(["sync", "--for", "beta", "--json"], store_root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "rescinded" not in payload
+
+
+# ------------------- composing sugar: review-blocker regressions (T014)
+
+def test_composing_to_request_single_argument_multi_agent(tmp_path: Path) -> None:
+    # WP02 review blocker 1: the rid identifies the counterparty - no
+    # --to / AGENTTALK_PEER needed even in a >2-agent roster.
+    root = _team_root(tmp_path)
+    _send_q(root, "lead", "w1", "q-1")
+    rc = _run(["composing", "--from", "w1", "--to-request", "q-1", "--quiet"], root)
+    assert rc == 0
+    msgs = [json.loads(p.read_text(encoding="utf-8"))
+            for p in (root / ".agenttalk" / "messages").glob("*.json")]
+    comp = next(m for m in msgs if m["kind"] == "composing")
+    assert comp["to"] == "lead"  # derived from the thread row
+    assert Store(root).read_composing_intent("w1")["threads"]["q-1"]["peer"] == "lead"
+
+
+def test_composing_to_request_rejects_outbound_view(store_root: Path, capsys) -> None:
+    # WP02 review blocker 2: the requester (open-outbound) is not drafting
+    # a reply - composing marks YOUR in-flight reply, not the peer's.
+    _send_q(store_root, "alpha", "beta", "q-1")
+    _run_expect_exit(["composing", "--from", "alpha", "--to", "beta",
+                      "--to-request", "q-1", "--quiet"], store_root, 2)
+    assert "do not owe a reply" in capsys.readouterr().err
+
+
+def test_composing_to_request_rejects_mismatched_to(tmp_path: Path, capsys) -> None:
+    root = _team_root(tmp_path)
+    _send_q(root, "lead", "w1", "q-1")
+    _run_expect_exit(["composing", "--from", "w1", "--to", "w2",
+                      "--to-request", "q-1", "--quiet"], root, 2)
+    assert "disagrees" in capsys.readouterr().err
+
+
+def test_composing_to_request_allows_needs_info_requester(store_root: Path) -> None:
+    # The needs-info ping-pong: after a review-result(needs-info) the ball
+    # is on the REQUESTER, who drafts the answer on the same rid. A
+    # role-based gate would break this; the state-based gate allows it.
+    rc = _run(["send", "--from", "alpha", "--to", "beta",
+               "--kind", "review-request", "--meta", "request_id=rq-1",
+               "-m", "please review", "--quiet"], store_root)
+    assert rc == 0
+    rc = _run(["send", "--from", "beta", "--to", "alpha",
+               "--kind", "review-result", "--meta", "request_id=rq-1",
+               "--meta", "status=needs-info", "-m", "which env?", "--quiet"],
+              store_root)
+    assert rc == 0
+    # Until alpha READS the needs-info it is reply-waiting (you cannot be
+    # drafting a reply to something unread) - composing refuses.
+    _run_expect_exit(["composing", "--from", "alpha", "--to-request", "rq-1",
+                      "--quiet"], store_root, 2)
+    assert _run(["drain", "--for", "alpha", "--quiet"], store_root) == 0
+    # Now alpha (the requester) owes the answer - composing must work,
+    # and the derived recipient is beta.
+    rc = _run(["composing", "--from", "alpha", "--to-request", "rq-1",
+               "--quiet"], store_root)
+    assert rc == 0
+    msgs = [json.loads(p.read_text(encoding="utf-8"))
+            for p in (store_root / ".agenttalk" / "messages").glob("*.json")]
+    comp = next(m for m in msgs if m["kind"] == "composing")
+    assert comp["to"] == "beta"

@@ -14,10 +14,13 @@ from pathlib import Path
 from agenttalk import __version__
 from agenttalk.display import render
 from agenttalk.store import (
+    COMPOSING_INTENT_STALE_SECONDS,
     CONTROL_KINDS,
     Store,
     find_root,
+    find_stores_upward,
     validate_agent_name,
+    validate_rescind,
 )
 from agenttalk import transcript as tx
 from agenttalk import codex_config as cxc
@@ -206,6 +209,60 @@ def _ensure_in_roster(name: str, roster: list[str] | None, *, label: str) -> Non
         sys.exit(2)
 
 
+def _thread_row_for(store: Store, agent: str, rid: str):
+    """The derived thread row for one rid from ``agent``'s perspective,
+    computed ACK-INDEPENDENTLY (empty ``closed_rids``).
+
+    The supersession barrier (`check`, the scoped-wait rescind wake) must
+    answer from the validated log alone — a local `ack` masks the thread
+    *view*, never the fact that a request was rescinded. Returns ``None``
+    when the rid is unknown or not ``agent``'s thread. Read-only: thread
+    derivation is a pure function; no cursor/threadstate writes.
+    """
+    rows = th.derive_threads(
+        store.valid_messages(), agent=agent, cursor="", closed_rids=set(),
+    )
+    for t in rows:
+        if t.request_id == rid:
+            return t
+    return None
+
+
+def _reply_in_flight(store: Store, t) -> bool:
+    """True iff ``t.peer`` has a FRESH composing-intent entry for this thread.
+
+    Freshness = the marker entry's ``at`` is younger than
+    COMPOSING_INTENT_STALE_SECONDS (the composing-extension cap — one
+    number, one meaning). Deliberately NOT gated on peer heartbeat: only
+    wait loops stamp heartbeats, and a peer that is *drafting* is by
+    definition not waiting, so a heartbeat condition would invalidate
+    every real marker. Corrupt/missing markers read as "not drafting"
+    (observational, C-004). Broadcast rows have no single peer — False.
+    """
+    if getattr(t, "is_broadcast", False):
+        return False
+    try:
+        validate_agent_name(t.peer)
+    except ValueError:
+        return False
+    threads_map = store.read_composing_intent(t.peer).get("threads")
+    entry = threads_map.get(t.request_id) if isinstance(threads_map, dict) else None
+    if not isinstance(entry, dict):
+        return False
+    at = entry.get("at")
+    if not isinstance(at, str) or not at:
+        return False
+    normalized = at[:-1] + "+00:00" if at.endswith("Z") else at
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        return False
+    if dt.tzinfo is None:
+        return False
+    age = (datetime.now(timezone.utc) - dt).total_seconds()
+    return 0 <= age <= COMPOSING_INTENT_STALE_SECONDS
+
+
 # ------------------------------------------------------------------- handlers
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -215,6 +272,23 @@ def cmd_init(args: argparse.Namespace) -> int:
     if len(agents) < 2:
         sys.stderr.write("agenttalk init: need at least two agents (e.g. --agents claude,codex)\n")
         return 2
+    # Up-tree guard (#13): two valid stores at different depths are the
+    # real split-brain mechanism behind the production "--root gotcha" —
+    # both resolve, neither errors, and two windows silently talk past
+    # each other. Refuse to create a nested store unless --force says the
+    # nesting is deliberate. A store at the target itself keeps the
+    # existing re-init behavior (idempotent without --force).
+    if not store.initialized() and not args.force:
+        found = find_stores_upward(root.parent)
+        if found:
+            stores = "\n".join(f"    {p / '.agenttalk'}" for p in found)
+            sys.stderr.write(
+                f"agenttalk init: refusing to create a nested store at {root} — "
+                f"an existing store was found up-tree:\n{stores}\n"
+                f"  To JOIN it:   pass --root {found[0]} (or set AGENTTALK_ROOT)\n"
+                f"  To NEST anyway (deliberate, e.g. a sandbox): re-run with --force\n"
+            )
+            return 2
     # store.init() validates the roster (safe names + uniqueness) and
     # raises ValueError on bad input; main() converts that to exit 2.
     cfg = store.init(agents, force=args.force)
@@ -250,6 +324,7 @@ def _gather_status(store: Store) -> dict:
     """Build the structured status payload shared by both output modes."""
     cfg = store.load_config()
     roles = cfg.get("roles", {}) or {}
+    liaison = store.operator_facing()
     msgs = store.all_messages()
     now = datetime.now(timezone.utc)
     agents = []
@@ -281,7 +356,7 @@ def _gather_status(store: Store) -> dict:
                 isinstance(dl, (int, float))
                 and time.time() > dl + STALE_THRESHOLD_SECONDS
             )
-        agents.append({
+        row = {
             "name": a,
             "role": roles.get(a),
             "cursor": store.cursor(a) or None,
@@ -292,7 +367,10 @@ def _gather_status(store: Store) -> dict:
             "stale": stale,
             "waiting": waiting,
             "waiting_stale": waiting_stale,
-        })
+        }
+        if a == liaison:
+            row["operator_facing"] = True  # additive: absent unless set
+        agents.append(row)
     invalid = store.list_invalid_messages()
     signing_enforced = store.signing_enforced()
     # project_id is path-derived; surfaces here for diagnostics
@@ -380,7 +458,9 @@ def _thread_warnings(store: Store, cfg: dict) -> list[str]:
     except (ValueError, OSError, FileNotFoundError):
         return []
     now = datetime.now(timezone.utc)
+    liaison = store.operator_facing()
     out: list[str] = []
+    pending_escalations_exist = False
     for a in roster:
         rows = th.derive_threads(msgs, agent=a, cursor=store.cursor(a), now=now,
                                  closed_rids=_closed_rids(store, a))
@@ -398,6 +478,10 @@ def _thread_warnings(store: Store, cfg: dict) -> list[str]:
             if t.state == "open-outbound"
             and t.age_seconds is not None
             and t.age_seconds > OPEN_OUTBOUND_STALE_SECONDS
+            # #14: a fresh "reply in flight" marker from the peer means
+            # the silence is explained — suppress the stale warning for
+            # exactly that thread (and only that thread).
+            and not _reply_in_flight(store, t)
         ]
         if stale:
             t0 = stale[0]
@@ -410,6 +494,35 @@ def _thread_warnings(store: Store, cfg: dict) -> list[str]:
                 f"awaiting {who} after {_format_age(t0.age_seconds)} — "
                 f"check `agenttalk threads --for {a}`."
             )
+        # #18: stale pending escalations are operator questions nobody is
+        # answering — the loudest possible diagnostic, addressed to the
+        # liaison (only its perspective is checked, so each escalation
+        # warns once, not once per roster member).
+        if a == liaison:
+            stale_esc = [
+                t for t in rows
+                if t.needs_operator and t.operator_state == "pending"
+                and t.age_seconds is not None
+                and t.age_seconds > OPEN_OUTBOUND_STALE_SECONDS
+            ]
+            if stale_esc:
+                ids = ", ".join(t.request_id for t in stale_esc[:3])
+                out.append(
+                    f"{a}: {len(stale_esc)} operator escalation(s) pending "
+                    f"past {_format_age(OPEN_OUTBOUND_STALE_SECONDS)} "
+                    f"[{ids}] — surface them to the operator and reply "
+                    f"(`agenttalk sync --for {a}`)."
+                )
+        if any(t.needs_operator and t.operator_state == "pending"
+               and t.role == "opener" for t in rows):
+            pending_escalations_exist = True
+    if pending_escalations_exist and liaison is None:
+        out.append(
+            "operator escalations are pending but NO operator-facing agent "
+            "is configured — they are routed to whoever was targeted, with "
+            "no liaison contract. Run `agenttalk roster set-operator-facing "
+            "<agent>`."
+        )
     return out
 
 
@@ -434,9 +547,17 @@ def cmd_threads(args: argparse.Namespace) -> int:
     shown = all_rows if args.all else [t for t in all_rows if t.state in th.ACTIONABLE_STATES]
 
     if args.json:
+        out_rows = []
+        for t in shown:
+            d = t.to_dict()
+            # reply-in-flight is display-layer (reads the peer's marker),
+            # additive, and only meaningful while you're the one waiting.
+            if t.state == "open-outbound" and _reply_in_flight(store, t):
+                d["reply_in_flight"] = True
+            out_rows.append(d)
         print(json.dumps({
             "agent": agent,
-            "threads": [t.to_dict() for t in shown],
+            "threads": out_rows,
             "counts": cnts,
         }, indent=2))
         return 0
@@ -452,6 +573,7 @@ def cmd_threads(args: argparse.Namespace) -> int:
         "owed-inbound": "OWED-INBOUND ",
         "open-outbound": "OPEN-OUTBOUND",
         "closed": "closed       ",
+        "closed-superseded": "SUPERSEDED   ",
     }
     for t in shown:
         age = _format_age(t.age_seconds) if t.age_seconds is not None else "?"
@@ -462,9 +584,16 @@ def cmd_threads(args: argparse.Namespace) -> int:
             bcast = f"  responded={len(t.responded)}/{len(t.audience)}"
             if t.pending:
                 bcast += f" pending=[{', '.join(t.pending)}]"
+        extra = ""
+        if t.state == "closed-superseded":
+            extra = f"  rescinded-by={t.rescinded_by}"
+        if t.needs_operator:
+            extra += f"  operator={t.operator_state}"
+        if t.state == "open-outbound" and _reply_in_flight(store, t):
+            extra += "  (reply in flight)"
         print(
             f"  [{label.get(t.state, t.state)}] {t.request_id:<16} "
-            f"{t.opener_kind:<15} peer={t.peer:<10} age={age:<8}{subj}{flag}{bcast}"
+            f"{t.opener_kind:<15} peer={t.peer:<10} age={age:<8}{subj}{flag}{bcast}{extra}"
         )
     return 0
 
@@ -513,7 +642,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         if a.get("waiting"):
             seen += " waiting(stale)" if a.get("waiting_stale") else " waiting"
         role = f" role={a['role']}" if a.get("role") else ""
-        print(f"  {a['name']:<10}{role} cursor={cursor:<32} unread={a['unread']:<3} {seen}")
+        of = " [operator-facing]" if a.get("operator_facing") else ""
+        print(f"  {a['name']:<10}{role}{of} cursor={cursor:<32} unread={a['unread']:<3} {seen}")
     for w in payload.get("warnings", []):
         print(f"WARN:       {w}")
     return 0
@@ -570,9 +700,57 @@ def cmd_composing(args: argparse.Namespace) -> int:
     cfg = store.load_config()
     roster = cfg.get("agents") or []
     sender = _resolve_self(args.sender, roster=roster)
-    recipient = _resolve_peer(args.recipient, cfg, sender)
     body = args.message or "still drafting — please hold the line"
     meta = _parse_meta(args.meta)
+    # --to-request sugar (#14): bind the ping to one thread so the peer's
+    # scoped wait extends (the comp_rid gate) AND record the observational
+    # reply-in-flight marker that threads/sync display. The rid alone
+    # identifies the counterparty, so the peer is DERIVED from the thread
+    # row — single-argument usage per FR-016 (WP02 review blocker 1);
+    # explicit --to is only a consistency override. Drafting only makes
+    # sense when you owe the thread's next move, i.e. owed-inbound
+    # (review blocker 2). Deliberately state-based, not role-based: after
+    # a review-result(needs-info) the ball bounces to the REQUESTER, who
+    # then legitimately drafts on the same rid — a role==responder gate
+    # would break that ping-pong.
+    rid = getattr(args, "to_request", None)
+    if rid:
+        if "request_id" in meta and meta["request_id"] != rid:
+            sys.stderr.write(
+                "agenttalk composing: --to-request and --meta request_id "
+                "disagree — pass one or the other.\n")
+            return 2
+        # VIEW-accurate row (real cursor + acks) — unlike the barrier
+        # helper `_thread_row_for`, which is deliberately cursor-blind:
+        # here we must see that a drained needs-info has moved the ball
+        # to the sender (owed-inbound), not a stale reply-waiting.
+        rows = th.derive_threads(
+            store.valid_messages(), agent=sender, cursor=store.cursor(sender),
+            closed_rids=_closed_rids(store, sender),
+        )
+        row = next((t for t in rows if t.request_id == rid), None)
+        if row is None:
+            sys.stderr.write(
+                f"agenttalk composing: no thread {rid!r} is visible to "
+                f"{sender} — check `agenttalk threads --for {sender} --all`.\n")
+            return 2
+        if row.state != "owed-inbound":
+            sys.stderr.write(
+                f"agenttalk composing: you do not owe a reply on thread "
+                f"{rid!r} (state: {row.state}) — composing marks YOUR "
+                f"in-flight reply, not the peer's.\n")
+            return 2
+        derived = row.peer
+        if args.recipient and args.recipient != derived:
+            sys.stderr.write(
+                f"agenttalk composing: --to {args.recipient!r} disagrees "
+                f"with thread {rid!r} (its counterparty is {derived!r}) — "
+                f"drop --to or fix the request id.\n")
+            return 2
+        recipient = derived
+        meta["request_id"] = rid
+    else:
+        recipient = _resolve_peer(args.recipient, cfg, sender)
     msg = store.send(
         sender=sender,
         recipient=recipient,
@@ -581,8 +759,194 @@ def cmd_composing(args: argparse.Namespace) -> int:
         subject=args.subject or "composing",
         meta=meta,
     )
+    if rid:
+        store.write_composing_intent(sender, rid, recipient)  # best-effort
     if not args.quiet:
         print(f"(composing ping sent: {sender} -> {recipient}; id={msg.id})")
+    return 0
+
+
+def cmd_rescind(args: argparse.Namespace) -> int:
+    """Mark one of your own tracked requests as no-longer-current (#12).
+
+    Writes a first-class, transcript-visible `rescind` message correlated
+    to the thread. Thread derivation reports the thread as
+    `closed-superseded`; a peer blocked in `wait --to-request` wakes with
+    a RESCINDED outcome (exit 3); `check --to-request` reports
+    superseded. Generic primitive only — HOLD/VOID/strike conventions
+    live in skills, never in the transport (C-006). Requester-only:
+    you can only rescind threads you opened.
+    """
+    store = _get_store(args)
+    cfg = store.load_config()
+    sender = _resolve_self(args.sender, roster=cfg.get("agents") or [])
+    rid = args.to_request
+    try:
+        openers = validate_rescind(store, sender, rid, target_msg_id=args.to_id)
+    except ValueError as e:
+        sys.stderr.write(f"agenttalk rescind: {e}\n")
+        return 2
+    # Idempotent audit semantics: rescinding an already-superseded thread
+    # still writes the message (the transcript is the provenance), but the
+    # derived state cannot change — say so.
+    row = _thread_row_for(store, sender, rid)
+    already = row is not None and row.state == "closed-superseded"
+    # Reason is OPTIONAL: read it only when explicitly provided (-m/--file).
+    # No implicit stdin fallback — a bare `rescind` must not block on (or
+    # sniff) stdin the way body-required commands may.
+    reason = ""
+    if getattr(args, "message", None) or getattr(args, "file", None):
+        reason = _read_body(args)
+    meta: dict = {"request_id": rid}
+    if args.to_id:
+        meta["target_msg_id"] = args.to_id
+    # One rescind per distinct opener recipient (a broadcast fanned out
+    # one opener copy per member; the rescind mirrors that so every
+    # waiter wakes). NOT a broadcast itself — no broadcast_id.
+    recipients = list(dict.fromkeys(m.recipient for m in openers))
+    for r in recipients:
+        msg = store.send(
+            sender=sender,
+            recipient=r,
+            body=reason,
+            kind="rescind",
+            subject=args.subject or f"rescind: {rid}",
+            meta=dict(meta),
+        )
+        if not args.quiet:
+            print(render(msg, header=f"AGENTTALK :: RESCIND  {sender} -> {r}"))
+    if already:
+        sys.stderr.write(
+            f"agenttalk rescind: note — thread {rid} was already superseded; "
+            f"state unchanged (this rescind is recorded for audit only).\n"
+        )
+    return 0
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    """The pre-action currentness gate (#12): current | superseded | unknown.
+
+    THE contract for irreversible actions: run this immediately before
+    acting on a request you drained earlier — a rescind that landed
+    after you read the request is invisible to you otherwise (the
+    executor-already-drained race that no inbox primitive can close).
+    Read-only: no cursor, heartbeat, or threadstate writes. Computed
+    ack-independently from the validated log (a local ack never masks
+    a rescind). Exit codes: 0 current, 3 superseded, 4 unknown rid.
+    """
+    store = _get_store(args)
+    agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
+    rid = args.to_request
+    row = _thread_row_for(store, agent, rid)
+    if row is None:
+        if args.json:
+            print(json.dumps({"request_id": rid, "state": "unknown",
+                              "rescind": None}, indent=2))
+        else:
+            print(f"unknown     {rid}")
+            sys.stderr.write(
+                f"agenttalk check: no thread {rid!r} is visible to {agent} — "
+                f"check the id (`agenttalk threads --for {agent} --all`) and "
+                f"the root (`agenttalk whoami`).\n"
+            )
+        return 4
+    if row.state == "closed-superseded":
+        rescind = {
+            "id": row.rescind_msg_id,
+            "by": row.rescinded_by,
+            "at": row.rescind_at,
+            "reason": row.rescind_reason,
+        }
+        if args.json:
+            print(json.dumps({"request_id": rid, "state": "superseded",
+                              "rescind": rescind}, indent=2))
+        else:
+            print(f"superseded  {rid}")
+            print(f"  rescinded by {row.rescinded_by} at {row.rescind_at}  "
+                  f"(msg {row.rescind_msg_id})")
+            if row.rescind_reason:
+                print(f"  reason: {row.rescind_reason}")
+            print("  do NOT act on this request — a fresh exchange needs a new request_id.")
+        return 3
+    if args.json:
+        print(json.dumps({"request_id": rid, "state": "current",
+                          "rescind": None}, indent=2))
+    else:
+        print(f"current     {rid}")
+    return 0
+
+
+def cmd_escalate(args: argparse.Namespace) -> int:
+    """Route an operator-input question to the operator-facing agent (#18).
+
+    Resolves the liaison from the roster's `operator_facing` designation
+    (explicit `--to` overrides), mints an `esc-` request_id, and sends an
+    ordinary tracked `question` carrying `needs_operator=true`. REFUSES
+    loudly (exit 2) when no liaison is resolvable — an escalation that
+    lands nowhere is exactly the invisible failure this exists to kill.
+    Advisory routing only: never authorization (C-007).
+    """
+    store = _get_store(args)
+    cfg = store.load_config()
+    roster = cfg.get("agents") or []
+    sender = _resolve_self(args.sender, roster=roster)
+    body = _read_body(args)
+    if not body:
+        sys.stderr.write(
+            "agenttalk escalate: empty body (use -m TEXT, --file PATH, or pipe "
+            "stdin).\n  State the decision you need from the operator, the "
+            "options, and your recommendation.\n"
+        )
+        return 2
+    if args.to:
+        try:
+            validate_agent_name(args.to)
+        except ValueError as e:
+            sys.stderr.write(f"agenttalk escalate: {e}\n")
+            return 2
+        _ensure_in_roster(args.to, roster, label="escalation target")
+        target = args.to
+    else:
+        target = store.operator_facing()
+        if target is None:
+            raw = store.operator_facing_raw()
+            if raw:
+                sys.stderr.write(
+                    f"agenttalk escalate: configured liaison {raw!r} is not in "
+                    f"the roster {sorted(roster)} — fix it with `agenttalk "
+                    f"roster set-operator-facing <agent>` (or --clear), or "
+                    f"pass --to <agent> explicitly.\n"
+                )
+            else:
+                sys.stderr.write(
+                    "agenttalk escalate: no operator-facing agent is "
+                    "configured — run `agenttalk roster set-operator-facing "
+                    "<agent>`, or pass --to <agent> explicitly.\n"
+                )
+            return 2
+    if target == sender:
+        sys.stderr.write(
+            f"agenttalk escalate: {sender} IS the operator-facing agent — "
+            f"you own the operator channel; ask your operator directly.\n"
+        )
+        return 2
+    meta = _parse_meta(args.meta)
+    meta["needs_operator"] = "true"  # force-set: the bucket discriminator
+    if "request_id" not in meta:
+        meta["request_id"] = "esc-" + uuid.uuid4().hex[:12]
+    msg = store.send(
+        sender=sender,
+        recipient=target,
+        body=body,
+        kind="question",
+        subject=args.subject or "operator input needed",
+        meta=meta,
+    )
+    if not args.quiet:
+        print(render(msg, header=f"AGENTTALK :: ESCALATE  {sender} -> {target}"))
+    # Always print the machine-parseable correlation line: the caller's
+    # next move is `agenttalk wait --to-request <this>`.
+    print(f"request_id={meta['request_id']}")
     return 0
 
 
@@ -740,12 +1104,33 @@ def cmd_roster(args: argparse.Namespace) -> int:
         store.set_group(args.group, members)
         print(f"roster: group '{args.group}' = {', '.join(members) or '(empty)'}")
         return 0
+    if action == "set-operator-facing":
+        # Single-slot designation (#18): "two liaisons" is unrepresentable.
+        # Advisory routing metadata only — never authorization (C-007).
+        if getattr(args, "clear", False):
+            if getattr(args, "name", None):
+                sys.stderr.write(
+                    "agenttalk roster set-operator-facing: pass a name OR "
+                    "--clear, not both\n")
+                return 2
+            store.set_operator_facing(None)
+            print("roster: operator-facing cleared")
+            return 0
+        if not getattr(args, "name", None):
+            sys.stderr.write(
+                "agenttalk roster set-operator-facing: need an agent name "
+                "(or --clear)\n")
+            return 2
+        store.set_operator_facing(args.name)  # ValueError -> exit 2 via main()
+        print(f"roster: {args.name} is now operator-facing (the liaison)")
+        return 0
 
     # show
     cfg = store.load_config()
     roster = cfg.get("agents", []) or []
     roles = cfg.get("roles", {}) or {}
     groups = cfg.get("groups", {}) or {}
+    liaison = store.operator_facing()
     self_name = os.environ.get("AGENTTALK_SELF")
     if self_name not in roster:
         self_name = None
@@ -754,6 +1139,7 @@ def cmd_roster(args: argparse.Namespace) -> int:
             "agents": roster,
             "roles": roles,
             "groups": groups,
+            "operator_facing": liaison,
             "self": self_name,
         }, indent=2))
         return 0
@@ -763,7 +1149,8 @@ def cmd_roster(args: argparse.Namespace) -> int:
         role = roles.get(a) or "-"
         member_of = [g for g, ms in groups.items() if a in ms]
         gl = ", ".join(member_of) if member_of else "-"
-        print(f"  {a}{you}  role={role}  groups=[{gl}]")
+        of = "  [operator-facing]" if a == liaison else ""
+        print(f"  {a}{you}  role={role}  groups=[{gl}]{of}")
     if groups:
         print("groups:")
         for g, ms in groups.items():
@@ -882,6 +1269,22 @@ def _write_waiting_marker(
         pass
 
 
+def _print_rescinded(store: Store, rid: str, row) -> None:
+    """Render the RESCINDED wake: banner + the deciding rescind message."""
+    print(f"AGENTTALK :: RESCINDED (thread {rid}) — do not act on this request")
+    deciding = next(
+        (m for m in store.valid_messages() if m.id == row.rescind_msg_id), None,
+    )
+    if deciding is not None:
+        print(render(deciding,
+                     header=f"AGENTTALK :: RESCIND  {deciding.sender} -> {deciding.recipient}"))
+    else:  # provenance fields still tell the story
+        print(f"  rescinded by {row.rescinded_by} at {row.rescind_at} "
+              f"(msg {row.rescind_msg_id})")
+        if row.rescind_reason:
+            print(f"  reason: {row.rescind_reason}")
+
+
 def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
     """Block until a message on ONE thread (request_id) arrives — ignoring
     unrelated traffic — and return only that match.
@@ -895,6 +1298,14 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
     """
     rid = args.to_request
     kind_filter = getattr(args, "kind", None)
+    # Rescind wake (#12): a superseded request must never be waited on.
+    # Checked at entry (the rescind may predate this wait entirely) and
+    # re-evaluated when a rescind on this rid arrives mid-wait. Exit 3 —
+    # distinct from reply (0) and timeout (1) per the exit-code contract.
+    row = _thread_row_for(store, agent, rid)
+    if row is not None and row.state == "closed-superseded":
+        _print_rescinded(store, rid, row)
+        return 3
     deadline = time.time() + args.timeout if args.timeout > 0 else None
     interval = max(0.1, args.interval)
     heartbeat_interval = max(0.0, args.heartbeat_interval)
@@ -902,6 +1313,7 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
     composing_extend = max(0.0, args.composing_extend)
     last_heartbeat = 0.0
     seen_composing: set[str] = set()
+    seen_rescinds: set[str] = set()
     total_extended = 0.0
     grace_used = False
     # Snapshot the newest inbox id NOW. Only composings that arrive AFTER
@@ -955,6 +1367,20 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
                             if not args.quiet:
                                 print(f"(composing from {m.sender}: deadline "
                                       f"extended by {amount:.0f}s, +{total_extended:.0f}s total)")
+                    continue
+                # A rescind on THIS rid is an outcome, not a match: it must
+                # wake the waiter even when --kind filters replies, and it
+                # is evaluated regardless of the floor (a concurrent drain
+                # may have consumed it globally; supersession still holds).
+                # Each rescind is evaluated once; a non-superseding one
+                # (e.g. not from the requester) is skipped permanently.
+                if m.kind == "rescind" and (m.meta or {}).get("request_id") == rid:
+                    if m.id not in seen_rescinds:
+                        seen_rescinds.add(m.id)
+                        row = _thread_row_for(store, agent, rid)
+                        if row is not None and row.state == "closed-superseded":
+                            _print_rescinded(store, rid, row)
+                            return 3
                     continue
                 if (m.meta or {}).get("request_id") != rid:
                     continue
@@ -1160,6 +1586,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
     _owe = {"owed-inbound": "you", "reply-waiting": "read", "open-outbound": "peer"}
 
     def _hint(t) -> str:
+        if t.needs_operator and t.operator_state == "pending" and t.state == "owed-inbound":
+            return (f"agenttalk reply --to-request {t.request_id}   "
+                    f"# OPERATOR INPUT NEEDED — ask your human, then relay")
         if t.state == "reply-waiting":
             return f"agenttalk drain --for {agent}   # a reply landed — read it first"
         if t.state == "owed-inbound":
@@ -1190,6 +1619,30 @@ def cmd_sync(args: argparse.Namespace) -> int:
                     "broadcast": bool((m.meta or {}).get("broadcast_id"))})
     fyi = fyi[-10:]  # recent only
 
+    # Rescinded threads a restarted agent might still act on: superseded
+    # threads whose deciding rescind it has NOT yet consumed (id past the
+    # cursor). Once drained, the flag stops nagging — the transcript
+    # remains the permanent record. (#12, FR-004)
+    rescinded = [
+        t.to_dict() for t in rows
+        if t.state == "closed-superseded"
+        and isinstance(t.rescind_msg_id, str)
+        and t.rescind_msg_id > (cursor or "")
+    ]
+
+    # The liaison's operator-input bucket (#18, FR-014): every pending
+    # escalation addressed to this agent, surfaced separately from (and
+    # in addition to) the actionable list.
+    liaison = store.operator_facing()
+    escalations = []
+    if agent == liaison:
+        escalations = [
+            {**t.to_dict(), "hint": _hint(t)}
+            for t in rows
+            if t.needs_operator and t.operator_state == "pending"
+            and t.role == "responder"
+        ]
+
     payload = {
         "agent": agent,
         "roster": roster,
@@ -1199,6 +1652,10 @@ def cmd_sync(args: argparse.Namespace) -> int:
         "threads": thread_payload,
         "unread_fyi": fyi,
     }
+    if rescinded:
+        payload["rescinded"] = rescinded       # additive: absent when none
+    if agent == liaison:
+        payload["escalations"] = escalations   # additive: liaison only
     if args.json:
         print(json.dumps(payload, indent=2))
         return 0
@@ -1208,10 +1665,27 @@ def cmd_sync(args: argparse.Namespace) -> int:
     member_of = [g for g, ms in (cfg.get("groups", {}) or {}).items() if agent in ms]
     if role or member_of:
         print(f"  role={role or '-'}  groups=[{', '.join(member_of) or '-'}]")
+    if agent == liaison:
+        print("  operator-facing: yes (you are the liaison)")
     print(f"  roster: {', '.join(roster)}")
     c = payload["counts"]
     print(f"  threads: reply-waiting={c['reply-waiting']} owed-inbound={c['owed-inbound']} "
-          f"open-outbound={c['open-outbound']} closed={c['closed']}")
+          f"open-outbound={c['open-outbound']} closed={c['closed']}"
+          + (f" superseded={c['closed-superseded']}" if c.get("closed-superseded") else ""))
+    if rescinded:
+        print(f"RESCINDED ({len(rescinded)} — do NOT act on these):")
+        for d in rescinded:
+            r = d.get("rescind") or {}
+            reason = f' — "{r.get("reason")}"' if r.get("reason") else ""
+            print(f"  {d['request_id']}  {d['opener_kind']}  rescinded by "
+                  f"{r.get('by')}{reason}")
+    if agent == liaison and escalations:
+        print(f"OPERATOR INPUT NEEDED ({len(escalations)} pending):")
+        for d in escalations:
+            age = _format_age(d["age_seconds"]) if d["age_seconds"] is not None else "?"
+            subj = f' "{d["subject"]}"' if d["subject"] else ""
+            print(f"  {d['request_id']}  from {d['peer']}  age={age}{subj}")
+            print(f"      -> {d['hint']}")
     if thread_payload:
         print("actionable threads (owe / hint):")
         for d in thread_payload:
@@ -1275,12 +1749,20 @@ def cmd_whoami(args: argparse.Namespace) -> int:
         warnings.append(f"self '{self_name}' is NOT in the roster {sorted(roster)} "
                         f"— wrong --root, or a typo? (root above)")
 
+    liaison = store.operator_facing()
     if args.json:
-        print(json.dumps({
+        payload = {
             "root": str(store.root), "self": self_name, "self_in_roster": in_roster,
             "peer": peer, "role": role, "groups": member_of or [],
-            "roster": roster, "unread": unread, "owed": owed, "warnings": warnings,
-        }, indent=2))
+            "roster": roster, "unread": unread, "owed": owed,
+            "warnings": warnings,
+        }
+        # Strict additivity (NFR-001): liaison keys appear only when the
+        # feature is in use — absent, not null (WP04 review blocker 1).
+        if liaison is not None:
+            payload["operator_facing"] = bool(self_name and self_name == liaison)
+            payload["liaison"] = liaison
+        print(json.dumps(payload, indent=2))
         return 0
     print(f"root:   {store.root}")
     tag = (" (in roster)" if in_roster else " (NOT in roster!)") if self_name else ""
@@ -1290,6 +1772,9 @@ def cmd_whoami(args: argparse.Namespace) -> int:
     if in_roster:
         print(f"role:   {role or '-'}   groups=[{', '.join(member_of) or '-'}]")
         print(f"unread: {unread}   owed (you must act): {owed}")
+    if liaison is not None:
+        of = "yes" if (self_name and self_name == liaison) else "no"
+        print(f"operator-facing: {of} (liaison: {liaison})")
     print(f"roster: {', '.join(roster)}")
     for w in warnings:
         print(f"WARN:   {w}")
@@ -1322,7 +1807,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _render_doctor_human(report) -> None:
-    print(f"agenttalk doctor — {report.project_root}")
+    # Root is the FIRST line (0.14.0, #13) — same contract as whoami: the
+    # wrong-root footgun must be diagnosable from line one.
+    print(f"root: {report.project_root}")
+    print("agenttalk doctor")
     print(f"  agenttalk version  {report.agenttalk_version}")
     print(f"  python version     {report.python_version}")
     print()
@@ -1736,7 +2224,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="File-backed message bus for two agent CLIs.",
     )
     p.add_argument("--version", action="version", version=f"agenttalk {__version__}")
-    p.add_argument("--root", help="Project root (default: walk up from CWD looking for .agenttalk/)")
+    p.add_argument("--root",
+                   help="Project root. Resolution precedence: this flag > "
+                        "$AGENTTALK_ROOT > walk up from CWD looking for "
+                        ".agenttalk/. A pinned root (flag or env) that has no "
+                        "store fails loudly — it never falls back to the walk.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pi = sub.add_parser("init", help="Initialize a fresh .agenttalk/ store in the current dir.")
@@ -1799,6 +2291,18 @@ def build_parser() -> argparse.ArgumentParser:
     r_sg.add_argument("group")
     r_sg.add_argument("members", help="Comma-separated agent names.")
     r_sg.set_defaults(func=cmd_roster)
+    r_of = rsub.add_parser(
+        "set-operator-facing",
+        help="Designate the ONE agent the human operator talks to directly "
+             "(the liaison). Workers route operator questions to it via "
+             "`agenttalk escalate`. Advisory routing metadata, not an "
+             "authorization boundary. Single slot: setting it replaces the "
+             "previous designation; --clear removes it.",
+    )
+    r_of.add_argument("name", nargs="?", help="Agent name (must be in the roster).")
+    r_of.add_argument("--clear", action="store_true",
+                      help="Remove the operator-facing designation.")
+    r_of.set_defaults(func=cmd_roster)
 
     pse = sub.add_parser("send", help="Send a message from one agent to another.")
     pse.add_argument("--from", dest="sender", help="Sender agent name (default: $AGENTTALK_SELF)")
@@ -1824,24 +2328,95 @@ def build_parser() -> argparse.ArgumentParser:
     pcomp = sub.add_parser(
         "composing",
         help="Send a 'composing' ping to the peer to extend their `wait` "
-             "deadline. Use periodically while drafting a long reply so a "
-             "240s default timeout doesn't fire mid-thought.",
+             "deadline (the default `wait --timeout` is 120s; each fresh "
+             "ping extends by --composing-extend, capped at 30 min total). "
+             "Use periodically while drafting a long reply.",
     )
     pcomp.add_argument("--from", dest="sender",
                        help="Sender agent name (default: $AGENTTALK_SELF)")
     pcomp.add_argument("--to", dest="recipient",
                        help="Recipient agent name (default: $AGENTTALK_PEER, "
                             "or the single other agent in the roster)")
+    pcomp.add_argument("--to-request", dest="to_request",
+                       help="Bind the ping to one open thread: sets "
+                            "meta.request_id (so the peer's scoped "
+                            "`wait --to-request` extends) AND records the "
+                            "reply-in-flight marker that `threads`/`sync` "
+                            "show as '(reply in flight)'. Validates the id "
+                            "is a live thread of yours.")
     pcomp.add_argument("--subject",
                        help="One-line summary (default: 'composing')")
     pcomp.add_argument("--meta", action="append",
-                       help="key=value (repeatable); e.g. request_id=<id> to "
-                            "correlate with the pending request")
+                       help="key=value (repeatable); prefer --to-request over "
+                            "a hand-built request_id=<id>")
     pcomp.add_argument("-m", "--message",
                        help="Body text (default: 'still drafting — please hold "
                             "the line')")
     pcomp.add_argument("--quiet", action="store_true")
     pcomp.set_defaults(func=cmd_composing)
+
+    presc = sub.add_parser(
+        "rescind",
+        help="Mark one of your own tracked requests as no-longer-current. "
+             "Transcript-visible; the thread becomes closed-superseded, a "
+             "peer blocked in `wait --to-request` wakes with exit 3, and "
+             "`check --to-request` reports superseded. Requester-only. "
+             "Prefer this over a prose 'ignore my last message' — prose "
+             "moves no thread state.",
+    )
+    presc.add_argument("--from", dest="sender",
+                       help="Sender agent name (default: $AGENTTALK_SELF)")
+    presc.add_argument("--to-request", dest="to_request", required=True,
+                       help="request_id of the thread to rescind (you must "
+                            "be its requester).")
+    presc.add_argument("--to-id", dest="to_id",
+                       help="Pin a specific message id as the superseded "
+                            "anchor (default: the thread opener).")
+    presc.add_argument("--subject", help="One-line summary (default: 'rescind: <id>')")
+    presc.add_argument("-m", "--message",
+                       help="Optional reason (else --file or stdin; empty is allowed)")
+    presc.add_argument("--file", help="Read the reason from this file path ('-' = stdin)")
+    presc.add_argument("--quiet", action="store_true")
+    presc.set_defaults(func=cmd_rescind)
+
+    pchk = sub.add_parser(
+        "check",
+        help="Pre-action currentness gate: is this request still current? "
+             "Prints current|superseded|unknown; exit 0/3/4. Run it "
+             "immediately before any irreversible action tied to a request "
+             "— exit 3 is a hard stop. Read-only; a local ack never masks "
+             "a rescind.",
+    )
+    pchk.add_argument("--for", dest="agent",
+                      help="Agent name (default: $AGENTTALK_SELF)")
+    pchk.add_argument("--to-request", dest="to_request", required=True,
+                      help="request_id to check.")
+    pchk.add_argument("--json", action="store_true",
+                      help='{"request_id", "state", "rescind"} — stable contract.')
+    pchk.set_defaults(func=cmd_check)
+
+    pesc = sub.add_parser(
+        "escalate",
+        help="Route an operator-input question to the operator-facing agent "
+             "(the liaison). Mints an esc- request_id (printed as "
+             "`request_id=<id>` for the follow-up `wait --to-request`). "
+             "Refuses (exit 2) when no liaison is configured — pass --to "
+             "to override explicitly.",
+    )
+    pesc.add_argument("--from", dest="sender",
+                      help="Sender agent name (default: $AGENTTALK_SELF)")
+    pesc.add_argument("--to",
+                      help="Explicit target override (default: the roster's "
+                           "operator-facing agent).")
+    pesc.add_argument("--subject",
+                      help="One-line summary (default: 'operator input needed')")
+    pesc.add_argument("--meta", action="append", help="key=value (repeatable)")
+    pesc.add_argument("-m", "--message",
+                      help="The operator question (else --file or stdin). Required.")
+    pesc.add_argument("--file", help="Read body from this file path ('-' = stdin)")
+    pesc.add_argument("--quiet", action="store_true",
+                      help="Print only the request_id line.")
+    pesc.set_defaults(func=cmd_escalate)
 
     ppro = sub.add_parser(
         "propose",
@@ -1944,7 +2519,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "request_id; ignore (and leave unread) all other "
                          "traffic. Non-consuming — advances only the per-thread "
                          "pointer, never the global cursor. Close the thread "
-                         "with `ack --to-request`.")
+                         "with `ack --to-request`. Exit codes: 0 reply, "
+                         "1 timeout, 3 the request was RESCINDED (wakes "
+                         "immediately; do not act on it).")
     pw.add_argument("--kind",
                     help="With --to-request: further restrict the scoped wait "
                          "to this message kind. Note: the per-thread pointer "

@@ -122,3 +122,12 @@ Do **not** call `agenttalk wait` from this skill - that is
 - Do not modify project files; this skill only sends a message.
 - Do not guess a target in a multi-agent roster. Ask the user or use a
   named group they already requested.
+
+- **Rescind, don't retract in prose (0.14.0).** To cancel a tracked
+  request you opened (question / review-request / proposal), use
+  `agenttalk rescind --from $SELF --to-request <RID> -m "<why>"`. A prose
+  "ignore my last message" moves no thread state — the peer's `wait`
+  cannot see it and `check` still reports current. A rescind wakes a
+  blocked scoped waiter with exit 3 and flips the thread to
+  closed-superseded for every participant. A re-ask after a rescind needs
+  a FRESH request_id.

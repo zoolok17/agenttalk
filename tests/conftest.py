@@ -30,5 +30,5 @@ def store(store_root: Path) -> Store:
 def _clear_agenttalk_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Strip AGENTTALK_* env vars between tests so resolution behavior is
     deterministic regardless of what the host shell has set."""
-    for var in ("AGENTTALK_SELF", "AGENTTALK_PEER"):
+    for var in ("AGENTTALK_SELF", "AGENTTALK_PEER", "AGENTTALK_ROOT"):
         monkeypatch.delenv(var, raising=False)

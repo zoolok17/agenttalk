@@ -176,6 +176,12 @@ If the peer's reply contradicts your draft on something important:
   consult in return.
 - **`request_id` is required.** It correlates the consult round.
 
+- **Mark long drafts (0.14.0).** While drafting a long reply on a known
+  thread, ping `agenttalk composing --from $SELF --to-request <RID>`
+  (repeat roughly every 2 minutes). It extends the peer's scoped wait AND
+  shows "(reply in flight)" in their threads/sync, preventing crossing
+  messages. Prefer it over a hand-built `--meta request_id=...`.
+
 ## Anti-groupthink
 
 If the peer's reply is just "agree, good plan", that adds no signal.

@@ -5,6 +5,88 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-06-05
+
+Operator-safety release, from the four-agent production band's second
+retro (2026-06-05) plus a direct operator requirement. Closes the two
+incidents that survived 0.13.0: a launch HOLD that crossed mid-flight
+with its "fire" message (a voided run), and two terminal windows
+silently talking to two different stores. Adds the operator-liaison
+workflow: one designated agent the human talks to, with a loud,
+correlated escalation path for everyone else.
+
+### Added
+
+- **Rescind.** `agenttalk rescind --from A --to-request RID [--to-id MSG]
+  [-m reason]` marks a tracked request you opened as no-longer-current.
+  First-class and transcript-visible (in the known kinds, NOT a hidden
+  control kind); thread derivation reports `closed-superseded` for every
+  participant; the first qualifying rescind decides and later duplicates
+  are audit-only; requester-only. A re-ask after a rescind needs a fresh
+  request_id. A per-agent manual `ack` keeps its own `closed` label —
+  view closure never masks the fact.
+- **Pre-action currentness gate.** `agenttalk check --for A --to-request
+  RID [--json]` prints `current`/`superseded`/`unknown` and exits 0/3/4.
+  The contract for irreversible actions: run it immediately before
+  acting on a request you drained earlier — the executor-already-read
+  race cannot be closed by any inbox primitive, only by this gate.
+  Read-only and ack-independent.
+- **Rescinded wake.** A scoped `wait --to-request` on a rescinded
+  request wakes immediately (at entry or mid-wait) with a `RESCINDED`
+  banner and **exit 3**, instead of blocking for a reply that should
+  never come. Exit 1 remains exclusively the wait timeout.
+- **Operator liaison.** `agenttalk roster set-operator-facing <name>`
+  (single slot — "two liaisons" is unrepresentable; `--clear` removes)
+  designates the one agent the human operator talks to directly.
+  `agenttalk escalate --from W -m "..."` routes an operator question to
+  the liaison automatically as a tracked question (`esc-` request_id,
+  printed as `request_id=<id>`), and refuses loudly (exit 2, with
+  remediation) when no liaison is resolvable. The liaison's `sync` shows
+  pending escalations under OPERATOR INPUT NEEDED; an answer on the same
+  request_id clears them. Advisory routing metadata — not authorization.
+- **Root hardening.** New `AGENTTALK_ROOT` env var with strict
+  precedence (`--root` flag > env > upward walk; a pinned root that has
+  no store fails loudly, never falls back). `agenttalk init` refuses to
+  create a nested store when one exists up-tree (`--force` for a
+  deliberate sandbox). `doctor` detects and names every store from the
+  working directory upward, flags split-brain layouts, and both `doctor`
+  and `whoami` lead with `root:` as their first line.
+- **Liaison diagnostics.** `doctor` checks the operator-facing
+  designation: unset-but-escalations-exist, configured-but-pruned
+  (error), and stale-heartbeat liaison.
+- **Reply-in-flight visibility.** `agenttalk composing --to-request RID`
+  binds the ping to one thread (the counterparty is derived from the
+  thread — single argument), extends the peer's scoped wait, and records
+  an observational marker that `threads`/`sync` show as
+  "(reply in flight)" — suppressing the stale-thread warning while a
+  reply is being drafted. Allowed exactly when you owe the thread's next
+  move (including the needs-info ping-pong).
+
+### Changed
+
+- `threads`/`sync`/`status` surface the new states: `SUPERSEDED` rows
+  with rescind provenance (who/when/why), a RESCINDED section in `sync`
+  for rescinds the agent has not yet consumed, the liaison's escalation
+  bucket, `[operator-facing]` markers, and new warnings (stale pending
+  escalations; escalations-with-no-liaison). All JSON additions are
+  strictly additive: absent when the features are unused, never null.
+- Bundled skills (both CLIs) teach the four new contracts: check before
+  irreversible actions; rescind over prose retractions; escalate instead
+  of asking your own window's human (with the liaison's single-voice
+  rule); and `composing --to-request` while drafting long replies.
+- The `composing` help text no longer claims a 240s default wait
+  timeout (the actual default is 120s).
+
+### Security
+
+- No trust-model change. `rescind` is validated content (same roster/
+  HMAC gates as any message; derivation honors only the requester's
+  rescind); `check` answers from the validated log and cannot be masked
+  by per-agent state; `operator_facing` is advisory routing metadata in
+  config.json, explicitly not an authorization boundary; the
+  reply-in-flight marker is observational with the heartbeat/waiting
+  tamper profile. See SECURITY.md.
+
 ## [0.13.0] - 2026-06-03
 
 Workflow-safety and Windows-ergonomics release for the remaining

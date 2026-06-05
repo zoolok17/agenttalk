@@ -197,3 +197,16 @@ for your request.
 - Do not loop forever. After 3 consecutive rejected reviews on the
   same scope without convergence, surface to the user.
 - If the peer sends `kind=end`, the session is over.
+
+- **Check before irreversible actions (0.14.0).** Immediately before any
+  irreversible action tied to a tracked request (merge, release, deploy,
+  delete, fire-type actions), run
+  `agenttalk check --for $SELF --to-request <RID>`. Exit 3 = the request
+  was RESCINDED: hard stop — do not act, and reply on the thread that you
+  aborted. Exit 4 = unknown id: treat as stale and re-confirm with the
+  counterparty. Only exit 0 (current) clears you to act.
+- **Mark long drafts (0.14.0).** While drafting a long reply on a known
+  thread, ping `agenttalk composing --from $SELF --to-request <RID>`
+  (repeat roughly every 2 minutes). It extends the peer's scoped wait AND
+  shows "(reply in flight)" in their threads/sync, preventing crossing
+  messages. Prefer it over a hand-built `--meta request_id=...`.

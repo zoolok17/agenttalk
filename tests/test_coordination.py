@@ -5,6 +5,8 @@ closure, and the `sync` rejoin digest."""
 from __future__ import annotations
 
 import json
+import threading
+import time as _time
 from pathlib import Path
 
 import pytest
@@ -200,3 +202,280 @@ def test_sync_caught_up_has_no_actionable(store: Store, store_root: Path,
     payload = json.loads(capsys.readouterr().out)
     assert payload["threads"] == []
     assert payload["counts"]["owed-inbound"] == 0
+
+
+# ======================================================================
+# 0.14.0 end-to-end gates (WP04): the two production incidents, dead
+# ======================================================================
+
+def _init_team(tmp_path: Path, agents: str) -> Path:
+    rc = cli.main(["init", "--path", str(tmp_path), "--agents", agents])
+    assert rc == 0
+    return tmp_path
+
+
+def _json_of(argv: list[str], root: Path, capsys) -> dict:
+    capsys.readouterr()
+    assert _run(argv, root) == 0
+    return json.loads(capsys.readouterr().out)
+
+
+# ----------------------------- T019: the rescind race (Success Criterion 1)
+
+def test_rescind_race_wake_path_mid_wait(tmp_path: Path, capsys) -> None:
+    """The HOLD/fire crossing, wake flavor: the executor is BLOCKED in a
+    scoped wait when the rescind lands - it must wake with exit 3, not
+    act, and not consume."""
+    root = _init_team(tmp_path, "lead,exec")
+    _run(["send", "--from", "lead", "--to", "exec", "--kind", "question",
+          "--meta", "request_id=q-fire", "-m", "fire the launch", "--quiet"], root)
+    s = Store(root)
+    # exec drains the request (reads it) and arms a scoped wait for
+    # follow-ups; the rescind arrives DURING the wait.
+    assert _run(["drain", "--for", "exec", "--quiet"], root) == 0
+    result: list[int] = []
+
+    def _waiter() -> None:
+        result.append(cli.main([
+            "--root", str(root), "wait", "--for", "exec",
+            "--to-request", "q-fire", "--timeout", "30",
+            "--heartbeat-interval", "0",
+        ]))
+
+    t = threading.Thread(target=_waiter)
+    t.start()
+    _time.sleep(0.8)  # let the waiter arm (poll interval 0.3s)
+    assert _run(["rescind", "--from", "lead", "--to-request", "q-fire",
+                 "-m", "HOLD - new data", "--quiet"], root) == 0
+    t.join(timeout=15)
+    assert not t.is_alive(), "waiter failed to wake on the rescind"
+    assert result == [3]
+    # the waiter's user-visible wake: banner + the rescind reason
+    out = capsys.readouterr().out
+    assert "RESCINDED" in out
+    assert "HOLD - new data" in out
+    # non-consuming: the rescind is still unread for a later drain
+    assert any(m.kind == "rescind" for m in s.unread_for("exec"))
+    # and the executor's thread view is terminal-superseded
+    data = _json_of(["threads", "--for", "exec", "--all", "--json"], root, capsys)
+    row = next(r for r in data["threads"] if r["request_id"] == "q-fire")
+    assert row["state"] == "closed-superseded"
+
+
+def test_rescind_race_check_gate_path(tmp_path: Path, capsys) -> None:
+    """The already-drained race no inbox primitive can close: exec read
+    the request minutes ago; the contract gate (`check`) catches the
+    rescind that landed after."""
+    root = _init_team(tmp_path, "lead,exec")
+    _run(["send", "--from", "lead", "--to", "exec", "--kind", "question",
+          "--meta", "request_id=q-fire", "-m", "fire", "--quiet"], root)
+    assert _run(["drain", "--for", "exec", "--quiet"], root) == 0  # consumed
+    assert _run(["rescind", "--from", "lead", "--to-request", "q-fire",
+                 "--quiet"], root) == 0
+    # the gate, immediately before the irreversible action:
+    _run_expect_exit(["check", "--for", "exec", "--to-request", "q-fire"], root, 3)
+    # exec declines instead of firing; thread is terminal for both
+    assert _run(["send", "--from", "exec", "--to", "lead", "--kind", "message",
+                 "--meta", "request_id=q-fire",
+                 "-m", "aborting: request was rescinded", "--quiet"], root) == 0
+    for agent in ("lead", "exec"):
+        data = _json_of(["threads", "--for", agent, "--all", "--json"], root, capsys)
+        row = next(t for t in data["threads"] if t["request_id"] == "q-fire")
+        assert row["state"] == "closed-superseded"
+
+
+def test_rescind_race_negative_control(tmp_path: Path) -> None:
+    """Success Criterion 1's '100% abort' is only meaningful if live
+    requests PASS the gate - no false positives."""
+    root = _init_team(tmp_path, "lead,exec")
+    _run(["send", "--from", "lead", "--to", "exec", "--kind", "question",
+          "--meta", "request_id=q-go", "-m", "proceed", "--quiet"], root)
+    assert _run(["drain", "--for", "exec", "--quiet"], root) == 0
+    _run_expect_exit(["check", "--for", "exec", "--to-request", "q-go"], root, 0)
+
+
+def test_rescind_race_crossing_variant(tmp_path: Path) -> None:
+    """The rescind is written WHILE exec is mid-drain (between send and
+    drain): supersession is decided by message-id order, not by what a
+    drain happened to consume."""
+    root = _init_team(tmp_path, "lead,exec")
+    _run(["send", "--from", "lead", "--to", "exec", "--kind", "question",
+          "--meta", "request_id=q-fire", "-m", "fire", "--quiet"], root)
+    # the crossing: rescind lands before exec's drain
+    assert _run(["rescind", "--from", "lead", "--to-request", "q-fire",
+                 "--quiet"], root) == 0
+    assert _run(["drain", "--for", "exec", "--quiet"], root) == 0  # consumes BOTH
+    _run_expect_exit(["check", "--for", "exec", "--to-request", "q-fire"], root, 3)
+
+
+# --------------------------- T020: the liaison flow (Success Criterion 3)
+
+def test_liaison_flow_happy_loop(tmp_path: Path, capsys) -> None:
+    root = _init_team(tmp_path, "lead,w1,w2")
+    assert _run(["roster", "set-operator-facing", "lead"], root) == 0
+    capsys.readouterr()
+    assert _run(["escalate", "--from", "w1",
+                 "-m", "Operator: deploy window today or tomorrow?"], root) == 0
+    out = capsys.readouterr().out
+    rid = next(ln for ln in out.splitlines()
+               if ln.startswith("request_id=")).split("=", 1)[1]
+    assert rid.startswith("esc-")
+    # liaison's bucket has exactly this one entry
+    digest = _json_of(["sync", "--for", "lead", "--json"], root, capsys)
+    assert [e["request_id"] for e in digest["escalations"]] == [rid]
+    # scoped visibility: w2 never sees it
+    w2 = _json_of(["sync", "--for", "w2", "--json"], root, capsys)
+    assert "escalations" not in w2
+    assert all(t["request_id"] != rid for t in w2["threads"])
+    # liaison answers on the same thread
+    assert _run(["reply", "--from", "lead", "--to-request", rid,
+                 "--meta", "operator_answer=true",
+                 "-m", "Operator says: tomorrow.", "--quiet"], root) == 0
+    digest = _json_of(["sync", "--for", "lead", "--json"], root, capsys)
+    assert digest.get("escalations", []) == [] or "escalations" not in digest
+    # the worker sees it answered
+    rows = _json_of(["threads", "--for", "w1", "--all", "--json"], root, capsys)
+    row = next(t for t in rows["threads"] if t["request_id"] == rid)
+    assert row["operator_state"] == "answered"
+
+
+def test_liaison_flow_refusals_e2e(tmp_path: Path, capsys) -> None:
+    root = _init_team(tmp_path, "lead,w1,w2")
+    # no liaison: refuse loudly WITH the remediation hint (FR-013/NFR-004)
+    capsys.readouterr()
+    _run_expect_exit(["escalate", "--from", "w1", "-m", "ping"], root, 2)
+    err = capsys.readouterr().err
+    assert "set-operator-facing" in err
+    assert "--to" in err
+    # explicit --to override still works
+    assert _run(["escalate", "--from", "w1", "--to", "lead", "-m", "ping",
+                 "--quiet"], root) == 0
+    # liaison self-escalation refused with its reason
+    assert _run(["roster", "set-operator-facing", "lead"], root) == 0
+    capsys.readouterr()
+    _run_expect_exit(["escalate", "--from", "lead", "-m", "self"], root, 2)
+    assert "operator channel" in capsys.readouterr().err
+    # liaison cleared mid-flight: the pending escalation survives and the
+    # (former) liaison's answer still closes it
+    capsys.readouterr()
+    assert _run(["escalate", "--from", "w2", "-m", "decision needed"], root) == 0
+    rid = next(ln for ln in capsys.readouterr().out.splitlines()
+               if ln.startswith("request_id=")).split("=", 1)[1]
+    assert _run(["roster", "set-operator-facing", "--clear"], root) == 0
+    assert _run(["reply", "--from", "lead", "--to-request", rid,
+                 "-m", "answer", "--quiet"], root) == 0
+    # consume the answer first: until drained it is (correctly) reply-waiting
+    assert _run(["drain", "--for", "w2", "--quiet"], root) == 0
+    rows = _json_of(["threads", "--for", "w2", "--all", "--json"], root, capsys)
+    row = next(t for t in rows["threads"] if t["request_id"] == rid)
+    assert row["state"] == "closed"
+    assert row["operator_state"] == "answered"
+
+
+def test_liaison_single_channel_invariant(tmp_path: Path, capsys) -> None:
+    root = _init_team(tmp_path, "lead,w1,w2")
+    assert _run(["roster", "set-operator-facing", "lead"], root) == 0
+    for w in ("w1", "w2"):
+        assert _run(["escalate", "--from", w, "-m", f"question from {w}",
+                     "--quiet"], root) == 0
+    digest = _json_of(["sync", "--for", "lead", "--json"], root, capsys)
+    assert len(digest["escalations"]) == 2
+    # zero escalation traffic addressed to anyone but the liaison
+    s = Store(root)
+    esc = [m for m in s.valid_messages()
+           if (m.meta or {}).get("needs_operator") == "true"]
+    assert len(esc) == 2
+    assert all(m.recipient == "lead" for m in esc)
+
+
+# ------------------------ T021: backward compatibility (NFR-001 / SC 5)
+
+_PRE_014_THREAD_KEYS = {"request_id", "opener_kind", "subject", "peer", "role",
+                        "state", "age_seconds", "last_msg_id", "unread"}
+
+
+def test_backcompat_json_shapes_without_new_features(tmp_path: Path, capsys) -> None:
+    """A store driven only by pre-0.14.0 operations: every pre-existing
+    key present, every new key ABSENT (strict additivity)."""
+    root = _init_team(tmp_path, "alpha,beta")
+    _run(["send", "--from", "alpha", "--to", "beta", "--kind", "question",
+          "--meta", "request_id=q-old", "-m", "hello", "--quiet"], root)
+    rows = _json_of(["threads", "--for", "alpha", "--all", "--json"], root, capsys)
+    assert set(rows) == {"agent", "threads", "counts"}
+    row = rows["threads"][0]
+    assert set(row) == _PRE_014_THREAD_KEYS
+    # counts: the ONE documented always-present addition (WP01 NFR-001
+    # carve-out, approved review round 3) - everything else unchanged.
+    assert set(rows["counts"]) == {"reply-waiting", "owed-inbound",
+                                   "open-outbound", "closed",
+                                   "closed-superseded"}
+    digest = _json_of(["sync", "--for", "beta", "--json"], root, capsys)
+    assert set(digest) == {"agent", "roster", "roles", "groups", "counts",
+                           "threads", "unread_fyi"}  # rescinded/escalations ABSENT
+    status = _json_of(["status", "--json"], root, capsys)
+    assert set(status) == {"root", "session_id", "project_id",
+                           "signing_enforced", "message_count",
+                           "invalid_messages", "agents",
+                           "stale_threshold_seconds", "warnings"}
+    for a in status["agents"]:
+        assert set(a) == {"name", "role", "cursor", "unread", "heartbeat",
+                          "last_seen_seconds", "stale", "waiting",
+                          "waiting_stale"}  # operator_facing ABSENT
+    who = _json_of(["whoami", "--for", "alpha", "--json"], root, capsys)
+    assert set(who) == {"root", "self", "self_in_roster", "peer", "role",
+                        "groups", "roster", "unread", "owed", "warnings"}
+    # liaison keys ABSENT (not null) when the feature is unused
+
+
+def test_backcompat_old_reader_paths_with_new_traffic(tmp_path: Path, capsys) -> None:
+    """A rescind + an escalation in the store: every PRE-EXISTING read
+    path keeps working - rescinds print as ordinary transcript content,
+    unread counts include them, cursor advance passes them, unrelated
+    threads are unaffected."""
+    root = _init_team(tmp_path, "lead,w1")
+    _run(["send", "--from", "lead", "--to", "w1", "--kind", "question",
+          "--meta", "request_id=q-1", "-m", "fire", "--quiet"], root)
+    _run(["send", "--from", "lead", "--to", "w1", "--kind", "question",
+          "--meta", "request_id=q-other", "-m", "unrelated", "--quiet"], root)
+    assert _run(["rescind", "--from", "lead", "--to-request", "q-1",
+                 "-m", "hold", "--quiet"], root) == 0
+    assert _run(["roster", "set-operator-facing", "lead"], root) == 0
+    assert _run(["escalate", "--from", "w1", "-m", "decision?", "--quiet"], root) == 0
+    s = Store(root)
+    assert len(s.unread_for("w1")) == 3  # q-1, q-other, rescind
+    capsys.readouterr()
+    assert _run(["drain", "--for", "w1"], root) == 0
+    out = capsys.readouterr().out
+    assert "kind=rescind" in out          # ordinary transcript content
+    assert len(s.unread_for("w1")) == 0   # cursor advanced past everything
+    # the unrelated thread is untouched by the rescind
+    rows = _json_of(["threads", "--for", "w1", "--all", "--json"], root, capsys)
+    other = next(t for t in rows["threads"] if t["request_id"] == "q-other")
+    assert other["state"] == "owed-inbound"
+    assert "rescind" not in other
+
+
+def test_backcompat_marker_and_config_tolerance(tmp_path: Path, capsys) -> None:
+    """Hand-corrupted composing marker + garbage operator_facing values:
+    every command behaves exactly as if they were absent."""
+    root = _init_team(tmp_path, "alpha,beta")
+    _run(["send", "--from", "alpha", "--to", "beta", "--kind", "question",
+          "--meta", "request_id=q-1", "-m", "x", "--quiet"], root)
+    (root / ".agenttalk" / "state" / "beta.composing.json").write_text(
+        "{corrupt", encoding="utf-8")
+    s = Store(root)
+    for garbage in (None, 123, ["alpha"]):
+        cfg = s.load_config()
+        cfg["operator_facing"] = garbage
+        s._write_config(cfg)
+        for argv in (["status", "--json"], ["sync", "--for", "alpha", "--json"],
+                     ["threads", "--for", "alpha", "--json"],
+                     ["whoami", "--for", "alpha", "--json"]):
+            capsys.readouterr()
+            assert _run(argv, root) == 0
+        who = _json_of(["whoami", "--for", "alpha", "--json"], root, capsys)
+        assert "liaison" not in who  # garbage config == feature unused: absent
+    # doctor flags garbage config at most informationally, never crashes
+    from agenttalk import doctor as _doctor
+    report = _doctor.run(root)
+    assert report.overall in ("ok", "warn", "error")  # i.e. it RAN

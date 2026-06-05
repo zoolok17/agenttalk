@@ -9,10 +9,16 @@ from pathlib import Path
 import pytest
 
 from agenttalk.store import (
+    COMPOSING_INTENT_STALE_SECONDS,
+    CONTROL_KINDS,
+    KNOWN_KINDS,
+    OPENER_KINDS,
     Store,
     find_root,
+    find_stores_upward,
     validate_agent_name,
     validate_agent_roster,
+    validate_rescind,
 )
 
 
@@ -283,3 +289,208 @@ def test_load_config_rejects_non_list_agents(tmp_path: Path) -> None:
     s.config_path.write_text(_json.dumps(cfg), encoding="utf-8")
     with pytest.raises(ValueError, match="must be a list"):
         s.load_config()
+
+
+# ======================================================================
+# 0.14.0 engine foundations (WP01)
+# ======================================================================
+
+def _team_store(tmp_path: Path, agents: list[str]) -> Store:
+    s = Store(tmp_path)
+    s.init(agents)
+    return s
+
+
+# ------------------------------------------------------------- kinds (T001)
+
+def test_rescind_is_a_known_kind() -> None:
+    assert "rescind" in KNOWN_KINDS
+
+
+def test_control_kinds_unchanged() -> None:
+    # C-003 regression guard: rescind must stay transcript-visible.
+    # Literal assertion on purpose - any addition to the control plane
+    # must consciously update this test.
+    assert CONTROL_KINDS == frozenset({"composing"})
+
+
+def test_opener_kinds_single_source() -> None:
+    # threads.py re-exports the store constant - same object, not a copy.
+    from agenttalk import threads
+    assert threads.OPENER_KINDS is OPENER_KINDS
+
+
+def test_send_rescind_kind_accepted(store: Store) -> None:
+    m = store.send(sender="alpha", recipient="beta", kind="rescind",
+                   body="changed my mind", meta={"request_id": "rq-x"})
+    assert m.kind == "rescind"
+
+
+# --------------------------------------------------- validate_rescind (T001)
+
+def test_validate_rescind_happy_path(store: Store) -> None:
+    opener = store.send(sender="alpha", recipient="beta", kind="question",
+                        body="fire?", meta={"request_id": "q-1"})
+    openers = validate_rescind(store, "alpha", "q-1")
+    assert [m.id for m in openers] == [opener.id]
+    assert openers[0].recipient == "beta"
+
+
+def test_validate_rescind_rejects_non_requester(store: Store) -> None:
+    store.send(sender="alpha", recipient="beta", kind="question",
+               body="fire?", meta={"request_id": "q-1"})
+    with pytest.raises(ValueError, match="only the requester"):
+        validate_rescind(store, "beta", "q-1")
+
+
+def test_validate_rescind_rejects_unknown_rid(store: Store) -> None:
+    with pytest.raises(ValueError, match="no thread with request_id"):
+        validate_rescind(store, "alpha", "q-nope")
+
+
+def test_validate_rescind_rejects_unknown_target_msg_id(store: Store) -> None:
+    store.send(sender="alpha", recipient="beta", kind="question",
+               body="fire?", meta={"request_id": "q-1"})
+    with pytest.raises(ValueError, match="not a message in thread"):
+        validate_rescind(store, "alpha", "q-1",
+                         target_msg_id="20990101-000000-000000-XXXX")
+
+
+def test_validate_rescind_thread_without_opener(store: Store) -> None:
+    # A bare correlated message (orphan reply) - nothing to rescind.
+    store.send(sender="alpha", recipient="beta", kind="message",
+               body="orphan", meta={"request_id": "q-orphan"})
+    with pytest.raises(ValueError, match="no visible opener"):
+        validate_rescind(store, "alpha", "q-orphan")
+
+
+def test_validate_rescind_broadcast_returns_all_opener_copies(tmp_path: Path) -> None:
+    s = _team_store(tmp_path, ["lead", "w1", "w2"])
+    for r in ("w1", "w2"):
+        s.send(sender="lead", recipient=r, kind="question", body="status?",
+               meta={"request_id": "b-1", "broadcast_id": "b-1", "audience": "all"})
+    openers = validate_rescind(s, "lead", "b-1")
+    assert sorted(m.recipient for m in openers) == ["w1", "w2"]
+    with pytest.raises(ValueError, match="only the requester"):
+        validate_rescind(s, "w1", "b-1")
+
+
+# ------------------------------------- root resolution + scanner (T002)
+
+def test_find_root_env_pin_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pinned = tmp_path / "pinned"
+    pinned.mkdir()
+    Store(pinned).init(["alpha", "beta"])
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setenv("AGENTTALK_ROOT", str(pinned))
+    # env wins even when an upward walk from `elsewhere` would find nothing
+    assert find_root(elsewhere) == pinned.resolve()
+
+
+def test_find_root_env_pin_returned_even_without_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A typo'd pin must fail LOUDLY downstream (must-exist check), never
+    # silently fall back to the walk - that would be a new silent fork.
+    ghost = tmp_path / "ghost"
+    monkeypatch.setenv("AGENTTALK_ROOT", str(ghost))
+    assert find_root(tmp_path) == ghost.resolve()
+
+
+def test_find_root_walk_unchanged_without_env(tmp_path: Path) -> None:
+    # (AGENTTALK_ROOT is stripped by the autouse conftest fixture.)
+    root = tmp_path / "proj"
+    sub = root / "a" / "b"
+    sub.mkdir(parents=True)
+    Store(root).init(["alpha", "beta"])
+    assert find_root(sub) == root.resolve()
+    # no store anywhere -> falls back to start
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    assert find_root(bare) == bare.resolve()
+
+
+def test_find_stores_upward(tmp_path: Path) -> None:
+    outer = tmp_path / "outer"
+    inner = outer / "mid" / "inner"
+    inner.mkdir(parents=True)
+    assert find_stores_upward(inner) == []
+    Store(outer).init(["alpha", "beta"])
+    assert find_stores_upward(inner) == [outer.resolve()]
+    Store(inner).init(["alpha", "beta"])
+    # walk order: nearest first
+    assert find_stores_upward(inner) == [inner.resolve(), outer.resolve()]
+
+
+# ------------------------------------------------ operator_facing (T003)
+
+def test_operator_facing_roundtrip(store: Store) -> None:
+    assert store.operator_facing() is None
+    assert store.operator_facing_raw() is None
+    store.set_operator_facing("alpha")
+    assert store.operator_facing() == "alpha"
+    assert store.operator_facing_raw() == "alpha"
+    store.set_operator_facing(None)
+    assert store.operator_facing() is None
+    assert "operator_facing" not in store.load_config()
+
+
+def test_set_operator_facing_rejects_non_roster(store: Store) -> None:
+    with pytest.raises(ValueError, match="not in the roster"):
+        store.set_operator_facing("ghost")
+
+
+def test_operator_facing_stale_after_roster_removal(store: Store) -> None:
+    store.set_operator_facing("beta")
+    store.remove_agent("beta")
+    # routing accessor refuses a pruned mailbox; raw keeps it for doctor
+    assert store.operator_facing() is None
+    assert store.operator_facing_raw() == "beta"
+
+
+def test_operator_facing_tolerates_garbage_config(store: Store) -> None:
+    for garbage in (None, 123, "", ["alpha"]):
+        cfg = store.load_config()
+        cfg["operator_facing"] = garbage
+        store._write_config(cfg)
+        assert store.operator_facing() is None
+        assert store.operator_facing_raw() is None
+
+
+# ------------------------------------------- composing intent (T003, #14)
+
+def test_composing_intent_roundtrip_and_clear(store: Store) -> None:
+    assert store.read_composing_intent("alpha") == {}
+    store.write_composing_intent("alpha", "q-1", "beta")
+    store.write_composing_intent("alpha", "q-2", "beta")
+    threads = store.read_composing_intent("alpha")["threads"]
+    assert set(threads) == {"q-1", "q-2"}
+    assert threads["q-1"]["peer"] == "beta"
+    assert "at" in threads["q-1"]
+    store.clear_composing_intent("alpha", "q-1")
+    assert set(store.read_composing_intent("alpha")["threads"]) == {"q-2"}
+    store.clear_composing_intent("alpha", "q-2")
+    # last entry removed -> file gone entirely
+    assert store.read_composing_intent("alpha") == {}
+    assert not (store.state_dir / "alpha.composing.json").exists()
+
+
+def test_composing_intent_corrupt_reads_empty(store: Store) -> None:
+    p = store.state_dir / "alpha.composing.json"
+    p.write_text("{not json", encoding="utf-8")
+    assert store.read_composing_intent("alpha") == {}
+    p.write_text(json.dumps(["a", "list"]), encoding="utf-8")
+    assert store.read_composing_intent("alpha") == {}
+
+
+def test_composing_intent_clear_missing_is_silent(store: Store) -> None:
+    store.clear_composing_intent("alpha")          # whole file, absent
+    store.clear_composing_intent("alpha", "q-1")   # one rid, absent
+
+
+def test_composing_intent_stale_constant_matches_cap() -> None:
+    # One number, one meaning: the marker staleness horizon equals the
+    # wait loop's cumulative composing-extension cap.
+    from agenttalk import cli
+    assert COMPOSING_INTENT_STALE_SECONDS == cli._COMPOSING_MAX_EXTEND_SECONDS

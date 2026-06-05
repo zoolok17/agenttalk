@@ -110,3 +110,12 @@ approved, every piece MUST be cross-reviewed via `/agenttalk.handoff`.
   commands only when the user asks for that setup.
 - Never send `--kind end` from this skill. Use `agenttalk end --from
   $SELF` directly only when the user has confirmed the session is over.
+
+- **Rescind, don't retract in prose (0.14.0).** To cancel a tracked
+  request you opened (question / review-request / proposal), use
+  `agenttalk rescind --from $SELF --to-request <RID> -m "<why>"`. A prose
+  "ignore my last message" moves no thread state — the peer's `wait`
+  cannot see it and `check` still reports current. A rescind wakes a
+  blocked scoped waiter with exit 3 and flips the thread to
+  closed-superseded for every participant. A re-ask after a rescind needs
+  a FRESH request_id.

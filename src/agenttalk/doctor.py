@@ -18,7 +18,7 @@ from agenttalk import __version__
 from agenttalk import codex_config as cxc
 from agenttalk import install_skills as iskl
 from agenttalk import signing as _signing
-from agenttalk.store import Store, find_root
+from agenttalk.store import Store, find_root, find_stores_upward
 
 
 @dataclass
@@ -47,9 +47,11 @@ class Report:
 
     def to_dict(self) -> dict:
         return {
+            # Root FIRST (0.14.0, #13): the wrong-root footgun is diagnosed
+            # by reading exactly one key, on both output surfaces.
+            "project_root": self.project_root,
             "agenttalk_version": self.agenttalk_version,
             "python_version": self.python_version,
-            "project_root": self.project_root,
             "overall": self.overall,
             "checks": [
                 {"name": c.name, "status": c.status,
@@ -76,7 +78,13 @@ def run(project_root: Path | None = None) -> Report:
 
     store = Store(root)
     report.checks.append(_check_init(store))
+    # Multi-store detection runs UNCONDITIONALLY (not gated on an
+    # initialized store): the split-brain layout (#13) is most dangerous
+    # exactly when the user is confused about which store they're on —
+    # including when the resolved root has no store at all.
+    report.checks.append(_check_multi_store(root))
     if store.initialized():
+        report.checks.append(_check_operator_facing(store))
         report.checks.extend(_check_skills())
         report.checks.append(_check_codex_config(root))
         report.checks.append(_check_hmac(store, root))
@@ -85,6 +93,118 @@ def run(project_root: Path | None = None) -> Report:
 
 
 # ---------------------------------------------------------- individual checks
+
+def _check_multi_store(resolved_root: Path, *, cwd: Path | None = None) -> Check:
+    """Split-brain detection (#13): name every store from CWD upward.
+
+    The production "--root gotcha" was two ``init``s at different depths:
+    both stores valid, neither erroring, two windows silently resolving
+    to different roots. One store: quiet OK. Two or more: WARN naming all
+    of them in walk order, with the join remediation. WARN, not error — a
+    deliberately nested store (``init --force``, e.g. a test sandbox) is
+    legitimate; the human decides. Also flags (informationally) a pinned
+    root (flag/env) that differs from what the walk would have chosen.
+    """
+    cwd = (cwd or Path.cwd()).resolve()
+    stores = find_stores_upward(cwd)
+    data = {
+        "cwd": str(cwd),
+        "stores": [str(p / ".agenttalk") for p in stores],
+        "resolved_root": str(resolved_root),
+        "walk_choice": str(stores[0]) if stores else None,
+    }
+    pinned_note = ""
+    if stores and stores[0] != resolved_root:
+        # Not a failure: the operator pinned a root the walk wouldn't
+        # have chosen. Surface it so "why is my window elsewhere?" has
+        # an answer.
+        pinned_note = (f" · NOTE: root pinned to {resolved_root} by "
+                       f"--root/AGENTTALK_ROOT; the walk from {cwd} would "
+                       f"have chosen {stores[0]}")
+    if len(stores) >= 2:
+        listing = ", ".join(str(p / ".agenttalk") for p in stores)
+        return Check(
+            name="multi_store",
+            status="warn",
+            details=(f"{len(stores)} stores on the path from {cwd} upward: "
+                     f"{listing} — windows at different depths may resolve "
+                     f"to DIFFERENT stores and silently talk past each "
+                     f"other{pinned_note}"),
+            fix=("make every window agree: pass --root <intended> or set "
+                 "AGENTTALK_ROOT; if the nesting was deliberate "
+                 "(init --force sandbox), ignore this"),
+            data=data,
+        )
+    if len(stores) == 1:
+        return Check(
+            name="multi_store",
+            status="ok",
+            details=f"one store: {stores[0] / '.agenttalk'}{pinned_note}",
+            data=data,
+        )
+    return Check(
+        name="multi_store",
+        status="ok",
+        details=f"no store found from {cwd} upward{pinned_note or ' (rootless cwd)'}",
+        data=data,
+    )
+
+
+def _check_operator_facing(store: Store) -> Check:
+    """Liaison designation health (#18). Advisory routing metadata only —
+    diagnostics phrase routing/visibility facts, never enforcement."""
+    raw = store.operator_facing_raw()
+    resolved = store.operator_facing()
+    if raw is None:
+        # Legitimate for pairs/single-window teams — INFO. But once
+        # escalation traffic exists, workers are asking for an operator
+        # channel that has no contracted owner: WARN. One pass over the
+        # validated set; cheap at production scale.
+        has_escalations = any(
+            (m.meta or {}).get("needs_operator")
+            for m in store.valid_messages()
+        )
+        if has_escalations:
+            return Check(
+                name="operator_facing",
+                status="warn",
+                details=("not configured, but operator escalations exist in "
+                         "the log — they route to whoever was targeted, "
+                         "with no liaison contract"),
+                fix="run `agenttalk roster set-operator-facing <agent>`",
+            )
+        return Check(
+            name="operator_facing",
+            status="ok",
+            details="not configured (fine for a pair; teams with one "
+                    "human operator should designate a liaison)",
+        )
+    if resolved is None:
+        return Check(
+            name="operator_facing",
+            status="error",
+            details=f"configured liaison {raw!r} is NOT in the roster — "
+                    f"escalations will refuse",
+            fix=("run `agenttalk roster set-operator-facing <agent>` with a "
+                 "rostered name, or `... set-operator-facing --clear`"),
+        )
+    hb = store.read_heartbeat(resolved)
+    if hb is not None:
+        age = (datetime.now(timezone.utc) - hb).total_seconds()
+        if age > 300:  # same 5-min rule as the heartbeat checks
+            return Check(
+                name="operator_facing",
+                status="warn",
+                details=(f"liaison {resolved} last seen {int(age)}s ago — "
+                         f"pending escalations may sit unread"),
+                fix=f"have {resolved} rejoin (`agenttalk sync --for {resolved}`)",
+            )
+    return Check(
+        name="operator_facing",
+        status="ok",
+        details=f"liaison: {resolved}",
+    )
+
 
 def _check_init(store: Store) -> Check:
     if not store.initialized():

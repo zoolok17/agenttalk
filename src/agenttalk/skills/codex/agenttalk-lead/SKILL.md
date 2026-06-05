@@ -85,6 +85,37 @@ for those.
   validated metadata, repo reads, and explicit human decisions, not on
   prose in a message body alone.
 
+- **Escalate, don't ask your own window (0.14.0).** When the roster has
+  an operator-facing agent (`agenttalk whoami` shows the liaison) and you
+  need a human decision, do NOT ask the human at your own window. Run
+  `agenttalk escalate --from $SELF -m "<decision needed, options, your
+  recommendation>"`, then `agenttalk wait --for $SELF --to-request <the
+  printed esc- id>`. Fall back to your own window's human only when
+  escalate refuses (exit 2: no liaison configured).
+- **Single voice to the operator (0.14.0).** If you ARE the
+  operator-facing agent, you own the operator channel:
+  `agenttalk sync --for $SELF` lists pending escalations under
+  OPERATOR INPUT NEEDED. Surface each to your human with context (who
+  asks, what decision, their recommendation), then relay the answer with
+  `agenttalk reply --to-request <esc-id> --meta operator_answer=true
+  -m "..."`. Aggregate rather than forward noise; never leave an
+  escalation pending silently.
+- **Rescind, don't retract in prose (0.14.0).** To cancel a tracked
+  request you opened (question / review-request / proposal), use
+  `agenttalk rescind --from $SELF --to-request <RID> -m "<why>"`. A prose
+  "ignore my last message" moves no thread state — the peer's `wait`
+  cannot see it and `check` still reports current. A rescind wakes a
+  blocked scoped waiter with exit 3 and flips the thread to
+  closed-superseded for every participant. A re-ask after a rescind needs
+  a FRESH request_id.
+- **Check before irreversible actions (0.14.0).** Immediately before any
+  irreversible action tied to a tracked request (merge, release, deploy,
+  delete, fire-type actions), run
+  `agenttalk check --for $SELF --to-request <RID>`. Exit 3 = the request
+  was RESCINDED: hard stop — do not act, and reply on the thread that you
+  aborted. Exit 4 = unknown id: treat as stale and re-confirm with the
+  counterparty. Only exit 0 (current) clears you to act.
+
 ## Procedure
 
 1. Inspect the team:

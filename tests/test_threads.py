@@ -239,8 +239,12 @@ def test_actionable_sorted_before_closed_and_stale_first() -> None:
 
 
 def test_counts_has_all_keys() -> None:
+    # 0.14.0: "closed-superseded" added (rescind support, #12) — the one
+    # explicitly-adjusted assertion under NFR-001's "asserts absence of
+    # new output" carve-out. Additive only: all prior keys unchanged.
     c = counts([])
-    assert c == {"reply-waiting": 0, "owed-inbound": 0, "open-outbound": 0, "closed": 0}
+    assert c == {"reply-waiting": 0, "owed-inbound": 0, "open-outbound": 0,
+                 "closed": 0, "closed-superseded": 0}
 
 
 # ----------------------------------------- multi-party broadcast threads
@@ -412,3 +416,239 @@ def test_threads_derives_from_validated_set(store: Store) -> None:
         cursor=store.all_messages()[-1].id,
     )
     assert rows2[0].state == "closed"
+
+
+# ======================================================================
+# Supersession (0.14.0, #12) - the D2 ordering rule
+# ======================================================================
+
+def _rescind(mid: str, sender: str, recipient: str, rid: str, *,
+             target: str | None = None, body: str = "hold") -> "Message":
+    m = _msg(mid, sender, recipient, "rescind", rid=rid)
+    m.body = body
+    if target is not None:
+        m.meta["target_msg_id"] = target
+    return m
+
+
+def test_rescind_supersedes_for_both_perspectives() -> None:
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="q1", subject="fire?"),
+        _rescind("002", "alpha", "beta", "q1", body="new data - hold"),
+    ]
+    for agent in ("alpha", "beta"):
+        t = derive_threads(msgs, agent=agent, cursor="", now=_BASE)[0]
+        assert t.state == "closed-superseded"
+        d = t.to_dict()
+        assert d["rescind"]["id"] == "002"
+        assert d["rescind"]["by"] == "alpha"
+        assert d["rescind"]["reason"] == "new data - hold"
+
+
+def test_rescind_by_non_requester_is_ignored() -> None:
+    # Derivation-level guard (validate_rescind blocks honest sends; this
+    # guards against anything that lands in the log another way).
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="q1"),
+        _rescind("002", "beta", "alpha", "q1"),
+    ]
+    t = derive_threads(msgs, agent="alpha", cursor="", now=_BASE)[0]
+    assert t.state != "closed-superseded"
+
+
+def test_responder_rescind_does_not_answer_a_question() -> None:
+    # The open-ended question rule ("any non-control reply closes")
+    # must NOT treat a rescind as the answer.
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="q1"),
+        _rescind("002", "beta", "alpha", "q1"),
+    ]
+    t = derive_threads(msgs, agent="beta", cursor="", now=_BASE)[0]
+    assert t.state == "owed-inbound"  # beta still owes the answer
+
+
+def test_rescind_target_msg_id_pinning() -> None:
+    # Pinned anchor OLDER than the rescind -> supersedes.
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="q1"),
+        _rescind("003", "alpha", "beta", "q1", target="001"),
+    ]
+    assert derive_threads(msgs, agent="alpha", cursor="", now=_BASE)[0].state == "closed-superseded"
+    # Pinned anchor NEWER than the rescind -> does not supersede.
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="q1"),
+        _rescind("002", "alpha", "beta", "q1", target="005"),
+        _msg("005", "alpha", "beta", "question", rid="q1"),  # re-ask after
+    ]
+    t = derive_threads(msgs, agent="alpha", cursor="", now=_BASE)[0]
+    assert t.state != "closed-superseded"
+
+
+def test_reply_after_rescind_stays_superseded() -> None:
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="q1"),
+        _rescind("002", "alpha", "beta", "q1"),
+        _msg("003", "beta", "alpha", "message", rid="q1"),  # late answer
+    ]
+    for agent in ("alpha", "beta"):
+        t = derive_threads(msgs, agent=agent, cursor="", now=_BASE)[0]
+        assert t.state == "closed-superseded"
+
+
+def test_reask_does_not_reopen_superseded_thread() -> None:
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="q1"),
+        _msg("002", "beta", "alpha", "message", rid="q1"),   # answered
+        _rescind("003", "alpha", "beta", "q1"),
+        _msg("004", "alpha", "beta", "question", rid="q1"),  # re-ask
+    ]
+    for agent in ("alpha", "beta"):
+        t = derive_threads(msgs, agent=agent, cursor="004", now=_BASE)[0]
+        assert t.state == "closed-superseded"
+
+
+def test_manual_ack_label_survives_rescind() -> None:
+    # Codex WP01 review blocker 1: a per-agent manual ack is an explicit
+    # "I handled this" - supersession overrides DERIVED states but never
+    # relabels an ack (existing closure paths untouched). The other,
+    # non-acking party still sees closed-superseded, and the check gate
+    # computes supersession from the log regardless of view labels.
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="q1"),
+        _rescind("002", "alpha", "beta", "q1"),
+    ]
+    acked = derive_threads(msgs, agent="beta", cursor="", now=_BASE,
+                           closed_rids={"q1"})[0]
+    assert acked.state == "closed"
+    assert "rescind" not in acked.to_dict()
+    other = derive_threads(msgs, agent="alpha", cursor="", now=_BASE)[0]
+    assert other.state == "closed-superseded"
+
+
+def test_duplicate_rescinds_first_decides() -> None:
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="q1"),
+        _rescind("002", "alpha", "beta", "q1", body="first"),
+        _rescind("003", "alpha", "beta", "q1", body="second"),
+    ]
+    t = derive_threads(msgs, agent="alpha", cursor="", now=_BASE)[0]
+    assert t.state == "closed-superseded"
+    assert t.to_dict()["rescind"]["id"] == "002"
+    assert t.to_dict()["rescind"]["reason"] == "first"
+
+
+def test_rescind_supersedes_broadcast_for_all_perspectives() -> None:
+    msgs = [
+        _msg("001", "lead", "w1", "question", rid="b1", audience="all"),
+        _msg("002", "lead", "w2", "question", rid="b1", audience="all"),
+        _msg("003", "w1", "lead", "message", rid="b1"),   # w1 answered
+        _rescind("004", "lead", "w1", "b1"),
+    ]
+    for agent in ("lead", "w1", "w2"):
+        t = derive_threads(msgs, agent=agent, cursor="", now=_BASE)[0]
+        assert t.state == "closed-superseded", agent
+        assert t.to_dict()["rescind"]["id"] == "004"
+    # the pre-rescind answer still shows w1 as having responded
+    t = derive_threads(msgs, agent="lead", cursor="", now=_BASE)[0]
+    assert t.responded == ["w1"]
+
+
+def test_member_rescind_does_not_count_as_broadcast_response() -> None:
+    msgs = [
+        _msg("001", "lead", "w1", "question", rid="b1", audience="all"),
+        _msg("002", "lead", "w2", "question", rid="b1", audience="all"),
+        _rescind("003", "w1", "lead", "b1"),  # member "rescind" (invalid use)
+    ]
+    t = derive_threads(msgs, agent="lead", cursor="", now=_BASE)[0]
+    assert t.state == "open-outbound"        # not superseded (wrong sender)
+    assert t.responded == []                 # and not an answer either
+    assert sorted(t.pending) == ["w1", "w2"]
+
+
+def test_counts_include_closed_superseded() -> None:
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="q1"),
+        _rescind("002", "alpha", "beta", "q1"),
+        _msg("003", "alpha", "beta", "question", rid="q2"),
+    ]
+    c = counts(derive_threads(msgs, agent="alpha", cursor="", now=_BASE))
+    assert c["closed-superseded"] == 1
+    assert c["open-outbound"] == 1
+    assert c["closed"] == 0
+    # the key exists even when zero
+    assert "closed-superseded" in counts([])
+
+
+def test_superseded_threads_sort_with_closed() -> None:
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="q1"),
+        _rescind("002", "alpha", "beta", "q1"),
+        _msg("003", "alpha", "beta", "question", rid="q2"),  # actionable
+    ]
+    threads = derive_threads(msgs, agent="alpha", cursor="", now=_BASE)
+    assert [t.request_id for t in threads] == ["q2", "q1"]  # actionable first
+
+
+def test_pairwise_to_dict_unchanged_without_new_features() -> None:
+    # NFR-001 / strict additivity: a plain thread's JSON has no new keys.
+    msgs = [_msg("001", "alpha", "beta", "question", rid="q1")]
+    d = derive_threads(msgs, agent="alpha", cursor="", now=_BASE)[0].to_dict()
+    assert "rescind" not in d
+    assert "needs_operator" not in d
+    assert "operator_state" not in d
+
+
+# ======================================================================
+# Escalation labels (0.14.0, #18)
+# ======================================================================
+
+def _escalation(mid: str, sender: str, recipient: str, rid: str) -> "Message":
+    m = _msg(mid, sender, recipient, "question", rid=rid)
+    m.meta["needs_operator"] = "true"
+    return m
+
+
+def test_escalation_pending_then_answered() -> None:
+    msgs = [_escalation("001", "w1", "lead", "esc-1")]
+    for agent, in (("w1",), ("lead",)):
+        t = derive_threads(msgs, agent=agent, cursor="", now=_BASE)[0]
+        assert t.needs_operator is True
+        assert t.operator_state == "pending"
+        d = t.to_dict()
+        assert d["needs_operator"] is True and d["operator_state"] == "pending"
+    answered = msgs + [_msg("002", "lead", "w1", "message", rid="esc-1")]
+    t = derive_threads(answered, agent="lead", cursor="", now=_BASE)[0]
+    assert t.operator_state == "answered"
+    assert t.state == "closed"
+
+
+def test_escalation_third_party_reply_does_not_answer() -> None:
+    msgs = [
+        _escalation("001", "w1", "lead", "esc-1"),
+        _msg("002", "w2", "w1", "message", rid="esc-1"),  # not the liaison
+    ]
+    t = derive_threads(msgs, agent="w1", cursor="002", now=_BASE)[0]
+    assert t.operator_state == "pending"
+
+
+def test_escalation_superseded_leaves_pending_bucket() -> None:
+    # A worker rescinding its own escalation removes the obligation -
+    # but it was never ANSWERED (Codex WP01 review blocker 2 / FR-014):
+    # terminal-without-an-answer is labeled "closed", not "answered".
+    msgs = [
+        _escalation("001", "w1", "lead", "esc-1"),
+        _rescind("002", "w1", "lead", "esc-1"),
+    ]
+    t = derive_threads(msgs, agent="lead", cursor="", now=_BASE)[0]
+    assert t.state == "closed-superseded"
+    assert t.operator_state == "closed"    # left the bucket, no fabricated answer
+
+
+def test_escalation_acked_is_closed_not_answered() -> None:
+    # Same FR-014 rule for the manual-ack path: the liaison acking the
+    # thread view does not fabricate an operator answer.
+    msgs = [_escalation("001", "w1", "lead", "esc-1")]
+    t = derive_threads(msgs, agent="lead", cursor="", now=_BASE,
+                       closed_rids={"esc-1"})[0]
+    assert t.state == "closed"
+    assert t.operator_state == "closed"

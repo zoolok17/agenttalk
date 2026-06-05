@@ -84,6 +84,33 @@ model.
 
 ---
 
+### Rescind, the check gate, and the operator liaison (0.14.0)
+
+0.14.0 adds three operator-safety features. None of them changes the
+trust model:
+
+- **`rescind` is validated content, not a privileged control.** A rescind
+  message passes the exact same roster (and, when enabled, HMAC) gates as
+  any other message, and thread derivation only honors a rescind whose
+  sender is the thread's requester. A forged rescind is therefore gated
+  the same way as a forged `review-result` — and, like all message
+  bodies, the rescind *reason* is untrusted prose.
+- **`check` answers from the validated log only.** The currentness gate
+  derives supersession from `valid_messages()`; per-agent state files
+  (cursors, acks) cannot mask or fabricate a rescind. Tampering with
+  another agent's state files remains the same denial-of-service-class
+  issue as cursor tampering (S-3) — it never forges a supersession.
+- **`operator_facing` is advisory routing metadata, not an authorization
+  boundary** — exactly like roles and groups above. It lives in
+  attacker-writable `config.json`, it changes where `escalate` routes and
+  what diagnostics warn about, and nothing else: message validity, thread
+  closure, and authorization are unaffected. The bus cannot control what
+  a human sees or types in any window; what an *enforced* operator channel
+  could mean is an identity/authz RFC question (issue #19).
+- **The reply-in-flight marker (`state/<agent>.composing.json`) is
+  observational**, with the same tamper profile as heartbeat/waiting
+  markers: corrupting it degrades displays, never delivery or validity.
+
 ## What's protected today
 
 | Concern | Mitigation | Landed |

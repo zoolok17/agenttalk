@@ -17,6 +17,7 @@ the invariant ``messages_for`` / dashboard rendering relies on.
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import shutil
@@ -58,6 +59,15 @@ KNOWN_KINDS = frozenset({
     # they do not surface as a returned reply. Added in 0.8.0 to fix
     # "reply landed seconds after wait timed out" sharp-edge.
     "composing",
+    # A requester marks one of its own tracked requests as no-longer-
+    # current. Correlated via meta.request_id (+ optional
+    # meta.target_msg_id); thread derivation reports the thread as
+    # `closed-superseded` and a scoped `wait` wakes with a distinct
+    # rescinded outcome. Deliberately NOT a control kind: it changes
+    # what other messages mean, so it must stay transcript-visible and
+    # auditable. Added in 0.14.0 (issue #12 — the launch-HOLD/fire
+    # crossing from the 2026-06-05 production retro).
+    "rescind",
 })
 
 # Kinds the bus uses to signal flow control rather than carry agent
@@ -65,6 +75,19 @@ KNOWN_KINDS = frozenset({
 # can show them for audit), but `agenttalk wait` does not return them
 # as a reply and `agenttalk recv` filters them out of the default view.
 CONTROL_KINDS = frozenset({"composing"})
+
+# Kinds that OPEN a trackable request/reply thread. Single source of
+# truth shared by thread derivation (threads.py) and rescind validation
+# (`validate_rescind`) — store.py cannot import threads.py (threads
+# imports store), so the constant lives here and threads re-exports it.
+OPENER_KINDS = frozenset({"review-request", "question", "proposal"})
+
+# Reply-in-flight marker entries older than this are ignored by readers.
+# Deliberately equal to the wait loop's cumulative composing-extension cap
+# (cli._COMPOSING_MAX_EXTEND_SECONDS): if composing pings could not have
+# held a waiter past this horizon, a drafting marker should not suppress
+# staleness warnings past it either. One number, one meaning. (0.14.0, #14)
+COMPOSING_INTENT_STALE_SECONDS = 1800.0
 
 # Agent names are interpolated directly into filesystem paths
 # (cursors, heartbeats), so they must be portable identifiers — not
@@ -629,6 +652,60 @@ class Store:
         self._write_config(cfg)
         return cfg
 
+    # ------------------------------------------------- operator liaison
+    #
+    # `operator_facing` is a single optional config slot naming the ONE
+    # agent the human operator talks to directly (the liaison). It is
+    # advisory ROUTING metadata, exactly like roles/groups: it never
+    # affects message validity, thread closure, or authorization (see
+    # SECURITY.md). Single-slot by representation — "two liaisons" is
+    # unrepresentable rather than merely warned about. Added in 0.14.0
+    # (issue #18). Tolerance follows the roles/groups precedent: an
+    # absent / null / non-string / stale value reads as "not
+    # configured" and never crashes a command.
+
+    def operator_facing_raw(self) -> str | None:
+        """The configured operator_facing value WITHOUT a roster check.
+
+        Diagnostics (doctor) need to distinguish "not configured" from
+        "configured but the agent is gone" — this returns whatever
+        non-empty string the config holds, valid or not.
+        """
+        v = self.load_config().get("operator_facing")
+        return v if isinstance(v, str) and v else None
+
+    def operator_facing(self) -> str | None:
+        """The designated liaison, or None when unset or not in the roster.
+
+        Routing callers (`escalate`) use this: a stale designation must
+        not route an operator question to a pruned mailbox.
+        """
+        cfg = self.load_config()
+        v = cfg.get("operator_facing")
+        if not (isinstance(v, str) and v):
+            return None
+        roster = cfg.get("agents", []) or []
+        return v if v in roster else None
+
+    def set_operator_facing(self, name: str | None) -> dict:
+        """Set (or clear, with None) the operator-facing designation.
+
+        Validates roster membership at set time; reading tolerates a
+        later roster change (see `operator_facing`).
+        """
+        cfg = self.load_config()
+        if name is None:
+            cfg.pop("operator_facing", None)
+        else:
+            roster = cfg.get("agents", []) or []
+            if name not in roster:
+                raise ValueError(
+                    f"agent {name!r} is not in the roster {sorted(roster)}"
+                )
+            cfg["operator_facing"] = name
+        self._write_config(cfg)
+        return cfg
+
     # --------------------------------------------------------------- writing
 
     def project_id(self) -> str:
@@ -1034,6 +1111,77 @@ class Store:
         except OSError:
             pass
 
+    # ------------------------------------------- reply-in-flight markers
+    #
+    # `state/<agent>.composing.json` records "agent is drafting a reply
+    # on thread <rid>" — written by `composing --to-request`, read by
+    # threads/sync display so a counterparty sees a reply in flight and
+    # does not fire a crossing message. STRICTLY observational, same
+    # discipline as `.heartbeat`/`.waiting`: nothing about delivery,
+    # cursors, or thread closure depends on it; missing/corrupt reads as
+    # "no marker". Staleness is the READER's job: an entry older than
+    # COMPOSING_INTENT_STALE_SECONDS is ignored. Added 0.14.0 (#14).
+
+    def write_composing_intent(self, agent: str, request_id: str, peer: str) -> None:
+        """Best-effort upsert of the reply-in-flight record for one thread."""
+        p = self.state_dir / f"{agent}.composing.json"
+        data = self.read_composing_intent(agent)
+        threads = data.get("threads")
+        if not isinstance(threads, dict):
+            threads = {}
+        threads[request_id] = {"peer": peer, "at": _now_iso()}
+        try:
+            _atomic_write_text(
+                p, json.dumps({"agent": agent, "threads": threads}, ensure_ascii=False)
+            )
+        except OSError:
+            pass  # observability only — a failed write degrades to "no marker"
+
+    def read_composing_intent(self, agent: str) -> dict:
+        """Return the parsed marker ({} if absent/corrupt). Never raises.
+
+        Shape: ``{"agent": <name>, "threads": {<rid>: {"peer": ..., "at": ISO}}}``.
+        Callers read ``.get("threads", {})`` and apply the staleness rule.
+        """
+        p = self.state_dir / f"{agent}.composing.json"
+        if not p.exists():
+            return {}
+        try:
+            raw = p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return {}
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def clear_composing_intent(self, agent: str, request_id: str | None = None) -> None:
+        """Drop one thread's entry (or the whole marker). Best-effort."""
+        p = self.state_dir / f"{agent}.composing.json"
+        if request_id is None:
+            try:
+                p.unlink()
+            except (FileNotFoundError, OSError):
+                pass
+            return
+        data = self.read_composing_intent(agent)
+        threads = data.get("threads")
+        if not isinstance(threads, dict) or request_id not in threads:
+            return
+        threads.pop(request_id, None)
+        try:
+            if threads:
+                _atomic_write_text(
+                    p, json.dumps({"agent": agent, "threads": threads}, ensure_ascii=False)
+                )
+            else:
+                p.unlink()
+        except (FileNotFoundError, OSError):
+            pass
+
     # ------------------------------------------------------- thread state
     #
     # Per-(agent, request_id) state for SCOPED thread work, kept separate
@@ -1178,12 +1326,84 @@ def _new_session_id() -> str:
 
 
 def find_root(start: Path | None = None) -> Path:
-    """Find the project root containing a `.agenttalk/` dir, searching upward.
+    """Resolve the bus root. Precedence: --root flag > AGENTTALK_ROOT > upward walk.
 
-    Falls back to the start dir (or CWD) so `init` can create a fresh store.
+    The explicit ``--root`` flag is handled by callers (they bypass this
+    function entirely), so here the order is: a non-empty
+    ``AGENTTALK_ROOT`` environment variable wins — and is returned
+    **whether or not a store exists there**, so the caller's must-exist
+    check fails loudly exactly like an invalid ``--root`` (the env var
+    never silently falls back to the walk; a typo'd pin must not route
+    a window to a different store). Otherwise: walk upward from
+    ``start`` (or CWD) to the first ancestor containing ``.agenttalk/``,
+    falling back to the start dir so ``init`` can create a fresh store.
+    AGENTTALK_ROOT is read HERE and nowhere else. Added 0.14.0 (#13).
     """
+    env = os.environ.get("AGENTTALK_ROOT")
+    if env:
+        return Path(env).resolve()
     start = Path(start or Path.cwd()).resolve()
     for d in [start, *start.parents]:
         if (d / DIRNAME).is_dir():
             return d
     return start
+
+
+def find_stores_upward(start: Path | None = None) -> list[Path]:
+    """Every ancestor (start inclusive → filesystem root) containing a
+    ``.agenttalk/`` store, in walk order.
+
+    The split-brain mechanism behind the production "--root gotcha" is
+    two ``init``s at different depths: both stores are valid, neither
+    errors, and two windows resolve to different roots. This scanner
+    powers the loud diagnostics: ``init``'s up-tree refusal and
+    ``doctor``'s multi-store report. Added 0.14.0 (#13).
+    """
+    start = Path(start or Path.cwd()).resolve()
+    return [d for d in [start, *start.parents] if (d / DIRNAME).is_dir()]
+
+
+def validate_rescind(
+    store: Store,
+    sender: str,
+    request_id: str,
+    target_msg_id: str | None = None,
+) -> list[Message]:
+    """Validate a rescind attempt; return the thread's opener copies.
+
+    Rules (research.md D2): only the thread's **requester** — the sender
+    of its opener(s) — may rescind it, and the thread must be visible in
+    ``valid_messages()`` (visibility matches derivation, so you cannot
+    rescind what derivation cannot see). ``target_msg_id``, when given,
+    must be a message in the thread.
+
+    Returns the opener copies in id order: one for a pairwise thread,
+    one per recipient for a broadcast fan-out (all sharing the same
+    sender). The caller addresses one rescind message to each distinct
+    opener recipient. Raises ``ValueError`` with an actionable message
+    otherwise.
+    """
+    msgs = store.valid_messages()
+    thread = [m for m in msgs if (m.meta or {}).get("request_id") == request_id]
+    if not thread:
+        raise ValueError(
+            f"no thread with request_id {request_id!r} is visible — check the id "
+            f"(agenttalk threads --for {sender}) and that you are on the right --root"
+        )
+    openers = [m for m in thread if m.kind in OPENER_KINDS]
+    if not openers:
+        raise ValueError(
+            f"thread {request_id!r} has no visible opener (review-request/"
+            f"question/proposal) — nothing to rescind"
+        )
+    requester = openers[0].sender  # fan-out copies share one sender
+    if sender != requester:
+        raise ValueError(
+            f"only the requester ({requester!r}) may rescind thread "
+            f"{request_id!r}; {sender!r} did not open it"
+        )
+    if target_msg_id is not None and not any(m.id == target_msg_id for m in thread):
+        raise ValueError(
+            f"--to-id {target_msg_id!r} is not a message in thread {request_id!r}"
+        )
+    return openers

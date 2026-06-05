@@ -286,3 +286,18 @@ sandbox:
   `agenttalk codex-config --enable` from the project root, which sets
   `approval_policy = "never"` and `sandbox_mode = "workspace-write"`
   for this project in `~/.codex/config.toml`. Then restart Codex.
+
+- **Check before irreversible actions (0.14.0).** Immediately before any
+  irreversible action tied to a tracked request (merge, release, deploy,
+  delete, fire-type actions), run
+  `agenttalk check --for $SELF --to-request <RID>`. Exit 3 = the request
+  was RESCINDED: hard stop — do not act, and reply on the thread that you
+  aborted. Exit 4 = unknown id: treat as stale and re-confirm with the
+  counterparty. Only exit 0 (current) clears you to act.
+- **Escalate, don't ask your own window (0.14.0).** When the roster has
+  an operator-facing agent (`agenttalk whoami` shows the liaison) and you
+  need a human decision, do NOT ask the human at your own window. Run
+  `agenttalk escalate --from $SELF -m "<decision needed, options, your
+  recommendation>"`, then `agenttalk wait --for $SELF --to-request <the
+  printed esc- id>`. Fall back to your own window's human only when
+  escalate refuses (exit 2: no liaison configured).
