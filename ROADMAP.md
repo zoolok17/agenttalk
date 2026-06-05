@@ -242,6 +242,17 @@ the test suite; the Codex-side one had **no Python in its sandbox**
 (diff/static review only). Lean on the Claude-side reviewer for anything
 that must *execute*.
 
+### CI gate (don't repeat the 0.14.0 red-matrix miss)
+The repo runs a `tests` workflow on every push: pytest on a 3.10-3.13 ×
+ubuntu/macos/windows matrix (plus a `security` workflow). Local green is
+NOT the gate — local runs are one Python on one OS with a configured
+host (installed skills, codex config). After EVERY push:
+`gh run list --limit 2`, and before tagging a release:
+`gh run watch <id> --exit-status` until the matrix is green. Known trap:
+`doctor`'s exit code reflects host-environment health — tests must pin
+the environment (monkeypatch the skill dirs), never assert exit 0 on an
+unpinned host.
+
 ### Release ritual (don't repeat the tags-vs-Releases miss)
 `git push --tags` creates **tags**; the GitHub **Releases page** shows
 **Release objects**, which are separate. Full ritual:
