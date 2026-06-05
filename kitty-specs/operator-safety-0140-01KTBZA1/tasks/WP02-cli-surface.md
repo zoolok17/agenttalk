@@ -30,6 +30,8 @@ subtasks:
 - T013
 - T014
 - T015
+agent: "claude"
+shell_pid: "32384"
 history:
 - date: '2026-06-05T13:34:21Z'
   event: created
@@ -252,3 +254,7 @@ path that could return 0 on a superseded thread), check's read-only
 guarantee, escalate refusal matrix completeness, request_id echo/autogen
 regression (v0.9.0 trap), JSON additivity (diff a 0.13.0-shaped store's
 outputs), composing sugar not touching the comp_rid wait gate.
+
+## Activity Log
+
+- 2026-06-05T14:24:21Z – claude – shell_pid=32384 – Started implementation via action command
