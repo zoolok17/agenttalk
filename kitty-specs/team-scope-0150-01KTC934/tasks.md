@@ -18,12 +18,12 @@ Feature traceability per-subtask (#15/#16/#17).
 | T003 | threads: responded_na + na_response labels; batch/audience passthrough fields (#15/#16) | WP01 | | [D] |
 | T004 | tests: store role resolution + quarantine matrix | WP01 | | [D] |
 | T005 | tests: threads NA labels + freeze independence + batch fields | WP01 | | [D] |
-| T006 | cli: broadcast --to-role + frozen-audience meta (#15) | WP02 | |
-| T007 | cli: broadcast partial-failure manifest + exit 5 (#16) | WP02 | |
-| T008 | cli: reply --na + FR-006 refusal (#15) | WP02 | |
-| T009 | cli: prune command (#17) | WP02 | |
-| T010 | cli: displays + warnings (n/a markers, quarantined count, incomplete-batch) | WP02 | |
-| T011 | tests: test_cli for T006-T010 incl. fault injection | WP02 | |
+| T006 | cli: broadcast --to-role + frozen-audience meta (#15) | WP02 | | [D] |
+| T007 | cli: broadcast partial-failure manifest + exit 5 (#16) | WP02 | | [D] |
+| T008 | cli: reply --na + FR-006 refusal (#15) | WP02 | | [D] |
+| T009 | cli: prune command (#17) | WP02 | | [D] |
+| T010 | cli: displays + warnings (n/a markers, quarantined count, incomplete-batch) | WP02 | | [D] |
+| T011 | tests: test_cli for T006-T010 incl. fault injection | WP02 | | [D] |
 | T012 | doctor: store-hygiene check (invalid + quarantined) (#17) | WP03 | |
 | T013 | tests: test_doctor (environment-pinned - the CI lesson) | WP03 | |
 | T014 | e2e: role routing + post-send freeze (SC 1) | WP04 | |
@@ -59,12 +59,12 @@ Feature traceability per-subtask (#15/#16/#17).
 **Priority**: P0. **Dependencies**: WP01.
 **Independent test**: quickstart sections 1-4 by hand; `pytest tests/test_cli.py` green.
 
-- [ ] T006 cli: broadcast --to-role + frozen meta (WP02)
-- [ ] T007 cli: partial-failure manifest + exit 5 (WP02)
-- [ ] T008 cli: reply --na + refusal (WP02)
-- [ ] T009 cli: prune command (WP02)
-- [ ] T010 cli: displays + warnings (WP02)
-- [ ] T011 tests: test_cli extensions (WP02)
+- [x] T006 cli: broadcast --to-role + frozen meta (WP02)
+- [x] T007 cli: partial-failure manifest + exit 5 (WP02)
+- [x] T008 cli: reply --na + refusal (WP02)
+- [x] T009 cli: prune command (WP02)
+- [x] T010 cli: displays + warnings (WP02)
+- [x] T011 tests: test_cli extensions (WP02)
 
 **Risks**: exit-code contract (5 is new; 0/1/2/3/4/130 untouched); strict additivity of every JSON addition.
 
