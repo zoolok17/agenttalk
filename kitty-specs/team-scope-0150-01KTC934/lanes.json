@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "mission_slug": "team-scope-0150-01KTC934",
+  "mission_id": "01KTC9344QAN739M36XRR8N6W8",
+  "mission_branch": "kitty/mission-team-scope-0150-01KTC934",
+  "target_branch": "master",
+  "lanes": [
+    {
+      "lane_id": "lane-a",
+      "wp_ids": [
+        "WP01",
+        "WP02",
+        "WP03",
+        "WP04",
+        "WP05"
+      ],
+      "write_scope": [
+        "CHANGELOG.md",
+        "README.md",
+        "SECURITY.md",
+        "pyproject.toml",
+        "src/agenttalk/__init__.py",
+        "src/agenttalk/cli.py",
+        "src/agenttalk/doctor.py",
+        "src/agenttalk/skills/**",
+        "src/agenttalk/store.py",
+        "src/agenttalk/threads.py",
+        "tests/test_cli.py",
+        "tests/test_coordination.py",
+        "tests/test_doctor.py",
+        "tests/test_store.py",
+        "tests/test_teams.py",
+        "tests/test_threads.py"
+      ],
+      "predicted_surfaces": [
+        "api",
+        "tracker-integration"
+      ],
+      "depends_on_lanes": [],
+      "parallel_group": 0
+    }
+  ],
+  "computed_at": "2026-06-05T16:33:16.255823+00:00",
+  "computed_from": "dependency_graph+ownership",
+  "planning_artifact_wps": [],
+  "collapse_report": {
+    "events": [
+      {
+        "wp_a": "WP02",
+        "wp_b": "WP01",
+        "rule": "dependency",
+        "evidence": "WP02 depends on WP01"
+      },
+      {
+        "wp_a": "WP03",
+        "wp_b": "WP02",
+        "rule": "dependency",
+        "evidence": "WP03 depends on WP02"
+      },
+      {
+        "wp_a": "WP04",
+        "wp_b": "WP02",
+        "rule": "dependency",
+        "evidence": "WP04 depends on WP02"
+      },
+      {
+        "wp_a": "WP05",
+        "wp_b": "WP04",
+        "rule": "dependency",
+        "evidence": "WP05 depends on WP04"
+      }
+    ],
+    "total_merges": 4,
+    "independent_wps_collapsed": 0,
+    "by_rule": {
+      "dependency": 4
+    }
+  }
+}

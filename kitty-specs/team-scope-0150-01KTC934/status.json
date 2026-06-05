@@ -1,0 +1,56 @@
+{
+  "event_count": 5,
+  "last_event_id": "01KTCA3EDZXBEHPCTSZD8F0Z2B",
+  "materialized_at": "2026-06-05T16:33:16.223529+00:00",
+  "mission_number": "",
+  "mission_slug": "team-scope-0150-01KTC934",
+  "mission_type": "software-dev",
+  "summary": {
+    "approved": 0,
+    "blocked": 0,
+    "canceled": 0,
+    "claimed": 0,
+    "done": 0,
+    "for_review": 0,
+    "in_progress": 0,
+    "in_review": 0,
+    "planned": 5
+  },
+  "work_packages": {
+    "WP01": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTCA3E5Q8169DNRMDMZWCF67",
+      "last_transition_at": "2026-06-05T16:33:15.959557+00:00"
+    },
+    "WP02": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTCA3EBQ51SEN1XEA43JXYN8",
+      "last_transition_at": "2026-06-05T16:33:16.151562+00:00"
+    },
+    "WP03": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTCA3ECE2DHCXXXVV7EH3T40",
+      "last_transition_at": "2026-06-05T16:33:16.174032+00:00"
+    },
+    "WP04": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTCA3ED6R0A12TZV0M0XXVNM",
+      "last_transition_at": "2026-06-05T16:33:16.198915+00:00"
+    },
+    "WP05": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTCA3EDZXBEHPCTSZD8F0Z2B",
+      "last_transition_at": "2026-06-05T16:33:16.223529+00:00"
+    }
+  }
+}
