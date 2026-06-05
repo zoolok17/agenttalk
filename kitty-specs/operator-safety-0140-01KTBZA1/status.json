@@ -1,0 +1,56 @@
+{
+  "event_count": 5,
+  "last_event_id": "01KTC0DVXTE6DZVP2P9S1ZN4JP",
+  "materialized_at": "2026-06-05T13:44:11.962029+00:00",
+  "mission_number": "",
+  "mission_slug": "operator-safety-0140-01KTBZA1",
+  "mission_type": "software-dev",
+  "summary": {
+    "approved": 0,
+    "blocked": 0,
+    "canceled": 0,
+    "claimed": 0,
+    "done": 0,
+    "for_review": 0,
+    "in_progress": 0,
+    "in_review": 0,
+    "planned": 5
+  },
+  "work_packages": {
+    "WP01": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTC0DVMNSQN2CN37ECT7BY3G",
+      "last_transition_at": "2026-06-05T13:44:11.669173+00:00"
+    },
+    "WP02": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTC0DVVBT66WZFHMKFXAXV6C",
+      "last_transition_at": "2026-06-05T13:44:11.883481+00:00"
+    },
+    "WP03": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTC0DVW4AKZYMGMB8HMZZK9V",
+      "last_transition_at": "2026-06-05T13:44:11.908356+00:00"
+    },
+    "WP04": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTC0DVWZ02WW0PZWNSC4XJMS",
+      "last_transition_at": "2026-06-05T13:44:11.935657+00:00"
+    },
+    "WP05": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTC0DVXTE6DZVP2P9S1ZN4JP",
+      "last_transition_at": "2026-06-05T13:44:11.962029+00:00"
+    }
+  }
+}
