@@ -129,3 +129,4 @@ fault-injection realism; reply request_id echo untouched (v0.9.0 trap).
 ## Activity Log
 
 - 2026-06-05T16:52:42Z – claude – shell_pid=52048 – Started implementation via action command
+- 2026-06-05T17:02:29Z – claude – shell_pid=52048 – CLI surface green: 534 passed
