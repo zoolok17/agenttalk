@@ -36,6 +36,7 @@ owned_files:
 - src/agenttalk/cli.py
 - tests/test_cli.py
 - tests/test_coordination.py
+- tests/test_teams.py
 tags: []
 ---
 

@@ -16,7 +16,7 @@ cross-reviewed by Codex over agenttalk before it is considered done.
 |----|-------------|
 | WP01 | `src/agenttalk/store.py`, `tests/test_store.py` |
 | WP02 | `src/agenttalk/threads.py`, `tests/test_threads.py` |
-| WP03 | `src/agenttalk/cli.py`, `tests/test_cli.py`, `tests/test_coordination.py` |
+| WP03 | `src/agenttalk/cli.py`, `tests/test_cli.py`, `tests/test_coordination.py`, `tests/test_teams.py` |
 | WP04 | `src/agenttalk/doctor.py`, `tests/test_doctor.py`, `src/agenttalk/__init__.py`, `pyproject.toml`, `README.md`, `SECURITY.md`, `CHANGELOG.md`, `ROADMAP.md` |
 
 ## Dependency graph
