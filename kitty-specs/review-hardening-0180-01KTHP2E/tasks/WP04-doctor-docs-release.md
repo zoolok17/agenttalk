@@ -117,3 +117,4 @@ pyproject/__init__/docs.
 ## Activity Log
 
 - 2026-06-07T21:07:32Z – claude – shell_pid=36020 – Started implementation via action command
+- 2026-06-07T21:17:06Z – claude – shell_pid=36020 – WP04 done; 0.18.0; suite 640; ruff clean
