@@ -2377,7 +2377,7 @@ def test_dashboard_rejects_host_option(
     """NFR-002(a): the alias has NO host surface at all — `--host` is an
     unknown option (usage exit 2), not a refused value."""
     code, _ = _exit_code(["--root", str(store_root), "dashboard",
-                          "--host", "0.0.0.0", "--port", "0"])
+                          "--host", "0.0.0.0", "--port", "0"])  # noqa: S104 — proving the option is REJECTED
     assert code == 2
     assert "--host" in capsys.readouterr().err
 
@@ -2428,7 +2428,7 @@ def test_serve_nonloopback_host_still_exits2(
     """The pre-0.17.0 ValueError path is untouched (and ordered before
     the new OSError handler)."""
     rc = cli.main(["--root", str(store_root), "serve",
-                   "--host", "0.0.0.0", "--port", "0"])
+                   "--host", "0.0.0.0", "--port", "0"])  # noqa: S104 — proving the host is REFUSED
     assert rc == 2
     err = capsys.readouterr().err
     assert "agenttalk serve:" in err and "loopback" in err

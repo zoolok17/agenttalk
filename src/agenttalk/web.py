@@ -151,7 +151,7 @@ def make_descriptors(paths: list[Path]) -> list[RootDescriptor]:
     """
     labels = _dedup_labels(paths)
     return [RootDescriptor(store=Store(p), label=lab)
-            for p, lab in zip(paths, labels)]
+            for p, lab in zip(paths, labels, strict=True)]
 
 
 def _format_url(host: str, port: int) -> str:

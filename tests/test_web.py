@@ -6,7 +6,9 @@ tests cover both happy-path rendering AND the refusal semantics.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -433,9 +435,6 @@ def test_head_returns_headers_no_body(tmp_path: Path) -> None:
 # Obligation-dashboard coverage (mission obligation-dashboard-0170).
 # Contract under test: kitty-specs/obligation-dashboard-0170-01KTHADQ/
 # data-model.md (schema v1) + research.md D5/D6/D9.
-
-import hashlib
-import time
 
 # The pre-0.17.0 CSP, byte-for-byte. The split-policy tests pin BOTH
 # literals so neither can drift silently (FR-009 / research D1).
