@@ -1,7 +1,7 @@
 {
-  "event_count": 7,
-  "last_event_id": "01KTJ6JMQPZFPEP348HENWYC3P",
-  "materialized_at": "2026-06-07T23:27:06.486803+00:00",
+  "event_count": 9,
+  "last_event_id": "01KTJ6JRJ3Z843RM13JM1BC9DZ",
+  "materialized_at": "2026-06-07T23:27:10.403176+00:00",
   "mission_number": "",
   "mission_slug": "dashboard-polish-0190-01KTJ4QB",
   "mission_type": "software-dev",
@@ -12,9 +12,9 @@
     "claimed": 0,
     "done": 0,
     "for_review": 0,
-    "in_progress": 0,
+    "in_progress": 1,
     "in_review": 0,
-    "planned": 1
+    "planned": 0
   },
   "work_packages": {
     "WP01": {
@@ -25,11 +25,11 @@
       "last_transition_at": "2026-06-07T23:27:06.486803+00:00"
     },
     "WP02": {
-      "actor": "finalize-tasks",
+      "actor": "claude",
       "force_count": 1,
-      "lane": "planned",
-      "last_event_id": "01KTJ59RM29RC2R2J207ZAD4XZ",
-      "last_transition_at": "2026-06-07T23:04:46.978712+00:00"
+      "lane": "in_progress",
+      "last_event_id": "01KTJ6JRJ3Z843RM13JM1BC9DZ",
+      "last_transition_at": "2026-06-07T23:27:10.403176+00:00"
     }
   }
 }

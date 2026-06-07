@@ -11,6 +11,8 @@ branch_strategy: Planning artifacts for this feature were generated on master. D
 subtasks:
 - T008
 - T009
+agent: "claude"
+shell_pid: "86660"
 history:
 - '2026-06-07: created from approved plan (5dc70e4, Codex pre-code approved 08f126ef)'
 authoritative_surface: README.md
@@ -79,3 +81,7 @@ new install-pin guidance; if `@v0.18.0` pins exist, bump to `@v0.19.0` — grep:
 Focus: doc-vs-code honesty; CHANGELOG matches the WP01 diff (additive keys +
 client features); schema_version-stays-1 stated; version consistency across
 pyproject/__init__/docs; no overclaim (bus-native only, no spec-kitty).
+
+## Activity Log
+
+- 2026-06-07T23:27:10Z – claude – shell_pid=86660 – Started implementation via action command
