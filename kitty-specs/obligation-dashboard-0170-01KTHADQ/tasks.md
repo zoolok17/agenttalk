@@ -15,9 +15,9 @@
 | T005 | Tests: `/api/state` schema contract (version pin, absent-not-null, composing array, no body keys) | WP01 | — | [D] |
 | T006 | Tests: multi-root separation, corrupt-root isolation, root[0]-only hrefs | WP01 | — | [D] |
 | T007 | Tests: security invariants (CSP pinning, peer gate, 405s, loopback) + no-mutation hash + perf smoke | WP01 | — | [D] |
-| T008 | `dashboard` subparser + `--store` plumbing + shared dispatch | WP02 | — |
-| T009 | Bind-failure handling (`OSError` → exit 2 actionable) + startup messages per spelling | WP02 | — |
-| T010 | CLI tests: alias surface, `--host` unknown option, `--store` plumbing, bind-failure exit 2, `serve` unchanged | WP02 | — |
+| T008 | `dashboard` subparser + `--store` plumbing + shared dispatch | WP02 | — | [D] |
+| T009 | Bind-failure handling (`OSError` → exit 2 actionable) + startup messages per spelling | WP02 | — | [D] |
+| T010 | CLI tests: alias surface, `--host` unknown option, `--store` plumbing, bind-failure exit 2, `serve` unchanged | WP02 | — | [D] |
 | T011 | README: dashboard/serve docs, CLI reference rows, install pin bumps | WP03 | — |
 | T012 | SECURITY.md dashboard section + CHANGELOG 0.17.0 + ROADMAP refresh | WP03 | — |
 | T013 | Version bump to 0.17.0 (pyproject.toml, `__init__.py`) + full-suite gate | WP03 | — |
@@ -59,9 +59,9 @@ signature + full suite run).
 **Independent test**: `python -m pytest tests/test_cli.py -q` green; quickstart §6 passes.
 **Estimated prompt size**: ~330 lines (3 subtasks).
 
-- [ ] T008 `dashboard` subparser + `--store` plumbing + shared dispatch (WP02)
-- [ ] T009 Bind-failure handling (`OSError` → exit 2) + startup messages (WP02)
-- [ ] T010 CLI tests: alias surface, `--host` rejection, bind failure, `serve` unchanged (WP02)
+- [x] T008 `dashboard` subparser + `--store` plumbing + shared dispatch (WP02)
+- [x] T009 Bind-failure handling (`OSError` → exit 2) + startup messages (WP02)
+- [x] T010 CLI tests: alias surface, `--host` rejection, bind failure, `serve` unchanged (WP02)
 
 **Dependencies**: Depends on WP01 (consumes the multi-root `make_server`
 surface and `/dashboard` landing route).
