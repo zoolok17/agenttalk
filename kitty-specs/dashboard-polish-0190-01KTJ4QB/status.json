@@ -1,7 +1,7 @@
 {
-  "event_count": 2,
-  "last_event_id": "01KTJ59RM29RC2R2J207ZAD4XZ",
-  "materialized_at": "2026-06-07T23:04:46.978712+00:00",
+  "event_count": 4,
+  "last_event_id": "01KTJ5ACQM8QGG27TQS92METQ4",
+  "materialized_at": "2026-06-07T23:05:07.572756+00:00",
   "mission_number": "",
   "mission_slug": "dashboard-polish-0190-01KTJ4QB",
   "mission_type": "software-dev",
@@ -12,17 +12,17 @@
     "claimed": 0,
     "done": 0,
     "for_review": 0,
-    "in_progress": 0,
+    "in_progress": 1,
     "in_review": 0,
-    "planned": 2
+    "planned": 1
   },
   "work_packages": {
     "WP01": {
-      "actor": "finalize-tasks",
+      "actor": "implement-command",
       "force_count": 1,
-      "lane": "planned",
-      "last_event_id": "01KTJ59RE9FYFRG03BQQH5XQZE",
-      "last_transition_at": "2026-06-07T23:04:46.793516+00:00"
+      "lane": "in_progress",
+      "last_event_id": "01KTJ5ACQM8QGG27TQS92METQ4",
+      "last_transition_at": "2026-06-07T23:05:07.572756+00:00"
     },
     "WP02": {
       "actor": "finalize-tasks",

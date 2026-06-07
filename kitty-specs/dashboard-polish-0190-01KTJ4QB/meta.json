@@ -6,5 +6,7 @@
   "mission_slug": "dashboard-polish-0190-01KTJ4QB",
   "mission_type": "software-dev",
   "slug": "dashboard-polish-0190-01KTJ4QB",
-  "target_branch": "master"
+  "target_branch": "master",
+  "vcs": "git",
+  "vcs_locked_at": "2026-06-07T23:05:06.932868+00:00"
 }
