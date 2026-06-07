@@ -28,7 +28,8 @@ subtasks:
 - T005
 - T006
 - T007
-shell_pid: '50824'
+shell_pid: "50824"
+agent: "claude"
 history:
 - '2026-06-07: created from approved plan rev2 (8e81ace, Codex pre-code review approved)'
 authoritative_surface: src/agenttalk/web.py
@@ -325,3 +326,7 @@ epoch_status vocabulary parity with `check --epoch`, CSP split (hostile-body
 routes unchanged), the no-mutation walk actually covering cursors/state
 files, absent-vs-null discipline against data-model.md, and that
 `make_server`'s legacy call shape is untouched for cli.py.
+
+## Activity Log
+
+- 2026-06-07T15:40:49Z – claude – shell_pid=50824 – Assigned agent via action command
