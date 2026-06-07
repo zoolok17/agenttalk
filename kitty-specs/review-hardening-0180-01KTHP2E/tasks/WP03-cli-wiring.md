@@ -17,6 +17,8 @@ subtasks:
 - T010
 - T011
 - T012
+agent: "claude"
+shell_pid: "84260"
 history:
 - '2026-06-07: created from approved plan rev2 (fffcb78, Codex pre-code approved)'
 authoritative_surface: src/agenttalk/cli.py
@@ -132,3 +134,7 @@ failure, 0 when all-retired); the warning is strictly before marker overwrite
 and never alters control flow/exit; tail known-roster switch; no new CLI
 command; `store.foreign_wait_pid` called with cli's own staleness policy
 (no store→cli import).
+
+## Activity Log
+
+- 2026-06-07T19:30:59Z – claude – shell_pid=84260 – Started implementation via action command
