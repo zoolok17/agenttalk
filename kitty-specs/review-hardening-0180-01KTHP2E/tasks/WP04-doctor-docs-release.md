@@ -15,6 +15,8 @@ subtasks:
 - T013
 - T014
 - T015
+agent: "claude"
+shell_pid: "36020"
 history:
 - '2026-06-07: created from approved plan rev2 (fffcb78, Codex pre-code approved)'
 authoritative_surface: src/agenttalk/doctor.py
@@ -111,3 +113,7 @@ Focus: doctor advisory framed as best-effort (not complete detection) + exit
 code unchanged; docs honesty (C-006/C-008 NOT overclaimed); CHANGELOG matches
 the real 4-WP diff incl. the FR-004 render change; version consistency across
 pyproject/__init__/docs.
+
+## Activity Log
+
+- 2026-06-07T21:07:32Z – claude – shell_pid=36020 – Started implementation via action command
