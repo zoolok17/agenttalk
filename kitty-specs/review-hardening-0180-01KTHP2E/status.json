@@ -1,0 +1,49 @@
+{
+  "event_count": 4,
+  "last_event_id": "01KTHQ53RT6N25ZH1YW6ZWKYJC",
+  "materialized_at": "2026-06-07T18:57:34.490210+00:00",
+  "mission_number": "",
+  "mission_slug": "review-hardening-0180-01KTHP2E",
+  "mission_type": "software-dev",
+  "summary": {
+    "approved": 0,
+    "blocked": 0,
+    "canceled": 0,
+    "claimed": 0,
+    "done": 0,
+    "for_review": 0,
+    "in_progress": 0,
+    "in_review": 0,
+    "planned": 4
+  },
+  "work_packages": {
+    "WP01": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTHQ53CQGYSRW86ZNDBS3BMR",
+      "last_transition_at": "2026-06-07T18:57:34.104018+00:00"
+    },
+    "WP02": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTHQ53PDRPC81H2YPGXJEXTS",
+      "last_transition_at": "2026-06-07T18:57:34.413920+00:00"
+    },
+    "WP03": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTHQ53QJ0V4S5YSYCCNXCQ6W",
+      "last_transition_at": "2026-06-07T18:57:34.450437+00:00"
+    },
+    "WP04": {
+      "actor": "finalize-tasks",
+      "force_count": 1,
+      "lane": "planned",
+      "last_event_id": "01KTHQ53RT6N25ZH1YW6ZWKYJC",
+      "last_transition_at": "2026-06-07T18:57:34.490210+00:00"
+    }
+  }
+}
