@@ -20,9 +20,9 @@
 | T010 | `broadcast --resume` skip-retired + dropped report + exit-0-when-all-retired (FR-005) | WP03 | — | [D] |
 | T011 | `wait` duplicate-activation warning via `foreign_wait_pid` (FR-007/008) | WP03 | — | [D] |
 | T012 | CLI tests: tail-retired, resume-skip-retired exits, wait-warning live/dead | WP03 | — | [D] |
-| T013 | `doctor` marker pid/liveness advisory (FR-009) + tests | WP04 | — |
-| T014 | Docs: README + SECURITY (one-window-per-agent unsupported; clock-agreement) (C-006/008) | WP04 | — |
-| T015 | CHANGELOG 0.18.0 + ROADMAP + version bump pyproject/`__init__` + full-suite gate | WP04 | — |
+| T013 | `doctor` marker pid/liveness advisory (FR-009) + tests | WP04 | — | [D] |
+| T014 | Docs: README + SECURITY (one-window-per-agent unsupported; clock-agreement) (C-006/008) | WP04 | — | [D] |
+| T015 | CHANGELOG 0.18.0 + ROADMAP + version bump pyproject/`__init__` + full-suite gate | WP04 | — | [D] |
 
 ## Work Packages
 
@@ -79,9 +79,9 @@
 **Independent test**: `python -m agenttalk --version` → 0.18.0; full suite green; quickstart §§6–8.
 **Estimated**: ~300 lines (3 subtasks).
 
-- [ ] T013 `doctor` marker pid/liveness advisory (FR-009) (WP04)
-- [ ] T014 Docs: README + SECURITY honesty notes (C-006/008) (WP04)
-- [ ] T015 CHANGELOG + ROADMAP + version 0.18.0 + full-suite gate (WP04)
+- [x] T013 `doctor` marker pid/liveness advisory (FR-009) (WP04)
+- [x] T014 Docs: README + SECURITY honesty notes (C-006/008) (WP04)
+- [x] T015 CHANGELOG + ROADMAP + version 0.18.0 + full-suite gate (WP04)
 
 **Dependencies**: Depends on WP03 (documents the final CLI surface; the liveness primitive it reuses is already in the lane transitively).
 
