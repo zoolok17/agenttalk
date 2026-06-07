@@ -8,13 +8,13 @@
 
 | ID | Description | WP | Parallel |
 |----|-------------|----|----------|
-| T001 | Additive `sent`/`received` per agent in `_agent_entries` (one pass over msgs) | WP01 | — |
-| T002 | Additive `edges` + `edges_truncated`/`edge_limit` in `_root_state` (Counter, self-excl, fan-out-incl, top-50) | WP01 | — |
-| T003 | `render_dashboard` shell: control bar (Refresh button + auto-refresh toggle) + roster/conversation containers | WP01 | — |
-| T004 | `_DASHBOARD_JS` renderer: hierarchical roster (client-side role classification), agent cards (incl client-computed owes), conversation panel | WP01 | — |
-| T005 | `_DASHBOARD_JS` refresh controls: addEventListener wiring, toggle starts/clears interval, button one-shot, no reload | WP01 | — |
-| T006 | Tests: `/api/state` additive keys (sent/received/edges/truncation), schema_version still 1, no key removed, no body, healthy-vs-degraded | WP01 | — |
-| T007 | Tests: CSP byte-identical (incl /dashboard), read-only no-mutation still passes, JS has no inline handlers/innerHTML, role-classifier convention | WP01 | — |
+| T001 | Additive `sent`/`received` per agent in `_agent_entries` (one pass over msgs) | WP01 | — | [D] |
+| T002 | Additive `edges` + `edges_truncated`/`edge_limit` in `_root_state` (Counter, self-excl, fan-out-incl, top-50) | WP01 | — | [D] |
+| T003 | `render_dashboard` shell: control bar (Refresh button + auto-refresh toggle) + roster/conversation containers | WP01 | — | [D] |
+| T004 | `_DASHBOARD_JS` renderer: hierarchical roster (client-side role classification), agent cards (incl client-computed owes), conversation panel | WP01 | — | [D] |
+| T005 | `_DASHBOARD_JS` refresh controls: addEventListener wiring, toggle starts/clears interval, button one-shot, no reload | WP01 | — | [D] |
+| T006 | Tests: `/api/state` additive keys (sent/received/edges/truncation), schema_version still 1, no key removed, no body, healthy-vs-degraded | WP01 | — | [D] |
+| T007 | Tests: CSP byte-identical (incl /dashboard), read-only no-mutation still passes, JS has no inline handlers/innerHTML, role-classifier convention | WP01 | — | [D] |
 | T008 | README dashboard section refresh (stats/edges/controls) | WP02 | — |
 | T009 | CHANGELOG 0.19.0 + ROADMAP header + version bump pyproject/`__init__` + full-suite gate | WP02 | — |
 
@@ -28,13 +28,13 @@
 **Independent test**: `python -m pytest tests/test_web.py -q` green; quickstart §§1–4 manually.
 **Estimated**: ~620 lines (7 subtasks — at the upper bound by design: web.py is a single-owner file, server + client land together, the 0.17.0 pattern).
 
-- [ ] T001 Additive `sent`/`received` per agent (WP01)
-- [ ] T002 Additive `edges` + truncation per root (WP01)
-- [ ] T003 `render_dashboard` shell: control bar + containers (WP01)
-- [ ] T004 `_DASHBOARD_JS`: hierarchical roster + cards + conversation panel (WP01)
-- [ ] T005 `_DASHBOARD_JS`: refresh controls (WP01)
-- [ ] T006 Tests: additive `/api/state` keys + healthy/degraded (WP01)
-- [ ] T007 Tests: CSP/no-mutation/textContent/role-classifier (WP01)
+- [x] T001 Additive `sent`/`received` per agent (WP01)
+- [x] T002 Additive `edges` + truncation per root (WP01)
+- [x] T003 `render_dashboard` shell: control bar + containers (WP01)
+- [x] T004 `_DASHBOARD_JS`: hierarchical roster + cards + conversation panel (WP01)
+- [x] T005 `_DASHBOARD_JS`: refresh controls (WP01)
+- [x] T006 Tests: additive `/api/state` keys + healthy/degraded (WP01)
+- [x] T007 Tests: CSP/no-mutation/textContent/role-classifier (WP01)
 
 **Implementation sketch**: server delta is small and additive (sent/received
 from the msgs already passed to `_agent_entries`; edges from one Counter in
