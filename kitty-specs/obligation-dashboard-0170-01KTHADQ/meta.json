@@ -1,0 +1,10 @@
+{
+  "created_at": "2026-06-07T15:15:07.529006+00:00",
+  "friendly_name": "obligation dashboard 0170",
+  "mission_id": "01KTHADQTQWHDYSYHKAR1Y311A",
+  "mission_number": null,
+  "mission_slug": "obligation-dashboard-0170-01KTHADQ",
+  "mission_type": "software-dev",
+  "slug": "obligation-dashboard-0170-01KTHADQ",
+  "target_branch": "master"
+}
