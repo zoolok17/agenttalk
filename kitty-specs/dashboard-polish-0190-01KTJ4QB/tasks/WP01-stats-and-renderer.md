@@ -27,7 +27,8 @@ subtasks:
 - T005
 - T006
 - T007
-shell_pid: '80276'
+shell_pid: "80276"
+agent: "claude"
 history:
 - '2026-06-07: created from approved plan (5dc70e4, Codex pre-code approved 08f126ef)'
 authoritative_surface: src/agenttalk/web.py
@@ -185,3 +186,7 @@ determinism); sent/received from the existing scan (no new walk); healthy-vs-
 degraded shape; additivity (extend not rewrite, schema_version 1, no body);
 refresh controls addEventListener-only + no reload; textContent-only renderer;
 the role-classifier convention pinned.
+
+## Activity Log
+
+- 2026-06-07T23:05:09Z – claude – shell_pid=80276 – Assigned agent via action command
