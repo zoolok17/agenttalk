@@ -13,9 +13,9 @@
 | T003 | `_process_alive(pid)` liveness primitive (POSIX + Windows ctypes, fail-quiet) | WP01 | — | [D] |
 | T004 | `Store.foreign_wait_pid(agent, self_pid, now=, stale_after=)` detector | WP01 | — | [D] |
 | T005 | Store-level tests: poison-signature degradation, malformed-id invalid, liveness/detector | WP01 | — | [D] |
-| T006 | `threads` broadcast: exclude retired from `pending`/`next_owner`; additive `audience_retired` (FR-006) | WP02 | — |
-| T007 | `web._all_messages` → known roster (FR-004 web) | WP02 | — |
-| T008 | threads + web tests (retired pending/audience_retired; retired history renders) | WP02 | — |
+| T006 | `threads` broadcast: exclude retired from `pending`/`next_owner`; additive `audience_retired` (FR-006) | WP02 | — | [D] |
+| T007 | `web._all_messages` → known roster (FR-004 web) | WP02 | — | [D] |
+| T008 | threads + web tests (retired pending/audience_retired; retired history renders) | WP02 | — | [D] |
 | T009 | `tail` → known roster (FR-004 tail) | WP03 | — |
 | T010 | `broadcast --resume` skip-retired + dropped report + exit-0-when-all-retired (FR-005) | WP03 | — |
 | T011 | `wait` duplicate-activation warning via `foreign_wait_pid` (FR-007/008) | WP03 | — |
@@ -50,9 +50,9 @@
 **Independent test**: `pytest tests/test_threads.py tests/test_web.py -q` green; quickstart §§3,5.
 **Estimated**: ~360 lines (3 subtasks).
 
-- [ ] T006 broadcast pending/next_owner excludes retired + `audience_retired` (FR-006) (WP02)
-- [ ] T007 `web._all_messages` → known roster (FR-004 web) (WP02)
-- [ ] T008 threads + web tests (WP02)
+- [x] T006 broadcast pending/next_owner excludes retired + `audience_retired` (FR-006) (WP02)
+- [x] T007 `web._all_messages` → known roster (FR-004 web) (WP02)
+- [x] T008 threads + web tests (WP02)
 
 **Dependencies**: Depends on WP01 (consumes the new invalid-classification; `web._all_messages` parity aligns with WP01's scan behavior).
 
