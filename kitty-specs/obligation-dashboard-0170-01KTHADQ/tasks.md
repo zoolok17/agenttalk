@@ -8,13 +8,13 @@
 
 | ID | Description | WP | Parallel |
 |----|-------------|----|----------|
-| T001 | Multi-root server plumbing: descriptors, label dedup, backward-compatible `make_server` | WP01 | — |
-| T002 | `build_state()` aggregate: per-root isolated collection (roster, presence, composing, epoch, counts, spec-kitty detection) | WP01 | — |
-| T003 | Thread rows: per-agent derivation, D5 ball-holder dedup, D6 epoch_status, mission/wp_id, broadcasts projection | WP01 | — |
-| T004 | New routes: `/api/state`, `/dashboard` HTML, `/static/dashboard.js`, per-route CSP, additive index link | WP01 | — |
-| T005 | Tests: `/api/state` schema contract (version pin, absent-not-null, composing array, no body keys) | WP01 | — |
-| T006 | Tests: multi-root separation, corrupt-root isolation, root[0]-only hrefs | WP01 | — |
-| T007 | Tests: security invariants (CSP pinning, peer gate, 405s, loopback) + no-mutation hash + perf smoke | WP01 | — |
+| T001 | Multi-root server plumbing: descriptors, label dedup, backward-compatible `make_server` | WP01 | — | [D] |
+| T002 | `build_state()` aggregate: per-root isolated collection (roster, presence, composing, epoch, counts, spec-kitty detection) | WP01 | — | [D] |
+| T003 | Thread rows: per-agent derivation, D5 ball-holder dedup, D6 epoch_status, mission/wp_id, broadcasts projection | WP01 | — | [D] |
+| T004 | New routes: `/api/state`, `/dashboard` HTML, `/static/dashboard.js`, per-route CSP, additive index link | WP01 | — | [D] |
+| T005 | Tests: `/api/state` schema contract (version pin, absent-not-null, composing array, no body keys) | WP01 | — | [D] |
+| T006 | Tests: multi-root separation, corrupt-root isolation, root[0]-only hrefs | WP01 | — | [D] |
+| T007 | Tests: security invariants (CSP pinning, peer gate, 405s, loopback) + no-mutation hash + perf smoke | WP01 | — | [D] |
 | T008 | `dashboard` subparser + `--store` plumbing + shared dispatch | WP02 | — |
 | T009 | Bind-failure handling (`OSError` → exit 2 actionable) + startup messages per spelling | WP02 | — |
 | T010 | CLI tests: alias surface, `--host` unknown option, `--store` plumbing, bind-failure exit 2, `serve` unchanged | WP02 | — |
@@ -32,13 +32,13 @@
 **Independent test**: `python -m pytest tests/test_web.py -q` green; quickstart §§1–5 pass manually via `web.serve_in_thread` equivalents.
 **Estimated prompt size**: ~640 lines (7 subtasks — at the upper bound deliberately: web.py and test_web.py are single-owner files, so splitting would create artificial cross-WP file ownership).
 
-- [ ] T001 Multi-root server plumbing: descriptors, label dedup, backward-compatible `make_server` (WP01)
-- [ ] T002 `build_state()` aggregate: per-root isolated collection (WP01)
-- [ ] T003 Thread rows: per-agent derivation, D5 dedup, D6 epoch_status, broadcasts (WP01)
-- [ ] T004 New routes `/api/state`, `/dashboard`, `/static/dashboard.js`, per-route CSP (WP01)
-- [ ] T005 Tests: `/api/state` schema contract (WP01)
-- [ ] T006 Tests: multi-root separation, corrupt-root isolation, root[0]-only hrefs (WP01)
-- [ ] T007 Tests: security invariants + no-mutation hash + perf smoke (WP01)
+- [x] T001 Multi-root server plumbing: descriptors, label dedup, backward-compatible `make_server` (WP01)
+- [x] T002 `build_state()` aggregate: per-root isolated collection (WP01)
+- [x] T003 Thread rows: per-agent derivation, D5 dedup, D6 epoch_status, broadcasts (WP01)
+- [x] T004 New routes `/api/state`, `/dashboard`, `/static/dashboard.js`, per-route CSP (WP01)
+- [x] T005 Tests: `/api/state` schema contract (WP01)
+- [x] T006 Tests: multi-root separation, corrupt-root isolation, root[0]-only hrefs (WP01)
+- [x] T007 Tests: security invariants + no-mutation hash + perf smoke (WP01)
 
 **Implementation sketch**: extend `web.py` only. `make_server` keeps its
 existing `(store, host, port, *, quiet)` call working byte-for-byte (cli.py
