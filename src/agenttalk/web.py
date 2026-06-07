@@ -718,6 +718,13 @@ def _derive_root_threads(
             chosen = open_pairs[0]
         _, t = chosen
         d = t.to_dict()
+        # Defensive (fresh-eyes 0.17.0 note): to_dict() adds a `rescind`
+        # block only on closed-superseded threads, and those are terminal
+        # → excluded above, so this is dead code TODAY. But its `reason`
+        # field carries sender-supplied body text, which must never enter
+        # /api/state (FR-003) — don't let that hang on an implicit
+        # invariant two functions away.
+        d.pop("rescind", None)
         _inject_next(d, t)
         opener = openers.get(rid)
         ometa = (opener.meta or {}) if opener is not None else {}

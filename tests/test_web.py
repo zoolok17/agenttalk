@@ -614,6 +614,36 @@ def test_api_state_thread_dedup_ball_holder(tmp_path: Path) -> None:
         srv.server_close()
 
 
+def test_api_state_rescinded_thread_excluded_and_reason_never_leaks(
+    tmp_path: Path,
+) -> None:
+    """Fresh-eyes 0.17.0 hardening pin: a rescinded thread is terminal →
+    not a row (counted in closed_threads), and the rescind block — whose
+    `reason` carries sender-supplied BODY text — must never appear on
+    any /api/state row even if the exclusion invariant ever drifts."""
+    s = _make_store(tmp_path)
+    s.send(sender="alpha", recipient="beta", kind="review-request",
+           subject="doomed", body="x", meta={"request_id": "rid-resc"})
+    s.send(sender="alpha", recipient="beta", kind="rescind",
+           subject="rescinding", body="SECRET RESCIND REASON BODY",
+           meta={"request_id": "rid-resc"})
+    s.send(sender="alpha", recipient="beta", kind="question",
+           subject="alive", body="y", meta={"request_id": "rid-live"})
+    srv, _t, base = _serve(s)
+    try:
+        raw = json.dumps(_state(base))
+        assert "SECRET RESCIND REASON BODY" not in raw
+        (root,) = _state(base)["roots"]
+        rids = [r["request_id"] for r in root["threads"]]
+        assert "rid-resc" not in rids and "rid-live" in rids
+        assert root["counts"]["closed_threads"] >= 1
+        for r in root["threads"]:
+            assert "rescind" not in r
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_state_broadcast_summary(tmp_path: Path) -> None:
     s = Store(tmp_path)
     s.init(["alpha", "beta", "gamma"])
