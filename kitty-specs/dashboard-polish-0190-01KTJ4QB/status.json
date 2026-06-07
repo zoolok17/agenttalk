@@ -1,17 +1,17 @@
 {
-  "event_count": 5,
-  "last_event_id": "01KTJ5VYBGME0RXSBT2TTCADRC",
-  "materialized_at": "2026-06-07T23:14:42.672424+00:00",
+  "event_count": 7,
+  "last_event_id": "01KTJ6JMQPZFPEP348HENWYC3P",
+  "materialized_at": "2026-06-07T23:27:06.486803+00:00",
   "mission_number": "",
   "mission_slug": "dashboard-polish-0190-01KTJ4QB",
   "mission_type": "software-dev",
   "summary": {
-    "approved": 0,
+    "approved": 1,
     "blocked": 0,
     "canceled": 0,
     "claimed": 0,
     "done": 0,
-    "for_review": 1,
+    "for_review": 0,
     "in_progress": 0,
     "in_review": 0,
     "planned": 1
@@ -20,9 +20,9 @@
     "WP01": {
       "actor": "user",
       "force_count": 1,
-      "lane": "for_review",
-      "last_event_id": "01KTJ5VYBGME0RXSBT2TTCADRC",
-      "last_transition_at": "2026-06-07T23:14:42.672424+00:00"
+      "lane": "approved",
+      "last_event_id": "01KTJ6JMQPZFPEP348HENWYC3P",
+      "last_transition_at": "2026-06-07T23:27:06.486803+00:00"
     },
     "WP02": {
       "actor": "finalize-tasks",
