@@ -12,6 +12,8 @@ subtasks:
 - T011
 - T012
 - T013
+agent: "claude"
+shell_pid: "79472"
 history:
 - '2026-06-07: created from approved plan rev2 (8e81ace, Codex pre-code review approved)'
 authoritative_surface: README.md
@@ -103,3 +105,7 @@ pyproject.toml, src/agenttalk/__init__.py.
 Focus: doc-vs-code honesty (overclaim hunt), stale pins, CHANGELOG
 completeness vs the actual diff, SECURITY.md blast-radius framing for
 multi-root, version consistency across pyproject/__init__/docs.
+
+## Activity Log
+
+- 2026-06-07T16:18:05Z – claude – shell_pid=79472 – Started implementation via action command
