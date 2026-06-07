@@ -168,3 +168,4 @@ fresh-vs-stale logic; no cli import in store.
 ## Activity Log
 
 - 2026-06-07T18:57:54Z – claude – shell_pid=84692 – Assigned agent via action command
+- 2026-06-07T19:07:31Z – claude – shell_pid=84692 – WP01 done; full suite 629 passed
