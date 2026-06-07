@@ -2575,6 +2575,23 @@ def test_resume_active_recipient_present_completes(tmp_path: Path, capsys) -> No
                for m in msgs)
 
 
+def test_resume_complete_batch_json_parseable(tmp_path: Path, capsys) -> None:
+    """Fresh-eyes M1: `--resume --json` on an already-complete batch emits a
+    single parseable manifest, not a human line."""
+    root = _team_root(tmp_path, agents="lead,w1")
+    # full single-recipient broadcast (audience_resolved == delivered)
+    _run(["send", "--from", "lead", "--to", "w1", "--kind", "question",
+          "--meta", "request_id=b-done", "--meta", "broadcast_id=b-done",
+          "--meta", "audience=all", "--meta", "audience_resolved=w1",
+          "-m", "q", "--quiet"], root)
+    capsys.readouterr()
+    rc = _run(["broadcast", "--from", "lead", "--resume", "b-done", "--json"], root)
+    assert rc == 0
+    manifest = json.loads(capsys.readouterr().out)   # stdout must be ONLY JSON
+    assert manifest["delivered"] == ["w1"]
+    assert manifest["missed"] == []
+
+
 def test_wait_warns_on_live_duplicate(tmp_path: Path, capsys,
                                       monkeypatch: pytest.MonkeyPatch) -> None:
     """FR-007: `wait` warns when foreign_wait_pid reports a live duplicate;

@@ -1215,7 +1215,14 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         existing = {m.recipient for m in copies}
         missed = [r for r in resolved if r not in existing]
         if not missed:
-            print(f"(batch {resume} complete - nothing to resume)")
+            # Already complete. Honor --json so a consumer polling resume
+            # always gets parseable stdout (0.18.0 fresh-eyes M1).
+            if getattr(args, "json", False):
+                print(json.dumps({"batch_id": resume,
+                                  "delivered": sorted(existing),
+                                  "missed": []}, indent=2))
+            else:
+                print(f"(batch {resume} complete - nothing to resume)")
             return 0
         # 0.18.0 (FR-005): a frozen recipient that has since been retired can
         # never receive — `store.send` refuses it. Skip-and-report it as
