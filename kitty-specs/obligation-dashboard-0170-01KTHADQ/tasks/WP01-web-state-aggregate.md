@@ -16,7 +16,7 @@ requirement_refs:
 - NFR-005
 planning_base_branch: master
 merge_target_branch: master
-branch_strategy: Single serial lane branched from master; squash-merge back to master at mission end.
+branch_strategy: Planning artifacts for this feature were generated on master. During /spec-kitty.implement this WP may branch from a dependency-specific base, but completed changes must merge back into master unless the human explicitly redirects the landing branch.
 subtasks:
 - T001
 - T002

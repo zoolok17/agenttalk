@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "mission_slug": "obligation-dashboard-0170-01KTHADQ",
+  "mission_id": "01KTHADQTQWHDYSYHKAR1Y311A",
+  "mission_branch": "kitty/mission-obligation-dashboard-0170-01KTHADQ",
+  "target_branch": "master",
+  "lanes": [
+    {
+      "lane_id": "lane-a",
+      "wp_ids": [
+        "WP01",
+        "WP02",
+        "WP03"
+      ],
+      "write_scope": [
+        "CHANGELOG.md",
+        "README.md",
+        "ROADMAP.md",
+        "SECURITY.md",
+        "pyproject.toml",
+        "src/agenttalk/__init__.py",
+        "src/agenttalk/cli.py",
+        "src/agenttalk/web.py",
+        "tests/test_cli.py",
+        "tests/test_web.py"
+      ],
+      "predicted_surfaces": [
+        "api",
+        "artifact-rendering",
+        "dashboard",
+        "legacy-cleanup",
+        "tests"
+      ],
+      "depends_on_lanes": [],
+      "parallel_group": 0
+    }
+  ],
+  "computed_at": "2026-06-07T15:40:16.917514+00:00",
+  "computed_from": "dependency_graph+ownership",
+  "planning_artifact_wps": [],
+  "collapse_report": {
+    "events": [
+      {
+        "wp_a": "WP02",
+        "wp_b": "WP01",
+        "rule": "dependency",
+        "evidence": "WP02 depends on WP01"
+      },
+      {
+        "wp_a": "WP03",
+        "wp_b": "WP02",
+        "rule": "dependency",
+        "evidence": "WP03 depends on WP02"
+      }
+    ],
+    "total_merges": 2,
+    "independent_wps_collapsed": 0,
+    "by_rule": {
+      "dependency": 2
+    }
+  }
+}
