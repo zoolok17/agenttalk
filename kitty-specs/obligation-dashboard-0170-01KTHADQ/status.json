@@ -1,7 +1,7 @@
 {
-  "event_count": 3,
-  "last_event_id": "01KTHBVVKG649ND0YP2741DEK0",
-  "materialized_at": "2026-06-07T15:40:16.880410+00:00",
+  "event_count": 5,
+  "last_event_id": "01KTHBWRXJ6B8RZSKGS6AVAAT0",
+  "materialized_at": "2026-06-07T15:40:46.898025+00:00",
   "mission_number": "",
   "mission_slug": "obligation-dashboard-0170-01KTHADQ",
   "mission_type": "software-dev",
@@ -12,17 +12,17 @@
     "claimed": 0,
     "done": 0,
     "for_review": 0,
-    "in_progress": 0,
+    "in_progress": 1,
     "in_review": 0,
-    "planned": 3
+    "planned": 2
   },
   "work_packages": {
     "WP01": {
-      "actor": "finalize-tasks",
+      "actor": "implement-command",
       "force_count": 1,
-      "lane": "planned",
-      "last_event_id": "01KTHBVVCZB5PJ46K2HYBN2V21",
-      "last_transition_at": "2026-06-07T15:40:16.671221+00:00"
+      "lane": "in_progress",
+      "last_event_id": "01KTHBWRXJ6B8RZSKGS6AVAAT0",
+      "last_transition_at": "2026-06-07T15:40:46.898025+00:00"
     },
     "WP02": {
       "actor": "finalize-tasks",

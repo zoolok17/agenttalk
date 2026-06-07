@@ -6,5 +6,7 @@
   "mission_slug": "obligation-dashboard-0170-01KTHADQ",
   "mission_type": "software-dev",
   "slug": "obligation-dashboard-0170-01KTHADQ",
-  "target_branch": "master"
+  "target_branch": "master",
+  "vcs": "git",
+  "vcs_locked_at": "2026-06-07T15:40:46.240993+00:00"
 }
