@@ -18,7 +18,8 @@ subtasks:
 - T003
 - T004
 - T005
-shell_pid: '84692'
+shell_pid: "84692"
+agent: "claude"
 history:
 - '2026-06-07: created from approved plan rev2 (fffcb78, Codex pre-code approved)'
 authoritative_surface: src/agenttalk/store.py
@@ -162,3 +163,7 @@ Focus: the guard truly precedes compare_digest; `_ID_RE` accepts every real id
 (test the monotonic bump near rollovers) and rejects `zzzz`; Windows liveness
 ctypes correctness + total fail-quiet; foreign_wait_pid self-vs-foreign and
 fresh-vs-stale logic; no cli import in store.
+
+## Activity Log
+
+- 2026-06-07T18:57:54Z – claude – shell_pid=84692 – Assigned agent via action command
