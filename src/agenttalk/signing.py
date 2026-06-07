@@ -324,6 +324,14 @@ def verify_message(msg_dict: dict, key: bytes, *,
             f"this project's id is {expected_key_id!r}"
         )
     claimed = meta["signature"]
+    # A non-string signature value (e.g. a JSON list smuggled into a
+    # message file) would make hmac.compare_digest raise TypeError, which
+    # escapes every read-path's `except ValueError` gate and crashes the
+    # whole bus — including list_invalid_messages, so the poison file
+    # could not even be quarantined (0.18.0 BLOCKER). Treat it as just
+    # another invalid signature.
+    if not isinstance(claimed, str):
+        raise ValueError("signature is not a string")
     actual = hmac.new(key, canonical_payload(msg_dict), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(claimed, actual):
         raise ValueError("signature mismatch")

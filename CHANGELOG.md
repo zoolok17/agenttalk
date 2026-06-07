@@ -5,6 +5,54 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] - 2026-06-07
+
+Review-hardening release (issue #21): fixes from two independent
+fresh-context full-codebase reviews — all cross-feature / cross-release
+interactions the per-diff review loop had missed — plus one
+operator-requested guardrail. Design Codex-accepted; per-WP reviewed.
+
+### Fixed
+- **BLOCKER:** a message file with a non-string `meta.signature` (signing
+  enforced) made `hmac.compare_digest` raise an uncaught `TypeError` that
+  crashed every read path — including `list_invalid_messages`, so the poison
+  file could not even be quarantined. It is now treated as a normal invalid
+  (quarantinable) message.
+- A message whose `id` is not a generated-id shape (e.g. `"zzzz"`) is now
+  rejected as invalid at scan time — previously it delivered and, once acked,
+  poisoned the recipient's cursor so every later message was hidden.
+- Retired identities' history no longer vanishes from `agenttalk tail` and the
+  dashboard message routes (`/api/messages`, `/messages/<id>`, index) — both
+  now validate against the known roster (active ∪ retired), matching
+  `valid_messages` and the dashboard thread panel.
+- `broadcast --resume` no longer gets permanently stuck (exit 5 forever) when a
+  frozen recipient was retired after a partial fan-out: retired recipients are
+  reported under `dropped` and skipped; an all-retired remainder resolves to
+  exit 0. Exit 5 is now emitted only on a genuine active-copy failure.
+- Broadcast obligation derivation no longer lists a retired audience member as
+  an owed `await-reply` — across `threads`, `sync`, `status`, `whoami`, and the
+  dashboard.
+
+### Added
+- `agenttalk wait`: advisory warning when another **live** process is already
+  waiting as the same agent in the same store (one window per agent is the
+  assumed model). Best-effort, never blocks, never changes the exit code.
+- `agenttalk doctor`: reports the current `.waiting` marker PID + liveness per
+  agent (advisory; not a complete duplicate check).
+- Additive fields: broadcast threads carry `audience_retired` (retired members
+  of the frozen audience); `broadcast --resume` manifests carry `dropped`.
+
+### Docs / honesty
+- README + SECURITY: one window per agent is unsupported-if-violated (warned,
+  not enforced); synced multi-machine stores assume clock agreement (id-shape
+  validation does not fix clock skew).
+
+### Notes
+- The dashboard/`tail` roster-parity fix is a visible change: retired
+  identities' historical messages now render where they previously did not.
+- Backward-compatible: new fields are additive (absent when unused); old
+  on-disk marker/heartbeat formats still read.
+
 ## [0.17.0] - 2026-06-07
 
 Obligation dashboard release (issue #20): the bus gets a glanceable,

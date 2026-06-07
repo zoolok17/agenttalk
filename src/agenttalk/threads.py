@@ -115,6 +115,11 @@ class Thread:
     audience: list[str] = field(default_factory=list)
     responded: list[str] = field(default_factory=list)
     pending: list[str] = field(default_factory=list)
+    # 0.18.0: audience members who have since been retired. The frozen
+    # `audience` (immutable history) still lists them, but they are excluded
+    # from `pending`/`next_owner` (a tombstone can never reply, so it is not an
+    # owed obligation). Surfaced additively for observability.
+    audience_retired: list[str] = field(default_factory=list)
     # Supersession (0.14.0, #12) — populated only when state is
     # closed-superseded: who rescinded, with what message, when, and why.
     rescind_msg_id: str | None = None
@@ -168,6 +173,10 @@ class Thread:
             d["audience"] = self.audience
             d["responded"] = self.responded
             d["pending"] = self.pending
+            # Additive (0.18.0): only when a frozen audience member is now
+            # retired — keeps clean-broadcast output byte-identical.
+            if self.audience_retired:
+                d["audience_retired"] = self.audience_retired
         # Additive: superseded threads carry the rescind provenance.
         if self.state == "closed-superseded":
             d["rescind"] = {
@@ -293,6 +302,7 @@ def _derive_broadcast(
     cursor: str,
     now: datetime,
     forced_closed: bool = False,
+    retired: set[str] | None = None,
 ) -> Thread | None:
     """Derive the multi-party thread for a broadcast (fan-out) correlation.
 
@@ -329,7 +339,12 @@ def _derive_broadcast(
                 # broadcaster distinguish "answered" from "not my role".
                 responded_na.add(m.sender)
             responses.append(m)
-    pending = [a for a in audience if a not in responded]
+    retired = retired or set()
+    # 0.18.0: a retired audience member can never reply, so it is not an owed
+    # obligation — exclude it from `pending`/`next_owner`. The frozen
+    # `audience` (history) still lists it; `audience_retired` surfaces it.
+    audience_retired = [a for a in audience if a in retired]
+    pending = [a for a in audience if a not in responded and a not in retired]
 
     # Frozen fan-out facts (0.15.0, #16) — display/warning passthrough
     # only; obligations above derive from the COPIES, never this meta.
@@ -412,6 +427,7 @@ def _derive_broadcast(
         audience=audience,
         responded=sorted(responded),
         pending=pending,
+        audience_retired=audience_retired,
         rescind_msg_id=superseding.id if superseding else None,
         rescinded_by=superseding.sender if superseding else None,
         rescind_at=superseding.ts if superseding else None,
@@ -429,6 +445,7 @@ def derive_threads(
     cursor: str,
     now: datetime | None = None,
     closed_rids: set[str] | None = None,
+    retired: set[str] | None = None,
 ) -> list[Thread]:
     """Return one :class:`Thread` per correlated request_id involving ``agent``.
 
@@ -444,6 +461,7 @@ def derive_threads(
     now = now or datetime.now(timezone.utc)
     cursor = cursor or ""
     closed_rids = closed_rids or set()
+    retired = retired or set()
 
     # Group by correlation id. Messages without a request_id are
     # untracked by design (you can't correlate what was never tagged).
@@ -470,7 +488,7 @@ def derive_threads(
         if bcast_openers:
             t = _derive_broadcast(
                 rid, group, bcast_openers, agent=agent, cursor=cursor, now=now,
-                forced_closed=(rid in closed_rids),
+                forced_closed=(rid in closed_rids), retired=retired,
             )
             if t is not None:
                 threads.append(t)

@@ -484,7 +484,12 @@ def _all_messages(store: Store) -> list[Message]:
     ``/api/status.invalid_messages`` instead of being rendered.
     """
     cfg = _safe_load_config(store)
-    roster = cfg.get("agents", []) or []
+    # 0.18.0 (FR-004): validate against the KNOWN roster (active ∪ retired),
+    # matching valid_messages / _validated_for_state — otherwise a retired
+    # identity's historical messages vanish from /api/messages, /messages/<id>,
+    # and the index while the thread panel still shows them. The two surfaces
+    # must agree.
+    roster = store._known_roster(cfg)  # noqa: SLF001 — D3 parity
     valid, _ = store._scan_messages()  # noqa: SLF001 — same call doctor uses
     require_sig = store.signing_enforced()
     key: bytes | None = None
@@ -684,11 +689,12 @@ def _derive_root_threads(
         if isinstance(rid, str) and rid and rid not in openers:
             openers[rid] = m
 
+    retired = set(store.retired_agents())  # 0.18.0: tombstones aren't owed moves
     views: dict[str, list[tuple[str, Thread]]] = {}
     for a in roster:
         derived = derive_threads(
             msgs_sorted, agent=a, cursor=store.cursor(a) or "",
-            closed_rids=_closed_rids_for(store, a),
+            closed_rids=_closed_rids_for(store, a), retired=retired,
         )
         for t in derived:
             views.setdefault(t.request_id, []).append((a, t))

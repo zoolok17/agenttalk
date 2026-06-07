@@ -1,6 +1,6 @@
 # Security policy & threat model
 
-> Last updated: 2026-06-07 (v0.17.0)
+> Last updated: 2026-06-07 (v0.18.0)
 
 agenttalk is a small file-backed message bus. The trust model is
 local: if you can write to a project's `.agenttalk/` directory, you
@@ -343,6 +343,34 @@ do what is cheaper and more honest.
      uninitialized store renders as an `errors` entry; it cannot 500
      the aggregate. JSON-unparseable configs therefore degrade
      visibly rather than silently vanishing.
+
+### Delivered in 0.18.0 (review-hardening)
+
+Two fresh-context full-codebase reviews surfaced robustness gaps that the
+per-feature review loop had missed. The fixes:
+
+- **Malformed-input robustness.** A message file with a non-string
+  `meta.signature` (signing enforced) previously made `hmac.compare_digest`
+  raise an uncaught `TypeError` that crashed every read path — including
+  `list_invalid_messages`, so the file could not even be quarantined. It is
+  now rejected as a normal invalid message. Likewise, a file whose `id` does
+  not match the generated-id shape is now classified invalid at scan time, so
+  a hand-written id can no longer be delivered or poison a recipient's cursor.
+  Both are quarantinable.
+
+Two **documented, unfixed** limitations (stated honestly, not closed):
+
+- **Same-agent concurrency is unsupported.** One window per agent is the
+  assumed model. The cursor/threadstate writers are atomic but not
+  process-safe read-modify-write, so two windows draining the same agent can
+  lose updates. 0.18.0 adds an advisory `agenttalk wait` warning (and a
+  `doctor` waiter-PID report) when a live duplicate is detected — best-effort,
+  never blocking, never enforcing. It is a guardrail, not a lock, and a single
+  per-agent marker cannot detect *all* duplicates.
+- **Cross-machine clock skew.** Id ordering is lexical over timestamp-prefixed
+  ids; a `.agenttalk/` synced across machines with disagreeing clocks can
+  mis-order or hide messages. Id-shape validation does **not** fix this
+  (a skewed id is well-formed); keep clocks in agreement.
 
 ### Still planned
 

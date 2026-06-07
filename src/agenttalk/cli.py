@@ -467,7 +467,8 @@ def _thread_warnings(store: Store, cfg: dict) -> list[str]:
     pending_escalations_exist = False
     for a in roster:
         rows = th.derive_threads(msgs, agent=a, cursor=store.cursor(a), now=now,
-                                 closed_rids=_closed_rids(store, a))
+                                 closed_rids=_closed_rids(store, a),
+                                 retired=set(store.retired_agents()))
         waiting = [t for t in rows if t.state == "reply-waiting"]
         if waiting:
             ids = ", ".join(t.request_id for t in waiting[:3])
@@ -586,6 +587,7 @@ def cmd_threads(args: argparse.Namespace) -> int:
     all_rows = th.derive_threads(
         store.valid_messages(), agent=agent, cursor=store.cursor(agent),
         closed_rids=_closed_rids(store, agent),
+        retired=set(store.retired_agents()),
     )
     cnts = th.counts(all_rows)
     shown = all_rows if args.all else [t for t in all_rows if t.state in th.ACTIONABLE_STATES]
@@ -1215,9 +1217,33 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         if not missed:
             print(f"(batch {resume} complete - nothing to resume)")
             return 0
+        # 0.18.0 (FR-005): a frozen recipient that has since been retired can
+        # never receive — `store.send` refuses it. Skip-and-report it as
+        # `dropped` instead of trapping the broadcaster at a permanent exit 5
+        # ("resume again" could never succeed). Only genuinely-active missing
+        # copies are (re)sent.
+        retired = set(store.retired_agents())
+        dropped = [r for r in missed if r in retired]
+        to_send = [r for r in missed if r not in retired]
+        if not to_send:
+            # Everything still missing is retired → nothing to send; the
+            # batch is as complete as it can ever be. Resolve (exit 0).
+            delivered = sorted(existing)
+            manifest = {"batch_id": resume, "delivered": delivered, "missed": []}
+            if dropped:
+                manifest["dropped"] = sorted(dropped)
+            if getattr(args, "json", False):
+                # --json: ONLY a parseable JSON object on stdout (no human line).
+                print(json.dumps(manifest, indent=2))
+            elif not args.quiet:
+                print(f"delivered=[{', '.join(delivered)}]")
+                print(f"dropped=[{', '.join(sorted(dropped))}]  (retired)")
+                print(f"(batch {resume} resolved: all remaining recipients "
+                      f"are retired and were dropped)")
+            return 0
         sent_resume: list = []
         failure: Exception | None = None
-        for r in missed:
+        for r in to_send:
             try:
                 msg = store.send(
                     sender=sender, recipient=r, body=proto.body,
@@ -1230,21 +1256,41 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
             sent_resume.append(msg)
         if failure is not None:
             delivered = sorted(existing | {m.recipient for m in sent_resume})
-            still_missed = [r for r in resolved if r not in delivered]
+            # still_missed = ACTIVE recipients we failed to (re)send; retired
+            # names are reported under `dropped`, never as a partial-failure.
+            still_missed = [r for r in to_send if r not in delivered]
+            manifest = {"batch_id": resume, "delivered": delivered,
+                        "missed": still_missed}
+            if dropped:
+                manifest["dropped"] = sorted(dropped)
             if getattr(args, "json", False):
-                print(json.dumps({"batch_id": resume, "delivered": delivered,
-                                  "missed": still_missed}, indent=2))
+                print(json.dumps(manifest, indent=2))
             else:
                 print(f"delivered=[{', '.join(delivered)}]")
                 print(f"missed=[{', '.join(still_missed)}]")
+                if dropped:
+                    print(f"dropped=[{', '.join(sorted(dropped))}]  (retired)")
             sys.stderr.write(
                 f"agenttalk broadcast: resume of {resume} STILL partial - "
                 f"copy for {still_missed[0]!r} failed: {failure}\n")
             return 5
-        if not args.quiet:
-            print(f"(batch {resume} resumed: {len(sent_resume)} missing "
-                  f"cop{'ies' if len(sent_resume) != 1 else 'y'} sent: "
-                  f"{', '.join(m.recipient for m in sent_resume)})")
+        # Success: all active copies sent. Build ONE manifest; --json emits
+        # only parseable JSON, otherwise the friendly summary (respecting
+        # --quiet). `missed` is empty here by definition; `dropped` carries
+        # the retired skips so the JSON success path is contract-complete.
+        delivered = sorted(existing | {m.recipient for m in sent_resume})
+        manifest = {"batch_id": resume, "delivered": delivered, "missed": []}
+        if dropped:
+            manifest["dropped"] = sorted(dropped)
+        if getattr(args, "json", False):
+            print(json.dumps(manifest, indent=2))
+        elif not args.quiet:
+            msg = (f"(batch {resume} resumed: {len(sent_resume)} missing "
+                   f"cop{'ies' if len(sent_resume) != 1 else 'y'} sent: "
+                   f"{', '.join(m.recipient for m in sent_resume)}")
+            if dropped:
+                msg += f"; dropped retired: {', '.join(sorted(dropped))}"
+            print(msg + ")")
         return 0
     # Audience resolution: role targets (#15, 0.15.0) resolve via the
     # roles map; groups/all via the existing resolver. Explicit flags —
@@ -1815,6 +1861,21 @@ def cmd_wait(args: argparse.Namespace) -> int:
     if getattr(args, "kind", None) and not getattr(args, "to_request", None):
         sys.stderr.write("agenttalk wait: --kind requires --to-request <id>\n")
         return 2
+    # 0.18.0 (FR-007): advisory duplicate-activation warning. One window per
+    # agent is the assumed model; if another LIVE process is already waiting
+    # as this agent in this store, say so. Best-effort and non-fatal — it
+    # never blocks the wait and never changes the exit code. A stale/dead
+    # marker (crash recovery) produces no warning. Checked here, before
+    # either path overwrites the marker (the only point the prior owner is
+    # still visible).
+    _foreign = store.foreign_wait_pid(agent, os.getpid(), now=time.time(),
+                                      stale_after=STALE_THRESHOLD_SECONDS)
+    if _foreign is not None:
+        sys.stderr.write(
+            f"warning: another live process (PID {_foreign}) is already "
+            f"waiting as {agent!r} in this store. One window per agent is "
+            f"assumed; concurrent same-agent use can lose cursor/threadstate "
+            f"updates.\n")
     if getattr(args, "to_request", None):
         return _scoped_wait(store, agent, args)
     deadline = time.time() + args.timeout if args.timeout > 0 else None
@@ -1957,7 +2018,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
     msgs = store.valid_messages()
     cursor = store.cursor(agent)
     closed = _closed_rids(store, agent)
-    rows = th.derive_threads(msgs, agent=agent, cursor=cursor, closed_rids=closed)
+    rows = th.derive_threads(msgs, agent=agent, cursor=cursor, closed_rids=closed,
+                             retired=set(store.retired_agents()))
     actionable = [t for t in rows if t.state in th.ACTIONABLE_STATES]
 
     # Per-thread last terminal decision (review-result / proposal-response).
@@ -2133,6 +2195,7 @@ def cmd_whoami(args: argparse.Namespace) -> int:
         rows = th.derive_threads(
             store.valid_messages(), agent=self_name, cursor=store.cursor(self_name),
             closed_rids=_closed_rids(store, self_name),
+            retired=set(store.retired_agents()),
         )
         owed = sum(1 for t in rows if t.state in ("owed-inbound", "reply-waiting"))
 
@@ -2518,7 +2581,10 @@ def cmd_tail(args: argparse.Namespace) -> int:
     """
     store = _get_store(args)
     cfg = store.load_config()
-    roster = cfg.get("agents") or []
+    # 0.18.0 (FR-004): validate against the KNOWN roster (active ∪ retired)
+    # so a retired identity's historical messages still print instead of
+    # showing as TAIL INVALID — matching valid_messages and the dashboard.
+    roster = store._known_roster(cfg)  # noqa: SLF001 — D3 parity
     # Mirror the HMAC enforcement that messages_for applies, so a
     # tampered or unsigned message never gets rendered with its
     # body in tail's output — only as a body-free INVALID warning.

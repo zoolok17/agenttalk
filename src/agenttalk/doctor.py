@@ -97,6 +97,9 @@ def run(project_root: Path | None = None) -> Report:
         report.checks.append(_check_codex_config(root))
         report.checks.append(_check_hmac(store, root))
         report.checks.extend(_check_heartbeats(store))
+        waiters = _check_active_waiters(store)
+        if waiters is not None:  # additive: absent unless a live waiter exists
+            report.checks.append(waiters)
     return report
 
 
@@ -500,3 +503,39 @@ def _check_heartbeats(store: Store) -> list[Check]:
                 details=f"last seen {int(age)}s ago",
             ))
     return out
+
+
+def _check_active_waiters(store: Store) -> Check | None:
+    """Report which agents currently have a LIVE `.waiting` marker, with the
+    owning PID (0.18.0, FR-009). Returns None — the check is ABSENT — when no
+    agent has a live waiting marker (a malformed/dead/missing marker reads as
+    no waiter), so a quiet store adds nothing to the report.
+
+    Advisory only. One window per agent is the assumed model; a marker whose
+    PID is alive means a process is actively waiting as that agent right now.
+    This is NOT a complete duplicate-detection registry — a single per-agent
+    marker can only name the CURRENT owner, not every concurrent window — so
+    the wording says "currently waiting", never "all duplicates". `doctor`'s
+    exit code is unaffected (this never errors).
+    """
+    from agenttalk.store import _process_alive  # local: avoid import churn
+    cfg = store.load_config()
+    live: list[dict] = []
+    for a in cfg.get("agents", []) or []:
+        marker = store.read_waiting(a)  # None on absent/corrupt — never raises
+        if not isinstance(marker, dict):
+            continue
+        pid = marker.get("pid")
+        if isinstance(pid, int) and _process_alive(pid):
+            live.append({"agent": a, "pid": pid})
+    if not live:
+        return None  # additive: no advisory when nobody is actively waiting
+    listing = ", ".join(f"{w['agent']} (PID {w['pid']})" for w in live)
+    return Check(
+        name="active_waiters",
+        status="ok",
+        details=(f"currently waiting: {listing}. One window per agent is "
+                 f"assumed; this names the current marker owner(s), not a "
+                 f"complete duplicate check."),
+        data={"live_waiters": live},
+    )

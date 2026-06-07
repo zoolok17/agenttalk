@@ -2492,3 +2492,114 @@ def test_dashboard_missing_store_warns_not_fatal(
     assert str(empty.resolve()) in err
     # the missing store is still passed through as a root descriptor
     assert [d.store.root for d in captured["extra"]] == [empty.resolve()]
+
+
+# ===================================== 0.18.0 (WP03): review-hardening CLI
+
+def test_tail_shows_retired_history(tmp_path: Path, capsys) -> None:
+    """FR-004: a retired identity's history prints in `tail` (known roster),
+    not as TAIL INVALID."""
+    root = _team_root(tmp_path, agents="lead,beta")
+    assert _run(["send", "--from", "beta", "--to", "lead",
+                 "-m", "HISTORY_FROM_BETA", "--quiet"], root) == 0
+    assert _run(["roster", "retire", "beta"], root) == 0
+    capsys.readouterr()
+    # bounded timeout: --from-start replays existing messages on the first
+    # scan, then the loop exits at the deadline. (timeout 0 means "forever".)
+    assert _run(["tail", "--from-start", "--timeout", "1",
+                 "--interval", "0.1"], root) == 0
+    captured = capsys.readouterr()
+    assert "HISTORY_FROM_BETA" in captured.out
+    assert "INVALID" not in captured.out and "INVALID" not in captured.err
+
+
+def _partial_broadcast(root: Path, bid: str, members) -> None:
+    """Send a frozen-audience broadcast to only the FIRST member, leaving the
+    rest 'missed' (audience_resolved names all)."""
+    resolved = ",".join(members)
+    _run(["send", "--from", "lead", "--to", members[0], "--kind", "question",
+          "--meta", f"request_id={bid}", "--meta", f"broadcast_id={bid}",
+          "--meta", "audience=all", "--meta", f"audience_resolved={resolved}",
+          "-m", "status?", "--quiet"], root)
+
+
+def test_resume_all_retired_exit0_json_parseable(tmp_path: Path, capsys) -> None:
+    """FR-005: when every still-missing recipient is retired, resume resolves
+    (exit 0) and `--json` stdout is a single parseable manifest with dropped."""
+    root = _team_root(tmp_path, agents="lead,w1,w2")
+    _partial_broadcast(root, "b-1", ["w1", "w2"])   # only w1 delivered
+    assert _run(["roster", "retire", "w2"], root) == 0
+    capsys.readouterr()
+    rc = _run(["broadcast", "--from", "lead", "--resume", "b-1", "--json"], root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    manifest = json.loads(out)   # stdout must be ONLY JSON
+    assert manifest["dropped"] == ["w2"]
+    assert manifest["missed"] == []
+    # no new copy was sent to the retired recipient
+    msgs = [json.loads(p.read_text(encoding="utf-8"))
+            for p in (root / ".agenttalk" / "messages").glob("*.json")]
+    assert all(m["to"] != "w2" for m in msgs)
+
+
+def test_resume_mixed_active_and_retired_json_parseable(tmp_path: Path, capsys) -> None:
+    """FR-005: a mix of one active-missing + one retired recipient → the
+    active copy is (re)sent, the retired one dropped, exit 0, and `--json`
+    success stdout is a single parseable manifest carrying both."""
+    root = _team_root(tmp_path, agents="lead,w1,w2,w3")
+    _partial_broadcast(root, "b-mix", ["w1", "w2", "w3"])  # only w1 delivered
+    assert _run(["roster", "retire", "w3"], root) == 0     # w2 active, w3 retired
+    capsys.readouterr()
+    rc = _run(["broadcast", "--from", "lead", "--resume", "b-mix", "--json"], root)
+    assert rc == 0
+    manifest = json.loads(capsys.readouterr().out)   # stdout must be ONLY JSON
+    assert "w2" in manifest["delivered"]
+    assert manifest["dropped"] == ["w3"]
+    msgs = [json.loads(p.read_text(encoding="utf-8"))
+            for p in (root / ".agenttalk" / "messages").glob("*.json")]
+    assert any(m["to"] == "w2" and m["meta"].get("broadcast_id") == "b-mix"
+               for m in msgs)
+    assert all(m["to"] != "w3" for m in msgs)
+
+
+def test_resume_active_recipient_present_completes(tmp_path: Path, capsys) -> None:
+    """A still-active missing recipient is actually (re)sent on resume."""
+    root = _team_root(tmp_path, agents="lead,w1,w2")
+    _partial_broadcast(root, "b-2", ["w1", "w2"])   # w2 still missing + active
+    capsys.readouterr()
+    rc = _run(["broadcast", "--from", "lead", "--resume", "b-2"], root)
+    assert rc == 0
+    msgs = [json.loads(p.read_text(encoding="utf-8"))
+            for p in (root / ".agenttalk" / "messages").glob("*.json")]
+    assert any(m["to"] == "w2" and m["meta"].get("broadcast_id") == "b-2"
+               for m in msgs)
+
+
+def test_wait_warns_on_live_duplicate(tmp_path: Path, capsys,
+                                      monkeypatch: pytest.MonkeyPatch) -> None:
+    """FR-007: `wait` warns when foreign_wait_pid reports a live duplicate;
+    the warning never changes the exit code."""
+    root = _team_root(tmp_path, agents="lead,beta")
+    monkeypatch.setattr("agenttalk.store.Store.foreign_wait_pid",
+                        lambda self, agent, pid, **kw: 4242)
+    capsys.readouterr()
+    # timeout 1 so the wait returns (exit 1, the documented wait-timeout)
+    rc = _run(["wait", "--for", "lead", "--timeout", "1",
+               "--heartbeat-interval", "0"], root)
+    err = capsys.readouterr().err
+    assert "another live process (PID 4242)" in err
+    assert "one window per agent" in err.lower()
+    assert rc == 1   # warning did NOT change the exit code
+
+
+def test_wait_no_warning_when_no_duplicate(tmp_path: Path, capsys,
+                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _team_root(tmp_path, agents="lead,beta")
+    monkeypatch.setattr("agenttalk.store.Store.foreign_wait_pid",
+                        lambda self, agent, pid, **kw: None)
+    capsys.readouterr()
+    rc = _run(["wait", "--for", "lead", "--timeout", "1",
+               "--heartbeat-interval", "0"], root)
+    err = capsys.readouterr().err
+    assert "another live process" not in err
+    assert rc == 1

@@ -825,3 +825,33 @@ def test_to_dict_never_emits_next_fields() -> None:
     for msgs, cur in ((open_msgs, ""), (closed_msgs, "002")):
         d = derive_threads(msgs, agent="alpha", cursor=cur, now=_BASE)[0].to_dict()
         assert "next_action" not in d and "next_owner" not in d
+
+
+# ===================================== 0.18.0 (WP02): retired audience members
+
+def test_broadcast_excludes_retired_from_pending_and_owner() -> None:
+    """A retired audience member can never reply, so it must not appear in
+    `pending` or the await-reply `next_owner` — but it stays in the frozen
+    `audience` and is surfaced via `audience_retired` (0.18.0, FR-006)."""
+    msgs, nxt = _broadcast("b-1", "lead", ["dev1", "dev2", "dev3"])
+    msgs.append(_msg(f"{nxt:03d}", "dev1", "lead", "message", rid="b-1"))  # dev1 replies
+    L = derive_threads(msgs, agent="lead", cursor=f"{nxt:03d}", now=_BASE,
+                       retired={"dev3"})
+    t = L[0]
+    assert t.audience == ["dev1", "dev2", "dev3"]          # frozen, unchanged
+    assert t.audience_retired == ["dev3"]
+    assert "dev3" not in t.pending                          # tombstone not owed
+    assert t.pending == ["dev2"]
+    # next_owner (await-reply on the pending set) never names the tombstone
+    if isinstance(t.next_owner, list):
+        assert "dev3" not in t.next_owner
+    d = t.to_dict()
+    assert d["audience_retired"] == ["dev3"]
+
+
+def test_broadcast_no_audience_retired_key_when_none() -> None:
+    """Additivity: a clean broadcast emits no `audience_retired` key."""
+    msgs, _ = _broadcast("b-1", "lead", ["dev1", "dev2"])
+    L = derive_threads(msgs, agent="lead", cursor="", now=_BASE)
+    assert L[0].audience_retired == []
+    assert "audience_retired" not in L[0].to_dict()

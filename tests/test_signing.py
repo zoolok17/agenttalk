@@ -555,3 +555,42 @@ def test_signatures_off_default_still_works(tmp_path: Path) -> None:
     msgs = s.messages_for("beta")
     assert len(msgs) == 1
     assert "signature" not in msgs[0].meta
+
+
+# ------------------------------------ 0.18.0 BLOCKER: non-string signature
+
+def test_verify_rejects_non_string_signature_as_valueerror() -> None:
+    """A non-string signature value (e.g. a JSON list smuggled into a
+    file) must raise ValueError, NOT a TypeError out of compare_digest.
+    The TypeError would escape every read-path `except ValueError` and
+    crash the whole bus (0.18.0 BLOCKER)."""
+    key = b"\x00" * 32
+    signed = signing.sign_message(_msg_dict(), key, key_id="kid-1")
+    signed["meta"]["signature"] = [1, 2, 3]   # wrong JSON type
+    with pytest.raises(ValueError, match="signature is not a string"):
+        signing.verify_message(signed, key)
+
+
+def test_poison_signature_degrades_gracefully(tmp_path: Path,
+                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    """With signing enforced, a poison-signature file must NOT crash the
+    read paths; it is reported invalid and a legit message still delivers."""
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(tmp_path / "k.key"))
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    signing.init_key(s.project_id())
+    s.send(sender="alpha", recipient="beta", body="legit")
+    poison = {
+        "id": "20990101-000000-000000-PSNx", "ts": "2099-01-01T00:00:00Z",
+        "from": "alpha", "to": "beta", "kind": "message", "subject": "",
+        "body": "x", "meta": {"signature": [1, 2, 3], "signature_version": "v1",
+                              "signature_alg": "hmac-sha256",
+                              "key_id": s.project_id()},
+    }
+    (s.messages_dir / "20990101-000000-000000-PSNx.json").write_text(
+        json.dumps(poison), encoding="utf-8")
+    # none of these crash:
+    assert any(m.body == "legit" for m in s.messages_for("beta"))
+    assert s.current_epoch() is None
+    invalid_ids = {mid for mid, _ in s.list_invalid_messages()}
+    assert "20990101-000000-000000-PSNx" in invalid_ids

@@ -905,3 +905,31 @@ def test_api_state_perf_smoke(tmp_path: Path) -> None:
             f"environment cannot meet the NFR-003 reference bound for any "
             f"command (build_state measured {elapsed:.2f}s)")
     assert elapsed < 2.0, f"build_state took {elapsed:.2f}s at 1k messages"
+
+
+# ===================================== 0.18.0 (WP02): retired history parity
+
+def test_retired_history_renders_on_message_routes(tmp_path: Path) -> None:
+    """FR-004: a retired identity's historical messages must render on the
+    dashboard message routes (known roster), matching the thread panel —
+    not vanish, and not be flagged invalid."""
+    s = Store(tmp_path)
+    s.init(["lead", "beta"])
+    s.send(sender="beta", recipient="lead", body="HISTORY_FROM_BETA")
+    s.send(sender="lead", recipient="beta", body="reply-to-beta")
+    s.retire_agent("beta")
+    # _all_messages (powers /api/messages, /messages/<id>, index) now sees them
+    bodies = {m.body for m in web._all_messages(s)}
+    assert "HISTORY_FROM_BETA" in bodies and "reply-to-beta" in bodies
+    # and they are NOT reported invalid
+    assert s.list_invalid_messages() == []
+    # served over HTTP too
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/api/messages") as resp:
+            payload = json.loads(resp.read())
+        served = {m["body"] for m in payload["messages"]}
+        assert "HISTORY_FROM_BETA" in served
+    finally:
+        srv.shutdown()
+        srv.server_close()

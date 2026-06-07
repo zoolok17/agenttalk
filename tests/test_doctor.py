@@ -422,3 +422,55 @@ def test_doctor_does_not_crash_on_active_retired_overlap(tmp_path: Path) -> None
     assert init.status == "error" and "BOTH" in init.details
     # the config-dependent checks were skipped (no crash)
     assert not any(c.name == "identity_registry" for c in report.checks)
+
+
+# ===================================== 0.18.0 (WP04): active-waiters advisory
+
+def test_doctor_active_waiters_reports_live_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-009: doctor names an agent with a LIVE `.waiting` marker (PID +
+    advisory), never errors, and frames it as the current owner — not a
+    complete duplicate check."""
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    s.write_waiting("alpha", {"agent": "alpha", "pid": 4242,
+                              "deadline_epoch": None})
+    monkeypatch.setattr("agenttalk.store._process_alive",
+                        lambda pid: pid == 4242)
+    report = doctor.run(tmp_path)
+    aw = next(c for c in report.checks if c.name == "active_waiters")
+    assert aw.status == "ok"               # advisory, never error
+    assert "alpha (PID 4242)" in aw.details
+    assert aw.data["live_waiters"] == [{"agent": "alpha", "pid": 4242}]
+    assert report.overall != "error"       # exit code unaffected
+
+
+def test_doctor_active_waiters_absent_when_no_live_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The advisory is ABSENT (no `active_waiters` check at all) when nobody
+    is actively waiting — no marker or a dead marker."""
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    # (a) no marker at all
+    report = doctor.run(tmp_path)
+    assert all(c.name != "active_waiters" for c in report.checks)
+    assert report.overall != "error"
+    # (b) a marker whose pid is dead → still absent
+    s.write_waiting("alpha", {"agent": "alpha", "pid": 4242,
+                              "deadline_epoch": None})
+    monkeypatch.setattr("agenttalk.store._process_alive", lambda pid: False)
+    report = doctor.run(tmp_path)
+    assert all(c.name != "active_waiters" for c in report.checks)
+
+
+def test_doctor_active_waiters_malformed_marker_no_crash(tmp_path: Path) -> None:
+    """A corrupt `.waiting` file reads as no waiter — doctor never crashes and
+    omits the advisory."""
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    (s.state_dir / "alpha.waiting").write_text("{not json", encoding="utf-8")
+    report = doctor.run(tmp_path)              # must not raise
+    assert all(c.name != "active_waiters" for c in report.checks)
+    assert report.overall != "error"

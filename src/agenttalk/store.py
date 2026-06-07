@@ -23,6 +23,7 @@ import secrets
 import shutil
 import string
 import threading
+import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +33,15 @@ from agenttalk import signing as _signing
 
 DIRNAME = ".agenttalk"
 _ID_ALPHABET = string.ascii_letters + string.digits
+# Canonical generated-message-id shape, built FROM _ID_ALPHABET so the
+# validator can never drift from `_new_id` (which emits
+# "%Y%m%d-%H%M%S-%f" + "-" + 4 chars of _ID_ALPHABET). A file whose id
+# does not match this is classified invalid at scan time — it can never
+# deliver or advance a cursor (0.18.0; closes the malformed-id
+# cursor-poison). NOTE: this rejects wrong-SHAPE ids only; a well-formed
+# but future-dated id from cross-machine clock skew still matches and is
+# a documented constraint, not fixed here.
+_ID_RE = re.compile(r"\A\d{8}-\d{6}-\d{6}-[" + re.escape(_ID_ALPHABET) + r"]{4}\Z")
 
 # Known message kinds. Receivers should silently skip anything else
 # rather than letting an unfamiliar kind smuggle through to the LLM
@@ -349,6 +359,14 @@ class Message:
                     f"field {fname!r} must be a non-empty string, "
                     f"got {type(data[fname]).__name__}"
                 )
+        # The id must be a real generated id. A hand-written or corrupt id
+        # of the wrong shape (e.g. "zzzz") would otherwise validate, deliver,
+        # and — once acked — poison the recipient's cursor, since delivery
+        # ordering is a lexicographic compare of ids (0.18.0).
+        if not _ID_RE.match(data["id"]):
+            raise ValueError(
+                f"malformed id {data['id']!r} (not a generated message id)"
+            )
         for fname in ("kind", "subject", "body"):
             if fname in data and not isinstance(data[fname], str):
                 raise ValueError(
@@ -1695,6 +1713,47 @@ class Store:
             return None
         return data
 
+    def foreign_wait_pid(self, agent: str, self_pid: int, *,
+                         now: float | None = None,
+                         stale_after: float | None = None) -> int | None:
+        """Return the PID of ANOTHER live process currently waiting as
+        ``agent`` in this store, or None (0.18.0, FR-007).
+
+        Reads the existing ``.waiting`` marker (which records ``pid`` and a
+        ``deadline_epoch``). Returns the marker's pid only when it is a
+        different process (``pid != self_pid``), the marker is still fresh,
+        and that pid is actually alive. A stale or dead owner yields None
+        (silent crash recovery), so a starting ``wait`` only warns about a
+        genuine concurrent same-agent window.
+
+        Freshness policy (``now`` / ``stale_after``) is passed IN so this
+        stays self-contained — the store never imports the CLI's staleness
+        constants. Best-effort and fail-quiet: any error reads as None.
+        """
+        if now is None:
+            now = time.time()
+        if stale_after is None:
+            stale_after = _WAIT_STALE_AFTER_DEFAULT
+        try:
+            marker = self.read_waiting(agent)
+            if not marker:
+                return None
+            pid = marker.get("pid")
+            if not isinstance(pid, int) or pid == self_pid:
+                return None
+            # Fresh? A bounded wait records a deadline_epoch; treat the
+            # marker as stale once it is past the deadline by more than the
+            # threshold. An unbounded wait (deadline None) is fresh as long
+            # as its owner is alive (the liveness check below decides).
+            deadline = marker.get("deadline_epoch")
+            if isinstance(deadline, (int, float)) and now > deadline + stale_after:
+                return None
+            if not _process_alive(pid):
+                return None
+            return pid
+        except Exception:  # noqa: BLE001 — observability only, never crash a wait
+            return None
+
     def clear_waiting(self, agent: str) -> None:
         """Remove the waiting marker if present. Best-effort, never raises."""
         p = self.state_dir / f"{agent}.waiting"
@@ -1882,6 +1941,65 @@ def _now_iso() -> str:
 
 _id_lock = threading.Lock()
 _last_id_dt: datetime | None = None
+
+# Default freshness window for `foreign_wait_pid` when the caller does not
+# pass one. Generous on purpose: the liveness check is the real gate, this
+# only discards an obviously-expired bounded-wait marker.
+_WAIT_STALE_AFTER_DEFAULT = 300.0
+
+
+def _process_alive(pid: int) -> bool:
+    """Best-effort, stdlib, fail-quiet liveness check (0.18.0, FR-007).
+
+    Returns True only when ``pid`` is positive, an int, and currently
+    running. NEVER raises: an uncertain probe returns False so the
+    duplicate-activation warning errs toward silence rather than a false
+    alarm or a crash.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes  # stdlib; imported lazily so POSIX never pays for it
+            from ctypes import wintypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            # Declare prototypes: a Win32 HANDLE is pointer-sized, but
+            # ctypes defaults restype/argtypes to c_int (32-bit), which
+            # truncates/sign-extends the handle on 64-bit Windows and would
+            # query/close the wrong handle. Set them explicitly.
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                             wintypes.DWORD]
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.GetExitCodeProcess.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            try:
+                code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return False
+                return code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001 — fail-quiet to "not alive"
+            return False
+    # POSIX
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+    except OSError:
+        return False
 
 
 def _new_id() -> str:

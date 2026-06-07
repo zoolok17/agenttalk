@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os as _os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,6 +16,9 @@ from agenttalk.store import (
     KNOWN_KINDS,
     OPENER_KINDS,
     Store,
+    _ID_RE,
+    _new_id,
+    _process_alive,
     find_root,
     find_stores_upward,
     validate_agent_name,
@@ -588,23 +592,28 @@ def test_quarantined_files_invisible_to_scanning(store: Store) -> None:
 
 def test_quarantine_embedded_id_collision_moves_invalid_only(store: Store) -> None:
     """Codex WP01 review repro: an INVALID file whose embedded id equals a
-    VALID file's stem must never cause the valid file to be moved."""
-    # valid file named aaa.json with id aaa (hand-built but fully valid)
-    valid = store.messages_dir / "aaa.json"
+    VALID file's stem must never cause the valid file to be moved.
+
+    (0.18.0: ids must now be generated-shape, so both the valid stem and the
+    colliding embedded id use a real id shape — the collision being tested is
+    the path-vs-embedded-id pairing, not the id format.)"""
+    cid = "20260101-000000-000000-AAAA"   # the colliding id
+    # valid file whose STEM is the colliding id, fully valid
+    valid = store.messages_dir / f"{cid}.json"
     valid.write_text(
-        '{"id": "aaa", "ts": "2026-01-01T00:00:00Z", "from": "alpha", '
+        '{"id": "' + cid + '", "ts": "2026-01-01T00:00:00Z", "from": "alpha", '
         '"to": "beta", "kind": "message", "subject": "", "body": "keep", '
         '"meta": {}}', encoding="utf-8")
     valid_bytes = valid.read_bytes()
-    # invalid file zzz.json EMBEDDING id aaa (unknown kind -> invalid)
-    bad = store.messages_dir / "zzz.json"
+    # invalid file (its own valid-shape stem) EMBEDDING the colliding id
+    bad = store.messages_dir / "20260101-000000-000000-ZZZZ.json"
     bad.write_text(
-        '{"id": "aaa", "ts": "2026-01-01T00:00:00Z", "from": "alpha", '
+        '{"id": "' + cid + '", "ts": "2026-01-01T00:00:00Z", "from": "alpha", '
         '"to": "beta", "kind": "not-a-kind", "subject": "", "body": "x", '
         '"meta": {}}', encoding="utf-8")
     # selection resolves the verdict to ITS file, not the colliding stem
     sel = {str(p): ident for p, ident, _ in store.list_invalid_message_paths()}
-    assert str(bad) in sel and sel[str(bad)] == "aaa"
+    assert str(bad) in sel and sel[str(bad)] == cid
     assert str(valid) not in sel
     records = store.quarantine_invalid()
     assert len(records) == 1
@@ -944,3 +953,73 @@ def test_init_force_preserves_tombstone_from_validation_failed_config(tmp_path: 
     assert "beta" in [e["name"] for e in cfg2.get("retired", [])]
     assert "beta" not in cfg2["agents"]
     Store(tmp_path).load_config()                  # no longer corrupt
+
+
+# ======================================================================
+# 0.18.0 review-hardening (WP01): id-shape validation + liveness primitive
+# ======================================================================
+
+
+def test_id_re_accepts_all_generated_ids() -> None:
+    """The validator is built from _ID_ALPHABET so it must accept every
+    id _new_id can emit — including the monotonic +1us bump near rollovers."""
+    for _ in range(3000):
+        assert _ID_RE.match(_new_id())
+
+
+def test_id_re_rejects_malformed() -> None:
+    for bad in ("zzzz", "", "20260607", "20260607-150219-427413",
+                "20260607-150219-427413-mZ", "20260607-150219-427413-mZLg!",
+                "xxxxxxxx-xxxxxx-xxxxxx-mZLg", "20260607-150219-427413-mZLg-x"):
+        assert not _ID_RE.match(bad), bad
+
+
+def test_malformed_id_is_invalid_not_delivered(tmp_path: Path) -> None:
+    """A roster-valid file with a non-generated id must be classified
+    invalid (quarantinable), never delivered, and never poison a cursor."""
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    _seed_invalid(s, "zzzz.json", json.dumps({
+        "id": "zzzz", "ts": "2025-01-01T00:00:00Z", "from": "alpha",
+        "to": "beta", "kind": "message", "subject": "", "body": "x", "meta": {},
+    }))
+    invalid_ids = {mid for mid, _ in s.list_invalid_messages()}
+    assert "zzzz" in invalid_ids
+    assert all(m.id != "zzzz" for m in s.messages_for("beta"))
+    # a real message still delivers (cursor not poisoned by zzzz)
+    s.send(sender="alpha", recipient="beta", body="REAL")
+    assert any(m.body == "REAL" for m in s.unread_for("beta"))
+
+
+def test_process_alive_basic() -> None:
+    assert _process_alive(_os.getpid()) is True
+    assert _process_alive(2 ** 31 - 1) is False   # almost-certainly dead
+    assert _process_alive(0) is False
+    assert _process_alive(-1) is False
+    assert _process_alive("x") is False           # never raises
+
+
+def test_foreign_wait_pid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    # same pid -> None (it's me, not a duplicate)
+    s.write_waiting("alpha", {"agent": "alpha", "pid": _os.getpid(),
+                              "deadline_epoch": None})
+    assert s.foreign_wait_pid("alpha", _os.getpid()) is None
+    # foreign + dead -> None
+    s.write_waiting("alpha", {"agent": "alpha", "pid": 2 ** 31 - 1,
+                              "deadline_epoch": None})
+    assert s.foreign_wait_pid("alpha", _os.getpid()) is None
+    # foreign + alive (monkeypatched) + fresh -> returns it
+    monkeypatch.setattr("agenttalk.store._process_alive", lambda pid: True)
+    s.write_waiting("alpha", {"agent": "alpha", "pid": 999999,
+                              "deadline_epoch": None})
+    assert s.foreign_wait_pid("alpha", _os.getpid()) == 999999
+    # foreign + alive but STALE (deadline far past) -> None
+    s.write_waiting("alpha", {"agent": "alpha", "pid": 999999,
+                              "deadline_epoch": 1000.0})
+    assert s.foreign_wait_pid("alpha", _os.getpid(),
+                              now=1_000_000_000.0, stale_after=60.0) is None
+    # no marker -> None
+    s.clear_waiting("alpha")
+    assert s.foreign_wait_pid("alpha", _os.getpid()) is None

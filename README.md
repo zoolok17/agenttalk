@@ -18,7 +18,7 @@ exported on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.17.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.18.0"
 agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
@@ -123,10 +123,10 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.17.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.18.0"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.17.0` with
+Pin to a specific tag so you control upgrades. Replace `v0.18.0` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
@@ -941,6 +941,28 @@ The loopback story is unchanged and non-negotiable: no auth, no
 remote-bind flag on any spelling — SSH-tunnel the port if you need it
 from another machine.
 
+### One window per agent (and the clock-agreement caveat)
+
+Two operating assumptions are worth stating plainly (0.18.0):
+
+- **One window per agent.** Each agent is meant to run in exactly one
+  window per store. Same-agent concurrent consumers are **unsupported**:
+  `advance_cursor` / `mark_thread_seen` / `close_thread` are atomic
+  *writes* but not process-safe read-modify-write, so two windows draining
+  the same agent can lose cursor/threadstate updates. 0.18.0 *warns* when
+  `agenttalk wait` detects another live process already waiting as the same
+  agent (advisory, best-effort — it never blocks and never changes the exit
+  code), and `agenttalk doctor` reports the current waiter's PID. It does
+  **not** enforce single-writer locking — the warning is a guardrail, not a
+  guarantee.
+- **Synced stores assume clock agreement.** Message ids are
+  timestamp-prefixed and delivery order is a lexical compare of ids. If you
+  sync one `.agenttalk/` across machines whose clocks disagree, a
+  future-dated id from the fast machine can mis-order or hide later messages
+  from the slow one. 0.18.0 rejects malformed (wrong-shape) ids, but a
+  well-formed *future-dated* id from clock skew is not caught — keep the
+  machines' clocks in agreement (e.g. NTP).
+
 ### Exit codes
 
 Stable across releases — skill bodies and external automation can
@@ -951,6 +973,7 @@ rely on these:
 | `0` | Success. For `wait`: a message was received. |
 | `1` | Reserved for `agenttalk wait` timeout (no new messages within `--timeout`). Loop skills should treat this as "keep waiting", not as an error. |
 | `2` | Usage error: missing/invalid identity (`--from`/`--to`/`--for` or `AGENTTALK_SELF`/`AGENTTALK_PEER`), unsafe agent name, identity not in roster, self-mail attempt, malformed `--meta`, corrupt config, missing `.agenttalk/`. 0.17.0: also a `serve`/`dashboard` bind failure (port in use / OS-denied) — with a `--port 0` remediation hint. Always prints a remediation hint to stderr. |
+| `5` | Partial broadcast fan-out: some copies written, some failed (see the delivered/missed manifest; `--resume`). 0.18.0: a frozen recipient retired *after* a partial fan-out is reported under `dropped` and skipped — it no longer traps `--resume` at a permanent exit 5; an all-retired remainder resolves to exit 0. |
 | `130` | `SIGINT` (Ctrl-C). |
 
 ---

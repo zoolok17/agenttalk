@@ -2,7 +2,7 @@
   "created_at": "2026-06-07T18:38:42.324520+00:00",
   "friendly_name": "review hardening 0180",
   "mission_id": "01KTHP2EWPN4CJ7Z9ND36063WE",
-  "mission_number": null,
+  "mission_number": 5,
   "mission_slug": "review-hardening-0180-01KTHP2E",
   "mission_type": "software-dev",
   "slug": "review-hardening-0180-01KTHP2E",

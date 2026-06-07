@@ -169,8 +169,8 @@ def test_status_does_not_crash_on_non_dict_meta(store: Store) -> None:
     """Regression: `meta: []` (truthy-falsey list) used to be coerced
     to `{}` and silently delivered as valid."""
     (store.messages_dir / "badmeta.json").write_text(
-        '{"id":"a1","ts":"2026-05-21T12:00:00Z","from":"alpha","to":"beta",'
-        '"kind":"message","body":"x","meta":[]}',
+        '{"id":"20260521-120000-000000-AAAA","ts":"2026-05-21T12:00:00Z",'
+        '"from":"alpha","to":"beta","kind":"message","body":"x","meta":[]}',
         encoding="utf-8",
     )
     invalid = store.list_invalid_messages()
