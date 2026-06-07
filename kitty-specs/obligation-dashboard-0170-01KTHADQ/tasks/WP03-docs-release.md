@@ -110,3 +110,4 @@ multi-root, version consistency across pyproject/__init__/docs.
 
 - 2026-06-07T16:18:05Z – claude – shell_pid=79472 – Started implementation via action command
 - 2026-06-07T16:24:22Z – claude – shell_pid=79472 – WP03 implemented; version 0.17.0; full suite 621 passed/3 skipped
+- 2026-06-07T16:40:31Z – claude – shell_pid=79472 – Codex approved rev2 (msg 20260607-164007)
