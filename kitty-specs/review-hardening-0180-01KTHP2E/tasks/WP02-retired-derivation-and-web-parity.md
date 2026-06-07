@@ -13,6 +13,8 @@ subtasks:
 - T006
 - T007
 - T008
+agent: "claude"
+shell_pid: "49528"
 history:
 - '2026-06-07: created from approved plan rev2 (fffcb78, Codex pre-code approved)'
 authoritative_surface: src/agenttalk/threads.py
@@ -117,3 +119,7 @@ Focus: the retired-set threading keeps `derive_threads` pure and the optional
 param truly default-safe; `pending`/`next_owner` never name a tombstone;
 `audience_retired` additivity; web known-roster switch matches
 `_validated_for_state` and doesn't widen beyond active∪retired.
+
+## Activity Log
+
+- 2026-06-07T19:19:48Z – claude – shell_pid=49528 – Started implementation via action command
