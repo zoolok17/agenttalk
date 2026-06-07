@@ -6,5 +6,7 @@
   "mission_slug": "review-hardening-0180-01KTHP2E",
   "mission_type": "software-dev",
   "slug": "review-hardening-0180-01KTHP2E",
-  "target_branch": "master"
+  "target_branch": "master",
+  "vcs": "git",
+  "vcs_locked_at": "2026-06-07T18:57:49.188856+00:00"
 }

@@ -1,7 +1,7 @@
 {
-  "event_count": 4,
-  "last_event_id": "01KTHQ53RT6N25ZH1YW6ZWKYJC",
-  "materialized_at": "2026-06-07T18:57:34.490210+00:00",
+  "event_count": 6,
+  "last_event_id": "01KTHQ5K1J8Q4JBJ6181XJZHRD",
+  "materialized_at": "2026-06-07T18:57:50.130765+00:00",
   "mission_number": "",
   "mission_slug": "review-hardening-0180-01KTHP2E",
   "mission_type": "software-dev",
@@ -12,17 +12,17 @@
     "claimed": 0,
     "done": 0,
     "for_review": 0,
-    "in_progress": 0,
+    "in_progress": 1,
     "in_review": 0,
-    "planned": 4
+    "planned": 3
   },
   "work_packages": {
     "WP01": {
-      "actor": "finalize-tasks",
+      "actor": "implement-command",
       "force_count": 1,
-      "lane": "planned",
-      "last_event_id": "01KTHQ53CQGYSRW86ZNDBS3BMR",
-      "last_transition_at": "2026-06-07T18:57:34.104018+00:00"
+      "lane": "in_progress",
+      "last_event_id": "01KTHQ5K1J8Q4JBJ6181XJZHRD",
+      "last_transition_at": "2026-06-07T18:57:50.130765+00:00"
     },
     "WP02": {
       "actor": "finalize-tasks",
