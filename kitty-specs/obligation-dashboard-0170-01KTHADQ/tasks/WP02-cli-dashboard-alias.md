@@ -14,6 +14,8 @@ subtasks:
 - T008
 - T009
 - T010
+agent: "claude"
+shell_pid: "25400"
 history:
 - '2026-06-07: created from approved plan rev2 (8e81ace, Codex pre-code review approved)'
 authoritative_surface: src/agenttalk/cli.py
@@ -166,3 +168,7 @@ Focus: the shared `cmd_serve` refactor not perturbing serve's behavior
 codes), `--store` resolution NOT doing an upward walk per path, the warn-
 not-refuse contract (D4), and the NFR-002(a) test shape (unknown option,
 not non-loopback refusal).
+
+## Activity Log
+
+- 2026-06-07T16:06:56Z – claude – shell_pid=25400 – Started implementation via action command
