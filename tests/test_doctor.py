@@ -440,10 +440,12 @@ def test_doctor_active_waiters_reports_live_marker(
                         lambda pid: pid == 4242)
     report = doctor.run(tmp_path)
     aw = next(c for c in report.checks if c.name == "active_waiters")
-    assert aw.status == "ok"               # advisory, never error
+    assert aw.status == "ok"               # the advisory itself never errors
     assert "alpha (PID 4242)" in aw.details
     assert aw.data["live_waiters"] == [{"agent": "alpha", "pid": 4242}]
-    assert report.overall != "error"       # exit code unaffected
+    # NOTE: report.overall is environment-dependent (other checks — skills,
+    # codex-config — may warn/error on a bare CI checkout). What FR-009 owns
+    # is that THIS check is advisory-only (status ok), asserted above.
 
 
 def test_doctor_active_waiters_absent_when_no_live_marker(
@@ -456,7 +458,6 @@ def test_doctor_active_waiters_absent_when_no_live_marker(
     # (a) no marker at all
     report = doctor.run(tmp_path)
     assert all(c.name != "active_waiters" for c in report.checks)
-    assert report.overall != "error"
     # (b) a marker whose pid is dead → still absent
     s.write_waiting("alpha", {"agent": "alpha", "pid": 4242,
                               "deadline_epoch": None})
@@ -473,4 +474,3 @@ def test_doctor_active_waiters_malformed_marker_no_crash(tmp_path: Path) -> None
     (s.state_dir / "alpha.waiting").write_text("{not json", encoding="utf-8")
     report = doctor.run(tmp_path)              # must not raise
     assert all(c.name != "active_waiters" for c in report.checks)
-    assert report.overall != "error"
