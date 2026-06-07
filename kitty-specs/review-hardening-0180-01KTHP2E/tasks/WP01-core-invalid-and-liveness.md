@@ -29,6 +29,7 @@ owned_files:
 - src/agenttalk/store.py
 - tests/test_signing.py
 - tests/test_store.py
+- tests/test_validation.py
 tags: []
 ---
 
