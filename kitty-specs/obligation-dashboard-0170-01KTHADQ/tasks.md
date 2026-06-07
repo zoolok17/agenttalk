@@ -18,9 +18,9 @@
 | T008 | `dashboard` subparser + `--store` plumbing + shared dispatch | WP02 | — | [D] |
 | T009 | Bind-failure handling (`OSError` → exit 2 actionable) + startup messages per spelling | WP02 | — | [D] |
 | T010 | CLI tests: alias surface, `--host` unknown option, `--store` plumbing, bind-failure exit 2, `serve` unchanged | WP02 | — | [D] |
-| T011 | README: dashboard/serve docs, CLI reference rows, install pin bumps | WP03 | — |
-| T012 | SECURITY.md dashboard section + CHANGELOG 0.17.0 + ROADMAP refresh | WP03 | — |
-| T013 | Version bump to 0.17.0 (pyproject.toml, `__init__.py`) + full-suite gate | WP03 | — |
+| T011 | README: dashboard/serve docs, CLI reference rows, install pin bumps | WP03 | — | [D] |
+| T012 | SECURITY.md dashboard section + CHANGELOG 0.17.0 + ROADMAP refresh | WP03 | — | [D] |
+| T013 | Version bump to 0.17.0 (pyproject.toml, `__init__.py`) + full-suite gate | WP03 | — | [D] |
 
 ## Work Packages
 
@@ -74,9 +74,9 @@ surface and `/dashboard` landing route).
 **Independent test**: `python -m agenttalk --version` → 0.17.0; doc claims match shipped behavior; full suite green.
 **Estimated prompt size**: ~300 lines (3 subtasks).
 
-- [ ] T011 README: dashboard/serve docs, CLI reference rows, install pin bumps (WP03)
-- [ ] T012 SECURITY.md dashboard section + CHANGELOG 0.17.0 + ROADMAP refresh (WP03)
-- [ ] T013 Version bump to 0.17.0 + full-suite gate (WP03)
+- [x] T011 README: dashboard/serve docs, CLI reference rows, install pin bumps (WP03)
+- [x] T012 SECURITY.md dashboard section + CHANGELOG 0.17.0 + ROADMAP refresh (WP03)
+- [x] T013 Version bump to 0.17.0 + full-suite gate (WP03)
 
 **Dependencies**: Depends on WP02 (documents the final CLI surface).
 
