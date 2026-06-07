@@ -57,9 +57,11 @@ their tests ONLY.
   "cursor_at_start","deadline_epoch"}`; `read_waiting` (store.py:1675) →
   dict|None, never raises.
 
-**Hard boundaries**: only the 4 owned files. Stdlib only. `store.py` must NOT
-import anything from `cli.py` (Codex note — freshness policy comes in as
-params). Full suite must stay green at your HEAD.
+**Hard boundaries**: only the owned files (signing.py, store.py + their
+tests, plus test_validation.py — the id-shape change reclassifies one
+hand-built short id there). Stdlib only. `store.py` must NOT import anything
+from `cli.py` (Codex note — freshness policy comes in as params). Full suite
+must stay green at your HEAD.
 
 ## T001 — Signature type-guard (FR-001)
 
