@@ -51,7 +51,9 @@ agenttalk dashboard [--port N] [--access-log] [--store PATH]...
 ## Security invariants (tested)
 
 1. `make_server` refuses non-loopback hosts — no new flag anywhere (C-007).
-2. `dashboard` alias cannot express a host at all.
+2. `dashboard` alias cannot express a host at all — tested as `--host` being
+   rejected as an unknown option (NFR-002a; a "refuses non-loopback host"
+   test is the wrong shape for a surface that has no host option).
 3. Per-request loopback peer check precedes every response incl. 405s.
 4. `/messages/<id>` response headers (incl. CSP) byte-identical to 0.16.0.
 5. No route writes to any store: full-tree sha256 snapshot unchanged after

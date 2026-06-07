@@ -64,11 +64,11 @@ it could not produce. HTTP status stays 200 (FR-005).
   "last_seen": "2026-06-07T15:29:58+00:00",  // ABSENT if never seen
   "last_seen_age_seconds": 2.1,    // ABSENT with last_seen absent
   "unread": 3,                     // messages past cursor
-  "composing": {                   // ABSENT unless an intent marker is live
-    "request_id": "abc-123",
-    "peer": "codex",
-    "age_seconds": 41.0
-  }
+  "composing": [                   // ABSENT when no live intent markers exist.
+    {"request_id": "abc-123",      // ARRAY: the store marker is a map keyed by
+     "peer": "codex",              // request_id and multiple simultaneous intents
+     "age_seconds": 41.0}          // are pinned by tests — all live entries are
+  ]                                // emitted, ordered by request_id.
 }
 ```
 
@@ -102,10 +102,13 @@ and the dashboard's mission context:
 }
 ```
 
-No `body` field exists in any `/api/state` shape (FR-003). Detail links are
-client-derivable: `/messages/<last_msg_id>` (existing route, root[0] only in
-v1 — multi-root message detail is out of scope; the HTML notes which root a
-thread belongs to).
+No `body` field exists in any `/api/state` shape (FR-003). **Detail links
+exist only for root[0] rows** (`/messages/<last_msg_id>`, the existing
+route): thread rows from other roots render their message ids as plain text
+with no link — a root-scoped detail route is explicitly out of scope for v1
+(would need its own CSP/validation guarantees). The HTML labels every thread
+with its root, and a test asserts non-root[0] rows produce no `/messages/`
+hrefs.
 
 ## 5. BroadcastSummary
 

@@ -39,5 +39,11 @@
   under Assumptions: the refresh mechanism (within the ≤3 s + CSP bounds) and
   the HTML route placement for the hierarchical view (within FR-009's
   compatibility bound). Neither changes scope or user-visible outcomes.
-- FR-010 was strengthened mid-spec with a live operator repro (WinError 10013
-  on the default port from a Windows reserved port range).
+- FR-010 was strengthened mid-spec with a live operator repro: an unrelated
+  local app already listening on 127.0.0.1:8765 surfaced as WinError 10013
+  (NOT a reserved-port-range case — that was the first guess, corrected after
+  checking the actual listener).
+- Pre-code Codex review (2026-06-07) tightened three contracts before task
+  generation: detail links are root[0]-only in v1 (FR-003), composing is an
+  array (store marker is a multi-entry map), NFR-002 split per surface
+  (alias has no host option to refuse — test it as unknown-option).
