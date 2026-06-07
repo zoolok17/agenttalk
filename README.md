@@ -18,7 +18,7 @@ exported on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.18.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.19.0"
 agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
@@ -123,10 +123,10 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.18.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.19.0"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.18.0` with
+Pin to a specific tag so you control upgrades. Replace `v0.19.0` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
@@ -940,6 +940,22 @@ never imports spec-kitty.
 The loopback story is unchanged and non-negotiable: no auth, no
 remote-bind flag on any spelling — SSH-tunnel the port if you need it
 from another machine.
+
+**0.19.0 polish.** The `/dashboard` view now renders a **hierarchical
+team layout** — the operator-facing liaison (or a lead-ish role) on top,
+developer-ish roles grouped left, reviewer-ish right (classified from the
+roster's `role`/`operator_facing`, client-side) — with an **agent card**
+per member showing last-seen, **messages sent/received**, how many
+threads it **owes**, and a composing badge. Below the roster, a
+**who-talks-to-whom** conversation panel lists message traffic as
+directed `from → to (count)` pairs. A **Refresh** button pulls fresh
+state on demand and an **auto-refresh toggle** (on by default) turns the
+~2 s polling on/off without reloading the page. For automation,
+`/api/state` gains additive keys (`schema_version` stays `1`): per-agent
+`sent`/`received` and a per-root `edges` array (`{from,to,count}`, top
+50, with `edges_truncated`/`edge_limit` when capped). Stats are
+**bus-native only** — agenttalk never imports spec-kitty or reads token
+usage; it shows what the message store actually contains.
 
 ### One window per agent (and the clock-agreement caveat)
 

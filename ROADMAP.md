@@ -6,7 +6,7 @@ the Claude Code + Codex collaboration that shipped 0.10.0–0.13.0, the first
 four-agent production retro (2026-06-03), **and the band's consolidated
 second retro (2026-06-05), which reprioritized everything below.**
 
-> Current release: **v0.18.0** (`master`). See `CHANGELOG.md` for history
+> Current release: **v0.19.0** (`master`). See `CHANGELOG.md` for history
 > and `SECURITY.md` for the trust model.
 
 ---

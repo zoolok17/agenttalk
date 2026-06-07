@@ -5,6 +5,40 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-06-08
+
+Dashboard polish release (issue #22): presentation upgrade on the existing
+read-only `serve`/`dashboard` surface. Bus-native only, additive,
+read-only — no new routes, no CSP change, no spec-kitty dependency. Design
+Codex-accepted; per-WP reviewed.
+
+### Added
+- `/api/state` (additive; `schema_version` stays 1): per-agent `sent` and
+  `received` message counts; per-root `edges` — an array of
+  `{from, to, count}` directed traffic pairs (self-excluded, broadcast
+  fan-out included, sorted by count desc, capped to the top 50 with
+  additive `edges_truncated`/`edge_limit` when more pairs exist). Computed
+  from the validated-message scan `/api/state` already performs (no extra
+  walk).
+- `/dashboard`: a **hierarchical team layout** — operator-facing liaison /
+  lead on top, developer-ish roles left, reviewer-ish right (classified
+  client-side from `role`/`operator_facing`); per-agent **cards** (name,
+  role/groups, last-seen, sent, received, owes, composing); a
+  **who-talks-to-whom** conversation panel from `edges`; a manual
+  **Refresh** button and an **auto-refresh toggle** (on by default), wired
+  with `addEventListener` (no inline handlers).
+
+### Unchanged
+- Routes, per-route CSP (script-capable only on `/dashboard`), exit codes,
+  read-only guarantee (no-mutation regression still passes), loopback-only
+  posture. Every prior `/api/state` key is intact; degraded roots keep the
+  errors-as-data shape (no partial stats/edges).
+
+### Notes
+- Stats are bus-native only: the dashboard never imports spec-kitty and
+  does not show token usage (not tracked by the bus — a deliberate honesty
+  choice, like task-completion counts).
+
 ## [0.18.0] - 2026-06-07
 
 Review-hardening release (issue #21): fixes from two independent

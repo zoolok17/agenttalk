@@ -75,6 +75,7 @@ import json
 import re
 import socket
 import threading
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -115,6 +116,11 @@ _DASHBOARD_CSP = ("default-src 'none'; script-src 'self'; "
 
 # Thread states that owe nothing (mirror threads._derive_next's gate).
 _TERMINAL_STATES = ("closed", "closed-superseded")
+
+# /api/state per-root conversation-edge cap (0.19.0, FR-002/003). When more
+# than this many distinct (from,to) pairs exist, the list is capped and the
+# root carries an additive truncation signal.
+_EDGE_LIMIT = 50
 
 
 @dataclass(frozen=True)
@@ -190,6 +196,27 @@ pre { background: #f7f7f7; padding: 1em; border: 1px solid #e0e0e0;
 .invalid { color: #b00; }
 .muted { color: #666; font-size: 0.9em; }
 .footer { margin-top: 3em; color: #888; font-size: 0.85em; }
+/* 0.19.0 dashboard polish: controls + hierarchical roster + cards */
+#controls { margin: 0.5em 0 1em; }
+#controls button { padding: 4px 12px; }
+.roster-top { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center;
+              margin: 0.5em 0; }
+.roster-cols { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start; }
+.col { flex: 1 1 30%; min-width: 220px; }
+.col-head { font-weight: 600; color: #555; text-transform: uppercase;
+            font-size: 0.75em; margin-bottom: 4px; }
+.agent-card { border: 1px solid #ddd; border-radius: 6px; padding: 8px 10px;
+              margin-bottom: 8px; background: #fafafa; }
+.col-left .agent-card { border-left: 3px solid #2d6cdf; }
+.col-right .agent-card { border-left: 3px solid #cf5b2d; }
+.roster-top .agent-card { border-left: 3px solid #2da44e; background: #f2fbf4;
+                          min-width: 240px; }
+.agent-name { font-weight: 600; }
+.agent-card .stats { font-size: 0.85em; color: #444; margin-top: 2px; }
+.agent-card .badge { display: inline-block; margin-top: 4px; padding: 1px 7px;
+                     border-radius: 3px; background: #fdf3e2; font-size: 0.8em; }
+ul.edges { columns: 2; font-size: 0.9em; }
+ul.edges li { break-inside: avoid; }
 """.strip()
 
 
@@ -319,6 +346,13 @@ def render_dashboard(roots: list[RootDescriptor]) -> bytes:
     body = (
         "<h1>agenttalk :: obligation dashboard</h1>"
         "<p><a href=\"/\">message log</a></p>"
+        # Refresh controls (0.19.0). No inline handlers — dashboard.js wires
+        # them with addEventListener, keeping the script-src 'self' CSP intact.
+        "<div id=\"controls\">"
+        "<button id=\"refresh-btn\" type=\"button\">Refresh</button> "
+        "<label><input type=\"checkbox\" id=\"autorefresh\" checked> "
+        "auto-refresh</label>"
+        "</div>"
         "<noscript><p>This view needs JavaScript (it polls "
         "<code>/api/state</code> every 2 seconds). Poll "
         "<code>GET /api/state</code> directly instead.</p></noscript>"
@@ -351,22 +385,6 @@ _DASHBOARD_JS = r"""
     if (s < 5400) return Math.round(s / 60) + 'm';
     return (s / 3600).toFixed(1) + 'h';
   }
-  function agentLine(a) {
-    var li = el('li');
-    li.appendChild(el('strong', null, a.name));
-    var bits = [];
-    if (a.operator_facing) bits.push('liaison');
-    if (a.role) bits.push(a.role);
-    if (a.last_seen_age_seconds !== undefined) {
-      bits.push('seen ' + fmtAge(a.last_seen_age_seconds) + ' ago');
-    }
-    if (a.unread) bits.push(a.unread + ' unread');
-    if (a.composing) bits.push('composing… (' + a.composing.length + ')');
-    if (bits.length) {
-      li.appendChild(el('span', 'muted', ' — ' + bits.join(' · ')));
-    }
-    return li;
-  }
   function threadRow(t, rootIndex) {
     var tr = el('tr');
     var subjCell = el('td');
@@ -396,6 +414,56 @@ _DASHBOARD_JS = r"""
     tr.appendChild(el('td', 'muted', fmtAge(t.age_seconds)));
     return tr;
   }
+  // Role -> layout column (0.19.0, FR-004/005). Convention documented in
+  // data-model.md; case-insensitive substring, FIRST match wins in order.
+  function classify(a) {
+    var role = (a.role || '').toLowerCase();
+    if (a.operator_facing === true || role.indexOf('lead') >= 0) return 'top';
+    if (role.indexOf('dev') >= 0 || role.indexOf('eng') >= 0 ||
+        role.indexOf('impl') >= 0) return 'left';
+    if (role.indexOf('review') >= 0 || role.indexOf('qa') >= 0 ||
+        role.indexOf('audit') >= 0) return 'right';
+    return 'center';
+  }
+  // owes = open threads in THIS root whose next_owner is this agent (a string,
+  // or membership when next_owner is a broadcast pending list). Client-side
+  // (the threads array is already on the wire) — no server field.
+  function owesCount(root, name) {
+    var n = 0, threads = root.threads || [];
+    for (var i = 0; i < threads.length; i++) {
+      var o = threads[i].next_owner;
+      if (o === name) n++;
+      else if (Object.prototype.toString.call(o) === '[object Array]' &&
+               o.indexOf(name) >= 0) n++;
+    }
+    return n;
+  }
+  function agentCard(a, owes) {
+    var card = el('div', 'agent-card');
+    card.appendChild(el('div', 'agent-name', a.name));
+    var meta = [];
+    if (a.operator_facing) meta.push('liaison');
+    if (a.role) meta.push(a.role);
+    if (a.groups && a.groups.length) meta.push('[' + a.groups.join(', ') + ']');
+    if (meta.length) card.appendChild(el('div', 'muted', meta.join(' · ')));
+    var stats = [];
+    if (a.last_seen_age_seconds !== undefined && a.last_seen_age_seconds !== null) {
+      stats.push('seen ' + fmtAge(a.last_seen_age_seconds) + ' ago');
+    } else {
+      stats.push('never seen');
+    }
+    stats.push('sent ' + (a.sent || 0));
+    stats.push('recv ' + (a.received || 0));
+    // Always show owes (FR-006): "owes 0" is meaningful — distinct from a
+    // card that doesn't expose the field.
+    stats.push('owes ' + (owes || 0));
+    if (a.unread) stats.push(a.unread + ' unread');
+    card.appendChild(el('div', 'stats', stats.join('  ·  ')));
+    if (a.composing && a.composing.length) {
+      card.appendChild(el('div', 'badge', 'composing… (' + a.composing.length + ')'));
+    }
+    return card;
+  }
   function renderRoot(section, root, rootIndex) {
     while (section.firstChild) section.removeChild(section.firstChild);
     section.appendChild(el('h2', null, root.label));
@@ -404,24 +472,61 @@ _DASHBOARD_JS = r"""
       section.appendChild(el('p', 'invalid', 'degraded: ' + root.errors.join('; ')));
       return;
     }
-    var agents = (root.agents || []).slice();
-    agents.sort(function (a, b) {  // liaison first, roster order otherwise
-      return (b.operator_facing ? 1 : 0) - (a.operator_facing ? 1 : 0);
-    });
-    var ul = el('ul');
-    for (var i = 0; i < agents.length; i++) ul.appendChild(agentLine(agents[i]));
-    if (root.retired && root.retired.length) {
-      ul.appendChild(el('li', 'muted', 'retired: ' + root.retired.join(', ')));
+    // --- hierarchical roster: liaison/lead on top, role-grouped columns below
+    var agents = root.agents || [];
+    var top = el('div', 'roster-top');
+    var colLeft = el('div', 'col col-left');
+    var colCenter = el('div', 'col col-center');
+    var colRight = el('div', 'col col-right');
+    colLeft.appendChild(el('div', 'col-head', 'developers'));
+    colCenter.appendChild(el('div', 'col-head', 'team'));
+    colRight.appendChild(el('div', 'col-head', 'reviewers'));
+    for (var i = 0; i < agents.length; i++) {
+      var a = agents[i];
+      var card = agentCard(a, owesCount(root, a.name));
+      var col = classify(a);
+      if (col === 'top') top.appendChild(card);
+      else if (col === 'left') colLeft.appendChild(card);
+      else if (col === 'right') colRight.appendChild(card);
+      else colCenter.appendChild(card);
     }
-    section.appendChild(ul);
+    if (top.firstChild) section.appendChild(top);
+    var cols = el('div', 'roster-cols');
+    cols.appendChild(colLeft);
+    cols.appendChild(colCenter);
+    cols.appendChild(colRight);
+    section.appendChild(cols);
+    if (root.retired && root.retired.length) {
+      section.appendChild(el('p', 'muted', 'retired: ' + root.retired.join(', ')));
+    }
+    // --- conversation panel: who talks to whom (edges)
+    var edges = root.edges || [];
+    section.appendChild(el('h3', null, 'conversations'));
+    if (!edges.length) {
+      section.appendChild(el('p', 'muted', 'no traffic yet'));
+    } else {
+      var eul = el('ul', 'edges');
+      for (var e = 0; e < edges.length; e++) {
+        eul.appendChild(el('li', null,
+          edges[e].from + ' → ' + edges[e].to + '  (' + edges[e].count + ')'));
+      }
+      section.appendChild(eul);
+      if (root.edges_truncated) {
+        section.appendChild(el('p', 'muted',
+          'showing top ' + (root.edge_limit || edges.length) +
+          ' pairs (more exist)'));
+      }
+    }
+    // --- open threads (the obligation table, unchanged)
     var threads = root.threads || [];
+    section.appendChild(el('h3', null, 'open threads'));
     if (!threads.length) {
       section.appendChild(el('p', 'muted', 'no open threads'));
     } else {
       var table = el('table');
       var head = el('tr');
-      var cols = ['subject', 'kind', 'state', 'next', 'tags', 'age'];
-      for (var c = 0; c < cols.length; c++) head.appendChild(el('th', null, cols[c]));
+      var hcols = ['subject', 'kind', 'state', 'next', 'tags', 'age'];
+      for (var c = 0; c < hcols.length; c++) head.appendChild(el('th', null, hcols[c]));
       table.appendChild(head);
       for (var r = 0; r < threads.length; r++) {
         table.appendChild(threadRow(threads[r], rootIndex));
@@ -458,8 +563,22 @@ _DASHBOARD_JS = r"""
       .then(render)
       .catch(function () { /* transient; retry next tick */ });
   }
+  // Refresh controls (0.19.0, FR-008): a manual button forces one poll; the
+  // auto-refresh toggle starts/clears the interval. Wired with
+  // addEventListener ONLY (no inline handlers — keeps script-src 'self').
+  // Toggling never reloads the page; renderRoot updates in place so scroll
+  // position is preserved.
+  var timer = null;
+  function startAuto() { if (!timer) timer = setInterval(poll, POLL_MS); }
+  function stopAuto() { if (timer) { clearInterval(timer); timer = null; } }
+  var btn = document.getElementById('refresh-btn');
+  if (btn) btn.addEventListener('click', poll);
+  var chk = document.getElementById('autorefresh');
+  if (chk) chk.addEventListener('change', function () {
+    if (chk.checked) startAuto(); else stopAuto();
+  });
   poll();
-  setInterval(poll, POLL_MS);
+  if (!chk || chk.checked) startAuto();
 })();
 """.strip().encode("utf-8")
 
@@ -766,6 +885,10 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
     roles = cfg.get("roles", {}) or {}
     groups = cfg.get("groups", {}) or {}
     now = datetime.now(timezone.utc)
+    # 0.19.0 (FR-001): per-agent message counts from the SAME validated `msgs`
+    # already passed in — no extra scan. Always-present integers (0 is data).
+    sent_counts: Counter = Counter(m.sender for m in msgs)
+    recv_counts: Counter = Counter(m.recipient for m in msgs)
     out: list[dict] = []
     for a in cfg.get("agents", []) or []:
         e: dict[str, Any] = {"name": a}
@@ -784,6 +907,8 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
             e["last_seen"] = hb.isoformat()
             e["last_seen_age_seconds"] = round((now - hb).total_seconds(), 3)
         e["unread"] = _unread_count(msgs, a, store.cursor(a))
+        e["sent"] = sent_counts.get(a, 0)
+        e["received"] = recv_counts.get(a, 0)
         threads_map = store.read_composing_intent(a).get("threads", {})
         composing: list[dict] = []
         if isinstance(threads_map, dict):
@@ -844,6 +969,24 @@ def _root_state(desc: RootDescriptor) -> dict:
         out["retired"] = store.retired_agents()
         out["threads"] = threads_rows
         out["broadcasts"] = broadcasts
+        # 0.19.0 (FR-002/003): who-talks-to-whom traffic edges from the SAME
+        # validated `msgs`. One Counter over (from,to) pairs, EXCLUDING
+        # self-addressed messages (e.g. barriers) and INCLUDING broadcast
+        # fan-out copies (this is traffic volume, not unique-thread semantics).
+        # Sorted count desc with a deterministic (from,to) tiebreak so the
+        # list is stable across polls; capped to the top 50 with an additive
+        # truncation signal. HEALTHY-root only — the degraded branch below
+        # keeps the errors-as-data shape.
+        pairs: Counter = Counter(
+            (m.sender, m.recipient) for m in msgs if m.sender != m.recipient)
+        out["edges"] = [
+            {"from": f, "to": t, "count": c}
+            for (f, t), c in sorted(pairs.items(),
+                                    key=lambda kv: (-kv[1], kv[0]))[:_EDGE_LIMIT]
+        ]
+        if len(pairs) > _EDGE_LIMIT:
+            out["edges_truncated"] = True
+            out["edge_limit"] = _EDGE_LIMIT
         kdir = store.root / "kitty-specs"
         if kdir.is_dir():
             # Filesystem detection ONLY (FR-008): never import spec-kitty.

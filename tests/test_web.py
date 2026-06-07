@@ -710,7 +710,10 @@ def test_api_state_corrupt_root_isolated(tmp_path: Path) -> None:
         assert roots[0]["errors"] == []
         assert roots[0]["agents"]  # healthy root complete
         assert roots[1]["errors"], "corrupt root must surface errors"
+        # degraded roots keep errors-as-data: NO partial fields, incl the
+        # 0.19.0 additive stats/edges (Codex pre-code note).
         assert "agents" not in roots[1] and "threads" not in roots[1]
+        assert "edges" not in roots[1]
         # recovery without a server restart (research D4)
         cfg_path.write_text(original, encoding="utf-8")
         roots = _state(base)["roots"]
@@ -930,6 +933,167 @@ def test_retired_history_renders_on_message_routes(tmp_path: Path) -> None:
             payload = json.loads(resp.read())
         served = {m["body"] for m in payload["messages"]}
         assert "HISTORY_FROM_BETA" in served
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# ===================================== 0.19.0 (WP01): dashboard polish
+
+def test_api_state_sent_received(tmp_path: Path) -> None:
+    """FR-001: additive per-agent sent/received from the same scan."""
+    s = Store(tmp_path)
+    s.init(["lead", "dev"])
+    s.send(sender="lead", recipient="dev", body="a")
+    s.send(sender="lead", recipient="dev", body="b")
+    s.send(sender="dev", recipient="lead", body="c")
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        by = {a["name"]: a for a in root["agents"]}
+        assert by["lead"]["sent"] == 2 and by["lead"]["received"] == 1
+        assert by["dev"]["sent"] == 1 and by["dev"]["received"] == 2
+        # always-present integers (0 is data, not absent)
+        (tmp_path / "x").mkdir()
+        s2 = Store(tmp_path / "x")
+        s2.init(["solo"])
+        srv2, _t2, base2 = _serve(s2)
+        try:
+            (r2,) = _state(base2)["roots"]
+            assert r2["agents"][0]["sent"] == 0
+            assert r2["agents"][0]["received"] == 0
+        finally:
+            srv2.shutdown()
+            srv2.server_close()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_edges_basic(tmp_path: Path) -> None:
+    """FR-002: edges are directed pair counts, self-excluded, sorted desc."""
+    s = Store(tmp_path)
+    s.init(["lead", "dev"])
+    s.send(sender="lead", recipient="dev", body="a")
+    s.send(sender="lead", recipient="dev", body="b")
+    s.send(sender="dev", recipient="lead", body="c")
+    # a self-addressed barrier message must NOT appear as an edge
+    s.send(sender="lead", recipient="lead", kind="message", subject="bump",
+           body="x", meta={"barrier": {"version": 1, "scope": "global",
+                                       "type": "epoch-bump"}})
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        assert root["edges"] == [
+            {"from": "lead", "to": "dev", "count": 2},
+            {"from": "dev", "to": "lead", "count": 1},
+        ]
+        assert "edges_truncated" not in root  # only a few pairs
+        # self-pair excluded
+        assert all(not (e["from"] == e["to"]) for e in root["edges"])
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_edges_include_broadcast_fanout(tmp_path: Path) -> None:
+    """FR-002: broadcast fan-out copies count as traffic (one edge per copy)."""
+    s = Store(tmp_path)
+    s.init(["lead", "a", "b"])
+    bid = "bc-1"
+    for member in ("a", "b"):
+        s.send(sender="lead", recipient=member, kind="question", subject="q",
+               body="q", meta={"request_id": bid, "broadcast_id": bid,
+                               "audience": ["a", "b"]})
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        edges = {(e["from"], e["to"]): e["count"] for e in root["edges"]}
+        assert edges[("lead", "a")] == 1
+        assert edges[("lead", "b")] == 1
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_edges_truncation(tmp_path: Path) -> None:
+    """FR-003: >50 distinct pairs -> capped + truncation signal."""
+    s = Store(tmp_path)
+    names = ["hub"] + [f"a{i:02d}" for i in range(60)]
+    s.init(names)
+    for i in range(60):
+        s.send(sender="hub", recipient=f"a{i:02d}", body="x")  # 60 distinct pairs
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        assert len(root["edges"]) == 50
+        assert root["edges_truncated"] is True
+        assert root["edge_limit"] == 50
+        # sorted desc then (from,to) — all counts equal here, so stable order
+        assert root["edges"] == sorted(
+            root["edges"], key=lambda e: (-e["count"], e["from"], e["to"]))
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_additive_keys_no_removal(tmp_path: Path) -> None:
+    """NFR-001: schema_version stays 1; no existing key removed/renamed; the
+    new keys are additive; no body anywhere."""
+    s = _make_store(tmp_path)
+    s.send(sender="alpha", recipient="beta", kind="review-request",
+           subject="r", body="x", meta={"request_id": "q1"})
+    srv, _t, base = _serve(s)
+    try:
+        state = _state(base)
+        assert state["schema_version"] == 1
+        (root,) = state["roots"]
+        # every pre-0.19.0 root key still present
+        for k in ("label", "path", "project_id", "errors", "signing_enforced",
+                  "epoch", "counts", "agents", "retired", "threads",
+                  "broadcasts"):
+            assert k in root, k
+        # additive
+        assert "edges" in root
+        for a in root["agents"]:
+            assert "sent" in a and "received" in a
+            assert "name" in a and "unread" in a  # prior keys intact
+        _assert_no_body_keys(state)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_dashboard_renderer_controls_and_safety() -> None:
+    """FR-008 / C-005: the served JS wires refresh controls with
+    addEventListener and never uses innerHTML; the shell has no inline
+    handlers."""
+    js = web._DASHBOARD_JS.decode("utf-8")
+    assert "addEventListener" in js
+    assert "refresh-btn" in js and "autorefresh" in js
+    assert "startAuto" in js and "clearInterval" in js
+    assert "innerHTML" not in js
+    assert "location.reload" not in js
+    # owes is rendered UNCONDITIONALLY (FR-006): "owes 0" must not be hidden
+    # behind a truthiness gate.
+    assert "owes ' + (owes || 0)" in js
+    assert "if (owes)" not in js
+    # role-classifier convention pinned (FR-005) so it can't silently drift
+    for term in ("lead", "dev", "eng", "impl", "review", "qa", "audit"):
+        assert term in js, term
+
+
+def test_dashboard_shell_no_inline_handlers(tmp_path: Path) -> None:
+    """C-004: the /dashboard HTML shell carries no inline event handlers
+    (which would require 'unsafe-inline' and weaken the CSP)."""
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/dashboard") as resp:
+            shell = resp.read().decode("utf-8")
+            assert resp.headers["Content-Security-Policy"] == _DASH_CSP
+        assert "onclick=" not in shell and "onchange=" not in shell
+        assert "refresh-btn" in shell and "autorefresh" in shell
     finally:
         srv.shutdown()
         srv.server_close()
