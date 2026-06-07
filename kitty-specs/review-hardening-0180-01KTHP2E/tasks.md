@@ -16,10 +16,10 @@
 | T006 | `threads` broadcast: exclude retired from `pending`/`next_owner`; additive `audience_retired` (FR-006) | WP02 | — | [D] |
 | T007 | `web._all_messages` → known roster (FR-004 web) | WP02 | — | [D] |
 | T008 | threads + web tests (retired pending/audience_retired; retired history renders) | WP02 | — | [D] |
-| T009 | `tail` → known roster (FR-004 tail) | WP03 | — |
-| T010 | `broadcast --resume` skip-retired + dropped report + exit-0-when-all-retired (FR-005) | WP03 | — |
-| T011 | `wait` duplicate-activation warning via `foreign_wait_pid` (FR-007/008) | WP03 | — |
-| T012 | CLI tests: tail-retired, resume-skip-retired exits, wait-warning live/dead | WP03 | — |
+| T009 | `tail` → known roster (FR-004 tail) | WP03 | — | [D] |
+| T010 | `broadcast --resume` skip-retired + dropped report + exit-0-when-all-retired (FR-005) | WP03 | — | [D] |
+| T011 | `wait` duplicate-activation warning via `foreign_wait_pid` (FR-007/008) | WP03 | — | [D] |
+| T012 | CLI tests: tail-retired, resume-skip-retired exits, wait-warning live/dead | WP03 | — | [D] |
 | T013 | `doctor` marker pid/liveness advisory (FR-009) + tests | WP04 | — |
 | T014 | Docs: README + SECURITY (one-window-per-agent unsupported; clock-agreement) (C-006/008) | WP04 | — |
 | T015 | CHANGELOG 0.18.0 + ROADMAP + version bump pyproject/`__init__` + full-suite gate | WP04 | — |
@@ -64,10 +64,10 @@
 **Independent test**: `pytest tests/test_cli.py tests/test_coordination.py -q` green; quickstart §§4,6.
 **Estimated**: ~420 lines (4 subtasks).
 
-- [ ] T009 `tail` → known roster (FR-004 tail) (WP03)
-- [ ] T010 `broadcast --resume` skip-retired + exit codes (FR-005) (WP03)
-- [ ] T011 `wait` duplicate-activation warning (FR-007/008) (WP03)
-- [ ] T012 CLI + coordination tests (WP03)
+- [x] T009 `tail` → known roster (FR-004 tail) (WP03)
+- [x] T010 `broadcast --resume` skip-retired + exit codes (FR-005) (WP03)
+- [x] T011 `wait` duplicate-activation warning (FR-007/008) (WP03)
+- [x] T012 CLI + coordination tests (WP03)
 
 **Dependencies**: Depends on WP01 (the `foreign_wait_pid` detector) and WP02 (resume reads the same retired-set semantics; single-owner cli serializes after).
 
