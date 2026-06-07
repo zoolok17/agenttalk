@@ -6,7 +6,7 @@ the Claude Code + Codex collaboration that shipped 0.10.0–0.13.0, the first
 four-agent production retro (2026-06-03), **and the band's consolidated
 second retro (2026-06-05), which reprioritized everything below.**
 
-> Current release: **v0.16.0** (`master`). See `CHANGELOG.md` for history
+> Current release: **v0.17.0** (`master`). See `CHANGELOG.md` for history
 > and `SECURITY.md` for the trust model.
 
 ---
@@ -104,6 +104,23 @@ lane; Claude implements, Codex per-WP review, CI matrix gate). Shipped:
 
 Still in later RFC phases (NOT in 0.16.0): per-agent crypto, policy
 permissions, hash-chain replay defense, enforceable `operator_facing`.
+
+### ✅ Phase 4 — `0.17.0` "obligation dashboard" — DELIVERED 2026-06-07
+Issue #20 (design converged over the bus: Claude proposal → Codex
+counter — extend `serve`, don't fork it — → accepted). Mission
+`obligation-dashboard-0170` (3 WPs, single serial lane, Codex pre-code
+design review + per-WP review; WP01/WP02 approved with ZERO findings).
+Shipped:
+- **`agenttalk dashboard`** — multi-root read-only obligation view on
+  the existing loopback-only server: roster hierarchy (liaison first),
+  presence/unread/composing, open threads with `next_owner` →
+  `next_action`, mission/WP tags, epoch staleness; ~2 s auto-refresh;
+  repeatable `--store`, degraded-root error isolation;
+- **`GET /api/state`** (`schema_version: 1`) for automation — subjects
+  and derived fields only, never bodies;
+- **FR-010 bind-failure honesty** — `serve`/`dashboard` exit 2 with a
+  `--port 0` hint (born from a live `WinError 10013` operator report);
+- per-route CSP split + full-tree-hash no-mutation regression.
 
 ### Demoted / deferred
 - **#9 safe rename** — ✅ DELIVERED in 0.16.0 as `roster rename

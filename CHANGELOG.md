@@ -5,6 +5,63 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-06-07
+
+Obligation dashboard release (issue #20): the bus gets a glanceable,
+multi-project, read-only web view of who is doing what — built by
+extending the existing `agenttalk serve` server, not forking it.
+Design converged over the bus itself (Claude proposal → Codex counter →
+accepted) and was Codex-reviewed pre-code and per-WP.
+
+### Added
+- `agenttalk dashboard` — alias to the same loopback-only server as
+  `serve`, landing on the new obligation view. Repeatable
+  `--store <project-root>` watches several projects in one tab (each
+  path IS the root — no upward walk; missing stores warn and render as
+  degraded panels). Deliberately has **no `--host` option**.
+- `GET /api/state` — purpose-built versioned aggregate
+  (`schema_version: 1`): roots as an array of namespaced objects with
+  roster/roles/liaison, retired tombstones, per-agent presence
+  (heartbeat age, unread, composing — an array, matching the
+  multi-entry marker), open-thread rows with `next_owner`/`next_action`,
+  `mission`/`wp_id` from opener meta, `epoch_at_send` forwarded in its
+  exact three-state form plus a derived `epoch_status`
+  (`current` / `previous-epoch` / `unknown-pre-epoch`, the
+  `check --epoch` vocabulary), broadcast manifests, counts, the current
+  epoch, and spec-kitty link metadata when `kitty-specs/` exists
+  (filesystem detection only). **No message bodies anywhere.**
+- `GET /dashboard` + `GET /static/dashboard.js` — hierarchy HTML
+  (liaison first), ~2 s auto-refresh via a self-hosted polling script;
+  DOM built via `textContent` only; detail links only for the first
+  root (existing `/messages/<id>` routes bind to root[0]).
+- Per-root error isolation: a corrupt or uninitialized root degrades to
+  an `errors` entry in the payload — never a 5xx, and it recovers on
+  the next poll without a server restart.
+- `/` (message log) gains a link to `/dashboard`.
+
+### Changed
+- `serve`/`dashboard` bind failures now exit **2** with an actionable
+  message naming the host:port and suggesting `--port 0` (previously a
+  raw `OSError` escaped to the generic handler — a real operator hit
+  this as bare `[WinError 10013]` when an unrelated app held 8765).
+- `make_server` accepts an additive keyword-only `extra=` list of root
+  descriptors; the legacy single-store call shape is unchanged.
+
+### Security
+- Per-route CSP split: only `/dashboard` allows (self-hosted) script +
+  same-origin fetch; the hostile-body routes keep the pre-0.17.0
+  policy byte-identical — both literals pinned by test.
+- Read-only proven by regression: a full-tree content-hash walk over
+  two stores asserts byte-identical state after mixed dashboard
+  traffic (hashes, not mtimes — Windows).
+- Loopback wall unchanged: no auth, no remote-bind flag on any
+  spelling; multi-root blast-radius framing documented in SECURITY.md.
+
+### Performance
+- `/api/state` costs ONE message-dir scan per root per request
+  (naively stacking the store's surfaces measured 5+ scans and ~9.6 s
+  at 1k messages; derivation itself profiles at ~5 ms).
+
 ## [0.16.0] - 2026-06-05
 
 Trusted-team safety release: Phase A of the identity/authz RFC

@@ -2604,17 +2604,56 @@ def cmd_reset(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    """Start the read-only local web dashboard."""
+    """Start the read-only local web dashboard / obligation dashboard.
+
+    Shared by both spellings (0.17.0): ``serve`` (single root, lands on
+    the message log ``/``) and ``dashboard`` (multi-root via repeatable
+    ``--store``, lands on ``/dashboard``). The spelling changes only
+    root selection, the URL printed, and the command name in errors —
+    it is the SAME server (same loopback wall, same routes).
+    """
     from agenttalk import web as _web
-    store = _get_store(args)
+    landing = getattr(args, "landing", "/")
+    spelling = "dashboard" if landing == "/dashboard" else "serve"
+    host = getattr(args, "host", "127.0.0.1")  # dashboard has no --host
+    stores = getattr(args, "stores", None)
+    extra: list = []
+    if stores:
+        # Each --store PATH **is** the project root — no upward walk
+        # (research D4: an explicit path must not silently resolve to a
+        # parent project). Missing stores WARN, never refuse: they show
+        # as degraded roots in /api/state until initialized.
+        paths = [Path(p).resolve() for p in stores]
+        for p in paths:
+            if not (p / ".agenttalk").is_dir():
+                sys.stderr.write(
+                    f"warning: {p} has no .agenttalk store yet — it will "
+                    f"appear as a degraded root until initialized\n")
+        descs = _web.make_descriptors(paths)
+        store = descs[0].store
+        extra = list(descs[1:])
+    else:
+        store = _get_store(args)
     try:
-        srv = _web.make_server(store, args.host, args.port, quiet=args.quiet)
-    except ValueError as e:
-        sys.stderr.write(f"agenttalk serve: {e}\n")
+        srv = _web.make_server(store, host, args.port, quiet=args.quiet,
+                               extra=extra)
+    except ValueError as e:  # non-loopback host refusal — keep FIRST
+        sys.stderr.write(f"agenttalk {spelling}: {e}\n")
+        return 2
+    except OSError as e:  # bind failure (FR-010, live repro 2026-06-07)
+        sys.stderr.write(
+            f"agenttalk {spelling}: could not bind {host}:{args.port} — {e}\n"
+            f"  Another program is probably listening on this port.\n"
+            f"  Try `--port 0` (the OS picks a free port) or another "
+            f"--port.\n")
         return 2
     actual_port = srv.server_address[1]
-    url = _web._format_url(args.host, actual_port)
-    sys.stderr.write(f"agenttalk: serving read-only dashboard at {url}\n")
+    url = _web._format_url(host, actual_port)
+    if landing == "/dashboard":
+        sys.stderr.write(
+            f"agenttalk: serving obligation dashboard at {url}dashboard\n")
+    else:
+        sys.stderr.write(f"agenttalk: serving read-only dashboard at {url}\n")
     sys.stderr.write("           (Ctrl-C to stop)\n")
     sys.stderr.flush()
     try:
@@ -3175,7 +3214,29 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Suppress per-request access logs (default: true)")
     psv.add_argument("--access-log", dest="quiet", action="store_false",
                      help="Print per-request access logs to stderr")
-    psv.set_defaults(func=cmd_serve)
+    psv.set_defaults(func=cmd_serve, landing="/")
+
+    pdb = sub.add_parser(
+        "dashboard",
+        help="Multi-root obligation dashboard (read-only, loopback-only) at "
+             "http://127.0.0.1:8765/dashboard — who owes what, whose turn it "
+             "is, and the next action, across one or many projects. Same "
+             "server as `serve` (it just lands on the hierarchy view). "
+             "Repeat --store to watch several projects in one browser tab.",
+    )
+    pdb.add_argument("--port", type=int, default=8765,
+                     help="TCP port (default: 8765; pass 0 for an OS-chosen "
+                          "ephemeral port)")
+    pdb.add_argument("--store", action="append", dest="stores", metavar="PATH",
+                     help="Project root to watch (repeatable; default: the "
+                          "resolved current project). The path itself is the "
+                          "project root — no upward search is performed.")
+    pdb.add_argument("--quiet", action="store_true", default=True,
+                     help="Suppress per-request access logs (default: true)")
+    pdb.add_argument("--access-log", dest="quiet", action="store_false",
+                     help="Print per-request access logs to stderr")
+    # Deliberately NO --host: the alias binds 127.0.0.1, period (NFR-002a).
+    pdb.set_defaults(func=cmd_serve, landing="/dashboard")
 
     prst = sub.add_parser(
         "reset",

@@ -1,6 +1,6 @@
 # Security policy & threat model
 
-> Last updated: 2026-06-03 (v0.12.0)
+> Last updated: 2026-06-07 (v0.17.0)
 
 agenttalk is a small file-backed message bus. The trust model is
 local: if you can write to a project's `.agenttalk/` directory, you
@@ -292,6 +292,57 @@ do what is cheaper and more honest.
    out-of-roster sender/recipient, or that fails HMAC
    verification when signing is enforced, is NOT rendered —
    it shows up under `/api/status.invalid_messages` instead.
+
+### Delivered in 0.17.0
+
+7b. **Multi-root obligation dashboard** (`agenttalk dashboard`,
+   `/dashboard`, `/api/state`) — an extension of the 0.7.0 server
+   above, not a second implementation, so every defense listed there
+   (loopback-only bind with no override, per-request peer check before
+   every method, GET/HEAD-only, strict route allowlist, validation
+   parity) applies to the new routes unchanged. What is new, stated
+   honestly:
+
+   - **Read-only by construction AND by regression.** `/api/state` is
+     composed exclusively from existing pure read surfaces; the
+     regression test `test_no_mutation_full_tree_hash` issues mixed
+     requests (state polls, HTML, detail, 404s, a POST) against two
+     stores and asserts every file under both `.agenttalk/` trees is
+     content-hash-identical afterwards — hashes, not mtimes, because
+     mtime is unreliable on Windows.
+   - **Per-route CSP split.** `/dashboard` is the ONLY route whose CSP
+     allows script (`script-src 'self'; connect-src 'self'` — the
+     self-hosted polling renderer; still no inline JS, no eval, no
+     remote origins). It renders no message-derived HTML server-side
+     and its client builds DOM via `textContent` only. The routes that
+     render hostile message bodies (`/messages/<id>`, `/`) keep the
+     pre-0.17.0 no-script policy **byte-identical**, pinned by
+     `test_csp_split_per_route`.
+   - **Multi-root widens the blast radius of the loopback wall.**
+     **Anything that can reach this local loopback port can read every
+     exposed root's data** — the server enforces a loopback bind and a
+     loopback peer address, NOT OS-user identity, and on typical
+     systems other local users/processes can connect to loopback
+     ports. The dashboard remains a single-human local-workstation
+     tool; on a shared machine, one port now exposes N projects'
+     subjects/roster/thread state instead of one. No cross-root
+     merging is performed and each root's data is namespaced under its
+     own entry; we do NOT claim cross-root isolation beyond that.
+     `/api/state` itself carries subjects and derived fields, never
+     message bodies — but bodies are still served by the PRE-EXISTING
+     first-root surfaces on the same port: `/messages/<id>` (HTML) and
+     `/api/messages` / `/api/messages/<id>` (JSON `body` fields).
+     Adding `/api/state` does not add a body surface; it also does not
+     remove the ones that were already there.
+   - **The `dashboard` spelling has no `--host` option at all** —
+     rejected as an unknown option, tested. `serve --host` keeps the
+     loopback allowlist. Bind failures (e.g. another local app already
+     on the port — a real WinError 10013 report) exit 2 with
+     remediation instead of leaking a traceback.
+   - **Degraded roots are data, not crashes.** A corrupt or
+     uninitialized store renders as an `errors` entry; it cannot 500
+     the aggregate. JSON-unparseable configs therefore degrade
+     visibly rather than silently vanishing.
 
 ### Still planned
 

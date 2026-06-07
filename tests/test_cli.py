@@ -2333,3 +2333,162 @@ def _run_json(argv: list[str], root: Path, capsys) -> dict:
     capsys.readouterr()
     assert _run(argv, root) == 0
     return json.loads(capsys.readouterr().out)
+
+
+# ================================================ 0.17.0 dashboard CLI (WP02)
+#
+# Contract: kitty-specs/obligation-dashboard-0170-01KTHADQ/contracts/
+# cli-surface.md. `dashboard` is an alias to the same server code as
+# `serve` (multi-root via --store, lands on /dashboard, NO --host);
+# bind failures exit 2 with an actionable message on both spellings.
+
+class _FakeServer:
+    """Stands in for ThreadingHTTPServer in CLI tests: web-layer behavior
+    is WP01-tested; here we only verify the wiring around it."""
+
+    def __init__(self) -> None:
+        self.server_address = ("127.0.0.1", 43210)
+
+    def serve_forever(self) -> None:
+        raise KeyboardInterrupt  # immediately "Ctrl-C" out of the loop
+
+    def server_close(self) -> None:
+        pass
+
+
+def _exit_code(argv: list[str]) -> tuple[int, None]:
+    try:
+        return int(cli.main(argv)), None
+    except SystemExit as e:
+        return (0 if e.code is None else int(e.code)), None
+
+
+def test_dashboard_help_surface(capsys: pytest.CaptureFixture) -> None:
+    code, _ = _exit_code(["dashboard", "--help"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "--store" in out and "--port" in out and "--access-log" in out
+    assert "--host" not in out
+
+
+def test_dashboard_rejects_host_option(
+    store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """NFR-002(a): the alias has NO host surface at all — `--host` is an
+    unknown option (usage exit 2), not a refused value."""
+    code, _ = _exit_code(["--root", str(store_root), "dashboard",
+                          "--host", "0.0.0.0", "--port", "0"])
+    assert code == 2
+    assert "--host" in capsys.readouterr().err
+
+
+def test_serve_parser_unchanged(capsys: pytest.CaptureFixture) -> None:
+    code, _ = _exit_code(["serve", "--help"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "--host" in out and "--port" in out and "--access-log" in out
+    assert "--store" not in out
+
+
+def test_bind_failure_exit2_both_spellings(
+    store_root: Path, capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-010 (research D10; live WinError 10013 repro 2026-06-07): a
+    bind OSError becomes exit 2 + an actionable message naming the
+    spelling, the host:port, and the --port remedies.
+
+    Raised via monkeypatch rather than a real second bind: HTTPServer
+    sets SO_REUSEADDR, whose Windows semantics let it bind straight
+    over a plain listener — a real-socket repro is not deterministic
+    cross-platform, and the contract under test is OUR handling, not
+    OS bind semantics."""
+    from agenttalk import web as _web
+
+    def boom(*a, **k):
+        raise OSError("[WinError 10013] An attempt was made to access a "
+                      "socket in a way forbidden by its access permissions")
+
+    monkeypatch.setattr(_web, "make_server", boom)
+    rc = cli.main(["--root", str(store_root), "serve", "--port", "8765"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "agenttalk serve: could not bind 127.0.0.1:8765" in err
+    assert "--port 0" in err
+    rc = cli.main(["--root", str(store_root), "dashboard", "--port", "8765"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "agenttalk dashboard: could not bind 127.0.0.1:8765" in err
+    assert "--port 0" in err
+
+
+def test_serve_nonloopback_host_still_exits2(
+    store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """The pre-0.17.0 ValueError path is untouched (and ordered before
+    the new OSError handler)."""
+    rc = cli.main(["--root", str(store_root), "serve",
+                   "--host", "0.0.0.0", "--port", "0"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "agenttalk serve:" in err and "loopback" in err
+
+
+def test_dashboard_store_plumbing(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agenttalk import web as _web
+    a = tmp_path / "proj-a"
+    a.mkdir()
+    Store(a).init(["alpha", "beta"])
+    b = tmp_path / "proj-b"
+    b.mkdir()
+    Store(b).init(["lead", "dev"])
+    captured: dict = {}
+
+    def fake_make_server(store, host, port, *, quiet=True, extra=None):
+        captured.update(store=store, host=host, port=port,
+                        extra=list(extra or []))
+        return _FakeServer()
+
+    monkeypatch.setattr(_web, "make_server", fake_make_server)
+    rc = cli.main(["dashboard", "--store", str(a), "--store", str(b),
+                   "--port", "0"])
+    assert rc == 0
+    assert captured["host"] == "127.0.0.1"
+    assert captured["store"].root == a.resolve()  # first --store is root[0]
+    assert [d.store.root for d in captured["extra"]] == [b.resolve()]
+    assert [d.label for d in captured["extra"]] == ["proj-b"]
+    err = capsys.readouterr().err
+    assert "obligation dashboard" in err
+    assert "/dashboard" in err  # the alias lands on the hierarchy view
+
+
+def test_dashboard_missing_store_warns_not_fatal(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Research D4: a --store path without .agenttalk WARNS and still
+    becomes a (degraded) root — a viewer observes, it does not gate."""
+    from agenttalk import web as _web
+    good = tmp_path / "good"
+    good.mkdir()
+    Store(good).init(["alpha", "beta"])
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    captured: dict = {}
+
+    def fake_make_server(store, host, port, *, quiet=True, extra=None):
+        captured.update(extra=list(extra or []))
+        return _FakeServer()
+
+    monkeypatch.setattr(_web, "make_server", fake_make_server)
+    rc = cli.main(["dashboard", "--store", str(good), "--store", str(empty),
+                   "--port", "0"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "no .agenttalk store yet" in err
+    assert str(empty.resolve()) in err
+    # the missing store is still passed through as a root descriptor
+    assert [d.store.root for d in captured["extra"]] == [empty.resolve()]

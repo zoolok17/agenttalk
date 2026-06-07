@@ -18,7 +18,7 @@ exported on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.16.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.17.0"
 agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
 
 # in your project root, once per project
@@ -123,10 +123,10 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.16.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.17.0"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.16.0` with
+Pin to a specific tag so you control upgrades. Replace `v0.17.0` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
@@ -665,7 +665,8 @@ so the long timeout is free observability.
 | `agenttalk hmac-init [--force]` | Generate the HMAC signing key for this project. Stored outside `.agenttalk/` (per-user config dir). The key's existence at the path-derived per-user location automatically activates signature enforcement — there's no config flag to flip. Override the default key path with `AGENTTALK_HMAC_KEY_FILE`. See `SECURITY.md`. |
 | `agenttalk reply [--from A] [--to-id MSG_ID \| --to-request REQUEST_ID] [--kind K] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--dry-run]` | Reply to the most recent received message, or anchor to a specific received message/thread. Auto-derives recipient and echoes the anchor's `request_id`; explicit `--meta request_id=...` wins. `--dry-run` prints the resolved recipient, request id, and kind without sending. A reply that opens a new thread (`review-request` or `proposal`) mints a fresh id instead of echoing. 0.15.0: `--na` sends a not-applicable response — closes your obligation, displayed as (n/a); refused on review-request/proposal threads. |
 | `agenttalk tail [--from-start] [--interval S] [--timeout S]` | Passive monitor: stream all messages as they arrive. Does **not** advance cursors or write heartbeats — safe to run in a third terminal alongside two active agents. `--from-start` replays existing messages first. |
-| `agenttalk serve [--port P] [--host H] [--access-log]` | Start a **read-only** local web dashboard at `http://127.0.0.1:8765/` for browsing the message log in a real browser. **Loopback-only by design** — only `127.0.0.1`, `::1`, and `localhost` are accepted; there is no flag to expose it elsewhere (SSH-tunnel `localhost:<port>` from another machine if needed). HTML output is escaped, strict CSP, `GET`/`HEAD` only, peer-IP check on every method. JSON at `/api/status` and `/api/messages` for scripting. See `SECURITY.md`. |
+| `agenttalk serve [--port P] [--host H] [--access-log]` | Start a **read-only** local web dashboard at `http://127.0.0.1:8765/` for browsing the message log in a real browser. **Loopback-only by design** — only `127.0.0.1`, `::1`, and `localhost` are accepted; there is no flag to expose it elsewhere (SSH-tunnel `localhost:<port>` from another machine if needed). HTML output is escaped, strict CSP, `GET`/`HEAD` only, peer-IP check on every method. JSON at `/api/status` and `/api/messages` for scripting. 0.17.0: the same server also serves `/dashboard` (the obligation view) and `/api/state`; a port that can't be bound now exits **2** with a `--port 0` hint instead of a raw traceback. See `SECURITY.md`. |
+| `agenttalk dashboard [--port P] [--store PATH]... [--access-log]` | The **obligation dashboard** (0.17.0): who owes what, whose turn it is, and the next action — per agent, per open thread, with mission/WP tags and epoch staleness. Same read-only loopback-only server as `serve`, landing on `http://127.0.0.1:8765/dashboard`; auto-refreshes every ~2 s. Repeat `--store <project-root>` to watch **several projects in one tab** (each path is the project root itself — no upward search; an uninitialized path shows as a degraded panel, not an error). No `--host` option exists on this spelling. `GET /api/state` (`schema_version: 1`) is the same data for scripting. |
 | `agenttalk install-skills [--claude-only\|--codex-only] [--force] [--dry-run]` | Copy bundled skill files to `~/.claude/commands/` and `~/.codex/skills/`. Idempotent — preserves your local edits unless `--force`. |
 | `agenttalk codex-config [--enable\|--disable\|--status]` | Manage per-project sandbox/trust block in `~/.codex/config.toml` so Codex can call agenttalk from inside its sandbox. |
 | `agenttalk doctor [--json]` | Health check: store initialized, skills installed + in sync, Codex sandbox block configured, heartbeats fresh. Per the global exit-code contract, exit 2 on any error; warnings exit 0 with the warning state visible in output. |
@@ -908,6 +909,38 @@ status/doctor use, path-paired at scan time, so a valid file can never
 be selected. Use `--dry-run` to inspect first; `doctor` shows
 invalid/quarantined counts.
 
+### The obligation dashboard (0.17.0)
+
+spec-kitty's kanban shows the *task* layer; `agenttalk dashboard` shows
+the *conversation/obligation* layer of the bus itself — and works
+without spec-kitty. One browser tab answers: which agents are alive
+(heartbeat age), who has unread backlog, who is composing, which
+threads are open, **whose court the ball is in** (`next_owner`) and
+what the move is (`next_action`), plus mission/WP tags when messages
+carry them in meta and epoch staleness after a `barrier bump`.
+
+```powershell
+# one project (current root):
+agenttalk dashboard
+
+# two live sessions, one tab:
+agenttalk dashboard --store D:\proj\band-a --store D:\proj\band-b
+```
+
+For automation, `GET /api/state` returns the same aggregate as
+versioned JSON (`schema_version: 1`): an array of root objects, each
+fully namespaced (no cross-root merging), with per-root `errors` as
+data — one corrupt store renders as a degraded panel while the others
+stay live. Thread rows carry subjects and derived fields only, never
+message bodies; body detail stays on the existing `/messages/<id>`
+routes (first root only). If a watched project contains `kitty-specs/`,
+the panel lists its missions — detection is filesystem-only, agenttalk
+never imports spec-kitty.
+
+The loopback story is unchanged and non-negotiable: no auth, no
+remote-bind flag on any spelling — SSH-tunnel the port if you need it
+from another machine.
+
 ### Exit codes
 
 Stable across releases — skill bodies and external automation can
@@ -917,7 +950,7 @@ rely on these:
 | --- | --- |
 | `0` | Success. For `wait`: a message was received. |
 | `1` | Reserved for `agenttalk wait` timeout (no new messages within `--timeout`). Loop skills should treat this as "keep waiting", not as an error. |
-| `2` | Usage error: missing/invalid identity (`--from`/`--to`/`--for` or `AGENTTALK_SELF`/`AGENTTALK_PEER`), unsafe agent name, identity not in roster, self-mail attempt, malformed `--meta`, corrupt config, missing `.agenttalk/`. Always prints a remediation hint to stderr. |
+| `2` | Usage error: missing/invalid identity (`--from`/`--to`/`--for` or `AGENTTALK_SELF`/`AGENTTALK_PEER`), unsafe agent name, identity not in roster, self-mail attempt, malformed `--meta`, corrupt config, missing `.agenttalk/`. 0.17.0: also a `serve`/`dashboard` bind failure (port in use / OS-denied) — with a `--port 0` remediation hint. Always prints a remediation hint to stderr. |
 | `130` | `SIGINT` (Ctrl-C). |
 
 ---
