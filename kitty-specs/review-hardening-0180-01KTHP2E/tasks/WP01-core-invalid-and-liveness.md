@@ -153,7 +153,7 @@ In `tests/test_signing.py` and `tests/test_store.py` (follow existing style):
 ## Definition of Done
 
 - [ ] `pytest tests/test_signing.py tests/test_store.py -q` green; FULL suite green.
-- [ ] Only the 4 owned files changed; `store.py` imports nothing from `cli.py`.
+- [ ] Only the owned files changed (signing.py, store.py, test_signing.py, test_store.py, test_validation.py — the last added because the id-shape change correctly reclassifies a hand-built short id there); `store.py` imports nothing from `cli.py`.
 - [ ] `_ID_RE` derived from `_ID_ALPHABET` (not hand-copied).
 - [ ] `_process_alive` + `foreign_wait_pid` never raise.
 - [ ] `pip install -e .` before testing.
