@@ -5,11 +5,15 @@ renamed; no existing JSON key changes shape.
 
 ## Commands
 
-### `agenttalk wait` / `agenttalk listen` (FR-007)
+### `agenttalk wait` (FR-007)
+`wait` is the **only** blocking-wait CLI command. (`listen` is a bundled skill
+that calls `wait`; there is no `agenttalk listen` CLI command and none is
+added.)
 - NEW: on startup, if another **live** process already holds the agent's
   `.waiting` marker (different pid, alive), print ONE advisory stderr warning
   (data-model §7). Never blocks; **exit code unchanged**.
-- Everything else identical.
+- Everything else identical. The listen skills inherit the warning by calling
+  `wait`.
 
 ### `agenttalk broadcast --resume <bid>` (FR-005)
 - Retired frozen recipients are SKIPPED and reported `dropped=[…]` (not sent).

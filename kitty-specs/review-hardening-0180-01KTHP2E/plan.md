@@ -45,7 +45,7 @@ src/agenttalk/
 ├── store.py     # FR-003 id-shape validation (Message.from_raw); FR-007 liveness primitive + foreign-wait detector
 ├── threads.py   # FR-006 broadcast pending excludes retired + audience_retired
 ├── web.py       # FR-004 dashboard message routes → known roster
-├── cli.py       # FR-004 tail → known roster; FR-005 resume skip-retired; FR-007 wait/listen warning
+├── cli.py       # FR-004 tail → known roster; FR-005 resume skip-retired; FR-007 `wait` duplicate warning
 ├── doctor.py    # FR-009 marker pid/liveness report
 └── __init__.py  # 0.18.0
 tests/  (per-module)   README.md SECURITY.md CHANGELOG.md ROADMAP.md pyproject.toml
@@ -65,8 +65,10 @@ tests/  (per-module)   README.md SECURITY.md CHANGELOG.md ROADMAP.md pyproject.t
   theme: render retired identities correctly. Depends on WP01.
 - **WP03 — CLI wiring.** `cli.py`, `tests/test_cli.py`,
   `tests/test_coordination.py`. FR-004 (tail → known roster), FR-005 (resume
-  skip-retired + exit-0-when-all-retired), FR-007 (wait/listen duplicate
-  warning using the WP01 detector). Single-owner cli. Depends on WP01, WP02.
+  skip-retired + exit-0-when-all-retired), FR-007 (`agenttalk wait` duplicate
+  warning using the WP01 detector — `wait` is the only blocking-wait command;
+  no `listen` CLI command exists or is added). Single-owner cli. Depends on
+  WP01, WP02.
 - **WP04 — doctor + docs + release.** `doctor.py`, `tests/test_doctor.py`,
   `README.md`, `SECURITY.md`, `CHANGELOG.md`, `ROADMAP.md`, `pyproject.toml`,
   `src/agenttalk/__init__.py`. FR-009 (marker pid/liveness, advisory), the

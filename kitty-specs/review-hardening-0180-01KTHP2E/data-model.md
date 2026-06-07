@@ -61,10 +61,14 @@ absence/corruption (`read_waiting` → None).
 
 ```python
 def _process_alive(pid: int) -> bool          # stdlib, fail-quiet (D3)
-def foreign_wait_pid(self, agent: str, self_pid: int) -> int | None  # D4
+def foreign_wait_pid(self, agent: str, self_pid: int, *,
+                     now: float | None = None,
+                     stale_after: float | None = None) -> int | None  # D4
 ```
-`foreign_wait_pid` returns the live foreign owner's pid or None. Pure read;
-no writes.
+`foreign_wait_pid` returns the live foreign owner's pid or None. Pure read; no
+writes. Freshness policy (clock + threshold) is passed IN — `store.py` does
+NOT import CLI staleness constants (Codex note); `cli.py` supplies its
+existing `STALE_THRESHOLD_SECONDS` and `time.time()`.
 
 ## 6. doctor report — additive marker liveness (FR-009)
 
@@ -77,7 +81,7 @@ Never changes `doctor`'s exit code.
 
 ## 7. CLI warning text (FR-007)
 
-One stderr line on `wait`/`listen` start when `foreign_wait_pid` is non-None,
+One stderr line on `agenttalk wait` start when `foreign_wait_pid` is non-None,
 e.g.:
 ```
 warning: another live process (PID 50824) is already waiting as 'claude' in

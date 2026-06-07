@@ -68,14 +68,18 @@ false one or crashing.
 
 ## D4 — Duplicate-detection semantics (FR-007, FR-008, FR-009)
 
-**Decision**: `Store.foreign_wait_pid(agent, self_pid) -> int | None`: read the
-existing `.waiting` marker; if it exists, is fresh (within the existing
-staleness threshold via its `deadline_epoch`/heartbeat cross-check, reusing
-the same liveness logic `status` already applies), carries a `pid` that is
-`!= self_pid` and `_process_alive(pid)` → return that pid; else None. A
-starting `wait`/`listen` (in `cli.py`) calls this BEFORE writing its own
-marker and, on a non-None result, prints one advisory stderr line. Never
-blocks, never changes the exit code.
+**Decision**: `Store.foreign_wait_pid(agent, self_pid, *, now=None,
+stale_after=None) -> int | None`: read the existing `.waiting` marker; if it
+exists, is fresh, carries a `pid` that is `!= self_pid` and
+`_process_alive(pid)` → return that pid; else None. **`store.py` must NOT
+import CLI staleness constants** (Codex note): the freshness threshold + clock
+are passed IN as parameters (the `cli.py` caller supplies its existing
+`STALE_THRESHOLD_SECONDS` / `time.time()`), or default to a store-local
+constant — store stays self-contained and unit-testable. A starting
+`agenttalk wait` (in `cli.py`) calls this BEFORE writing its own marker and,
+on a non-None result, prints one advisory stderr line. `listen` is a skill
+that calls `wait`, so it inherits the warning; there is no `agenttalk listen`
+CLI command. Never blocks, never changes the exit code.
 
 **Framing (Codex constraint)**: a single per-agent marker cannot be a complete
 duplicate registry (a second writer overwrites the first), so the feature

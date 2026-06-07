@@ -57,12 +57,13 @@ projection, while remaining observable (the frozen historical audience still
 records that they were addressed).
 
 ### Scenario 6 — a second window for the same agent is flagged (NEW)
-An operator accidentally starts a second long-lived command (`wait`/`listen`)
-for an agent that is already actively waiting in another window of the same
-store. Today nothing warns, and concurrent same-agent consumers can silently
-lose cursor/threadstate updates. After this release the second command prints
-an advisory warning naming the other live process; it never blocks and never
-changes exit codes. `doctor` reports the current marker's PID and liveness.
+An operator accidentally starts a second `agenttalk wait` for an agent that is
+already actively waiting in another window of the same store (directly, or via
+a listen-style skill that calls `wait` under the hood). Today nothing warns,
+and concurrent same-agent consumers can silently lose cursor/threadstate
+updates. After this release the second `wait` prints an advisory warning
+naming the other live process; it never blocks and never changes exit codes.
+`doctor` reports the current marker's PID and liveness.
 
 ### Testing expectations
 pytest, extending the existing suites (`test_store.py`, `test_signing.py`,
@@ -82,7 +83,7 @@ reviewer repro.
 | FR-004 | The dashboard message routes (`/api/messages`, `/api/messages/<id>`, `/messages/<id>`, index) and the `tail` command validate against the **known** roster (active ∪ retired), matching `valid_messages` / the dashboard's thread panel — so a retired identity's historical messages render rather than silently disappearing or being flagged invalid. | Proposed |
 | FR-005 | `broadcast --resume` skips frozen recipients that are no longer on the active roster (retired), reports them as `dropped=[…]`, and sends the remaining active missing copies. If all still-missing recipients are retired, the batch resolves successfully (**exit 0**) with the dropped list, instead of a permanent partial-failure exit 5. | Proposed |
 | FR-006 | Broadcast thread derivation excludes retired audience members from `pending` and from the `next_owner`/`await-reply` obligation projection. The frozen historical audience is preserved and retired members remain observable via an additive `audience_retired` field (absent when none). | Proposed |
-| FR-007 | A starting long-lived command (`wait`, `listen`) detects when another **live** process is already acting as the same agent in the same store (via the existing active-wait marker, which records the owning process id) and prints an advisory stderr warning that names the other process id, states the one-window-per-agent assumption, and notes that concurrent same-agent use can lose cursor/threadstate updates. | Proposed |
+| FR-007 | A starting `agenttalk wait` (the only blocking-wait CLI command; the listen skills consume it indirectly) detects when another **live** process is already acting as the same agent in the same store (via the existing active-wait marker, which records the owning process id) and prints an advisory stderr warning that names the other process id, states the one-window-per-agent assumption, and notes that concurrent same-agent use can lose cursor/threadstate updates. No new CLI command is added. | Proposed |
 | FR-008 | The duplicate-activation check is best-effort and fail-quiet: a stale or dead owning process produces no warning (silent crash recovery); any error in the liveness probe is swallowed; the warning never blocks startup and never changes the exit code. | Proposed |
 | FR-009 | `doctor` reports the current active-wait marker's process id and liveness per agent where present, framed as advisory (it does not claim to have found all duplicates). | Proposed |
 
@@ -122,7 +123,7 @@ reviewer repro.
    end; the all-retired case exits 0.
 5. No "who owes the next move" output ever names a retired identity — verified
    in derivation and CLI.
-6. Starting a second `wait`/`listen` for an already-actively-waiting agent
+6. Starting a second `agenttalk wait` for an already-actively-waiting agent
    prints the advisory warning; a stale/dead marker does not — verified with a
    simulated live and a simulated dead owner.
 7. Documentation states plainly that one window per agent is assumed and
@@ -145,8 +146,10 @@ reviewer repro.
 - The active-wait marker already records (or can additively record) the owning
   process id; if a structured form is introduced, readers stay
   backward-compatible (NFR-001). The exact marker is a plan-phase detail.
-- "Long-lived command" for FR-007 means the blocking-wait commands (`wait`,
-  `listen`); one-shot commands are out of scope for the warning.
+- FR-007 targets the `agenttalk wait` command (the one blocking-wait CLI
+  command). `listen` is a bundled skill that calls `wait`, not a CLI command,
+  so it inherits the warning indirectly; no `agenttalk listen` command exists
+  or is added. One-shot commands are out of scope for the warning.
 - The canonical id shape is whatever the id generator emits today; the
   validating pattern is derived from it so the two cannot drift.
 

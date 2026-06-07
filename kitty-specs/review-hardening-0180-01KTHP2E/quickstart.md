@@ -56,6 +56,9 @@ agenttalk threads --for lead --json
 
 ## 6. Duplicate same-agent activation warning (FR-007/008)
 
+`wait` is the blocking-wait command; the listen skills call it, so they
+inherit this warning. There is no `agenttalk listen` CLI command.
+
 ```powershell
 # Terminal A:
 agenttalk wait --for claude --timeout 0
