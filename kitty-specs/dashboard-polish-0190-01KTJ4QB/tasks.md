@@ -15,8 +15,8 @@
 | T005 | `_DASHBOARD_JS` refresh controls: addEventListener wiring, toggle starts/clears interval, button one-shot, no reload | WP01 | — | [D] |
 | T006 | Tests: `/api/state` additive keys (sent/received/edges/truncation), schema_version still 1, no key removed, no body, healthy-vs-degraded | WP01 | — | [D] |
 | T007 | Tests: CSP byte-identical (incl /dashboard), read-only no-mutation still passes, JS has no inline handlers/innerHTML, role-classifier convention | WP01 | — | [D] |
-| T008 | README dashboard section refresh (stats/edges/controls) | WP02 | — |
-| T009 | CHANGELOG 0.19.0 + ROADMAP header + version bump pyproject/`__init__` + full-suite gate | WP02 | — |
+| T008 | README dashboard section refresh (stats/edges/controls) | WP02 | — | [D] |
+| T009 | CHANGELOG 0.19.0 + ROADMAP header + version bump pyproject/`__init__` + full-suite gate | WP02 | — | [D] |
 
 ## Work Packages
 
@@ -55,8 +55,8 @@ convention).
 **Independent test**: `python -m agenttalk --version` → 0.19.0; doc claims match shipped behavior; full suite green.
 **Estimated**: ~200 lines (2 subtasks).
 
-- [ ] T008 README dashboard section refresh (WP02)
-- [ ] T009 CHANGELOG + ROADMAP + version 0.19.0 + full-suite gate (WP02)
+- [x] T008 README dashboard section refresh (WP02)
+- [x] T009 CHANGELOG + ROADMAP + version 0.19.0 + full-suite gate (WP02)
 
 **Dependencies**: Depends on WP01 (documents the shipped dashboard surface).
 
