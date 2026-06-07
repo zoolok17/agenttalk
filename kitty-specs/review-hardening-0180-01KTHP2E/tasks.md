@@ -8,11 +8,11 @@
 
 | ID | Description | WP | Parallel |
 |----|-------------|----|----------|
-| T001 | Signature type-guard in `verify_message` (FR-001) + graceful-degradation tests | WP01 | — |
-| T002 | `_ID_RE` + id-shape validation in `Message.from_raw` (FR-003) | WP01 | — |
-| T003 | `_process_alive(pid)` liveness primitive (POSIX + Windows ctypes, fail-quiet) | WP01 | — |
-| T004 | `Store.foreign_wait_pid(agent, self_pid, now=, stale_after=)` detector | WP01 | — |
-| T005 | Store-level tests: poison-signature degradation, malformed-id invalid, liveness/detector | WP01 | — |
+| T001 | Signature type-guard in `verify_message` (FR-001) + graceful-degradation tests | WP01 | — | [D] |
+| T002 | `_ID_RE` + id-shape validation in `Message.from_raw` (FR-003) | WP01 | — | [D] |
+| T003 | `_process_alive(pid)` liveness primitive (POSIX + Windows ctypes, fail-quiet) | WP01 | — | [D] |
+| T004 | `Store.foreign_wait_pid(agent, self_pid, now=, stale_after=)` detector | WP01 | — | [D] |
+| T005 | Store-level tests: poison-signature degradation, malformed-id invalid, liveness/detector | WP01 | — | [D] |
 | T006 | `threads` broadcast: exclude retired from `pending`/`next_owner`; additive `audience_retired` (FR-006) | WP02 | — |
 | T007 | `web._all_messages` → known roster (FR-004 web) | WP02 | — |
 | T008 | threads + web tests (retired pending/audience_retired; retired history renders) | WP02 | — |
@@ -34,11 +34,11 @@
 **Independent test**: `pytest tests/test_signing.py tests/test_store.py -q` green; quickstart §§1–2 manually.
 **Estimated**: ~480 lines (5 subtasks).
 
-- [ ] T001 Signature type-guard in `verify_message` (FR-001) (WP01)
-- [ ] T002 `_ID_RE` + id-shape validation in `Message.from_raw` (FR-003) (WP01)
-- [ ] T003 `_process_alive(pid)` liveness primitive (WP01)
-- [ ] T004 `Store.foreign_wait_pid` detector (WP01)
-- [ ] T005 Store-level tests (WP01)
+- [x] T001 Signature type-guard in `verify_message` (FR-001) (WP01)
+- [x] T002 `_ID_RE` + id-shape validation in `Message.from_raw` (FR-003) (WP01)
+- [x] T003 `_process_alive(pid)` liveness primitive (WP01)
+- [x] T004 `Store.foreign_wait_pid` detector (WP01)
+- [x] T005 Store-level tests (WP01)
 
 **Dependencies**: none.
 
