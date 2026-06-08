@@ -1,17 +1,17 @@
 {
-  "event_count": 14,
-  "last_event_id": "01KTMKMMTA2WNC6N4GTDEWW8JR",
-  "materialized_at": "2026-06-08T21:53:52.458799+00:00",
+  "event_count": 16,
+  "last_event_id": "01KTMKMRT2FFTP9B38PPH4DKEV",
+  "materialized_at": "2026-06-08T21:53:56.547023+00:00",
   "mission_number": "",
   "mission_slug": "coordination-polish-0240-01KTMG5Z",
   "mission_type": "software-dev",
   "summary": {
-    "approved": 1,
+    "approved": 2,
     "blocked": 0,
     "canceled": 0,
     "claimed": 0,
     "done": 0,
-    "for_review": 2,
+    "for_review": 1,
     "in_progress": 0,
     "in_review": 0,
     "planned": 0
@@ -27,9 +27,9 @@
     "WP02": {
       "actor": "user",
       "force_count": 1,
-      "lane": "for_review",
-      "last_event_id": "01KTMJ3B0PQSH5J0533XXA6YBR",
-      "last_transition_at": "2026-06-08T21:26:56.790443+00:00"
+      "lane": "approved",
+      "last_event_id": "01KTMKMRT2FFTP9B38PPH4DKEV",
+      "last_transition_at": "2026-06-08T21:53:56.547023+00:00"
     },
     "WP03": {
       "actor": "user",
