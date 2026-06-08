@@ -164,6 +164,13 @@ the local trust model), not dropped:
 
 ## Where things stand
 
+- **0.20.0–0.23.0 (2026-06-08) closed the v0.19.0 fresh-review program.**
+  0.20–0.22 fixed all HIGH/MED/LOW review findings (review-driven, two-lane,
+  fully cross-reviewed). **0.23.0 bundled the dev-discipline `devkit` skill
+  pack** — `craft-code`, `test-coverage`, `review-code`, `write-docs`,
+  `review-docs` — into the package as a non-spec-kitty fallback: `install-skills`
+  installs it by default to `~/.claude/skills` + `~/.codex/skills` (`--no-devkit`
+  / `--devkit-only` to control), and `doctor` reports its freshness.
 - **0.13.0 shipped the whole Phase-1 ergonomics wave** (#6/#7/#8/#10
   closed) the same day the band's first retro landed — much of their
   friction list is a **version-skew report**: the quoting tax and part of
