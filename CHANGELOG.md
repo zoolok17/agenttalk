@@ -7,9 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.22.0] - 2026-06-08
 
-Review-fixes batch 3 docs/skills hardening. This entry covers the
-agent-facing prose lane prepared alongside the low-risk runtime hardening
-work.
+Review-fixes batch 3: low-risk runtime hardening, diagnostic accuracy, and
+agent-facing docs/skills contract cleanup.
+
+### Fixed
+- Atomic writes are now crash-durable: temp files are fsynced before
+  `os.replace`, POSIX parent directories are fsynced after the rename, and
+  Windows replaces retry through transient sharing violations from concurrent
+  readers. Transcript export now uses the shared atomic writer.
+- `/api/state` now degrades to errors-as-data for any single-root collection
+  failure, so one corrupt root cannot 500 the whole aggregate.
+- Message delivery and thread derivation now fail closed on an empty or corrupt
+  roster, delivering nothing instead of falling through to the old empty-roster
+  fail-open path.
+- `send -m ""` is treated as a deliberate empty body without stdin fallthrough,
+  and `send --kind rescind` / `send --kind end` are rejected in favor of the
+  dedicated commands.
+- Broadcast not-applicable rollup is last-write-wins per member: a later
+  substantive reply clears an earlier accidental `--na`.
+- Dashboard loopback checks are now address-aware, rejecting non-loopback IPv6
+  addresses that merely start with `::1` while accepting IPv4-mapped loopback.
+  The server also binds a loopback literal and uses a per-server address family
+  instead of mutating `ThreadingHTTPServer` globally.
+- `doctor` now warns when a configured operator liaison has never listened, and
+  the active-waiters diagnostic is explicit that PID reuse makes it advisory.
 
 ### Changed
 - Proposal skills now point countered proposals at `meta.in_reply_to` only;
@@ -25,6 +46,15 @@ work.
   implementer instead of rewriting a peer's patch during read-only review.
 - `SECURITY.md` now states the unsigned-mode trust boundary directly and
   records non-wall-clock cursor / future-id handling as a future design item.
+
+### Tests
+- Added `tests/test_atomic.py` coverage for durable atomic writes, cleanup after
+  write failure, Windows replace retry, and transcript atomicity.
+- Added focused regressions for empty/corrupt-roster fail-closed delivery,
+  `send -m ""`, `send --kind rescind/end` guards, broadcast `--na`
+  last-write-wins, address-aware loopback checks, localhost literal binding,
+  per-server address family, liaison-never-listened warnings, subject/meta HTML
+  escaping, and unicode/CRLF multiline body round-trip.
 
 ## [0.21.0] - 2026-06-08
 

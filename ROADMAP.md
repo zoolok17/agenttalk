@@ -132,6 +132,34 @@ Shipped:
   − self; complete `reply --dry-run --all` preflight; v1 restricted to
   non-question follow-ups.
 
+### Deferred from the v0.19.0 fresh review (post-`0.22.0` backlog)
+The combined Claude-fleet + Codex fresh-eyes review (2026-06-08) shipped all
+HIGH/MED findings as `0.20.0`/`0.21.0` and the LOW/NIT sweep as `0.22.0`.
+These remaining items were consciously deferred (low value or accepted within
+the local trust model), not dropped:
+- **`renamed_to` thread aliasing** — after a mid-flight `roster rename`,
+  in-flight pairwise threads opened to/from the old name aren't matched to the
+  successor (the old name is a tombstone you can't act as). `--drain-check`
+  surfaces open threads before rename, so this is an opt-in operator tradeoff.
+  Real fix: pass an old↔new alias map into `derive_threads`.
+- **init/reset config-lock** — `Store.init()` / `Store.reset()` write
+  `config.json` outside `_config_lock()`. init is a first-write and reset is
+  rare, so the lost-update window the 0.21.0 lock closes doesn't really apply;
+  wrap them only if reset/init concurrency becomes a real scenario.
+- **empty/single-agent roster contract** — `cmd_init` already guards ≥2 at the
+  CLI; the store-level permissiveness is unpinned. Decide + pin if it matters.
+- **future-id / non-wall-clock cursor** — a correctly-named future-dated id can
+  still advance the monotonic cursor (SECURITY.md limitation #10). Needs a
+  cursor-design decision, not an ad-hoc quarantine.
+- **`multi_store` pinned-root walk** — the split-brain check walks from CWD; a
+  pinned `--root` elsewhere is surfaced via the existing pinned-note rather than
+  a second walk. Deepen only if it proves confusing in practice.
+- **`serve` localhost display** — `serve --host localhost` prints
+  `http://localhost:…` though it now binds the `127.0.0.1` literal. Cosmetic.
+- **HTTPResponse teardown warning** — an intermittent benign urllib test-client
+  unraisable at GC; not a runtime issue. Tidy `test_web` response closing if it
+  becomes noisy.
+
 ---
 
 ## Where things stand
