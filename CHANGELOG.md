@@ -5,6 +5,35 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] - 2026-06-08
+
+Review-fixes batch 2: medium-severity correctness and test-coverage fixes from
+the v0.19.0 fresh-review pass. Implemented test-first and Codex-reviewed.
+
+### Fixed
+- `/api/state` now applies the same composing-marker freshness rule as the
+  CLI: only `0 <= age <= COMPOSING_INTENT_STALE_SECONDS` is shown. Stale or
+  future-dated composing markers no longer make the dashboard show abandoned
+  writers as actively composing.
+- Roster/admin config mutations are serialized with an `O_EXCL` sidecar lock
+  around `config.json` read-modify-write operations. This prevents concurrent
+  roster changes from silently losing updates, including retire/rename
+  tombstones.
+- Pairwise open-outbound thread hints no longer name a retired peer as
+  `next_owner`. The thread remains visible, but the derived owner no longer
+  points at a tombstone that cannot reply.
+- `agenttalk codex-config --enable/--disable` now preserves CRLF line endings
+  without double-translation, avoiding silent rewrites of Windows-style config
+  files.
+
+### Tests
+- Added concurrent send coverage for in-process threads and cross-process
+  writers to guard against message id/file clobbering.
+- Added config-lock tests for live-holder timeout, dead-pid stale-lock cleanup,
+  and concurrent roster updates without lost config writes.
+- Added focused coverage for stale dashboard composing markers, retired-peer
+  thread hints, and CRLF preservation in `codex-config`.
+
 ## [0.20.0] - 2026-06-08
 
 Review-fixes batch 1: high-severity findings from the v0.19.0 fresh-review
