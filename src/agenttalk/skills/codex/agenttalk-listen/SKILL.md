@@ -156,7 +156,9 @@ to review it.
    - If neither is available and you can't determine what to review,
      send a `kind=message` asking for clarification first.
 3. **Review read-only.** Do NOT modify the peer's files.
-4. **Send the verdict** via `kind=review-result`:
+4. Point findings back to the implementer; the reviewer owns the
+   diagnosis, not rewriting the patch.
+5. **Send the verdict** via `kind=review-result`:
    - `--meta status=approved|rejected|needs-info`
    - `--meta request_id=<echoed>`
    - Body: Findings (ordered by severity, with file/line refs),

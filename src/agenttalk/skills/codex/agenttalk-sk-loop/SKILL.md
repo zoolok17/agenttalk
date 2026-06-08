@@ -25,6 +25,7 @@ mission completion, `kind=end`, or when the user explicitly stops you.
 ```bash
 SELF="${AGENTTALK_SELF:-codex}"
 PEER="${AGENTTALK_PEER:-claude}"
+MODEL_TAG="${AGENTTALK_MODEL_TAG:-gpt-5}"
 ```
 
 `PEER` is the wake target for this terminal. In a roster with more
@@ -32,7 +33,8 @@ than two agents, set `AGENTTALK_PEER` explicitly to the teammate you
 expect to wake for this lane, or use a lead/listen workflow outside
 the sk-loop for broader coordination. Always resolve inside your
 current shell - env from prior tool calls does not persist across
-separate tool-call processes.
+separate tool-call processes. Set `AGENTTALK_MODEL_TAG` when the
+mission coordinator wants a specific spec-kitty model label.
 
 If `.agenttalk/` is not under the current directory, pass `--root
 <path>` before the subcommand on every invocation, for example
@@ -86,7 +88,7 @@ spec-kitty returns.
 
 #### Action: implement WP##
 
-1. Claim: `spec-kitty agent action implement WP## --mission "$MISSION" --agent "$SELF":gpt-5.5:implementer:implementer`
+1. Claim: `spec-kitty agent action implement WP## --mission "$MISSION" --agent "${SELF}:${MODEL_TAG}:implementer:implementer"`
 2. `cd` into the workspace path printed by the claim.
 3. Read the prompt file. Execute the work (read existing code first,
    write code, write tests, run the project's validation command).
@@ -104,7 +106,7 @@ spec-kitty returns.
 
 #### Action: review WP##
 
-1. Claim: `spec-kitty agent action review WP## --mission "$MISSION" --agent "$SELF":gpt-5.5:reviewer:reviewer`
+1. Claim: `spec-kitty agent action review WP## --mission "$MISSION" --agent "${SELF}:${MODEL_TAG}:reviewer:reviewer"`
 2. `cd` into the workspace path printed by the claim.
 3. Read the review prompt file. Run the diff commands inside it.
 4. Verify acceptance criteria, owned_files boundary, dead-code check

@@ -95,11 +95,12 @@ the user which agent should receive the handoff.
 ### 2. Generate a request_id
 
 ```powershell
-$reqId = [guid]::NewGuid().ToString()
+$reqId = "rq-" + [guid]::NewGuid().ToString()
 ```
 
 Required so the receiver can echo it back in `review-result` and you
-can match the verdict to your request.
+can match the verdict to your request. Use the `rq-` prefix for review
+requests so they stay visually distinct from proposal ids (`pp-...`).
 
 ### 3. Build the meta
 

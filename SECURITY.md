@@ -1,6 +1,6 @@
 # Security policy & threat model
 
-> Last updated: 2026-06-07 (v0.18.0)
+> Last updated: 2026-06-08 (v0.22.0)
 
 agenttalk is a small file-backed message bus. The trust model is
 local: if you can write to a project's `.agenttalk/` directory, you
@@ -47,6 +47,10 @@ If your threat model includes **another local user with project-dir
 write access but no per-user key-dir access**, see the "Delivered in
 0.6.0" section below — optional HMAC signatures defend exactly that
 case (enable via `agenttalk hmac-init`).
+
+If signing is not enforced, unsigned mode trusts any local writer who
+can drop a well-formed file into `.agenttalk/messages/`. That is the
+default local-coordination posture, not an authentication boundary.
 
 For **same OS user** attackers and shared/network-mounted
 `.agenttalk/` dirs where the attacker can also read your per-user
@@ -385,6 +389,11 @@ Two **documented, unfixed** limitations (stated honestly, not closed):
    needs to treat one rostered participant as less trusted than
    another, it will need per-agent keys and explicit authorization
    semantics.
+10. **Non-wall-clock cursors / future-id handling.** Today, message
+    ids sort lexically by wall-clock timestamp. A non-wall-clock cursor
+    design, or an explicit future-id quarantine policy, is still needed
+    before synced or skewed-clock stores can make stronger ordering
+    promises.
 
 ### Roadmap detail: optional HMAC signatures (0.6.0+ if needed)
 

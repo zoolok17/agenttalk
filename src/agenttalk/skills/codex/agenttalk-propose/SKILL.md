@@ -97,7 +97,7 @@ implementation work.
      or ask the user.
    - `proposal-response status=countered`: treat the old proposal as
      closed, then read the fresh counter proposal linked by
-     `meta.in_reply_to` or `meta.counter_request_id`.
+     `meta.in_reply_to`.
 
 Scoped wait intentionally ignores unrelated traffic. If the proposal
 stalls or you suspect another urgent thread is waiting on you, run

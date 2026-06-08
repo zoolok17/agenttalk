@@ -28,6 +28,7 @@ Resolve your name in your current shell:
 ```powershell
 $SELF = if ($env:AGENTTALK_SELF) { $env:AGENTTALK_SELF } else { "claude" }
 $PEER = if ($env:AGENTTALK_PEER) { $env:AGENTTALK_PEER } else { "codex" }
+$MODEL_TAG = if ($env:AGENTTALK_MODEL_TAG) { $env:AGENTTALK_MODEL_TAG } else { "claude-code" }
 ```
 
 `PEER` is the wake target for this terminal. In a roster with more
@@ -35,7 +36,8 @@ than two agents, set `AGENTTALK_PEER` explicitly to the teammate you
 expect to wake for this lane, or use a lead/listen workflow outside
 the sk-loop for broader coordination. Always resolve inside your
 current shell - env from prior tool calls does not persist across
-separate tool-call processes.
+separate tool-call processes. Set `AGENTTALK_MODEL_TAG` when the
+mission coordinator wants a specific spec-kitty model label.
 
 If `.agenttalk/` is not under the current directory, pass `--root
 <path>` before the subcommand on every invocation, for example
@@ -91,7 +93,7 @@ whichever spec-kitty returns.
 
 #### Action: implement WP##
 
-1. Claim: `spec-kitty agent action implement WP## --mission $MISSION --agent ${SELF}:opus-4-7:implementer:implementer`
+1. Claim: `spec-kitty agent action implement WP## --mission $MISSION --agent ${SELF}:${MODEL_TAG}:implementer:implementer`
 2. `cd` into the workspace path printed by the claim.
 3. Read the prompt file. Execute the work (read existing code first,
    write code, write tests, run the project's validation command).
@@ -109,7 +111,7 @@ whichever spec-kitty returns.
 
 #### Action: review WP##
 
-1. Claim: `spec-kitty agent action review WP## --mission $MISSION --agent ${SELF}:opus-4-7:reviewer:reviewer`
+1. Claim: `spec-kitty agent action review WP## --mission $MISSION --agent ${SELF}:${MODEL_TAG}:reviewer:reviewer`
 2. `cd` into the workspace path printed by the claim.
 3. Read the review prompt file. Run the diff commands inside it.
 4. Verify acceptance criteria, owned_files boundary, dead-code check.

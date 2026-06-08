@@ -93,10 +93,12 @@ the user which agent should receive the handoff.
 ### 2. Generate a request_id
 
 ```bash
-REQ_ID=$(uuidgen 2>/dev/null || python -c 'import uuid; print(uuid.uuid4())')
+REQ_ID="rq-$(uuidgen 2>/dev/null || python -c 'import uuid; print(uuid.uuid4())')"
 ```
 
 Required for correlation - the receiver echoes it in `review-result`.
+Use the `rq-` prefix for review requests so they stay visually distinct
+from proposal ids (`pp-...`).
 
 ### 3. Build the meta
 

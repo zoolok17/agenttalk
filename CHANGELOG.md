@@ -5,6 +5,27 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] - 2026-06-08
+
+Review-fixes batch 3 docs/skills hardening. This entry covers the
+agent-facing prose lane prepared alongside the low-risk runtime hardening
+work.
+
+### Changed
+- Proposal skills now point countered proposals at `meta.in_reply_to` only;
+  the removed `meta.counter_request_id` field was never part of the CLI
+  contract.
+- Handoff skills now mint review-request ids with an `rq-` prefix, keeping
+  them visually distinct from proposal ids (`pp-...`).
+- Spec-kitty loop skills now use `AGENTTALK_MODEL_TAG` with conservative
+  defaults instead of stale hard-coded model-version labels.
+- The Codex consult skill now parses `agenttalk status --json` through stdin
+  and no longer depends on `bc` for freshness checks.
+- Codex listen review guidance now explicitly sends findings back to the
+  implementer instead of rewriting a peer's patch during read-only review.
+- `SECURITY.md` now states the unsigned-mode trust boundary directly and
+  records non-wall-clock cursor / future-id handling as a future design item.
+
 ## [0.21.0] - 2026-06-08
 
 Review-fixes batch 2: medium-severity correctness and test-coverage fixes from

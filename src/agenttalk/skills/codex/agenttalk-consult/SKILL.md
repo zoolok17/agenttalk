@@ -78,11 +78,20 @@ Run `agenttalk status --json` and parse the result. For each entry
 in `agents`, check the one matching `$TARGET`:
 
 ```bash
-STATUS_JSON=$(agenttalk status --json)
-TARGET_HB=$(python -c "import json,sys; d=json.loads('''$STATUS_JSON''');
-a=[x for x in d['agents'] if x['name']=='$TARGET'][0];
-print(a['last_seen_seconds'] if a['heartbeat'] else 'none')")
-if [ "$TARGET_HB" = "none" ] || (( $(echo "$TARGET_HB > 300" | bc -l) )); then
+TARGET_STATE=$(
+  agenttalk status --json |
+    TARGET="$TARGET" python -c 'import json, os, sys
+target = os.environ["TARGET"]
+data = json.load(sys.stdin)
+agent = next((x for x in data["agents"] if x["name"] == target), None)
+try:
+    age = float(agent.get("last_seen_seconds")) if agent else float("inf")
+except (TypeError, ValueError):
+    age = float("inf")
+fresh = bool(agent and agent.get("heartbeat") and age <= 300)
+print("fresh" if fresh else "stale")'
+)
+if [ "$TARGET_STATE" = "stale" ]; then
   echo "Skip consult; target not listening."
 fi
 ```
