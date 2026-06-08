@@ -22,6 +22,8 @@ subtasks:
 - T008
 - T009
 - T010
+agent: "claude"
+shell_pid: "28516"
 history:
 - Created by /spec-kitty.tasks for coordination-polish-0240-01KTMG5Z
 authoritative_surface: src/agenttalk/cli.py
@@ -164,3 +166,7 @@ Planning base **master**; final merge target **master**. Branch from WP01's lane
 ## Implementation command
 
 `spec-kitty agent action implement WP02 --agent <name>`
+
+## Activity Log
+
+- 2026-06-08T21:14:57Z – claude – shell_pid=28516 – Started implementation via action command
