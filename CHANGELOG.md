@@ -5,6 +5,32 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-06-08
+
+Review-fixes batch 1: high-severity findings from the v0.19.0 fresh-review
+pass, plus the independently converged HMAC key-health finding. Implemented
+test-first and Codex-reviewed.
+
+### Fixed
+- Message files whose filename stem does not match the embedded `id` are now
+  invalid/quarantinable instead of deliverable. This closes the
+  low-sorting-filename / high-embedded-id cursor-poisoning vector.
+- Validated message delivery and thread replay now explicitly sort by message
+  id, restoring the documented chronological contract; duplicate ids are
+  defensively de-duplicated.
+- `agenttalk init` now honors the global root contract: `--path`/`--here`
+  still wins, then global `--root`, then `$AGENTTALK_ROOT`, then CWD. This
+  prevents accidental second-store creation when a root was pinned globally.
+- HMAC key loading, inspection, and verification now reject empty, short, or
+  garbage key files. `doctor` reports invalid keys as errors instead of
+  falsely showing signing as enabled and healthy.
+
+### Notes
+- A correctly named future-dated message id can still expose the broader
+  clock-skew/monotonic-cursor tradeoff in unsigned mode. That remains a
+  separate design item; no ad hoc timestamp quarantine was added in this
+  release.
+
 ## [0.19.0] - 2026-06-08
 
 Dashboard polish release (issue #22): presentation upgrade on the existing
