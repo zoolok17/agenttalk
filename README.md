@@ -18,8 +18,8 @@ exported on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.22.0"
-agenttalk install-skills          # copies skill files into ~/.claude/commands and ~/.codex/skills
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.23.0"
+agenttalk install-skills          # installs bus skills + the dev-discipline devkit
 
 # in your project root, once per project
 agenttalk init --here --agents claude,codex
@@ -123,10 +123,10 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.22.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.23.0"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.22.0` with
+Pin to a specific tag so you control upgrades. Replace `v0.23.0` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
@@ -143,6 +143,29 @@ re-running pip.
 
 Either path puts an `agenttalk` script on your PATH. The package is
 stdlib-only (no third-party runtime deps) and requires Python 3.10+.
+
+Install the bundled agent skills once per user:
+
+```powershell
+agenttalk install-skills
+```
+
+By default this installs two skill families:
+
+- The agenttalk bus skills for cross-agent collaboration:
+  `~/.claude/commands/agenttalk.*.md` for Claude Code and
+  `~/.codex/skills/agenttalk-*/SKILL.md` for Codex.
+- The dev-discipline devkit, shared by both agents:
+  `craft-code`, `test-coverage`, `review-code`, `write-docs`, and
+  `review-docs` under both `~/.claude/skills/` and `~/.codex/skills/`.
+
+Use `agenttalk install-skills --no-devkit` to install only the bus
+skills, or `agenttalk install-skills --devkit-only` to refresh only the
+devkit. `--claude-only` and `--codex-only` scope the bus skills only;
+the devkit is shared unless you pass `--no-devkit`. Existing edited
+files are preserved unless you pass `--force`; use `--dry-run --force`
+to preview overwrites first. Restart Claude Code and Codex after
+installing or refreshing skills.
 
 If you also want Codex to call agenttalk from inside its sandbox, run
 this once per project root:
@@ -178,8 +201,9 @@ This creates `.agenttalk/` with:
   sessions/            markdown/jsonl transcripts written by `agenttalk end`
 ```
 
-Slash commands are installed globally (one-time, not per project) via
-`agenttalk install-skills` — see the [Install](#install) section.
+Slash commands and Agent Skills are installed globally (one-time, not
+per project) via `agenttalk install-skills` — see the [Install](#install)
+section.
 
 ---
 
@@ -667,9 +691,9 @@ so the long timeout is free observability.
 | `agenttalk tail [--from-start] [--interval S] [--timeout S]` | Passive monitor: stream all messages as they arrive. Does **not** advance cursors or write heartbeats — safe to run in a third terminal alongside two active agents. `--from-start` replays existing messages first. |
 | `agenttalk serve [--port P] [--host H] [--access-log]` | Start a **read-only** local web dashboard at `http://127.0.0.1:8765/` for browsing the message log in a real browser. **Loopback-only by design** — only `127.0.0.1`, `::1`, and `localhost` are accepted; there is no flag to expose it elsewhere (SSH-tunnel `localhost:<port>` from another machine if needed). HTML output is escaped, strict CSP, `GET`/`HEAD` only, peer-IP check on every method. JSON at `/api/status` and `/api/messages` for scripting. 0.17.0: the same server also serves `/dashboard` (the obligation view) and `/api/state`; a port that can't be bound now exits **2** with a `--port 0` hint instead of a raw traceback. See `SECURITY.md`. |
 | `agenttalk dashboard [--port P] [--store PATH]... [--access-log]` | The **obligation dashboard** (0.17.0): who owes what, whose turn it is, and the next action — per agent, per open thread, with mission/WP tags and epoch staleness. Same read-only loopback-only server as `serve`, landing on `http://127.0.0.1:8765/dashboard`; auto-refreshes every ~2 s. Repeat `--store <project-root>` to watch **several projects in one tab** (each path is the project root itself — no upward search; an uninitialized path shows as a degraded panel, not an error). No `--host` option exists on this spelling. `GET /api/state` (`schema_version: 1`) is the same data for scripting. |
-| `agenttalk install-skills [--claude-only\|--codex-only] [--force] [--dry-run]` | Copy bundled skill files to `~/.claude/commands/` and `~/.codex/skills/`. Idempotent — preserves your local edits unless `--force`. |
+| `agenttalk install-skills [--claude-only\|--codex-only] [--no-devkit\|--devkit-only] [--force] [--dry-run]` | Copy bundled bus skills to `~/.claude/commands/` and `~/.codex/skills/`, and by default copy the shared dev-discipline devkit (`craft-code`, `test-coverage`, `review-code`, `write-docs`, `review-docs`) to both `~/.claude/skills/` and `~/.codex/skills/`. `--claude-only` and `--codex-only` scope only the bus skills; use `--no-devkit` to skip the shared devkit. Idempotent — preserves your local edits unless `--force`; use `--dry-run --force` to preview overwrites. |
 | `agenttalk codex-config [--enable\|--disable\|--status]` | Manage per-project sandbox/trust block in `~/.codex/config.toml` so Codex can call agenttalk from inside its sandbox. |
-| `agenttalk doctor [--json]` | Health check: store initialized, skills installed + in sync, Codex sandbox block configured, heartbeats fresh. Per the global exit-code contract, exit 2 on any error; warnings exit 0 with the warning state visible in output. |
+| `agenttalk doctor [--json]` | Health check: store initialized, bus skills installed + in sync, devkit absent/in sync/stale state surfaced, Codex sandbox block configured, heartbeats fresh. Per the global exit-code contract, exit 2 on any error; warnings exit 0 with the warning state visible in output. |
 | `agenttalk status --json` | Structured status output for automation (consult freshness, external tooling). Same data as plain `status` plus `invalid_messages[]`, `warnings[]`, per-agent `waiting` / `waiting_stale`, and thread-derived warning state (additive — existing keys unchanged). |
 | `agenttalk --version` | Print the installed version. |
 

@@ -5,6 +5,34 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] - 2026-06-08
+
+Dev-discipline skill bundle: agenttalk now ships the five shared coding
+discipline skills as version-controlled package content, so teams no longer
+depend on untracked personal/global copies.
+
+### Added
+- Bundled the devkit skill pack under `src/agenttalk/skills/devkit/`:
+  `craft-code`, `test-coverage`, `review-code`, `write-docs`, and
+  `review-docs`, including `review-code/references/security.md`.
+- `agenttalk install-skills --devkit-only` installs only the devkit pack to
+  both `~/.claude/skills/` and `~/.codex/skills/`.
+- `agenttalk doctor` now reports `devkit_skills`, surfacing full absence as an
+  opt-out-friendly OK hint while warning on partial or stale devkit installs.
+
+### Changed
+- `agenttalk install-skills` now installs the devkit by default alongside the
+  existing bus skills. Use `--no-devkit` to keep the old bus-only behavior.
+- Added `--claude-skills-dir` and `--codex-skills-dir` overrides for testing or
+  custom devkit install locations. The existing `--claude-only` and
+  `--codex-only` flags continue to scope only the bus-skill side.
+
+### Tests
+- Added installer coverage for devkit package presence, default library
+  behavior, both-agent install layout, `--devkit-only`, `--no-devkit`, and
+  devkit frontmatter.
+- Added doctor coverage for absent, in-sync, partial, and stale devkit states.
+
 ## [0.22.0] - 2026-06-08
 
 Review-fixes batch 3: low-risk runtime hardening, diagnostic accuracy, and
