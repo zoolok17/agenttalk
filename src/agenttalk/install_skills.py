@@ -1,12 +1,19 @@
 """Copy bundled skill files out to the global locations Claude Code and
 Codex actually scan.
 
-Claude Code reads slash commands from ``~/.claude/commands/*.md``.
-Codex reads skills from ``~/.codex/skills/<name>/SKILL.md``.
+Two skill families ship in the package:
 
-We ship canonical copies inside the package at
-``src/agenttalk/skills/{claude,codex}/...`` and this module copies them
-out on demand.
+* **Bus skills** (the agenttalk collaboration commands). Claude reads these
+  as slash commands from ``~/.claude/commands/*.md``; Codex reads them from
+  ``~/.codex/skills/<name>/SKILL.md``. The two sides differ in format, so they
+  have separate sources under ``src/agenttalk/skills/{claude,codex}/``.
+* **Devkit skills** (the dev-discipline pack: craft-code, test-coverage,
+  review-code, write-docs, review-docs — a non-spec-kitty fallback). These are
+  byte-identical Agent-Skills ``SKILL.md`` folders for BOTH agents, so a single
+  source under ``src/agenttalk/skills/devkit/<name>/`` installs to BOTH
+  ``~/.claude/skills/<name>/`` and ``~/.codex/skills/<name>/``.
+
+This module copies them out on demand.
 """
 
 from __future__ import annotations
@@ -25,6 +32,16 @@ def default_claude_dir() -> Path:
 
 
 def default_codex_dir() -> Path:
+    return Path.home() / ".codex" / "skills"
+
+
+def default_claude_skills_dir() -> Path:
+    """Claude Agent-Skills dir — where the devkit installs (auto-invocable +
+    gives the /<name> command). Distinct from the bus-command dir."""
+    return Path.home() / ".claude" / "skills"
+
+
+def default_codex_skills_dir() -> Path:
     return Path.home() / ".codex" / "skills"
 
 
@@ -82,16 +99,46 @@ def _codex_pairs(codex_dir: Path) -> list[tuple[Path, Path]]:
     return pairs
 
 
+def _devkit_pairs(claude_skills_dir: Path, codex_skills_dir: Path) -> list[tuple[Path, Path]]:
+    """Dev-discipline pack, paired with BOTH agents' Agent-Skills dirs.
+
+    The devkit is format-identical for both agents, so one bundled source under
+    ``skills/devkit/<name>/`` maps to ``<claude_skills_dir>/<name>/...`` AND
+    ``<codex_skills_dir>/<name>/...``. Each skill folder is copied whole, so a
+    nested ``references/`` file (e.g. review-code/references/security.md) goes
+    along with the SKILL.md.
+    """
+    src_dir = SKILLS_ROOT / "devkit"
+    pairs: list[tuple[Path, Path]] = []
+    if not src_dir.exists():
+        return pairs
+    for src in sorted(src_dir.rglob("*")):
+        if not src.is_file():
+            continue
+        rel = src.relative_to(src_dir)  # e.g. review-code/references/security.md
+        pairs.append((src, claude_skills_dir / rel))
+        pairs.append((src, codex_skills_dir / rel))
+    return pairs
+
+
 def install(
     *,
     claude: bool = True,
     codex: bool = True,
+    devkit: bool = False,
     claude_dir: Path | None = None,
     codex_dir: Path | None = None,
+    claude_skills_dir: Path | None = None,
+    codex_skills_dir: Path | None = None,
     force: bool = False,
     dry_run: bool = False,
 ) -> InstallResult:
     """Copy skill files to their global locations.
+
+    ``claude`` / ``codex`` gate the bus skills; ``devkit`` gates the
+    dev-discipline pack (installed to BOTH agents' Agent-Skills dirs).
+    ``devkit`` defaults False here so library callers (and tests) never write
+    to a real HOME implicitly — the CLI turns it on by default.
 
     Idempotent: if a target file is byte-identical to the source it's
     reported as ``unchanged``. If the target exists but differs and
@@ -101,12 +148,16 @@ def install(
     result = InstallResult()
     claude_dir = (claude_dir or default_claude_dir()).expanduser()
     codex_dir = (codex_dir or default_codex_dir()).expanduser()
+    claude_skills_dir = (claude_skills_dir or default_claude_skills_dir()).expanduser()
+    codex_skills_dir = (codex_skills_dir or default_codex_skills_dir()).expanduser()
 
     pairs: list[tuple[Path, Path]] = []
     if claude:
         pairs.extend(_claude_pairs(claude_dir))
     if codex:
         pairs.extend(_codex_pairs(codex_dir))
+    if devkit:
+        pairs.extend(_devkit_pairs(claude_skills_dir, codex_skills_dir))
 
     for src, dst in pairs:
         action = _plan_one(src, dst, force=force, dry_run=dry_run)

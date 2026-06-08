@@ -2357,20 +2357,30 @@ def cmd_hmac_init(args: argparse.Namespace) -> int:
 
 
 def cmd_install_skills(args: argparse.Namespace) -> int:
-    claude = not args.codex_only
-    codex = not args.claude_only
-    if not claude and not codex:
-        sys.stderr.write("agenttalk install-skills: nothing to do (both sides excluded)\n")
+    if args.devkit_only:
+        claude = codex = False
+        devkit = True
+    else:
+        claude = not args.codex_only
+        codex = not args.claude_only
+        devkit = not args.no_devkit  # dev-discipline pack installs by default
+    if not (claude or codex or devkit):
+        sys.stderr.write("agenttalk install-skills: nothing to do (everything excluded)\n")
         return 2
 
     claude_dir = Path(args.claude_dir) if args.claude_dir else None
     codex_dir = Path(args.codex_dir) if args.codex_dir else None
+    claude_skills_dir = Path(args.claude_skills_dir) if args.claude_skills_dir else None
+    codex_skills_dir = Path(args.codex_skills_dir) if args.codex_skills_dir else None
 
     res = iskl.install(
         claude=claude,
         codex=codex,
+        devkit=devkit,
         claude_dir=claude_dir,
         codex_dir=codex_dir,
+        claude_skills_dir=claude_skills_dir,
+        codex_skills_dir=codex_skills_dir,
         force=args.force,
         dry_run=args.dry_run,
     )
@@ -3374,12 +3384,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     pis = sub.add_parser(
         "install-skills",
-        help="Copy bundled agenttalk skill files to ~/.claude/commands/ and ~/.codex/skills/.",
+        help="Copy bundled skills out: agenttalk bus skills to ~/.claude/commands/ + "
+             "~/.codex/skills/, and the dev-discipline pack to ~/.claude/skills/ + "
+             "~/.codex/skills/ (skip with --no-devkit).",
     )
-    pis.add_argument("--claude-only", action="store_true", help="Install only Claude-side skills")
-    pis.add_argument("--codex-only", action="store_true", help="Install only Codex-side skills")
-    pis.add_argument("--claude-dir", help="Override Claude commands dir (default: ~/.claude/commands)")
-    pis.add_argument("--codex-dir", help="Override Codex skills dir (default: ~/.codex/skills)")
+    pis.add_argument("--claude-only", action="store_true", help="Install only Claude-side bus skills")
+    pis.add_argument("--codex-only", action="store_true", help="Install only Codex-side bus skills")
+    pis.add_argument("--no-devkit", action="store_true",
+                     help="Skip the dev-discipline pack; install only the agenttalk bus skills")
+    pis.add_argument("--devkit-only", action="store_true",
+                     help="Install ONLY the dev-discipline pack (to the Agent-Skills dirs), "
+                          "not the agenttalk bus skills")
+    pis.add_argument("--claude-dir", help="Override Claude bus-command dir (default: ~/.claude/commands)")
+    pis.add_argument("--codex-dir", help="Override Codex bus-skills dir (default: ~/.codex/skills)")
+    pis.add_argument("--claude-skills-dir",
+                     help="Override Claude devkit Agent-Skills dir (default: ~/.claude/skills)")
+    pis.add_argument("--codex-skills-dir",
+                     help="Override Codex devkit skills dir (default: ~/.codex/skills)")
     pis.add_argument("--force", action="store_true",
                      help="Overwrite existing files even if they differ from bundled")
     pis.add_argument("--dry-run", action="store_true", help="Show what would happen without writing")
