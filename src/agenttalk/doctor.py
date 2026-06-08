@@ -91,6 +91,9 @@ def run(project_root: Path | None = None) -> Report:
     # error IS the registry-hygiene finding for that case.
     if store.initialized() and init_check.status != "error":
         report.checks.append(_check_operator_facing(store))
+        esc_target = _check_escalation_target(store)
+        if esc_target is not None:  # additive: absent for solo/healthy rosters
+            report.checks.append(esc_target)
         report.checks.append(_check_identity_registry(store))
         report.checks.append(_check_store_hygiene(store))
         report.checks.extend(_check_skills())
@@ -227,6 +230,36 @@ def _check_operator_facing(store: Store) -> Check:
         name="operator_facing",
         status="ok",
         details=f"liaison: {resolved}",
+    )
+
+
+def _check_escalation_target(store: Store) -> Check | None:
+    """No-human-facing-target nudge (0.24.0, feedback 3.1).
+
+    Warns a MULTI-agent team that has neither a resolvable liaison nor a sole
+    lead: `agenttalk escalate` would have nowhere to route an operator question.
+    Returns None — the check is ABSENT — for a solo roster, or when a liaison OR
+    a sole lead exists, so healthy and single-window setups stay quiet. Advisory
+    only; it can only push the report to `warn`, never `error`.
+
+    Distinct from `_check_operator_facing`, which is about liaison freshness and
+    fires only once escalation traffic exists; this one is proactive and fires
+    on the structural gap before any escalation is attempted.
+    """
+    cfg = store.load_config()
+    agents = cfg.get("agents", []) or []
+    if len(agents) < 2:
+        return None  # solo: nothing to escalate between; never warn
+    if store.operator_facing() is not None or store.sole_lead() is not None:
+        return None  # a liaison OR a lead is a valid escalation target
+    return Check(
+        name="escalation_target",
+        status="warn",
+        details=("no human-facing escalation target: this team has neither a "
+                 "liaison nor a lead, so `agenttalk escalate` has nowhere to go"),
+        fix=("designate one: `agenttalk roster set-operator-facing <agent>` "
+             "(liaison) or `agenttalk roster set-role <agent> lead`"),
+        data={"agents": len(agents)},
     )
 
 

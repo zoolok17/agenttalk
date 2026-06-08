@@ -2692,3 +2692,156 @@ def test_wait_no_warning_when_no_duplicate(tmp_path: Path, capsys,
     err = capsys.readouterr().err
     assert "another live process" not in err
     assert rc == 1
+
+
+# --- 0.24.0: escalate lead-fallback (WP02, FR-001/002/003) ----------------
+
+def _lead_team(tmp_path: Path) -> Path:
+    Store(tmp_path).init(["alpha", "beta", "gamma"])
+    return tmp_path
+
+
+def test_escalate_falls_back_to_lead(tmp_path: Path, capsys) -> None:
+    root = _lead_team(tmp_path)
+    Store(root).set_role("beta", "lead")
+    rc = _run(["escalate", "--from", "alpha", "-m", "need a ruling"], root)
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "routing to the lead 'beta'" in out.err
+    assert "request_id=esc-" in out.out
+
+
+def test_escalate_no_liaison_no_lead_exits_2_with_both_remediations(
+    tmp_path: Path, capsys,
+) -> None:
+    root = _lead_team(tmp_path)
+    rc = _run(["escalate", "--from", "alpha", "-m", "x"], root)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "set-operator-facing" in err and "set-role" in err
+
+
+def test_escalate_liaison_takes_precedence_over_lead(tmp_path: Path, capsys) -> None:
+    root = _lead_team(tmp_path)
+    s = Store(root)
+    s.set_operator_facing("gamma")
+    s.set_role("beta", "lead")
+    rc = _run(["escalate", "--from", "alpha", "-m", "x"], root)
+    out = capsys.readouterr()
+    assert rc == 0
+    assert "routing to the lead" not in out.err  # liaison wins
+
+
+def test_escalate_to_override_beats_lead(tmp_path: Path, capsys) -> None:
+    root = _lead_team(tmp_path)
+    Store(root).set_role("beta", "lead")
+    rc = _run(["escalate", "--from", "alpha", "--to", "gamma", "-m", "x"], root)
+    assert rc == 0
+    assert "routing to the lead" not in capsys.readouterr().err
+
+
+def test_escalate_two_legacy_leads_exits_2(tmp_path: Path, capsys) -> None:
+    root = _lead_team(tmp_path)
+    s = Store(root)
+    cfg = s.load_config()
+    cfg["roles"] = {"beta": "lead", "gamma": "lead"}
+    s._write_config(cfg)
+    rc = _run(["escalate", "--from", "alpha", "-m", "x"], root)
+    assert rc == 2  # sole_lead() ambiguous -> None -> refuse
+
+
+# --- 0.24.0: roster set-role demote/promote notice (WP02, FR-005) ---------
+
+def test_roster_set_role_lead_prints_demote_promote(tmp_path: Path, capsys) -> None:
+    root = _lead_team(tmp_path)
+    _run(["roster", "set-role", "alpha", "lead"], root)
+    capsys.readouterr()
+    rc = _run(["roster", "set-role", "beta", "lead"], root)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "demoted alpha, promoted beta to lead" in out
+
+
+def test_roster_set_role_lead_idempotent_no_demote_line(tmp_path: Path, capsys) -> None:
+    root = _lead_team(tmp_path)
+    _run(["roster", "set-role", "alpha", "lead"], root)
+    capsys.readouterr()
+    _run(["roster", "set-role", "alpha", "lead"], root)
+    assert "demoted" not in capsys.readouterr().out
+
+
+# --- 0.24.0: wake wk- correlation id (WP02, FR-010/011) -------------------
+
+def test_send_wake_mints_wk_id(tmp_path: Path, capsys) -> None:
+    root = _lead_team(tmp_path)
+    rc = _run(["send", "--from", "alpha", "--to", "beta", "--kind", "wake",
+               "-m", "resume"], root)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "wk-" in out
+    wake = [m for m in Store(root).valid_messages() if m.kind == "wake"][-1]
+    assert (wake.meta or {}).get("request_id", "").startswith("wk-")
+
+
+def test_send_wake_honors_explicit_request_id(tmp_path: Path) -> None:
+    root = _lead_team(tmp_path)
+    rc = _run(["send", "--from", "alpha", "--to", "beta", "--kind", "wake",
+               "--meta", "request_id=mine-123", "-m", "resume"], root)
+    assert rc == 0
+    wake = [m for m in Store(root).valid_messages() if m.kind == "wake"][-1]
+    assert (wake.meta or {}).get("request_id") == "mine-123"
+
+
+# --- 0.24.0: owed-inbound pre-send warning (WP02, FR-012/013/014) ---------
+
+def test_send_warns_when_owing_peer_a_proposal(tmp_path: Path, capsys) -> None:
+    root = _lead_team(tmp_path)
+    _run(["propose", "--from", "beta", "--to", "alpha", "-m", "a vs b"], root)
+    capsys.readouterr()
+    rc = _run(["send", "--from", "alpha", "--to", "beta", "--kind", "note",
+               "-m", "ping"], root)
+    out = capsys.readouterr()
+    assert rc == 0  # send still succeeds
+    assert "you owe beta an open decision-request" in out.err
+    assert "proposal pp-" in out.err
+
+
+def test_send_no_warning_when_replying_same_request_id(tmp_path: Path, capsys) -> None:
+    root = _lead_team(tmp_path)
+    _run(["propose", "--from", "beta", "--to", "alpha", "-m", "a vs b"], root)
+    pp = [m for m in Store(root).valid_messages()
+          if m.kind == "proposal"][-1].meta["request_id"]
+    capsys.readouterr()
+    _run(["send", "--from", "alpha", "--to", "beta", "--kind", "note",
+          "--meta", f"request_id={pp}", "-m", "go with a"], root)
+    assert "you owe" not in capsys.readouterr().err
+
+
+def test_send_no_warning_for_non_decision_owed(tmp_path: Path, capsys) -> None:
+    root = _lead_team(tmp_path)
+    _run(["send", "--from", "beta", "--to", "alpha", "--kind", "question",
+          "-m", "status?"], root)
+    capsys.readouterr()
+    _run(["send", "--from", "alpha", "--to", "beta", "--kind", "note",
+          "-m", "hi"], root)
+    assert "you owe" not in capsys.readouterr().err
+
+
+def test_send_owed_warning_is_best_effort(tmp_path: Path, capsys, monkeypatch) -> None:
+    root = _lead_team(tmp_path)
+
+    def _boom(*a, **k):
+        raise RuntimeError("derivation exploded")
+
+    monkeypatch.setattr(cli.th, "derive_threads", _boom)
+    rc = _run(["send", "--from", "alpha", "--to", "beta", "--kind", "note",
+               "-m", "hi"], root)
+    assert rc == 0  # the send is never disturbed by a derivation failure
+
+
+def test_roster_add_with_role_lead_demotes_prior(tmp_path: Path) -> None:
+    # review BLOCKING #1: the add path must honor at-most-one-lead too.
+    root = _lead_team(tmp_path)
+    _run(["roster", "set-role", "alpha", "lead"], root)
+    _run(["roster", "add", "delta", "--role", "lead"], root)
+    assert Store(root).sole_lead() == "delta"

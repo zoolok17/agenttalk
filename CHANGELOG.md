@@ -5,6 +5,45 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] - 2026-06-08
+
+Coordination polish: three multi-agent fixes surfaced by production feedback
+(`agenttalk-improvements.md`, items 3.1 / 3.3 / 3.2) and design-reviewed with
+the peer agent. All additive and backward-compatible.
+
+### Added
+- **Escalation falls back to the team lead.** When `agenttalk escalate` has no
+  `operator_facing` liaison configured, it now routes the operator question to
+  the team **lead** instead of refusing — so a reviewer needing a human ruling
+  is never stranded. Resolution order is `--to` → liaison → the single lead →
+  exit 2 (with a remediation naming both `roster set-operator-facing` and
+  `roster set-role … lead`).
+- **At-most-one-`lead` roster invariant.** `roster set-role <agent> lead` now
+  atomically demotes any prior lead and promotes the new one in a single step
+  (`demoted X, promoted Y to lead`) — no `--force`, no manual two-step. The
+  comparison is case-insensitive; the role is stored verbatim.
+- **`doctor` no-escalation-target check.** Warns when a multi-agent team has
+  neither a liaison nor a lead, so the gap is visible before an escalation is
+  attempted. Absent for solo rosters and when a liaison or lead exists.
+- **`wk-` correlation id on `wake` messages.** A `wake` now carries a `wk-` id
+  so a reply can echo it, ending the fragile habit of reusing the raw message
+  id. An explicit `request_id` is still honored.
+- **Owed-inbound pre-send warning.** Before sending a peer unrelated traffic
+  while you owe them an open decision-request (a `proposal` or an operator
+  escalation), `send` emits a soft, best-effort warning naming the owed id.
+  Suppressed when replying on that same `request_id`; silent for non-decision
+  traffic; never blocks or fails the send.
+
+### Unchanged (honesty notes)
+- The roster `lead` role and the `operator_facing` liaison stay **distinct**
+  concepts: the liaison is still the primary escalation target, the lead is only
+  the fallback. They are not merged.
+- The invariant is **at-most-one** lead, not exactly-one — zero leads remains a
+  valid state, and solo / symmetric-pair runs are never forced to have a lead.
+- `escalate` still exits 2 when there is genuinely no target; message history,
+  message schema, exit codes, and `store.OPENER_KINDS` (wake is not a thread
+  opener) are unchanged.
+
 ## [0.23.1] - 2026-06-08
 
 Patch release: restore Python 3.10-3.12 compatibility in the Codex config

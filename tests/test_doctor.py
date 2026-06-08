@@ -612,3 +612,35 @@ def test_doctor_active_waiters_malformed_marker_no_crash(tmp_path: Path) -> None
     (s.state_dir / "alpha.waiting").write_text("{not json", encoding="utf-8")
     report = doctor.run(tmp_path)              # must not raise
     assert all(c.name != "active_waiters" for c in report.checks)
+
+
+# --- 0.24.0: escalation-target nudge (WP01, FR-009) -----------------------
+
+def _esc_check(report):
+    return next((c for c in report.checks if c.name == "escalation_target"), None)
+
+
+def test_doctor_escalation_target_warns_when_no_liaison_no_lead(tmp_path: Path) -> None:
+    Store(tmp_path).init(["alpha", "beta"])
+    chk = _esc_check(doctor.run(tmp_path))
+    assert chk is not None and chk.status == "warn"
+    assert "set-operator-facing" in chk.fix and "set-role" in chk.fix
+
+
+def test_doctor_escalation_target_absent_with_liaison(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    s.set_operator_facing("alpha")
+    assert _esc_check(doctor.run(tmp_path)) is None
+
+
+def test_doctor_escalation_target_absent_with_lead(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    s.set_role("alpha", "lead")
+    assert _esc_check(doctor.run(tmp_path)) is None
+
+
+def test_doctor_escalation_target_absent_for_solo(tmp_path: Path) -> None:
+    Store(tmp_path).init(["alpha"])
+    assert _esc_check(doctor.run(tmp_path)) is None

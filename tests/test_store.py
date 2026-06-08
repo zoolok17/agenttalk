@@ -1086,3 +1086,60 @@ def test_foreign_wait_pid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     # no marker -> None
     s.clear_waiting("alpha")
     assert s.foreign_wait_pid("alpha", _os.getpid()) is None
+
+
+# --- 0.24.0: at-most-one-lead invariant + sole_lead (WP01) ----------------
+
+def test_set_role_lead_is_unique_demotes_prior(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    assert s.set_role("alpha", "lead") == []          # first lead, nothing demoted
+    demoted = s.set_role("beta", "lead")              # move the lead
+    assert demoted == ["alpha"]                       # prior lead reported
+    roles = s.load_config().get("roles", {})
+    leads = [a for a, r in roles.items() if r == "lead"]
+    assert leads == ["beta"]                          # exactly one lead remains
+
+
+def test_set_role_lead_idempotent_self_set(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    s.set_role("alpha", "lead")
+    assert s.set_role("alpha", "lead") == []          # re-setting self: no demotion
+    assert s.sole_lead() == "alpha"
+
+
+def test_set_role_lead_case_insensitive(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    s.set_role("alpha", "lead")
+    demoted = s.set_role("beta", "Lead")              # different casing, same role
+    assert demoted == ["alpha"]
+    assert s.sole_lead() == "beta"
+    assert s.load_config()["roles"]["beta"] == "Lead"  # stored verbatim
+
+
+def test_set_role_zero_leads_is_valid(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    s.set_role("alpha", "lead")
+    s.set_role("alpha", "reviewer")                   # demote the lead to another role
+    assert s.sole_lead() is None                      # zero leads: allowed, no error
+
+
+def test_sole_lead_resolution(tmp_path: Path) -> None:
+    s = _store3(tmp_path)
+    assert s.sole_lead() is None                      # zero leads
+    s.set_role("alpha", "lead")
+    assert s.sole_lead() == "alpha"                   # exactly one
+    # Legacy/hand-edited config with TWO leads -> ambiguous -> None (not a guess)
+    cfg = s.load_config()
+    cfg["roles"] = {"alpha": "lead", "beta": "lead"}
+    s._write_config(cfg)
+    assert s.sole_lead() is None
+
+
+def test_add_agent_lead_also_enforces_uniqueness(tmp_path: Path) -> None:
+    # review BLOCKING #1: `add --role lead` must not bypass the invariant.
+    s = _store3(tmp_path)
+    s.set_role("alpha", "lead")
+    s.add_agent("delta", role="lead")                 # new agent added AS lead
+    assert s.sole_lead() == "delta"                   # prior lead demoted
+    roles = s.load_config().get("roles", {})
+    assert [a for a, r in roles.items() if r == "lead"] == ["delta"]

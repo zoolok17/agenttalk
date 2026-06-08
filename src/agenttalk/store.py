@@ -898,7 +898,9 @@ class Store:
                 cfg["agents"] = roster
             if role is not None:
                 roles = self._cfg_dict(cfg, "roles")
-                roles[name] = role
+                # Route through the same choke point as set_role so `add --role
+                # lead` can't bypass the at-most-one-lead invariant (review BLOCKING #1).
+                self._assign_role_enforcing_lead(roles, name, role)
                 validate_roles(roles, roster)
             if groups:
                 g = self._cfg_dict(cfg, "groups")
@@ -935,17 +937,61 @@ class Store:
             self._write_config(cfg)
         return cfg
 
-    def set_role(self, name: str, role: str) -> dict:
+    def set_role(self, name: str, role: str) -> list[str]:
+        """Set ``name``'s role, enforcing an at-most-one-``lead`` invariant.
+
+        If ``role`` is the lead role (compared case-insensitively, but stored
+        verbatim) and other agents already hold it, they are demoted in the
+        SAME config write — so the team can never end up with two leads, and
+        switching the lead is one atomic op rather than a demote-then-promote
+        two-step (0.24.0, feedback 3.1). Setting ``lead`` on the agent that is
+        already the sole lead is an idempotent no-op.
+
+        Returns the list of agents demoted from lead by this call (empty unless
+        a lead was actually moved). The previous return value (the cfg dict) was
+        unused by any caller. Zero leads remains a valid state — this never
+        forces a lead to exist.
+        """
         with self._config_lock():
             cfg = self.load_config()
             roster = cfg.get("agents", []) or []
             if name not in roster:
                 raise ValueError(f"agent {name!r} is not in the roster {sorted(roster)}")
             roles = self._cfg_dict(cfg, "roles")
-            roles[name] = role
+            demoted = self._assign_role_enforcing_lead(roles, name, role)
             validate_roles(roles, roster)
             self._write_config(cfg)
-        return cfg
+        return demoted
+
+    @staticmethod
+    def _assign_role_enforcing_lead(roles: dict, name: str, role: str) -> list[str]:
+        """Set ``roles[name] = role``, enforcing the at-most-one-``lead``
+        invariant: if ``role`` is the lead role (case-insensitive, stored
+        verbatim), every OTHER current lead is demoted first. Returns the demoted
+        agent names (normally 0 or 1; a hand-edited/legacy config with several
+        leads is self-healed). The SINGLE choke point shared by every role-write
+        path (``set_role`` and ``add_agent``) so the invariant can't be bypassed.
+        Caller holds the config lock and runs ``validate_roles`` afterwards."""
+        demoted: list[str] = []
+        if role.casefold() == "lead":
+            for other, r in list(roles.items()):
+                if other != name and isinstance(r, str) and r.casefold() == "lead":
+                    roles.pop(other, None)
+                    demoted.append(other)
+        roles[name] = role
+        return demoted
+
+    def sole_lead(self) -> str | None:
+        """The single active agent whose role is ``lead`` (case-insensitive), or
+        None. Returns None for ZERO leads AND for the legacy >1 case: ambiguity
+        reads as "no unambiguous lead", so escalation falls through to its
+        remediation path rather than guessing a target (0.24.0, research D3)."""
+        cfg = self.load_config()
+        roster = cfg.get("agents", []) or []
+        roles = cfg.get("roles") or {}
+        leads = [a for a in roster
+                 if isinstance(roles.get(a), str) and roles[a].casefold() == "lead"]
+        return leads[0] if len(leads) == 1 else None
 
     def set_group(self, group: str, members: list[str]) -> dict:
         with self._config_lock():

@@ -897,3 +897,16 @@ def test_broadcast_no_audience_retired_key_when_none() -> None:
     L = derive_threads(msgs, agent="lead", cursor="", now=_BASE)
     assert L[0].audience_retired == []
     assert "audience_retired" not in L[0].to_dict()
+
+
+# --- 0.24.0: wake mints a correlation id but opens no thread (WP02) --------
+
+def test_wake_is_not_a_thread_opener() -> None:
+    from agenttalk.store import OPENER_KINDS
+    assert "wake" not in OPENER_KINDS
+
+
+def test_wake_message_creates_no_thread_row() -> None:
+    msgs = [_msg("m1", "alpha", "beta", kind="wake", rid="wk-abc123")]
+    rows = derive_threads(msgs, agent="beta", cursor="")
+    assert rows == []  # a wake correlation id is FYI-class, never an open thread

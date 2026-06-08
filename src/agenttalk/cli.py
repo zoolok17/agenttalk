@@ -86,13 +86,19 @@ def _parse_meta(items: list[str] | None) -> dict:
     return out
 
 
-# Kinds that OPEN a trackable thread get a request_id auto-minted if the
-# caller didn't pass one, so `agenttalk threads` can correlate the reply.
-# Distinct prefixes make the id self-describing in logs/transcripts.
+# Kinds that get a request_id auto-minted if the caller didn't pass one, so a
+# reply can echo it. Distinct prefixes make the id self-describing in
+# logs/transcripts. Most of these also OPEN a trackable thread (they are in
+# store.OPENER_KINDS, so `agenttalk threads` correlates the reply) — but `wake`
+# is deliberately NOT a thread opener: it mints a `wk-` id purely so a reply can
+# correlate, while staying FYI-class for thread derivation (0.24.0, feedback
+# 3.3). Minting and thread-opening are separate concerns kept in separate
+# constants (this map vs. store.OPENER_KINDS).
 _AUTOGEN_REQUEST_ID_PREFIX = {
     "review-request": "rq-",
     "question": "q-",
     "proposal": "pp-",
+    "wake": "wk-",
 }
 
 # A response kind -> the opener kind it is meant to correlate with. Used
@@ -118,7 +124,8 @@ def _maybe_autogen_request_id(kind: str, meta: dict, *, quiet: bool) -> None:
         return
     meta["request_id"] = prefix + uuid.uuid4().hex[:12]
     if not quiet:
-        label = "proposal id" if kind == "proposal" else "auto request_id"
+        label = {"proposal": "proposal id", "wake": "wake id"}.get(
+            kind, "auto request_id")
         print(f"({label}: {meta['request_id']})")
 
 
@@ -733,6 +740,45 @@ def _format_age(seconds: float) -> str:
     return f"{int(seconds / 86400)}d ago"
 
 
+def _warn_owed_decision_to_peer(store, sender: str, recipient: str,
+                                outgoing_request_id: str | None) -> None:
+    """Soft, best-effort pre-send nudge (0.24.0, feedback 3.2).
+
+    If the sender currently owes the RECIPIENT an open *decision-request* — a
+    `proposal` or an operator escalation (``needs_operator``) — warn before
+    sending unrelated traffic, so a fresh message doesn't cross an open
+    decision the peer is waiting on. Suppressed when this message is itself a
+    reply on that same ``request_id``, and silent for non-decision traffic
+    (plain question/review/note). NEVER blocks or fails the send: any
+    thread-derivation error is swallowed (the warning is advisory only).
+    """
+    try:
+        rows = th.derive_threads(
+            store.valid_messages(), agent=sender, cursor=store.cursor(sender),
+            closed_rids=_closed_rids(store, sender),
+        )
+        owed = [
+            t for t in rows
+            if t.state == "owed-inbound" and t.peer == recipient
+            and (t.opener_kind == "proposal" or t.needs_operator)
+            and t.request_id != outgoing_request_id
+        ]
+        if not owed:
+            return
+        labels = ", ".join(
+            f"{'operator escalation' if t.needs_operator else 'proposal'} "
+            f"{t.request_id}"
+            for t in owed
+        )
+        sys.stderr.write(
+            f"agenttalk send: warning: you owe {recipient} an open "
+            f"decision-request ({labels}) — answer or rescind it before "
+            f"unrelated traffic (this message was still sent).\n"
+        )
+    except Exception:
+        return  # advisory only; a derivation failure must never disturb the send
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     # rescind/end have dedicated commands that handle multi-recipient fan-out
     # and anchoring; a hand-rolled `send --kind rescind` would only address one
@@ -770,6 +816,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     meta = _parse_meta(args.meta)
     _maybe_autogen_request_id(args.kind, meta, quiet=args.quiet)
     _warn_missing_request_id(args.kind, meta)
+    _warn_owed_decision_to_peer(store, sender, recipient, meta.get("request_id"))
     msg = store.send(
         sender=sender,
         recipient=recipient,
@@ -1098,21 +1145,44 @@ def cmd_escalate(args: argparse.Namespace) -> int:
     else:
         target = store.operator_facing()
         if target is None:
-            raw = store.operator_facing_raw()
-            if raw:
-                sys.stderr.write(
-                    f"agenttalk escalate: configured liaison {raw!r} is not in "
-                    f"the roster {sorted(roster)} — fix it with `agenttalk "
-                    f"roster set-operator-facing <agent>` (or --clear), or "
-                    f"pass --to <agent> explicitly.\n"
-                )
+            # No usable liaison. Fall back to the team's single lead rather than
+            # stranding the escalation (0.24.0, feedback 3.1). The at-most-one
+            # invariant makes `sole_lead()` unambiguous; it is None for zero or
+            # (legacy) multiple leads, in which case we still refuse loudly.
+            lead = store.sole_lead()
+            if lead is not None and lead != sender:
+                target = lead
+                if not args.quiet:
+                    sys.stderr.write(
+                        f"agenttalk escalate: no operator-facing liaison is "
+                        f"configured; routing to the lead {lead!r}.\n"
+                    )
             else:
-                sys.stderr.write(
-                    "agenttalk escalate: no operator-facing agent is "
-                    "configured — run `agenttalk roster set-operator-facing "
-                    "<agent>`, or pass --to <agent> explicitly.\n"
-                )
-            return 2
+                raw = store.operator_facing_raw()
+                if lead is not None and lead == sender:
+                    sys.stderr.write(
+                        "agenttalk escalate: no liaison is configured and you "
+                        "are the lead — ask your operator directly, or pass "
+                        "--to <agent> explicitly.\n"
+                    )
+                elif raw:
+                    sys.stderr.write(
+                        f"agenttalk escalate: configured liaison {raw!r} is not "
+                        f"in the roster {sorted(roster)}, and no lead is set — "
+                        f"fix the liaison with `agenttalk roster "
+                        f"set-operator-facing <agent>` (or --clear), designate a "
+                        f"lead with `agenttalk roster set-role <agent> lead`, or "
+                        f"pass --to <agent> explicitly.\n"
+                    )
+                else:
+                    sys.stderr.write(
+                        "agenttalk escalate: no operator-facing liaison and no "
+                        "lead are configured — run `agenttalk roster "
+                        "set-operator-facing <agent>` or `agenttalk roster "
+                        "set-role <agent> lead`, or pass --to <agent> "
+                        "explicitly.\n"
+                    )
+                return 2
     if target == sender:
         sys.stderr.write(
             f"agenttalk escalate: {sender} IS the operator-facing agent — "
@@ -1569,8 +1639,14 @@ def cmd_roster(args: argparse.Namespace) -> int:
               f"to {args.to} (sender {msg.sender}; note {msg.id}).")
         return 0
     if action == "set-role":
-        store.set_role(args.name, args.role)
-        print(f"roster: {args.name} role={args.role}")
+        demoted = store.set_role(args.name, args.role)
+        # At-most-one-lead invariant: if assigning lead moved it off another
+        # agent, say so in one line — no --force two-step (0.24.0, feedback 3.1).
+        if demoted:
+            print(f"roster: demoted {', '.join(demoted)}, promoted "
+                  f"{args.name} to {args.role}")
+        else:
+            print(f"roster: {args.name} role={args.role}")
         return 0
     if action == "set-group":
         members = [m.strip() for m in args.members.split(",") if m.strip()]
@@ -3059,17 +3135,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     pesc = sub.add_parser(
         "escalate",
+        description="Route an operator-input question to a human-facing agent. "
+                    "Target resolution: --to override -> operator-facing liaison "
+                    "-> the single role=lead agent (fallback) -> refuse (exit 2) "
+                    "with a remediation naming `roster set-operator-facing` and "
+                    "`roster set-role <agent> lead`.",
         help="Route an operator-input question to the operator-facing agent "
-             "(the liaison). Mints an esc- request_id (printed as "
-             "`request_id=<id>` for the follow-up `wait --to-request`). "
-             "Refuses (exit 2) when no liaison is configured — pass --to "
-             "to override explicitly.",
+             "(the liaison). Resolution: --to override -> liaison -> the single "
+             "role=lead agent (fallback) -> refuse. Mints an esc- request_id "
+             "(printed as `request_id=<id>` for the follow-up `wait "
+             "--to-request`). Refuses (exit 2) only when none of those resolve.",
     )
     pesc.add_argument("--from", dest="sender",
                       help="Sender agent name (default: $AGENTTALK_SELF)")
     pesc.add_argument("--to",
-                      help="Explicit target override (default: the roster's "
-                           "operator-facing agent).")
+                      help="Explicit target override (default resolution: the "
+                           "operator-facing liaison, else the single role=lead "
+                           "agent as a fallback).")
     pesc.add_argument("--subject",
                       help="One-line summary (default: 'operator input needed')")
     pesc.add_argument("--meta", action="append", help="key=value (repeatable)")

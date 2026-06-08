@@ -2,11 +2,11 @@
   "created_at": "2026-06-08T20:53:27.566542+00:00",
   "friendly_name": "coordination polish 0240",
   "mission_id": "01KTMG5Z795ZV3H7YTRG7Q4VM0",
-  "mission_number": null,
+  "mission_number": 7,
   "mission_slug": "coordination-polish-0240-01KTMG5Z",
   "mission_type": "software-dev",
   "slug": "coordination-polish-0240-01KTMG5Z",
+  "source_description": "agenttalk 0.24.0 coordination polish: escalate lead-fallback + at-most-one-lead invariant + doctor nudge (feedback 3.1), wake correlation id (3.3), owed-inbound pre-send warning (3.2). From agenttalk-improvements.md production feedback; design-reviewed with Codex.",
   "target_branch": "master",
-  "vcs": "git",
-  "source_description": "agenttalk 0.24.0 coordination polish: escalate lead-fallback + at-most-one-lead invariant + doctor nudge (feedback 3.1), wake correlation id (3.3), owed-inbound pre-send warning (3.2). From agenttalk-improvements.md production feedback; design-reviewed with Codex."
+  "vcs": "git"
 }

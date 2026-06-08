@@ -6,7 +6,7 @@ the Claude Code + Codex collaboration that shipped 0.10.0–0.13.0, the first
 four-agent production retro (2026-06-03), **and the band's consolidated
 second retro (2026-06-05), which reprioritized everything below.**
 
-> Current release: **v0.19.0** (`master`). See `CHANGELOG.md` for history
+> Current release: **v0.24.0** (`master`). See `CHANGELOG.md` for history
 > and `SECURITY.md` for the trust model.
 
 ---
@@ -164,6 +164,12 @@ the local trust model), not dropped:
 
 ## Where things stand
 
+- **0.24.0 (2026-06-08) "coordination polish"** acted on production feedback
+  from a 4-agent mission (`agenttalk-improvements.md`): `escalate` now falls back
+  to the team lead (backed by an at-most-one-`lead` roster invariant and a
+  `doctor` no-target check), `wake` carries a `wk-` correlation id, and `send`
+  warns before talking over an open decision you owe a peer. Claim-as-lock and
+  the rest of the feedback's section 1/2 were scoped to spec-kitty, not the bus.
 - **0.20.0–0.23.0 (2026-06-08) closed the v0.19.0 fresh-review program.**
   0.20–0.22 fixed all HIGH/MED/LOW review findings (review-driven, two-lane,
   fully cross-reviewed). **0.23.0 bundled the dev-discipline `devkit` skill
