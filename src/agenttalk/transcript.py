@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from agenttalk._atomic import write_text as _atomic_write_text
 from agenttalk.store import Message, Store
 
 
@@ -46,6 +47,8 @@ def export(store: Store, *, fmt: str = "md", out: Path | None = None) -> Path:
     else:
         raise ValueError(f"unknown format: {fmt!r}")
     out = out or (store.sessions_dir / default_name)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(text, encoding="utf-8")
+    # Atomic + crash-safe like every other bus write — `agenttalk end` always
+    # writes here, so a crash mid-export must not leave a truncated session
+    # record (review batch-3 nit).
+    _atomic_write_text(out, text)
     return out

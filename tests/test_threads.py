@@ -79,6 +79,32 @@ def test_open_outbound_to_retired_peer_omits_tombstone_as_next_owner() -> None:
     assert live.next_owner == "beta"
 
 
+def test_broadcast_na_rollup_is_last_write_wins() -> None:
+    """A broadcast member's NA flag must reflect their LATEST reply: a later
+    substantive answer clears a prior accidental NA, and a later NA sets it
+    (review nit — the rollup used to stickily accumulate NA forever)."""
+    opener = _msg("001", "lead", "alice", "question", rid="b1", audience="all")
+
+    def reply(mid: str, body: str, *, na: bool) -> Message:
+        meta: dict = {"request_id": "b1"}
+        if na:
+            meta["response"] = "not-applicable"
+        return Message(id=mid, ts=_BASE.isoformat().replace("+00:00", "Z"),
+                       sender="alice", recipient="lead", kind="message",
+                       subject="", body=body, meta=meta)
+
+    # NA then substantive -> NA cleared
+    t = derive_threads([opener, reply("002", "na", na=True),
+                        reply("003", "real", na=False)],
+                       agent="lead", cursor="", now=_BASE)[0]
+    assert t.responded_na == []
+    # substantive then NA -> stays NA
+    t2 = derive_threads([opener, reply("002", "real", na=False),
+                         reply("003", "na", na=True)],
+                        agent="lead", cursor="", now=_BASE)[0]
+    assert t2.responded_na == ["alice"]
+
+
 # ------------------------------------------------------- response closes
 
 def test_review_result_closes_for_requester_once_consumed() -> None:

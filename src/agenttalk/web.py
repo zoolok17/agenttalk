@@ -1004,7 +1004,12 @@ def _root_state(desc: RootDescriptor) -> dict:
                     p.name for p in kdir.iterdir() if p.is_dir()),
             }
         return out
-    except (OSError, ValueError) as e:
+    except Exception as e:  # noqa: BLE001
+        # Degrade to errors-as-data for ANY failure, not just OSError/ValueError:
+        # this function's whole contract (FR-005) is that one corrupt root must
+        # never escape and 500 the entire /api/state aggregate. A broad catch is
+        # strictly safer than propagating an unanticipated exception type
+        # (review). The errors-as-data shape is the documented degraded form.
         return {"label": label, "path": path, "errors": [str(e)]}
 
 

@@ -52,7 +52,11 @@ def _get_store(args: argparse.Namespace, *, must_exist: bool = True) -> Store:
 
 
 def _read_body(args: argparse.Namespace) -> str:
-    if getattr(args, "message", None):
+    # `is not None` (not truthiness): an explicit `-m ""` is a deliberate
+    # empty body, so it must short-circuit here rather than fall through to
+    # --file / the stdin sniff (which could hang on an open pipe). Whether an
+    # empty body is allowed is governed downstream by --allow-empty (review nit).
+    if getattr(args, "message", None) is not None:
         return args.message
     f = getattr(args, "file", None)
     if f:

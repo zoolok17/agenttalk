@@ -1715,6 +1715,18 @@ def test_init_path_wins_over_global_root(
     assert not (via_root / ".agenttalk").exists()
 
 
+def test_read_body_explicit_empty_message_short_circuits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`-m ""` is a deliberate empty body — _read_body must return it without
+    consulting stdin (which could hang on an open pipe). Pre-fix the falsy ""
+    fell through to the stdin sniff (review nit)."""
+    import argparse
+    args = argparse.Namespace(message="", file=None)
+    monkeypatch.setattr("sys.stdin", None)  # any stdin access would AttributeError
+    assert cli._read_body(args) == ""
+
+
 # --------------------------------------- roster set-operator-facing (T012)
 
 def test_set_operator_facing_roundtrip_and_displays(tmp_path: Path, capsys) -> None:

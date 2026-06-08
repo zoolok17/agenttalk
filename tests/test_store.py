@@ -665,6 +665,17 @@ def test_validated_messages_returned_in_id_order(store: Store) -> None:
     assert set(sent).issubset(set(got))
 
 
+def test_corrupt_config_delivers_nothing_failclosed(store: Store) -> None:
+    """A corrupt/unloadable config (empty roster) must deliver NOTHING, not
+    fall through to validate's empty-roster fail-open and deliver forged or
+    off-roster messages (review L)."""
+    store.send(sender="alpha", recipient="beta", body="hi")
+    assert any(m.body == "hi" for m in store.messages_for("beta"))  # normal path
+    store.config_path.write_text("{ not valid json", encoding="utf-8")
+    assert store.messages_for("beta") == []   # fail-closed on corrupt roster
+    assert store.valid_messages() == []
+
+
 # ============================================================= #19 Phase A
 # Identity registry, retirement & epoch store layer (WP01).
 

@@ -331,9 +331,9 @@ def _derive_broadcast(
     first_opener_id = min(m.id for m in openers)
 
     responded: set[str] = set()
-    responded_na: set[str] = set()
+    last_na: dict[str, bool] = {}  # member -> was their LATEST reply NA?
     responses: list[Message] = []
-    for m in group:
+    for m in group:  # id-sorted (chronological): a later reply overwrites earlier
         if m.id <= first_opener_id:
             continue
         # A broadcast question is open-ended: any non-control reply from a
@@ -344,11 +344,14 @@ def _derive_broadcast(
         if (m.kind not in CONTROL_KINDS and m.kind != "rescind"
                 and m.sender in audience and m.recipient == sender):
             responded.add(m.sender)
-            if _is_na(m):
-                # NA closes like any answer; the label (#15) lets the
-                # broadcaster distinguish "answered" from "not my role".
-                responded_na.add(m.sender)
+            # NA closes like any answer; the label (#15) lets the broadcaster
+            # distinguish "answered" from "not my role". Last-write-wins per
+            # member, so a later substantive reply CLEARS a prior accidental NA
+            # (and vice versa) — the rollup reflects the member's latest answer
+            # instead of stickily flagging NA forever (review nit).
+            last_na[m.sender] = _is_na(m)
             responses.append(m)
+    responded_na = {who for who, na in last_na.items() if na}
     retired = retired or set()
     # 0.18.0: a retired audience member can never reply, so it is not an owed
     # obligation — exclude it from `pending`/`next_owner`. The frozen

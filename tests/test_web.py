@@ -569,6 +569,29 @@ def test_api_state_excludes_stale_composing(tmp_path: Path) -> None:
         srv.server_close()
 
 
+def test_root_state_degrades_on_unexpected_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A root's collection must degrade to errors-as-data for ANY exception,
+    not just OSError/ValueError — one corrupt root must never 500 the whole
+    /api/state aggregate (FR-005, review)."""
+    s = _make_store(tmp_path)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("unexpected non-ValueError failure")
+
+    monkeypatch.setattr(web, "_agent_entries", boom)
+    srv, _t, base = _serve(s)
+    try:
+        state = _state(base)  # must be 200, not 500
+        (root,) = state["roots"]
+        assert root["errors"]  # degraded, not crashed
+        assert "unexpected" in root["errors"][0]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_state_epoch_status_three_state(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
     # pre-0.16-style opener: hand-written WITHOUT the epoch_at_send key

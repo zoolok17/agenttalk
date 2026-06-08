@@ -1621,6 +1621,14 @@ class Store:
             roster = self._known_roster(cfg)
         except (ValueError, OSError, FileNotFoundError):
             roster = []
+        if not roster:
+            # Fail CLOSED: a missing/corrupt roster (load_config raised, or an
+            # empty agents list) means there are no valid senders/recipients,
+            # so deliver NOTHING — rather than fall through to Message.validate's
+            # empty-roster fail-open and deliver forged/off-roster messages
+            # (review L). CLI delivery commands already abort earlier on a
+            # corrupt config; this makes the store-level contract explicit.
+            return []
         require_sig = self.signing_enforced()
         project_id = self.project_id() if require_sig else None
         key: bytes | None = None
