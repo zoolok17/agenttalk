@@ -5,6 +5,21 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.1] - 2026-06-08
+
+Patch release: restore Python 3.10-3.12 compatibility in the Codex config
+editor. No behavior change on 3.13+.
+
+### Fixed
+- `codex_config` read the per-project config with `Path.read_text(newline="")`,
+  but the `newline` keyword on `Path.read_text()` only exists in Python 3.13+.
+  On 3.10-3.12 every `enable_project`/`disable_project` call raised
+  `TypeError: read_text() got an unexpected keyword argument 'newline'`,
+  breaking the feature and turning the CI test matrix red from 0.21.0 onward.
+  Reads now go through `open(..., newline="")`, which is portable across all
+  supported versions and still disables universal-newline translation so CRLF
+  configs are preserved.
+
 ## [0.23.0] - 2026-06-08
 
 Dev-discipline skill bundle: agenttalk now ships the five shared coding

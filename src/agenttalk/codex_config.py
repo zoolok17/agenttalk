@@ -20,6 +20,17 @@ from pathlib import Path
 from agenttalk._atomic import write_text as _atomic_write_text
 
 
+def _read_text_no_translate(path: Path) -> str:
+    """Read *path* as UTF-8 with universal-newline translation disabled.
+
+    ``Path.read_text(newline=...)`` only gained the ``newline`` keyword in
+    Python 3.13; on 3.10-3.12 it raises ``TypeError``. ``open(newline="")`` has
+    accepted it for far longer, so go through it directly to stay portable.
+    """
+    with open(path, encoding="utf-8", newline="") as f:
+        return f.read()
+
+
 MANAGED_KEYS = ("trust_level", "approval_policy", "sandbox_mode")
 TARGET_VALUES = {
     "trust_level": '"trusted"',
@@ -243,7 +254,7 @@ def enable_project(config_path: Path, project_dir: Path) -> Result:
     # config is detectable (read_text() default would silently fold \r\n to
     # \n, making the detector below dead code and rewriting the user's whole
     # file to LF — review M4a/L). We write back with newline="" too.
-    text = config_path.read_text(encoding="utf-8", newline="")
+    text = _read_text_no_translate(config_path)
     # Preserve original newline style
     newline = "\r\n" if "\r\n" in text else "\n"
     lines = text.split(newline)
@@ -326,7 +337,7 @@ def disable_project(config_path: Path, project_dir: Path) -> Result:
         return Result(action="no-op", config_path=config_path, project_dir=project_key,
                       changes=["config does not exist"])
 
-    text = config_path.read_text(encoding="utf-8", newline="")
+    text = _read_text_no_translate(config_path)
     newline = "\r\n" if "\r\n" in text else "\n"
     lines = text.split(newline)
     trailing_newline = lines and lines[-1] == ""
