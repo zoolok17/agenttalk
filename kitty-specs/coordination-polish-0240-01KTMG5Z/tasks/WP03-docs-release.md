@@ -4,7 +4,9 @@ title: Docs + version 0.24.0
 dependencies:
 - WP01
 - WP02
-requirement_refs: []
+requirement_refs:
+- NFR-002
+- NFR-004
 planning_base_branch: master
 merge_target_branch: master
 branch_strategy: Execution worktree allocated per computed lane from lanes.json; work branches from master and merges into master.
