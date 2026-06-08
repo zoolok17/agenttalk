@@ -592,6 +592,50 @@ def test_root_state_degrades_on_unexpected_exception(
         srv.server_close()
 
 
+def test_is_loopback_addr_is_address_aware() -> None:
+    """The per-request loopback check is address-aware, not string-prefix:
+    a non-loopback IPv6 peer that merely starts with '::1' is rejected, while
+    the IPv4-mapped loopback form is accepted (review nit)."""
+    assert web._is_loopback_addr("127.0.0.1")
+    assert web._is_loopback_addr("::1")
+    assert web._is_loopback_addr("::ffff:127.0.0.1")    # v4-mapped loopback
+    assert web._is_loopback_addr("localhost")
+    assert not web._is_loopback_addr("::1a2b:0:0:0:1")  # startswith '::1', NOT loopback
+    assert not web._is_loopback_addr("10.0.0.5")
+    assert not web._is_loopback_addr("8.8.8.8")
+    assert not web._is_loopback_addr("evil.example.com")
+    assert not web._is_loopback_addr("")
+
+
+def test_make_server_localhost_binds_loopback_literal(tmp_path: Path) -> None:
+    """`localhost` is bound as the 127.0.0.1 literal, not delegated to the OS
+    resolver (a hosts override could otherwise point it off-loopback)."""
+    s = _make_store(tmp_path)
+    srv = web.make_server(s, "localhost", 0)
+    try:
+        assert srv.server_address[0] == "127.0.0.1"
+    finally:
+        srv.server_close()
+
+
+def test_make_server_ipv6_uses_inet6_without_global_mutation(tmp_path: Path) -> None:
+    """IPv6 loopback uses a per-server AF_INET6 subclass and never mutates the
+    process-global ThreadingHTTPServer.address_family (review nit)."""
+    import socket as _socket
+    from http.server import ThreadingHTTPServer
+    before = ThreadingHTTPServer.address_family
+    s = _make_store(tmp_path)
+    try:
+        srv = web.make_server(s, "::1", 0)
+    except OSError:
+        pytest.skip("no IPv6 loopback available")
+    try:
+        assert srv.address_family == _socket.AF_INET6        # per-server family
+        assert ThreadingHTTPServer.address_family == before  # base class untouched
+    finally:
+        srv.server_close()
+
+
 def test_api_state_epoch_status_three_state(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
     # pre-0.16-style opener: hand-written WITHOUT the epoch_at_send key

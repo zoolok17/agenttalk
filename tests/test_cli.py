@@ -1727,6 +1727,22 @@ def test_read_body_explicit_empty_message_short_circuits(
     assert cli._read_body(args) == ""
 
 
+def test_send_rejects_kind_rescind(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """`send --kind rescind` is rejected — rescind has a dedicated command that
+    handles fan-out/anchoring (review nit)."""
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    rc = cli.main(["--root", str(tmp_path), "send", "--from", "alpha",
+                   "--to", "beta", "-m", "x", "--kind", "rescind"])
+    assert rc == 2
+    assert "dedicated" in capsys.readouterr().err
+
+
+def test_send_rejects_kind_end(tmp_path: Path) -> None:
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    _run_expect_exit(["send", "--from", "alpha", "--to", "beta", "-m", "x",
+                      "--kind", "end"], tmp_path, 2)
+
+
 # --------------------------------------- roster set-operator-facing (T012)
 
 def test_set_operator_facing_roundtrip_and_displays(tmp_path: Path, capsys) -> None:

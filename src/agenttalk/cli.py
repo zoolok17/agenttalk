@@ -734,6 +734,15 @@ def _format_age(seconds: float) -> str:
 
 
 def cmd_send(args: argparse.Namespace) -> int:
+    # rescind/end have dedicated commands that handle multi-recipient fan-out
+    # and anchoring; a hand-rolled `send --kind rescind` would only address one
+    # recipient and could half-supersede a multi-party thread (review nit).
+    if args.kind in ("rescind", "end"):
+        sys.stderr.write(
+            f"agenttalk send: --kind {args.kind} is not allowed via `send` — use "
+            f"the dedicated `agenttalk {args.kind}` command, which handles "
+            f"fan-out/anchoring correctly.\n")
+        return 2
     store = _get_store(args)
     cfg = store.load_config()
     roster = cfg.get("agents") or []

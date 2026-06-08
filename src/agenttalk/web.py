@@ -71,6 +71,7 @@ no-script policy byte-identical.
 from __future__ import annotations
 
 import html
+import ipaddress
 import json
 import re
 import socket
@@ -92,10 +93,29 @@ from agenttalk.threads import Thread, derive_threads
 # The only host strings accepted by ``make_server``. No opt-in to
 # extend this list — if you need remote access, SSH-tunnel.
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
-# Per-request peer-IP allowlist. The dual-stack mapped form
-# ``::ffff:127.0.0.1`` is what an IPv6 socket reports when an IPv4
-# loopback client connects; treat it as loopback.
-LOOPBACK_PEER_PREFIXES = ("127.", "::1", "::ffff:127.")
+
+
+def _is_loopback_addr(peer: str) -> bool:
+    """True iff ``peer`` is a loopback address (defense-in-depth peer check).
+
+    Address-aware, not string-prefix: parse with ``ipaddress`` and accept
+    only genuinely-loopback addresses. This rejects non-loopback peers whose
+    text merely *starts with* ``::1`` (e.g. ``::1a2b:...``) — the trap in the
+    old ``startswith('::1')`` matcher — while still accepting the IPv4-mapped
+    form ``::ffff:127.0.0.1`` (what a dual-stack socket reports for an IPv4
+    loopback client) via ``ipv4_mapped``. A non-IP literal is loopback only
+    when it is exactly ``localhost``.
+    """
+    if not peer:
+        return False
+    try:
+        addr = ipaddress.ip_address(peer)
+    except ValueError:
+        return peer == "localhost"
+    if addr.is_loopback:
+        return True
+    mapped = getattr(addr, "ipv4_mapped", None)  # ::ffff:127.0.0.1 -> 127.0.0.1
+    return mapped is not None and mapped.is_loopback
 
 _MESSAGE_ID_RE = re.compile(r"\A[A-Za-z0-9_.\-]{1,128}\Z")
 
@@ -1050,9 +1070,7 @@ def _make_handler(roots: list[RootDescriptor]) -> type[BaseHTTPRequestHandler]:
 
         # ---- defense-in-depth: per-request loopback check
         def _is_loopback_peer(self) -> bool:
-            peer = (self.client_address[0] or "")
-            return any(peer == p.rstrip(".") or peer.startswith(p)
-                       for p in LOOPBACK_PEER_PREFIXES)
+            return _is_loopback_addr(self.client_address[0] or "")
 
         # ---- response helpers
         def _send(self, status: int, body: bytes, content_type: str,
@@ -1245,16 +1263,20 @@ def make_server(store: Store, host: str, port: int,
     handler_cls = _make_handler(roots)
     if not quiet:
         handler_cls._quiet = False  # noqa: SLF001 — class attr by design
-    # ``::1`` is IPv6 loopback; everything else in the allowlist is
-    # IPv4. ``localhost`` is left to the OS resolver (defaults to v4
-    # on virtually every system; users that need v6 ask for ``::1``).
-    family = socket.AF_INET6 if ":" in host else socket.AF_INET
-    ThreadingHTTPServer.address_family = family
-    try:
-        return ThreadingHTTPServer((host, port), handler_cls)
-    finally:
-        # Restore default for any other use of the class in-process.
-        ThreadingHTTPServer.address_family = socket.AF_INET
+    # Bind a loopback LITERAL — never delegate 'localhost' to the OS resolver.
+    # A hosts-file/DNS override could map 'localhost' off-loopback while the
+    # validation above believed it was loopback, so 'localhost' is purely a
+    # CLI alias for 127.0.0.1; users who need IPv6 ask for '::1'.
+    bind_host = "127.0.0.1" if host == "localhost" else host
+    family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
+
+    # Per-call subclass instead of mutating the process-global
+    # ThreadingHTTPServer.address_family — that had an interleaving race and
+    # leaked the family into any other in-process use of the base class.
+    class _LoopbackServer(ThreadingHTTPServer):
+        address_family = family
+
+    return _LoopbackServer((bind_host, port), handler_cls)
 
 
 def serve(store: Store, *, host: str = "127.0.0.1", port: int = 8765,
