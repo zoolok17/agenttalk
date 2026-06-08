@@ -323,6 +323,18 @@ def test_operator_facing_states(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert "'lead'" in c.details
 
 
+def test_operator_facing_warns_when_liaison_never_listened(tmp_path: Path) -> None:
+    """A configured liaison that has NEVER listened (no heartbeat) is exactly
+    the unread-escalations risk this check exists to catch — it must WARN, not
+    report OK (review)."""
+    s = Store(tmp_path)
+    s.init(["lead", "w1"])
+    s.set_operator_facing("lead")  # configured, but no heartbeat ever written
+    c = doctor._check_operator_facing(s)
+    assert c.status == "warn"
+    assert "never listened" in c.details
+
+
 def test_operator_facing_no_enforcement_language(tmp_path: Path) -> None:
     # C-007: diagnostics phrase routing/visibility facts, never enforcement.
     s = Store(tmp_path)

@@ -676,6 +676,16 @@ def test_corrupt_config_delivers_nothing_failclosed(store: Store) -> None:
     assert store.valid_messages() == []
 
 
+def test_message_body_roundtrips_unicode_crlf_multiline(store: Store) -> None:
+    """Real agent messages carry code blocks, multiline plans, and non-ASCII
+    text. A body must survive the send()->disk->messages_for() round trip
+    byte-for-byte (review test-coverage gap)."""
+    body = "approved -> ship · 我们 \U0001f389\r\nline2\nline3\ttab"
+    store.send(sender="alpha", recipient="beta", body=body)
+    reload = store.messages_for("beta")[-1]
+    assert reload.body == body
+
+
 # ============================================================= #19 Phase A
 # Identity registry, retirement & epoch store layer (WP01).
 

@@ -200,16 +200,28 @@ def _check_operator_facing(store: Store) -> Check:
                  "rostered name, or `... set-operator-facing --clear`"),
         )
     hb = store.read_heartbeat(resolved)
-    if hb is not None:
-        age = (datetime.now(timezone.utc) - hb).total_seconds()
-        if age > 300:  # same 5-min rule as the heartbeat checks
-            return Check(
-                name="operator_facing",
-                status="warn",
-                details=(f"liaison {resolved} last seen {int(age)}s ago — "
-                         f"pending escalations may sit unread"),
-                fix=f"have {resolved} rejoin (`agenttalk sync --for {resolved}`)",
-            )
+    if hb is None:
+        # Never listened (or an unreadable/corrupt heartbeat — read_heartbeat
+        # collapses both to None). This is the exact scenario this check exists
+        # to catch — escalations routed to a liaison nobody is reading — so it
+        # must WARN, not fall through to OK (review).
+        return Check(
+            name="operator_facing",
+            status="warn",
+            details=(f"liaison {resolved} is configured but has never listened "
+                     f"(no readable heartbeat) — pending escalations may sit "
+                     f"unread"),
+            fix=f"have {resolved} start listening (`agenttalk wait --for {resolved}`)",
+        )
+    age = (datetime.now(timezone.utc) - hb).total_seconds()
+    if age > 300:  # same 5-min rule as the heartbeat checks
+        return Check(
+            name="operator_facing",
+            status="warn",
+            details=(f"liaison {resolved} last seen {int(age)}s ago — "
+                     f"pending escalations may sit unread"),
+            fix=f"have {resolved} rejoin (`agenttalk sync --for {resolved}`)",
+        )
     return Check(
         name="operator_facing",
         status="ok",
@@ -547,8 +559,9 @@ def _check_active_waiters(store: Store) -> Check | None:
     return Check(
         name="active_waiters",
         status="ok",
-        details=(f"currently waiting: {listing}. One window per agent is "
-                 f"assumed; this names the current marker owner(s), not a "
-                 f"complete duplicate check."),
+        details=(f"active waiting marker(s): {listing}. The PID is alive, but "
+                 f"PID reuse means this is advisory — a marker owner, not a "
+                 f"guaranteed live `agenttalk wait`; it is not a complete "
+                 f"duplicate check."),
         data={"live_waiters": live},
     )

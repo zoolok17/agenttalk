@@ -636,6 +636,29 @@ def test_make_server_ipv6_uses_inet6_without_global_mutation(tmp_path: Path) -> 
         srv.server_close()
 
 
+def test_message_subject_and_meta_are_html_escaped(tmp_path: Path) -> None:
+    """XSS defense isn't only the body: subject and meta keys/values are also
+    attacker-influenced (a coding agent can write arbitrary message JSON) and
+    rendered into the operator's browser, so they must be escaped too."""
+    s = _make_store(tmp_path)
+    s.send(sender="alpha", recipient="beta",
+           subject="<script>alert('subj')</script>",
+           body="ok",
+           meta={"<script>k</script>": "<script>v</script>"})
+    mid = s._scan_messages()[0][0].id
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/messages/{mid}") as resp:
+            html_body = resp.read().decode("utf-8")
+        assert "<script>alert('subj')" not in html_body      # subject escaped
+        assert "&lt;script&gt;alert(&#x27;subj&#x27;)" in html_body
+        assert "<script>k</script>" not in html_body         # meta key escaped
+        assert "<script>v</script>" not in html_body         # meta value escaped
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_state_epoch_status_three_state(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
     # pre-0.16-style opener: hand-written WITHOUT the epoch_at_send key
