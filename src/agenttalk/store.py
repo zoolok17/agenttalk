@@ -1345,6 +1345,17 @@ class Store:
                     ident = p.stem
                 invalid.append((p, ident, str(e)))
                 continue
+            if p.stem != msg.id:
+                # The file name must equal the embedded id — send() is the
+                # only writer and always names files <id>.json. A mismatch is
+                # a forged/corrupt/renamed file: a low-sorting name carrying a
+                # high (e.g. future-dated) embedded id would otherwise be
+                # delivered and poison the cursor, stranding real lower-id
+                # messages (review H1). Quarantine it instead of delivering.
+                invalid.append((p, msg.id,
+                                f"filename stem {p.stem!r} does not match "
+                                f"embedded id {msg.id!r}"))
+                continue
             valid.append((msg, p))
         return valid, invalid
 
@@ -1547,7 +1558,23 @@ class Store:
                 except ValueError:
                     continue
             out.append(m)
-        return out
+        # Restore the documented "sorted by id (chronological)" contract:
+        # _scan_messages_with_paths yields raw filesystem-iteration (filename)
+        # order, which equals id order ONLY because stem==id is now enforced
+        # above. Sort explicitly so delivery, cursor advance, and thread
+        # replay are correct even if that invariant is ever relaxed (review H1).
+        out.sort(key=lambda m: m.id)
+        # Defensive dedupe by id: stem==id + unique filenames make duplicate
+        # ids structurally impossible today, but double-delivery would be a
+        # silent correctness bug if that ever changed, so guard it cheaply.
+        deduped: list[Message] = []
+        seen_ids: set[str] = set()
+        for m in out:
+            if m.id in seen_ids:
+                continue
+            seen_ids.add(m.id)
+            deduped.append(m)
+        return deduped
 
     def current_epoch(self) -> str | None:
         """The global epoch id = the message id of the latest validated global

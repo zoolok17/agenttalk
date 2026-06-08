@@ -453,16 +453,29 @@ def _check_hmac(store: Store, project_root: Path) -> Check:
             name="hmac", status="ok",
             details=f"disabled (no key file at {health.path}; run `agenttalk hmac-init` to enable)",
         )
-    if not health.readable:
-        return Check(
-            name="hmac", status="error",
-            details=f"key file at {health.path} is not readable by this process",
-        )
+    # in_project_dir is checked BEFORE readability/validity: a key committed
+    # inside the project defeats the whole threat model, so surface that
+    # specific misconfiguration even if the file is also unreadable/invalid.
     if health.in_project_dir:
         return Check(
             name="hmac", status="error",
             details=f"key file is INSIDE the project at {health.path}",
             fix="move it under the per-user keys dir (defeats the threat model otherwise)",
+        )
+    if not health.readable:
+        return Check(
+            name="hmac", status="error",
+            details=f"key file at {health.path} is not readable by this process",
+        )
+    if not health.valid:
+        # File exists and is readable but does not parse as a >=16-byte hex
+        # key. signing_enforced() is existence-only, so without this branch
+        # doctor would report enabled-OK while every signed read is refused
+        # (garbage key) or forgeable (the old empty/short-key gap) — review C*.
+        return Check(
+            name="hmac", status="error",
+            details=f"key file at {health.path} is invalid: {health.key_error}",
+            fix="regenerate it with `agenttalk hmac-init --force`",
         )
     if health.mode_warning:
         return Check(

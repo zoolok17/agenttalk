@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import doctor
+from agenttalk import doctor, signing
 from agenttalk.store import Store
 
 
@@ -37,6 +37,66 @@ def test_doctor_on_initialized_project_includes_all_check_categories(
     assert "codex_config" in names
     assert "heartbeat.alpha" in names
     assert "heartbeat.beta" in names
+
+
+# ----- hmac check status mapping (review C*: doctor must NOT report a
+# degenerate/garbage key as enabled-OK; closes doctor.py 456-472) ------
+
+def test_doctor_hmac_reports_error_for_short_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proj = tmp_path / "proj"
+    Store(proj).init(["alpha", "beta"])
+    badkey = tmp_path / "bad.key"           # OUTSIDE the project dir
+    badkey.write_text("00", encoding="utf-8")  # valid hex, 1 byte
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(badkey))
+    report = doctor.run(proj)
+    hmac = next(c for c in report.checks if c.name == "hmac")
+    assert hmac.status == "error"
+    assert "16 bytes" in hmac.details
+
+
+def test_doctor_hmac_reports_error_for_garbage_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proj = tmp_path / "proj"
+    Store(proj).init(["alpha", "beta"])
+    badkey = tmp_path / "bad.key"
+    badkey.write_text("not hex at all", encoding="utf-8")
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(badkey))
+    report = doctor.run(proj)
+    hmac = next(c for c in report.checks if c.name == "hmac")
+    assert hmac.status == "error"
+    assert "hex" in hmac.details
+
+
+def test_doctor_hmac_reports_enabled_ok_for_good_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proj = tmp_path / "proj"
+    store = Store(proj)
+    store.init(["alpha", "beta"])
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(tmp_path / "good.key"))
+    signing.init_key(store.project_id())   # full 32-byte key OUTSIDE project
+    report = doctor.run(proj)
+    hmac = next(c for c in report.checks if c.name == "hmac")
+    assert hmac.status == "ok"
+    assert "enabled" in hmac.details
+
+
+def test_doctor_hmac_flags_key_inside_project_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proj = tmp_path / "proj"
+    store = Store(proj)
+    store.init(["alpha", "beta"])
+    inside = proj / "inside.key"
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(inside))
+    signing.init_key(store.project_id())   # writes a valid key, but in-project
+    report = doctor.run(proj)
+    hmac = next(c for c in report.checks if c.name == "hmac")
+    assert hmac.status == "error"
+    assert "INSIDE the project" in hmac.details
 
 
 def test_doctor_heartbeat_check_distinguishes_fresh_stale_missing(

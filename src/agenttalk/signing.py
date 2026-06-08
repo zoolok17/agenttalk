@@ -49,6 +49,10 @@ from pathlib import Path
 SIGNATURE_VERSION = "v1"
 SIGNATURE_ALG = "hmac-sha256"
 _KEY_BYTES = 32  # 256-bit HMAC key per RFC 2104 recommendation
+_MIN_KEY_BYTES = 16  # RFC 2104 floor: keys shorter than the hash's block
+# minimum are weak. sign/verify/load/inspect ALL enforce this so a
+# degenerate (empty/short/garbage) key can never present as a working,
+# "enforced" signing setup (review C*).
 
 
 # --------------------------------------------------------------- canonicalization
@@ -175,11 +179,22 @@ def _write_key_file(path: Path, key: bytes) -> None:
 def _read_key_file(path: Path) -> bytes:
     raw = path.read_text(encoding="utf-8").strip()
     try:
-        return bytes.fromhex(raw)
+        key = bytes.fromhex(raw)
     except ValueError as e:
         raise ValueError(
             f"key file at {path} is not a valid hex string: {e}"
         ) from e
+    if len(key) < _MIN_KEY_BYTES:
+        # An empty/whitespace file decodes to b'' and a 2-hex-char file to
+        # 1 byte; either would silently HMAC under a weak/public key while
+        # signing_enforced() (existence-only) still reports green. Reject
+        # on every read path so the failure is loud, not forgeable.
+        raise ValueError(
+            f"key file at {path} decodes to {len(key)} bytes; HMAC keys must "
+            f"be at least {_MIN_KEY_BYTES} bytes (run `agenttalk hmac-init` to "
+            f"generate a {_KEY_BYTES}-byte key)"
+        )
+    return key
 
 
 def init_key(project_id: str, *, override: str | os.PathLike | None = None,
@@ -222,6 +237,8 @@ class KeyHealth:
     mode_warning: str | None     # set if mode is too permissive
     in_project_dir: bool         # True = configuration error
     project_root: Path
+    valid: bool = False          # key file parses as hex AND meets length floor
+    key_error: str | None = None  # why it's invalid (set iff readable & not valid)
 
     def to_dict(self) -> dict:
         return {
@@ -232,6 +249,8 @@ class KeyHealth:
                            else None),
             "mode_warning": self.mode_warning,
             "in_project_dir": self.in_project_dir,
+            "valid": self.valid,
+            "key_error": self.key_error,
         }
 
 
@@ -253,6 +272,15 @@ def inspect_key(project_id: str, project_root: Path, *,
         health.readable = True
     except OSError:
         health.readable = False
+    if health.readable:
+        # Parse + length-check via the same gate load_key uses, so doctor
+        # can never report a degenerate/garbage key as enabled-OK (review C*).
+        try:
+            _read_key_file(path)
+            health.valid = True
+        except ValueError as e:
+            health.valid = False
+            health.key_error = str(e)
     if os.name != "nt":
         try:
             mode = path.stat().st_mode & 0o777
@@ -285,8 +313,8 @@ def sign_message(msg_dict: dict, key: bytes, *,
     Mutates only the returned copy. Idempotent: signing an already-
     signed message replaces the old signature.
     """
-    if not isinstance(key, (bytes, bytearray)) or len(key) < 16:
-        raise ValueError("HMAC key must be at least 16 bytes")
+    if not isinstance(key, (bytes, bytearray)) or len(key) < _MIN_KEY_BYTES:
+        raise ValueError(f"HMAC key must be at least {_MIN_KEY_BYTES} bytes")
     out = dict(msg_dict)
     meta = dict(out.get("meta") or {})
     meta.pop("signature", None)  # replace any existing
@@ -307,6 +335,11 @@ def verify_message(msg_dict: dict, key: bytes, *,
 
     Uses ``hmac.compare_digest`` for constant-time comparison.
     """
+    if not isinstance(key, (bytes, bytearray)) or len(key) < _MIN_KEY_BYTES:
+        # Mirror sign_message: a too-short key must fail loudly here too,
+        # so the weak-key invariant is local to verification and a future
+        # in-process caller can't silently verify under a degenerate key.
+        raise ValueError(f"HMAC key must be at least {_MIN_KEY_BYTES} bytes")
     meta = msg_dict.get("meta") or {}
     if "signature" not in meta:
         raise ValueError("missing signature")

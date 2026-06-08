@@ -623,6 +623,48 @@ def test_quarantine_embedded_id_collision_moves_invalid_only(store: Store) -> No
     assert store.quarantined_count() == 1
 
 
+# ======================================================================
+# review H1: filename-stem must match embedded id; validated set sorted
+# by id (cursor-poisoning / wrong-replay-order defense)
+# ======================================================================
+
+def test_filename_stem_mismatch_is_invalid_and_not_delivered(store: Store) -> None:
+    """A file whose name does not equal its embedded id is forged/corrupt:
+    quarantinable, never delivered, and unable to poison a cursor.
+
+    Vector: a low-sorting filename embedding a valid-shape HIGH/future id.
+    The embedded id passes _ID_RE (shape), so only a stem==id check stops
+    it from being delivered and advancing the cursor past real messages."""
+    forged_id = "29990101-000000-000000-AAAA"   # valid shape, far future
+    p = store.messages_dir / "00000000-000000-000000-zzzz.json"  # low filename
+    p.write_text(json.dumps({
+        "id": forged_id, "ts": "2026-01-01T00:00:00Z", "from": "alpha",
+        "to": "beta", "kind": "message", "subject": "", "body": "forged",
+        "meta": {},
+    }), encoding="utf-8")
+    invalid = dict(store.list_invalid_messages())
+    assert forged_id in invalid
+    assert "stem" in invalid[forged_id] and "does not match" in invalid[forged_id]
+    # never delivered
+    assert all(m.id != forged_id for m in store.messages_for("beta"))
+    # cursor not poisoned: a real (lower-id) message still delivers afterward
+    store.send(sender="alpha", recipient="beta", body="REAL")
+    unread = store.unread_for("beta")
+    assert any(m.body == "REAL" for m in unread)
+    assert all(m.id != forged_id for m in unread)
+
+
+def test_validated_messages_returned_in_id_order(store: Store) -> None:
+    """valid_messages()/_validated_messages() contract says id order
+    (chronological). Pin it so a future change can't silently regress to
+    raw filesystem-iteration order."""
+    sent = [store.send(sender="alpha", recipient="beta", body=str(i)).id
+            for i in range(6)]
+    got = [m.id for m in store.valid_messages()]
+    assert got == sorted(got)
+    assert set(sent).issubset(set(got))
+
+
 # ============================================================= #19 Phase A
 # Identity registry, retirement & epoch store layer (WP01).
 

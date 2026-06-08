@@ -267,7 +267,20 @@ def _reply_in_flight(store: Store, t) -> bool:
 # ------------------------------------------------------------------- handlers
 
 def cmd_init(args: argparse.Namespace) -> int:
-    root = Path(args.path).resolve() if args.path else Path.cwd().resolve()
+    # Resolution precedence mirrors the documented global --root contract so
+    # init can't silently diverge from every other command (review H2):
+    #   init's own --path/--here  >  global --root  >  $AGENTTALK_ROOT  >  CWD.
+    # Before this, init used --path/CWD only, so `agenttalk --root X init`
+    # created a SECOND store under CWD — the exact split-brain the #13
+    # up-tree guard exists to prevent.
+    if args.path:
+        root = Path(args.path).resolve()
+    elif getattr(args, "root", None):
+        root = Path(args.root).resolve()
+    elif os.environ.get("AGENTTALK_ROOT"):
+        root = Path(os.environ["AGENTTALK_ROOT"]).resolve()
+    else:
+        root = Path.cwd().resolve()
     store = Store(root)
     agents = [a.strip() for a in args.agents.split(",") if a.strip()]
     if len(agents) < 2:

@@ -237,6 +237,82 @@ def test_load_key_rejects_garbage_content(
         signing.load_key("pid-1")
 
 
+# ----- weak-key rejection (review C*: sign enforces >=16 bytes, the
+# verify/load/inspect side must too, else a degenerate key yields a
+# forgeable-but-"enforced" state and a falsely-green doctor) ----------
+
+def test_load_key_rejects_empty_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    p = tmp_path / "empty.key"
+    p.write_text("", encoding="utf-8")  # decodes to b"" — too short
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(p))
+    with pytest.raises(ValueError, match="16 bytes"):
+        signing.load_key("pid-1")
+
+
+def test_load_key_rejects_whitespace_only_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    p = tmp_path / "ws.key"
+    p.write_text("   \n", encoding="utf-8")  # strips to "" -> b""
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(p))
+    with pytest.raises(ValueError, match="16 bytes"):
+        signing.load_key("pid-1")
+
+
+def test_load_key_rejects_short_hex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    p = tmp_path / "short.key"
+    p.write_text("00", encoding="utf-8")  # valid hex, 1 byte — too short
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(p))
+    with pytest.raises(ValueError, match="16 bytes"):
+        signing.load_key("pid-1")
+
+
+def test_verify_message_rejects_short_key() -> None:
+    """verify_message must reject an undersized key the same way
+    sign_message does, so the invariant is local to verification."""
+    with pytest.raises(ValueError, match="16 bytes"):
+        signing.verify_message({"meta": {}}, b"short")
+
+
+def test_inspect_key_flags_empty_key_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    p = tmp_path / "empty.key"
+    p.write_text("", encoding="utf-8")
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(p))
+    h = signing.inspect_key("pid-1", project_root=tmp_path.parent)
+    assert h.exists and h.readable
+    assert not h.valid
+    assert h.key_error and "16 bytes" in h.key_error
+
+
+def test_inspect_key_flags_garbage_key_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    p = tmp_path / "bad.key"
+    p.write_text("not hex at all", encoding="utf-8")
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(p))
+    h = signing.inspect_key("pid-1", project_root=tmp_path.parent)
+    assert h.exists and h.readable
+    assert not h.valid
+    assert h.key_error and "hex" in h.key_error
+
+
+def test_inspect_key_good_key_is_valid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(tmp_path / "k.key"))
+    signing.init_key("pid-1")
+    h = signing.inspect_key("pid-1", project_root=tmp_path.parent)
+    assert h.exists and h.readable
+    assert h.valid
+    assert h.key_error is None
+
+
 # ---------------------------------------------------- inspect_key health
 
 def test_inspect_key_reports_missing(

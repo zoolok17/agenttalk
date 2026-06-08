@@ -1671,6 +1671,50 @@ def test_init_reinit_at_same_root_unchanged(store_root: Path) -> None:
     assert rc == 0
 
 
+# --------------------------------------- init honors global --root / env
+# (review H2: every other command honors --root/AGENTTALK_ROOT; init must
+# too, or it silently creates a SECOND store in the wrong dir = split-brain)
+
+def test_init_honors_global_root_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)              # cwd is a clean temp dir
+    target = tmp_path / "proj"
+    target.mkdir()
+    rc = cli.main(["--root", str(target), "init", "--agents", "a,b"])
+    assert rc == 0
+    assert (target / ".agenttalk").is_dir()           # created at --root
+    assert not (tmp_path / ".agenttalk").exists()     # NOT in cwd
+
+
+def test_init_honors_agenttalk_root_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "proj2"
+    target.mkdir()
+    monkeypatch.setenv("AGENTTALK_ROOT", str(target))
+    rc = cli.main(["init", "--agents", "a,b"])
+    assert rc == 0
+    assert (target / ".agenttalk").is_dir()
+    assert not (tmp_path / ".agenttalk").exists()
+
+
+def test_init_path_wins_over_global_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    via_path = tmp_path / "viapath"
+    via_path.mkdir()
+    via_root = tmp_path / "viaroot"
+    via_root.mkdir()
+    rc = cli.main(["--root", str(via_root), "init", "--path", str(via_path),
+                   "--agents", "a,b"])
+    assert rc == 0
+    assert (via_path / ".agenttalk").is_dir()         # explicit --path wins
+    assert not (via_root / ".agenttalk").exists()
+
+
 # --------------------------------------- roster set-operator-facing (T012)
 
 def test_set_operator_facing_roundtrip_and_displays(tmp_path: Path, capsys) -> None:
