@@ -21,7 +21,8 @@ subtasks:
 - T003
 - T004
 - T005
-shell_pid: '41124'
+shell_pid: "41124"
+agent: "claude"
 history:
 - Created by /spec-kitty.tasks for coordination-polish-0240-01KTMG5Z
 authoritative_surface: src/agenttalk/store.py
@@ -168,3 +169,7 @@ WP's lane is allocated from `lanes.json` at finalize time.
 ## Implementation command
 
 `spec-kitty agent action implement WP01 --agent <name>`
+
+## Activity Log
+
+- 2026-06-08T21:07:19Z – claude – shell_pid=41124 – Assigned agent via action command
