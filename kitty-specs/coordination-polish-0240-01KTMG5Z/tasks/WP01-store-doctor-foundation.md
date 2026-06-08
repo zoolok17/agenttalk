@@ -12,12 +12,16 @@ requirement_refs:
 planning_base_branch: master
 merge_target_branch: master
 branch_strategy: Planning artifacts for this feature were generated on master. During /spec-kitty.implement this WP may branch from a dependency-specific base, but completed changes must merge back into master unless the human explicitly redirects the landing branch.
+base_branch: kitty/mission-coordination-polish-0240-01KTMG5Z
+base_commit: 2533c504fd8d3ea930cacbb908df318019d0005e
+created_at: '2026-06-08T21:07:17.643725+00:00'
 subtasks:
 - T001
 - T002
 - T003
 - T004
 - T005
+shell_pid: '41124'
 history:
 - Created by /spec-kitty.tasks for coordination-polish-0240-01KTMG5Z
 authoritative_surface: src/agenttalk/store.py
