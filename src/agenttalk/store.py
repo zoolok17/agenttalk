@@ -16,6 +16,7 @@ the invariant ``messages_for`` / dashboard rendering relies on.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -663,6 +664,86 @@ class Store:
     def _write_config(self, cfg: dict) -> None:
         _atomic_write_text(self.config_path, json.dumps(cfg, indent=2))
 
+    # --- config mutation lock (review M2) -----------------------------------
+    #
+    # config.json is shared mutable state that any agent legitimately writes
+    # (roster admin: add/remove/set-role/set-group/set-operator-facing/retire/
+    # rename). _write_config is an atomic single-file replace, but the
+    # surrounding load -> mutate -> write is NOT atomic, so two concurrent admin
+    # ops both read the same base and the later writer silently clobbers the
+    # earlier's change (a dropped retire/rename can even re-open a name #19
+    # promises is permanent). There is no lock server, so serialize those
+    # critical sections with an O_EXCL sidecar lock file — portable on Windows
+    # and POSIX. Per-agent cursor/threadstate/heartbeat writes are deliberately
+    # NOT locked: they are single-writer under the documented one-window-per-
+    # agent model; only shared config.json needs this.
+
+    def _read_lock_pid(self, lock: Path) -> int | None:
+        try:
+            data = json.loads(lock.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        pid = data.get("pid") if isinstance(data, dict) else None
+        return pid if isinstance(pid, int) else None
+
+    def _break_stale_lock(self, lock: Path) -> bool:
+        """Break a lock held by a provably-dead pid; return True if broken.
+
+        The claim is ATOMIC (``os.replace`` the lock onto a per-pid sidecar):
+        only one racing stealer wins the rename, the loser's replace raises
+        and it re-loops, so two processes can never both break the same lock
+        and then both enter the critical section. A lock that is unreadable,
+        garbage, our own pid, or held by a LIVE pid is never broken — we wait
+        out the timeout instead (no mtime-only breaking)."""
+        pid = self._read_lock_pid(lock)
+        if pid is None or pid == os.getpid() or _process_alive(pid):
+            return False
+        claimed = lock.with_name(f"{lock.name}.stale.{os.getpid()}")
+        try:
+            os.replace(str(lock), str(claimed))
+        except OSError:
+            return False  # lock vanished or another stealer won the claim
+        try:
+            os.unlink(str(claimed))
+        except OSError:
+            pass
+        return True
+
+    @contextlib.contextmanager
+    def _config_lock(self, *, timeout: float = 10.0, poll: float = 0.05):
+        """Hold an exclusive lock across a config read-modify-write."""
+        lock = self.dir / "config.lock"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + timeout
+        fd: int | None = None
+        while True:
+            try:
+                fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                if self._break_stale_lock(lock):
+                    continue  # broke a dead holder — retry create immediately
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"could not acquire the config lock at {lock} within "
+                        f"{timeout:g}s — another agent may be mid roster-admin. "
+                        f"If no agent is running, remove the stale lock file."
+                    ) from None
+                time.sleep(poll)
+        try:
+            try:
+                os.write(fd, json.dumps({
+                    "pid": os.getpid(), "at": _now_iso(), "root": str(self.root),
+                }).encode("utf-8"))
+            finally:
+                os.close(fd)
+            yield
+        finally:
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+
     @staticmethod
     def _cfg_dict(cfg: dict, key: str) -> dict:
         """Return cfg[key] as a dict, coercing absent/null to a fresh {}.
@@ -795,85 +876,89 @@ class Store:
         role / group memberships. A deliberate local admin op — NOT a
         security boundary and NOT process supervision."""
         validate_agent_name(name)
-        cfg = self.load_config()
-        roster = list(cfg.get("agents", []))
-        is_new = name not in roster
-        if is_new:
-            # B2 (#19 Phase A): a retired tombstone is permanent and
-            # non-rebindable (FR-002). Refuse at WRITE time — do not rely on
-            # load_config fail-closing on the next read (that writes a bad
-            # config first and gives a confusing error later). Case-insensitive,
-            # because a tombstone must be unrepresentable as a new active name.
-            retired_keys = {r.casefold(): r for r in self._retired_names(cfg)}
-            if name.casefold() in retired_keys:
-                raise ValueError(
-                    f"agent name {name!r} is a retired tombstone "
-                    f"({retired_keys[name.casefold()]!r}) and cannot be re-bound; "
-                    f"tombstones are permanent (#19). Pick a different name."
-                )
-            validate_agent_roster(roster + [name])  # case-insensitive uniqueness
-            roster.append(name)
-            cfg["agents"] = roster
-        if role is not None:
-            roles = self._cfg_dict(cfg, "roles")
-            roles[name] = role
-            validate_roles(roles, roster)
-        if groups:
-            g = self._cfg_dict(cfg, "groups")
-            for gn in groups:
-                validate_group_name(gn)
-                members = g.setdefault(gn, [])
-                if name not in members:
-                    members.append(name)
-            validate_groups(g, roster)
-        # All validation passed — only now perform side effects, so a bad
-        # role/group never orphans a freshly-written cursor file.
-        self._write_config(cfg)
-        if is_new:
-            cur = self.state_dir / f"{name}.cursor"
-            if not cur.exists():
-                _atomic_write_text(cur, "")
+        with self._config_lock():
+            cfg = self.load_config()
+            roster = list(cfg.get("agents", []))
+            is_new = name not in roster
+            if is_new:
+                # B2 (#19 Phase A): a retired tombstone is permanent and
+                # non-rebindable (FR-002). Refuse at WRITE time — do not rely on
+                # load_config fail-closing on the next read (that writes a bad
+                # config first and gives a confusing error later). Case-insensitive,
+                # because a tombstone must be unrepresentable as a new active name.
+                retired_keys = {r.casefold(): r for r in self._retired_names(cfg)}
+                if name.casefold() in retired_keys:
+                    raise ValueError(
+                        f"agent name {name!r} is a retired tombstone "
+                        f"({retired_keys[name.casefold()]!r}) and cannot be re-bound; "
+                        f"tombstones are permanent (#19). Pick a different name."
+                    )
+                validate_agent_roster(roster + [name])  # case-insensitive uniqueness
+                roster.append(name)
+                cfg["agents"] = roster
+            if role is not None:
+                roles = self._cfg_dict(cfg, "roles")
+                roles[name] = role
+                validate_roles(roles, roster)
+            if groups:
+                g = self._cfg_dict(cfg, "groups")
+                for gn in groups:
+                    validate_group_name(gn)
+                    members = g.setdefault(gn, [])
+                    if name not in members:
+                        members.append(name)
+                validate_groups(g, roster)
+            # All validation passed — only now perform side effects, so a bad
+            # role/group never orphans a freshly-written cursor file.
+            self._write_config(cfg)
+            if is_new:
+                cur = self.state_dir / f"{name}.cursor"
+                if not cur.exists():
+                    _atomic_write_text(cur, "")
         return cfg
 
     def remove_agent(self, name: str) -> dict:
         """Remove an agent from the roster, its role, and all group
         memberships. Leaves its cursor/messages as historical record."""
-        cfg = self.load_config()
-        roster = list(cfg.get("agents", []))
-        if name in roster:
-            roster.remove(name)
-            cfg["agents"] = roster
-        if isinstance(cfg.get("roles"), dict):
-            cfg["roles"].pop(name, None)
-        if isinstance(cfg.get("groups"), dict):
-            for members in cfg["groups"].values():
-                if name in members:
-                    members.remove(name)
-        self._write_config(cfg)
+        with self._config_lock():
+            cfg = self.load_config()
+            roster = list(cfg.get("agents", []))
+            if name in roster:
+                roster.remove(name)
+                cfg["agents"] = roster
+            if isinstance(cfg.get("roles"), dict):
+                cfg["roles"].pop(name, None)
+            if isinstance(cfg.get("groups"), dict):
+                for members in cfg["groups"].values():
+                    if name in members:
+                        members.remove(name)
+            self._write_config(cfg)
         return cfg
 
     def set_role(self, name: str, role: str) -> dict:
-        cfg = self.load_config()
-        roster = cfg.get("agents", []) or []
-        if name not in roster:
-            raise ValueError(f"agent {name!r} is not in the roster {sorted(roster)}")
-        roles = self._cfg_dict(cfg, "roles")
-        roles[name] = role
-        validate_roles(roles, roster)
-        self._write_config(cfg)
+        with self._config_lock():
+            cfg = self.load_config()
+            roster = cfg.get("agents", []) or []
+            if name not in roster:
+                raise ValueError(f"agent {name!r} is not in the roster {sorted(roster)}")
+            roles = self._cfg_dict(cfg, "roles")
+            roles[name] = role
+            validate_roles(roles, roster)
+            self._write_config(cfg)
         return cfg
 
     def set_group(self, group: str, members: list[str]) -> dict:
-        cfg = self.load_config()
-        roster = cfg.get("agents", []) or []
-        validate_group_name(group)
-        for m in members:
-            if m not in roster:
-                raise ValueError(f"group member {m!r} is not in the roster {sorted(roster)}")
-        groups = self._cfg_dict(cfg, "groups")
-        groups[group] = list(dict.fromkeys(members))  # de-dupe, preserve order
-        validate_groups(groups, roster)
-        self._write_config(cfg)
+        with self._config_lock():
+            cfg = self.load_config()
+            roster = cfg.get("agents", []) or []
+            validate_group_name(group)
+            for m in members:
+                if m not in roster:
+                    raise ValueError(f"group member {m!r} is not in the roster {sorted(roster)}")
+            groups = self._cfg_dict(cfg, "groups")
+            groups[group] = list(dict.fromkeys(members))  # de-dupe, preserve order
+            validate_groups(groups, roster)
+            self._write_config(cfg)
         return cfg
 
     # ------------------------------------------------- operator liaison
@@ -917,17 +1002,18 @@ class Store:
         Validates roster membership at set time; reading tolerates a
         later roster change (see `operator_facing`).
         """
-        cfg = self.load_config()
-        if name is None:
-            cfg.pop("operator_facing", None)
-        else:
-            roster = cfg.get("agents", []) or []
-            if name not in roster:
-                raise ValueError(
-                    f"agent {name!r} is not in the roster {sorted(roster)}"
-                )
-            cfg["operator_facing"] = name
-        self._write_config(cfg)
+        with self._config_lock():
+            cfg = self.load_config()
+            if name is None:
+                cfg.pop("operator_facing", None)
+            else:
+                roster = cfg.get("agents", []) or []
+                if name not in roster:
+                    raise ValueError(
+                        f"agent {name!r} is not in the roster {sorted(roster)}"
+                    )
+                cfg["operator_facing"] = name
+            self._write_config(cfg)
         return cfg
 
     # ----------------------------------------- retirement / rename (0.16.0 #19)
@@ -964,27 +1050,28 @@ class Store:
         ``renamed_to`` links a rename's tombstone to its successor (set by
         :meth:`rename_agent`). Refuses a name that is not currently active.
         """
-        cfg = self.load_config()
-        active = cfg.get("agents", []) or []
-        if name not in active:
-            if name in self._retired_names(cfg):
-                raise ValueError(f"identity {name!r} is already retired")
-            raise ValueError(
-                f"cannot retire {name!r}: not in the active roster {sorted(active)}"
-            )
-        self._strip_identity(cfg, name)
-        retired = cfg.get("retired")
-        if not isinstance(retired, list):
-            retired = []
-        retired.append({
-            "name": name,
-            "retired_at": _now_iso(),
-            "renamed_to": renamed_to,
-            "reason": reason,
-        })
-        cfg["retired"] = retired
-        validate_retired(retired, cfg.get("agents", []) or [])  # fail before write
-        self._write_config(cfg)
+        with self._config_lock():
+            cfg = self.load_config()
+            active = cfg.get("agents", []) or []
+            if name not in active:
+                if name in self._retired_names(cfg):
+                    raise ValueError(f"identity {name!r} is already retired")
+                raise ValueError(
+                    f"cannot retire {name!r}: not in the active roster {sorted(active)}"
+                )
+            self._strip_identity(cfg, name)
+            retired = cfg.get("retired")
+            if not isinstance(retired, list):
+                retired = []
+            retired.append({
+                "name": name,
+                "retired_at": _now_iso(),
+                "renamed_to": renamed_to,
+                "reason": reason,
+            })
+            cfg["retired"] = retired
+            validate_retired(retired, cfg.get("agents", []) or [])  # fail before write
+            self._write_config(cfg)
         return cfg
 
     def rename_agent(self, old: str, new: str, *, reason: str | None = None) -> dict:
@@ -994,64 +1081,65 @@ class Store:
         referencing ``old`` stays valid; ``old`` is non-rebindable (FR-002/005/006).
         """
         validate_agent_name(new)
-        cfg = self.load_config()
-        active = cfg.get("agents", []) or []
-        if old not in active:
-            raise ValueError(
-                f"cannot rename {old!r}: not in the active roster {sorted(active)}"
-            )
-        # Non-rebindable: `new` must not collide (case-insensitively) with ANY
-        # known identity — active or a retired tombstone.
-        known_keys = {k.casefold(): k for k in self._known_roster(cfg)}
-        if new.casefold() in known_keys:
-            clash = known_keys[new.casefold()]
-            is_tomb = new.casefold() in {r.casefold() for r in self._retired_names(cfg)}
-            where = "a retired tombstone" if is_tomb else "already an active identity"
-            raise ValueError(
-                f"cannot rename {old!r} to {new!r}: {clash!r} is {where}; "
-                f"identities are non-rebindable (#19)"
-            )
-        # Snapshot old's role / group memberships / liaison BEFORE stripping.
-        old_role = (cfg.get("roles") or {}).get(old)
-        old_groups = [g for g, members in (cfg.get("groups") or {}).items()
-                      if old in members]
-        was_liaison = cfg.get("operator_facing") == old
-        # Retire old -> tombstone(renamed_to=new), then activate new + carryover.
-        self._strip_identity(cfg, old)
-        retired = cfg.get("retired")
-        if not isinstance(retired, list):
-            retired = []
-        retired.append({
-            "name": old,
-            "retired_at": _now_iso(),
-            "renamed_to": new,
-            "reason": reason,
-        })
-        cfg["retired"] = retired
-        roster = list(cfg.get("agents", []) or [])
-        roster.append(new)
-        cfg["agents"] = roster
-        if old_role is not None:
-            self._cfg_dict(cfg, "roles")[new] = old_role
-        if old_groups:
-            g = self._cfg_dict(cfg, "groups")
-            for gn in old_groups:
-                members = g.setdefault(gn, [])
-                if new not in members:
-                    members.append(new)
-        if was_liaison:
-            cfg["operator_facing"] = new
-        # Validate the WHOLE resulting config before writing (fail-closed).
-        validate_agent_roster(roster)
-        validate_retired(retired, roster)
-        if cfg.get("roles"):
-            validate_roles(cfg["roles"], roster)
-        if cfg.get("groups"):
-            validate_groups(cfg["groups"], roster)
-        self._write_config(cfg)
-        cur = self.state_dir / f"{new}.cursor"
-        if not cur.exists():
-            _atomic_write_text(cur, "")
+        with self._config_lock():
+            cfg = self.load_config()
+            active = cfg.get("agents", []) or []
+            if old not in active:
+                raise ValueError(
+                    f"cannot rename {old!r}: not in the active roster {sorted(active)}"
+                )
+            # Non-rebindable: `new` must not collide (case-insensitively) with ANY
+            # known identity — active or a retired tombstone.
+            known_keys = {k.casefold(): k for k in self._known_roster(cfg)}
+            if new.casefold() in known_keys:
+                clash = known_keys[new.casefold()]
+                is_tomb = new.casefold() in {r.casefold() for r in self._retired_names(cfg)}
+                where = "a retired tombstone" if is_tomb else "already an active identity"
+                raise ValueError(
+                    f"cannot rename {old!r} to {new!r}: {clash!r} is {where}; "
+                    f"identities are non-rebindable (#19)"
+                )
+            # Snapshot old's role / group memberships / liaison BEFORE stripping.
+            old_role = (cfg.get("roles") or {}).get(old)
+            old_groups = [g for g, members in (cfg.get("groups") or {}).items()
+                          if old in members]
+            was_liaison = cfg.get("operator_facing") == old
+            # Retire old -> tombstone(renamed_to=new), then activate new + carryover.
+            self._strip_identity(cfg, old)
+            retired = cfg.get("retired")
+            if not isinstance(retired, list):
+                retired = []
+            retired.append({
+                "name": old,
+                "retired_at": _now_iso(),
+                "renamed_to": new,
+                "reason": reason,
+            })
+            cfg["retired"] = retired
+            roster = list(cfg.get("agents", []) or [])
+            roster.append(new)
+            cfg["agents"] = roster
+            if old_role is not None:
+                self._cfg_dict(cfg, "roles")[new] = old_role
+            if old_groups:
+                g = self._cfg_dict(cfg, "groups")
+                for gn in old_groups:
+                    members = g.setdefault(gn, [])
+                    if new not in members:
+                        members.append(new)
+            if was_liaison:
+                cfg["operator_facing"] = new
+            # Validate the WHOLE resulting config before writing (fail-closed).
+            validate_agent_roster(roster)
+            validate_retired(retired, roster)
+            if cfg.get("roles"):
+                validate_roles(cfg["roles"], roster)
+            if cfg.get("groups"):
+                validate_groups(cfg["groups"], roster)
+            self._write_config(cfg)
+            cur = self.state_dir / f"{new}.cursor"
+            if not cur.exists():
+                _atomic_write_text(cur, "")
         return cfg
 
     def _drain_check(self, name: str) -> list[dict]:
