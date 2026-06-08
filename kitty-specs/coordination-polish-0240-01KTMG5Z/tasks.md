@@ -11,11 +11,11 @@ WP01 (store + doctor) → WP02 (cli, depends WP01) → WP03 (docs/version, depen
 
 | ID | Description | WP | Parallel |
 |----|-------------|----|----------|
-| T001 | `store.set_role` at-most-one-lead invariant (atomic demote+promote, idempotent, case-insensitive, zero-leads ok, returns demoted name) | WP01 | |
-| T002 | `store.sole_lead() -> str\|None` (None for zero AND legacy >1) | WP01 | [P] |
-| T003 | `doctor.py` no-human-facing-target Check (multi-agent only; neither liaison nor lead) | WP01 | [P] |
-| T004 | tests: `test_store.py` — invariant, sole_lead, idempotent, case-insensitive, zero-leads | WP01 | |
-| T005 | tests: `test_doctor.py` — warn / absent(liaison) / absent(lead) / solo | WP01 | |
+| T001 | `store.set_role` at-most-one-lead invariant (atomic demote+promote, idempotent, case-insensitive, zero-leads ok, returns demoted name) | WP01 | | [D] |
+| T002 | `store.sole_lead() -> str\|None` (None for zero AND legacy >1) | WP01 | [D] |
+| T003 | `doctor.py` no-human-facing-target Check (multi-agent only; neither liaison nor lead) | WP01 | [D] |
+| T004 | tests: `test_store.py` — invariant, sole_lead, idempotent, case-insensitive, zero-leads | WP01 | | [D] |
+| T005 | tests: `test_doctor.py` — warn / absent(liaison) / absent(lead) / solo | WP01 | | [D] |
 | T006 | `escalate` lead-fallback resolution + remediation message + fallback notice | WP02 | |
 | T007 | roster `set-role` handler prints `demoted X, promoted Y` (no --force) | WP02 | |
 | T008 | wake `wk-` id: add to `_AUTOGEN_REQUEST_ID_PREFIX` (+ comment); honor explicit id | WP02 | [P] |
@@ -33,11 +33,11 @@ invariant, sole_lead semantics, and the doctor warn/absent/solo cases all pass.
 **Requirements**: FR-004, FR-005 (store half), FR-006, FR-007, FR-008, FR-009.
 **Prompt**: [tasks/WP01-store-doctor-foundation.md](./tasks/WP01-store-doctor-foundation.md)
 
-- [ ] T001 store.set_role at-most-one-lead invariant (WP01)
-- [ ] T002 store.sole_lead() helper (WP01)
-- [ ] T003 doctor no-human-facing-target Check (WP01)
-- [ ] T004 test_store.py coverage (WP01)
-- [ ] T005 test_doctor.py coverage (WP01)
+- [x] T001 store.set_role at-most-one-lead invariant (WP01)
+- [x] T002 store.sole_lead() helper (WP01)
+- [x] T003 doctor no-human-facing-target Check (WP01)
+- [x] T004 test_store.py coverage (WP01)
+- [x] T005 test_doctor.py coverage (WP01)
 
 **Risks**: changing `set_role` return shape could ripple to callers — keep it
 backward-compatible (return cfg, communicate demoted name additively). Case-folding the
