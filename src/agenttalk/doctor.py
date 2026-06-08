@@ -94,6 +94,7 @@ def run(project_root: Path | None = None) -> Report:
         report.checks.append(_check_identity_registry(store))
         report.checks.append(_check_store_hygiene(store))
         report.checks.extend(_check_skills())
+        report.checks.append(_check_devkit())
         report.checks.append(_check_codex_config(root))
         report.checks.append(_check_hmac(store, root))
         report.checks.extend(_check_heartbeats(store))
@@ -406,6 +407,67 @@ def _compare_skill_side(name: str, side: str, target: Path) -> Check:
         details=f"{total}/{total} in sync at {target}",
         data={"target": str(target), "missing": [], "differs": [],
               "total": total},
+    )
+
+
+def _check_devkit() -> Check:
+    """Freshness of the dev-discipline pack (devkit) against BOTH Agent-Skills
+    dirs (~/.claude/skills + ~/.codex/skills).
+
+    The pack installs by default but is OPT-OUT (`--no-devkit`), so a FULL
+    absence is reported OK (the user may have opted out) — just surfaced with
+    the install hint rather than silently passing. A PARTIAL or STALE install
+    (e.g. an upgrade that didn't re-run install-skills) is a real problem and
+    WARNs. Distinct from the bus skills, whose absence is an error.
+    """
+    pairs = iskl._devkit_pairs(
+        iskl.default_claude_skills_dir(), iskl.default_codex_skills_dir(),
+    )
+    if not pairs:
+        return Check(name="devkit_skills", status="ok",
+                     details="no devkit pack bundled in this build")
+    missing: list[str] = []
+    differs: list[str] = []
+    for src, dst in pairs:
+        if not dst.exists():
+            missing.append(str(dst))
+            continue
+        try:
+            if not filecmp.cmp(src, dst, shallow=False):
+                differs.append(str(dst))
+        except OSError:
+            differs.append(str(dst))
+    total = len(pairs)
+    data = {"total": total, "missing": missing, "differs": differs}
+    if len(missing) == total:
+        return Check(
+            name="devkit_skills", status="ok",
+            details=("dev-discipline pack not installed (optional). Add it with "
+                     "`agenttalk install-skills --devkit-only` — or this is "
+                     "expected if you used --no-devkit."),
+            data=data,
+        )
+    if missing:
+        return Check(
+            name="devkit_skills", status="warn",
+            details=f"{len(missing)}/{total} devkit files missing (incomplete install)",
+            fix="run `agenttalk install-skills --devkit-only`",
+            data=data,
+        )
+    if differs:
+        return Check(
+            name="devkit_skills", status="warn",
+            details=(f"{len(differs)}/{total} devkit files differ from the bundled "
+                     f"version (stale after upgrade?)"),
+            fix=("inspect with `agenttalk install-skills --devkit-only --dry-run --force`, "
+                 "then overwrite with `agenttalk install-skills --devkit-only --force` "
+                 "(local edits will be lost)"),
+            data=data,
+        )
+    return Check(
+        name="devkit_skills", status="ok",
+        details=f"{total}/{total} devkit files in sync",
+        data=data,
     )
 
 

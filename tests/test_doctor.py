@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import doctor, signing
+from agenttalk import doctor, install_skills as iskl, signing
 from agenttalk.store import Store
 
 
@@ -333,6 +333,72 @@ def test_operator_facing_warns_when_liaison_never_listened(tmp_path: Path) -> No
     c = doctor._check_operator_facing(s)
     assert c.status == "warn"
     assert "never listened" in c.details
+
+
+# ----- devkit (dev-discipline pack) doctor check -----------------------
+
+def _point_devkit_at(monkeypatch: pytest.MonkeyPatch, cl: Path, cx: Path) -> None:
+    monkeypatch.setattr(iskl, "default_claude_skills_dir", lambda: cl)
+    monkeypatch.setattr(iskl, "default_codex_skills_dir", lambda: cx)
+
+
+def test_doctor_devkit_absent_is_ok_with_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full absence is OK (the pack is opt-out via --no-devkit) but surfaced
+    with the install hint — not silently passed."""
+    proj = tmp_path / "proj"
+    Store(proj).init(["alpha", "beta"])
+    _point_devkit_at(monkeypatch, tmp_path / "cl", tmp_path / "cx")
+    dk = next(c for c in doctor.run(proj).checks if c.name == "devkit_skills")
+    assert dk.status == "ok"
+    assert "not installed" in dk.details and "install-skills" in dk.details
+
+
+def test_doctor_devkit_in_sync_is_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proj = tmp_path / "proj"
+    Store(proj).init(["alpha", "beta"])
+    cl, cx = tmp_path / "cl", tmp_path / "cx"
+    _point_devkit_at(monkeypatch, cl, cx)
+    iskl.install(claude=False, codex=False, devkit=True,
+                 claude_skills_dir=cl, codex_skills_dir=cx)
+    dk = next(c for c in doctor.run(proj).checks if c.name == "devkit_skills")
+    assert dk.status == "ok"
+    assert "in sync" in dk.details
+
+
+def test_doctor_devkit_partial_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proj = tmp_path / "proj"
+    Store(proj).init(["alpha", "beta"])
+    cl, cx = tmp_path / "cl", tmp_path / "cx"
+    _point_devkit_at(monkeypatch, cl, cx)
+    iskl.install(claude=False, codex=False, devkit=True,
+                 claude_skills_dir=cl, codex_skills_dir=cx)
+    (cl / "craft-code" / "SKILL.md").unlink()  # incomplete: one file gone
+    dk = next(c for c in doctor.run(proj).checks if c.name == "devkit_skills")
+    assert dk.status == "warn"
+    assert "missing" in dk.details
+    assert "--devkit-only" in (dk.fix or "")
+
+
+def test_doctor_devkit_stale_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proj = tmp_path / "proj"
+    Store(proj).init(["alpha", "beta"])
+    cl, cx = tmp_path / "cl", tmp_path / "cx"
+    _point_devkit_at(monkeypatch, cl, cx)
+    iskl.install(claude=False, codex=False, devkit=True,
+                 claude_skills_dir=cl, codex_skills_dir=cx)
+    (cl / "review-code" / "SKILL.md").write_text("local edit\n", encoding="utf-8")
+    dk = next(c for c in doctor.run(proj).checks if c.name == "devkit_skills")
+    assert dk.status == "warn"
+    assert "differ" in dk.details
+    assert "--force" in (dk.fix or "")
 
 
 def test_operator_facing_no_enforcement_language(tmp_path: Path) -> None:
