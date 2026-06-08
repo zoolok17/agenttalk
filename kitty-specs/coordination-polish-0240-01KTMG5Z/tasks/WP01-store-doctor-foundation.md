@@ -173,3 +173,4 @@ WP's lane is allocated from `lanes.json` at finalize time.
 ## Activity Log
 
 - 2026-06-08T21:07:19Z – claude – shell_pid=41124 – Assigned agent via action command
+- 2026-06-08T21:26:53Z – claude – shell_pid=41124 – WP01 ready (lane-a): all 12 subtasks done; full suite 728 passed, ruff clean
