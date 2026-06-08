@@ -16,13 +16,13 @@ WP01 (store + doctor) → WP02 (cli, depends WP01) → WP03 (docs/version, depen
 | T003 | `doctor.py` no-human-facing-target Check (multi-agent only; neither liaison nor lead) | WP01 | [D] |
 | T004 | tests: `test_store.py` — invariant, sole_lead, idempotent, case-insensitive, zero-leads | WP01 | | [D] |
 | T005 | tests: `test_doctor.py` — warn / absent(liaison) / absent(lead) / solo | WP01 | | [D] |
-| T006 | `escalate` lead-fallback resolution + remediation message + fallback notice | WP02 | |
-| T007 | roster `set-role` handler prints `demoted X, promoted Y` (no --force) | WP02 | |
-| T008 | wake `wk-` id: add to `_AUTOGEN_REQUEST_ID_PREFIX` (+ comment); honor explicit id | WP02 | [P] |
-| T009 | owed-inbound pre-send warning in `cmd_send` (soft, same-peer decision-kinds, suppress same request_id, best-effort) — CUTTABLE (C-004) | WP02 | |
-| T010 | tests: `test_cli.py` (escalate matrix, set-role notice, wk-, owed-inbound) + `test_threads.py` (OPENER_KINDS excludes wake) | WP02 | |
-| T011 | Version bump 0.24.0 (`pyproject.toml`, `__init__.py`) + README install pins | WP03 | |
-| T012 | CHANGELOG 0.24.0 section + ROADMAP header | WP03 | |
+| T006 | `escalate` lead-fallback resolution + remediation message + fallback notice | WP02 | | [D] |
+| T007 | roster `set-role` handler prints `demoted X, promoted Y` (no --force) | WP02 | | [D] |
+| T008 | wake `wk-` id: add to `_AUTOGEN_REQUEST_ID_PREFIX` (+ comment); honor explicit id | WP02 | [D] |
+| T009 | owed-inbound pre-send warning in `cmd_send` (soft, same-peer decision-kinds, suppress same request_id, best-effort) — CUTTABLE (C-004) | WP02 | | [D] |
+| T010 | tests: `test_cli.py` (escalate matrix, set-role notice, wk-, owed-inbound) + `test_threads.py` (OPENER_KINDS excludes wake) | WP02 | | [D] |
+| T011 | Version bump 0.24.0 (`pyproject.toml`, `__init__.py`) + README install pins | WP03 | | [D] |
+| T012 | CHANGELOG 0.24.0 section + ROADMAP header | WP03 | | [D] |
 
 ## WP01 — Store + doctor foundation
 
@@ -55,11 +55,11 @@ FR-013, FR-014.
 **Dependencies**: WP01 (needs `store.sole_lead()` and the `set_role` demoted-name return).
 **Prompt**: [tasks/WP02-cli-wiring.md](./tasks/WP02-cli-wiring.md)
 
-- [ ] T006 escalate lead-fallback (WP02)
-- [ ] T007 roster set-role notice (WP02)
-- [ ] T008 wake wk- correlation id (WP02)
-- [ ] T009 owed-inbound pre-send warning — cuttable (WP02)
-- [ ] T010 test_cli.py + test_threads.py coverage (WP02)
+- [x] T006 escalate lead-fallback (WP02)
+- [x] T007 roster set-role notice (WP02)
+- [x] T008 wake wk- correlation id (WP02)
+- [x] T009 owed-inbound pre-send warning — cuttable (WP02)
+- [x] T010 test_cli.py + test_threads.py coverage (WP02)
 
 **Risks**: owed-inbound warning (T009) noise/complexity — keep it tight and cut per C-004
 rather than stretch. The pre-send warning must never fail the send (best-effort).
@@ -73,8 +73,8 @@ rather than stretch. The pre-send warning must never fail the send (best-effort)
 **Dependencies**: WP01, WP02.
 **Prompt**: [tasks/WP03-docs-release.md](./tasks/WP03-docs-release.md)
 
-- [ ] T011 version bump 0.24.0 + README pins (WP03)
-- [ ] T012 CHANGELOG 0.24.0 + ROADMAP header (WP03)
+- [x] T011 version bump 0.24.0 + README pins (WP03)
+- [x] T012 CHANGELOG 0.24.0 + ROADMAP header (WP03)
 
 **Risks**: CHANGELOG must match what actually shipped (note if T009 was cut).
 
