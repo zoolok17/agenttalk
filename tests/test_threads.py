@@ -63,6 +63,22 @@ def test_open_outbound_and_owed_inbound_two_perspectives() -> None:
     assert b[0].peer == "alpha"
 
 
+def test_open_outbound_to_retired_peer_omits_tombstone_as_next_owner() -> None:
+    """review M3: alpha awaits beta, but beta has been retired — a tombstone
+    can never reply, so the requester's next_owner hint must NOT name it
+    (mirrors the broadcast path's retired-exclusion)."""
+    msgs = [_msg("001", "alpha", "beta", "review-request", rid="r1", subject="WP1")]
+    with_retired = derive_threads(msgs, agent="alpha", cursor="", now=_BASE,
+                                  retired={"beta"})
+    t = with_retired[0]
+    assert t.state == "open-outbound"      # still visible (observability)
+    assert t.next_action == "await-reply"
+    assert t.next_owner is None            # tombstone NOT named as owner
+    # regression guard: a LIVE peer is still named
+    live = derive_threads(msgs, agent="alpha", cursor="", now=_BASE)[0]
+    assert live.next_owner == "beta"
+
+
 # ------------------------------------------------------- response closes
 
 def test_review_result_closes_for_requester_once_consumed() -> None:

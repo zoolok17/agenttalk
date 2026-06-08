@@ -41,6 +41,12 @@ __pycache__/
 build/
 dist/
 
+# Test / coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+
 
 # Per-release scratch release-note files (kept out of the repo per
 # the v0.4.0 review feedback — they're for GitHub release pages only)

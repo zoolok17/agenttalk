@@ -37,6 +37,35 @@ def test_enable_creates_config_when_missing(tmp_path: Path) -> None:
     assert "trust_level = \"trusted\"" in text
 
 
+def test_enable_preserves_crlf_line_endings(tmp_path: Path) -> None:
+    """A CRLF config (Notepad default on Windows) must keep its line
+    endings — the old read_text() folded \\r\\n to \\n and silently
+    rewrote the user's whole file to LF (review M4a)."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_bytes(b'model = "gpt-5.5"\r\nother = 1\r\n')
+    project = tmp_path / "proj"
+    project.mkdir()
+    enable_project(cfg, project)
+    raw = cfg.read_bytes()
+    assert b"\r\n" in raw                              # CRLF preserved
+    assert b"\r\r" not in raw                          # no double-translation
+    assert raw.count(b"\n") == raw.count(b"\r\n")      # every \n is part of \r\n
+
+
+def test_disable_preserves_crlf_line_endings(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    project = tmp_path / "proj"
+    project.mkdir()
+    enable_project(cfg, project)
+    # rewrite to CRLF, then disable, and assert endings survive
+    cfg.write_bytes(cfg.read_text(encoding="utf-8").replace("\n", "\r\n").encode("utf-8"))
+    disable_project(cfg, project)
+    raw = cfg.read_bytes()
+    assert b"\r\n" in raw
+    assert b"\r\r" not in raw
+    assert raw.count(b"\n") == raw.count(b"\r\n")
+
+
 def test_enable_appends_block_when_section_missing(tmp_path: Path) -> None:
     cfg = tmp_path / "config.toml"
     _write(cfg, "model = \"gpt-5.5\"\n")

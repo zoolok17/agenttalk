@@ -239,7 +239,11 @@ def enable_project(config_path: Path, project_dir: Path) -> Result:
             changes=[f"created config with {_section_header(project_key)}"] + list(MANAGED_KEYS),
         )
 
-    text = config_path.read_text(encoding="utf-8")
+    # newline="" disables universal-newline translation on read, so a CRLF
+    # config is detectable (read_text() default would silently fold \r\n to
+    # \n, making the detector below dead code and rewriting the user's whole
+    # file to LF — review M4a/L). We write back with newline="" too.
+    text = config_path.read_text(encoding="utf-8", newline="")
     # Preserve original newline style
     newline = "\r\n" if "\r\n" in text else "\n"
     lines = text.split(newline)
@@ -301,7 +305,10 @@ def enable_project(config_path: Path, project_dir: Path) -> Result:
 
     if trailing_newline:
         lines.append("")
-    _atomic_write_text(config_path, newline.join(lines), newline=newline)
+    # newline="" → write the joined text verbatim. The line endings are
+    # already baked in by split/join on the detected `newline`; letting
+    # open() translate again would double them (\r\n -> \r\r\n) — review M4a.
+    _atomic_write_text(config_path, newline.join(lines), newline="")
     return Result(action=action, config_path=config_path, project_dir=project_key, changes=changes)
 
 
@@ -319,7 +326,7 @@ def disable_project(config_path: Path, project_dir: Path) -> Result:
         return Result(action="no-op", config_path=config_path, project_dir=project_key,
                       changes=["config does not exist"])
 
-    text = config_path.read_text(encoding="utf-8")
+    text = config_path.read_text(encoding="utf-8", newline="")
     newline = "\r\n" if "\r\n" in text else "\n"
     lines = text.split(newline)
     trailing_newline = lines and lines[-1] == ""
@@ -349,7 +356,10 @@ def disable_project(config_path: Path, project_dir: Path) -> Result:
     lines[start:end] = new_block
     if trailing_newline:
         lines.append("")
-    _atomic_write_text(config_path, newline.join(lines), newline=newline)
+    # newline="" → write the joined text verbatim. The line endings are
+    # already baked in by split/join on the detected `newline`; letting
+    # open() translate again would double them (\r\n -> \r\r\n) — review M4a.
+    _atomic_write_text(config_path, newline.join(lines), newline="")
     return Result(action="removed", config_path=config_path, project_dir=project_key,
                   changes=removed)
 

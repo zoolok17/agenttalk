@@ -545,6 +545,30 @@ def test_api_state_composing_array(tmp_path: Path) -> None:
         srv.server_close()
 
 
+def test_api_state_excludes_stale_composing(tmp_path: Path) -> None:
+    """A crashed/abandoned composing marker (older than the CLI's active
+    window) must NOT show on the dashboard — the CLI applies
+    0 <= age <= COMPOSING_INTENT_STALE_SECONDS; /api/state must too,
+    or it shows dead writers as 'composing' forever (review C2/M1)."""
+    s = _make_store(tmp_path)
+    s.write_composing_intent("alpha", "q-fresh", "beta")
+    s.write_composing_intent("alpha", "q-stale", "beta")
+    cf = s.state_dir / "alpha.composing.json"
+    data = json.loads(cf.read_text(encoding="utf-8"))
+    data["threads"]["q-stale"]["at"] = "2020-01-01T00:00:00+00:00"  # ancient
+    cf.write_text(json.dumps(data), encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        rids = [c["request_id"] for c in alpha.get("composing", [])]
+        assert "q-fresh" in rids
+        assert "q-stale" not in rids
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_state_epoch_status_three_state(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
     # pre-0.16-style opener: hand-written WITHOUT the epoch_at_send key

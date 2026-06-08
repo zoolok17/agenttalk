@@ -214,7 +214,8 @@ def _is_na(m: Message) -> bool:
     return (m.meta or {}).get("response") == "not-applicable"
 
 
-def _derive_next(t: "Thread", agent: str) -> tuple[str | None, object]:
+def _derive_next(t: "Thread", agent: str,
+                 retired: set[str] | None = None) -> tuple[str | None, object]:
     """Map a derived thread to ``(next_action, next_owner)`` — who owes the next
     move and what it is (0.16.0, #19 Phase A, FR-014/015).
 
@@ -230,6 +231,7 @@ def _derive_next(t: "Thread", agent: str) -> tuple[str | None, object]:
     Produced ``next_action`` vocabulary (closed set — only these are emitted):
     ``reply`` | ``read-reply`` | ``await-reply`` | ``answer-operator``.
     """
+    retired = retired or set()
     if t.state in ("closed", "closed-superseded"):
         return None, None
     # An open operator escalation dominates: `agent` must get the operator's
@@ -244,7 +246,15 @@ def _derive_next(t: "Thread", agent: str) -> tuple[str | None, object]:
     if t.state == "open-outbound":
         if t.is_broadcast:
             return "await-reply", (list(t.pending) if t.pending else None)
-        return "await-reply", t.peer
+        # Pairwise: don't name a RETIRED peer as the awaited owner — a
+        # tombstone can never reply, so pointing the requester at it is a
+        # stranded obligation (review M3). Mirror the broadcast path, which
+        # already drops retired members from `pending`/next_owner. The thread
+        # stays open-outbound (observability), but the hint owner is None so
+        # nobody is told to wait on a dead identity. Gating callers
+        # (_open_thread_for/_drain_check) pass retired=set(), so they are
+        # unaffected and open threads stay visible for forwarding/drain.
+        return "await-reply", (None if t.peer in retired else t.peer)
     return None, None
 
 
@@ -627,7 +637,7 @@ def derive_threads(
     # the assembled rows (covers pairwise AND broadcast) — a pure projection of
     # state, so it cannot affect any derivation above.
     for t in threads:
-        t.next_action, t.next_owner = _derive_next(t, agent)
+        t.next_action, t.next_owner = _derive_next(t, agent, retired)
 
     # Stable, useful ordering: actionable first (by the ACTIONABLE_STATES
     # order), then terminal (closed / closed-superseded share a rank);

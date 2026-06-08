@@ -85,7 +85,7 @@ from typing import Any, Callable
 
 from agenttalk import __version__
 from agenttalk import signing as _signing
-from agenttalk.store import Message, Store
+from agenttalk.store import COMPOSING_INTENT_STALE_SECONDS, Message, Store
 from agenttalk.threads import Thread, derive_threads
 
 
@@ -919,10 +919,18 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
                 at = _parse_iso(ent.get("at"))
                 if at is None:
                     continue  # unparseable marker entry — skip, don't guess
+                age = round((now - at).total_seconds(), 3)
+                if age < 0 or age > COMPOSING_INTENT_STALE_SECONDS:
+                    # Mirror the CLI's active-window rule (cli.py _composing
+                    # freshness): a crashed/abandoned writer — or a clock-skewed
+                    # future marker (negative age) — is NOT actively composing.
+                    # Without this the dashboard shows it as composing forever
+                    # (review C2/M1).
+                    continue
                 composing.append({
                     "request_id": rid,
                     "peer": ent.get("peer"),
-                    "age_seconds": round((now - at).total_seconds(), 3),
+                    "age_seconds": age,
                 })
         if composing:
             e["composing"] = composing
