@@ -13,6 +13,8 @@ branch_strategy: Planning artifacts for this feature were generated on master. D
 subtasks:
 - T011
 - T012
+agent: "claude"
+shell_pid: "89452"
 history:
 - Created by /spec-kitty.tasks for coordination-polish-0240-01KTMG5Z
 authoritative_surface: README.md
@@ -102,3 +104,7 @@ from their merged lane base. Execution worktree allocated from `lanes.json`.
 ## Implementation command
 
 `spec-kitty agent action implement WP03 --agent <name>`
+
+## Activity Log
+
+- 2026-06-08T21:22:48Z – claude – shell_pid=89452 – Started implementation via action command
