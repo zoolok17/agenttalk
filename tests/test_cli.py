@@ -1750,7 +1750,8 @@ def test_cli_capacity_refresh_and_show(tmp_path: Path, capsys: pytest.CaptureFix
     sl = tmp_path / "statusline.json"
     sl.write_text(json.dumps({"rate_limits": {
         "five_hour": {"used_percentage": 85.0, "resets_at": 9999999999},
-        "seven_day": {"used_percentage": 40.0, "resets_at": 9999999999}}}), encoding="utf-8")
+        "seven_day": {"used_percentage": 40.0, "resets_at": 9999999999}},
+        "context_window": {"context_window_size": 200000, "used_percentage": 90}}), encoding="utf-8")
     rc = cli.main(["--root", str(tmp_path), "capacity", "refresh", "--for", "alpha",
                    "--source", "claude", "--statusline-path", str(sl)])
     assert rc == 0
@@ -1760,6 +1761,7 @@ def test_cli_capacity_refresh_and_show(tmp_path: Path, capsys: pytest.CaptureFix
     assert rc2 == 0
     out2 = capsys.readouterr().out
     assert "5h 85% used" in out2 and "⚠" in out2  # near-cap flagged with ⚠
+    assert "context 90%" in out2 and "near compaction" in out2  # context headroom shown + flagged
 
 
 def test_cli_capacity_show_empty(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:

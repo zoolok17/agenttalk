@@ -47,9 +47,22 @@ def _write_codex_rollout(sessions: Path, name: str, *records: dict) -> Path:
     return p
 
 
-def _token_count(rl: dict) -> dict:
+_CODEX_INFO = {
+    "total_token_usage": {"input_tokens": 141298351, "total_tokens": 141709863},
+    "last_token_usage": {"input_tokens": 125244, "total_tokens": 125386},
+    "model_context_window": 258400,
+}
+
+_CLAUDE_CONTEXT = {
+    "context_window_size": 1000000, "used_percentage": 21,
+    "current_usage": {"input_tokens": 2, "cache_read_input_tokens": 205000,
+                      "cache_creation_input_tokens": 1186, "output_tokens": 500},
+}
+
+
+def _token_count(rl: dict, info: dict | None = None) -> dict:
     return {"timestamp": "2026-06-09T08:00:00.0Z", "type": "event_msg",
-            "payload": {"type": "token_count", "info": {}, "rate_limits": rl}}
+            "payload": {"type": "token_count", "info": info or {}, "rate_limits": rl}}
 
 
 # ----------------------------------------------------------- snapshot model
@@ -98,6 +111,25 @@ def test_read_claude_statusline_none_on_absent_or_garbage(tmp_path: Path) -> Non
 def test_read_claude_statusline_none_when_windows_empty(tmp_path: Path) -> None:
     p = _write_claude(tmp_path, {"rate_limits": {"five_hour": {}, "seven_day": {}}})
     assert cap.read_claude_statusline("claude", path=p) is None
+
+
+def test_read_claude_statusline_parses_context_window(tmp_path: Path) -> None:
+    p = _write_claude(tmp_path, dict(_CLAUDE_JSON, context_window=_CLAUDE_CONTEXT))
+    snap = cap.read_claude_statusline("claude", path=p)
+    assert snap is not None
+    assert snap.context_used_percent == 21.0
+    assert snap.context_window_size == 1000000
+    assert snap.context_tokens == 2 + 205000 + 1186  # input side only; output excluded
+
+
+def test_read_claude_statusline_context_only_without_budget(tmp_path: Path) -> None:
+    """Context present but rate-limit windows empty still yields a snapshot —
+    context headroom is independently useful."""
+    p = _write_claude(tmp_path, {"rate_limits": {"five_hour": {}, "seven_day": {}},
+                                 "context_window": {"context_window_size": 200000, "used_percentage": 60}})
+    snap = cap.read_claude_statusline("claude", path=p)
+    assert snap is not None
+    assert snap.context_used_percent == 60.0 and snap.primary_used_percent is None
 
 
 # --------------------------------------------------------- Codex rollout read
@@ -216,6 +248,43 @@ def test_read_codex_rollout_maps_windows_by_minutes_not_position(tmp_path: Path)
     assert snap is not None
     assert snap.primary_used_percent == 12.0 and snap.primary_window_minutes == 300
     assert snap.secondary_used_percent == 41.0 and snap.secondary_window_minutes == 10080
+
+
+# --------------------------------------------------------- context headroom
+
+def test_read_codex_rollout_parses_context(tmp_path: Path) -> None:
+    _write_codex_rollout(tmp_path, "rollout-a.jsonl", _token_count(_CODEX_RL, _CODEX_INFO))
+    snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path)
+    assert snap is not None
+    assert snap.context_window_size == 258400
+    assert snap.context_tokens == 125244          # last_token_usage.input_tokens, NOT cumulative
+    assert snap.context_used_percent == round(125244 / 258400 * 100, 1)  # ~48.5
+
+
+def test_read_codex_rollout_context_only_without_budget(tmp_path: Path) -> None:
+    rl = {"limit_id": "codex", "primary": None, "secondary": None, "plan_type": "pro"}
+    rec = {"timestamp": "2026-06-09T08:30:00Z", "type": "event_msg",
+           "payload": {"type": "token_count", "info": _CODEX_INFO, "rate_limits": rl}}
+    _write_codex_rollout(tmp_path, "rollout-a.jsonl", rec)
+    snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path)
+    assert snap is not None
+    assert snap.context_used_percent is not None and snap.primary_used_percent is None
+
+
+def test_read_codex_rollout_no_info_leaves_context_none(tmp_path: Path) -> None:
+    _write_codex_rollout(tmp_path, "rollout-a.jsonl", _token_count(_CODEX_RL))  # info={}
+    snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path)
+    assert snap is not None
+    assert snap.context_used_percent is None and snap.context_tokens is None
+
+
+def test_context_helpers_guard_bad_input() -> None:
+    assert cap._codex_context(None) == (None, None, None)
+    # zero/garbage window must not divide-by-zero — percent stays None
+    assert cap._codex_context({"model_context_window": 0,
+                               "last_token_usage": {"input_tokens": 5}}) == (None, 0, 5)
+    assert cap._claude_context(None) == (None, None, None)
+    assert cap._claude_context({"used_percentage": 50}) == (50.0, None, None)
 
 
 # ------------------------------------------------------------- read_local

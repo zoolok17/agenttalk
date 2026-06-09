@@ -78,6 +78,14 @@ class CapacitySnapshot:
     plan_type: str | None = None
     limit_id: str | None = None
     rate_limit_reached_type: str | None = None
+    # Context-window headroom: how full THIS agent's conversation context is —
+    # the thing that triggers (auto)compaction (distinct from the rate-limit
+    # budget above). ``context_used_percent`` is 0–100; ``context_tokens`` is the
+    # current occupancy. A lead steers long/heavy work away from agents near
+    # compaction. Advisory, same observed_at/confidence as the budget fields.
+    context_used_percent: float | None = None
+    context_window_size: int | None = None
+    context_tokens: int | None = None
     confidence: str = "observed"           # observed | stale | unknown
 
     def to_dict(self) -> dict:
@@ -116,8 +124,10 @@ def read_claude_statusline(
         return None
     five = rl.get("five_hour") if isinstance(rl.get("five_hour"), dict) else {}
     week = rl.get("seven_day") if isinstance(rl.get("seven_day"), dict) else {}
-    if five.get("used_percentage") is None and week.get("used_percentage") is None:
-        return None  # rate_limits present but carries no window data yet
+    ctx_pct, ctx_size, ctx_tokens = _claude_context(data.get("context_window"))
+    has_budget = not (five.get("used_percentage") is None and week.get("used_percentage") is None)
+    if not has_budget and ctx_pct is None:
+        return None  # rate_limits present but carries no budget or context data yet
     return CapacitySnapshot(
         source_agent=source_agent, observed_at=_now_iso(), source="claude_statusline",
         primary_used_percent=_as_float(five.get("used_percentage")),
@@ -126,8 +136,30 @@ def read_claude_statusline(
         secondary_used_percent=_as_float(week.get("used_percentage")),
         secondary_resets_at=_as_int(week.get("resets_at")),
         secondary_window_minutes=WEEKLY_MINUTES,
+        context_used_percent=ctx_pct,
+        context_window_size=ctx_size,
+        context_tokens=ctx_tokens,
         confidence="observed",
     )
+
+
+def _claude_context(cw: object) -> tuple[float | None, int | None, int | None]:
+    """Pull (used_percent, window_size, tokens) from the status-line
+    ``context_window`` block. ``used_percentage`` is given directly; the token
+    occupancy is the input side of ``current_usage`` (which is null right after a
+    compact, until the next API call). Any piece may be None."""
+    if not isinstance(cw, dict):
+        return None, None, None
+    pct = _as_float(cw.get("used_percentage"))
+    size = _as_int(cw.get("context_window_size"))
+    usage = cw.get("current_usage") if isinstance(cw.get("current_usage"), dict) else {}
+    parts = [
+        _as_int(usage.get("input_tokens")),
+        _as_int(usage.get("cache_read_input_tokens")),
+        _as_int(usage.get("cache_creation_input_tokens")),
+    ]
+    tokens = sum(p for p in parts if p is not None) if any(p is not None for p in parts) else None
+    return pct, size, tokens
 
 
 def _normalize_ts(ts: object) -> str | None:
@@ -196,10 +228,28 @@ def _pick_windows(prim: object, sec: object) -> tuple[dict, dict]:
     return five or {}, week or {}
 
 
+def _codex_context(info: object) -> tuple[float | None, int | None, int | None]:
+    """Pull (used_percent, window_size, tokens) from a token_count ``info`` block.
+    Codex re-sends the full context each turn, so ``last_token_usage.input_tokens``
+    is the current window occupancy; percent = tokens / model_context_window.
+    NOT ``total_token_usage`` (that's cumulative across the session). Any piece
+    may be None."""
+    if not isinstance(info, dict):
+        return None, None, None
+    size = _as_int(info.get("model_context_window"))
+    last = info.get("last_token_usage") if isinstance(info.get("last_token_usage"), dict) else {}
+    tokens = _as_int(last.get("input_tokens"))
+    pct = round(tokens / size * 100, 1) if tokens is not None and size and size > 0 else None
+    return pct, size, tokens
+
+
 def _codex_snapshot(source_agent: str, rec: dict) -> CapacitySnapshot | None:
-    rl = rec.get("payload", {}).get("rate_limits", {})
+    payload = rec.get("payload", {})
+    rl = payload.get("rate_limits", {})
     five, week = _pick_windows(rl.get("primary"), rl.get("secondary"))
-    if five.get("used_percent") is None and week.get("used_percent") is None:
+    ctx_pct, ctx_size, ctx_tokens = _codex_context(payload.get("info"))
+    has_budget = not (five.get("used_percent") is None and week.get("used_percent") is None)
+    if not has_budget and ctx_pct is None:
         return None
     # observed_at = when CODEX took the reading (the record timestamp), not when
     # WE read the file — so staleness reflects the agent's real last activity.
@@ -220,6 +270,9 @@ def _codex_snapshot(source_agent: str, rec: dict) -> CapacitySnapshot | None:
         plan_type=_as_str(rl.get("plan_type")),
         limit_id=_as_str(rl.get("limit_id")),
         rate_limit_reached_type=_as_str(rl.get("rate_limit_reached_type")),
+        context_used_percent=ctx_pct,
+        context_window_size=ctx_size,
+        context_tokens=ctx_tokens,
         confidence="observed",
     )
 

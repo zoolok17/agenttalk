@@ -2455,13 +2455,15 @@ def _fmt_pct(used: object) -> str:
     return f"{used:.0f}% used" if isinstance(used, (int, float)) and not isinstance(used, bool) else "?% used"
 
 
-def _print_capacity_row(agent: str, snap: dict, *, threshold: float, reset_soon_min: int) -> None:
+def _print_capacity_row(agent: str, snap: dict, *, threshold: float, reset_soon_min: int,
+                        context_threshold: float = 80.0) -> None:
     conf = capmod.effective_confidence(snap)
     if conf == "unknown":
         print(f"  {agent:<14} budget unknown (no readable signal on its side)")
         return
     p, pr = snap.get("primary_used_percent"), snap.get("primary_resets_at")
     s, sr = snap.get("secondary_used_percent"), snap.get("secondary_resets_at")
+    ctx = snap.get("context_used_percent")
     flags: list[str] = []
     for label, used, reset in (("5h", p, pr), ("weekly", s, sr)):
         if isinstance(used, (int, float)) and not isinstance(used, bool) and used >= threshold:
@@ -2469,11 +2471,14 @@ def _print_capacity_row(agent: str, snap: dict, *, threshold: float, reset_soon_
         rin = _reset_in_minutes(reset)
         if rin is not None and 0 < rin <= reset_soon_min:
             flags.append(f"{label} resets in {rin}m")
+    if isinstance(ctx, (int, float)) and not isinstance(ctx, bool) and ctx >= context_threshold:
+        flags.append(f"context {ctx:.0f}%≥{context_threshold:.0f} (near compaction)")
     plan = snap.get("plan_type") or "?"
+    ctx_seg = f"  context {ctx:.0f}%" if isinstance(ctx, (int, float)) and not isinstance(ctx, bool) else ""
     stale = "" if conf == "observed" else f" [{conf}]"
     warn = ("  ⚠ " + "; ".join(flags)) if flags else ""
     print(f"  {agent:<14} 5h {_fmt_pct(p)} ({_fmt_reset(pr)})  "
-          f"weekly {_fmt_pct(s)} ({_fmt_reset(sr)})  plan={plan}{stale}{warn}")
+          f"weekly {_fmt_pct(s)} ({_fmt_reset(sr)}){ctx_seg}  plan={plan}{stale}{warn}")
 
 
 def cmd_capacity(args: argparse.Namespace) -> int:
@@ -2493,7 +2498,8 @@ def cmd_capacity(args: argparse.Namespace) -> int:
               f"(source={snap.source}, confidence={snap.confidence})")
         if snap.source != "unknown":
             _print_capacity_row(agent, snap.to_dict(),
-                                threshold=args.threshold, reset_soon_min=args.reset_soon_min)
+                                threshold=args.threshold, reset_soon_min=args.reset_soon_min,
+                                context_threshold=args.context_threshold)
         else:
             print("  no local budget signal found — published an 'unknown' snapshot. "
                   "On Claude, configure a status line (or CC_STATUSLINE_DEBUG=1) so "
@@ -2506,11 +2512,12 @@ def cmd_capacity(args: argparse.Namespace) -> int:
         print("agenttalk capacity: no budgets published yet — each agent runs "
               "`agenttalk capacity refresh` (advisory; lead reads this to plan work).")
         return 0
-    print(f"team budget (advisory; flag ≥{args.threshold:.0f}% used or reset within "
-          f"{args.reset_soon_min}m):")
+    print(f"team budget (advisory; flag ≥{args.threshold:.0f}% used, reset within "
+          f"{args.reset_soon_min}m, or context ≥{args.context_threshold:.0f}%):")
     for agent in sorted(caps):
         _print_capacity_row(agent, caps[agent],
-                            threshold=args.threshold, reset_soon_min=args.reset_soon_min)
+                            threshold=args.threshold, reset_soon_min=args.reset_soon_min,
+                            context_threshold=args.context_threshold)
     return 0
 
 
@@ -3548,8 +3555,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     pcap = sub.add_parser(
         "capacity",
-        help="Advisory rate-limit budget: publish your own 5h/weekly usage "
-             "(refresh) or view the team's (show) so a lead can plan work.",
+        help="Advisory headroom: publish your own 5h/weekly rate-limit budget + "
+             "context-window fill (refresh) or view the team's (show) so a lead can plan work.",
     )
     pcap.add_argument("mode", nargs="?", choices=["show", "refresh"], default="show",
                       help="show (default) the team's published budgets, or refresh (publish your own)")
@@ -3558,6 +3565,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="On refresh, which local source to read (default: auto-detect)")
     pcap.add_argument("--threshold", type=float, default=80.0,
                       help="Flag a window at/above this %% used (default: 80)")
+    pcap.add_argument("--context-threshold", dest="context_threshold", type=float, default=80.0,
+                      help="Flag context-window fill at/above this %% — near (auto)compaction (default: 80)")
     pcap.add_argument("--reset-soon-min", dest="reset_soon_min", type=int, default=30,
                       help="Flag a window resetting within this many minutes (default: 30)")
     pcap.add_argument("--statusline-path", help="Override the Claude status-line dump path (refresh)")
