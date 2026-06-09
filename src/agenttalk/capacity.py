@@ -198,7 +198,12 @@ def _codex_snapshot(source_agent: str, rec: dict) -> CapacitySnapshot | None:
         return None
     # observed_at = when CODEX took the reading (the record timestamp), not when
     # WE read the file — so staleness reflects the agent's real last activity.
-    observed = _normalize_ts(rec.get("timestamp")) or _now_iso()
+    # If the timestamp is missing/malformed, do NOT fabricate a fresh time (that
+    # would hide staleness); skip this record so the caller falls back to an
+    # older record/file or an 'unknown' snapshot (review nit, Codex).
+    observed = _normalize_ts(rec.get("timestamp"))
+    if observed is None:
+        return None
     return CapacitySnapshot(
         source_agent=source_agent, observed_at=observed, source="codex_rollout",
         primary_used_percent=_as_float(five.get("used_percent")),

@@ -182,6 +182,17 @@ def test_read_codex_rollout_observed_at_from_record_timestamp(tmp_path: Path) ->
     assert snap is not None and snap.observed_at == "2026-06-09T08:30:00Z"
 
 
+def test_read_codex_rollout_skips_record_without_trustworthy_timestamp(tmp_path: Path) -> None:
+    """A missing/garbage record timestamp must not be papered over with a fresh
+    observed_at (that would hide staleness) — the record is skipped (review nit)."""
+    no_ts = {"type": "event_msg", "payload": {"type": "token_count", "rate_limits": _CODEX_RL}}
+    _write_codex_rollout(tmp_path, "rollout-a.jsonl", no_ts)
+    assert cap.read_codex_rollout("codex", sessions_dir=tmp_path) is None
+    bad_ts = dict(no_ts, timestamp="not-a-date")
+    _write_codex_rollout(tmp_path, "rollout-b.jsonl", bad_ts)
+    assert cap.read_codex_rollout("codex", sessions_dir=tmp_path) is None
+
+
 def test_read_codex_rollout_maps_windows_by_minutes_not_position(tmp_path: Path) -> None:
     """Windows are classified by window_minutes (300=5h, 10080=weekly), so a
     primary/secondary swap still lands in the right slots."""
