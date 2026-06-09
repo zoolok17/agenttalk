@@ -164,6 +164,14 @@ the local trust model), not dropped:
 
 ## Where things stand
 
+- **0.25.0 (2026-06-09) "budget-aware coordination"** — `agenttalk capacity
+  refresh|show`: each agent self-publishes a privacy-safe, advisory snapshot of
+  its own 5-hour + weekly rate-limit budget (Claude via the status-line dump,
+  Codex via `~/.codex/sessions` rollouts), and the bundled lead skills factor it
+  into planning — steer long/uncertain work off a near-cap agent, defer near a
+  reset, warn when all owners are low; **never gates**. Built as a spike with
+  Codex; strictly advisory (% + reset, not exact tokens; plan-specific; degrades
+  to `unknown`). Idea + design from production: a lead should plan around limits.
 - **0.24.0 (2026-06-08) "coordination polish"** acted on production feedback
   from a 4-agent mission (`agenttalk-improvements.md`): `escalate` now falls back
   to the team lead (backed by an at-most-one-`lead` roster invariant and a
