@@ -130,6 +130,31 @@ for those.
   (restore = move the file back into messages/); never hand-delete
   message files.
 
+## Advisory capacity hints
+
+When planning long or parallel work, publish your own local budget
+snapshot and read the team's published snapshots:
+
+```powershell
+agenttalk capacity refresh --for $SELF
+agenttalk capacity
+```
+
+Treat capacity as a coarse planning hint only. A missing, stale,
+unknown, or high-usage snapshot never blocks protocol progress, review
+validity, or spec-kitty state. Use the output to steer long work away
+from a near-cap agent, prefer short/interruptible tasks when a reset is
+soon, ask an agent to refresh if its signal is stale/unknown, and warn
+the operator when every plausible owner is low or unknown.
+
+Do not scrape another agent's provider files. Each agent must
+self-publish its own snapshot with `agenttalk capacity refresh`.
+Codex reads local `~/.codex/sessions` rollouts; Claude Code reads
+`~/.claude/statusline-last-input.json`, which the Claude worker must
+keep fresh with a status line dump (for example `CC_STATUSLINE_DEBUG=1`
+when supported, or a status-line script that writes the latest input
+JSON to that path).
+
 ## Procedure
 
 1. Inspect the team:
@@ -139,9 +164,15 @@ for those.
    agenttalk sync --for $SELF
    agenttalk threads --for $SELF
    ```
-2. Clarify the mission only if necessary. For an implementation split
+2. For long or parallel work, refresh your own capacity and read the
+   team's advisory snapshots:
+   ```powershell
+   agenttalk capacity refresh --for $SELF
+   agenttalk capacity
+   ```
+3. Clarify the mission only if necessary. For an implementation split
    outside spec-kitty, get explicit user approval before dispatching.
-3. Decompose into small assignments with clear owners and reviewers.
+4. Decompose into small assignments with clear owners and reviewers.
    Prefer point-to-point work requests for owned implementation:
    ```powershell
    agenttalk send --from $SELF --to <agent> --kind question `
@@ -149,7 +180,7 @@ for those.
      --meta assignment=<short-id> `
      -m "<goal, scope, verification, expected reply>"
    ```
-4. Use broadcast for shared awareness or parallel input:
+5. Use broadcast for shared awareness or parallel input:
    ```powershell
    agenttalk broadcast --from $SELF --to-group <group> --kind question `
      --subject "<decision/input needed>" `
@@ -160,7 +191,7 @@ for those.
    `agenttalk reply --to-request <b-id>`. There is no special
    reply-all primitive in this pass; a follow-up to everyone is a new
    `agenttalk broadcast`.
-5. Track open work:
+6. Track open work:
    ```powershell
    agenttalk sync --for $SELF
    agenttalk threads --for $SELF
@@ -175,7 +206,7 @@ for those.
    If a worker is unsure where a reply will route, tell them to run
    `agenttalk reply --to-request <request_id> --dry-run` first; dry-run
    prints the recipient, request id, and kind without sending.
-6. Collect results, request cross-review for implemented pieces, and
+7. Collect results, request cross-review for implemented pieces, and
    summarize the outcome to the user with unresolved blockers called
    out explicitly.
 

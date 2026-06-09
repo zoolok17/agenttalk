@@ -5,6 +5,40 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.0] - 2026-06-09
+
+Budget-aware coordination: agents can self-publish a privacy-safe,
+advisory snapshot of their local 5-hour and weekly rate-limit budget so
+a lead can make better assignment choices during long team runs.
+
+### Added
+- **`agenttalk capacity refresh|show`.** `refresh` reads the current
+  agent's local Claude Code or Codex budget signal and stores a normalized
+  snapshot under `.agenttalk/state/`; `show` (the default) prints the
+  team's published 5-hour/weekly usage, reset timing, stale/unknown
+  confidence, and near-cap/reset-soon flags.
+- **Codex rollout parsing.** Codex refresh reads local
+  `~/.codex/sessions/**/rollout-*.jsonl`, prefers the current
+  `CODEX_THREAD_ID`, scans for the last `payload.rate_limits` record, maps
+  300-minute and 10080-minute windows to 5-hour and weekly slots, and uses
+  the rollout record timestamp for staleness.
+- **Claude Code status-line parsing.** Claude refresh reads
+  `~/.claude/statusline-last-input.json` (or `--statusline-path`) and
+  normalizes `rate_limits.five_hour` and `rate_limits.seven_day`.
+- **Lead skill guidance.** Bundled Claude and Codex lead skills now tell a
+  lead to refresh its own capacity, read team snapshots, steer long work
+  away from near-cap agents, and warn the operator when every plausible
+  owner is low or unknown.
+
+### Unchanged
+- Capacity is strictly advisory. Missing, stale, unknown, or high-usage
+  snapshots never block protocol progress, review validity, or spec-kitty
+  state transitions.
+- Published snapshots contain only derived budget metadata: percentages,
+  reset epochs, window lengths, source, confidence, and non-secret plan
+  labels. Raw session files, prompts, auth paths, token bodies, account ids,
+  and local provider paths stay local.
+
 ## [0.24.0] - 2026-06-08
 
 Coordination polish: three multi-agent fixes surfaced by production feedback
