@@ -5,6 +5,20 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.1] - 2026-06-09
+
+Patch release fixing capacity timestamp parsing on Python 3.10.
+
+### Fixed
+- **Codex capacity snapshots on Python 3.10.** `_normalize_ts` fed provider
+  timestamps of variable sub-second precision (e.g. Codex's `"...:00.0Z"`)
+  straight to `datetime.fromisoformat`, which on Python 3.10 accepts only
+  3- or 6-digit fractions and raises `ValueError` — so a real Codex rollout
+  yielded no capacity snapshot on 3.10. The fraction is now padded/truncated
+  to 6 digits before parsing, so any precision parses on every supported
+  Python. Advisory-only: the bug degraded gracefully (no snapshot) and never
+  crashed or gated protocol progress.
+
 ## [0.25.0] - 2026-06-09
 
 Budget-aware coordination: agents can self-publish a privacy-safe,
