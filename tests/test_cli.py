@@ -617,42 +617,47 @@ def test_wait_consumed_composing_does_not_extend_subsequent_wait(
     capsys: pytest.CaptureFixture,
 ) -> None:
     """A composing ping consumed in one wait must not survive to extend
-    the NEXT wait — the on-disk cursor advances past it under --ack
-    (the default). Regression for Codex's iter-1 BLOCKER #2:
-    "single stale composing makes every later wait pay the extension
-    again, contradicting the recv --ack rationale that stale control
-    pings should not pin the cursor."
+    the NEXT wait. Under --ack (the default) the first wait advances the
+    on-disk cursor past the consumed composing, so a later wait never
+    re-sees it and cannot re-extend. Regression for Codex's iter-1
+    BLOCKER #2: "single stale composing makes every later wait pay the
+    extension again, contradicting the recv --ack rationale that stale
+    control pings should not pin the cursor."
+
+    Asserted on the extension's OBSERVABLE output: `wait` prints a
+    "composing from <peer>" notice exactly when a ping extends its
+    deadline. This is fully deterministic. We deliberately do NOT assert
+    on wall-clock elapsed (absolute or relative): the poll loop's
+    `time.sleep` can be descheduled and overshoot under CI load, which
+    makes any timing threshold flaky while proving nothing the output
+    does not already prove.
     """
     # One stale composing in the inbox.
     store.send(sender="alpha", recipient="beta",
                body="hold on", kind="composing")
     capsys.readouterr()
-    # First wait — short timeout, 1s extension. The composing gets
-    # consumed for extension AND the cursor advances past it.
-    started = time.perf_counter()
+    # First wait: the composing is fresh, so it is consumed for extension
+    # (the "composing from alpha" notice prints) AND --ack advances the
+    # cursor past it. Run non-quiet so the notice is observable.
     rc1 = _run(["wait", "--for", "beta", "--timeout", "0.2",
                 "--grace", "0",
-                "--composing-extend", "1.0",
-                "--heartbeat-interval", "0", "--quiet"], store_root)
-    first_elapsed = time.perf_counter() - started
+                "--composing-extend", "0.5",
+                "--heartbeat-interval", "0"], store_root)
+    out1 = capsys.readouterr().out
     assert rc1 == 1
-    assert Store(store_root).cursor("beta") != ""
-    # Second wait — same stale composing, but cursor is now past it.
-    # If the bug existed, this would also extend by ~1s. Compare against
-    # the first wait instead of an absolute ceiling so Windows/CI process
-    # overhead cancels out.
-    started = time.perf_counter()
+    assert "composing from alpha" in out1            # fresh ping DID extend
+    assert Store(store_root).cursor("beta") != ""    # ...and advanced the cursor
+    # Second wait: same stale composing, but the cursor is now past it, so it
+    # must not be re-seen and must not extend. If the bug existed, the notice
+    # would print again.
     rc2 = _run(["wait", "--for", "beta", "--timeout", "0.2",
                 "--grace", "0",
-                "--composing-extend", "1.0",
+                "--composing-extend", "0.5",
                 "--heartbeat-interval", "0"], store_root)
-    second_elapsed = time.perf_counter() - started
-    out = capsys.readouterr().out
+    out2 = capsys.readouterr().out
     assert rc2 == 1
-    assert "composing from alpha" not in out
-    assert second_elapsed + 0.4 < first_elapsed, (
-        "second wait re-extended on a stale composing: "
-        f"first={first_elapsed:.2f}s second={second_elapsed:.2f}s"
+    assert "composing from alpha" not in out2, (
+        f"second wait re-extended on a stale composing: {out2!r}"
     )
 
 
