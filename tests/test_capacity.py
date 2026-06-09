@@ -8,6 +8,7 @@ anything missing or malformed — never raise (the signal is advisory).
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -135,6 +136,63 @@ def test_read_codex_rollout_none_on_absent_or_no_ratelimits(tmp_path: Path) -> N
     assert cap.read_codex_rollout("codex", sessions_dir=tmp_path / "missing") is None
     _write_codex_rollout(tmp_path, "rollout-x.jsonl", {"type": "other", "payload": {}})
     assert cap.read_codex_rollout("codex", sessions_dir=tmp_path) is None
+
+
+def test_read_codex_rollout_thread_id_wins_over_newest(tmp_path: Path) -> None:
+    """A NEWER rollout without the thread id loses to an older one whose
+    filename carries it (Codex contract: don't pick a resumed/forked sibling)."""
+    newest = dict(_CODEX_RL, primary={"used_percent": 99.0, "window_minutes": 300, "resets_at": 1})
+    match = dict(_CODEX_RL, primary={"used_percent": 33.0, "window_minutes": 300, "resets_at": 2})
+    f_new = _write_codex_rollout(tmp_path, "rollout-newest.jsonl", _token_count(newest))
+    f_match = _write_codex_rollout(tmp_path, "rollout-2026-THREADXYZ.jsonl", _token_count(match))
+    os.utime(f_new, (3_000_000, 3_000_000))      # newest mtime, NO thread id
+    os.utime(f_match, (2_000_000, 2_000_000))     # older, has thread id in name
+    snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path, thread_id="THREADXYZ")
+    assert snap is not None and snap.primary_used_percent == 33.0
+
+
+def test_read_codex_rollout_uses_thread_id_from_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    other = dict(_CODEX_RL, primary={"used_percent": 99.0, "window_minutes": 300, "resets_at": 1})
+    match = dict(_CODEX_RL, primary={"used_percent": 22.0, "window_minutes": 300, "resets_at": 2})
+    f_other = _write_codex_rollout(tmp_path, "rollout-other.jsonl", _token_count(other))
+    f_match = _write_codex_rollout(tmp_path, "rollout-TID123.jsonl", _token_count(match))
+    os.utime(f_other, (3_000_000, 3_000_000))
+    os.utime(f_match, (2_000_000, 2_000_000))
+    monkeypatch.setenv("CODEX_THREAD_ID", "TID123")
+    snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path)  # thread_id resolved from env
+    assert snap is not None and snap.primary_used_percent == 22.0
+
+
+def test_read_codex_rollout_falls_back_to_newest_without_thread_id(tmp_path: Path) -> None:
+    old = dict(_CODEX_RL, primary={"used_percent": 5.0, "window_minutes": 300, "resets_at": 1})
+    new = dict(_CODEX_RL, primary={"used_percent": 70.0, "window_minutes": 300, "resets_at": 2})
+    f_old = _write_codex_rollout(tmp_path, "rollout-old.jsonl", _token_count(old))
+    f_new = _write_codex_rollout(tmp_path, "rollout-new.jsonl", _token_count(new))
+    os.utime(f_old, (1_000_000, 1_000_000))
+    os.utime(f_new, (2_000_000, 2_000_000))
+    snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path, thread_id=None)
+    assert snap is not None and snap.primary_used_percent == 70.0  # newest overall
+
+
+def test_read_codex_rollout_observed_at_from_record_timestamp(tmp_path: Path) -> None:
+    rec = {"timestamp": "2026-06-09T08:30:00Z", "type": "event_msg",
+           "payload": {"type": "token_count", "rate_limits": _CODEX_RL}}
+    _write_codex_rollout(tmp_path, "rollout-a.jsonl", rec)
+    snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path)
+    assert snap is not None and snap.observed_at == "2026-06-09T08:30:00Z"
+
+
+def test_read_codex_rollout_maps_windows_by_minutes_not_position(tmp_path: Path) -> None:
+    """Windows are classified by window_minutes (300=5h, 10080=weekly), so a
+    primary/secondary swap still lands in the right slots."""
+    rl = dict(_CODEX_RL,
+              primary={"used_percent": 41.0, "window_minutes": 10080, "resets_at": 1},
+              secondary={"used_percent": 12.0, "window_minutes": 300, "resets_at": 2})
+    _write_codex_rollout(tmp_path, "rollout-a.jsonl", _token_count(rl))
+    snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path)
+    assert snap is not None
+    assert snap.primary_used_percent == 12.0 and snap.primary_window_minutes == 300
+    assert snap.secondary_used_percent == 41.0 and snap.secondary_window_minutes == 10080
 
 
 # ------------------------------------------------------------- read_local

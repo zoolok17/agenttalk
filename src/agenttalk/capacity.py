@@ -129,10 +129,24 @@ def read_claude_statusline(
     )
 
 
-def _last_rate_limits_in(path: Path) -> dict | None:
-    """Stream a rollout JSONL and return the LAST ``payload.rate_limits`` dict.
+def _normalize_ts(ts: object) -> str | None:
+    """Normalize a provider timestamp to UTC ISO-Z seconds, or None."""
+    if not isinstance(ts, str) or not ts:
+        return None
+    norm = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+    try:
+        dt = datetime.fromisoformat(norm)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
-    Streams line-by-line and only JSON-parses lines containing the marker, so a
+
+def _last_rate_limits_record(path: Path) -> dict | None:
+    """Stream a rollout JSONL and return the LAST record carrying
+    ``payload.rate_limits`` (the whole record, so the caller can read its
+    ``timestamp``). Only JSON-parses lines containing the marker, so a
     multi-MB session file stays cheap to scan.
     """
     last: dict | None = None
@@ -146,27 +160,53 @@ def _last_rate_limits_in(path: Path) -> dict | None:
                 except ValueError:
                     continue
                 payload = rec.get("payload") if isinstance(rec, dict) else None
-                rl = payload.get("rate_limits") if isinstance(payload, dict) else None
-                if isinstance(rl, dict):
-                    last = rl
+                if isinstance(payload, dict) and isinstance(payload.get("rate_limits"), dict):
+                    last = rec
     except OSError:
         return None
     return last
 
 
-def _codex_snapshot(source_agent: str, rl: dict) -> CapacitySnapshot | None:
-    prim = rl.get("primary") if isinstance(rl.get("primary"), dict) else {}
-    sec = rl.get("secondary") if isinstance(rl.get("secondary"), dict) else {}
-    if prim.get("used_percent") is None and sec.get("used_percent") is None:
+def _file_contains(path: Path, needle: str) -> bool:
+    """True if ``needle`` appears anywhere in the file (streamed, stops early)."""
+    try:
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
+                if needle in line:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _pick_windows(prim: object, sec: object) -> tuple[dict, dict]:
+    """Map the two rate-limit windows to (5-hour, weekly) by ``window_minutes``
+    when present (robust to position), else fall back to primary=5h/secondary=
+    weekly position order (Codex's verified default)."""
+    cands = [w for w in (prim, sec) if isinstance(w, dict)]
+    five = next((w for w in cands if w.get("window_minutes") == FIVE_HOUR_MINUTES), None)
+    week = next((w for w in cands if w.get("window_minutes") == WEEKLY_MINUTES), None)
+    if five is None and week is None:  # window_minutes absent — position fallback
+        return (prim if isinstance(prim, dict) else {}), (sec if isinstance(sec, dict) else {})
+    return five or {}, week or {}
+
+
+def _codex_snapshot(source_agent: str, rec: dict) -> CapacitySnapshot | None:
+    rl = rec.get("payload", {}).get("rate_limits", {})
+    five, week = _pick_windows(rl.get("primary"), rl.get("secondary"))
+    if five.get("used_percent") is None and week.get("used_percent") is None:
         return None
+    # observed_at = when CODEX took the reading (the record timestamp), not when
+    # WE read the file — so staleness reflects the agent's real last activity.
+    observed = _normalize_ts(rec.get("timestamp")) or _now_iso()
     return CapacitySnapshot(
-        source_agent=source_agent, observed_at=_now_iso(), source="codex_rollout",
-        primary_used_percent=_as_float(prim.get("used_percent")),
-        primary_resets_at=_as_int(prim.get("resets_at")),
-        primary_window_minutes=_as_int(prim.get("window_minutes")) or FIVE_HOUR_MINUTES,
-        secondary_used_percent=_as_float(sec.get("used_percent")),
-        secondary_resets_at=_as_int(sec.get("resets_at")),
-        secondary_window_minutes=_as_int(sec.get("window_minutes")) or WEEKLY_MINUTES,
+        source_agent=source_agent, observed_at=observed, source="codex_rollout",
+        primary_used_percent=_as_float(five.get("used_percent")),
+        primary_resets_at=_as_int(five.get("resets_at")),
+        primary_window_minutes=_as_int(five.get("window_minutes")) or FIVE_HOUR_MINUTES,
+        secondary_used_percent=_as_float(week.get("used_percent")),
+        secondary_resets_at=_as_int(week.get("resets_at")),
+        secondary_window_minutes=_as_int(week.get("window_minutes")) or WEEKLY_MINUTES,
         plan_type=_as_str(rl.get("plan_type")),
         limit_id=_as_str(rl.get("limit_id")),
         rate_limit_reached_type=_as_str(rl.get("rate_limit_reached_type")),
@@ -176,28 +216,41 @@ def _codex_snapshot(source_agent: str, rl: dict) -> CapacitySnapshot | None:
 
 def read_codex_rollout(
     source_agent: str, *, sessions_dir: str | os.PathLike | None = None,
-    max_files: int = 8,
+    thread_id: str | None = None, max_files: int = 8,
 ) -> CapacitySnapshot | None:
-    """Parse the newest Codex rollout that carries rate-limit data.
+    """Parse the CURRENT Codex session's rollout for its rate-limit budget.
 
-    Scans up to ``max_files`` most-recently-modified ``rollout-*.jsonl`` files
-    (the active session appends to its rollout, so newest-mtime is the current
-    one) and returns the last rate-limit record found.
+    Selection (per Codex's contract): if ``CODEX_THREAD_ID`` is set, prefer
+    rollout files matching that thread id (by filename, then by content), newest
+    mtime first — this avoids picking a resumed/forked sibling. Falls back to the
+    newest rollout overall when no thread id is set or matches. Within the chosen
+    file, takes the LAST ``payload.rate_limits`` record.
     """
     root = Path(sessions_dir) if sessions_dir is not None else Path.home() / ".codex" / "sessions"
     if not root.is_dir():
         return None
     try:
-        rollouts = sorted(
-            root.rglob("rollout-*.jsonl"),
-            key=lambda p: p.stat().st_mtime, reverse=True,
-        )
+        rollouts = sorted(root.rglob("rollout-*.jsonl"),
+                          key=lambda p: p.stat().st_mtime, reverse=True)
     except OSError:
         return None
-    for f in rollouts[:max_files]:
-        rl = _last_rate_limits_in(f)
-        if rl is not None:
-            snap = _codex_snapshot(source_agent, rl)
+    if not rollouts:
+        return None
+    tid = thread_id if thread_id is not None else os.environ.get("CODEX_THREAD_ID")
+    candidates = rollouts
+    if tid:
+        by_name = [f for f in rollouts if tid in f.name]
+        if by_name:
+            candidates = by_name
+        else:
+            by_content = [f for f in rollouts[:max_files] if _file_contains(f, tid)]
+            if by_content:
+                candidates = by_content
+            # else: no match anywhere — fall back to newest overall (candidates = rollouts)
+    for f in candidates[:max_files]:
+        rec = _last_rate_limits_record(f)
+        if rec is not None:
+            snap = _codex_snapshot(source_agent, rec)
             if snap is not None:
                 return snap
     return None
@@ -207,6 +260,7 @@ def read_local(
     source_agent: str, *, source: str = "auto",
     statusline_path: str | os.PathLike | None = None,
     sessions_dir: str | os.PathLike | None = None,
+    thread_id: str | None = None,
 ) -> CapacitySnapshot:
     """Read THIS agent's budget snapshot, auto-detecting the runtime.
 
@@ -224,7 +278,7 @@ def read_local(
     if src == "claude":
         snap = read_claude_statusline(source_agent, path=statusline_path)
     elif src == "codex":
-        snap = read_codex_rollout(source_agent, sessions_dir=sessions_dir)
+        snap = read_codex_rollout(source_agent, sessions_dir=sessions_dir, thread_id=thread_id)
     return snap or CapacitySnapshot.unknown(source_agent)
 
 
