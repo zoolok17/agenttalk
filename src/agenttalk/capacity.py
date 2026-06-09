@@ -119,15 +119,18 @@ def read_claude_statusline(
         data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    rl = data.get("rate_limits") if isinstance(data, dict) else None
-    if not isinstance(rl, dict):
+    if not isinstance(data, dict):
         return None
+    # Budget (rate_limits) and context (context_window) are independent blocks;
+    # a snapshot publishes from EITHER, so an absent rate_limits must not discard
+    # present context data (and vice-versa).
+    rl = data.get("rate_limits") if isinstance(data.get("rate_limits"), dict) else {}
     five = rl.get("five_hour") if isinstance(rl.get("five_hour"), dict) else {}
     week = rl.get("seven_day") if isinstance(rl.get("seven_day"), dict) else {}
     ctx_pct, ctx_size, ctx_tokens = _claude_context(data.get("context_window"))
     has_budget = not (five.get("used_percentage") is None and week.get("used_percentage") is None)
     if not has_budget and ctx_pct is None:
-        return None  # rate_limits present but carries no budget or context data yet
+        return None  # neither budget nor context data present yet
     return CapacitySnapshot(
         source_agent=source_agent, observed_at=_now_iso(), source="claude_statusline",
         primary_used_percent=_as_float(five.get("used_percentage")),
@@ -180,24 +183,31 @@ def _normalize_ts(ts: object) -> str | None:
     return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _last_rate_limits_record(path: Path) -> dict | None:
-    """Stream a rollout JSONL and return the LAST record carrying
-    ``payload.rate_limits`` (the whole record, so the caller can read its
-    ``timestamp``). Only JSON-parses lines containing the marker, so a
-    multi-MB session file stays cheap to scan.
+def _last_capacity_record(path: Path) -> dict | None:
+    """Stream a rollout JSONL and return the LAST record carrying budget
+    (``payload.rate_limits``) AND/OR context (``payload.info`` with
+    ``model_context_window``) — the whole record, so the caller can read its
+    ``timestamp``. Eligibility is decoupled from ``rate_limits`` so a
+    context-only record still publishes. Only JSON-parses lines containing a
+    marker, so a multi-MB session file stays cheap to scan.
     """
     last: dict | None = None
     try:
         with path.open(encoding="utf-8") as fh:
             for line in fh:
-                if '"rate_limits"' not in line:
+                if '"rate_limits"' not in line and '"model_context_window"' not in line:
                     continue
                 try:
                     rec = json.loads(line)
                 except ValueError:
                     continue
                 payload = rec.get("payload") if isinstance(rec, dict) else None
-                if isinstance(payload, dict) and isinstance(payload.get("rate_limits"), dict):
+                if not isinstance(payload, dict):
+                    continue
+                has_budget = isinstance(payload.get("rate_limits"), dict)
+                info = payload.get("info")
+                has_context = isinstance(info, dict) and "model_context_window" in info
+                if has_budget or has_context:
                     last = rec
     except OSError:
         return None
@@ -244,8 +254,8 @@ def _codex_context(info: object) -> tuple[float | None, int | None, int | None]:
 
 
 def _codex_snapshot(source_agent: str, rec: dict) -> CapacitySnapshot | None:
-    payload = rec.get("payload", {})
-    rl = payload.get("rate_limits", {})
+    payload = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+    rl = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), dict) else {}
     five, week = _pick_windows(rl.get("primary"), rl.get("secondary"))
     ctx_pct, ctx_size, ctx_tokens = _codex_context(payload.get("info"))
     has_budget = not (five.get("used_percent") is None and week.get("used_percent") is None)
@@ -287,7 +297,7 @@ def read_codex_rollout(
     rollout files matching that thread id (by filename, then by content), newest
     mtime first — this avoids picking a resumed/forked sibling. Falls back to the
     newest rollout overall when no thread id is set or matches. Within the chosen
-    file, takes the LAST ``payload.rate_limits`` record.
+    file, takes the LAST record carrying budget and/or context data.
     """
     root = Path(sessions_dir) if sessions_dir is not None else Path.home() / ".codex" / "sessions"
     if not root.is_dir():
@@ -311,7 +321,7 @@ def read_codex_rollout(
                 candidates = by_content
             # else: no match anywhere — fall back to newest overall (candidates = rollouts)
     for f in candidates[:max_files]:
-        rec = _last_rate_limits_record(f)
+        rec = _last_capacity_record(f)
         if rec is not None:
             snap = _codex_snapshot(source_agent, rec)
             if snap is not None:

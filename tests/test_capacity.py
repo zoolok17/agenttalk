@@ -123,13 +123,17 @@ def test_read_claude_statusline_parses_context_window(tmp_path: Path) -> None:
 
 
 def test_read_claude_statusline_context_only_without_budget(tmp_path: Path) -> None:
-    """Context present but rate-limit windows empty still yields a snapshot —
-    context headroom is independently useful."""
-    p = _write_claude(tmp_path, {"rate_limits": {"five_hour": {}, "seven_day": {}},
-                                 "context_window": {"context_window_size": 200000, "used_percentage": 60}})
+    """Context present with NO rate_limits block still yields a snapshot —
+    budget and context are independent; either alone is publishable."""
+    p = _write_claude(tmp_path, {"context_window": {"context_window_size": 200000,
+                                                    "used_percentage": 60}})
     snap = cap.read_claude_statusline("claude", path=p)
     assert snap is not None
     assert snap.context_used_percent == 60.0 and snap.primary_used_percent is None
+    # an empty/placeholder rate_limits block alongside context behaves the same
+    p2 = _write_claude(tmp_path, {"rate_limits": {"five_hour": {}, "seven_day": {}},
+                                  "context_window": {"context_window_size": 200000, "used_percentage": 60}})
+    assert cap.read_claude_statusline("claude", path=p2) is not None
 
 
 # --------------------------------------------------------- Codex rollout read
@@ -262,9 +266,10 @@ def test_read_codex_rollout_parses_context(tmp_path: Path) -> None:
 
 
 def test_read_codex_rollout_context_only_without_budget(tmp_path: Path) -> None:
-    rl = {"limit_id": "codex", "primary": None, "secondary": None, "plan_type": "pro"}
+    """A token_count record with context (info) but NO rate_limits key is still
+    eligible — record selection is decoupled from rate_limits."""
     rec = {"timestamp": "2026-06-09T08:30:00Z", "type": "event_msg",
-           "payload": {"type": "token_count", "info": _CODEX_INFO, "rate_limits": rl}}
+           "payload": {"type": "token_count", "info": _CODEX_INFO}}
     _write_codex_rollout(tmp_path, "rollout-a.jsonl", rec)
     snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path)
     assert snap is not None
