@@ -23,6 +23,7 @@ from agenttalk.store import (
     validate_agent_name,
     validate_rescind,
 )
+from agenttalk import capacity as capmod
 from agenttalk import transcript as tx
 from agenttalk import codex_config as cxc
 from agenttalk import doctor as dr
@@ -2432,6 +2433,87 @@ def cmd_hmac_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reset_in_minutes(epoch: object) -> int | None:
+    if not isinstance(epoch, (int, float)) or isinstance(epoch, bool):
+        return None
+    delta = epoch - time.time()
+    return max(0, int(delta // 60))
+
+
+def _fmt_reset(epoch: object) -> str:
+    mins = _reset_in_minutes(epoch)
+    if mins is None:
+        return "reset ?"
+    if mins == 0:
+        return "resets now"
+    if mins < 60:
+        return f"resets {mins}m"
+    return f"resets {mins // 60}h{mins % 60:02d}m"
+
+
+def _fmt_pct(used: object) -> str:
+    return f"{used:.0f}% used" if isinstance(used, (int, float)) and not isinstance(used, bool) else "?% used"
+
+
+def _print_capacity_row(agent: str, snap: dict, *, threshold: float, reset_soon_min: int) -> None:
+    conf = capmod.effective_confidence(snap)
+    if conf == "unknown":
+        print(f"  {agent:<14} budget unknown (no readable signal on its side)")
+        return
+    p, pr = snap.get("primary_used_percent"), snap.get("primary_resets_at")
+    s, sr = snap.get("secondary_used_percent"), snap.get("secondary_resets_at")
+    flags: list[str] = []
+    for label, used, reset in (("5h", p, pr), ("weekly", s, sr)):
+        if isinstance(used, (int, float)) and not isinstance(used, bool) and used >= threshold:
+            flags.append(f"{label} {used:.0f}%≥{threshold:.0f}")
+        rin = _reset_in_minutes(reset)
+        if rin is not None and 0 < rin <= reset_soon_min:
+            flags.append(f"{label} resets in {rin}m")
+    plan = snap.get("plan_type") or "?"
+    stale = "" if conf == "observed" else f" [{conf}]"
+    warn = ("  ⚠ " + "; ".join(flags)) if flags else ""
+    print(f"  {agent:<14} 5h {_fmt_pct(p)} ({_fmt_reset(pr)})  "
+          f"weekly {_fmt_pct(s)} ({_fmt_reset(sr)})  plan={plan}{stale}{warn}")
+
+
+def cmd_capacity(args: argparse.Namespace) -> int:
+    """Advisory rate-limit budget: publish your own snapshot (refresh) or view
+    the team's published budgets (show). STRICTLY advisory — a missing, stale,
+    or unknown signal never blocks anything; it's a hint for the lead."""
+    store = _get_store(args)
+    roster = store.load_config().get("agents") or []
+    if args.mode == "refresh":
+        agent = _resolve_self(args.agent, roster=roster)
+        snap = capmod.read_local(
+            agent, source=args.source,
+            statusline_path=args.statusline_path, sessions_dir=args.sessions_dir,
+        )
+        store.write_capacity(agent, snap.to_dict())
+        print(f"agenttalk capacity: published {agent} "
+              f"(source={snap.source}, confidence={snap.confidence})")
+        if snap.source != "unknown":
+            _print_capacity_row(agent, snap.to_dict(),
+                                threshold=args.threshold, reset_soon_min=args.reset_soon_min)
+        else:
+            print("  no local budget signal found — published an 'unknown' snapshot. "
+                  "On Claude, configure a status line (or CC_STATUSLINE_DEBUG=1) so "
+                  "rate_limits are dumped; on Codex this reads ~/.codex/sessions rollouts.")
+        return 0
+
+    # show
+    caps = store.read_all_capacities()
+    if not caps:
+        print("agenttalk capacity: no budgets published yet — each agent runs "
+              "`agenttalk capacity refresh` (advisory; lead reads this to plan work).")
+        return 0
+    print(f"team budget (advisory; flag ≥{args.threshold:.0f}% used or reset within "
+          f"{args.reset_soon_min}m):")
+    for agent in sorted(caps):
+        _print_capacity_row(agent, caps[agent],
+                            threshold=args.threshold, reset_soon_min=args.reset_soon_min)
+    return 0
+
+
 def cmd_install_skills(args: argparse.Namespace) -> int:
     if args.devkit_only:
         claude = codex = False
@@ -3463,6 +3545,24 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Overwrite an existing key. Every message signed with "
                          "the old key becomes unverifiable.")
     ph.set_defaults(func=cmd_hmac_init)
+
+    pcap = sub.add_parser(
+        "capacity",
+        help="Advisory rate-limit budget: publish your own 5h/weekly usage "
+             "(refresh) or view the team's (show) so a lead can plan work.",
+    )
+    pcap.add_argument("mode", nargs="?", choices=["show", "refresh"], default="show",
+                      help="show (default) the team's published budgets, or refresh (publish your own)")
+    pcap.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
+    pcap.add_argument("--source", choices=["auto", "claude", "codex"], default="auto",
+                      help="On refresh, which local source to read (default: auto-detect)")
+    pcap.add_argument("--threshold", type=float, default=80.0,
+                      help="Flag a window at/above this %% used (default: 80)")
+    pcap.add_argument("--reset-soon-min", dest="reset_soon_min", type=int, default=30,
+                      help="Flag a window resetting within this many minutes (default: 30)")
+    pcap.add_argument("--statusline-path", help="Override the Claude status-line dump path (refresh)")
+    pcap.add_argument("--sessions-dir", help="Override the Codex sessions dir (refresh)")
+    pcap.set_defaults(func=cmd_capacity)
 
     pis = sub.add_parser(
         "install-skills",

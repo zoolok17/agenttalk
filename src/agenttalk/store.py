@@ -2004,6 +2004,56 @@ class Store:
         except (FileNotFoundError, OSError):
             pass
 
+    # --------------------------------------------------- capacity (budget)
+    #
+    # Advisory rate-limit budget snapshots an agent self-publishes so a lead
+    # can factor remaining 5h/weekly budget into how it organizes work. Like
+    # the heartbeat/composing markers, this is STRICTLY observational: a
+    # missing/corrupt/stale snapshot never blocks protocol progress. The
+    # snapshot carries only derived budget metadata (see capacity.py), never
+    # account ids, auth paths, or token/session contents.
+
+    def write_capacity(self, agent: str, snapshot: dict) -> None:
+        """Best-effort publish of ``agent``'s budget snapshot to the bus."""
+        p = self.state_dir / f"{agent}.capacity.json"
+        try:
+            _atomic_write_text(p, json.dumps(snapshot, ensure_ascii=False))
+        except (OSError, TypeError):
+            pass  # observability only — a failed write degrades to "no snapshot"
+
+    def read_capacity(self, agent: str) -> dict | None:
+        """Return ``agent``'s published snapshot dict, or None if
+        absent/empty/corrupt. Never raises."""
+        p = self.state_dir / f"{agent}.capacity.json"
+        if not p.exists():
+            return None
+        try:
+            raw = p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not raw:
+            return None
+        try:
+            d = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        return d if isinstance(d, dict) else None
+
+    def read_all_capacities(self) -> dict[str, dict]:
+        """All published snapshots keyed by agent (derived from the state dir,
+        so a retired/forgotten agent's stale file still surfaces). Skips
+        absent/corrupt files."""
+        out: dict[str, dict] = {}
+        if not self.state_dir.is_dir():
+            return out
+        suffix = ".capacity.json"
+        for p in sorted(self.state_dir.glob(f"*{suffix}")):
+            agent = p.name[: -len(suffix)]
+            d = self.read_capacity(agent)
+            if d is not None:
+                out[agent] = d
+        return out
+
     # ------------------------------------------------------- thread state
     #
     # Per-(agent, request_id) state for SCOPED thread work, kept separate

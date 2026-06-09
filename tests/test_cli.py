@@ -1743,6 +1743,42 @@ def test_send_rejects_kind_end(tmp_path: Path) -> None:
                       "--kind", "end"], tmp_path, 2)
 
 
+# --------------------------------------- capacity (advisory budget awareness)
+
+def test_cli_capacity_refresh_and_show(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    sl = tmp_path / "statusline.json"
+    sl.write_text(json.dumps({"rate_limits": {
+        "five_hour": {"used_percentage": 85.0, "resets_at": 9999999999},
+        "seven_day": {"used_percentage": 40.0, "resets_at": 9999999999}}}), encoding="utf-8")
+    rc = cli.main(["--root", str(tmp_path), "capacity", "refresh", "--for", "alpha",
+                   "--source", "claude", "--statusline-path", str(sl)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "alpha" in out and "claude_statusline" in out
+    rc2 = cli.main(["--root", str(tmp_path), "capacity"])
+    assert rc2 == 0
+    out2 = capsys.readouterr().out
+    assert "5h 85% used" in out2 and "⚠" in out2  # near-cap flagged with ⚠
+
+
+def test_cli_capacity_show_empty(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    rc = cli.main(["--root", str(tmp_path), "capacity"])
+    assert rc == 0
+    assert "no budgets published" in capsys.readouterr().out
+
+
+def test_cli_capacity_refresh_unknown_when_no_signal(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    rc = cli.main(["--root", str(tmp_path), "capacity", "refresh", "--for", "alpha",
+                   "--source", "claude", "--statusline-path", str(tmp_path / "nope.json")])
+    assert rc == 0
+    assert "unknown" in capsys.readouterr().out.lower()
+
+
 # --------------------------------------- roster set-operator-facing (T012)
 
 def test_set_operator_facing_roundtrip_and_displays(tmp_path: Path, capsys) -> None:

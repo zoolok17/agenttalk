@@ -686,6 +686,27 @@ def test_message_body_roundtrips_unicode_crlf_multiline(store: Store) -> None:
     assert reload.body == body
 
 
+def test_capacity_roundtrip_and_read_all(store: Store) -> None:
+    snap = {"source_agent": "alpha", "observed_at": "2026-06-09T08:00:00Z",
+            "source": "codex_rollout", "primary_used_percent": 12.0,
+            "confidence": "observed"}
+    store.write_capacity("alpha", snap)
+    assert store.read_capacity("alpha") == snap
+    store.write_capacity("beta", {"source_agent": "beta", "confidence": "unknown"})
+    allc = store.read_all_capacities()
+    assert set(allc) == {"alpha", "beta"}
+    assert allc["alpha"]["primary_used_percent"] == 12.0
+
+
+def test_capacity_absent_and_corrupt_never_raise(store: Store) -> None:
+    assert store.read_capacity("alpha") is None          # absent
+    p = store.state_dir / "alpha.capacity.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{not json", encoding="utf-8")
+    assert store.read_capacity("alpha") is None          # corrupt -> None
+    assert store.read_all_capacities() == {}             # corrupt skipped
+
+
 # ============================================================= #19 Phase A
 # Identity registry, retirement & epoch store layer (WP01).
 
