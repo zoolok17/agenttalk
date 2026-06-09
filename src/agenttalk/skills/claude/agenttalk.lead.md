@@ -130,9 +130,9 @@ for those.
   (restore = move the file back into messages/); never hand-delete
   message files.
 
-## Advisory capacity hints
+## Advisory capacity and context hints
 
-When planning long or parallel work, publish your own local budget
+When planning long or parallel work, publish your own local headroom
 snapshot and read the team's published snapshots:
 
 ```powershell
@@ -144,8 +144,9 @@ Treat capacity as a coarse planning hint only. A missing, stale,
 unknown, or high-usage snapshot never blocks protocol progress, review
 validity, or spec-kitty state. Use the output to steer long work away
 from a near-cap agent, prefer short/interruptible tasks when a reset is
-soon, ask an agent to refresh if its signal is stale/unknown, and warn
-the operator when every plausible owner is low or unknown.
+soon, steer context-heavy work away from agents near compaction, ask an
+agent to refresh if its signal is stale/unknown, and warn the operator
+when every plausible owner is low, near compaction, stale, or unknown.
 
 Do not scrape another agent's provider files. Each agent must
 self-publish its own snapshot with `agenttalk capacity refresh`.
@@ -153,7 +154,9 @@ Codex reads local `~/.codex/sessions` rollouts; Claude Code reads
 `~/.claude/statusline-last-input.json`, which the Claude worker must
 keep fresh with a status line dump (for example `CC_STATUSLINE_DEBUG=1`
 when supported, or a status-line script that writes the latest input
-JSON to that path).
+JSON to that path). The snapshot may contain rate-limit budget,
+context-window fill, or both; treat either signal as useful but never
+authoritative.
 
 ## Procedure
 
@@ -164,7 +167,7 @@ JSON to that path).
    agenttalk sync --for $SELF
    agenttalk threads --for $SELF
    ```
-2. For long or parallel work, refresh your own capacity and read the
+2. For long or parallel work, refresh your own capacity/context and read the
    team's advisory snapshots:
    ```powershell
    agenttalk capacity refresh --for $SELF

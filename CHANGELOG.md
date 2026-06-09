@@ -5,6 +5,42 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0] - 2026-06-09
+
+Context-aware coordination phase 1: capacity snapshots now include the
+agent's local context-window fill so leads can avoid assigning long,
+context-heavy work to agents near compaction.
+
+### Added
+- **Context headroom in `agenttalk capacity`.** Snapshots now carry optional
+  `context_used_percent`, `context_window_size`, and `context_tokens` fields.
+  `capacity show` prints a `context N%` segment and flags near-compaction
+  snapshots with `--context-threshold` (default 80).
+- **Claude Code context parsing.** Claude refresh reads
+  `context_window.used_percentage`, `context_window.context_window_size`, and
+  input-side `context_window.current_usage` token counts from the same
+  status-line input file used for rate-limit data. A status line with context
+  but no `rate_limits` block still publishes.
+- **Codex context parsing.** Codex refresh reads
+  `payload.info.last_token_usage.input_tokens` and
+  `payload.info.model_context_window` from the same rollout `token_count`
+  records used for budget data. It uses current input tokens divided by the
+  model context window, not cumulative `total_token_usage`. A rollout record
+  with context data but no `rate_limits` block still publishes.
+- **Lead skill guidance.** Bundled Claude and Codex lead skills now treat
+  context headroom as a coarse planning hint alongside rate-limit budget:
+  steer long work away from near-compaction agents, ask stale/unknown agents to
+  refresh, and warn the operator when every plausible owner is low or near
+  compaction.
+
+### Unchanged
+- Context headroom is advisory only. Missing, stale, unknown, or
+  near-compaction snapshots never block protocol progress, review validity, or
+  spec-kitty state transitions.
+- The privacy boundary is unchanged: snapshots publish only derived numbers and
+  non-secret labels, not raw rollout/status-line contents, prompts, session
+  text, provider paths, token bodies, auth paths, or account identifiers.
+
 ## [0.25.1] - 2026-06-09
 
 Patch release fixing capacity timestamp parsing on Python 3.10.

@@ -18,7 +18,7 @@ exported on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.25.1"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.26.0"
 agenttalk install-skills          # installs bus skills + the dev-discipline devkit
 
 # in your project root, once per project
@@ -123,10 +123,10 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.25.1"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.26.0"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.25.1` with
+Pin to a specific tag so you control upgrades. Replace `v0.26.0` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
@@ -392,8 +392,9 @@ do not assert stale HOLD/GO decisions from prose in an old message.
 ### Advisory capacity
 
 For operators coordinating long or parallel runs, `agenttalk capacity`
-lets each agent self-publish a coarse local rate-limit snapshot so a
-lead can plan work around 5-hour and weekly budget pressure:
+lets each agent self-publish a coarse local headroom snapshot so a
+lead can plan work around both 5-hour/weekly rate-limit pressure and
+context-window compaction risk:
 
 ```powershell
 # run in each agent window to publish that agent's own local signal
@@ -406,25 +407,36 @@ agenttalk capacity
 This signal is strictly advisory. Missing, stale, or unknown capacity
 must never block protocol progress or decide whether a review is valid.
 Use it as a planning hint: steer long work away from a near-cap agent,
-prefer short/interruptible tasks when a reset is soon, and tell the
-operator when every plausible owner is low or unknown.
+prefer short/interruptible tasks when a reset is soon, avoid assigning
+large context-heavy work to an agent near compaction, and tell the
+operator when every plausible owner is low, near compaction, stale, or
+unknown.
 
 Agents publish only normalized metadata under `.agenttalk/state/`:
-percent used, reset epochs, window lengths, source, confidence, and
-non-secret plan labels. They do not publish raw session files, prompts,
-auth paths, token bodies, account ids, or local provider paths.
+rate-limit percent used, reset epochs, budget window lengths,
+context-window percent used, context window size/current context tokens,
+source, confidence, and non-secret plan labels. They do not publish raw
+session files, prompts, auth paths, token bodies, account ids, or local
+provider paths.
 
 On Codex, `agenttalk capacity refresh --source codex` reads the local
 `~/.codex/sessions/**/rollout-*.jsonl` files, prefers the current
-`CODEX_THREAD_ID` when present, and takes the last
-`payload.rate_limits` record from the chosen rollout. On Claude Code,
-`agenttalk capacity refresh --source claude` reads
+`CODEX_THREAD_ID` when present, and takes the last record carrying
+`payload.rate_limits` and/or context data in `payload.info`. Codex
+context fill uses
+`info.last_token_usage.input_tokens / info.model_context_window * 100`;
+it does not use cumulative `total_token_usage`.
+
+On Claude Code, `agenttalk capacity refresh --source claude` reads
 `~/.claude/statusline-last-input.json`, which must be kept fresh by a
 Claude status line dump. Either enable `CC_STATUSLINE_DEBUG=1` if your
 Claude Code build writes that debug input file, or configure a status
 line script that writes the latest status-line input JSON to that path.
-The JSON needs `rate_limits.five_hour` and `rate_limits.seven_day`
-objects with `used_percentage` and `resets_at`.
+The JSON may carry rate-limit data in `rate_limits.five_hour` and
+`rate_limits.seven_day`, context data in `context_window`, or both.
+Context data uses `context_window.used_percentage`,
+`context_window.context_window_size`, and input-side
+`context_window.current_usage` token counts.
 
 ### Ending the session
 
@@ -707,7 +719,7 @@ so the long timeout is free observability.
 | `agenttalk status` | Show roster, per-agent cursor, unread count, and **actionable warnings**: never-acked unread, soft-deadlocks, unconsumed correlated replies, and stale outbound threads. |
 | `agenttalk threads [--for A] [--all] [--json]` | Derive request/reply thread state from validated messages. Default view shows actionable rows only (`reply-waiting`, `owed-inbound`, `open-outbound`); `--all` includes `closed`. 0.16.0: open rows in `--json` carry read-only `next_owner` / `next_action` (`reply`/`read-reply`/`await-reply`/`answer-operator`) — who owes the next move, a pure projection of state. |
 | `agenttalk sync --for A [--json]` | Rejoin digest: show identity, roster, actionable threads grouped by request id, terminal decisions, recent unread non-action messages, and deterministic next-action hints. Pure derivation; no cursor or threadstate writes. |
-| `agenttalk capacity [show\|refresh] [--for A] [--source auto\|claude\|codex] [--threshold N] [--reset-soon-min N] [--statusline-path PATH] [--sessions-dir PATH]` | Advisory rate-limit budget snapshots. `refresh` reads the caller's local Claude/Codex signal and publishes a normalized snapshot for `A`; `show` (the default) prints the team's published 5-hour/weekly usage, stale/unknown confidence, and near-cap/reset-soon flags. Never gates progress. |
+| `agenttalk capacity [show\|refresh] [--for A] [--source auto\|claude\|codex] [--threshold N] [--context-threshold N] [--reset-soon-min N] [--statusline-path PATH] [--sessions-dir PATH]` | Advisory headroom snapshots. `refresh` reads the caller's local Claude/Codex signal and publishes a normalized snapshot for `A`; `show` (the default) prints the team's published 5-hour/weekly usage, context-window fill, stale/unknown confidence, and near-cap/reset-soon/near-compaction flags. Never gates progress. |
 | `agenttalk send --from A --to B [--kind K] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -)` | Drop a message into the bus. `--file -` reads the body from stdin. `review-request`, `question`, and `proposal` without `--meta request_id=...` get one minted + printed; `wake` gets a `wk-` correlation id minted the same way but does **not** open a thread (0.24.0); `review-result` and `proposal-response` without one warn (soft, exit 0). |
 | `agenttalk broadcast --from A (--to-group G \| --all) [--kind message\|note\|question] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--print-id] [--quiet]` | Fan out one message per recipient, excluding the sender. Mints `broadcast_id=b-...`, stores it as `meta.broadcast_id` and `meta.request_id`, and prints the recipient list unless quiet. 0.15.0: `--to-role <role>` targets every member holding a role (frozen into each copy at send time); a PARTIAL fan-out exits **5** with a delivered/missed manifest — recover with `--resume <bid>` or rescind. |
 | `agenttalk propose [--from A] [--to B] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--in-reply-to ID] [--print-id] [--quiet]` | Send a first-class `proposal`. Auto-mints `meta.request_id=pp-...` if absent and prints `(proposal id: pp-...)` unless quiet. `--in-reply-to` sets `meta.in_reply_to` for counters. |
