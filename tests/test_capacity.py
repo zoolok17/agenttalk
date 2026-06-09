@@ -193,6 +193,18 @@ def test_read_codex_rollout_skips_record_without_trustworthy_timestamp(tmp_path:
     assert cap.read_codex_rollout("codex", sessions_dir=tmp_path) is None
 
 
+def test_normalize_ts_accepts_any_fractional_precision() -> None:
+    """Providers emit variable sub-second precision (e.g. Codex's "...:00.0Z").
+    Python 3.10's fromisoformat only accepts 3- or 6-digit fractions, so the
+    parser must pad/truncate; every precision normalizes to the same UTC second
+    on all supported Pythons (regression guard for the 3.10-only CI failure)."""
+    for frac in ("", ".0", ".12", ".123", ".123456", ".1234567"):
+        assert cap._normalize_ts(f"2026-06-09T08:00:00{frac}Z") == "2026-06-09T08:00:00Z"
+    assert cap._normalize_ts("2026-06-09T08:00:00.0+02:00") == "2026-06-09T06:00:00Z"  # offset honored
+    assert cap._normalize_ts("not-a-date") is None        # garbage -> None
+    assert cap._normalize_ts("2026-06-09T08:00:00") is None  # naive (no tz) -> None
+
+
 def test_read_codex_rollout_maps_windows_by_minutes_not_position(tmp_path: Path) -> None:
     """Windows are classified by window_minutes (300=5h, 10080=weekly), so a
     primary/secondary swap still lands in the right slots."""

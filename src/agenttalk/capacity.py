@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -134,6 +135,10 @@ def _normalize_ts(ts: object) -> str | None:
     if not isinstance(ts, str) or not ts:
         return None
     norm = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+    # Python 3.10's fromisoformat only accepts 3- or 6-digit fractional seconds,
+    # but providers emit variable precision (e.g. "...:00.0Z"); pad/truncate the
+    # fraction to 6 digits so any precision parses on every supported version.
+    norm = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], norm, count=1)
     try:
         dt = datetime.fromisoformat(norm)
     except ValueError:
