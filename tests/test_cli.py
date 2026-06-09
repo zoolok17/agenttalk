@@ -627,27 +627,32 @@ def test_wait_consumed_composing_does_not_extend_subsequent_wait(
     store.send(sender="alpha", recipient="beta",
                body="hold on", kind="composing")
     capsys.readouterr()
-    # First wait — short timeout, short extension. The composing gets
+    # First wait — short timeout, 1s extension. The composing gets
     # consumed for extension AND the cursor advances past it.
+    started = time.perf_counter()
     rc1 = _run(["wait", "--for", "beta", "--timeout", "0.2",
                 "--grace", "0",
-                "--composing-extend", "0.5",
+                "--composing-extend", "1.0",
                 "--heartbeat-interval", "0", "--quiet"], store_root)
+    first_elapsed = time.perf_counter() - started
     assert rc1 == 1
     assert Store(store_root).cursor("beta") != ""
     # Second wait — same stale composing, but cursor is now past it.
-    # If the bug existed, this would also extend by ~0.5s; the assertion
-    # is "elapsed near the raw 0.2s timeout, not near 0.7s".
-    started = time.time()
+    # If the bug existed, this would also extend by ~1s. Compare against
+    # the first wait instead of an absolute ceiling so Windows/CI process
+    # overhead cancels out.
+    started = time.perf_counter()
     rc2 = _run(["wait", "--for", "beta", "--timeout", "0.2",
                 "--grace", "0",
-                "--composing-extend", "0.5",
-                "--heartbeat-interval", "0", "--quiet"], store_root)
-    elapsed = time.time() - started
+                "--composing-extend", "1.0",
+                "--heartbeat-interval", "0"], store_root)
+    second_elapsed = time.perf_counter() - started
+    out = capsys.readouterr().out
     assert rc2 == 1
-    assert elapsed < 0.5, (
-        f"second wait re-extended on a stale composing: {elapsed:.2f}s "
-        f"(expected ~0.2s)"
+    assert "composing from alpha" not in out
+    assert second_elapsed + 0.4 < first_elapsed, (
+        "second wait re-extended on a stale composing: "
+        f"first={first_elapsed:.2f}s second={second_elapsed:.2f}s"
     )
 
 
