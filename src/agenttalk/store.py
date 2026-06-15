@@ -1965,6 +1965,70 @@ class Store:
         except OSError:
             pass
 
+    def clear_dead_waiter(self, agent: str, self_pid: int) -> bool:
+        """Remove ``agent``'s waiting marker iff it is owned by a CONFIRMED-DEAD
+        other process (reap fix #4b). Returns True when it cleared one.
+
+        Cosmetic crash-recovery: a wait that died without running its
+        ``finally`` leaves a ghost ``.waiting`` marker that makes ``status``
+        report a waiter that no longer exists. A *fresh* wait arming as the
+        same agent calls this so the ghost is removed rather than merely
+        overwritten (which already happens, but only for the same agent).
+        Never touches a LIVE owner (that is the duplicate-activation case,
+        handled separately) or our own pid. Best-effort, never raises.
+        """
+        try:
+            marker = self.read_waiting(agent)
+            if not marker:
+                return False
+            pid = marker.get("pid")
+            if not isinstance(pid, int) or pid == self_pid:
+                return False
+            if _process_alive(pid):
+                return False
+            self.clear_waiting(agent)
+            return True
+        except Exception:  # noqa: BLE001 — observability only, never crash a wait
+            return False
+
+    def live_waiter_count(self, *, now: float | None = None,
+                          stale_after: float | None = None) -> int:
+        """Number of agents with a FRESH, LIVE ``.waiting`` marker (soft-cap
+        signal, fix #4c). Counts every live waiter including the caller.
+
+        Same freshness gate as ``foreign_wait_pid`` (not stale past
+        ``deadline_epoch + stale_after``, owner pid alive) but across the
+        whole state dir and without the ``pid != self`` filter — the caller
+        warns when this exceeds a soft threshold so leftover poll loops from
+        old sessions get noticed. Read-only, best-effort, never raises.
+        """
+        if now is None:
+            now = time.time()
+        if stale_after is None:
+            stale_after = _WAIT_STALE_AFTER_DEFAULT
+        count = 0
+        try:
+            if not self.state_dir.is_dir():
+                return 0
+            for p in self.state_dir.iterdir():
+                if p.suffix != ".waiting":
+                    continue
+                marker = self.read_waiting(p.stem)
+                if not marker:
+                    continue
+                pid = marker.get("pid")
+                if not isinstance(pid, int):
+                    continue
+                deadline = marker.get("deadline_epoch")
+                if isinstance(deadline, (int, float)) and now > deadline + stale_after:
+                    continue
+                if not _process_alive(pid):
+                    continue
+                count += 1
+        except OSError:
+            return count
+        return count
+
     # ------------------------------------------- reply-in-flight markers
     #
     # `state/<agent>.composing.json` records "agent is drafting a reply

@@ -246,6 +246,140 @@ def test_scoped_wait_rescind_wakes_when_cursor_exceeds_baseline(
     assert "RESCINDED" in capsys.readouterr().out
 
 
+# ------------------------- WP-A: poll backoff (#3) + waiter reaping (#4)
+
+def test_next_backoff_growth_and_reset() -> None:
+    base, cap = 0.3, 2.0
+    seq, cur = [], base
+    for _ in range(5):
+        seq.append(round(cur, 3))
+        cur = cli._next_backoff(cur, base, cap, activity=False)
+    assert seq == [0.3, 0.6, 1.2, 2.0, 2.0]          # grows x2, clamps at cap
+    assert cli._next_backoff(2.0, base, cap, activity=True) == base  # reset on activity
+
+
+def test_next_backoff_disabled_when_cap_le_base() -> None:
+    # cap <= base => fixed-interval polling, byte-identical to pre-backoff.
+    assert cli._next_backoff(0.3, 0.3, 0.3, activity=False) == 0.3
+    assert cli._next_backoff(0.3, 0.3, 0.1, activity=False) == 0.3
+    assert cli._next_backoff(0.3, 0.3, 0.3, activity=True) == 0.3
+
+
+def test_clamp_sleep_bounds() -> None:
+    # No deadline, no heartbeat -> the desired sleep is unchanged.
+    assert cli._clamp_sleep(2.0, 100.0, None, 0.0, 0.0) == 2.0
+    # Clamp to time-left-to-deadline.
+    assert cli._clamp_sleep(2.0, 100.0, 100.5, 0.0, 0.0) == pytest.approx(0.5)
+    # Clamp to next-heartbeat-due (last_heartbeat + interval - now).
+    assert cli._clamp_sleep(2.0, 100.0, None, 99.0, 1.5) == pytest.approx(0.5)
+    # Min of both boundaries.
+    assert cli._clamp_sleep(2.0, 100.0, 100.8, 99.7, 1.0) == pytest.approx(0.7)
+    # Floor at 0 when the deadline already passed.
+    assert cli._clamp_sleep(2.0, 200.0, 100.0, 0.0, 0.0) == 0.0
+
+
+def test_wait_idle_times_out_with_backoff(store_root: Path) -> None:
+    """Backoff (default cap 2.0) must NOT delay the timeout: the sleep is
+    clamped to the deadline, so a short idle wait still exits 1 promptly.
+    One-sided bound, no exact wall-clock assertion."""
+    import time as _t
+    t0 = _t.monotonic()
+    rc = _run(["wait", "--for", "alpha", "--timeout", "0.3", "--grace", "0",
+               "--quiet"], store_root)
+    elapsed = _t.monotonic() - t0
+    assert rc == 1
+    assert elapsed < 3.0, f"backoff overshot the deadline ({elapsed:.1f}s)"
+
+
+def test_wait_backoff_sleep_sequence(
+    store_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drive the real wait loop with an idle bus and intercept time.sleep:
+    enabled backoff grows 0.3->0.6->1.2->2.0; disabled (cap <= interval) stays
+    a flat fixed interval — byte-identical to pre-backoff. --timeout 0 +
+    --heartbeat-interval 0 removes the deadline/heartbeat clamps so the raw
+    sequence is observable. Fully deterministic — no real sleeping."""
+    recorded: list[float] = []
+
+    class _Stop(Exception):
+        pass
+
+    def fake_sleep(d: float) -> None:
+        recorded.append(round(d, 3))
+        if len(recorded) >= 4:
+            raise _Stop()
+
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+    base_argv = ["--root", str(store_root), "wait", "--for", "alpha",
+                 "--timeout", "0", "--heartbeat-interval", "0",
+                 "--interval", "0.3", "--quiet"]
+    try:
+        cli.main([*base_argv, "--max-poll-interval", "2.0"])
+    except _Stop:
+        pass
+    assert recorded == [0.3, 0.6, 1.2, 2.0]
+
+    recorded.clear()
+    try:
+        cli.main([*base_argv, "--max-poll-interval", "0"])  # disabled
+    except _Stop:
+        pass
+    assert recorded == [0.3, 0.3, 0.3, 0.3]
+
+
+def test_wait_refuse_stacked_exits_6(
+    store: Store, store_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fix #4a opt-in: a LIVE duplicate waiter + --refuse-stacked-wait -> exit 6."""
+    monkeypatch.setattr("agenttalk.store._process_alive", lambda pid: True)
+    store.write_waiting("alpha", {"agent": "alpha", "pid": 999999,
+                                  "deadline_epoch": None})
+    rc = _run(["wait", "--for", "alpha", "--refuse-stacked-wait",
+               "--timeout", "5", "--quiet"], store_root)
+    assert rc == 6
+
+
+def test_wait_warns_but_proceeds_without_refuse(
+    store: Store, store_root: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Default stays WARN: a live duplicate warns but the wait still arms
+    (so re-arm loops in sk-loop/listen are unaffected) and times out."""
+    monkeypatch.setattr("agenttalk.store._process_alive", lambda pid: True)
+    store.write_waiting("alpha", {"agent": "alpha", "pid": 999999,
+                                  "deadline_epoch": None})
+    rc = _run(["wait", "--for", "alpha", "--timeout", "0.2", "--grace", "0",
+               "--quiet"], store_root)
+    assert rc == 1
+    assert "another live process" in capsys.readouterr().err
+
+
+def test_wait_dead_marker_does_not_block(
+    store: Store, store_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fix #4b: a CONFIRMED-DEAD waiter marker neither blocks arming nor (with
+    the strict flag) triggers a refuse — it is reaped, and the wait proceeds."""
+    monkeypatch.setattr("agenttalk.store._process_alive", lambda pid: False)
+    store.write_waiting("alpha", {"agent": "alpha", "pid": 999999,
+                                  "deadline_epoch": None})
+    rc = _run(["wait", "--for", "alpha", "--refuse-stacked-wait",
+               "--timeout", "0.2", "--grace", "0", "--quiet"], store_root)
+    assert rc == 1
+
+
+def test_wait_softcap_warns(
+    store: Store, store_root: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """fix #4c: more than WAITER_SOFTCAP live waiters -> non-blocking warning."""
+    monkeypatch.setattr("agenttalk.store._process_alive", lambda pid: True)
+    for i in range(cli.WAITER_SOFTCAP + 1):
+        store.write_waiting(f"w{i}", {"agent": f"w{i}", "pid": 1000 + i,
+                                      "deadline_epoch": None})
+    rc = _run(["wait", "--for", "alpha", "--timeout", "0.05", "--grace", "0",
+               "--quiet"], store_root)
+    assert rc == 1
+    assert "live agenttalk waiters" in capsys.readouterr().err
+
+
 # ------------------------------------------------ ack --to-request (closure)
 
 def test_ack_to_request_closes_thread(store: Store, store_root: Path) -> None:

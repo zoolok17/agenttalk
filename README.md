@@ -725,7 +725,7 @@ so the long timeout is free observability.
 | `agenttalk propose [--from A] [--to B] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--in-reply-to ID] [--print-id] [--quiet]` | Send a first-class `proposal`. Auto-mints `meta.request_id=pp-...` if absent and prints `(proposal id: pp-...)` unless quiet. `--in-reply-to` sets `meta.in_reply_to` for counters. |
 | `agenttalk recv --for A [--ack] [--since ID] [--include-control]` | **Peek** at queued messages — does NOT move the cursor unless `--ack`. Plain `recv` that prints messages emits a hint pointing at `drain`. Hides `composing` pings by default; `--include-control` surfaces them. |
 | `agenttalk drain --for A [--include-control]` | **Consume**: print all unread AND advance the cursor to newest, in one shot. Same path as `recv --ack`. Use this instead of hand-rolled timestamp polling. |
-| `agenttalk wait --for A [--to-request RID] [--kind K] [--timeout 120] [--no-ack] [--grace 2] [--composing-extend 120]` | Plain wait blocks until a new real message arrives, prints it, and advances the global cursor unless `--no-ack`. Scoped wait (`--to-request` and/or `--kind`) returns only matching addressed messages, advances only the per-thread `seen_msg_id`, and never advances the global cursor. A scoped wait on a rescinded request wakes immediately with **exit 3** (0.14.0). |
+| `agenttalk wait --for A [--to-request RID] [--kind K] [--timeout 120] [--no-ack] [--grace 2] [--composing-extend 120] [--max-poll-interval 2.0] [--refuse-stacked-wait]` | Plain wait blocks until a new real message arrives, prints it, and advances the global cursor unless `--no-ack`. Scoped wait (`--to-request` and/or `--kind`) returns only matching addressed messages, advances only the per-thread `seen_msg_id`, and never advances the global cursor. A scoped wait on a rescinded request wakes immediately with **exit 3** (0.14.0). Idle polling backs off from `--interval` up to `--max-poll-interval` (reset on activity; set `<= --interval` to disable). `--refuse-stacked-wait` exits **6** instead of warning when a live duplicate waiter already holds the mailbox. |
 | `agenttalk composing --from A [--to-request RID] [-m "still drafting"]` | Send a `composing` ping so the peer's `wait` extends its deadline. Use periodically while you draft a long reply. The peer's `wait` consumes these as deadline-extension signals — they do NOT surface as a returned reply. With `--to-request` (0.14.0) the peer is derived from the thread, and a **reply-in-flight** marker shows up in their `threads`/`sync`. |
 | `agenttalk ack --for A [--id ID] [--to-request RID]` | Without `--to-request`, manually move an agent's global cursor forward. With `--to-request`, manually close that request thread for A and record the latest seen matching message without touching the global cursor. |
 | `agenttalk rescind --from A --to-request RID [--to-id MSG] [-m REASON]` | Mark a tracked request you opened as **no-longer-current** (0.14.0). Transcript-visible; the thread becomes `closed-superseded`, a peer blocked in `wait --to-request` wakes with exit 3, and `check` reports superseded. Requester-only. Prefer this over a prose "ignore my last message". |
@@ -1044,7 +1044,16 @@ Two operating assumptions are worth stating plainly (0.18.0):
   agent (advisory, best-effort — it never blocks and never changes the exit
   code), and `agenttalk doctor` reports the current waiter's PID. It does
   **not** enforce single-writer locking — the warning is a guardrail, not a
-  guarantee.
+  guarantee. Pass `--refuse-stacked-wait` to turn that warning into a hard
+  **exit 6** (refuse to arm a duplicate loop); a confirmed-dead waiter's
+  ghost marker is reaped at arm, and `wait` also warns when more than 8
+  live waiters share one store (leftover loops from old sessions).
+- **Idle waiters back off.** `agenttalk wait` adaptively grows its poll
+  interval from `--interval` up to `--max-poll-interval` (default 2.0s)
+  while the bus is quiet, resetting to `--interval` the instant a message,
+  composing, or rescind lands — so an idle bus polls near-zero without
+  delaying a live reply by more than the cap. Set `--max-poll-interval`
+  `<=` `--interval` to disable (fixed-interval polling).
 - **Synced stores assume clock agreement.** Message ids are
   timestamp-prefixed and delivery order is a lexical compare of ids. If you
   sync one `.agenttalk/` across machines whose clocks disagree, a
@@ -1064,6 +1073,7 @@ rely on these:
 | `1` | Reserved for `agenttalk wait` timeout (no new messages within `--timeout`). Loop skills should treat this as "keep waiting", not as an error. |
 | `2` | Usage error: missing/invalid identity (`--from`/`--to`/`--for` or `AGENTTALK_SELF`/`AGENTTALK_PEER`), unsafe agent name, identity not in roster, self-mail attempt, malformed `--meta`, corrupt config, missing `.agenttalk/`. 0.17.0: also a `serve`/`dashboard` bind failure (port in use / OS-denied) — with a `--port 0` remediation hint. Always prints a remediation hint to stderr. |
 | `5` | Partial broadcast fan-out: some copies written, some failed (see the delivered/missed manifest; `--resume`). 0.18.0: a frozen recipient retired *after* a partial fan-out is reported under `dropped` and skipped — it no longer traps `--resume` at a permanent exit 5; an all-retired remainder resolves to exit 0. |
+| `6` | `agenttalk wait --refuse-stacked-wait` only: another LIVE process already holds this agent's mailbox, so this wait refused to stack a duplicate poll loop. Without the flag this is a non-fatal warning (exit unchanged). |
 | `130` | `SIGINT` (Ctrl-C). |
 
 ---
@@ -1071,7 +1081,7 @@ rely on these:
 
 0.14.0 additions: **3** = the request was superseded/rescinded
 (`check`, and a scoped `wait --to-request` waking on a rescind);
-**4** = unknown request id (`check`); **5** = PARTIAL broadcast fan-out (0.15.0 — some copies written, some failed; see the delivered/missed manifest). Exit 1 remains *exclusively* the
+**4** = unknown request id (`check`); **5** = PARTIAL broadcast fan-out (0.15.0 — some copies written, some failed; see the delivered/missed manifest); **6** = `wait --refuse-stacked-wait` hit a live duplicate waiter. Exit 1 remains *exclusively* the
 `wait` timeout; 2 remains usage/refusal.
 
 ## How terminals see messages

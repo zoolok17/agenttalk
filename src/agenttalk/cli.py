@@ -341,6 +341,12 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 STALE_THRESHOLD_SECONDS = 60.0
 
+# Soft cap on concurrent live waiters in one store (fix #4c). When `wait`
+# arms and finds more than this many fresh+live `.waiting` markers, it prints
+# a non-blocking warning — leftover poll loops from old sessions are the
+# accumulation half of the multi-day slowdown. Advisory only; never blocks.
+WAITER_SOFTCAP = 8
+
 # An outbound request still unanswered after this long is surfaced as a
 # status warning — the peer may have missed it, or you forgot to wait.
 OPEN_OUTBOUND_STALE_SECONDS = 600.0
@@ -1819,6 +1825,39 @@ def _write_waiting_marker(
         pass
 
 
+def _next_backoff(cur: float, base: float, cap: float, activity: bool) -> float:
+    """Next poll-loop sleep under adaptive backoff (fix #3).
+
+    Reset to ``base`` the moment the bus shows activity; otherwise grow x2
+    toward ``cap``. When ``cap <= base`` (backoff disabled) this ALWAYS
+    returns ``base``, so the fixed-interval polling behavior is byte-identical
+    to pre-backoff. Pure function — no clock, no I/O — so it is unit-tested
+    without any wall-clock flakiness.
+    """
+    cap_eff = max(base, cap)
+    if activity:
+        return base
+    return min(cap_eff, cur * 2.0)
+
+
+def _clamp_sleep(desired: float, now: float, deadline: float | None,
+                 last_heartbeat: float, heartbeat_interval: float) -> float:
+    """Clamp a desired backoff sleep so it never overshoots a timing boundary.
+
+    Backoff may grow the idle poll interval to several seconds, but the loop
+    must still (a) detect the timeout deadline on time and (b) keep the
+    heartbeat cadence honest. So the actual sleep is the MIN of the desired
+    backoff, the time left to the deadline, and the time to the next heartbeat
+    due — floored at 0. Pure function; unit-tested without a clock.
+    """
+    eff = desired
+    if deadline is not None:
+        eff = min(eff, deadline - now)
+    if heartbeat_interval > 0:
+        eff = min(eff, last_heartbeat + heartbeat_interval - now)
+    return max(0.0, eff)
+
+
 def _print_rescinded(store: Store, rid: str, row) -> None:
     """Render the RESCINDED wake: banner + the deciding rescind message."""
     print(f"AGENTTALK :: RESCINDED (thread {rid}) — do not act on this request")
@@ -1872,6 +1911,13 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
     # composing would otherwise be re-seen by every future scoped wait and
     # re-extend it indefinitely (Codex review of review-012-001).
     baseline = max((m.id for m in store.messages_for(agent)), default="")
+    # Adaptive poll backoff (fix #3): same contract as cmd_wait. Activity is
+    # any inbox id beyond `baseline` (a fresh message/composing/rescind);
+    # old traffic in (scan_since, baseline] never resets the backoff.
+    base = interval
+    cap = max(base, max(0.0, args.max_poll_interval))
+    cur_sleep = base
+    last_seen_max_id = baseline
     if heartbeat_interval > 0:
         store.write_heartbeat(agent)
         last_heartbeat = time.time()
@@ -1899,8 +1945,10 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
             # (baseline, floor]. min() keeps control-message detection intact.
             # Empty-string-safe: min("", x) == "" == full scan.
             scan_since = min(floor, baseline)
+            scoped_msgs = store.messages_for(agent, since_id=scan_since)
+            cur_max = max((m.id for m in scoped_msgs), default=last_seen_max_id)
             match = None
-            for m in store.messages_for(agent, since_id=scan_since):
+            for m in scoped_msgs:
                 if m.kind in CONTROL_KINDS:
                     # A composing extends the deadline ONLY if it is fresh for
                     # this wait (id > baseline) AND not bound to a different
@@ -1967,7 +2015,20 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
             if heartbeat_interval > 0 and time.time() - last_heartbeat >= heartbeat_interval:
                 store.write_heartbeat(agent)
                 last_heartbeat = time.time()
-            time.sleep(interval)
+            # No match this poll. With backoff enabled, sleep clamped to the
+            # deadline / next heartbeat then grow (or reset on fresh traffic);
+            # when disabled (cap <= base) take the original fixed-interval
+            # sleep so that path is byte-identical to pre-backoff.
+            if cap > base:
+                activity = cur_max > last_seen_max_id
+                if activity:
+                    last_seen_max_id = cur_max
+                eff = _clamp_sleep(cur_sleep, time.time(), deadline,
+                                   last_heartbeat, heartbeat_interval)
+                time.sleep(eff)
+                cur_sleep = _next_backoff(cur_sleep, base, cap, activity)
+            else:
+                time.sleep(interval)
     finally:
         store.clear_waiting(agent)
 
@@ -1986,15 +2047,38 @@ def cmd_wait(args: argparse.Namespace) -> int:
     # never blocks the wait and never changes the exit code. A stale/dead
     # marker (crash recovery) produces no warning. Checked here, before
     # either path overwrites the marker (the only point the prior owner is
-    # still visible).
-    _foreign = store.foreign_wait_pid(agent, os.getpid(), now=time.time(),
+    # still visible). This arm-gate also covers the scoped path (it runs
+    # before the --to-request dispatch below).
+    _now = time.time()
+    _foreign = store.foreign_wait_pid(agent, os.getpid(), now=_now,
                                       stale_after=STALE_THRESHOLD_SECONDS)
     if _foreign is not None:
+        # fix #4a (opt-in): refuse to stack a second live waiter on this
+        # mailbox. Default stays WARN (re-arm patterns in sk-loop/listen rely
+        # on it); only --refuse-stacked-wait turns the warning into exit 6.
+        if getattr(args, "refuse_stacked_wait", False):
+            sys.stderr.write(
+                f"agenttalk wait: refusing to stack — another live process "
+                f"(PID {_foreign}) already holds {agent!r}'s mailbox. Stop it "
+                f"first, or omit --refuse-stacked-wait to run concurrently.\n")
+            return 6
         sys.stderr.write(
             f"warning: another live process (PID {_foreign}) is already "
             f"waiting as {agent!r} in this store. One window per agent is "
             f"assumed; concurrent same-agent use can lose cursor/threadstate "
             f"updates.\n")
+    else:
+        # fix #4b: no LIVE foreign owner, but a CONFIRMED-DEAD one may have
+        # left a ghost marker that makes `status` show a phantom waiter. Reap
+        # it (no-op when the marker is absent, ours, or owned by a live proc).
+        store.clear_dead_waiter(agent, os.getpid())
+    # fix #4c: warn (non-blocking) when leftover poll loops accumulate.
+    _live = store.live_waiter_count(now=_now, stale_after=STALE_THRESHOLD_SECONDS)
+    if _live > WAITER_SOFTCAP:
+        sys.stderr.write(
+            f"warning: {_live} live agenttalk waiters in this store "
+            f"(> {WAITER_SOFTCAP}); leftover poll loops from old sessions may "
+            f"be polling the bus. Consider stopping stale ones.\n")
     if getattr(args, "to_request", None):
         return _scoped_wait(store, agent, args)
     deadline = time.time() + args.timeout if args.timeout > 0 else None
@@ -2007,6 +2091,15 @@ def cmd_wait(args: argparse.Namespace) -> int:
     seen_composing: set[str] = set()
     total_extended = 0.0
     grace_used = False
+    # Adaptive poll backoff (fix #3): grow the idle sleep from `base` toward
+    # `cap`, reset to base on any inbox activity. cap <= base disables it
+    # (byte-identical fixed-interval polling). `last_seen_max_id` is the
+    # activity signal — any new message/composing/rescind pushes the inbox's
+    # max id up, which resets the sleep to base.
+    base = interval
+    cap = max(base, max(0.0, args.max_poll_interval))
+    cur_sleep = base
+    last_seen_max_id = cursor_at_start or ""
     # Stamp once up front so peers see the listener immediately.
     if heartbeat_interval > 0:
         store.write_heartbeat(agent)
@@ -2022,6 +2115,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
     try:
         while True:
             msgs = store.messages_for(agent, since_id=cursor_at_start or None)
+            cur_max = max((m.id for m in msgs), default=last_seen_max_id)
             for m in msgs:
                 if m.kind in CONTROL_KINDS:
                     # Today the only control kind is `composing`; keep the
@@ -2086,7 +2180,21 @@ def cmd_wait(args: argparse.Namespace) -> int:
             if heartbeat_interval > 0 and time.time() - last_heartbeat >= heartbeat_interval:
                 store.write_heartbeat(agent)
                 last_heartbeat = time.time()
-            time.sleep(interval)
+            # No real message this poll. With backoff enabled, sleep the
+            # current interval clamped to the deadline / next heartbeat, then
+            # grow (or reset to base on fresh inbox activity). When disabled
+            # (cap <= base) take the original unconditional fixed-interval
+            # sleep so that path is byte-identical to pre-backoff.
+            if cap > base:
+                activity = cur_max > last_seen_max_id
+                if activity:
+                    last_seen_max_id = cur_max
+                eff = _clamp_sleep(cur_sleep, time.time(), deadline,
+                                   last_heartbeat, heartbeat_interval)
+                time.sleep(eff)
+                cur_sleep = _next_backoff(cur_sleep, base, cap, activity)
+            else:
+                time.sleep(interval)
     finally:
         # Always retract the marker — message received, timeout, or the
         # KeyboardInterrupt that main() catches one frame up. Best-effort.
@@ -3356,6 +3464,16 @@ def build_parser() -> argparse.ArgumentParser:
     pw.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
     pw.add_argument("--timeout", type=float, default=120.0, help="Seconds to wait (0 = forever, default 120)")
     pw.add_argument("--interval", type=float, default=0.3, help="Poll interval in seconds (default 0.3)")
+    pw.add_argument("--max-poll-interval", dest="max_poll_interval", type=float, default=2.0,
+                    help="Cap (seconds) for adaptive idle poll backoff: when the bus is "
+                         "quiet the poll interval grows from --interval up to this cap, "
+                         "resetting to --interval on any activity. Bounds the per-waiter "
+                         "idle CPU cost. Set <= --interval to disable (fixed-interval "
+                         "polling). (default 2.0)")
+    pw.add_argument("--refuse-stacked-wait", dest="refuse_stacked_wait", action="store_true",
+                    help="Exit 6 instead of warning when another LIVE process already "
+                         "holds this agent's mailbox, so a terminal can't stack duplicate "
+                         "poll loops. Default: warn only (re-arm loops rely on the warning).")
     pw.add_argument("--ack", action="store_true", default=True,
                     help="Advance cursor past the received msg (default true)")
     pw.add_argument("--no-ack", dest="ack", action="store_false")

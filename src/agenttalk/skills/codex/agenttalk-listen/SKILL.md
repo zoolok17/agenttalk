@@ -101,10 +101,16 @@ cursor. Unrelated traffic remains unread for `sync`, `threads`, or
   actionable before looping back.
 - exit 1: timeout (no new messages in 30 min). Loop back immediately
   as a liveness safety net. Do NOT return control to the user.
+- exit 6: another LIVE process already holds this agent's mailbox and
+  you passed `--refuse-stacked-wait`. Do NOT blindly re-arm — that
+  would just refuse again. Stop the duplicate loop (or confirm it is
+  really yours) first, then re-arm without the flag.
 
 Use a **long** timeout (1800s). The `agenttalk wait` subprocess polls
-the filesystem internally (~0.3s) so real messages still return
-immediately.
+the filesystem internally (it starts at ~0.3s and **backs off** up to
+`--max-poll-interval`, default 2.0s, while the bus is idle — resetting
+to the base interval the instant traffic arrives), so real messages
+still return promptly while an idle waiter costs almost nothing.
 
 ## Message classification
 

@@ -1155,6 +1155,50 @@ def test_foreign_wait_pid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     assert s.foreign_wait_pid("alpha", _os.getpid()) is None
 
 
+def test_clear_dead_waiter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """fix #4b: a CONFIRMED-DEAD foreign marker is reaped; a live one, our
+    own, or an absent one is left untouched."""
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    live = 4242
+    monkeypatch.setattr("agenttalk.store._process_alive", lambda pid: pid == live)
+    # foreign + dead -> cleared
+    s.write_waiting("alpha", {"agent": "alpha", "pid": 999, "deadline_epoch": None})
+    assert s.clear_dead_waiter("alpha", _os.getpid()) is True
+    assert s.read_waiting("alpha") is None
+    # foreign + alive -> NOT cleared
+    s.write_waiting("alpha", {"agent": "alpha", "pid": live, "deadline_epoch": None})
+    assert s.clear_dead_waiter("alpha", _os.getpid()) is False
+    assert s.read_waiting("alpha") is not None
+    # our own pid -> NOT cleared (we're about to overwrite it ourselves)
+    s.write_waiting("alpha", {"agent": "alpha", "pid": _os.getpid(),
+                              "deadline_epoch": None})
+    assert s.clear_dead_waiter("alpha", _os.getpid()) is False
+    assert s.read_waiting("alpha") is not None
+    # absent -> False
+    s.clear_waiting("alpha")
+    assert s.clear_dead_waiter("alpha", _os.getpid()) is False
+
+
+def test_live_waiter_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """fix #4c soft-cap signal: counts every FRESH+LIVE waiter marker, skips
+    dead-owner and stale-past-deadline ones."""
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    # pid 999 is the only dead process; everything else is alive.
+    monkeypatch.setattr("agenttalk.store._process_alive", lambda pid: pid != 999)
+    assert s.live_waiter_count() == 0
+    s.write_waiting("alpha", {"agent": "alpha", "pid": 111, "deadline_epoch": None})
+    s.write_waiting("beta", {"agent": "beta", "pid": 222, "deadline_epoch": None})
+    assert s.live_waiter_count() == 2
+    # dead owner -> not counted
+    s.write_waiting("gamma", {"agent": "gamma", "pid": 999, "deadline_epoch": None})
+    assert s.live_waiter_count() == 2
+    # alive but STALE (deadline far past + threshold) -> not counted
+    s.write_waiting("delta", {"agent": "delta", "pid": 333, "deadline_epoch": 1000.0})
+    assert s.live_waiter_count(now=1_000_000_000.0, stale_after=60.0) == 2
+
+
 # --- 0.24.0: at-most-one-lead invariant + sole_lead (WP01) ----------------
 
 def test_set_role_lead_is_unique_demotes_prior(tmp_path: Path) -> None:
