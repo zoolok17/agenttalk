@@ -2066,8 +2066,13 @@ class Store:
         plan, when ``dry_run``).
 
         Safety contract (the whole point of WP-B):
-        - INVALID / unparseable files are NEVER moved — they are not in the
-          valid scan, so status/doctor/prune keep seeing them.
+        - Only DELIVERY-valid messages are moved. Selection is the structural
+          scan MINUS every path the full delivery gate
+          (``_invalid_file_entries`` — parse + schema + roster + HMAC) rejects,
+          so a parse-valid-but-off-roster or bad/missing-signature file is
+          NEVER archived and stays visible to status/doctor/prune. (Structural
+          validity alone is NOT enough — a roster/HMAC-invalid file parses
+          cleanly but must remain reportable as tamper.)
         - ``keep_floor`` falsy ("") is a no-op (a fail-safe fired upstream).
         - Per-file ``shutil.move`` (atomic rename); a collision in the cold
           dir is timestamp-suffixed, never overwritten (the quarantine /
@@ -2077,10 +2082,15 @@ class Store:
         """
         if not keep_floor:
             return []
-        valid_p, _ = self._scan_messages_with_paths()  # full scan; invalid excluded
+        valid_p, _ = self._scan_messages_with_paths()  # structural pass
+        # Exclude everything the FULL delivery gate rejects (roster + HMAC on
+        # top of parse/schema) so tamper stays live-visible, not silently cold.
+        invalid_names = {p.name for p, _, _ in self._invalid_file_entries()}
         records: list[dict] = []
         made_dir = False
         for m, src in valid_p:
+            if src.name in invalid_names:
+                continue
             if m.id >= keep_floor:
                 continue
             dst = self.compacted_dir / src.name

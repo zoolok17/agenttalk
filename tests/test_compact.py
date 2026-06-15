@@ -8,8 +8,11 @@ matters so the keep_age tail never protects the just-created test messages."""
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 from agenttalk import cli
 from agenttalk import threads as th
@@ -40,6 +43,21 @@ def _thread_state_set(store: Store, agent: str, now: datetime) -> set[tuple[str,
 
 def _ids_in_messages_dir(store: Store) -> set[str]:
     return {p.stem for p in store.messages_dir.iterdir() if p.suffix == ".json"}
+
+
+def _hand_write(store: Store, msg_id: str, **fields) -> str:
+    """Write a raw message file (bypassing send) with an explicit LOW id so it
+    sorts into the archivable prefix. Used to plant delivery-invalid files."""
+    body = {"id": msg_id, "ts": "2020-01-01T00:00:00Z", "from": "alpha",
+            "to": "beta", "kind": "message", "subject": "", "body": "", "meta": {}}
+    body.update(fields)
+    (store.messages_dir / f"{msg_id}.json").write_text(
+        json.dumps(body), encoding="utf-8")
+    return msg_id
+
+
+def _invalid_idents(store: Store) -> set[str]:
+    return {ident for ident, _ in store.list_invalid_messages()}
 
 
 # ---------------------------------------------------------- keep_floor math
@@ -149,6 +167,53 @@ def test_protected_thread_group_stays_live(tmp_path: Path) -> None:
     assert {r["id"] for r in res["archived"]} == {old}
     # r1 still derivable as open-outbound for alpha
     assert ("r1", "open-outbound") in _thread_state_set(s, "alpha", _LATER)
+
+
+def test_roster_invalid_file_stays_visible_after_compaction(tmp_path: Path) -> None:
+    """Regression (codex MAJOR): a parse-valid but OFF-ROSTER file (delivery-
+    invalid) must NOT be archived — it stays in list_invalid_messages so
+    status/doctor/prune still see the tamper. The structural scan alone would
+    have moved it."""
+    s = _store(tmp_path)
+    ghost = _hand_write(s, "20200101-000000-000000-aaaa", **{"from": "ghost"})
+    for i in range(3):
+        s.send(sender="alpha", recipient="beta", body=f"old{i}")
+    s.send(sender="alpha", recipient="beta", kind="note", body="epoch",
+           meta=_BARRIER_META)
+    newest = s.send(sender="alpha", recipient="beta", body="n").id
+    s.set_cursor("alpha", newest)
+    s.set_cursor("beta", newest)
+    assert ghost in _invalid_idents(s)                      # before
+    res = cli._run_compaction(s, s.load_config(), keep_count=2,
+                              keep_age_days=0.0, dry_run=False, now=_LATER)
+    assert len(res["archived"]) >= 1                         # real notes archived
+    assert ghost not in {r["id"] for r in res["archived"]}
+    assert (s.messages_dir / f"{ghost}.json").exists()       # NOT moved
+    assert ghost in _invalid_idents(s)                       # still reportable
+
+
+def test_hmac_invalid_file_stays_visible_after_compaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (codex MAJOR), signing enforced: a missing-signature file is
+    delivery-invalid and must NOT be archived."""
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(tmp_path / "hmac.key"))
+    s = _store(tmp_path)
+    assert _run(["hmac-init"], tmp_path) == 0
+    assert s.signing_enforced()
+    for i in range(3):
+        s.send(sender="alpha", recipient="beta", body=f"old{i}")   # auto-signed
+    s.send(sender="alpha", recipient="beta", kind="note", body="epoch",
+           meta=_BARRIER_META)
+    newest = s.send(sender="alpha", recipient="beta", body="n").id
+    s.set_cursor("alpha", newest)
+    s.set_cursor("beta", newest)
+    unsigned = _hand_write(s, "20200101-000000-000000-bbbb")        # no signature
+    assert unsigned in _invalid_idents(s)
+    cli._run_compaction(s, s.load_config(), keep_count=2,
+                        keep_age_days=0.0, dry_run=False, now=_LATER)
+    assert (s.messages_dir / f"{unsigned}.json").exists()
+    assert unsigned in _invalid_idents(s)
 
 
 def test_invalid_files_are_never_archived(tmp_path: Path) -> None:

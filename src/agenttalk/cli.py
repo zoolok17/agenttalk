@@ -489,7 +489,10 @@ COMPACT_DEFAULTS = {
     "enabled": False,          # the automatic opportunistic trigger (OFF for v1)
     "keep_count": 1000,        # always keep at least this many newest messages
     "keep_age_days": 30.0,     # always keep everything younger than this
-    "trigger_threshold": 500,  # auto check only fires above this live count
+    # Auto check fires only above this live count. Kept ABOVE keep_count so the
+    # auto path never wakes in a dead band where archiving is impossible
+    # (live <= keep_count => count_floor "" => nothing to do but stamp).
+    "trigger_threshold": 1200,
     "min_interval_seconds": 3600.0,  # auto check throttle
 }
 
