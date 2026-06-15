@@ -2015,18 +2015,22 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
             if heartbeat_interval > 0 and time.time() - last_heartbeat >= heartbeat_interval:
                 store.write_heartbeat(agent)
                 last_heartbeat = time.time()
-            # No match this poll. With backoff enabled, sleep clamped to the
-            # deadline / next heartbeat then grow (or reset on fresh traffic);
-            # when disabled (cap <= base) take the original fixed-interval
-            # sleep so that path is byte-identical to pre-backoff.
+            # No match this poll. Reset to base IMMEDIATELY on fresh traffic
+            # (so a real reply right after a composing isn't stuck behind a
+            # capped sleep), then sleep clamped to the deadline / next
+            # heartbeat, and grow only after an idle sleep. When disabled
+            # (cap <= base) take the original fixed-interval sleep —
+            # byte-identical to pre-backoff.
             if cap > base:
                 activity = cur_max > last_seen_max_id
                 if activity:
                     last_seen_max_id = cur_max
+                    cur_sleep = base
                 eff = _clamp_sleep(cur_sleep, time.time(), deadline,
                                    last_heartbeat, heartbeat_interval)
                 time.sleep(eff)
-                cur_sleep = _next_backoff(cur_sleep, base, cap, activity)
+                if not activity:
+                    cur_sleep = _next_backoff(cur_sleep, base, cap, activity=False)
             else:
                 time.sleep(interval)
     finally:
@@ -2072,11 +2076,14 @@ def cmd_wait(args: argparse.Namespace) -> int:
         # left a ghost marker that makes `status` show a phantom waiter. Reap
         # it (no-op when the marker is absent, ours, or owned by a live proc).
         store.clear_dead_waiter(agent, os.getpid())
-    # fix #4c: warn (non-blocking) when leftover poll loops accumulate.
+    # fix #4c: warn (non-blocking) when leftover poll loops accumulate. This
+    # wait has not written its own marker yet, so count it explicitly (_live +
+    # 1) — otherwise arming as the (cap+1)-th waiter wouldn't warn, which is
+    # exactly the accumulation we want to surface as it happens.
     _live = store.live_waiter_count(now=_now, stale_after=STALE_THRESHOLD_SECONDS)
-    if _live > WAITER_SOFTCAP:
+    if _live + 1 > WAITER_SOFTCAP:
         sys.stderr.write(
-            f"warning: {_live} live agenttalk waiters in this store "
+            f"warning: {_live + 1} live agenttalk waiters in this store "
             f"(> {WAITER_SOFTCAP}); leftover poll loops from old sessions may "
             f"be polling the bus. Consider stopping stale ones.\n")
     if getattr(args, "to_request", None):
@@ -2180,19 +2187,25 @@ def cmd_wait(args: argparse.Namespace) -> int:
             if heartbeat_interval > 0 and time.time() - last_heartbeat >= heartbeat_interval:
                 store.write_heartbeat(agent)
                 last_heartbeat = time.time()
-            # No real message this poll. With backoff enabled, sleep the
-            # current interval clamped to the deadline / next heartbeat, then
-            # grow (or reset to base on fresh inbox activity). When disabled
-            # (cap <= base) take the original unconditional fixed-interval
-            # sleep so that path is byte-identical to pre-backoff.
+            # No real message this poll. With backoff enabled, reset the
+            # interval to base IMMEDIATELY when the inbox advanced (a fresh
+            # message/composing/rescind) so the very next poll is fast — then
+            # sleep (clamped to the deadline / next heartbeat), and grow only
+            # after an idle, no-activity sleep. Resetting BEFORE the sleep is
+            # what keeps a real reply that lands right after a composing from
+            # waiting out a full capped interval. When disabled (cap <= base)
+            # take the original fixed-interval sleep — byte-identical to
+            # pre-backoff.
             if cap > base:
                 activity = cur_max > last_seen_max_id
                 if activity:
                     last_seen_max_id = cur_max
+                    cur_sleep = base
                 eff = _clamp_sleep(cur_sleep, time.time(), deadline,
                                    last_heartbeat, heartbeat_interval)
                 time.sleep(eff)
-                cur_sleep = _next_backoff(cur_sleep, base, cap, activity)
+                if not activity:
+                    cur_sleep = _next_backoff(cur_sleep, base, cap, activity=False)
             else:
                 time.sleep(interval)
     finally:

@@ -369,15 +369,77 @@ def test_wait_dead_marker_does_not_block(
 def test_wait_softcap_warns(
     store: Store, store_root: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
-    """fix #4c: more than WAITER_SOFTCAP live waiters -> non-blocking warning."""
+    """fix #4c: arming as the (WAITER_SOFTCAP+1)-th waiter warns. Seeds EXACTLY
+    WAITER_SOFTCAP existing markers — this wait is the one that tips over the
+    cap, so it must warn even though it hasn't written its own marker yet
+    (regression guard for the count+1 off-by-one)."""
     monkeypatch.setattr("agenttalk.store._process_alive", lambda pid: True)
-    for i in range(cli.WAITER_SOFTCAP + 1):
+    for i in range(cli.WAITER_SOFTCAP):
         store.write_waiting(f"w{i}", {"agent": f"w{i}", "pid": 1000 + i,
                                       "deadline_epoch": None})
     rc = _run(["wait", "--for", "alpha", "--timeout", "0.05", "--grace", "0",
                "--quiet"], store_root)
     assert rc == 1
     assert "live agenttalk waiters" in capsys.readouterr().err
+
+
+def _drive_wait_to_cap_then_inject(store_root: Path, monkeypatch, inject, *,
+                                   scoped: bool) -> list[float]:
+    """Run a real wait loop with an idle bus until backoff reaches the 2.0s
+    cap, then call `inject()` (which writes a fresh message) so the NEXT poll
+    sees activity. Returns the recorded sleep durations. The sleep right after
+    injection must be base (0.3), not the capped 2.0 — that is the
+    immediate-reset invariant. Deterministic: time.sleep is intercepted."""
+    recorded: list[float] = []
+
+    class _Stop(Exception):
+        pass
+
+    def fake_sleep(d: float) -> None:
+        recorded.append(round(d, 3))
+        if len(recorded) == 4:      # just slept the first capped 2.0
+            inject()
+        if len(recorded) >= 5:      # captured the post-injection sleep
+            raise _Stop()
+
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+    argv = ["--root", str(store_root), "wait", "--for", "alpha",
+            "--timeout", "0", "--heartbeat-interval", "0", "--interval", "0.3",
+            "--max-poll-interval", "2.0", "--quiet"]
+    if scoped:
+        argv += ["--to-request", "r1"]
+    try:
+        cli.main(argv)
+    except _Stop:
+        pass
+    return recorded
+
+
+def test_wait_backoff_resets_immediately_on_activity(
+    store: Store, store_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (codex MAJOR): after backoff reaches the cap, a fresh
+    composing must drop the NEXT plain-wait sleep back to base — not leave a
+    real reply waiting out a full ~2s capped interval."""
+    def inject() -> None:
+        store.send(sender="beta", recipient="alpha", kind="composing",
+                   body="drafting")
+    recorded = _drive_wait_to_cap_then_inject(store_root, monkeypatch, inject,
+                                              scoped=False)
+    assert recorded == [0.3, 0.6, 1.2, 2.0, 0.3]
+
+
+def test_scoped_wait_backoff_resets_immediately_on_activity(
+    store: Store, store_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (codex MAJOR), scoped path: fresh thread traffic after the
+    cap resets the next scoped-wait sleep to base."""
+    def inject() -> None:
+        store.send(sender="beta", recipient="alpha", kind="composing",
+                   body="drafting", meta={"request_id": "r1"})
+    recorded = _drive_wait_to_cap_then_inject(store_root, monkeypatch, inject,
+                                              scoped=True)
+    assert recorded == [0.3, 0.6, 1.2, 2.0, 0.3]
 
 
 # ------------------------------------------------ ack --to-request (closure)
