@@ -929,8 +929,18 @@ def test_wait_writes_and_clears_waiting_marker_on_message(
     saw_marker: dict = {}
 
     def _inject() -> None:
-        time.sleep(0.4)
-        saw_marker["mid_wait"] = s.read_waiting("beta")
+        # POLL for the marker over a bounded window instead of reading once at
+        # a fixed offset — arm-time work (foreign-pid scan, soft-cap, optional
+        # auto-compact) can delay the marker write on a slow/loaded runner, and
+        # a single fixed read raced it (3.12/windows CI flake). Bounded well
+        # under the wait's 3s timeout so a genuinely missing marker still fails.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            marker = s.read_waiting("beta")
+            if marker is not None:
+                saw_marker["mid_wait"] = marker
+                break
+            time.sleep(0.02)
         s.send(sender="alpha", recipient="beta", body="hi", kind="message")
 
     t = threading.Thread(target=_inject, daemon=True)
@@ -941,7 +951,7 @@ def test_wait_writes_and_clears_waiting_marker_on_message(
         assert rc == 0
     finally:
         t.join(timeout=5)
-    assert saw_marker["mid_wait"] is not None
+    assert saw_marker.get("mid_wait") is not None
     assert saw_marker["mid_wait"]["agent"] == "beta"
     assert "pid" in saw_marker["mid_wait"]
     assert s.read_waiting("beta") is None  # cleared on exit

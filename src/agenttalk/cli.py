@@ -2109,6 +2109,10 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
     # distinct from reply (0) and timeout (1) per the exit-code contract.
     row = _thread_row_for(store, agent, rid)
     if row is not None and row.state == "closed-superseded":
+        # cmd_wait wrote an early observability marker before dispatching here;
+        # this entry return precedes our own try/finally, so clear it so a
+        # rescinded scoped wait never leaves a ghost waiter.
+        store.clear_waiting(agent)
         _print_rescinded(store, rid, row)
         return 3
     deadline = time.time() + args.timeout if args.timeout > 0 else None
@@ -2302,6 +2306,19 @@ def cmd_wait(args: argparse.Namespace) -> int:
             f"warning: {_live + 1} live agenttalk waiters in this store "
             f"(> {WAITER_SOFTCAP}); leftover poll loops from old sessions may "
             f"be polling the bus. Consider stopping stale ones.\n")
+    # Make this waiter observable to `status` ASAP — BEFORE the optional
+    # (and potentially heavy) auto-compaction below — so arm latency can't hide
+    # a live waiter. foreign_wait_pid + the soft-cap count above MUST stay
+    # ahead of this write (the duplicate-owner check needs the prior owner's
+    # marker visible, and the soft-cap's `_live + 1` self-count assumes ours
+    # isn't written yet). Each wait path rewrites this same marker with its own
+    # cursor/deadline once it starts looping — this early stamp just closes the
+    # arm-latency observability gap. deadline mirrors the per-path computation.
+    _early_cursor = (store.thread_seen(agent, args.to_request)
+                     if getattr(args, "to_request", None) else store.cursor(agent))
+    _early_deadline = _now + args.timeout if args.timeout > 0 else None
+    _write_waiting_marker(store, agent, cursor_at_start=_early_cursor,
+                          timeout=args.timeout, deadline=_early_deadline)
     # fix #2 (opt-in, OFF by default): opportunistic safe compaction once the
     # store grows past the threshold. Throttled + fail-safe; never blocks.
     _maybe_auto_compact(store, now_epoch=_now)
