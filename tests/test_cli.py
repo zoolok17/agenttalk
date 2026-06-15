@@ -481,13 +481,23 @@ def test_wait_post_timeout_grace_returns_late_message(
     s = Store(store_root)
 
     def _inject_after_deadline() -> None:
-        # Lands AFTER the 1s deadline — sleep() never undershoots, so the lower
-        # bound (message must arrive post-deadline to exercise grace) is
-        # race-free by construction — and well within the wide 3s grace window,
-        # so the single post-timeout scan is guaranteed to catch it regardless
-        # of scheduler jitter. (rc 0 holds even if a slow arm makes it land
-        # before the deadline: it's then caught at the deadline scan instead.)
-        time.sleep(1.3)
+        # Sync on the wait's ACTUAL deadline via the .waiting marker's
+        # deadline_epoch (NOT a fixed thread sleep, which races a late arm and
+        # could land before the real deadline -> caught by the normal scan, not
+        # grace). Send just AFTER the deadline but well within the 3s grace
+        # window, so the message is delivered ONLY by the post-timeout grace
+        # scan — deterministically exercising the grace path.
+        deadline_epoch = None
+        poll_until = time.monotonic() + 2.0
+        while time.monotonic() < poll_until:
+            m = s.read_waiting("beta")
+            if m is not None and isinstance(m.get("deadline_epoch"), (int, float)):
+                deadline_epoch = m["deadline_epoch"]
+                break
+            time.sleep(0.02)
+        assert deadline_epoch is not None, "wait never published a deadline"
+        while time.time() <= deadline_epoch + 0.2:  # past the deadline, in grace
+            time.sleep(0.02)
         s.send(sender="alpha", recipient="beta",
                body="just barely in time", kind="message")
 
@@ -559,6 +569,32 @@ def test_wait_composing_extends_deadline_and_returns_real_reply(
         assert "hold on" not in out  # composing body never surfaced
     finally:
         t.join(timeout=5)
+
+
+def test_wait_composing_extends_deadline_duration(
+    store_root: Path,
+) -> None:
+    """Prove the composing actually extends the deadline BY ITS AMOUNT (not
+    just that a reply lands). Pre-stage one composing, send NO real reply, and
+    assert the wait runs at least base_timeout + composing_extend before timing
+    out. The lower bound is race-free — the loop never returns before its
+    (extended) deadline and sleeps never undershoot — so this can't flake, and
+    a base-only timeout (~0.5s) would fall well short of the 0.85s floor."""
+    from agenttalk.store import Store
+
+    s = Store(store_root)
+    s.send(sender="alpha", recipient="beta", body="hold on", kind="composing")
+    started = time.time()
+    rc = _run(["wait", "--for", "beta", "--timeout", "0.5",
+               "--grace", "0",
+               "--composing-extend", "0.5",  # extends 0.5 -> ~1.0s effective
+               "--heartbeat-interval", "0", "--quiet"], store_root)
+    elapsed = time.time() - started
+    assert rc == 1  # no real reply: still times out, just later
+    assert elapsed >= 0.85, (
+        f"composing did not extend the deadline by its amount: {elapsed:.2f}s "
+        "(base 0.5 + extend 0.5 should be ~1.0s)"
+    )
 
 
 def test_wait_composing_extension_disabled_with_zero(
