@@ -2109,10 +2109,6 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
     # distinct from reply (0) and timeout (1) per the exit-code contract.
     row = _thread_row_for(store, agent, rid)
     if row is not None and row.state == "closed-superseded":
-        # cmd_wait wrote an early observability marker before dispatching here;
-        # this entry return precedes our own try/finally, so clear it so a
-        # rescinded scoped wait never leaves a ghost waiter.
-        store.clear_waiting(agent)
         _print_rescinded(store, rid, row)
         return 3
     deadline = time.time() + args.timeout if args.timeout > 0 else None
@@ -2319,43 +2315,47 @@ def cmd_wait(args: argparse.Namespace) -> int:
     _early_deadline = _now + args.timeout if args.timeout > 0 else None
     _write_waiting_marker(store, agent, cursor_at_start=_early_cursor,
                           timeout=args.timeout, deadline=_early_deadline)
-    # fix #2 (opt-in, OFF by default): opportunistic safe compaction once the
-    # store grows past the threshold. Throttled + fail-safe; never blocks.
-    _maybe_auto_compact(store, now_epoch=_now)
-    if getattr(args, "to_request", None):
-        return _scoped_wait(store, agent, args)
-    deadline = time.time() + args.timeout if args.timeout > 0 else None
-    interval = max(0.1, args.interval)
-    heartbeat_interval = max(0.0, args.heartbeat_interval)
-    grace = max(0.0, args.grace)
-    composing_extend = max(0.0, args.composing_extend)
-    cursor_at_start = store.cursor(agent)
-    last_heartbeat = 0.0
-    seen_composing: set[str] = set()
-    total_extended = 0.0
-    grace_used = False
-    # Adaptive poll backoff (fix #3): grow the idle sleep from `base` toward
-    # `cap`, reset to base on any inbox activity. cap <= base disables it
-    # (byte-identical fixed-interval polling). `last_seen_max_id` is the
-    # activity signal — any new message/composing/rescind pushes the inbox's
-    # max id up, which resets the sleep to base.
-    base = interval
-    cap = max(base, max(0.0, args.max_poll_interval))
-    cur_sleep = base
-    last_seen_max_id = cursor_at_start or ""
-    # Stamp once up front so peers see the listener immediately.
-    if heartbeat_interval > 0:
-        store.write_heartbeat(agent)
-        last_heartbeat = time.time()
-    # Observational waiting marker: lets `status` flag two agents that
-    # are blocked on each other (issue #5 soft-deadlock). Cleared in the
-    # finally below so a normal exit (message/timeout) never leaves it,
-    # and a crashed shell's orphan is detectable via heartbeat/deadline.
-    _write_waiting_marker(
-        store, agent, cursor_at_start=cursor_at_start,
-        timeout=args.timeout, deadline=deadline,
-    )
+    # Everything after the early marker write is wrapped in one try/finally so
+    # a failure before the poll loop (the scoped entry-return, a cursor read
+    # that raises, any pre-loop setup error) can't leak the .waiting marker —
+    # writing the marker earlier (above) widened the cleanup scope (codex
+    # review). The per-path while loops used to own this finally; it now covers
+    # both paths plus the gap above them.
     try:
+        # fix #2 (opt-in, OFF by default): opportunistic safe compaction once
+        # the store grows past the threshold. Throttled + fail-safe.
+        _maybe_auto_compact(store, now_epoch=_now)
+        if getattr(args, "to_request", None):
+            return _scoped_wait(store, agent, args)
+        deadline = time.time() + args.timeout if args.timeout > 0 else None
+        interval = max(0.1, args.interval)
+        heartbeat_interval = max(0.0, args.heartbeat_interval)
+        grace = max(0.0, args.grace)
+        composing_extend = max(0.0, args.composing_extend)
+        cursor_at_start = store.cursor(agent)
+        last_heartbeat = 0.0
+        seen_composing: set[str] = set()
+        total_extended = 0.0
+        grace_used = False
+        # Adaptive poll backoff (fix #3): grow the idle sleep from `base`
+        # toward `cap`, reset to base on any inbox activity. cap <= base
+        # disables it (byte-identical fixed-interval polling).
+        # `last_seen_max_id` is the activity signal — any new
+        # message/composing/rescind pushes the inbox's max id up, resetting
+        # the sleep to base.
+        base = interval
+        cap = max(base, max(0.0, args.max_poll_interval))
+        cur_sleep = base
+        last_seen_max_id = cursor_at_start or ""
+        if heartbeat_interval > 0:
+            store.write_heartbeat(agent)
+            last_heartbeat = time.time()
+        # Refresh the marker with the loop's real (post-compaction) deadline +
+        # freshly-read cursor; the early stamp above only covered arm latency.
+        _write_waiting_marker(
+            store, agent, cursor_at_start=cursor_at_start,
+            timeout=args.timeout, deadline=deadline,
+        )
         while True:
             msgs = store.messages_for(agent, since_id=cursor_at_start or None)
             cur_max = max((m.id for m in msgs), default=last_seen_max_id)

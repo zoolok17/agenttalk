@@ -967,6 +967,31 @@ def test_wait_clears_waiting_marker_on_timeout(
     assert s.read_waiting("beta") is None
 
 
+def test_wait_clears_marker_on_pre_loop_error(
+    store_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: an error AFTER the early marker write but BEFORE the poll
+    loop (here the second cursor() read raises) must still clear the .waiting
+    marker — the top-level try/finally covers the widened arm window. Without
+    it, moving the marker earlier would leak a ghost waiter on a setup error."""
+    orig_cursor = Store.cursor
+    calls = {"n": 0}
+
+    def flaky_cursor(self: Store, agent: str) -> str:
+        calls["n"] += 1
+        if calls["n"] >= 2:          # the 2nd read (cursor_at_start) blows up
+            raise OSError("boom")
+        return orig_cursor(self, agent)
+
+    monkeypatch.setattr(Store, "cursor", flaky_cursor)
+    rc = _run(["wait", "--for", "beta", "--timeout", "3",
+               "--heartbeat-interval", "0", "--quiet"], store_root)
+    assert rc == 2                    # OSError surfaces as a usage/error exit
+    assert calls["n"] >= 2            # we really hit the raising read
+    monkeypatch.undo()
+    assert Store(store_root).read_waiting("beta") is None  # NOT leaked
+
+
 # ------------------------------------------------- status actionable warnings
 
 def test_status_warns_never_acked_unread(
