@@ -5,6 +5,58 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.0] - 2026-06-15
+
+Performance: eliminate the multi-day, machine-wide slowdown caused by
+`agenttalk wait` polling. The per-poll cost was `O(waiters × store-size ×
+poll-rate)` — every poll re-read and re-validated the entire `messages/`
+store, the store never shrank, and dead waiters never stopped polling. Four
+changes attack each factor; combined they keep an idle multi-agent bus cheap
+indefinitely. All changes preserve existing delivery, validation, signing,
+cursor/thread, epoch, and rescind semantics.
+
+### Fixed
+- **`wait` no longer re-parses the whole store every poll.** The poll now
+  reads incrementally from the agent's cursor — only message files newer than
+  the last-seen id are opened/parsed/validated. Per-poll cost drops from
+  `O(store)` to `~O(new messages)` (≈18× faster at 800 messages, and flat as
+  the store grows). The `since_id` floor is delivery-only; `valid_messages()`,
+  epoch/thread/rescind derivation, and the invalid-file report still scan the
+  full log.
+
+### Added
+- **Adaptive poll backoff.** An idle `wait` backs its poll interval off
+  (doubling up to a cap) and snaps back to the base interval the instant any
+  activity (message, composing, rescind) appears. Every sleep is clamped to the
+  deadline and heartbeat interval, so timeouts and liveness are unaffected.
+  Configurable via `--max-poll-interval` (default 2.0s; set at/below
+  `--interval` to disable). Cuts idle polling ~6× (≈200→32 polls/min/waiter).
+- **`agenttalk compact`.** Bounds live-store growth via conservative prefix
+  compaction: archives only a contiguous prefix of delivery-valid messages
+  below a safe `keep_floor` (the minimum of every active cursor, the current
+  epoch barrier, the earliest message of any non-closed thread group, and a
+  keep-tail of recent history). Never archives invalid/tamper files (they stay
+  visible to `status`/`doctor`/`prune`). Manual command is always available
+  (`--dry-run`, `--keep-count`, `--keep-age-days`, `--json`); an opportunistic
+  auto-trigger at wait-arm is **off by default** (`compact.enabled`), threshold-
+  and throttle-gated, never a background daemon. Archived messages move to
+  `archived/compacted/` (cold storage). Config: `compact.enabled`,
+  `compact.keep_count` (1000), `compact.keep_age_days` (30),
+  `compact.trigger_threshold` (1200), `compact.min_interval_seconds` (3600).
+- **Stale-waiter handling at `wait` arm.** Confirmed-dead `.waiting` markers are
+  cleared; a soft-cap warning fires when live waiters exceed a threshold; and an
+  opt-in `--refuse-stacked-wait` refuses to arm a second live waiter for the
+  same agent (exit **6**). The default remains a non-fatal warning — duplicate
+  detection is advisory, not a transport lock.
+
+### Notes
+- **Retention boundary.** Cold-archived *closed* history is no longer
+  derivable, so `check --to-request` on a historical closed request may return
+  `unknown` (exit 4) after compaction — safe and fail-closed, but not
+  byte-identical history. Live derivations are unchanged.
+- Capacity/headroom snapshots, advisory semantics, and the privacy boundary are
+  unchanged.
+
 ## [0.26.0] - 2026-06-09
 
 Context-aware coordination phase 1: capacity snapshots now include the
