@@ -481,8 +481,12 @@ def test_wait_post_timeout_grace_returns_late_message(
     s = Store(store_root)
 
     def _inject_after_deadline() -> None:
-        # 1s timeout, message lands at ~1.3s, grace window is 2s wide
-        # so the post-timeout scan catches it.
+        # Lands AFTER the 1s deadline — sleep() never undershoots, so the lower
+        # bound (message must arrive post-deadline to exercise grace) is
+        # race-free by construction — and well within the wide 3s grace window,
+        # so the single post-timeout scan is guaranteed to catch it regardless
+        # of scheduler jitter. (rc 0 holds even if a slow arm makes it land
+        # before the deadline: it's then caught at the deadline scan instead.)
         time.sleep(1.3)
         s.send(sender="alpha", recipient="beta",
                body="just barely in time", kind="message")
@@ -491,7 +495,7 @@ def test_wait_post_timeout_grace_returns_late_message(
     t.start()
     try:
         rc = _run(["wait", "--for", "beta", "--timeout", "1",
-                   "--grace", "2",
+                   "--grace", "3",
                    "--heartbeat-interval", "0"], store_root)
         assert rc == 0
         out = capsys.readouterr().out
@@ -517,26 +521,28 @@ def test_wait_composing_extends_deadline_and_returns_real_reply(
     store_root: Path,
     capsys: pytest.CaptureFixture,
 ) -> None:
-    """A `composing` ping resets the waiter's clock without being
-    returned as a reply; the subsequent real message is what `wait`
-    surfaces."""
+    """A `composing` ping extends the deadline so a later real reply is still
+    surfaced (and the composing body itself is never returned as a payload).
+
+    PRE-STAGE the composing so the very first poll is guaranteed to see it and
+    extend the 0.5s deadline by 2s — no fixed-sleep-vs-deadline race on a tight
+    margin (the prior 0.4s-vs-0.5s injection flaked on a loaded runner). The
+    real reply is then injected from a thread at a modest 0.3s, which dwarfs
+    scheduler jitter inside the ~2.5s extended window. Same model as
+    test_wait_duplicate_composing_counted_only_once."""
     import threading
     from agenttalk.store import Store
 
     s = Store(store_root)
+    # Pre-staged: present before the wait arms, so the first scan extends.
+    s.send(sender="alpha", recipient="beta", body="hold on", kind="composing")
 
-    def _inject() -> None:
-        # composing arrives at 0.4s (extends 0.5s deadline by another 2s)
-        time.sleep(0.4)
-        s.send(sender="alpha", recipient="beta",
-               body="hold on", kind="composing")
-        # real reply arrives at 1.2s — would have timed out at 0.5s + grace
-        # without the composing extension.
-        time.sleep(0.8)
+    def _inject_reply() -> None:
+        time.sleep(0.3)  # well inside the +2s extension; not racing a deadline
         s.send(sender="alpha", recipient="beta",
                body="here's the real answer", kind="message")
 
-    t = threading.Thread(target=_inject, daemon=True)
+    t = threading.Thread(target=_inject_reply, daemon=True)
     t.start()
     try:
         rc = _run(["wait", "--for", "beta", "--timeout", "0.5",
@@ -559,28 +565,22 @@ def test_wait_composing_extension_disabled_with_zero(
     store_root: Path,
     capsys: pytest.CaptureFixture,
 ) -> None:
-    """--composing-extend 0 means composing pings are still consumed
-    (won't surface as replies) but don't extend the deadline."""
-    import threading
+    """--composing-extend 0: a composing is still consumed (never surfaced as a
+    reply) but does NOT extend the deadline.
+
+    PRE-STAGE the composing so the consume-but-don't-extend path is exercised
+    on the first scan deterministically; with no extension and no real reply
+    the wait times out at its base 0.5s deadline (rc 1) regardless of jitter.
+    No thread, no race."""
     from agenttalk.store import Store
 
     s = Store(store_root)
-
-    def _inject() -> None:
-        time.sleep(0.2)
-        s.send(sender="alpha", recipient="beta",
-               body="hold on", kind="composing")
-
-    t = threading.Thread(target=_inject, daemon=True)
-    t.start()
-    try:
-        rc = _run(["wait", "--for", "beta", "--timeout", "0.5",
-                   "--grace", "0",
-                   "--composing-extend", "0",
-                   "--heartbeat-interval", "0", "--quiet"], store_root)
-        assert rc == 1  # timed out — no extension, no real reply
-    finally:
-        t.join(timeout=5)
+    s.send(sender="alpha", recipient="beta", body="hold on", kind="composing")
+    rc = _run(["wait", "--for", "beta", "--timeout", "0.5",
+               "--grace", "0",
+               "--composing-extend", "0",
+               "--heartbeat-interval", "0", "--quiet"], store_root)
+    assert rc == 1  # consumed, not extended, no real reply -> timeout
 
 
 def test_wait_duplicate_composing_counted_only_once(
