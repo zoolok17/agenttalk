@@ -736,6 +736,7 @@ so the long timeout is free observability.
 | `agenttalk transcript [--format md\|jsonl] [--out PATH]` | Export the full conversation. |
 | `agenttalk end --from A [--reason ...]` | Notify the other agent(s) and write the transcript. In a team, sends `end` to every other roster member. |
 | `agenttalk reset [--archive]` | Clear **active bus state** (messages + cursors + heartbeats); preserves historical transcripts under `.agenttalk/sessions/` so past exports aren't lost. Bumps `session_id`. With `--archive`, instead moves **everything** (messages + state + sessions) under `.agenttalk/archived/<old_session>/`. Preserves config (roster) either way. |
+| `agenttalk compact [--dry-run] [--keep-count N] [--keep-age-days D] [--json]` | Bound live-store growth by archiving a **safe prefix** of old messages (`id < keep_floor`) into the cold `.agenttalk/archived/compacted/` dir. `keep_floor` is the MIN of: the lowest active cursor (never archive a message unread by an active recipient), the current epoch barrier, the earliest message of any **protected** thread (owed-inbound / reply-waiting / open-outbound / closed-superseded — kept whole), and a keep-tail (`keep_count` newest + everything younger than `keep_age_days`). Any undeterminable component fails safe to **archive nothing**. Never archives invalid files (they stay for `prune`/`doctor`). Diagnostics name which component capped the floor; `--dry-run` plans without moving. |
 | `agenttalk hmac-init [--force]` | Generate the HMAC signing key for this project. Stored outside `.agenttalk/` (per-user config dir). The key's existence at the path-derived per-user location automatically activates signature enforcement — there's no config flag to flip. Override the default key path with `AGENTTALK_HMAC_KEY_FILE`. See `SECURITY.md`. |
 | `agenttalk reply [--from A] [--to-id MSG_ID \| --to-request REQUEST_ID] [--kind K] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--dry-run]` | Reply to the most recent received message, or anchor to a specific received message/thread. Auto-derives recipient and echoes the anchor's `request_id`; explicit `--meta request_id=...` wins. `--dry-run` prints the resolved recipient, request id, and kind without sending. A reply that opens a new thread (`review-request` or `proposal`) mints a fresh id instead of echoing. 0.15.0: `--na` sends a not-applicable response — closes your obligation, displayed as (n/a); refused on review-request/proposal threads. |
 | `agenttalk tail [--from-start] [--interval S] [--timeout S]` | Passive monitor: stream all messages as they arrive. Does **not** advance cursors or write heartbeats — safe to run in a third terminal alongside two active agents. `--from-start` replays existing messages first. |
@@ -1054,6 +1055,26 @@ Two operating assumptions are worth stating plainly (0.18.0):
   composing, or rescind lands — so an idle bus polls near-zero without
   delaying a live reply by more than the cap. Set `--max-poll-interval`
   `<=` `--interval` to disable (fixed-interval polling).
+- **Compaction bounds growth, and is lossy-by-design for *closed* history.**
+  `agenttalk compact` moves a safe prefix of old messages into the cold
+  `archived/compacted/` dir, which is **never read back** (same contract as
+  `reset --archive`). It is engineered to be safe for everything *live* —
+  it never archives a message unread by an active recipient, the epoch
+  barrier, any protected (non-closed) thread's messages, or invalid files,
+  so `current_epoch`, `threads`/`sync`, `wait`-on-rescind, and delivery are
+  byte-for-byte unchanged across a compaction. The deliberate trade-off is
+  the **retention boundary**: once an old *closed/resolved* request's
+  messages are cold-archived, that request is no longer derivable, so a
+  later `check --to-request <old-closed-id>` can return **unknown (exit 4)**
+  rather than reconstructing its historical verdict. This is safe and
+  fail-closed (unknown, never a wrong answer), but it is *not* byte-identical
+  history — compaction trades cold closed-thread history for a bounded live
+  store. Automatic compaction at `wait`-arm is **off by default**
+  (`compact.enabled=false`); when enabled it only fires above
+  `compact.trigger_threshold` live messages and is throttled by
+  `compact.min_interval_seconds`. Tune retention with `compact.keep_count`
+  (default 1000) and `compact.keep_age_days` (default 30); the manual
+  `agenttalk compact` command runs regardless of the enable flag.
 - **Synced stores assume clock agreement.** Message ids are
   timestamp-prefixed and delivery order is a lexical compare of ids. If you
   sync one `.agenttalk/` across machines whose clocks disagree, a

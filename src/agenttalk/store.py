@@ -2029,6 +2029,93 @@ class Store:
             return count
         return count
 
+    # ----------------------------------------------------- compaction (#2)
+    #
+    # `compact` archives a contiguous PREFIX of VALID messages (id <
+    # keep_floor) into archived/compacted/ — COLD storage, never read back,
+    # so a moved message is invisible to every live derivation. The keep_floor
+    # POLICY lives in the CLI (it needs thread derivation, and threads.py
+    # imports Store, so Store must not import it back). Store only provides the
+    # safe mover + counters + the throttle stamp; correctness rides entirely on
+    # the caller passing a sound keep_floor.
+
+    @property
+    def compacted_dir(self) -> Path:
+        """Cold destination for compacted messages. A sibling of the
+        reset-archive session dirs, NOT one of them — per-message
+        compaction must never collide with `reset --archive`'s wholesale
+        ``archived/<session_id>/`` moves."""
+        return self.dir / "archived" / "compacted"
+
+    def live_message_count(self) -> int:
+        """Count ``*.json`` files in messages/ (cheap readdir, no parse). The
+        auto-compaction threshold proxy — an over-count from invalid files is
+        harmless for a trigger gate."""
+        d = self.messages_dir
+        if not d.is_dir():
+            return 0
+        try:
+            return sum(1 for p in d.iterdir() if p.suffix == ".json")
+        except OSError:
+            return 0
+
+    def archive_messages_below(self, keep_floor: str, *,
+                               dry_run: bool = False) -> list[dict]:
+        """Move every VALID message with ``id < keep_floor`` into
+        archived/compacted/. Returns ``[{"id","from","to"}]`` per file (the
+        plan, when ``dry_run``).
+
+        Safety contract (the whole point of WP-B):
+        - INVALID / unparseable files are NEVER moved — they are not in the
+          valid scan, so status/doctor/prune keep seeing them.
+        - ``keep_floor`` falsy ("") is a no-op (a fail-safe fired upstream).
+        - Per-file ``shutil.move`` (atomic rename); a collision in the cold
+          dir is timestamp-suffixed, never overwritten (the quarantine /
+          ``_archive_session`` precedent). Partial progress is safe and the
+          caller recomputes ``keep_floor`` each run, so a crashed run is
+          simply re-runnable — never cumulatively wrong.
+        """
+        if not keep_floor:
+            return []
+        valid_p, _ = self._scan_messages_with_paths()  # full scan; invalid excluded
+        records: list[dict] = []
+        made_dir = False
+        for m, src in valid_p:
+            if m.id >= keep_floor:
+                continue
+            dst = self.compacted_dir / src.name
+            record = {"id": m.id, "from": str(src), "to": str(dst)}
+            if not dry_run:
+                if not made_dir:
+                    self.compacted_dir.mkdir(parents=True, exist_ok=True)
+                    made_dir = True
+                if dst.exists():
+                    dst = self.compacted_dir / (
+                        f"{src.name}.{_now_iso().replace(':', '-')}")
+                    record["to"] = str(dst)
+                shutil.move(str(src), str(dst))
+            records.append(record)
+        return records
+
+    def read_compact_stamp(self) -> dict | None:
+        """Last auto-compaction record (throttle gate). None if absent/corrupt."""
+        p = self.state_dir / "compact.json"
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, ValueError, OSError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def write_compact_stamp(self, payload: dict) -> None:
+        """Best-effort throttle/audit stamp for the last compaction run."""
+        try:
+            _atomic_write_text(self.state_dir / "compact.json",
+                               json.dumps(payload, ensure_ascii=False))
+        except OSError:
+            pass
+
     # ------------------------------------------- reply-in-flight markers
     #
     # `state/<agent>.composing.json` records "agent is drafting a reply

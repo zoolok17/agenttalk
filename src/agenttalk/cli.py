@@ -8,7 +8,7 @@ import os
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agenttalk import __version__
@@ -476,6 +476,219 @@ def _closed_rids(store: Store, agent: str) -> set[str]:
         rid for rid, e in store.read_threadstate(agent).items()
         if isinstance(e, dict) and e.get("closed") is True
     }
+
+
+# ----------------------------------------------------- compaction (#2)
+#
+# `compact` archives a safe contiguous PREFIX of valid messages (id <
+# keep_floor) to the COLD archived/compacted/ dir. The keep_floor policy is the
+# whole safety story; it lives here (not in Store) because it reuses thread
+# derivation, and threads.py imports Store. Store provides only the safe mover.
+
+COMPACT_DEFAULTS = {
+    "enabled": False,          # the automatic opportunistic trigger (OFF for v1)
+    "keep_count": 1000,        # always keep at least this many newest messages
+    "keep_age_days": 30.0,     # always keep everything younger than this
+    "trigger_threshold": 500,  # auto check only fires above this live count
+    "min_interval_seconds": 3600.0,  # auto check throttle
+}
+
+# Thread states whose entire request group must stay LIVE (never compacted):
+# the ball is on someone, or it was rescinded and the supersession must remain
+# derivable. Everything else (plain "closed") is archivable.
+_COMPACT_PROTECTED_STATES = frozenset(
+    {"owed-inbound", "reply-waiting", "open-outbound", "closed-superseded"})
+
+
+def _compact_config(cfg: dict) -> dict:
+    """Resolve compact knobs from config over the defaults (missing key =
+    default; an older store with no ``compact`` block just gets defaults)."""
+    raw = cfg.get("compact")
+    raw = raw if isinstance(raw, dict) else {}
+    out = dict(COMPACT_DEFAULTS)
+    for k in out:
+        if k in raw:
+            out[k] = raw[k]
+    return out
+
+
+def _parse_ts(ts: str) -> datetime | None:
+    """Parse a message ``ts`` to an aware datetime, or None if unparseable."""
+    if not isinstance(ts, str) or not ts:
+        return None
+    norm = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+    try:
+        dt = datetime.fromisoformat(norm)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _min_floor(values: list[str | None]) -> str | None:
+    """Combine keep-floor candidates. None = "this dimension imposes no
+    restriction" (skipped). "" = a fail-safe ("keep everything") and WINS.
+    Otherwise the lexical MIN — the most conservative floor keeps the most."""
+    present = [v for v in values if v is not None]
+    if not present:
+        return None
+    if any(v == "" for v in present):
+        return ""
+    return min(present)
+
+
+def _compute_keep_floor(store: Store, cfg: dict, *, keep_count: int,
+                        keep_age_days: float, now: datetime | None = None):
+    """Return ``(keep_floor, capped_by, components)``.
+
+    Archive valid messages with ``id < keep_floor``. ``""`` means a fail-safe
+    fired — archive NOTHING. Pure read; reuses the SAME validated message set
+    and per-agent cursor / closed_rids / retired that ``threads``/``sync`` use,
+    so an ``ack --to-request`` thread stops pinning compaction.
+    """
+    now = now or datetime.now(timezone.utc)
+    components: dict[str, str | None] = {}
+
+    # cursor: never archive a message unread by an active recipient. id <
+    # min(active cursors) => id < every active cursor => already read by
+    # whichever single agent it is addressed to. An active agent that never
+    # consumed (cursor "") fails safe to "keep everything".
+    active = cfg.get("agents") or []
+    if not active:
+        components["cursor"] = ""
+    else:
+        cursors = [store.cursor(a) for a in active]
+        components["cursor"] = "" if any(c == "" for c in cursors) else min(cursors)
+
+    # Need the validated log for epoch + thread + keeptail; if it can't be
+    # read, fail safe.
+    try:
+        msgs = store.valid_messages()
+        epoch = store.current_epoch()
+    except (ValueError, OSError, FileNotFoundError):
+        return "", "fail-safe", components
+
+    components["epoch"] = epoch  # None => no barrier => no restriction
+
+    # thread: keep the WHOLE request group of any protected row. Earliest group
+    # id (opener) so opener+replies+rescind provenance all stay live.
+    try:
+        retired = set(store.retired_agents())
+        protected: set[str] = set()
+        for a in active:
+            for t in th.derive_threads(msgs, agent=a, cursor=store.cursor(a),
+                                       now=now, closed_rids=_closed_rids(store, a),
+                                       retired=retired):
+                if t.state in _COMPACT_PROTECTED_STATES:
+                    protected.add(t.request_id)
+        if protected:
+            earliest: dict[str, str] = {}
+            for m in msgs:
+                rid = (m.meta or {}).get("request_id")
+                if isinstance(rid, str) and rid in protected:
+                    if rid not in earliest or m.id < earliest[rid]:
+                        earliest[rid] = m.id
+            components["thread"] = min(earliest.values()) if earliest else None
+        else:
+            components["thread"] = None
+    except Exception:  # noqa: BLE001 — a derivation error must archive NOTHING
+        components["thread"] = ""
+
+    # keeptail: keep newest keep_count AND everything younger than keep_age
+    # (the UNION => the lower of the two boundaries).
+    ids = sorted(m.id for m in msgs)
+    count_floor = "" if len(ids) <= keep_count else ids[len(ids) - keep_count]
+    cutoff = now - timedelta(days=keep_age_days)
+    young = [m.id for m in msgs
+             if (_parse_ts(m.ts) is not None and _parse_ts(m.ts) >= cutoff)]
+    age_floor = min(young) if young else None
+    components["keeptail"] = _min_floor([count_floor, age_floor])
+
+    keep_floor = _min_floor(list(components.values())) or ""
+    capped = [k for k, v in components.items() if v is not None and v == keep_floor]
+    capped_by = ",".join(capped) if capped else "none"
+    return keep_floor, capped_by, components
+
+
+def _run_compaction(store: Store, cfg: dict, *, keep_count: int,
+                    keep_age_days: float, dry_run: bool,
+                    now: datetime | None = None) -> dict:
+    """Compute the floor and move (or plan) the prefix. Stamps the throttle
+    record on a real run."""
+    keep_floor, capped_by, components = _compute_keep_floor(
+        store, cfg, keep_count=keep_count, keep_age_days=keep_age_days, now=now)
+    records = store.archive_messages_below(keep_floor, dry_run=dry_run)
+    if not dry_run:
+        store.write_compact_stamp({
+            "at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "at_epoch": time.time(),
+            "keep_floor": keep_floor, "capped_by": capped_by,
+            "archived": len(records),
+        })
+    return {"dry_run": dry_run, "keep_floor": keep_floor, "capped_by": capped_by,
+            "components": components, "archived": records}
+
+
+def _maybe_auto_compact(store: Store, *, now_epoch: float) -> None:
+    """Opportunistic compaction at wait-arm: OFF by default, only above the
+    threshold, throttled, and totally fail-safe — it must NEVER raise into the
+    wait loop."""
+    try:
+        cfg = store.load_config()
+        cc = _compact_config(cfg)
+        if not cc.get("enabled"):
+            return
+        if store.live_message_count() <= int(cc["trigger_threshold"]):
+            return
+        stamp = store.read_compact_stamp()
+        if stamp is not None:
+            last = stamp.get("at_epoch")
+            if (isinstance(last, (int, float))
+                    and now_epoch - last < float(cc["min_interval_seconds"])):
+                return
+        res = _run_compaction(store, cfg, keep_count=int(cc["keep_count"]),
+                              keep_age_days=float(cc["keep_age_days"]),
+                              dry_run=False)
+        if res["archived"]:
+            sys.stderr.write(
+                f"agenttalk: auto-compacted {len(res['archived'])} message(s) "
+                f"to archived/compacted/ (capped by {res['capped_by']}).\n")
+    except Exception:  # noqa: BLE001 — compaction must never break a wait
+        return
+
+
+def cmd_compact(args: argparse.Namespace) -> int:
+    store = _get_store(args)
+    try:
+        cfg = store.load_config()
+    except (ValueError, OSError, FileNotFoundError) as e:
+        sys.stderr.write(f"agenttalk: {e}\n")
+        return 2
+    cc = _compact_config(cfg)
+    keep_count = (args.keep_count if args.keep_count is not None
+                  else int(cc["keep_count"]))
+    keep_age = (args.keep_age_days if args.keep_age_days is not None
+                else float(cc["keep_age_days"]))
+    res = _run_compaction(store, cfg, keep_count=keep_count,
+                          keep_age_days=keep_age, dry_run=args.dry_run)
+    n = len(res["archived"])
+    if args.json:
+        print(json.dumps({
+            "dry_run": res["dry_run"],
+            "keep_floor": res["keep_floor"],
+            "capped_by": res["capped_by"],
+            "archived_count": n,
+            "archived_ids": [r["id"] for r in res["archived"]],
+            "components": res["components"],
+        }, ensure_ascii=False))
+        return 0
+    if not res["keep_floor"]:
+        print(f"compact: nothing archived — a keep-everything fail-safe held "
+              f"(capped by {res['capped_by']}).")
+        return 0
+    verb = "would archive" if res["dry_run"] else "archived"
+    print(f"compact: {verb} {n} message(s) to archived/compacted/ "
+          f"(keep_floor={res['keep_floor']}, capped by {res['capped_by']}).")
+    return 0
 
 
 def _thread_warnings(store: Store, cfg: dict) -> list[str]:
@@ -2086,6 +2299,9 @@ def cmd_wait(args: argparse.Namespace) -> int:
             f"warning: {_live + 1} live agenttalk waiters in this store "
             f"(> {WAITER_SOFTCAP}); leftover poll loops from old sessions may "
             f"be polling the bus. Consider stopping stale ones.\n")
+    # fix #2 (opt-in, OFF by default): opportunistic safe compaction once the
+    # store grows past the threshold. Throttled + fail-safe; never blocks.
+    _maybe_auto_compact(store, now_epoch=_now)
     if getattr(args, "to_request", None):
         return _scoped_wait(store, agent, args)
     deadline = time.time() + args.timeout if args.timeout > 0 else None
@@ -3472,6 +3688,27 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Also surface control-plane kinds ('composing') that the "
                           "default view hides. The cursor advances past them either way.")
     pdr.set_defaults(func=cmd_drain)
+
+    pcompact = sub.add_parser(
+        "compact",
+        help="Archive a safe prefix of old messages to archived/compacted/ "
+             "(cold storage), bounding live-store growth. Never archives "
+             "unread, epoch-barrier, protected-thread, or invalid messages.",
+    )
+    pcompact.add_argument("--dry-run", action="store_true",
+                          help="Show what would be archived (and which keep_floor "
+                               "component caps it) without moving any file.")
+    pcompact.add_argument("--keep-count", dest="keep_count", type=int, default=None,
+                          help="Override config: always keep at least this many "
+                               "newest messages live.")
+    pcompact.add_argument("--keep-age-days", dest="keep_age_days", type=float,
+                          default=None,
+                          help="Override config: always keep messages younger "
+                               "than this many days live.")
+    pcompact.add_argument("--json", action="store_true",
+                          help="Emit a JSON result (keep_floor, capped_by, "
+                               "archived ids, components).")
+    pcompact.set_defaults(func=cmd_compact)
 
     pw = sub.add_parser("wait", help="Block until a new message arrives for an agent, then print it.")
     pw.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
