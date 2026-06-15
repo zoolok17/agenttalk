@@ -1443,7 +1443,7 @@ class Store:
     # --------------------------------------------------------------- reading
 
     def _scan_messages_with_paths(
-        self,
+        self, *, since_id: str | None = None,
     ) -> tuple[list[tuple[Message, Path]], list[tuple[Path, str, str]]]:
         """The canonical disk walk, keeping each verdict paired with ITS file.
 
@@ -1453,6 +1453,18 @@ class Store:
         an ident is NOT a file identity (an invalid file may embed an id
         that collides with another file's stem — Codex WP01 review
         repro), so any after-the-fact ident→path mapping can misresolve.
+
+        ``since_id`` is the delivery-hot-path fast skip (perf fix #1): a
+        file whose stem is ``<= since_id`` is dropped BEFORE it is read or
+        parsed, so a poller that already consumed everything up to its
+        cursor pays ~no per-file open/parse/validate cost as the store
+        grows. This is sound for DELIVERY only — filenames are ``<id>.json``
+        and ``stem == id`` is enforced below, so a skipped valid file has
+        ``id <= since_id`` and would be filtered anyway, and a skipped
+        forged file (stem mismatching a higher embedded id) is one we'd
+        never deliver. It is NOT sound for tamper visibility, so the
+        invalid report / quarantine callers MUST NOT pass ``since_id``
+        (they keep full-scanning). ``None`` = full scan (current behavior).
         """
         valid: list[tuple[Message, Path]] = []
         invalid: list[tuple[Path, str, str]] = []
@@ -1460,6 +1472,11 @@ class Store:
             return valid, invalid
         for p in sorted(self.messages_dir.iterdir()):
             if p.suffix != ".json":
+                continue
+            # Fast skip BEFORE any read/parse: stem == id is enforced just
+            # below for delivered files, and ids sort lexically, so a stem
+            # <= since_id cannot become a deliverable id > since_id.
+            if since_id and p.stem <= since_id:
                 continue
             try:
                 text = p.read_text(encoding="utf-8")
@@ -1493,7 +1510,9 @@ class Store:
             valid.append((msg, p))
         return valid, invalid
 
-    def _scan_messages(self) -> tuple[list[Message], list[tuple[str, str]]]:
+    def _scan_messages(
+        self, *, since_id: str | None = None,
+    ) -> tuple[list[Message], list[tuple[str, str]]]:
         """Read every file in messages/ once, separating valid messages
         from invalid ones. Returns (valid, invalid) where invalid is
         [(file_stem_or_id, reason)].
@@ -1505,8 +1524,11 @@ class Store:
         numeric id against a string cursor. (Since 0.15.0 this is a
         projection of ``_scan_messages_with_paths`` — one walk, one
         gate set.)
+
+        ``since_id`` forwards the delivery-hot-path fast skip; see
+        ``_scan_messages_with_paths``. Delivery callers only.
         """
-        valid_p, invalid_p = self._scan_messages_with_paths()
+        valid_p, invalid_p = self._scan_messages_with_paths(since_id=since_id)
         return ([m for m, _ in valid_p],
                 [(ident, reason) for _, ident, reason in invalid_p])
 
@@ -1652,13 +1674,18 @@ class Store:
         """
         return self._validated_messages()
 
-    def _validated_messages(self) -> list[Message]:
+    def _validated_messages(self, *, since_id: str | None = None) -> list[Message]:
         """Shared trust gate behind ``messages_for`` and ``valid_messages``.
 
         Applies schema/roster validation and (when enforced) HMAC
         signature verification to every scanned message, returning the
-        survivors in id order. No recipient/since filtering — callers
-        layer that on top.
+        survivors in id order. No recipient filtering — callers layer
+        that on top.
+
+        ``since_id`` forwards the delivery fast skip into the scan so
+        files at or below the cursor are never opened (perf fix #1).
+        ``valid_messages`` MUST keep the default ``None`` (full log) —
+        epoch / thread / rescind derivation reads the whole history.
         """
         try:
             cfg = self.load_config()
@@ -1683,7 +1710,7 @@ class Store:
                 key = _signing.load_key(project_id)
             except (FileNotFoundError, OSError, ValueError):
                 key = None  # key vanished between check and load — refuse
-        valid, _ = self._scan_messages()
+        valid, _ = self._scan_messages(since_id=since_id)
         out: list[Message] = []
         for m in valid:
             try:
@@ -1756,7 +1783,12 @@ class Store:
         what was skipped.
         """
         msgs: list[Message] = []
-        for m in self._validated_messages():
+        # Forward since_id into the scan so files at/below the cursor are
+        # never opened (perf fix #1). The post-scan ``m.id <= since_id``
+        # check below is kept belt-and-suspenders: it is the semantic
+        # source of truth for EXCLUSIVE delivery and stays correct even if
+        # the filename==id fast-skip invariant is ever relaxed.
+        for m in self._validated_messages(since_id=since_id):
             if m.recipient != agent:
                 continue
             if since_id and m.id <= since_id:

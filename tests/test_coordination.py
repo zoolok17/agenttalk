@@ -129,6 +129,123 @@ def test_scoped_wait_does_not_redeliver_globally_consumed(store: Store, store_ro
     assert elapsed < 2.0
 
 
+# ------------------- perf fix #1: scoped-wait scan bound (floor vs baseline)
+
+def test_scoped_wait_composing_extends_mid_wait(tmp_path: Path) -> None:
+    """Baseline behavior under the perf fix: a composing that arrives DURING
+    a scoped wait (id > baseline) still extends the deadline. The wait would
+    have timed out at its 0.5s base deadline; the +10s extension lets the
+    real reply (sent at ~0.8s) arrive and return 0."""
+    root = _init_team(tmp_path, "lead,exec")
+    _run(["send", "--from", "lead", "--to", "exec", "--kind", "question",
+          "--meta", "request_id=q-fire", "-m", "fire", "--quiet"], root)
+    assert _run(["drain", "--for", "exec", "--quiet"], root) == 0  # cursor=baseline
+    result: list[int] = []
+
+    def _waiter() -> None:
+        result.append(cli.main([
+            "--root", str(root), "wait", "--for", "exec", "--to-request", "q-fire",
+            "--timeout", "0.5", "--grace", "0", "--interval", "0.05",
+            "--composing-extend", "10", "--heartbeat-interval", "0", "--quiet",
+        ]))
+
+    t = threading.Thread(target=_waiter)
+    t.start()
+    _time.sleep(0.2)  # waiter arms; baseline captured
+    _run(["send", "--from", "lead", "--to", "exec", "--kind", "composing",
+          "-m", "drafting", "--quiet"], root)
+    _time.sleep(0.6)  # past the 0.5s base deadline — only the extension keeps it alive
+    _run(["send", "--from", "lead", "--to", "exec", "--kind", "review-result",
+          "--meta", "request_id=q-fire", "--meta", "status=approved",
+          "-m", "lgtm", "--quiet"], root)
+    t.join(timeout=15)
+    assert not t.is_alive(), "waiter never returned"
+    assert result == [0], "mid-wait composing failed to extend the deadline"
+
+
+def test_scoped_wait_composing_extends_when_cursor_exceeds_baseline(
+    tmp_path: Path,
+) -> None:
+    """Perf-fix edge: a concurrent same-agent consumer advances the GLOBAL
+    cursor above the wait's baseline, so floor = max(thread_seen, cursor) >
+    baseline. Scanning only from floor would skip a composing in
+    (baseline, floor]; scanning from min(floor, baseline) still sees it. The
+    composing here (id < the advanced cursor) must still extend the deadline."""
+    root = _init_team(tmp_path, "lead,exec")
+    _run(["send", "--from", "lead", "--to", "exec", "--kind", "question",
+          "--meta", "request_id=q-fire", "-m", "fire", "--quiet"], root)
+    assert _run(["drain", "--for", "exec", "--quiet"], root) == 0
+    s = Store(root)
+    result: list[int] = []
+
+    def _waiter() -> None:
+        result.append(cli.main([
+            "--root", str(root), "wait", "--for", "exec", "--to-request", "q-fire",
+            "--timeout", "0.5", "--grace", "0", "--interval", "0.05",
+            "--composing-extend", "10", "--heartbeat-interval", "0", "--quiet",
+        ]))
+
+    t = threading.Thread(target=_waiter)
+    t.start()
+    _time.sleep(0.2)  # waiter arms; baseline = the q-fire id
+    # composing lands first (id just above baseline)...
+    _run(["send", "--from", "lead", "--to", "exec", "--kind", "composing",
+          "-m", "drafting", "--quiet"], root)
+    # ...then a later unrelated message, which a concurrent consumer drains,
+    # dragging the GLOBAL cursor ABOVE both baseline and the composing id.
+    r1 = s.send(sender="lead", recipient="exec", kind="note", body="other")
+    s.advance_cursor("exec", r1.id)
+    assert s.cursor("exec") == r1.id  # floor now exceeds baseline
+    _time.sleep(0.6)  # past base deadline — survives only if the composing extended
+    _run(["send", "--from", "lead", "--to", "exec", "--kind", "review-result",
+          "--meta", "request_id=q-fire", "--meta", "status=approved",
+          "-m", "lgtm", "--quiet"], root)
+    t.join(timeout=15)
+    assert not t.is_alive(), "waiter never returned"
+    assert result == [0], (
+        "composing in (baseline, floor] was skipped — scan bound regressed "
+        "from min(floor, baseline) to floor"
+    )
+
+
+def test_scoped_wait_rescind_wakes_when_cursor_exceeds_baseline(
+    tmp_path: Path, capsys
+) -> None:
+    """Perf-fix edge: a rescind on the waited thread whose id falls in
+    (baseline, floor] must still wake the scoped wait (exit 3) even after a
+    concurrent consumer advanced the global cursor above it. Scanning only
+    from floor would never surface the rescind; min(floor, baseline) does."""
+    root = _init_team(tmp_path, "lead,exec")
+    _run(["send", "--from", "lead", "--to", "exec", "--kind", "question",
+          "--meta", "request_id=q-fire", "-m", "fire", "--quiet"], root)
+    assert _run(["drain", "--for", "exec", "--quiet"], root) == 0
+    s = Store(root)
+    result: list[int] = []
+
+    def _waiter() -> None:
+        result.append(cli.main([
+            "--root", str(root), "wait", "--for", "exec", "--to-request", "q-fire",
+            "--timeout", "2", "--grace", "0", "--interval", "0.05",
+            "--heartbeat-interval", "0",
+        ]))
+
+    t = threading.Thread(target=_waiter)
+    t.start()
+    _time.sleep(0.3)  # waiter arms; baseline = the q-fire id
+    # rescind lands first (id in (baseline, floor])...
+    assert _run(["rescind", "--from", "lead", "--to-request", "q-fire",
+                 "-m", "HOLD", "--quiet"], root) == 0
+    # ...then a later unrelated message a concurrent consumer drains, pulling
+    # the global cursor ABOVE the rescind id.
+    r1 = s.send(sender="lead", recipient="exec", kind="note", body="other")
+    s.advance_cursor("exec", r1.id)
+    assert s.cursor("exec") == r1.id  # floor now exceeds the rescind id
+    t.join(timeout=15)
+    assert not t.is_alive(), "waiter failed to wake on the rescind"
+    assert result == [3], "rescind in (baseline, floor] was skipped by the scan bound"
+    assert "RESCINDED" in capsys.readouterr().out
+
+
 # ------------------------------------------------ ack --to-request (closure)
 
 def test_ack_to_request_closes_thread(store: Store, store_root: Path) -> None:

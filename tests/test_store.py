@@ -127,6 +127,52 @@ def test_cursor_advance_filters_unread(store: Store) -> None:
     assert unread[0].id == m2.id
 
 
+@pytest.mark.parametrize("n", [10, 100, 300])
+def test_messages_for_since_id_does_not_open_old_files(
+    store: Store, monkeypatch: pytest.MonkeyPatch, n: int
+) -> None:
+    """Perf fix #1 guard: messages_for(since_id=newest) must open ZERO
+    message files regardless of store size, so a caught-up poller's
+    per-poll cost is independent of how big messages/ has grown. The
+    contrast assertion (a full scan opens all N) keeps this honest — it
+    fails loudly if the skip ever silently degrades to a no-op."""
+    ids = [store.send(sender="alpha", recipient="beta", body=str(i)).id
+           for i in range(n)]
+    newest = ids[-1]
+
+    opened: list[str] = []
+    real_read_text = Path.read_text
+
+    def counting_read_text(self: Path, *a: object, **k: object) -> str:
+        if self.parent == store.messages_dir:
+            opened.append(self.name)
+        return real_read_text(self, *a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", counting_read_text)
+
+    # Caught up: nothing strictly newer than the cursor → no file opened.
+    assert store.messages_for("beta", since_id=newest) == []
+    assert opened == [], (
+        f"hot path opened {len(opened)} message files for N={n}; "
+        "per-poll cost must be independent of store size"
+    )
+
+    # Honesty check: a full scan really does open every file, so the
+    # zero above is a real skip, not a vacuous truth.
+    opened.clear()
+    assert len(store.messages_for("beta")) == n
+    assert len(opened) == n
+
+
+def test_messages_for_since_id_is_exclusive_after_skip(store: Store) -> None:
+    """The filename fast-skip must not change EXCLUSIVE since_id semantics:
+    the cursor message itself is never redelivered, the next one is."""
+    m1 = store.send(sender="alpha", recipient="beta", body="one")
+    m2 = store.send(sender="alpha", recipient="beta", body="two")
+    got = store.messages_for("beta", since_id=m1.id)
+    assert [m.id for m in got] == [m2.id]
+
+
 def test_advance_cursor_never_moves_backwards(store: Store) -> None:
     m1 = store.send(sender="alpha", recipient="beta", body="one")
     m2 = store.send(sender="alpha", recipient="beta", body="two")

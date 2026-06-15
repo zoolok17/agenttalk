@@ -1890,8 +1890,17 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
             # match we still advance ONLY the thread pointer (never the
             # global cursor), so scoped wait stays non-consuming.
             floor = max(store.thread_seen(agent, rid), store.cursor(agent))
+            # Perf fix #1: skip files at/below the cursor before they're
+            # read. Bound the scan at min(floor, baseline), NOT floor: under
+            # one-window-per-agent floor <= baseline always, but a concurrent
+            # same-agent consumer could advance the global cursor mid-wait so
+            # floor > baseline — and a fresh composing/rescind has id > baseline,
+            # so scanning only from floor could skip a control message in
+            # (baseline, floor]. min() keeps control-message detection intact.
+            # Empty-string-safe: min("", x) == "" == full scan.
+            scan_since = min(floor, baseline)
             match = None
-            for m in store.messages_for(agent):
+            for m in store.messages_for(agent, since_id=scan_since):
                 if m.kind in CONTROL_KINDS:
                     # A composing extends the deadline ONLY if it is fresh for
                     # this wait (id > baseline) AND not bound to a different
