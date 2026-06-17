@@ -514,6 +514,34 @@ def test_install_activity_hook_codex_uses_group_shape(tmp_path: Path) -> None:
     assert cmds.count("agenttalk heartbeat") == 1
 
 
+def test_generated_ps1_is_bom_ascii_and_parses(tmp_path: Path) -> None:
+    """0.28.1 regression: the GENERATED supervisor.ps1 must (a) be ASCII-only
+    (no em-dash etc.) and BOM-prefixed so Windows PowerShell 5.1 decodes it, and
+    (b) actually PARSE under PowerShell. The prior tests structural-checked the
+    template but never ran the .ps1 through PS — so a non-ASCII char + BOM-less
+    write cascaded into parse errors and the script never ran."""
+    s = _team(tmp_path)
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    ps1 = s.dir / "supervisor.ps1"
+    raw = ps1.read_bytes()
+    # (a) UTF-8 BOM + the BODY is ASCII-only (a non-ASCII regression fails here)
+    assert raw[:3] == b"\xef\xbb\xbf", "supervisor.ps1 must be written with a UTF-8 BOM"
+    body = raw[3:]
+    non_ascii = [b for b in body if b > 0x7F]
+    assert not non_ascii, f"supervisor.ps1 body must be ASCII-only; found {non_ascii[:5]}"
+    # (b) it actually parses under PowerShell (skip where none is available)
+    pwsh = shutil.which("pwsh") or shutil.which("powershell")
+    if not pwsh:
+        return
+    check = (
+        "$e=$null; "
+        f"[void][System.Management.Automation.Language.Parser]::ParseFile('{ps1}',"
+        "[ref]$null,[ref]$e); if($e -and $e.Count){ $e[0].Message; exit 1 }")
+    res = subprocess.run([pwsh, "-NoProfile", "-Command", check],
+                         capture_output=True, text=True, timeout=60)
+    assert res.returncode == 0, f"supervisor.ps1 failed to parse: {res.stdout}{res.stderr}"
+
+
 def test_supervise_plan_exact_generated_command_runs(tmp_path: Path, capsys) -> None:
     """Regression for the BLOCKER: the generated script's command line
     (`supervise --plan --state-file S --now N`, LIVE report, NO --json) must
