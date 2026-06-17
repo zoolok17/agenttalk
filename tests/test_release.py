@@ -152,6 +152,30 @@ def test_is_release_authorized_fallback_plain_pair(tmp_path: Path) -> None:
     assert s.is_release_authorized("ghost") is False  # off-roster
 
 
+def test_is_release_authorized_fails_closed_on_ambiguous_multilead(
+    tmp_path: Path
+) -> None:
+    """Regression (codex MAJOR — broken access control): with 2+ role=lead and
+    NO operator_facing, leadership is ambiguous => authorize NO ONE (fail
+    closed). sole_lead() returns None for both zero and 2+ leads, so this must
+    NOT fall through to the any-active-agent fallback."""
+    s = _team(tmp_path, "lead1,lead2,worker")
+    s.set_role("lead1", "lead")
+    # set_role enforces at-most-one-lead, so force a 2-lead config directly.
+    import json as _json
+    cfg = _json.loads(s.config_path.read_text(encoding="utf-8"))
+    cfg["roles"] = {"lead1": "lead", "lead2": "lead"}
+    s.config_path.write_text(_json.dumps(cfg), encoding="utf-8")
+    assert s.sole_lead() is None                  # ambiguous
+    assert s.is_release_authorized("lead1") is False
+    assert s.is_release_authorized("lead2") is False
+    assert s.is_release_authorized("worker") is False  # NOT the fallback
+    # repairing it (designate a liaison) restores a single authority
+    s.set_operator_facing("lead1")
+    assert s.is_release_authorized("lead1") is True
+    assert s.is_release_authorized("worker") is False
+
+
 def test_release_command_warns_when_unauthorized(tmp_path: Path, capsys) -> None:
     s = _team(tmp_path, "lead,worker,other")
     s.set_operator_facing("lead")

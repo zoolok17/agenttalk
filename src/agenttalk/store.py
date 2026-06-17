@@ -1056,14 +1056,20 @@ class Store:
         loop). ``release`` is loop-control, so a listener must not obey it from
         an arbitrary peer.
 
-        Authority resolution (read-only): the ``operator_facing`` liaison if
-        one is set; else the sole ``role=lead``; else — when there is NEITHER a
-        liaison NOR an unambiguous lead (a plain pair / solo / legacy team) —
-        ANY active agent (a compatibility fallback so the signal still works
-        on un-roled teams). A release from an unauthorized sender is reported
-        to the human by the listener and otherwise ignored: the loop keeps
-        listening. This is advisory routing metadata; the listen skill is the
-        primary enforcement point (see SECURITY.md — trusted-team model).
+        Authority resolution (read-only):
+        - the ``operator_facing`` liaison if one is set -> only it;
+        - else the sole ``role=lead`` -> only it;
+        - else branch on the lead COUNT (``sole_lead`` returns None for BOTH
+          zero and 2+ leads, so we must distinguish them here):
+            - ZERO leads (a plain pair / solo / un-roled team) -> ANY active
+              agent (compatibility fallback so the signal still works);
+            - 2+ leads -> FAIL CLOSED: leadership is ambiguous, so authorize
+              NO ONE until a liaison is set or lead uniqueness is repaired.
+
+        A release from an unauthorized sender is reported to the human by the
+        listener and otherwise ignored: the loop keeps listening. This is
+        advisory routing metadata; the listen skill is the primary enforcement
+        point (see SECURITY.md — trusted-team model).
         """
         liaison = self.operator_facing()
         if liaison is not None:
@@ -1071,7 +1077,18 @@ class Store:
         lead = self.sole_lead()
         if lead is not None:
             return sender == lead
-        return sender in (self.load_config().get("agents") or [])
+        # No liaison and no UNAMBIGUOUS lead. Distinguish zero-lead (fallback)
+        # from 2+-lead (fail closed) — sole_lead() collapses both to None.
+        cfg = self.load_config()
+        roster = cfg.get("agents", []) or []
+        roles = cfg.get("roles") or {}
+        lead_count = sum(
+            1 for a in roster
+            if isinstance(roles.get(a), str) and roles[a].casefold() == "lead"
+        )
+        if lead_count >= 2:
+            return False  # ambiguous leadership -> no one is authoritative
+        return sender in roster  # zero leads -> plain-team compatibility
 
     def set_operator_facing(self, name: str | None) -> dict:
         """Set (or clear, with None) the operator-facing designation.
