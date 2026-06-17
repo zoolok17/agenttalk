@@ -408,6 +408,11 @@ $ErrorActionPreference = 'Stop'
 $Root      = Split-Path -Parent $PSScriptRoot   # the project root (.agenttalk/..)
 $ConfigPath = Join-Path $PSScriptRoot 'supervisor.json'
 $StatePath  = Join-Path $PSScriptRoot 'supervisor-state.json'   # SCRIPT-owned, not the bus
+# Resolve the project-local shim once and use it for ALL of the SUPERVISOR's
+# own bus calls, so they work PATH-independently - the console script may not be
+# on PATH in a source/sandbox env (only `python -m agenttalk` works). The shim
+# bakes the known Python; this never depends on PATH.
+$AgenttalkCmd = Join-Path $PSScriptRoot 'bin\agenttalk.cmd'
 $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
 # Baked at `supervise --init`: the Python that runs the bus + whether this is a
 # source checkout (prepend <root>/src to PYTHONPATH) vs a pip install.
@@ -423,6 +428,26 @@ function Pid-Alive($procId) {
   if (-not $procId) { return $false }
   return [bool](Get-Process -Id $procId -ErrorAction SilentlyContinue)
 }
+# region quote-arg  (extracted verbatim by the test harness - keep self-contained)
+function Quote-Arg([string]$a) {
+  # Windows command-line quoting (the CommandLineToArgvW rules): an arg with no
+  # space/tab/quote needs none; otherwise wrap in double quotes, doubling any
+  # run of backslashes that precedes a quote (or the closing quote) and escaping
+  # embedded quotes as \". This is what makes -ArgumentList preserve a path WITH
+  # SPACES as ONE argument at the Start-Process handoff (PS would otherwise split
+  # a bare array element on spaces).
+  if ($a -ne '' -and $a -notmatch '[ \t"]') { return $a }
+  $sb = New-Object System.Text.StringBuilder
+  [void]$sb.Append('"'); $bs = 0
+  foreach ($ch in $a.ToCharArray()) {
+    if ($ch -eq '\') { $bs++ }
+    elseif ($ch -eq '"') { [void]$sb.Append('\' * ($bs * 2 + 1)); [void]$sb.Append('"'); $bs = 0 }
+    else { if ($bs) { [void]$sb.Append('\' * $bs); $bs = 0 }; [void]$sb.Append($ch) }
+  }
+  [void]$sb.Append('\' * ($bs * 2)); [void]$sb.Append('"')
+  return $sb.ToString()
+}
+# endregion quote-arg
 function Launch($name, $plan) {
   $a = $cfg.agents.$name
   $file = $a.launch.windows_file
@@ -458,7 +483,15 @@ function Launch($name, $plan) {
   foreach ($k in $applied.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item -Path ("Env:" + $k) -Value $applied[$k] }
   try {
     $cwd = if ($a.cwd) { $a.cwd } else { $Root }
-    $proc = Start-Process -FilePath $file -ArgumentList $argv -WorkingDirectory $cwd -PassThru
+    # Quote each token per Windows rules and pass ONE command-line string: a bare
+    # array element containing a space would otherwise be split into two args at
+    # the Start-Process handoff (so a path/arg WITH SPACES survives as one arg).
+    if (@($argv).Count -gt 0) {
+      $argline = (@($argv) | ForEach-Object { Quote-Arg ([string]$_) }) -join ' '
+      $proc = Start-Process -FilePath $file -ArgumentList $argline -WorkingDirectory $cwd -PassThru
+    } else {
+      $proc = Start-Process -FilePath $file -WorkingDirectory $cwd -PassThru
+    }
   } finally {
     foreach ($k in $saved.Keys) {
       if ($null -eq $saved[$k]) { Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue }
@@ -480,7 +513,7 @@ do {
   Save-State $state
   # 2) ask Python for the safe action plan
   $now = [int][double]::Parse((Get-Date -UFormat %s))
-  $plan = (& agenttalk --root $Root supervise --plan --state-file $StatePath --now $now) | ConvertFrom-Json
+  $plan = (& $AgenttalkCmd --root $Root supervise --plan --state-file $StatePath --now $now) | ConvertFrom-Json
   foreach ($name in $plan.agents.PSObject.Properties.Name) {
     $p = $plan.agents.$name
     if ($DryRun) { Write-Host ("{0}: {1} - {2}" -f $name, $p.action, $p.reason); continue }
@@ -497,22 +530,22 @@ do {
           # Claude pins the minted session id; Codex marks launched + NO fake
           # id). Then re-load so the in-memory state matches.
           $sidArg = @(); if ($res.session_id) { $sidArg = @('--session-id', $res.session_id) }
-          & agenttalk --root $Root supervise --record-launch --for $name --cli $p.cli --pid $res.pid @sidArg --state-file $StatePath | Out-Null
+          & $AgenttalkCmd --root $Root supervise --record-launch --for $name --cli $p.cli --pid $res.pid @sidArg --state-file $StatePath | Out-Null
           $state = Load-State
           # Clear the manual marker ONLY after a CONFIRMED relaunch (a $null
           # PID = no/invalid launch command) - never silently drop a request
           # whose relaunch failed; it must remain for the next poll to retry.
-          if ($p.clear_marker) { & agenttalk --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }
+          if ($p.clear_marker) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }
         } else {
           Write-Warning ("supervisor: {0}: {1} FAILED (no PID) - keeping marker/state for retry" -f $name, $p.action)
         }
       }
-      'clear_marker' { if ($p.clear_marker) { & agenttalk --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; $state.agents.$name = $p.next_state }
-      'refuse_protected' { Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason); if ($p.clear_marker) { & agenttalk --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; $state.agents.$name = $p.next_state }
+      'clear_marker' { if ($p.clear_marker) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; $state.agents.$name = $p.next_state }
+      'refuse_protected' { Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason); if ($p.clear_marker) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; $state.agents.$name = $p.next_state }
       { $_ -in 'warn_only','suspect_warn' } {
         Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason)
         if ($p.notify -and $cfg.notify_sender -and $cfg.notify_to) {
-          & agenttalk --root $Root send --from $cfg.notify_sender --to $cfg.notify_to --kind note -m ("supervisor: {0}: {1}" -f $name, $p.reason) --quiet | Out-Null
+          & $AgenttalkCmd --root $Root send --from $cfg.notify_sender --to $cfg.notify_to --kind note -m ("supervisor: {0}: {1}" -f $name, $p.reason) --quiet | Out-Null
         }
         $state.agents.$name = $p.next_state
       }
@@ -560,15 +593,19 @@ def init(store: Store, *, force: bool = False, python_exe: str | None = None) ->
            .replace("__AGENTTALK_PYTHON__", py.replace("'", "''"))
            .replace("__SRC_ON_PYPATH__", "$true" if src_is_checkout else "$false"))
     out: dict[str, str] = {}
-    # The .ps1 + .cmd shim are written UTF-8 with a BOM (utf-8-sig): Windows
-    # PowerShell 5.1 decodes a BOM-less file as Windows-1252, corrupting any
-    # non-ASCII byte into a parse error (the 0.28.1 live-test bug). Templates are
-    # ASCII-only; the BOM is belt-and-suspenders (fine for PS 7+ / cmd.exe). The
-    # .json stays plain UTF-8 (a BOM would break Python's json.loads on read).
+    # supervisor.ps1 is written UTF-8 WITH a BOM (utf-8-sig): Windows PowerShell
+    # 5.1 decodes a BOM-less file as Windows-1252, corrupting any non-ASCII byte
+    # into a parse error (the 0.28.1 live-test bug). The template is ASCII-only;
+    # the BOM is belt-and-suspenders (fine for PS 7+).
+    # The .cmd shim is written WITHOUT a BOM (plain utf-8): cmd.exe does NOT
+    # tolerate a UTF-8 BOM in a batch file - it fuses onto the first token so
+    # `@echo off` becomes `<BOM>@echo off` ("'?@echo' is not recognized"), echo
+    # stays on, and the shim spews errors. The shim is ASCII, so no BOM is needed.
+    # The .json also stays plain UTF-8 (a BOM would break Python's json.loads).
     targets = [
         (store.dir / "supervisor.json", CONFIG_TEMPLATE, "utf-8"),
         (store.dir / "supervisor.ps1", ps1, "utf-8-sig"),
-        (store.dir / "bin" / "agenttalk.cmd", agenttalk_shim(py), "utf-8-sig"),
+        (store.dir / "bin" / "agenttalk.cmd", agenttalk_shim(py), "utf-8"),
     ]
     for path, content, encoding in targets:
         if path.exists() and not force:

@@ -8,6 +8,7 @@ fixtures. The generated PS/bash scripts are thin executors (documented-manual).
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -403,6 +404,13 @@ def test_ps_template_applies_and_restores_env() -> None:
     assert "finally" in ps                                 # restore in a finally
     assert "Remove-Item -Path (\"Env:\"" in ps             # restore: unset what wasn't set
     assert "Invoke-Expression" not in ps
+    # Launch wires Quote-Arg -> a single joined command-line -> Start-Process
+    # (BLOCKER 2): the raw $argv array must NEVER go straight to -ArgumentList,
+    # or a token with a space splits in two at the handoff.
+    assert "function Quote-Arg" in ps
+    assert "$argline = (@($argv) | ForEach-Object { Quote-Arg" in ps
+    assert "-ArgumentList $argline" in ps
+    assert "-ArgumentList $argv" not in ps
 
 
 def test_record_launch_codex_marks_launched_no_fake_id(tmp_path: Path) -> None:
@@ -560,6 +568,102 @@ def test_supervise_plan_exact_generated_command_runs(tmp_path: Path, capsys) -> 
     assert rc == 0
     plan = json.loads(capsys.readouterr().out)   # must be valid JSON
     assert plan["agents"]["worker"]["action"] == sup.RELAUNCH
+
+
+def _pick_powershell() -> str | None:
+    """Windows PowerShell 5.1 first (the launch-layer bugs are 5.1-specific), then
+    pwsh. None if neither is present (skip the Windows-gated runtime tests)."""
+    for sh in ("powershell", "pwsh"):
+        found = shutil.which(sh)
+        if found:
+            return found
+    return None
+
+
+def test_generated_ps1_runs_bus_calls_without_console_script_on_path(tmp_path: Path) -> None:
+    """0.28.1 BLOCKER 1 (RUNTIME): the generated supervisor.ps1 must make ITS OWN
+    bus calls via the project-local shim (`& $AgenttalkCmd`), so they work even
+    when the `agenttalk` console script is NOT on PATH (only `python -m agenttalk`
+    resolves - a source/sandbox env). We run the REAL .ps1 with `-Once -DryRun`
+    under a PATH stripped to the Windows dirs and assert it produces the plan with
+    no `is not recognized` / CommandNotFound error. A structural template check
+    can't catch a bare `agenttalk` regressing back in - only running it can."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    s = _team(tmp_path)                                   # roster: lead, worker
+    # A real supervisor.json (the shipped template uses an AGENT_NAME placeholder);
+    # write it BEFORE --init so init leaves it intact and only emits the .ps1 + shim.
+    (s.dir / "supervisor.json").write_text(json.dumps(_CONFIG), encoding="utf-8")
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    ps1 = s.dir / "supervisor.ps1"
+    assert ps1.exists() and (s.dir / "bin" / "agenttalk.cmd").exists()
+    # PATH reduced to the Windows dirs only: no Python Scripts dir, so a bare
+    # `agenttalk[.exe]` console script is unreachable - only the baked shim works.
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    reduced = dict(os.environ)
+    reduced["PATH"] = os.pathsep.join([
+        os.path.join(windir, "System32"), windir,
+        os.path.join(windir, "System32", "WindowsPowerShell", "v1.0")])
+    res = subprocess.run(
+        [shell, "-NoProfile", "-File", str(ps1), "-Once", "-DryRun"],
+        capture_output=True, text=True, timeout=120, env=reduced, cwd=str(tmp_path))
+    combined = res.stdout + res.stderr
+    assert res.returncode == 0, f"supervisor.ps1 -Once -DryRun failed: {combined}"
+    assert "is not recognized" not in combined and "CommandNotFound" not in combined, combined
+    # the DryRun plan line for the dead worker actually printed (the bus call ran)
+    assert "worker:" in res.stdout, f"no plan emitted; stdout={res.stdout!r} stderr={res.stderr!r}"
+
+
+def test_generated_ps1_quotes_args_with_spaces_as_single_arg(tmp_path: Path) -> None:
+    """0.28.1 BLOCKER 2 (RUNTIME): the launcher must quote each token per Windows
+    rules and hand Start-Process ONE command-line string, or an arg containing a
+    space splits into two at the handoff. We extract the EXACT Quote-Arg function
+    from the generated .ps1 and drive the SAME (Quote-Arg + -join + Start-Process)
+    path the launcher uses, launching python with a space-containing arg from a
+    cwd that ALSO contains spaces, and assert the child saw it as ONE argument."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    s = _team(tmp_path)
+    (s.dir / "supervisor.json").write_text(json.dumps(_CONFIG), encoding="utf-8")
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    ps1_text = (s.dir / "supervisor.ps1").read_text(encoding="utf-8-sig")
+    start = ps1_text.index("# region quote-arg")
+    end = ps1_text.index("# endregion quote-arg")
+    quote_arg = ps1_text[start:end]                       # the verbatim function
+    assert "function Quote-Arg" in quote_arg
+    cwd_spaces = tmp_path / "dir with spaces"
+    cwd_spaces.mkdir()
+    out = tmp_path / "argv.json"
+    py = __import__("sys").executable
+    # python -c reads sys.argv[0]='-c', the rest are the passed tokens; the LAST
+    # token is the output path. The launcher's exact arg path is reproduced below.
+    code = ("import json,sys,os; p=sys.argv[-1]; "
+            "open(p,'w').write(json.dumps({'argv': sys.argv[1:-1], 'cwd': os.getcwd()}))")
+
+    def _ps_lit(v: str) -> str:
+        return "'" + v.replace("'", "''") + "'"
+
+    harness = "\n".join([
+        quote_arg,
+        f"$py = {_ps_lit(py)}",
+        f"$argv = @('-c', {_ps_lit(code)}, 'a b c', 'plain', {_ps_lit(str(out))})",
+        "$argline = (@($argv) | ForEach-Object { Quote-Arg ([string]$_) }) -join ' '",
+        f"$p = Start-Process -FilePath $py -ArgumentList $argline "
+        f"-WorkingDirectory {_ps_lit(str(cwd_spaces))} -PassThru -Wait",
+        "exit $p.ExitCode",
+    ])
+    harness_path = tmp_path / "quote_harness.ps1"
+    harness_path.write_text(harness, encoding="utf-8-sig")
+    res = subprocess.run([shell, "-NoProfile", "-File", str(harness_path)],
+                         capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, f"harness failed: {res.stdout}{res.stderr}"
+    data = json.loads(out.read_text(encoding="utf-8"))
+    # the space-containing arg survived as ONE argument (not split into 'a','b','c')
+    assert data["argv"] == ["a b c", "plain"], data["argv"]
+    # and the spaced working directory was honored
+    assert data["cwd"].replace("\\", "/").endswith("dir with spaces"), data["cwd"]
 
 
 def test_failed_launch_preserves_marker_success_clears(tmp_path: Path) -> None:
