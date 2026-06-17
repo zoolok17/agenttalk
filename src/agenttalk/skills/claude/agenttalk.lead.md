@@ -239,3 +239,23 @@ off-contract thread, close your local view:
 ```powershell
 agenttalk ack --for $SELF --to-request <request_id>
 ```
+
+## Stopping a team member (release vs "done for now")
+
+A listening member exits its loop ONLY on `kind=release` or `kind=end`.
+A prose note — "done for now", "stand by", "nothing more right now",
+"good work" — does **NOT** stop a listener, and you must NOT expect it
+to: write those as normal notes and the member keeps listening, ready
+for the next task.
+
+- **To stand a member down** (exit its loop; you may restart it later):
+  ```powershell
+  agenttalk release --from $SELF --to <agent> [-m "reason"]
+  agenttalk release --from $SELF --all          # stand down the whole team
+  agenttalk release --from $SELF --to-group <g>  # a group
+  ```
+  `release` does NOT export a transcript (that's `end`). It is
+  authoritative only when you are the `operator_facing` agent or the
+  sole `role=lead` — set one with `roster set-operator-facing` so your
+  releases are obeyed rather than reported-and-ignored.
+- **For "done for now"**, send a normal `note` — it never stops anyone.

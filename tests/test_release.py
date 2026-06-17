@@ -1,0 +1,198 @@
+"""Tests for WP-1: the `release` stand-down signal + listen-exit clarity.
+
+`release` is a dedicated loop-control kind so a prose "done for now" can never
+be misread as "stop listening". The exit DECISION lives in the listen skill, so
+the code tests assert SURFACING + SEND + AUTHORIZATION semantics, and a
+skill-text-contract test guards the behavioral rule against drift.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+import agenttalk
+from agenttalk import cli
+from agenttalk.store import CONTROL_KINDS, KNOWN_KINDS, OPENER_KINDS, Store
+
+
+def _run(argv: list[str], root: Path) -> int:
+    return cli.main(["--root", str(root), *argv])
+
+
+def _team(tmp_path: Path, agents: str = "lead,worker") -> Store:
+    s = Store(tmp_path)
+    s.init(agents.split(","))
+    return s
+
+
+# ------------------------------------------------ (a) known kind, not control
+
+def test_release_is_known_non_control_non_opener() -> None:
+    assert "release" in KNOWN_KINDS
+    assert "release" not in CONTROL_KINDS   # must surface in wait/recv
+    assert "release" not in OPENER_KINDS    # opens no thread
+
+
+def test_release_message_validates(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    m = s.send(sender="lead", recipient="worker", body="stand down", kind="release")
+    m.validate(["lead", "worker"])  # does not raise
+    # clean: a release is not an opener, so send mints no thread correlation id
+    assert "request_id" not in (m.meta or {})
+    assert "broadcast_id" not in (m.meta or {})
+
+
+# ------------------------------------------------ (b) wait surfaces release
+
+def test_wait_returns_release_like_a_real_message(tmp_path: Path, capsys) -> None:
+    s = _team(tmp_path)
+    s.send(sender="lead", recipient="worker", body="stand down", kind="release")
+    rc = _run(["wait", "--for", "worker", "--timeout", "5", "--quiet"], tmp_path)
+    assert rc == 0  # surfaced (NOT filtered like a control kind)
+    assert "stand down" in capsys.readouterr().out
+
+
+def test_wait_returns_done_for_now_note_identically(tmp_path: Path, capsys) -> None:
+    """Contrast: at the BUS layer a 'done for now' note ALSO just surfaces
+    (exit 0). 'keep listening vs exit' is purely the skill's call on the KIND,
+    never the body — so the bus treats release and a prose note identically."""
+    s = _team(tmp_path)
+    s.send(sender="lead", recipient="worker", body="great work, you're done for now",
+           kind="note")
+    rc = _run(["wait", "--for", "worker", "--timeout", "5", "--quiet"], tmp_path)
+    assert rc == 0
+    assert "done for now" in capsys.readouterr().out
+
+
+# ------------------------------------------------ (c) recv shows release
+
+def test_recv_shows_release_in_default_view(tmp_path: Path, capsys) -> None:
+    s = _team(tmp_path)
+    s.send(sender="lead", recipient="worker", body="stand down", kind="release")
+    rc = _run(["recv", "--for", "worker"], tmp_path)
+    assert rc == 0
+    assert "stand down" in capsys.readouterr().out  # not control-filtered
+
+
+# ------------------------------------------------ (d) the release command
+
+def _sessions_transcripts(s: Store) -> list[Path]:
+    d = s.dir / "sessions"
+    return list(d.glob("transcript-*")) if d.is_dir() else []
+
+
+def test_release_single_to_is_clean_and_no_transcript(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    s.set_operator_facing("lead")
+    before = _sessions_transcripts(s)
+    rc = _run(["release", "--from", "lead", "--to", "worker", "-m", "stand down",
+               "--quiet"], tmp_path)
+    assert rc == 0
+    msgs = s.messages_for("worker")
+    assert len(msgs) == 1 and msgs[0].kind == "release"
+    assert "request_id" not in (msgs[0].meta or {})   # opens no thread
+    assert "broadcast_id" not in (msgs[0].meta or {})
+    assert _sessions_transcripts(s) == before          # NO transcript (unlike `end`)
+
+
+def test_release_all_fans_out_to_every_other_active(tmp_path: Path) -> None:
+    s = _team(tmp_path, "lead,w1,w2,w3")
+    s.set_operator_facing("lead")
+    rc = _run(["release", "--from", "lead", "--all", "--quiet"], tmp_path)
+    assert rc == 0
+    for w in ("w1", "w2", "w3"):
+        got = s.messages_for(w)
+        assert len(got) == 1 and got[0].kind == "release"
+    assert s.messages_for("lead") == []  # sender excluded
+
+
+def test_release_to_group(tmp_path: Path) -> None:
+    s = _team(tmp_path, "lead,w1,w2,w3")
+    s.set_operator_facing("lead")
+    s.set_group("pod", ["w1", "w2"])
+    rc = _run(["release", "--from", "lead", "--to-group", "pod", "--quiet"], tmp_path)
+    assert rc == 0
+    assert len(s.messages_for("w1")) == 1
+    assert len(s.messages_for("w2")) == 1
+    assert s.messages_for("w3") == []  # not in the group
+
+
+def test_release_requires_exactly_one_target(tmp_path: Path) -> None:
+    _team(tmp_path)
+    assert _run(["release", "--from", "lead", "--quiet"], tmp_path) == 2
+    assert _run(["release", "--from", "lead", "--to", "worker", "--all",
+                 "--quiet"], tmp_path) == 2
+
+
+# ------------------------------------------------ (f) authorization
+
+def test_is_release_authorized_liaison(tmp_path: Path) -> None:
+    s = _team(tmp_path, "lead,worker,other")
+    s.set_operator_facing("lead")
+    assert s.is_release_authorized("lead") is True
+    assert s.is_release_authorized("worker") is False
+    assert s.is_release_authorized("other") is False
+
+
+def test_is_release_authorized_sole_lead(tmp_path: Path) -> None:
+    s = _team(tmp_path, "lead,worker")
+    s.set_role("lead", "lead")
+    assert s.is_release_authorized("lead") is True
+    assert s.is_release_authorized("worker") is False
+
+
+def test_is_release_authorized_fallback_plain_pair(tmp_path: Path) -> None:
+    """No liaison and no unambiguous lead (plain pair) => any active agent is
+    authorized (compatibility)."""
+    s = _team(tmp_path, "alpha,beta")
+    assert s.is_release_authorized("alpha") is True
+    assert s.is_release_authorized("beta") is True
+    assert s.is_release_authorized("ghost") is False  # off-roster
+
+
+def test_release_command_warns_when_unauthorized(tmp_path: Path, capsys) -> None:
+    s = _team(tmp_path, "lead,worker,other")
+    s.set_operator_facing("lead")
+    rc = _run(["release", "--from", "other", "--to", "worker", "--quiet"], tmp_path)
+    assert rc == 0  # non-fatal — still sends
+    assert "not the operator-facing" in capsys.readouterr().err
+
+
+def test_release_command_no_warning_when_authorized(tmp_path: Path, capsys) -> None:
+    s = _team(tmp_path, "lead,worker")
+    s.set_operator_facing("lead")
+    rc = _run(["release", "--from", "lead", "--to", "worker", "--quiet"], tmp_path)
+    assert rc == 0
+    assert "not the operator-facing" not in capsys.readouterr().err
+
+
+# ------------------------------------------------ (e) skill-text contract
+
+def _skill(*parts: str) -> str:
+    return (Path(agenttalk.__file__).parent / "skills" / Path(*parts)).read_text(
+        encoding="utf-8")
+
+
+@pytest.mark.parametrize("path", [
+    ("claude", "agenttalk.listen.md"),
+    ("codex", "agenttalk-listen", "SKILL.md"),
+])
+def test_listen_skills_state_release_end_only_exit_and_antipattern(path) -> None:
+    text = _skill(*path)
+    assert "exits ONLY on `kind=release`" in text  # the hard rule
+    assert "KEEP LISTENING" in text
+    assert "Anti-pattern" in text                  # the exact-trap example
+    assert "done for now" in text                  # the prose that must NOT exit
+
+
+@pytest.mark.parametrize("path", [
+    ("claude", "agenttalk.lead.md"),
+    ("codex", "agenttalk-lead", "SKILL.md"),
+])
+def test_lead_skills_state_release_to_stop_and_note_for_done(path) -> None:
+    text = _skill(*path)
+    assert "agenttalk release" in text             # the way to actually stop a member
+    assert "done for now" in text
+    assert "never stops anyone" in text            # a note doesn't stop a listener

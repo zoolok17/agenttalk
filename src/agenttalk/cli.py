@@ -3305,6 +3305,88 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_release(args: argparse.Namespace) -> int:
+    """Send a `release` (stand-down) signal so a listener exits its loop.
+
+    Distinct from `end`: NO transcript export and the agent may be restarted
+    later. A single `--to` is a metadata-clean point-to-point send (opens no
+    thread — no request_id/broadcast_id); `--to-group`/`--all` fan the same
+    clean signal out with a lightweight delivered/missed report (re-run to
+    retry — there is no `--resume` correlation id by design). Only the
+    operator-facing / sole-lead sender's release is authoritative; the command
+    warns (non-fatal) otherwise, and the listen skill is the enforcement point.
+    """
+    store = _get_store(args)
+    cfg = store.load_config()
+    sender = _resolve_self(args.sender, roster=cfg.get("agents") or [])
+    if sum(bool(x) for x in (args.recipient, args.to_group, args.all)) != 1:
+        sys.stderr.write("agenttalk release: specify exactly one of "
+                         "--to <agent>, --to-group <group>, or --all\n")
+        return 2
+    # The reason is OPTIONAL — only read a body when one was actually given
+    # (-m or --file). Do NOT fall through to _read_body's stdin sniff, which
+    # would block/error when release is run without a reason in a pipeline.
+    if args.message is not None or args.file:
+        body = _read_body(args) or "released — stand down (you may be restarted later)"
+    else:
+        body = "released — stand down (you may be restarted later)"
+    # Advisory authorization: a release only stands a listener down when it
+    # comes from the liaison / sole lead. Warn (never block) otherwise.
+    if not store.is_release_authorized(sender):
+        sys.stderr.write(
+            f"warning: {sender!r} is not the operator-facing or sole-lead "
+            f"agent — recipients may report and IGNORE this release. A release "
+            f"only stands a listener down when sent by the liaison or the sole "
+            f"role=lead (set one with `roster set-operator-facing` / "
+            f"`roster set-role ... lead`).\n")
+    if args.recipient:
+        # Single target: let store.send validate (self-mail / off-roster /
+        # retired -> ValueError -> exit 2 via main). Clean meta: kind=release
+        # is not an opener, so send() mints no request_id/broadcast_id.
+        store.send(sender=sender, recipient=args.recipient, body=body,
+                   kind="release")
+        if not args.quiet:
+            print(f"released: {args.recipient} (stood down)")
+        return 0
+    # Group / all: resolve to a concrete active recipient list and fan out the
+    # same clean signal. No correlation id, so no --resume — re-run to retry.
+    target = "all" if args.all else args.to_group
+    try:
+        recipients = store.resolve_audience(target, exclude=sender)
+    except ValueError as e:
+        sys.stderr.write(f"agenttalk release: {e}\n")
+        return 2
+    if not recipients:
+        sys.stderr.write(
+            f"agenttalk release: audience {target!r} has no recipients "
+            f"besides {sender}.\n")
+        return 2
+    sent: list = []
+    failure: Exception | None = None
+    for r in recipients:
+        try:
+            sent.append(store.send(sender=sender, recipient=r, body=body,
+                                   kind="release"))
+        except Exception as e:  # noqa: BLE001 — account every copy
+            failure = e
+            break
+    if failure is not None:
+        delivered = [m.recipient for m in sent]
+        missed = [r for r in recipients if r not in delivered]
+        if not args.quiet:
+            print(f"delivered=[{', '.join(delivered)}]")
+            print(f"missed=[{', '.join(missed)}]")
+        sys.stderr.write(
+            f"agenttalk release: partial — copy for {missed[0]!r} failed: "
+            f"{failure}. Re-run to retry the missed recipients.\n")
+        return 5
+    if not args.quiet:
+        n = len(sent)
+        print(f"released: {', '.join(m.recipient for m in sent)} "
+              f"({n} agent{'s' if n != 1 else ''} stood down)")
+    return 0
+
+
 def cmd_end(args: argparse.Namespace) -> int:
     store = _get_store(args)
     cfg = store.load_config()
@@ -3818,6 +3900,23 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--from", dest="sender", help="Sender agent name (default: $AGENTTALK_SELF)")
     pe.add_argument("--reason", help="Free-text reason")
     pe.set_defaults(func=cmd_end)
+
+    prel = sub.add_parser(
+        "release",
+        help="Signal an agent (or team) to STAND DOWN and exit its listen "
+             "loop. Distinct from `end`: no transcript export, and the agent "
+             "may be restarted later. Only the operator-facing / sole-lead "
+             "sender's release is authoritative (others warn). Target exactly "
+             "one of --to / --to-group / --all.",
+    )
+    prel.add_argument("--from", dest="sender", help="Sender agent name (default: $AGENTTALK_SELF)")
+    prel.add_argument("--to", dest="recipient", help="Release ONE agent (point-to-point).")
+    prel.add_argument("--to-group", dest="to_group", help="Release every member of this group.")
+    prel.add_argument("--all", action="store_true", help="Release all other active agents.")
+    prel.add_argument("-m", "--message", dest="message", help="Optional stand-down reason.")
+    prel.add_argument("--file", dest="file", help="Read the reason from this file ('-' = stdin).")
+    prel.add_argument("--quiet", action="store_true")
+    prel.set_defaults(func=cmd_release)
 
     prpl = sub.add_parser(
         "reply",

@@ -65,6 +65,15 @@ KNOWN_KINDS = frozenset({
     "proposal-response",
     "wake",
     "end",
+    # Loop-control signal: "stand down / exit your listen loop — we may
+    # restart you later." Distinct from `end` (whole session over + transcript
+    # export): `release` is lighter (no transcript) and the agent may be
+    # re-armed. Deliberately NOT a control kind — `wait` must RETURN it so the
+    # listener sees it and exits (same path as `end`); the exit decision lives
+    # in the listen skill, not the bus. Opens no thread (not an opener kind).
+    # Added for the listen-exit-clarity feature: a DEDICATED stop signal so a
+    # prose "done for now" can never be misread as "stop listening".
+    "release",
     # Control-plane kind: peer is still drafting a real reply. Receivers
     # treat these as a deadline-extension signal in `agenttalk wait` —
     # they do not surface as a returned reply. Added in 0.8.0 to fix
@@ -1041,6 +1050,28 @@ class Store:
             return None
         roster = cfg.get("agents", []) or []
         return v if v in roster else None
+
+    def is_release_authorized(self, sender: str) -> bool:
+        """Whether ``sender`` may AUTHORITATIVELY release a listener (exit its
+        loop). ``release`` is loop-control, so a listener must not obey it from
+        an arbitrary peer.
+
+        Authority resolution (read-only): the ``operator_facing`` liaison if
+        one is set; else the sole ``role=lead``; else — when there is NEITHER a
+        liaison NOR an unambiguous lead (a plain pair / solo / legacy team) —
+        ANY active agent (a compatibility fallback so the signal still works
+        on un-roled teams). A release from an unauthorized sender is reported
+        to the human by the listener and otherwise ignored: the loop keeps
+        listening. This is advisory routing metadata; the listen skill is the
+        primary enforcement point (see SECURITY.md — trusted-team model).
+        """
+        liaison = self.operator_facing()
+        if liaison is not None:
+            return sender == liaison
+        lead = self.sole_lead()
+        if lead is not None:
+            return sender == lead
+        return sender in (self.load_config().get("agents") or [])
 
     def set_operator_facing(self, name: str | None) -> dict:
         """Set (or clear, with None) the operator-facing designation.
