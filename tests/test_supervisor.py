@@ -281,9 +281,9 @@ def test_stuck_recover_when_alive_stale_and_hook_on() -> None:
     assert p["action"] == sup.STUCK_RECOVER
     assert p["kill_first"] is True            # alive-but-stuck -> kill before resume
     assert p["launch_mode"] == "resume"
-    assert p["session_args"] == (
-        '--resume SID --permission-mode dontAsk '
-        '--allowedTools "Bash(agenttalk *)" -p "continue listening"')
+    assert p["session_args"] == ["--resume", "SID", "--permission-mode", "dontAsk",
+                                 "--allowedTools", "Bash(agenttalk *)",
+                                 "-p", "/agenttalk.listen"]
     assert p["next_state"]["consecutive_fails"] == 1   # backoff applies
 
 
@@ -318,12 +318,12 @@ def test_stuck_recover_requires_hook_else_suspect() -> None:
 # ---------------------------------------- WP-3: session-id lifecycle + args
 
 def test_session_id_fresh_then_resume() -> None:
-    # no session_id yet -> fresh launch (template carries {SESSION_ID})
+    # no session_id yet -> fresh launch (token list still carries {SESSION_ID})
     p = _plan_hook(_report(heartbeat_stale=True),
                    {"agents": {"worker": {"pid_alive": True}}})
     assert p["launch_mode"] == "fresh"
     assert p["session_id"] is None
-    assert p["session_args"] == "--session-id {SESSION_ID}"
+    assert "{SESSION_ID}" in p["session_args"]            # token list
     # once the script has pinned a session_id -> resume reuses it
     p2 = _plan_hook(_report(heartbeat_stale=True),
                     {"agents": {"worker": {"pid_alive": True, "session_id": "abc-123"}}})
@@ -331,21 +331,33 @@ def test_session_id_fresh_then_resume() -> None:
     assert "abc-123" in p2["session_args"]
 
 
-def test_session_args_per_cli() -> None:
-    assert sup.session_args("claude", "fresh", None) == "--session-id {SESSION_ID}"
-    assert sup.session_args("claude", "resume", "X") == (
-        '--resume X --permission-mode dontAsk '
-        '--allowedTools "Bash(agenttalk *)" -p "continue listening"')
-    # Codex (blocker 1): NO fake --session-id on a fresh launch; resume uses
-    # --last; the listen prompt is ALWAYS present.
+def test_session_args_per_cli_explicit_skill() -> None:
+    # Claude: explicit /agenttalk.listen as a SINGLE token, both modes.
+    assert sup.session_args("claude", "fresh", None) == [
+        "--session-id", "{SESSION_ID}", "-p", "/agenttalk.listen"]
+    assert sup.session_args("claude", "resume", "X") == [
+        "--resume", "X", "--permission-mode", "dontAsk",
+        "--allowedTools", "Bash(agenttalk *)", "-p", "/agenttalk.listen"]
+    # Codex (blocker 1): NO fake --session-id on fresh; resume via --last; the
+    # EXPLICIT $agenttalk-listen skill is a SINGLE token in both modes.
     cfresh = sup.session_args("codex", "fresh", None)
     assert "--session-id" not in cfresh
-    assert "continue listening" in cfresh
+    assert cfresh[-1] == "$agenttalk-listen"
     cresume = sup.session_args("codex", "resume", None)
-    assert "resume --last" in cresume and "continue listening" in cresume
-    # per-agent override wins
-    over = {"session": {"resume_args": "--resume {SESSION_ID} --yolo"}}
-    assert sup.session_args("claude", "resume", "Z", over) == "--resume Z --yolo"
+    assert cresume[:2] == ["resume", "--last"] and cresume[-1] == "$agenttalk-listen"
+    # per-agent override wins (token list)
+    over = {"session": {"resume": ["--resume", "{SESSION_ID}", "--yolo"]}}
+    assert sup.session_args("claude", "resume", "Z", over) == ["--resume", "Z", "--yolo"]
+
+
+def test_ps_arglist_quotes_dollar_literally() -> None:
+    # blocker 1(b): the prompt is ONE single-quoted literal — `$` never expands,
+    # nesting quotes never reshape tokens.
+    rendered = sup.ps_arglist(["-a", "never", "$agenttalk-listen"])
+    assert rendered == "'-a','never','$agenttalk-listen'"
+    assert "'$agenttalk-listen'" in rendered
+    # embedded single quotes are doubled
+    assert sup.ps_arglist(["it's"]) == "'it''s'"
 
 
 def test_codex_relaunch_command_uses_codex_args() -> None:
@@ -356,8 +368,32 @@ def test_codex_relaunch_command_uses_codex_args() -> None:
     p = sup.plan_actions(rpt, {"agents": {"c": {"pid_alive": True, "launched": True}}},
                          cfg, now_epoch=NOW)["agents"]["c"]
     assert p["cli"] == "codex" and p["launch_mode"] == "resume"
-    assert p["session_args"] == "resume --last -a never -s workspace-write 'continue listening'"
+    assert p["session_args"] == ["resume", "--last", "-a", "never", "-s",
+                                 "workspace-write", "$agenttalk-listen"]
     assert "--session-id" not in p["session_args"]
+    assert p["session_args_ps"].endswith("'$agenttalk-listen'")  # quote-safe
+
+
+def test_record_launch_codex_marks_launched_no_fake_id(tmp_path: Path) -> None:
+    """Blocker 2/launch-state: the SCRIPT-side launch-success rule (via the
+    --record-launch command) — Codex gets launched=true + NO pinned id; Claude
+    pins the minted id. Tested through the real command, not a hand-injected
+    planner input."""
+    _team(tmp_path)
+    sf = tmp_path / "state.json"
+    sf.write_text(json.dumps({"agents": {"worker": {}}}), encoding="utf-8")
+    # codex launch success: no --session-id passed
+    assert _run(["supervise", "--record-launch", "--for", "worker", "--cli", "codex",
+                 "--pid", "777", "--state-file", str(sf)], tmp_path) == 0
+    e = json.loads(sf.read_text(encoding="utf-8"))["agents"]["worker"]
+    assert e["pid"] == 777 and e["launched"] is True and e["session_id"] is None
+    # claude launch success: minted id pinned
+    sf.write_text(json.dumps({"agents": {"worker": {}}}), encoding="utf-8")
+    assert _run(["supervise", "--record-launch", "--for", "worker", "--cli", "claude",
+                 "--pid", "888", "--session-id", "sess-x", "--state-file", str(sf)],
+                tmp_path) == 0
+    e2 = json.loads(sf.read_text(encoding="utf-8"))["agents"]["worker"]
+    assert e2["pid"] == 888 and e2["launched"] is True and e2["session_id"] == "sess-x"
 
 
 def test_state_round_trip_preserves_pid_and_session(tmp_path: Path) -> None:

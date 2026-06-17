@@ -3489,6 +3489,22 @@ def cmd_supervise(args: argparse.Namespace) -> int:
               "global, never clobbered). Now set activity_hook=true for the "
               "instrumented agents in supervisor.json to enable stuck-recovery.")
         return 0
+    if args.record_launch:
+        if not args.agent or not args.state_file:
+            sys.stderr.write("agenttalk supervise --record-launch: need --for "
+                             "<agent> and --state-file <path>\n")
+            return 2
+        p = Path(args.state_file)
+        state = {}
+        if p.exists():
+            try:
+                state = json.loads(p.read_text(encoding="utf-8")) or {}
+            except (ValueError, OSError):
+                state = {}
+        sup.record_launch(state, args.agent, cli=args.cli or "claude",
+                          pid=args.pid, session_id=args.session_id)
+        p.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return 0
     if args.clear_restart:
         if not args.agent or not args.request_id:
             sys.stderr.write("agenttalk supervise --clear-restart: need --for "
@@ -4102,6 +4118,15 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Emit the action plan (the shared decision table) as JSON.")
     gsup.add_argument("--clear-restart", dest="clear_restart", action="store_true",
                       help="Clear a restart-request marker by --for + --request-id.")
+    gsup.add_argument("--record-launch", dest="record_launch", action="store_true",
+                      help="(script use) Apply launch-success state for --for: "
+                           "Claude pins --session-id; Codex marks launched + no "
+                           "pinned id. Needs --state-file.")
+    psup.add_argument("--cli", help="(--record-launch) the agent CLI ('claude'|'codex').")
+    psup.add_argument("--pid", type=int, default=None,
+                      help="(--record-launch) the launched process id.")
+    psup.add_argument("--session-id", dest="session_id",
+                      help="(--record-launch) the minted session id (Claude).")
     gsup.add_argument("--install-activity-hook", dest="install_activity_hook",
                       action="store_true",
                       help="MERGE the activity heartbeat hook into the project "

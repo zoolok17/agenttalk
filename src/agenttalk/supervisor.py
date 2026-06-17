@@ -49,24 +49,29 @@ _DEFAULTS = {
     "backoff": {"base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180},
 }
 
-# Per-CLI session-argument templates (the {SESSION_ID} placeholder is filled by
-# Python for resume, or by the script after it mints a uuid for a fresh
-# launch). Operator-overridable per agent via config["agents"][n]["session"];
-# the Codex forms are best-effort defaults pending the operator's exact CLI.
+# Per-CLI session-argument templates, as LISTS of literal tokens (so the
+# generated PowerShell uses an array-of-literals ArgumentList — single-quoted
+# PS literals do NOT expand `$`, so the Codex `$agenttalk-listen` prompt and
+# any token survive intact, sidestepping the quote-nesting + $-expansion
+# hazards codex flagged). The launch PROMPT is the EXPLICIT listen skill for
+# BOTH fresh and resume (a fresh session has no context, so prose won't enter
+# listen mode): Claude `/agenttalk.listen`, Codex `$agenttalk-listen`.
+# {SESSION_ID} is filled by Python for resume, or by the script (claude only)
+# after it mints a uuid. Operator-overridable per agent via
+# config["agents"][n]["session"]["fresh"|"resume"] (a token list).
 _SESSION_DEFAULTS = {
     "claude": {
-        "fresh_args": "--session-id {SESSION_ID}",
-        "resume_args": ('--resume {SESSION_ID} --permission-mode dontAsk '
-                        '--allowedTools "Bash(agenttalk *)" -p "continue listening"'),
+        "fresh": ["--session-id", "{SESSION_ID}", "-p", "/agenttalk.listen"],
+        "resume": ["--resume", "{SESSION_ID}", "--permission-mode", "dontAsk",
+                   "--allowedTools", "Bash(agenttalk *)", "-p", "/agenttalk.listen"],
     },
     "codex": {
-        # Codex does NOT pin a session id at launch (unlike Claude's
-        # --session-id). A fresh launch just starts with the listen prompt; a
-        # relaunch RESUMES the most-recent session in this workspace
-        # (`resume --last`) — a documented best-effort (codex review may refine
-        # to a captured id). The listen prompt is ALWAYS included.
-        "fresh_args": "-a never -s workspace-write 'continue listening'",
-        "resume_args": "resume --last -a never -s workspace-write 'continue listening'",
+        # Codex does NOT pin a session id at launch; a fresh launch starts with
+        # the listen skill, a relaunch RESUMES the most-recent workspace session
+        # (`resume --last`, documented best-effort). The skill is ALWAYS present.
+        "fresh": ["-a", "never", "-s", "workspace-write", "$agenttalk-listen"],
+        "resume": ["resume", "--last", "-a", "never", "-s", "workspace-write",
+                   "$agenttalk-listen"],
     },
 }
 
@@ -81,32 +86,46 @@ def _backoff_cfg(config: dict) -> dict:
 
 
 def session_args(cli: str, mode: str, session_id: str | None,
-                 cfg_agent: dict | None = None) -> str:
-    """The exact session CLI args for a (cli, mode) launch. ``mode`` is "fresh"
-    or "resume". A per-agent ``session`` config overrides the built-in
-    templates. ``{SESSION_ID}`` is substituted when ``session_id`` is known
-    (resume); for a fresh launch the template is returned verbatim and the
-    script substitutes the uuid it mints. Pure + deterministic — this is what
-    makes the generated resume command line unit-testable (the WP-2 lesson)."""
+                 cfg_agent: dict | None = None) -> list[str]:
+    """The session CLI args for a (cli, mode) launch as a LIST of literal
+    tokens. ``mode`` is "fresh" or "resume". A per-agent ``session`` config
+    overrides the built-in token lists. ``{SESSION_ID}`` is substituted when
+    ``session_id`` is known (resume); for a fresh launch the ``{SESSION_ID}``
+    token is left for the script to fill with the uuid it mints. Pure +
+    deterministic — each token is one argument, so the generated command line
+    is unit-testable and quote-safe."""
     cli = cli if cli in _SESSION_DEFAULTS else "claude"
-    key = "fresh_args" if mode == "fresh" else "resume_args"
-    template = _SESSION_DEFAULTS[cli][key]
+    key = "fresh" if mode == "fresh" else "resume"
+    tokens = _SESSION_DEFAULTS[cli][key]
     over = (cfg_agent or {}).get("session")
-    if isinstance(over, dict) and isinstance(over.get(key), str):
-        template = over[key]
-    return template.replace("{SESSION_ID}", session_id) if session_id else template
+    if isinstance(over, dict) and isinstance(over.get(key), list):
+        tokens = over[key]
+    if session_id:
+        return [session_id if t == "{SESSION_ID}" else t for t in tokens]
+    return list(tokens)
+
+
+def ps_arglist(tokens: list[str]) -> str:
+    """Render tokens as a PowerShell single-quoted array-element string for an
+    ``-ArgumentList @(...)`` slot: each token is a single-quoted literal (PS
+    single quotes do NOT expand ``$``; embedded single quotes are doubled), so
+    ``$agenttalk-listen`` stays one literal argument, never an expansion."""
+    return ",".join("'" + t.replace("'", "''") + "'" for t in tokens)
 
 
 def _launch_detail(st: dict, cfg_agent: dict) -> dict:
     """Resume/launch fields for a launch action. RESUME once the agent has been
     launched before — Claude pins a session_id (set by the script on a fresh
     launch); Codex doesn't pin, so a ``launched`` flag drives its resume-by-last.
-    Either signal means "we've launched this agent, so resume its context"."""
+    Either signal means "we've launched this agent, so resume its context".
+    ``session_args`` is the token list; ``session_args_ps`` is the quote-safe PS
+    array-element form the generated script splices into {SESSION_ARGS}."""
     cli = cfg_agent.get("cli", "claude")
     session_id = st.get("session_id") or None
     mode = "resume" if (session_id or st.get("launched")) else "fresh"
+    tokens = session_args(cli, mode, session_id, cfg_agent)
     return {"cli": cli, "launch_mode": mode, "session_id": session_id,
-            "session_args": session_args(cli, mode, session_id, cfg_agent)}
+            "session_args": tokens, "session_args_ps": ps_arglist(tokens)}
 
 
 def build_report(store: Store, *, now_epoch: float,
@@ -325,6 +344,30 @@ def plan_actions(report: dict, state: dict, config: dict,
     return {"now_epoch": now_epoch, "agents": out}
 
 
+def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
+                  session_id: str | None = None) -> dict:
+    """Apply a CLI's launch-SUCCESS state to ``state`` IN PLACE — the rule the
+    generated script defers to Python (so it's testable, not PS-internal).
+    Claude PINS the session_id it minted (resume by id); Codex pins NOTHING —
+    it has no launch-time id, so its ``launched`` flag drives resume-by-last,
+    and persisting a fake id would be wrong. Both mark ``pid`` + ``launched``.
+    """
+    agents = state.setdefault("agents", {})
+    if not isinstance(agents, dict):
+        agents = state["agents"] = {}
+    entry = agents.get(agent)
+    if not isinstance(entry, dict):
+        entry = agents[agent] = {}
+    entry["pid"] = pid
+    entry["pid_alive"] = True
+    entry["launched"] = True
+    if cli == "codex":
+        entry["session_id"] = None        # never persist a fake id for codex
+    elif session_id:
+        entry["session_id"] = session_id  # claude: pin the minted/known id
+    return state
+
+
 # --------------------------------------------------------------- init / scaffold
 
 CONFIG_TEMPLATE = """\
@@ -388,12 +431,13 @@ function Launch($name, $plan) {
   if (-not $a.launch.windows -or $a.launch.windows -like 'EXAMPLE*') {
     Write-Warning "supervisor: agent '$name' has no real launch.windows command — fill supervisor.json"; return $null
   }
-  # Resolve {SESSION_ARGS}: the planner pre-fills RESUME args (session id known);
-  # a FRESH first launch mints + pins a new session id here, then persists it so
-  # every later relaunch RESUMES it (context preserved across a force-kill).
+  # {SESSION_ARGS} is the planner's PS array-of-literals string (single-quoted
+  # tokens — `$` does NOT expand, each token = one argument). On a FRESH Claude
+  # launch the {SESSION_ID} token is still present; mint + substitute a uuid.
+  # Codex has no {SESSION_ID} (it doesn't pin), so $sid stays $null there.
+  $sargs = $plan.session_args_ps
   $sid = $plan.session_id
-  $sargs = $plan.session_args
-  if ($plan.launch_mode -eq 'fresh') {
+  if ($plan.launch_mode -eq 'fresh' -and $sargs -match '\{SESSION_ID\}') {
     $sid = [guid]::NewGuid().ToString()
     $sargs = $sargs -replace '\{SESSION_ID\}', $sid
   }
@@ -428,18 +472,21 @@ do {
         # has nothing to kill. Both resume the pinned session.
         if ($p.kill_first -and (Pid-Alive $state.agents.$name.pid)) { Stop-Process -Id $state.agents.$name.pid -Force -ErrorAction SilentlyContinue }
         $res = Launch $name $p
-        $ns = $p.next_state
+        $state.agents.$name = $p.next_state    # planner fields (passes pid/session_id/launched through)
         if ($res) {
-          $ns | Add-Member pid $res.pid -Force; $ns | Add-Member pid_alive $true -Force
-          $ns | Add-Member session_id $res.session_id -Force   # persist so next launch RESUMES
-          $state.agents.$name = $ns
+          Save-State $state
+          # Apply the launch-SUCCESS state via Python (the authoritative rule:
+          # Claude pins the minted session id; Codex marks launched + NO fake
+          # id). Then re-load so the in-memory state matches.
+          $sidArg = @(); if ($res.session_id) { $sidArg = @('--session-id', $res.session_id) }
+          & agenttalk --root $Root supervise --record-launch --for $name --cli $p.cli --pid $res.pid @sidArg --state-file $StatePath | Out-Null
+          $state = Load-State
           # Clear the manual marker ONLY after a CONFIRMED relaunch (a $null
           # PID = no/invalid launch command) — never silently drop a request
           # whose relaunch failed; it must remain for the next poll to retry.
           if ($p.clear_marker) { & agenttalk --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }
         } else {
           Write-Warning ("supervisor: {0}: {1} FAILED (no PID) — keeping marker/state for retry" -f $name, $p.action)
-          $state.agents.$name = $ns
         }
       }
       'clear_marker' { if ($p.clear_marker) { & agenttalk --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; $state.agents.$name = $p.next_state }
