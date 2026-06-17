@@ -1002,6 +1002,26 @@ class Store:
                  if isinstance(roles.get(a), str) and roles[a].casefold() == "lead"]
         return leads[0] if len(leads) == 1 else None
 
+    def protected_agents(self) -> set[str]:
+        """Agents the supervisor must NEVER auto-kill/relaunch (WP-2): the
+        ``operator_facing`` liaison UNION EVERY active ``role=lead`` agent.
+
+        Fails CLOSED on ambiguity by design — unlike ``sole_lead`` (which
+        collapses 2+ leads to None), this protects ALL leads, so a 2-lead team
+        with no liaison still has both human channels protected from an
+        unattended auto-restart. Read-only.
+        """
+        cfg = self.load_config()
+        roster = cfg.get("agents", []) or []
+        roles = cfg.get("roles") or {}
+        protected = {a for a in roster
+                     if isinstance(roles.get(a), str)
+                     and roles[a].casefold() == "lead"}
+        liaison = self.operator_facing()
+        if liaison is not None:
+            protected.add(liaison)
+        return protected
+
     def set_group(self, group: str, members: list[str]) -> dict:
         with self._config_lock():
             cfg = self.load_config()
@@ -2173,6 +2193,45 @@ class Store:
                                json.dumps(payload, ensure_ascii=False))
         except OSError:
             pass
+
+    # ------------------------------------------- restart-request markers (#WP-2)
+    #
+    # A `state/<agent>.restart-request` marker is the MANUAL trigger for the
+    # external supervisor: `agenttalk request-restart --for <agent>` writes it
+    # atomically; the supervisor watches, relaunches, and clears it BY
+    # request_id (so a marker rewritten after the relaunch decision is not lost
+    # — never silently drop a failed request). Bus-side protocol; the
+    # supervisor's own pid/backoff state stays in a script-local file, not here.
+
+    def write_restart_request(self, agent: str, payload: dict) -> None:
+        """Atomically write ``agent``'s restart-request marker."""
+        _atomic_write_text(self.state_dir / f"{agent}.restart-request",
+                           json.dumps(payload, ensure_ascii=False))
+
+    def read_restart_request(self, agent: str) -> dict | None:
+        """Return ``agent``'s restart-request marker, or None if absent/corrupt."""
+        p = self.state_dir / f"{agent}.restart-request"
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, ValueError, OSError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def clear_restart_request(self, agent: str, request_id: str) -> bool:
+        """Clear ``agent``'s restart-request marker ONLY if its current
+        ``request_id`` matches — so a NEWER request written after the relaunch
+        decision survives (no lost-wakeup). Returns True when it cleared one.
+        Best-effort, never raises."""
+        marker = self.read_restart_request(agent)
+        if not marker or marker.get("request_id") != request_id:
+            return False
+        try:
+            (self.state_dir / f"{agent}.restart-request").unlink()
+            return True
+        except OSError:
+            return False
 
     # ------------------------------------------- reply-in-flight markers
     #

@@ -30,6 +30,7 @@ from agenttalk import doctor as dr
 from agenttalk import install_skills as iskl
 from agenttalk import signing as _signing
 from agenttalk import threads as th
+from agenttalk import supervisor as sup
 
 # Hard ceiling on cumulative deadline extension from `composing` pings,
 # regardless of how many arrive. Prevents a misbehaving (or stuck) peer
@@ -3387,6 +3388,106 @@ def cmd_release(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_supervisor_config(store: Store) -> dict:
+    p = store.dir / "supervisor.json"
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (ValueError, OSError):
+        return {}
+
+
+def cmd_request_restart(args: argparse.Namespace) -> int:
+    """Queue a MANUAL restart of an agent (the supervisor relaunches + clears).
+
+    Writes an atomic, request_id-scoped state/<agent>.restart-request marker.
+    A protected agent (operator_facing / role=lead) needs --force-protected,
+    enforced by the supervisor.
+    """
+    store = _get_store(args)
+    roster = store.load_config().get("agents") or []
+    agent = args.agent
+    if agent not in roster:
+        sys.stderr.write(f"agenttalk request-restart: {agent!r} is not in the "
+                         f"roster {sorted(roster)}\n")
+        return 2
+    requested_by = (_resolve_self(args.sender, roster=roster)
+                    if getattr(args, "sender", None) else "operator")
+    rid = "rr-" + uuid.uuid4().hex[:12]
+    store.write_restart_request(agent, {
+        "agent": agent,
+        "request_id": rid,
+        "source": "manual",
+        "requested_by": requested_by,
+        "at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "at_epoch": time.time(),
+        "force_protected": bool(args.force_protected),
+        "reason": args.reason or "",
+    })
+    extra = " (force-protected)" if args.force_protected else ""
+    print(f"request-restart: queued restart of {agent!r} [{rid}]{extra} — the "
+          f"supervisor will relaunch it.")
+    return 0
+
+
+def cmd_supervise(args: argparse.Namespace) -> int:
+    """Supervisor support (thin): --init scaffolds config+scripts; --report
+    emits the read-only liveness JSON; --plan emits the action plan (the shared
+    decision table); --clear-restart clears a restart marker by request_id."""
+    store = _get_store(args)
+    if args.init:
+        res = sup.init(store, force=args.force)
+        for path, status in res.items():
+            print(f"  {status}: {path}")
+        wrote = [p for p, s in res.items() if s == "written"]
+        if not wrote:
+            print("supervise --init: all files already exist (use --force to "
+                  "regenerate).")
+        else:
+            print("supervise --init: fill in each agent's launch command in "
+                  "supervisor.json, then run the supervisor script in its own "
+                  "window.")
+        return 0
+    if args.clear_restart:
+        if not args.agent or not args.request_id:
+            sys.stderr.write("agenttalk supervise --clear-restart: need --for "
+                             "<agent> and --request-id <rid>\n")
+            return 2
+        cleared = store.clear_restart_request(args.agent, args.request_id)
+        print(f"cleared restart-request for {args.agent!r}" if cleared
+              else f"no matching restart-request for {args.agent!r} "
+                   f"[{args.request_id}] (already cleared or superseded)")
+        return 0
+    config = _load_supervisor_config(store)
+    now = args.now if args.now is not None else time.time()
+    suspect = config.get("suspect_after_seconds")
+    suspect = float(suspect) if isinstance(suspect, (int, float)) else None
+    if args.report:
+        print(json.dumps(sup.build_report(store, now_epoch=now,
+                                          suspect_after_seconds=suspect), indent=2))
+        return 0
+    if args.plan:
+        if args.report_file:
+            report = json.loads(Path(args.report_file).read_text(encoding="utf-8"))
+        else:
+            report = sup.build_report(store, now_epoch=now,
+                                      suspect_after_seconds=suspect)
+        state = {}
+        if args.state_file and Path(args.state_file).exists():
+            try:
+                state = json.loads(Path(args.state_file).read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                state = {}
+        print(json.dumps(sup.plan_actions(report, state, config, now_epoch=now),
+                         indent=2))
+        return 0
+    sys.stderr.write("agenttalk supervise: choose --init, --report, --plan, or "
+                     "--clear-restart\n")
+    return 2
+
+
 def cmd_end(args: argparse.Namespace) -> int:
     store = _get_store(args)
     cfg = store.load_config()
@@ -3917,6 +4018,45 @@ def build_parser() -> argparse.ArgumentParser:
     prel.add_argument("--file", dest="file", help="Read the reason from this file ('-' = stdin).")
     prel.add_argument("--quiet", action="store_true")
     prel.set_defaults(func=cmd_release)
+
+    prr = sub.add_parser(
+        "request-restart",
+        help="Queue a MANUAL restart of an agent (the external supervisor "
+             "relaunches it and clears the request). A protected "
+             "(operator_facing/lead) agent requires --force-protected.",
+    )
+    prr.add_argument("--for", dest="agent", required=True, help="Agent to restart.")
+    prr.add_argument("--from", dest="sender", help="Requester (default: 'operator').")
+    prr.add_argument("--reason", help="Free-text reason.")
+    prr.add_argument("--force-protected", dest="force_protected", action="store_true",
+                     help="Allow restarting a protected (operator_facing/lead) agent.")
+    prr.set_defaults(func=cmd_request_restart)
+
+    psup = sub.add_parser(
+        "supervise",
+        help="External-supervisor support (thin): scaffold the config+scripts, "
+             "emit the read-only liveness report, compute the safe action plan, "
+             "or clear a restart marker. The generated script owns the loop.",
+    )
+    gsup = psup.add_mutually_exclusive_group(required=True)
+    gsup.add_argument("--init", action="store_true",
+                      help="Scaffold supervisor.json + supervisor.ps1 + supervisor.sh.")
+    gsup.add_argument("--report", action="store_true",
+                      help="Emit the read-only per-agent liveness snapshot (JSON).")
+    gsup.add_argument("--plan", action="store_true",
+                      help="Emit the action plan (the shared decision table) as JSON.")
+    gsup.add_argument("--clear-restart", dest="clear_restart", action="store_true",
+                      help="Clear a restart-request marker by --for + --request-id.")
+    psup.add_argument("--force", action="store_true", help="(--init) overwrite existing files.")
+    psup.add_argument("--now", type=float, default=None,
+                      help="Override 'now' (epoch seconds) for report/plan — test hook.")
+    psup.add_argument("--report-file", dest="report_file",
+                      help="(--plan) read the report from this JSON file instead of live.")
+    psup.add_argument("--state-file", dest="state_file",
+                      help="(--plan) the supervisor's local state JSON (pids/backoff).")
+    psup.add_argument("--for", dest="agent", help="(--clear-restart) agent name.")
+    psup.add_argument("--request-id", dest="request_id", help="(--clear-restart) rid to clear.")
+    psup.set_defaults(func=cmd_supervise)
 
     prpl = sub.add_parser(
         "reply",

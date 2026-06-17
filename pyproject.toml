@@ -42,6 +42,10 @@ ignore = [
     "S105",  # hardcoded "test passwords" used as message bodies
     "S106",
 ]
+# The supervisor module embeds generated PowerShell/bash script templates as
+# string literals; those shell one-liners legitimately exceed the Python line
+# length. The Python logic in the file still respects it.
+"src/agenttalk/supervisor.py" = ["E501"]
 
 [project.scripts]
 agenttalk = "agenttalk.cli:main"
