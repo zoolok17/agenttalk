@@ -8,6 +8,8 @@ fixtures. The generated PS/bash scripts are thin executors (documented-manual).
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -348,6 +350,36 @@ def test_session_args_per_cli_explicit_skill() -> None:
     # per-agent override wins (token list)
     over = {"session": {"resume": ["--resume", "{SESSION_ID}", "--yolo"]}}
     assert sup.session_args("claude", "resume", "Z", over) == ["--resume", "Z", "--yolo"]
+
+
+def test_launch_template_splices_session_args_unquoted() -> None:
+    """Regression for the LAST mile: the generated launch template must splice
+    {SESSION_ARGS} UNQUOTED inside -ArgumentList @(...) — wrapping it in quotes
+    ('{SESSION_ARGS}') re-collapses ps_arglist's array back into one string and
+    `$agenttalk-listen` is dropped/expanded again."""
+    launch = json.loads(sup.CONFIG_TEMPLATE)["agents"]["AGENT_NAME"]["launch"]
+    for cmd in (launch["windows"], launch["_windows_codex"]):
+        assert "-ArgumentList @(" in cmd            # array expression
+        assert "{SESSION_ARGS}" in cmd
+        assert "'{SESSION_ARGS}'" not in cmd        # NOT quote-wrapped (the bug)
+    # end-to-end: substitute like the script does, then confirm the resulting
+    # @(...) yields the prompt as ONE literal token (PowerShell-parsed when a PS
+    # is available; structural otherwise).
+    tokens = sup.session_args("codex", "resume", None)        # ends in $agenttalk-listen
+    ps = sup.ps_arglist(tokens)
+    cmd = launch["_windows_codex"].split(": ", 1)[1].replace("{SESSION_ARGS}", ps)
+    assert "@('-C','<cwd>','resume','--last'," in cmd
+    assert "'$agenttalk-listen')" in cmd            # single-quoted, one element
+    pwsh = shutil.which("pwsh") or shutil.which("powershell")
+    if pwsh:
+        # evaluate ONLY the ArgumentList array (never the Start-Process line),
+        # asserting token count + the prompt as a single literal element.
+        snippet = f"$a=@({ps}); Write-Output $a.Count; Write-Output $a[-1]"
+        out = subprocess.run([pwsh, "-NoProfile", "-Command", snippet],
+                             capture_output=True, text=True, timeout=30)
+        lines = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+        assert lines[0] == str(len(tokens))          # no collapse, no split
+        assert lines[-1] == "$agenttalk-listen"      # `$` NOT expanded
 
 
 def test_ps_arglist_quotes_dollar_literally() -> None:

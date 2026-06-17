@@ -389,11 +389,11 @@ CONFIG_TEMPLATE = """\
       "env": { "AGENTTALK_SELF": "AGENT_NAME" },
       "pid_strategy": "launched-process",
       "launch": {
-        "windows": "EXAMPLE (claude): Start-Process -FilePath claude.cmd -WorkingDirectory '<cwd>' -PassThru -ArgumentList '{SESSION_ARGS}'",
-        "_windows_codex": "EXAMPLE (codex): Start-Process -FilePath codex.cmd -WorkingDirectory '<cwd>' -PassThru -ArgumentList '-C','<cwd>','{SESSION_ARGS}'",
+        "windows": "EXAMPLE (claude): Start-Process -FilePath claude.cmd -WorkingDirectory '<cwd>' -PassThru -ArgumentList @({SESSION_ARGS})",
+        "_windows_codex": "EXAMPLE (codex): Start-Process -FilePath codex.cmd -WorkingDirectory '<cwd>' -PassThru -ArgumentList @('-C','<cwd>',{SESSION_ARGS})",
         "posix": "EXAMPLE (claude): setsid claude {SESSION_ARGS} >\\"$cwd/agent.log\\" 2>&1 & echo $!"
       },
-      "_comment_launch": "Launch the CLI EXECUTABLE DIRECTLY (claude.cmd/codex.cmd) so the -PassThru PID dies with the agent. Do NOT wrap in 'powershell -NoExit -Command' (the wrapper outlives the agent => the supervisor watches the wrong PID). {SESSION_ARGS} is filled by the supervisor: '--session-id <uuid>' on first launch, the full --resume/-a-never form on relaunch.",
+      "_comment_launch": "Launch the CLI EXECUTABLE DIRECTLY (claude.cmd/codex.cmd) so the -PassThru PID dies with the agent. Do NOT wrap in 'powershell -NoExit -Command' (the wrapper outlives the agent => the supervisor watches the wrong PID). Splice {SESSION_ARGS} UNQUOTED inside -ArgumentList @(...): it is a comma-separated list of single-quoted PS literals, so '$agenttalk-listen' stays ONE argument and '$' never expands. The supervisor fills it: '--session-id','<uuid>',... on first launch, the --resume/resume-last form on relaunch.",
       "_comment_activity_hook": "Set activity_hook=true ONLY after installing the PostToolUse/Codex hook (supervise --install-activity-hook). Until then a stale heartbeat is warn-only (suspect), never a kill — so an un-instrumented agent is never mistaken for stuck."
     }
   }
