@@ -5,6 +5,53 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0] - 2026-06-17
+
+Two reliability features for long-running multi-agent teams: an explicit
+"stand down" signal so a listener is never stopped by accident, and an
+external supervisor that auto-recovers agents through server-side outages.
+
+### Added
+- **`release` signal + `agenttalk release`.** A dedicated control kind that
+  tells a listener to exit its loop — distinct from `end` (which also exports
+  a transcript). It's the ONLY thing besides `end` that stops a listener;
+  every other message means "work done for now, keep listening". `agenttalk
+  release --from A --to B` targets one agent; `--to-group`/`--all` stand down a
+  team. A listener obeys `release` only from an `operator_facing`/lead sender
+  (fail-closed on ambiguous leadership); release from anyone else is reported
+  and the listener keeps listening. No transcript is exported.
+- **`agenttalk supervise` — external agent supervisor.** `supervise --init`
+  generates a per-team `supervisor.json` + a PowerShell supervisor script that
+  launches each agent and monitors it. It **auto-restarts** an agent when the
+  process it launched **dies**, and — when the activity hook is installed —
+  when the agent **hangs** on an API error (alive but not progressing). Every
+  relaunch **resumes the agent's session with full context** (Claude
+  `--session-id`/`--resume`; Codex `resume --last`). Per-agent exponential
+  backoff (so a real outage doesn't hot-loop), and the human-facing lead is
+  protected (warn-only, never auto-killed). The Python core stays thin and
+  stdlib-only; the generated script owns terminal launch/kill.
+- **`agenttalk request-restart --for <agent>`.** Lead/operator-triggered
+  restart: writes a marker the supervisor consumes (kill-if-alive + resume).
+  `--force-protected` is required to restart a protected agent.
+- **`agenttalk heartbeat` + activity hook.** A throttled liveness stamp the
+  supervisor reads. Installed as a PostToolUse hook (`supervise
+  --install-activity-hook`, Claude `.claude/settings.json` or Codex
+  `.codex/hooks.json`, merge-safe), it keeps the heartbeat fresh *at tool
+  boundaries* while working (plus the wait-loop heartbeat while idle), so a
+  stale heartbeat reliably means "stuck" — distinguishing a hung agent from a
+  busy one. Stuck-recovery (the only path that auto-kills an alive agent)
+  fires ONLY when the activity hook is enabled; otherwise a stale heartbeat is
+  warn-only, never a kill.
+
+### Notes
+- The supervisor replaces the manual "tell each agent who it is + start the
+  listen loop" step: the launch command is non-interactive (identity via
+  `AGENTTALK_SELF`, listen skill auto-invoked). Launch commands are
+  operator-filled in `supervisor.json` (examples provided).
+- v1 ships the PowerShell supervisor; a POSIX bash supervisor is a follow-up
+  (the Python core is already cross-platform). Codex resume is `resume --last`
+  (best-effort) until a real Codex session id is captured.
+
 ## [0.27.0] - 2026-06-15
 
 Performance: eliminate the multi-day, machine-wide slowdown caused by
