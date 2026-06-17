@@ -336,8 +336,13 @@ def test_session_args_per_cli() -> None:
     assert sup.session_args("claude", "resume", "X") == (
         '--resume X --permission-mode dontAsk '
         '--allowedTools "Bash(agenttalk *)" -p "continue listening"')
-    # codex forms (best-effort defaults, operator-overridable)
-    assert sup.session_args("codex", "resume", "Y") == "resume Y -a never -s workspace-write"
+    # Codex (blocker 1): NO fake --session-id on a fresh launch; resume uses
+    # --last; the listen prompt is ALWAYS present.
+    cfresh = sup.session_args("codex", "fresh", None)
+    assert "--session-id" not in cfresh
+    assert "continue listening" in cfresh
+    cresume = sup.session_args("codex", "resume", None)
+    assert "resume --last" in cresume and "continue listening" in cresume
     # per-agent override wins
     over = {"session": {"resume_args": "--resume {SESSION_ID} --yolo"}}
     assert sup.session_args("claude", "resume", "Z", over) == "--resume Z --yolo"
@@ -347,10 +352,26 @@ def test_codex_relaunch_command_uses_codex_args() -> None:
     cfg = {"agents": {"c": {"auto_restart": True, "activity_hook": True, "cli": "codex"}}}
     rpt = {"agents": {"c": {"protected": False, "heartbeat_stale": True,
                             "restart_request": None}}}
-    p = sup.plan_actions(rpt, {"agents": {"c": {"pid_alive": True, "session_id": "S9"}}},
+    # codex has no pinned session_id; the `launched` flag drives resume-by-last
+    p = sup.plan_actions(rpt, {"agents": {"c": {"pid_alive": True, "launched": True}}},
                          cfg, now_epoch=NOW)["agents"]["c"]
-    assert p["cli"] == "codex"
-    assert p["session_args"] == "resume S9 -a never -s workspace-write"
+    assert p["cli"] == "codex" and p["launch_mode"] == "resume"
+    assert p["session_args"] == "resume --last -a never -s workspace-write 'continue listening'"
+    assert "--session-id" not in p["session_args"]
+
+
+def test_state_round_trip_preserves_pid_and_session(tmp_path: Path) -> None:
+    """Blocker 3: a healthy/no-op tick must NOT drop the supervisor-owned pid /
+    session_id / launched — else the next loop sees pid=null, thinks the agent
+    died, and relaunches a HEALTHY agent every poll (and loses the session)."""
+    st = {"agents": {"worker": {"pid_alive": True, "pid": 4321,
+                                "session_id": "sess-9", "launched": True}}}
+    p = _plan_hook(_report(heartbeat_stale=False), st)
+    assert p["action"] == sup.NONE
+    ns = p["next_state"]
+    assert ns["pid"] == 4321
+    assert ns["session_id"] == "sess-9"
+    assert ns["launched"] is True
 
 
 # ---------------------------------------- WP-3: heartbeat command (throttled)
@@ -403,6 +424,26 @@ def test_install_activity_hook_merges_and_is_idempotent(tmp_path: Path) -> None:
     data2 = json.loads(settings.read_text(encoding="utf-8"))
     post = [h["command"] for g in data2["hooks"]["PostToolUse"] for h in g["hooks"]]
     assert post.count("agenttalk heartbeat") == 1
+
+
+def test_install_activity_hook_codex_uses_group_shape(tmp_path: Path) -> None:
+    """Blocker 2: the Codex hook must be the matcher-GROUP shape (mirroring
+    Claude), not a flat {type,command} — else it mis-installs and the
+    presence-check duplicates a correctly-shaped existing hook."""
+    s = _team(tmp_path)
+    assert _run(["supervise", "--install-activity-hook", "--codex-only"], tmp_path) == 0
+    hooks_file = s.root / ".codex" / "hooks.json"
+    assert hooks_file.exists()
+    assert not (s.root / ".claude" / "settings.json").exists()  # codex-only
+    groups = json.loads(hooks_file.read_text(encoding="utf-8"))["hooks"]["PostToolUse"]
+    # matcher-group shape: each group has a NESTED hooks list
+    assert groups[0]["matcher"] == "*"
+    assert groups[0]["hooks"][0]["command"] == "agenttalk heartbeat"
+    # idempotent (presence-check sees the nested shape)
+    assert _run(["supervise", "--install-activity-hook", "--codex-only"], tmp_path) == 0
+    groups2 = json.loads(hooks_file.read_text(encoding="utf-8"))["hooks"]["PostToolUse"]
+    cmds = [h["command"] for g in groups2 for h in g["hooks"]]
+    assert cmds.count("agenttalk heartbeat") == 1
 
 
 def test_supervise_plan_exact_generated_command_runs(tmp_path: Path, capsys) -> None:
