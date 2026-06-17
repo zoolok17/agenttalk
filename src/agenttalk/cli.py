@@ -3399,6 +3399,29 @@ def _load_supervisor_config(store: Store) -> dict:
         return {}
 
 
+def cmd_heartbeat(args: argparse.Namespace) -> int:
+    """Stamp this agent's ACTIVITY heartbeat (the supervisor's stuck signal).
+
+    Wired as a Claude PostToolUse / Codex hook so it fires on every tool call
+    while the model is WORKING (the wait loop already stamps it while IDLE), so
+    the heartbeat is fresh in both states and goes stale only when the model is
+    genuinely stuck. THROTTLED: a no-op when the heartbeat is younger than
+    --min-interval, so the per-tool-call hook never pays Python startup more
+    than once per interval (the stuck threshold is ~120s; ~5s granularity is
+    plenty).
+    """
+    store = _get_store(args)
+    roster = store.load_config().get("agents") or []
+    agent = _resolve_self(args.agent, roster=roster)
+    min_interval = max(0.0, args.min_interval)
+    if min_interval > 0:
+        hb = store.read_heartbeat(agent)
+        if hb is not None and (time.time() - hb.timestamp()) < min_interval:
+            return 0  # still fresh — throttled no-op
+    store.write_heartbeat(agent)
+    return 0
+
+
 def cmd_request_restart(args: argparse.Namespace) -> int:
     """Queue a MANUAL restart of an agent (the supervisor relaunches + clears).
 
@@ -3450,6 +3473,21 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                   "supervisor.json, then run supervisor.ps1 in its own window. "
                   "(v1 ships the PowerShell supervisor; a POSIX bash supervisor "
                   "is a follow-up — the Python core is already cross-platform.)")
+        print("\nActivity hook (UNLOCKS stuck-recovery — set activity_hook=true "
+              "per agent after installing it):\n"
+              "  agenttalk supervise --install-activity-hook   # merges project "
+              ".claude/settings.json (add --codex for .codex/hooks.json)\n"
+              "Or paste this PostToolUse hook into your project .claude/settings.json:\n"
+              f"{sup.claude_hook_snippet()}")
+        return 0
+    if args.install_activity_hook:
+        res = sup.install_activity_hook(store, claude=not args.codex_only,
+                                        codex=args.codex or args.codex_only)
+        for path, status in res.items():
+            print(f"  {status}: {path}")
+        print("install-activity-hook: merged into PROJECT config only (never "
+              "global, never clobbered). Now set activity_hook=true for the "
+              "instrumented agents in supervisor.json to enable stuck-recovery.")
         return 0
     if args.clear_restart:
         if not args.agent or not args.request_id:
@@ -3463,29 +3501,32 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         return 0
     config = _load_supervisor_config(store)
     now = args.now if args.now is not None else time.time()
-    suspect = config.get("suspect_after_seconds")
-    suspect = float(suspect) if isinstance(suspect, (int, float)) else None
+    stuck = config.get("stuck_after_seconds")
+    stuck = float(stuck) if isinstance(stuck, (int, float)) else None
+
+    def _read_state() -> dict:
+        if args.state_file and Path(args.state_file).exists():
+            try:
+                return json.loads(Path(args.state_file).read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                return {}
+        return {}
+
     if args.report:
         print(json.dumps(sup.build_report(store, now_epoch=now,
-                                          suspect_after_seconds=suspect), indent=2))
+                                          stuck_after_seconds=stuck,
+                                          state=_read_state() or None), indent=2))
         return 0
     if args.plan:
         if args.report_file:
             report = json.loads(Path(args.report_file).read_text(encoding="utf-8"))
         else:
-            report = sup.build_report(store, now_epoch=now,
-                                      suspect_after_seconds=suspect)
-        state = {}
-        if args.state_file and Path(args.state_file).exists():
-            try:
-                state = json.loads(Path(args.state_file).read_text(encoding="utf-8"))
-            except (ValueError, OSError):
-                state = {}
-        print(json.dumps(sup.plan_actions(report, state, config, now_epoch=now),
-                         indent=2))
+            report = sup.build_report(store, now_epoch=now, stuck_after_seconds=stuck)
+        print(json.dumps(sup.plan_actions(report, _read_state(), config,
+                                          now_epoch=now), indent=2))
         return 0
-    sys.stderr.write("agenttalk supervise: choose --init, --report, --plan, or "
-                     "--clear-restart\n")
+    sys.stderr.write("agenttalk supervise: choose --init, --report, --plan, "
+                     "--install-activity-hook, or --clear-restart\n")
     return 2
 
 
@@ -4020,6 +4061,19 @@ def build_parser() -> argparse.ArgumentParser:
     prel.add_argument("--quiet", action="store_true")
     prel.set_defaults(func=cmd_release)
 
+    phb = sub.add_parser(
+        "heartbeat",
+        help="Stamp this agent's activity heartbeat (the supervisor's "
+             "stuck-detection signal). Throttled — a no-op if the heartbeat is "
+             "younger than --min-interval. Wire as a Claude PostToolUse / Codex "
+             "hook so it stays fresh while the model works.",
+    )
+    phb.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
+    phb.add_argument("--min-interval", dest="min_interval", type=float, default=5.0,
+                     help="No-op if the heartbeat is younger than this many "
+                          "seconds (default 5).")
+    phb.set_defaults(func=cmd_heartbeat)
+
     prr = sub.add_parser(
         "request-restart",
         help="Queue a MANUAL restart of an agent (the external supervisor "
@@ -4048,6 +4102,16 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Emit the action plan (the shared decision table) as JSON.")
     gsup.add_argument("--clear-restart", dest="clear_restart", action="store_true",
                       help="Clear a restart-request marker by --for + --request-id.")
+    gsup.add_argument("--install-activity-hook", dest="install_activity_hook",
+                      action="store_true",
+                      help="MERGE the activity heartbeat hook into the project "
+                           ".claude/settings.json (and .codex/hooks.json with "
+                           "--codex). Never global, never clobbers. Unlocks "
+                           "stuck-recovery once you set activity_hook=true.")
+    psup.add_argument("--codex", action="store_true",
+                      help="(--install-activity-hook) ALSO install the Codex hook.")
+    psup.add_argument("--codex-only", dest="codex_only", action="store_true",
+                      help="(--install-activity-hook) install ONLY the Codex hook.")
     psup.add_argument("--force", action="store_true", help="(--init) overwrite existing files.")
     psup.add_argument("--now", type=float, default=None,
                       help="Override 'now' (epoch seconds) for report/plan — test hook.")

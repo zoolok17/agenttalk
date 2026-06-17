@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from agenttalk import cli, supervisor as sup
 from agenttalk.store import Store
 
@@ -52,20 +54,20 @@ def test_scenario_i_dead_pid_relaunches() -> None:
     assert p["next_state"]["backoff_next_epoch"] == NOW + 30  # base
 
 
-def test_scenario_ii_alive_stale_heartbeat_is_suspect_warn_not_kill() -> None:
-    # alive + stale + not in a real wait -> SUSPECT only (never relaunch/kill)
-    p = _plan(_report(heartbeat_stale=True, waiting_pid_alive=False),
+def test_scenario_ii_alive_stale_without_hook_is_suspect_warn_not_kill() -> None:
+    # alive + stale + NO activity hook (the default _CONFIG) -> SUSPECT only:
+    # we can't tell stuck from busy, so never relaunch/kill (the WP-2 trap).
+    p = _plan(_report(heartbeat_stale=True),
               {"agents": {"worker": {"pid_alive": True, "last_warn_epoch": 0}}})
     assert p["action"] == sup.SUSPECT_WARN
     assert p["kill_first"] is False
-    # a healthy agent legitimately blocked in a long wait is NOT suspect
-    p2 = _plan(_report(heartbeat_stale=True, waiting_pid_alive=True),
-               {"agents": {"worker": {"pid_alive": True}}})
-    assert p2["action"] == sup.NONE
     # rate-limited: warned recently -> NONE this poll
     p3 = _plan(_report(heartbeat_stale=True),
                {"agents": {"worker": {"pid_alive": True, "last_warn_epoch": NOW - 10}}})
     assert p3["action"] == sup.NONE
+    # fresh heartbeat -> healthy regardless of hook
+    assert _plan(_report(heartbeat_stale=False),
+                 {"agents": {"worker": {"pid_alive": True}}})["action"] == sup.NONE
 
 
 def test_scenario_iii_manual_marker_relaunches_and_clears() -> None:
@@ -240,7 +242,7 @@ def test_supervise_init_generates_and_is_idempotent(tmp_path: Path, capsys) -> N
     assert "Start-Process" in ps and "-PassThru" in ps
     assert "wt.exe" in ps
     assert "DryRun" in ps
-    assert "keeping restart marker for retry" in ps  # clear-only-on-success path
+    assert "keeping marker/state for retry" in ps   # clear-only-on-success path
     # idempotent: a second --init overwrites nothing
     assert _run(["supervise", "--init"], tmp_path) == 0
     assert "all files already exist" in capsys.readouterr().out
@@ -259,6 +261,148 @@ def test_supervise_plan_cli_with_fixtures(tmp_path: Path, capsys) -> None:
     assert rc == 0
     plan = json.loads(capsys.readouterr().out)
     assert plan["agents"]["worker"]["action"] == sup.RELAUNCH
+
+
+_HOOK_CONFIG = {
+    "agents": {"worker": {"auto_restart": True, "activity_hook": True, "cli": "claude"}},
+    "backoff": {"base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180},
+}
+
+
+def _plan_hook(report, state, *, now=NOW, config=_HOOK_CONFIG):
+    return sup.plan_actions(report, state, config, now_epoch=now)["agents"]["worker"]
+
+
+# ---------------------------------------- WP-3: stuck-recovery matrix
+
+def test_stuck_recover_when_alive_stale_and_hook_on() -> None:
+    p = _plan_hook(_report(heartbeat_stale=True),
+                   {"agents": {"worker": {"pid_alive": True, "session_id": "SID"}}})
+    assert p["action"] == sup.STUCK_RECOVER
+    assert p["kill_first"] is True            # alive-but-stuck -> kill before resume
+    assert p["launch_mode"] == "resume"
+    assert p["session_args"] == (
+        '--resume SID --permission-mode dontAsk '
+        '--allowedTools "Bash(agenttalk *)" -p "continue listening"')
+    assert p["next_state"]["consecutive_fails"] == 1   # backoff applies
+
+
+def test_stuck_alive_fresh_is_none() -> None:
+    p = _plan_hook(_report(heartbeat_stale=False),
+                   {"agents": {"worker": {"pid_alive": True}}})
+    assert p["action"] == sup.NONE
+
+
+def test_stuck_protected_is_warn_only() -> None:
+    p = _plan_hook(_report(protected=True, heartbeat_stale=True),
+                   {"agents": {"worker": {"pid_alive": True}}})
+    assert p["action"] == sup.WARN_ONLY
+    assert p["notify"] is True               # never kill a protected human channel
+
+
+def test_stuck_dead_pid_is_relaunch_not_stuck() -> None:
+    # death still routes to relaunch (v1), distinct from stuck_recover
+    p = _plan_hook(_report(heartbeat_stale=True),
+                   {"agents": {"worker": {"pid_alive": False}}})
+    assert p["action"] == sup.RELAUNCH
+
+
+def test_stuck_recover_requires_hook_else_suspect() -> None:
+    cfg = {"agents": {"worker": {"auto_restart": True, "activity_hook": False}}}
+    p = sup.plan_actions(_report(heartbeat_stale=True),
+                         {"agents": {"worker": {"pid_alive": True, "last_warn_epoch": 0}}},
+                         cfg, now_epoch=NOW)["agents"]["worker"]
+    assert p["action"] == sup.SUSPECT_WARN   # no hook -> never kill
+
+
+# ---------------------------------------- WP-3: session-id lifecycle + args
+
+def test_session_id_fresh_then_resume() -> None:
+    # no session_id yet -> fresh launch (template carries {SESSION_ID})
+    p = _plan_hook(_report(heartbeat_stale=True),
+                   {"agents": {"worker": {"pid_alive": True}}})
+    assert p["launch_mode"] == "fresh"
+    assert p["session_id"] is None
+    assert p["session_args"] == "--session-id {SESSION_ID}"
+    # once the script has pinned a session_id -> resume reuses it
+    p2 = _plan_hook(_report(heartbeat_stale=True),
+                    {"agents": {"worker": {"pid_alive": True, "session_id": "abc-123"}}})
+    assert p2["launch_mode"] == "resume"
+    assert "abc-123" in p2["session_args"]
+
+
+def test_session_args_per_cli() -> None:
+    assert sup.session_args("claude", "fresh", None) == "--session-id {SESSION_ID}"
+    assert sup.session_args("claude", "resume", "X") == (
+        '--resume X --permission-mode dontAsk '
+        '--allowedTools "Bash(agenttalk *)" -p "continue listening"')
+    # codex forms (best-effort defaults, operator-overridable)
+    assert sup.session_args("codex", "resume", "Y") == "resume Y -a never -s workspace-write"
+    # per-agent override wins
+    over = {"session": {"resume_args": "--resume {SESSION_ID} --yolo"}}
+    assert sup.session_args("claude", "resume", "Z", over) == "--resume Z --yolo"
+
+
+def test_codex_relaunch_command_uses_codex_args() -> None:
+    cfg = {"agents": {"c": {"auto_restart": True, "activity_hook": True, "cli": "codex"}}}
+    rpt = {"agents": {"c": {"protected": False, "heartbeat_stale": True,
+                            "restart_request": None}}}
+    p = sup.plan_actions(rpt, {"agents": {"c": {"pid_alive": True, "session_id": "S9"}}},
+                         cfg, now_epoch=NOW)["agents"]["c"]
+    assert p["cli"] == "codex"
+    assert p["session_args"] == "resume S9 -a never -s workspace-write"
+
+
+# ---------------------------------------- WP-3: heartbeat command (throttled)
+
+def test_heartbeat_command_stamps(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    assert s.read_heartbeat("worker") is None
+    assert _run(["heartbeat", "--for", "worker"], tmp_path) == 0
+    assert s.read_heartbeat("worker") is not None
+
+
+def test_heartbeat_throttle_is_noop_when_fresh(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    _run(["heartbeat", "--for", "worker"], tmp_path)
+    first = s.read_heartbeat("worker")
+    # immediate re-stamp with a large throttle -> no-op (timestamp unchanged)
+    assert _run(["heartbeat", "--for", "worker", "--min-interval", "9999"], tmp_path) == 0
+    assert s.read_heartbeat("worker") == first
+    # min-interval 0 always stamps
+    assert _run(["heartbeat", "--for", "worker", "--min-interval", "0"], tmp_path) == 0
+
+
+def test_heartbeat_unknown_agent_exit_2(tmp_path: Path) -> None:
+    _team(tmp_path)
+    # _resolve_self rejects an off-roster identity with a usage exit (2).
+    with pytest.raises(SystemExit) as e:
+        _run(["heartbeat", "--for", "ghost"], tmp_path)
+    assert e.value.code == 2
+
+
+# ---------------------------------------- WP-3: install-activity-hook (merge-safe)
+
+def test_install_activity_hook_merges_and_is_idempotent(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    # a pre-existing unrelated hook + key must be preserved
+    settings.write_text(json.dumps({
+        "model": "opus",
+        "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+            {"type": "command", "command": "echo pre"}]}]}}), encoding="utf-8")
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    assert data["model"] == "opus"                       # preserved
+    assert data["hooks"]["PreToolUse"]                   # preserved
+    cmds = [h["command"] for g in data["hooks"]["PostToolUse"] for h in g["hooks"]]
+    assert "agenttalk heartbeat" in cmds
+    # idempotent: second install adds nothing
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+    data2 = json.loads(settings.read_text(encoding="utf-8"))
+    post = [h["command"] for g in data2["hooks"]["PostToolUse"] for h in g["hooks"]]
+    assert post.count("agenttalk heartbeat") == 1
 
 
 def test_supervise_plan_exact_generated_command_runs(tmp_path: Path, capsys) -> None:
