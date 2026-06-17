@@ -228,15 +228,19 @@ def test_supervise_init_generates_and_is_idempotent(tmp_path: Path, capsys) -> N
     assert _run(["supervise", "--init"], tmp_path) == 0
     out = capsys.readouterr().out
     assert "written" in out
-    for f in ("supervisor.json", "supervisor.ps1", "supervisor.sh"):
-        assert (s.dir / f).exists()
-    # script anchors: calls the Python plan, the safe launcher, the wt warning,
-    # and the dry-run hook.
+    assert (s.dir / "supervisor.json").exists()
+    assert (s.dir / "supervisor.ps1").exists()
+    assert not (s.dir / "supervisor.sh").exists()  # v1: PowerShell only
+    # script anchors: calls the Python plan (NO invalid --json flag), the safe
+    # launcher, the wt warning, the dry-run hook, and preserves a marker on a
+    # failed relaunch.
     ps = (s.dir / "supervisor.ps1").read_text(encoding="utf-8")
-    assert "supervise --plan" in ps
+    assert "supervise --plan --state-file" in ps
+    assert "--json" not in ps                       # blocker regression guard
     assert "Start-Process" in ps and "-PassThru" in ps
     assert "wt.exe" in ps
     assert "DryRun" in ps
+    assert "keeping restart marker for retry" in ps  # clear-only-on-success path
     # idempotent: a second --init overwrites nothing
     assert _run(["supervise", "--init"], tmp_path) == 0
     assert "all files already exist" in capsys.readouterr().out
@@ -255,3 +259,43 @@ def test_supervise_plan_cli_with_fixtures(tmp_path: Path, capsys) -> None:
     assert rc == 0
     plan = json.loads(capsys.readouterr().out)
     assert plan["agents"]["worker"]["action"] == sup.RELAUNCH
+
+
+def test_supervise_plan_exact_generated_command_runs(tmp_path: Path, capsys) -> None:
+    """Regression for the BLOCKER: the generated script's command line
+    (`supervise --plan --state-file S --now N`, LIVE report, NO --json) must
+    actually parse and emit valid JSON — the prior templates passed a
+    non-existent --json flag and would have argparse-failed at runtime."""
+    s = _team(tmp_path)
+    (s.dir / "supervisor.json").write_text(json.dumps(_CONFIG), encoding="utf-8")
+    state_file = s.dir / "supervisor-state.json"
+    state_file.write_text(json.dumps({"agents": {"worker": {"pid_alive": False}}}),
+                          encoding="utf-8")
+    # EXACTLY the args supervisor.ps1 invokes (live report; no --json).
+    rc = _run(["supervise", "--plan", "--state-file", str(state_file),
+               "--now", str(NOW)], tmp_path)
+    assert rc == 0
+    plan = json.loads(capsys.readouterr().out)   # must be valid JSON
+    assert plan["agents"]["worker"]["action"] == sup.RELAUNCH
+
+
+def test_failed_launch_preserves_marker_success_clears(tmp_path: Path) -> None:
+    """Executor/plan boundary (codex MAJOR): the plan tells the executor to
+    relaunch a fresh manual request and clear its rid, but the clear is a
+    SEPARATE command the script runs ONLY after a confirmed relaunch. A failed
+    launch (no clear call) leaves the marker for retry; a successful one clears
+    it. (The PS executor gates the clear inside `if ($newPid)`.)"""
+    s = _team(tmp_path)
+    s.write_restart_request("worker", {"agent": "worker", "request_id": "rr-1",
+                                       "force_protected": False})
+    rpt = sup.build_report(s, now_epoch=NOW)
+    plan = sup.plan_actions(rpt, {"agents": {"worker": {"pid_alive": False}}},
+                            {"agents": {"worker": {"auto_restart": True}}},
+                            now_epoch=NOW)["agents"]["worker"]
+    assert plan["action"] == sup.RELAUNCH and plan["clear_marker"] == "rr-1"
+    # FAILED launch -> executor does NOT call clear -> marker survives
+    assert s.read_restart_request("worker") is not None
+    # SUCCESSFUL launch -> executor clears via the dedicated command
+    _run(["supervise", "--clear-restart", "--for", "worker",
+          "--request-id", "rr-1"], tmp_path)
+    assert s.read_restart_request("worker") is None

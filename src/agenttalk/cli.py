@@ -3447,8 +3447,9 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                   "regenerate).")
         else:
             print("supervise --init: fill in each agent's launch command in "
-                  "supervisor.json, then run the supervisor script in its own "
-                  "window.")
+                  "supervisor.json, then run supervisor.ps1 in its own window. "
+                  "(v1 ships the PowerShell supervisor; a POSIX bash supervisor "
+                  "is a follow-up — the Python core is already cross-platform.)")
         return 0
     if args.clear_restart:
         if not args.agent or not args.request_id:
