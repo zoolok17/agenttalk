@@ -27,6 +27,7 @@ is preserved across a force-kill.
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime, timezone
 
 from agenttalk.store import Store, _process_alive
@@ -105,27 +106,20 @@ def session_args(cli: str, mode: str, session_id: str | None,
     return list(tokens)
 
 
-def ps_arglist(tokens: list[str]) -> str:
-    """Render tokens as a PowerShell single-quoted array-element string for an
-    ``-ArgumentList @(...)`` slot: each token is a single-quoted literal (PS
-    single quotes do NOT expand ``$``; embedded single quotes are doubled), so
-    ``$agenttalk-listen`` stays one literal argument, never an expansion."""
-    return ",".join("'" + t.replace("'", "''") + "'" for t in tokens)
-
-
 def _launch_detail(st: dict, cfg_agent: dict) -> dict:
     """Resume/launch fields for a launch action. RESUME once the agent has been
     launched before - Claude pins a session_id (set by the script on a fresh
     launch); Codex doesn't pin, so a ``launched`` flag drives its resume-by-last.
     Either signal means "we've launched this agent, so resume its context".
-    ``session_args`` is the token list; ``session_args_ps`` is the quote-safe PS
-    array-element form the generated script splices into {SESSION_ARGS}."""
+    ``session_args`` is the token LIST the executor splices into the config's
+    ``launch.windows_args`` wherever the literal "{SESSION_ARGS}" element appears
+    (an array-element splice - no string interpolation, so each token is exactly
+    one argument and nothing needs quoting)."""
     cli = cfg_agent.get("cli", "claude")
     session_id = st.get("session_id") or None
     mode = "resume" if (session_id or st.get("launched")) else "fresh"
-    tokens = session_args(cli, mode, session_id, cfg_agent)
     return {"cli": cli, "launch_mode": mode, "session_id": session_id,
-            "session_args": tokens, "session_args_ps": ps_arglist(tokens)}
+            "session_args": session_args(cli, mode, session_id, cfg_agent)}
 
 
 def build_report(store: Store, *, now_epoch: float,
@@ -387,13 +381,12 @@ CONFIG_TEMPLATE = """\
       "activity_hook": false,
       "cwd": "REPLACE_WITH_PROJECT_DIR",
       "env": { "AGENTTALK_SELF": "AGENT_NAME" },
-      "pid_strategy": "launched-process",
       "launch": {
-        "windows": "EXAMPLE (claude): Start-Process -FilePath claude.cmd -WorkingDirectory '<cwd>' -PassThru -ArgumentList @({SESSION_ARGS})",
-        "_windows_codex": "EXAMPLE (codex): Start-Process -FilePath codex.cmd -WorkingDirectory '<cwd>' -PassThru -ArgumentList @('-C','<cwd>',{SESSION_ARGS})",
-        "posix": "EXAMPLE (claude): setsid claude {SESSION_ARGS} >\\"$cwd/agent.log\\" 2>&1 & echo $!"
+        "windows_file": "REPLACE: the REAL agent executable, e.g. C:\\\\Users\\\\you\\\\.local\\\\bin\\\\claude.exe (claude) or node_modules\\\\@openai\\\\codex...\\\\codex.exe (codex)",
+        "windows_args": ["{SESSION_ARGS}"],
+        "_windows_args_codex": ["-C", "<cwd>", "{SESSION_ARGS}"]
       },
-      "_comment_launch": "Launch the CLI EXECUTABLE DIRECTLY (claude.cmd/codex.cmd) so the -PassThru PID dies with the agent. Do NOT wrap in 'powershell -NoExit -Command' (the wrapper outlives the agent => the supervisor watches the wrong PID). Splice {SESSION_ARGS} UNQUOTED inside -ArgumentList @(...): it is a comma-separated list of single-quoted PS literals, so '$agenttalk-listen' stays ONE argument and '$' never expands. The supervisor fills it: '--session-id','<uuid>',... on first launch, the --resume/resume-last form on relaunch.",
+      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS, so its PID dies immediately and the supervisor relaunch-storms. windows_args is a real array; the literal '{SESSION_ARGS}' element is replaced (array-splice, not string interpolation) with the session tokens: --session-id <uuid> ... on first launch, the --resume / resume --last form on relaunch. The executor runs Start-Process -FilePath <file> -ArgumentList <args> -WorkingDirectory <cwd> -PassThru AFTER applying env (it prepends .agenttalk/bin so a bare `agenttalk` resolves via the generated shim). No Invoke-Expression.",
       "_comment_activity_hook": "Set activity_hook=true ONLY after installing the PostToolUse/Codex hook (supervise --install-activity-hook). Until then a stale heartbeat is warn-only (suspect), never a kill - so an un-instrumented agent is never mistaken for stuck."
     }
   }
@@ -416,6 +409,10 @@ $Root      = Split-Path -Parent $PSScriptRoot   # the project root (.agenttalk/.
 $ConfigPath = Join-Path $PSScriptRoot 'supervisor.json'
 $StatePath  = Join-Path $PSScriptRoot 'supervisor-state.json'   # SCRIPT-owned, not the bus
 $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+# Baked at `supervise --init`: the Python that runs the bus + whether this is a
+# source checkout (prepend <root>/src to PYTHONPATH) vs a pip install.
+$AgenttalkPython = '__AGENTTALK_PYTHON__'
+$SrcOnPyPath = __SRC_ON_PYPATH__
 
 function Load-State {
   if (Test-Path $StatePath) { return (Get-Content $StatePath -Raw | ConvertFrom-Json) }
@@ -428,27 +425,48 @@ function Pid-Alive($procId) {
 }
 function Launch($name, $plan) {
   $a = $cfg.agents.$name
-  if (-not $a.launch.windows -or $a.launch.windows -like 'EXAMPLE*') {
-    Write-Warning "supervisor: agent '$name' has no real launch.windows command - fill supervisor.json"; return $null
+  $file = $a.launch.windows_file
+  if (-not $file -or $file -like 'REPLACE:*') {
+    Write-Warning "supervisor: agent '$name' has no real launch.windows_file (the agent EXECUTABLE) - fill supervisor.json"; return $null
   }
-  # {SESSION_ARGS} is the planner's PS array-of-literals string (single-quoted
-  # tokens - `$` does NOT expand, each token = one argument). On a FRESH Claude
-  # launch the {SESSION_ID} token is still present; mint + substitute a uuid.
-  # Codex has no {SESSION_ID} (it doesn't pin), so $sid stays $null there.
-  $sargs = $plan.session_args_ps
+  # Build the argument array by splicing the session tokens into windows_args
+  # wherever the literal '{SESSION_ARGS}' element appears. Array-element splice
+  # (NOT string interpolation): each token is exactly one argument and nothing
+  # needs quoting. On a FRESH Claude launch a '{SESSION_ID}' token is still
+  # present -> mint + substitute a uuid; Codex has none (it doesn't pin).
   $sid = $plan.session_id
-  if ($plan.launch_mode -eq 'fresh' -and $sargs -match '\{SESSION_ID\}') {
+  $tokens = @($plan.session_args)
+  if ($plan.launch_mode -eq 'fresh' -and ($tokens -contains '{SESSION_ID}')) {
     $sid = [guid]::NewGuid().ToString()
-    $sargs = $sargs -replace '\{SESSION_ID\}', $sid
+    $tokens = $tokens | ForEach-Object { if ($_ -eq '{SESSION_ID}') { $sid } else { $_ } }
   }
-  $cmd = $a.launch.windows -replace '\{SESSION_ARGS\}', $sargs
-  # Launch the CLI EXECUTABLE DIRECTLY (claude.cmd/codex.cmd) via Start-Process
-  # -PassThru so the monitored PID dies with the agent. Do NOT wrap in
-  # `powershell -NoExit -Command` or use wt.exe - both outlive the agent, so the
-  # supervisor would watch the wrong PID and loop-restart forever.
-  $proc = Invoke-Expression $cmd
+  $argv = @()
+  foreach ($x in @($a.launch.windows_args)) {
+    if ($x -eq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ($x -replace '<cwd>', $a.cwd) }
+  }
+  # Apply the agent's env (+ AGENTTALK_ROOT/PYTHON/PYTHONPATH and a PATH prepend
+  # of .agenttalk/bin so a bare `agenttalk` resolves via the generated shim),
+  # launch the REAL executable directly with -PassThru (its PID dies with the
+  # agent - never a .cmd/shim, which would hand off and exit), then RESTORE the
+  # supervisor's own env. No shell-string eval: the file + arg array go straight
+  # to Start-Process.
+  $saved = @{}
+  $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PYTHON = $AgenttalkPython;
+               PATH = (Join-Path $PSScriptRoot 'bin') + ';' + $env:PATH }
+  if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
+  if ($a.env) { foreach ($k in $a.env.PSObject.Properties.Name) { $applied[$k] = $a.env.$k } }
+  foreach ($k in $applied.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item -Path ("Env:" + $k) -Value $applied[$k] }
+  try {
+    $cwd = if ($a.cwd) { $a.cwd } else { $Root }
+    $proc = Start-Process -FilePath $file -ArgumentList $argv -WorkingDirectory $cwd -PassThru
+  } finally {
+    foreach ($k in $saved.Keys) {
+      if ($null -eq $saved[$k]) { Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue }
+      else { Set-Item -Path ("Env:" + $k) -Value $saved[$k] }
+    }
+  }
   if ($proc -and $proc.Id) { return @{ pid = $proc.Id; session_id = $sid } }
-  Write-Warning "supervisor: launch of '$name' returned no PID (need Start-Process -PassThru); not auto-restarting it"; return $null
+  Write-Warning "supervisor: launch of '$name' returned no PID; not auto-restarting it"; return $null
 }
 
 do {
@@ -506,31 +524,57 @@ do {
 } while (-not $Once)
 """
 
-def init(store: Store, *, force: bool = False) -> dict:
-    """Scaffold the supervisor config + PowerShell script under ``.agenttalk/``.
-    Returns ``{path: "written"|"exists"}``. Never overwrites without ``force``
-    (the config especially - it holds the operator's filled-in launch commands).
+def agenttalk_shim(python_exe: str) -> str:
+    """A project-local Windows shim so a bare ``agenttalk`` resolves regardless
+    of console-script PATH discovery. It runs ``python -m agenttalk`` with a
+    KNOWN Python (``sys.executable`` captured at init, overridable via
+    AGENTTALK_PYTHON) and prepends ``<root>/src`` to PYTHONPATH only when this is
+    a source checkout - so it works for BOTH a pip install and a checkout. The
+    supervisor prepends ``.agenttalk/bin`` to PATH before launching an agent."""
+    py = python_exe.replace('"', '')
+    return (
+        "@echo off\r\n"
+        "setlocal\r\n"
+        f'if not defined AGENTTALK_PYTHON set "AGENTTALK_PYTHON={py}"\r\n'
+        # %~dp0 = <root>\\.agenttalk\\bin\\ ; ..\\..\\src = <root>\\src
+        'if exist "%~dp0..\\..\\src\\agenttalk\\__init__.py" '
+        'set "PYTHONPATH=%~dp0..\\..\\src;%PYTHONPATH%"\r\n'
+        '"%AGENTTALK_PYTHON%" -m agenttalk %*\r\n'
+    )
+
+
+def init(store: Store, *, force: bool = False, python_exe: str | None = None) -> dict:
+    """Scaffold the supervisor config + PowerShell script + the project-local
+    ``agenttalk`` shim under ``.agenttalk/``. Returns ``{path: "written"|"exists"}``.
+    Never overwrites without ``force`` (the config especially - it holds the
+    operator's filled-in launch commands).
 
     v1 ships the PowerShell supervisor only (the operator is on Windows); a
     POSIX (bash) supervisor is a documented follow-up - the Python core
     (``supervise --report``/``--plan``, ``request-restart``) is already
     cross-platform, so a future ``supervisor.sh`` is a thin add.
     """
+    py = python_exe or sys.executable
+    src_is_checkout = (store.root / "src" / "agenttalk" / "__init__.py").exists()
+    ps1 = (PS_TEMPLATE
+           .replace("__AGENTTALK_PYTHON__", py.replace("'", "''"))
+           .replace("__SRC_ON_PYPATH__", "$true" if src_is_checkout else "$false"))
     out: dict[str, str] = {}
-    # The .ps1 is written UTF-8 with a BOM (utf-8-sig): Windows PowerShell 5.1
-    # decodes a BOM-less file as Windows-1252, which corrupts any non-ASCII byte
-    # and cascades into parse errors (the 0.28.1 live-test bug). The template is
-    # already ASCII-only; the BOM is belt-and-suspenders and is also fine for
-    # PowerShell 7+. The .json stays plain UTF-8 (a BOM would break Python's
-    # json.loads when the config is read back).
+    # The .ps1 + .cmd shim are written UTF-8 with a BOM (utf-8-sig): Windows
+    # PowerShell 5.1 decodes a BOM-less file as Windows-1252, corrupting any
+    # non-ASCII byte into a parse error (the 0.28.1 live-test bug). Templates are
+    # ASCII-only; the BOM is belt-and-suspenders (fine for PS 7+ / cmd.exe). The
+    # .json stays plain UTF-8 (a BOM would break Python's json.loads on read).
     targets = [
         (store.dir / "supervisor.json", CONFIG_TEMPLATE, "utf-8"),
-        (store.dir / "supervisor.ps1", PS_TEMPLATE, "utf-8-sig"),
+        (store.dir / "supervisor.ps1", ps1, "utf-8-sig"),
+        (store.dir / "bin" / "agenttalk.cmd", agenttalk_shim(py), "utf-8-sig"),
     ]
     for path, content, encoding in targets:
         if path.exists() and not force:
             out[str(path)] = "exists"
             continue
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding=encoding)
         out[str(path)] = "written"
     return out

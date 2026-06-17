@@ -234,15 +234,17 @@ def test_supervise_init_generates_and_is_idempotent(tmp_path: Path, capsys) -> N
     assert "written" in out
     assert (s.dir / "supervisor.json").exists()
     assert (s.dir / "supervisor.ps1").exists()
+    assert (s.dir / "bin" / "agenttalk.cmd").exists()   # the project-local shim
     assert not (s.dir / "supervisor.sh").exists()  # v1: PowerShell only
-    # script anchors: calls the Python plan (NO invalid --json flag), the safe
-    # launcher, the wt warning, the dry-run hook, and preserves a marker on a
-    # failed relaunch.
+    # script anchors: calls the Python plan (NO invalid --json flag), launches
+    # the REAL exe via -FilePath/-ArgumentList (NOT Invoke-Expression), applies
+    # + restores env, the dry-run hook, and preserves state on a failed launch.
     ps = (s.dir / "supervisor.ps1").read_text(encoding="utf-8")
     assert "supervise --plan --state-file" in ps
     assert "--json" not in ps                       # blocker regression guard
-    assert "Start-Process" in ps and "-PassThru" in ps
-    assert "wt.exe" in ps
+    assert "Start-Process -FilePath" in ps and "-ArgumentList" in ps and "-PassThru" in ps
+    assert "Invoke-Expression" not in ps            # file/args executor, no expr
+    assert "windows_file" in ps                     # launches the real exe
     assert "DryRun" in ps
     assert "keeping marker/state for retry" in ps   # clear-only-on-success path
     # idempotent: a second --init overwrites nothing
@@ -352,44 +354,18 @@ def test_session_args_per_cli_explicit_skill() -> None:
     assert sup.session_args("claude", "resume", "Z", over) == ["--resume", "Z", "--yolo"]
 
 
-def test_launch_template_splices_session_args_unquoted() -> None:
-    """Regression for the LAST mile: the generated launch template must splice
-    {SESSION_ARGS} UNQUOTED inside -ArgumentList @(...) — wrapping it in quotes
-    ('{SESSION_ARGS}') re-collapses ps_arglist's array back into one string and
-    `$agenttalk-listen` is dropped/expanded again."""
-    launch = json.loads(sup.CONFIG_TEMPLATE)["agents"]["AGENT_NAME"]["launch"]
-    for cmd in (launch["windows"], launch["_windows_codex"]):
-        assert "-ArgumentList @(" in cmd            # array expression
-        assert "{SESSION_ARGS}" in cmd
-        assert "'{SESSION_ARGS}'" not in cmd        # NOT quote-wrapped (the bug)
-    # end-to-end: substitute like the script does, then confirm the resulting
-    # @(...) yields the prompt as ONE literal token (PowerShell-parsed when a PS
-    # is available; structural otherwise).
-    tokens = sup.session_args("codex", "resume", None)        # ends in $agenttalk-listen
-    ps = sup.ps_arglist(tokens)
-    cmd = launch["_windows_codex"].split(": ", 1)[1].replace("{SESSION_ARGS}", ps)
-    assert "@('-C','<cwd>','resume','--last'," in cmd
-    assert "'$agenttalk-listen')" in cmd            # single-quoted, one element
-    pwsh = shutil.which("pwsh") or shutil.which("powershell")
-    if pwsh:
-        # evaluate ONLY the ArgumentList array (never the Start-Process line),
-        # asserting token count + the prompt as a single literal element.
-        snippet = f"$a=@({ps}); Write-Output $a.Count; Write-Output $a[-1]"
-        out = subprocess.run([pwsh, "-NoProfile", "-Command", snippet],
-                             capture_output=True, text=True, timeout=30)
-        lines = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
-        assert lines[0] == str(len(tokens))          # no collapse, no split
-        assert lines[-1] == "$agenttalk-listen"      # `$` NOT expanded
-
-
-def test_ps_arglist_quotes_dollar_literally() -> None:
-    # blocker 1(b): the prompt is ONE single-quoted literal — `$` never expands,
-    # nesting quotes never reshape tokens.
-    rendered = sup.ps_arglist(["-a", "never", "$agenttalk-listen"])
-    assert rendered == "'-a','never','$agenttalk-listen'"
-    assert "'$agenttalk-listen'" in rendered
-    # embedded single quotes are doubled
-    assert sup.ps_arglist(["it's"]) == "'it''s'"
+def test_config_launch_is_file_args_not_monitorable_cmd() -> None:
+    """Launch-layer rework: the config exposes a real-exe windows_file + a
+    windows_args ARRAY with the {SESSION_ARGS} splice element — NOT a
+    Start-Process expression, and NEVER a monitorable .cmd shim (a shim hands
+    off + exits -> relaunch storm)."""
+    agent = json.loads(sup.CONFIG_TEMPLATE)["agents"]["AGENT_NAME"]
+    launch = agent["launch"]
+    assert "windows_file" in launch and "windows" not in launch  # new shape
+    assert "{SESSION_ARGS}" in launch["windows_args"]            # splice element
+    assert ".cmd" not in launch["windows_file"]                 # not a shim pid
+    assert "REAL CLI executable" in agent["_comment_launch"]
+    assert ".cmd" in agent["_comment_launch"]                   # warns against it
 
 
 def test_codex_relaunch_command_uses_codex_args() -> None:
@@ -403,7 +379,30 @@ def test_codex_relaunch_command_uses_codex_args() -> None:
     assert p["session_args"] == ["resume", "--last", "-a", "never", "-s",
                                  "workspace-write", "$agenttalk-listen"]
     assert "--session-id" not in p["session_args"]
-    assert p["session_args_ps"].endswith("'$agenttalk-listen'")  # quote-safe
+
+
+def test_agenttalk_shim_resolves_both_install_modes() -> None:
+    """The generated shim makes a bare `agenttalk` resolve for BOTH a source
+    checkout (prepend <root>/src to PYTHONPATH) and a pip install (python -m),
+    using a known Python (no console-script PATH discovery)."""
+    shim = sup.agenttalk_shim(r"C:\py\python.exe")
+    assert "-m agenttalk %*" in shim                       # pip-install path
+    assert 'AGENTTALK_PYTHON=C:\\py\\python.exe' in shim    # known python baked
+    assert "src\\agenttalk\\__init__.py" in shim           # source-checkout guard
+    assert "PYTHONPATH" in shim
+
+
+def test_ps_template_applies_and_restores_env() -> None:
+    """The executor applies the agent env (+ AGENTTALK_ROOT/PYTHON/PYTHONPATH +
+    a PATH prepend of .agenttalk/bin so a bare `agenttalk` resolves) around
+    Start-Process and RESTORES the supervisor's own env afterward."""
+    ps = sup.PS_TEMPLATE
+    assert "AGENTTALK_ROOT" in ps and "AGENTTALK_PYTHON" in ps
+    assert "$a.env" in ps                                  # applies per-agent env
+    assert "bin') + ';' + $env:PATH" in ps                 # PATH prepend of the shim dir
+    assert "finally" in ps                                 # restore in a finally
+    assert "Remove-Item -Path (\"Env:\"" in ps             # restore: unset what wasn't set
+    assert "Invoke-Expression" not in ps
 
 
 def test_record_launch_codex_marks_launched_no_fake_id(tmp_path: Path) -> None:
@@ -529,17 +528,20 @@ def test_generated_ps1_is_bom_ascii_and_parses(tmp_path: Path) -> None:
     body = raw[3:]
     non_ascii = [b for b in body if b > 0x7F]
     assert not non_ascii, f"supervisor.ps1 body must be ASCII-only; found {non_ascii[:5]}"
-    # (b) it actually parses under PowerShell (skip where none is available)
-    pwsh = shutil.which("pwsh") or shutil.which("powershell")
-    if not pwsh:
+    # (b) it actually parses — under EVERY PowerShell present, PREFERRING
+    # Windows PowerShell 5.1 (the bug was 5.1-specific); skip only if none.
+    shells = [sh for sh in (shutil.which("powershell"), shutil.which("pwsh")) if sh]
+    if not shells:
         return
     check = (
         "$e=$null; "
         f"[void][System.Management.Automation.Language.Parser]::ParseFile('{ps1}',"
         "[ref]$null,[ref]$e); if($e -and $e.Count){ $e[0].Message; exit 1 }")
-    res = subprocess.run([pwsh, "-NoProfile", "-Command", check],
-                         capture_output=True, text=True, timeout=60)
-    assert res.returncode == 0, f"supervisor.ps1 failed to parse: {res.stdout}{res.stderr}"
+    for sh in shells:
+        res = subprocess.run([sh, "-NoProfile", "-Command", check],
+                             capture_output=True, text=True, timeout=60)
+        assert res.returncode == 0, (
+            f"supervisor.ps1 failed to parse under {sh}: {res.stdout}{res.stderr}")
 
 
 def test_supervise_plan_exact_generated_command_runs(tmp_path: Path, capsys) -> None:
