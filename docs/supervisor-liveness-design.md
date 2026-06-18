@@ -1,6 +1,6 @@
 # Design: supervisor liveness-model redesign (0.28.1 blocker)
 
-Status: draft (design-review round 4 — codex round-3 ruling folded in)
+Status: draft (design-review round 5 — codex round-4 classifier fix folded in)
 Date: 2026-06-18
 Author: claude-agenttalk-developer-2
 Reviewer: codex (authoritative on the Codex process model)
@@ -197,12 +197,22 @@ brain that never reaches the listen loop OBSERVABLE: if the brain exits, or
 `readiness_seen` is never achieved, by grace expiry -> treated as a failed
 launch (`DEAD`), not healthy.
 
+**Readiness CLEARS grace immediately (codex round-4):** the first fresh `wait`
+heartbeat sets `readiness_seen=true` AND `launching=false` in the same tick, so
+the agent LEAVES `LAUNCHING` at once — it does NOT linger until the 120s grace
+expires. `LAUNCHING` therefore applies only while readiness is UNRESOLVED
+(`launching && !readiness_seen && now < launch_grace_until`). The consequence
+that matters: once an agent has been ready, a subsequent brain death is
+classified normally (`DEAD` / `ZOMBIE_WAIT`) and recovered — it can NEVER be
+masked as "still launching" just because it died inside the original grace
+window.
+
 The table is evaluated TOP-DOWN; the first matching row wins (so the
 readiness-failed row is reached before `ACTIVE_OR_BUSY`).
 
 | State            | Condition (first match wins, top-down)                           | Action |
 |------------------|------------------------------------------------------------------|--------|
-| `LAUNCHING`      | `now < launch_grace_until` (still in grace: brain not-yet-found, OR found but `!readiness_seen`) | discover brain; do NOT treat launcher death as failure; NONE |
+| `LAUNCHING`      | `launching && !readiness_seen && now < launch_grace_until` (still in grace with readiness UNRESOLVED: brain not-yet-found, OR found but no first heartbeat yet) | discover brain; do NOT treat launcher death as failure; NONE |
 | `READINESS_FAILED` | grace expired AND `brain_alive && !readiness_seen` (brain came up but never reached the listen loop — early `-p` exit / wedged start) | **failed launch:** kill tree + relaunch (backoff) |
 | `DEAD`           | grace expired AND `!brain_alive && !wait_alive`                  | relaunch (backoff) |
 | `ZOMBIE_WAIT`    | grace expired AND `!brain_alive && wait_alive`                  | kill orphan wait/runner set, THEN relaunch |
@@ -251,9 +261,11 @@ State machine (transitions):
 2. Each poll while `LAUNCHING`: from the snapshot, walk children of
    `launcher_pid` (and grand-children) to find a process whose name matches the
    CLI's `brain_pattern`. When found, record `brain_pid` + `brain_start` (but
-   STAY `LAUNCHING` until readiness). Set `readiness_seen=true` on the FIRST
-   fresh `wait` heartbeat observed after this launch; only then is
-   `HEALTHY_IDLE` reachable (codex Q2/Q3).
+   STAY `LAUNCHING` until readiness). On the FIRST fresh `wait` heartbeat after
+   this launch, set `readiness_seen=true` AND `launching=false` together — this
+   CLEARS the grace immediately (the agent is classified normally from then on,
+   no need to wait out the 120s, and a later brain death is no longer masked as
+   LAUNCHING); only then is `HEALTHY_IDLE` reachable (codex Q2/Q3/round-4).
 3. Readiness/grace failure (codex Q2): if `launch_grace_until` passes and either
    no `brain_pid` was found OR the brain was found but `readiness_seen` never
    became true (early `-p` exit / never reached the listen loop), treat as a
@@ -321,8 +333,13 @@ liveness branch is rewritten from `pid_alive` to the state classifier:
   helper returning one of the states, evaluated TOP-DOWN in the same order as
   the table (computed from `brain_alive`, `readiness_seen`, `wait_alive`,
   `hb_stale`, `activity_hook`, `launching`, grace).
-- `LAUNCHING` -> `NONE` (or a new `AWAIT_GRACE` reason) — never relaunch in
-  grace; set `readiness_seen=true` on the first fresh `wait` heartbeat.
+- `LAUNCHING` (`launching && !readiness_seen && now < launch_grace_until`) ->
+  `NONE` (or a new `AWAIT_GRACE` reason) — never relaunch while readiness is
+  unresolved in grace. The first fresh `wait` heartbeat sets `readiness_seen=true`
+  AND `launching=false` in `next_state`, so the agent exits `LAUNCHING`
+  immediately and is classified normally on the very next tick (codex round-4: a
+  ready agent must not stay `LAUNCHING` until grace expiry, nor have a later
+  death masked as launching).
 - `READINESS_FAILED` (NEW — mirrors the table, evaluated BEFORE `ACTIVE_OR_BUSY`)
   -> `grace expired && brain_alive && !readiness_seen` -> `STUCK_RECOVER`-style
   `RELAUNCH` with `kill_first=tree` (the brain came up but never reached the
@@ -551,3 +568,21 @@ decision settle the resume mechanism. Folded in above:
   fallback unless explicitly configured. (§Resume bootstrap, test 9.)
 - **Confirmed good:** `READINESS_FAILED` / `ACTIVE_OR_BUSY` ordering closes the
   round-2 conflict.
+
+## Design decisions (codex design-review round 4 — RESOLVED)
+
+Codex confirmed the resume ruling folded correctly; one classifier fix:
+
+- **MAJOR (LAUNCHING must not mask a ready/dead agent):** the `LAUNCHING` row
+  guarded only on `now < launch_grace_until`, so an agent that had already
+  reached brain + first heartbeat would stay `LAUNCHING` for the whole 120s
+  grace, and a post-readiness brain death in that window would be masked.
+  Fixed: `LAUNCHING` now requires `launching && !readiness_seen && now <
+  launch_grace_until`; the first fresh `wait` heartbeat sets `readiness_seen=true`
+  AND `launching=false` together, so the agent exits `LAUNCHING` immediately and a
+  later death is classified `DEAD`/`ZOMBIE_WAIT`. Mirrored in the §Launch flow and
+  the `plan_actions` LAUNCHING bullet. (§Classification readiness-gate,
+  §Launch step 2, §plan_actions.)
+- Codex confirmed acceptable for the design gate: resume/bootstrap,
+  READINESS_FAILED ordering, snapshot-file transport, managed_pids freshness,
+  start-time-guarded brain discovery, leaves-first tree kill.
