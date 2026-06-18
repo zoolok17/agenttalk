@@ -1,6 +1,6 @@
 # Design: supervisor liveness-model redesign (0.28.1 blocker)
 
-Status: draft (design-review round 2 — codex round-1 findings folded in)
+Status: draft (design-review round 3 — codex round-2 findings folded in)
 Date: 2026-06-18
 Author: claude-agenttalk-developer-2
 Reviewer: codex (authoritative on the Codex process model)
@@ -22,7 +22,7 @@ naive heartbeat check is *also* fooled (zombie).
 This design replaces the single-PID liveness model with a **process-tree
 liveness model**: discover and monitor a long-lived *brain* PID, treat the bus
 heartbeat as one input (never the sole signal), and classify each agent into
-one of six states. The decision core stays pure Python (`plan_actions`); the
+one of its liveness states. The decision core stays pure Python (`plan_actions`); the
 `.ps1` stays a thin executor that supplies a process snapshot and performs
 kills. The merged launch layer (`launch.windows_file`/`windows_args`) is kept
 as-is; this work **adds** state fields + discovery rather than ripping it out.
@@ -124,8 +124,9 @@ cleanup/kill fallback, always start-time-guarded, never as a liveness signal.
 New per-CLI config (in `supervisor.json`, defaults baked at `--init`):
 `requires_brain_pid` (Codex `true`; Claude `true` until Phase 2 — see §CLI),
 `brain_pattern` (process-name regex; Codex `^codex`), `launch_grace_seconds`
-(default **120** — codex Q3), and `codex_home_isolation` (default `true` for
-supervised Codex — see §Resume).
+(default **120** — codex Q3), and `codex_home_isolation` (default **`false`** —
+the safe default is the shared-home fail-closed rollout diff; `true` opt-in
+requires the SEEDED-home bootstrap — see §Resume).
 
 ## Process-snapshot input (the helper)
 
@@ -170,7 +171,11 @@ the `.ps1` writes it to a SEPARATE `supervisor-snapshot.json` and passes
 an inline form is ever used for speed it MUST be stripped from `next_state` and
 never written back into `supervisor-state.json` (it can contain command lines).
 
-## Classification — the six states
+## Classification — the state machine (6 core states + 2 guards)
+
+Six core liveness states (LAUNCHING, HEALTHY_IDLE, ACTIVE_OR_BUSY, STUCK, DEAD,
+ZOMBIE_WAIT) plus two guard states added in design-review: `READINESS_FAILED`
+(round-2 MAJOR) and `SNAPSHOT_UNAVAILABLE` (round-1 BLOCKER).
 
 Inputs per agent: `brain_alive` (brain_pid present in snapshot with matching
 start-time), `hb_age`/`hb_stale` (bus heartbeat), `readiness_seen` (at least one
@@ -186,15 +191,25 @@ brain that never reaches the listen loop OBSERVABLE: if the brain exits, or
 `readiness_seen` is never achieved, by grace expiry -> treated as a failed
 launch (`DEAD`), not healthy.
 
-| State            | Condition                                                        | Action |
+The table is evaluated TOP-DOWN; the first matching row wins (so the
+readiness-failed row is reached before `ACTIVE_OR_BUSY`).
+
+| State            | Condition (first match wins, top-down)                           | Action |
 |------------------|------------------------------------------------------------------|--------|
-| `LAUNCHING`      | `launching && now < launch_grace_until` (brain not-yet-found, OR found but `!readiness_seen`) | discover brain; do NOT treat launcher death as failure; NONE |
-| `HEALTHY_IDLE`   | `brain_alive && readiness_seen && !hb_stale`                     | NONE |
-| `ACTIVE_OR_BUSY` | `brain_alive && (hb_stale OR !readiness_seen) && (!activity_hook OR within suspect window)` | warn/suspect only — **never kill** |
-| `STUCK`          | `brain_alive && readiness_seen && hb_stale && activity_hook && stale > stuck_after` | kill tree + resume |
-| `DEAD`           | grace expired AND `!brain_alive && !wait_alive` (incl. brain never found / exited before readiness) | relaunch (backoff) |
+| `LAUNCHING`      | `now < launch_grace_until` (still in grace: brain not-yet-found, OR found but `!readiness_seen`) | discover brain; do NOT treat launcher death as failure; NONE |
+| `READINESS_FAILED` | grace expired AND `brain_alive && !readiness_seen` (brain came up but never reached the listen loop — early `-p` exit / wedged start) | **failed launch:** kill tree + relaunch (backoff) |
+| `DEAD`           | grace expired AND `!brain_alive && !wait_alive`                  | relaunch (backoff) |
 | `ZOMBIE_WAIT`    | grace expired AND `!brain_alive && wait_alive`                  | kill orphan wait/runner set, THEN relaunch |
-| `SNAPSHOT_UNAVAILABLE` | total snapshot failure AND `requires_brain_pid` (see §Process-snapshot) | warn + operator notify, **no kill, no relaunch** |
+| `STUCK`          | `brain_alive && readiness_seen && hb_stale && activity_hook && stale > stuck_after` | kill tree + resume |
+| `ACTIVE_OR_BUSY` | `brain_alive && readiness_seen && hb_stale && (!activity_hook OR within suspect window)` | warn/suspect only — **never kill** |
+| `HEALTHY_IDLE`   | `brain_alive && readiness_seen && !hb_stale`                     | NONE |
+| `SNAPSHOT_UNAVAILABLE` | total snapshot failure AND `requires_brain_pid` (evaluated first; see §Process-snapshot) | warn + operator notify, **no kill, no relaunch** |
+
+Note the ordering closes the round-2 MAJOR: once grace has expired, a
+`brain_alive && !readiness_seen` agent matches `READINESS_FAILED` (a failed
+launch) and can NEVER fall through to `ACTIVE_OR_BUSY` — `ACTIVE_OR_BUSY` now
+requires `readiness_seen` (it only applies to an agent that DID become ready and
+later went heartbeat-stale).
 
 Protected agents (operator-facing ∪ active leads) are NEVER auto-killed: in any
 kill-worthy state they downgrade to `warn_only` (today's rule, preserved).
@@ -246,26 +261,38 @@ Object in v1.
 
 ### Resume (deterministic context pin — FULL scope)
 
-codex review round 1 — MAJOR: deterministic resume needs a FIRM ambiguity rule;
-never silently fall back to `resume --last`. Resolution: make per-agent
-**`CODEX_HOME` isolation the DEFAULT** for supervised Codex, with the rollout
-diff as a fail-closed secondary check.
+codex round 1 — MAJOR: deterministic resume needs a FIRM ambiguity rule; never
+silently `resume --last`. codex round 2 — BLOCKER: a blank isolated `CODEX_HOME`
+is NOT a safe drop-in (an empty home has no `auth.json` / `config.toml` /
+`skills/agenttalk-listen`; `codex doctor` against it reports no credentials, and
+the agent can't resolve the listen skill). Resolution: the **DEFAULT is the
+fail-closed rollout diff in the operator's real `CODEX_HOME`** (codex's option b
+— safe, no secret handling); a SEEDED isolated home is an explicit opt-in.
 
-- **Codex (default — `codex_home_isolation=true`):** the supervisor launches the
-  agent with a dedicated `CODEX_HOME` (e.g. `.agenttalk/codex-home/<agent>/`), so
-  that agent's `sessions/**/rollout-*.jsonl` set is unambiguous and isolated from
-  the operator's other Codex sessions. The single rollout in that home is the
-  agent's `session_id`; relaunch as
-  `resume <session_id> -a never -s workspace-write $agenttalk-listen`.
-- **Codex (rollout diff, when isolation is disabled):** snapshot
-  `.codex/sessions/**/rollout-*.jsonl` before launch (`rollout_baseline`) and
-  after the brain is ready. **FAIL CLOSED:** accept a `session_id` ONLY if
+- **Codex (DEFAULT — `codex_home_isolation=false`):** snapshot the real
+  `<CODEX_HOME>/sessions/**/rollout-*.jsonl` before launch (`rollout_baseline`)
+  and after the brain is ready. **FAIL CLOSED:** accept a `session_id` ONLY if
   EXACTLY ONE new rollout matches this agent's cwd + launch window
-  (`mtime ∈ [launch, ready]`) + agent marker. If zero or >1 match, do NOT claim
-  a deterministic `session_id` and **never** silently use `resume --last`:
-  relaunch FRESH (`$agenttalk-listen`, new context) and warn that context was not
+  (`mtime ∈ [launch, ready]`) + agent marker. If zero or >1 match, do NOT claim a
+  deterministic `session_id` and **never** silently use `resume --last`: relaunch
+  FRESH (`$agenttalk-listen`, new context) and warn that context was not
   preserved this cycle. Ambiguity downgrades context preservation; it never
-  resumes the wrong session.
+  resumes the wrong session. (No auth/skill risk: the real home keeps the
+  operator's credentials + skills.)
+- **Codex (opt-in — `codex_home_isolation=true`, SEEDED):** for environments
+  that run other Codex sessions in the same cwd (where the diff would fail-closed
+  often), the supervisor may use a dedicated `CODEX_HOME`
+  (`.agenttalk/codex-home/<agent>/`) so the rollout set is unambiguous — but only
+  after a **bootstrap that SEEDS the home**: link (preferred, to avoid copying
+  secrets to a second path) or copy `auth.json`, `config.toml`,
+  `skills/agenttalk-listen`, and any required plugin/runtime config from the real
+  `~/.codex`; validate with `codex doctor` BEFORE first use; if the doctor check
+  fails, do NOT launch into the isolated home — fall back to the default
+  (shared-home fail-closed diff) and warn. Secret rules: never log `auth.json`
+  contents; prefer a junction/symlink so the secret is not duplicated on disk;
+  the seeded home lives under `.agenttalk/` (already gitignored). This path is
+  available in v1 but OFF by default; it is the only way to guarantee a
+  deterministic pin under concurrent same-cwd Codex.
 - **Claude:** already pins `--session-id <uuid>` at fresh launch and resumes
   with `--resume <uuid>` — no rollout-diff needed. (Caveat from
   claude-code-guide: session lookup is scoped to the launch directory, so keep
@@ -274,18 +301,24 @@ diff as a fail-closed secondary check.
 ## `plan_actions` changes (the decision core)
 
 `_plan_one` keeps its shape (manual marker > liveness > healthy) but the
-liveness branch is rewritten from `pid_alive` to the six-state classifier:
+liveness branch is rewritten from `pid_alive` to the state classifier:
 
 - Replace `pid_alive = st.get("pid_alive")` with a `_classify(rpt, st, cfg)`
-  helper returning one of the six states (computed from `brain_alive`,
-  `wait_alive`, `hb_stale`, `activity_hook`, `launching`, grace).
+  helper returning one of the states, evaluated TOP-DOWN in the same order as
+  the table (computed from `brain_alive`, `readiness_seen`, `wait_alive`,
+  `hb_stale`, `activity_hook`, `launching`, grace).
 - `LAUNCHING` -> `NONE` (or a new `AWAIT_GRACE` reason) — never relaunch in
-  grace.
+  grace; set `readiness_seen=true` on the first fresh `wait` heartbeat.
+- `READINESS_FAILED` (NEW — mirrors the table, evaluated BEFORE `ACTIVE_OR_BUSY`)
+  -> `grace expired && brain_alive && !readiness_seen` -> `STUCK_RECOVER`-style
+  `RELAUNCH` with `kill_first=tree` (the brain came up but never reached the
+  listen loop — kill the wedged tree, relaunch with backoff). This is what stops
+  an early-`-p` exit being mis-classified as `ACTIVE_OR_BUSY`.
+- `STUCK` -> `STUCK_RECOVER` (kill_first=tree).
+- `ACTIVE_OR_BUSY` (requires `readiness_seen`) -> `SUSPECT_WARN`/`NONE`
+  (rate-limited) — reuses today's no-hook trap logic.
 - `HEALTHY_IDLE` -> existing healthy path (advance `healthy_since`, reset
   backoff after sustained liveness).
-- `ACTIVE_OR_BUSY` -> `SUSPECT_WARN`/`NONE` (rate-limited) — reuses today's
-  no-hook trap logic.
-- `STUCK` -> `STUCK_RECOVER` (kill_first=tree).
 - `DEAD` -> `RELAUNCH`.
 - `ZOMBIE_WAIT` -> new `RELAUNCH` variant with `kill_orphans=true` so the
   executor reaps the orphan `wait`/runner set first.
@@ -412,11 +445,12 @@ bus calls are PATH-independent; Windows-gated runtime tests stay gated on
 ## v1 vs follow-up
 
 v1 (this work, gates 0.28.1):
-- brain-PID discovery + 6-state classifier (+ readiness gate + fail-closed
+- brain-PID discovery + state classifier (6 core + READINESS_FAILED /
+  SNAPSHOT_UNAVAILABLE guards) (+ readiness gate + fail-closed
   `SNAPSHOT_UNAVAILABLE`) + leaves-first tree-kill + deterministic Codex resume
-  (isolated `CODEX_HOME` default, fail-closed rollout diff) + the snapshot helper
-  (separate `--snapshot-file`) + the test matrix. Codex ships with
-  `requires_brain_pid=true`.
+  (DEFAULT = shared-home fail-closed rollout diff; SEEDED isolated `CODEX_HOME`
+  is an opt-in) + the snapshot helper (separate `--snapshot-file`) + the test
+  matrix. Codex ships with `requires_brain_pid=true`.
 
 Follow-up (NOT 0.28.1):
 - Windows Job Object kill containment.
@@ -435,10 +469,10 @@ sections above:
   `requires_brain_pid` CLI -> `SNAPSHOT_UNAVAILABLE` (warn/notify, no kill, no
   relaunch). Legacy single-PID path is opt-in only for a validated non-forking
   CLI. (§Process-snapshot, §Backward-compat, §plan_actions.)
-- **MAJOR (resume ambiguity):** isolated `CODEX_HOME` is the DEFAULT for
-  supervised Codex; the rollout diff is fail-closed (exactly one new rollout
-  matching cwd/launch-window/marker) and NEVER silently uses `resume --last`.
-  (§Resume.)
+- **MAJOR (resume ambiguity):** fail-closed rollout diff (exactly one new rollout
+  matching cwd/launch-window/marker), NEVER silent `resume --last`. (The round-1
+  resolution made isolated `CODEX_HOME` the default; **superseded by round-2** —
+  the default is now the shared-home fail-closed diff, see below.) (§Resume.)
 - **Q1:** ship Codex `requires_brain_pid=true`; Claude a config knob with
   destructive recovery disabled until Phase 2; degenerate `brain==launcher`
   supported only when explicitly configured. (§CLI-agnostic.)
@@ -450,7 +484,27 @@ sections above:
 - **Q4:** snapshot goes to a SEPARATE `supervisor-snapshot.json` via
   `--snapshot-file`; never persisted into `next_state`. (§Process-snapshot,
   §plan_actions, §.ps1.)
-- **Q5:** see MAJOR above (isolated `CODEX_HOME` default).
+- **Q5:** resume ambiguity rule (see MAJOR; superseded by round-2 default below).
 - **Q6:** `managed_pids` re-derived every poll, persisted on change, with
   `start` + `last_seen`; stale entries only a start-time-guarded kill fallback.
   (§State schema.)
+
+## Design decisions (codex design-review round 2 — RESOLVED)
+
+- **BLOCKER (unseeded isolated home):** an empty `CODEX_HOME` loses
+  auth/config/skills (codex verified `codex doctor` reports no credentials).
+  Resolution = codex's option (b): the **DEFAULT is the shared-home fail-closed
+  rollout diff** (no secret handling, keeps the operator's auth + listen skill).
+  A SEEDED isolated home (`codex_home_isolation=true`) is an explicit opt-in that
+  must bootstrap auth.json/config.toml/skills (link-preferred, `codex doctor`
+  validated, fall back to the default on failure). `codex_home_isolation`
+  default flipped to **`false`**. (§Resume, §State-schema config knobs.)
+- **MAJOR (readiness-failure conflict):** the classification table is now
+  evaluated TOP-DOWN with an explicit `READINESS_FAILED` row
+  (`grace expired && brain_alive && !readiness_seen` -> failed launch: kill tree
+  + relaunch) placed BEFORE `ACTIVE_OR_BUSY`, and `ACTIVE_OR_BUSY` now REQUIRES
+  `readiness_seen`. An early `-p` exit can no longer be mis-classified as
+  warn-only. Mirrored in the `plan_actions` bullet list. (§Classification,
+  §plan_actions, test 6.)
+- Confirmed fixed from round 1: snapshot fail-closed; no silent `resume --last`;
+  Q1/Q3/Q4/Q6 folded correctly.
