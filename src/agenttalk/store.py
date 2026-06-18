@@ -2101,11 +2101,19 @@ class Store:
 
     def agent_active(self, name: str, *, now: float | None = None) -> bool:
         """Is this identity currently IN USE? True when the agent's heartbeat is
-        fresher than ``ACTIVE_WITHIN_SECONDS`` OR it has a live ``.waiting`` marker
-        (an alive owner pid). The OR matters: a listener parked in ``wait`` has a
-        waiting marker even with NO activity hook (so no heartbeat), while a busy
-        agent has a fresh heartbeat but (per the zombie-wait insight) no waiter.
-        Read-only, best-effort, never raises - an uncertain probe reads as False."""
+        fresher than ``ACTIVE_WITHIN_SECONDS`` OR it has a FRESH, live ``.waiting``
+        marker (owner pid alive AND not past ``deadline_epoch + stale_after``, the
+        same freshness gate ``live_waiter_count`` uses - codex-reviewer-1 r1, so a
+        long-expired marker whose pid was reused does not false-positive). The OR
+        matters: a listener parked in ``wait`` has a marker even with NO activity
+        hook (no heartbeat), while a busy agent has a heartbeat but (the zombie-wait
+        insight) no waiter. The ``name`` is VALIDATED before any state-file read
+        (an unsafe name can't be a real active identity and must never be
+        interpolated into a path - codex-reviewer-1 r1). Never raises."""
+        try:
+            validate_agent_name(name)
+        except ValueError:
+            return False
         if now is None:
             now = time.time()
         hb = self.read_heartbeat(name)
@@ -2114,30 +2122,41 @@ class Store:
         marker = self.read_waiting(name)
         if isinstance(marker, dict):
             pid = marker.get("pid")
-            if isinstance(pid, int) and _process_alive(pid):
+            deadline = marker.get("deadline_epoch")
+            stale = (isinstance(deadline, (int, float))
+                     and now > deadline + _WAIT_STALE_AFTER_DEFAULT)
+            if isinstance(pid, int) and not stale and _process_alive(pid):
                 return True
         return False
 
     def suggest_unique_name(self, base: str, *, now: float | None = None,
                             limit: int = 1000) -> str:
-        """The first free ``<base>-N`` (N>=2) that is NEITHER a current roster
-        member, NOR an active identity, NOR a retired tombstone - so a joining
-        agent can adopt it without colliding or hitting the tombstone refusal.
-        Falls back to ``<base>-<limit+1>`` if somehow all are taken."""
+        """The first free ``<base>-N`` (N>=2) that is a VALID identifier AND
+        neither a current roster member, an active identity, nor a retired
+        tombstone - so a joining agent can ALWAYS adopt the suggestion without
+        colliding or failing validation. The base is TRUNCATED so the suffix
+        keeps the result within the 64-char limit (codex-reviewer-1 r1: an
+        unbounded ``<base>-N`` could exceed the validator and be unadoptable)."""
         if now is None:
             now = time.time()
         cfg = self.load_config()
         roster = {a.casefold() for a in cfg.get("agents", []) or []}
         retired = {r.casefold() for r in self._retired_names(cfg)}
         for n in range(2, limit + 1):
-            cand = f"{base}-{n}"
+            suffix = f"-{n}"
+            cand = base[:max(1, 64 - len(suffix))] + suffix
             key = cand.casefold()
             if key in roster or key in retired:
+                continue
+            try:
+                validate_agent_name(cand)
+            except ValueError:
                 continue
             if self.agent_active(cand, now=now):
                 continue
             return cand
-        return f"{base}-{limit + 1}"
+        # Exhausted (pathological): a bounded, valid last resort.
+        return (base[:max(1, 64 - len(f"-{limit + 1}"))] + f"-{limit + 1}")
 
     # ----------------------------------------------------- compaction (#2)
     #

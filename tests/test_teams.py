@@ -176,14 +176,47 @@ def test_agent_active_heartbeat_or_live_waiter(tmp_path: Path) -> None:
     hb = s.read_heartbeat("codex").timestamp()
     assert s.agent_active("codex", now=hb + 1) is True              # fresh
     assert s.agent_active("codex", now=hb + ACTIVE_WITHIN_SECONDS + 5) is False  # stale
-    # a live waiting marker (alive pid) is active even with NO heartbeat
+    # a FRESH live waiting marker (alive pid, within deadline) is active even
+    # with NO heartbeat
     s.write_waiting("lead", {"agent": "lead", "pid": os.getpid(),
                              "deadline_epoch": hb + 1800})
-    assert s.agent_active("lead", now=hb + 99999) is True
+    assert s.agent_active("lead", now=hb + 100) is True
+    # ...but a long-EXPIRED marker (past deadline + stale_after) does NOT count,
+    # even if its pid happens to still be alive (codex-reviewer-1 r1 follow-up)
+    assert s.agent_active("lead", now=hb + 1800 + 99999) is False
     # a dead pid is NOT active
     s.write_waiting("lead", {"agent": "lead", "pid": 2_000_000_000,
                              "deadline_epoch": hb + 1800})
-    assert s.agent_active("lead", now=hb + 99999) is False
+    assert s.agent_active("lead", now=hb + 100) is False
+
+
+def test_agent_active_invalid_name_is_false_not_path_probe(tmp_path: Path) -> None:
+    # codex-reviewer-1 r1: an unsafe name must NOT be interpolated into a state
+    # file path - agent_active validates first and returns False.
+    s = Store(tmp_path)
+    s.init(["codex"])
+    assert s.agent_active("../evil") is False
+    assert s.agent_active("a/b") is False
+
+
+def test_roster_add_unique_rejects_unsafe_name_before_probe(tmp_path: Path) -> None:
+    # the CLI validates the raw name BEFORE the active probe -> usage exit 2
+    # (path-traversal class never reaches the filesystem read).
+    root = _team(tmp_path, ["codex"])
+    _run_expect_exit(["roster", "add", "../evil", "--unique"], root, 2)
+
+
+def test_suggest_unique_name_stays_within_64_chars(tmp_path: Path) -> None:
+    # codex-reviewer-1 r1: a long active base must still yield an ADOPTABLE
+    # suggestion (<=64 chars, passes validate_agent_name).
+    from agenttalk.store import validate_agent_name
+    s = Store(tmp_path)
+    base = "c" * 64                      # a maximal valid base
+    s.init([base])
+    s.write_heartbeat(base)              # make it active so a variant is suggested
+    sug = s.suggest_unique_name(base)
+    assert len(sug) <= 64
+    assert validate_agent_name(sug) == sug   # adoptable (does not raise)
 
 
 def test_suggest_unique_name_skips_roster_and_active(tmp_path: Path) -> None:

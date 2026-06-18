@@ -1801,6 +1801,10 @@ def cmd_roster(args: argparse.Namespace) -> int:
     action = getattr(args, "roster_cmd", None)
     if action == "add":
         name = args.name
+        # Validate BEFORE any state-file probe: agent_active()/suggest read
+        # .agenttalk/state/<name>.* paths, so an unsafe name must be rejected up
+        # front (codex-reviewer-1 r1 - no path interpolation of a raw name).
+        validate_agent_name(name)
         already = name in (store.load_config().get("agents", []) or [])
         active = store.agent_active(name)
         if getattr(args, "unique", False) and active:
