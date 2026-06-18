@@ -572,7 +572,14 @@ def test_supervise_plan_exact_generated_command_runs(tmp_path: Path, capsys) -> 
 
 def _pick_powershell() -> str | None:
     """Windows PowerShell 5.1 first (the launch-layer bugs are 5.1-specific), then
-    pwsh. None if neither is present (skip the Windows-gated runtime tests)."""
+    pwsh. None if neither is present (skip the Windows-gated runtime tests).
+
+    These runtime tests exercise the .cmd shim and Windows Start-Process arg
+    quoting, which are Windows-only - a `.cmd` batch file can't execute under
+    pwsh on Linux/macOS (GitHub's POSIX runners DO ship pwsh, so a bare
+    which() check is not enough). Gate on the OS, not just shell presence."""
+    if os.name != "nt":
+        return None
     for sh in ("powershell", "pwsh"):
         found = shutil.which(sh)
         if found:
