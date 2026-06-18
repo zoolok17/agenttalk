@@ -4,12 +4,14 @@ roster management, audience resolution, and broadcast fan-out."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from agenttalk import cli
 from agenttalk.store import (
+    ACTIVE_WITHIN_SECONDS,
     Store,
     validate_group_name,
     validate_groups,
@@ -162,6 +164,72 @@ def test_roster_add_remove_via_cli(tmp_path: Path, capsys: pytest.CaptureFixture
     assert "c" in Store(root).load_config()["agents"]
     assert _run(["roster", "remove", "c", "--force"], root) == 0
     assert "c" not in Store(root).load_config()["agents"]
+
+
+# ------------------------------------------------ unique-name self-join guard
+
+def test_agent_active_heartbeat_or_live_waiter(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["codex", "lead"])
+    assert s.agent_active("lead") is False              # no heartbeat, no waiter
+    s.write_heartbeat("codex")
+    hb = s.read_heartbeat("codex").timestamp()
+    assert s.agent_active("codex", now=hb + 1) is True              # fresh
+    assert s.agent_active("codex", now=hb + ACTIVE_WITHIN_SECONDS + 5) is False  # stale
+    # a live waiting marker (alive pid) is active even with NO heartbeat
+    s.write_waiting("lead", {"agent": "lead", "pid": os.getpid(),
+                             "deadline_epoch": hb + 1800})
+    assert s.agent_active("lead", now=hb + 99999) is True
+    # a dead pid is NOT active
+    s.write_waiting("lead", {"agent": "lead", "pid": 2_000_000_000,
+                             "deadline_epoch": hb + 1800})
+    assert s.agent_active("lead", now=hb + 99999) is False
+
+
+def test_suggest_unique_name_skips_roster_and_active(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["codex", "codex-2"])           # codex-2 already a roster member
+    s.write_heartbeat("codex")             # codex itself active
+    # codex active + codex-2 taken -> the first FREE variant is codex-3
+    assert s.suggest_unique_name("codex") == "codex-3"
+
+
+def test_roster_add_unique_refuses_active_and_suggests(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _team(tmp_path, ["codex", "codex-2"])
+    Store(root).write_heartbeat("codex")            # codex is ACTIVE
+    # plain text refusal: exit 3 + a suggestion on stderr
+    rc = _run(["roster", "add", "codex", "--unique"], root)
+    assert rc == 3
+    err = capsys.readouterr().err
+    assert "ACTIVE identity" in err and "codex-3" in err
+    # --json refusal shape
+    rc = _run(["roster", "add", "codex", "--unique", "--json"], root)
+    assert rc == 3
+    data = json.loads(capsys.readouterr().out)
+    assert data == {"refused": True, "active_holder": "codex", "suggested": "codex-3"}
+    # codex was NOT re-added / no second identity created
+    assert Store(root).load_config()["agents"].count("codex") == 1
+
+
+def test_roster_add_unique_allows_free_name(tmp_path: Path) -> None:
+    root = _team(tmp_path, ["codex"])
+    assert _run(["roster", "add", "claude-dev", "--unique"], root) == 0
+    assert "claude-dev" in Store(root).load_config()["agents"]
+
+
+def test_roster_add_plain_rebind_active_warns_but_succeeds(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _team(tmp_path, ["codex"])
+    Store(root).write_heartbeat("codex")            # active
+    # plain add (idempotent) of an ACTIVE existing name -> exit 0 + warning
+    assert _run(["roster", "add", "codex"], root) == 0
+    err = capsys.readouterr().err
+    assert "LIVE owner" in err and "--unique" in err
+    assert Store(root).load_config()["agents"].count("codex") == 1
+    # a plain add of a NON-active (new) name -> no warning
+    assert _run(["roster", "add", "fresh-name"], root) == 0
+    assert "LIVE owner" not in capsys.readouterr().err
 
 
 # -------------------------------------------------------- broadcast

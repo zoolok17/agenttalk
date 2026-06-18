@@ -1800,9 +1800,35 @@ def cmd_roster(args: argparse.Namespace) -> int:
     store = _get_store(args)
     action = getattr(args, "roster_cmd", None)
     if action == "add":
-        store.add_agent(args.name, role=getattr(args, "role", None),
+        name = args.name
+        already = name in (store.load_config().get("agents", []) or [])
+        active = store.agent_active(name)
+        if getattr(args, "unique", False) and active:
+            # FRESH self-join guard: refuse to adopt a name a LIVE agent holds,
+            # and suggest a free variant. Exit 3 (distinct from usage exit 2) so a
+            # skill/automation can branch and adopt the suggestion.
+            suggested = store.suggest_unique_name(name)
+            if getattr(args, "json", False):
+                print(json.dumps({"refused": True, "active_holder": name,
+                                  "suggested": suggested}, indent=2))
+            else:
+                sys.stderr.write(
+                    f"agenttalk roster add --unique: {name!r} is an ACTIVE identity "
+                    f"(fresh heartbeat or a live waiter) - refusing to re-bind it. "
+                    f"Join as {suggested!r} instead (set $AGENTTALK_SELF to it).\n")
+            return 3
+        store.add_agent(name, role=getattr(args, "role", None),
                         groups=getattr(args, "group", None))
-        print(f"roster: added {args.name}")
+        if already and active:
+            # plain (idempotent) add that re-binds a name a LIVE agent holds:
+            # non-fatal warning (catches the rejoin/re-init-misuse path) - the
+            # add still succeeds (exit 0) so deliberate re-init is unaffected.
+            sys.stderr.write(
+                f"WARNING: {name!r} already has a LIVE owner (fresh heartbeat or a "
+                f"live waiter); `roster add` is idempotent so this did NOT create a "
+                f"second identity, but if you are a NEW agent use "
+                f"`roster add <name> --unique` to claim a unique name.\n")
+        print(f"roster: added {name}")
         return 0
     if action == "remove":
         # FR-007: refuse by default with a retire hint; --force removes
@@ -3649,6 +3675,15 @@ def build_parser() -> argparse.ArgumentParser:
     r_add.add_argument("--role", help="Role label (e.g. implementer, reviewer, lead).")
     r_add.add_argument("--group", action="append",
                        help="Add the agent to this group (repeatable).")
+    r_add.add_argument("--unique", action="store_true",
+                       help="Self-join guard: REFUSE (exit 3) if <name> is an "
+                            "ACTIVE identity (fresh heartbeat or a live waiter), "
+                            "printing a free variant to adopt instead. Use this on "
+                            "a FRESH self-join so two agents never share one name; "
+                            "plain `add` stays idempotent for rejoin/re-init.")
+    r_add.add_argument("--json", action="store_true",
+                       help="(add --unique) machine-readable refusal "
+                            '{"refused", "active_holder", "suggested"}.')
     r_add.set_defaults(func=cmd_roster)
     r_rm = rsub.add_parser(
         "remove",

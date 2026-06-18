@@ -55,6 +55,29 @@ If `.agenttalk/` is not under the current directory, pass `--root
 `agenttalk sync --root ...`; global options must precede the
 subcommand.
 
+## Self-join: claim a UNIQUE name
+
+If you are a **NEW** agent joining the roster (not rejoining an identity
+that is already yours), never silently adopt a name another live agent
+holds - `roster add` is idempotent, so re-using an ACTIVE name binds two
+agents to one identity. Check first, then claim with `--unique`:
+
+```bash
+agenttalk roster                          # see who is already on the team
+agenttalk roster add <name> --unique      # claim a UNIQUE identity
+```
+
+`--unique` REFUSES (exit 3) when `<name>` is an ACTIVE identity (a fresh
+heartbeat or a live waiter) and prints a free variant (e.g. `codex-2`).
+If it refuses, **adopt the suggested name**: `export
+AGENTTALK_SELF=<suggested>` (and re-resolve `SELF`) before doing anything
+else, then continue. Use `--json` to parse `{refused, active_holder,
+suggested}`.
+
+Only when you are **REJOINING** an identity that is already yours (after a
+restart, context compaction, or re-init) use the plain idempotent
+`agenttalk roster add <name>` - you ARE that name (see Rejoin bootstrap).
+
 ## Rejoin bootstrap
 
 Before acting after a restart, context compaction, or long idle period,

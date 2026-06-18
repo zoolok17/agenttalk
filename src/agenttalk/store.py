@@ -2097,6 +2097,48 @@ class Store:
             return count
         return count
 
+    # ----------------------------------------------- unique-name self-join guard
+
+    def agent_active(self, name: str, *, now: float | None = None) -> bool:
+        """Is this identity currently IN USE? True when the agent's heartbeat is
+        fresher than ``ACTIVE_WITHIN_SECONDS`` OR it has a live ``.waiting`` marker
+        (an alive owner pid). The OR matters: a listener parked in ``wait`` has a
+        waiting marker even with NO activity hook (so no heartbeat), while a busy
+        agent has a fresh heartbeat but (per the zombie-wait insight) no waiter.
+        Read-only, best-effort, never raises - an uncertain probe reads as False."""
+        if now is None:
+            now = time.time()
+        hb = self.read_heartbeat(name)
+        if hb is not None and (now - hb.timestamp()) <= ACTIVE_WITHIN_SECONDS:
+            return True
+        marker = self.read_waiting(name)
+        if isinstance(marker, dict):
+            pid = marker.get("pid")
+            if isinstance(pid, int) and _process_alive(pid):
+                return True
+        return False
+
+    def suggest_unique_name(self, base: str, *, now: float | None = None,
+                            limit: int = 1000) -> str:
+        """The first free ``<base>-N`` (N>=2) that is NEITHER a current roster
+        member, NOR an active identity, NOR a retired tombstone - so a joining
+        agent can adopt it without colliding or hitting the tombstone refusal.
+        Falls back to ``<base>-<limit+1>`` if somehow all are taken."""
+        if now is None:
+            now = time.time()
+        cfg = self.load_config()
+        roster = {a.casefold() for a in cfg.get("agents", []) or []}
+        retired = {r.casefold() for r in self._retired_names(cfg)}
+        for n in range(2, limit + 1):
+            cand = f"{base}-{n}"
+            key = cand.casefold()
+            if key in roster or key in retired:
+                continue
+            if self.agent_active(cand, now=now):
+                continue
+            return cand
+        return f"{base}-{limit + 1}"
+
     # ----------------------------------------------------- compaction (#2)
     #
     # `compact` archives a contiguous PREFIX of VALID messages (id <
@@ -2465,6 +2507,11 @@ _last_id_dt: datetime | None = None
 # pass one. Generous on purpose: the liveness check is the real gate, this
 # only discards an obviously-expired bounded-wait marker.
 _WAIT_STALE_AFTER_DEFAULT = 300.0
+
+# An identity counts as ACTIVE (someone is using this name) when its heartbeat
+# is fresher than this OR it has a live waiting marker. Used by the unique-name
+# self-join guard (`roster add --unique`) to refuse re-binding a live identity.
+ACTIVE_WITHIN_SECONDS = 120.0
 
 
 def _process_alive(pid: int) -> bool:

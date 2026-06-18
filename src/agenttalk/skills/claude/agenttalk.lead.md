@@ -32,6 +32,14 @@ In a team setup, prefer unique role-suffixed names such as
 `claude-dev`, `codex-dev`, `claude-rev`, `codex-rev`, and
 `claude-lead`. The default `claude` / `codex` pair remains valid.
 
+**Claim a UNIQUE identity on a fresh join.** When YOU first join, or when
+an agent registers itself, use `agenttalk roster add <name> --unique`: it
+REFUSES (exit 3) if `<name>` is an ACTIVE identity (fresh heartbeat or a
+live waiter) and prints a free variant to adopt instead (set
+`$env:AGENTTALK_SELF` to it). This stops two agents silently sharing one
+name (`roster add` is idempotent). A deliberate REJOIN of an identity that
+is already yours keeps the plain idempotent `agenttalk roster add <name>`.
+
 On start or rejoin, run:
 
 ```powershell
