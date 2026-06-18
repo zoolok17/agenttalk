@@ -129,7 +129,15 @@ def _launch_detail(st: dict, cfg_agent: dict) -> dict:
     one argument, nothing needs quoting)."""
     cli = cfg_agent.get("cli", "claude")
     session_id = st.get("session_id") or None
-    resume = bool(st.get("resume_available") or session_id or st.get("launched"))
+    # codex review (impl r1 MAJOR): resume must mean "reached readiness once".
+    # For codex, drive it ONLY from resume_available - legacy `launched` is set at
+    # launch time (before readiness), so honoring it would `resume --last` after a
+    # failed first launch (the design says FRESH before first readiness). Claude
+    # pins its id, so a known session_id still implies resume there.
+    if cli == "codex":
+        resume = bool(st.get("resume_available"))
+    else:
+        resume = bool(st.get("resume_available") or session_id or st.get("launched"))
     mode = "resume" if resume else "fresh"
     return {"cli": cli, "launch_mode": mode, "session_id": session_id,
             "resume_mode": "last" if resume else "fresh",
@@ -164,6 +172,18 @@ def _start_of(row: dict | None):
     return (row or {}).get("start_time")
 
 
+def _iso_epoch(value) -> float | None:
+    """Parse an ISO-8601 start-time to epoch seconds (best-effort). Returns None
+    for non-ISO test sentinels (e.g. "t2") so guards using it degrade to off."""
+    if not isinstance(value, str):
+        return None
+    try:
+        s = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        return None
+
+
 def _pid_alive_guarded(idx: dict[int, dict], pid, expected_start) -> bool:
     """A recorded pid is alive ONLY if present AND its start-time matches what we
     recorded (a recycled pid with a different start-time is NOT our process)."""
@@ -194,25 +214,62 @@ def _wait_row_for(idx: dict[int, dict], agent: str) -> dict | None:
     return None
 
 
+def _depth_to_launcher(idx: dict[int, dict], row: dict, launcher_pid: int) -> int | None:
+    """Number of parent hops from ``row`` up to a node that is (or is a direct
+    child of) ``launcher_pid`` - climbing WITHIN the snapshot. Works even when the
+    launcher ROW itself has exited (a forking launcher), because we match on the
+    recorded ``parent_pid`` reaching ``launcher_pid``, not on the launcher row
+    being present. None if the chain never reaches the launcher."""
+    cur, depth, seen = row, 0, set()
+    while isinstance(cur, dict):
+        cpid = cur.get("pid")
+        if cpid in seen:
+            return None
+        seen.add(cpid)
+        if cpid == launcher_pid:
+            return depth
+        if cur.get("parent_pid") == launcher_pid:
+            return depth
+        ppid = cur.get("parent_pid")
+        nxt = idx.get(ppid) if isinstance(ppid, int) else None
+        if nxt is None:
+            return None
+        cur, depth = nxt, depth + 1
+    return None
+
+
 def _discover_brain(idx: dict[int, dict], agent: str, launcher_pid,
-                    brain_pattern: str) -> dict | None:
-    """Find the long-lived brain process. Primary signal: walk UP the parent
-    chain from the agent's live `wait` process to the TOPMOST ancestor whose name
-    matches ``brain_pattern`` - this survives the forking launcher's exit (the
-    wait + its TUI ancestor stay alive after the launcher hands off and dies).
-    Fallback while the launcher is still alive: the matching descendant of
-    ``launcher_pid``. Returns the brain row or None."""
+                    brain_pattern: str, launch_epoch: float | None = None) -> dict | None:
+    """Find the long-lived brain process. THREE signals, in order:
+
+    1. up from the agent's live ``wait`` process to the TOPMOST brain-named
+       ancestor (needs command lines to find the wait; survives launcher exit);
+    2. name + ancestry to the RECORDED ``launcher_pid`` - a brain-named row whose
+       parent chain reaches the launcher, preferring the one CLOSEST to it. This
+       works with NULL command lines AND after the launcher row has exited (codex
+       impl-review BLOCKER), bounded by a soft start-time guard so a reused
+       launcher pid can't graft an unrelated pre-launch process;
+    3. the degenerate non-forking case: the launcher row itself matches the name
+       (claude.exe is its own long-lived brain).
+    Returns the brain row or None."""
     pat = (brain_pattern or "").lower()
 
     def _name_matches(row):
         return pat and pat in (row.get("name") or "").lower()
 
-    # Primary: up from the wait process to the highest brain-named ancestor.
+    def _started_after_launch(row) -> bool:
+        # soft guard: if both the candidate start and the launch epoch parse,
+        # require the candidate to have started at/after the launch (small slack);
+        # otherwise (non-ISO test sentinels / unknown) do NOT reject.
+        if launch_epoch is None:
+            return True
+        se = _iso_epoch(_start_of(row))
+        return se is None or se >= float(launch_epoch) - 5.0
+
+    # (1) up from the wait process to the highest brain-named ancestor.
     wait = _wait_row_for(idx, agent)
     if wait is not None:
-        best = None
-        seen = set()
-        cur = wait
+        best, seen, cur = None, set(), wait
         while isinstance(cur, dict):
             cpid = cur.get("pid")
             if cpid in seen:
@@ -224,31 +281,31 @@ def _discover_brain(idx: dict[int, dict], agent: str, launcher_pid,
             cur = idx.get(ppid) if isinstance(ppid, int) else None
         if best is not None:
             return best
-    # Fallback: a still-alive launcher whose OWN name matches (the degenerate
-    # NON-forking case: claude.exe is itself the long-lived brain), else a
-    # brain-named descendant of a still-alive launcher.
-    if isinstance(launcher_pid, int) and launcher_pid in idx:
-        if _name_matches(idx[launcher_pid]):
-            return idx[launcher_pid]
-        kids = _children_map(idx)
-        stack, seen = list(kids.get(launcher_pid, [])), set()
-        while stack:
-            pid = stack.pop()
-            if pid in seen:
+    # (2) name + ancestry to the recorded launcher (null-command-line safe).
+    if isinstance(launcher_pid, int):
+        best, best_depth = None, None
+        for row in idx.values():
+            if not _name_matches(row) or not _started_after_launch(row):
                 continue
-            seen.add(pid)
-            row = idx.get(pid)
-            if row is not None and _name_matches(row):
-                return row
-            stack.extend(kids.get(pid, []))
+            d = _depth_to_launcher(idx, row, launcher_pid)
+            if d is not None and (best_depth is None or d < best_depth):
+                best, best_depth = row, d
+        if best is not None:
+            return best
+    # (3) degenerate non-forking: the launcher row itself is the brain.
+    if isinstance(launcher_pid, int) and launcher_pid in idx and _name_matches(idx[launcher_pid]):
+        return idx[launcher_pid]
     return None
 
 
-def _managed_set(idx: dict[int, dict], brain_pid, agent: str,
-                 now_epoch: float) -> list[dict]:
+def _managed_set(idx: dict[int, dict], brain_pid, agent: str, now_epoch: float,
+                 prior: list[dict] | None = None) -> list[dict]:
     """The descendant set to track + reap for a kill: every process under
     ``brain_pid`` PLUS the agent's `wait` row, each with start-time + last_seen.
-    Used for the leaves-first tree kill and ZOMBIE_WAIT orphan reaping."""
+    ALSO carries forward any PRIOR managed pid that is STILL alive with a matching
+    start-time (codex impl-review BLOCKER) - so an orphan wait whose command line
+    is unavailable (brain gone, can't match by cmdline) is still reaped instead of
+    surviving un-killed. Used for the leaves-first tree kill + ZOMBIE_WAIT."""
     out: dict[int, dict] = {}
 
     def _kind(row):
@@ -275,6 +332,15 @@ def _managed_set(idx: dict[int, dict], brain_pid, agent: str,
     if wait is not None and isinstance(wait.get("pid"), int):
         out[wait["pid"]] = {"pid": wait["pid"], "start": _start_of(wait),
                             "kind": "wait", "last_seen": now_epoch}
+    # carry forward a prior managed pid that is STILL live + start-matching (its
+    # command line may now be unavailable, so cmdline matching alone would miss it).
+    for m in (prior or []):
+        pid = m.get("pid")
+        if not isinstance(pid, int) or pid in out:
+            continue
+        if _pid_alive_guarded(idx, pid, m.get("start")):
+            out[pid] = {"pid": pid, "start": m.get("start"),
+                        "kind": m.get("kind", "runner"), "last_seen": now_epoch}
     return list(out.values())
 
 
@@ -291,6 +357,7 @@ def _liveness(snapshot: list[dict] | None, st: dict, cfg_agent: dict,
                 "wait_alive": False, "managed_pids": st.get("managed_pids") or [],
                 "discovered_brain": False}
     idx = _snap_index(snapshot)
+    prior = st.get("managed_pids") or []
     brain_pid = st.get("brain_pid")
     brain_start = st.get("brain_start")
     brain_alive = _pid_alive_guarded(idx, brain_pid, brain_start)
@@ -298,12 +365,17 @@ def _liveness(snapshot: list[dict] | None, st: dict, cfg_agent: dict,
     if not brain_alive:
         cand = _discover_brain(idx, agent, st.get("launcher_pid"),
                                cfg_agent.get("brain_pattern")
-                               or _liveness_cfg(cfg_agent).get("brain_pattern", ""))
+                               or _liveness_cfg(cfg_agent).get("brain_pattern", ""),
+                               launch_epoch=st.get("last_launch_epoch"))
         if cand is not None:
             brain_pid, brain_start = cand.get("pid"), _start_of(cand)
             brain_alive, discovered = True, True
-    wait_alive = _wait_row_for(idx, agent) is not None
-    managed = _managed_set(idx, brain_pid if brain_alive else None, agent, now_epoch)
+    managed = _managed_set(idx, brain_pid if brain_alive else None, agent, now_epoch,
+                           prior=prior)
+    # wait_alive: a fresh command-line match OR a carried-forward live managed
+    # wait pid (codex impl-review BLOCKER - cmdline may be unavailable now).
+    wait_alive = (_wait_row_for(idx, agent) is not None
+                  or any(m.get("kind") == "wait" for m in managed))
     return {"snapshot_available": True, "brain_pid": brain_pid,
             "brain_start": brain_start, "brain_alive": brain_alive,
             "wait_alive": wait_alive, "managed_pids": managed,
@@ -400,7 +472,12 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     stuck_after = float(config.get("stuck_after_seconds", _DEFAULTS["stuck_after_seconds"]))
     grace_seconds = float(config.get("launch_grace_seconds", _DEFAULTS["launch_grace_seconds"]))
     activity_hook = bool(cfg_agent.get("activity_hook", False))
-    requires_brain = bool(_liveness_cfg(cfg_agent).get("requires_brain_pid", True))
+    _lcfg = _liveness_cfg(cfg_agent)
+    requires_brain = bool(_lcfg.get("requires_brain_pid", True))
+    # the EFFECTIVE isolation flag (per-CLI default merged) - emitted in the plan
+    # so the executor seeds CODEX_HOME exactly when the planner assumed it, even
+    # if the raw config omits the field (codex impl-review MAJOR).
+    codex_home_isolation = bool(_lcfg.get("codex_home_isolation", False))
 
     protected = bool(rpt.get("protected"))
     hb_stale = bool(rpt.get("heartbeat_stale"))
@@ -479,6 +556,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                "kill_orphans": bool(kill_orphans), "kill_targets": kill_targets or [],
                "bypass_backoff": bool(bypass_backoff), "notify": bool(notify),
                "discover_brain": bool(discover_brain),
+               "codex_home_isolation": codex_home_isolation,
                "reason": reason, "cli": None, "launch_mode": None,
                "resume_mode": None, "session_id": None, "session_args": None,
                "next_state": nxt}
@@ -934,7 +1012,10 @@ do {
         # Per-agent isolated SEEDED CODEX_HOME for codex (fail closed: skip the
         # relaunch this tick if seeding can't provide auth/config/listen-skill).
         $homeEnv = $null; $seedOk = $true
-        if (($p.cli -eq 'codex') -and $cfg.agents.$name.codex_home_isolation) {
+        if (($p.cli -eq 'codex') -and $p.codex_home_isolation) {
+          # the planner emits the EFFECTIVE isolation flag (per-CLI default
+          # merged), so seeding matches what the plan assumed even if the raw
+          # config omits the field.
           $homeEnv = Seed-CodexHome $name
           if (-not $homeEnv) { $seedOk = $false }
         }

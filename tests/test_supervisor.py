@@ -624,6 +624,76 @@ def test_resume_mode_fresh_then_last() -> None:
     assert p2["state"] == "DEAD" and p2["resume_mode"] == "last"
 
 
+# -------------------------- impl-review r1 regressions (codex findings) ------
+
+def test_brain_discovery_with_null_command_lines(tmp_path: Path) -> None:
+    """impl-review BLOCKER 1: discovery must work by name + ancestry even when
+    `command_line` is null AND the launcher row has exited (partial snapshot).
+    codex.exe(200,parent=199) + wait(400,parent=200), both command_line=None,
+    launcher 199 gone -> brain 200 discovered, readiness clears on fresh hb."""
+    snap = [{"pid": BRAIN_PID, "parent_pid": LAUNCHER_PID, "name": "codex.exe",
+             "command_line": None, "start_time": BRAIN_START},
+            {"pid": WAIT_PID, "parent_pid": BRAIN_PID, "name": "python.exe",
+             "command_line": None, "start_time": "t-wait"}]
+    st = {"agents": {"worker": {"launcher_pid": LAUNCHER_PID, "launching": True,
+                                "launch_grace_until": NOW + 100, "readiness_seen": False}}}
+    p = _plan(_report(heartbeat_stale=False), st, snapshot=snap)
+    assert p["state"] == "HEALTHY_IDLE"
+    assert p["next_state"]["brain_pid"] == BRAIN_PID
+    assert p["next_state"]["readiness_seen"] is True
+
+
+def test_zombie_wait_via_carried_managed_pid_null_cmdline(tmp_path: Path) -> None:
+    """impl-review BLOCKER 2: with the brain gone and the orphan wait's command
+    line now unavailable, a prior start-matching managed wait pid must be carried
+    forward, counted as wait_alive, and reaped (ZOMBIE_WAIT, not a silent DEAD)."""
+    snap = [{"pid": WAIT_PID, "parent_pid": 1, "name": "python.exe",
+             "command_line": None, "start_time": "wait-start"}]
+    st = {"agents": {"worker": _ready(
+        backoff_next_epoch=0,
+        managed_pids=[{"pid": WAIT_PID, "start": "wait-start", "kind": "wait",
+                       "last_seen": 0}])}}
+    p = _plan(_report(heartbeat_stale=False), st, snapshot=snap)
+    assert p["state"] == "ZOMBIE_WAIT" and p["kill_orphans"] is True
+    assert WAIT_PID in [t["pid"] for t in p["kill_targets"]]
+
+
+def test_codex_failed_first_launch_is_fresh_not_resume() -> None:
+    """impl-review MAJOR 1: codex resume must be driven by resume_available, NOT
+    legacy `launched` (set at launch time, before readiness). A failed first
+    launch (launched=true, resume_available=false) must relaunch FRESH."""
+    cfg = {"agents": {"worker": {"cli": "codex", "auto_restart": True}},
+           "launch_grace_seconds": 120}
+    st = {"agents": {"worker": {"launcher_pid": LAUNCHER_PID, "launching": True,
+                                "launch_grace_until": NOW - 1, "readiness_seen": False,
+                                "resume_available": False, "launched": True,
+                                "backoff_next_epoch": 0}}}
+    p = sup.plan_actions(_report(heartbeat_stale=True), st, cfg,
+                         now_epoch=NOW, snapshot=[])["agents"]["worker"]
+    assert p["state"] == "DEAD" and p["resume_mode"] == "fresh"
+    assert "--last" not in (p["session_args"] or [])
+
+
+def test_effective_codex_home_isolation_emitted_in_plan() -> None:
+    """impl-review MAJOR 2: the plan must carry the EFFECTIVE isolation flag (the
+    per-CLI default merged), so the executor seeds CODEX_HOME exactly when the
+    planner assumed it - even if the raw config omits the field."""
+    codex_cfg = {"agents": {"worker": {"cli": "codex", "auto_restart": True}}}
+    pc = sup.plan_actions(_report(), {"agents": {"worker": {}}}, codex_cfg,
+                          now_epoch=NOW, snapshot=[])["agents"]["worker"]
+    assert pc["codex_home_isolation"] is True       # codex default true
+    claude_cfg = {"agents": {"worker": {"cli": "claude", "auto_restart": True}}}
+    pl = sup.plan_actions(_report(), {"agents": {"worker": {}}}, claude_cfg,
+                          now_epoch=NOW, snapshot=[])["agents"]["worker"]
+    assert pl["codex_home_isolation"] is False      # claude default false
+    # an explicit override wins
+    off_cfg = {"agents": {"worker": {"cli": "codex", "auto_restart": True,
+                                     "codex_home_isolation": False}}}
+    po = sup.plan_actions(_report(), {"agents": {"worker": {}}}, off_cfg,
+                          now_epoch=NOW, snapshot=[])["agents"]["worker"]
+    assert po["codex_home_isolation"] is False
+
+
 # ---------------------------------------- WP-3: heartbeat command (throttled)
 
 def test_heartbeat_command_stamps(tmp_path: Path) -> None:
