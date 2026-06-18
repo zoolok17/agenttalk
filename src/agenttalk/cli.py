@@ -3498,11 +3498,18 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         state = {}
         if p.exists():
             try:
-                state = json.loads(p.read_text(encoding="utf-8")) or {}
+                # utf-8-sig: PowerShell 5.1 Set-Content writes a BOM that plain
+                # json.loads chokes on (state round-trip would silently fail).
+                state = json.loads(p.read_text(encoding="utf-8-sig")) or {}
             except (ValueError, OSError):
                 state = {}
+        rl_cfg = _load_supervisor_config(store)
+        grace = rl_cfg.get("launch_grace_seconds")
+        grace = float(grace) if isinstance(grace, (int, float)) else None
         sup.record_launch(state, args.agent, cli=args.cli or "claude",
-                          pid=args.pid, session_id=args.session_id)
+                          pid=args.pid, pid_start=args.pid_start,
+                          now_epoch=(args.now if args.now is not None else time.time()),
+                          grace_seconds=grace, session_id=args.session_id)
         p.write_text(json.dumps(state, indent=2), encoding="utf-8")
         return 0
     if args.clear_restart:
@@ -3523,7 +3530,8 @@ def cmd_supervise(args: argparse.Namespace) -> int:
     def _read_state() -> dict:
         if args.state_file and Path(args.state_file).exists():
             try:
-                return json.loads(Path(args.state_file).read_text(encoding="utf-8"))
+                # utf-8-sig tolerates the PowerShell 5.1 Set-Content BOM.
+                return json.loads(Path(args.state_file).read_text(encoding="utf-8-sig"))
             except (ValueError, OSError):
                 return {}
         return {}
@@ -3535,11 +3543,22 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         return 0
     if args.plan:
         if args.report_file:
-            report = json.loads(Path(args.report_file).read_text(encoding="utf-8"))
+            report = json.loads(Path(args.report_file).read_text(encoding="utf-8-sig"))
         else:
             report = sup.build_report(store, now_epoch=now, stuck_after_seconds=stuck)
+        # The executor's process snapshot (a JSON list of rows). A dict marker
+        # {"unavailable": true}, a missing/unreadable file, or no --snapshot-file
+        # => UNAVAILABLE (None): a brain-required CLI then fails closed. utf-8-sig
+        # tolerates the PowerShell 5.1 Set-Content BOM.
+        snapshot = None
+        if args.snapshot_file and Path(args.snapshot_file).exists():
+            try:
+                raw = json.loads(Path(args.snapshot_file).read_text(encoding="utf-8-sig"))
+                snapshot = raw if isinstance(raw, list) else None
+            except (ValueError, OSError):
+                snapshot = None
         print(json.dumps(sup.plan_actions(report, _read_state(), config,
-                                          now_epoch=now), indent=2))
+                                          now_epoch=now, snapshot=snapshot), indent=2))
         return 0
     sys.stderr.write("agenttalk supervise: choose --init, --report, --plan, "
                      "--install-activity-hook, or --clear-restart\n")
@@ -4124,9 +4143,16 @@ def build_parser() -> argparse.ArgumentParser:
                            "pinned id. Needs --state-file.")
     psup.add_argument("--cli", help="(--record-launch) the agent CLI ('claude'|'codex').")
     psup.add_argument("--pid", type=int, default=None,
-                      help="(--record-launch) the launched process id.")
+                      help="(--record-launch) the LAUNCHER process id from Start-Process.")
+    psup.add_argument("--pid-start", dest="pid_start", default=None,
+                      help="(--record-launch) the launcher process start-time "
+                           "(anti-pid-reuse guard).")
     psup.add_argument("--session-id", dest="session_id",
                       help="(--record-launch) the minted session id (Claude).")
+    psup.add_argument("--snapshot-file", dest="snapshot_file", default=None,
+                      help="(--plan) the executor's process snapshot JSON (list of "
+                           "{pid,parent_pid,name,command_line,start_time}). Missing "
+                           "or unreadable => UNAVAILABLE (brain-required CLI fails closed).")
     gsup.add_argument("--install-activity-hook", dest="install_activity_hook",
                       action="store_true",
                       help="MERGE the activity heartbeat hook into the project "

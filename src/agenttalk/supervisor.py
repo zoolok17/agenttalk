@@ -40,6 +40,8 @@ WARN_ONLY = "warn_only"          # protected agent died/stuck - warn/note, never
 REFUSE_PROTECTED = "refuse_protected"  # manual restart of a protected agent w/o --force-protected
 SUSPECT_WARN = "suspect_warn"    # alive + stale but NO activity hook - warn, never kill
 CLEAR_MARKER = "clear_marker"    # a consumed restart marker on a now-healthy agent: just clear it
+SNAPSHOT_UNAVAILABLE = "snapshot_unavailable"  # requires_brain_pid + no snapshot - fail closed (warn, no kill/relaunch)
+READINESS_FAILED = "readiness_failed"  # grace expired, brain up but never reached the listen loop - failed launch
 NONE = "none"                    # healthy, nothing to do
 
 # Default cadence knobs (config overrides these).
@@ -47,7 +49,18 @@ _DEFAULTS = {
     "poll_seconds": 15,
     "stuck_after_seconds": 120,            # alive + heartbeat older than this = stuck
     "suspect_warn_interval_seconds": 300,  # rate-limit for the no-hook warn fallback
+    "launch_grace_seconds": 120,           # forking-CLI startup grace (brain discovery + first hb)
     "backoff": {"base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180},
+}
+
+# Per-CLI liveness defaults (config["agents"][n] overrides). A FORKING launcher
+# (codex.exe) needs brain-PID discovery; requires_brain_pid gates the fail-closed
+# SNAPSHOT_UNAVAILABLE path. brain_pattern matches the long-lived "brain" process
+# name in the snapshot. Claude keeps requires_brain_pid until Phase 2 verifies
+# whether claude.exe forks (its destructive recovery stays off by config).
+_LIVENESS_DEFAULTS = {
+    "codex":  {"requires_brain_pid": True,  "brain_pattern": "codex",  "codex_home_isolation": True},
+    "claude": {"requires_brain_pid": True,  "brain_pattern": "claude", "codex_home_isolation": False},
 }
 
 # Per-CLI session-argument templates, as LISTS of literal tokens (so the
@@ -107,19 +120,204 @@ def session_args(cli: str, mode: str, session_id: str | None,
 
 
 def _launch_detail(st: dict, cfg_agent: dict) -> dict:
-    """Resume/launch fields for a launch action. RESUME once the agent has been
-    launched before - Claude pins a session_id (set by the script on a fresh
-    launch); Codex doesn't pin, so a ``launched`` flag drives its resume-by-last.
-    Either signal means "we've launched this agent, so resume its context".
-    ``session_args`` is the token LIST the executor splices into the config's
-    ``launch.windows_args`` wherever the literal "{SESSION_ARGS}" element appears
-    (an array-element splice - no string interpolation, so each token is exactly
-    one argument and nothing needs quoting)."""
+    """Resume/launch fields for a launch action. RESUME once the agent has
+    reached readiness in its (isolated, for codex) home before - ``resume_available``
+    is the new signal (Codex: ``resume --last``; Claude: ``--resume <pinned id>``).
+    ``session_id``/``launched`` are honored for back-compat. ``session_args`` is the
+    token LIST the executor splices into ``launch.windows_args`` wherever the
+    literal "{SESSION_ARGS}" element appears (array-element splice - each token is
+    one argument, nothing needs quoting)."""
     cli = cfg_agent.get("cli", "claude")
     session_id = st.get("session_id") or None
-    mode = "resume" if (session_id or st.get("launched")) else "fresh"
+    resume = bool(st.get("resume_available") or session_id or st.get("launched"))
+    mode = "resume" if resume else "fresh"
     return {"cli": cli, "launch_mode": mode, "session_id": session_id,
+            "resume_mode": "last" if resume else "fresh",
             "session_args": session_args(cli, mode, session_id, cfg_agent)}
+
+
+# ---- process-snapshot interpretation (PURE; testable from synthetic rows) ---
+#
+# The .ps1 executor captures a Win32_Process snapshot each poll and hands it to
+# Python via --snapshot-file. THIS is where it is interpreted: which recorded
+# pids are still alive (start-time guarded, to defeat pid-reuse), where the
+# long-lived "brain" is, whether the agent's `agenttalk wait` is alive, and the
+# managed descendant set for a tree-kill. All pure - no OS calls - so the whole
+# liveness/classification path is unit-tested from hand-built snapshots.
+#
+# A snapshot is a LIST of rows {pid, parent_pid, name, command_line, start_time}.
+# ``snapshot is None`` means UNAVAILABLE (capture failed) - distinct from an
+# empty list (captured, nothing matched). command_line may be missing/empty
+# (access-limited): we then degrade to name+ancestry only and NEVER match/kill a
+# process by a guessed name (codex discipline note 3).
+
+def _snap_index(snapshot: list[dict] | None) -> dict[int, dict]:
+    idx: dict[int, dict] = {}
+    for row in snapshot or []:
+        pid = row.get("pid")
+        if isinstance(pid, int):
+            idx[pid] = row
+    return idx
+
+
+def _start_of(row: dict | None):
+    return (row or {}).get("start_time")
+
+
+def _pid_alive_guarded(idx: dict[int, dict], pid, expected_start) -> bool:
+    """A recorded pid is alive ONLY if present AND its start-time matches what we
+    recorded (a recycled pid with a different start-time is NOT our process)."""
+    if not isinstance(pid, int) or pid not in idx:
+        return False
+    if expected_start is None:
+        return True  # nothing to compare against (first sighting) - trust presence
+    return _start_of(idx[pid]) == expected_start
+
+
+def _children_map(idx: dict[int, dict]) -> dict[int, list[int]]:
+    kids: dict[int, list[int]] = {}
+    for pid, row in idx.items():
+        ppid = row.get("parent_pid")
+        if isinstance(ppid, int):
+            kids.setdefault(ppid, []).append(pid)
+    return kids
+
+
+def _wait_row_for(idx: dict[int, dict], agent: str) -> dict | None:
+    """The agent's `agenttalk wait --for <agent>` process row, matched by command
+    line (degrades to None when command lines are unavailable - we never guess)."""
+    for row in idx.values():
+        cl = row.get("command_line") or ""
+        if "agenttalk" in cl and "wait" in cl and (
+                f"--for {agent}" in cl or f"--for={agent}" in cl):
+            return row
+    return None
+
+
+def _discover_brain(idx: dict[int, dict], agent: str, launcher_pid,
+                    brain_pattern: str) -> dict | None:
+    """Find the long-lived brain process. Primary signal: walk UP the parent
+    chain from the agent's live `wait` process to the TOPMOST ancestor whose name
+    matches ``brain_pattern`` - this survives the forking launcher's exit (the
+    wait + its TUI ancestor stay alive after the launcher hands off and dies).
+    Fallback while the launcher is still alive: the matching descendant of
+    ``launcher_pid``. Returns the brain row or None."""
+    pat = (brain_pattern or "").lower()
+
+    def _name_matches(row):
+        return pat and pat in (row.get("name") or "").lower()
+
+    # Primary: up from the wait process to the highest brain-named ancestor.
+    wait = _wait_row_for(idx, agent)
+    if wait is not None:
+        best = None
+        seen = set()
+        cur = wait
+        while isinstance(cur, dict):
+            cpid = cur.get("pid")
+            if cpid in seen:
+                break
+            seen.add(cpid)
+            if _name_matches(cur):
+                best = cur  # keep climbing - we want the TOPMOST brain match
+            ppid = cur.get("parent_pid")
+            cur = idx.get(ppid) if isinstance(ppid, int) else None
+        if best is not None:
+            return best
+    # Fallback: a still-alive launcher whose OWN name matches (the degenerate
+    # NON-forking case: claude.exe is itself the long-lived brain), else a
+    # brain-named descendant of a still-alive launcher.
+    if isinstance(launcher_pid, int) and launcher_pid in idx:
+        if _name_matches(idx[launcher_pid]):
+            return idx[launcher_pid]
+        kids = _children_map(idx)
+        stack, seen = list(kids.get(launcher_pid, [])), set()
+        while stack:
+            pid = stack.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            row = idx.get(pid)
+            if row is not None and _name_matches(row):
+                return row
+            stack.extend(kids.get(pid, []))
+    return None
+
+
+def _managed_set(idx: dict[int, dict], brain_pid, agent: str,
+                 now_epoch: float) -> list[dict]:
+    """The descendant set to track + reap for a kill: every process under
+    ``brain_pid`` PLUS the agent's `wait` row, each with start-time + last_seen.
+    Used for the leaves-first tree kill and ZOMBIE_WAIT orphan reaping."""
+    out: dict[int, dict] = {}
+
+    def _kind(row):
+        cl = row.get("command_line") or ""
+        if "agenttalk" in cl and "wait" in cl:
+            return "wait"
+        return "runner"
+
+    if isinstance(brain_pid, int) and brain_pid in idx:
+        kids = _children_map(idx)
+        stack, seen = list(kids.get(brain_pid, [])), set()
+        while stack:
+            pid = stack.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            row = idx.get(pid)
+            if row is None:
+                continue
+            out[pid] = {"pid": pid, "start": _start_of(row),
+                        "kind": _kind(row), "last_seen": now_epoch}
+            stack.extend(kids.get(pid, []))
+    wait = _wait_row_for(idx, agent)
+    if wait is not None and isinstance(wait.get("pid"), int):
+        out[wait["pid"]] = {"pid": wait["pid"], "start": _start_of(wait),
+                            "kind": "wait", "last_seen": now_epoch}
+    return list(out.values())
+
+
+def _liveness(snapshot: list[dict] | None, st: dict, cfg_agent: dict,
+              agent: str, now_epoch: float) -> dict:
+    """Derive the snapshot-based liveness facts for one agent (PURE).
+
+    Returns ``snapshot_available`` (False when capture failed), ``brain_pid`` /
+    ``brain_start`` (recorded, or freshly DISCOVERED this tick), ``brain_alive``,
+    ``wait_alive``, ``managed_pids`` (refreshed), and ``discovered_brain``."""
+    if snapshot is None:
+        return {"snapshot_available": False, "brain_pid": st.get("brain_pid"),
+                "brain_start": st.get("brain_start"), "brain_alive": False,
+                "wait_alive": False, "managed_pids": st.get("managed_pids") or [],
+                "discovered_brain": False}
+    idx = _snap_index(snapshot)
+    brain_pid = st.get("brain_pid")
+    brain_start = st.get("brain_start")
+    brain_alive = _pid_alive_guarded(idx, brain_pid, brain_start)
+    discovered = False
+    if not brain_alive:
+        cand = _discover_brain(idx, agent, st.get("launcher_pid"),
+                               cfg_agent.get("brain_pattern")
+                               or _liveness_cfg(cfg_agent).get("brain_pattern", ""))
+        if cand is not None:
+            brain_pid, brain_start = cand.get("pid"), _start_of(cand)
+            brain_alive, discovered = True, True
+    wait_alive = _wait_row_for(idx, agent) is not None
+    managed = _managed_set(idx, brain_pid if brain_alive else None, agent, now_epoch)
+    return {"snapshot_available": True, "brain_pid": brain_pid,
+            "brain_start": brain_start, "brain_alive": brain_alive,
+            "wait_alive": wait_alive, "managed_pids": managed,
+            "discovered_brain": discovered}
+
+
+def _liveness_cfg(cfg_agent: dict) -> dict:
+    """Per-agent liveness config merged over the per-CLI defaults."""
+    cli = cfg_agent.get("cli", "claude")
+    base = dict(_LIVENESS_DEFAULTS.get(cli, _LIVENESS_DEFAULTS["claude"]))
+    for k in ("requires_brain_pid", "brain_pattern", "codex_home_isolation"):
+        if k in cfg_agent:
+            base[k] = cfg_agent[k]
+    return base
 
 
 def build_report(store: Store, *, now_epoch: float,
@@ -188,16 +386,25 @@ def build_report(store: Store, *, now_epoch: float,
 
 
 def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
-              *, now_epoch: float) -> dict:
-    """Decide ONE agent's action + next state. Pure - no I/O, no clock."""
+              liveness: dict, *, now_epoch: float) -> dict:
+    """Decide ONE agent's action + next state via the 8-state classifier. PURE -
+    no I/O, no clock. ``liveness`` is the snapshot-derived fact bundle from
+    :func:`_liveness`. The classifier is evaluated TOP-DOWN: manual marker >
+    SNAPSHOT_UNAVAILABLE > LAUNCHING > READINESS_FAILED > DEAD > ZOMBIE_WAIT >
+    STUCK > ACTIVE_OR_BUSY > HEALTHY_IDLE (codex round-2/round-4 ordering)."""
     backoff = _backoff_cfg(config)
+    base, cap = float(backoff["base_seconds"]), float(backoff["cap_seconds"])
+    reset_after = float(backoff["reset_after_seconds"])
     suspect_interval = float(config.get(
         "suspect_warn_interval_seconds", _DEFAULTS["suspect_warn_interval_seconds"]))
-    reset_after = float(backoff["reset_after_seconds"])
+    stuck_after = float(config.get("stuck_after_seconds", _DEFAULTS["stuck_after_seconds"]))
+    grace_seconds = float(config.get("launch_grace_seconds", _DEFAULTS["launch_grace_seconds"]))
     activity_hook = bool(cfg_agent.get("activity_hook", False))
+    requires_brain = bool(_liveness_cfg(cfg_agent).get("requires_brain_pid", True))
 
     protected = bool(rpt.get("protected"))
-    pid_alive = bool(st.get("pid_alive", False))
+    hb_stale = bool(rpt.get("heartbeat_stale"))
+    hb_age = rpt.get("heartbeat_age_seconds")
     marker = rpt.get("restart_request") or None
     consumed = list(st.get("consumed_rids", []))
     fails = int(st.get("consecutive_fails", 0))
@@ -205,124 +412,221 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     healthy_since = st.get("healthy_since")
     last_warn = float(st.get("last_warn_epoch", 0.0) or 0.0)
 
-    # carry-forward state; mutated per branch below. The supervisor-OWNED
-    # fields (pid, session_id, launched) are passed THROUGH so the script can
-    # persist next_state by replacement without dropping them - otherwise the
-    # first healthy `none` tick would wipe pid/session_id and the supervisor
-    # would relaunch a healthy agent every poll (codex blocker). On a launch
-    # the script overwrites pid/session_id/launched with the new values.
+    snap_ok = bool(liveness.get("snapshot_available"))
+    brain_alive = bool(liveness.get("brain_alive"))
+    wait_alive = bool(liveness.get("wait_alive"))
+    brain_pid = liveness.get("brain_pid")
+    brain_start = liveness.get("brain_start")
+    managed = liveness.get("managed_pids") or []
+
+    launching = bool(st.get("launching", False))
+    grace_until = float(st.get("launch_grace_until", 0.0) or 0.0)
+    readiness_seen = bool(st.get("readiness_seen", False))
+    resume_available = bool(st.get("resume_available", False))
+
+    # The FIRST fresh wait heartbeat after launch is readiness: it sets
+    # readiness_seen AND CLEARS launching in the same tick (codex round-4) - so a
+    # ready agent leaves LAUNCHING immediately and a later death is not masked.
+    if brain_alive and not hb_stale and not readiness_seen:
+        readiness_seen, launching, resume_available = True, False, True
+    in_grace = launching and (not readiness_seen) and now_epoch < grace_until
+
+    # carry-forward: ALL supervisor-owned fields pass THROUGH (BLOCKER-3 lesson -
+    # a healthy `none` tick must never drop discovery/liveness state). The
+    # volatile snapshot is NEVER stored here (codex discipline note 1).
     nxt = {
-        "consecutive_fails": fails,
-        "backoff_next_epoch": backoff_next,
-        "healthy_since": healthy_since,
-        "consumed_rids": consumed,
+        "consecutive_fails": fails, "backoff_next_epoch": backoff_next,
+        "healthy_since": healthy_since, "consumed_rids": consumed,
         "last_warn_epoch": last_warn,
-        "pid": st.get("pid"),
-        "session_id": st.get("session_id"),
-        "launched": bool(st.get("launched", False)),
+        "launcher_pid": st.get("launcher_pid"), "launcher_start": st.get("launcher_start"),
+        "brain_pid": brain_pid, "brain_start": brain_start, "managed_pids": managed,
+        "launching": launching, "launch_grace_until": grace_until,
+        "readiness_seen": readiness_seen, "resume_available": resume_available,
+        "last_launch_epoch": st.get("last_launch_epoch"),
+        "session_id": st.get("session_id"), "launched": bool(st.get("launched", False)),
     }
 
     def _relaunch_state() -> None:
         nf = fails + 1
-        delay = min(float(backoff["cap_seconds"]),
-                    float(backoff["base_seconds"]) * (2 ** (nf - 1)))
         nxt["consecutive_fails"] = nf
-        nxt["backoff_next_epoch"] = now_epoch + delay
+        nxt["backoff_next_epoch"] = now_epoch + min(cap, base * (2 ** (nf - 1)))
         nxt["healthy_since"] = None
+        # a relaunch starts a fresh grace; readiness must be re-earned and the
+        # stale brain pid is cleared (re-discovered after relaunch).
+        nxt["readiness_seen"] = False
+        nxt["launching"] = True
+        nxt["launch_grace_until"] = now_epoch + grace_seconds
+        nxt["brain_pid"] = None
+        nxt["brain_start"] = None
+        nxt["managed_pids"] = []
 
-    def _result(action, **detail):
-        res = {"agent": name, "action": action,
-               "clear_marker": detail.get("clear_marker"),
-               "kill_first": bool(detail.get("kill_first", False)),
-               "bypass_backoff": bool(detail.get("bypass_backoff", False)),
-               "notify": bool(detail.get("notify", False)),
-               "reason": detail.get("reason", ""),
-               "cli": None, "launch_mode": None, "session_id": None,
-               "session_args": None,
+    def _targets(include_brain: bool) -> list[dict]:
+        # EVERY kill target carries its start-time so the executor can refuse to
+        # kill a recycled pid (codex discipline note 2).
+        out: list[dict] = []
+        if include_brain and isinstance(brain_pid, int):
+            out.append({"pid": brain_pid, "start": brain_start})
+        for m in managed:
+            if isinstance(m.get("pid"), int):
+                out.append({"pid": m["pid"], "start": m.get("start")})
+        return out
+
+    def _result(action, *, state, kill_first=False, kill_orphans=False,
+                kill_targets=None, clear_marker=None, bypass_backoff=False,
+                notify=False, discover_brain=False, reason=""):
+        res = {"agent": name, "action": action, "state": state,
+               "clear_marker": clear_marker, "kill_first": bool(kill_first),
+               "kill_orphans": bool(kill_orphans), "kill_targets": kill_targets or [],
+               "bypass_backoff": bool(bypass_backoff), "notify": bool(notify),
+               "discover_brain": bool(discover_brain),
+               "reason": reason, "cli": None, "launch_mode": None,
+               "resume_mode": None, "session_id": None, "session_args": None,
                "next_state": nxt}
         if action in (RELAUNCH, STUCK_RECOVER):
-            res.update(_launch_detail(st, cfg_agent))  # resume vs fresh + args
+            res.update(_launch_detail({**st, "resume_available": resume_available},
+                                      cfg_agent))
         return res
 
-    # 1) Manual restart-request marker (highest priority).
+    # 0) Manual restart-request marker (highest priority).
     if isinstance(marker, dict) and isinstance(marker.get("request_id"), str):
         rid = marker["request_id"]
-        forced = bool(marker.get("force_protected"))
-        if protected and not forced:
+        if protected and not bool(marker.get("force_protected")):
             nxt["last_warn_epoch"] = now_epoch
-            return _result(REFUSE_PROTECTED, clear_marker=rid, notify=True,
-                           reason="restart of a protected agent requires "
-                                  "--force-protected")
+            return _result(REFUSE_PROTECTED, state="REFUSE_PROTECTED", clear_marker=rid,
+                           notify=True, reason="restart of a protected agent requires "
+                                               "--force-protected")
         if rid not in consumed:
-            # Honor once: bypass backoff, kill a still-alive process first.
             nxt["consumed_rids"] = [*consumed, rid]
+            kt = _targets(include_brain=True)
             _relaunch_state()
-            return _result(RELAUNCH, clear_marker=rid, kill_first=pid_alive,
-                           bypass_backoff=True,
+            return _result(RELAUNCH, state="MANUAL_RESTART", clear_marker=rid,
+                           kill_first=bool(kt), kill_targets=kt, bypass_backoff=True,
                            reason=f"manual restart-request {rid}")
-        # Already consumed this rid:
-        if pid_alive:
-            # the relaunch took - just clean up the (stale) marker.
-            return _result(CLEAR_MARKER, clear_marker=rid,
+        if brain_alive:
+            return _result(CLEAR_MARKER, state="HEALTHY_IDLE", clear_marker=rid,
                            reason=f"restart {rid} already applied; clearing marker")
-        # consumed but still dead -> the relaunch FAILED. Do NOT bypass again
-        # and do NOT silently clear; fall through to the backoff-gated path.
+        # consumed but brain still absent -> relaunch FAILED; fall through (no re-bypass).
 
-    # 2) Supervised process is dead.
-    if not pid_alive:
-        if protected:
-            nxt["last_warn_epoch"] = now_epoch
-            return _result(WARN_ONLY, notify=True,
-                           reason="protected agent died - restart it manually "
-                                  "(or use request-restart --force-protected)")
-        if now_epoch >= backoff_next:
-            _relaunch_state()
-            return _result(RELAUNCH, reason="supervised process died")
-        return _result(BACKOFF_WAIT,
-                       reason=f"dead; backing off until {backoff_next:.0f}")
-
-    # 3) Alive but the activity heartbeat has gone stale.
-    if rpt.get("heartbeat_stale"):
-        if not activity_hook:
-            # No reliable activity signal -> cannot tell stuck from a healthy
-            # long-turn. WARN ONLY, rate-limited; NEVER kill (the WP-2 trap).
+    # 1) Snapshot unavailable -> FAIL CLOSED for a brain-required CLI (codex BLOCKER):
+    #    we cannot confirm brain liveness, and the launcher pid is expected dead,
+    #    so NEVER auto-kill/relaunch off a missing snapshot.
+    if not snap_ok:
+        if requires_brain:
             if now_epoch - last_warn >= suspect_interval:
                 nxt["last_warn_epoch"] = now_epoch
-                return _result(SUSPECT_WARN,
-                               reason="heartbeat stale but NO activity hook - "
-                                      "cannot confirm stuck; not killed (install "
-                                      "the activity hook to enable recovery)")
-            return _result(NONE, reason="suspect (no hook; warn rate-limited)")
+                return _result(SNAPSHOT_UNAVAILABLE, state="SNAPSHOT_UNAVAILABLE",
+                               notify=True,
+                               reason="process snapshot unavailable; cannot confirm "
+                                      "brain liveness - not killing/relaunching (fail closed)")
+            return _result(NONE, state="SNAPSHOT_UNAVAILABLE",
+                           reason="snapshot unavailable (warn rate-limited)")
+        # Legacy non-forking CLI (requires_brain_pid=false): old single-PID path.
+        if not bool(st.get("pid_alive", False)):
+            if protected:
+                nxt["last_warn_epoch"] = now_epoch
+                return _result(WARN_ONLY, state="DEAD", notify=True,
+                               reason="protected agent died - restart manually")
+            if now_epoch >= backoff_next:
+                _relaunch_state()
+                return _result(RELAUNCH, state="DEAD", reason="supervised process died (legacy)")
+            return _result(BACKOFF_WAIT, state="DEAD",
+                           reason=f"dead; backing off until {backoff_next:.0f}")
+        if healthy_since is None:
+            nxt["healthy_since"] = now_epoch
+        elif fails and (now_epoch - float(healthy_since)) >= reset_after:
+            nxt["consecutive_fails"], nxt["backoff_next_epoch"] = 0, 0.0
+        return _result(NONE, state="HEALTHY_IDLE", reason="healthy (legacy)")
+
+    # 2) LAUNCHING: still in grace with readiness UNRESOLVED. Discover the brain;
+    #    launcher death here is expected, NOT a failure.
+    if in_grace:
+        return _result(NONE, state="LAUNCHING", discover_brain=True,
+                       reason="in launch grace; discovering brain / awaiting readiness")
+
+    # Past grace (or readiness cleared launching): classify on brain liveness.
+    # 3) READINESS_FAILED: brain came up but never reached the listen loop.
+    if brain_alive and not readiness_seen:
         if protected:
             nxt["last_warn_epoch"] = now_epoch
-            return _result(WARN_ONLY, notify=True,
-                           reason="protected agent appears stuck - recover it "
-                                  "manually (request-restart --force-protected)")
+            return _result(WARN_ONLY, state="READINESS_FAILED", notify=True,
+                           reason="protected agent reached brain but not readiness; recover manually")
         if now_epoch >= backoff_next:
+            kt = _targets(include_brain=True)
             _relaunch_state()
-            return _result(STUCK_RECOVER, kill_first=True,
-                           reason="alive but activity-stale -> stuck; "
-                                  "kill + resume")
-        return _result(BACKOFF_WAIT,
+            return _result(RELAUNCH, state="READINESS_FAILED", kill_first=True,
+                           kill_targets=kt,
+                           reason="brain up but no readiness within grace (failed launch); kill tree + relaunch")
+        return _result(BACKOFF_WAIT, state="READINESS_FAILED",
+                       reason=f"readiness failed; backing off until {backoff_next:.0f}")
+
+    # 4/5) Brain is gone -> DEAD (nothing left) or ZOMBIE_WAIT (orphan wait alive).
+    if not brain_alive:
+        zombie = wait_alive
+        if protected:
+            nxt["last_warn_epoch"] = now_epoch
+            return _result(WARN_ONLY, state="ZOMBIE_WAIT" if zombie else "DEAD",
+                           notify=True,
+                           reason="protected agent brain gone - recover manually")
+        if now_epoch >= backoff_next:
+            kt = _targets(include_brain=False)  # brain already gone; reap orphans
+            _relaunch_state()
+            if zombie:
+                return _result(RELAUNCH, state="ZOMBIE_WAIT", kill_orphans=True,
+                               kill_targets=kt,
+                               reason="brain gone but orphan wait still alive; reap orphans + relaunch")
+            return _result(RELAUNCH, state="DEAD", reason="brain process gone")
+        return _result(BACKOFF_WAIT, state="ZOMBIE_WAIT" if zombie else "DEAD",
+                       reason=f"brain gone; backing off until {backoff_next:.0f}")
+
+    # 6) STUCK: brain alive + ready + heartbeat stale past threshold + hook on.
+    if hb_stale and activity_hook and (hb_age is None or float(hb_age) > stuck_after):
+        if protected:
+            nxt["last_warn_epoch"] = now_epoch
+            return _result(WARN_ONLY, state="STUCK", notify=True,
+                           reason="protected agent appears stuck - recover manually")
+        if now_epoch >= backoff_next:
+            kt = _targets(include_brain=True)
+            _relaunch_state()
+            return _result(STUCK_RECOVER, state="STUCK", kill_first=True, kill_targets=kt,
+                           reason="brain alive but activity-stale -> stuck; kill tree + resume")
+        return _result(BACKOFF_WAIT, state="STUCK",
                        reason=f"stuck; backing off until {backoff_next:.0f}")
 
-    # 4) Healthy. Advance/trip the sustained-liveness backoff reset.
+    # 7) ACTIVE_OR_BUSY: brain alive + ready + stale but (no hook OR within suspect
+    #    window) -> warn/suspect only, NEVER kill.
+    if hb_stale:
+        if not activity_hook:
+            if now_epoch - last_warn >= suspect_interval:
+                nxt["last_warn_epoch"] = now_epoch
+                return _result(SUSPECT_WARN, state="ACTIVE_OR_BUSY",
+                               reason="heartbeat stale but NO activity hook - cannot "
+                                      "confirm stuck; not killed")
+            return _result(NONE, state="ACTIVE_OR_BUSY",
+                           reason="suspect (no hook; warn rate-limited)")
+        # hook on but within the stuck threshold -> still considered active/busy
+        return _result(NONE, state="ACTIVE_OR_BUSY",
+                       reason="heartbeat aging but within stuck threshold; busy")
+
+    # 8) HEALTHY_IDLE: brain alive + ready + fresh heartbeat.
     if healthy_since is None:
         nxt["healthy_since"] = now_epoch
     elif fails and (now_epoch - float(healthy_since)) >= reset_after:
-        nxt["consecutive_fails"] = 0
-        nxt["backoff_next_epoch"] = 0.0
-    return _result(NONE, reason="healthy")
+        nxt["consecutive_fails"], nxt["backoff_next_epoch"] = 0, 0.0
+    return _result(NONE, state="HEALTHY_IDLE", reason="healthy")
 
 
 def plan_actions(report: dict, state: dict, config: dict,
-                 *, now_epoch: float) -> dict:
+                 *, now_epoch: float, snapshot: list[dict] | None = None) -> dict:
     """The SHARED decision table. Returns ``{"now_epoch", "agents": {name: plan}}``
-    where each plan has ``action`` (one of the module's action constants),
-    ``clear_marker``/``kill_first``/``bypass_backoff``/``notify``/``reason``,
-    and ``next_state`` for the supervisor to persist. Only agents present in
-    BOTH the config and the report are planned (config drives what is
-    supervised; the report supplies bus facts)."""
+    where each plan has ``action``/``state`` plus ``kill_first``/``kill_orphans``/
+    ``kill_targets``/``discover_brain``/``resume_mode``/``next_state`` for the
+    executor. Only agents present in BOTH the config and the report are planned
+    (config drives what is supervised; the report supplies bus facts).
+
+    ``snapshot`` is the executor's process snapshot (list of rows) interpreted
+    per agent by :func:`_liveness`. ``snapshot is None`` means UNAVAILABLE -> a
+    brain-required CLI fails CLOSED (no kill/relaunch). It is an INPUT only and is
+    never folded into ``next_state``."""
     cfg_agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
     rpt_agents = report.get("agents") or {}
     state_agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
@@ -334,24 +638,42 @@ def plan_actions(report: dict, state: dict, config: dict,
         if not isinstance(rpt, dict):
             continue
         st = state_agents.get(name) if isinstance(state_agents.get(name), dict) else {}
-        out[name] = _plan_one(name, rpt, st, config, cfg_agent, now_epoch=now_epoch)
+        liveness = _liveness(snapshot, st, cfg_agent, name, now_epoch)
+        out[name] = _plan_one(name, rpt, st, config, cfg_agent, liveness,
+                              now_epoch=now_epoch)
     return {"now_epoch": now_epoch, "agents": out}
 
 
 def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
+                  pid_start: str | None = None, now_epoch: float | None = None,
+                  grace_seconds: float | None = None,
                   session_id: str | None = None) -> dict:
-    """Apply a CLI's launch-SUCCESS state to ``state`` IN PLACE - the rule the
-    generated script defers to Python (so it's testable, not PS-internal).
-    Claude PINS the session_id it minted (resume by id); Codex pins NOTHING -
-    it has no launch-time id, so its ``launched`` flag drives resume-by-last,
-    and persisting a fake id would be wrong. Both mark ``pid`` + ``launched``.
-    """
+    """Apply a launch-SUCCESS to ``state`` IN PLACE - the rule the generated
+    script defers to Python (testable, not PS-internal). ``pid`` is the
+    LAUNCHER pid from Start-Process (the short-lived bootstrap for a forking CLI;
+    the long-lived ``brain_pid`` is DISCOVERED later by the planner from the
+    snapshot). Records the launcher + start-time (anti-reuse), opens a fresh
+    launch GRACE, resets readiness, and clears the stale brain so it is
+    re-discovered. ``resume_available`` is sticky (a prior session still exists).
+    Claude pins its minted ``session_id`` (codex resumes by ``--last``)."""
     agents = state.setdefault("agents", {})
     if not isinstance(agents, dict):
         agents = state["agents"] = {}
     entry = agents.get(agent)
     if not isinstance(entry, dict):
         entry = agents[agent] = {}
+    entry["launcher_pid"] = pid
+    entry["launcher_start"] = pid_start
+    entry["launching"] = True
+    entry["readiness_seen"] = False
+    entry["brain_pid"] = None
+    entry["brain_start"] = None
+    entry["managed_pids"] = []
+    if now_epoch is not None:
+        entry["last_launch_epoch"] = now_epoch
+        if grace_seconds is not None:
+            entry["launch_grace_until"] = now_epoch + float(grace_seconds)
+    # legacy back-compat (non-forking pid_alive path + old tests)
     entry["pid"] = pid
     entry["pid_alive"] = True
     entry["launched"] = True
@@ -366,10 +688,11 @@ def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
 
 CONFIG_TEMPLATE = """\
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "poll_seconds": 15,
   "stuck_after_seconds": 120,
   "suspect_warn_interval_seconds": 300,
+  "launch_grace_seconds": 120,
   "backoff": { "base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180 },
   "notify_sender": null,
   "notify_to": null,
@@ -379,6 +702,9 @@ CONFIG_TEMPLATE = """\
       "auto_restart": true,
       "auto_restart_protected": false,
       "activity_hook": false,
+      "requires_brain_pid": true,
+      "brain_pattern": "claude",
+      "codex_home_isolation": false,
       "cwd": "REPLACE_WITH_PROJECT_DIR",
       "env": { "AGENTTALK_SELF": "AGENT_NAME" },
       "launch": {
@@ -386,7 +712,8 @@ CONFIG_TEMPLATE = """\
         "windows_args": ["{SESSION_ARGS}"],
         "_windows_args_codex": ["-C", "<cwd>", "{SESSION_ARGS}"]
       },
-      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS, so its PID dies immediately and the supervisor relaunch-storms. windows_args is a real array; the literal '{SESSION_ARGS}' element is replaced (array-splice, not string interpolation) with the session tokens: --session-id <uuid> ... on first launch, the --resume / resume --last form on relaunch. The executor runs Start-Process -FilePath <file> -ArgumentList <args> -WorkingDirectory <cwd> -PassThru AFTER applying env (it prepends .agenttalk/bin so a bare `agenttalk` resolves via the generated shim). No Invoke-Expression.",
+      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS - but note even the native codex.exe is a FORKING launcher whose pid dies after handoff, which is why the supervisor monitors a DISCOVERED long-lived brain_pid (a brain_pattern-named descendant), not the Start-Process pid. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor runs Start-Process -FilePath <file> -ArgumentList <args> -WorkingDirectory <cwd> -PassThru AFTER applying env (it prepends .agenttalk/bin so a bare `agenttalk` resolves via the generated shim). No Invoke-Expression.",
+      "_comment_liveness": "requires_brain_pid=true (forking CLI): the supervisor discovers + monitors a long-lived brain_pid matching brain_pattern (codex: 'codex', claude: 'claude'); a missing process snapshot FAILS CLOSED (no kill/relaunch). Set false ONLY for a validated non-forking CLI where the launched exe IS the long-lived process. codex_home_isolation=true (recommended for codex when other codex run in the same project dir): launch with a per-agent SEEDED CODEX_HOME so `resume --last` is unambiguous.",
       "_comment_activity_hook": "Set activity_hook=true ONLY after installing the PostToolUse/Codex hook (supervise --install-activity-hook). Until then a stale heartbeat is warn-only (suspect), never a kill - so an un-instrumented agent is never mistaken for stuck."
     }
   }
@@ -448,7 +775,84 @@ function Quote-Arg([string]$a) {
   return $sb.ToString()
 }
 # endregion quote-arg
-function Launch($name, $plan) {
+# region exec-helpers  (extracted verbatim by the test harness - self-contained)
+function Proc-Start($procId) {
+  # The live start-time of a pid in the SAME ISO format Get-ProcSnapshot emits,
+  # so recorded start-times compare exactly (anti-pid-reuse). $null if gone.
+  if (-not $procId) { return $null }
+  try {
+    $p = Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction Stop
+    if ($p -and $p.CreationDate) { return ([datetimeoffset]$p.CreationDate).ToString('o') }
+  } catch {}
+  return $null
+}
+function Get-ProcSnapshot($path) {
+  # Capture the full process table -> the JSON list Python's planner interprets
+  # (brain discovery / wait-orphan / managed set). On ANY failure write an OBJECT
+  # marker (NOT a list) so Python reads it as UNAVAILABLE and fails closed.
+  try {
+    $procs = Get-CimInstance Win32_Process -ErrorAction Stop
+    $rows = foreach ($p in $procs) {
+      $start = $null
+      try { if ($p.CreationDate) { $start = ([datetimeoffset]$p.CreationDate).ToString('o') } } catch {}
+      [pscustomobject]@{ pid = [int]$p.ProcessId; parent_pid = [int]$p.ParentProcessId;
+                         name = $p.Name; command_line = $p.CommandLine; start_time = $start }
+    }
+    # -InputObject (NOT a pipe) serializes the array AS a JSON array for any
+    # count; a pipe would unroll it into a {"value":..,"Count":..} wrapper. Empty
+    # is written as a literal [] (an empty captured table, NOT unavailable).
+    $arr = @($rows)
+    if ($arr.Count -eq 0) { '[]' | Set-Content $path -Encoding utf8 }
+    else { ConvertTo-Json -InputObject $arr -Depth 4 | Set-Content $path -Encoding utf8 }
+    return $true
+  } catch {
+    @{ unavailable = $true } | ConvertTo-Json | Set-Content $path -Encoding utf8
+    return $false
+  }
+}
+function Stop-Tree($targets) {
+  # Leaves-first, start-time-guarded kill. Python lists kill_targets brain-first,
+  # so we kill in REVERSE (managed descendants/leaves before the brain). A target
+  # whose live start-time no longer matches is a RECYCLED pid -> never killed.
+  $arr = @($targets); [array]::Reverse($arr)
+  foreach ($t in $arr) {
+    if (-not $t.pid) { continue }
+    $live = Proc-Start $t.pid
+    if ($null -eq $live) { continue }                 # already gone
+    if ($t.start -and ($live -ne $t.start)) { continue }  # pid reused - DO NOT kill
+    Stop-Process -Id $t.pid -Force -ErrorAction SilentlyContinue
+  }
+}
+function Seed-CodexHome($name) {
+  # Provision a per-agent ISOLATED CODEX_HOME so `resume --last` is unambiguous.
+  # Link (junction for dir trees, symlink-or-copy for files) auth.json/config.toml
+  # + skills/(>=agenttalk-listen)/plugins/rules from the real home; NEVER share
+  # sessions/. FAIL CLOSED (return $null) if auth/config/the listen skill is
+  # missing. Returns the home path on success. (NOTE: $home is a READ-ONLY
+  # automatic variable in PowerShell - we MUST use a different name.)
+  $isoHome = Join-Path $PSScriptRoot ('codex-home\' + $name)
+  $src = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+  if (-not (Test-Path $src)) { Write-Warning ("supervisor: {0}: source CODEX_HOME '{1}' not found - cannot seed" -f $name, $src); return $null }
+  New-Item -ItemType Directory -Force -Path $isoHome | Out-Null
+  foreach ($f in @('auth.json','config.toml')) {
+    $s = Join-Path $src $f; $d = Join-Path $isoHome $f
+    if ((Test-Path $s) -and (-not (Test-Path $d))) {
+      try { New-Item -ItemType SymbolicLink -Path $d -Target $s -ErrorAction Stop | Out-Null }
+      catch { Copy-Item $s $d -Force }
+    }
+  }
+  foreach ($dn in @('skills','plugins','rules')) {
+    $s = Join-Path $src $dn; $d = Join-Path $isoHome $dn
+    if ((Test-Path $s) -and (-not (Test-Path $d))) {
+      try { New-Item -ItemType Junction -Path $d -Target $s -ErrorAction Stop | Out-Null } catch {}
+    }
+  }
+  $ok = (Test-Path (Join-Path $isoHome 'auth.json')) -and (Test-Path (Join-Path $isoHome 'config.toml')) -and (Test-Path (Join-Path $isoHome 'skills\agenttalk-listen'))
+  if (-not $ok) { Write-Warning ("supervisor: {0}: seeded CODEX_HOME missing auth/config/agenttalk-listen skill - failing closed" -f $name); return $null }
+  return $isoHome
+}
+# endregion exec-helpers
+function Launch($name, $plan, $codexHome) {
   $a = $cfg.agents.$name
   $file = $a.launch.windows_file
   if (-not $file -or $file -like 'REPLACE:*') {
@@ -479,6 +883,7 @@ function Launch($name, $plan) {
   $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PYTHON = $AgenttalkPython;
                PATH = (Join-Path $PSScriptRoot 'bin') + ';' + $env:PATH }
   if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
+  if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }  # per-agent isolated home
   if ($a.env) { foreach ($k in $a.env.PSObject.Properties.Name) { $applied[$k] = $a.env.$k } }
   foreach ($k in $applied.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item -Path ("Env:" + $k) -Value $applied[$k] }
   try {
@@ -498,51 +903,65 @@ function Launch($name, $plan) {
       else { Set-Item -Path ("Env:" + $k) -Value $saved[$k] }
     }
   }
-  if ($proc -and $proc.Id) { return @{ pid = $proc.Id; session_id = $sid } }
+  if ($proc -and $proc.Id) { return @{ pid = $proc.Id; session_id = $sid; start = (Proc-Start $proc.Id) } }
   Write-Warning "supervisor: launch of '$name' returned no PID; not auto-restarting it"; return $null
 }
 
 do {
   $state = Load-State
   if (-not $state.agents) { $state | Add-Member agents ([pscustomobject]@{}) -Force }
-  # 1) refresh launched-pid liveness into the state the planner reads
+  # 1) capture the process snapshot (the executor's only OS-liveness source) +
+  #    keep the legacy pid_alive refresh for any non-forking CLI.
+  $SnapPath = Join-Path $PSScriptRoot 'supervisor-snapshot.json'
+  Get-ProcSnapshot $SnapPath | Out-Null
   foreach ($name in $cfg.agents.PSObject.Properties.Name) {
     $st = $state.agents.$name; if (-not $st) { $st = [pscustomobject]@{}; $state.agents | Add-Member $name $st -Force }
-    $procId = $st.pid; $st | Add-Member pid_alive (Pid-Alive $procId) -Force
+    $st | Add-Member pid_alive (Pid-Alive $st.pid) -Force
   }
   Save-State $state
-  # 2) ask Python for the safe action plan
+  # 2) ask Python for the safe action plan (it interprets the snapshot)
   $now = [int][double]::Parse((Get-Date -UFormat %s))
-  $plan = (& $AgenttalkCmd --root $Root supervise --plan --state-file $StatePath --now $now) | ConvertFrom-Json
+  $plan = (& $AgenttalkCmd --root $Root supervise --plan --state-file $StatePath --snapshot-file $SnapPath --now $now) | ConvertFrom-Json
   foreach ($name in $plan.agents.PSObject.Properties.Name) {
     $p = $plan.agents.$name
-    if ($DryRun) { Write-Host ("{0}: {1} - {2}" -f $name, $p.action, $p.reason); continue }
+    if ($DryRun) { Write-Host ("{0}: {1} ({2}) - {3}" -f $name, $p.action, $p.state, $p.reason); continue }
     switch ($p.action) {
       { $_ -in 'relaunch','stuck_recover' } {
-        # stuck_recover kills the alive-but-stuck process first; dead-relaunch
-        # has nothing to kill. Both resume the pinned session.
-        if ($p.kill_first -and (Pid-Alive $state.agents.$name.pid)) { Stop-Process -Id $state.agents.$name.pid -Force -ErrorAction SilentlyContinue }
-        $res = Launch $name $p
-        $state.agents.$name = $p.next_state    # planner fields (passes pid/session_id/launched through)
-        if ($res) {
-          Save-State $state
-          # Apply the launch-SUCCESS state via Python (the authoritative rule:
-          # Claude pins the minted session id; Codex marks launched + NO fake
-          # id). Then re-load so the in-memory state matches.
-          $sidArg = @(); if ($res.session_id) { $sidArg = @('--session-id', $res.session_id) }
-          & $AgenttalkCmd --root $Root supervise --record-launch --for $name --cli $p.cli --pid $res.pid @sidArg --state-file $StatePath | Out-Null
-          $state = Load-State
-          # Clear the manual marker ONLY after a CONFIRMED relaunch (a $null
-          # PID = no/invalid launch command) - never silently drop a request
-          # whose relaunch failed; it must remain for the next poll to retry.
-          if ($p.clear_marker) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }
+        # Kill FIRST when the plan says so: a leaves-first, start-time-guarded
+        # process-TREE kill of the recorded targets (brain + managed descendants
+        # + any orphan wait). The launcher pid is long dead - we never rely on it.
+        if (($p.kill_first -or $p.kill_orphans) -and $p.kill_targets) { Stop-Tree $p.kill_targets }
+        # Per-agent isolated SEEDED CODEX_HOME for codex (fail closed: skip the
+        # relaunch this tick if seeding can't provide auth/config/listen-skill).
+        $homeEnv = $null; $seedOk = $true
+        if (($p.cli -eq 'codex') -and $cfg.agents.$name.codex_home_isolation) {
+          $homeEnv = Seed-CodexHome $name
+          if (-not $homeEnv) { $seedOk = $false }
+        }
+        if (-not $seedOk) {
+          Write-Warning ("supervisor: {0}: CODEX_HOME seed failed - skipping relaunch this tick" -f $name)
+          $state.agents.$name = $p.next_state
         } else {
-          Write-Warning ("supervisor: {0}: {1} FAILED (no PID) - keeping marker/state for retry" -f $name, $p.action)
+          $res = Launch $name $p $homeEnv
+          $state.agents.$name = $p.next_state    # planner fields pass brain/managed/launching/etc through
+          if ($res) {
+            Save-State $state
+            # Record the LAUNCHER pid + start (anti-reuse) + open grace via Python
+            # (authoritative: claude pins the minted id; codex resumes by --last).
+            $extra = @(); if ($res.session_id) { $extra += @('--session-id', $res.session_id) }
+            if ($res.start) { $extra += @('--pid-start', $res.start) }
+            & $AgenttalkCmd --root $Root supervise --record-launch --for $name --cli $p.cli --pid $res.pid @extra --now $now --state-file $StatePath | Out-Null
+            $state = Load-State
+            # Clear the manual marker ONLY after a CONFIRMED relaunch.
+            if ($p.clear_marker) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }
+          } else {
+            Write-Warning ("supervisor: {0}: {1} FAILED (no PID) - keeping marker/state for retry" -f $name, $p.action)
+          }
         }
       }
       'clear_marker' { if ($p.clear_marker) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; $state.agents.$name = $p.next_state }
       'refuse_protected' { Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason); if ($p.clear_marker) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; $state.agents.$name = $p.next_state }
-      { $_ -in 'warn_only','suspect_warn' } {
+      { $_ -in 'warn_only','suspect_warn','snapshot_unavailable' } {
         Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason)
         if ($p.notify -and $cfg.notify_sender -and $cfg.notify_to) {
           & $AgenttalkCmd --root $Root send --from $cfg.notify_sender --to $cfg.notify_to --kind note -m ("supervisor: {0}: {1}" -f $name, $p.reason) --quiet | Out-Null
