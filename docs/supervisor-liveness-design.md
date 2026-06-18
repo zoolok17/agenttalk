@@ -1,6 +1,6 @@
 # Design: supervisor liveness-model redesign (0.28.1 blocker)
 
-Status: draft (design-review round 3 — codex round-2 findings folded in)
+Status: draft (design-review round 4 — codex round-3 ruling folded in)
 Date: 2026-06-18
 Author: claude-agenttalk-developer-2
 Reviewer: codex (authoritative on the Codex process model)
@@ -33,8 +33,8 @@ Goals:
 - Never relaunch an agent that is actually alive (kill the storm).
 - Never be fooled into "healthy" by an orphaned `wait` heartbeat (kill the
   zombie).
-- Preserve context across a supervisor-driven relaunch (deterministic
-  session pin — operator approved FULL scope).
+- Preserve context across a supervisor-driven relaunch (Codex: per-agent
+  isolated `CODEX_HOME` + `resume --last`; operator approved FULL scope).
 - Keep the decision core deterministic and unit-testable from synthetic
   process snapshots (no real process death in CI).
 - Be CLI-agnostic: the same state machine must serve Codex today and Claude
@@ -57,8 +57,10 @@ Per agent the supervisor tracks:
   managed PID; it is MANDATORY for a `healthy` classification.**
 - `managed_pids` — last-seen descendant set (command-runner(s) + the
   `wait`/python). Used for the recursive kill and zombie detection.
-- `session_id` — the Codex rollout UUID, discovered once, for deterministic
-  resume.
+- `resume_available` — whether this agent has reached readiness in its isolated
+  `CODEX_HOME` at least once (so `resume --last` is safe). Replaces the Codex
+  rollout-UUID `session_id`, which the round-3 ruling DROPPED (isolated home
+  makes `--last` unambiguous).
 - `last_launch_epoch`, `launch_grace_until`, `consecutive_fails`.
 - **A start-time is persisted with every PID** to defeat PID reuse (a recycled
   PID with a different start-time is NOT our process).
@@ -93,11 +95,14 @@ backoff_next_epoch, healthy_since, consumed_rids, last_warn_epoch}` to:
       "launching":         false,                       // in grace?
       "launch_grace_until": 0.0,                        // epoch; >now => in grace
       "last_launch_epoch": 1718700611.0,
-      "readiness_seen":    true,                         // first fresh wait hb seen post-launch (Q3)
+      "readiness_seen":    true,                         // first fresh wait hb seen this launch (Q3)
 
-      // --- resume / context (NEW for codex; claude already pins) ---
-      "session_id":        "0a1b...uuid",               // codex rollout UUID (deterministic)
-      "rollout_baseline":  ["rollout-2026-...-aaaa.jsonl"], // pre-launch snapshot for the diff
+      // --- resume / context ---
+      // codex round-3 ruling: supervised Codex uses an ISOLATED CODEX_HOME +
+      // `resume --last` (NO rollout-UUID / NO rollout diff). State only needs to
+      // know whether a resumable session exists in this agent's private home.
+      "codex_home":        ".agenttalk/codex-home/codex-test",  // per-agent isolated home
+      "resume_available":  true,                         // reached readiness >=1x -> --last is safe
 
       // --- backoff / markers (UNCHANGED) ---
       "consecutive_fails": 0,
@@ -124,9 +129,10 @@ cleanup/kill fallback, always start-time-guarded, never as a liveness signal.
 New per-CLI config (in `supervisor.json`, defaults baked at `--init`):
 `requires_brain_pid` (Codex `true`; Claude `true` until Phase 2 — see §CLI),
 `brain_pattern` (process-name regex; Codex `^codex`), `launch_grace_seconds`
-(default **120** — codex Q3), and `codex_home_isolation` (default **`false`** —
-the safe default is the shared-home fail-closed rollout diff; `true` opt-in
-requires the SEEDED-home bootstrap — see §Resume).
+(default **120** — codex Q3), and `codex_home_isolation` (default **`true`** —
+codex round-3 + operator decision: concurrent same-cwd Codex is NORMAL, so every
+supervised Codex agent gets a private SEEDED `CODEX_HOME` and resumes with
+`resume --last`; see §Resume).
 
 ## Process-snapshot input (the helper)
 
@@ -233,11 +239,15 @@ State machine (transitions):
 ## Flows
 
 ### Launch + discovery (grace)
-1. `Launch` runs the merged launch layer (env apply, Quote-Arg, native exe,
-   `Start-Process -PassThru`). Record `launcher_pid` + `launcher_start`, set
-   `launching=true`, `readiness_seen=false`,
+1. `Launch` (Codex): ensure the per-agent isolated `CODEX_HOME` is seeded (see
+   §Resume bootstrap), set `CODEX_HOME` in the launch env, then run the merged
+   launch layer (env apply, Quote-Arg, native exe, `Start-Process -PassThru`).
+   Choose the form by `resume_available`: FRESH on the first launch
+   (`codex -C <projectdir> -a never -s workspace-write $agenttalk-listen`),
+   `resume --last` once a session exists. Record `launcher_pid` +
+   `launcher_start`, set `launching=true`, `readiness_seen=false`,
    `launch_grace_until = now + launch_grace_seconds` (config, default **120s**
-   — codex Q3), snapshot `rollout_baseline` (codex; see Resume).
+   — codex Q3).
 2. Each poll while `LAUNCHING`: from the snapshot, walk children of
    `launcher_pid` (and grand-children) to find a process whose name matches the
    CLI's `brain_pattern`. When found, record `brain_pid` + `brain_start` (but
@@ -259,40 +269,44 @@ any matching orphan `agenttalk wait --for <agent>` (matched by command line).
 relaunch. Each kill checks start-time to avoid killing a reused PID. NOT a Job
 Object in v1.
 
-### Resume (deterministic context pin — FULL scope)
+### Resume (per-agent isolated CODEX_HOME + `resume --last` — codex round-3 ruling)
 
-codex round 1 — MAJOR: deterministic resume needs a FIRM ambiguity rule; never
-silently `resume --last`. codex round 2 — BLOCKER: a blank isolated `CODEX_HOME`
-is NOT a safe drop-in (an empty home has no `auth.json` / `config.toml` /
-`skills/agenttalk-listen`; `codex doctor` against it reports no credentials, and
-the agent can't resolve the listen skill). Resolution: the **DEFAULT is the
-fail-closed rollout diff in the operator's real `CODEX_HOME`** (codex's option b
-— safe, no secret handling); a SEEDED isolated home is an explicit opt-in.
+Codex's authoritative round-3 ruling (operator: concurrent same-cwd Codex is
+NORMAL): supervised Codex agents get a **per-agent isolated, SEEDED `CODEX_HOME`
+by default** and resume with **`resume --last`**. The rollout-UUID `session_id` +
+rollout baseline/diff are **DROPPED from the 0.28.1 path** entirely — isolation
+makes `--last` unambiguous (only this agent's sessions live in its home), so the
+diff is unnecessary complexity. (Earlier rounds explored shared-home rollout
+diff; superseded.)
 
-- **Codex (DEFAULT — `codex_home_isolation=false`):** snapshot the real
-  `<CODEX_HOME>/sessions/**/rollout-*.jsonl` before launch (`rollout_baseline`)
-  and after the brain is ready. **FAIL CLOSED:** accept a `session_id` ONLY if
-  EXACTLY ONE new rollout matches this agent's cwd + launch window
-  (`mtime ∈ [launch, ready]`) + agent marker. If zero or >1 match, do NOT claim a
-  deterministic `session_id` and **never** silently use `resume --last`: relaunch
-  FRESH (`$agenttalk-listen`, new context) and warn that context was not
-  preserved this cycle. Ambiguity downgrades context preservation; it never
-  resumes the wrong session. (No auth/skill risk: the real home keeps the
-  operator's credentials + skills.)
-- **Codex (opt-in — `codex_home_isolation=true`, SEEDED):** for environments
-  that run other Codex sessions in the same cwd (where the diff would fail-closed
-  often), the supervisor may use a dedicated `CODEX_HOME`
-  (`.agenttalk/codex-home/<agent>/`) so the rollout set is unambiguous — but only
-  after a **bootstrap that SEEDS the home**: link (preferred, to avoid copying
-  secrets to a second path) or copy `auth.json`, `config.toml`,
-  `skills/agenttalk-listen`, and any required plugin/runtime config from the real
-  `~/.codex`; validate with `codex doctor` BEFORE first use; if the doctor check
-  fails, do NOT launch into the isolated home — fall back to the default
-  (shared-home fail-closed diff) and warn. Secret rules: never log `auth.json`
-  contents; prefer a junction/symlink so the secret is not duplicated on disk;
-  the seeded home lives under `.agenttalk/` (already gitignored). This path is
-  available in v1 but OFF by default; it is the only way to guarantee a
-  deterministic pin under concurrent same-cwd Codex.
+- **Codex (DEFAULT — `codex_home_isolation=true`):** each supervised Codex agent
+  runs with `CODEX_HOME=.agenttalk/codex-home/<agent>/` (a private home, NOT
+  sharing `sessions/` with the operator's real home or other agents). Launch
+  command: `codex -C <projectdir> resume --last -a never -s workspace-write
+  $agenttalk-listen` once `resume_available` (this agent has reached readiness in
+  its home at least once). **Before first readiness there is no session to
+  resume — launch FRESH** (`codex -C <projectdir> -a never -s workspace-write
+  $agenttalk-listen`); only after the first fresh wait heartbeat is
+  `resume_available` set, so subsequent relaunches `resume --last`. Because the
+  home is private, `--last` always refers to THIS agent's most recent session —
+  unambiguous even when the operator runs other Codex in the same project dir.
+- **Seeded-home bootstrap (codex round-3 MAJOR — required before first launch):**
+  provision the isolated home with, at minimum, `auth.json`, `config.toml`, and
+  `skills/` (containing at least `agenttalk-listen`), and ALSO `plugins/` +
+  `rules/` when present in the real home. It MUST NOT share `sessions/` (that is
+  what keeps `--last` unambiguous). Windows provisioning: **directory junctions**
+  for `skills/` / `plugins/` / `rules/`; **file symlink** for `auth.json` /
+  `config.toml` when symlink privilege is available, otherwise **copy with a
+  restricted ACL** (and re-seed if the source changes). Validate with
+  `codex doctor` — but treat it as advisory: **websocket / reachability failures
+  must NOT fail the bootstrap**; only missing/invalid `auth`/`config`/skill, or no
+  first fresh wait heartbeat within grace, fail closed. **Never silently fall back
+  to a shared-home rollout diff** unless an operator explicitly configures it.
+  Secret rules: never log `auth.json` contents; the seeded home lives under
+  `.agenttalk/` (already gitignored).
+- **Legacy/opt-out (non-default):** shared-home `resume --last` or the old
+  rollout-diff are NOT part of the 0.28.1 default; if ever wanted they are an
+  explicit, documented opt-out — not implemented in v1 unless an operator asks.
 - **Claude:** already pins `--session-id <uuid>` at fresh launch and resumes
   with `--resume <uuid>` — no rollout-diff needed. (Caveat from
   claude-code-guide: session lookup is scoped to the launch directory, so keep
@@ -327,14 +341,15 @@ liveness branch is rewritten from `pid_alive` to the state classifier:
   relaunch, state unchanged (the BLOCKER fix — never relaunch off a missing
   snapshot).
 - `next_state` passes through the new fields (brain_pid, brain_start,
-  managed_pids, session_id, launching, launch_grace_until, readiness_seen)
-  exactly as it passes pid/session_id today (the BLOCKER-3 lesson: a healthy
+  managed_pids, launching, launch_grace_until, readiness_seen, resume_available,
+  codex_home) exactly as it passes pid today (the BLOCKER-3 lesson: a healthy
   `none` tick must not drop supervisor-owned fields). The volatile snapshot is
   an INPUT only and is NEVER copied into `next_state` (codex Q4).
 
 New action/detail fields on the plan result: `kill_orphans` (bool),
 `kill_targets` (the pid+start list the executor must reap),
-`discover_brain` (bool, set while LAUNCHING), `resume_session_id`.
+`discover_brain` (bool, set while LAUNCHING), `resume_mode`
+(`fresh` | `last` — driven by `resume_available`).
 
 ## `.ps1` executor changes (thin)
 
@@ -348,14 +363,16 @@ New action/detail fields on the plan result: `kill_orphans` (bool),
    script already has the snapshot; this is pure traversal).
 3. `Stop-Tree $targets` — recursive, leaves-first, start-time-checked kill;
    re-snapshot to verify empty before relaunch.
-4. `Snapshot-Rollouts $codexHome` — list `<CODEX_HOME>/sessions/**/rollout-*.jsonl`
-   for the baseline/diff (codex only; defaults to the per-agent isolated
-   `CODEX_HOME` so the set is unambiguous — see §Resume).
+4. `Seed-CodexHome $agent` — idempotently provision the per-agent isolated
+   `CODEX_HOME` (junctions for `skills`/`plugins`/`rules`, symlink-or-ACL-copy for
+   `auth.json`/`config.toml`, never sharing `sessions/`); advisory `codex doctor`
+   (ignore websocket/reachability failures). Run before a Codex launch (§Resume).
 5. The do-loop still: refresh snapshot -> `supervise --plan` -> switch on
-   action. `relaunch`/`stuck_recover` now consult `kill_targets`/`kill_orphans`
-   and call `supervise --record-launch` with the discovered `brain_pid` +
-   `session_id`. All of the script's own bus calls keep using `$AgenttalkCmd`
-   (the merged shim).
+   action. `relaunch`/`stuck_recover` now consult `kill_targets`/`kill_orphans`,
+   seed the home, launch FRESH or `resume --last` per `resume_mode`, and call
+   `supervise --record-launch` with the discovered `brain_pid` (+
+   `resume_available=true` once readiness is seen). All of the script's own bus
+   calls keep using `$AgenttalkCmd` (the merged shim).
 
 ## CLI-agnostic notes
 
@@ -368,11 +385,11 @@ The state machine is CLI-neutral; the per-CLI surface is a small config block �
    the degenerate `brain_pid == launcher_pid` case resolves discovery
    immediately (a supported, explicit configuration — never a silent default).
 2. **brain pattern** — `^codex` for codex; Claude's pattern is set in Phase 2.
-3. **resume form** — codex = isolated-`CODEX_HOME` (default) or fail-closed
-   rollout-UUID `resume <id>`; claude = `--resume <pinned-uuid>` (simpler,
-   already implemented).
-4. **session discovery** — codex = the single rollout in its isolated home (or
-   fail-closed diff); claude = the uuid we minted at fresh launch (none needed).
+3. **resume form** — codex = isolated SEEDED `CODEX_HOME` + `resume --last`
+   (fresh before first readiness); claude = `--resume <pinned-uuid>` (simpler,
+   already implemented — no isolated home needed since the id is pinned).
+4. **session discovery** — codex = none needed (`--last` within the private home);
+   claude = the uuid we minted at fresh launch.
 
 This keeps v1 shippable for Codex without blocking on Phase 2, and ensures no
 Claude agent is auto-killed/relaunched destructively before its fork behavior is
@@ -423,11 +440,15 @@ Decision-core tests feed `plan_actions` hand-built snapshots + state:
    `LAUNCHING` until the first heartbeat, then `HEALTHY_IDLE`.
 7. `pid-reuse` — a pid present but start-time mismatched -> treated as NOT our
    process (DEAD, not healthy).
-8. `deterministic-session-pin` — isolated `CODEX_HOME` with exactly one rollout
-   -> stored as session_id; resume uses `resume <id>` not `--last`.
-9. `rollout-ambiguous-fails-closed` (codex MAJOR) — isolation disabled and the
-   diff finds 0 or >1 matching new rollouts -> NO `session_id`, relaunch FRESH +
-   warn; the plan NEVER emits `resume --last`.
+8. `resume-mode-fresh-then-last` (codex round-3) — `resume_available=false` ->
+   plan emits `resume_mode=fresh`; after readiness sets `resume_available=true`,
+   a later relaunch emits `resume_mode=last`. The plan NEVER emits a rollout-UUID
+   `resume <id>` (that path is dropped).
+9. `seeded-home-bootstrap` (Windows-gated runtime) — `Seed-CodexHome` provisions
+   a temp isolated home: junctions for `skills`/`plugins`/`rules`, file
+   symlink-or-ACL-copy for `auth.json`/`config.toml`, and `sessions/` is NOT
+   shared; missing auth/config/skill fails closed, a simulated websocket/doctor
+   reachability failure does NOT.
 10. `snapshot-unavailable-fails-closed` (codex BLOCKER) — `requires_brain_pid`
     and an `unavailable` snapshot marker -> `SNAPSHOT_UNAVAILABLE` (warn, no
     kill, no relaunch); state unchanged. AND `non-forking-cli-legacy-ok` ->
@@ -447,10 +468,10 @@ bus calls are PATH-independent; Windows-gated runtime tests stay gated on
 v1 (this work, gates 0.28.1):
 - brain-PID discovery + state classifier (6 core + READINESS_FAILED /
   SNAPSHOT_UNAVAILABLE guards) (+ readiness gate + fail-closed
-  `SNAPSHOT_UNAVAILABLE`) + leaves-first tree-kill + deterministic Codex resume
-  (DEFAULT = shared-home fail-closed rollout diff; SEEDED isolated `CODEX_HOME`
-  is an opt-in) + the snapshot helper (separate `--snapshot-file`) + the test
-  matrix. Codex ships with `requires_brain_pid=true`.
+  `SNAPSHOT_UNAVAILABLE`) + leaves-first tree-kill + Codex resume via a per-agent
+  SEEDED isolated `CODEX_HOME` + `resume --last` (rollout-UUID/diff DROPPED) + the
+  snapshot helper (separate `--snapshot-file`) + the test matrix. Codex ships with
+  `requires_brain_pid=true` and `codex_home_isolation=true`.
 
 Follow-up (NOT 0.28.1):
 - Windows Job Object kill containment.
@@ -492,19 +513,41 @@ sections above:
 ## Design decisions (codex design-review round 2 — RESOLVED)
 
 - **BLOCKER (unseeded isolated home):** an empty `CODEX_HOME` loses
-  auth/config/skills (codex verified `codex doctor` reports no credentials).
-  Resolution = codex's option (b): the **DEFAULT is the shared-home fail-closed
-  rollout diff** (no secret handling, keeps the operator's auth + listen skill).
-  A SEEDED isolated home (`codex_home_isolation=true`) is an explicit opt-in that
-  must bootstrap auth.json/config.toml/skills (link-preferred, `codex doctor`
-  validated, fall back to the default on failure). `codex_home_isolation`
-  default flipped to **`false`**. (§Resume, §State-schema config knobs.)
+  auth/config/skills (codex verified `codex doctor` reports no credentials). The
+  round-2 resolution made the shared-home fail-closed diff the default; **this is
+  SUPERSEDED by round 3** (operator: concurrent same-cwd Codex is normal) — the
+  default is now a per-agent SEEDED isolated home + `resume --last`. The empty-home
+  risk is addressed by the seeding bootstrap, not by avoiding isolation.
 - **MAJOR (readiness-failure conflict):** the classification table is now
   evaluated TOP-DOWN with an explicit `READINESS_FAILED` row
   (`grace expired && brain_alive && !readiness_seen` -> failed launch: kill tree
   + relaunch) placed BEFORE `ACTIVE_OR_BUSY`, and `ACTIVE_OR_BUSY` now REQUIRES
   `readiness_seen`. An early `-p` exit can no longer be mis-classified as
   warn-only. Mirrored in the `plan_actions` bullet list. (§Classification,
-  §plan_actions, test 6.)
+  §plan_actions, test 6.) **(codex round-3 confirmed this fix good.)**
 - Confirmed fixed from round 1: snapshot fail-closed; no silent `resume --last`;
   Q1/Q3/Q4/Q6 folded correctly.
+
+## Design decisions (codex design-review round 3 — RESOLVED, authoritative)
+
+Codex's authoritative ruling (also posted to the lead) + the operator's Q5
+decision settle the resume mechanism. Folded in above:
+
+- **BLOCKER (resume mechanism):** supervised Codex defaults to a per-agent
+  **isolated, SEEDED `CODEX_HOME`** (`codex_home_isolation=true`) and resumes via
+  **`resume --last`**. The rollout-UUID `session_id` + rollout baseline/diff are
+  **DROPPED from the 0.28.1 path** — isolation makes `--last` unambiguous. (§Resume,
+  §State schema, §config knobs, v1 list.)
+- **MAJOR (state/launch simplification):** state tracks `resume_available` (not
+  `session_id`); launch is `codex -C <projectdir> resume --last -a never -s
+  workspace-write $agenttalk-listen` once readiness has been reached, FRESH before
+  that. (§State schema, §Launch, §plan_actions `resume_mode`.)
+- **MAJOR (seeded-home scope):** the bootstrap provisions `auth.json`,
+  `config.toml`, `skills/` (≥ `agenttalk-listen`), and `plugins/`+`rules/` when
+  present; MUST NOT share `sessions/`. Windows: junctions for dir trees, file
+  symlink-or-ACL-copy for files. `codex doctor` is advisory — websocket/
+  reachability failures do NOT fail bootstrap; missing/invalid auth/config/skill
+  or no first wait heartbeat within grace DO (fail closed). No silent shared-home
+  fallback unless explicitly configured. (§Resume bootstrap, test 9.)
+- **Confirmed good:** `READINESS_FAILED` / `ACTIVE_OR_BUSY` ordering closes the
+  round-2 conflict.
