@@ -1,6 +1,6 @@
 # Design: supervisor liveness-model redesign (0.28.1 blocker)
 
-Status: draft (design-review)
+Status: draft (design-review round 2 — codex round-1 findings folded in)
 Date: 2026-06-18
 Author: claude-agenttalk-developer-2
 Reviewer: codex (authoritative on the Codex process model)
@@ -88,15 +88,16 @@ backoff_next_epoch, healthy_since, consumed_rids, last_warn_epoch}` to:
       "launcher_start":    "2026-06-18T08:50:11.0Z",   // start-time, anti-reuse
       "brain_pid":         20480,                       // null until discovered
       "brain_start":       "2026-06-18T08:50:43.0Z",
-      "managed_pids":      [ {"pid": 25080, "start": "...", "kind": "wait"},
-                             {"pid": 25012, "start": "...", "kind": "runner"} ],
+      "managed_pids":      [ {"pid": 25080, "start": "...", "last_seen": 1718700750.0, "kind": "wait"},
+                             {"pid": 25012, "start": "...", "last_seen": 1718700750.0, "kind": "runner"} ],
       "launching":         false,                       // in grace?
       "launch_grace_until": 0.0,                        // epoch; >now => in grace
       "last_launch_epoch": 1718700611.0,
+      "readiness_seen":    true,                         // first fresh wait hb seen post-launch (Q3)
 
       // --- resume / context (NEW for codex; claude already pins) ---
-      "session_id":        "0a1b...uuid",               // codex rollout UUID
-      "rollout_baseline":  ["rollout-2026-...-aaaa.jsonl"], // pre-launch snapshot
+      "session_id":        "0a1b...uuid",               // codex rollout UUID (deterministic)
+      "rollout_baseline":  ["rollout-2026-...-aaaa.jsonl"], // pre-launch snapshot for the diff
 
       // --- backoff / markers (UNCHANGED) ---
       "consecutive_fails": 0,
@@ -111,8 +112,20 @@ backoff_next_epoch, healthy_since, consumed_rids, last_warn_epoch}` to:
 
 `launched` (today's boolean) is subsumed by `brain_pid != null || launching`.
 Back-compat: a state file from the old schema is read with all new fields
-defaulting (`brain_pid=null`, `launching=false`, `managed_pids=[]`); the first
-poll re-discovers, so no migration step is required.
+defaulting (`brain_pid=null`, `launching=false`, `managed_pids=[]`,
+`readiness_seen=false`); the first poll re-discovers, so no migration step is
+required.
+
+`managed_pids` freshness (codex Q6): re-derived from the snapshot EVERY poll and
+persisted whenever the set changes, each row carrying `start` (anti-reuse) and
+`last_seen` (epoch). A stale `managed_pids` entry is only ever used as a
+cleanup/kill fallback, always start-time-guarded, never as a liveness signal.
+
+New per-CLI config (in `supervisor.json`, defaults baked at `--init`):
+`requires_brain_pid` (Codex `true`; Claude `true` until Phase 2 — see §CLI),
+`brain_pattern` (process-name regex; Codex `^codex`), `launch_grace_seconds`
+(default **120** — codex Q3), and `codex_home_isolation` (default `true` for
+supervised Codex — see §Resume).
 
 ## Process-snapshot input (the helper)
 
@@ -131,31 +144,57 @@ each poll and hands it to Python as part of the state (alongside the existing
 (`ProcessId`, `ParentProcessId`, `Name`, `CommandLine`, `CreationDate`).
 Note from the live test: Codex's *sandboxed* `Get-CimInstance` was DENIED, but
 the EXTERNAL supervisor runs unsandboxed and has permission — we design for the
-real supervisor context. **Graceful degradation:** if `CommandLine` is null
-(access-limited) we fall back to name + ancestry only (we lose the
-`wait --for <agent>` match but keep tree-kill); if the whole snapshot fails, we
-emit an empty snapshot and Python falls back to the legacy single-PID
-`pid_alive` path (warn-only, never a blind kill).
+real supervisor context.
 
-The snapshot is passed via the state file the `.ps1` already writes before
-calling `supervise --plan` (add a top-level `"_snapshot": [...]` key, or a
-`--snapshot-file` arg — see Open Questions Q4).
+**Degradation rules (codex review round 1 — BLOCKER: fail closed, NEVER to the
+legacy single-PID path for a forking CLI):**
+- *Partial:* if `CommandLine` is null (access-limited) but the tree is still
+  enumerable, we fall back to name + ancestry only (we lose the
+  `wait --for <agent>` command-line match but keep brain-discovery + tree-kill).
+- *Total snapshot failure* for a CLI configured `requires_brain_pid=true`
+  (Codex, and Claude until Phase 2 proves it does not fork): **FAIL CLOSED.**
+  Without a snapshot we cannot find `brain_pid`, and the recorded `launcher_pid`
+  is *expected* to be dead — so falling back to legacy `pid_alive` would read
+  `false` and relaunch forever (the exact storm). Instead emit a new action
+  `SNAPSHOT_UNAVAILABLE` -> warn + (rate-limited) operator notify, **no
+  auto-kill, no auto-relaunch**, state unchanged. The supervisor effectively
+  pauses managing that agent until the snapshot returns.
+- *Legacy single-PID `pid_alive` fallback is ONLY permitted* for a CLI
+  explicitly configured `requires_brain_pid=false` AND where
+  `brain_pid == launcher_pid` has been validated (a confirmed non-forking CLI).
+  This is opt-in per CLI, never the silent default.
+
+The snapshot is **volatile and never persisted as durable state** (codex Q4):
+the `.ps1` writes it to a SEPARATE `supervisor-snapshot.json` and passes
+`--snapshot-file` to `supervise --plan`. It is an INPUT to the planner only; if
+an inline form is ever used for speed it MUST be stripped from `next_state` and
+never written back into `supervisor-state.json` (it can contain command lines).
 
 ## Classification — the six states
 
 Inputs per agent: `brain_alive` (brain_pid present in snapshot with matching
-start-time), `hb_age`/`hb_stale` (bus heartbeat), `wait_alive` (a managed
-`wait` row present), `activity_hook` (config), `launching` (in grace),
-`protected`, plus the manual restart marker (unchanged, highest priority).
+start-time), `hb_age`/`hb_stale` (bus heartbeat), `readiness_seen` (at least one
+FRESH `wait` heartbeat has been observed SINCE this launch — codex Q3),
+`wait_alive` (a managed `wait` row present), `activity_hook` (config),
+`launching` (in grace), `protected`, plus the manual restart marker (unchanged,
+highest priority).
+
+**Readiness gate (codex Q2/Q3):** brain presence stops treating launcher death
+as failure, but is NOT sufficient for `HEALTHY_IDLE` — that requires the FIRST
+fresh `wait` heartbeat (`readiness_seen`). This makes an early `-p` exit / a
+brain that never reaches the listen loop OBSERVABLE: if the brain exits, or
+`readiness_seen` is never achieved, by grace expiry -> treated as a failed
+launch (`DEAD`), not healthy.
 
 | State            | Condition                                                        | Action |
 |------------------|------------------------------------------------------------------|--------|
-| `LAUNCHING`      | `launching && now < launch_grace_until`                          | discover brain; do NOT treat launcher death as failure; NONE/clear on success |
-| `HEALTHY_IDLE`   | `brain_alive && !hb_stale`                                       | NONE |
-| `ACTIVE_OR_BUSY` | `brain_alive && hb_stale && (!activity_hook OR within suspect window)` | warn/suspect only — **never kill** |
-| `STUCK`          | `brain_alive && hb_stale && activity_hook && stale > stuck_after` | kill tree + resume |
-| `DEAD`           | `!brain_alive && !wait_alive` (and grace expired)                | relaunch (backoff) |
-| `ZOMBIE_WAIT`    | `!brain_alive && wait_alive` (and grace expired)                 | kill orphan wait/runner set, THEN relaunch |
+| `LAUNCHING`      | `launching && now < launch_grace_until` (brain not-yet-found, OR found but `!readiness_seen`) | discover brain; do NOT treat launcher death as failure; NONE |
+| `HEALTHY_IDLE`   | `brain_alive && readiness_seen && !hb_stale`                     | NONE |
+| `ACTIVE_OR_BUSY` | `brain_alive && (hb_stale OR !readiness_seen) && (!activity_hook OR within suspect window)` | warn/suspect only — **never kill** |
+| `STUCK`          | `brain_alive && readiness_seen && hb_stale && activity_hook && stale > stuck_after` | kill tree + resume |
+| `DEAD`           | grace expired AND `!brain_alive && !wait_alive` (incl. brain never found / exited before readiness) | relaunch (backoff) |
+| `ZOMBIE_WAIT`    | grace expired AND `!brain_alive && wait_alive`                  | kill orphan wait/runner set, THEN relaunch |
+| `SNAPSHOT_UNAVAILABLE` | total snapshot failure AND `requires_brain_pid` (see §Process-snapshot) | warn + operator notify, **no kill, no relaunch** |
 
 Protected agents (operator-facing ∪ active leads) are NEVER auto-killed: in any
 kill-worthy state they downgrade to `warn_only` (today's rule, preserved).
@@ -181,16 +220,20 @@ State machine (transitions):
 ### Launch + discovery (grace)
 1. `Launch` runs the merged launch layer (env apply, Quote-Arg, native exe,
    `Start-Process -PassThru`). Record `launcher_pid` + `launcher_start`, set
-   `launching=true`, `launch_grace_until = now + grace_seconds` (config,
-   default 90s), snapshot `rollout_baseline` (codex; see Resume).
+   `launching=true`, `readiness_seen=false`,
+   `launch_grace_until = now + launch_grace_seconds` (config, default **120s**
+   — codex Q3), snapshot `rollout_baseline` (codex; see Resume).
 2. Each poll while `LAUNCHING`: from the snapshot, walk children of
    `launcher_pid` (and grand-children) to find a process whose name matches the
-   CLI's brain pattern (`codex` for codex; TBD for claude — Q1). When found,
-   record `brain_pid` + `brain_start`, set `launching=false`. Also require a
-   *fresh* `wait` heartbeat as readiness before declaring `HEALTHY_IDLE`.
-3. If `launch_grace_until` passes with no brain: kill any launcher descendants,
-   `consecutive_fails++`, relaunch with backoff. Launcher death DURING grace is
-   expected and is NOT counted as a failure.
+   CLI's `brain_pattern`. When found, record `brain_pid` + `brain_start` (but
+   STAY `LAUNCHING` until readiness). Set `readiness_seen=true` on the FIRST
+   fresh `wait` heartbeat observed after this launch; only then is
+   `HEALTHY_IDLE` reachable (codex Q2/Q3).
+3. Readiness/grace failure (codex Q2): if `launch_grace_until` passes and either
+   no `brain_pid` was found OR the brain was found but `readiness_seen` never
+   became true (early `-p` exit / never reached the listen loop), treat as a
+   FAILED launch: kill any launcher descendants, `consecutive_fails++`, relaunch
+   with backoff. Launcher death DURING grace is expected and is NOT a failure.
 
 ### Classify (the table above) — pure Python in `plan_actions`.
 
@@ -202,13 +245,27 @@ relaunch. Each kill checks start-time to avoid killing a reused PID. NOT a Job
 Object in v1.
 
 ### Resume (deterministic context pin — FULL scope)
-- **Codex:** snapshot `.codex/sessions/**/rollout-*.jsonl` BEFORE launch
-  (`rollout_baseline`) and again after the brain is ready; the NEW rollout UUID
-  for this agent/cwd is the agent's `session_id`. Relaunch as
-  `resume <session_id> -a never -s workspace-write $agenttalk-listen`
-  (deterministic — NOT `resume --last`, which is ambiguous when two codex share
-  a cwd). Documented fallback: an isolated `CODEX_HOME` per agent so the rollout
-  set is unambiguous.
+
+codex review round 1 — MAJOR: deterministic resume needs a FIRM ambiguity rule;
+never silently fall back to `resume --last`. Resolution: make per-agent
+**`CODEX_HOME` isolation the DEFAULT** for supervised Codex, with the rollout
+diff as a fail-closed secondary check.
+
+- **Codex (default — `codex_home_isolation=true`):** the supervisor launches the
+  agent with a dedicated `CODEX_HOME` (e.g. `.agenttalk/codex-home/<agent>/`), so
+  that agent's `sessions/**/rollout-*.jsonl` set is unambiguous and isolated from
+  the operator's other Codex sessions. The single rollout in that home is the
+  agent's `session_id`; relaunch as
+  `resume <session_id> -a never -s workspace-write $agenttalk-listen`.
+- **Codex (rollout diff, when isolation is disabled):** snapshot
+  `.codex/sessions/**/rollout-*.jsonl` before launch (`rollout_baseline`) and
+  after the brain is ready. **FAIL CLOSED:** accept a `session_id` ONLY if
+  EXACTLY ONE new rollout matches this agent's cwd + launch window
+  (`mtime ∈ [launch, ready]`) + agent marker. If zero or >1 match, do NOT claim
+  a deterministic `session_id` and **never** silently use `resume --last`:
+  relaunch FRESH (`$agenttalk-listen`, new context) and warn that context was not
+  preserved this cycle. Ambiguity downgrades context preservation; it never
+  resumes the wrong session.
 - **Claude:** already pins `--session-id <uuid>` at fresh launch and resumes
   with `--resume <uuid>` — no rollout-diff needed. (Caveat from
   claude-code-guide: session lookup is scoped to the launch directory, so keep
@@ -232,10 +289,15 @@ liveness branch is rewritten from `pid_alive` to the six-state classifier:
 - `DEAD` -> `RELAUNCH`.
 - `ZOMBIE_WAIT` -> new `RELAUNCH` variant with `kill_orphans=true` so the
   executor reaps the orphan `wait`/runner set first.
-- `next_state` passes through the new fields (brain_pid, managed_pids,
-  session_id, launching, grace) exactly as it passes pid/session_id today (the
-  BLOCKER-3 lesson: a healthy `none` tick must not drop supervisor-owned
-  fields).
+- `SNAPSHOT_UNAVAILABLE` (NEW) -> for `requires_brain_pid` CLIs when the snapshot
+  is totally absent: warn + (rate-limited) operator notify, no kill, no
+  relaunch, state unchanged (the BLOCKER fix — never relaunch off a missing
+  snapshot).
+- `next_state` passes through the new fields (brain_pid, brain_start,
+  managed_pids, session_id, launching, launch_grace_until, readiness_seen)
+  exactly as it passes pid/session_id today (the BLOCKER-3 lesson: a healthy
+  `none` tick must not drop supervisor-owned fields). The volatile snapshot is
+  an INPUT only and is NEVER copied into `next_state` (codex Q4).
 
 New action/detail fields on the plan result: `kill_orphans` (bool),
 `kill_targets` (the pid+start list the executor must reap),
@@ -243,14 +305,19 @@ New action/detail fields on the plan result: `kill_orphans` (bool),
 
 ## `.ps1` executor changes (thin)
 
-1. `Get-ProcSnapshot` — capture the snapshot, write it into the state the
-   script already passes to `supervise --plan` (or `--snapshot-file`).
+1. `Get-ProcSnapshot` — capture the snapshot, write it to a SEPARATE
+   `supervisor-snapshot.json` and pass `--snapshot-file` to `supervise --plan`
+   (codex Q4: volatile, may contain command lines, must not become durable
+   state). On total failure, write an explicit empty/`unavailable` marker so
+   Python can choose `SNAPSHOT_UNAVAILABLE` rather than mistaking it for "no
+   processes".
 2. `Find-Brain $launcherPid $pattern` — ancestry walk over the snapshot (the
    script already has the snapshot; this is pure traversal).
 3. `Stop-Tree $targets` — recursive, leaves-first, start-time-checked kill;
    re-snapshot to verify empty before relaunch.
-4. `Snapshot-Rollouts $cwd` — list `.codex/sessions/**/rollout-*.jsonl` for the
-   baseline/diff (codex only).
+4. `Snapshot-Rollouts $codexHome` — list `<CODEX_HOME>/sessions/**/rollout-*.jsonl`
+   for the baseline/diff (codex only; defaults to the per-agent isolated
+   `CODEX_HOME` so the set is unambiguous — see §Resume).
 5. The do-loop still: refresh snapshot -> `supervise --plan` -> switch on
    action. `relaunch`/`stuck_recover` now consult `kill_targets`/`kill_orphans`
    and call `supervise --record-launch` with the discovered `brain_pid` +
@@ -259,15 +326,24 @@ New action/detail fields on the plan result: `kill_orphans` (bool),
 
 ## CLI-agnostic notes
 
-The state machine is CLI-neutral; only three things are per-CLI:
-1. **brain pattern** — `codex` process name for codex; **OPEN for claude (Q1)**
-   — Claude may NOT fork (Phase 2 unverified). If `claude.exe` is itself the
-   long-lived process, `brain_pid == launcher_pid` and discovery resolves
-   immediately (a degenerate, supported case).
-2. **resume form** — codex = rollout-UUID `resume <id>`; claude = `--resume
-   <pinned-uuid>` (simpler, already implemented).
-3. **session discovery** — codex = rollout snapshot diff; claude = the uuid we
-   minted at fresh launch (no discovery needed).
+The state machine is CLI-neutral; the per-CLI surface is a small config block —
+`requires_brain_pid`, `brain_pattern`, resume form, session discovery:
+1. **`requires_brain_pid`** (codex Q1) — `true` for Codex (ship it now). Claude
+   stays `true` as a config knob but **destructive Claude recovery is NOT enabled
+   until Phase 2** proves whether `claude.exe` forks. If Phase 2 shows Claude is
+   the long-lived process itself, set its `brain_pattern` to match `claude` and
+   the degenerate `brain_pid == launcher_pid` case resolves discovery
+   immediately (a supported, explicit configuration — never a silent default).
+2. **brain pattern** — `^codex` for codex; Claude's pattern is set in Phase 2.
+3. **resume form** — codex = isolated-`CODEX_HOME` (default) or fail-closed
+   rollout-UUID `resume <id>`; claude = `--resume <pinned-uuid>` (simpler,
+   already implemented).
+4. **session discovery** — codex = the single rollout in its isolated home (or
+   fail-closed diff); claude = the uuid we minted at fresh launch (none needed).
+
+This keeps v1 shippable for Codex without blocking on Phase 2, and ensures no
+Claude agent is auto-killed/relaunched destructively before its fork behavior is
+known.
 
 Separately tracked open risk (from the memory, not this bug): **does
 `claude -p /agenttalk.listen` stay alive across a long listen loop?** If `-p`
@@ -283,11 +359,15 @@ un-monitorable launcher, exactly the handoff storm we are fixing).
 
 - `supervisor.json` configs are unchanged; `launch.windows_file` /
   `launch.windows_args` (the merged layer) stay. New config knobs:
-  `launch_grace_seconds` (default 90), `brain_pattern` (per-CLI default).
+  `launch_grace_seconds` (default 120), `brain_pattern`, `requires_brain_pid`,
+  `codex_home_isolation` (per-CLI defaults baked at `--init`).
 - `supervisor-state.json` old-schema files load with new fields defaulted;
   first poll re-discovers. No migration.
-- If the snapshot is empty/denied, Python degrades to the legacy single-PID
-  `pid_alive` path (warn-only on staleness, no blind kill).
+- If the snapshot is totally unavailable for a `requires_brain_pid` CLI, the
+  supervisor FAILS CLOSED (`SNAPSHOT_UNAVAILABLE`): warn + operator notify, no
+  kill, no relaunch (codex BLOCKER). The legacy single-PID `pid_alive` path is
+  used ONLY for a CLI explicitly configured `requires_brain_pid=false` with a
+  validated `brain_pid == launcher_pid` — never as a silent fallback.
 
 ## Test matrix (synthetic process snapshots — no real processes)
 
@@ -302,14 +382,25 @@ Decision-core tests feed `plan_actions` hand-built snapshots + state:
 4. `brain-alive-hb-stale-no-hook` (ACTIVE_OR_BUSY) — same but no hook ->
    `SUSPECT_WARN`/`NONE`, never kill.
 5. `no-brain-found-in-grace` — launching, grace expired, no codex descendant ->
-   relaunch + `consecutive_fails++`; AND `in-grace-launcher-dead` -> NONE (no
-   failure) while `now < launch_grace_until`.
-6. `pid-reuse` — a pid present but start-time mismatched -> treated as NOT our
+   relaunch + `consecutive_fails++`; AND `in-grace-launcher-dead` -> `LAUNCHING`
+   (no failure) while `now < launch_grace_until`.
+6. `brain-found-but-no-readiness-by-grace` (codex Q2) — brain present the whole
+   grace but `readiness_seen` never true (no first wait heartbeat) -> failed
+   launch -> relaunch (NOT healthy). And `brain-found-readiness-late` -> stays
+   `LAUNCHING` until the first heartbeat, then `HEALTHY_IDLE`.
+7. `pid-reuse` — a pid present but start-time mismatched -> treated as NOT our
    process (DEAD, not healthy).
-7. `deterministic-session-pin` — rollout baseline vs post-launch diff yields
-   exactly one new UUID -> stored as session_id; resume command uses
-   `resume <id>` not `--last`.
-8. `protected-brain-dead` -> `warn_only` (never relaunch a lead).
+8. `deterministic-session-pin` — isolated `CODEX_HOME` with exactly one rollout
+   -> stored as session_id; resume uses `resume <id>` not `--last`.
+9. `rollout-ambiguous-fails-closed` (codex MAJOR) — isolation disabled and the
+   diff finds 0 or >1 matching new rollouts -> NO `session_id`, relaunch FRESH +
+   warn; the plan NEVER emits `resume --last`.
+10. `snapshot-unavailable-fails-closed` (codex BLOCKER) — `requires_brain_pid`
+    and an `unavailable` snapshot marker -> `SNAPSHOT_UNAVAILABLE` (warn, no
+    kill, no relaunch); state unchanged. AND `non-forking-cli-legacy-ok` ->
+    `requires_brain_pid=false` + validated `brain==launcher` permits the legacy
+    `pid_alive` path.
+11. `protected-brain-dead` -> `warn_only` (never relaunch a lead).
 
 Plus existing discipline retained: state round-trip preserves the new
 supervisor-owned fields; the generated `.ps1` parses (BOM/ASCII) and its own
@@ -321,34 +412,45 @@ bus calls are PATH-independent; Windows-gated runtime tests stay gated on
 ## v1 vs follow-up
 
 v1 (this work, gates 0.28.1):
-- brain-PID discovery + 6-state classifier + tree-kill + deterministic codex
-  resume + the snapshot helper with graceful degradation + the test matrix.
+- brain-PID discovery + 6-state classifier (+ readiness gate + fail-closed
+  `SNAPSHOT_UNAVAILABLE`) + leaves-first tree-kill + deterministic Codex resume
+  (isolated `CODEX_HOME` default, fail-closed rollout diff) + the snapshot helper
+  (separate `--snapshot-file`) + the test matrix. Codex ships with
+  `requires_brain_pid=true`.
 
 Follow-up (NOT 0.28.1):
 - Windows Job Object kill containment.
-- Claude `-p`-stays-alive fix if Phase 2 shows it exits (Q2).
+- Claude `-p`-stays-alive fix + Claude `brain_pattern` once Phase 2 verifies
+  whether `claude.exe` forks (destructive Claude recovery stays disabled until
+  then). The readiness gate already makes an early `-p` exit observable as DEAD.
 - Auto-resolution of `windows_file` (already deferred).
 - `supervise --add-agent` (operator's "eventually").
 
-## Open questions for codex (design-review)
+## Design decisions (codex design-review round 1 — RESOLVED)
 
-- **Q1 (brain pattern for claude):** does `claude.exe` fork like `codex.exe`,
-  or is it the long-lived process itself? If unknown until Phase 2, is the
-  "degenerate: brain==launcher" handling sufficient to ship v1 for codex while
-  leaving claude's pattern a config knob?
-- **Q2 (`-p` longevity):** out of scope for this bug, but do you want the
-  design to ASSUME the listen loop keeps the turn open, or to add a readiness
-  re-check that catches an early `-p` exit as DEAD?
-- **Q3 (grace window):** 90s default reasonable for codex TUI cold start on the
-  operator's box, or longer? Should readiness require the FIRST `wait`
-  heartbeat, or just brain presence?
-- **Q4 (snapshot transport):** inline `_snapshot` key in the state file the
-  `.ps1` already writes, vs a separate `--snapshot-file`? Inline is simplest
-  (one read) but bloats the state file; a separate file keeps state clean.
-- **Q5 (rollout diff reliability):** is the pre/post `rollout-*.jsonl` diff
-  robust when the operator runs other codex sessions in the same `cwd`
-  concurrently, or should isolated `CODEX_HOME` be the DEFAULT rather than the
-  fallback?
-- **Q6 (managed_pids freshness):** persist the full last-seen descendant set
-  every poll, or only refresh on state change? Persisting every poll defeats
-  pid-reuse better but writes more.
+Both findings addressed and all six questions answered by codex; folded into the
+sections above:
+
+- **BLOCKER (snapshot fail-closed):** total snapshot loss for a
+  `requires_brain_pid` CLI -> `SNAPSHOT_UNAVAILABLE` (warn/notify, no kill, no
+  relaunch). Legacy single-PID path is opt-in only for a validated non-forking
+  CLI. (§Process-snapshot, §Backward-compat, §plan_actions.)
+- **MAJOR (resume ambiguity):** isolated `CODEX_HOME` is the DEFAULT for
+  supervised Codex; the rollout diff is fail-closed (exactly one new rollout
+  matching cwd/launch-window/marker) and NEVER silently uses `resume --last`.
+  (§Resume.)
+- **Q1:** ship Codex `requires_brain_pid=true`; Claude a config knob with
+  destructive recovery disabled until Phase 2; degenerate `brain==launcher`
+  supported only when explicitly configured. (§CLI-agnostic.)
+- **Q2:** readiness re-check added — brain exit / no first heartbeat by grace ->
+  failed launch (DEAD). (§Classification, §Launch.)
+- **Q3:** grace default **120s**, configurable; `HEALTHY_IDLE` requires the
+  first fresh `wait` heartbeat (not brain presence alone). (§Classification,
+  §Launch.)
+- **Q4:** snapshot goes to a SEPARATE `supervisor-snapshot.json` via
+  `--snapshot-file`; never persisted into `next_state`. (§Process-snapshot,
+  §plan_actions, §.ps1.)
+- **Q5:** see MAJOR above (isolated `CODEX_HOME` default).
+- **Q6:** `managed_pids` re-derived every poll, persisted on change, with
+  `start` + `last_seen`; stale entries only a start-time-guarded kill fallback.
+  (§State schema.)
