@@ -63,9 +63,14 @@ def write_text(path: Path, text: str, *, encoding: str = "utf-8",
         except PermissionError:
             if os.name != "nt":
                 raise   # a genuine POSIX rename failure must still surface
-            # Windows sandbox blocks the rename for good -> direct-write + latch.
-            _sandbox_direct_write = True
+            # The bounded retry is exhausted (a transient reader violation would
+            # have cleared inside _replace_with_retry, keeping the atomic path) -
+            # the Windows sandbox blocks the rename for good. Direct-write the
+            # final path; LATCH the flag ONLY after that SUCCEEDS (Codex
+            # guardrail: never flip on a mere WinError5). A failing direct-write
+            # raises loudly + leaves the flag false.
             _direct_write(path, text, encoding=encoding, newline=newline)
+            _sandbox_direct_write = True
             try:
                 os.unlink(tmp)
             except OSError:

@@ -145,6 +145,52 @@ def test_write_text_posix_rename_failure_still_raises(
     assert _atomic._sandbox_direct_write is False           # never latched on POSIX
 
 
+def test_latch_stays_false_on_transient_winerror5_then_retry_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GUARDRAIL (codex): the latch must flip ONLY after the bounded retry is
+    exhausted AND a direct-write succeeds - NEVER on a mere WinError5. An ordinary
+    Windows transient sharing-violation that clears on retry keeps the ATOMIC path
+    (flag stays false)."""
+    monkeypatch.setattr("agenttalk._atomic._sandbox_direct_write", False)
+    monkeypatch.setattr("agenttalk._atomic.os.name", "nt")
+    monkeypatch.setattr("agenttalk._atomic.time.sleep", lambda _s: None)
+    real = os.replace
+    calls = {"n": 0}
+
+    def flaky(src: str, dst: str) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise PermissionError("transient sharing violation")
+        return real(src, dst)
+
+    monkeypatch.setattr("os.replace", flaky)
+    _atomic.write_text(tmp_path / "t.txt", "data")
+    assert (tmp_path / "t.txt").read_text(encoding="utf-8") == "data"
+    assert calls["n"] >= 2                                 # retried (atomic) ...
+    assert _atomic._sandbox_direct_write is False          # ... and did NOT latch
+
+
+def test_latch_not_set_when_direct_write_fallback_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """codex regression: if the direct-write fallback itself FAILS (not a sandbox
+    rename block - e.g. ACL/disk), write_text must raise loudly and the latch must
+    stay FALSE, so a non-sandbox failure never makes the whole process bypass the
+    atomic path. Forced by a blocked rename + a direct-write target that can't be
+    opened (a directory)."""
+    monkeypatch.setattr("agenttalk._atomic._sandbox_direct_write", False)
+    monkeypatch.setattr("agenttalk._atomic.os.name", "nt")
+    monkeypatch.setattr("agenttalk._atomic.time.sleep", lambda _s: None)
+    monkeypatch.setattr("os.replace", lambda *a, **k: (_ for _ in ()).throw(
+        PermissionError("[WinError 5] sandbox")))
+    target = tmp_path / "is_a_dir"
+    target.mkdir()                                         # open('w') on a dir -> raises
+    with pytest.raises(OSError):
+        _atomic.write_text(target, "x")
+    assert _atomic._sandbox_direct_write is False          # NOT latched on a failed fallback
+
+
 def test_transcript_export_is_atomic_no_temp_leak(tmp_path: Path) -> None:
     """transcript.export must write through _atomic (no half-written
     session record, no leftover temp file)."""
