@@ -976,13 +976,18 @@ function Preflight($name, $plan, $file, $codexHome) {
     if ($plan.cli -eq 'codex') {
       # run `python -m agenttalk --version` INSIDE codex's workspace sandbox with
       # the seeded home - exactly how the supervised agent will reach the bus.
-      $saved = $env:CODEX_HOME
+      # Set PYTHONPATH the SAME way Launch() does (src on a source checkout) so
+      # the preflight tests the agent's REAL import env and does not fail closed
+      # on a checkout where agenttalk is not globally installed (reviewer-1 r1).
+      $saved = $env:CODEX_HOME; $savedPP = $env:PYTHONPATH
       if ($codexHome) { $env:CODEX_HOME = $codexHome }
+      if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
       try {
         & $file sandbox -P :workspace -C $Root python -m agenttalk --version | Out-Null
         $rc = $LASTEXITCODE
       } finally {
         if ($null -eq $saved) { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue } else { $env:CODEX_HOME = $saved }
+        if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP }
       }
       if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - codex sandbox preflight `python -m agenttalk --version` exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
       return $true

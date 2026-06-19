@@ -815,6 +815,14 @@ def test_ps_template_seeds_preflights_and_drops_baked_python_for_agent() -> None
     assert "function Preflight" in ps
     assert "python -m agenttalk --version" in ps            # the smoke-test
     assert "fail closed" in ps.lower()
+    # reviewer-1 r1: the CODEX preflight must set PYTHONPATH the SAME way Launch
+    # does (src on a checkout) so it tests the agent's REAL import env and does
+    # not fail closed on a checkout where agenttalk is not globally installed.
+    pf = ps[ps.index("function Preflight"):]
+    pf = pf[:pf.index("\ndo {")]                            # the Preflight body
+    codex_branch = pf[pf.index("$plan.cli -eq 'codex'"):pf.index("} else {")]
+    assert "'src') + ';' + $env:PYTHONPATH" in codex_branch
+    assert "& $file sandbox -P :workspace -C $Root python -m agenttalk --version" in codex_branch
 
 
 # ---------------------------------------- WP-3: heartbeat command (throttled)
