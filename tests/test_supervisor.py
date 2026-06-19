@@ -705,24 +705,29 @@ def test_effective_codex_home_isolation_emitted_in_plan() -> None:
 # ---------------------------------------- 0.28.1 blocker #2: unattended auto-mode
 
 def test_codex_config_overlay_sets_keys_preserves_others_idempotent() -> None:
-    existing = ('model = "gpt-5"\napproval_policy = "on-request"\n\n'
-                '[windows]\nfoo = 1\n')
+    # (d) unrelated sections / comments / quoting preserved verbatim; (b) an
+    # existing [windows] WITH a sibling key -> set sandbox in-place, keep sibling.
+    existing = ('# operator notes\nmodel = "gpt-5"\napproval_policy = "on-request"\n\n'
+                '[windows]\nfoo = 1\n\n[mcp_servers.fs]\ncommand = "node"\n')
     out = sup.codex_config_overlay(existing, repo_path=r"C:\proj\agenttalk",
                                    windows_sandbox="unelevated")
+    assert "# operator notes" in out                      # comment preserved
     assert 'model = "gpt-5"' in out                       # operator key preserved
+    assert "[mcp_servers.fs]" in out and 'command = "node"' in out  # unrelated section kept
     assert 'approval_policy = "never"' in out             # managed key set...
     assert 'approval_policy = "on-request"' not in out    # ...replacing the old value
     assert 'sandbox_mode = "workspace-write"' in out
-    assert 'foo = 1' in out                               # other [windows] key kept
+    assert 'foo = 1' in out                               # sibling [windows] key kept
     assert 'sandbox = "unelevated"' in out                # the UAC fix
-    # writable_roots is a DOUBLE-QUOTED path with escaped backslashes
+    # (e) writable_roots is a DOUBLE-QUOTED path with escaped backslashes
     assert r'writable_roots = ["C:\\proj\\agenttalk"]' in out
     assert out.count("[windows]") == 1                    # no duplicate table
-    # idempotent
+    # (c) idempotent re-apply -> identical, no dupes
     assert sup.codex_config_overlay(out, repo_path=r"C:\proj\agenttalk",
                                     windows_sandbox="unelevated") == out
-    # empty input still yields a valid overlay with both tables
+    # (a) empty/no config.toml -> created with ALL managed keys + both tables
     fresh = sup.codex_config_overlay("", repo_path="C:\\x", windows_sandbox="elevated")
+    assert 'approval_policy = "never"' in fresh and 'sandbox_mode = "workspace-write"' in fresh
     assert 'sandbox = "elevated"' in fresh and "[sandbox_workspace_write]" in fresh
 
 
