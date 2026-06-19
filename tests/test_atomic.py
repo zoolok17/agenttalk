@@ -82,6 +82,69 @@ def test_replace_retry_rides_out_transient_permission_error(
     assert calls["n"] >= 3  # retried past the transient failures
 
 
+def test_write_text_uses_rename_on_normal_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a normal host write_text takes the ATOMIC temp+os.replace path - NOT
+    the sandbox direct-write fallback. Asserted by spying os.replace."""
+    monkeypatch.setattr("agenttalk._atomic._sandbox_direct_write", False)
+    real = os.replace
+    seen = {"n": 0}
+    monkeypatch.setattr("os.replace", lambda s, d: (seen.__setitem__("n", seen["n"] + 1),
+                                                    real(s, d))[1])
+    _atomic.write_text(tmp_path / "a.txt", "data")
+    assert seen["n"] == 1                                  # went through the rename
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "data"
+    assert _atomic._sandbox_direct_write is False          # latch NOT tripped
+
+
+def test_write_text_sandbox_fallback_on_blocked_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When os.replace persistently raises PermissionError on Windows (the Codex
+    workspace-write sandbox), write_text FALLS BACK to a direct final-path write
+    of the full content - no leftover temp - and latches the process-local flag.
+    Models test #3's [WinError 5] cross-platform via os.name + os.replace +
+    no-op sleep (so the bounded retry doesn't actually wait)."""
+    monkeypatch.setattr("agenttalk._atomic._sandbox_direct_write", False)
+    monkeypatch.setattr("agenttalk._atomic.os.name", "nt")
+    monkeypatch.setattr("agenttalk._atomic.time.sleep", lambda _s: None)
+    monkeypatch.setattr("os.replace", lambda *a, **k: (_ for _ in ()).throw(
+        PermissionError("[WinError 5] Access is denied (sandbox)")))
+    target = tmp_path / "m.json"
+    _atomic.write_text(target, '{"id":"x"}')
+    assert target.read_text(encoding="utf-8") == '{"id":"x"}'   # full content landed
+    assert _atomic._sandbox_direct_write is True                # latch tripped
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith("m.json.")]
+    assert leftovers == []                                      # temp cleaned up
+
+
+def test_write_text_latch_skips_temp_after_sandbox_detected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the sandbox is detected, subsequent writes skip the doomed temp+retry
+    entirely (no mkstemp call) and go straight to direct-write."""
+    monkeypatch.setattr("agenttalk._atomic._sandbox_direct_write", True)
+    monkeypatch.setattr("agenttalk._atomic.tempfile.mkstemp", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("mkstemp must NOT be called once the sandbox latch is set")))
+    _atomic.write_text(tmp_path / "n.txt", "direct")
+    assert (tmp_path / "n.txt").read_text(encoding="utf-8") == "direct"
+
+
+def test_write_text_posix_rename_failure_still_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On POSIX a genuine rename PermissionError must STILL surface - the
+    direct-write fallback is Windows-sandbox-only, never a silent POSIX downgrade."""
+    monkeypatch.setattr("agenttalk._atomic._sandbox_direct_write", False)
+    monkeypatch.setattr("agenttalk._atomic.os.name", "posix")
+    monkeypatch.setattr("os.replace", lambda *a, **k: (_ for _ in ()).throw(
+        PermissionError("denied")))
+    with pytest.raises(PermissionError):
+        _atomic.write_text(tmp_path / "p.txt", "x")
+    assert _atomic._sandbox_direct_write is False           # never latched on POSIX
+
+
 def test_transcript_export_is_atomic_no_temp_leak(tmp_path: Path) -> None:
     """transcript.export must write through _atomic (no half-written
     session record, no leftover temp file)."""

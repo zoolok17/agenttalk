@@ -1254,3 +1254,68 @@ def test_add_agent_lead_also_enforces_uniqueness(tmp_path: Path) -> None:
     assert s.sole_lead() == "delta"                   # prior lead demoted
     roles = s.load_config().get("roles", {})
     assert [a for a, r in roles.items() if r == "lead"] == ["delta"]
+
+
+# ----------------------------------------- sandbox-safe observational writes
+
+def test_bus_writes_survive_blocked_rename_in_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A SUPERVISED codex agent's workspace-write sandbox blocks the temp+rename
+    in _atomic.write_text with [WinError 5] (test #3). The fallback lives in the
+    SHARED write_text, so ALL bus writes survive: heartbeat, waiting, AND a
+    message publish (send) + its cursor advance - not just observational files.
+    Simulated cross-platform via os.name='nt' + os.replace->PermissionError +
+    no-op sleep."""
+    import agenttalk._atomic as _atomic
+    monkeypatch.setattr("agenttalk._atomic._sandbox_direct_write", False)
+    monkeypatch.setattr("agenttalk._atomic.os.name", "nt")
+    monkeypatch.setattr("agenttalk._atomic.time.sleep", lambda _s: None)
+    s = Store(tmp_path)
+    s.init(["alpha", "codex-test"])
+    monkeypatch.setattr("os.replace", lambda *a, **k: (_ for _ in ()).throw(
+        PermissionError("[WinError 5] Access is denied (sandbox)")))
+    s.write_heartbeat("codex-test")
+    s.write_waiting("codex-test", {"agent": "codex-test", "pid": _os.getpid(),
+                                   "deadline_epoch": 1})
+    # a message PUBLISH also survives (the write_text fallback covers it, not just
+    # the observational markers)
+    s.send(sender="codex-test", recipient="alpha", body="hi from the sandbox")
+    assert _atomic._sandbox_direct_write is True            # latch tripped once
+    assert s.read_heartbeat("codex-test") is not None
+    assert s.read_waiting("codex-test")["pid"] == _os.getpid()
+    got = s.messages_for("alpha")                           # the published msg landed
+    assert any(m.body == "hi from the sandbox" for m in got)
+
+
+def test_cursor_rejects_torn_id_biasing_to_duplicate(tmp_path: Path) -> None:
+    """cursor() must reject a torn/partial id (non-empty + not the id regex) as
+    no-cursor - biasing to re-seeing a message (duplicate), never skipping."""
+    s = Store(tmp_path)
+    s.init(["alpha"])
+    cp = s.state_dir / "alpha.cursor"
+    cp.write_text("20260619-114133-097", encoding="utf-8")  # truncated id (a prefix)
+    assert s.cursor("alpha") == ""                          # treated as no-cursor
+    cp.write_text("garbage not an id", encoding="utf-8")
+    assert s.cursor("alpha") == ""
+    # a VALID id round-trips
+    msg = s.send(sender="alpha", recipient="alpha", body="x")
+    s.advance_cursor("alpha", msg.id)
+    assert s.cursor("alpha") == msg.id
+
+
+def test_read_heartbeat_waiting_tolerate_torn_read(tmp_path: Path) -> None:
+    """A direct write is NOT atomic, so a reader can catch a half-write. The
+    readers must treat a truncated/garbage file as 'no signal' (None), never
+    throw - so a torn read never breaks a wait loop."""
+    s = Store(tmp_path)
+    s.init(["codex-test"])
+    (s.state_dir / "codex-test.heartbeat").write_text("2026-06-19T09:99",
+                                                      encoding="utf-8")  # bad ISO
+    assert s.read_heartbeat("codex-test") is None
+    (s.state_dir / "codex-test.waiting").write_text('{"agent":"codex-test","pi',
+                                                    encoding="utf-8")  # half JSON
+    assert s.read_waiting("codex-test") is None
+    # empty (caught mid-truncate) also reads as None, not a crash
+    (s.state_dir / "codex-test.heartbeat").write_text("", encoding="utf-8")
+    assert s.read_heartbeat("codex-test") is None

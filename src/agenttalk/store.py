@@ -1890,7 +1890,19 @@ class Store:
         p = self.state_dir / f"{agent}.cursor"
         if not p.exists():
             return ""
-        return p.read_text(encoding="utf-8").strip()
+        try:
+            raw = p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+        # Torn-read guard (0.28.1 / Codex sandbox): under the sandbox the cursor
+        # is direct-written (non-atomic, see _atomic.write_text), so a concurrent
+        # reader could catch a half-written id. A non-empty value that is NOT a
+        # valid message id is treated as NO cursor - a partial id is a strict
+        # PREFIX of the real id (lexicographically LOWER), so this biases toward
+        # re-seeing a message (DUPLICATE delivery), never SKIPPING one.
+        if raw and not _ID_RE.match(raw):
+            return ""
+        return raw
 
     def set_cursor(self, agent: str, msg_id: str) -> None:
         p = self.state_dir / f"{agent}.cursor"
@@ -1909,7 +1921,9 @@ class Store:
 
         Called periodically by `agenttalk wait` so peers can see whether
         someone is actively listening. Pure observability — never required
-        for correctness.
+        for correctness. (Uses the shared write_text, which falls back to a
+        direct write inside a Codex sandbox that blocks the temp+rename; see
+        _atomic.write_text.)
         """
         p = self.state_dir / f"{agent}.heartbeat"
         _atomic_write_text(p, _now_iso())
@@ -1954,7 +1968,8 @@ class Store:
 
         Overwrites any existing marker (a fresh `wait` supersedes a
         stale one). Best-effort: callers treat any write failure as
-        non-fatal since this is observability-only.
+        non-fatal since this is observability-only. (Shared write_text, with the
+        in-sandbox direct-write fallback - see _atomic.write_text.)
         """
         p = self.state_dir / f"{agent}.waiting"
         _atomic_write_text(p, json.dumps(info, ensure_ascii=False))
