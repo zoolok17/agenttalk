@@ -59,10 +59,14 @@ _DEFAULTS = {
 # name in the snapshot. Claude keeps requires_brain_pid until Phase 2 verifies
 # whether claude.exe forks (its destructive recovery stays off by config).
 _LIVENESS_DEFAULTS = {
+    # allow_launcher_self: may the launcher pid itself BE the brain? FALSE for a
+    # FORKING launcher (codex.exe spawns the real TUI then exits - pinning the
+    # launcher would false-kill a healthy agent at grace expiry, test #4); TRUE
+    # for a non-forking CLI where the launched exe IS the long-lived process.
     "codex":  {"requires_brain_pid": True,  "brain_pattern": "codex",  "codex_home_isolation": True,
-               "windows_sandbox": "unelevated"},
+               "windows_sandbox": "unelevated", "allow_launcher_self": False},
     "claude": {"requires_brain_pid": True,  "brain_pattern": "claude", "codex_home_isolation": False,
-               "windows_sandbox": "unelevated"},
+               "windows_sandbox": "unelevated", "allow_launcher_self": True},
 }
 
 # Per-CLI session-argument templates, as LISTS of literal tokens (so the
@@ -264,23 +268,40 @@ def _depth_to_launcher(idx: dict[int, dict], row: dict, launcher_pid: int) -> in
 
 
 def _discover_brain(idx: dict[int, dict], agent: str, launcher_pid,
-                    brain_pattern: str, launch_epoch: float | None = None) -> dict | None:
-    """Find the long-lived brain process. THREE signals, in order:
+                    brain_pattern: str, launch_epoch: float | None = None,
+                    allow_launcher_self: bool = False) -> dict | None:
+    """Find the long-lived brain process - NEVER the forking LAUNCHER (test #4).
 
-    1. up from the agent's live ``wait`` process to the TOPMOST brain-named
-       ancestor (needs command lines to find the wait; survives launcher exit);
-    2. name + ancestry to the RECORDED ``launcher_pid`` - a brain-named row whose
-       parent chain reaches the launcher, preferring the one CLOSEST to it. This
-       works with NULL command lines AND after the launcher row has exited (codex
-       impl-review BLOCKER), bounded by a soft start-time guard so a reused
-       launcher pid can't graft an unrelated pre-launch process;
-    3. the degenerate non-forking case: the launcher row itself matches the name
-       (claude.exe is its own long-lived brain).
+    ``allow_launcher_self`` FALSE (codex): the launcher (codex.exe) spawns the real
+    TUI then EXITS, so the launcher row must be EXCLUDED from every strategy - else
+    we pin the launcher, it dies after handoff, and grace expiry false-kills a
+    healthy agent. TRUE (claude / non-forking): the launcher IS the brain.
+
+    THREE signals, in order:
+    1. up from the agent's live ``wait`` process to the HIGHEST ELIGIBLE
+       brain-named ancestor (the TUI ABOVE command-runner/wait but BELOW the
+       launcher; needs command lines; survives launcher exit);
+    2. name + ancestry to the RECORDED ``launcher_pid`` - an eligible brain-named
+       row whose parent chain reaches the launcher, preferring the one CLOSEST to
+       the launcher (the TUI is its direct child = depth 0; codex-command-runner.exe
+       also matches the 'codex' substring but is depth 1, so it never wins),
+       tie-broken by in-the-wait-chain, then started-after-launch, then
+       deterministic (start, pid). Null-command-line safe.
+    3. the degenerate non-forking case (ONLY when allow_launcher_self): the
+       launcher row itself matches the name (claude.exe is its own brain).
     Returns the brain row or None."""
     pat = (brain_pattern or "").lower()
 
     def _name_matches(row):
         return pat and pat in (row.get("name") or "").lower()
+
+    def _is_launcher(row):
+        return isinstance(launcher_pid, int) and row.get("pid") == launcher_pid
+
+    def _eligible(row):
+        # a brain candidate must match the pattern AND, for a forking CLI, must
+        # NOT be the launcher itself.
+        return _name_matches(row) and (allow_launcher_self or not _is_launcher(row))
 
     def _started_after_launch(row) -> bool:
         # soft guard: if both the candidate start and the launch epoch parse,
@@ -291,8 +312,21 @@ def _discover_brain(idx: dict[int, dict], agent: str, launcher_pid,
         se = _iso_epoch(_start_of(row))
         return se is None or se >= float(launch_epoch) - 5.0
 
-    # (1) up from the wait process to the highest brain-named ancestor.
+    # pids on the wait-ancestor chain (strategy-1 climb + strategy-2 tie-break).
     wait = _wait_row_for(idx, agent)
+    wait_chain: set = set()
+    if wait is not None:
+        cur, seen = wait, set()
+        while isinstance(cur, dict):
+            cpid = cur.get("pid")
+            if cpid in seen:
+                break
+            seen.add(cpid)
+            wait_chain.add(cpid)
+            ppid = cur.get("parent_pid")
+            cur = idx.get(ppid) if isinstance(ppid, int) else None
+
+    # (1) up from the wait process to the highest ELIGIBLE brain-named ancestor.
     if wait is not None:
         best, seen, cur = None, set(), wait
         while isinstance(cur, dict):
@@ -300,25 +334,33 @@ def _discover_brain(idx: dict[int, dict], agent: str, launcher_pid,
             if cpid in seen:
                 break
             seen.add(cpid)
-            if _name_matches(cur):
-                best = cur  # keep climbing - we want the TOPMOST brain match
+            if _eligible(cur):
+                best = cur  # keep climbing - the TOPMOST eligible (the TUI), not the launcher
             ppid = cur.get("parent_pid")
             cur = idx.get(ppid) if isinstance(ppid, int) else None
         if best is not None:
             return best
     # (2) name + ancestry to the recorded launcher (null-command-line safe).
     if isinstance(launcher_pid, int):
-        best, best_depth = None, None
+        cands = []
         for row in idx.values():
-            if not _name_matches(row) or not _started_after_launch(row):
+            if not _eligible(row) or not _started_after_launch(row):
                 continue
             d = _depth_to_launcher(idx, row, launcher_pid)
-            if d is not None and (best_depth is None or d < best_depth):
-                best, best_depth = row, d
-        if best is not None:
-            return best
+            if d is None:
+                continue
+            se = _iso_epoch(_start_of(row))
+            cands.append((d,                                       # closest to launcher
+                          0 if row.get("pid") in wait_chain else 1,  # prefer the wait chain
+                          se if se is not None else float("inf"),    # earliest started
+                          row.get("pid") if isinstance(row.get("pid"), int) else 1 << 62,
+                          row))
+        if cands:
+            cands.sort(key=lambda c: c[:4])
+            return cands[0][4]
     # (3) degenerate non-forking: the launcher row itself is the brain.
-    if isinstance(launcher_pid, int) and launcher_pid in idx and _name_matches(idx[launcher_pid]):
+    if (allow_launcher_self and isinstance(launcher_pid, int)
+            and launcher_pid in idx and _name_matches(idx[launcher_pid])):
         return idx[launcher_pid]
     return None
 
@@ -382,19 +424,33 @@ def _liveness(snapshot: list[dict] | None, st: dict, cfg_agent: dict,
                 "wait_alive": False, "managed_pids": st.get("managed_pids") or [],
                 "discovered_brain": False}
     idx = _snap_index(snapshot)
+    lcfg = _liveness_cfg(cfg_agent)
+    allow_launcher_self = bool(lcfg.get("allow_launcher_self", False))
+    launcher_pid = st.get("launcher_pid")
     prior = st.get("managed_pids") or []
     brain_pid = st.get("brain_pid")
     brain_start = st.get("brain_start")
-    brain_alive = _pid_alive_guarded(idx, brain_pid, brain_start)
+    # STALE-STATE REPAIR (test #4): a stored brain_pid == the LAUNCHER on a
+    # forking CLI is a BAD pin (an older buggy discovery). Treat it as dead and
+    # re-discover, so we never classify ZOMBIE_WAIT / false-kill off the bad pin.
+    bad_launcher_pin = (not allow_launcher_self and brain_pid is not None
+                        and brain_pid == launcher_pid)
+    brain_alive = (not bad_launcher_pin
+                   and _pid_alive_guarded(idx, brain_pid, brain_start))
     discovered = False
     if not brain_alive:
-        cand = _discover_brain(idx, agent, st.get("launcher_pid"),
+        cand = _discover_brain(idx, agent, launcher_pid,
                                cfg_agent.get("brain_pattern")
-                               or _liveness_cfg(cfg_agent).get("brain_pattern", ""),
-                               launch_epoch=st.get("last_launch_epoch"))
+                               or lcfg.get("brain_pattern", ""),
+                               launch_epoch=st.get("last_launch_epoch"),
+                               allow_launcher_self=allow_launcher_self)
         if cand is not None:
             brain_pid, brain_start = cand.get("pid"), _start_of(cand)
             brain_alive, discovered = True, True
+        elif bad_launcher_pin:
+            # repaired-away the bad pin but found no real brain -> not alive,
+            # and clear the stale launcher pin from the reported brain_pid.
+            brain_pid, brain_start = None, None
     managed = _managed_set(idx, brain_pid if brain_alive else None, agent, now_epoch,
                            prior=prior)
     # wait_alive: a fresh command-line match OR a carried-forward live managed
@@ -412,7 +468,7 @@ def _liveness_cfg(cfg_agent: dict) -> dict:
     cli = cfg_agent.get("cli", "claude")
     base = dict(_LIVENESS_DEFAULTS.get(cli, _LIVENESS_DEFAULTS["claude"]))
     for k in ("requires_brain_pid", "brain_pattern", "codex_home_isolation",
-              "windows_sandbox"):
+              "windows_sandbox", "allow_launcher_self"):
         if k in cfg_agent:
             base[k] = cfg_agent[k]
     return base
@@ -815,6 +871,7 @@ CONFIG_TEMPLATE = """\
       "brain_pattern": "claude",
       "codex_home_isolation": false,
       "windows_sandbox": "unelevated",
+      "allow_launcher_self": true,
       "cwd": "REPLACE_WITH_PROJECT_DIR",
       "env": { "AGENTTALK_SELF": "AGENT_NAME" },
       "launch": {
@@ -823,7 +880,7 @@ CONFIG_TEMPLATE = """\
         "_windows_args_codex": ["-C", "<cwd>", "{SESSION_ARGS}"]
       },
       "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS - but note even the native codex.exe is a FORKING launcher whose pid dies after handoff, which is why the supervisor monitors a DISCOVERED long-lived brain_pid (a brain_pattern-named descendant), not the Start-Process pid. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor runs Start-Process -FilePath <file> -ArgumentList <args> -WorkingDirectory <cwd> -PassThru AFTER applying env (AGENTTALK_ROOT + PYTHONPATH=<repo>/src on a source checkout + the per-agent env). The in-sandbox agent reaches the bus via `python -m agenttalk` (bare python + src on PYTHONPATH), NOT a baked absolute python and NOT the .agenttalk/bin shim - those stay SUPERVISOR-only (the supervisor's own bus calls). No Invoke-Expression.",
-      "_comment_liveness": "requires_brain_pid=true (forking CLI): the supervisor discovers + monitors a long-lived brain_pid matching brain_pattern (codex: 'codex', claude: 'claude'); a missing process snapshot FAILS CLOSED (no kill/relaunch). Set false ONLY for a validated non-forking CLI where the launched exe IS the long-lived process. codex_home_isolation=true (recommended for codex when other codex run in the same project dir): launch with a per-agent SEEDED CODEX_HOME so `resume --last` is unambiguous.",
+      "_comment_liveness": "requires_brain_pid=true (forking CLI): the supervisor discovers + monitors a long-lived brain_pid matching brain_pattern (codex: 'codex', claude: 'claude'); a missing process snapshot FAILS CLOSED (no kill/relaunch). Set false ONLY for a validated non-forking CLI where the launched exe IS the long-lived process. codex_home_isolation=true (recommended for codex when other codex run in the same project dir): launch with a per-agent SEEDED CODEX_HOME so `resume --last` is unambiguous. allow_launcher_self: set FALSE for a FORKING launcher (codex.exe spawns the real TUI then exits - the supervisor must monitor the TUI, never the launcher pid, or it false-kills a healthy agent); TRUE (this template default, claude) when the launched exe IS the long-lived brain.",
       "_comment_activity_hook": "Set activity_hook=true ONLY after installing the PostToolUse/Codex hook (supervise --install-activity-hook). Until then a stale heartbeat is warn-only (suspect), never a kill - so an un-instrumented agent is never mistaken for stuck."
     }
   }

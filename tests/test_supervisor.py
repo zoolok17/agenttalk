@@ -651,6 +651,93 @@ def test_brain_discovery_with_null_command_lines(tmp_path: Path) -> None:
     assert p["next_state"]["readiness_seen"] is True
 
 
+# --------------------- test #4: never pin the forking LAUNCHER as the brain ---
+
+def _codex_tree(*, launcher=True, order_launcher_first=True):
+    """A real forking-codex process tree: launcher codex.exe(199) -> TUI
+    codex.exe(200) -> codex-command-runner.exe(300) -> python `wait`(400)."""
+    L = {"pid": LAUNCHER_PID, "parent_pid": 1, "name": "codex.exe",
+         "command_line": "codex launcher", "start_time": "t1"}
+    T = {"pid": BRAIN_PID, "parent_pid": LAUNCHER_PID, "name": "codex.exe",
+         "command_line": "codex tui", "start_time": BRAIN_START}
+    R = {"pid": 300, "parent_pid": BRAIN_PID, "name": "codex-command-runner.exe",
+         "command_line": "runner", "start_time": "t3"}
+    W = {"pid": WAIT_PID, "parent_pid": 300, "name": "python.exe",
+         "command_line": "agenttalk wait --for codex-test", "start_time": "t-wait"}
+    rows = ([L] if (launcher and order_launcher_first) else []) + [T, R, W]
+    if launcher and not order_launcher_first:
+        rows.append(L)
+    return rows
+
+
+def _codex_cfg():
+    return {"agents": {"codex-test": {"cli": "codex", "auto_restart": True,
+                                      "activity_hook": True}},
+            "launch_grace_seconds": 120, "stuck_after_seconds": 120}
+
+
+def _codex_rpt(stale=False):
+    return {"agents": {"codex-test": {"protected": False, "heartbeat_stale": stale,
+                                      "heartbeat_age_seconds": 9999.0 if stale else 1.0,
+                                      "restart_request": None}}}
+
+
+def test_discover_brain_picks_tui_not_launcher() -> None:
+    """test #4 root cause: _discover_brain must pick the long-lived TUI (200),
+    NEVER the forking launcher (199, which exits after handoff). The
+    codex-command-runner.exe (300, also matches the 'codex' substring) is below
+    the TUI so it never wins either."""
+    idx = sup._snap_index(_codex_tree())
+    b = sup._discover_brain(idx, "codex-test", LAUNCHER_PID, "codex",
+                            allow_launcher_self=False)
+    assert b["pid"] == BRAIN_PID                      # the TUI, not 199 / not 300
+
+
+def test_discover_brain_tui_wins_even_when_launcher_iterates_first() -> None:
+    idx = sup._snap_index(_codex_tree(order_launcher_first=True))
+    b = sup._discover_brain(idx, "codex-test", LAUNCHER_PID, "codex",
+                            allow_launcher_self=False)
+    assert b["pid"] == BRAIN_PID
+    # and after the launcher has EXITED, the TUI is still found (parent_pid persists)
+    idx2 = sup._snap_index(_codex_tree(launcher=False))
+    assert sup._discover_brain(idx2, "codex-test", LAUNCHER_PID, "codex",
+                               allow_launcher_self=False)["pid"] == BRAIN_PID
+
+
+def test_allow_launcher_self_true_picks_launcher() -> None:
+    """A non-forking CLI (allow_launcher_self=true) still selects the launcher as
+    its own brain (claude.exe) - the codex exclusion must not regress it."""
+    idx = sup._snap_index(_codex_tree())
+    b = sup._discover_brain(idx, "codex-test", LAUNCHER_PID, "codex",
+                            allow_launcher_self=True)
+    assert b["pid"] == LAUNCHER_PID
+
+
+def test_stale_launcher_pin_repairs_to_tui_not_zombie() -> None:
+    """test #4 false-kill: a stored brain_pid == launcher_pid (a bad pin from the
+    old discovery) must be REPAIRED to the real TUI, NOT classified ZOMBIE_WAIT
+    and killed. Holds whether the launcher is still alive or already exited."""
+    for launcher_alive in (True, False):
+        st = {"agents": {"codex-test": {
+            "brain_pid": LAUNCHER_PID, "brain_start": "t1", "launcher_pid": LAUNCHER_PID,
+            "readiness_seen": True, "resume_available": True, "launching": False,
+            "launch_grace_until": NOW - 1}}}
+        p = sup.plan_actions(_codex_rpt(stale=False), st, _codex_cfg(),
+                             now_epoch=NOW,
+                             snapshot=_codex_tree(launcher=launcher_alive))["agents"]["codex-test"]
+        assert p["state"] == "HEALTHY_IDLE" and p["action"] == sup.NONE, launcher_alive
+        assert p["next_state"]["brain_pid"] == BRAIN_PID         # repaired to the TUI
+        assert p["kill_targets"] == []                           # nothing killed
+
+
+def test_allow_launcher_self_default_is_false_for_codex() -> None:
+    assert sup._liveness_cfg({"cli": "codex"})["allow_launcher_self"] is False
+    assert sup._liveness_cfg({"cli": "claude"})["allow_launcher_self"] is True
+    # explicit per-agent override wins
+    assert sup._liveness_cfg({"cli": "codex", "allow_launcher_self": True})[
+        "allow_launcher_self"] is True
+
+
 def test_zombie_wait_via_carried_managed_pid_null_cmdline(tmp_path: Path) -> None:
     """impl-review BLOCKER 2: with the brain gone and the orphan wait's command
     line now unavailable, a prior start-matching managed wait pid must be carried
