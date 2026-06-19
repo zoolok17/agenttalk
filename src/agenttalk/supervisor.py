@@ -59,8 +59,10 @@ _DEFAULTS = {
 # name in the snapshot. Claude keeps requires_brain_pid until Phase 2 verifies
 # whether claude.exe forks (its destructive recovery stays off by config).
 _LIVENESS_DEFAULTS = {
-    "codex":  {"requires_brain_pid": True,  "brain_pattern": "codex",  "codex_home_isolation": True},
-    "claude": {"requires_brain_pid": True,  "brain_pattern": "claude", "codex_home_isolation": False},
+    "codex":  {"requires_brain_pid": True,  "brain_pattern": "codex",  "codex_home_isolation": True,
+               "windows_sandbox": "unelevated"},
+    "claude": {"requires_brain_pid": True,  "brain_pattern": "claude", "codex_home_isolation": False,
+               "windows_sandbox": "unelevated"},
 }
 
 # Per-CLI session-argument templates, as LISTS of literal tokens (so the
@@ -75,8 +77,15 @@ _LIVENESS_DEFAULTS = {
 # config["agents"][n]["session"]["fresh"|"resume"] (a token list).
 _SESSION_DEFAULTS = {
     "claude": {
-        "fresh": ["--session-id", "{SESSION_ID}", "-p", "/agenttalk.listen"],
-        "resume": ["--resume", "{SESSION_ID}", "--permission-mode", "dontAsk",
+        # {PERM_MODE} is filled from claude_permission_mode (default
+        # "bypassPermissions"): an UNATTENDED supervised agent must NEVER prompt
+        # (no human to answer) and must NOT auto-deny real work. Set on BOTH fresh
+        # AND resume - the mode is not persisted across sessions, so a fresh
+        # launch with no mode would default to prompting and HANG (codex +
+        # claude-code-guide converged ruling, 0.28.1 blocker #2).
+        "fresh": ["--session-id", "{SESSION_ID}", "--permission-mode", "{PERM_MODE}",
+                  "-p", "/agenttalk.listen"],
+        "resume": ["--resume", "{SESSION_ID}", "--permission-mode", "{PERM_MODE}",
                    "--allowedTools", "Bash(agenttalk *)", "-p", "/agenttalk.listen"],
     },
     "codex": {
@@ -100,26 +109,41 @@ def _backoff_cfg(config: dict) -> dict:
 
 
 def session_args(cli: str, mode: str, session_id: str | None,
-                 cfg_agent: dict | None = None) -> list[str]:
+                 cfg_agent: dict | None = None,
+                 perm_mode: str = "bypassPermissions") -> list[str]:
     """The session CLI args for a (cli, mode) launch as a LIST of literal
     tokens. ``mode`` is "fresh" or "resume". A per-agent ``session`` config
     overrides the built-in token lists. ``{SESSION_ID}`` is substituted when
-    ``session_id`` is known (resume); for a fresh launch the ``{SESSION_ID}``
-    token is left for the script to fill with the uuid it mints. Pure +
-    deterministic - each token is one argument, so the generated command line
-    is unit-testable and quote-safe."""
+    ``session_id`` is known (resume); ``{PERM_MODE}`` is substituted from
+    ``perm_mode`` (Claude's unattended permission mode). Pure + deterministic -
+    each token is one argument, so the generated command line is unit-testable
+    and quote-safe."""
     cli = cli if cli in _SESSION_DEFAULTS else "claude"
     key = "fresh" if mode == "fresh" else "resume"
     tokens = _SESSION_DEFAULTS[cli][key]
     over = (cfg_agent or {}).get("session")
     if isinstance(over, dict) and isinstance(over.get(key), list):
         tokens = over[key]
-    if session_id:
-        return [session_id if t == "{SESSION_ID}" else t for t in tokens]
-    return list(tokens)
+
+    def _sub(t):
+        if t == "{PERM_MODE}":
+            return perm_mode
+        if session_id and t == "{SESSION_ID}":
+            return session_id
+        return t
+    return [_sub(t) for t in tokens]
 
 
-def _launch_detail(st: dict, cfg_agent: dict) -> dict:
+def claude_permission_mode(config: dict, cfg_agent: dict) -> str:
+    """Resolve Claude's unattended permission mode: per-agent override, else the
+    top-level ``claude_permission_mode`` knob, else ``bypassPermissions``."""
+    for src in (cfg_agent, config):
+        if isinstance(src, dict) and isinstance(src.get("claude_permission_mode"), str):
+            return src["claude_permission_mode"]
+    return "bypassPermissions"
+
+
+def _launch_detail(st: dict, cfg_agent: dict, perm_mode: str = "bypassPermissions") -> dict:
     """Resume/launch fields for a launch action. RESUME once the agent has
     reached readiness in its (isolated, for codex) home before - ``resume_available``
     is the new signal (Codex: ``resume --last``; Claude: ``--resume <pinned id>``).
@@ -141,7 +165,8 @@ def _launch_detail(st: dict, cfg_agent: dict) -> dict:
     mode = "resume" if resume else "fresh"
     return {"cli": cli, "launch_mode": mode, "session_id": session_id,
             "resume_mode": "last" if resume else "fresh",
-            "session_args": session_args(cli, mode, session_id, cfg_agent)}
+            "session_args": session_args(cli, mode, session_id, cfg_agent,
+                                         perm_mode=perm_mode)}
 
 
 # ---- process-snapshot interpretation (PURE; testable from synthetic rows) ---
@@ -386,7 +411,8 @@ def _liveness_cfg(cfg_agent: dict) -> dict:
     """Per-agent liveness config merged over the per-CLI defaults."""
     cli = cfg_agent.get("cli", "claude")
     base = dict(_LIVENESS_DEFAULTS.get(cli, _LIVENESS_DEFAULTS["claude"]))
-    for k in ("requires_brain_pid", "brain_pattern", "codex_home_isolation"):
+    for k in ("requires_brain_pid", "brain_pattern", "codex_home_isolation",
+              "windows_sandbox"):
         if k in cfg_agent:
             base[k] = cfg_agent[k]
     return base
@@ -478,6 +504,8 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     # so the executor seeds CODEX_HOME exactly when the planner assumed it, even
     # if the raw config omits the field (codex impl-review MAJOR).
     codex_home_isolation = bool(_lcfg.get("codex_home_isolation", False))
+    windows_sandbox = _lcfg.get("windows_sandbox", "unelevated")  # UAC fix (codex)
+    perm_mode = claude_permission_mode(config, cfg_agent)  # Claude unattended mode
 
     protected = bool(rpt.get("protected"))
     hb_stale = bool(rpt.get("heartbeat_stale"))
@@ -557,12 +585,13 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                "bypass_backoff": bool(bypass_backoff), "notify": bool(notify),
                "discover_brain": bool(discover_brain),
                "codex_home_isolation": codex_home_isolation,
+               "windows_sandbox": windows_sandbox, "perm_mode": perm_mode,
                "reason": reason, "cli": None, "launch_mode": None,
                "resume_mode": None, "session_id": None, "session_args": None,
                "next_state": nxt}
         if action in (RELAUNCH, STUCK_RECOVER):
             res.update(_launch_detail({**st, "resume_available": resume_available},
-                                      cfg_agent))
+                                      cfg_agent, perm_mode=perm_mode))
         return res
 
     # 0) Manual restart-request marker (highest priority).
@@ -771,9 +800,11 @@ CONFIG_TEMPLATE = """\
   "stuck_after_seconds": 120,
   "suspect_warn_interval_seconds": 300,
   "launch_grace_seconds": 120,
+  "claude_permission_mode": "bypassPermissions",
   "backoff": { "base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180 },
   "notify_sender": null,
   "notify_to": null,
+  "_comment_unattended": "A SUPERVISED agent is UNATTENDED (no human to approve a prompt/UAC). The supervisor SEEDS each agent so it launches in a never-prompt, never-elevate, workspace-write mode: Claude gets --permission-mode <claude_permission_mode> (default bypassPermissions) + a seeded .claude/settings.json defaultMode; Codex gets a seeded isolated CODEX_HOME config.toml (approval_policy=never, sandbox_mode=workspace-write, [windows] sandbox=<windows_sandbox>, writable_roots=[repo]). A PREFLIGHT smoke-test runs the EXACT seeded mode before launch and FAILS CLOSED on a bad config instead of relaunch-storming.",
   "agents": {
     "AGENT_NAME": {
       "cli": "claude",
@@ -783,6 +814,7 @@ CONFIG_TEMPLATE = """\
       "requires_brain_pid": true,
       "brain_pattern": "claude",
       "codex_home_isolation": false,
+      "windows_sandbox": "unelevated",
       "cwd": "REPLACE_WITH_PROJECT_DIR",
       "env": { "AGENTTALK_SELF": "AGENT_NAME" },
       "launch": {
@@ -901,24 +933,31 @@ function Stop-Tree($targets) {
     Stop-Process -Id $t.pid -Force -ErrorAction SilentlyContinue
   }
 }
-function Seed-CodexHome($name) {
-  # Provision a per-agent ISOLATED CODEX_HOME so `resume --last` is unambiguous.
-  # Link (junction for dir trees, symlink-or-copy for files) auth.json/config.toml
-  # + skills/(>=agenttalk-listen)/plugins/rules from the real home; NEVER share
-  # sessions/. FAIL CLOSED (return $null) if auth/config/the listen skill is
-  # missing. Returns the home path on success. (NOTE: $home is a READ-ONLY
-  # automatic variable in PowerShell - we MUST use a different name.)
+function Seed-CodexHome($name, $sandbox) {
+  # Provision a per-agent ISOLATED CODEX_HOME so `resume --last` is unambiguous
+  # AND so it launches UNATTENDED (config.toml overlaid with approval=never /
+  # sandbox=workspace-write / [windows] sandbox=<sandbox> / writable_roots=repo).
+  # auth.json is symlink-or-copied; skills/plugins/rules are junctioned; NEVER
+  # share sessions/. config.toml is always COPIED (never symlinked - the overlay
+  # must NOT modify the operator's real config) then overlaid. FAIL CLOSED
+  # (return $null) if auth/config/the listen skill is missing. ($home is a
+  # READ-ONLY automatic variable - we use $isoHome.)
+  if (-not $sandbox) { $sandbox = 'unelevated' }
   $isoHome = Join-Path $PSScriptRoot ('codex-home\' + $name)
   $src = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
   if (-not (Test-Path $src)) { Write-Warning ("supervisor: {0}: source CODEX_HOME '{1}' not found - cannot seed" -f $name, $src); return $null }
   New-Item -ItemType Directory -Force -Path $isoHome | Out-Null
-  foreach ($f in @('auth.json','config.toml')) {
-    $s = Join-Path $src $f; $d = Join-Path $isoHome $f
-    if ((Test-Path $s) -and (-not (Test-Path $d))) {
-      try { New-Item -ItemType SymbolicLink -Path $d -Target $s -ErrorAction Stop | Out-Null }
-      catch { Copy-Item $s $d -Force }
-    }
+  # auth.json: symlink (no secret duplication) or copy fallback; keep if present.
+  $sa = Join-Path $src 'auth.json'; $da = Join-Path $isoHome 'auth.json'
+  if ((Test-Path $sa) -and (-not (Test-Path $da))) {
+    try { New-Item -ItemType SymbolicLink -Path $da -Target $sa -ErrorAction Stop | Out-Null }
+    catch { Copy-Item $sa $da -Force }
   }
+  # config.toml: ALWAYS copy fresh (pick up operator changes) then overlay the
+  # unattended keys via the tested Python core. NEVER seed .sandbox-secrets.
+  $sc = Join-Path $src 'config.toml'; $dc = Join-Path $isoHome 'config.toml'
+  if (Test-Path $sc) { Copy-Item $sc $dc -Force } elseif (-not (Test-Path $dc)) { Set-Content $dc '' -Encoding utf8 }
+  & $AgenttalkCmd --root $Root supervise --seed-codex-config --home $isoHome --repo $Root --sandbox $sandbox | Out-Null
   foreach ($dn in @('skills','plugins','rules')) {
     $s = Join-Path $src $dn; $d = Join-Path $isoHome $dn
     if ((Test-Path $s) -and (-not (Test-Path $d))) {
@@ -928,6 +967,38 @@ function Seed-CodexHome($name) {
   $ok = (Test-Path (Join-Path $isoHome 'auth.json')) -and (Test-Path (Join-Path $isoHome 'config.toml')) -and (Test-Path (Join-Path $isoHome 'skills\agenttalk-listen'))
   if (-not $ok) { Write-Warning ("supervisor: {0}: seeded CODEX_HOME missing auth/config/agenttalk-listen skill - failing closed" -f $name); return $null }
   return $isoHome
+}
+function Preflight($name, $plan, $file, $codexHome) {
+  # Smoke-test that the agent can invoke agenttalk in the EXACT seeded mode
+  # BEFORE we launch - so a broken config FAILS CLOSED here instead of burning
+  # the launch grace in a relaunch loop. Returns $true on success.
+  try {
+    if ($plan.cli -eq 'codex') {
+      # run `python -m agenttalk --version` INSIDE codex's workspace sandbox with
+      # the seeded home - exactly how the supervised agent will reach the bus.
+      $saved = $env:CODEX_HOME
+      if ($codexHome) { $env:CODEX_HOME = $codexHome }
+      try {
+        & $file sandbox -P :workspace -C $Root python -m agenttalk --version | Out-Null
+        $rc = $LASTEXITCODE
+      } finally {
+        if ($null -eq $saved) { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue } else { $env:CODEX_HOME = $saved }
+      }
+      if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - codex sandbox preflight `python -m agenttalk --version` exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
+      return $true
+    } else {
+      # claude / generic: confirm `python -m agenttalk` resolves with the src on
+      # PYTHONPATH (the in-sandbox-robust invocation the skills use).
+      $savedPP = $env:PYTHONPATH
+      if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
+      try { & python -m agenttalk --version | Out-Null; $rc = $LASTEXITCODE }
+      finally { if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP } }
+      if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - preflight `python -m agenttalk --version` exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
+      return $true
+    }
+  } catch {
+    Write-Warning ("supervisor: {0}: CONFIG ERROR - preflight threw ({1}); NOT launching (fail closed)" -f $name, $_.Exception.Message); return $false
+  }
 }
 # endregion exec-helpers
 function Launch($name, $plan, $codexHome) {
@@ -951,15 +1022,14 @@ function Launch($name, $plan, $codexHome) {
   foreach ($x in @($a.launch.windows_args)) {
     if ($x -eq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ($x -replace '<cwd>', $a.cwd) }
   }
-  # Apply the agent's env (+ AGENTTALK_ROOT/PYTHON/PYTHONPATH and a PATH prepend
-  # of .agenttalk/bin so a bare `agenttalk` resolves via the generated shim),
-  # launch the REAL executable directly with -PassThru (its PID dies with the
-  # agent - never a .cmd/shim, which would hand off and exit), then RESTORE the
-  # supervisor's own env. No shell-string eval: the file + arg array go straight
-  # to Start-Process.
+  # Apply the agent's env, launch the REAL executable directly with -PassThru,
+  # then RESTORE the supervisor's own env. The IN-SANDBOX agent reaches the bus
+  # via `python -m agenttalk` (bare python + src on PYTHONPATH) - so we do NOT
+  # bake the absolute AGENTTALK_PYTHON into the AGENT's env (it's an
+  # outside-workspace path the sandbox DENIES; blocker #2 point 8). The baked
+  # shim + AGENTTALK_PYTHON stay SUPERVISOR-only (the supervisor's own bus calls).
   $saved = @{}
-  $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PYTHON = $AgenttalkPython;
-               PATH = (Join-Path $PSScriptRoot 'bin') + ';' + $env:PATH }
+  $applied = @{ AGENTTALK_ROOT = $Root }
   if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }  # per-agent isolated home
   if ($a.env) { foreach ($k in $a.env.PSObject.Properties.Name) { $applied[$k] = $a.env.$k } }
@@ -1009,18 +1079,26 @@ do {
         # process-TREE kill of the recorded targets (brain + managed descendants
         # + any orphan wait). The launcher pid is long dead - we never rely on it.
         if (($p.kill_first -or $p.kill_orphans) -and $p.kill_targets) { Stop-Tree $p.kill_targets }
-        # Per-agent isolated SEEDED CODEX_HOME for codex (fail closed: skip the
-        # relaunch this tick if seeding can't provide auth/config/listen-skill).
+        # SEED the agent for UNATTENDED launch (blocker #2). Codex: a per-agent
+        # isolated CODEX_HOME with the overlaid auto-mode config.toml (the
+        # planner emits the EFFECTIVE isolation flag + windows_sandbox). Claude:
+        # merge {defaultMode} into the launch dir's .claude/settings.json. Then a
+        # PREFLIGHT smoke-test in the EXACT seeded mode -> FAIL CLOSED (skip the
+        # launch, do not burn the grace) on a broken config.
         $homeEnv = $null; $seedOk = $true
         if (($p.cli -eq 'codex') -and $p.codex_home_isolation) {
-          # the planner emits the EFFECTIVE isolation flag (per-CLI default
-          # merged), so seeding matches what the plan assumed even if the raw
-          # config omits the field.
-          $homeEnv = Seed-CodexHome $name
+          $homeEnv = Seed-CodexHome $name $p.windows_sandbox
           if (-not $homeEnv) { $seedOk = $false }
         }
+        $a = $cfg.agents.$name
+        if ($p.cli -eq 'claude') {
+          $launchDir = if ($a.cwd) { $a.cwd } else { $Root }
+          & $AgenttalkCmd --root $Root supervise --seed-claude-settings --dir $launchDir --mode $p.perm_mode | Out-Null
+        }
+        $file = $a.launch.windows_file
+        if ($seedOk -and -not (Preflight $name $p $file $homeEnv)) { $seedOk = $false }
         if (-not $seedOk) {
-          Write-Warning ("supervisor: {0}: CODEX_HOME seed failed - skipping relaunch this tick" -f $name)
+          Write-Warning ("supervisor: {0}: seed/preflight failed - skipping relaunch this tick (fail closed)" -f $name)
           $state.agents.$name = $p.next_state
         } else {
           $res = Launch $name $p $homeEnv
@@ -1074,6 +1152,102 @@ def agenttalk_shim(python_exe: str) -> str:
         'set "PYTHONPATH=%~dp0..\\..\\src;%PYTHONPATH%"\r\n'
         '"%AGENTTALK_PYTHON%" -m agenttalk %*\r\n'
     )
+
+
+# ---- unattended auto-mode seeding (0.28.1 blocker #2) ----------------------
+#
+# A SUPERVISED agent is UNATTENDED: there is no human to approve a permission
+# prompt or a UAC dialog, and the sandbox denies bare `agenttalk` (a WindowsApps
+# app-alias) + outside-workspace abs paths. So the supervisor SEEDS the agent's
+# config so it launches ALREADY in a never-prompt, never-elevate, workspace-
+# write mode. These overlay/merge helpers are PURE + unit-tested; the executor
+# (Seed-CodexHome / Launch) calls them via `supervise --seed-*`.
+
+def _toml_sections(text: str) -> list[dict]:
+    """Split TOML text into ordered sections: the root table (header None) then
+    each ``[table]``. Each section = {name, header (verbatim line or None),
+    lines (verbatim body lines)}. Comments / blanks / unknown keys are preserved
+    verbatim - we only touch the specific managed keys."""
+    secs = [{"name": None, "header": None, "lines": []}]
+    for line in (text or "").splitlines():
+        st = line.strip()
+        if st.startswith("[") and st.endswith("]") and not st.startswith("[["):
+            secs.append({"name": st[1:-1].strip(), "header": line, "lines": []})
+        else:
+            secs[-1]["lines"].append(line)
+    return secs
+
+
+def _toml_set_key(sec: dict, key: str, value_literal: str) -> None:
+    """Set ``key = value_literal`` in a section: replace an existing ACTIVE
+    assignment of that exact key, else append. A commented-out key is left as-is
+    and the active assignment is appended."""
+    newline = f"{key} = {value_literal}"
+    for i, ln in enumerate(sec["lines"]):
+        stripped = ln.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            continue
+        if stripped.split("=", 1)[0].strip() == key:
+            sec["lines"][i] = newline
+            return
+    sec["lines"].append(newline)
+
+
+def _toml_table(secs: list[dict], name: str) -> dict:
+    for s in secs:
+        if s["name"] == name:
+            return s
+    s = {"name": name, "header": f"[{name}]", "lines": []}
+    secs.append(s)
+    return s
+
+
+def _toml_basic_str(value: str) -> str:
+    """A TOML BASIC (double-quoted) string with backslashes/quotes escaped - used
+    for the writable_roots path so a Windows path survives (double-quoted per the
+    ruling)."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def codex_config_overlay(text: str, *, repo_path: str,
+                         windows_sandbox: str = "unelevated") -> str:
+    """Overlay the unattended-auto-mode keys onto an existing codex config.toml,
+    PRESERVING every other key the operator set. Managed keys (double-quoted
+    values, per the ruling): root ``approval_policy="never"`` +
+    ``sandbox_mode="workspace-write"``; ``[windows] sandbox="<windows_sandbox>"``
+    (the UAC fix - "unelevated" avoids the per-home elevated-sandbox admin
+    install); ``[sandbox_workspace_write] writable_roots=["<repo>"]``. Idempotent:
+    re-applying replaces our managed lines in place."""
+    secs = _toml_sections(text)
+    root = secs[0]
+    _toml_set_key(root, "approval_policy", '"never"')
+    _toml_set_key(root, "sandbox_mode", '"workspace-write"')
+    _toml_set_key(_toml_table(secs, "windows"), "sandbox",
+                  _toml_basic_str(windows_sandbox))
+    _toml_set_key(_toml_table(secs, "sandbox_workspace_write"), "writable_roots",
+                  "[" + _toml_basic_str(repo_path) + "]")
+    out: list[str] = []
+    for s in secs:
+        if s["header"] is not None:
+            out.append(s["header"])
+        out.extend(s["lines"])
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def seed_claude_settings(text: str | None, *, mode: str = "bypassPermissions") -> str:
+    """Merge ``{"defaultMode": <mode>}`` into an existing .claude/settings.json
+    body, preserving every other key. Returns the new JSON text. A malformed /
+    empty body is replaced with a minimal valid one (we never crash the launch)."""
+    data = {}
+    if text:
+        try:
+            loaded = json.loads(text)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (ValueError, TypeError):
+            data = {}
+    data["defaultMode"] = mode
+    return json.dumps(data, indent=2)
 
 
 def init(store: Store, *, force: bool = False, python_exe: str | None = None) -> dict:

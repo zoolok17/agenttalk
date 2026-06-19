@@ -3519,6 +3519,34 @@ def cmd_supervise(args: argparse.Namespace) -> int:
               "global, never clobbered). Now set activity_hook=true for the "
               "instrumented agents in supervisor.json to enable stuck-recovery.")
         return 0
+    if args.seed_codex_config:
+        # Overlay the unattended-auto-mode keys onto a (already-COPIED) config.toml
+        # in the isolated CODEX_HOME. --home is the isolated home; the repo abs
+        # path (writable_roots) defaults to the store root.
+        if not args.home:
+            sys.stderr.write("agenttalk supervise --seed-codex-config: need --home <dir>\n")
+            return 2
+        cfg_p = Path(args.home) / "config.toml"
+        existing = cfg_p.read_text(encoding="utf-8") if cfg_p.exists() else ""
+        repo = str(Path(args.repo).resolve() if args.repo else store.root.resolve())
+        sandbox = args.sandbox or "unelevated"
+        cfg_p.parent.mkdir(parents=True, exist_ok=True)
+        cfg_p.write_text(sup.codex_config_overlay(existing, repo_path=repo,
+                                                  windows_sandbox=sandbox), encoding="utf-8")
+        print(f"seeded codex config.toml (sandbox={sandbox}): {cfg_p}")
+        return 0
+    if args.seed_claude_settings:
+        # Merge {"defaultMode": <mode>} into <dir>/.claude/settings.json.
+        if not args.dir:
+            sys.stderr.write("agenttalk supervise --seed-claude-settings: need --dir <dir>\n")
+            return 2
+        sp = Path(args.dir) / ".claude" / "settings.json"
+        existing = sp.read_text(encoding="utf-8") if sp.exists() else None
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        mode = args.mode or "bypassPermissions"
+        sp.write_text(sup.seed_claude_settings(existing, mode=mode), encoding="utf-8")
+        print(f"seeded .claude/settings.json (defaultMode={mode}): {sp}")
+        return 0
     if args.record_launch:
         if not args.agent or not args.state_file:
             sys.stderr.write("agenttalk supervise --record-launch: need --for "
@@ -4180,6 +4208,23 @@ def build_parser() -> argparse.ArgumentParser:
                       help="(script use) Apply launch-success state for --for: "
                            "Claude pins --session-id; Codex marks launched + no "
                            "pinned id. Needs --state-file.")
+    gsup.add_argument("--seed-codex-config", dest="seed_codex_config", action="store_true",
+                      help="(script use) Overlay the unattended auto-mode keys "
+                           "(approval_policy/sandbox_mode/[windows] sandbox/"
+                           "writable_roots) onto config.toml in --home. Idempotent; "
+                           "preserves other keys.")
+    gsup.add_argument("--seed-claude-settings", dest="seed_claude_settings",
+                      action="store_true",
+                      help="(script use) Merge {\"defaultMode\": --mode} into "
+                           "<--dir>/.claude/settings.json (the Claude unattended seed).")
+    psup.add_argument("--home", help="(--seed-codex-config) the isolated CODEX_HOME dir.")
+    psup.add_argument("--repo", help="(--seed-codex-config) repo abs path for "
+                                     "writable_roots (default: the --root store dir).")
+    psup.add_argument("--sandbox", help="(--seed-codex-config) [windows] sandbox value "
+                                        "(default 'unelevated').")
+    psup.add_argument("--dir", help="(--seed-claude-settings) the agent launch dir.")
+    psup.add_argument("--mode", help="(--seed-claude-settings) defaultMode "
+                                     "(default 'bypassPermissions').")
     psup.add_argument("--cli", help="(--record-launch) the agent CLI ('claude'|'codex').")
     psup.add_argument("--pid", type=int, default=None,
                       help="(--record-launch) the LAUNCHER process id from Start-Process.")

@@ -334,9 +334,10 @@ def test_stuck_recover_when_alive_stale_and_hook_on() -> None:
     assert p["action"] == sup.STUCK_RECOVER and p["state"] == "STUCK"
     assert p["kill_first"] is True            # alive-but-stuck -> kill tree first
     assert p["launch_mode"] == "resume"
-    assert p["session_args"] == ["--resume", "SID", "--permission-mode", "dontAsk",
-                                 "--allowedTools", "Bash(agenttalk *)",
-                                 "-p", "/agenttalk.listen"]
+    # unattended default permission mode (blocker #2): bypassPermissions on resume
+    assert p["session_args"] == ["--resume", "SID", "--permission-mode",
+                                 "bypassPermissions", "--allowedTools",
+                                 "Bash(agenttalk *)", "-p", "/agenttalk.listen"]
     assert p["next_state"]["consecutive_fails"] == 1   # backoff applies
 
 
@@ -389,12 +390,17 @@ def test_session_id_fresh_then_resume() -> None:
 
 
 def test_session_args_per_cli_explicit_skill() -> None:
-    # Claude: explicit /agenttalk.listen as a SINGLE token, both modes.
+    # Claude: explicit /agenttalk.listen as a SINGLE token, both modes; the
+    # unattended permission mode (blocker #2) is on BOTH fresh and resume, from
+    # the {PERM_MODE} token (default bypassPermissions).
     assert sup.session_args("claude", "fresh", None) == [
-        "--session-id", "{SESSION_ID}", "-p", "/agenttalk.listen"]
+        "--session-id", "{SESSION_ID}", "--permission-mode", "bypassPermissions",
+        "-p", "/agenttalk.listen"]
     assert sup.session_args("claude", "resume", "X") == [
-        "--resume", "X", "--permission-mode", "dontAsk",
+        "--resume", "X", "--permission-mode", "bypassPermissions",
         "--allowedTools", "Bash(agenttalk *)", "-p", "/agenttalk.listen"]
+    # the perm mode is configurable
+    assert "dontAsk" in sup.session_args("claude", "fresh", None, perm_mode="dontAsk")
     # Codex (blocker 1): NO fake --session-id on fresh; resume via --last; the
     # EXPLICIT $agenttalk-listen skill is a SINGLE token in both modes.
     cfresh = sup.session_args("codex", "fresh", None)
@@ -451,13 +457,15 @@ def test_agenttalk_shim_resolves_both_install_modes() -> None:
 
 
 def test_ps_template_applies_and_restores_env() -> None:
-    """The executor applies the agent env (+ AGENTTALK_ROOT/PYTHON/PYTHONPATH +
-    a PATH prepend of .agenttalk/bin so a bare `agenttalk` resolves) around
-    Start-Process and RESTORES the supervisor's own env afterward."""
+    """The executor applies the agent env (AGENTTALK_ROOT + PYTHONPATH-src +
+    per-agent env + CODEX_HOME) around Start-Process and RESTORES the
+    supervisor's own env afterward. It does NOT bake the absolute
+    AGENTTALK_PYTHON into the AGENT env (blocker #2 point 8 - in-sandbox uses
+    `python -m`); that stays supervisor-only."""
     ps = sup.PS_TEMPLATE
-    assert "AGENTTALK_ROOT" in ps and "AGENTTALK_PYTHON" in ps
+    assert "$applied = @{ AGENTTALK_ROOT = $Root }" in ps   # lean agent env
     assert "$a.env" in ps                                  # applies per-agent env
-    assert "bin') + ';' + $env:PATH" in ps                 # PATH prepend of the shim dir
+    assert "'src') + ';' + $env:PYTHONPATH" in ps          # src on PYTHONPATH for `python -m`
     assert "finally" in ps                                 # restore in a finally
     assert "Remove-Item -Path (\"Env:\"" in ps             # restore: unset what wasn't set
     assert "Invoke-Expression" not in ps
@@ -692,6 +700,116 @@ def test_effective_codex_home_isolation_emitted_in_plan() -> None:
     po = sup.plan_actions(_report(), {"agents": {"worker": {}}}, off_cfg,
                           now_epoch=NOW, snapshot=[])["agents"]["worker"]
     assert po["codex_home_isolation"] is False
+
+
+# ---------------------------------------- 0.28.1 blocker #2: unattended auto-mode
+
+def test_codex_config_overlay_sets_keys_preserves_others_idempotent() -> None:
+    existing = ('model = "gpt-5"\napproval_policy = "on-request"\n\n'
+                '[windows]\nfoo = 1\n')
+    out = sup.codex_config_overlay(existing, repo_path=r"C:\proj\agenttalk",
+                                   windows_sandbox="unelevated")
+    assert 'model = "gpt-5"' in out                       # operator key preserved
+    assert 'approval_policy = "never"' in out             # managed key set...
+    assert 'approval_policy = "on-request"' not in out    # ...replacing the old value
+    assert 'sandbox_mode = "workspace-write"' in out
+    assert 'foo = 1' in out                               # other [windows] key kept
+    assert 'sandbox = "unelevated"' in out                # the UAC fix
+    # writable_roots is a DOUBLE-QUOTED path with escaped backslashes
+    assert r'writable_roots = ["C:\\proj\\agenttalk"]' in out
+    assert out.count("[windows]") == 1                    # no duplicate table
+    # idempotent
+    assert sup.codex_config_overlay(out, repo_path=r"C:\proj\agenttalk",
+                                    windows_sandbox="unelevated") == out
+    # empty input still yields a valid overlay with both tables
+    fresh = sup.codex_config_overlay("", repo_path="C:\\x", windows_sandbox="elevated")
+    assert 'sandbox = "elevated"' in fresh and "[sandbox_workspace_write]" in fresh
+
+
+def test_seed_claude_settings_merges_default_mode() -> None:
+    out = sup.seed_claude_settings('{"model": "opus"}', mode="bypassPermissions")
+    data = json.loads(out)
+    assert data == {"model": "opus", "defaultMode": "bypassPermissions"}
+    # empty / malformed -> minimal valid
+    assert json.loads(sup.seed_claude_settings(None))["defaultMode"] == "bypassPermissions"
+    assert json.loads(sup.seed_claude_settings("{bad json"))["defaultMode"] == "bypassPermissions"
+
+
+def test_claude_permission_mode_resolution() -> None:
+    assert sup.claude_permission_mode({}, {}) == "bypassPermissions"          # default
+    assert sup.claude_permission_mode({"claude_permission_mode": "plan"}, {}) == "plan"  # top
+    assert sup.claude_permission_mode({"claude_permission_mode": "plan"},
+                                      {"claude_permission_mode": "dontAsk"}) == "dontAsk"  # per-agent wins
+
+
+def test_seed_codex_config_cli_overlays_in_place(tmp_path: Path) -> None:
+    _team(tmp_path)
+    home = tmp_path / "iso"
+    home.mkdir()
+    (home / "config.toml").write_text('model = "x"\n', encoding="utf-8")
+    rc = _run(["supervise", "--seed-codex-config", "--home", str(home),
+               "--repo", str(tmp_path), "--sandbox", "unelevated"], tmp_path)
+    assert rc == 0
+    txt = (home / "config.toml").read_text(encoding="utf-8")
+    assert 'model = "x"' in txt and 'approval_policy = "never"' in txt
+    assert 'sandbox = "unelevated"' in txt
+
+
+def test_seed_claude_settings_cli_merges(tmp_path: Path) -> None:
+    _team(tmp_path)
+    d = tmp_path / "launch"
+    d.mkdir()
+    (d / ".claude").mkdir()
+    (d / ".claude" / "settings.json").write_text('{"model": "opus"}', encoding="utf-8")
+    rc = _run(["supervise", "--seed-claude-settings", "--dir", str(d),
+               "--mode", "bypassPermissions"], tmp_path)
+    assert rc == 0
+    data = json.loads((d / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    assert data["model"] == "opus" and data["defaultMode"] == "bypassPermissions"
+
+
+def test_plan_emits_windows_sandbox_and_perm_mode() -> None:
+    cfg = {"agents": {"worker": {"cli": "codex", "auto_restart": True,
+                                 "windows_sandbox": "elevated"}},
+           "claude_permission_mode": "dontAsk"}
+    p = sup.plan_actions(_report(), {"agents": {"worker": {}}}, cfg,
+                         now_epoch=NOW, snapshot=[])["agents"]["worker"]
+    assert p["windows_sandbox"] == "elevated"     # per-agent override emitted
+    assert p["perm_mode"] == "dontAsk"            # top-level knob emitted
+
+
+def test_claude_session_args_carry_bypass_permissions_fresh_and_resume() -> None:
+    cfg = {"agents": {"c": {"cli": "claude", "auto_restart": True, "activity_hook": True}}}
+    rpt = {"agents": {"c": {"protected": False, "heartbeat_stale": True,
+                            "heartbeat_age_seconds": 999.0, "restart_request": None}}}
+    # a claude agent that reached readiness + went stuck -> resume w/ perm mode
+    st = {"agents": {"c": {"brain_pid": BRAIN_PID, "brain_start": BRAIN_START,
+                           "readiness_seen": True, "resume_available": True,
+                           "session_id": "SID"}}}
+    snap = [{"pid": BRAIN_PID, "parent_pid": LAUNCHER_PID, "name": "claude.exe",
+             "command_line": "claude", "start_time": BRAIN_START},
+            {"pid": WAIT_PID, "parent_pid": BRAIN_PID, "name": "python.exe",
+             "command_line": "agenttalk wait --for c", "start_time": "t-wait"}]
+    p = sup.plan_actions(rpt, st, cfg, now_epoch=NOW, snapshot=snap)["agents"]["c"]
+    assert "--permission-mode" in p["session_args"]
+    i = p["session_args"].index("--permission-mode")
+    assert p["session_args"][i + 1] == "bypassPermissions"
+
+
+def test_ps_template_seeds_preflights_and_drops_baked_python_for_agent() -> None:
+    ps = sup.PS_TEMPLATE
+    # the agent env no longer carries the absolute AGENTTALK_PYTHON nor the
+    # .agenttalk/bin shim PATH prepend (in-sandbox agent uses `python -m`).
+    assert "$applied = @{ AGENTTALK_ROOT = $Root }" in ps
+    assert "AGENTTALK_PYTHON = $AgenttalkPython" not in ps   # not in the AGENT env
+    # Seed-CodexHome copies config.toml then overlays via the python core
+    assert "function Seed-CodexHome" in ps
+    assert "supervise --seed-codex-config" in ps
+    # claude settings seed + the PREFLIGHT fail-closed gate
+    assert "supervise --seed-claude-settings" in ps
+    assert "function Preflight" in ps
+    assert "python -m agenttalk --version" in ps            # the smoke-test
+    assert "fail closed" in ps.lower()
 
 
 # ---------------------------------------- WP-3: heartbeat command (throttled)
@@ -1036,15 +1154,22 @@ def test_seed_codex_home_provisions_and_fails_closed(tmp_path: Path) -> None:
     (src / "auth.json").write_text('{"token":"x"}', encoding="utf-8")
     (src / "config.toml").write_text("k = 1", encoding="utf-8")
     out = tmp_path / "seed.json"
+    # Seed-CodexHome overlays config.toml via `& $AgenttalkCmd ... --seed-codex-config`,
+    # so the harness must define $Root + the generated shim path.
+    cmd_path = tmp_path / ".agenttalk" / "bin" / "agenttalk.cmd"
+    preamble = [f"$Root = {_pslit(str(tmp_path))}",
+                f"$AgenttalkCmd = {_pslit(str(cmd_path))}"]
     harness = "\n".join([
-        helpers,
+        helpers, *preamble,
         f"$env:CODEX_HOME = {_pslit(str(src))}",
-        "$h = Seed-CodexHome 'codex-test'",
+        "$h = Seed-CodexHome 'codex-test' 'unelevated'",
         "$res = @{ home = $h;"
         " auth = (Test-Path (Join-Path $h 'auth.json'));"
         " config = (Test-Path (Join-Path $h 'config.toml'));"
         " skill = (Test-Path (Join-Path $h 'skills\\agenttalk-listen'));"
-        " sessions_shared = (Test-Path (Join-Path $h 'sessions')) }",
+        " sessions_shared = (Test-Path (Join-Path $h 'sessions'));"
+        " overlaid = ([bool](Select-String -Path (Join-Path $h 'config.toml')"
+        " -Pattern 'approval_policy = \"never\"' -Quiet)) }",
         f"$res | ConvertTo-Json | Set-Content {_pslit(str(out))} -Encoding utf8",
     ])
     hp = tmp_path / "seed_harness.ps1"
@@ -1056,14 +1181,15 @@ def test_seed_codex_home_provisions_and_fails_closed(tmp_path: Path) -> None:
     assert data["home"], "seeding returned no home"
     assert data["auth"] and data["config"] and data["skill"]
     assert data["sessions_shared"] is False, "isolated home must NOT share sessions/"
+    assert data["overlaid"], "config.toml must be overlaid with the unattended keys"
     # FAIL CLOSED: a source missing auth.json -> no home returned
     (src / "auth.json").unlink()
     out2 = tmp_path / "seed2.json"
     # use a DIFFERENT agent so the (already-seeded) home isn't reused
     harness2 = "\n".join([
-        helpers,
+        helpers, *preamble,
         f"$env:CODEX_HOME = {_pslit(str(src))}",
-        "$h = Seed-CodexHome 'codex-test-2'",
+        "$h = Seed-CodexHome 'codex-test-2' 'unelevated'",
         f"@{{ home = $h }} | ConvertTo-Json | Set-Content {_pslit(str(out2))} -Encoding utf8",
     ])
     hp2 = tmp_path / "seed_harness2.ps1"

@@ -28,6 +28,26 @@ If `.agenttalk/` is not under the current directory, pass `--root
 `agenttalk sync --root ...`; global options must precede the
 subcommand.
 
+## Invoking agenttalk under the Codex sandbox
+
+Inside Codex's workspace sandbox, **bare `agenttalk` is DENIED** - it resolves
+to the Windows App Execution Alias under `...\WindowsApps`, which the sandbox
+blocks ("Access is denied") - and the `.agenttalk\bin\agenttalk.cmd` shim
+cannot exec in-sandbox either. ALWAYS invoke the bus as a Python module with a
+bare, PATH-resolved `python`:
+
+```bash
+python -m agenttalk <subcommand> ...
+```
+
+A supervised launch already sets `AGENTTALK_ROOT`, `AGENTTALK_SELF`, and (for a
+source checkout) `PYTHONPATH=<repo>\src`, so `python -m agenttalk` resolves and
+WRITES to the in-workspace `.agenttalk/` (allowed; only OUTSIDE-workspace reads
+are denied). Do NOT bake an absolute python path - use bare `python`. Bare
+`agenttalk` / the `.cmd` shim are fine for a HUMAN, out-of-sandbox use, or the
+external supervisor's OWN calls - NOT for an in-sandbox agent. Everywhere this
+skill shows `agenttalk <cmd>`, run it as `python -m agenttalk <cmd>` in-sandbox.
+
 Use `agenttalk roster` to inspect available agents, roles, and groups.
 In a team setup, prefer unique role-suffixed names such as
 `claude-dev`, `codex-dev`, `claude-rev`, `codex-rev`, and
