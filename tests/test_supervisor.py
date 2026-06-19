@@ -36,6 +36,11 @@ _CONFIG = {
     "suspect_warn_interval_seconds": 300,
     "launch_grace_seconds": 120,
 }
+_HOOK_CODEX_CONFIG = {
+    **_CONFIG,
+    "agents": {"worker": {"auto_restart": True, "cli": "codex",
+                          "activity_hook": True}},
+}
 
 # ---- snapshot-model fixtures (the 8-state classifier reads a process snapshot) ----
 BRAIN_PID, BRAIN_START, LAUNCHER_PID, WAIT_PID = 200, "t-brain", 199, 400
@@ -80,8 +85,8 @@ def _report(**agent_fields) -> dict:
 
 
 def _plan(report, state, *, now=NOW, snapshot=None, config=_CONFIG):
-    # snapshot defaults to [] (captured but EMPTY = no brain present), not None
-    # (None means the capture FAILED -> SNAPSHOT_UNAVAILABLE).
+    # snapshot defaults to [] (captured but EMPTY = no process rows), not None
+    # (None means the capture FAILED; heartbeat liveness still applies).
     snap = [] if snapshot is None else snapshot
     return sup.plan_actions(report, state, config, now_epoch=now,
                             snapshot=snap)["agents"]["worker"]
@@ -89,17 +94,16 @@ def _plan(report, state, *, now=NOW, snapshot=None, config=_CONFIG):
 
 # ----------------------------------------- the 5 required safety scenarios
 
-def test_scenario_i_dead_pid_relaunches() -> None:
-    # brain recorded but ABSENT from the snapshot (and no orphan wait) -> DEAD.
+def test_scenario_i_fresh_heartbeat_ignores_missing_brain_snapshot() -> None:
+    # Heartbeat freshness is the liveness authority: a missing brain snapshot no
+    # longer kills a healthy, heartbeating agent.
     p = _plan(_report(), {"agents": {"worker": _ready(backoff_next_epoch=0)}}, snapshot=[])
-    assert p["action"] == sup.RELAUNCH and p["state"] == "DEAD"
-    assert p["next_state"]["consecutive_fails"] == 1
-    assert p["next_state"]["backoff_next_epoch"] == NOW + 30  # base
+    assert p["action"] == sup.NONE and p["state"] == "HEALTHY_IDLE"
 
 
 def test_scenario_ii_alive_stale_without_hook_is_suspect_warn_not_kill() -> None:
-    # brain alive + ready + stale + NO activity hook (default _CONFIG) ->
-    # ACTIVE_OR_BUSY: SUSPECT only, never kill (the WP-2 trap).
+    # stale + NO activity hook (default _CONFIG) -> ACTIVE_OR_BUSY: SUSPECT only,
+    # never kill (the WP-2 trap).
     p = _plan(_report(heartbeat_stale=True),
               {"agents": {"worker": _ready(last_warn_epoch=0)}}, snapshot=_snap())
     assert p["action"] == sup.SUSPECT_WARN and p["state"] == "ACTIVE_OR_BUSY"
@@ -120,33 +124,40 @@ def test_scenario_iii_manual_marker_relaunches_and_clears() -> None:
               snapshot=_snap())
     assert p["action"] == sup.RELAUNCH and p["state"] == "MANUAL_RESTART"
     assert p["clear_marker"] == "rr-1"
-    assert p["kill_first"] is True          # brain alive -> kill tree before relaunch
-    assert p["kill_targets"]                # non-empty (brain + managed)
+    assert p["kill_first"] is True          # best-effort cleanup before relaunch
+    assert p["kill_targets"]                # non-empty (launcher + managed)
     assert p["bypass_backoff"] is True      # bypasses the future backoff_next
     assert "rr-1" in p["next_state"]["consumed_rids"]
 
 
-def test_scenario_iv_protected_death_is_warn_only() -> None:
-    p = _plan(_report(protected=True), {"agents": {"worker": _ready()}}, snapshot=[])
+def test_scenario_iv_protected_stale_heartbeat_is_warn_only() -> None:
+    p = _plan(_report(protected=True, heartbeat_stale=True),
+              {"agents": {"worker": _ready()}}, snapshot=[],
+              config=_HOOK_CODEX_CONFIG)
     assert p["action"] == sup.WARN_ONLY
+    assert p["state"] == "STUCK_OR_DEAD"
     assert p["notify"] is True
     # never a relaunch/kill of a protected agent
 
 
 def test_scenario_v_backoff_escalates_then_resets() -> None:
-    # 1st death -> relaunch, backoff base (30)
+    # 1st stale heartbeat with activity hook -> stuck recovery, backoff base (30)
     s1 = {"agents": {"worker": _ready(consecutive_fails=0, backoff_next_epoch=0)}}
-    p1 = _plan(_report(), s1, snapshot=[])
-    assert p1["action"] == sup.RELAUNCH and p1["next_state"]["backoff_next_epoch"] == NOW + 30
-    # still dead, inside backoff -> wait
+    p1 = _plan(_report(heartbeat_stale=True), s1, snapshot=[],
+               config=_HOOK_CODEX_CONFIG)
+    assert p1["action"] == sup.STUCK_RECOVER
+    assert p1["next_state"]["backoff_next_epoch"] == NOW + 30
+    # still stale, inside backoff -> wait
     s2 = {"agents": {"worker": _ready(consecutive_fails=1, backoff_next_epoch=NOW + 30)}}
-    assert _plan(_report(), s2, now=NOW + 5, snapshot=[])["action"] == sup.BACKOFF_WAIT
-    # backoff elapsed -> relaunch, delay doubles (60)
-    p3 = _plan(_report(), s2, now=NOW + 31, snapshot=[])
-    assert p3["action"] == sup.RELAUNCH
+    assert _plan(_report(heartbeat_stale=True), s2, now=NOW + 5, snapshot=[],
+                 config=_HOOK_CODEX_CONFIG)["action"] == sup.BACKOFF_WAIT
+    # backoff elapsed -> recovery, delay doubles (60)
+    p3 = _plan(_report(heartbeat_stale=True), s2, now=NOW + 31, snapshot=[],
+               config=_HOOK_CODEX_CONFIG)
+    assert p3["action"] == sup.STUCK_RECOVER
     assert p3["next_state"]["consecutive_fails"] == 2
     assert p3["next_state"]["backoff_next_epoch"] == (NOW + 31) + 60
-    # sustained liveness (brain alive + ready + fresh hb) resets the backoff
+    # sustained liveness (fresh hb) resets the backoff
     s4 = {"agents": {"worker": _ready(consecutive_fails=2, healthy_since=NOW - 200)}}
     p4 = _plan(_report(), s4, snapshot=_snap())
     assert p4["action"] == sup.NONE
@@ -173,11 +184,12 @@ def test_protected_marker_with_force_relaunches() -> None:
 
 
 def test_consumed_marker_still_dead_does_not_bypass_backoff() -> None:
-    # the manual relaunch already fired (rid consumed) but the brain is STILL
-    # gone -> do NOT bypass backoff again every poll; honor the backoff window.
-    p = _plan(_report(restart_request={"request_id": "rr-1"}),
+    # the manual relaunch already fired (rid consumed) but the heartbeat is STILL
+    # stale -> do NOT bypass backoff again every poll; honor the backoff window.
+    p = _plan(_report(heartbeat_stale=True, restart_request={"request_id": "rr-1"}),
               {"agents": {"worker": _ready(consumed_rids=["rr-1"],
-                                           backoff_next_epoch=NOW + 9999)}}, snapshot=[])
+                                           backoff_next_epoch=NOW + 9999)}},
+              snapshot=[], config=_HOOK_CODEX_CONFIG)
     assert p["action"] == sup.BACKOFF_WAIT
     assert p["clear_marker"] is None        # never silently clear a failed request
 
@@ -299,15 +311,15 @@ def test_supervise_plan_cli_with_fixtures(tmp_path: Path, capsys) -> None:
     report_file.write_text(json.dumps(_report()), encoding="utf-8")
     state_file = tmp_path / "state.json"
     state_file.write_text(json.dumps({"agents": {"worker": {}}}), encoding="utf-8")
-    snap_file = tmp_path / "snap.json"   # empty snapshot = captured, no brain -> DEAD
+    snap_file = tmp_path / "snap.json"   # empty snapshot is fine when heartbeat is fresh
     snap_file.write_text("[]", encoding="utf-8")
     rc = _run(["supervise", "--plan", "--report-file", str(report_file),
                "--state-file", str(state_file), "--snapshot-file", str(snap_file),
                "--now", str(NOW)], tmp_path)
     assert rc == 0
     plan = json.loads(capsys.readouterr().out)
-    assert plan["agents"]["worker"]["action"] == sup.RELAUNCH
-    assert plan["agents"]["worker"]["state"] == "DEAD"
+    assert plan["agents"]["worker"]["action"] == sup.NONE
+    assert plan["agents"]["worker"]["state"] == "HEALTHY_IDLE"
 
 
 _HOOK_CONFIG = {
@@ -326,13 +338,13 @@ def _plan_hook(report, state, *, now=NOW, config=_HOOK_CONFIG, snapshot=None):
 # ---------------------------------------- WP-3: stuck-recovery matrix
 
 def test_stuck_recover_when_alive_stale_and_hook_on() -> None:
-    # claude brain alive + ready + stale + hook -> STUCK_RECOVER (resume the
-    # pinned session). _ready() makes resume_available true.
+    # stale heartbeat + hook -> STUCK_RECOVER (resume the pinned session).
+    # _ready() makes resume_available true.
     p = _plan_hook(_report(heartbeat_stale=True),
                    {"agents": {"worker": _ready(session_id="SID")}},
                    snapshot=_snap(cli="claude"))
-    assert p["action"] == sup.STUCK_RECOVER and p["state"] == "STUCK"
-    assert p["kill_first"] is True            # alive-but-stuck -> kill tree first
+    assert p["action"] == sup.STUCK_RECOVER and p["state"] == "STUCK_OR_DEAD"
+    assert p["kill_first"] is True            # best-effort cleanup before resume
     assert p["launch_mode"] == "resume"
     # unattended default permission mode (blocker #2): bypassPermissions on resume
     assert p["session_args"] == ["--resume", "SID", "--permission-mode",
@@ -355,10 +367,10 @@ def test_stuck_protected_is_warn_only() -> None:
 
 
 def test_stuck_dead_pid_is_relaunch_not_stuck() -> None:
-    # brain GONE still routes to relaunch (DEAD), distinct from stuck_recover
+    # stale heartbeat routes to stuck recovery even when no brain is discovered.
     p = _plan_hook(_report(heartbeat_stale=True),
                    {"agents": {"worker": _ready()}}, snapshot=[])
-    assert p["action"] == sup.RELAUNCH and p["state"] == "DEAD"
+    assert p["action"] == sup.STUCK_RECOVER and p["state"] == "STUCK_OR_DEAD"
 
 
 def test_stuck_recover_requires_hook_else_suspect() -> None:
@@ -542,15 +554,12 @@ def test_launcher_exits_brain_lives_is_healthy() -> None:
 
 
 def test_zombie_wait_reaps_orphans_then_relaunches() -> None:
-    # brain GONE, but an orphan `agenttalk wait` still heartbeats -> ZOMBIE_WAIT:
-    # reap the orphan set (kill_orphans + kill_targets) THEN relaunch.
+    # Fresh heartbeat wins over a missing brain even when a wait row exists.
     snap = [{"pid": WAIT_PID, "parent_pid": 1, "name": "python.exe",
              "command_line": "agenttalk wait --for worker", "start_time": "t-wait"}]
     p = _plan(_report(heartbeat_stale=False),
               {"agents": {"worker": _ready(backoff_next_epoch=0)}}, snapshot=snap)
-    assert p["action"] == sup.RELAUNCH and p["state"] == "ZOMBIE_WAIT"
-    assert p["kill_orphans"] is True
-    assert WAIT_PID in [t["pid"] for t in p["kill_targets"]]
+    assert p["action"] == sup.NONE and p["state"] == "HEALTHY_IDLE"
 
 
 def test_in_grace_launcher_dead_is_none_no_brain_yet() -> None:
@@ -567,53 +576,56 @@ def test_no_brain_by_grace_expiry_relaunches() -> None:
     st = {"agents": {"worker": {"launcher_pid": 199, "launching": True,
                                 "launch_grace_until": NOW - 1, "readiness_seen": False,
                                 "backoff_next_epoch": 0}}}
-    p = _plan(_report(heartbeat_stale=True), st, snapshot=[])
-    assert p["action"] == sup.RELAUNCH and p["state"] == "DEAD"
+    p = _plan(_report(heartbeat_stale=True), st, snapshot=[],
+              config=_HOOK_CODEX_CONFIG)
+    assert p["action"] == sup.STUCK_RECOVER and p["state"] == "STUCK_OR_DEAD"
     assert p["next_state"]["consecutive_fails"] == 1
 
 
 def test_readiness_failed_after_grace_kills_and_relaunches() -> None:
-    # brain came up but NEVER reached the listen loop (no first heartbeat); grace
-    # expired -> READINESS_FAILED: kill tree + relaunch (catches an early -p exit).
+    # no first heartbeat after grace -> stale heartbeat recovery; brain presence
+    # only contributes kill targets.
     st = {"agents": {"worker": {"launcher_pid": 199, "launching": True,
                                 "launch_grace_until": NOW - 1, "readiness_seen": False,
                                 "backoff_next_epoch": 0}}}
-    p = _plan(_report(heartbeat_stale=True), st, snapshot=_snap())
-    assert p["action"] == sup.RELAUNCH and p["state"] == "READINESS_FAILED"
+    p = _plan(_report(heartbeat_stale=True), st, snapshot=_snap(),
+              config=_HOOK_CODEX_CONFIG)
+    assert p["action"] == sup.STUCK_RECOVER and p["state"] == "STUCK_OR_DEAD"
     assert p["kill_first"] is True and p["kill_targets"]
 
 
 def test_pid_reuse_start_mismatch_is_not_alive() -> None:
-    # recorded brain pid is present in the snapshot but with a DIFFERENT
-    # start-time (a recycled pid) -> NOT our process -> DEAD, not healthy.
+    # A recycled/mismatched brain pid no longer drives liveness; fresh heartbeat
+    # keeps the agent healthy.
     snap = [{"pid": BRAIN_PID, "parent_pid": 1, "name": "notcodex.exe",
              "command_line": "something-else", "start_time": "DIFFERENT"}]
     p = _plan(_report(heartbeat_stale=False),
               {"agents": {"worker": _ready(backoff_next_epoch=0)}}, snapshot=snap)
-    assert p["state"] == "DEAD" and p["action"] == sup.RELAUNCH
+    assert p["state"] == "HEALTHY_IDLE" and p["action"] == sup.NONE
 
 
-def test_snapshot_unavailable_fails_closed() -> None:
-    # requires_brain_pid (codex) + a FAILED capture (None) -> SNAPSHOT_UNAVAILABLE:
-    # warn, NO kill, NO relaunch (never storm off a missing snapshot).
+def test_snapshot_unavailable_does_not_block_heartbeat_liveness() -> None:
+    # Snapshot failure only reduces kill-target quality; heartbeat staleness
+    # remains authoritative.
     p = sup.plan_actions(_report(heartbeat_stale=True),
-                         {"agents": {"worker": _ready(last_warn_epoch=0)}}, _CONFIG,
+                         {"agents": {"worker": _ready(last_warn_epoch=0)}},
+                         _HOOK_CODEX_CONFIG,
                          now_epoch=NOW, snapshot=None)["agents"]["worker"]
-    assert p["state"] == "SNAPSHOT_UNAVAILABLE"
-    assert p["action"] == sup.SNAPSHOT_UNAVAILABLE
-    assert p["kill_first"] is False and p["kill_targets"] == []
+    assert p["state"] == "STUCK_OR_DEAD"
+    assert p["action"] == sup.STUCK_RECOVER
 
 
-def test_non_forking_cli_uses_legacy_pid_alive_when_no_snapshot() -> None:
-    # an explicitly NON-forking CLI (requires_brain_pid=false) may use the legacy
-    # single-pid path when the snapshot is unavailable.
+def test_non_forking_cli_uses_heartbeat_when_no_snapshot() -> None:
+    # Even legacy/non-forking configs now use heartbeat freshness for liveness.
     cfg = {"agents": {"worker": {"auto_restart": True, "cli": "claude",
-                                 "requires_brain_pid": False}},
+                                 "requires_brain_pid": False,
+                                 "activity_hook": True}},
            "launch_grace_seconds": 120}
-    dead = sup.plan_actions(_report(), {"agents": {"worker": {"pid_alive": False,
-                                                              "backoff_next_epoch": 0}}},
+    dead = sup.plan_actions(_report(heartbeat_stale=True),
+                            {"agents": {"worker": {"pid_alive": False,
+                                                   "backoff_next_epoch": 0}}},
                             cfg, now_epoch=NOW, snapshot=None)["agents"]["worker"]
-    assert dead["action"] == sup.RELAUNCH and dead["state"] == "DEAD"
+    assert dead["action"] == sup.STUCK_RECOVER and dead["state"] == "STUCK_OR_DEAD"
     alive = sup.plan_actions(_report(), {"agents": {"worker": {"pid_alive": True}}},
                              cfg, now_epoch=NOW, snapshot=None)["agents"]["worker"]
     assert alive["action"] == sup.NONE and alive["state"] == "HEALTHY_IDLE"
@@ -625,11 +637,13 @@ def test_resume_mode_fresh_then_last() -> None:
     st_fresh = {"agents": {"worker": {"launcher_pid": 199, "launching": True,
                                       "launch_grace_until": NOW - 1, "readiness_seen": False,
                                       "backoff_next_epoch": 0}}}
-    p = _plan(_report(heartbeat_stale=True), st_fresh, snapshot=[])
+    p = _plan(_report(heartbeat_stale=True), st_fresh, snapshot=[],
+              config=_HOOK_CODEX_CONFIG)
     assert p["resume_mode"] == "fresh"
-    p2 = _plan(_report(heartbeat_stale=False),
-               {"agents": {"worker": _ready(backoff_next_epoch=0)}}, snapshot=[])
-    assert p2["state"] == "DEAD" and p2["resume_mode"] == "last"
+    p2 = _plan(_report(heartbeat_stale=True),
+               {"agents": {"worker": _ready(backoff_next_epoch=0)}}, snapshot=[],
+               config=_HOOK_CODEX_CONFIG)
+    assert p2["state"] == "STUCK_OR_DEAD" and p2["resume_mode"] == "last"
 
 
 # -------------------------- impl-review r1 regressions (codex findings) ------
@@ -715,8 +729,8 @@ def test_allow_launcher_self_true_picks_launcher() -> None:
 
 def test_stale_launcher_pin_repairs_to_tui_not_zombie() -> None:
     """test #4 false-kill: a stored brain_pid == launcher_pid (a bad pin from the
-    old discovery) must be REPAIRED to the real TUI, NOT classified ZOMBIE_WAIT
-    and killed. Holds whether the launcher is still alive or already exited."""
+    old discovery) must be REPAIRED to the real TUI while a fresh heartbeat stays
+    healthy. Holds whether the launcher is still alive or already exited."""
     for launcher_alive in (True, False):
         st = {"agents": {"codex-test": {
             "brain_pid": LAUNCHER_PID, "brain_start": "t1", "launcher_pid": LAUNCHER_PID,
@@ -738,18 +752,18 @@ def test_allow_launcher_self_default_is_false_for_codex() -> None:
         "allow_launcher_self"] is True
 
 
-def test_zombie_wait_via_carried_managed_pid_null_cmdline(tmp_path: Path) -> None:
-    """impl-review BLOCKER 2: with the brain gone and the orphan wait's command
-    line now unavailable, a prior start-matching managed wait pid must be carried
-    forward, counted as wait_alive, and reaped (ZOMBIE_WAIT, not a silent DEAD)."""
+def test_stale_heartbeat_reaps_carried_managed_pid_null_cmdline(tmp_path: Path) -> None:
+    """A prior start-matching managed wait pid with a now-null command line is
+    still a safe cleanup target when heartbeat staleness triggers recovery."""
     snap = [{"pid": WAIT_PID, "parent_pid": 1, "name": "python.exe",
              "command_line": None, "start_time": "wait-start"}]
     st = {"agents": {"worker": _ready(
         backoff_next_epoch=0,
         managed_pids=[{"pid": WAIT_PID, "start": "wait-start", "kind": "wait",
                        "last_seen": 0}])}}
-    p = _plan(_report(heartbeat_stale=False), st, snapshot=snap)
-    assert p["state"] == "ZOMBIE_WAIT" and p["kill_orphans"] is True
+    p = _plan(_report(heartbeat_stale=True), st, snapshot=snap,
+              config=_HOOK_CODEX_CONFIG)
+    assert p["state"] == "STUCK_OR_DEAD" and p["kill_orphans"] is True
     assert WAIT_PID in [t["pid"] for t in p["kill_targets"]]
 
 
@@ -757,7 +771,8 @@ def test_codex_failed_first_launch_is_fresh_not_resume() -> None:
     """impl-review MAJOR 1: codex resume must be driven by resume_available, NOT
     legacy `launched` (set at launch time, before readiness). A failed first
     launch (launched=true, resume_available=false) must relaunch FRESH."""
-    cfg = {"agents": {"worker": {"cli": "codex", "auto_restart": True}},
+    cfg = {"agents": {"worker": {"cli": "codex", "auto_restart": True,
+                                 "activity_hook": True}},
            "launch_grace_seconds": 120}
     st = {"agents": {"worker": {"launcher_pid": LAUNCHER_PID, "launching": True,
                                 "launch_grace_until": NOW - 1, "readiness_seen": False,
@@ -765,7 +780,7 @@ def test_codex_failed_first_launch_is_fresh_not_resume() -> None:
                                 "backoff_next_epoch": 0}}}
     p = sup.plan_actions(_report(heartbeat_stale=True), st, cfg,
                          now_epoch=NOW, snapshot=[])["agents"]["worker"]
-    assert p["state"] == "DEAD" and p["resume_mode"] == "fresh"
+    assert p["state"] == "STUCK_OR_DEAD" and p["resume_mode"] == "fresh"
     assert "--last" not in (p["session_args"] or [])
 
 
@@ -1025,13 +1040,14 @@ def test_supervise_plan_exact_generated_command_runs(tmp_path: Path, capsys) -> 
     state_file = s.dir / "supervisor-state.json"
     state_file.write_text(json.dumps({"agents": {"worker": {}}}), encoding="utf-8")
     snap_file = s.dir / "supervisor-snapshot.json"
-    snap_file.write_text("[]", encoding="utf-8")   # captured, no brain -> DEAD
+    snap_file.write_text("[]", encoding="utf-8")   # captured, no brain; no hook -> suspect
     # EXACTLY the args supervisor.ps1 invokes (live report; no --json).
     rc = _run(["supervise", "--plan", "--state-file", str(state_file),
                "--snapshot-file", str(snap_file), "--now", str(NOW)], tmp_path)
     assert rc == 0
     plan = json.loads(capsys.readouterr().out)   # must be valid JSON
-    assert plan["agents"]["worker"]["action"] == sup.RELAUNCH
+    assert plan["agents"]["worker"]["action"] == sup.SUSPECT_WARN
+    assert plan["agents"]["worker"]["state"] == "ACTIVE_OR_BUSY"
 
 
 def _pick_powershell() -> str | None:
