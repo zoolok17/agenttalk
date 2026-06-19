@@ -1269,7 +1269,7 @@ def test_bus_writes_survive_blocked_rename_in_sandbox(
     no-op sleep."""
     import agenttalk._atomic as _atomic
     monkeypatch.setattr("agenttalk._atomic._sandbox_direct_write", False)
-    monkeypatch.setattr("agenttalk._atomic.os.name", "nt")
+    monkeypatch.setattr("agenttalk._atomic._is_windows", lambda: True)
     monkeypatch.setattr("agenttalk._atomic.time.sleep", lambda _s: None)
     s = Store(tmp_path)
     s.init(["alpha", "codex-test"])

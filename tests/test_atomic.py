@@ -107,7 +107,7 @@ def test_write_text_sandbox_fallback_on_blocked_rename(
     Models test #3's [WinError 5] cross-platform via os.name + os.replace +
     no-op sleep (so the bounded retry doesn't actually wait)."""
     monkeypatch.setattr("agenttalk._atomic._sandbox_direct_write", False)
-    monkeypatch.setattr("agenttalk._atomic.os.name", "nt")
+    monkeypatch.setattr("agenttalk._atomic._is_windows", lambda: True)
     monkeypatch.setattr("agenttalk._atomic.time.sleep", lambda _s: None)
     monkeypatch.setattr("os.replace", lambda *a, **k: (_ for _ in ()).throw(
         PermissionError("[WinError 5] Access is denied (sandbox)")))
@@ -137,7 +137,7 @@ def test_write_text_posix_rename_failure_still_raises(
     """On POSIX a genuine rename PermissionError must STILL surface - the
     direct-write fallback is Windows-sandbox-only, never a silent POSIX downgrade."""
     monkeypatch.setattr("agenttalk._atomic._sandbox_direct_write", False)
-    monkeypatch.setattr("agenttalk._atomic.os.name", "posix")
+    monkeypatch.setattr("agenttalk._atomic._is_windows", lambda: False)
     monkeypatch.setattr("os.replace", lambda *a, **k: (_ for _ in ()).throw(
         PermissionError("denied")))
     with pytest.raises(PermissionError):
@@ -153,7 +153,7 @@ def test_latch_stays_false_on_transient_winerror5_then_retry_success(
     Windows transient sharing-violation that clears on retry keeps the ATOMIC path
     (flag stays false)."""
     monkeypatch.setattr("agenttalk._atomic._sandbox_direct_write", False)
-    monkeypatch.setattr("agenttalk._atomic.os.name", "nt")
+    monkeypatch.setattr("agenttalk._atomic._is_windows", lambda: True)
     monkeypatch.setattr("agenttalk._atomic.time.sleep", lambda _s: None)
     real = os.replace
     calls = {"n": 0}
@@ -180,7 +180,7 @@ def test_latch_not_set_when_direct_write_fallback_fails(
     atomic path. Forced by a blocked rename + a direct-write target that can't be
     opened (a directory)."""
     monkeypatch.setattr("agenttalk._atomic._sandbox_direct_write", False)
-    monkeypatch.setattr("agenttalk._atomic.os.name", "nt")
+    monkeypatch.setattr("agenttalk._atomic._is_windows", lambda: True)
     monkeypatch.setattr("agenttalk._atomic.time.sleep", lambda _s: None)
     monkeypatch.setattr("os.replace", lambda *a, **k: (_ for _ in ()).throw(
         PermissionError("[WinError 5] sandbox")))

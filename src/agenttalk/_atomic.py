@@ -25,6 +25,14 @@ from pathlib import Path
 _sandbox_direct_write = False
 
 
+def _is_windows() -> bool:
+    """Platform check used by the write paths below. A FUNCTION (not a direct
+    ``os.name`` read) so tests can simulate Windows/POSIX by patching THIS -
+    patching ``os.name`` globally corrupts pathlib's flavour on the host and
+    breaks unrelated Path ops (CI POSIX failure, 2026-06-19)."""
+    return os.name == "nt"
+
+
 def write_text(path: Path, text: str, *, encoding: str = "utf-8",
                newline: str = "\n") -> None:
     """Durably write ``text`` to ``path`` - atomic where the platform allows it.
@@ -61,7 +69,7 @@ def write_text(path: Path, text: str, *, encoding: str = "utf-8",
         try:
             _replace_with_retry(tmp, path)
         except PermissionError:
-            if os.name != "nt":
+            if not _is_windows():
                 raise   # a genuine POSIX rename failure must still surface
             # The bounded retry is exhausted (a transient reader violation would
             # have cleared inside _replace_with_retry, keeping the atomic path) -
@@ -106,7 +114,7 @@ def _replace_with_retry(src: str, dst: Path) -> None:
     ``write_text`` can fall back to a direct write. POSIX renames don't hit this
     and replace once.
     """
-    if os.name != "nt":
+    if not _is_windows():
         os.replace(src, dst)
         return
     for delay in (0.01, 0.02, 0.04, 0.08):   # ~0.15s total, < 200ms
@@ -125,7 +133,7 @@ def _fsync_dir(directory: Path) -> None:
     (and isn't required there), and a failure here must never turn an
     otherwise-successful write into an error.
     """
-    if os.name == "nt":
+    if _is_windows():
         return
     try:
         dfd = os.open(str(directory), os.O_RDONLY)
