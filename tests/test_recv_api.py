@@ -108,6 +108,42 @@ def test_scoped_floor_respects_global_cursor(tmp_path) -> None:
     assert rec["id"] == t2.id                         # t1 is below the floor
 
 
+# ----------------------------------- poll() surfaces terminal state (reviewer-1 P1)
+
+def test_poll_surfaces_scoped_terminal_with_no_message(tmp_path) -> None:
+    # reviewer-1 P1: a wrapper must be able to LEARN a scoped thread was rescinded/
+    # closed even when no message is pending (parity with scoped wait's entry-check).
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="q?", kind="question",
+           meta={"request_id": "q1"})
+    resc = s.send(sender="alpha", recipient="beta", body="", kind="rescind",
+                  subject="rescind: q1", meta={"request_id": "q1"})
+    # advance beta's GLOBAL cursor PAST the rescind -> no scoped message above floor.
+    s.advance_cursor("beta", resc.id)
+    # next_record hides it (the parity bug); poll() surfaces the TERMINAL state.
+    assert recv_api.next_record(s, "beta", scoped_request_id="q1") is None
+    env = recv_api.poll(s, "beta", scoped_request_id="q1")
+    assert env["record"] is None
+    assert env["scoped"]["request_id"] == "q1"
+    assert env["scoped"]["closed"] is True and env["scoped"]["superseded"] is True
+
+
+def test_records_since_and_include_control_knobs(tmp_path) -> None:
+    # reviewer-1 P2: --since / include-control are knobs ON recv_api (the CLI mirror
+    # routes through here; no duplicated cursor logic in cli.py).
+    s = _store(tmp_path)
+    m1 = s.send(sender="alpha", recipient="beta", body="one")
+    s.send(sender="alpha", recipient="beta", body="two")
+    s.send(sender="alpha", recipient="beta", body="", kind="composing",
+           meta={"request_id": "r"})
+    # since overrides the global floor.
+    assert [r["body"] for r in recv_api.records(s, "beta", since=m1.id)] == ["two"]
+    # include_control surfaces composing; default excludes it.
+    assert any(r["kind"] == "composing"
+               for r in recv_api.records(s, "beta", include_control=True))
+    assert all(r["kind"] != "composing" for r in recv_api.records(s, "beta"))
+
+
 # --------------------------------------------------- recv --json CLI mirror
 
 def test_recv_json_cli_mirror(tmp_path, capsys) -> None:

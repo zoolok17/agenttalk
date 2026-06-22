@@ -2012,22 +2012,18 @@ def _do_recv(
 
 def _do_recv_json(store: Store, agent: str, *, since: str | None, ack: bool,
                   include_control: bool) -> int:
-    """`recv --json`: a CLI MIRROR over the wrapper's in-process recv_api.to_record
-    (NOT a second implementation). Structurally identical to _do_recv - same floor,
-    same control-filter, same --ack advance - but emits one structured JSON record
-    per line instead of human text. The wrapper itself uses recv_api in-process and
-    never shells this."""
+    """`recv --json`: a CLI MIRROR over the SAME in-process recv_api functions the
+    wrapper uses - NOT a second implementation. It routes the cursor/floor/control
+    semantics entirely through recv_api.records + recv_api.commit (no duplicated
+    cursor logic here); --since / --include-control are knobs ON recv_api. The
+    wrapper itself uses recv_api in-process and never shells this."""
     from .wrapper import recv_api
 
-    cursor = since if since is not None else store.cursor(agent)
-    msgs = store.messages_for(agent, since_id=cursor or None)
-    visible = msgs if include_control else [m for m in msgs if m.kind not in CONTROL_KINDS]
-    for m in visible:
-        rec = recv_api.to_record(m, mode=recv_api.GLOBAL,
-                                 cursor_before=cursor or "", cursor_after=m.id)
+    recs = recv_api.records(store, agent, since=since, include_control=include_control)
+    for rec in recs:
         print(json.dumps(rec, ensure_ascii=False))
-    if ack and msgs:
-        store.advance_cursor(agent, msgs[-1].id)
+    if ack and recs:
+        recv_api.commit(store, agent, recs[-1])
     return 0
 
 

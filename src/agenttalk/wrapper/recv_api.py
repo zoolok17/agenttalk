@@ -75,21 +75,27 @@ def _terminal_state(store, agent: str, rid: str) -> tuple[bool, bool]:
     return (False, False)
 
 
-def records(store, agent: str, *, scoped_request_id: str | None = None) -> list[dict]:
+def records(store, agent: str, *, scoped_request_id: str | None = None,
+            since: str | None = None, include_control: bool = False) -> list[dict]:
     """All currently-unread messages for ``agent`` as structured records (oldest
-    first), NON-consuming. ``messages_for`` already excludes CONTROL_KINDS."""
+    first), NON-consuming. Control kinds (composing) are filtered unless
+    ``include_control``. ``since`` overrides the GLOBAL floor (history inspection);
+    it is ignored in scoped mode (scoped floors at max(thread_seen, cursor))."""
     if scoped_request_id is None:
-        before = store.cursor(agent)
-        msgs = [m for m in store.messages_for(agent, since_id=before or None)
-                if m.kind not in CONTROL_KINDS]
+        before = since if since is not None else store.cursor(agent)
+        msgs = store.messages_for(agent, since_id=before or None)
+        if not include_control:
+            msgs = [m for m in msgs if m.kind not in CONTROL_KINDS]
         return [to_record(m, mode=GLOBAL, cursor_before=before, cursor_after=m.id)
                 for m in msgs]
     rid = scoped_request_id
     seen = store.thread_seen(agent, rid)
     gcur = store.cursor(agent)
     floor = max(seen, gcur)
-    msgs = [m for m in store.messages_for(agent, since_id=floor or None)
-            if m.kind not in CONTROL_KINDS and m.meta.get("request_id") == rid]
+    msgs = store.messages_for(agent, since_id=floor or None)
+    if not include_control:
+        msgs = [m for m in msgs if m.kind not in CONTROL_KINDS]
+    msgs = [m for m in msgs if m.meta.get("request_id") == rid]
     closed, superseded = _terminal_state(store, agent, rid)
     out = []
     for m in msgs:
@@ -101,9 +107,37 @@ def records(store, agent: str, *, scoped_request_id: str | None = None) -> list[
     return out
 
 
+def poll(store, agent: str, *, scoped_request_id: str | None = None,
+         since: str | None = None, include_control: bool = False) -> dict:
+    """A receive ENVELOPE: the unread ``records`` PLUS, for scoped mode, the
+    thread's TERMINAL control state (closed/superseded) INDEPENDENT of message
+    delivery - so a wrapper learns a thread was rescinded/closed even when no new
+    message is pending (parity with scoped wait's entry-check; Codex carry-forward
+    #1: closed/superseded is terminal control state, learnable with no message).
+    """
+    recs = records(store, agent, scoped_request_id=scoped_request_id,
+                   since=since, include_control=include_control)
+    env = {
+        "mode": SCOPED if scoped_request_id is not None else GLOBAL,
+        "record": recs[0] if recs else None,
+        "records": recs,
+        "scoped": None,
+    }
+    if scoped_request_id is not None:
+        closed, superseded = _terminal_state(store, agent, scoped_request_id)
+        env["scoped"] = {
+            "request_id": scoped_request_id,
+            "seen": store.thread_seen(agent, scoped_request_id),
+            "closed": closed,
+            "superseded": superseded,
+        }
+    return env
+
+
 def next_record(store, agent: str, *, scoped_request_id: str | None = None) -> dict | None:
     """The NEXT (oldest) unread message as a structured record, or None. A PEEK -
-    call ``commit`` to consume."""
+    call ``commit`` to consume. For scoped mode, prefer ``poll`` when you also need
+    to learn terminal (rescinded/closed) state with no message pending."""
     recs = records(store, agent, scoped_request_id=scoped_request_id)
     return recs[0] if recs else None
 
