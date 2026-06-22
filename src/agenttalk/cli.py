@@ -2010,9 +2010,33 @@ def _do_recv(
     return 0
 
 
+def _do_recv_json(store: Store, agent: str, *, since: str | None, ack: bool,
+                  include_control: bool) -> int:
+    """`recv --json`: a CLI MIRROR over the wrapper's in-process recv_api.to_record
+    (NOT a second implementation). Structurally identical to _do_recv - same floor,
+    same control-filter, same --ack advance - but emits one structured JSON record
+    per line instead of human text. The wrapper itself uses recv_api in-process and
+    never shells this."""
+    from .wrapper import recv_api
+
+    cursor = since if since is not None else store.cursor(agent)
+    msgs = store.messages_for(agent, since_id=cursor or None)
+    visible = msgs if include_control else [m for m in msgs if m.kind not in CONTROL_KINDS]
+    for m in visible:
+        rec = recv_api.to_record(m, mode=recv_api.GLOBAL,
+                                 cursor_before=cursor or "", cursor_after=m.id)
+        print(json.dumps(rec, ensure_ascii=False))
+    if ack and msgs:
+        store.advance_cursor(agent, msgs[-1].id)
+    return 0
+
+
 def cmd_recv(args: argparse.Namespace) -> int:
     store = _get_store(args)
     agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
+    if getattr(args, "json", False):
+        return _do_recv_json(store, agent, since=args.since, ack=args.ack,
+                             include_control=args.include_control)
     return _do_recv(
         store,
         agent,
@@ -4052,6 +4076,12 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--include-control", action="store_true",
                     help="Also surface control-plane kinds ('composing') that the "
                          "default view hides. Useful for debugging wait extensions.")
+    pr.add_argument("--json", action="store_true",
+                    help="Emit one structured JSON record per message (the same "
+                         "schema the wrapper's in-process recv_api returns: id, ts, "
+                         "from, to, kind, subject, body, meta, request_id, "
+                         "broadcast_id, correlation_id, mode, cursor). A debug "
+                         "mirror; machines use recv_api in-process, not this.")
     pr.set_defaults(func=cmd_recv)
 
     pdr = sub.add_parser(
