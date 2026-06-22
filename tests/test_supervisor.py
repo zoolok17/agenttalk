@@ -318,10 +318,12 @@ def test_ps_template_console_action_log_and_quiet() -> None:
     # (LAUNCHING / rate-limited ACTIVE_OR_BUSY also have no action) - codex r1.
     assert "$p.state -eq 'HEALTHY_IDLE'" in ps
     assert "if ($DryRun)" in ps                         # DryRun keeps its own print
-    # reviewer-1 r1: -Quiet must also gate the Write-Warning action paths, and the
+    # reviewer-1 r1/r2: -Quiet must silence ALL warnings - including the ones in the
+    # helper functions on the relaunch path - so it sets $WarningPreference once
+    # (inherited by called functions) rather than gating each Write-Warning. And the
     # warning actions are NOT double-logged by the info Write-Host (excluded there).
     assert "'warn_only','suspect_warn','refuse_protected','snapshot_unavailable' -notcontains" in ps
-    assert "if (-not $Quiet) { Write-Warning" in ps     # warnings gated by -Quiet
+    assert "$WarningPreference = 'SilentlyContinue'" in ps   # -Quiet silences all warnings
 
 
 def test_supervise_plan_cli_with_fixtures(tmp_path: Path, capsys) -> None:
@@ -1169,6 +1171,44 @@ def test_generated_ps1_quiet_suppresses_warning_path(tmp_path: Path) -> None:
     quiet = _once("-Quiet")                               # quiet run -> console silent
     assert "lead" in noisy, f"expected a console warning for the stale protected lead; got {noisy!r}"
     assert "lead" not in quiet, f"-Quiet must suppress the warning console output; got {quiet!r}"
+
+
+def test_generated_ps1_quiet_suppresses_relaunch_helper_warnings(tmp_path: Path) -> None:
+    """0.29.0 (reviewer-1 r2): -Quiet must also silence warnings emitted by the
+    HELPER functions (Seed-CodexHome / Preflight / Launch) on the relaunch path,
+    not just the loop's own Write-Warning lines. We drive a stale claude agent with
+    the activity hook on (=> stuck_recover => relaunch path) and NO launch
+    .windows_file, so a helper warns but NO real process is launched. Once without
+    -Quiet a warning/log prints; once with -Quiet the console is silent - which is
+    only true because the script sets $WarningPreference, not per-line guards."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    s = _team(tmp_path)
+    config = {"agents": {"worker": {"auto_restart": True, "cli": "claude",
+                                    "activity_hook": True}},
+              "backoff": {"base_seconds": 30, "cap_seconds": 900,
+                          "reset_after_seconds": 180},
+              "suspect_warn_interval_seconds": 300, "launch_grace_seconds": 120}
+    (s.dir / "supervisor.json").write_text(json.dumps(config), encoding="utf-8")
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    ps1 = s.dir / "supervisor.ps1"
+    # readiness (past grace), not in backoff, NO heartbeat => stale => stuck_recover,
+    # which enters the relaunch path; the missing windows_file makes a HELPER warn
+    # (no real Start-Process happens).
+    (s.dir / "supervisor-state.json").write_text(
+        json.dumps({"agents": {"worker": _ready(backoff_next_epoch=0)}}),
+        encoding="utf-8")
+
+    def _once(*extra: str) -> str:
+        r = subprocess.run([shell, "-NoProfile", "-File", str(ps1), "-Once", *extra],
+                           capture_output=True, text=True, timeout=120, cwd=str(tmp_path))
+        return r.stdout + r.stderr
+
+    noisy = _once()
+    quiet = _once("-Quiet")
+    assert "worker" in noisy, f"expected a relaunch-path warning/log for worker; got {noisy!r}"
+    assert "worker" not in quiet, f"-Quiet must suppress relaunch-path helper warnings; got {quiet!r}"
 
 
 def test_generated_ps1_quotes_args_with_spaces_as_single_arg(tmp_path: Path) -> None:
