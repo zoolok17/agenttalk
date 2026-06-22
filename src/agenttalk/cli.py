@@ -3485,6 +3485,37 @@ def cmd_request_restart(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_wrap(args: argparse.Namespace) -> int:
+    """Run an agent CLI under the progress-adapter wrapper (0.30.0).
+
+    Launches the CLI in structured-stream mode, stamps this agent's heartbeat on
+    real progress events (throttled), renders readable output, and runs the
+    degraded-output detector. The supervisor stays dumb (heartbeat/backoff/kill).
+    Phase 1 supports ``--cli codex`` (``codex exec --json``); Claude is Phase 2.
+    """
+    from .wrapper import run as wrapper_run
+
+    store = _get_store(args)
+    roster = store.load_config().get("agents") or []
+    agent = _resolve_self(args.agent, roster=roster)
+    argv = list(args.cmd or [])
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        sys.stderr.write("agenttalk wrap: a launch command is required after `--`\n")
+        return 2
+    sender = (_resolve_self(args.sender, roster=roster)
+              if getattr(args, "sender", None) else agent)
+    try:
+        return wrapper_run.run_wrapper(
+            cli=args.cli, agent=agent, argv=argv, store=store, sender=sender,
+            min_interval=args.min_interval, render=not args.no_render,
+        )
+    except ValueError as e:
+        sys.stderr.write(f"agenttalk wrap: {e}\n")
+        return 2
+
+
 def cmd_supervise(args: argparse.Namespace) -> int:
     """Supervisor support (thin): --init scaffolds config+scripts; --report
     emits the read-only liveness JSON; --plan emits the action plan (the shared
@@ -4188,6 +4219,29 @@ def build_parser() -> argparse.ArgumentParser:
     prr.add_argument("--force-protected", dest="force_protected", action="store_true",
                      help="Allow restarting a protected (operator_facing/lead) agent.")
     prr.set_defaults(func=cmd_request_restart)
+
+    pwrap = sub.add_parser(
+        "wrap",
+        help="Run an agent CLI under the progress-adapter wrapper: launch it in "
+             "structured-stream mode, stamp heartbeat on real progress events "
+             "(throttled), render readable output, and detect degraded output. "
+             "Phase 1: --cli codex (`codex exec --json`).",
+    )
+    pwrap.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
+    pwrap.add_argument("--cli", default="codex",
+                       help="Which CLI is being wrapped (Phase 1: codex).")
+    pwrap.add_argument("--from", dest="sender",
+                       help="Identity recorded as the degraded-restart requester "
+                            "(default: the wrapped agent).")
+    pwrap.add_argument("--min-interval", dest="min_interval", type=float, default=5.0,
+                       help="Throttle: stamp heartbeat at most once per this many "
+                            "seconds (default 5).")
+    pwrap.add_argument("--no-render", dest="no_render", action="store_true",
+                       help="Do not echo the agent's output to this console.")
+    pwrap.add_argument("cmd", nargs=argparse.REMAINDER,
+                       help="-- followed by the launch command, e.g. "
+                            "`-- codex -a never exec --json \"...\"`.")
+    pwrap.set_defaults(func=cmd_wrap)
 
     psup = sub.add_parser(
         "supervise",
