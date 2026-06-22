@@ -265,11 +265,18 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             success = _run_one(_session.build_turn(session_state, prompt))
         if success:
             session_state.turns += 1
+            # Unconditional: a clean completed turn ALWAYS ends with a fresh
+            # heartbeat, even if the engine's min_interval throttled the in-turn
+            # stamps (e.g. a quick retry right after a failure).
+            store.write_heartbeat(agent)
         else:
             # the turn FAILED (no completed boundary / nonzero exit, after any
             # resume->fresh retry): undo any heartbeat its streaming progress
-            # stamped, so a failed attempt leaves NO fresh heartbeat.
+            # stamped, so a failed attempt leaves NO fresh heartbeat - AND reset the
+            # engine throttle (reused across turns) so a successful retry within
+            # min_interval is not throttled into leaving no fresh heartbeat.
             store.clear_heartbeat(agent)
+            engine.reset_heartbeat_throttle()
         if persist is not None:
             persist(session_state)
         return success

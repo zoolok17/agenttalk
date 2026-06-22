@@ -38,6 +38,14 @@ class WrapperEngine:
     def _should_stamp(self, now: float) -> bool:
         return self._last_stamp is None or (now - self._last_stamp) >= self.min_interval
 
+    def reset_heartbeat_throttle(self) -> None:
+        """Forget the last-stamp time so the NEXT progress event stamps regardless
+        of min_interval. Used when a failed turn clears the store heartbeat: the
+        engine is reused across turns, so the throttle must be reset to line up with
+        the cleared store state, or a successful retry within min_interval would be
+        throttled and leave no fresh heartbeat."""
+        self._last_stamp = None
+
     def process(self, event: Event, now: float) -> None:
         if self.on_render is not None:
             self.on_render(event)

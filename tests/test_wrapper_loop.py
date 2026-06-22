@@ -302,6 +302,38 @@ def test_make_drive_stamps_liveness_during_successful_turn(tmp_path) -> None:
     assert s.read_heartbeat("beta") is not None
 
 
+def test_make_drive_failed_then_successful_retry_keeps_liveness(tmp_path) -> None:
+    # reviewer-1 gate r3: a failed turn clears the heartbeat AND resets the engine
+    # throttle, so a SUCCESSFUL retry within min_interval still stamps mid-turn and
+    # ends fresh - the throttle does not suppress the retry into leaving no heartbeat.
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex")
+    mid: list[object] = []
+    calls = {"n": 0}
+
+    def spawn(argv, stdin):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return [json.dumps({"type": "turn.started"})]   # partial -> stamps then FAILS
+
+        def gen():
+            yield json.dumps({"type": "turn.started"})
+            mid.append(s.read_heartbeat("beta"))            # mid-turn of the RETRY
+            yield json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "x"}})
+            yield json.dumps({"type": "turn.completed"})
+        return gen()
+
+    rec = {"from": "a", "kind": "message", "body": "hi",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=spawn,
+                           clock=lambda: 0.0, min_interval=5.0, render=False)
+    assert drive(rec) is False                  # first turn fails (partial)
+    assert s.read_heartbeat("beta") is None     # failed turn cleared it
+    assert drive(rec) is True                   # retry succeeds within min_interval
+    assert mid and mid[0] is not None           # mid-turn liveness of the retry (throttle reset)
+    assert s.read_heartbeat("beta") is not None  # final heartbeat present
+
+
 def test_loop_failed_turn_backs_off_not_hot_spin(tmp_path) -> None:
     # codex r2 MAJOR 2: a persistent drive failure must NOT hot-loop spawning; the
     # loop backs off (sleeps) between failed attempts and never stamps heartbeat.
