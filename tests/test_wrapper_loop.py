@@ -222,6 +222,61 @@ def test_make_drive_resume_and_fresh_both_fail_returns_false(tmp_path) -> None:
     assert st.turns == 0                               # a failed turn does not advance
 
 
+class _Stream:
+    """A spawner result with a controllable child exit code (codex r2)."""
+
+    def __init__(self, lines, returncode=None):
+        self._lines = lines
+        self.returncode = returncode
+
+    def __iter__(self):
+        return iter(self._lines)
+
+
+def test_make_drive_partial_stream_is_failure(tmp_path) -> None:
+    # codex r2 MAJOR 1: a stream that started a turn but never reached a COMPLETED
+    # boundary (no turn.completed / message_stop) is NOT success - the message must
+    # not be committed for an incomplete turn.
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex")
+    partial = [json.dumps(o) for o in [
+        {"type": "thread.started", "thread_id": "t-1"},
+        {"type": "turn.started"},          # ... then the child dies; no turn.completed
+    ]]
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"],
+                           spawn=lambda a, i: partial, clock=lambda: 0.0, render=False)
+    # fresh exec has no resume to retry, so a partial first turn just fails.
+    assert drive({"from": "a", "kind": "message", "body": "hi",
+                  "correlation_id": None, "request_id": None, "broadcast_id": None}) is False
+    assert st.turns == 0
+
+
+def test_make_drive_nonzero_exit_is_failure(tmp_path) -> None:
+    # codex r2 MAJOR 1: even a stream that reached turn.completed is NOT success if
+    # the child exited nonzero.
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex")
+    drive = run.make_drive(
+        s, "beta", "codex", st, ["codex"], clock=lambda: 0.0, render=False,
+        spawn=lambda a, i: _Stream(_codex_turn_lines(), returncode=1),
+    )
+    assert drive({"from": "a", "kind": "message", "body": "hi",
+                  "correlation_id": None, "request_id": None, "broadcast_id": None}) is False
+
+
+def test_loop_failed_turn_backs_off_not_hot_spin(tmp_path) -> None:
+    # codex r2 MAJOR 2: a persistent drive failure must NOT hot-loop spawning; the
+    # loop backs off (sleeps) between failed attempts and never stamps heartbeat.
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="poison")
+    sleeps: list[float] = []
+    loop.run_loop(s, "beta", lambda rec: False, clock=lambda: 0.0,
+                  sleep=lambda d: sleeps.append(d), max_polls=4)
+    assert len(sleeps) >= 3              # backed off on each failed retry (not a hot spin)
+    assert s.cursor("beta") == ""        # never committed
+    assert s.read_heartbeat("beta") is None  # a failed turn does NOT stamp heartbeat
+
+
 def test_loop_with_make_drive_end_to_end(tmp_path) -> None:
     # the full Phase-B pipeline, no real CLI: loop -> make_drive -> fake codex stream.
     s = _store(tmp_path)

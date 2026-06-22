@@ -151,23 +151,32 @@ def run_wrapper(
     return proc.wait()
 
 
-def _spawn_turn_lines(argv: list[str], stdin_text: str | None) -> Iterator[str]:
-    """Spawn the CLI for one turn, feed the prompt on STDIN (dodges quoting), and
-    yield its stdout lines. Default spawner for make_drive; tests inject their own."""
-    proc = subprocess.Popen(  # noqa: S603 - argv is operator-provided launch command
-        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, text=True, bufsize=1,
-    )
-    if proc.stdin is not None:
-        if stdin_text is not None:
-            proc.stdin.write(stdin_text)
-        proc.stdin.close()
-    try:
-        yield from (proc.stdout or [])
-    finally:
-        if proc.stdout:
-            proc.stdout.close()
-        proc.wait()
+class _ProcStream:
+    """Default make_drive spawner: spawn the CLI for one turn (prompt on STDIN, to
+    dodge quoting), yield its stdout lines, and expose the child EXIT CODE as
+    ``.returncode`` once the stream is exhausted - so the drive path can tell a
+    clean completed turn from a partial stream that died with a bad exit. Tests
+    inject their own spawner (a plain list = unknown exit, an object with
+    ``.returncode`` = a controlled exit)."""
+
+    def __init__(self, argv: list[str], stdin_text: str | None) -> None:
+        self._proc = subprocess.Popen(  # noqa: S603 - operator-provided launch command
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+        if self._proc.stdin is not None:
+            if stdin_text is not None:
+                self._proc.stdin.write(stdin_text)
+            self._proc.stdin.close()
+        self.returncode: int | None = None
+
+    def __iter__(self) -> Iterator[str]:
+        try:
+            yield from (self._proc.stdout or [])
+        finally:
+            if self._proc.stdout:
+                self._proc.stdout.close()
+            self.returncode = self._proc.wait()
 
 
 def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str], *,
@@ -204,16 +213,20 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         on_info=_default_info,
         min_interval=min_interval,
     )
-    spawner = spawn or _spawn_turn_lines
+    spawner = spawn or _ProcStream
 
     def _run_one(spec) -> bool:
         """Spawn ONE CLI invocation for ``spec`` and process its JSONL via the
-        engine. Returns True iff the turn made progress and hit no terminal
-        (non-retryable) adapter_error - a failed/empty/garbage stream is False."""
+        engine. A turn SUCCEEDS only if it reached a COMPLETED turn boundary
+        (TURN_FINISHED: codex turn.completed / claude message_stop), hit no terminal
+        (non-retryable) adapter_error, AND the child exited cleanly. Partial progress
+        (turn started then the stream died / nonzero exit before completion) is NOT
+        success - so the message is never committed for an incomplete turn."""
         argv = list(base_argv) + spec.args
-        saw_progress = False
+        stream = spawner(argv, spec.stdin)
+        saw_completion = False
         saw_terminal = False
-        for line in spawner(argv, spec.stdin):
+        for line in stream:
             s = line.strip()
             if not s:
                 continue
@@ -223,12 +236,15 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 continue
             _session.observe_event(session_state, raw)   # capture codex thread_id
             for ev in mapper(raw):
-                if ev.is_progress:
-                    saw_progress = True
+                if ev.type == EventType.TURN_FINISHED:
+                    saw_completion = True
                 elif ev.type == EventType.ADAPTER_ERROR and not ev.retryable:
                     saw_terminal = True
                 engine.process(ev, clock())
-        return saw_progress and not saw_terminal
+        # rc is None for an injected list spawn (unknown -> trust the boundary); a
+        # real _ProcStream reports the child exit code (nonzero = failed turn).
+        rc = getattr(stream, "returncode", None)
+        return saw_completion and not saw_terminal and rc in (0, None)
 
     def drive(record: dict) -> bool:
         prompt = _prompt.assemble_turn_prompt(record, rules=rules)

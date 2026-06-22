@@ -41,6 +41,7 @@ def run_loop(store, agent: str, drive: Callable[[dict], bool], *,
     polls = 0
     last_hb: float | None = None
     cur_sleep = idle_interval
+    fail_sleep = idle_interval
     while True:
         if max_polls is not None and polls >= max_polls:
             return turns
@@ -59,15 +60,19 @@ def run_loop(store, agent: str, drive: Callable[[dict], bool], *,
         if is_terminal_control(record):
             recv_api.commit(store, agent, record)       # consume + skip (control)
             continue
-        # Drive ONE turn. Commit the inbound message ONLY when the turn SUCCEEDS:
-        # a failed turn (no progress / terminal error / failed resume) returns falsy
-        # and is NOT committed, so it re-delivers next iteration (at-least-once). If
-        # it keeps failing with no progress, the heartbeat goes stale -> the
-        # supervisor restarts the wrapper (rather than a silent healthy-looking spin).
+        # Drive ONE turn. Commit the inbound message ONLY when the turn SUCCEEDS.
         if drive(record):
             recv_api.commit(store, agent, record)
             store.write_heartbeat(agent)
             last_hb = clock()
+            fail_sleep = idle_interval                  # reset failure backoff
             turns += 1
             if max_turns is not None and turns >= max_turns:
                 return turns
+        else:
+            # FAILED turn: do NOT commit (re-delivers, at-least-once) and do NOT
+            # stamp the heartbeat - so a persistent no-progress failure goes stale
+            # and the supervisor restarts us. BACK OFF before retrying so we never
+            # hammer the CLI in a hot spawn loop (a process storm) before that.
+            sleep(fail_sleep)
+            fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
