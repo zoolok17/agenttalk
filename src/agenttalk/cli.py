@@ -3512,13 +3512,40 @@ def cmd_request_restart(args: argparse.Namespace) -> int:
     return 0
 
 
+def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
+                    sender: str, min_interval: float, render: bool) -> int:
+    """The long-running supervised wrapper loop (design C): own the idle bus-wait +
+    heartbeat, drive the CLI ONE turn per inbound message in structured-stream mode
+    (session continuity owned here), then return to the wait. Runs until killed -
+    the supervisor supervises THIS process. Manual /agenttalk.listen stays the
+    default; this is the opt-in supervised mode."""
+    from .wrapper import loop as wloop
+    from .wrapper import run as wrapper_run
+    from .wrapper import session as wsession
+
+    state = wsession.load_session(store, agent, cli)
+    try:
+        drive = wrapper_run.make_drive(
+            store, agent, cli, state, base_argv, sender=sender,
+            min_interval=min_interval, render=render,
+            persist=lambda st: wsession.save_session(store, agent, st),
+        )
+    except ValueError as e:
+        sys.stderr.write(f"agenttalk wrap: {e}\n")
+        return 2
+    wsession.save_session(store, agent, state)   # persist the (possibly minted) id
+    wloop.run_loop(store, agent, drive)          # runs until the supervisor kills it
+    return 0
+
+
 def cmd_wrap(args: argparse.Namespace) -> int:
     """Run an agent CLI under the progress-adapter wrapper (0.30.0).
 
-    Launches the CLI in structured-stream mode, stamps this agent's heartbeat on
-    real progress events (throttled), renders readable output, and runs the
-    degraded-output detector. The supervisor stays dumb (heartbeat/backoff/kill).
-    Phase 1 supports ``--cli codex`` (``codex exec --json``); Claude is Phase 2.
+    Default (one-shot ``-- <argv>``): launch the CLI in structured-stream mode,
+    stamp heartbeat on progress (throttled), render, run the degraded detector.
+    ``--loop``: become the long-running SUPERVISED wrapper that owns the idle
+    bus-wait + heartbeat and drives the CLI one turn per inbound message (design C).
+    The supervisor stays dumb (heartbeat/backoff/kill).
     """
     from .wrapper import run as wrapper_run
 
@@ -3533,6 +3560,10 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         return 2
     sender = (_resolve_self(args.sender, roster=roster)
               if getattr(args, "sender", None) else agent)
+    if getattr(args, "loop", False):
+        return _wrap_loop_mode(store, agent, cli=args.cli, base_argv=argv,
+                               sender=sender, min_interval=args.min_interval,
+                               render=not args.no_render)
     try:
         return wrapper_run.run_wrapper(
             cli=args.cli, agent=agent, argv=argv, store=store, sender=sender,
@@ -4272,9 +4303,16 @@ def build_parser() -> argparse.ArgumentParser:
                             "seconds (default 5).")
     pwrap.add_argument("--no-render", dest="no_render", action="store_true",
                        help="Do not echo the agent's output to this console.")
+    pwrap.add_argument("--loop", action="store_true",
+                       help="Run as the long-running SUPERVISED wrapper: own the "
+                            "idle bus-wait + heartbeat and drive the CLI one turn "
+                            "per inbound message (design C). Opt-in; manual "
+                            "/agenttalk.listen stays the default.")
     pwrap.add_argument("cmd", nargs=argparse.REMAINDER,
-                       help="-- followed by the launch command, e.g. "
-                            "`-- codex -a never exec --json \"...\"`.")
+                       help="-- followed by the BASE launch command (the per-turn "
+                            "session/stream args are appended), e.g. `-- codex -a "
+                            "never -s workspace-write` (loop) or `-- codex ... exec "
+                            "--json \"...\"` (one-shot).")
     pwrap.set_defaults(func=cmd_wrap)
 
     psup = sub.add_parser(

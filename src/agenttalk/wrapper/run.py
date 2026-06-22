@@ -149,3 +149,78 @@ def run_wrapper(
         if proc.stdout:
             proc.stdout.close()
     return proc.wait()
+
+
+def _spawn_turn_lines(argv: list[str], stdin_text: str | None) -> Iterator[str]:
+    """Spawn the CLI for one turn, feed the prompt on STDIN (dodges quoting), and
+    yield its stdout lines. Default spawner for make_drive; tests inject their own."""
+    proc = subprocess.Popen(  # noqa: S603 - argv is operator-provided launch command
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, bufsize=1,
+    )
+    if proc.stdin is not None:
+        if stdin_text is not None:
+            proc.stdin.write(stdin_text)
+        proc.stdin.close()
+    try:
+        yield from (proc.stdout or [])
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
+        proc.wait()
+
+
+def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str], *,
+               sender: str | None = None, min_interval: float = 5.0,
+               render: bool = True, rules: str | None = None,
+               clock: Callable[[], float] = time.monotonic,
+               spawn: Callable[[list[str], str | None], Iterable[str]] | None = None,
+               persist: Callable[[object], None] | None = None) -> Callable[[dict], None]:
+    """Build the per-turn ``drive(record)`` callback for loop.run_loop. Each call
+    drives ONE real CLI turn: assemble the prompt -> build the session turn args ->
+    spawn the CLI (prompt on stdin) -> process the JSONL stream via the engine
+    (heartbeat-on-progress + degraded + render) while capturing codex's durable
+    thread_id (session.observe_event on the RAW stream).
+
+    The detector + engine are created ONCE and reused across turns, so the degraded
+    confirmation window (which counts degraded turns across CLI invocations) and the
+    heartbeat throttle persist. ``spawn`` is injectable for tests (no real
+    subprocess); ``persist`` is called after each turn to save session state."""
+    from . import prompt as _prompt
+    from . import session as _session
+
+    mapper = _ADAPTERS.get(cli)
+    if mapper is None:
+        raise ValueError(f"no wrapper adapter for cli {cli!r}")
+    cfg = DegradedConfig(telemetry_only=_TELEMETRY_ONLY.get(cli, False))
+    detector = DegradedDetector(cli, cfg)
+    engine = WrapperEngine(
+        detector=detector,
+        on_heartbeat=_default_heartbeat(store, agent),
+        on_render=(_default_render if render else None),
+        on_escalate=_default_escalate(store, agent, sender or agent),
+        on_info=_default_info,
+        min_interval=min_interval,
+    )
+    spawner = spawn or _spawn_turn_lines
+
+    def drive(record: dict) -> None:
+        prompt = _prompt.assemble_turn_prompt(record, rules=rules)
+        spec = _session.build_turn(session_state, prompt)
+        argv = list(base_argv) + spec.args
+        for line in spawner(argv, spec.stdin):
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                raw = json.loads(s)
+            except (ValueError, TypeError):
+                continue
+            _session.observe_event(session_state, raw)   # capture codex thread_id
+            for ev in mapper(raw):
+                engine.process(ev, clock())
+        session_state.turns += 1
+        if persist is not None:
+            persist(session_state)
+
+    return drive
