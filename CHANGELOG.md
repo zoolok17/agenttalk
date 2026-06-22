@@ -5,6 +5,20 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.0] - 2026-06-22
+
+Supervisor observability: the supervisor now shows its decisions in its own
+console, so an operator can watch what it's doing instead of staring at a
+silent window.
+
+### Added
+- **Supervisor console action log.** The generated `supervisor.ps1` prints a
+  concise line for each agent as it polls: real actions (relaunch, stuck
+  recovery, warnings, refusals) always print with their reason; steady
+  healthy/no-action states print only on change; a periodic "N/M healthy"
+  summary shows the loop is alive without flooding. A new `-Quiet` switch
+  silences it (including helper warnings); `-DryRun` still prints every agent.
+
 ## [0.28.1] - 2026-06-22
 
 Makes the v0.28.0 supervisor actually work end-to-end for an UNATTENDED agent
