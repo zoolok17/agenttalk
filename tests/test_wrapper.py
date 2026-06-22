@@ -274,6 +274,48 @@ def test_degraded_real_tool_this_turn_downgrades_high_to_candidate() -> None:
     assert all(s.level != "escalate" for s in out)
 
 
+def test_degraded_escalates_exactly_once_across_sustained_turns() -> None:
+    # reviewer-1 P1: a SUSTAINED bad stream must escalate EXACTLY ONCE (not every
+    # window_turns) until a clean self-heal re-arms us - otherwise it spams restarts
+    # / overwrites the marker.
+    d = DegradedDetector("claude", DegradedConfig(window_turns=2, telemetry_only=False))
+    seq = []
+    for _ in range(5):  # 5 sustained degraded turns, no clean progress between
+        seq += [(Event(ET.TURN_STARTED), 0.0),
+                (Event(ET.MODEL_OUTPUT, text=LEAK_HIGH), 0.0),
+                (Event(ET.TURN_FINISHED), 0.0)]
+    sigs = _feed(d, seq)
+    escalations = [s for s in sigs if s and s.level == "escalate"]
+    assert len(escalations) == 1, f"expected exactly ONE escalation, got {len(escalations)}"
+
+
+def test_degraded_leak_then_tool_started_same_turn_is_clean() -> None:
+    # reviewer-1 P2: a high-confidence leak EARLIER in a turn, then a REAL
+    # tool_started, self-heals the CURRENT turn -> it ends clean, no escalation even
+    # at window_turns=1.
+    d = DegradedDetector("claude", DegradedConfig(window_turns=1, telemetry_only=False))
+    sigs = _feed(d, [
+        (Event(ET.TURN_STARTED), 0.0),
+        (Event(ET.MODEL_OUTPUT, text=LEAK_HIGH), 0.0),
+        (Event(ET.TOOL_STARTED, tool="Read"), 0.0),
+        (Event(ET.TURN_FINISHED), 0.0),
+    ])
+    assert all(s is None for s in sigs), f"expected a clean turn, got {[s for s in sigs if s]}"
+
+
+def test_degraded_latch_rearms_after_self_heal() -> None:
+    # after escalating, a clean self-heal clears the latch so a LATER fresh degraded
+    # burst escalates again as a NEW incident (two incidents -> two escalations).
+    d = DegradedDetector("claude", DegradedConfig(window_turns=2, telemetry_only=False))
+    burst = [(Event(ET.TURN_STARTED), 0.0), (Event(ET.MODEL_OUTPUT, text=LEAK_HIGH), 0.0),
+             (Event(ET.TURN_FINISHED), 0.0)]
+    clean = [(Event(ET.TURN_STARTED), 0.0), (Event(ET.MODEL_OUTPUT, text="all good"), 0.0),
+             (Event(ET.TURN_FINISHED), 0.0)]
+    sigs = _feed(d, burst + burst + clean + burst + burst)
+    escalations = [s for s in sigs if s and s.level == "escalate"]
+    assert len(escalations) == 2, f"two incidents -> two escalations, got {len(escalations)}"
+
+
 # --------------------------------------------------------- run.py wiring
 
 def test_parse_lines_skips_blank_and_nonjson() -> None:

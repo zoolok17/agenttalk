@@ -138,11 +138,19 @@ class DegradedDetector:
         self._degraded_this_turn = False
         self._degraded_turns = 0          # consecutive high-confidence degraded turns
         self._window_open_ts: float | None = None
+        self._escalated = False           # once-escalated latch (escalate EXACTLY once)
         self._last_reason = ""
 
-    def _clear_window(self) -> None:
+    def _reset_counters(self) -> None:
         self._degraded_turns = 0
         self._window_open_ts = None
+
+    def _self_heal(self) -> None:
+        # Clean progress (a real tool firing or a clean turn) resets the window AND
+        # clears the once-escalated latch, so a LATER fresh degraded burst escalates
+        # again as a new incident (latched until clean self-healing, then re-arms).
+        self._reset_counters()
+        self._escalated = False
 
     def feed(self, event: Event, now: float) -> FeedResult:
         etype = event.type
@@ -152,9 +160,12 @@ class DegradedDetector:
             return FeedResult()
         if etype == EventType.TOOL_STARTED:
             # A real structured tool firing IS clean progress: the agent is
-            # executing the protocol -> the window self-heals.
+            # executing the protocol. It self-heals the window AND the CURRENT turn
+            # (a high-confidence leak earlier this turn no longer counts), and
+            # clears the escalation latch.
             self._tool_started_this_turn = True
-            self._clear_window()
+            self._degraded_this_turn = False
+            self._self_heal()
             return FeedResult()
         if etype in (EventType.MODEL_OUTPUT, EventType.MODEL_OUTPUT_DELTA):
             return self._scan_model_output(event, now)
@@ -184,8 +195,9 @@ class DegradedDetector:
 
     def _on_turn_finished(self, now: float) -> DegradedSignal | None:
         if not self._degraded_this_turn:
-            # a clean turn (no high-confidence leak) within the window = self-heal.
-            self._clear_window()
+            # a clean turn (no high-confidence leak) = self-heal: reset the window
+            # and clear the escalation latch.
+            self._self_heal()
             return None
         # this turn was degraded: extend / open the window.
         first = self._degraded_turns == 0
@@ -195,13 +207,20 @@ class DegradedDetector:
         if self.config.telemetry_only:
             # Codex: detect + log, never escalate (no real leak signature yet).
             return DegradedSignal("informational", "high", self._last_reason) if first else None
+        if self._escalated:
+            # already escalated for this sustained incident: keep detecting but do
+            # NOT re-escalate. Escalate EXACTLY ONCE until a clean self-heal re-arms
+            # us (otherwise a sustained bad stream would spam restarts / overwrite
+            # the marker every window_turns).
+            return None
         # explicit None-check: window_open_ts can legitimately be 0.0 (falsy), so
         # `ts or now` would wrongly treat a window opened at t=0 as unset.
         base = self._window_open_ts if self._window_open_ts is not None else now
         elapsed = now - base
         if self._degraded_turns >= self.config.window_turns or elapsed >= self.config.window_seconds:
             reason = self._last_reason
-            self._clear_window()
+            self._reset_counters()      # reset counting, but KEEP the latch set
+            self._escalated = True
             return DegradedSignal("escalate", "high", reason)
         # first degraded turn, window now open: informational only.
         return DegradedSignal("informational", "high", self._last_reason) if first else None
