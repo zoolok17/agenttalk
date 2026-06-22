@@ -171,6 +171,13 @@ cursor. Unrelated traffic remains unread for `sync`, `threads`, or
   you passed `--refuse-stacked-wait`. Do NOT blindly re-arm — that
   would just refuse again. Stop the duplicate loop (or confirm it is
   really yours) first, then re-arm without the flag.
+- backgrounded wait: if you arm the wait in the BACKGROUND (to stay
+  responsive while it blocks), a run ending exit 1 is the normal timeout
+  even though your harness may render the finished background command as
+  "failed". It is NOT a failure. Just re-arm a fresh wait — do NOT read the
+  task output file to investigate. Only exit 0 carries a message to handle;
+  routinely reading a timed-out wait's output is a fragile extra tool call
+  best skipped (exit 6 still means stacked-waiter, handled as above).
 
 Use a **long** timeout (1800s). The `agenttalk wait` subprocess polls
 the filesystem internally (it starts at ~0.3s and **backs off** up to
