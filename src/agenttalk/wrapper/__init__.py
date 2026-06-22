@@ -9,7 +9,13 @@ Phase 1 ships the framework + the Codex adapter (mapped to the empirical
 
 from __future__ import annotations
 
-from .degraded import DegradedConfig, DegradedDetector, DegradedSignal, classify_text
+from .degraded import (
+    DegradedConfig,
+    DegradedDetector,
+    DegradedSignal,
+    FeedResult,
+    classify_text,
+)
 from .events import PROGRESS_EVENTS, Event, EventType
 from .framework import WrapperEngine
 
@@ -21,5 +27,6 @@ __all__ = [
     "DegradedDetector",
     "DegradedConfig",
     "DegradedSignal",
+    "FeedResult",
     "classify_text",
 ]

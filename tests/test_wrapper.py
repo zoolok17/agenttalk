@@ -122,6 +122,28 @@ def test_engine_heartbeat_throttle() -> None:
     assert stamps == [0.0, 6.0]
 
 
+def test_engine_degraded_model_output_does_not_stamp_heartbeat() -> None:
+    # reviewer-1/codex r1: a high-confidence degraded MODEL_OUTPUT must be
+    # classified BEFORE the heartbeat decision and must NOT stamp - leaked
+    # tool-call markup proves the agent broken; it cannot also keep it healthy.
+    # A clean MODEL_OUTPUT still stamps.
+    stamps: list[float] = []
+    infos: list[object] = []
+    eng = WrapperEngine(
+        detector=DegradedDetector("claude", DegradedConfig(window_turns=2, telemetry_only=False)),
+        on_heartbeat=lambda e, now: stamps.append(now),
+        on_info=lambda s: infos.append(s),
+        min_interval=0.0,
+    )
+    eng.process(Event(ET.TURN_STARTED), now=0.0)                   # progress -> stamps 0.0
+    eng.process(Event(ET.MODEL_OUTPUT, text=LEAK_HIGH), now=1.0)   # degraded -> NO stamp at 1.0
+    assert 1.0 not in stamps, "leaked model output must NOT stamp the heartbeat"
+    eng.process(Event(ET.TURN_FINISHED), now=2.0)                 # detector still flags it
+    assert any(s.level == "informational" for s in infos), "detector still reports degraded"
+    eng.process(Event(ET.MODEL_OUTPUT, text="all good now"), now=3.0)  # clean -> stamps
+    assert 3.0 in stamps, "clean model output still stamps"
+
+
 def test_engine_error_and_degraded_never_stamp() -> None:
     stamps: list[float] = []
     rendered: list[EventType] = []
@@ -157,7 +179,8 @@ def test_classify_text_tiers() -> None:
 
 
 def _feed(detector, events_with_now):
-    return [detector.feed(ev, now) for ev, now in events_with_now]
+    # feed() returns a FeedResult; the window tests assert on the .signal it carries.
+    return [detector.feed(ev, now).signal for ev, now in events_with_now]
 
 
 def test_degraded_self_heals_via_tool_started() -> None:

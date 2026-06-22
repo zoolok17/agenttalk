@@ -61,7 +61,7 @@ class DegradedConfig:
 
 @dataclass(frozen=True)
 class DegradedSignal:
-    """Returned by ``DegradedDetector.feed`` when something noteworthy happens.
+    """A noteworthy degraded-output event.
 
     level      - "informational" (first sight / candidate / telemetry) or
                  "escalate" (confirmation window closed -> request restart).
@@ -73,6 +73,21 @@ class DegradedSignal:
     level: str
     confidence: str
     reason: str
+
+
+@dataclass(frozen=True)
+class FeedResult:
+    """What ``DegradedDetector.feed`` returns for one event.
+
+    signal             - a DegradedSignal to route (or None).
+    suppress_heartbeat - True iff THIS event is high-confidence degraded model
+                         output, so the engine must NOT let it stamp the heartbeat
+                         (leaked text proves the agent broken; it must not also
+                         mark it healthy). Only ever set for MODEL_OUTPUT(_DELTA).
+    """
+
+    signal: DegradedSignal | None = None
+    suppress_heartbeat: bool = False
 
 
 def _strip_code(text: str) -> str:
@@ -129,28 +144,28 @@ class DegradedDetector:
         self._degraded_turns = 0
         self._window_open_ts = None
 
-    def feed(self, event: Event, now: float) -> DegradedSignal | None:
+    def feed(self, event: Event, now: float) -> FeedResult:
         etype = event.type
         if etype == EventType.TURN_STARTED:
             self._tool_started_this_turn = False
             self._degraded_this_turn = False
-            return None
+            return FeedResult()
         if etype == EventType.TOOL_STARTED:
             # A real structured tool firing IS clean progress: the agent is
             # executing the protocol -> the window self-heals.
             self._tool_started_this_turn = True
             self._clear_window()
-            return None
+            return FeedResult()
         if etype in (EventType.MODEL_OUTPUT, EventType.MODEL_OUTPUT_DELTA):
             return self._scan_model_output(event, now)
         if etype == EventType.TURN_FINISHED:
-            return self._on_turn_finished(now)
-        return None
+            return FeedResult(signal=self._on_turn_finished(now))
+        return FeedResult()
 
-    def _scan_model_output(self, event: Event, now: float) -> DegradedSignal | None:
+    def _scan_model_output(self, event: Event, now: float) -> FeedResult:
         confidence = classify_text(event.text)
         if confidence is None:
-            return None
+            return FeedResult()
         # A real structured tool already fired this turn -> the markup is far more
         # likely commentary; downgrade a "high" hit to candidate.
         if self._tool_started_this_turn and confidence == "high":
@@ -158,11 +173,14 @@ class DegradedDetector:
         reason = _redacted_reason(confidence, event.text or "")
         self._last_reason = reason
         if confidence == "candidate":
-            # candidate-only: warn/telemetry, does NOT fuel escalation.
-            return DegradedSignal("informational", "candidate", reason)
-        # high-confidence: this turn is degraded; the window opens at turn finish.
+            # candidate-only: warn/telemetry, does NOT fuel escalation and does
+            # NOT suppress the heartbeat (too weak to call the agent broken).
+            return FeedResult(signal=DegradedSignal("informational", "candidate", reason))
+        # high-confidence: this turn is degraded (the window opens at turn finish),
+        # AND this very event must NOT stamp the heartbeat - leaked tool-call markup
+        # must never refresh health as if it were good model progress.
         self._degraded_this_turn = True
-        return None
+        return FeedResult(suppress_heartbeat=True)
 
     def _on_turn_finished(self, now: float) -> DegradedSignal | None:
         if not self._degraded_this_turn:

@@ -41,13 +41,15 @@ class WrapperEngine:
     def process(self, event: Event, now: float) -> None:
         if self.on_render is not None:
             self.on_render(event)
-        # Heartbeat ONLY on real progress, throttled by min_interval. ADAPTER_ERROR
-        # and DEGRADED_OUTPUT are not progress, so a noisy-but-broken agent never
-        # refreshes its own liveness here.
-        if event.is_progress and self._should_stamp(now):
+        # Classify FIRST: a high-confidence degraded MODEL_OUTPUT must not stamp the
+        # heartbeat (leaked tool-call markup proves the agent broken; it must not
+        # also mark it healthy). Then stamp only a real, non-suppressed progress
+        # event, throttled. ADAPTER_ERROR / DEGRADED_OUTPUT are not progress at all.
+        result = self.detector.feed(event, now)
+        if event.is_progress and not result.suppress_heartbeat and self._should_stamp(now):
             self._last_stamp = now
             self.on_heartbeat(event, now)
-        sig = self.detector.feed(event, now)
+        sig = result.signal
         if sig is None:
             return
         if sig.level == "escalate":
