@@ -77,12 +77,22 @@ class Event:
     def is_progress(self) -> bool:
         """True iff this event should stamp the agent's activity heartbeat.
 
-        A raw text delta does NOT stamp (ruling on the Claude adapter): a leaked
-        turn streams degraded text fragments, so only the CLEAN assembled model
-        output (scanned, and suppressed when degraded) may stamp text liveness.
-        Thinking deltas DO stamp - they are genuine reasoning progress and close
-        the pure-reasoning gap. Non-text-delta progress is unaffected.
+        Channel-based carve-outs preserve the no-mask invariant on the Claude
+        adapter (model-output liveness must never come from un-vetted bytes):
+          * a raw text_delta does NOT stamp - a leaked turn streams degraded text
+            fragments, so only the CLEAN assembled text model_output (scanned, and
+            suppressed when degraded) may stamp text liveness.
+          * an assembled THINKING snapshot does NOT stamp - it is render-only and
+            is never scanned, so letting it stamp would refresh health in a
+            degraded turn that happens to contain a thinking block, masking the
+            bad text (reviewer-1 gate finding).
+        The live thinking_delta (MODEL_OUTPUT_DELTA channel=thinking) STILL stamps
+        - it is genuine reasoning progress and is what closes the pure-reasoning
+        gap. So: thinking_delta = progress; assembled thinking = render-only;
+        text_delta = render-only; assembled text = progress only when clean.
         """
         if self.type == EventType.MODEL_OUTPUT_DELTA and self.channel == "text":
+            return False
+        if self.type == EventType.MODEL_OUTPUT and self.channel == "thinking":
             return False
         return self.type in PROGRESS_EVENTS

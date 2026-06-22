@@ -103,6 +103,9 @@ def test_text_delta_does_not_stamp_thinking_delta_does() -> None:
     assert Event(ET.MODEL_OUTPUT_DELTA, text="reason", channel="thinking").is_progress is True
     # the assembled text model_output still stamps (when clean) + is the scan target
     assert Event(ET.MODEL_OUTPUT, text="done", channel="text").is_progress is True
+    # reviewer-1 gate: the assembled THINKING snapshot is render-only (NOT progress)
+    # so it cannot mask a degraded turn; the live thinking_delta above still stamps.
+    assert Event(ET.MODEL_OUTPUT, text="reasoning", channel="thinking").is_progress is False
     # default channel (codex) unchanged
     assert Event(ET.MODEL_OUTPUT_DELTA, text="x").is_progress is True
 
@@ -119,6 +122,22 @@ def test_engine_claude_liveness_only_thinking_and_clean_text_stamp() -> None:
     eng.process(Event(ET.MODEL_OUTPUT, text="clean assembled answer", channel="text"), 3.0)
     # thinking delta stamped; text delta did NOT; clean assembled text stamped.
     assert stamps == ["thinking", "text"]
+
+
+def test_engine_degraded_turn_with_thinking_block_does_not_stamp() -> None:
+    # reviewer-1 gate mask case: a degraded turn whose only model outputs are an
+    # assembled THINKING snapshot and the degraded assembled TEXT must produce NO
+    # heartbeat stamp - the thinking snapshot is render-only and the degraded text
+    # is suppressed, so neither refreshes (masks) health.
+    stamps: list[object] = []
+    eng = WrapperEngine(
+        detector=DegradedDetector("claude", DegradedConfig(telemetry_only=False)),
+        on_heartbeat=lambda e, now: stamps.append((e.type.value, e.channel)),
+        min_interval=0.0,
+    )
+    eng.process(Event(ET.MODEL_OUTPUT, text="internal reasoning", channel="thinking"), 1.0)
+    eng.process(Event(ET.MODEL_OUTPUT, text=LEAK_HIGH, channel="text"), 2.0)
+    assert stamps == [], f"a degraded turn with a thinking block must not stamp; got {stamps}"
 
 
 # --------------------------------------------------------- never-scan-thinking guard
