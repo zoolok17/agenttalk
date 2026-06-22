@@ -5,6 +5,53 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.1] - 2026-06-22
+
+Makes the v0.28.0 supervisor actually work end-to-end for an UNATTENDED agent
+on Windows, plus a roster-safety fix. Hardened across six live kill-and-recover
+tests on a real Windows box (each surfaced a distinct real-world failure); the
+final cycle — launch with no UAC, reach the listen loop, stay healthy, get
+killed, and auto-relaunch with context — passes.
+
+### Fixed
+- **Supervisor liveness now uses a UTC clock.** The generated `supervisor.ps1`
+  derived "now" from `Get-Date -UFormat %s`, which on Windows PowerShell 5.1 is
+  a LOCAL-time epoch. Heartbeats are stamped UTC, so on any non-UTC machine the
+  supervisor read every heartbeat as stale by the timezone offset and
+  false-killed healthy agents. Now uses
+  `[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()`.
+- **Launch layer reworked** so a supervised agent can actually start: launch the
+  real CLI executable (never a `.cmd`/npm/PowerShell shim that hands off and
+  exits), PATH-independent bus calls via a generated shim, Windows argument
+  quoting, and an ASCII-only `supervisor.ps1` written UTF-8-with-BOM so PS 5.1
+  parses it.
+- **Unattended auto-mode.** The supervisor seeds each agent to launch in a
+  never-prompt, never-elevate mode (no human to approve a prompt/UAC): Codex
+  gets a seeded isolated `CODEX_HOME` (`approval_policy=never`,
+  `[windows] sandbox=unelevated` — avoids the per-home admin/UAC install,
+  workspace-write), Claude gets `--permission-mode bypassPermissions` + a seeded
+  `.claude/settings.json`. A preflight smoke-test fails closed on a bad config
+  instead of relaunch-storming.
+- **In-sandbox bus access.** Listen/lead skills invoke `python -m agenttalk`
+  (bare `python` + `src` on `PYTHONPATH`) so the bus works inside the Codex
+  workspace sandbox, where the bare `agenttalk` app-execution-alias is denied.
+- **Atomic writes survive the sandbox.** `_atomic.write_text` keeps the atomic
+  temp+rename everywhere it works, but on a persistent Windows `os.replace`
+  PermissionError (the Codex sandbox holds a write handle for the process
+  lifetime) falls back to a direct final-path write. Covers every bus write a
+  sandboxed agent makes (publish, cursor advance, heartbeat, waiting).
+- **Heartbeat-staleness liveness.** Replaced fragile process-tree/PID "brain"
+  discovery (which mis-identified Codex's forking launcher and false-killed
+  healthy agents) with heartbeat freshness as the liveness authority — fresh
+  means healthy; stale (with the activity hook on) means restart. Fails safe:
+  it can miss a dead agent (a no-op) but never kills a healthy one.
+
+### Added
+- **`roster add --unique`.** Refuses (exit 3) when the name is an active
+  identity and suggests a free variant, so a joining agent never silently
+  re-binds someone else's identity. Plain `roster add` stays idempotent (warns
+  on an active re-bind). Listen/lead skills pick a unique name on self-join.
+
 ## [0.28.0] - 2026-06-17
 
 Two reliability features for long-running multi-agent teams: an explicit
