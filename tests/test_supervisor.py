@@ -490,6 +490,20 @@ def test_ps_template_applies_and_restores_env() -> None:
     assert "-ArgumentList $argv" not in ps
 
 
+def test_ps_template_uses_utc_epoch_for_now() -> None:
+    """The `--now` epoch passed to `supervise --plan` MUST be UTC: heartbeats are
+    stamped in UTC and the plan compares now-vs-heartbeat for staleness. On
+    Windows PowerShell 5.1 `Get-Date -UFormat %s` returns a LOCAL-time epoch, so
+    on a non-UTC machine `$now` is skewed by the TZ offset and every heartbeat
+    looks stale -> the supervisor false-kills healthy agents (the UTC+2 / 7201s
+    skew that broke live test #6). Guard the locale-independent UTC form."""
+    ps = sup.PS_TEMPLATE
+    assert "$now = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()" in ps
+    # the local-time trap must not be the actual now-assignment (it may still be
+    # named in an explanatory comment, so ban the ASSIGNMENT form, not the phrase)
+    assert "Parse((Get-Date -UFormat %s))" not in ps
+
+
 def test_record_launch_codex_marks_launched_no_fake_id(tmp_path: Path) -> None:
     """Blocker 2/launch-state: the SCRIPT-side launch-success rule (via the
     --record-launch command) — Codex gets launched=true + NO pinned id; Claude

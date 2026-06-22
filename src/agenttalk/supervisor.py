@@ -1069,7 +1069,14 @@ do {
   }
   Save-State $state
   # 2) ask Python for the safe action plan (it interprets the snapshot)
-  $now = [int][double]::Parse((Get-Date -UFormat %s))
+  # MUST be a UTC epoch: heartbeats are stamped in UTC (...Z), and the Python
+  # plan compares now-vs-heartbeat for staleness. `Get-Date -UFormat %s` on
+  # Windows PowerShell 5.1 returns a LOCAL-time epoch, so on any non-UTC machine
+  # `$now` is off by the TZ offset and EVERY heartbeat looks stale by that much
+  # -> the supervisor false-kills healthy agents (operator at UTC+2 saw a 7201s
+  # skew -> constant stuck_recover). DateTimeOffset.UtcNow.ToUnixTimeSeconds() is
+  # unambiguous UTC and locale-independent.
+  $now = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
   $plan = (& $AgenttalkCmd --root $Root supervise --plan --state-file $StatePath --snapshot-file $SnapPath --now $now) | ConvertFrom-Json
   foreach ($name in $plan.agents.PSObject.Properties.Name) {
     $p = $plan.agents.$name
