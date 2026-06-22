@@ -9,6 +9,8 @@ control. Pure + testable.
 
 from __future__ import annotations
 
+import json
+
 # The wrapper feeds the rules; the model classifies + acts (per the listen skill).
 _DEFAULT_RULES = (
     "Handle this agenttalk message per the listen rules: classify by kind + meta; "
@@ -27,16 +29,21 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
     if rejoin:
         out += ["== REJOIN CONTEXT ==", rejoin, ""]
     out.append("== INBOUND AGENTTALK MESSAGE ==")
-    out.append(f"from: {record.get('from')}")
-    out.append(f"kind: {record.get('kind')}")
+    out.append(f"from: {record.get('from')}  to: {record.get('to')}  "
+               f"kind: {record.get('kind')}")
     if record.get("subject"):
         out.append(f"subject: {record['subject']}")
-    cid = record.get("correlation_id")
-    if cid:
-        out.append(
-            f"correlation_id: {cid} "
-            f"(request_id={record.get('request_id')} "
-            f"broadcast_id={record.get('broadcast_id')})"
-        )
-    out += ["", record.get("body") or "", "", "== HOW TO HANDLE ==", rules]
+    out.append(f"correlation_id: {record.get('correlation_id')} "
+               f"(request_id={record.get('request_id')} "
+               f"broadcast_id={record.get('broadcast_id')})")
+    out += ["", record.get("body") or "", ""]
+    # The FULL structured record, incl meta + scoped state. Classification data
+    # (review-result status / needs-info, consult round/status, na markers,
+    # escalation flags, assignment ids, future fields) often lives ONLY in meta,
+    # so the model must see the whole record - not a hand-picked summary.
+    out.append("== STRUCTURED RECORD (classify by kind + meta) ==")
+    out.append("```json")
+    out.append(json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True))
+    out.append("```")
+    out += ["== HOW TO HANDLE ==", rules]
     return "\n".join(out)

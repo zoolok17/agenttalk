@@ -34,6 +34,17 @@ def test_prompt_assembly_includes_message_and_rules() -> None:
     assert "REJOIN CONTEXT" in p2 and "roster: a,b" in p2 and "custom rules" in p2
 
 
+def test_prompt_includes_meta_for_classification(tmp_path) -> None:
+    # codex finding: classification data often lives ONLY in meta (review-result
+    # status/needs-info, consult round, ...). The full record must reach the model.
+    rec = {"from": "alpha", "to": "beta", "kind": "review-result", "subject": "",
+           "body": "see status", "meta": {"status": "needs-info", "round": 3},
+           "request_id": "rq-1", "broadcast_id": None, "correlation_id": "rq-1"}
+    p = prompt.assemble_turn_prompt(rec)
+    assert "needs-info" in p and '"round": 3' in p   # meta-only data is present
+    assert "review-result" in p and "to: beta" in p
+
+
 # --------------------------------------------------------------- session
 
 def test_session_codex_fresh_then_resume_then_fallback() -> None:
@@ -89,11 +100,32 @@ def test_loop_drives_each_message_and_commits(tmp_path) -> None:
     s.send(sender="alpha", recipient="beta", body="one")
     m2 = s.send(sender="alpha", recipient="beta", body="two")
     seen: list[str] = []
-    turns = loop.run_loop(s, "beta", lambda rec: seen.append(rec["body"]),
-                          clock=lambda: 0.0, sleep=lambda d: None, max_turns=2)
+
+    def drive(rec):
+        seen.append(rec["body"])
+        return True                      # success -> commit
+
+    turns = loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                          max_turns=2)
     assert turns == 2 and seen == ["one", "two"]
-    # commit AFTER each turn advanced the global cursor to the newest handled msg.
+    # commit on SUCCESS advanced the global cursor to the newest handled msg.
     assert s.cursor("beta") == m2.id
+
+
+def test_loop_does_not_commit_failed_turn(tmp_path) -> None:
+    # a failed turn (drive -> falsy) is NOT committed: the message re-delivers.
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="one")
+    attempts = {"n": 0}
+
+    def failing_drive(rec):
+        attempts["n"] += 1
+        return False                     # turn failed
+
+    loop.run_loop(s, "beta", failing_drive, clock=lambda: 0.0, sleep=lambda d: None,
+                  max_polls=3)
+    assert attempts["n"] >= 1            # the same record was retried, never committed
+    assert s.cursor("beta") == ""        # NOT committed -> re-delivered
 
 
 def test_loop_idle_stamps_heartbeat(tmp_path) -> None:
@@ -143,6 +175,51 @@ def test_make_drive_codex_captures_thread_id_and_resumes(tmp_path) -> None:
            "correlation_id": None, "request_id": None, "broadcast_id": None})
     assert spawned[1][0] == ["codex", "exec", "resume", "--json", "t-1"]
     assert st.turns == 2
+
+
+def _failed_turn_lines(msg: str = "no session") -> list[str]:
+    return [json.dumps({"type": "turn.failed", "error": {"message": msg}})]
+
+
+def test_make_drive_resume_failure_retries_fresh(tmp_path) -> None:
+    # reviewer-1/codex: a persisted thread_id whose RESUME turn fails must clear the
+    # stale id, retry FRESH (exec --json) for the same record, observe the new id,
+    # and report success. The next invocation uses exec --json, not exec resume.
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex", codex_thread_id="t-old", resume_available=True)
+    spawned: list[list[str]] = []
+
+    def fake_spawn(argv, stdin):
+        spawned.append(argv)
+        if "resume" in argv:
+            return _failed_turn_lines()              # the resume turn FAILS (terminal)
+        return _codex_turn_lines(thread_id="t-new")  # the fresh exec SUCCEEDS
+
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=fake_spawn,
+                           clock=lambda: 0.0, render=False)
+    ok = drive({"from": "a", "kind": "message", "body": "hi",
+                "correlation_id": None, "request_id": None, "broadcast_id": None})
+    assert ok is True                                  # fresh retry succeeded
+    assert spawned[0] == ["codex", "exec", "resume", "--json", "t-old"]  # resume first
+    assert spawned[1] == ["codex", "exec", "--json"]                      # then fresh
+    assert st.codex_thread_id == "t-new"               # new id observed + persisted
+    assert st.turns == 1
+
+
+def test_make_drive_resume_and_fresh_both_fail_returns_false(tmp_path) -> None:
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex", codex_thread_id="t-old")
+
+    def fake_spawn(argv, stdin):
+        return _failed_turn_lines("broken")            # every attempt fails
+
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=fake_spawn,
+                           clock=lambda: 0.0, render=False)
+    ok = drive({"from": "a", "kind": "message", "body": "hi",
+                "correlation_id": None, "request_id": None, "broadcast_id": None})
+    assert ok is False                                 # genuine failure -> no commit
+    assert st.resume_available is False                # marked unavailable
+    assert st.turns == 0                               # a failed turn does not advance
 
 
 def test_loop_with_make_drive_end_to_end(tmp_path) -> None:

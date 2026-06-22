@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 
 from . import claude_adapter, codex_adapter
 from .degraded import DegradedConfig, DegradedDetector
-from .events import Event
+from .events import Event, EventType
 from .framework import WrapperEngine
 
 # cli -> event mapper.
@@ -175,12 +175,14 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                render: bool = True, rules: str | None = None,
                clock: Callable[[], float] = time.monotonic,
                spawn: Callable[[list[str], str | None], Iterable[str]] | None = None,
-               persist: Callable[[object], None] | None = None) -> Callable[[dict], None]:
+               persist: Callable[[object], None] | None = None) -> Callable[[dict], bool]:
     """Build the per-turn ``drive(record)`` callback for loop.run_loop. Each call
-    drives ONE real CLI turn: assemble the prompt -> build the session turn args ->
-    spawn the CLI (prompt on stdin) -> process the JSONL stream via the engine
-    (heartbeat-on-progress + degraded + render) while capturing codex's durable
-    thread_id (session.observe_event on the RAW stream).
+    drives ONE real CLI turn and returns whether it SUCCEEDED. A turn fails if it
+    produced no progress event or hit a TERMINAL (non-retryable) adapter_error
+    (turn.failed, a nonzero-no-JSON child, a resume no-session). On a failed CODEX
+    RESUME turn it marks resume unavailable, persists, and retries FRESH (exec
+    --json) for the SAME record before returning; run_loop only commits the inbound
+    message when drive returns True, so a failed turn is never lost (at-least-once).
 
     The detector + engine are created ONCE and reused across turns, so the degraded
     confirmation window (which counts degraded turns across CLI invocations) and the
@@ -204,10 +206,13 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
     )
     spawner = spawn or _spawn_turn_lines
 
-    def drive(record: dict) -> None:
-        prompt = _prompt.assemble_turn_prompt(record, rules=rules)
-        spec = _session.build_turn(session_state, prompt)
+    def _run_one(spec) -> bool:
+        """Spawn ONE CLI invocation for ``spec`` and process its JSONL via the
+        engine. Returns True iff the turn made progress and hit no terminal
+        (non-retryable) adapter_error - a failed/empty/garbage stream is False."""
         argv = list(base_argv) + spec.args
+        saw_progress = False
+        saw_terminal = False
         for line in spawner(argv, spec.stdin):
             s = line.strip()
             if not s:
@@ -218,9 +223,29 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 continue
             _session.observe_event(session_state, raw)   # capture codex thread_id
             for ev in mapper(raw):
+                if ev.is_progress:
+                    saw_progress = True
+                elif ev.type == EventType.ADAPTER_ERROR and not ev.retryable:
+                    saw_terminal = True
                 engine.process(ev, clock())
-        session_state.turns += 1
+        return saw_progress and not saw_terminal
+
+    def drive(record: dict) -> bool:
+        prompt = _prompt.assemble_turn_prompt(record, rules=rules)
+        spec = _session.build_turn(session_state, prompt)
+        attempted_resume = session_state.cli == "codex" and "resume" in spec.args
+        success = _run_one(spec)
+        if not success and attempted_resume:
+            # the resume turn failed -> force a FRESH exec for the SAME record and
+            # retry inline (a new thread_id will be observed + persisted).
+            _session.mark_resume_unavailable(session_state, "resume turn failed")
+            if persist is not None:
+                persist(session_state)
+            success = _run_one(_session.build_turn(session_state, prompt))
+        if success:
+            session_state.turns += 1
         if persist is not None:
             persist(session_state)
+        return success
 
     return drive

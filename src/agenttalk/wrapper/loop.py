@@ -27,7 +27,7 @@ def is_terminal_control(record: dict) -> bool:
     return bool(sc and (sc.get("closed") or sc.get("superseded")))
 
 
-def run_loop(store, agent: str, drive: Callable[[dict], None], *,
+def run_loop(store, agent: str, drive: Callable[[dict], bool], *,
              idle_interval: float = 0.3, max_idle_interval: float = 2.0,
              heartbeat_interval: float = 10.0,
              clock: Callable[[], float] = time.monotonic,
@@ -59,10 +59,15 @@ def run_loop(store, agent: str, drive: Callable[[dict], None], *,
         if is_terminal_control(record):
             recv_api.commit(store, agent, record)       # consume + skip (control)
             continue
-        drive(record)                                   # ONE turn (engine stamps heartbeat)
-        recv_api.commit(store, agent, record)           # at-least-once: commit AFTER the turn
-        store.write_heartbeat(agent)
-        last_hb = clock()
-        turns += 1
-        if max_turns is not None and turns >= max_turns:
-            return turns
+        # Drive ONE turn. Commit the inbound message ONLY when the turn SUCCEEDS:
+        # a failed turn (no progress / terminal error / failed resume) returns falsy
+        # and is NOT committed, so it re-delivers next iteration (at-least-once). If
+        # it keeps failing with no progress, the heartbeat goes stale -> the
+        # supervisor restarts the wrapper (rather than a silent healthy-looking spin).
+        if drive(record):
+            recv_api.commit(store, agent, record)
+            store.write_heartbeat(agent)
+            last_hb = clock()
+            turns += 1
+            if max_turns is not None and turns >= max_turns:
+                return turns
