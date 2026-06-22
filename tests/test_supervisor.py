@@ -1193,14 +1193,18 @@ def test_generated_ps1_quiet_suppresses_relaunch_helper_warnings(tmp_path: Path)
     (s.dir / "supervisor.json").write_text(json.dumps(config), encoding="utf-8")
     assert _run(["supervise", "--init"], tmp_path) == 0
     ps1 = s.dir / "supervisor.ps1"
-    # readiness (past grace), not in backoff, NO heartbeat => stale => stuck_recover,
-    # which enters the relaunch path; the missing windows_file makes a HELPER warn
-    # (no real Start-Process happens).
-    (s.dir / "supervisor-state.json").write_text(
-        json.dumps({"agents": {"worker": _ready(backoff_next_epoch=0)}}),
-        encoding="utf-8")
+    state_file = s.dir / "supervisor-state.json"
 
     def _once(*extra: str) -> str:
+        # RESET to the stale-but-ready state before EACH run so both deterministically
+        # hit stuck_recover -> the relaunch path. (A prior normal run mutates state into
+        # backoff, which would otherwise downgrade the second run to backoff_wait and
+        # skip the helper-warning path - reviewer-1 r3 note.) readiness = past grace,
+        # not in backoff; NO heartbeat written => stale; missing windows_file => a
+        # HELPER warns with no real Start-Process.
+        state_file.write_text(
+            json.dumps({"agents": {"worker": _ready(backoff_next_epoch=0)}}),
+            encoding="utf-8")
         r = subprocess.run([shell, "-NoProfile", "-File", str(ps1), "-Once", *extra],
                            capture_output=True, text=True, timeout=120, cwd=str(tmp_path))
         return r.stdout + r.stderr
