@@ -318,6 +318,10 @@ def test_ps_template_console_action_log_and_quiet() -> None:
     # (LAUNCHING / rate-limited ACTIVE_OR_BUSY also have no action) - codex r1.
     assert "$p.state -eq 'HEALTHY_IDLE'" in ps
     assert "if ($DryRun)" in ps                         # DryRun keeps its own print
+    # reviewer-1 r1: -Quiet must also gate the Write-Warning action paths, and the
+    # warning actions are NOT double-logged by the info Write-Host (excluded there).
+    assert "'warn_only','suspect_warn','refuse_protected','snapshot_unavailable' -notcontains" in ps
+    assert "if (-not $Quiet) { Write-Warning" in ps     # warnings gated by -Quiet
 
 
 def test_supervise_plan_cli_with_fixtures(tmp_path: Path, capsys) -> None:
@@ -1130,6 +1134,41 @@ def test_generated_ps1_runs_bus_calls_without_console_script_on_path(tmp_path: P
     assert "is not recognized" not in combined and "CommandNotFound" not in combined, combined
     # the DryRun plan line for the dead worker actually printed (the bus call ran)
     assert "worker:" in res.stdout, f"no plan emitted; stdout={res.stdout!r} stderr={res.stderr!r}"
+
+
+def test_generated_ps1_quiet_suppresses_warning_path(tmp_path: Path) -> None:
+    """0.29.0 (reviewer-1 r1): -Quiet must silence the WHOLE console log, including
+    the Write-Warning ACTION paths - not just the new info Write-Host. We run the
+    REAL generated .ps1 against a PROTECTED, stale agent (the lead: role=lead =>
+    protected => warn_only, which NEVER launches a process, so it is safe to run
+    the real loop in CI). Once WITHOUT -Quiet the warning prints; once WITH -Quiet
+    the console is silent. A structural string check can't prove the gating works."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    s = _team(tmp_path)                                   # roster: lead (protected), worker
+    # Supervise the LEAD: a stale protected agent is warn_only - it warns and never
+    # launches, so this exercises a Write-Warning path with no real Start-Process.
+    config = {"agents": {"lead": {"auto_restart": True, "cli": "claude"}},
+              "backoff": {"base_seconds": 30, "cap_seconds": 900,
+                          "reset_after_seconds": 180},
+              "suspect_warn_interval_seconds": 300, "launch_grace_seconds": 120}
+    (s.dir / "supervisor.json").write_text(json.dumps(config), encoding="utf-8")
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    ps1 = s.dir / "supervisor.ps1"
+    # readiness state (past initial launch grace) + NO heartbeat written => stale.
+    (s.dir / "supervisor-state.json").write_text(
+        json.dumps({"agents": {"lead": _ready()}}), encoding="utf-8")
+
+    def _once(*extra: str) -> str:
+        r = subprocess.run([shell, "-NoProfile", "-File", str(ps1), "-Once", *extra],
+                           capture_output=True, text=True, timeout=120, cwd=str(tmp_path))
+        return r.stdout + r.stderr
+
+    noisy = _once()                                       # normal run -> warning prints
+    quiet = _once("-Quiet")                               # quiet run -> console silent
+    assert "lead" in noisy, f"expected a console warning for the stale protected lead; got {noisy!r}"
+    assert "lead" not in quiet, f"-Quiet must suppress the warning console output; got {quiet!r}"
 
 
 def test_generated_ps1_quotes_args_with_spaces_as_single_arg(tmp_path: Path) -> None:
