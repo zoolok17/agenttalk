@@ -304,6 +304,22 @@ def test_supervise_init_generates_and_is_idempotent(tmp_path: Path, capsys) -> N
     assert "all files already exist" in capsys.readouterr().out
 
 
+def test_ps_template_console_action_log_and_quiet() -> None:
+    # 0.29.0 observability: the NORMAL loop (not just -DryRun) logs each agent's
+    # state+action+reason - real actions ALWAYS print, steady no-action agents
+    # print on state CHANGE only (no per-poll flood); -Quiet suppresses all of it.
+    ps = sup.PS_TEMPLATE
+    assert "[switch]$Quiet" in ps                       # the suppress switch
+    assert "-not $Quiet" in ps                          # the log is gated on it
+    assert "$p.action -ne 'none'" in ps                 # always-print a real action
+    assert "$lastLogged" in ps                          # change-detection memory
+    assert "agents healthy" in ps                       # periodic liveness summary
+    # the healthy count is HEALTHY_IDLE ONLY, not every action=='none' state
+    # (LAUNCHING / rate-limited ACTIVE_OR_BUSY also have no action) - codex r1.
+    assert "$p.state -eq 'HEALTHY_IDLE'" in ps
+    assert "if ($DryRun)" in ps                         # DryRun keeps its own print
+
+
 def test_supervise_plan_cli_with_fixtures(tmp_path: Path, capsys) -> None:
     s = _team(tmp_path)
     (s.dir / "supervisor.json").write_text(json.dumps(_CONFIG), encoding="utf-8")
