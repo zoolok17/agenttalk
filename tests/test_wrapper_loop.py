@@ -249,6 +249,9 @@ def test_make_drive_partial_stream_is_failure(tmp_path) -> None:
     assert drive({"from": "a", "kind": "message", "body": "hi",
                   "correlation_id": None, "request_id": None, "broadcast_id": None}) is False
     assert st.turns == 0
+    # reviewer-1 gate: a FAILED turn must NOT leave a fresh heartbeat (so a
+    # persistently-crashing child goes stale -> supervisor restart).
+    assert s.read_heartbeat("beta") is None
 
 
 def test_make_drive_nonzero_exit_is_failure(tmp_path) -> None:
@@ -262,6 +265,18 @@ def test_make_drive_nonzero_exit_is_failure(tmp_path) -> None:
     )
     assert drive({"from": "a", "kind": "message", "body": "hi",
                   "correlation_id": None, "request_id": None, "broadcast_id": None}) is False
+    assert s.read_heartbeat("beta") is None     # reviewer-1 gate: no heartbeat on failure
+
+
+def test_make_drive_success_stamps_heartbeat(tmp_path) -> None:
+    # the flip side: a CLEAN completed turn stamps the heartbeat exactly once.
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex")
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"], clock=lambda: 0.0,
+                           render=False, spawn=lambda a, i: _codex_turn_lines())
+    assert drive({"from": "a", "kind": "message", "body": "hi",
+                  "correlation_id": None, "request_id": None, "broadcast_id": None}) is True
+    assert s.read_heartbeat("beta") is not None
 
 
 def test_loop_failed_turn_backs_off_not_hot_spin(tmp_path) -> None:

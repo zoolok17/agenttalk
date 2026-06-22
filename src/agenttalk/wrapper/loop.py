@@ -61,10 +61,12 @@ def run_loop(store, agent: str, drive: Callable[[dict], bool], *,
             recv_api.commit(store, agent, record)       # consume + skip (control)
             continue
         # Drive ONE turn. Commit the inbound message ONLY when the turn SUCCEEDS.
+        # drive() stamps the heartbeat itself on a clean completed turn (and NOT on
+        # a failed turn), so the loop does not stamp here - a failed turn leaves no
+        # fresh heartbeat (reviewer-1 gate).
         if drive(record):
             recv_api.commit(store, agent, record)
-            store.write_heartbeat(agent)
-            last_hb = clock()
+            last_hb = clock()                           # drive already stamped on success
             fail_sleep = idle_interval                  # reset failure backoff
             turns += 1
             if max_turns is not None and turns >= max_turns:

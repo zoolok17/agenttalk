@@ -207,7 +207,13 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
     detector = DegradedDetector(cli, cfg)
     engine = WrapperEngine(
         detector=detector,
-        on_heartbeat=_default_heartbeat(store, agent),
+        # The per-turn heartbeat is conditional on a CLEAN COMPLETED turn (stamped
+        # by drive() at turn-end on success), NOT on every progress event - else a
+        # partial/crashing/nonzero-exit turn would stamp during streaming and then
+        # be classified failed, leaving a fresh heartbeat that hides a persistently
+        # failing agent (reviewer-1 gate). So the engine's heartbeat sink is a
+        # no-op here; the loop owns idle heartbeat + nothing on a failed turn.
+        on_heartbeat=lambda _e, _now: None,
         on_render=(_default_render if render else None),
         on_escalate=_default_escalate(store, agent, sender or agent),
         on_info=_default_info,
@@ -260,6 +266,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             success = _run_one(_session.build_turn(session_state, prompt))
         if success:
             session_state.turns += 1
+            store.write_heartbeat(agent)   # stamp ONLY a clean completed turn
         if persist is not None:
             persist(session_state)
         return success
