@@ -2048,6 +2048,21 @@ class Store:
         except OSError:
             pass
 
+    def clear_heartbeat(self, agent: str) -> None:
+        """Remove the heartbeat marker if present. Best-effort, never raises. The
+        wrapper uses this to FORCE-STALE a failed turn: a turn may stamp heartbeat
+        on its streaming progress (so a long SUCCESSFUL turn stays live), but if the
+        turn then fails (no completed boundary / nonzero exit), clearing ensures the
+        failed attempt leaves no fresh heartbeat -> a persistently-failing agent
+        goes stale -> the supervisor restarts it."""
+        p = self.state_dir / f"{agent}.heartbeat"
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
     def clear_dead_waiter(self, agent: str, self_pid: int) -> bool:
         """Remove ``agent``'s waiting marker iff it is owned by a CONFIRMED-DEAD
         other process (reap fix #4b). Returns True when it cleared one.

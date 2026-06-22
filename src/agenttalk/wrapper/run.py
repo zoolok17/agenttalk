@@ -207,13 +207,12 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
     detector = DegradedDetector(cli, cfg)
     engine = WrapperEngine(
         detector=detector,
-        # The per-turn heartbeat is conditional on a CLEAN COMPLETED turn (stamped
-        # by drive() at turn-end on success), NOT on every progress event - else a
-        # partial/crashing/nonzero-exit turn would stamp during streaming and then
-        # be classified failed, leaving a fresh heartbeat that hides a persistently
-        # failing agent (reviewer-1 gate). So the engine's heartbeat sink is a
-        # no-op here; the loop owns idle heartbeat + nothing on a failed turn.
-        on_heartbeat=lambda _e, _now: None,
+        # Stamp heartbeat on streaming progress so a long SUCCESSFUL turn stays live
+        # before it completes (in-turn liveness). A FAILED turn may also stamp here
+        # mid-stream, so drive() CLEARS the heartbeat when the turn ends failed -
+        # net: live during a successful turn, no fresh heartbeat after a failed one
+        # (reviewer-1 gate: both, via stamp-during + clear-on-failure).
+        on_heartbeat=_default_heartbeat(store, agent),
         on_render=(_default_render if render else None),
         on_escalate=_default_escalate(store, agent, sender or agent),
         on_info=_default_info,
@@ -266,7 +265,11 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             success = _run_one(_session.build_turn(session_state, prompt))
         if success:
             session_state.turns += 1
-            store.write_heartbeat(agent)   # stamp ONLY a clean completed turn
+        else:
+            # the turn FAILED (no completed boundary / nonzero exit, after any
+            # resume->fresh retry): undo any heartbeat its streaming progress
+            # stamped, so a failed attempt leaves NO fresh heartbeat.
+            store.clear_heartbeat(agent)
         if persist is not None:
             persist(session_state)
         return success

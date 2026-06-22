@@ -269,13 +269,36 @@ def test_make_drive_nonzero_exit_is_failure(tmp_path) -> None:
 
 
 def test_make_drive_success_stamps_heartbeat(tmp_path) -> None:
-    # the flip side: a CLEAN completed turn stamps the heartbeat exactly once.
+    # the flip side: a CLEAN completed turn leaves a fresh heartbeat.
     s = _store(tmp_path)
     st = session.SessionState(cli="codex")
     drive = run.make_drive(s, "beta", "codex", st, ["codex"], clock=lambda: 0.0,
                            render=False, spawn=lambda a, i: _codex_turn_lines())
     assert drive({"from": "a", "kind": "message", "body": "hi",
                   "correlation_id": None, "request_id": None, "broadcast_id": None}) is True
+    assert s.read_heartbeat("beta") is not None
+
+
+def test_make_drive_stamps_liveness_during_successful_turn(tmp_path) -> None:
+    # reviewer-1 gate r2: in-turn liveness must stay fresh for a long SUCCESSFUL
+    # turn (stamp on streaming progress BEFORE completion), not only at the end.
+    # The generator captures the heartbeat MID-stream (after turn.started, before
+    # turn.completed) to prove it.
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex")
+    mid: list[object] = []
+
+    def gen_spawn(argv, stdin):
+        yield json.dumps({"type": "turn.started"})
+        mid.append(s.read_heartbeat("beta"))   # stamped DURING the turn, pre-completion
+        yield json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "x"}})
+        yield json.dumps({"type": "turn.completed"})
+
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=gen_spawn,
+                           clock=lambda: 0.0, render=False)
+    assert drive({"from": "a", "kind": "message", "body": "hi",
+                  "correlation_id": None, "request_id": None, "broadcast_id": None}) is True
+    assert mid and mid[0] is not None          # liveness was fresh BEFORE completion
     assert s.read_heartbeat("beta") is not None
 
 
