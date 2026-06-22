@@ -162,3 +162,17 @@ def test_recv_json_cli_mirror(tmp_path, capsys) -> None:
     rc = cli.main(["--root", str(tmp_path), "recv", "--for", "beta", "--json", "--ack"])
     assert rc == 0
     assert s.cursor("beta") == m2.id
+
+
+def test_recv_json_ack_advances_past_hidden_control(tmp_path) -> None:
+    # reviewer-1 re-review: --ack must advance past the NEWEST RAW message
+    # (control-inclusive) so a trailing hidden composing never stays stuck behind
+    # the cursor - the recv --ack / drain invariant.
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="visible")
+    comp = s.send(sender="alpha", recipient="beta", body="", kind="composing",
+                  meta={"request_id": "r"})
+    rc = cli.main(["--root", str(tmp_path), "recv", "--for", "beta", "--json", "--ack"])
+    assert rc == 0
+    # cursor advanced to the LATER composing id, not the visible message.
+    assert s.cursor("beta") == comp.id

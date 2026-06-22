@@ -2022,8 +2022,15 @@ def _do_recv_json(store: Store, agent: str, *, since: str | None, ack: bool,
     recs = recv_api.records(store, agent, since=since, include_control=include_control)
     for rec in recs:
         print(json.dumps(rec, ensure_ascii=False))
-    if ack and recs:
-        recv_api.commit(store, agent, recs[-1])
+    if ack:
+        # --ack advances past the NEWEST RAW message - control-INCLUSIVE, even when
+        # the printed records hide composing - so hidden control never stays stuck
+        # behind the cursor (the recv --ack / drain invariant). Still one impl: the
+        # ack target comes from recv_api.records(include_control=True), committed via
+        # recv_api.commit; cli.py carries no cursor logic of its own.
+        raw = recv_api.records(store, agent, since=since, include_control=True)
+        if raw:
+            recv_api.commit(store, agent, raw[-1])
     return 0
 
 
