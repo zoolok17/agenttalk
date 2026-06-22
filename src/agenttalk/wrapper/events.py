@@ -59,6 +59,10 @@ class Event:
                     self-recovers from (e.g. a WebSocket->HTTPS fallback) is
                     retryable=True (log only, never act); a terminal failure
                     (turn.failed) is retryable=False. Ignored for other types.
+    ``channel``   - for model output, which stream the text is: "text" (assistant
+                    output, the degraded-scan target) or "thinking" (internal
+                    reasoning - NEVER scanned, but a thinking_delta IS liveness).
+                    None for non-model events / CLIs without the distinction.
     ``raw``       - the original adapter payload, kept for diagnostics/render.
     """
 
@@ -66,9 +70,19 @@ class Event:
     text: str | None = None
     tool: str | None = None
     retryable: bool = False
+    channel: str | None = None
     raw: dict = field(default_factory=dict)
 
     @property
     def is_progress(self) -> bool:
-        """True iff this event should stamp the agent's activity heartbeat."""
+        """True iff this event should stamp the agent's activity heartbeat.
+
+        A raw text delta does NOT stamp (ruling on the Claude adapter): a leaked
+        turn streams degraded text fragments, so only the CLEAN assembled model
+        output (scanned, and suppressed when degraded) may stamp text liveness.
+        Thinking deltas DO stamp - they are genuine reasoning progress and close
+        the pure-reasoning gap. Non-text-delta progress is unaffected.
+        """
+        if self.type == EventType.MODEL_OUTPUT_DELTA and self.channel == "text":
+            return False
         return self.type in PROGRESS_EVENTS

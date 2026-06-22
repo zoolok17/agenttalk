@@ -20,18 +20,20 @@ import uuid
 from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, timezone
 
-from . import codex_adapter
+from . import claude_adapter, codex_adapter
 from .degraded import DegradedConfig, DegradedDetector
 from .events import Event
 from .framework import WrapperEngine
 
-# cli -> (event mapper, default telemetry_only). Claude is Phase 2.
+# cli -> event mapper.
 _ADAPTERS: dict[str, Callable[[object], list[Event]]] = {
     "codex": codex_adapter.map_event,
+    "claude": claude_adapter.map_event,
 }
 # Codex has no observed real tool-call-leak signature yet -> detect + log, never
-# escalate. The Claude adapter (Phase 2) will flip this to escalation-enabled.
-_TELEMETRY_ONLY = {"codex": True}
+# escalate. Claude's leak (tool-call markup as assistant text) is the cataloged
+# high-confidence signature -> escalation-enabled.
+_TELEMETRY_ONLY = {"codex": True, "claude": False}
 
 
 def parse_lines(lines: Iterable[str], mapper: Callable[[object], list[Event]]) -> Iterator[Event]:

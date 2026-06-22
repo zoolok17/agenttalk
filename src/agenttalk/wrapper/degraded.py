@@ -167,7 +167,13 @@ class DegradedDetector:
             self._degraded_this_turn = False
             self._self_heal()
             return FeedResult()
-        if etype in (EventType.MODEL_OUTPUT, EventType.MODEL_OUTPUT_DELTA):
+        if etype == EventType.MODEL_OUTPUT:
+            # Scan only the COMPLETE assembled model output, never fragmentary
+            # deltas (a multi-token signature can span deltas), and NEVER the
+            # thinking channel (internal reasoning may legitimately discuss tool
+            # syntax - a first-class false-positive guard).
+            if event.channel == "thinking":
+                return FeedResult()
             return self._scan_model_output(event, now)
         if etype == EventType.TURN_FINISHED:
             return FeedResult(signal=self._on_turn_finished(now))

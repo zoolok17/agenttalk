@@ -366,5 +366,6 @@ def test_run_wrapper_degraded_codex_message_escalates_when_enabled() -> None:
 
 def test_run_wrapper_unknown_cli_raises() -> None:
     import pytest
+    # codex + claude are registered (Phase 1 + 2); an unknown CLI has no adapter.
     with pytest.raises(ValueError):
-        run.run_wrapper(cli="claude", agent="w", argv=["claude"], line_source=[])
+        run.run_wrapper(cli="gemini", agent="w", argv=["gemini"], line_source=[])

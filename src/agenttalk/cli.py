@@ -4229,7 +4229,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pwrap.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
     pwrap.add_argument("--cli", default="codex",
-                       help="Which CLI is being wrapped (Phase 1: codex).")
+                       help="Which CLI is being wrapped: 'codex' (codex exec "
+                            "--json) or 'claude' (stream-json).")
     pwrap.add_argument("--from", dest="sender",
                        help="Identity recorded as the degraded-restart requester "
                             "(default: the wrapped agent).")
