@@ -547,7 +547,8 @@ def _liveness_cfg(cfg_agent: dict) -> dict:
 def build_report(store: Store, *, now_epoch: float,
                  stuck_after_seconds: float | None = None,
                  suspect_after_seconds: float | None = None,
-                 state: dict | None = None) -> dict:
+                 state: dict | None = None,
+                 supervisor_config: dict | None = None) -> dict:
     """Point-in-time bus-side liveness snapshot. Read-only.
 
     ``protected`` is ``operator_facing`` UNION every active ``role=lead`` agent
@@ -558,6 +559,14 @@ def build_report(store: Store, *, now_epoch: float,
     - but when its ``state`` is passed, the recorded ``session_id`` (and pid) is
     merged for an operator-facing view (session_id is supervisor-local, not a
     bus fact, so it is opt-in via state).
+
+    ``supervisor_config`` (the supervisor.json) is opt-in: when passed, each
+    agent's ``heartbeat_stale`` is computed against its PER-AGENT/PER-CLI threshold
+    (:func:`resolve_stuck_after`), so the operator-facing report MATCHES the
+    planner's per-CLI decision (a wrapped Codex is not shown stale at the global
+    threshold while the planner correctly holds to 900s). Without it the single
+    global threshold applies (legacy behavior). The resolved per-agent threshold
+    is reported as ``stuck_after_seconds`` on each agent entry.
     """
     threshold = stuck_after_seconds
     if threshold is None:
@@ -568,17 +577,24 @@ def build_report(store: Store, *, now_epoch: float,
     roster = cfg.get("agents", []) or []
     roles = cfg.get("roles") or {}
     protected = store.protected_agents()
+    sup_cfg = supervisor_config if isinstance(supervisor_config, dict) else None
+    sup_agents = (sup_cfg.get("agents") if sup_cfg and isinstance(
+        sup_cfg.get("agents"), dict) else {})
     state_agents = (state or {}).get("agents") if isinstance(state, dict) else None
     state_agents = state_agents if isinstance(state_agents, dict) else {}
     agents: dict[str, dict] = {}
     for a in roster:
+        # per-agent/per-CLI threshold when the supervisor config is supplied
+        # (report parity with the planner); else the single global threshold.
+        threshold_a = (resolve_stuck_after(sup_cfg, sup_agents.get(a) or {})
+                       if sup_cfg is not None else float(threshold))
         hb = store.read_heartbeat(a)
         if hb is None:
             hb_age = None
             stale = True
         else:
             hb_age = max(0.0, now_epoch - hb.timestamp())
-            stale = hb_age > threshold
+            stale = hb_age > threshold_a
         marker = store.read_waiting(a)
         w_pid = marker.get("pid") if isinstance(marker, dict) else None
         w_pid = w_pid if isinstance(w_pid, int) else None
@@ -588,6 +604,7 @@ def build_report(store: Store, *, now_epoch: float,
             "protected": a in protected,
             "heartbeat_age_seconds": hb_age,
             "heartbeat_stale": stale,
+            "stuck_after_seconds": threshold_a,
             "waiting": marker is not None,
             "waiting_pid": w_pid,
             "waiting_pid_alive": bool(w_pid is not None and _process_alive(w_pid)),

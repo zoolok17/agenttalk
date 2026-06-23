@@ -3686,13 +3686,15 @@ def cmd_supervise(args: argparse.Namespace) -> int:
     if args.report:
         print(json.dumps(sup.build_report(store, now_epoch=now,
                                           stuck_after_seconds=stuck,
-                                          state=_read_state() or None), indent=2))
+                                          state=_read_state() or None,
+                                          supervisor_config=config), indent=2))
         return 0
     if args.plan:
         if args.report_file:
             report = json.loads(Path(args.report_file).read_text(encoding="utf-8-sig"))
         else:
-            report = sup.build_report(store, now_epoch=now, stuck_after_seconds=stuck)
+            report = sup.build_report(store, now_epoch=now, stuck_after_seconds=stuck,
+                                      supervisor_config=config)
         # The executor's process snapshot (a JSON list of rows). A dict marker
         # {"unavailable": true}, a missing/unreadable file, or no --snapshot-file
         # => UNAVAILABLE (None): a brain-required CLI then fails closed. utf-8-sig

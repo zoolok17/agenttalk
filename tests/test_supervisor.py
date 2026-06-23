@@ -1628,3 +1628,24 @@ def test_wrapped_claude_has_no_codex_floor() -> None:
                    {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
                    snapshot=_wrap_snap(cli="claude"), config=cfg)
     assert p["action"] == sup.STUCK_RECOVER
+
+
+def test_report_parity_wrapped_codex_uses_per_cli_threshold(tmp_path: Path) -> None:
+    # REPORT PARITY: the operator-facing build_report must match the planner's
+    # per-CLI decision (the operator watches the supervisor console during the
+    # dogfood). A 300s-old heartbeat is STALE under the global 120s default but
+    # FRESH under the wrapped-codex 900s threshold - the report must show fresh.
+    s = _team(tmp_path)
+    s.write_heartbeat("worker")
+    hb_ts = s.read_heartbeat("worker").timestamp()
+    sup_cfg = {"agents": {"worker": {"cli": "codex", "wrapped": True}}}
+    # global view (no supervisor_config): stale at 120s
+    glob = sup.build_report(s, now_epoch=hb_ts + 300, stuck_after_seconds=120)
+    assert glob["agents"]["worker"]["heartbeat_stale"] is True
+    # parity view (supervisor_config passed): fresh under the per-CLI 900s
+    parity = sup.build_report(s, now_epoch=hb_ts + 300, stuck_after_seconds=120,
+                              supervisor_config=sup_cfg)
+    assert parity["agents"]["worker"]["heartbeat_stale"] is False
+    assert parity["agents"]["worker"]["stuck_after_seconds"] == 900.0
+    # a non-wrapped agent in the same report keeps the global threshold
+    assert parity["agents"]["lead"]["stuck_after_seconds"] == 120.0
