@@ -13,7 +13,8 @@ a restart-request marker.
 from __future__ import annotations
 
 import json
-import subprocess
+# subprocess spawns ONLY the operator-provided CLI launch command; never shell=True.
+import subprocess  # nosec B404
 import sys
 import time
 import uuid
@@ -139,7 +140,8 @@ def run_wrapper(
         engine.run(parse_lines(line_source, mapper), clock)
         return 0
 
-    proc = subprocess.Popen(  # noqa: S603 - argv is operator-provided launch command
+    # argv is the operator-provided launch command; never shell=True.
+    proc = subprocess.Popen(  # noqa: S603  # nosec B603
         argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         bufsize=1,
     )
@@ -160,7 +162,8 @@ class _ProcStream:
     ``.returncode`` = a controlled exit)."""
 
     def __init__(self, argv: list[str], stdin_text: str | None) -> None:
-        self._proc = subprocess.Popen(  # noqa: S603 - operator-provided launch command
+        # argv is the operator-provided launch command; never shell=True.
+        self._proc = subprocess.Popen(  # noqa: S603  # nosec B603
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
