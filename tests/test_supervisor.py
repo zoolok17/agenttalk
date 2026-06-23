@@ -1559,6 +1559,72 @@ def test_config_template_ships_wrapped_example() -> None:
     cfg = json.loads(sup.CONFIG_TEMPLATE)
     w = cfg["agents"]["AGENT_NAME_WRAPPED"]
     assert w["wrapped"] is True
+    # the codex sample ships a conservative heavy-reasoning threshold (Codex
+    # ruling: 1200 for a known implementer/reviewer role, not the bare 900)
+    assert w["stuck_after_seconds"] == 1200
     args = w["launch"]["windows_args"]
     assert "{SESSION_ARGS}" not in args          # wrapper owns session; no splice
     assert args[:3] == ["-m", "agenttalk", "wrap"] and "--loop" in args
+
+
+# ---------- per-CLI wrapped stuck_after defaults + the codex low-threshold guardrail
+
+def test_resolve_stuck_after_per_cli_defaults_and_override() -> None:
+    # per-CLI wrapped defaults
+    assert sup.resolve_stuck_after({}, {"cli": "claude", "wrapped": True}) == 180.0
+    assert sup.resolve_stuck_after({}, {"cli": "codex", "wrapped": True}) == 900.0
+    # an explicit per-agent override always wins
+    assert sup.resolve_stuck_after(
+        {}, {"cli": "codex", "wrapped": True, "stuck_after_seconds": 1500}) == 1500.0
+    # non-wrapped keeps the global behavior (config, then the built-in default)
+    assert sup.resolve_stuck_after({"stuck_after_seconds": 77}, {"cli": "codex"}) == 77.0
+    assert sup.resolve_stuck_after({}, {"cli": "codex"}) == 120.0
+
+
+def test_wrapped_codex_default_threshold_tolerates_reasoning_gap() -> None:
+    # A 300s silent pure-reasoning gap is STALE under the global 120s threshold,
+    # but a wrapped codex re-derives against its 900s default -> NOT stale -> the
+    # planner does NOT false-kill it mid-reasoning.
+    p = _plan_wrap(_report(heartbeat_stale=True, heartbeat_age_seconds=300.0),
+                   {"agents": {"worker": _wrap_ready()}}, snapshot=_wrap_snap())
+    assert p["action"] == sup.NONE and p["state"] == "HEALTHY_IDLE"
+
+
+def test_wrapped_codex_low_stuck_after_refuses_restart() -> None:
+    # An UNSAFE-low threshold (< 600s floor) without opt-in: REFUSE restart
+    # authority (warn-only) + notify - never silently coerce to 900.
+    cfg = {**_WRAP_CONFIG,
+           "agents": {"worker": {"auto_restart": True, "cli": "codex",
+                                 "wrapped": True, "stuck_after_seconds": 120}}}
+    p = _plan_wrap(_report(heartbeat_stale=True),
+                   {"agents": {"worker": _wrap_ready(last_warn_epoch=0,
+                                                     backoff_next_epoch=0)}},
+                   snapshot=_wrap_snap(), config=cfg)
+    assert p["action"] == sup.SUSPECT_WARN and p["state"] == "ACTIVE_OR_BUSY"
+    assert p["kill_first"] is False and p["notify"] is True
+    assert "allow_low_stuck_after" in p["reason"]
+
+
+def test_wrapped_codex_low_stuck_after_opt_in_restarts() -> None:
+    # The operator explicitly opts in -> the low threshold is honored and
+    # restart-on-stale is restored.
+    cfg = {**_WRAP_CONFIG,
+           "agents": {"worker": {"auto_restart": True, "cli": "codex",
+                                 "wrapped": True, "stuck_after_seconds": 120,
+                                 "allow_low_stuck_after": True}}}
+    p = _plan_wrap(_report(heartbeat_stale=True),
+                   {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
+                   snapshot=_wrap_snap(), config=cfg)
+    assert p["action"] == sup.STUCK_RECOVER
+
+
+def test_wrapped_claude_has_no_codex_floor() -> None:
+    # the < 600s guardrail is codex-only; a wrapped claude with a tight threshold
+    # is honored (it stays fresh through reasoning via deltas).
+    cfg = {**_WRAP_CONFIG,
+           "agents": {"worker": {"auto_restart": True, "cli": "claude",
+                                 "wrapped": True, "stuck_after_seconds": 120}}}
+    p = _plan_wrap(_report(heartbeat_stale=True),
+                   {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
+                   snapshot=_wrap_snap(cli="claude"), config=cfg)
+    assert p["action"] == sup.STUCK_RECOVER

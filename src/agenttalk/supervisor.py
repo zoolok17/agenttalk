@@ -68,6 +68,42 @@ _LIVENESS_DEFAULTS = {
                "windows_sandbox": "unelevated", "allow_launcher_self": True},
 }
 
+# Per-CLI heartbeat-stale thresholds for WRAPPED agents (a per-agent
+# ``stuck_after_seconds`` override always wins; the global ``stuck_after_seconds``
+# is the fallback for legacy/unclassified agents). Codex's ruling (he consulted
+# reviewer-1): a wrapped CLAUDE streams thinking/text/tool deltas and stays fresh
+# through reasoning, so a tight threshold works; a wrapped CODEX is ITEM-LEVEL
+# (no exec --json event closes the pure-reasoning gap on 0.141.0), so a long
+# pure-reasoning stretch is SILENT and the threshold must be loose enough not to
+# false-kill it mid-reasoning. These are an OPERATIONAL false-positive tradeoff,
+# NOT a provably-safe bound (reviewer-1 wording).
+_WRAPPED_STUCK_AFTER_DEFAULTS = {"claude": 180.0, "codex": 900.0}
+# Below this, a wrapped CODEX restart-on-stale is too aggressive (likely to
+# false-kill mid-reasoning): the planner WARNS + REFUSES restart authority
+# (degrades to warn-only) unless the operator opts in with
+# ``allow_low_stuck_after=true``. We never SILENTLY coerce the value (no
+# ``max(configured, 900)``) - that would make config surprising.
+_WRAPPED_CODEX_MIN_STUCK_AFTER = 600.0
+
+
+def resolve_stuck_after(config: dict, cfg_agent: dict) -> float:
+    """The per-agent heartbeat-stale threshold (PURE). An explicit per-agent
+    ``stuck_after_seconds`` wins; else a WRAPPED agent uses the per-CLI default
+    (:data:`_WRAPPED_STUCK_AFTER_DEFAULTS`); else the global ``stuck_after_seconds``
+    (config, then the built-in default). Non-wrapped agents keep the existing
+    global behavior."""
+    gt = (config or {}).get("stuck_after_seconds")
+    global_threshold = float(gt) if isinstance(gt, (int, float)) else float(
+        _DEFAULTS["stuck_after_seconds"])
+    cfg_agent = cfg_agent or {}
+    v = cfg_agent.get("stuck_after_seconds")
+    if isinstance(v, (int, float)):
+        return float(v)
+    if bool(cfg_agent.get("wrapped", False)):
+        cli = cfg_agent.get("cli", "claude")
+        return float(_WRAPPED_STUCK_AFTER_DEFAULTS.get(cli, global_threshold))
+    return global_threshold
+
 # Per-CLI session-argument templates, as LISTS of literal tokens (so the
 # generated PowerShell uses an array-of-literals ArgumentList - single-quoted
 # PS literals do NOT expand `$`, so the Codex `$agenttalk-listen` prompt and
@@ -595,15 +631,22 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     # progress during a turn, so a stale heartbeat genuinely means stuck/dead.
     # That makes wrapped a "can confirm stuck" signal exactly like activity_hook -
     # so wrapped agents recover on stale (instead of warn-only) without needing the
-    # PostToolUse hook installed. CAVEAT (per-CLI, documented in CONFIG_TEMPLATE):
-    # wrapped CODEX is item-level (no token deltas), so a long pure-reasoning
-    # stretch is silent between turn.started and the final agent_message - its
-    # stuck_after_seconds must exceed the longest plausible reasoning gap or
-    # restart-on-stale false-kills it mid-reasoning. Wrapped CLAUDE streams
-    # thinking deltas and stays fresh through reasoning. stuck_after stays a config
-    # knob (never hardcoded here); see the wrapped config comment.
+    # PostToolUse hook installed. The per-CLI threshold (resolve_stuck_after) keeps
+    # a wrapped CODEX (item-level; silent during a long pure-reasoning gap) from
+    # being false-killed mid-reasoning; a wrapped CLAUDE (thinking/text deltas)
+    # stays fresh and can run tighter.
     wrapped = bool(_lcfg.get("wrapped", False))
-    can_confirm_stuck = activity_hook or wrapped
+    cli_name = cfg_agent.get("cli", "claude")
+    stuck_after = resolve_stuck_after(config, cfg_agent)
+    # GUARDRAIL (Codex ruling): for a wrapped CODEX, restart-on-stale below the
+    # min threshold is too aggressive (item-level stream => likely false-kill
+    # mid-reasoning). REFUSE restart authority (degrade to warn-only) + warn,
+    # unless the operator explicitly opts in. We never silently coerce the value.
+    allow_low_stuck_after = bool(cfg_agent.get("allow_low_stuck_after", False))
+    unsafe_low_codex = (wrapped and cli_name == "codex"
+                        and stuck_after < _WRAPPED_CODEX_MIN_STUCK_AFTER
+                        and not allow_low_stuck_after)
+    can_confirm_stuck = (activity_hook or wrapped) and not unsafe_low_codex
     # the EFFECTIVE isolation flag (per-CLI default merged) - emitted in the plan
     # so the executor seeds CODEX_HOME exactly when the planner assumed it, even
     # if the raw config omits the field (codex impl-review MAJOR).
@@ -612,7 +655,17 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     perm_mode = claude_permission_mode(config, cfg_agent)  # Claude unattended mode
 
     protected = bool(rpt.get("protected"))
+    # build_report computes heartbeat_stale with the GLOBAL threshold (it sees only
+    # the bus roster, not the supervisor per-agent cli/wrapped config). For a
+    # WRAPPED agent the planner re-derives staleness from the reported age against
+    # its per-CLI threshold (a codex must tolerate a long silent reasoning gap);
+    # non-wrapped agents keep the report's global decision unchanged. A wrapped
+    # agent that never heartbeated (age None) keeps the report's stale=True.
     hb_stale = bool(rpt.get("heartbeat_stale"))
+    if wrapped:
+        hb_age = rpt.get("heartbeat_age_seconds")
+        if isinstance(hb_age, (int, float)):
+            hb_stale = float(hb_age) > stuck_after
     marker = rpt.get("restart_request") or None
     consumed = list(st.get("consumed_rids", []))
     fails = int(st.get("consecutive_fails", 0))
@@ -732,13 +785,22 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             return _result(WARN_ONLY, state="STUCK_OR_DEAD", notify=True,
                            reason="protected agent heartbeat stale - recover manually")
         if not can_confirm_stuck:
+            if unsafe_low_codex:
+                warn_reason = (
+                    f"wrapped codex stuck_after_seconds={stuck_after:.0f} below the "
+                    f"{_WRAPPED_CODEX_MIN_STUCK_AFTER:.0f}s floor - REFUSING "
+                    "restart-on-stale (item-level stream would risk a false-kill "
+                    "mid-reasoning); raise stuck_after_seconds or set "
+                    "allow_low_stuck_after=true to opt in")
+            else:
+                warn_reason = ("heartbeat stale but NO activity hook - cannot "
+                               "confirm stuck; not killed")
             if now_epoch - last_warn >= suspect_interval:
                 nxt["last_warn_epoch"] = now_epoch
                 return _result(SUSPECT_WARN, state="ACTIVE_OR_BUSY",
-                               reason="heartbeat stale but NO activity hook - cannot "
-                                      "confirm stuck; not killed")
+                               notify=unsafe_low_codex, reason=warn_reason)
             return _result(NONE, state="ACTIVE_OR_BUSY",
-                           reason="suspect (no hook; warn rate-limited)")
+                           reason="suspect (warn rate-limited)")
         if now_epoch >= backoff_next:
             kt = _targets(include_launcher=True)
             _relaunch_state()
@@ -867,13 +929,16 @@ CONFIG_TEMPLATE = """\
       "auto_restart": true,
       "auto_restart_protected": false,
       "wrapped": true,
+      "stuck_after_seconds": 1200,
       "cwd": "REPLACE_WITH_PROJECT_DIR",
       "env": { "AGENTTALK_SELF": "AGENT_NAME_WRAPPED" },
       "launch": {
         "windows_file": "REPLACE: the PYTHON exe that runs agenttalk, e.g. C:\\\\Users\\\\you\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python314\\\\python.exe",
         "windows_args": ["-m", "agenttalk", "wrap", "--for", "AGENT_NAME_WRAPPED", "--cli", "codex", "--loop", "--", "REPLACE: the REAL codex.exe / claude.exe path - the wrapper drives it ONE turn per inbound message"]
       },
-      "_comment_wrapped": "WRAPPED agent (opt-in; the manual /agenttalk.listen agent above stays the default). Set wrapped=true to supervise the agent THROUGH `agenttalk wrap --loop`: windows_file is the PYTHON exe (NOT the CLI exe), windows_args is the FIXED wrap command, and the REAL codex.exe/claude.exe goes at the tail after '--' (it is what windows_file would be for a manual agent). NO {SESSION_ARGS} token - the wrapper owns session continuity end-to-end (it persists + reloads the codex thread_id / claude session-id across its own turns AND across a supervisor relaunch, so a restart re-runs the identical wrap argv and reload-resumes). The wrapper python IS the long-lived supervised root, so brain discovery is RETIRED for wrapped agents (brain_pid stays null); the per-turn child (codex exec / claude -p) is reaped via the start-guarded managed_pids tree-kill. activity_hook is NOT needed: a wrapped agent is instrumented by construction (heartbeat on every idle bus-wait cycle + on streaming progress), so a stale heartbeat past grace RECOVERS (restart) instead of warn-only. PER-CLI stuck_after ASYMMETRY (important): wrapped CLAUDE streams thinking + text deltas and stays fresh through reasoning, so it can run a TIGHT stuck_after_seconds; wrapped CODEX is ITEM-LEVEL (no token deltas) so a long pure-reasoning stretch is SILENT between turn.started and the final agent_message - its stuck_after_seconds MUST be >= the longest plausible pure-reasoning gap or restart-on-stale FALSE-KILLS it mid-reasoning. stuck_after_seconds is GLOBAL today, so a mixed wrapped roster must use the larger (codex) value; a per-CLI stuck_after default is a pending refinement. Do NOT set an aggressive stuck_after for a wrapped codex. KNOWN LIMITATION (banked future dead-letter item): a poison inbound message makes the loop fail the turn -> clear heartbeat -> stale -> supervisor restart -> reload-resume -> re-deliver the same message -> fail again; net is a SLOW restart loop throttled by supervisor backoff (base..cap) until a dead-letter / skip-after-N fix lands or an operator intervenes."
+      "_comment_wrapped": "WRAPPED agent (opt-in; the manual /agenttalk.listen agent above stays the default). Set wrapped=true to supervise the agent THROUGH `agenttalk wrap --loop`: windows_file is the PYTHON exe (NOT the CLI exe), windows_args is the FIXED wrap command, and the REAL codex.exe/claude.exe goes at the tail after '--' (it is what windows_file would be for a manual agent). NO {SESSION_ARGS} token - the wrapper owns session continuity end-to-end (it persists + reloads the codex thread_id / claude session-id across its own turns AND across a supervisor relaunch, so a restart re-runs the identical wrap argv and reload-resumes). The wrapper python IS the long-lived supervised root, so brain discovery is RETIRED for wrapped agents (brain_pid stays null); the per-turn child (codex exec / claude -p) is reaped via the start-guarded managed_pids tree-kill. activity_hook is NOT needed: a wrapped agent is instrumented by construction (heartbeat on every idle bus-wait cycle + on streaming progress), so a stale heartbeat past grace RECOVERS (restart) instead of warn-only.",
+      "_comment_wrapped_stuck_after": "PER-CLI stuck_after_seconds (a per-agent stuck_after_seconds override ALWAYS wins; the global stuck_after_seconds is only the legacy/unclassified fallback). Defaults when unset: wrapped CLAUDE=180s, wrapped CODEX=900s. WHY they differ: wrapped CLAUDE streams thinking+text+tool deltas and stays fresh through reasoning, so a tight threshold is fine; wrapped CODEX is ITEM-LEVEL (no exec --json event closes the pure-reasoning gap) so a long pure-reasoning stretch is SILENT between turn.started and the final agent_message. These are an OPERATIONAL false-positive tradeoff, NOT a provably-safe bound: pick the threshold above the longest pure-reasoning gap your codex role plausibly hits. For a heavy reasoning/refactor/review codex role (like this sample) 1200-1800s is the right template default - this example uses 1200. GUARDRAIL: for wrapped+codex the supervisor WARNS and REFUSES restart-on-stale (degrades to warn-only) when stuck_after_seconds is below 600s, UNLESS you set allow_low_stuck_after=true to opt in. The value is never silently coerced. DO NOT try to tighten codex with a synthetic active-turn timer heartbeat: no intermediate exec --json event exists to confirm progress, so a timer would mark a silently-wedged turn healthy forever and defeat restart authority - the only levers are the per-CLI threshold + per-agent overrides.",
+      "_comment_wrapped_limitation": "KNOWN LIMITATION (banked future dead-letter item): a poison inbound message makes the loop fail the turn -> clear heartbeat -> stale -> supervisor restart -> reload-resume -> re-deliver the same message -> fail again; net is a SLOW restart loop throttled by supervisor backoff (base..cap) until a dead-letter / skip-after-N fix lands or an operator intervenes."
     }
   }
 }
