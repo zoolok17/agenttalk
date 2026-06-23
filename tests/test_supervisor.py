@@ -1428,3 +1428,137 @@ def test_seed_codex_home_provisions_and_fails_closed(tmp_path: Path) -> None:
     assert r2.returncode == 0, f"{r2.stdout}{r2.stderr}"
     d2 = json.loads(out2.read_text(encoding="utf-8-sig"))
     assert not d2["home"], "missing auth must FAIL CLOSED (no home)"
+
+
+# ---------------------------------------- Phase C: wrapped:true (wrap --loop)
+#
+# A wrapped agent is supervised THROUGH `agenttalk wrap --loop`: the wrapper
+# (python) IS the long-lived root, so brain discovery is retired (brain_pid
+# stays None) but the per-turn child (codex exec / claude -p) is still reaped
+# via the start-guarded managed_pids tree-kill. Because the wrapper is
+# instrumented by construction (heartbeat on idle-wait + streaming progress), a
+# wrapped agent treats a stale heartbeat as confirm-stuck and RECOVERS without
+# the activity hook installed. Session continuity is owned by the wrapper, so
+# the supervisor injects NO session args (launch_mode "wrap", session_args []).
+
+WRAP_LAUNCHER_PID, WRAP_CHILD_PID = 300, 301
+
+_WRAP_CONFIG = {
+    "agents": {"worker": {"auto_restart": True, "cli": "codex", "wrapped": True}},
+    "backoff": {"base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180},
+    "launch_grace_seconds": 120,
+}
+
+
+def _wrap_snap(*, cli="codex", launcher_pid=WRAP_LAUNCHER_PID,
+               child_pid=WRAP_CHILD_PID, child_start="t-child"):
+    """A wrapped-agent snapshot: the python wrapper (launcher) + its per-turn CLI
+    child. The child is a real codex.exe/claude.exe row, so WITHOUT wrapping the
+    brain-discovery would mistake it for the long-lived brain - the wrapped path
+    must instead treat it as just a managed (reapable) descendant."""
+    name = "codex.exe" if cli == "codex" else "claude.exe"
+    return [
+        {"pid": launcher_pid, "parent_pid": 1, "name": "python.exe",
+         "command_line": f"python -m agenttalk wrap --for worker --cli {cli} --loop",
+         "start_time": "t-wrap"},
+        {"pid": child_pid, "parent_pid": launcher_pid, "name": name,
+         "command_line": f"{name} exec --json", "start_time": child_start},
+    ]
+
+
+def _wrap_ready(**over) -> dict:
+    st = {"launcher_pid": WRAP_LAUNCHER_PID, "launcher_start": "t-wrap",
+          "readiness_seen": True, "launching": False,
+          "last_launch_epoch": NOW - 1000}
+    st.update(over)
+    return st
+
+
+def _plan_wrap(report, state, *, now=NOW, snapshot=None, config=_WRAP_CONFIG):
+    snap = [] if snapshot is None else snapshot
+    return sup.plan_actions(report, state, config, now_epoch=now,
+                            snapshot=snap)["agents"]["worker"]
+
+
+def test_wrapped_liveness_retires_brain_keeps_managed() -> None:
+    snap = _wrap_snap()
+    lv = sup._liveness(snap, _wrap_ready(), {"cli": "codex", "wrapped": True},
+                       "worker", NOW)
+    assert lv["brain_pid"] is None and lv["brain_start"] is None
+    assert lv["discovered_brain"] is False
+    # the per-turn child is still tracked for the start-guarded tree-kill
+    pids = [m["pid"] for m in lv["managed_pids"]]
+    assert WRAP_CHILD_PID in pids
+    # CONTRAST: the SAME snapshot, NOT wrapped, discovers that codex.exe child as
+    # the brain - proving the wrapped path is what suppresses it.
+    lv2 = sup._liveness(snap, _wrap_ready(), {"cli": "codex"}, "worker", NOW)
+    assert lv2["brain_pid"] == WRAP_CHILD_PID and lv2["discovered_brain"] is True
+
+
+def test_wrapped_launch_detail_has_no_session_args() -> None:
+    for cli_name in ("codex", "claude"):
+        d = sup._launch_detail({"session_id": "x", "resume_available": True},
+                               {"cli": cli_name, "wrapped": True})
+        assert d["launch_mode"] == "wrap" and d["resume_mode"] == "wrap"
+        assert d["session_args"] == [] and d["session_id"] is None
+
+
+def test_wrapped_restart_on_stale_without_hook() -> None:
+    # The crux: a wrapped codex agent has NO activity_hook, yet a stale heartbeat
+    # past grace+backoff RECOVERS (the non-wrapped no-hook codex is SUSPECT_WARN -
+    # see test_stuck_recover_requires_hook_else_suspect).
+    p = _plan_wrap(_report(heartbeat_stale=True),
+                   {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
+                   snapshot=_wrap_snap())
+    assert p["action"] == sup.STUCK_RECOVER and p["state"] == "STUCK_OR_DEAD"
+    # the wrapper owns session: no fresh/resume branch, no session tokens
+    assert p["launch_mode"] == "wrap" and p["session_args"] == []
+    # the relaunch reaps the wrapper (launcher) AND the live per-turn child,
+    # every target start-guarded against pid reuse
+    assert p["kill_first"] is True
+    tpids = {t["pid"] for t in p["kill_targets"]}
+    assert WRAP_LAUNCHER_PID in tpids and WRAP_CHILD_PID in tpids
+    assert all("start" in t for t in p["kill_targets"])
+    assert p["next_state"]["brain_pid"] is None
+
+
+def test_wrapped_claude_also_recovers_on_stale_without_hook() -> None:
+    cfg = {**_WRAP_CONFIG,
+           "agents": {"worker": {"auto_restart": True, "cli": "claude",
+                                 "wrapped": True}}}
+    p = _plan_wrap(_report(heartbeat_stale=True),
+                   {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
+                   snapshot=_wrap_snap(cli="claude"), config=cfg)
+    assert p["action"] == sup.STUCK_RECOVER and p["session_args"] == []
+
+
+def test_wrapped_in_grace_does_not_request_brain_discovery() -> None:
+    st = {"agents": {"worker": _wrap_ready(launching=True, readiness_seen=False,
+                                           launch_grace_until=NOW + 60)}}
+    p = _plan_wrap(_report(heartbeat_stale=True), st, snapshot=_wrap_snap())
+    assert p["action"] == sup.NONE and p["state"] == "LAUNCHING"
+    assert p["discover_brain"] is False
+    # CONTRAST: a non-wrapped agent in grace DOES ask the executor to discover.
+    st2 = {"agents": {"worker": _ready(launching=True, readiness_seen=False,
+                                       launch_grace_until=NOW + 60)}}
+    p2 = _plan(_report(heartbeat_stale=True), st2, snapshot=_snap())
+    assert p2["state"] == "LAUNCHING" and p2["discover_brain"] is True
+
+
+def test_wrapped_healthy_idle_keeps_brain_none() -> None:
+    # a fresh heartbeat is healthy; the carried-through brain stays None (no
+    # discovery to preserve) while managed_pids still tracks the child.
+    p = _plan_wrap(_report(heartbeat_stale=False),
+                   {"agents": {"worker": _wrap_ready()}}, snapshot=_wrap_snap())
+    assert p["action"] == sup.NONE and p["state"] == "HEALTHY_IDLE"
+    assert p["next_state"]["brain_pid"] is None
+    assert [m["pid"] for m in p["next_state"]["managed_pids"]] == [WRAP_CHILD_PID]
+
+
+def test_config_template_ships_wrapped_example() -> None:
+    cfg = json.loads(sup.CONFIG_TEMPLATE)
+    w = cfg["agents"]["AGENT_NAME_WRAPPED"]
+    assert w["wrapped"] is True
+    args = w["launch"]["windows_args"]
+    assert "{SESSION_ARGS}" not in args          # wrapper owns session; no splice
+    assert args[:3] == ["-m", "agenttalk", "wrap"] and "--loop" in args

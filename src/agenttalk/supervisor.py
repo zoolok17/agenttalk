@@ -155,6 +155,15 @@ def _launch_detail(st: dict, cfg_agent: dict, perm_mode: str = "bypassPermission
     literal "{SESSION_ARGS}" element appears (array-element splice - each token is
     one argument, nothing needs quoting)."""
     cli = cfg_agent.get("cli", "claude")
+    if bool(cfg_agent.get("wrapped", False)):
+        # WRAPPED: launched THROUGH `agenttalk wrap --loop` with a FIXED argv (no
+        # {SESSION_ARGS} splice point). The wrapper owns session continuity
+        # end-to-end - it persists + reloads the codex thread_id / claude
+        # session-id across its own turns AND across a supervisor relaunch (a
+        # restart re-runs the identical wrap argv and the loop reload-resumes). So
+        # there is NO fresh/resume branch and NO session tokens to inject here.
+        return {"cli": cli, "launch_mode": "wrap", "session_id": None,
+                "resume_mode": "wrap", "session_args": []}
     session_id = st.get("session_id") or None
     # codex review (impl r1 MAJOR): resume must mean "reached readiness once".
     # For codex, drive it ONLY from resume_available - legacy `launched` is set at
@@ -435,6 +444,22 @@ def _liveness(snapshot: list[dict] | None, st: dict, cfg_agent: dict,
     allow_launcher_self = bool(lcfg.get("allow_launcher_self", False))
     launcher_pid = st.get("launcher_pid")
     prior = st.get("managed_pids") or []
+    if bool(lcfg.get("wrapped", False)):
+        # WRAPPED agent (launched THROUGH `agenttalk wrap --loop`): the wrapper
+        # (python) IS the long-lived root = launcher_pid, so there is no forking
+        # TUI to find and brain discovery is RETIRED (brain_pid stays None).
+        # Heartbeat freshness is the liveness authority; managed_pids still tracks
+        # the per-turn child (a launcher-tree descendant) so the start-guarded
+        # tree-kill can reap it. allow_launcher_self / brain_pattern are moot here.
+        managed = _launcher_managed_set(idx, launcher_pid, agent, now_epoch,
+                                        launch_epoch=st.get("last_launch_epoch"),
+                                        prior=prior)
+        wait_alive = (_wait_row_for(idx, agent) is not None
+                      or any(m.get("kind") == "wait" for m in managed))
+        return {"snapshot_available": True, "brain_pid": None,
+                "brain_start": None, "brain_alive": False,
+                "wait_alive": wait_alive, "managed_pids": managed,
+                "discovered_brain": False}
     brain_pid = st.get("brain_pid")
     brain_start = st.get("brain_start")
     # STALE-STATE REPAIR (test #4): a stored brain_pid == the LAUNCHER on a
@@ -477,7 +502,7 @@ def _liveness_cfg(cfg_agent: dict) -> dict:
     cli = cfg_agent.get("cli", "claude")
     base = dict(_LIVENESS_DEFAULTS.get(cli, _LIVENESS_DEFAULTS["claude"]))
     for k in ("requires_brain_pid", "brain_pattern", "codex_home_isolation",
-              "windows_sandbox", "allow_launcher_self"):
+              "windows_sandbox", "allow_launcher_self", "wrapped"):
         if k in cfg_agent:
             base[k] = cfg_agent[k]
     return base
@@ -565,6 +590,20 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     grace_seconds = float(config.get("launch_grace_seconds", _DEFAULTS["launch_grace_seconds"]))
     activity_hook = bool(cfg_agent.get("activity_hook", False))
     _lcfg = _liveness_cfg(cfg_agent)
+    # A WRAPPED agent is instrumented BY CONSTRUCTION: the wrap --loop loop writes
+    # a heartbeat on every idle bus-wait cycle AND the engine stamps on streaming
+    # progress during a turn, so a stale heartbeat genuinely means stuck/dead.
+    # That makes wrapped a "can confirm stuck" signal exactly like activity_hook -
+    # so wrapped agents recover on stale (instead of warn-only) without needing the
+    # PostToolUse hook installed. CAVEAT (per-CLI, documented in CONFIG_TEMPLATE):
+    # wrapped CODEX is item-level (no token deltas), so a long pure-reasoning
+    # stretch is silent between turn.started and the final agent_message - its
+    # stuck_after_seconds must exceed the longest plausible reasoning gap or
+    # restart-on-stale false-kills it mid-reasoning. Wrapped CLAUDE streams
+    # thinking deltas and stays fresh through reasoning. stuck_after stays a config
+    # knob (never hardcoded here); see the wrapped config comment.
+    wrapped = bool(_lcfg.get("wrapped", False))
+    can_confirm_stuck = activity_hook or wrapped
     # the EFFECTIVE isolation flag (per-CLI default merged) - emitted in the plan
     # so the executor seeds CODEX_HOME exactly when the planner assumed it, even
     # if the raw config omits the field (codex impl-review MAJOR).
@@ -679,19 +718,20 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     # 1) LAUNCHING: still in grace with readiness unresolved. Launcher death and
     # missing/incorrect brain discovery are irrelevant during startup.
     if in_grace:
-        return _result(NONE, state="LAUNCHING", discover_brain=True,
+        return _result(NONE, state="LAUNCHING", discover_brain=not wrapped,
                        reason="in launch grace; awaiting first fresh heartbeat")
 
-    # 2) STUCK_OR_DEAD: heartbeat stale past grace. With the activity hook on,
-    # stale means the agent is neither waiting nor completing tools; restart.
-    # Without that hook, a long working turn would not heartbeat, so keep the
-    # existing warn-only safety behavior.
+    # 2) STUCK_OR_DEAD: heartbeat stale past grace. With the activity hook on (or a
+    # WRAPPED agent, instrumented by construction), stale means the agent is
+    # neither waiting nor completing tools; restart. Without either signal, a long
+    # working turn would not heartbeat, so keep the existing warn-only safety
+    # behavior.
     if hb_stale:
         if protected:
             nxt["last_warn_epoch"] = now_epoch
             return _result(WARN_ONLY, state="STUCK_OR_DEAD", notify=True,
                            reason="protected agent heartbeat stale - recover manually")
-        if not activity_hook:
+        if not can_confirm_stuck:
             if now_epoch - last_warn >= suspect_interval:
                 nxt["last_warn_epoch"] = now_epoch
                 return _result(SUSPECT_WARN, state="ACTIVE_OR_BUSY",
@@ -821,6 +861,19 @@ CONFIG_TEMPLATE = """\
       "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS. The native codex.exe is also a FORKING launcher whose pid dies after handoff, so the supervisor records a discovered long-lived brain_pid only for session repair and scoped cleanup; heartbeat freshness is the liveness authority. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor runs Start-Process -FilePath <file> -ArgumentList <args> -WorkingDirectory <cwd> -PassThru AFTER applying env (AGENTTALK_ROOT + PYTHONPATH=<repo>/src on a source checkout + the per-agent env). The in-sandbox agent reaches the bus via `python -m agenttalk` (bare python + src on PYTHONPATH), NOT a baked absolute python and NOT the .agenttalk/bin shim - those stay SUPERVISOR-only (the supervisor's own bus calls). No Invoke-Expression.",
       "_comment_liveness": "heartbeat freshness is the liveness authority: fresh heartbeat is healthy; stale heartbeat recovers only when activity_hook=true, otherwise warn-only. Process snapshots, brain_pattern, and allow_launcher_self only help record session metadata and choose scoped kill targets. requires_brain_pid is retained as an accepted legacy key and no longer gates restart decisions. codex_home_isolation=true (recommended for codex when other codex run in the same project dir): launch with a per-agent SEEDED CODEX_HOME so `resume --last` is unambiguous. allow_launcher_self: set FALSE for a FORKING launcher (codex.exe spawns the real TUI then exits); TRUE when the launched exe IS the long-lived process.",
       "_comment_activity_hook": "Set activity_hook=true ONLY after installing the PostToolUse/Codex hook (supervise --install-activity-hook). Until then a stale heartbeat is warn-only (suspect), never a kill - so an un-instrumented agent is never mistaken for stuck."
+    },
+    "AGENT_NAME_WRAPPED": {
+      "cli": "codex",
+      "auto_restart": true,
+      "auto_restart_protected": false,
+      "wrapped": true,
+      "cwd": "REPLACE_WITH_PROJECT_DIR",
+      "env": { "AGENTTALK_SELF": "AGENT_NAME_WRAPPED" },
+      "launch": {
+        "windows_file": "REPLACE: the PYTHON exe that runs agenttalk, e.g. C:\\\\Users\\\\you\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python314\\\\python.exe",
+        "windows_args": ["-m", "agenttalk", "wrap", "--for", "AGENT_NAME_WRAPPED", "--cli", "codex", "--loop", "--", "REPLACE: the REAL codex.exe / claude.exe path - the wrapper drives it ONE turn per inbound message"]
+      },
+      "_comment_wrapped": "WRAPPED agent (opt-in; the manual /agenttalk.listen agent above stays the default). Set wrapped=true to supervise the agent THROUGH `agenttalk wrap --loop`: windows_file is the PYTHON exe (NOT the CLI exe), windows_args is the FIXED wrap command, and the REAL codex.exe/claude.exe goes at the tail after '--' (it is what windows_file would be for a manual agent). NO {SESSION_ARGS} token - the wrapper owns session continuity end-to-end (it persists + reloads the codex thread_id / claude session-id across its own turns AND across a supervisor relaunch, so a restart re-runs the identical wrap argv and reload-resumes). The wrapper python IS the long-lived supervised root, so brain discovery is RETIRED for wrapped agents (brain_pid stays null); the per-turn child (codex exec / claude -p) is reaped via the start-guarded managed_pids tree-kill. activity_hook is NOT needed: a wrapped agent is instrumented by construction (heartbeat on every idle bus-wait cycle + on streaming progress), so a stale heartbeat past grace RECOVERS (restart) instead of warn-only. PER-CLI stuck_after ASYMMETRY (important): wrapped CLAUDE streams thinking + text deltas and stays fresh through reasoning, so it can run a TIGHT stuck_after_seconds; wrapped CODEX is ITEM-LEVEL (no token deltas) so a long pure-reasoning stretch is SILENT between turn.started and the final agent_message - its stuck_after_seconds MUST be >= the longest plausible pure-reasoning gap or restart-on-stale FALSE-KILLS it mid-reasoning. stuck_after_seconds is GLOBAL today, so a mixed wrapped roster must use the larger (codex) value; a per-CLI stuck_after default is a pending refinement. Do NOT set an aggressive stuck_after for a wrapped codex. KNOWN LIMITATION (banked future dead-letter item): a poison inbound message makes the loop fail the turn -> clear heartbeat -> stale -> supervisor restart -> reload-resume -> re-deliver the same message -> fail again; net is a SLOW restart loop throttled by supervisor backoff (base..cap) until a dead-letter / skip-after-N fix lands or an operator intervenes."
     }
   }
 }
