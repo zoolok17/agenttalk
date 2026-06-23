@@ -672,12 +672,15 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     perm_mode = claude_permission_mode(config, cfg_agent)  # Claude unattended mode
 
     protected = bool(rpt.get("protected"))
-    # build_report computes heartbeat_stale with the GLOBAL threshold (it sees only
-    # the bus roster, not the supervisor per-agent cli/wrapped config). For a
-    # WRAPPED agent the planner re-derives staleness from the reported age against
-    # its per-CLI threshold (a codex must tolerate a long silent reasoning gap);
-    # non-wrapped agents keep the report's global decision unchanged. A wrapped
-    # agent that never heartbeated (age None) keeps the report's stale=True.
+    # build_report computes heartbeat_stale per-agent when it is given the
+    # supervisor_config (cmd_supervise passes it), but a legacy/global report (no
+    # supervisor_config) uses the single global threshold. The planner is the
+    # safety authority, so for a WRAPPED agent it ALWAYS re-derives staleness from
+    # the reported age against its per-CLI threshold (a codex must tolerate a long
+    # silent reasoning gap) - harmless when the report already matched, and the
+    # backstop when a global report file is supplied. Non-wrapped agents keep the
+    # report's decision unchanged. A wrapped agent that never heartbeated (age
+    # None) keeps the report's stale=True.
     hb_stale = bool(rpt.get("heartbeat_stale"))
     if wrapped:
         hb_age = rpt.get("heartbeat_age_seconds")
