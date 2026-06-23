@@ -958,9 +958,15 @@ def test_ps_template_seeds_preflights_and_drops_baked_python_for_agent() -> None
     # not fail closed on a checkout where agenttalk is not globally installed.
     pf = ps[ps.index("function Preflight"):]
     pf = pf[:pf.index("\ndo {")]                            # the Preflight body
-    codex_branch = pf[pf.index("$plan.cli -eq 'codex'"):pf.index("} else {")]
+    ci = pf.index("$plan.cli -eq 'codex'")
+    codex_branch = pf[ci:pf.index("} else {", ci)]          # from codex to the codex/claude divider
     assert "'src') + ';' + $env:PYTHONPATH" in codex_branch
     assert "& $file sandbox -P :workspace -C $Root python -m agenttalk --version" in codex_branch
+    # Phase C: a WRAPPED agent ($file is python, not the CLI) is preflighted BEFORE
+    # the codex branch and validates the python wrapper, NOT the codex sandbox.
+    wrap_branch = pf[pf.index("$plan.launch_mode -eq 'wrap'"):ci]
+    assert "& $file -m agenttalk --version" in wrap_branch
+    assert "& $file sandbox" not in wrap_branch    # never treats $file as the codex CLI
 
 
 # ---------------------------------------- WP-3: heartbeat command (throttled)
@@ -1649,3 +1655,54 @@ def test_report_parity_wrapped_codex_uses_per_cli_threshold(tmp_path: Path) -> N
     assert parity["agents"]["worker"]["stuck_after_seconds"] == 900.0
     # a non-wrapped agent in the same report keeps the global threshold
     assert parity["agents"]["lead"]["stuck_after_seconds"] == 120.0
+
+
+def _stub_cmd(path: Path, log: Path) -> None:
+    """A fake CLI executable: append its args to ``log`` and exit 0. Lets the
+    Preflight RUNTIME test assert WHICH invocation ran without a real codex/python."""
+    path.write_text(f'@echo off\r\n>>"{log}" echo %*\r\nexit /b 0\r\n', encoding="utf-8")
+
+
+def test_preflight_wrapped_codex_validates_python_not_codex_sandbox(tmp_path: Path) -> None:
+    """reviewer-1 P1 (RUNTIME): for a wrapped agent windows_file is PYTHON, not the
+    CLI, so Preflight must smoke-test `& $file -m agenttalk --version` and NOT
+    `& $file sandbox ...` - otherwise `python.exe sandbox` exits nonzero and the
+    wrapped:true launch fails closed before Launch(). Drives the EXACT shipped
+    Preflight (extracted from the generated .ps1)."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)        # includes function Preflight
+    wlog, clog = tmp_path / "wrap.log", tmp_path / "codex.log"
+    wstub, cstub = tmp_path / "pywrap.cmd", tmp_path / "codexcli.cmd"
+    _stub_cmd(wstub, wlog)
+    _stub_cmd(cstub, clog)
+    out = tmp_path / "pf.json"
+    preamble = [f"$Root = {_pslit(str(tmp_path))}", "$SrcOnPyPath = $false"]
+    harness = "\n".join([
+        helpers, *preamble,
+        # wrapped codex: $file is the python wrapper stub; launch_mode 'wrap'
+        f"$wrapOk = Preflight 'wrapped-codex' (@{{ cli='codex'; launch_mode='wrap' }}) {_pslit(str(wstub))} $null",
+        # non-wrapped codex contrast: the real codex sandbox smoke-test branch
+        f"$codexOk = Preflight 'plain-codex' (@{{ cli='codex'; launch_mode='resume' }}) {_pslit(str(cstub))} $null",
+        # only the return values via JSON; the stubs logged their argv to files we
+        # read directly in Python (Get-Content -Raw decorates the string, which
+        # ConvertTo-Json then mangles into an object).
+        "@{ wrapOk=$wrapOk; codexOk=$codexOk } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(out))} -Encoding utf8",
+    ])
+    hp = tmp_path / "pf_harness.ps1"
+    hp.write_text(harness, encoding="utf-8-sig")
+    res = subprocess.run([shell, "-NoProfile", "-File", str(hp)],
+                         capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, f"{res.stdout}{res.stderr}"
+    d = json.loads(out.read_text(encoding="utf-8-sig"))
+    wrap_args = wlog.read_text(encoding="utf-8") if wlog.exists() else ""
+    codex_args = clog.read_text(encoding="utf-8") if clog.exists() else ""
+    # wrapped codex: preflight PASSES, ran `-m agenttalk --version`, NEVER `sandbox`
+    assert d["wrapOk"] is True
+    assert "-m agenttalk --version" in wrap_args
+    assert "sandbox" not in wrap_args
+    # non-wrapped codex contrast: the sandbox smoke-test DID run (branch divergence)
+    assert d["codexOk"] is True
+    assert "sandbox" in codex_args

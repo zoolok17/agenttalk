@@ -1114,6 +1114,27 @@ function Preflight($name, $plan, $file, $codexHome) {
   # BEFORE we launch - so a broken config FAILS CLOSED here instead of burning
   # the launch grace in a relaunch loop. Returns $true on success.
   try {
+    if ($plan.launch_mode -eq 'wrap') {
+      # WRAPPED agent: $file is the PYTHON wrapper exe (it runs `agenttalk wrap
+      # --loop`), NOT the CLI - so smoke-test that THIS python can import agenttalk
+      # in the launch env (PYTHONPATH src on a checkout; the seeded CODEX_HOME
+      # applied for a wrapped codex so the env matches what the wrapper's child
+      # codex inherits). Do NOT run the codex CLI smoke-test here - $file is
+      # python, not codex (using $file also validates the CONFIGURED wrapper
+      # python for a wrapped claude, not the ambient python).
+      $saved = $env:CODEX_HOME; $savedPP = $env:PYTHONPATH
+      if ($codexHome) { $env:CODEX_HOME = $codexHome }
+      if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
+      try {
+        & $file -m agenttalk --version | Out-Null
+        $rc = $LASTEXITCODE
+      } finally {
+        if ($null -eq $saved) { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue } else { $env:CODEX_HOME = $saved }
+        if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP }
+      }
+      if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - wrapped preflight (python -m agenttalk --version) exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
+      return $true
+    }
     if ($plan.cli -eq 'codex') {
       # run `python -m agenttalk --version` INSIDE codex's workspace sandbox with
       # the seeded home - exactly how the supervised agent will reach the bus.
