@@ -369,3 +369,29 @@ def test_run_wrapper_unknown_cli_raises() -> None:
     # codex + claude are registered (Phase 1 + 2); an unknown CLI has no adapter.
     with pytest.raises(ValueError):
         run.run_wrapper(cli="gemini", agent="w", argv=["gemini"], line_source=[])
+
+
+def test_procstream_decodes_utf8_and_replaces_bad_bytes() -> None:
+    """Dogfood P0 regression: the wrapper read the child's stdout in text mode with
+    no explicit encoding, so on Windows it decoded UTF-8 as cp1252 and CRASHED on
+    the first non-ASCII byte (a smart quote). _ProcStream now pins utf-8/replace.
+    Drive a REAL child emitting smart quotes + em-dash + emoji + a LONE invalid byte
+    and assert: no crash, correct decode, the bad byte becomes the replacement char.
+    (The smart double-quote U+201D is E2 80 9D - its 3rd byte 0x9d is exactly what
+    crashed the dogfood; a WELL-FRAMED 0x9d decodes fine while a LONE 0x9d is
+    replaced.)"""
+    import sys
+    payload = "“it’s” — done \U0001f600"  # curly quotes, em-dash, emoji
+    code = (
+        "import sys; "
+        f"sys.stdout.buffer.write({payload!r}.encode('utf-8')); "
+        "sys.stdout.buffer.write(b'\\x9d'); "   # LONE invalid byte -> must be replaced
+        "sys.stdout.buffer.write(b'\\n'); "
+        "sys.stdout.buffer.flush()"
+    )
+    stream = run._ProcStream([sys.executable, "-c", code], None)
+    text = "".join(stream)            # must NOT raise UnicodeDecodeError
+    assert stream.returncode == 0
+    for ch in ("“", "’", "”", "—", "\U0001f600"):
+        assert ch in text             # every well-framed UTF-8 char decoded intact
+    assert "�" in text           # the lone 0x9d became the replacement char

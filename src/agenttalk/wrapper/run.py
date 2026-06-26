@@ -141,9 +141,14 @@ def run_wrapper(
         return 0
 
     # argv is the operator-provided launch command; never shell=True.
+    # encoding/errors are EXPLICIT: codex/claude emit UTF-8, but text=True alone
+    # decodes child stdout via the platform default (cp1252 on Windows) and CRASHES
+    # on the first non-ASCII byte (e.g. a smart quote). errors="replace" means a
+    # genuinely malformed byte renders a replacement char instead of killing the
+    # wrapper. In text mode this also governs the stdin prompt write.
     proc = subprocess.Popen(  # noqa: S603  # nosec B603
         argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        bufsize=1,
+        encoding="utf-8", errors="replace", bufsize=1,
     )
     try:
         engine.run(parse_lines(proc.stdout or [], mapper), clock)
@@ -163,9 +168,13 @@ class _ProcStream:
 
     def __init__(self, argv: list[str], stdin_text: str | None) -> None:
         # argv is the operator-provided launch command; never shell=True.
+        # Explicit encoding/errors (see run_wrapper): UTF-8 child output must not be
+        # decoded as cp1252 on Windows (crash on the first non-ASCII byte), and a
+        # malformed byte must be replaced, not fatal. Governs the stdin prompt too.
         self._proc = subprocess.Popen(  # noqa: S603  # nosec B603
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, bufsize=1,
+            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+            bufsize=1,
         )
         if self._proc.stdin is not None:
             if stdin_text is not None:

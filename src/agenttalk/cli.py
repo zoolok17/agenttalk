@@ -3549,6 +3549,16 @@ def cmd_wrap(args: argparse.Namespace) -> int:
     """
     from .wrapper import run as wrapper_run
 
+    # The wrapper renders the child's (UTF-8) progress to ITS OWN stdout; on Windows
+    # that stream defaults to cp1252 and would mojibake/raise on non-ASCII. This is a
+    # dedicated `wrap` process, so reconfiguring its stdout to utf-8/replace is safe.
+    _reconf = getattr(sys.stdout, "reconfigure", None)
+    if callable(_reconf):
+        try:
+            _reconf(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass  # already detached / not reconfigurable -> render is best-effort
+
     store = _get_store(args)
     roster = store.load_config().get("agents") or []
     agent = _resolve_self(args.agent, roster=roster)
