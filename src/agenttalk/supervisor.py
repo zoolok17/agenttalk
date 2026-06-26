@@ -170,7 +170,20 @@ def session_args(cli: str, mode: str, session_id: str | None,
         if session_id and t == "{SESSION_ID}":
             return session_id
         return t
-    return [_sub(t) for t in tokens]
+    result = [_sub(t) for t in tokens]
+    # codex hook-trust (0.31.1): when the codex activity hook is installed
+    # (activity_hook=true), the `heartbeat --hook` command's changed HASH
+    # re-triggers codex's hook-trust review, which PROMPTS and would strand an
+    # unattended non-wrapped codex before its first heartbeat. Inject the
+    # documented GLOBAL --dangerously-bypass-hook-trust (prepended, so it sits
+    # BEFORE the subcommand) so the supervisor's OWN agenttalk hook runs
+    # un-prompted. A wrapped codex never reaches here (launch_mode=wrap returns
+    # session_args=[]); a codex without the activity hook has no prompt to bypass;
+    # an operator who already added the flag is not double-flagged.
+    if (cli == "codex" and (cfg_agent or {}).get("activity_hook")
+            and "--dangerously-bypass-hook-trust" not in result):
+        result = ["--dangerously-bypass-hook-trust", *result]
+    return result
 
 
 def claude_permission_mode(config: dict, cfg_agent: dict) -> str:
@@ -942,7 +955,7 @@ CONFIG_TEMPLATE = """\
       },
       "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS. The native codex.exe is also a FORKING launcher whose pid dies after handoff, so the supervisor records a discovered long-lived brain_pid only for session repair and scoped cleanup; heartbeat freshness is the liveness authority. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor runs Start-Process -FilePath <file> -ArgumentList <args> -WorkingDirectory <cwd> -PassThru AFTER applying env (AGENTTALK_ROOT + PYTHONPATH=<repo>/src on a source checkout + the per-agent env). The in-sandbox agent reaches the bus via `python -m agenttalk` (bare python + src on PYTHONPATH), NOT a baked absolute python and NOT the .agenttalk/bin shim - those stay SUPERVISOR-only (the supervisor's own bus calls). No Invoke-Expression.",
       "_comment_liveness": "heartbeat freshness is the liveness authority: fresh heartbeat is healthy; stale heartbeat recovers only when activity_hook=true, otherwise warn-only. Process snapshots, brain_pattern, and allow_launcher_self only help record session metadata and choose scoped kill targets. requires_brain_pid is retained as an accepted legacy key and no longer gates restart decisions. codex_home_isolation=true (recommended for codex when other codex run in the same project dir): launch with a per-agent SEEDED CODEX_HOME so `resume --last` is unambiguous. allow_launcher_self: set FALSE for a FORKING launcher (codex.exe spawns the real TUI then exits); TRUE when the launched exe IS the long-lived process.",
-      "_comment_activity_hook": "Set activity_hook=true ONLY after installing the PostToolUse/Codex hook (supervise --install-activity-hook). Until then a stale heartbeat is warn-only (suspect), never a kill - so an un-instrumented agent is never mistaken for stuck."
+      "_comment_activity_hook": "Set activity_hook=true ONLY after installing the PostToolUse/Codex hook (supervise --install-activity-hook). Until then a stale heartbeat is warn-only (suspect), never a kill - so an un-instrumented agent is never mistaken for stuck. The hook runs `agenttalk heartbeat --hook` (soft: it can never block a tool call). For a NON-wrapped codex agent with activity_hook=true, the supervisor adds the GLOBAL --dangerously-bypass-hook-trust to the codex launch: the installed agenttalk hook changes codex's hook-trust hash and would otherwise PROMPT to re-trust on every unattended launch and strand the agent. This bypasses hook-trust for the supervisor's OWN hook, for controlled UNATTENDED supervision only (a wrapped codex does not use the activity hook and is unaffected)."
     },
     "AGENT_NAME_WRAPPED": {
       "cli": "codex",

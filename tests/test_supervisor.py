@@ -474,8 +474,11 @@ def test_codex_relaunch_command_uses_codex_args() -> None:
                            "readiness_seen": True, "resume_available": True}}}
     p = sup.plan_actions(rpt, st, cfg, now_epoch=NOW, snapshot=snap)["agents"]["c"]
     assert p["cli"] == "codex" and p["launch_mode"] == "resume"
-    assert p["session_args"] == ["resume", "--last", "-a", "never", "-s",
-                                 "workspace-write", "$agenttalk-listen"]
+    # activity_hook=true codex -> the GLOBAL --dangerously-bypass-hook-trust is
+    # prepended (before the `resume` subcommand) so the changed hook hash does not
+    # strand the unattended launch (0.31.1); the rest is the codex resume args.
+    assert p["session_args"] == ["--dangerously-bypass-hook-trust", "resume", "--last",
+                                 "-a", "never", "-s", "workspace-write", "$agenttalk-listen"]
     assert "--session-id" not in p["session_args"]
 
 
@@ -1718,6 +1721,52 @@ def test_report_parity_wrapped_codex_uses_per_cli_threshold(tmp_path: Path) -> N
     assert parity["agents"]["worker"]["stuck_after_seconds"] == 900.0
     # a non-wrapped agent in the same report keeps the global threshold
     assert parity["agents"]["lead"]["stuck_after_seconds"] == 120.0
+
+
+# ---------- 0.31.1: codex hook-trust bypass for non-wrapped codex + activity_hook
+
+def test_session_args_codex_activity_hook_injects_bypass_hook_trust() -> None:
+    """A non-wrapped codex with the activity hook installed gets the GLOBAL
+    --dangerously-bypass-hook-trust PREPENDED (before the subcommand), so the
+    changed hook hash never strands an unattended launch on a trust prompt."""
+    fresh = sup.session_args("codex", "fresh", None, {"activity_hook": True})
+    assert fresh[0] == "--dangerously-bypass-hook-trust"   # global flag, before -a / prompt
+    resume = sup.session_args("codex", "resume", None, {"activity_hook": True})
+    assert resume[0] == "--dangerously-bypass-hook-trust"  # before the `resume` subcommand
+    assert resume[1] == "resume"
+    # no activity hook -> no installed hook -> no prompt to bypass -> flag ABSENT
+    assert "--dangerously-bypass-hook-trust" not in sup.session_args(
+        "codex", "fresh", None, {"activity_hook": False})
+    assert "--dangerously-bypass-hook-trust" not in sup.session_args(
+        "codex", "fresh", None, None)
+    # claude is unaffected (codex-only)
+    assert "--dangerously-bypass-hook-trust" not in sup.session_args(
+        "claude", "fresh", "sid", {"activity_hook": True})
+    # idempotent: an operator who already put it in a session override is not doubled
+    over = {"activity_hook": True,
+            "session": {"fresh": ["--dangerously-bypass-hook-trust", "-a", "never", "x"]}}
+    assert sup.session_args("codex", "fresh", None, over).count(
+        "--dangerously-bypass-hook-trust") == 1
+
+
+def test_plan_nonwrapped_codex_hook_relaunch_carries_bypass() -> None:
+    cfg = {"agents": {"worker": {"auto_restart": True, "cli": "codex",
+                                 "activity_hook": True}},
+           "backoff": {"base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180},
+           "launch_grace_seconds": 120}
+    p = sup.plan_actions(_report(heartbeat_stale=True),
+                         {"agents": {"worker": _ready(backoff_next_epoch=0)}},
+                         cfg, now_epoch=NOW, snapshot=_snap())["agents"]["worker"]
+    assert p["action"] == sup.STUCK_RECOVER
+    assert "--dangerously-bypass-hook-trust" in p["session_args"]
+
+
+def test_plan_wrapped_codex_has_no_bypass_flag() -> None:
+    # wrapped codex owns its session (session_args=[]); no hook, no bypass flag.
+    p = _plan_wrap(_report(heartbeat_stale=True),
+                   {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
+                   snapshot=_wrap_snap())
+    assert "--dangerously-bypass-hook-trust" not in (p["session_args"] or [])
 
 
 def _stub_cmd(path: Path, log: Path) -> None:
