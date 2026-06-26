@@ -24,6 +24,7 @@ from agenttalk.store import (
     validate_rescind,
 )
 from agenttalk import capacity as capmod
+from agenttalk import domains as dom
 from agenttalk import transcript as tx
 from agenttalk import codex_config as cxc
 from agenttalk import doctor as dr
@@ -1962,6 +1963,143 @@ def cmd_roster(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_domain_registry(store: Store) -> dom.Registry:
+    return dom.load_registry(store.dir / dom.FILENAME, store.load_config())
+
+
+def _domain_ref_text(label: str, refset: dict, cfg: dict) -> str:
+    parts: list[str] = []
+    for key in ("agents", "groups", "roles"):
+        values = refset.get(key) or []
+        if values:
+            parts.append(f"{key}={','.join(values)}")
+    resolved = dom.resolve_refset(refset, cfg)
+    suffix = f" -> {', '.join(resolved)}" if resolved else ""
+    return f"{label}: {'; '.join(parts) if parts else '-'}{suffix}"
+
+
+def cmd_domain(args: argparse.Namespace) -> int:
+    """View and validate the durable domain registry.
+
+    Phase 0 is intentionally read-only: users can hand-edit
+    ``.agenttalk/domains.json`` and use these pure-core commands to inspect and
+    validate it. Lane/knowledge/lease mutation is deliberately out of scope.
+    """
+    store = _get_store(args)
+    registry = _load_domain_registry(store)
+    cfg = store.load_config()
+    action = getattr(args, "domain_cmd", None) or "list"
+    domains = registry.data["domains"]
+
+    if action == "validate":
+        payload = {
+            "valid": True,
+            "source_exists": registry.source_exists,
+            "path": str(registry.path),
+            "registry_hash": registry.registry_hash,
+            "domain_count": len(domains),
+            "shared_path_count": len(registry.data["shared_paths"]),
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2))
+        else:
+            source = str(registry.path) if registry.source_exists else f"{registry.path} (missing; empty registry)"
+            print(
+                f"domain registry: valid ({payload['domain_count']} domains, "
+                f"{payload['shared_path_count']} shared paths)"
+            )
+            print(f"  source: {source}")
+            print(f"  hash: {registry.registry_hash}")
+        return 0
+
+    if action == "list":
+        items = [
+            {
+                "id": domain_id,
+                "title": entry["title"],
+                "owned_glob_count": len(entry["owned_globs"]),
+            }
+            for domain_id, entry in domains.items()
+        ]
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "registry_hash": registry.registry_hash,
+                "source_exists": registry.source_exists,
+                "domains": items,
+            }, indent=2))
+        else:
+            print(f"domains ({len(items)})  hash={registry.registry_hash}")
+            if not registry.source_exists:
+                print(f"  {registry.path} is missing; showing an empty registry")
+            for item in items:
+                print(
+                    f"  {item['id']}  {item['title']} "
+                    f"({item['owned_glob_count']} owned glob"
+                    f"{'s' if item['owned_glob_count'] != 1 else ''})"
+                )
+        return 0
+
+    if action == "show":
+        domain_id = args.domain_id
+        if domain_id not in domains:
+            raise ValueError(f"unknown domain {domain_id!r} (known: {sorted(domains)})")
+        entry = domains[domain_id]
+        if getattr(args, "json", False):
+            payload = dict(entry)
+            payload["id"] = domain_id
+            payload["resolved"] = {
+                "owners": dom.resolve_refset(entry["owners"], cfg),
+                "reviewers": dom.resolve_refset(entry["reviewers"], cfg),
+                "curators": dom.resolve_refset(entry["curators"], cfg),
+            }
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"domain {domain_id}: {entry['title']}")
+            if entry.get("description"):
+                print(f"  description: {entry['description']}")
+            print(f"  {_domain_ref_text('owners', entry['owners'], cfg)}")
+            print(f"  {_domain_ref_text('reviewers', entry['reviewers'], cfg)}")
+            print(f"  {_domain_ref_text('curators', entry['curators'], cfg)}")
+            print("  owned_globs:")
+            for glob in entry["owned_globs"]:
+                print(f"    - {glob}")
+        return 0
+
+    if action == "check-path":
+        verdicts = dom.check_paths(
+            registry.data, args.paths, casefold_paths=getattr(args, "casefold_paths", None),
+        )
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "registry_hash": registry.registry_hash,
+                "paths": verdicts,
+            }, indent=2))
+        else:
+            for verdict in verdicts:
+                if verdict["overlap"]:
+                    status = "OVERLAP"
+                elif verdict["owned"]:
+                    status = "owned"
+                else:
+                    status = "UNOWNED"
+                bits: list[str] = []
+                if verdict["domains"]:
+                    bits.append("domains=" + ",".join(verdict["domains"]))
+                if verdict["shared_paths"]:
+                    shared = [
+                        f"{m['glob']}[{m['category']}:{m['requires']}]"
+                        for m in verdict["shared_paths"]
+                    ]
+                    bits.append("shared=" + ",".join(shared))
+                if verdict["casefold_paths"]:
+                    bits.append("casefold=true")
+                suffix = f"  {'; '.join(bits)}" if bits else ""
+                print(f"{verdict['path']}: {status}{suffix}")
+        return 0
+
+    raise ValueError(f"unknown domain action {action!r}")
+
+
 def _do_recv(
     store: Store,
     agent: str,
@@ -3875,6 +4013,47 @@ def build_parser() -> argparse.ArgumentParser:
     r_of.add_argument("--clear", action="store_true",
                       help="Remove the operator-facing designation.")
     r_of.set_defaults(func=cmd_roster)
+
+    pdom = sub.add_parser(
+        "domain",
+        help="View and validate the durable domain registry used by native "
+             "lanes and knowledge. Phase 0 is read-only: no lane/knowledge "
+             "state is created.",
+    )
+    pdom.add_argument("--json", action="store_true",
+                      help="(default list) machine-readable domain registry summary.")
+    pdom.set_defaults(func=cmd_domain, domain_cmd="list")
+    dsub = pdom.add_subparsers(dest="domain_cmd")
+    d_list = dsub.add_parser("list", help="List domains in .agenttalk/domains.json.")
+    d_list.add_argument("--json", action="store_true",
+                        default=argparse.SUPPRESS,
+                        help="Emit structured JSON instead of human-readable text.")
+    d_list.set_defaults(func=cmd_domain)
+    d_show = dsub.add_parser("show", help="Show one domain and resolved refs.")
+    d_show.add_argument("domain_id")
+    d_show.add_argument("--json", action="store_true",
+                        default=argparse.SUPPRESS,
+                        help="Emit structured JSON instead of human-readable text.")
+    d_show.set_defaults(func=cmd_domain)
+    d_check = dsub.add_parser(
+        "check-path",
+        help="Classify repo-relative paths against domain owned_globs and shared_paths.",
+    )
+    d_check.add_argument("paths", nargs="+")
+    d_check.add_argument("--json", action="store_true",
+                         default=argparse.SUPPRESS,
+                         help="Emit structured JSON instead of human-readable text.")
+    d_case = d_check.add_mutually_exclusive_group()
+    d_case.add_argument("--case-sensitive", dest="casefold_paths", action="store_false",
+                        help="Match paths case-sensitively.")
+    d_case.add_argument("--case-insensitive", dest="casefold_paths", action="store_true",
+                        help="Case-fold paths before matching.")
+    d_check.set_defaults(func=cmd_domain, casefold_paths=None)
+    d_val = dsub.add_parser("validate", help="Validate .agenttalk/domains.json.")
+    d_val.add_argument("--json", action="store_true",
+                       default=argparse.SUPPRESS,
+                       help="Emit structured JSON instead of human-readable text.")
+    d_val.set_defaults(func=cmd_domain)
 
     pse = sub.add_parser("send", help="Send a message from one agent to another.")
     pse.add_argument("--from", dest="sender", help="Sender agent name (default: $AGENTTALK_SELF)")
