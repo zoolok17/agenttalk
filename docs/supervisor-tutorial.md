@@ -1,0 +1,347 @@
+# Tutorial: the 24/7 supervisor and the progress wrapper
+
+This is a hands-on walkthrough of running agenttalk agents **unattended**
+— a background monitor that keeps named agents alive across provider
+outages, rate-limit windows, and stuck turns, and restarts them
+**with their session context intact** so they pick up where they left
+off.
+
+It is optional. The default agenttalk workflow is interactive: you open
+a terminal per agent and run `/agenttalk.listen`. The supervisor is for
+the case where you want agents to survive being left alone for hours.
+
+By the end you will have:
+
+- a background monitor watching one or more agents,
+- agents that auto-restart on crash/outage and resume their session,
+- (optionally) agents wrapped for live visibility plus stuck-recovery.
+
+> **Platform.** The generated monitor is **PowerShell** (`supervisor.ps1`)
+> on Windows. A POSIX monitor is a follow-up; the CLI surface
+> (`supervise`, `wrap`, `request-restart`, `heartbeat`) is
+> cross-platform, only the generated monitor script is Windows-first.
+
+---
+
+## 1. The mental model
+
+Three ideas carry the whole feature:
+
+1. **Heartbeat freshness is the liveness authority.** Each agent stamps
+   a small `heartbeat` file as it works and while it idles in `wait`. A
+   **fresh** heartbeat means healthy — even if the supervisor can't find
+   the process. A **stale** heartbeat (older than `stuck_after_seconds`)
+   is the only signal that triggers recovery. There is no fragile
+   "find the right PID" dance deciding life-or-death.
+
+2. **The supervisor is an external monitor, not a daemon inside the
+   bus.** `agenttalk supervise` only computes a read-only **report**
+   (who is alive/stale) and an **action plan** (the decision table).
+   A generated PowerShell script polls those and does the actual
+   launching/killing. The bus stays just files.
+
+3. **Every restart resumes the pinned session.** A relaunch re-runs the
+   agent against its saved session id (Claude `--resume`, Codex
+   `resume`), so the restarted agent still remembers the branch it was
+   on, the files it inspected, and the turn it was mid-way through.
+   Restart-with-context is the headline — it is the difference between
+   "the agent is back" and "the agent is back and knows what it was
+   doing."
+
+There are **two ways** an agent can be made stuck-recoverable:
+
+- **Manual-listen agent + activity hook.** A normal `/agenttalk.listen`
+  agent with the `agenttalk heartbeat` PostToolUse hook installed. It
+  heartbeats at every tool boundary plus the idle wait loop.
+- **Wrapped agent.** The agent runs *through* `agenttalk wrap --loop`,
+  which owns the idle wait and heartbeats by construction (plus streams
+  the agent's progress to the console). No hook needed.
+
+Until an agent can confirm "stuck" (hook installed **or** wrapped), a
+stale heartbeat is **warn-only** — never a kill. An un-instrumented
+agent is never mistaken for stuck.
+
+---
+
+## 2. Prerequisites
+
+- agenttalk installed and a store initialized in your project
+  (`agenttalk init --here --agents ...`). See the README quickstart.
+- The **real** CLI executables (not shims):
+  - Claude Code: e.g. `C:\Users\you\.local\bin\claude.exe`
+  - Codex: the native exe, e.g.
+    `...\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe`
+    (a `.cmd`/npm/PowerShell shim hands off and exits — the supervisor
+    needs the real exe).
+- For wrapped agents: the **Python** executable that runs agenttalk
+  (e.g. `...\Python314\python.exe`).
+
+> **Unattended means no human to approve prompts.** The supervisor seeds
+> each agent into a never-prompt, never-elevate, workspace-write mode
+> (Claude `--permission-mode bypassPermissions` + a seeded
+> `.claude/settings.json`; Codex a seeded isolated `CODEX_HOME`
+> `config.toml` with `approval_policy=never`, `sandbox_mode=workspace-write`).
+> Only run this on a repo you trust the agents to modify autonomously.
+
+---
+
+## 3. Scaffold the config
+
+From your project root:
+
+```powershell
+agenttalk supervise --init
+```
+
+This creates two files under `.agenttalk/` (use `--force` to overwrite):
+
+- **`supervisor.json`** — the config you fill in: cadence knobs plus a
+  per-agent block describing how to launch each agent.
+- **`supervisor.ps1`** — the generated PowerShell monitor. You run this;
+  you do not edit it. It polls `supervise --plan` and executes the plan
+  (launch / relaunch-with-resume / scoped kill / warn).
+
+The scaffold ships **two example agent blocks** so you can copy whichever
+archetype you need:
+
+- `AGENT_NAME` — a **manual-listen** agent (the default).
+- `AGENT_NAME_WRAPPED` — a **wrapped** agent driven through `wrap --loop`.
+
+---
+
+## 4. Fill in `supervisor.json`
+
+### Top-level knobs (sane defaults shown)
+
+```jsonc
+{
+  "schema_version": 2,
+  "poll_seconds": 15,              // how often the monitor checks
+  "stuck_after_seconds": 120,      // global stale threshold (per-agent overrides win)
+  "launch_grace_seconds": 120,     // startup grace before liveness is judged
+  "claude_permission_mode": "bypassPermissions",
+  "backoff": { "base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180 },
+  "agents": { /* one block per agent */ }
+}
+```
+
+`backoff` throttles relaunch storms: a flapping agent waits
+`base..cap` seconds (exponential) between attempts, resetting after
+`reset_after_seconds` of health.
+
+### A manual-listen agent
+
+```jsonc
+"claude-dev": {
+  "cli": "claude",
+  "auto_restart": true,
+  "activity_hook": false,          // flip to true AFTER installing the hook (step 5)
+  "cwd": "D:\\Projects\\example",
+  "env": { "AGENTTALK_SELF": "claude-dev" },
+  "launch": {
+    "windows_file": "C:\\Users\\you\\.local\\bin\\claude.exe",
+    "windows_args": ["{SESSION_ARGS}"]
+  }
+}
+```
+
+The literal `{SESSION_ARGS}` element is spliced by the executor with the
+session tokens — fresh on first launch, `--resume <id>` on relaunch. The
+launch prompt drops the agent straight into `/agenttalk.listen`.
+
+### A wrapped agent (recommended for hands-off codex/claude)
+
+```jsonc
+"codex-dev": {
+  "cli": "codex",
+  "auto_restart": true,
+  "wrapped": true,
+  "stuck_after_seconds": 1200,     // see the threshold note below
+  "cwd": "D:\\Projects\\example",
+  "env": { "AGENTTALK_SELF": "codex-dev" },
+  "launch": {
+    "windows_file": "C:\\Users\\you\\AppData\\Local\\Programs\\Python\\Python314\\python.exe",
+    "windows_args": [
+      "-m", "agenttalk", "wrap", "--for", "codex-dev", "--cli", "codex",
+      "--loop", "--",
+      "C:\\path\\to\\codex.exe", "-a", "never", "-s", "workspace-write",
+      "-C", "D:\\Projects\\example"
+    ]
+  }
+}
+```
+
+Key differences for a wrapped agent:
+
+- `windows_file` is the **Python** exe, not the CLI exe.
+- The **real** codex/claude exe goes at the tail, after `--`, with its
+  base launch args. The wrapper appends the per-turn streaming/session
+  args itself.
+- **No `{SESSION_ARGS}` token** — the wrapper owns session continuity
+  end to end (it persists and reloads the Codex `thread_id` / Claude
+  `session-id` across its own turns *and* across a supervisor relaunch).
+- No activity hook needed: a wrapped agent is instrumented by
+  construction, so a stale heartbeat past grace **recovers** rather than
+  warn-only.
+
+> **Per-CLI stale thresholds.** A wrapped **Claude** streams thinking,
+> text, and tool deltas, so it stays fresh through reasoning — default
+> `stuck_after_seconds` 180s. A wrapped **Codex** is item-level: no
+> event closes a long pure-reasoning gap, so the stream goes silent
+> between turn start and the final message — default 900s, and for a
+> heavy reasoning/review role pick 1200–1800s. **Guardrail:** a wrapped
+> Codex with `stuck_after_seconds` below 600s degrades to warn-only
+> (refuses restart authority) unless you set `allow_low_stuck_after=true`.
+> The value is never silently coerced. Pick the threshold above the
+> longest pure-reasoning gap your role plausibly hits.
+
+---
+
+## 5. (Manual agents only) install the activity hook
+
+A manual-listen agent only becomes stuck-recoverable once it can prove
+it is working. Install the heartbeat hook, then flip `activity_hook`:
+
+```powershell
+agenttalk supervise --install-activity-hook          # Claude PostToolUse hook
+agenttalk supervise --install-activity-hook --codex  # also the Codex hook
+```
+
+This **merges** the `agenttalk heartbeat` hook into the project
+`.claude/settings.json` (and `.codex/hooks.json` with `--codex`) — never
+global, never clobbering your existing settings. Then set
+`"activity_hook": true` on that agent's block.
+
+Wrapped agents skip this entirely.
+
+---
+
+## 6. Run the monitor
+
+```powershell
+# from the project root, in a dedicated terminal:
+.\.agenttalk\supervisor.ps1
+```
+
+The monitor loops every `poll_seconds`: it asks `agenttalk supervise
+--plan` for the decision table and executes it — launching agents that
+aren't running, relaunching (with `--resume`) agents whose heartbeat went
+stale past grace, killing only the scoped process tree it manages, and
+warning (never killing) for un-instrumented stale agents.
+
+Leave it running. It survives the agents crashing; the agents survive it
+restarting.
+
+### Watch what it sees
+
+In another terminal:
+
+```powershell
+agenttalk supervise --report   # read-only liveness JSON: per-agent fresh/stale, threshold
+agenttalk supervise --plan     # the action plan the script will execute
+agenttalk dashboard            # browser view: heartbeat age, who's composing, open threads
+```
+
+`--report` and `--plan` are pure read-only derivations — safe to run any
+time, they change nothing.
+
+---
+
+## 7. Restart an agent on demand (with context)
+
+To bounce an agent yourself — say it wedged, or you want it to reload
+after you changed something:
+
+```powershell
+agenttalk request-restart --for codex-dev --reason "reload after config change"
+```
+
+This writes a small restart-request marker. On its next poll the monitor
+relaunches `codex-dev` **resuming its pinned session**, then clears the
+marker. The agent comes back remembering its prior turn — the branch, the
+files it had open, the work in flight. (Restarting a *protected* agent —
+see below — needs `--force-protected`.)
+
+---
+
+## 8. The progress wrapper, standalone
+
+You can run the wrapper **without** the supervisor, to get live
+visibility and a working-turn heartbeat for a single agent:
+
+```powershell
+# Codex:
+agenttalk wrap --for codex-dev --cli codex --loop -- `
+  "C:\path\to\codex.exe" -a never -s workspace-write -C "D:\Projects\example"
+
+# Claude:
+agenttalk wrap --for claude-dev --cli claude --loop -- `
+  "C:\Users\you\.local\bin\claude.exe" --permission-mode bypassPermissions
+```
+
+The wrapper:
+
+- **gives visibility** — it echoes the agent's structured stream to the
+  console (token/thinking deltas for Claude; item-level events for
+  Codex), so a supervised agent is no longer a black box (`--no-render`
+  to silence it).
+- **heartbeats while working** — not just while idle, so a long, honest
+  work turn never looks stuck.
+- **detects degraded output** — a confirmed garble-then-silence pattern
+  can request a restart of itself (recorded as `--from`).
+- **owns one turn per inbound message** — it idles on the bus, and when a
+  message lands it drives the CLI through exactly one turn, then returns
+  to idle, persisting the session id so the next turn (or a relaunch)
+  resumes.
+
+`--loop` is what makes it the long-running supervised wrapper. Without
+`--loop` it wraps a single one-shot invocation.
+
+---
+
+## 9. Safety and known limitations
+
+- **Protected agents are never auto-killed.** The operator-facing
+  liaison and every active `role=lead` agent are protected: the
+  supervisor warns/notes but does not kill them, and a manual
+  `request-restart` of one needs `--force-protected`. You do not want
+  your one human-facing voice silently bounced.
+- **Loopback-only observability.** `agenttalk dashboard` /
+  `agenttalk serve` bind `127.0.0.1` only — there is no remote-bind flag.
+  SSH-tunnel the port if you need it from another machine. See
+  `SECURITY.md`.
+- **Unattended trust.** Seeded `bypassPermissions` / `approval_policy=never`
+  means the agents act without asking. Scope `writable_roots` to the
+  repo and only supervise projects you trust the agents to change.
+- **Wrapped-Codex threshold is conservative by design.** Because Codex's
+  stream is silent during pure reasoning, the stale threshold is loose
+  (900s+) to avoid false-killing a thinking agent. A genuinely wedged
+  Codex turn therefore takes that long to be caught. This is an
+  operational false-positive tradeoff, not a provable bound.
+- **Poison-message slow restart loop.** If an inbound message reliably
+  crashes a wrapped agent's turn, the cycle is: fail → heartbeat goes
+  stale → restart → reload-resume → re-deliver the same message → fail
+  again. Backoff throttles it (base..cap), but it does not stop until a
+  dead-letter / skip-after-N fix lands or you intervene. (Dead-letter is
+  a banked future item.)
+- **Pinned executables.** `windows_file` must be the real CLI exe (or
+  Python for wrapped), never a `.cmd`/npm/PowerShell shim — a shim hands
+  off and exits, and the supervisor would track the wrong process.
+
+---
+
+## 10. Command reference
+
+| Command | What it does |
+| --- | --- |
+| `agenttalk supervise --init [--force]` | Scaffold `supervisor.json` + `supervisor.ps1`. |
+| `agenttalk supervise --report` | Read-only per-agent liveness JSON (fresh/stale + threshold). |
+| `agenttalk supervise --plan` | The action plan (decision table) the monitor executes. |
+| `agenttalk supervise --install-activity-hook [--codex\|--codex-only]` | Merge the heartbeat PostToolUse hook into the **project** `.claude/settings.json` (and/or `.codex/hooks.json`). Never global, never clobbers. |
+| `agenttalk wrap --for A --cli claude\|codex [--loop] [--no-render] -- <real exe> <base args>` | Run an agent through the progress wrapper: visibility + working-turn heartbeat + degraded detection. `--loop` = long-running supervised wrapper, one turn per inbound message. |
+| `agenttalk request-restart --for A [--reason ...] [--force-protected]` | Queue a manual restart (resumes the pinned session). `--force-protected` to restart a protected agent. |
+| `agenttalk heartbeat [--for A] [--min-interval 5]` | Stamp the activity heartbeat (wired as a hook for manual agents; the wrapper does this for you). Throttled, so the per-tool-call hook is nearly free. |
+
+For the full per-agent config schema, read the generated
+`supervisor.json` — every field carries an inline `_comment_*` explaining
+it.
