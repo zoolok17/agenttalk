@@ -644,3 +644,73 @@ def test_doctor_escalation_target_absent_with_lead(tmp_path: Path) -> None:
 def test_doctor_escalation_target_absent_for_solo(tmp_path: Path) -> None:
     Store(tmp_path).init(["alpha"])
     assert _esc_check(doctor.run(tmp_path)) is None
+
+
+# ----- 0.31.1: supervised-codex visibility (resolved exe + version + sandbox hint) ----
+
+def _write_supervisor(store: Store, agents: dict) -> None:
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({"agents": agents}), encoding="utf-8")
+
+
+def test_doctor_supervised_codex_absent_without_supervisor_json(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["worker"])
+    assert doctor._check_supervised_codex(s) is None     # no supervisor.json -> additive absent
+
+
+def test_doctor_supervised_codex_surfaces_path_and_version(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["cdx"])
+    _write_supervisor(s, {"cdx": {"cli": "codex",
+                                  "launch": {"windows_file": "C:/codex.exe"}}})
+
+    def runner(exe, args, timeout):
+        if args == ["--version"]:
+            return (0, "codex-cli 0.142.3\n")
+        if args == ["sandbox", "--help"]:
+            return (0, "Usage: codex sandbox ...")
+        return (None, "unexpected")
+
+    chk = doctor._check_supervised_codex(s, runner=runner)
+    assert chk.status == "ok"
+    assert "C:/codex.exe" in chk.details and "0.142.3" in chk.details
+    assert chk.data["codex"][0]["version"] == "codex-cli 0.142.3"
+    assert chk.data["codex"][0]["sandbox_probe_ok"] is True
+
+
+def test_doctor_supervised_codex_warns_and_hints_on_probe_failure(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["cdx"])
+    _write_supervisor(s, {"cdx": {"cli": "codex",
+                                  "launch": {"windows_file": "C:/old-codex.exe"}}})
+
+    def runner(exe, args, timeout):
+        if args == ["--version"]:
+            return (0, "codex-cli 0.129.0-alpha.15\n")
+        return (None, "OSError")             # sandbox --help fails (alpha/MS-Store shape)
+
+    chk = doctor._check_supervised_codex(s, runner=runner)
+    assert chk.status == "warn"
+    assert "sandbox probe FAILED" in chk.details
+    assert "npm stable" in chk.fix and "MS-Store" in chk.fix
+    assert chk.data["codex"][0]["sandbox_probe_ok"] is False
+
+
+def test_doctor_supervised_codex_wrapped_resolves_base_argv_tail(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["wcdx"])
+    _write_supervisor(s, {"wcdx": {
+        "cli": "codex", "wrapped": True,
+        "launch": {"windows_file": "C:/python.exe",
+                   "windows_args": ["-m", "agenttalk", "wrap", "--for", "wcdx",
+                                    "--cli", "codex", "--loop", "--", "C:/real-codex.exe"]}}})
+    seen: dict = {}
+
+    def runner(exe, args, timeout):
+        seen["exe"] = exe                    # the wrapped codex exe = the base argv tail
+        return (0, "codex-cli 0.142.3") if args == ["--version"] else (0, "ok")
+
+    chk = doctor._check_supervised_codex(s, runner=runner)
+    assert seen["exe"] == "C:/real-codex.exe"   # NOT python (windows_file)
+    assert chk.status == "ok"

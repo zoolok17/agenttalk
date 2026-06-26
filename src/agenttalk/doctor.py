@@ -9,6 +9,10 @@ something is off. Designed so a fresh user can self-diagnose
 from __future__ import annotations
 
 import filecmp
+import json
+# subprocess is used ONLY to run the operator-configured codex exe `--version` /
+# `sandbox --help` as a best-effort, timeout-bounded diagnostic probe; never shell.
+import subprocess  # nosec B404
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -104,6 +108,9 @@ def run(project_root: Path | None = None) -> Report:
         waiters = _check_active_waiters(store)
         if waiters is not None:  # additive: absent unless a live waiter exists
             report.checks.append(waiters)
+        codex_vis = _check_supervised_codex(store)
+        if codex_vis is not None:  # additive: absent unless a supervised codex agent
+            report.checks.append(codex_vis)
     return report
 
 
@@ -659,4 +666,96 @@ def _check_active_waiters(store: Store) -> Check | None:
                  f"guaranteed live `agenttalk wait`; it is not a complete "
                  f"duplicate check."),
         data={"live_waiters": live},
+    )
+
+
+def _resolve_supervised_codex_exe(agent_cfg: dict) -> str | None:
+    """The codex executable a supervised codex agent will actually run: the base
+    argv tail after ``--`` for a wrapped agent (windows_file is python there), else
+    ``launch.windows_file``. None when unset / still a REPLACE placeholder."""
+    launch = agent_cfg.get("launch") if isinstance(agent_cfg.get("launch"), dict) else {}
+    if agent_cfg.get("wrapped"):
+        args = launch.get("windows_args") or []
+        if isinstance(args, list) and "--" in args:
+            tail = args[args.index("--") + 1:]
+            exe = tail[0] if tail else None
+        else:
+            exe = None
+    else:
+        exe = launch.get("windows_file")
+    if not isinstance(exe, str) or not exe or exe.startswith("REPLACE"):
+        return None
+    return exe
+
+
+def _default_codex_runner(exe: str, args: list[str], timeout: float):
+    """Run ``exe args`` best-effort; return (returncode, combined_output) or
+    (None, reason) on any failure. Timeout-bounded so `doctor` never hangs; never
+    shell (operator-configured exe path)."""
+    try:
+        # operator-configured codex exe path; argv is a list, never shell.
+        p = subprocess.run(  # noqa: S603  # nosec B603
+            [exe, *args], capture_output=True, text=True,
+            timeout=timeout, encoding="utf-8", errors="replace",
+        )
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, type(e).__name__
+
+
+def _check_supervised_codex(store: Store, *, runner=None) -> Check | None:
+    """0.31.1: surface the RESOLVED codex exe + its ``codex --version`` for each
+    supervised codex agent, with a best-effort, NON-blocking ``codex sandbox
+    --help`` probe whose failure prints a hint (an old/alpha build - e.g. the
+    MS-Store codex - vs the npm stable codex agenttalk expects). A diagnostic only:
+    it can WARN but never errors, and never hangs (each probe is timeout-bounded).
+    Returns None when there is no supervisor.json or no codex agent configured."""
+    runner = runner or _default_codex_runner
+    sup_path = store.dir / "supervisor.json"
+    if not sup_path.exists():
+        return None
+    try:
+        cfg = json.loads(sup_path.read_text(encoding="utf-8-sig"))
+    except (ValueError, OSError):
+        return None  # the supervisor's own --init/validate owns a malformed config
+    agents = cfg.get("agents") if isinstance(cfg.get("agents"), dict) else {}
+    exes: dict[str, list[str]] = {}   # resolved exe -> agent names using it
+    for name, a in agents.items():
+        if isinstance(a, dict) and a.get("cli") == "codex":
+            exe = _resolve_supervised_codex_exe(a)
+            if exe:
+                exes.setdefault(exe, []).append(name)
+    if not exes:
+        return None
+    entries: list[dict] = []
+    any_warn = False
+    for exe, names in exes.items():
+        rc, out = runner(exe, ["--version"], 5.0)
+        version = out.strip().splitlines()[0].strip() if (rc == 0 and out) else None
+        sbx_rc, _ = runner(exe, ["sandbox", "--help"], 5.0)
+        sandbox_ok = sbx_rc == 0
+        if version is None or not sandbox_ok:
+            any_warn = True
+        entries.append({"exe": exe, "agents": sorted(names),
+                        "version": version, "sandbox_probe_ok": sandbox_ok})
+    lines = []
+    for e in entries:
+        v = e["version"] or "UNVERSIONED (codex --version did not run)"
+        lines.append(f"{', '.join(e['agents'])} -> {e['exe']} [{v}]"
+                     + ("" if e["sandbox_probe_ok"] else " · sandbox probe FAILED"))
+    if any_warn:
+        return Check(
+            name="supervised_codex",
+            status="warn",
+            details="; ".join(lines),
+            fix=("a sandbox probe / version failure may mean a wrong or old/alpha "
+                 "codex (e.g. the MS-Store build) - agenttalk expects the npm "
+                 "stable codex; check the launch.windows_file / wrap base path"),
+            data={"codex": entries},
+        )
+    return Check(
+        name="supervised_codex",
+        status="ok",
+        details="; ".join(lines),
+        data={"codex": entries},
     )
