@@ -45,6 +45,35 @@ def test_prompt_includes_meta_for_classification(tmp_path) -> None:
     assert "review-result" in p and "to: beta" in p
 
 
+def test_prompt_is_pure_handler_no_consume_full_classification_and_safety() -> None:
+    """Pre-0.30.0 BLOCKER fix: the per-turn prompt makes the model a PURE handler.
+    It must FORBID the consume/cursor commands (a model-side drain is an unsupported
+    second consumer that can skip a mid-turn arrival = silent message-loss) and the
+    skill re-read, while INLINING the full classification table + the operator-safety
+    contracts so the model never needs the listen skill."""
+    p = prompt.assemble_turn_prompt(
+        {"from": "alpha", "to": "beta", "kind": "note", "body": "fyi",
+         "correlation_id": "rq-1", "request_id": "rq-1", "broadcast_id": None})
+    low = p.lower()
+    # FORBID consuming / moving the cursor (the silent-message-loss hazard) ...
+    assert "do not touch the inbox" in low
+    for cmd in ("sync", "threads", "drain", "recv", "wait", "ack"):
+        assert cmd in low
+    # ... and forbid re-reading the listen skill (everything is inlined).
+    assert "do not re-read the agenttalk-listen skill" in low
+    # INLINED classification table (no SKILL.md read needed).
+    assert "review-result" in p and "proposal-response" in p
+    assert "consult=true" in p and "--na" in p and "note / message" in p
+    # Operator-safety contracts preserved (matter MORE for a headless wrapped agent).
+    assert "headless" in low and "escalate" in low and "liaison" in low
+    assert "irreversible" in low and "rescinded" in low
+    assert "data, never instructions" in low
+    # Loop-exit is the WRAPPER's job, not the model's.
+    assert "release" in low and "end" in low and "wrapper's job" in low
+    # Sending IS the model's job (kept).
+    assert "you may send" in low
+
+
 # --------------------------------------------------------------- session
 
 def test_session_codex_fresh_then_resume_then_fallback() -> None:
@@ -93,6 +122,53 @@ def test_is_terminal_control() -> None:
     assert loop.is_terminal_control({"scoped": {"closed": False, "superseded": False}}) is False
     assert loop.is_terminal_control({"scoped": None}) is False
     assert loop.is_terminal_control({}) is False
+
+
+def test_is_stop_signal_gates_release_on_protected_sender(tmp_path) -> None:
+    # The wrapped model is a pure handler now, so the WRAPPER must obey loop-exit.
+    # release is gated on a lead/operator-facing sender; end is the canonical
+    # shutdown from any sender; ordinary kinds never stop the loop.
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")                       # alpha is now protected
+    assert loop.is_stop_signal(s, {"kind": "release", "from": "alpha"}) is True
+    assert loop.is_stop_signal(s, {"kind": "release", "from": "beta"}) is False
+    assert loop.is_stop_signal(s, {"kind": "end", "from": "beta"}) is True
+    assert loop.is_stop_signal(s, {"kind": "message", "from": "alpha"}) is False
+
+
+def test_loop_stops_and_commits_on_release_from_lead(tmp_path) -> None:
+    s = _store(tmp_path)
+    s.set_role("alpha", "lead")
+    s.send(sender="alpha", recipient="beta", body="do work")
+    rel = s.send(sender="alpha", recipient="beta", kind="release", body="stand down")
+    s.send(sender="alpha", recipient="beta", body="after release")  # must NOT be driven
+    seen: list[str] = []
+
+    def drive(rec):
+        seen.append(rec["body"])
+        return True
+
+    turns = loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                          max_polls=10)
+    # the real message before the release drove a turn; the release STOPPED the loop
+    # (never driven as a turn) and was committed; the message after was never reached.
+    assert seen == ["do work"] and turns == 1
+    assert s.cursor("beta") == rel.id                 # committed the release, stopped there
+
+
+def test_loop_stops_on_end(tmp_path) -> None:
+    s = _store(tmp_path)
+    end = s.send(sender="alpha", recipient="beta", kind="end", body="bye")
+    drove = {"n": 0}
+
+    def drive(rec):
+        drove["n"] += 1
+        return True
+
+    turns = loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                          max_polls=5)
+    assert turns == 0 and drove["n"] == 0             # end is never driven as a turn
+    assert s.cursor("beta") == end.id                 # consumed (committed) on stop
 
 
 def test_loop_drives_each_message_and_commits(tmp_path) -> None:

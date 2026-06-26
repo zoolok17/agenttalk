@@ -27,6 +27,22 @@ def is_terminal_control(record: dict) -> bool:
     return bool(sc and (sc.get("closed") or sc.get("superseded")))
 
 
+def is_stop_signal(store, record: dict) -> bool:
+    """A loop-exit control message: ``kind=end`` (graceful shutdown) or
+    ``kind=release`` from a lead / operator-facing sender. The wrapped MODEL is a
+    PURE per-turn handler now (it no longer runs the listen loop), so the WRAPPER
+    must obey a lead's release/end and STAND DOWN - the model never exits the loop
+    itself. ``release`` is gated on a protected sender (operator-facing UNION leads)
+    so a non-lead cannot stand down a supervised wrapper; ``end`` is the canonical
+    shutdown kind and is honored from any (bus-authenticated) sender."""
+    kind = record.get("kind")
+    if kind == "end":
+        return True
+    if kind == "release":
+        return record.get("from") in store.protected_agents()
+    return False
+
+
 def run_loop(store, agent: str, drive: Callable[[dict], bool], *,
              idle_interval: float = 0.3, max_idle_interval: float = 2.0,
              heartbeat_interval: float = 10.0,
@@ -60,6 +76,11 @@ def run_loop(store, agent: str, drive: Callable[[dict], bool], *,
         if is_terminal_control(record):
             recv_api.commit(store, agent, record)       # consume + skip (control)
             continue
+        if is_stop_signal(store, record):
+            # release (from a lead/liaison) or end: the wrapper owns loop-exit now
+            # that the model is a pure handler. Consume it and STAND DOWN.
+            recv_api.commit(store, agent, record)
+            return turns
         # Drive ONE turn. Commit the inbound message ONLY when the turn SUCCEEDS.
         # drive() stamps the heartbeat itself on a clean completed turn (and NOT on
         # a failed turn), so the loop does not stamp here - a failed turn leaves no
