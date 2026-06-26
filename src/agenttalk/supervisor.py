@@ -1136,22 +1136,24 @@ function Preflight($name, $plan, $file, $codexHome) {
       return $true
     }
     if ($plan.cli -eq 'codex') {
-      # run `python -m agenttalk --version` INSIDE codex's workspace sandbox with
-      # the seeded home - exactly how the supervised agent will reach the bus.
-      # Set PYTHONPATH the SAME way Launch() does (src on a source checkout) so
-      # the preflight tests the agent's REAL import env and does not fail closed
-      # on a checkout where agenttalk is not globally installed (reviewer-1 r1).
+      # Plain import hard gate under the Codex launch env: set the seeded CODEX_HOME
+      # + PYTHONPATH (src on a checkout, the SAME way Launch() does) and run
+      # `python -m agenttalk --version` - exactly how the supervised agent reaches
+      # the bus. We deliberately do NOT run `codex sandbox ...` as a launch gate:
+      # that subcommand's flags drift across Codex CLI releases (field Codex moved
+      # to `sandbox windows ...` / `--permissions-profile` and dropped `-P`), and a
+      # hard-coded probe FAILED CLOSED on otherwise-valid agents (0.31.1 field bug).
+      # A genuine codex sandbox/runtime problem now surfaces at launch (no heartbeat
+      # -> stale -> backoff restart) instead of bricking a good agent here.
       $saved = $env:CODEX_HOME; $savedPP = $env:PYTHONPATH
       if ($codexHome) { $env:CODEX_HOME = $codexHome }
       if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
-      try {
-        & $file sandbox -P :workspace -C $Root python -m agenttalk --version | Out-Null
-        $rc = $LASTEXITCODE
-      } finally {
+      try { & python -m agenttalk --version | Out-Null; $rc = $LASTEXITCODE }
+      finally {
         if ($null -eq $saved) { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue } else { $env:CODEX_HOME = $saved }
         if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP }
       }
-      if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - codex sandbox preflight `python -m agenttalk --version` exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
+      if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - preflight `python -m agenttalk --version` exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
       return $true
     } else {
       # claude / generic: confirm `python -m agenttalk` resolves with the src on
@@ -1500,12 +1502,17 @@ def init(store: Store, *, force: bool = False, python_exe: str | None = None) ->
 
 # ---- activity-hook install (opt-in; unlocks stuck_recover) -----------------
 #
-# The hook runs `agenttalk heartbeat` on every tool call (it resolves the agent
-# from $AGENTTALK_SELF and is throttled, so it's a dumb one-liner). It is what
-# makes "stale heartbeat == genuinely stuck" true; until it's installed,
-# activity_hook stays false and a stale heartbeat is only a warn (never a kill).
+# The hook runs `agenttalk heartbeat --hook` on every tool call (it resolves the
+# agent from $AGENTTALK_SELF and is throttled, so it's a dumb one-liner; --hook is
+# soft so it can NEVER block a tool call). It is what makes "stale heartbeat ==
+# genuinely stuck" true; until it's installed, activity_hook stays false and a
+# stale heartbeat is only a warn (never a kill).
 
-ACTIVITY_HOOK_COMMAND = "agenttalk heartbeat"
+ACTIVITY_HOOK_COMMAND = "agenttalk heartbeat --hook"
+# Legacy bare command shipped before 0.31.1; install/upgrade rewrites it to the
+# --hook form (a PostToolUse hook must never block a tool call on a bad identity).
+_LEGACY_ACTIVITY_HOOK_COMMANDS = ("agenttalk heartbeat",)
+_ACTIVITY_HOOK_COMMANDS = (ACTIVITY_HOOK_COMMAND, *_LEGACY_ACTIVITY_HOOK_COMMANDS)
 
 
 def claude_hook_snippet() -> str:
@@ -1516,22 +1523,43 @@ def claude_hook_snippet() -> str:
 
 
 def _merge_post_tool_use_hook(settings: dict) -> bool:
-    """Add the heartbeat PostToolUse hook to a settings dict IN PLACE, in the
-    matcher-GROUP shape both Claude and Codex use ({"matcher","hooks":[...]}),
+    """Add (or UPGRADE) the heartbeat PostToolUse hook in a settings dict IN PLACE,
+    in the matcher-GROUP shape both Claude and Codex use ({"matcher","hooks":[...]}),
     preserving every existing key/group. Returns True if it changed anything
-    (False = already present, idempotent). The presence-check scans the NESTED
-    hooks of every group so a correctly-shaped existing hook isn't duplicated."""
+    (False = already present + current, idempotent).
+
+    The presence-check scans the NESTED hooks of every group and matches BOTH the
+    current ``agenttalk heartbeat --hook`` and the LEGACY bare ``agenttalk
+    heartbeat``: the FIRST match is UPGRADED in place to the current command, and
+    any ADDITIONAL heartbeat hooks are removed (dedupe) - so an upgrade from a
+    pre-0.31.1 install never leaves a bare (blocking) hook or a duplicate."""
     hooks = settings.setdefault("hooks", {})
     groups = hooks.setdefault("PostToolUse", [])
     if not isinstance(groups, list):
         return False  # malformed - refuse to touch
+    changed = False
+    seen = False
     for g in groups:
-        for h in (g.get("hooks", []) if isinstance(g, dict) else []):
-            if isinstance(h, dict) and h.get("command") == ACTIVITY_HOOK_COMMAND:
-                return False  # already installed
-    groups.append({"matcher": "*", "hooks": [
-        {"type": "command", "command": ACTIVITY_HOOK_COMMAND}]})
-    return True
+        if not isinstance(g, dict):
+            continue
+        kept: list = []
+        for h in g.get("hooks", []):
+            if isinstance(h, dict) and h.get("command") in _ACTIVITY_HOOK_COMMANDS:
+                if seen:
+                    changed = True          # drop the duplicate (dedupe)
+                    continue
+                seen = True
+                if h.get("command") != ACTIVITY_HOOK_COMMAND:
+                    h["command"] = ACTIVITY_HOOK_COMMAND   # upgrade bare -> --hook
+                    changed = True
+            kept.append(h)
+        if isinstance(g.get("hooks"), list) and len(kept) != len(g["hooks"]):
+            g["hooks"] = kept
+    if not seen:
+        groups.append({"matcher": "*", "hooks": [
+            {"type": "command", "command": ACTIVITY_HOOK_COMMAND}]})
+        changed = True
+    return changed
 
 
 def install_activity_hook(store: Store, *, claude: bool = True,

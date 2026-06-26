@@ -3605,6 +3605,23 @@ def cmd_heartbeat(args: argparse.Namespace) -> int:
     than once per interval (the stuck threshold is ~120s; ~5s granularity is
     plenty).
     """
+    if getattr(args, "hook", False):
+        # HOOK MODE (wired as PostToolUse / Codex hook): must NEVER block a tool
+        # call. Swallow EVERY error and exit 0 - unresolved/off-roster identity, an
+        # uninitialized/missing store, a write failure, anything. Stay SILENT (the
+        # hook fires on every tool call, so a per-call warning would spam the
+        # transcript). Manual `agenttalk heartbeat` keeps the strict path below.
+        try:
+            return _do_heartbeat(args)
+        except SystemExit:
+            return 0   # _resolve_self / _get_store usage-exit -> soft no-op
+        except Exception:  # noqa: BLE001 - a hook must never propagate / block
+            return 0
+    return _do_heartbeat(args)
+
+
+def _do_heartbeat(args: argparse.Namespace) -> int:
+    """Strict heartbeat stamp (throttled). Raises on a bad identity / store."""
     store = _get_store(args)
     roster = store.load_config().get("agents") or []
     agent = _resolve_self(args.agent, roster=roster)
@@ -4453,6 +4470,11 @@ def build_parser() -> argparse.ArgumentParser:
     phb.add_argument("--min-interval", dest="min_interval", type=float, default=5.0,
                      help="No-op if the heartbeat is younger than this many "
                           "seconds (default 5).")
+    phb.add_argument("--hook", action="store_true",
+                     help="Soft hook mode for a PostToolUse/Codex hook: NEVER block "
+                          "a tool call - swallow every error (unresolved identity, "
+                          "uninitialized store, write failure) and exit 0, silently. "
+                          "Manual use stays strict (exit 2 on a bad identity).")
     phb.set_defaults(func=cmd_heartbeat)
 
     prr = sub.add_parser(

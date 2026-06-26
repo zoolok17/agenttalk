@@ -961,7 +961,14 @@ def test_ps_template_seeds_preflights_and_drops_baked_python_for_agent() -> None
     ci = pf.index("$plan.cli -eq 'codex'")
     codex_branch = pf[ci:pf.index("} else {", ci)]          # from codex to the codex/claude divider
     assert "'src') + ';' + $env:PYTHONPATH" in codex_branch
-    assert "& $file sandbox -P :workspace -C $Root python -m agenttalk --version" in codex_branch
+    # 0.31.1: the non-wrapped Codex preflight is the PLAIN import gate under the
+    # Codex env (seeded CODEX_HOME + PYTHONPATH), NOT a `codex sandbox ...` probe -
+    # the sandbox flags drift across Codex CLI releases and a hard-coded probe
+    # false-fail-closed on valid agents.
+    assert "$env:CODEX_HOME = $codexHome" in codex_branch    # still under the codex home
+    assert "& python -m agenttalk --version" in codex_branch
+    assert "& $file sandbox" not in codex_branch             # no codex sandbox probe
+    assert "-P :workspace" not in codex_branch               # the drift-prone flag is gone
     # Phase C: a WRAPPED agent ($file is python, not the CLI) is preflighted BEFORE
     # the codex branch and validates the python wrapper, NOT the codex sandbox.
     wrap_branch = pf[pf.index("$plan.launch_mode -eq 'wrap'"):ci]
@@ -997,6 +1004,28 @@ def test_heartbeat_unknown_agent_exit_2(tmp_path: Path) -> None:
     assert e.value.code == 2
 
 
+def test_heartbeat_hook_mode_off_roster_returns_0_and_writes_nothing(tmp_path: Path) -> None:
+    """0.31.1: --hook (PostToolUse) mode must NEVER block a tool call. An
+    off-roster / unresolved identity returns 0 (not exit 2) and writes no
+    heartbeat, silently."""
+    s = _team(tmp_path)
+    assert _run(["heartbeat", "--for", "ghost", "--hook"], tmp_path) == 0
+    assert s.read_heartbeat("ghost") is None
+    assert s.read_heartbeat("worker") is None     # nothing stamped for anyone
+
+
+def test_heartbeat_hook_mode_valid_identity_still_writes(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    assert s.read_heartbeat("worker") is None
+    assert _run(["heartbeat", "--for", "worker", "--hook"], tmp_path) == 0
+    assert s.read_heartbeat("worker") is not None  # valid identity -> normal stamp
+
+
+def test_heartbeat_hook_mode_uninitialized_store_returns_0(tmp_path: Path) -> None:
+    # no store.init() here: a missing/uninitialized store must not block the tool.
+    assert _run(["heartbeat", "--for", "worker", "--hook"], tmp_path) == 0
+
+
 # ---------------------------------------- WP-3: install-activity-hook (merge-safe)
 
 def test_install_activity_hook_merges_and_is_idempotent(tmp_path: Path) -> None:
@@ -1013,12 +1042,12 @@ def test_install_activity_hook_merges_and_is_idempotent(tmp_path: Path) -> None:
     assert data["model"] == "opus"                       # preserved
     assert data["hooks"]["PreToolUse"]                   # preserved
     cmds = [h["command"] for g in data["hooks"]["PostToolUse"] for h in g["hooks"]]
-    assert "agenttalk heartbeat" in cmds
+    assert "agenttalk heartbeat --hook" in cmds            # 0.31.1: soft hook command
     # idempotent: second install adds nothing
     assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
     data2 = json.loads(settings.read_text(encoding="utf-8"))
     post = [h["command"] for g in data2["hooks"]["PostToolUse"] for h in g["hooks"]]
-    assert post.count("agenttalk heartbeat") == 1
+    assert post.count("agenttalk heartbeat --hook") == 1
 
 
 def test_install_activity_hook_codex_uses_group_shape(tmp_path: Path) -> None:
@@ -1033,12 +1062,35 @@ def test_install_activity_hook_codex_uses_group_shape(tmp_path: Path) -> None:
     groups = json.loads(hooks_file.read_text(encoding="utf-8"))["hooks"]["PostToolUse"]
     # matcher-group shape: each group has a NESTED hooks list
     assert groups[0]["matcher"] == "*"
-    assert groups[0]["hooks"][0]["command"] == "agenttalk heartbeat"
+    assert groups[0]["hooks"][0]["command"] == "agenttalk heartbeat --hook"
     # idempotent (presence-check sees the nested shape)
     assert _run(["supervise", "--install-activity-hook", "--codex-only"], tmp_path) == 0
     groups2 = json.loads(hooks_file.read_text(encoding="utf-8"))["hooks"]["PostToolUse"]
     cmds = [h["command"] for g in groups2 for h in g["hooks"]]
-    assert cmds.count("agenttalk heartbeat") == 1
+    assert cmds.count("agenttalk heartbeat --hook") == 1
+
+
+def test_install_activity_hook_upgrades_and_dedupes_legacy_bare(tmp_path: Path) -> None:
+    """0.31.1: a pre-existing BARE `agenttalk heartbeat` hook (which BLOCKS a tool
+    call on a bad identity) is UPGRADED in place to `--hook`, and a duplicate bare
+    entry is removed - upgrades never leave a blocking or duplicated hook."""
+    s = _team(tmp_path)
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    # two legacy bare entries (in separate groups) + an unrelated hook to preserve
+    settings.write_text(json.dumps({"hooks": {"PostToolUse": [
+        {"matcher": "*", "hooks": [
+            {"type": "command", "command": "agenttalk heartbeat"},
+            {"type": "command", "command": "echo other"}]},
+        {"matcher": "Edit", "hooks": [
+            {"type": "command", "command": "agenttalk heartbeat"}]},
+    ]}}), encoding="utf-8")
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    cmds = [h["command"] for g in data["hooks"]["PostToolUse"] for h in g["hooks"]]
+    assert cmds.count("agenttalk heartbeat --hook") == 1     # upgraded + deduped
+    assert "agenttalk heartbeat" not in cmds                 # no bare (blocking) hook left
+    assert "echo other" in cmds                              # unrelated hook preserved
 
 
 def test_generated_ps1_is_bom_ascii_and_parses(tmp_path: Path) -> None:
@@ -1683,7 +1735,9 @@ def test_preflight_wrapped_codex_validates_python_not_codex_sandbox(tmp_path: Pa
         helpers, *preamble,
         # wrapped codex: $file is the python wrapper stub; launch_mode 'wrap'
         f"$wrapOk = Preflight 'wrapped-codex' (@{{ cli='codex'; launch_mode='wrap' }}) {_pslit(str(wstub))} $null",
-        # non-wrapped codex contrast: the real codex sandbox smoke-test branch
+        # non-wrapped codex (0.31.1): must NOT call `$file sandbox ...` - it runs the
+        # ambient `python -m agenttalk --version` gate, so the $file stub is never
+        # invoked (its log stays empty / has no 'sandbox').
         f"$codexOk = Preflight 'plain-codex' (@{{ cli='codex'; launch_mode='resume' }}) {_pslit(str(cstub))} $null",
         # only the return values via JSON; the stubs logged their argv to files we
         # read directly in Python (Get-Content -Raw decorates the string, which
@@ -1703,6 +1757,7 @@ def test_preflight_wrapped_codex_validates_python_not_codex_sandbox(tmp_path: Pa
     assert d["wrapOk"] is True
     assert "-m agenttalk --version" in wrap_args
     assert "sandbox" not in wrap_args
-    # non-wrapped codex contrast: the sandbox smoke-test DID run (branch divergence)
-    assert d["codexOk"] is True
-    assert "sandbox" in codex_args
+    # non-wrapped codex (0.31.1): the drift-prone `$file sandbox ...` probe is GONE -
+    # the $file stub is never invoked, so its log has no 'sandbox'. (codexOk depends
+    # on the ambient python having agenttalk importable, so it is not asserted.)
+    assert "sandbox" not in codex_args
