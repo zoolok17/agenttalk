@@ -1004,12 +1004,18 @@ def test_heartbeat_unknown_agent_exit_2(tmp_path: Path) -> None:
     assert e.value.code == 2
 
 
-def test_heartbeat_hook_mode_off_roster_returns_0_and_writes_nothing(tmp_path: Path) -> None:
-    """0.31.1: --hook (PostToolUse) mode must NEVER block a tool call. An
-    off-roster / unresolved identity returns 0 (not exit 2) and writes no
-    heartbeat, silently."""
+def test_heartbeat_hook_mode_off_roster_returns_0_and_is_silent(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """0.31.1 (reviewer-1): --hook (PostToolUse) mode must NEVER block a tool call
+    AND must be SILENT on an unresolved/off-roster identity - the strict resolver
+    writes to stderr BEFORE raising, so hook mode redirects stdout+stderr. Returns
+    0, writes no heartbeat, and emits NOTHING on stdout/stderr (else it spams every
+    tool call)."""
     s = _team(tmp_path)
     assert _run(["heartbeat", "--for", "ghost", "--hook"], tmp_path) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err == ""   # silent: no per-call spam
     assert s.read_heartbeat("ghost") is None
     assert s.read_heartbeat("worker") is None     # nothing stamped for anyone
 
@@ -1021,9 +1027,14 @@ def test_heartbeat_hook_mode_valid_identity_still_writes(tmp_path: Path) -> None
     assert s.read_heartbeat("worker") is not None  # valid identity -> normal stamp
 
 
-def test_heartbeat_hook_mode_uninitialized_store_returns_0(tmp_path: Path) -> None:
-    # no store.init() here: a missing/uninitialized store must not block the tool.
+def test_heartbeat_hook_mode_uninitialized_store_returns_0_and_is_silent(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    # no store.init() here: a missing/uninitialized store must not block the tool,
+    # and must be silent (no stderr from the strict store/identity resolution).
     assert _run(["heartbeat", "--for", "worker", "--hook"], tmp_path) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err == ""
 
 
 # ---------------------------------------- WP-3: install-activity-hook (merge-safe)

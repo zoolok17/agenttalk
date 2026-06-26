@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import sys
@@ -3607,12 +3609,17 @@ def cmd_heartbeat(args: argparse.Namespace) -> int:
     """
     if getattr(args, "hook", False):
         # HOOK MODE (wired as PostToolUse / Codex hook): must NEVER block a tool
-        # call. Swallow EVERY error and exit 0 - unresolved/off-roster identity, an
-        # uninitialized/missing store, a write failure, anything. Stay SILENT (the
-        # hook fires on every tool call, so a per-call warning would spam the
-        # transcript). Manual `agenttalk heartbeat` keeps the strict path below.
+        # call AND must stay SILENT (it fires on every tool call, so any output
+        # would spam the transcript). The strict helpers (_get_store /
+        # _resolve_self) write to stderr BEFORE raising SystemExit, so catching the
+        # exit is not enough - we must REDIRECT stdout+stderr to a throwaway sink
+        # around the whole call, then swallow every error and exit 0 (unresolved/
+        # off-roster identity, uninitialized/missing store, write failure, anything).
+        # Manual `agenttalk heartbeat` keeps the strict, noisy path below.
+        sink = io.StringIO()
         try:
-            return _do_heartbeat(args)
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                return _do_heartbeat(args)
         except SystemExit:
             return 0   # _resolve_self / _get_store usage-exit -> soft no-op
         except Exception:  # noqa: BLE001 - a hook must never propagate / block
