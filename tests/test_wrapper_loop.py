@@ -59,8 +59,11 @@ def test_prompt_is_pure_handler_no_consume_full_classification_and_safety() -> N
     assert "do not touch the inbox" in low
     for cmd in ("sync", "threads", "drain", "recv", "wait", "ack"):
         assert cmd in low
-    # ... and forbid re-reading the listen skill (everything is inlined).
+    # ... and forbid re-reading the LISTEN skill / re-running its bus loop (inlined),
+    # but NARROWLY: task/devkit skills stay available for real work (reviewer-1 note).
     assert "do not re-read the agenttalk-listen skill" in low
+    assert "load any other skill" not in low          # not the broad bar anymore
+    assert "task/devkit skills" in low and "craft-code" in low
     # INLINED classification table (no SKILL.md read needed).
     assert "review-result" in p and "proposal-response" in p
     assert "consult=true" in p and "--na" in p and "note / message" in p
