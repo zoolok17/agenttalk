@@ -5,6 +5,72 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.0] - 2026-06-26
+
+The progress-adapter wrapper. Supervised agents can now run through
+`agenttalk wrap`, which makes an agent VISIBLE (renders its turn to the
+console), keeps its heartbeat fresh while it WORKS (not just while idle),
+detects degraded output, and lets the supervisor auto-restart a crashed or hung
+agent WITH its session context intact. Validated end-to-end live on Windows
+(Codex and Claude), including a kill-and-resume-with-memory test. Also bundles
+the court-leak listen-skill fix. Manual `/agenttalk.listen` stays the default;
+the wrapper is strictly opt-in per agent (`wrapped: true`).
+
+### Added
+- **`agenttalk wrap` — the progress-adapter wrapper.** Launches a CLI in
+  structured-stream mode and, per event, stamps a throttled heartbeat, renders
+  readable output to the console, and scans for degraded output (a tool-call
+  leaked as text). Two adapters: Codex (`codex exec --json`, item-level events)
+  and Claude (`-p --output-format stream-json`, token + thinking deltas — so a
+  long pure-reasoning Claude turn stays live). One-shot mode (`wrap -- <argv>`)
+  for visibility; long-running `--loop` mode for supervised agents.
+- **Wrapper-owned listen loop (`wrap --loop`, opt-in `wrapped: true`).** The
+  wrapper becomes the long-running supervised process: it owns the idle bus-wait
+  + heartbeat and drives the CLI one turn per inbound message, with session
+  continuity across turns AND across a supervisor relaunch (Codex `thread_id` /
+  Claude `--session-id`/`--resume`, persisted atomically). The model is a pure
+  per-turn handler; the wrapper owns message delivery and the cursor (no
+  model-side inbox commands). The wrapper handles loop-exit on `release`/`end`.
+- **Machine-readable receive API** (`agenttalk recv --json` + an in-process
+  path) so the wrapper consumes the bus via structured records, never by parsing
+  human-readable output. Mirrors `wait`'s exact global/scoped cursor semantics.
+- **Supervisor launches wrapped agents through the wrapper.** A `wrapped: true`
+  agent is launched as the real Python wrapper (`-m agenttalk wrap --for <a>
+  --cli <cli> --loop -- <real CLI argv>`); the supervisor supervises the one
+  long-lived wrapper process and retires brain-pid discovery for wrapped agents
+  (the wrapper is the scoped root; heartbeat is the liveness authority). Per-CLI
+  stale thresholds: wrapped Claude defaults to 180s, wrapped Codex to 900s (with
+  a <600s guardrail), because Codex's item-level stream is silent during long
+  reasoning while Claude's deltas keep it fresh. The supervisor console and
+  `supervise --report` use the per-CLI threshold (report parity).
+
+### Fixed
+- **Listen skill: a backgrounded `wait` that exits 1 is a clean timeout, not a
+  failure** — re-arm; do not read the background task's output file (the read
+  path where the intermittent "court" tool-call-leaked-as-text degraded output
+  surfaced). Both Claude and Codex listen variants.
+- **Wrapper decodes child stdout as UTF-8** (`errors="replace"`) instead of the
+  Windows cp1252 default, so an agent emitting a smart quote or em-dash no longer
+  crashes the wrapper.
+
+### Known limitations
+- Wrapped Codex uses a conservative stale threshold (default 900s) because no
+  `codex exec --json` event marks progress during pure reasoning, so a genuine
+  hang is detected only after that window. Wrapped Claude is tighter (180s).
+- A poison inbound message that reliably fails a turn produces a
+  backoff-throttled restart loop until operator/dead-letter intervention
+  (a dead-letter / skip-after-N path is a planned follow-up).
+- After a turn the wrapper waits silently (no explicit "idle" line); a clearer
+  idle signal is a planned follow-up.
+
+### Upgrade
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.30.0"
+```
+Regenerate the supervisor scaffold with `agenttalk supervise --init --force` to
+pick up the wrapped-agent template and the wrapped preflight. Manual agents are
+unaffected; opt into the wrapper per agent with `wrapped: true`.
+
 ## [0.29.0] - 2026-06-22
 
 Supervisor observability: the supervisor now shows its decisions in its own
