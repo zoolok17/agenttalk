@@ -5,6 +5,46 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.0] - 2026-06-26
+
+The domain registry foundation, plus the documentation for the supervisor
+and the progress wrapper. This is Phase 0 of a unified ownership middle
+tier: a single project-local registry that the upcoming lane and knowledge
+layers will share, instead of each inventing its own ownership model. Also
+adds the supervisor/wrapper tutorial and README coverage that 0.30.0
+shipped without.
+
+### Added
+- **`agenttalk domain` — the shared ownership registry (foundation).** A
+  project-local `.agenttalk/domains.json` maps named domains to owners,
+  reviewers, curators, and owned globs, plus a shared-path policy; refs are
+  resolved against the roster (agents/groups/roles). Read-only commands:
+  `domain list` (domains + a stable, key-order-independent registry hash),
+  `domain show <id>` (one domain with resolved refs), `domain check-path
+  <paths...>` (classify repo-relative paths as owned/unowned/shared, with
+  `--case-sensitive`/`--case-insensitive`), and `domain validate`. The
+  registry is preserved across `agenttalk reset` (it is config-like, not
+  active bus state). The registry hash is the staleness keystone the later
+  lane/knowledge phases stamp into their records. No mutation command yet —
+  author the JSON by hand.
+- **Supervisor + wrapper documentation.** A new README section ("Unattended
+  operation: the supervisor and the wrapper") and a full step-by-step
+  tutorial at `docs/supervisor-tutorial.md`: the heartbeat-liveness model,
+  scaffolding and filling `supervisor.json` (manual and wrapped archetypes),
+  the activity hook, running the monitor, restart-with-context (all four
+  resume paths), the wrapper standalone, migrating a project in and out of
+  supervision, and the safety/limitations. Adds the previously-undocumented
+  `agenttalk wrap` to the CLI reference, plus README coverage of the new
+  domain registry.
+
+### Upgrade
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.31.0"
+```
+No migration. The domain registry is opt-in — create `.agenttalk/domains.json`
+to use it. The supervisor and wrapper are unchanged from 0.30.0; this release
+documents them.
+
 ## [0.30.0] - 2026-06-26
 
 The progress-adapter wrapper. Supervised agents can now run through

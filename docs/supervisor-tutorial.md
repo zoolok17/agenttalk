@@ -40,13 +40,21 @@ Three ideas carry the whole feature:
    A generated PowerShell script polls those and does the actual
    launching/killing. The bus stays just files.
 
-3. **Every restart resumes the pinned session.** A relaunch re-runs the
-   agent against its saved session id (Claude `--resume`, Codex
-   `resume`), so the restarted agent still remembers the branch it was
-   on, the files it inspected, and the turn it was mid-way through.
-   Restart-with-context is the headline — it is the difference between
-   "the agent is back" and "the agent is back and knows what it was
-   doing."
+3. **Every restart resumes the agent's session, so it keeps its
+   context** — the branch it was on, the files it inspected, the turn it
+   was mid-way through. *How* it resumes depends on the agent:
+   - **manual Claude** — the supervisor pins the minted session id and
+     relaunches with `--resume <id>`;
+   - **manual Codex** — the supervisor relaunches with `resume --last`,
+     picking up the most recent workspace session in that agent's
+     (seeded/isolated) `CODEX_HOME` once it is ready (so keep one Codex
+     per home, or the "last" session is ambiguous);
+   - **wrapped agents (Claude or Codex)** — the wrapper itself persists
+     the Claude session id / Codex `thread_id` and reload-resumes it,
+     across both its own turns and a supervisor relaunch.
+
+   Restart-with-context is the headline — the difference between "the
+   agent is back" and "the agent is back and knows what it was doing."
 
 There are **two ways** an agent can be made stuck-recoverable:
 
@@ -93,13 +101,22 @@ From your project root:
 agenttalk supervise --init
 ```
 
-This creates two files under `.agenttalk/` (use `--force` to overwrite):
+This creates three things under `.agenttalk/` (use `--force` to
+overwrite):
 
 - **`supervisor.json`** — the config you fill in: cadence knobs plus a
   per-agent block describing how to launch each agent.
 - **`supervisor.ps1`** — the generated PowerShell monitor. You run this;
   you do not edit it. It polls `supervise --plan` and executes the plan
   (launch / relaunch-with-resume / scoped kill / warn).
+- **`bin/agenttalk.cmd`** — a tiny shim the monitor calls so its own bus
+  commands resolve to the right Python/agenttalk regardless of your PATH.
+  You don't invoke it directly.
+
+Once you start the monitor it also writes **`supervisor-state.json`** —
+script-owned bookkeeping (per-agent launcher pids, pinned Claude session
+ids, backoff timers). That is the monitor's own state, **not** bus state,
+and it's safe to delete while the monitor isn't running.
 
 The scaffold ships **two example agent blocks** so you can copy whichever
 archetype you need:
@@ -225,8 +242,9 @@ Wrapped agents skip this entirely.
 
 The monitor loops every `poll_seconds`: it asks `agenttalk supervise
 --plan` for the decision table and executes it — launching agents that
-aren't running, relaunching (with `--resume`) agents whose heartbeat went
-stale past grace, killing only the scoped process tree it manages, and
+aren't running, relaunching (resuming each agent's session — see section
+1) agents whose heartbeat went stale past grace, killing only the scoped
+process tree it manages, and
 warning (never killing) for un-instrumented stale agents.
 
 Leave it running. It survives the agents crashing; the agents survive it
@@ -257,10 +275,12 @@ agenttalk request-restart --for codex-dev --reason "reload after config change"
 ```
 
 This writes a small restart-request marker. On its next poll the monitor
-relaunches `codex-dev` **resuming its pinned session**, then clears the
-marker. The agent comes back remembering its prior turn — the branch, the
-files it had open, the work in flight. (Restarting a *protected* agent —
-see below — needs `--force-protected`.)
+relaunches `codex-dev` **resuming its session** (the exact mechanism
+depends on the agent — see section 1; for a manual Codex this is
+`resume --last` in its `CODEX_HOME`), then clears the marker. The agent
+comes back remembering its prior turn — the branch, the files it had open,
+the work in flight. (Restarting a *protected* agent — see below — needs
+`--force-protected`.)
 
 ---
 
@@ -314,8 +334,9 @@ interactively (`agenttalk init` done long ago, agents in
 `/agenttalk.listen`). To put them under supervision:
 
 1. **Scaffold** from the project root: `agenttalk supervise --init`. This
-   only writes `supervisor.json` + `supervisor.ps1`. Your `.agenttalk/`
-   messages, roster, and state are untouched.
+   writes `supervisor.json`, `supervisor.ps1`, and the `bin/agenttalk.cmd`
+   shim (see section 3). Your `.agenttalk/` messages, roster, and state
+   are untouched.
 2. **Fill `supervisor.json` with the agents you already have.** Reuse the
    exact roster names (`agenttalk roster` to confirm) and the project path
    as `cwd`. Per agent, decide: keep it a manual-listen agent (then install
@@ -355,8 +376,11 @@ hand with `/agenttalk.listen` as before.
 Optional cleanup — none of it required, all of it inert when the monitor
 isn't running:
 
-- **`supervisor.json` / `supervisor.ps1`** can stay; they do nothing
-  unless you run the monitor. Delete them if you prefer a clean tree.
+- **`supervisor.json`, `supervisor.ps1`, `bin/agenttalk.cmd`, and
+  `supervisor-state.json`** can all stay; the config/script/shim do
+  nothing unless you run the monitor, and `supervisor-state.json` is just
+  the monitor's bookkeeping. Delete any of them if you prefer a clean
+  tree (none is bus state).
 - **The activity hook** (manual agents) is a harmless heartbeat stamp on
   every tool call. To remove it, delete the `agenttalk heartbeat` entry
   the install merged into the project `.claude/settings.json` (and
@@ -372,11 +396,14 @@ isn't running:
 
 ### What survives either direction
 
-Heartbeat files, cursors, threadstate, and session ids live under
-`.agenttalk/state/` and are valid in both modes — they're liveness and
-continuity hints, not mode-specific. Switching does not invalidate them,
-so you can flip back and forth (supervise an overnight run, return to
-interactive in the morning) without ever rebuilding state.
+Bus state — heartbeats, cursors, threadstate — lives under
+`.agenttalk/state/` and is mode-agnostic, valid whether or not a monitor
+is running. Session *continuity* is held differently per path (a pinned
+Claude id in `supervisor-state.json`; a manual Codex's `resume --last`
+against its `CODEX_HOME`; a wrapped agent's own persisted id/`thread_id`),
+but none of it is invalidated by switching modes. So you can flip back and
+forth — supervise an overnight run, return to interactive in the morning —
+without ever rebuilding state.
 
 ---
 
@@ -420,7 +447,7 @@ interactive in the morning) without ever rebuilding state.
 | `agenttalk supervise --plan` | The action plan (decision table) the monitor executes. |
 | `agenttalk supervise --install-activity-hook [--codex\|--codex-only]` | Merge the heartbeat PostToolUse hook into the **project** `.claude/settings.json` (and/or `.codex/hooks.json`). Never global, never clobbers. |
 | `agenttalk wrap --for A --cli claude\|codex [--loop] [--no-render] -- <real exe> <base args>` | Run an agent through the progress wrapper: visibility + working-turn heartbeat + degraded detection. `--loop` = long-running supervised wrapper, one turn per inbound message. |
-| `agenttalk request-restart --for A [--reason ...] [--force-protected]` | Queue a manual restart (resumes the pinned session). `--force-protected` to restart a protected agent. |
+| `agenttalk request-restart --for A [--reason ...] [--force-protected]` | Queue a manual restart (resumes the session — mechanism per section 1). `--force-protected` to restart a protected agent. |
 | `agenttalk heartbeat [--for A] [--min-interval 5]` | Stamp the activity heartbeat (wired as a hook for manual agents; the wrapper does this for you). Throttled, so the per-tool-call hook is nearly free. |
 
 For the full per-agent config schema, read the generated

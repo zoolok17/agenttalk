@@ -18,7 +18,7 @@ exported on session end.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.30.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.31.0"
 agenttalk install-skills          # installs bus skills + the dev-discipline devkit
 
 # in your project root, once per project
@@ -123,10 +123,10 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.30.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.31.0"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.30.0` with
+Pin to a specific tag so you control upgrades. Replace `v0.31.0` with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 
@@ -706,6 +706,79 @@ so the long timeout is free observability.
 
 ---
 
+## Domains: a shared ownership registry (experimental, 0.31.0)
+
+A **domain** is a named slice of the repo with owners, reviewers,
+curators, and a set of owned globs — declared once in a project-local
+registry at `.agenttalk/domains.json`. It is the shared spine that
+upcoming **lane** (diff-bounds / deliver gates) and **knowledge**
+features will hang off, so they reference one ownership model instead of
+inventing their own.
+
+0.31.0 ships the **foundation**: the registry plus read-only inspection
+and validation. There is no mutation command yet — you author
+`domains.json` by hand — and the lane/knowledge layers land in later
+releases.
+
+A minimal registry (owner/reviewer/curator refs are objects keyed by
+`agents`, `groups`, or `roles`, resolved against your roster):
+
+```json
+{
+  "schema_version": 1,
+  "domains": {
+    "cli": {
+      "title": "CLI surface",
+      "owners": { "groups": ["devs"] },
+      "reviewers": { "roles": ["reviewer"] },
+      "curators": { "agents": ["claude"] },
+      "owned_globs": ["src/agenttalk/cli.py", "tests/test_cli.py"],
+      "description": "The argparse command surface"
+    }
+  },
+  "shared_paths": [
+    {
+      "glob": "pyproject.toml",
+      "category": "package-metadata",
+      "requires": "shared-lease-or-lead-approval",
+      "default_reviewers": { "roles": ["reviewer"] }
+    }
+  ]
+}
+```
+
+Then inspect it:
+
+```text
+$ agenttalk domain validate
+domain registry: valid (1 domains, 1 shared paths)
+  hash: 4e74e0e5...
+
+$ agenttalk domain list
+domains (1)  hash=4e74e0e5...
+  cli  CLI surface (2 owned globs)
+
+$ agenttalk domain check-path src/agenttalk/cli.py pyproject.toml docs/foo.md
+src/agenttalk/cli.py: owned  domains=cli; casefold=true
+pyproject.toml: UNOWNED  shared=pyproject.toml[package-metadata:shared-lease-or-lead-approval]; casefold=true
+docs/foo.md: UNOWNED  casefold=true
+```
+
+- **`validate`** checks structure and resolves every ref against the
+  roster; **`list`** summarizes domains; **`show <id>`** prints one domain
+  with resolved owners/reviewers/curators; **`check-path <paths...>`**
+  classifies repo-relative paths as owned / unowned / shared (with
+  `--case-sensitive` / `--case-insensitive`).
+- The **registry hash** is a stable, key-order-independent digest — the
+  staleness keystone the later lane/knowledge phases stamp into their
+  records, so a registry change can flag dependent state.
+
+`domains.json` lives outside `messages/` and `state/`, so `agenttalk
+reset` preserves it like config rather than clearing it as active bus
+state.
+
+---
+
 ## Unattended operation: the supervisor and the wrapper
 
 Everything above assumes you're at the keyboard, one terminal per agent.
@@ -732,8 +805,11 @@ Three ideas carry it:
   supervise --report`/`--plan` are read-only derivations; a generated
   `supervisor.ps1` polls the plan and does the launching/relaunching/
   scoped-killing. The bus stays just files.
-- **Every restart resumes the pinned session** (Claude `--resume`, Codex
-  `resume`), so a relaunched agent still knows what it was doing.
+- **Every restart resumes the agent's session**, so a relaunched agent
+  still knows what it was doing — via a pinned id for manual Claude
+  (`--resume <id>`), `resume --last` in its `CODEX_HOME` for manual Codex,
+  or the wrapper's own persisted id/`thread_id` for wrapped agents. The
+  tutorial spells out all four paths.
 
 Quick start:
 
@@ -793,6 +869,7 @@ Protected agents — the operator-facing liaison and every active
 | `agenttalk roster add <name> [--role R] [--group G]...` / `remove <name> [--force]` / `set-role <name> <role>` / `set-group <group> <a,b,c>` | Deliberate roster/group admin operations. Groups are validated roster subsets; `all` is implicit and reserved. 0.16.0: `add` refuses a retired-tombstone name; `remove` is refused by default with a retire hint — `--force` removes anyway and warns that history-read breaks (no tombstone — re-addable). |
 | `agenttalk roster retire <name> [--reason R]` / `rename <old> <new> [--drain-check] [--reason R]` / `forward <retired> --to <live> --to-request RID [--from A]` | Identity lifecycle (0.16.0, #19). `retire` makes a **permanent tombstone** (can't send, name never re-bound, history stays valid). `rename` = retire `<old>`→tombstone + add `<new>`, carrying over role/group/operator-facing; `--drain-check` refuses while work is owed to/from `<old>`. `forward` redirects a single owed request to a live agent, transcript-visible. |
 | `agenttalk barrier bump --from A --scope global [-m REASON] [--json]` | Fire a **global epoch barrier** (0.16.0, #19): one meta-marked message whose id becomes the new epoch, marking everything before it as a previous epoch. Any active member may bump (trusted-team global-stall lever). Tracked openers after it record `epoch_at_send` automatically. |
+| `agenttalk domain [--json] {list,show <id>,check-path <paths...>,validate}` | Inspect the project's **domain registry** (`.agenttalk/domains.json`, 0.31.0). `list` = domains + registry hash; `show <id>` = one domain with resolved owner/reviewer/curator refs; `check-path <paths...>` = classify repo-relative paths as owned/unowned/shared (`--case-sensitive`/`--case-insensitive`); `validate` = structure + ref resolution. Read-only foundation for upcoming lane/knowledge features; author `domains.json` by hand for now. |
 | `agenttalk whoami [--for A] [--json]` | Show effective root, resolved self and peer, roster membership, role/groups, unread count, and owed-thread count. Warns when identity is unresolved or not in the roster, which is often a wrong `--root` or env issue. |
 | `agenttalk status` | Show roster, per-agent cursor, unread count, and **actionable warnings**: never-acked unread, soft-deadlocks, unconsumed correlated replies, and stale outbound threads. |
 | `agenttalk threads [--for A] [--all] [--json]` | Derive request/reply thread state from validated messages. Default view shows actionable rows only (`reply-waiting`, `owed-inbound`, `open-outbound`); `--all` includes `closed`. 0.16.0: open rows in `--json` carry read-only `next_owner` / `next_action` (`reply`/`read-reply`/`await-reply`/`answer-operator`) — who owes the next move, a pure projection of state. |
