@@ -717,7 +717,9 @@ through.
 
 > **Full walkthrough: [docs/supervisor-tutorial.md](docs/supervisor-tutorial.md)** —
 > scaffold, fill the config, run the monitor, wrap an agent, and trigger a
-> restart-with-context, step by step.
+> restart-with-context, step by step. It also covers **migrating an
+> existing project in and out of supervision** (it's additive and
+> reversible — no data migration, no re-init).
 
 Three ideas carry it:
 

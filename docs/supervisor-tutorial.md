@@ -299,7 +299,88 @@ The wrapper:
 
 ---
 
-## 9. Safety and known limitations
+## 9. Migrating an existing project in and out of supervision
+
+Supervision is **additive and reversible**. The bus — your messages,
+roster, cursors, threads, and session history — is never touched by
+turning supervision on or off. There is no data migration, no `reset`,
+no re-`init`. You are only adding (or removing) an external monitor and a
+few optional config files.
+
+### Adding supervision to a project you already run by hand
+
+You already have a working store and have been running agents
+interactively (`agenttalk init` done long ago, agents in
+`/agenttalk.listen`). To put them under supervision:
+
+1. **Scaffold** from the project root: `agenttalk supervise --init`. This
+   only writes `supervisor.json` + `supervisor.ps1`. Your `.agenttalk/`
+   messages, roster, and state are untouched.
+2. **Fill `supervisor.json` with the agents you already have.** Reuse the
+   exact roster names (`agenttalk roster` to confirm) and the project path
+   as `cwd`. Per agent, decide: keep it a manual-listen agent (then install
+   the activity hook, step 5) or run it wrapped (step 4's wrapped
+   archetype). You don't have to convert every agent — see "mixed mode".
+3. **Stop your hand-run listener terminals** for the agents you're now
+   supervising — the supervisor will launch them. Leave any agent you want
+   to keep driving by hand alone.
+4. **Run the monitor**: `.\.agenttalk\supervisor.ps1`. It launches the
+   configured agents (fresh on first launch) and keeps them alive from
+   then on.
+
+That's the whole migration. Because the store is shared, a supervised
+agent and the rest of your team see the same bus — a supervised
+`codex-dev` and a hand-run `claude-rev` message each other normally.
+
+> **One window per agent still holds.** Don't leave a hand-run
+> `/agenttalk.listen` for `codex-dev` open *and* have the supervisor launch
+> `codex-dev` — that's two consumers on one mailbox (unsupported; see the
+> README "one window per agent" note). Pick one driver per agent.
+
+### Mixed mode
+
+You can supervise some agents and run others by hand in the same store.
+Only the agents listed in `supervisor.json` are managed; everyone else is
+ignored by the monitor. This is the normal path while you try supervision
+on one agent before trusting it with the whole team.
+
+### Backing out — returning to attended/interactive
+
+To stop supervising, **stop running `supervisor.ps1`** (Ctrl-C its
+terminal). That is the only required step — the supervisor is just an
+external monitor, so once it's gone nothing auto-restarts anything. Your
+agents and bus are unaffected. Relaunch any agent you want to drive by
+hand with `/agenttalk.listen` as before.
+
+Optional cleanup — none of it required, all of it inert when the monitor
+isn't running:
+
+- **`supervisor.json` / `supervisor.ps1`** can stay; they do nothing
+  unless you run the monitor. Delete them if you prefer a clean tree.
+- **The activity hook** (manual agents) is a harmless heartbeat stamp on
+  every tool call. To remove it, delete the `agenttalk heartbeat` entry
+  the install merged into the project `.claude/settings.json` (and
+  `.codex/hooks.json`) — there's no auto-uninstall, and it was a careful
+  merge, so remove only that entry.
+- **Unattended permission seeding.** Supervision seeds agents into a
+  never-prompt mode. To get approval prompts back for attended use, revert
+  the seeded Claude `defaultMode` in the project `.claude/settings.json`
+  (set it back to `default` or remove the key), and for Codex either
+  relaunch against your normal `CODEX_HOME` instead of the seeded isolated
+  one, or run `agenttalk codex-config --disable` if you had enabled the
+  per-project sandbox block.
+
+### What survives either direction
+
+Heartbeat files, cursors, threadstate, and session ids live under
+`.agenttalk/state/` and are valid in both modes — they're liveness and
+continuity hints, not mode-specific. Switching does not invalidate them,
+so you can flip back and forth (supervise an overnight run, return to
+interactive in the morning) without ever rebuilding state.
+
+---
+
+## 10. Safety and known limitations
 
 - **Protected agents are never auto-killed.** The operator-facing
   liaison and every active `role=lead` agent are protected: the
@@ -330,7 +411,7 @@ The wrapper:
 
 ---
 
-## 10. Command reference
+## 11. Command reference
 
 | Command | What it does |
 | --- | --- |
