@@ -1,16 +1,37 @@
 # agenttalk
 
-A small file-backed message bus that lets coding-agent CLIs — **Claude
-Code**, **Codex**, or several named instances of either — work on the
-same project and message each other directly. Built for the spec-driven
-workflow where one agent implements and another reviews, and now able
-to model named teams with roles, groups, broadcast fan-out, and an
-optional lead role.
+A small, file-backed bus that lets coding-agent CLIs — **Claude Code**
+and **Codex**, a pair or a named team — **talk to each other directly**
+and work on the same repo. No daemon, just files.
+
+At its core it's still exactly that: two agents messaging each other so an
+implementer and a reviewer collaborate without you copy-pasting between
+windows. Around that core it has grown to meet real multi-agent work —
+named teams (roles, groups, broadcast, a lead/liaison), operator-safety
+primitives (escalation, supersede/rescind, pre-action checks, epochs),
+24/7 unattended supervision that auto-restarts agents *with their context
+intact*, a shared ownership/domain registry, and a lightweight
+review-assurance layer (gates + typed evidence). **The essence is
+unchanged; the surface area grew.**
 
 Agents share a project-local `.agenttalk/` directory; every message
 becomes a small JSON file. Each CLI runs in its own terminal window so
 you see the full conversation as it happens. A markdown transcript is
 exported on session end.
+
+## Capabilities at a glance
+
+| Layer | What it gives you |
+| --- | --- |
+| **Talk directly** | `send`/`reply` point-to-point or `broadcast` fan-out; every message is a JSON file both terminals see. |
+| **Review handoffs** | `handoff` (implement → fresh review), `propose`, `consult` — cross-review by an agent that didn't write the code. |
+| **Named teams** | roles, groups, a `lead`/operator-liaison; `escalate` routes decisions to one human voice. |
+| **Operator-safety** | supersede/`rescind`, pre-action `check`, epoch barriers — stale or rescinded requests can't quietly close. |
+| **24/7 supervision** | auto-restart agents *with their session intact* across outages; a progress wrapper (`wrap`) for visibility. |
+| **Shared ownership** | a `domain` registry mapping repo areas to owners/reviewers. |
+| **Assurance** | `gate` HOLD/GO state + typed review evidence, so unsafe closure is hard. |
+
+The first row is the whole essence; everything else is opt-in.
 
 ---
 
