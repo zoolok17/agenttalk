@@ -29,6 +29,7 @@ severity policy, ephemeral adversarial reviewers.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
@@ -71,6 +72,22 @@ HOLD_UNDECIDED_COUNTER = "undecided_counter"
 HOLD_COUNTER_NO_REMEDIATION = "accepted_counter_missing_remediation"
 HOLD_OPEN_BLOCKER = "open_blocker_remediation"
 HOLD_PUBLISH_NOT_ALLOWED = "publish_not_allowed"
+# P3 specialist sign-off hold codes (join the same stable set).
+HOLD_MISSING_SIGNOFF = "missing_required_signoff"
+HOLD_UNROUTABLE_SIGNOFF = "unroutable_required_signoff"
+HOLD_INVALID_POLICY = "invalid_signoff_policy"
+HOLD_UNMAPPED_RISK = "unmapped_required_risk"
+HOLD_STALE_ROUTE = "stale_signoff_route"
+
+# Core-neutral risk envelope (project: extensions allowed, like gates). Core
+# VALIDATES the string; it never DECIDES a change's risk - the project supplies
+# the risk inventory and the risk -> signoff policy mapping.
+CORE_RISK_CLASSES = frozenset({
+    "none", "unknown", "release", "security", "performance", "persistence",
+    "docs-contract", "quality"})
+_RISK_EXTENSION_RE = re.compile(r"\Aproject:[a-z0-9][a-z0-9_.-]{0,63}\Z")
+
+SIGNOFF_DIRNAME = "signoffs.json"
 
 _CLOSE_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _FULL_SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
@@ -98,10 +115,15 @@ def empty_close(close_id: str, *, scope: str, revision: str, revision_kind: str,
         "opened_at": opened_at,
         "epoch_at_open": epoch_at_open,         # AUDIT ONLY - never the freeze
         "status": OPEN,
-        "required_lenses": required_lenses,     # [{id, allowed_agents, allowed_roles, required}]
+        "required_lenses": required_lenses,     # [{id, allowed_agents, allowed_roles, allowed_groups, required}]
         "lens_acks": {},                        # lens_id -> ack record
         "counters": {},                         # counter_id -> counter record
         "remediation_items": {},                # item_id -> remediation record
+        # P3: explicit risk inventory + DERIVED required signoffs (set by `apply`).
+        "risk_inventory": [],                   # [{risk_class, source, affected_paths, na_reason}]
+        "required_signoffs": [],                # first-class derived signoff sets (see apply_signoffs)
+        "signoff_overrides": {},                # set_id -> {by, reason, at} (the unroutable lead escape)
+        "signoff_route": None,                  # {policy_hash, risk_inventory_hash, revision, derived_at, derived_by}
         "draft": None,                          # merged human draft (lead)
         "final": None,                          # snapshot recorded at publish
         "events": [],                           # append-only audit trail
@@ -110,15 +132,24 @@ def empty_close(close_id: str, *, scope: str, revision: str, revision_kind: str,
 
 # --------------------------------------------------------------- pure verdict
 
-def compute_verdict(record: dict, gate_check: dict) -> dict[str, Any]:
+def compute_verdict(record: dict, gate_check: dict,
+                    signoff_eval: dict | None = None) -> dict[str, Any]:
     """PURE: derive HOLD|GO + the stable hold codes from a close ``record`` and a
     ``gate_check`` result (:func:`gates.check_gates` output for the close's
     gate_scope). No I/O. GO requires, in order of the codes below: a well-formed
     record on a frozen, resolved, clean (or dirty-with-artifact) revision; the gate
     check GO; every REQUIRED lens terminally satisfied by an AUTHORIZED,
     non-stale ack (accept / na-with-reason / counter-that-was-decided); every
-    counter decided; every ACCEPTED counter carrying a remediation item; and every
-    OPEN blocker remediation resolved by its named gate being green. Returns
+    counter decided; every ACCEPTED counter carrying a remediation item; every
+    OPEN blocker remediation resolved by its named gate being green; and (P3) every
+    derived required signoff met by enough DISTINCT qualifying acks.
+
+    ``signoff_eval`` is the impure->pure bridge for P3: the CLI resolves the signoff
+    policy + roster/group/role/domain refsets + git diff (all I/O) and passes the
+    already-resolved evaluation in; this function only COUNTS, so it stays pure and
+    unit-testable. It is None for a P2-only close; a close that HAS
+    ``required_signoffs`` but is handed no ``signoff_eval`` fails closed (the CLI
+    always supplies one for P3 closes). Returns
     ``{"verdict", "holds": [{code, detail}], "ok"}``."""
     holds: list[dict] = []
 
@@ -186,7 +217,118 @@ def compute_verdict(record: dict, gate_check: dict) -> dict[str, Any]:
         if item.get("blocker") and item.get("gate") not in green:
             hold(HOLD_OPEN_BLOCKER,
                  f"blocker remediation {item_id!r} gate {item.get('gate')!r} is not green")
+
+    # P3: derived specialist sign-off counts (pure over the CLI-supplied eval).
+    for code, detail in _evaluate_signoffs(record, signoff_eval):
+        hold(code, detail)
     return _verdict(holds)
+
+
+def _evaluate_signoffs(record: dict, ev: dict | None) -> list[tuple[str, str]]:
+    """PURE: given a close ``record`` and a CLI-resolved ``ev`` bundle, return
+    (code, detail) signoff holds. ``ev`` carries everything that needed I/O to
+    produce - resolved current candidate agents per set, the active roster, the
+    current policy/risk-inventory hashes, and any policy/unmapped errors - so the
+    counting here reads NO config.
+
+    ev = {
+      "policy_present": bool,
+      "policy_error": str | None,          # malformed policy / bad refset
+      "current_policy_hash": str,
+      "current_risk_inventory_hash": str,
+      "unmapped_risks": [risk_class, ...], # declared non-none risks with no mapping
+      "resolved_candidates": {set_id: [agent, ...]},  # who may currently sign each set
+      "active_agents": [agent, ...],       # current active roster (retired excluded)
+    }
+    """
+    if not record.get("signoff_route"):
+        return []                       # P2-only close (apply never run): nothing to do
+    req = record.get("required_signoffs") or []
+    if not isinstance(ev, dict):
+        # fail closed: a P3 close (apply ran) MUST be evaluated with a resolved bundle.
+        return [(HOLD_INVALID_POLICY,
+                 "signoff route present but no signoff evaluation supplied")]
+    out: list[tuple[str, str]] = []
+    if ev.get("policy_error"):
+        return [(HOLD_INVALID_POLICY, str(ev["policy_error"]))]
+    for rc in ev.get("unmapped_risks") or []:
+        out.append((HOLD_UNMAPPED_RISK,
+                    f"declared risk {rc!r} has no signoff policy mapping (allow_unmapped is false)"))
+    route = record.get("signoff_route") or {}
+    if (route.get("policy_hash") != ev.get("current_policy_hash")
+            or route.get("risk_inventory_hash") != ev.get("current_risk_inventory_hash")):
+        out.append((HOLD_STALE_ROUTE,
+                    "signoff route is stale (policy or risk inventory changed since "
+                    "`close signoffs apply`); rerun apply"))
+    acks = record.get("lens_acks", {})
+    revision = record.get("revision")
+    active = set(ev.get("active_agents") or [])
+    resolved = ev.get("resolved_candidates") or {}
+    overrides = record.get("signoff_overrides", {}) or {}
+    for s in req:
+        if not isinstance(s, dict):
+            continue
+        sid = s.get("id")
+        if sid in overrides:
+            continue                    # recorded close-lead escape (audited, not counted)
+        required_count = int(s.get("required_count") or 0)
+        if required_count <= 0:
+            continue
+        candidates = set(resolved.get(sid) or [])
+        if not candidates:
+            out.append((HOLD_UNROUTABLE_SIGNOFF,
+                        f"signoff {sid!r} requires {required_count} but no candidate "
+                        "agents resolve from its refsets (override to escape)"))
+            continue
+        countable = set(s.get("countable_statuses") or [ACCEPT])
+        allow_na = bool(s.get("allow_na"))
+        override_counts = bool(s.get("override_counts"))
+        signers = _signoff_signers(
+            record, s.get("generated_lens_ids") or [], acks, revision, candidates,
+            active, countable, allow_na, override_counts)
+        if len(signers) < required_count:
+            out.append((HOLD_MISSING_SIGNOFF,
+                        f"signoff {sid!r} needs {required_count} distinct qualifying "
+                        f"acks, has {len(signers)}"))
+    return out
+
+
+def _signoff_signers(record, lens_ids, acks, revision, candidates, active,
+                     countable, allow_na, override_counts) -> set[str]:
+    """The set of DISTINCT agents who satisfy a signoff set: a qualifying
+    (candidate AND active) agent with a non-stale countable ack on any of the set's
+    generated lenses. na counts only with allow_na + a reason; an undecided counter
+    never counts; an --override ack counts only if override_counts."""
+    signers: set[str] = set()
+    counters = record.get("counters", {})
+    for lid in lens_ids:
+        ack = acks.get(lid)
+        if not isinstance(ack, dict):
+            continue
+        agent = ack.get("from")
+        if agent not in candidates or agent not in active:
+            continue
+        if ack.get("revision") != revision:        # stale ack (reviewed other code)
+            continue
+        status = ack.get("status")
+        if ack.get("override"):
+            if override_counts and status in countable:
+                signers.add(agent)
+            continue
+        if status == NA:
+            if allow_na and ack.get("reason"):
+                signers.add(agent)
+            continue
+        if status == COUNTER:
+            cid = ack.get("counter_id")
+            counter = counters.get(cid) if isinstance(cid, str) else None
+            decided = isinstance(counter, dict) and counter.get("decision") != COUNTER_PENDING
+            if COUNTER in countable and decided:
+                signers.add(agent)
+            continue
+        if status in countable:                     # accept (default)
+            signers.add(agent)
+    return signers
 
 
 def _verdict(holds: list[dict]) -> dict[str, Any]:
@@ -214,12 +356,19 @@ def _green_gate_names(gate_check: dict) -> set[str]:
 
 
 def _ack_authorized(ack: dict, lens: dict) -> bool:
+    """PURE: an ack authorizes a lens via the SAME refset vocabulary as the roster
+    and domains - agent / role / group. Group membership is resolved at ack time by
+    the CLI and stored on the ack as ``from_groups`` (mirroring ``from_role``), so
+    this stays pure (no roster read)."""
     if ack.get("override"):           # a recorded lead/operator override
         return True
     agent = ack.get("from")
     if agent in (lens.get("allowed_agents") or []):
         return True
-    return ack.get("from_role") in (lens.get("allowed_roles") or [])
+    if ack.get("from_role") in (lens.get("allowed_roles") or []):
+        return True
+    allowed_groups = set(lens.get("allowed_groups") or [])
+    return bool(allowed_groups & set(ack.get("from_groups") or []))
 
 
 def _is_wellformed(record: object) -> bool:
@@ -255,23 +404,205 @@ def validate_lens_spec(raw: dict) -> dict:
     lid = raw.get("id")
     if not isinstance(lid, str) or not lid:
         raise CloseError("each required lens needs a non-empty id")
-    return {
+    spec = {
         "id": lid,
         "allowed_agents": _str_list(raw.get("allowed_agents")),
         "allowed_roles": _str_list(raw.get("allowed_roles")),
+        "allowed_groups": _str_list(raw.get("allowed_groups")),
         "required": bool(raw.get("required", True)),
     }
+    # P3: generated signoff lenses carry their set id + refset for audit/routing.
+    if raw.get("signoff_set_id"):
+        spec["signoff_set_id"] = str(raw["signoff_set_id"])
+    return spec
 
 
 def _str_list(value: object) -> list[str]:
     if value is None:
         return []
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-        raise CloseError("allowed_agents/allowed_roles must be lists of strings")
+        raise CloseError("allowed_agents/allowed_roles/allowed_groups must be lists of strings")
     return list(value)
 
 
+# ---------------------------------------------------- P3 signoff policy + derive
+
+def validate_risk_class(value: object) -> str:
+    """Core VALIDATES a risk_class string (envelope OR a project: extension); it
+    never DECIDES risk. Raises CloseError on a bad string."""
+    if not isinstance(value, str) or not value:
+        raise CloseError("risk_class must be a non-empty string")
+    if value in CORE_RISK_CLASSES or _RISK_EXTENSION_RE.match(value):
+        return value
+    raise CloseError(
+        f"risk_class {value!r} is not in the core envelope {sorted(CORE_RISK_CLASSES)} "
+        "or a project:extension")
+
+
+def _refset(raw: object) -> dict:
+    """Normalize a candidate refset using the SAME vocabulary as roster/domains."""
+    raw = raw or {}
+    if not isinstance(raw, dict):
+        raise CloseError("a candidate refset must be an object {agents, groups, roles}")
+    return {"agents": _str_list(raw.get("agents")),
+            "groups": _str_list(raw.get("groups")),
+            "roles": _str_list(raw.get("roles"))}
+
+
+def validate_signoff_policy(raw: object) -> dict:
+    """Validate + normalize ``.agenttalk/signoffs.json``. A MISSING file is a valid
+    EMPTY policy (handled by the loader); here ``raw`` is the parsed object. Raises
+    CloseError (CLI -> invalid_signoff_policy) on a malformed policy."""
+    if not isinstance(raw, dict):
+        raise CloseError("signoff policy must be a JSON object")
+    defaults = raw.get("defaults") or {}
+    if not isinstance(defaults, dict):
+        raise CloseError("signoff policy 'defaults' must be an object")
+    default_reviewers = _refset((defaults or {}).get("reviewers"))
+    risk_policies_raw = raw.get("risk_policies") or {}
+    if not isinstance(risk_policies_raw, dict):
+        raise CloseError("signoff policy 'risk_policies' must be an object")
+    risk_policies: dict[str, list[dict]] = {}
+    seen_ids: set[str] = set()
+    for risk_class, sets in risk_policies_raw.items():
+        validate_risk_class(risk_class)
+        if not isinstance(sets, list):
+            raise CloseError(f"risk_policies[{risk_class!r}] must be a list of signoff sets")
+        norm_sets = []
+        for s in sets:
+            if not isinstance(s, dict):
+                raise CloseError(f"each signoff set under {risk_class!r} must be an object")
+            sid = s.get("id")
+            if not isinstance(sid, str) or not sid:
+                raise CloseError(f"a signoff set under {risk_class!r} needs a non-empty id")
+            count = s.get("required_count", 1)
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                raise CloseError(f"signoff set {sid!r} required_count must be a non-negative int")
+            statuses = _str_list(s.get("countable_statuses")) or [ACCEPT]
+            for st in statuses:
+                if st not in ACK_STATUSES:
+                    raise CloseError(
+                        f"signoff set {sid!r} countable_statuses has invalid {st!r}")
+            rsid = f"{risk_class}:{sid}"
+            if rsid in seen_ids:
+                raise CloseError(f"duplicate signoff set {rsid!r}")
+            seen_ids.add(rsid)
+            norm_sets.append({
+                "id": sid,
+                "required_count": count,
+                "candidates": _refset(s.get("candidates")),
+                "use_default_reviewers": bool(s.get("use_default_reviewers", False)),
+                "include_domain_reviewers": bool(s.get("include_domain_reviewers", False)),
+                "allow_na": bool(s.get("allow_na", False)),
+                "countable_statuses": statuses,
+                "override_counts": bool(s.get("override_counts", False)),
+            })
+        risk_policies[risk_class] = norm_sets
+    return {
+        "schema_version": int(raw.get("schema_version", SCHEMA_VERSION)),
+        "defaults": {"reviewers": default_reviewers},
+        "risk_policies": risk_policies,
+        "allow_unmapped": bool(raw.get("allow_unmapped", False)),
+    }
+
+
+def _stable_hash(obj: object) -> str:
+    return hashlib.sha256(
+        json.dumps(obj, sort_keys=True, ensure_ascii=False, default=str)
+        .encode("utf-8")).hexdigest()
+
+
+def policy_hash(policy: dict) -> str:
+    return _stable_hash(policy)
+
+
+def risk_inventory_hash(inventory: list) -> str:
+    # order-independent: hash the sorted normalized entries
+    norm = sorted(
+        (str(e.get("risk_class")), str(e.get("na_reason") or ""),
+         tuple(sorted(e.get("affected_paths") or [])))
+        for e in inventory if isinstance(e, dict))
+    return _stable_hash(norm)
+
+
+def _signoff_set_id(risk_class: str, set_id: str) -> str:
+    return f"{risk_class}:{set_id}"
+
+
+def generated_lens_ids(risk_class: str, set_id: str, count: int) -> list[str]:
+    base = f"so:{_signoff_set_id(risk_class, set_id)}"
+    return [f"{base}#{k}" for k in range(1, max(count, 1) + 1)]
+
+
+def derive_required_signoffs(policy: dict, risk_inventory: list) -> dict:
+    """PURE: map a validated ``policy`` + a close's ``risk_inventory`` into derived
+    required-signoff set records (refsets + generated lens ids), plus the list of
+    declared non-none risks that have NO policy mapping. A risk entry carrying an
+    ``na_reason`` is dispositioned N/A and requires no signoff. Returns
+    ``{"signoffs": [...], "unmapped": [risk_class, ...]}``. Candidate REFSETS are
+    stored, not concrete agents - the CLI resolves them at check time."""
+    out: list[dict] = []
+    unmapped: list[str] = []
+    allow_unmapped = bool(policy.get("allow_unmapped"))
+    risk_policies = policy.get("risk_policies") or {}
+    seen = set()
+    for entry in risk_inventory or []:
+        if not isinstance(entry, dict):
+            continue
+        rc = entry.get("risk_class")
+        if rc == "none" or not rc:
+            continue
+        if entry.get("na_reason"):                  # explicitly dispositioned N/A
+            continue
+        sets = risk_policies.get(rc)
+        if not sets:
+            if not allow_unmapped and rc not in unmapped:
+                unmapped.append(rc)
+            continue
+        for s in sets:
+            rsid = _signoff_set_id(rc, s["id"])
+            if rsid in seen:
+                continue
+            seen.add(rsid)
+            out.append({
+                "id": rsid,
+                "risk_class": rc,
+                "set_id": s["id"],
+                "required_count": s["required_count"],
+                "candidate_refset": s["candidates"],
+                "use_default_reviewers": s["use_default_reviewers"],
+                "include_domain_reviewers": s["include_domain_reviewers"],
+                "allow_na": s["allow_na"],
+                "countable_statuses": s["countable_statuses"],
+                "override_counts": s["override_counts"],
+                "generated_lens_ids": generated_lens_ids(rc, s["id"], s["required_count"]),
+            })
+    return {"signoffs": out, "unmapped": unmapped}
+
+
 # --------------------------------------------------------------- persistence
+
+def signoffs_policy_path(store):
+    return store.dir / SIGNOFF_DIRNAME
+
+
+def load_signoff_policy(store) -> tuple[dict | None, str | None]:
+    """Load + validate ``.agenttalk/signoffs.json``. Returns (policy, error):
+    a MISSING file is a valid EMPTY policy -> (None, None) meaning "no policy,
+    zero derived signoffs"; a present-but-malformed/unparseable file fails CLOSED
+    -> (None, error) which the CLI surfaces as invalid_signoff_policy."""
+    path = signoffs_policy_path(store)
+    if not path.exists():
+        return None, None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as e:
+        return None, f"signoffs.json is unreadable/corrupt: {e}"
+    try:
+        return validate_signoff_policy(raw), None
+    except CloseError as e:
+        return None, str(e)
+
 
 def closes_dir(store):
     return store.dir / DIRNAME
@@ -326,11 +657,13 @@ def _event(record: dict, kind: str, by: str, at: str, **fields: Any) -> None:
 def apply_ack(record: dict, *, lens_id: str, status: str, agent: str,
               from_role: str | None, at: str, evidence: dict | None = None,
               reason: str | None = None, counter_id: str | None = None,
-              override: bool = False) -> dict:
+              override: bool = False, from_groups: list[str] | None = None) -> dict:
     """Record a lens ack. Refuses if the close is not accepting acks (must be open/
     reopened, not published). ACCEPT carries typed evidence (validated by the
     caller via gates.validate_review_result_evidence); NA needs a reason; COUNTER
-    needs a counter_id (the caller also creates the counter record)."""
+    needs a counter_id (the caller also creates the counter record). ``from_groups``
+    (resolved by the CLI from the roster) is stored so group-refset authorization
+    stays pure (see :func:`_ack_authorized`)."""
     if record.get("status") == PUBLISHED:
         raise CloseError("close is published; reopen before acking (stale-proof)")
     if status not in ACK_STATUSES:
@@ -341,6 +674,7 @@ def apply_ack(record: dict, *, lens_id: str, status: str, agent: str,
         raise CloseError("a COUNTER ack requires a counter_id")
     record["lens_acks"][lens_id] = {
         "lens": lens_id, "status": status, "from": agent, "from_role": from_role,
+        "from_groups": list(from_groups or []),
         "revision": record.get("revision"), "at": at,
         "evidence": evidence or {}, "reason": reason, "counter_id": counter_id,
         "override": bool(override),
@@ -442,4 +776,82 @@ def reopen(record: dict, *, by: str, at: str, revision: str | None = None,
     if revision_clean is not None:
         record["revision_clean"] = bool(revision_clean)
     _event(record, "reopen", by, at, revision=revision)
+    return record
+
+
+def apply_signoffs(record: dict, *, policy: dict, risk_inventory: list,
+                   derived_by: str, at: str,
+                   resolved_candidates_at_apply: dict | None = None) -> dict:
+    """The ONLY mutating derivation step. Freeze the route INPUTS (policy hash, risk
+    inventory hash, revision), derive first-class required_signoffs from
+    (policy, risk_inventory), and (re)generate their signoff lens slots as
+    ``required: false`` P2 lenses carrying the candidate refset (so the P2 ack
+    machinery + refset auth apply, but P2's per-lens required-checks skip them - the
+    count is enforced purely by _evaluate_signoffs). Concrete agents are NOT frozen:
+    the refsets resolve against the current roster/groups/roles/domains at check.
+    ``resolved_candidates_at_apply`` is recorded AUDIT-ONLY."""
+    if record.get("status") == PUBLISHED:
+        raise CloseError("close is published; reopen before re-deriving signoffs")
+    inv = [_validate_risk_entry(e) for e in (risk_inventory or [])]
+    derived = derive_required_signoffs(policy, inv)
+    signoffs = derived["signoffs"]
+    audit = resolved_candidates_at_apply or {}
+    for s in signoffs:
+        s["resolved_candidates_at_apply"] = list(audit.get(s["id"], []))
+    record["risk_inventory"] = inv
+    record["required_signoffs"] = signoffs
+    # rebuild generated signoff lenses (drop any from a prior apply, keep manual ones)
+    manual = [ln for ln in record.get("required_lenses", [])
+              if isinstance(ln, dict) and not ln.get("signoff_set_id")]
+    generated = []
+    for s in signoffs:
+        for lid in s["generated_lens_ids"]:
+            generated.append(validate_lens_spec({
+                "id": lid, "required": False, "signoff_set_id": s["id"],
+                "allowed_agents": s["candidate_refset"].get("agents"),
+                "allowed_roles": s["candidate_refset"].get("roles"),
+                "allowed_groups": s["candidate_refset"].get("groups"),
+            }))
+    record["required_lenses"] = manual + generated
+    record["signoff_route"] = {
+        "policy_hash": policy_hash(policy),
+        "risk_inventory_hash": risk_inventory_hash(inv),
+        "revision": record.get("revision"),
+        "derived_at": at, "derived_by": derived_by,
+        "unmapped_risks": derived["unmapped"],
+    }
+    _event(record, "signoffs:apply", derived_by, at,
+           required=len(signoffs), unmapped=len(derived["unmapped"]))
+    return record
+
+
+def _validate_risk_entry(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        raise CloseError("each risk_inventory entry must be an object")
+    rc = validate_risk_class(raw.get("risk_class"))
+    na_reason = raw.get("na_reason")
+    if na_reason is not None and not (isinstance(na_reason, str) and na_reason.strip()):
+        raise CloseError("risk_inventory na_reason, when present, must be a non-empty string")
+    return {
+        "risk_class": rc,
+        "source": raw.get("source"),
+        "affected_paths": _str_list(raw.get("affected_paths")),
+        "na_reason": na_reason,
+    }
+
+
+def signoff_override(record: dict, *, set_id: str, by: str, at: str, reason: str) -> dict:
+    """The SINGLE escape for an unroutable/blocked required signoff: a recorded
+    close-lead override with a reason. It is audited as an override, NOT counted as a
+    specialist signoff (the CLI gates this on close-lead authority)."""
+    if record.get("status") == PUBLISHED:
+        raise CloseError("close is published; reopen before overriding a signoff")
+    if not (reason and reason.strip()):
+        raise CloseError("a signoff override requires a reason")
+    known = {s.get("id") for s in record.get("required_signoffs", []) if isinstance(s, dict)}
+    if set_id not in known:
+        raise CloseError(f"no required signoff {set_id!r} on this close (known: {sorted(known)})")
+    record.setdefault("signoff_overrides", {})[set_id] = {
+        "by": by, "reason": reason, "at": at}
+    _event(record, "signoffs:override", by, at, set_id=set_id)
     return record

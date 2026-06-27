@@ -1031,8 +1031,51 @@ a team-wide epoch bump. The global epoch is audit-only at open; only an explicit
 `close publish --verdict go --bump-barrier` fires the release barrier (after
 recording `GO`), and a `hold` never bumps it.
 
-P3 items — role→member routing, specialist discovery, skill rubrics, severity
-policy, and ephemeral adversarial reviewers — are intentionally out of scope.
+### Specialist sign-off by risk class (`agenttalk close signoffs`)
+
+`agenttalk close signoffs {plan,apply,override}` turns the close's explicit
+lenses into review **sign-offs routed from the risk classes in play**. It is
+opt-in (no `.agenttalk/signoffs.json` policy = zero derived signoffs) and, like
+everything in `close`, **advisory**: it counts who signed and whether the
+required counts are met; it is not an access-control boundary.
+
+The project owns the policy in `.agenttalk/signoffs.json`: per risk class, a list
+of signoff sets `{id, required_count, candidates: {agents, groups, roles},
+use_default_reviewers, include_domain_reviewers, allow_na, countable_statuses,
+override_counts}`, plus `defaults.reviewers` and `allow_unmapped`. The core
+**validates** the policy and the risk-class strings (the envelope `none`,
+`unknown`, `release`, `security`, `performance`, `persistence`, `docs-contract`,
+`quality`, plus `project:…` extensions) but never **decides** a change's risk —
+the lead/project supplies the close's risk inventory.
+
+`close open … --derive-signoffs --risk-class X` (or `close signoffs apply`)
+freezes the route: it records the policy hash, the risk-inventory hash, and the
+revision, derives first-class `required_signoffs`, and generates `required:false`
+signoff lens slots. Changed paths default to `git diff --name-only
+<base>..<revision>` (the frozen revision; `--changed-path` is an audited
+override). Crucially it **freezes the route inputs, not the people**: candidate
+refsets resolve against the *current* roster/groups/roles (and, additively, the
+matched domains' `reviewers` from `domains.json`) at check time, so a reviewer
+added or removed later is honored without reopening; only a policy / risk /
+revision change raises `stale_signoff_route` until you re-apply.
+
+A set is satisfied by enough **distinct, currently-qualifying** acks (`close ack
+--lens <generated-id>`): one agent cannot satisfy `required_count=2` with two
+acks, a non-candidate ack is refused, `na` counts only when the set sets
+`allow_na` (and carries a reason), a `counter` does not count unless listed in
+`countable_statuses`, and a lead `--override` ack does not count unless the set
+sets `override_counts`. `close check` adds the stable HOLD codes
+`missing_required_signoff`, `unroutable_required_signoff`, `invalid_signoff_policy`,
+`unmapped_required_risk`, and `stale_signoff_route` (still exit 0=GO / 3=HOLD). An
+unroutable or otherwise blocked set has exactly one escape: `close signoffs
+override --set ID --from LEAD --reason …` (close-lead authority; recorded and
+audited, never counted as a specialist sign-off).
+
+The verdict stays **pure**: the CLI does all the I/O (load the policy, resolve
+refsets against roster/domains, run `git diff`, hash the route) and hands
+`compute_verdict` a resolved evaluation; the core only counts. Rubric content,
+automatic specialist discovery, risk inference from code, and ephemeral reviewers
+remain out of scope (P4+).
 
 ### Rejoining a session with `sync`
 

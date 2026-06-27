@@ -1481,6 +1481,251 @@ def _check_close_authority(store, actor: str, action: str) -> bool:
     return authorized
 
 
+# ----- P3 signoff helpers (the impure resolution shell; the verdict stays pure) -
+
+def _agent_groups(cfg: dict, agent: str) -> list[str]:
+    """The groups an agent currently belongs to (for ack from_groups - keeps the
+    pure refset-group authorization working without the core reading the roster)."""
+    groups = cfg.get("groups", {}) or {}
+    return [g for g, members in groups.items()
+            if isinstance(members, list) and agent in members]
+
+
+def _merge_refsets(*refsets: dict) -> dict:
+    merged = {"agents": [], "groups": [], "roles": []}
+    for rs in refsets:
+        for key in merged:
+            merged[key].extend((rs or {}).get(key) or [])
+    return merged
+
+
+def _signoff_domain_refset(store, changed_paths: list[str]) -> dict:
+    """Additive ONLY: the union of matched owned-domain reviewers + matched
+    shared-path default_reviewers for the close's changed paths. Touching a domain
+    never mints a requirement; this only widens an existing set's candidates. Missing
+    registry = empty."""
+    merged = _merge_refsets()
+    if not changed_paths:
+        return merged
+    try:
+        reg = _load_domain_registry(store)
+        data = reg.data
+    except Exception:  # noqa: BLE001 - a broken registry must not crash close check
+        return merged
+    verdicts = dom.check_paths(data, changed_paths)
+    domains = data.get("domains", {})
+    shared = data.get("shared_paths", [])
+    matched_domains: set[str] = set()
+    matched_globs: set[str] = set()
+    for v in verdicts:
+        matched_domains.update(v.get("domains", []))
+        for sm in v.get("shared_paths", []):
+            matched_globs.add(sm.get("glob"))
+    parts = [merged]
+    for did in matched_domains:
+        parts.append(domains.get(did, {}).get("reviewers") or {})
+    for entry in shared:
+        if entry.get("glob") in matched_globs:
+            parts.append(entry.get("default_reviewers") or {})
+    return _merge_refsets(*parts)
+
+
+def _changed_paths_of(record: dict) -> list[str]:
+    inv = record.get("risk_inventory") or []
+    return sorted({p for e in inv if isinstance(e, dict)
+                   for p in (e.get("affected_paths") or [])})
+
+
+def _build_signoff_eval(store, record: dict):
+    """Resolve everything P3 needs from config/roster/domains (IMPURE) into the
+    bundle compute_verdict consumes (PURE). None when the close has no derived
+    signoffs (P2-only). Fails closed via policy_error on a malformed policy."""
+    from agenttalk import close as close_mod
+    if not record.get("signoff_route"):   # P3 in play iff `apply` has run
+        return None
+    cfg = store.load_config()
+    active = store.active_agents()
+    policy, err = close_mod.load_signoff_policy(store)
+    if err:
+        return {"policy_present": True, "policy_error": err,
+                "current_policy_hash": "", "current_risk_inventory_hash": "",
+                "unmapped_risks": [], "resolved_candidates": {}, "active_agents": active}
+    inv = record.get("risk_inventory") or []
+    cur_policy_hash = close_mod.policy_hash(policy) if policy else ""
+    cur_inv_hash = close_mod.risk_inventory_hash(inv)
+    unmapped = (close_mod.derive_required_signoffs(policy, inv)["unmapped"]
+                if policy else [])
+    domain_refset = _signoff_domain_refset(store, _changed_paths_of(record))
+    default_reviewers = ((policy or {}).get("defaults", {}) or {}).get("reviewers") or {}
+    resolved: dict[str, list[str]] = {}
+    for s in record["required_signoffs"]:
+        merged = _merge_refsets(
+            s.get("candidate_refset") or {},
+            default_reviewers if s.get("use_default_reviewers") else {},
+            domain_refset if s.get("include_domain_reviewers") else {})
+        resolved[s["id"]] = dom.resolve_refset(merged, cfg)
+    return {"policy_present": policy is not None, "policy_error": None,
+            "current_policy_hash": cur_policy_hash,
+            "current_risk_inventory_hash": cur_inv_hash,
+            "unmapped_risks": unmapped, "resolved_candidates": resolved,
+            "active_agents": active}
+
+
+def _signoff_risk_inventory(args, store, record: dict) -> list[dict]:
+    """Build a risk inventory from CLI flags. Changed paths DEFAULT from the frozen
+    revision's git diff (base..revision); manual --changed-path is an audited
+    override. --risk-class X (repeatable) -> active risk; --risk-na CLASS=REASON ->
+    dispositioned N/A."""
+    revision = record.get("revision")
+    paths = list(getattr(args, "changed_path", None) or [])
+    path_source = "manual"
+    if not paths:
+        base = getattr(args, "base", None) or f"{revision}^"
+        rc, out = _git(store.root, ["diff", "--name-only", f"{base}..{revision}"])
+        if rc == 0:
+            paths = [ln.strip() for ln in out.splitlines() if ln.strip()]
+            path_source = f"git-diff {base}..{revision[:12]}"
+    inv: list[dict] = []
+    for rc_class in getattr(args, "risk_class", None) or []:
+        inv.append({"risk_class": rc_class, "source": path_source,
+                    "affected_paths": paths, "na_reason": None})
+    for spec in getattr(args, "risk_na", None) or []:
+        if "=" not in spec:
+            raise close_na_error("--risk-na must be CLASS=REASON")
+        cls, reason = spec.split("=", 1)
+        inv.append({"risk_class": cls, "source": "cli-na",
+                    "affected_paths": [], "na_reason": reason})
+    return inv
+
+
+def close_na_error(msg: str):
+    from agenttalk import close as close_mod
+    return close_mod.CloseError(msg)
+
+
+def _signoff_set_for_lens(record: dict, lens_id: str) -> str | None:
+    """The signoff set a generated lens belongs to, or None for a plain P2 lens."""
+    for ln in record.get("required_lenses", []) or []:
+        if isinstance(ln, dict) and ln.get("id") == lens_id and ln.get("signoff_set_id"):
+            return ln["signoff_set_id"]
+    return None
+
+
+def _close_derive_signoffs(args, store, record: dict, actor: str) -> int:
+    """Resolve policy + risk inventory + refsets and APPLY them onto ``record`` (in
+    place). The single mutating derivation; the caller persists. Returns 0 or a CLI
+    exit code (2 on invalid policy / bad input)."""
+    from agenttalk import close as close_mod
+    policy, err = close_mod.load_signoff_policy(store)
+    if err:
+        sys.stderr.write(f"agenttalk close signoffs: invalid policy - {err}\n")
+        return 2
+    if policy is None:
+        sys.stderr.write(
+            "agenttalk close signoffs: no .agenttalk/signoffs.json policy "
+            "(opt-in) - nothing to derive.\n")
+        return 2
+    try:
+        inv = _signoff_risk_inventory(args, store, record)
+        audit = _resolve_signoff_audit(store, policy, inv, record)
+        close_mod.apply_signoffs(record, policy=policy, risk_inventory=inv,
+                                 derived_by=actor, at=_iso_now(),
+                                 resolved_candidates_at_apply=audit)
+    except close_mod.CloseError as e:
+        sys.stderr.write(f"agenttalk close signoffs: {e}\n")
+        return 2
+    return 0
+
+
+def _resolve_signoff_audit(store, policy, inv, record) -> dict:
+    """AUDIT-ONLY snapshot of who currently resolves for each derived set (concrete
+    agents at apply time). NOT the authority - check re-resolves the refsets."""
+    from agenttalk import close as close_mod
+    cfg = store.load_config()
+    derived = close_mod.derive_required_signoffs(policy, inv)["signoffs"]
+    changed = sorted({p for e in inv if isinstance(e, dict)
+                      for p in (e.get("affected_paths") or [])})
+    domain_refset = _signoff_domain_refset(store, changed)
+    default_reviewers = ((policy or {}).get("defaults", {}) or {}).get("reviewers") or {}
+    audit = {}
+    for s in derived:
+        merged = _merge_refsets(
+            s.get("candidate_refset") or {},
+            default_reviewers if s.get("use_default_reviewers") else {},
+            domain_refset if s.get("include_domain_reviewers") else {})
+        audit[s["id"]] = dom.resolve_refset(merged, cfg)
+    return audit
+
+
+def _cmd_close_signoffs(args, store, roster) -> int:
+    """`close signoffs {plan,apply,override}` - the impure derivation layer."""
+    from agenttalk import close as close_mod
+    sub = getattr(args, "signoffs_cmd", None)
+
+    if sub == "plan":
+        record = close_mod.load_close(store, args.id)
+        policy, err = close_mod.load_signoff_policy(store)
+        if err:
+            sys.stderr.write(f"agenttalk close signoffs plan: invalid policy - {err}\n")
+            return 2
+        if policy is None:
+            print("signoff policy: none (.agenttalk/signoffs.json absent) - "
+                  "zero derived signoffs")
+            return 0
+        try:
+            inv = _signoff_risk_inventory(args, store, record)
+        except close_mod.CloseError as e:
+            sys.stderr.write(f"agenttalk close signoffs plan: {e}\n")
+            return 2
+        derived = close_mod.derive_required_signoffs(policy, inv)
+        audit = _resolve_signoff_audit(store, policy, inv, record)
+        out = {"would_require": derived["signoffs"], "unmapped_risks": derived["unmapped"],
+               "resolved_candidates": audit, "risk_inventory": inv}
+        if getattr(args, "json", False):
+            print(json.dumps(out, indent=2))
+        else:
+            if derived["unmapped"]:
+                print("UNMAPPED risks (would HOLD unless allow_unmapped): "
+                      + ", ".join(derived["unmapped"]))
+            if not derived["signoffs"]:
+                print("no signoffs derived for this risk inventory")
+            for s in derived["signoffs"]:
+                cands = ", ".join(audit.get(s["id"], [])) or "(none - would be unroutable)"
+                print(f"  {s['id']}: need {s['required_count']} of [{cands}]")
+        return 0
+
+    if sub == "apply":
+        record = close_mod.load_close(store, args.id)
+        actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        _check_close_authority(store, actor, "signoffs apply")
+        rc = _close_derive_signoffs(args, store, record, actor)
+        if rc != 0:
+            return rc
+        close_mod.save_close(store, record)
+        n = len(record.get("required_signoffs") or [])
+        unmapped = (record.get("signoff_route") or {}).get("unmapped_risks") or []
+        print(f"applied signoffs to {args.id}: {n} required set(s)"
+              + (f"; UNMAPPED {', '.join(unmapped)}" if unmapped else ""))
+        return 0
+
+    if sub == "override":
+        record = close_mod.load_close(store, args.id)
+        actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        _check_close_authority(store, actor, "signoffs override")
+        try:
+            close_mod.signoff_override(record, set_id=args.set, by=actor,
+                                       at=_iso_now(), reason=args.reason)
+        except close_mod.CloseError as e:
+            sys.stderr.write(f"agenttalk close signoffs override: {e}\n")
+            return 2
+        close_mod.save_close(store, record)
+        print(f"signoff {args.set} overridden on {args.id} by {actor} (audited, not counted)")
+        return 0
+
+    sys.stderr.write("agenttalk close signoffs: expected plan, apply, or override.\n")
+    return 2
+
+
 def _close_lens_specs(args) -> list[dict]:
     from agenttalk import close as close_mod
     # --allow LENS:TOKEN  (TOKEN '@role' -> allowed_roles, else allowed_agents)
@@ -1541,19 +1786,27 @@ def cmd_close(args: argparse.Namespace) -> int:
                 f"agenttalk close open: {close_id!r} already exists "
                 "(use --force to overwrite, or `close reopen`).\n")
             return 2
-        close_mod.save_close(store, record)
         if not clean and not args.dirty_artifact:
             sys.stderr.write(
                 "agenttalk close open: WARNING - worktree is dirty and no "
                 "--dirty-artifact was recorded; close check will HOLD on revision "
                 "until a clean SHA or a recorded diff artifact is provided.\n")
+        if getattr(args, "derive_signoffs", False):
+            rc = _close_derive_signoffs(args, store, record, opener)
+            if rc != 0:
+                return rc
+        close_mod.save_close(store, record)
         if getattr(args, "json", False):
             print(json.dumps(record, indent=2))
         else:
             print(f"opened close {close_id} @ {revision[:12]} ({kind}, "
                   f"{'clean' if clean else 'dirty'}); "
-                  f"{len(record['required_lenses'])} required lens(es)")
+                  f"{len(record['required_lenses'])} lens(es), "
+                  f"{len(record.get('required_signoffs') or [])} signoff(s)")
         return 0
+
+    if action == "signoffs":
+        return _cmd_close_signoffs(args, store, roster)
 
     if action == "ack":
         record = close_mod.load_close(store, args.id)
@@ -1598,12 +1851,27 @@ def cmd_close(args: argparse.Namespace) -> int:
                     f"agenttalk close ack: --override IGNORED - {agent!r} is not a "
                     f"recognized close lead {sorted(leads)}; the ack stays subject "
                     "to the lens authorization (override is a lead privilege).\n")
+        from_groups = _agent_groups(store.load_config(), agent)
+        # A signoff-lens ack must come from a CURRENT candidate (resolved from the
+        # set's refsets). Refusing non-candidates gives a clear error AND stops a
+        # non-candidate from displacing a valid signer's slot ack. Override is the
+        # lead escape (recorded, advisory) and bypasses this candidacy gate.
+        sid = _signoff_set_for_lens(record, args.lens)
+        if sid is not None and not override:
+            ev = _build_signoff_eval(store, record) or {}
+            candidates = set((ev.get("resolved_candidates") or {}).get(sid, []))
+            if agent not in candidates:
+                sys.stderr.write(
+                    f"agenttalk close ack: {agent!r} is not a current candidate for "
+                    f"signoff {sid!r} (candidates: {sorted(candidates) or 'none'}); "
+                    "refusing. Use `close signoffs override` for the lead escape.\n")
+                return 2
         try:
             close_mod.apply_ack(
                 record, lens_id=args.lens, status=args.status, agent=agent,
                 from_role=from_role, at=_iso_now(), evidence=evidence,
                 reason=args.reason, counter_id=counter_id,
-                override=override)
+                override=override, from_groups=from_groups)
         except close_mod.CloseError as e:
             sys.stderr.write(f"agenttalk close ack: {e}\n")
             return 2
@@ -1664,9 +1932,14 @@ def cmd_close(args: argparse.Namespace) -> int:
             record = {"close_id": args.id}  # corrupt -> compute_verdict -> malformed
         gate_check = gate_mod.check_gates(
             store.root, scope=record.get("gate_scope") if isinstance(record, dict) else None)
-        result = close_mod.compute_verdict(record if isinstance(record, dict) else {}, gate_check)
+        rec = record if isinstance(record, dict) else {}
+        signoff_eval = _build_signoff_eval(store, rec) if isinstance(record, dict) else None
+        result = close_mod.compute_verdict(rec, gate_check, signoff_eval)
         if getattr(args, "json", False):
-            print(json.dumps({**result, "gate_verdict": gate_check["verdict"]}, indent=2))
+            print(json.dumps({**result, "gate_verdict": gate_check["verdict"],
+                              "signoff_policy": (None if signoff_eval is None
+                                                 else "present" if signoff_eval.get("policy_present")
+                                                 else "none")}, indent=2))
         else:
             _print_verdict(args.id, result)
         return 0 if result["verdict"] == close_mod.VERDICT_GO else 3
@@ -1681,7 +1954,8 @@ def cmd_close(args: argparse.Namespace) -> int:
                 "`close reopen` first.\n")
             return 2
         gate_check = gate_mod.check_gates(store.root, scope=record.get("gate_scope"))
-        result = close_mod.compute_verdict(record, gate_check)
+        signoff_eval = _build_signoff_eval(store, record)
+        result = close_mod.compute_verdict(record, gate_check, signoff_eval)
         if args.verdict == "go" and result["verdict"] != close_mod.VERDICT_GO:
             sys.stderr.write(
                 "agenttalk close publish: refusing GO - close check is HOLD:\n")
@@ -4703,8 +4977,43 @@ def build_parser() -> argparse.ArgumentParser:
     copen.add_argument("--dirty-artifact", help="Pointer to a recorded diff when the worktree is dirty.")
     copen.add_argument("--allow-dirty", action="store_true", help="Proceed on a dirty worktree (records dirty).")
     copen.add_argument("--force", action="store_true", help="Overwrite an existing close with this id.")
+    copen.add_argument("--derive-signoffs", action="store_true",
+                       help="P3: derive required signoffs from the risk inventory + signoffs.json.")
+    copen.add_argument("--risk-class", action="append",
+                       help="P3: a risk class in play (repeatable; needs --derive-signoffs).")
+    copen.add_argument("--risk-na", action="append",
+                       help="P3: dispositioned-N/A risk CLASS=REASON (repeatable).")
+    copen.add_argument("--changed-path", action="append",
+                       help="P3: changed path (repeatable; default = git diff base..revision).")
+    copen.add_argument("--base", help="P3: diff base for changed paths (default revision^).")
     copen.add_argument("--json", action="store_true", help="Emit the opened record.")
     copen.set_defaults(func=cmd_close)
+
+    csign = csub.add_parser("signoffs", help="P3: derive/inspect specialist sign-offs.")
+    csignsub = csign.add_subparsers(dest="signoffs_cmd")
+    csplan = csignsub.add_parser("plan", help="READ-ONLY: preview derived signoffs + candidates.")
+    csplan.add_argument("--id", required=True)
+    csplan.add_argument("--risk-class", action="append", help="Risk class in play (repeatable).")
+    csplan.add_argument("--risk-na", action="append", help="Dispositioned-N/A risk CLASS=REASON.")
+    csplan.add_argument("--changed-path", action="append", help="Changed path (default git diff).")
+    csplan.add_argument("--base", help="Diff base (default revision^).")
+    csplan.add_argument("--json", action="store_true")
+    csplan.set_defaults(func=cmd_close)
+    csapply = csignsub.add_parser("apply", help="The ONLY mutating derivation: freeze the route.")
+    csapply.add_argument("--id", required=True)
+    csapply.add_argument("--from", dest="actor", help="Close lead applying the derivation.")
+    csapply.add_argument("--risk-class", action="append", help="Risk class in play (repeatable).")
+    csapply.add_argument("--risk-na", action="append", help="Dispositioned-N/A risk CLASS=REASON.")
+    csapply.add_argument("--changed-path", action="append", help="Changed path (default git diff).")
+    csapply.add_argument("--base", help="Diff base (default revision^).")
+    csapply.set_defaults(func=cmd_close)
+    csov = csignsub.add_parser("override", help="Lead escape for an unroutable/blocked signoff.")
+    csov.add_argument("--id", required=True)
+    csov.add_argument("--set", required=True, help="Required signoff set id to override.")
+    csov.add_argument("--from", dest="actor", help="Close lead recording the override.")
+    csov.add_argument("--reason", required=True, help="Why the signoff is being overridden.")
+    csov.set_defaults(func=cmd_close)
+    csign.set_defaults(func=cmd_close, signoffs_cmd=None)
 
     cack = csub.add_parser("ack", help="Record a lens ack (accept / counter / na).")
     cack.add_argument("--id", required=True)
