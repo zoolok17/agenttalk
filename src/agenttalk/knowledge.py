@@ -235,23 +235,53 @@ def new_curate_event(*, base: dict, action: str, curated_by: str, resolved_from:
 # --------------------------------------------------------------- current view
 
 def event_problem(evt: object) -> str | None:
-    """FULL structural validation of one event - the reader/fold use this so a
-    minimally-shaped-but-invalid line can NEVER become current and hide a valid note
-    (codex blocker). Returns an error string, or None if the event is foldable.
-    Validates the SAME fields publish/curate produce: type, body+cap, anchor, ids,
-    authority."""
+    """FULL structural validation of one persisted event AS AN EVENT - the reader/
+    fold use this so a JSON-valid-but-malformed line can NEVER become current, hide a
+    valid note, OR FORGE curation (codex + reviewer-1 blockers). Validates the note
+    fields AND domain_registry_hash, verified_against_sha shape, the allowed authority
+    states, the event-kind <-> authority-state matrix (publish=uncurated,
+    curate=verified|lead_override, retract=retracted - so an open-capture publish can
+    never self-declare verified), and the per-kind required lineage fields. Returns an
+    error string, or None if the event is foldable."""
     if not isinstance(evt, dict):
         return "not a JSON object"
     if evt.get("schema_version") != SCHEMA_VERSION:
         return "schema_version must be 1"
-    if evt.get("event") not in (EVENT_PUBLISH, EVENT_CURATE, EVENT_RETRACT):
+    event = evt.get("event")
+    if event not in (EVENT_PUBLISH, EVENT_CURATE, EVENT_RETRACT):
         return "event must be publish|curate|retract"
     for key in ("id", "key", "domain_id"):
         if not isinstance(evt.get(key), str) or not evt.get(key):
             return f"{key} is required"
+    if not isinstance(evt.get("domain_registry_hash"), str) or not evt.get("domain_registry_hash"):
+        return "domain_registry_hash is required"
+    vsha = evt.get("verified_against_sha")
+    if vsha is not None and not (isinstance(vsha, str) and _FULL_SHA_RE.match(vsha)):
+        return "verified_against_sha must be null or a full 40-char SHA"
     auth = evt.get("authority")
-    if not isinstance(auth, dict) or not isinstance(auth.get("state"), str):
-        return "authority.state is required"
+    if not isinstance(auth, dict):
+        return "authority is required"
+    state = auth.get("state")
+    if state not in (AUTH_UNCURATED, AUTH_VERIFIED, AUTH_LEAD_OVERRIDE, AUTH_RETRACTED):
+        return f"authority.state must be one of uncurated|verified|lead_override|retracted, got {state!r}"
+    # event-kind <-> authority-state matrix: a publish (open capture) can NEVER be
+    # verified/lead_override (that requires a separate curate event) - this is the
+    # forged-curation guard.
+    if event == EVENT_PUBLISH and state != AUTH_UNCURATED:
+        return "a publish event must be uncurated (curation is a separate curate event)"
+    if event == EVENT_CURATE and state not in (AUTH_VERIFIED, AUTH_LEAD_OVERRIDE):
+        return "a curate event must be verified or lead_override"
+    if event == EVENT_RETRACT and state != AUTH_RETRACTED:
+        return "a retract event must be retracted"
+    # per-kind lineage fields
+    if event == EVENT_PUBLISH and not (isinstance(evt.get("author"), str) and evt.get("author")):
+        return "a publish event requires author"
+    if event in (EVENT_CURATE, EVENT_RETRACT) and not (
+            isinstance(evt.get("curated_by"), str) and evt.get("curated_by")):
+        return "a curate/retract event requires curated_by"
+    if event == EVENT_RETRACT and not (
+            isinstance(evt.get("retract_reason"), str) and evt.get("retract_reason").strip()):
+        return "a retract event requires a non-empty retract_reason"
     try:
         validate_key(evt["key"])
         validate_note_id(evt["id"])

@@ -79,6 +79,36 @@ def test_shallow_invalid_event_does_not_hide_valid_note() -> None:
     assert view[("cli", "cli.seam")]["id"] == "kn-1"      # valid note remains current
 
 
+def test_forged_verified_publish_rejected() -> None:
+    # reviewer-1 blocker: an open-capture publish must NOT self-declare verified
+    # (forging the curation gate). The event-kind <-> authority-state matrix rejects it.
+    forged = _publish()
+    forged["authority"] = {"state": kn.AUTH_VERIFIED, "resolved_from": "active_agent",
+                           "reason": None}
+    assert kn.event_problem(forged) is not None
+    view = kn.current_view([_publish(note_id="kn-ok"), forged])
+    # the forged event is skipped; the legitimate uncurated publish remains current
+    assert kn.current_view([forged]) == {}            # forged alone -> nothing valid
+    assert view[("cli", "cli.seam")]["id"] == "kn-ok"
+
+
+def test_incomplete_curate_event_rejected() -> None:
+    # reviewer-1 blocker: a curate event missing domain_registry_hash (or other
+    # required fields) must be rejected, not accepted-then-evaluated-stale (which
+    # would hide the real verified note).
+    bad = {"schema_version": 1, "event": "curate", "id": "kn-bad1", "key": "cli.seam",
+           "domain_id": "cli", "type": "gotcha", "body": "bad verified line",
+           "anchor": {"kind": "path", "path": "src/cli.py"},
+           "authority": {"state": "verified"}}        # no domain_registry_hash / curated_by
+    assert kn.event_problem(bad) is not None
+    # a valid verified note is NOT replaced by the malformed curate
+    pub = _publish()
+    verify = kn.new_curate_event(base=pub, action="verify", curated_by="o",
+                                 resolved_from="curator", at="t2", reason=None)
+    rec = kn.resolve_views([pub, verify, bad])[("cli", "cli.seam")]
+    assert rec["curated"]["id"] == verify["id"]       # malformed curate skipped
+
+
 def test_resolve_views_uncurated_publish_does_not_shadow_verified() -> None:
     # codex blocker 1: an uncurated publish over a verified key must NOT replace the
     # authoritative (curated) note.
