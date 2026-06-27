@@ -82,6 +82,23 @@ def test_validate_registry_rejects_unknown_refs(tmp_path: Path) -> None:
         dom.validate_registry(registry, Store(root).load_config())
 
 
+def test_validate_registry_rejects_duplicate_shared_glob(tmp_path: Path) -> None:
+    # C2/D-11 (codex P1): two shared_paths entries with the SAME normalized glob but
+    # DIFFERENT approvers would collapse the all-matching rule (the verdict keys entries
+    # by glob) -> one approver silently clears the path, bypassing the other. Validation
+    # must fail closed; merge into one entry instead.
+    root = _root(tmp_path)
+    registry = _registry()
+    registry["shared_paths"].append({
+        "glob": "pyproject.toml",                      # duplicate of the existing entry
+        "category": "package-metadata",
+        "requires": "shared-lease-or-lead-approval",
+        "default_approvers": {"agents": ["beta"]},     # DIFFERENT approver
+    })
+    with pytest.raises(dom.DomainError, match="duplicate"):
+        dom.validate_registry(registry, Store(root).load_config())
+
+
 def test_normalize_repo_path_rejects_absolute_and_escape() -> None:
     assert dom.normalize_repo_path(r".\\src\\agenttalk\\..\\agenttalk\\cli.py") == "src/agenttalk/cli.py"
     assert dom.normalize_repo_path("SRC/CLI.PY", casefold=True) == "src/cli.py"

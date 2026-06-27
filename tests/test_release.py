@@ -160,13 +160,22 @@ def test_is_release_authorized_sole_lead(tmp_path: Path) -> None:
     assert s.is_release_authorized("worker") is False
 
 
-def test_is_release_authorized_fallback_plain_pair(tmp_path: Path) -> None:
-    """No liaison and no unambiguous lead (plain pair) => any active agent is
-    authorized (compatibility)."""
+def test_is_release_authorized_plain_pair_fails_closed(tmp_path: Path) -> None:
+    """0.40.0 unification: is_release_authorized now DELEGATES to the single
+    loop-exit resolver, which has NO zero-lead any-active fallback. A plain pair
+    with no liaison and no role=lead authorizes NO ONE (fail closed) - it must
+    match loop_exit_relay_authorized exactly (no authority drift)."""
     s = _team(tmp_path, "alpha,beta")
+    assert s.is_release_authorized("alpha") is False
+    assert s.is_release_authorized("beta") is False
+    assert s.is_release_authorized("ghost") is False
+    # the two resolvers are now ONE: identical answers for every sender.
+    for who in ("alpha", "beta", "ghost"):
+        assert s.is_release_authorized(who) == s.loop_exit_relay_authorized(who)
+    # designating a liaison restores a single authority
+    s.set_operator_facing("alpha")
     assert s.is_release_authorized("alpha") is True
-    assert s.is_release_authorized("beta") is True
-    assert s.is_release_authorized("ghost") is False  # off-roster
+    assert s.is_release_authorized("beta") is False
 
 
 def test_is_release_authorized_fails_closed_on_ambiguous_multilead(

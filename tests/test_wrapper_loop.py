@@ -477,6 +477,77 @@ def test_loop_failed_turn_backs_off_not_hot_spin(tmp_path) -> None:
     assert s.read_heartbeat("beta") is None  # a failed turn does NOT stamp heartbeat
 
 
+# --------------------------------------------- C3 (0.40.0): one-shot scoped loop
+
+def test_one_shot_scoped_does_not_starve_or_consume_unrelated(tmp_path) -> None:
+    # AUDIT P1-c: an unrelated head-of-inbox message must NOT starve a scoped
+    # one-shot, and the one-shot must NOT consume it from the GLOBAL inbox (it stays
+    # unread for a later global sync). The one-shot drives ONLY its scoped request.
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="unrelated head")   # no request_id
+    target = s.send(sender="alpha", recipient="beta", body="the task",
+                    meta={"request_id": "rq-1"})
+    seen: list[str] = []
+
+    def drive(rec):
+        seen.append(rec["body"])
+        return True
+
+    turns = loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                          max_turns=1, only_request_id="rq-1")
+    assert turns == 1 and seen == ["the task"]        # drove ONLY the scoped request
+    assert s.cursor("beta") == ""                      # unrelated NOT globally consumed
+    assert s.thread_seen("beta", "rq-1") == target.id  # scoped seen advanced only
+    assert s.read_waiting("beta") is None              # waiting cleared on exit
+
+
+def test_one_shot_times_out_nonzero_when_request_never_arrives(tmp_path) -> None:
+    # AUDIT P1-c: a one-shot whose request never arrives must TERMINATE (bounded),
+    # not spin forever. max_wall is the in-process bound; turns==0 -> nonzero exit.
+    s = _store(tmp_path)
+    t = {"n": 0.0}
+
+    def clock():
+        t["n"] += 100.0
+        return t["n"]
+
+    turns = loop.run_loop(s, "beta", lambda rec: True, clock=clock,
+                          sleep=lambda d: None, only_request_id="rq-missing",
+                          max_wall=50.0)
+    assert turns == 0                                  # never arrived -> no turn driven
+    assert s.read_waiting("beta") is None              # waiting cleared on exit
+
+
+def test_one_shot_idle_stamps_heartbeat_while_waiting(tmp_path) -> None:
+    # AUDIT P1-c: while waiting for its scoped request the one-shot keeps the
+    # heartbeat FRESH (the old skip branch never stamped -> it went stale spinning).
+    s = _store(tmp_path)
+    t = {"n": 0.0}
+
+    def clock():
+        t["n"] += 100.0
+        return t["n"]
+
+    turns = loop.run_loop(s, "beta", lambda rec: True, clock=clock,
+                          sleep=lambda d: None, only_request_id="rq-x",
+                          max_polls=3, heartbeat_interval=10.0)
+    assert turns == 0
+    assert s.read_heartbeat("beta") is not None        # waiting one-shot is not stale
+    assert s.read_waiting("beta") is None              # cleared on exit
+
+
+def test_continuous_loop_clears_waiting_on_stop(tmp_path) -> None:
+    # AUDIT residual: the wrapper must clear its .waiting marker on a NORMAL exit
+    # (try/finally), not only when killed. A marked authorized release stands it down.
+    s = _store(tmp_path)
+    s.set_operator_facing("alpha")
+    s.send(sender="alpha", recipient="beta", kind="release", body="down",
+           meta=_human_meta())
+    loop.run_loop(s, "beta", lambda rec: True, clock=lambda: 0.0,
+                  sleep=lambda d: None, max_polls=5)
+    assert s.read_waiting("beta") is None
+
+
 def test_loop_with_make_drive_end_to_end(tmp_path) -> None:
     # the full Phase-B pipeline, no real CLI: loop -> make_drive -> fake codex stream.
     s = _store(tmp_path)

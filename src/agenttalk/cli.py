@@ -1360,20 +1360,25 @@ def cmd_gate(args: argparse.Namespace) -> int:
     if action == "set":
         actor = _resolve_self(getattr(args, "actor", None), roster=store.load_config().get("agents") or [])
         required = True if args.required else False if args.optional else None
-        gate = gate_mod.set_gate(
-            store.root,
-            name=args.name,
-            status=args.status,
-            severity=args.severity,
-            scope=args.scope,
-            actor=actor,
-            evidence_source=args.evidence_source,
-            evidence=args.evidence,
-            reason=args.reason,
-            revision=args.revision,
-            epoch=store.current_epoch(),
-            required=required,
-        )
+        # Serialize the whole load->mutate->write as ONE critical section so a
+        # concurrent set/waive cannot read-modify-write over each other and drop
+        # a gate. gates.py also refuses on load_error independently (direct
+        # callers), so corrupt state is never silently overwritten either way.
+        with store._config_lock():
+            gate = gate_mod.set_gate(
+                store.root,
+                name=args.name,
+                status=args.status,
+                severity=args.severity,
+                scope=args.scope,
+                actor=actor,
+                evidence_source=args.evidence_source,
+                evidence=args.evidence,
+                reason=args.reason,
+                revision=args.revision,
+                epoch=store.current_epoch(),
+                required=required,
+            )
         if getattr(args, "json", False):
             print(json.dumps(gate, indent=2))
         else:
@@ -1383,16 +1388,17 @@ def cmd_gate(args: argparse.Namespace) -> int:
         actor = None
         if getattr(args, "actor", None):
             actor = _resolve_self(args.actor, roster=store.load_config().get("agents") or [])
-        gate = gate_mod.waive_gate(
-            store.root,
-            name=args.name,
-            operator=args.operator,
-            reason=args.reason,
-            scope=args.scope,
-            expires=args.expires,
-            date=args.date,
-            actor=actor,
-        )
+        with store._config_lock():
+            gate = gate_mod.waive_gate(
+                store.root,
+                name=args.name,
+                operator=args.operator,
+                reason=args.reason,
+                scope=args.scope,
+                expires=args.expires,
+                date=args.date,
+                actor=actor,
+            )
         if getattr(args, "json", False):
             print(json.dumps(gate, indent=2))
         else:
@@ -2128,7 +2134,29 @@ def _lane_eval(store, lane: dict, other_active: list[dict], head: str,
     base = lane.get("base_sha")
     changed = _lane_diff(store.root, base, head)
     touched = [p["path"] for p in changed.get("paths", []) if p.get("touched")]
-    classifications = {p: dom.check_path(reg.data, p) for p in touched}
+    # Resolve shared-path approver authority at eval time so compute_verdict can
+    # REVALIDATE each recorded approval against the current registry (audit fix):
+    # for every touched shared path, map each matching shared entry's glob to the
+    # set of agents currently authorized for it (close leads + the entry's
+    # default_approvers). The pure verdict reads cls['shared_entry_approvers'] /
+    # cls['close_leads'] and never resolves refsets itself.
+    cfg = store.load_config()
+    leads = sorted(_close_lead_set(store))
+
+    def _classify(p: str) -> dict:
+        cls = dom.check_path(reg.data, p)
+        if cls.get("shared_paths"):
+            per_glob: dict[str, list[str]] = {}
+            for entry in reg.data.get("shared_paths", []):
+                if dom.glob_matches(entry["glob"], p, casefold=cfg_casefold):
+                    per_glob[entry["glob"]] = sorted(
+                        set(leads)
+                        | set(dom.resolve_refset(entry.get("default_approvers") or {}, cfg)))
+            cls["shared_entry_approvers"] = per_glob
+            cls["close_leads"] = leads
+        return cls
+
+    classifications = {p: _classify(p) for p in touched}
     target_head_now = _lane_resolve(store, lane.get("target_ref"))
     merge = _lane_merge(store.root, target_head_now, head)
     scope = gate_scope or f"lane:{lane.get('lane_id')}"
@@ -2219,10 +2247,13 @@ def cmd_lane(args: argparse.Namespace) -> int:
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         leads = _close_lead_set(store)
         reg = _load_domain_registry(store)
-        # Authority for a shared-path approval (it gates a shared path to GO, so it is
-        # ENFORCED, not advisory - the P3 bypass lesson): a close lead, OR a
-        # default_APPROVER of a shared path that matches --path. FAIL CLOSED: if the
-        # path matches no shared entry, or no authorized approver resolves, refuse.
+        cfg = store.load_config()
+        # ALL-MATCHING authority (lead decision D-11): every shared entry that matches
+        # --path must eventually be approved by an authorized approver. This command
+        # records the actor's approval against EACH matching entry the actor is
+        # authorized for (a close lead is authorized for ALL -> clears the path in one
+        # shot; a specific default_approver contributes only their entry). FAIL CLOSED:
+        # no matching entry, or the actor authorized for NONE of them -> refuse.
         matched = [e for e in reg.data.get("shared_paths", [])
                    if dom.glob_matches(e["glob"], args.path, casefold=dom.default_casefold_paths())]
         if not matched:
@@ -2230,15 +2261,21 @@ def cmd_lane(args: argparse.Namespace) -> int:
                 f"agenttalk lane approve-shared: {args.path!r} matches no shared_path "
                 "in domains.json - nothing to approve (fail closed).\n")
             return 2
-        approvers = set(leads)
-        for entry in matched:
-            approvers |= set(dom.resolve_refset(entry.get("default_approvers") or {},
-                                                store.load_config()))
-        if actor not in approvers:
+        authorized: list[dict] = []
+        unauthorized_globs: list[str] = []
+        for e in matched:
+            appr_set = set(leads) | set(
+                dom.resolve_refset(e.get("default_approvers") or {}, cfg))
+            if actor in appr_set:
+                authorized.append(e)
+            else:
+                unauthorized_globs.append(e["glob"])
+        if not authorized:
+            globs = sorted(e["glob"] for e in matched)
             sys.stderr.write(
                 f"agenttalk lane approve-shared: {actor!r} is not an authorized approver "
-                f"(close lead or the shared path's default_approvers) {sorted(approvers) or 'none'}; "
-                "refusing (a shared approval gates a shared path to GO).\n")
+                f"for any shared entry matching {args.path!r} {globs} (close lead or the "
+                "entry's default_approvers); refusing (fail closed).\n")
             return 2
         with store._config_lock():
             data = lane_mod.load_lanes(store)
@@ -2246,12 +2283,26 @@ def cmd_lane(args: argparse.Namespace) -> int:
             if not isinstance(lane, dict):
                 sys.stderr.write(f"agenttalk lane approve-shared: no lane {args.id!r}.\n")
                 return 2
-            lane_mod.add_shared_approval(
-                lane, path_or_glob=args.path, approved_by=actor, reason=args.reason,
-                at=_iso_now(), epoch=store.current_epoch(),
-                registry_hash=reg.registry_hash)
+            for e in authorized:
+                # Persist each MATCHED ENTRY GLOB as the authority token (not the raw
+                # --path): the verdict requires a valid approval per matching entry.
+                lane_mod.add_shared_approval(
+                    lane, path_or_glob=e["glob"], approved_by=actor, reason=args.reason,
+                    at=_iso_now(), epoch=store.current_epoch(),
+                    registry_hash=reg.registry_hash)
             lane_mod.save_lanes(store, data)
-        print(f"recorded shared-path approval for {args.path} on lane {args.id} by {actor}")
+        recorded = sorted(e["glob"] for e in authorized)
+        msg = (f"recorded shared-path approval(s) for {recorded} (via {args.path}) "
+               f"on lane {args.id} by {actor}")
+        if unauthorized_globs:
+            # Report the ACTOR's authority limit, NOT lane-outstanding state: another
+            # approver may already have cleared these entries, so claiming they are
+            # "still needed" could contradict the gate (reviewer-1 P3). Run `lane check`
+            # for the authoritative outstanding picture.
+            msg += (f"; NOTE: you ({actor}) are not an authorized approver for "
+                    f"{sorted(unauthorized_globs)} - those entries need approval by their "
+                    "own authorized approvers (run `lane check` for the gate verdict)")
+        print(msg)
         return 0
 
     if action in ("check", "deliver"):
@@ -5124,12 +5175,33 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         sys.stderr.write(f"agenttalk wrap: {e}\n")
         return 2
     wsession.save_session(store, agent, state)   # persist the (possibly minted) id
+    # ONE-SHOT: bound the wait in-process so an ephemeral reviewer whose request
+    # never arrives (or is closed/superseded) exits NONZERO with a diagnostic well
+    # before the supervisor's deadline kill, instead of waiting idle to the kill.
+    # The bound mirrors the launch marker's timeout_seconds when we can still read
+    # it (it may already be archived after the claim), else a conservative default.
+    max_wall: float | None = None
+    if one_shot_request_id:
+        marker = store.read_launch_request(one_shot_request_id)
+        try:
+            max_wall = float(int((marker or {}).get("timeout_seconds") or 1800))
+        except (TypeError, ValueError):
+            max_wall = 1800.0
     turns = wloop.run_loop(
         store, agent, drive,
         max_turns=1 if one_shot_request_id else None,
         only_request_id=one_shot_request_id,
+        max_wall=max_wall,
     )
     if one_shot_request_id and turns < 1:
+        # Distinguish a dead thread from a never-arriving request for the diagnostic
+        # (read-only scoped poll; either way it is a nonzero one-shot exit).
+        from .wrapper import recv_api as _recv_api
+        env = _recv_api.poll(store, agent, scoped_request_id=one_shot_request_id)
+        sc = env.get("scoped") or {}
+        why = ("thread closed/superseded" if (sc.get("closed") or sc.get("superseded"))
+               else f"no message on request {one_shot_request_id!r} within the one-shot bound")
+        sys.stderr.write(f"agenttalk wrap --one-shot: no turn driven ({why}).\n")
         return 1
     return 0
 

@@ -92,6 +92,7 @@ def set_gate(
     if status == "green" and severity == "blocker" and not evidence:
         raise ValueError("severity=blocker gates need evidence before they can be set green")
     state = load_gate_state(root)
+    _refuse_on_load_error(state)
     gate = dict(state["gates"].get(name, {}))
     now = _now_iso()
     gate.update({
@@ -148,6 +149,7 @@ def waive_gate(
     scope = _clean_text("scope", scope)
     _parse_expiry(expires)
     state = load_gate_state(root)
+    _refuse_on_load_error(state)
     now = _now_iso()
     gate = dict(state["gates"].get(name, {"name": name}))
     gate.update({
@@ -190,16 +192,38 @@ def check_gates(root: Path, *, scope: str | None = None, now: datetime | None = 
         checked.append(item)
         blockers.append(item)
     for name in required:
-        if name not in gates:
+        gate = gates.get(name)
+        if gate is None:
             item = {
                 "name": name,
                 "status": "unknown",
                 "severity": "blocker",
                 "scope": scope or "release",
+                "blocks": True,
                 "reason": "required gate is missing",
             }
             checked.append(item)
             blockers.append(item)
+        elif scope and gate.get("scope") not in (scope, "global"):
+            # Present but recorded under a non-matching scope: the scope filter
+            # below would skip it, so it must NOT pass the missing-check by
+            # presence and then vanish (that was a fail-closed violation -> a
+            # false GO). A required gate only satisfies a scoped check when it
+            # is applicable to that scope. Block explicitly.
+            item = {
+                "name": name,
+                "status": "unknown",
+                "severity": "blocker",
+                "scope": scope,
+                "blocks": True,
+                "reason": (
+                    f"required gate recorded under scope {gate.get('scope')!r}, "
+                    f"not applicable to checked scope {scope!r}"
+                ),
+            }
+            checked.append(item)
+            blockers.append(item)
+        # else: present and applicable -> the main loop below evaluates it.
     for _name, gate in sorted(gates.items()):
         if scope and gate.get("scope") not in (scope, "global"):
             continue
@@ -259,8 +283,20 @@ def _gate_verdict(gate: dict, *, now: datetime) -> dict:
         else:
             blocks = severity == "blocker"
             reason = "waiver expired or invalid"
-    elif severity == "blocker" and status in ("red", "unknown"):
+    elif severity == "blocker" and status != "green":
+        # A blocker clears ONLY on validated green (load_gate_state enforces the
+        # evidence source/refs for a green blocker) or an active waiver (handled
+        # above). Every other status blocks - including `skipped`, which means
+        # "not run / no usable evidence", NOT "not applicable". Use a waiver for
+        # genuine not-applicable, never `skipped`.
         blocks = True
+        if not reason:
+            if status == "skipped":
+                reason = "required evidence not run (skipped); use a waiver for not-applicable"
+            elif status == "red":
+                reason = "gate is red"
+            else:
+                reason = f"blocker gate status {status!r} is not a validated green"
     return {
         "name": str(gate.get("name") or ""),
         "status": status,
@@ -272,6 +308,22 @@ def _gate_verdict(gate: dict, *, now: datetime) -> dict:
         "updated_by": gate.get("updated_by"),
         "waiver": gate.get("waiver") if status == "waived" else None,
     }
+
+
+def _refuse_on_load_error(state: dict) -> None:
+    """Fail closed: never overwrite gate state we could not parse.
+
+    A mutation (set/waive) that loaded a corrupt gates.json must NOT silently
+    rewrite it with a clean single-gate state - that would erase the existing
+    (unparseable) required gates and could flip a later check to a false GO.
+    Refuse so the operator repairs or removes the file deliberately. This guard
+    lives in the core so direct callers are covered, not only the CLI path.
+    """
+    if state.get("load_error"):
+        raise ValueError(
+            f"{state['load_error']} - refusing to overwrite gate state; "
+            "repair or remove .agenttalk/gates.json before recording gates"
+        )
 
 
 def _state_load_error(reason: str) -> dict:

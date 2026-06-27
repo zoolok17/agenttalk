@@ -117,6 +117,20 @@ def validate_registry(raw: object, cfg: dict[str, Any]) -> dict[str, Any]:
     shared_paths = [
         _validate_shared_path(i, entry, cfg) for i, entry in enumerate(shared_raw)
     ]
+    # Reject DUPLICATE normalized globs: two shared_paths entries for the identical glob
+    # with different approver sets are ambiguous-by-construction, and the lane verdict
+    # keys matching entries by glob - a duplicate would collapse the all-matching rule
+    # (D-11) to one approver set, silently bypassing the other entry's authority (codex
+    # P1). Fail closed: merge them into one entry with the combined approvers instead.
+    seen_globs: dict[str, int] = {}
+    for i, entry in enumerate(shared_paths):
+        g = entry["glob"]
+        if g in seen_globs:
+            raise DomainError(
+                f"shared_paths[{i}].glob {g!r} duplicates shared_paths[{seen_globs[g]}]; "
+                "merge entries with the same glob into one (combine their approvers/reviewers)"
+            )
+        seen_globs[g] = i
     return {
         "schema_version": SCHEMA_VERSION,
         "domains": domains,

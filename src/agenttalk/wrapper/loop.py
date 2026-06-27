@@ -85,18 +85,58 @@ def run_loop(store, agent: str, drive: Callable[[dict], bool], *,
              clock: Callable[[], float] = time.monotonic,
              sleep: Callable[[float], None] = time.sleep,
              max_turns: int | None = None, max_polls: int | None = None,
-             only_request_id: str | None = None) -> int:
+             only_request_id: str | None = None,
+             max_wall: float | None = None) -> int:
     """Run the wrapper listen loop. ``drive(record)`` handles ONE turn (injected).
-    Returns the number of turns driven. ``max_turns`` / ``max_polls`` bound the
-    loop for tests (both None = run forever)."""
+    Returns the number of turns driven. ``max_turns`` / ``max_polls`` / ``max_wall``
+    bound the loop (all None = run forever; tests inject clock/sleep).
+
+    Two modes:
+      * CONTINUOUS (``only_request_id is None``): the long-running supervised loop.
+        Reads the GLOBAL inbox, honors loop-control (release/end via
+        classify_loop_control), drives one turn per inbound message.
+      * ONE-SHOT (``only_request_id`` set): an ephemeral reviewer scoped to ONE
+        launch request. Uses SCOPED receive so an unrelated head-of-inbox message
+        cannot starve it (it stays unread for a later global sync); keeps the
+        heartbeat fresh while waiting; exits on the scoped thread going
+        closed/superseded; and is bounded by ``max_wall``/``max_polls`` so it exits
+        (turns==0 -> the caller maps a nonzero process exit) instead of spinning
+        forever if its request never arrives.
+
+    The ``.waiting`` marker is ALWAYS cleared on exit (try/finally) so a normal
+    stand-down / one-shot completion does not leave a stale waiting marker."""
     store.write_waiting(agent, {"agent": agent, "mode": "wrapper-loop"})
+    try:
+        if only_request_id is not None:
+            return _run_one_shot(
+                store, agent, drive, rid=only_request_id,
+                idle_interval=idle_interval, max_idle_interval=max_idle_interval,
+                heartbeat_interval=heartbeat_interval, clock=clock, sleep=sleep,
+                max_turns=max_turns, max_polls=max_polls, max_wall=max_wall)
+        return _run_continuous(
+            store, agent, drive, idle_interval=idle_interval,
+            max_idle_interval=max_idle_interval, heartbeat_interval=heartbeat_interval,
+            clock=clock, sleep=sleep, max_turns=max_turns, max_polls=max_polls,
+            max_wall=max_wall)
+    finally:
+        store.clear_waiting(agent)
+
+
+def _run_continuous(store, agent: str, drive: Callable[[dict], bool], *,
+                    idle_interval: float, max_idle_interval: float,
+                    heartbeat_interval: float, clock: Callable[[], float],
+                    sleep: Callable[[float], None], max_turns: int | None,
+                    max_polls: int | None, max_wall: float | None) -> int:
     turns = 0
     polls = 0
     last_hb: float | None = None
     cur_sleep = idle_interval
     fail_sleep = idle_interval
+    start = clock()
     while True:
         if max_polls is not None and polls >= max_polls:
+            return turns
+        if max_wall is not None and (clock() - start) >= max_wall:
             return turns
         polls += 1
         record = recv_api.next_record(store, agent)
@@ -125,12 +165,6 @@ def run_loop(store, agent: str, drive: Callable[[dict], bool], *,
             # driven into the model, then KEEP LISTENING (idle stays listening).
             recv_api.commit(store, agent, record)
             continue
-        if only_request_id and record.get("request_id") != only_request_id:
-            # One-shot ephemeral reviewers are scoped to the launch request. Leave
-            # unrelated content unread rather than spending the single turn on it.
-            sleep(cur_sleep)
-            cur_sleep = min(max_idle_interval, cur_sleep * 2.0)
-            continue
         # Drive ONE turn. Commit the inbound message ONLY when the turn SUCCEEDS.
         # drive() stamps the heartbeat itself on a clean completed turn (and NOT on
         # a failed turn), so the loop does not stamp here - a failed turn leaves no
@@ -147,5 +181,63 @@ def run_loop(store, agent: str, drive: Callable[[dict], bool], *,
             # stamp the heartbeat - so a persistent no-progress failure goes stale
             # and the supervisor restarts us. BACK OFF before retrying so we never
             # hammer the CLI in a hot spawn loop (a process storm) before that.
+            sleep(fail_sleep)
+            fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+
+
+def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
+                  idle_interval: float, max_idle_interval: float,
+                  heartbeat_interval: float, clock: Callable[[], float],
+                  sleep: Callable[[float], None], max_turns: int | None,
+                  max_polls: int | None, max_wall: float | None) -> int:
+    """SCOPED one-shot loop for an ephemeral reviewer (see run_loop). Receives only
+    messages on ``rid`` so unrelated traffic neither starves it nor is consumed from
+    the global inbox; bounded so it always terminates."""
+    turns = 0
+    polls = 0
+    last_hb: float | None = None
+    cur_sleep = idle_interval
+    fail_sleep = idle_interval
+    start = clock()
+    while True:
+        if max_polls is not None and polls >= max_polls:
+            return turns                # bound hit: caller maps turns==0 -> nonzero
+        if max_wall is not None and (clock() - start) >= max_wall:
+            return turns                # wall timeout: never spin forever
+        polls += 1
+        env = recv_api.poll(store, agent, scoped_request_id=rid)
+        record = env.get("record")
+        scoped = env.get("scoped") or {}
+        now = clock()
+        if record is None:
+            # No scoped message pending. If the thread is terminal (rescinded/closed
+            # or superseded) the request is dead -> stop waiting (turns==0 -> nonzero).
+            if scoped.get("closed") or scoped.get("superseded"):
+                return turns
+            # Otherwise keep the heartbeat fresh so a waiting one-shot never looks
+            # stale to the supervisor, then back off. An unrelated head-of-inbox
+            # message is NOT returned here (scoped floor) and is NOT committed, so it
+            # cannot starve us and stays unread for a later global sync.
+            if last_hb is None or (now - last_hb) >= heartbeat_interval:
+                store.write_heartbeat(agent)
+                last_hb = now
+            sleep(cur_sleep)
+            cur_sleep = min(max_idle_interval, cur_sleep * 2.0)
+            continue
+        cur_sleep = idle_interval
+        if is_terminal_control(record):
+            # scoped record on a rescinded/closed thread: consume + stop (terminal).
+            recv_api.commit(store, agent, record)
+            return turns
+        # A scoped record carries ``rid`` by construction - it is the work this
+        # ephemeral reviewer was spawned for. Commit only on a successful turn.
+        if drive(record):
+            recv_api.commit(store, agent, record)       # SCOPED: thread-seen only
+            last_hb = clock()
+            fail_sleep = idle_interval
+            turns += 1
+            if max_turns is not None and turns >= max_turns:
+                return turns
+        else:
             sleep(fail_sleep)
             fail_sleep = min(max_idle_interval, fail_sleep * 2.0)

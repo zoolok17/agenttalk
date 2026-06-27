@@ -1072,54 +1072,25 @@ class Store:
         return v if v in roster else None
 
     def is_release_authorized(self, sender: str) -> bool:
-        """Whether ``sender`` may AUTHORITATIVELY release a listener (exit its
-        loop). ``release`` is loop-control, so a listener must not obey it from
-        an arbitrary peer.
-
-        Authority resolution (read-only):
-        - the ``operator_facing`` liaison if one is set -> only it;
-        - else the sole ``role=lead`` -> only it;
-        - else branch on the lead COUNT (``sole_lead`` returns None for BOTH
-          zero and 2+ leads, so we must distinguish them here):
-            - ZERO leads (a plain pair / solo / un-roled team) -> ANY active
-              agent (compatibility fallback so the signal still works);
-            - 2+ leads -> FAIL CLOSED: leadership is ambiguous, so authorize
-              NO ONE until a liaison is set or lead uniqueness is repaired.
-
-        A release from an unauthorized sender is reported to the human by the
-        listener and otherwise ignored: the loop keeps listening. This is
-        advisory routing metadata; the listen skill is the primary enforcement
-        point (see SECURITY.md — trusted-team model).
-        """
-        liaison = self.operator_facing()
-        if liaison is not None:
-            return sender == liaison
-        lead = self.sole_lead()
-        if lead is not None:
-            return sender == lead
-        # No liaison and no UNAMBIGUOUS lead. Distinguish zero-lead (fallback)
-        # from 2+-lead (fail closed) — sole_lead() collapses both to None.
-        cfg = self.load_config()
-        roster = cfg.get("agents", []) or []
-        roles = cfg.get("roles") or {}
-        lead_count = sum(
-            1 for a in roster
-            if isinstance(roles.get(a), str) and roles[a].casefold() == "lead"
-        )
-        if lead_count >= 2:
-            return False  # ambiguous leadership -> no one is authoritative
-        return sender in roster  # zero leads -> plain-team compatibility
+        """DEPRECATED legacy alias - delegates to the SINGLE loop-exit resolver
+        :meth:`loop_exit_relay_authorized` (0.40.0 unification). It used to carry a
+        divergent zero-lead any-active fallback, which made the CLI ``release``
+        authority MORE permissive than the wrapper loop-exit classifier (an authority
+        DRIFT the fresh audit flagged). There is now ONE resolver: no liaison + no
+        sole lead -> FAIL CLOSED. Kept only so existing callers/tests keep one name."""
+        return self.loop_exit_relay_authorized(sender)
 
     def loop_exit_relay_authorized(self, sender: str) -> bool:
-        """Whether ``sender`` may relay a loop-EXIT control (release/end) that a
-        listener obeys. NARROWER than :meth:`is_release_authorized` on purpose
-        (stand-down authority, 0.39.0): the ``operator_facing`` liaison if set,
-        ELSE the sole ``role=lead``, ELSE FAIL CLOSED. There is NO zero-lead
-        any-active fallback here - taking an agent offline is a human-relayed act,
-        so an un-configured team must designate a liaison or a single lead
-        (doctor/docs say so). Distinct from :meth:`protected_agents` (kill-
-        protection, deliberately broad) - loop-exit authority is a different,
-        narrower concern."""
+        """The SINGLE resolver for who may relay a loop-EXIT control (release/end)
+        that a listener obeys - used by both the wrapper loop-exit classifier and the
+        CLI ``release`` command (0.40.0 unification; :meth:`is_release_authorized` is a
+        thin delegating alias). Authority (stand-down authority, 0.39.0): the
+        ``operator_facing`` liaison if set, ELSE the sole ``role=lead``, ELSE FAIL
+        CLOSED. There is NO zero-lead any-active fallback - taking an agent offline is
+        a human-relayed act, so an un-configured team must designate a liaison or a
+        single lead (doctor/docs say so). Distinct from :meth:`protected_agents` (kill-
+        protection, deliberately broad) - loop-exit authority is a different, narrower
+        concern."""
         liaison = self.operator_facing()
         if liaison is not None:
             return sender == liaison

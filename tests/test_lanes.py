@@ -61,8 +61,30 @@ def _changed(*paths, error=None):
         {"path": p, "status": "M", "touched": True} for p in paths]}
 
 
-def _cls(domains, shared=None):
-    return {"domains": domains, "shared_paths": shared or [], "unowned": not domains}
+def _cls(domains, shared=None, *, approvers=None, leads=None):
+    cls = {"domains": domains, "shared_paths": shared or [], "unowned": not domains}
+    if shared:
+        # Mirror the CLI: map each matching shared entry glob to its authorized
+        # approver set (close leads + the entry's default_approvers). The pure
+        # verdict reads these resolved fields; it never resolves refsets itself.
+        per_glob = {s["glob"]: sorted(set(approvers or []) | set(leads or []))
+                    for s in shared}
+        cls["shared_entry_approvers"] = per_glob
+        cls["close_leads"] = sorted(leads or [])
+    return cls
+
+
+def _cls_multi(per_glob_approvers: dict, *, leads=None):
+    """A shared classification with MULTIPLE overlapping entries: {glob: [approvers]}.
+    Mirrors the CLI enrichment (each entry's approvers already unioned with leads)."""
+    leads = leads or []
+    return {
+        "domains": [], "unowned": True,
+        "shared_paths": [{"glob": g} for g in per_glob_approvers],
+        "shared_entry_approvers": {g: sorted(set(ap) | set(leads))
+                                   for g, ap in per_glob_approvers.items()},
+        "close_leads": sorted(leads),
+    }
 
 
 def _gate_go():
@@ -128,11 +150,152 @@ def test_hold_domain_overlap() -> None:
 def test_hold_shared_missing_then_approved() -> None:
     lane = _lane(path_subset=["shared"])
     changed = _changed("shared/x.py")
-    cls = {"shared/x.py": _cls([], shared=[{"glob": "shared/**"}])}
+    cls = {"shared/x.py": _cls([], shared=[{"glob": "shared/**"}],
+                               approvers=["dev2"], leads=["lead"])}
     assert lanes.HOLD_SHARED_MISSING_APPROVAL in _codes(_ev(lane, changed, cls))
-    lanes.add_shared_approval(lane, path_or_glob="shared", approved_by="lead",
+    # an approval on the MATCHED ENTRY GLOB by an authorized approver, fresh -> GO
+    lanes.add_shared_approval(lane, path_or_glob="shared/**", approved_by="dev2",
                               reason="ok", at="t", epoch=None, registry_hash="rh1")
     assert _ev(lane, changed, cls)["verdict"] == lanes.VERDICT_GO
+
+
+# --- C2 (0.40.0): shared-approval over-grant + verdict-time revalidation ------
+
+def test_shared_broad_prefix_token_does_not_clear_nested() -> None:
+    """AUDIT over-grant fix: the dropped path_under_prefix arm means a broad raw
+    segment-prefix token ('shared') no longer clears a nested shared path it does
+    not glob-match. The approval simply does not match -> still MISSING."""
+    lane = _lane(path_subset=["shared"])
+    changed = _changed("shared/secret.sql")
+    cls = {"shared/secret.sql": _cls([], shared=[{"glob": "shared/secret.sql"}],
+                                     approvers=["dba"], leads=["lead"])}
+    lanes.add_shared_approval(lane, path_or_glob="shared", approved_by="lead",
+                              reason="broad", at="t", epoch=None, registry_hash="rh1")
+    v = _ev(lane, changed, cls)
+    assert lanes.HOLD_SHARED_MISSING_APPROVAL in _codes(v)
+    assert v["verdict"] == lanes.VERDICT_HOLD
+
+
+def test_shared_forged_approver_is_wrong_not_ok() -> None:
+    """An approval that MATCHES the path but was recorded by someone NOT authorized
+    for the matched entry -> HOLD_SHARED_WRONG_APPROVAL (the dead code goes live),
+    NOT a clear and NOT a plain 'missing'."""
+    lane = _lane(path_subset=["shared"])
+    changed = _changed("shared/x.py")
+    cls = {"shared/x.py": _cls([], shared=[{"glob": "shared/**"}],
+                               approvers=["dev2"], leads=["lead"])}
+    lanes.add_shared_approval(lane, path_or_glob="shared/**", approved_by="intruder",
+                              reason="forged", at="t", epoch=None, registry_hash="rh1")
+    v = _ev(lane, changed, cls)
+    codes = _codes(v)
+    assert lanes.HOLD_SHARED_WRONG_APPROVAL in codes
+    assert lanes.HOLD_SHARED_MISSING_APPROVAL not in codes
+    assert v["verdict"] == lanes.VERDICT_HOLD
+
+
+def test_shared_stale_epoch_approval_is_wrong() -> None:
+    """A matching, authorized approval that is STALE (epoch moved since it was
+    recorded) does not clear -> HOLD_SHARED_WRONG_APPROVAL."""
+    lane = _lane(path_subset=["shared"])
+    changed = _changed("shared/x.py")
+    cls = {"shared/x.py": _cls([], shared=[{"glob": "shared/**"}],
+                               approvers=["dev2"], leads=["lead"])}
+    lanes.add_shared_approval(lane, path_or_glob="shared/**", approved_by="dev2",
+                              reason="ok", at="t", epoch="E1", registry_hash="rh1")
+    v = _ev(lane, changed, cls, current_epoch="E2")  # epoch moved
+    assert lanes.HOLD_SHARED_WRONG_APPROVAL in _codes(v)
+
+
+def test_shared_stale_registry_approval_is_wrong() -> None:
+    lane = _lane(path_subset=["shared"])
+    changed = _changed("shared/x.py")
+    cls = {"shared/x.py": _cls([], shared=[{"glob": "shared/**"}],
+                               approvers=["dev2"], leads=["lead"])}
+    lanes.add_shared_approval(lane, path_or_glob="shared/**", approved_by="dev2",
+                              reason="ok", at="t", epoch=None, registry_hash="rh1")
+    v = _ev(lane, changed, cls, current_registry_hash="rh2")  # registry changed
+    assert lanes.HOLD_SHARED_WRONG_APPROVAL in _codes(v)
+
+
+def test_shared_lead_always_authorized() -> None:
+    """A close lead is authorized for any matched shared entry (covers a registry
+    that later dropped the entry the approval named)."""
+    lane = _lane(path_subset=["shared"])
+    changed = _changed("shared/x.py")
+    cls = {"shared/x.py": _cls([], shared=[{"glob": "shared/**"}],
+                               approvers=["dev2"], leads=["lead"])}
+    lanes.add_shared_approval(lane, path_or_glob="shared/**", approved_by="lead",
+                              reason="lead ok", at="t", epoch=None, registry_hash="rh1")
+    assert _ev(lane, changed, cls)["verdict"] == lanes.VERDICT_GO
+
+
+# --- C2 (0.40.0) D-11: ALL-matching-entries-must-approve (overlapping shared entries) -
+
+def _approve(lane, glob, who, *, epoch=None, rh="rh1"):
+    lanes.add_shared_approval(lane, path_or_glob=glob, approved_by=who, reason="ok",
+                              at="t", epoch=epoch, registry_hash=rh)
+
+
+def test_shared_overlap_needs_all_matching_entries() -> None:
+    # shared/** (A) AND shared/secret.sql (B) both match shared/secret.sql -> BOTH must
+    # approve. Neither alone clears (one approval each -> the other entry still missing).
+    changed = _changed("shared/secret.sql")
+    cls = {"shared/secret.sql": _cls_multi(
+        {"shared/**": ["A"], "shared/secret.sql": ["B"]}, leads=["lead"])}
+    only_a = _lane(path_subset=["shared"])
+    _approve(only_a, "shared/**", "A")
+    assert lanes.HOLD_SHARED_MISSING_APPROVAL in _codes(_ev(only_a, changed, cls))
+    only_b = _lane(path_subset=["shared"])
+    _approve(only_b, "shared/secret.sql", "B")
+    assert lanes.HOLD_SHARED_MISSING_APPROVAL in _codes(_ev(only_b, changed, cls))
+    both = _lane(path_subset=["shared"])
+    _approve(both, "shared/**", "A")
+    _approve(both, "shared/secret.sql", "B")
+    assert _ev(both, changed, cls)["verdict"] == lanes.VERDICT_GO
+
+
+def test_shared_incomparable_overlap_needs_both() -> None:
+    # reviewer-1 + codex P1 (the bug that rejected 48825db): NON-comparable overlapping
+    # globs - shared/a/** (B) and shared/*/b.sql (A) both match shared/a/b.sql, neither a
+    # subset of the other. Under all-matching, BOTH A and B must approve; neither alone
+    # clears (no winner-picking -> no bypass).
+    changed = _changed("shared/a/b.sql")
+    cls = {"shared/a/b.sql": _cls_multi(
+        {"shared/a/**": ["B"], "shared/*/b.sql": ["A"]}, leads=["lead"])}
+    only_a = _lane(path_subset=["shared"])
+    _approve(only_a, "shared/*/b.sql", "A")
+    assert lanes.HOLD_SHARED_MISSING_APPROVAL in _codes(_ev(only_a, changed, cls))
+    only_b = _lane(path_subset=["shared"])
+    _approve(only_b, "shared/a/**", "B")
+    assert lanes.HOLD_SHARED_MISSING_APPROVAL in _codes(_ev(only_b, changed, cls))
+    both = _lane(path_subset=["shared"])
+    _approve(both, "shared/a/**", "B")
+    _approve(both, "shared/*/b.sql", "A")
+    assert _ev(both, changed, cls)["verdict"] == lanes.VERDICT_GO
+
+
+def test_shared_overlap_lead_clears_all_entries() -> None:
+    # a close lead is authorized for EVERY matching entry, so one approval per entry by
+    # the lead clears the path (the CLI records all of them in one approve-shared call).
+    changed = _changed("shared/secret.sql")
+    cls = {"shared/secret.sql": _cls_multi(
+        {"shared/**": ["A"], "shared/secret.sql": ["B"]}, leads=["lead"])}
+    lane = _lane(path_subset=["shared"])
+    _approve(lane, "shared/**", "lead")
+    _approve(lane, "shared/secret.sql", "lead")
+    assert _ev(lane, changed, cls)["verdict"] == lanes.VERDICT_GO
+
+
+def test_shared_overlap_unauthorized_against_matching_entry_is_wrong() -> None:
+    # An approval recorded against a matching entry by someone NOT authorized for it is
+    # "wrong" (more actionable than missing).
+    changed = _changed("shared/secret.sql")
+    cls = {"shared/secret.sql": _cls_multi(
+        {"shared/**": ["A"], "shared/secret.sql": ["B"]}, leads=["lead"])}
+    lane = _lane(path_subset=["shared"])
+    _approve(lane, "shared/**", "A")                       # shared/** satisfied
+    _approve(lane, "shared/secret.sql", "A")               # A not authorized for secret.sql
+    assert lanes.HOLD_SHARED_WRONG_APPROVAL in _codes(_ev(lane, changed, cls))
 
 
 def test_hold_active_lane_overlap() -> None:
@@ -385,6 +548,47 @@ def test_cli_shared_approval_authority_and_fail_closed(tmp_path: Path) -> None:
     # a path matching no shared entry fails closed
     assert _run(["lane", "approve-shared", "--id", "l1", "--path", "src/core/x",
                  "--from", "lead", "--reason", "x"], root) == 2
+
+
+def test_cli_shared_approval_all_matching_records_authorized_entries(tmp_path: Path) -> None:
+    # C2 (0.40.0, D-11): approve-shared records the actor's approval against EACH matching
+    # entry the actor is authorized for, persisting the entry glob (not the raw --path),
+    # and reports the entries that still need approval. ALL matching entries must be
+    # approved before the path clears.
+    root, base = _repo(tmp_path)
+    br = _branch(root)
+    s = Store(root)
+    (s.dir / "domains.json").write_text(json.dumps({
+        "schema_version": 1,
+        "domains": {"core": {"title": "Core", "owners": {"agents": ["dev"]},
+                             "owned_globs": ["src/core/**"]}},
+        "shared_paths": [
+            {"glob": "shared/**", "category": "schema", "requires": "lead-approval",
+             "default_approvers": {"agents": ["dev2"]}},
+            {"glob": "shared/secret.sql", "category": "schema", "requires": "lead-approval",
+             "default_approvers": {"agents": ["dev"]}}]}), encoding="utf-8")
+    (root / "shared").mkdir()
+    _run(["lane", "assign", "--id", "l1", "--from", "lead", "--assignee", "dev",
+          "--domain", "core", "--base", base, "--target", br, "--path", "shared"], root)
+    # shared/secret.sql matches BOTH entries. dev2 is authorized for shared/** only ->
+    # records shared/**, still needs shared/secret.sql (by dev).
+    assert _run(["lane", "approve-shared", "--id", "l1", "--path", "shared/secret.sql",
+                 "--from", "dev2", "--reason", "broad"], root) == 0
+    globs = {a["path_or_glob"] for a in lanes.load_lanes(s)["lanes"]["l1"]["shared_approvals"]}
+    assert globs == {"shared/**"}
+    # dev is authorized for shared/secret.sql -> records it; now BOTH entries approved.
+    assert _run(["lane", "approve-shared", "--id", "l1", "--path", "shared/secret.sql",
+                 "--from", "dev", "--reason", "dba ok"], root) == 0
+    globs = {a["path_or_glob"] for a in lanes.load_lanes(s)["lanes"]["l1"]["shared_approvals"]}
+    assert globs == {"shared/**", "shared/secret.sql"}
+    # a close lead is authorized for EVERY matching entry -> one call records both.
+    # Re-assign l1 fresh (--force) so its approvals reset, then lead approves once.
+    _run(["lane", "assign", "--id", "l1", "--from", "lead", "--assignee", "dev", "--force",
+          "--domain", "core", "--base", base, "--target", br, "--path", "shared"], root)
+    assert _run(["lane", "approve-shared", "--id", "l1", "--path", "shared/secret.sql",
+                 "--from", "lead", "--reason", "lead clears all"], root) == 0
+    lead_globs = {a["path_or_glob"] for a in lanes.load_lanes(s)["lanes"]["l1"]["shared_approvals"]}
+    assert lead_globs == {"shared/**", "shared/secret.sql"}
 
 
 def test_cli_assign_unknown_domain_refused(tmp_path: Path) -> None:

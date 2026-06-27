@@ -262,9 +262,23 @@ def compute_verdict(lane: dict, *, changed: dict, classifications: dict,
         shared = cls.get("shared_paths") or []
         domains = cls.get("domains") or []
         if shared:
-            if not _shared_approved(lane, disp, casefold=casefold):
+            status = _shared_approval_status(
+                lane, disp, cls, current_epoch=current_epoch,
+                current_registry_hash=current_registry_hash, casefold=casefold)
+            if status == "wrong":
+                # Some matching shared entry HAS an approval but it is stale (epoch/
+                # registry moved) or was recorded by someone not authorized for THAT
+                # entry. Distinct from "missing" so a stale/forged approval is never
+                # mistaken for a real one.
+                hold(HOLD_SHARED_WRONG_APPROVAL,
+                     f"shared path {disp!r} has an approval that is stale, forged, or "
+                     "not authorized for a matching shared entry")
+            elif status != "ok":
+                # ALL-matching rule: every shared entry that matches the path must be
+                # approved; at least one matching entry has no satisfying approval.
                 hold(HOLD_SHARED_MISSING_APPROVAL,
-                     f"shared path {disp!r} has no recorded approval")
+                     f"shared path {disp!r} is missing a required approval - EVERY "
+                     "matching shared entry must be approved by an authorized approver")
             continue
         if not domains:
             hold(HOLD_UNOWNED, f"{disp!r} is unowned (no domain) and not a shared path")
@@ -319,15 +333,69 @@ def _verdict(holds: list[dict]) -> dict[str, Any]:
             "holds": holds, "ok": not holds}
 
 
-def _shared_approved(lane: dict, path: str, *, casefold: bool) -> bool:
-    for appr in lane.get("shared_approvals", []) or []:
-        if not isinstance(appr, dict):
+def _shared_approval_status(lane: dict, path: str, cls: dict, *,
+                            current_epoch: str | None, current_registry_hash: str,
+                            casefold: bool) -> str:
+    """ALL-MATCHING-ENTRIES-MUST-APPROVE (lead decision D-11, 0.40.0): a touched shared
+    ``path`` is approved only when EVERY shared entry that matches it has a valid
+    approval - fresh (epoch + registry hash current) AND recorded against THAT entry by
+    an approver authorized for it (its default_approvers, resolved by the CLI into
+    ``cls['shared_entry_approvers']``, or a close lead).
+
+    This is the ONLY provably fail-closed rule for overlapping shared entries: there is
+    NO winner-picking, so there is no ordering/containment to get wrong - which is the
+    unsound class that bit us twice (a string-prefix match, then a TOTAL-order tuple
+    over what is really a PARTIAL order; both let one approver bypass another for
+    cross-cutting / non-comparable globs). Stricter-is-safer: a path governed by two
+    shared policies must satisfy BOTH; overlap is a deliberate registry choice.
+
+    Returns ok|wrong|missing: "wrong" if some matching entry has an approval that is
+    stale/forged/unauthorized (more actionable than a bare "missing"); "missing" if some
+    matching entry has no approval at all; "ok" only when every matching entry is
+    satisfied. The common case (exactly one matching entry) is unchanged.
+    """
+    per_glob = cls.get("shared_entry_approvers") or {}
+    leads = set(cls.get("close_leads") or [])
+    if not per_glob:
+        return "missing"   # shared but no resolved entries -> fail closed
+    approvals = [a for a in (lane.get("shared_approvals") or []) if isinstance(a, dict)]
+    any_wrong = False
+    any_missing = False
+    for glob, entry_approvers in per_glob.items():
+        try:
+            glob_norm = dom.normalize_glob(glob, casefold=casefold)
+        except (dom.DomainError, ValueError):
+            any_wrong = True       # a registry glob we cannot normalize -> fail closed
             continue
-        pg = appr.get("path_or_glob", "")
-        if dom.glob_matches(pg, path, casefold=casefold) or path_under_prefix(
-                path, pg, casefold=casefold):
-            return True
-    return False
+        authorized = set(entry_approvers or []) | leads
+        satisfied = False
+        recorded_for_entry = False
+        for appr in approvals:
+            pg = appr.get("path_or_glob") or ""
+            try:
+                if dom.normalize_glob(pg, casefold=casefold) != glob_norm:
+                    continue
+            except (dom.DomainError, ValueError):
+                continue           # a malformed stored token never matches (fail safe)
+            recorded_for_entry = True
+            if appr.get("epoch") != current_epoch:
+                continue
+            if appr.get("registry_hash") != current_registry_hash:
+                continue
+            if appr.get("approved_by") in authorized:
+                satisfied = True
+                break
+        if satisfied:
+            continue
+        if recorded_for_entry:
+            any_wrong = True       # an approval exists for this entry but is stale/unauth
+        else:
+            any_missing = True     # this matching entry has no approval at all
+    if any_wrong:
+        return "wrong"
+    if any_missing:
+        return "missing"
+    return "ok"
 
 
 # --------------------------------------------------------------- state I/O
