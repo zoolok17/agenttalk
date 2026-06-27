@@ -5,6 +5,46 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.0] - 2026-06-27
+
+The assurance review/test skill pack (assurance P4). Five new dev-discipline
+skills — installed to both Claude and Codex by `install-skills` — give reviewers
+and testers ready-made, evidence-honest rubrics that emit the typed
+`review-result` the gate/close consume. Generic skeletons; projects supply their
+own domain checklists.
+
+### Added
+- **Five devkit skills** (installed to `~/.claude/skills/` and `~/.codex/skills/`):
+  - **`review-failure-injection`** — adversarial review of parsers, IO,
+    persistence, untrusted input, resource limits, and cleanup/teardown.
+  - **`review-contract-drift`** — schema/settings/renderers/tests/docs parity
+    when a feature is retired, renamed, or reconfigured.
+  - **`review-release-readiness`** — release-gate review (CI triggers, artifact
+    type, manifest/permissions, gates, docs/version drift) → HOLD/GO.
+  - **`system-review-protocol`** — a narrow-trigger milestone/full-repo
+    adversarial review that coordinates lenses → ACCEPT/COUNTER/NA → draft close
+    → remediation through the existing `agenttalk close` flow.
+  - **`tester-qa`** — a first-class QA persona that writes/runs/triages tests and
+    reports *actually executed* evidence (read-only against production in review
+    mode; not a coverage-percentage rubric).
+- Every skill carries a shared **evidence-honesty contract**: `tests_executed`
+  means an actual command + result/exit (or CI run id), never inspected-only;
+  release-blocking claims anchor to `automation_ci`; a skill picks one primary
+  `risk_class` but lists all touched classes (the lead-owned close risk inventory
+  stays authoritative for routing).
+
+### Notes
+- Generic and opt-in: agenttalk ships the skill skeletons + the evidence rules;
+  projects supply domain-specific checklists, `signoffs.json`, and CI gates. This
+  completes the assurance arc's review layer (P4). Next on the roadmap: ephemeral
+  reviewers and the lane deliver-gate.
+
+### Upgrade
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.35.0"
+agenttalk install-skills   # picks up the new assurance review/test pack
+```
+
 ## [0.34.0] - 2026-06-27
 
 Specialist sign-off by risk class (assurance P3). A milestone close can now
