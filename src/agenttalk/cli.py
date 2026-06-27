@@ -32,6 +32,7 @@ from agenttalk import transcript as tx
 from agenttalk import codex_config as cxc
 from agenttalk import doctor as dr
 from agenttalk import gates as gate_mod
+from agenttalk import lanes as lane_mod
 from agenttalk import install_skills as iskl
 from agenttalk import signing as _signing
 from agenttalk import threads as th
@@ -2051,6 +2052,260 @@ def cmd_close(args: argparse.Namespace) -> int:
     sys.stderr.write(
         "agenttalk close: expected open, ack, draft, counter, check, publish, "
         "reopen, list, or show.\n")
+    return 2
+
+
+# ----------------------------------------------------------------- lane (P1)
+#
+# Lane deliver-gate: the CLI/git adapter resolves all I/O (git diff, merge-tree,
+# domain classification, gate check, epoch, registry hash, active-lane snapshot)
+# and hands lane_mod.compute_verdict already-resolved data — the verdict stays pure.
+
+def _lane_diff(root, base: str, head: str) -> dict:
+    """`git diff --name-status -z -M -C base..head` parsed structurally. touched =
+    paths a delivery WRITES (M/A/D/T, rename old+new, copy DEST); a copy SOURCE is
+    evidence-only. Fails closed: unavailable / parse_error."""
+    rc, out = _git(root, ["diff", "--name-status", "-z", "-M", "-C", f"{base}..{head}"])
+    if rc != 0:
+        return {"error": "unavailable", "paths": []}
+    toks = out.split("\x00")
+    paths: list[dict] = []
+    i = 0
+    try:
+        while i < len(toks):
+            st = toks[i]
+            if not st:
+                i += 1
+                continue
+            code = st[0]
+            if code in ("R", "C"):
+                old, new = toks[i + 1], toks[i + 2]
+                i += 3
+                if code == "R":   # rename: old removed + new added -> both touched
+                    paths.append({"path": old, "status": st, "touched": True, "role": "rename-old"})
+                    paths.append({"path": new, "old_path": old, "status": st,
+                                  "touched": True, "role": "rename-new"})
+                else:             # copy: dest touched, source evidence-only
+                    paths.append({"path": old, "status": st, "touched": False, "role": "copy-source"})
+                    paths.append({"path": new, "old_path": old, "status": st,
+                                  "touched": True, "role": "copy-dest"})
+            else:
+                p = toks[i + 1]
+                i += 2
+                paths.append({"path": p, "status": st, "touched": True})
+    except IndexError:
+        return {"error": "parse_error", "paths": []}
+    return {"error": None, "paths": paths}
+
+
+def _lane_merge(root, target_head: str, head: str) -> dict:
+    """`git merge-tree --write-tree <target_head> <head>` is the conflict authority.
+    rc 0 = clean; rc 1 = conflict; anything else (incl. git <2.38 / unavailable) =
+    honest-degraded unknown — NEVER inferred clean."""
+    rc, out = _git(root, ["merge-tree", "--write-tree", target_head, head])
+    if rc == 0:
+        return {"status": "clean", "detail": (out.strip().splitlines() or [""])[0][:40]}
+    if rc == 1:
+        return {"status": "conflict", "detail": "merge-tree reported conflicts"}
+    return {"status": "unknown", "detail": f"merge-tree rc={rc} (requires Git>=2.38?)"}
+
+
+def _lane_resolve(store, ref: str):
+    """Resolve a ref/SHA to a full SHA via the P2 git helper; raise LaneError."""
+    try:
+        sha, _kind = _resolve_revision(store.root, ref)
+        return sha
+    except Exception as e:  # noqa: BLE001 - normalize to LaneError for the CLI
+        raise lane_mod.LaneError(f"could not resolve {ref!r} to a full SHA: {e}") from e
+
+
+def _lane_eval(store, lane: dict, other_active: list[dict], head: str,
+               gate_scope: str | None):
+    """Resolve everything and run the pure verdict. Returns (verdict, ctx) where ctx
+    carries changed/merge/gate_check/head/target_head_now for the artifact + output."""
+    cfg_casefold = dom.default_casefold_paths()
+    reg = _load_domain_registry(store)
+    base = lane.get("base_sha")
+    changed = _lane_diff(store.root, base, head)
+    touched = [p["path"] for p in changed.get("paths", []) if p.get("touched")]
+    classifications = {p: dom.check_path(reg.data, p) for p in touched}
+    target_head_now = _lane_resolve(store, lane.get("target_ref"))
+    merge = _lane_merge(store.root, target_head_now, head)
+    scope = gate_scope or f"lane:{lane.get('lane_id')}"
+    gate_check = gate_mod.check_gates(store.root, scope=scope)
+    verdict = lane_mod.compute_verdict(
+        lane, changed=changed, classifications=classifications,
+        active_lanes=other_active, current_epoch=store.current_epoch(),
+        current_registry_hash=reg.registry_hash, merge=merge, gate_check=gate_check,
+        casefold=cfg_casefold)
+    ctx = {"changed": changed, "merge": merge, "gate_check": gate_check, "head": head,
+           "target_head_now": target_head_now,
+           "target_moved": target_head_now != lane.get("target_head_at_assign")}
+    return verdict, ctx
+
+
+def _print_lane_verdict(lane_id: str, verdict: dict, ctx: dict) -> None:
+    print(f"{verdict['verdict']}  (lane {lane_id} @ {ctx['head'][:12]})")
+    if ctx.get("target_moved"):
+        print(f"  note: target moved since assign -> recomputed merge vs {ctx['target_head_now'][:12]}")
+    for h in verdict["holds"]:
+        print(f"  HOLD[{h['code']}]: {h['detail']}")
+
+
+def cmd_lane(args: argparse.Namespace) -> int:
+    """Lane deliver-gate (advisory, point-in-time coordination; see lanes.py)."""
+    store = _get_store(args)
+    action = getattr(args, "lane_cmd", None)
+    roster = store.load_config().get("agents") or []
+
+    if action == "assign":
+        lane_id = lane_mod.validate_lane_id(args.id)
+        actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        _ensure_in_roster(args.assignee, roster, label="assignee")
+        reg = _load_domain_registry(store)
+        if args.domain not in (reg.data.get("domains") or {}):
+            sys.stderr.write(
+                f"agenttalk lane assign: unknown domain {args.domain!r} "
+                f"(known: {sorted((reg.data.get('domains') or {}))}).\n")
+            return 2
+        try:
+            base = _lane_resolve(store, args.base)
+            target_head = _lane_resolve(store, args.target)
+            prefixes = lane_mod.normalize_prefixes(args.path, casefold=False)
+        except lane_mod.LaneError as e:
+            sys.stderr.write(f"agenttalk lane assign: {e}\n")
+            return 2
+        casefold = dom.default_casefold_paths()
+        with store._config_lock():
+            data = lane_mod.load_lanes(store)
+            if lane_id in (data.get("lanes") or {}) and not args.force:
+                sys.stderr.write(
+                    f"agenttalk lane assign: lane {lane_id!r} already exists "
+                    "(use --force).\n")
+                return 2
+            for other in lane_mod.active_lanes(data):
+                if other.get("lane_id") == lane_id:
+                    continue
+                if not lane_mod.prefixes_disjoint(prefixes, other.get("path_subset") or [],
+                                                  casefold=casefold):
+                    sys.stderr.write(
+                        f"agenttalk lane assign: path subset overlaps active lane "
+                        f"{other.get('lane_id')!r} {other.get('path_subset')} - refusing "
+                        "(fail closed on overlap).\n")
+                    return 2
+            lane = lane_mod.new_lane(
+                lane_id, assignee=args.assignee, assigned_by=actor, assigned_at=_iso_now(),
+                domain_id=args.domain, path_subset=prefixes, base_sha=base,
+                target_ref=args.target, target_head_at_assign=target_head,
+                epoch_at_assign=store.current_epoch(),
+                registry_hash_at_assign=reg.registry_hash, notes=args.notes)
+            data.setdefault("lanes", {})[lane_id] = lane
+            lane_mod.save_lanes(store, data)
+        print(f"assigned lane {lane_id} to {args.assignee} @ domain {args.domain}; "
+              f"base {base[:12]} -> {args.target} ({target_head[:12]}); "
+              f"subset {prefixes or '[whole domain]'}")
+        return 0
+
+    if action == "approve-shared":
+        actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        leads = _close_lead_set(store)
+        reg = _load_domain_registry(store)
+        # authority: a close-lead, OR a default_approver of the matched shared path.
+        approvers = set(leads)
+        for entry in reg.data.get("shared_paths", []):
+            if dom.glob_matches(entry["glob"], args.path, casefold=dom.default_casefold_paths()):
+                approvers |= set(dom.resolve_refset(entry.get("default_reviewers") or {},
+                                                    store.load_config()))
+        if approvers and actor not in approvers:
+            sys.stderr.write(
+                f"agenttalk lane approve-shared: {actor!r} is not authorized "
+                f"(close lead or shared-path default approver) {sorted(approvers)}; "
+                "refusing (a shared approval gates a shared path to GO).\n")
+            return 2
+        with store._config_lock():
+            data = lane_mod.load_lanes(store)
+            lane = (data.get("lanes") or {}).get(args.id)
+            if not isinstance(lane, dict):
+                sys.stderr.write(f"agenttalk lane approve-shared: no lane {args.id!r}.\n")
+                return 2
+            lane_mod.add_shared_approval(
+                lane, path_or_glob=args.path, approved_by=actor, reason=args.reason,
+                at=_iso_now(), epoch=store.current_epoch(),
+                registry_hash=reg.registry_hash)
+            lane_mod.save_lanes(store, data)
+        print(f"recorded shared-path approval for {args.path} on lane {args.id} by {actor}")
+        return 0
+
+    if action in ("check", "deliver"):
+        data = lane_mod.load_lanes(store)
+        lane = (data.get("lanes") or {}).get(args.id)
+        if not isinstance(lane, dict):
+            sys.stderr.write(f"agenttalk lane {action}: no lane {args.id!r}.\n")
+            return 2
+        try:
+            head = _lane_resolve(store, args.head) if getattr(args, "head", None) else \
+                _lane_resolve(store, "HEAD")
+        except lane_mod.LaneError as e:
+            sys.stderr.write(f"agenttalk lane {action}: {e}\n")
+            return 2
+        others = [ln for ln in lane_mod.active_lanes(data) if ln.get("lane_id") != args.id]
+        verdict, ctx = _lane_eval(store, lane, others, head, getattr(args, "gate_scope", None))
+        if action == "check":
+            if getattr(args, "json", False):
+                print(json.dumps({**verdict, "target_moved": ctx["target_moved"],
+                                  "merge": ctx["merge"]}, indent=2))
+            else:
+                _print_lane_verdict(args.id, verdict, ctx)
+            return 0 if verdict["verdict"] == lane_mod.VERDICT_GO else 3
+        # deliver
+        actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        if verdict["verdict"] != lane_mod.VERDICT_GO:
+            sys.stderr.write("agenttalk lane deliver: HOLD - lane stays active.\n")
+            _print_lane_verdict(args.id, verdict, ctx)
+            return 3
+        # GO: write the durable artifact FIRST, then clear the lane under the lock.
+        try:
+            artifact = lane_mod.write_delivery_artifact(
+                store, lane=lane, head_sha=head, verdict=verdict, changed=ctx["changed"],
+                merge=ctx["merge"], gate_check=ctx["gate_check"], delivered_by=actor,
+                at=_iso_now())
+        except OSError as e:
+            sys.stderr.write(
+                f"agenttalk lane deliver: artifact write failed ({e}); lane stays "
+                "active (NOT cleared).\n")
+            return 2
+        with store._config_lock():
+            data = lane_mod.load_lanes(store)
+            (data.get("lanes") or {}).pop(args.id, None)
+            lane_mod.save_lanes(store, data)
+        print(f"delivered lane {args.id} @ {head[:12]} (GO); evidence: {artifact}")
+        return 0
+
+    if action == "status":
+        data = lane_mod.load_lanes(store)
+        lanes = lane_mod.active_lanes(data)
+        if getattr(args, "json", False):
+            print(json.dumps(lanes, indent=2))
+            return 0
+        if not lanes:
+            print("active lanes: none")
+            return 0
+        reg = _load_domain_registry(store)
+        cur_epoch = store.current_epoch()
+        print(f"active lanes ({len(lanes)}):")
+        for ln in lanes:
+            stale = []
+            if ln.get("epoch_at_assign") != cur_epoch:
+                stale.append("epoch")
+            if ln.get("registry_hash_at_assign") != reg.registry_hash:
+                stale.append("registry")
+            tag = f" STALE[{','.join(stale)}]" if stale else ""
+            print(f"  {ln['lane_id']}: {ln.get('assignee')} @ {ln.get('domain_id')} "
+                  f"{ln.get('path_subset') or '[whole domain]'} -> {ln.get('target_ref')}{tag}")
+        return 0
+
+    sys.stderr.write(
+        "agenttalk lane: expected assign, check, deliver, status, or approve-shared.\n")
     return 2
 
 
@@ -4184,6 +4439,18 @@ def cmd_tail(args: argparse.Namespace) -> int:
 def cmd_reset(args: argparse.Namespace) -> int:
     """Clear messages/cursors/heartbeats and start a fresh session."""
     store = _get_store(args)
+    # reset deletes state/ — warn if it would drop ACTIVE lanes (coordination state
+    # is intentionally cleared, but the operator should see it go).
+    try:
+        active = lane_mod.active_lanes(lane_mod.load_lanes(store))
+        if active:
+            sys.stderr.write(
+                f"warning: reset will clear {len(active)} ACTIVE lane(s) "
+                f"({', '.join(ln.get('lane_id', '?') for ln in active)}); lane "
+                "coordination state does not survive reset (delivery artifacts under "
+                ".agenttalk/lane-deliveries/ are NOT touched).\n")
+    except lane_mod.LaneError:
+        pass  # a malformed lanes.json must not block reset
     cfg, archive_path = store.reset(archive=args.archive)
     if archive_path is not None:
         print(f"archived previous session to: {archive_path}")
@@ -5256,6 +5523,53 @@ def build_parser() -> argparse.ArgumentParser:
     cshow = csub.add_parser("show", help="Show one close record (JSON).")
     cshow.add_argument("--id", required=True)
     cshow.set_defaults(func=cmd_close)
+
+    # ----- lane (deliver-gate; advisory point-in-time coordination, opt-in) -----
+    plane = sub.add_parser(
+        "lane",
+        help="Scoped work lanes with a deliver-gate: segment-aware path bounds vs the "
+             "domain registry + active-lane overlap + merge-tree + gates -> HOLD/GO.",
+    )
+    plane.set_defaults(func=cmd_lane, lane_cmd=None)
+    lsub = plane.add_subparsers(dest="lane_cmd")
+
+    lassign = lsub.add_parser("assign", help="Assign a lane (validates + stamps under lock).")
+    lassign.add_argument("--id", required=True, help="Lane id (safe identifier).")
+    lassign.add_argument("--from", dest="actor", help="Agent assigning the lane.")
+    lassign.add_argument("--assignee", required=True, help="Agent who works the lane.")
+    lassign.add_argument("--domain", required=True, help="Domain id (must exist in domains.json).")
+    lassign.add_argument("--base", required=True, help="Base ref/SHA (frozen to a full SHA).")
+    lassign.add_argument("--target", required=True, help="Target ref to deliver toward (e.g. main).")
+    lassign.add_argument("--path", action="append",
+                         help="Repo-relative path PREFIX in scope (repeatable; omit = whole domain).")
+    lassign.add_argument("--notes", help="Free-text notes.")
+    lassign.add_argument("--force", action="store_true", help="Overwrite an existing lane id.")
+    lassign.set_defaults(func=cmd_lane)
+
+    lcheck = lsub.add_parser("check", help="READ-ONLY deliver-gate verdict (exit 0=GO/3=HOLD).")
+    lcheck.add_argument("--id", required=True)
+    lcheck.add_argument("--head", help="Head ref/SHA to evaluate (default: HEAD).")
+    lcheck.add_argument("--gate-scope", help="Gate scope to check (default: lane:<id>).")
+    lcheck.add_argument("--json", action="store_true")
+    lcheck.set_defaults(func=cmd_lane)
+
+    ldeliver = lsub.add_parser("deliver", help="Gate + (on GO) write evidence and clear the lane.")
+    ldeliver.add_argument("--id", required=True)
+    ldeliver.add_argument("--from", dest="actor", help="Delivering agent.")
+    ldeliver.add_argument("--head", help="Head ref/SHA to deliver (default: HEAD).")
+    ldeliver.add_argument("--gate-scope", help="Gate scope (default: lane:<id>).")
+    ldeliver.set_defaults(func=cmd_lane)
+
+    lstatus = lsub.add_parser("status", help="List active lanes with staleness indicators.")
+    lstatus.add_argument("--json", action="store_true")
+    lstatus.set_defaults(func=cmd_lane)
+
+    lappr = lsub.add_parser("approve-shared", help="Record a shared-path approval (lead/approver).")
+    lappr.add_argument("--id", required=True)
+    lappr.add_argument("--path", required=True, help="Shared path/glob being approved.")
+    lappr.add_argument("--from", dest="actor", help="Approving agent.")
+    lappr.add_argument("--reason", required=True, help="Why the shared path is approved.")
+    lappr.set_defaults(func=cmd_lane)
 
     pbar = sub.add_parser(
         "barrier",

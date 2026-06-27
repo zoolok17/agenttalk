@@ -788,8 +788,8 @@ inventing their own.
 
 0.31.0 ships the **foundation**: the registry plus read-only inspection
 and validation. There is no mutation command yet — you author
-`domains.json` by hand — and the lane/knowledge layers land in later
-releases.
+`domains.json` by hand. The **lane** deliver-gate builds on it (0.36.0,
+see below); the knowledge layer lands later.
 
 A minimal registry (owner/reviewer/curator refs are objects keyed by
 `agents`, `groups`, or `roles`, resolved against your roster):
@@ -847,6 +847,56 @@ docs/foo.md: UNOWNED  casefold=true
 `domains.json` lives outside `messages/` and `state/`, so `agenttalk
 reset` preserves it like config rather than clearing it as active bus
 state.
+
+### Lanes: a scoped deliver-gate (0.36.0)
+
+A **lane** is an active, scoped assignment built on the domain registry:
+one assignee works a subset of a domain (repo-relative path **prefixes**)
+from a base SHA toward a target ref. `agenttalk lane
+{assign,check,deliver,status,approve-shared}` then gates *delivering* that
+work.
+
+`lane assign --id L --domain D --assignee A --base BASE --target REF
+[--path PREFIX …]` records the lane in `.agenttalk/state/lanes.json`
+(active coordination state — `reset` clears it, with a warning, and never
+touches the delivery artifacts below), resolving base/target to full SHAs
+and stamping the current epoch + registry hash. Assign runs under a lock
+and **fails closed** if the path subset overlaps another active lane.
+
+`lane check --id L [--head H]` is read-only and prints `HOLD`/`GO` with
+stable codes, exiting `0`=GO / `3`=HOLD (composing with `gate check` and
+`close check`). The verdict is a pure function over resolved evidence: it
+computes the changed paths from `git diff --name-status -z -M -C
+base..head`, classifies each **written** path against the domain registry
+using the **same segment-aware matcher** as domains (so `src/foo` covers
+`src/foo/x` but not `src/foobar`), checks overlap against other active
+lanes, runs `git merge-tree --write-tree` against the *current* target
+head as the conflict authority (a conflict or a degraded/unavailable
+result HOLDs — it never infers clean), checks epoch/registry staleness,
+and consumes `gates.check_gates(scope="lane:<id>")`. A rename's old path
+is in-bounds-checked (it's removed); a copy's source is evidence-only.
+Hold codes: `stale_epoch`, `stale_registry`, `diff_unavailable`,
+`diff_parse_error`, `casefold_collision`, `out_of_bounds_path`,
+`unowned_path`, `domain_overlap_path`, `shared_path_missing_approval`,
+`shared_path_wrong_approval`, `active_lane_overlap`, `merge_conflict`,
+`merge_unknown_degraded`, `gate_hold`.
+
+`lane deliver --id L` runs the same gate; on GO it writes a durable
+delivery artifact under `.agenttalk/lane-deliveries/` (the stable pointer
+for close/gate evidence) **first**, then clears the lane under the lock —
+if the artifact write fails the lane stays active. On HOLD it exits 3 and
+the lane stays active. A shared path needs `lane approve-shared --id L
+--path P --reason …` from a close lead or the shared path's
+`default_reviewers` first.
+
+Like gates and close, lanes are **advisory, point-in-time coordination**:
+a GO means "as of the current target head your work is in bounds and
+merges cleanly," not a file lock, a Git/OS authorization, or a guarantee
+the real merge stays clean later. Lanes **consume** gate state and never
+set it. Core ships the schema, segment-aware bounds, diff parsing, the
+pure verdict, and the artifact shape; the project supplies `domains.json`,
+shared-path policy, lane ids/assignees/targets/subsets, and required
+gates.
 
 ---
 
