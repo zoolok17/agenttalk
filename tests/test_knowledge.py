@@ -67,6 +67,38 @@ def test_current_view_latest_by_key_and_skips_invalid() -> None:
     assert view[("cli", "cli.seam")]["id"] == "kn-2"
 
 
+def test_shallow_invalid_event_does_not_hide_valid_note() -> None:
+    # codex blocker 2: a minimally-shaped-but-invalid latest line (no body/type/
+    # valid anchor) must NOT become current and hide the prior valid note.
+    valid = _publish(note_id="kn-1")
+    minimal_bad = {"schema_version": 1, "event": "publish", "id": "kn-bad",
+                   "key": "cli.seam", "domain_id": "cli", "anchor": {},
+                   "authority": {"state": "uncurated"}}
+    assert kn.event_problem(minimal_bad) is not None      # rejected by full validation
+    view = kn.current_view([valid, minimal_bad])
+    assert view[("cli", "cli.seam")]["id"] == "kn-1"      # valid note remains current
+
+
+def test_resolve_views_uncurated_publish_does_not_shadow_verified() -> None:
+    # codex blocker 1: an uncurated publish over a verified key must NOT replace the
+    # authoritative (curated) note.
+    pub = _publish(note_id="kn-1")
+    verify = kn.new_curate_event(base=pub, action="verify", curated_by="o",
+                                 resolved_from="curator", at="t2", reason=None)
+    later_uncurated = _publish(note_id="kn-3", body="a fresh unblessed proposal")
+    rec = kn.resolve_views([pub, verify, later_uncurated])[("cli", "cli.seam")]
+    assert rec["latest"]["id"] == "kn-3"                  # capture sees the proposal
+    assert rec["curated"]["authority"]["state"] == kn.AUTH_VERIFIED  # authoritative unchanged
+    assert rec["tombstoned"] is False
+
+
+def test_unsafe_path_anchors_rejected() -> None:
+    # codex finding 3: path-bearing anchors must be safe repo-relative paths.
+    for bad in ("../outside.py", "C:/outside.py", "..\\outside.py", "/abs/x.py"):
+        with pytest.raises(kn.KnowledgeError):
+            kn.validate_anchor({"kind": "path", "path": bad})
+
+
 def test_retract_is_terminal_until_superseded() -> None:
     pub = _publish()
     ret = kn.new_curate_event(base=pub, action="retract", curated_by="owner",
@@ -213,6 +245,24 @@ def test_cli_capture_open_curate_gated(tmp_path: Path, capsys: pytest.CaptureFix
     capsys.readouterr()
     assert _run(["knowledge", "pull"], root) == 0   # now curated -> visible
     assert "1 active" in capsys.readouterr().out
+
+
+def test_cli_uncurated_publish_does_not_hide_verified(tmp_path: Path,
+                                                      capsys: pytest.CaptureFixture) -> None:
+    # codex blocker 1, end-to-end: publish -> verify -> later uncurated publish of the
+    # same key must NOT make the verified note vanish from default pull.
+    root = _repo(tmp_path)
+    _pub(root)
+    _run(["knowledge", "curate", "verify", "--from", "curator", "--domain", "cli",
+          "--key", "cli.seam"], root)
+    assert _pub(root) == 0          # dev re-publishes the same key (uncurated proposal)
+    capsys.readouterr()
+    assert _run(["knowledge", "pull"], root) == 0
+    out = capsys.readouterr().out
+    assert "1 active" in out and "verified" in out      # verified note still visible
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--include-uncurated"], root) == 0
+    assert "uncurated" in capsys.readouterr().out       # the proposal shows only here
 
 
 def test_cli_anchor_change_makes_note_stale(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:

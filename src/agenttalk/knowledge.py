@@ -27,6 +27,8 @@ import json
 import re
 from typing import Any
 
+from agenttalk import domains as dom
+
 SCHEMA_VERSION = 1
 STORE_DIRNAME = "knowledge"
 NOTES_FILENAME = "notes.jsonl"
@@ -123,9 +125,9 @@ def validate_anchor(raw: object) -> dict:
         raise KnowledgeError(f"anchor.kind must be one of {sorted(ANCHOR_KINDS)}, got {kind!r}")
     out: dict[str, Any] = {"kind": kind}
     if kind == "path":
-        out["path"] = _require_str(raw, "path")
+        out["path"] = _norm_path(_require_str(raw, "path"))
     elif kind == "symbol":
-        out["path"] = _require_str(raw, "path")
+        out["path"] = _norm_path(_require_str(raw, "path"))
         out["symbol"] = _require_str(raw, "symbol")
     elif kind == "request":
         out["request_id"] = _require_str(raw, "request_id")
@@ -135,7 +137,7 @@ def validate_anchor(raw: object) -> dict:
         out["mission"] = _require_str(raw, "mission")
         out["wp_id"] = _require_str(raw, "wp_id")
         if raw.get("path") is not None:
-            out["path"] = _require_str(raw, "path")
+            out["path"] = _norm_path(_require_str(raw, "path"))
     elif kind == "sha":
         sha = raw.get("sha")
         if not (isinstance(sha, str) and _FULL_SHA_RE.match(sha)):
@@ -154,6 +156,16 @@ def _require_str(raw: dict, field: str) -> str:
     if not isinstance(v, str) or not v:
         raise KnowledgeError(f"anchor.{field} is required and must be a non-empty string")
     return v
+
+
+def _norm_path(value: str) -> str:
+    """Normalize a path-bearing anchor to a safe repo-relative path (reuse the
+    domains normalizer so anchors classify like domain ownership and absolute/
+    escaping paths are rejected)."""
+    try:
+        return dom.normalize_repo_path(value)
+    except dom.DomainError as e:
+        raise KnowledgeError(f"anchor path {value!r} is not a safe repo-relative path: {e}") from e
 
 
 def anchor_path(anchor: dict) -> str | None:
@@ -222,31 +234,79 @@ def new_curate_event(*, base: dict, action: str, curated_by: str, resolved_from:
 
 # --------------------------------------------------------------- current view
 
-def _is_wellformed(evt: object) -> bool:
+def event_problem(evt: object) -> str | None:
+    """FULL structural validation of one event - the reader/fold use this so a
+    minimally-shaped-but-invalid line can NEVER become current and hide a valid note
+    (codex blocker). Returns an error string, or None if the event is foldable.
+    Validates the SAME fields publish/curate produce: type, body+cap, anchor, ids,
+    authority."""
     if not isinstance(evt, dict):
-        return False
+        return "not a JSON object"
     if evt.get("schema_version") != SCHEMA_VERSION:
-        return False
+        return "schema_version must be 1"
     if evt.get("event") not in (EVENT_PUBLISH, EVENT_CURATE, EVENT_RETRACT):
-        return False
+        return "event must be publish|curate|retract"
     for key in ("id", "key", "domain_id"):
         if not isinstance(evt.get(key), str) or not evt.get(key):
-            return False
-    if not isinstance(evt.get("anchor"), dict):
-        return False
-    return True
+            return f"{key} is required"
+    auth = evt.get("authority")
+    if not isinstance(auth, dict) or not isinstance(auth.get("state"), str):
+        return "authority.state is required"
+    try:
+        validate_key(evt["key"])
+        validate_note_id(evt["id"])
+        validate_type(evt.get("type"))
+        validate_body(evt.get("body"))
+        validate_anchor(evt.get("anchor"))
+    except KnowledgeError as e:
+        return str(e)
+    return None
+
+
+def _is_wellformed(evt: object) -> bool:
+    return event_problem(evt) is None
 
 
 def current_view(events: list[dict]) -> dict[tuple, dict]:
-    """PURE: fold append-only events into the latest valid event per (domain_id, key),
-    in file order (later wins). Invalid events are skipped (fail-safe). A retract is
-    kept as the terminal event for its key (so the reader knows it is tombstoned)."""
+    """PURE: fold append-only events into the latest VALID event per (domain_id, key),
+    in file order (later wins). Invalid events are skipped (fail-safe - a malformed
+    latest line never hides a valid note). A retract is kept as the terminal event."""
     view: dict[tuple, dict] = {}
     for evt in events:
         if not _is_wellformed(evt):
             continue
         view[(evt["domain_id"], evt["key"])] = evt
     return view
+
+
+def resolve_views(events: list[dict]) -> dict[tuple, dict]:
+    """PURE: per (domain_id, key), the latest valid event PLUS the latest CURATED
+    event - so open capture cannot mutate the authoritative (curated) visible set
+    (codex blocker). Returns {key: {"latest", "curated", "tombstoned"}}:
+
+      * latest:     the latest valid event (for --include-uncurated proposals)
+      * curated:    the latest verify / lead_override / retract event (authoritative)
+      * tombstoned: the latest curation was a retract
+
+    Default pull shows ``curated`` (verified, non-tombstoned); a later uncurated
+    publish updates ``latest`` only, so the verified note never silently disappears.
+    Re-opening a retracted key requires a fresh publish AND re-curation."""
+    out: dict[tuple, dict] = {}
+    for evt in events:
+        if not _is_wellformed(evt):
+            continue
+        k = (evt["domain_id"], evt["key"])
+        rec = out.setdefault(k, {"latest": None, "curated": None, "tombstoned": False})
+        rec["latest"] = evt
+        state = (evt.get("authority") or {}).get("state")
+        if evt.get("event") == EVENT_RETRACT or state == AUTH_RETRACTED:
+            rec["curated"] = evt
+            rec["tombstoned"] = True
+        elif state in (AUTH_VERIFIED, AUTH_LEAD_OVERRIDE):
+            rec["curated"] = evt
+            rec["tombstoned"] = False
+        # an uncurated publish updates `latest` only (capture-open, curate-gated)
+    return out
 
 
 def is_retracted(note: dict) -> bool:

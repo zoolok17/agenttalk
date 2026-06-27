@@ -2514,18 +2514,26 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
     if action in ("pull", "search", "onboard"):
         events, problems = kn.read_events(store)
         reg = _load_domain_registry(store)
-        view = kn.current_view(events)
-        rows = []
-        for (domain_id, _key), note in sorted(view.items()):
-            if getattr(args, "domain", None) and domain_id != args.domain:
-                continue
-            rows.append((note, _knowledge_eval(store, note, reg)))
         include_stale = getattr(args, "include_stale", False)
         include_uncurated = getattr(args, "include_uncurated", False)
+        # Curated/capture split (codex blocker): default shows the latest CURATED
+        # note per key; a later uncurated publish only appears with --include-uncurated
+        # and NEVER shadows the verified note in the default view.
+        rows = []
+        for (domain_id, _key), rec in sorted(kn.resolve_views(events).items()):
+            if getattr(args, "domain", None) and domain_id != args.domain:
+                continue
+            latest, curated = rec["latest"], rec["curated"]
+            if include_uncurated and latest is not None and not kn.is_curated(latest) \
+                    and not kn.is_retracted(latest):
+                note = latest          # an uncurated proposal (capture)
+            else:
+                note = curated         # the authoritative verified note
+            if note is None or kn.is_retracted(note):
+                continue
+            rows.append((note, _knowledge_eval(store, note, reg)))
 
         def visible(note, verdict):
-            if kn.is_retracted(note):
-                return False
             if verdict["hard_stale"] and not include_stale:
                 return False
             if not kn.is_curated(note) and not include_uncurated:
