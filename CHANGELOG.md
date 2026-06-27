@@ -5,6 +5,49 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.0] - 2026-06-27
+
+Ephemeral adversarial reviewers (evidence-only). The lead can ask the supervisor
+to spin up a **fresh, one-shot agent** for an independent adversarial review of a
+scope; it files a typed `review-result` that feeds the gate/close, then is reaped
+and its temporary identity retired. Fresh-by-construction = no in-context
+blindness. **Disabled by default**, capped, and supervisor-gated — and it
+produces *evidence only*, never a counted sign-off (so a lead can't manufacture
+specialist signers; P3 integrity is preserved).
+
+### Added
+- **`request-launch` + a supervisor launch-request lifecycle.** The lead drops a
+  data-only `request-launch` marker (whitelisted profile/skill/roles, scope at a
+  full SHA, bounded prompt); the supervisor atomically claims it and runs a
+  **separate one-shot lifecycle** (claimed → rostered as a unique `adversary-*`
+  identity → one bus `review-request` → launched via a one-shot wrapper with a
+  fresh session → completed only on a schema-valid `review-result` → reaped +
+  retired). **No auto-restart, ever**; a startup janitor idempotently reaps
+  orphaned `adversary-*` launches after a crash; process trees are killed on
+  timeout/failure.
+- **Evidence-only outcome:** an approved ephemeral review is evidence that can
+  block or counter a close; it does **not** count toward any required specialist
+  sign-off. Rejected → counter/remediation; needs-info/malformed/none → HOLD. The
+  supervisor never synthesizes approval from prose.
+- **Cost & authority controls (disabled by default):** `ephemeral_reviewers.*`
+  config — `enabled`, `max_concurrent`, per-hour/per-day caps, timeouts,
+  prompt-size cap, allowlisted profiles/skills/roles/groups, `require_authorized_lead`.
+  Authority is stricter than release fallback: operator-facing or sole active
+  lead only, no zero-lead fallback, fail closed on ambiguous multi-lead.
+
+### Notes
+- Honest scope: v1 is *prompt/session freshness*, not a hard isolation boundary
+  (a frozen worktree + filtered bus view would be; deferred). Reviewed code and
+  the marker prompt are untrusted data. Counted-sign-off mode is intentionally
+  deferred.
+
+### Upgrade
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.36.0"
+```
+Additive and opt-in; ephemeral reviewers stay disabled until you enable them in
+the supervisor config.
+
 ## [0.35.0] - 2026-06-27
 
 The assurance review/test skill pack (assurance P4). Five new dev-discipline
