@@ -2281,32 +2281,31 @@ def cmd_lane(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk lane deliver: HOLD - lane stays active.\n")
             _print_lane_verdict(args.id, verdict, ctx)
             return 3
-        # GO: write the durable artifact FIRST, then clear the lane under the lock.
-        try:
-            artifact = lane_mod.write_delivery_artifact(
-                store, lane=lane, head_sha=head, verdict=verdict, changed=ctx["changed"],
-                merge=ctx["merge"], gate_check=ctx["gate_check"], delivered_by=actor,
-                at=_iso_now())
-        except OSError as e:
-            sys.stderr.write(
-                f"agenttalk lane deliver: artifact write failed ({e}); lane stays "
-                "active (NOT cleared).\n")
-            return 2
+        # GO: revalidate the lane UNDER the lock, and only if it is still the lane we
+        # evaluated, write the durable artifact FIRST and then clear it. A concurrent
+        # `assign --force` between eval and here changes the fingerprint -> FAIL CLOSED
+        # (exit 3, NO artifact written), so a caller gating on the exit code or the
+        # artifact can never see a false success for a lane we did not deliver
+        # (reviewer-1 BLOCKER).
         with store._config_lock():
             data = lane_mod.load_lanes(store)
             current = (data.get("lanes") or {}).get(args.id)
-            # Only clear the lane we ACTUALLY evaluated: if a concurrent
-            # `assign --force` replaced it between eval and now, the fingerprint
-            # differs -> leave the new lane active (the artifact is honest evidence
-            # of the old evaluation; the new lane must be re-checked).
             if not isinstance(current, dict) or lane_mod.fingerprint(current) != lane_mod.fingerprint(lane):
                 sys.stderr.write(
                     f"agenttalk lane deliver: lane {args.id!r} changed since evaluation "
-                    "(concurrent reassign?) - NOT clearing it; evidence written, re-check "
+                    "(concurrent reassign?) - aborting; NO evidence written, re-check "
                     "the current lane.\n")
-                print(f"delivered evidence for lane {args.id} @ {head[:12]} (GO); "
-                      f"lane left active (changed under us): {artifact}")
-                return 0
+                return 3
+            try:
+                artifact = lane_mod.write_delivery_artifact(
+                    store, lane=lane, head_sha=head, verdict=verdict, changed=ctx["changed"],
+                    merge=ctx["merge"], gate_check=ctx["gate_check"], delivered_by=actor,
+                    at=_iso_now())
+            except OSError as e:
+                sys.stderr.write(
+                    f"agenttalk lane deliver: artifact write failed ({e}); lane stays "
+                    "active (NOT cleared).\n")
+                return 2
             (data.get("lanes") or {}).pop(args.id, None)
             lane_mod.save_lanes(store, data)
         print(f"delivered lane {args.id} @ {head[:12]} (GO); evidence: {artifact}")

@@ -269,6 +269,31 @@ def test_cli_check_out_of_bounds_holds(tmp_path: Path) -> None:
     assert _run(["lane", "check", "--id", "l1", "--head", head], root) == 3
 
 
+def test_cli_deliver_aborts_fail_closed_on_concurrent_change(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # reviewer-1 BLOCKER: if the lane changed (concurrent reassign) between the
+    # pre-lock eval and the locked clear, deliver must FAIL CLOSED (exit 3, NO
+    # artifact, lane left active) - never a false success. Force a fingerprint
+    # mismatch by making fingerprint() unique per call (eval call != locked call).
+    root, base = _repo(tmp_path)
+    br = _branch(root)
+    _run(["lane", "assign", "--id", "l1", "--from", "lead", "--assignee", "dev",
+          "--domain", "core", "--base", base, "--target", br, "--path", "src/core"], root)
+    head = _commit(root, "src/core/a.py", "base\nchange\n")
+    counter = {"n": 0}
+
+    def _unique_fp(_lane):
+        counter["n"] += 1
+        return (counter["n"],)
+
+    monkeypatch.setattr(lanes, "fingerprint", _unique_fp)
+    assert _run(["lane", "deliver", "--id", "l1", "--from", "dev", "--head", head], root) == 3
+    # no artifact written, lane still active
+    deliveries = Store(root).dir / "lane-deliveries"
+    assert not deliveries.exists() or not list(deliveries.glob("*.json"))
+    assert [ln["lane_id"] for ln in lanes.active_lanes(lanes.load_lanes(Store(root)))] == ["l1"]
+
+
 def test_cli_deliver_hold_leaves_lane_active(tmp_path: Path) -> None:
     root, base = _repo(tmp_path)
     br = _branch(root)
