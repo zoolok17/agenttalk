@@ -198,6 +198,10 @@ When you receive `kind=review-request`, check `meta`:
    - `--meta status=approved|rejected`
    - `--meta request_id=<echoed>` if present
    - `--meta wp_id=<echoed>`
+   - If `status=approved`, also include typed evidence metadata:
+     `risk_class`, `release_blocker`, `tests_referenced`,
+     `tests_executed`, `evidence` or `artifacts`, `residual_risk`,
+     and `na_reason` for any `n/a` field.
 
 ### Ad-hoc cross-review mode - mission/wp_id absent
 
@@ -219,6 +223,10 @@ to review it.
 4. **Send the verdict** via `kind=review-result`:
    - `--meta status=approved|rejected|needs-info`
    - `--meta request_id=<echoed>`
+   - If `status=approved`, also include typed evidence metadata:
+     `risk_class`, `release_blocker`, `tests_referenced`,
+     `tests_executed`, `evidence` or `artifacts`, `residual_risk`,
+     and `na_reason` for any `n/a` field.
    - Body: Findings (ordered by severity, with file/line refs),
      Verification performed, Residual risks. If approved, state
      explicitly "no blocking findings".
@@ -331,7 +339,8 @@ iteration:
   `agenttalk check --for $SELF --to-request <RID>`. Exit 3 = the request
   was RESCINDED: hard stop — do not act, and reply on the thread that you
   aborted. Exit 4 = unknown id: treat as stale and re-confirm with the
-  counterparty. Only exit 0 (current) clears you to act.
+  counterparty. Only exit 0 (current) clears you to act. When assurance
+  gates apply, run the same check with `--gates`; exit 3 also means HOLD.
 - **Mark long drafts (0.14.0).** While drafting a long reply on a known
   thread, ping `agenttalk composing --from $SELF --to-request <RID>`
   (repeat roughly every 2 minutes). It extends the peer's scoped wait AND

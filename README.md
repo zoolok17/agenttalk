@@ -908,6 +908,29 @@ Protected agents — the operator-facing liaison and every active
 | `agenttalk status --json` | Structured status output for automation (consult freshness, external tooling). Same data as plain `status` plus `invalid_messages[]`, `warnings[]`, per-agent `waiting` / `waiting_stale`, and thread-derived warning state (additive — existing keys unchanged). |
 | `agenttalk --version` | Print the installed version. |
 
+### Assurance gates and approved review evidence
+
+Use `agenttalk gate {set,list,check,waive}` to manage lightweight
+assurance state in `.agenttalk/gates.json`. Required gates default to
+empty until a project opts in. `gate check` prints top-line `GO` or
+`HOLD`; it exits 3 when an unwaived `severity=blocker` gate is `red` or
+`unknown`. A blocker gate can be set `green` only with
+`--evidence-source automation_ci`; operator waivers must use `gate waive`,
+which records the operator, date, reason, scope, and expiration.
+
+Use `agenttalk check --for A --to-request RID --gates` immediately
+before release, merge, tag, or milestone-close actions that must respect
+gate state. It keeps the existing currentness/rescind behavior and adds
+a `HOLD` failure when gates block. With `--json`, the output includes an
+additive `gates` object.
+
+A `review-result` with `--meta status=approved` must include typed
+evidence metadata: `risk_class`, `release_blocker`,
+`tests_referenced`, `tests_executed`, `evidence` or `artifacts`, and
+`residual_risk`. Use `na_reason` when any field is `n/a`. A lightweight
+approval can use `risk_class=none`, `release_blocker=no`, `n/a` evidence
+fields, and a short `na_reason`.
+
 ### Rejoining a session with `sync`
 
 Use `agenttalk sync --for A` before an agent acts after a restart,
@@ -1042,6 +1065,9 @@ typo can't produce a "sent" message the receiver will silently skip:
 - `wake` — state-change signal for sk-loop (low-latency peer wake)
 - `end` — terminate the listen loop on the other side
 - `composing` — control-plane: "I'm still drafting a real reply, hold the line." Consumed by `agenttalk wait` as a deadline-extension signal; never returned as a reply. Hidden from `recv` by default. Send via `agenttalk composing` (preferred) or `send --kind composing`.
+
+For `review-result`, `status=approved` also requires typed evidence
+metadata; see "Assurance gates and approved review evidence" above.
 
 Adding a new kind requires updating `KNOWN_KINDS` in
 `src/agenttalk/store.py` *and* documenting it here + in the skill

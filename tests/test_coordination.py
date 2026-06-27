@@ -28,6 +28,19 @@ def _run_expect_exit(argv: list[str], root: Path, code: int) -> None:
     assert int(rc) == code
 
 
+def _approval_meta_args() -> list[str]:
+    return [
+        "--meta", "status=approved",
+        "--meta", "risk_class=none",
+        "--meta", "release_blocker=no",
+        "--meta", "tests_referenced=n/a",
+        "--meta", "tests_executed=n/a",
+        "--meta", "evidence=n/a",
+        "--meta", "residual_risk=n/a",
+        "--meta", "na_reason=lightweight review",
+    ]
+
+
 # --------------------------------------------------------- threadstate (store)
 
 def test_threadstate_seen_is_monotonic(store: Store) -> None:
@@ -156,7 +169,7 @@ def test_scoped_wait_composing_extends_mid_wait(tmp_path: Path) -> None:
           "-m", "drafting", "--quiet"], root)
     _time.sleep(0.6)  # past the 0.5s base deadline — only the extension keeps it alive
     _run(["send", "--from", "lead", "--to", "exec", "--kind", "review-result",
-          "--meta", "request_id=q-fire", "--meta", "status=approved",
+          "--meta", "request_id=q-fire", *_approval_meta_args(),
           "-m", "lgtm", "--quiet"], root)
     t.join(timeout=15)
     assert not t.is_alive(), "waiter never returned"
@@ -198,7 +211,7 @@ def test_scoped_wait_composing_extends_when_cursor_exceeds_baseline(
     assert s.cursor("exec") == r1.id  # floor now exceeds baseline
     _time.sleep(0.6)  # past base deadline — survives only if the composing extended
     _run(["send", "--from", "lead", "--to", "exec", "--kind", "review-result",
-          "--meta", "request_id=q-fire", "--meta", "status=approved",
+          "--meta", "request_id=q-fire", *_approval_meta_args(),
           "-m", "lgtm", "--quiet"], root)
     t.join(timeout=15)
     assert not t.is_alive(), "waiter never returned"

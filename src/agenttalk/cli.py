@@ -30,6 +30,7 @@ from agenttalk import domains as dom
 from agenttalk import transcript as tx
 from agenttalk import codex_config as cxc
 from agenttalk import doctor as dr
+from agenttalk import gates as gate_mod
 from agenttalk import install_skills as iskl
 from agenttalk import signing as _signing
 from agenttalk import threads as th
@@ -1043,6 +1044,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     meta = _parse_meta(args.meta)
     _maybe_autogen_request_id(args.kind, meta, quiet=args.quiet)
     _warn_missing_request_id(args.kind, meta)
+    gate_mod.validate_review_result_evidence(args.kind, meta)
     _warn_owed_decision_to_peer(store, sender, recipient, meta.get("request_id"))
     msg = store.send(
         sender=sender,
@@ -1279,27 +1281,123 @@ def cmd_check(args: argparse.Namespace) -> int:
     if getattr(args, "epoch", False):
         epoch_state, cur_epoch, exit_code = _epoch_verdict(store, rid)
         epoch_obj = {"state": epoch_state, "current_epoch": cur_epoch}
+    gate_obj = None
+    if getattr(args, "gates", False):
+        gate_obj = gate_mod.check_gates(store.root)
+        if gate_obj["verdict"] == "HOLD" and exit_code == 0:
+            exit_code = 3
     if args.json:
         out = {"request_id": rid, "state": "current", "rescind": None}
         if epoch_obj is not None:
             out["epoch"] = epoch_obj
+        if gate_obj is not None:
+            out["gates"] = gate_obj
         print(json.dumps(out, indent=2))
     else:
         if exit_code == 0:
             print(f"current     {rid}")
             if epoch_obj is not None:
                 print(f"  epoch: current ({epoch_obj['current_epoch'] or 'no barrier'})")
-        elif epoch_obj["state"] == "previous-epoch":
+        elif epoch_obj is not None and epoch_obj["state"] == "previous-epoch":
             print(f"previous-epoch  {rid}")
             print(f"  this request predates the current global epoch "
                   f"({epoch_obj['current_epoch']}) — do NOT act on it; re-ask "
                   f"under the current barrier for irreversible actions.")
-        else:  # unknown-pre-epoch
+        elif epoch_obj is not None:  # unknown-pre-epoch
             print(f"pre-epoch   {rid}")
             print(f"  this opener predates epochs (no epoch_at_send) and a "
                   f"barrier exists ({epoch_obj['current_epoch']}) — do NOT act; "
                   f"re-ask under the current barrier for irreversible actions.")
+        else:
+            print(f"hold        {rid}")
+        if gate_obj is not None:
+            print(f"  gates: {gate_obj['verdict']}")
+            for blocker in gate_obj["blockers"]:
+                why = f" - {blocker['reason']}" if blocker.get("reason") else ""
+                print(f"    blocker {blocker['name']}: {blocker['status']}{why}")
     return exit_code
+
+
+def cmd_gate(args: argparse.Namespace) -> int:
+    """Manage lightweight assurance gates."""
+    store = _get_store(args)
+    action = getattr(args, "gate_cmd", None)
+    if action == "list":
+        state = gate_mod.load_gate_state(store.root)
+        if getattr(args, "json", False):
+            print(json.dumps(state, indent=2))
+            return 0
+        required = state.get("required_gates") or []
+        if required:
+            print("required gates: " + ", ".join(required))
+        gates = state.get("gates") or {}
+        if not gates:
+            print("gates: none")
+            return 0
+        print(f"gates ({len(gates)}):")
+        for name, gate in sorted(gates.items()):
+            req = " required" if name in required else ""
+            print(
+                f"  {name}: {gate.get('status', 'unknown')} "
+                f"{gate.get('severity', 'blocker')} scope={gate.get('scope', 'global')}{req}"
+            )
+        return 0
+    if action == "check":
+        scope = "release" if getattr(args, "release", False) else getattr(args, "scope", None)
+        result = gate_mod.check_gates(store.root, scope=scope)
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2))
+        else:
+            print(result["verdict"])
+            if result["required_gates"]:
+                print("required gates: " + ", ".join(result["required_gates"]))
+            for blocker in result["blockers"]:
+                why = f" - {blocker['reason']}" if blocker.get("reason") else ""
+                print(f"  blocker {blocker['name']}: {blocker['status']}{why}")
+        return 0 if result["verdict"] == "GO" else 3
+    if action == "set":
+        actor = _resolve_self(getattr(args, "actor", None), roster=store.load_config().get("agents") or [])
+        required = True if args.required else False if args.optional else None
+        gate = gate_mod.set_gate(
+            store.root,
+            name=args.name,
+            status=args.status,
+            severity=args.severity,
+            scope=args.scope,
+            actor=actor,
+            evidence_source=args.evidence_source,
+            evidence=args.evidence,
+            reason=args.reason,
+            revision=args.revision,
+            epoch=store.current_epoch(),
+            required=required,
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(gate, indent=2))
+        else:
+            print(f"gate {gate['name']}: {gate['status']} {gate['severity']} scope={gate['scope']}")
+        return 0
+    if action == "waive":
+        actor = None
+        if getattr(args, "actor", None):
+            actor = _resolve_self(args.actor, roster=store.load_config().get("agents") or [])
+        gate = gate_mod.waive_gate(
+            store.root,
+            name=args.name,
+            operator=args.operator,
+            reason=args.reason,
+            scope=args.scope,
+            expires=args.expires,
+            date=args.date,
+            actor=actor,
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(gate, indent=2))
+        else:
+            print(f"gate {gate['name']}: waived until {gate['waiver']['expires']}")
+        return 0
+    sys.stderr.write("agenttalk gate: expected set, list, check, or waive.\n")
+    return 2
 
 
 def cmd_prune(args: argparse.Namespace) -> int:
@@ -3321,6 +3419,7 @@ def cmd_reply(args: argparse.Namespace) -> int:
         print(f"(dry-run) reply {sender} -> {anchor.sender}  thread={rid}  "
               f"kind={kind}; nothing sent.")
         return 0
+    gate_mod.validate_review_result_evidence(kind, meta)
     msg = store.send(
         sender=sender,
         recipient=anchor.sender,
@@ -4171,9 +4270,53 @@ def build_parser() -> argparse.ArgumentParser:
                            "request predates the latest barrier (stale / "
                            "previous-epoch / pre-epoch). Run before irreversible "
                            "actions after an epoch boundary.")
+    pchk.add_argument("--gates", action="store_true",
+                      help="Also check assurance gates: exit 3 when gate state is HOLD.")
     pchk.add_argument("--json", action="store_true",
                       help='{"request_id", "state", "rescind"} — stable contract.')
     pchk.set_defaults(func=cmd_check)
+
+    pgate = sub.add_parser(
+        "gate",
+        help="Manage lightweight assurance gates. Blocker gates feed check --gates.",
+    )
+    pgate.set_defaults(func=cmd_gate, gate_cmd=None)
+    gatesub = pgate.add_subparsers(dest="gate_cmd")
+    gset = gatesub.add_parser("set", help="Set or update one gate.")
+    gset.add_argument("--from", dest="actor", help="Agent recording this gate update.")
+    gset.add_argument("--name", required=True, help="Gate id, e.g. connected-l1.")
+    gset.add_argument("--status", required=True, choices=sorted(gate_mod.VALID_STATUSES))
+    gset.add_argument("--severity", default="blocker", choices=sorted(gate_mod.VALID_SEVERITIES))
+    gset.add_argument("--scope", default="global", help="Gate scope (default: global).")
+    gset.add_argument("--reason", help="Human-readable reason or summary.")
+    gset.add_argument("--evidence", action="append", help="Evidence artifact path/id (repeatable).")
+    gset.add_argument("--evidence-source", default="manual_review",
+                      choices=sorted(gate_mod.VALID_EVIDENCE_SOURCES))
+    gset.add_argument("--revision", help="Revision/head this evidence applies to.")
+    req_group = gset.add_mutually_exclusive_group()
+    req_group.add_argument("--required", action="store_true", help="Declare this gate required.")
+    req_group.add_argument("--optional", action="store_true", help="Remove this gate from required gates.")
+    gset.add_argument("--json", action="store_true", help="Emit the stored gate object.")
+    gset.set_defaults(func=cmd_gate)
+    glist = gatesub.add_parser("list", help="List known gates.")
+    glist.add_argument("--json", action="store_true", help="Emit full gate state.")
+    glist.set_defaults(func=cmd_gate)
+    gcheck = gatesub.add_parser("check", help="Print GO or HOLD from current gate state.")
+    gscope = gcheck.add_mutually_exclusive_group()
+    gscope.add_argument("--release", action="store_true", help="Check release-scoped gates.")
+    gscope.add_argument("--scope", help="Check this scope plus global gates.")
+    gcheck.add_argument("--json", action="store_true", help="Emit structured verdict.")
+    gcheck.set_defaults(func=cmd_gate)
+    gwaive = gatesub.add_parser("waive", help="Record an operator waiver for one gate.")
+    gwaive.add_argument("--from", dest="actor", help="Agent recording the waiver.")
+    gwaive.add_argument("--name", required=True, help="Gate id to waive.")
+    gwaive.add_argument("--operator", required=True, help="Operator accepting the risk.")
+    gwaive.add_argument("--reason", required=True, help="Reason for the waiver.")
+    gwaive.add_argument("--scope", required=True, help="Waiver scope.")
+    gwaive.add_argument("--expires", required=True, help="Expiration date/time, e.g. 2026-07-01.")
+    gwaive.add_argument("--date", help="Decision date (defaults to now).")
+    gwaive.add_argument("--json", action="store_true", help="Emit the stored gate object.")
+    gwaive.set_defaults(func=cmd_gate)
 
     pbar = sub.add_parser(
         "barrier",

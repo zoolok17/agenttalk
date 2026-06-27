@@ -164,7 +164,7 @@ handle it before asking the user.
 ### 6. Act on the reply
 
 Match it by `meta.request_id`:
-- `status=approved` -> proceed or ship.
+- `status=approved` -> proceed or ship only after any required gate check passes.
 - `status=rejected` -> apply requested changes, then call
   `$agenttalk-handoff` again (new request_id).
 - `status=needs-info` -> answer via `$agenttalk-send` (kind=message),
@@ -206,7 +206,8 @@ for your request.
   `agenttalk check --for $SELF --to-request <RID>`. Exit 3 = the request
   was RESCINDED: hard stop — do not act, and reply on the thread that you
   aborted. Exit 4 = unknown id: treat as stale and re-confirm with the
-  counterparty. Only exit 0 (current) clears you to act.
+  counterparty. Only exit 0 (current) clears you to act. When assurance
+  gates apply, run the same check with `--gates`; exit 3 also means HOLD.
 - **Mark long drafts (0.14.0).** While drafting a long reply on a known
   thread, ping `agenttalk composing --from $SELF --to-request <RID>`
   (repeat roughly every 2 minutes). It extends the peer's scoped wait AND

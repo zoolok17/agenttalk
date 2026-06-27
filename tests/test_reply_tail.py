@@ -17,6 +17,19 @@ def _run(argv: list[str], root: Path) -> int:
         return 0 if e.code is None else int(e.code)
 
 
+def _approval_meta_args() -> list[str]:
+    return [
+        "--meta", "status=approved",
+        "--meta", "risk_class=none",
+        "--meta", "release_blocker=no",
+        "--meta", "tests_referenced=n/a",
+        "--meta", "tests_executed=n/a",
+        "--meta", "evidence=n/a",
+        "--meta", "residual_risk=n/a",
+        "--meta", "na_reason=lightweight review",
+    ]
+
+
 # ===================================================================== REPLY
 
 def test_reply_to_last_message_auto_derives_recipient(
@@ -114,7 +127,7 @@ def test_reply_explicit_kind_wins(
            kind="review-request", meta={"request_id": "r1"})
     capsys.readouterr()
     _run(["reply", "--from", "beta", "--kind", "review-result",
-          "--meta", "status=approved", "-m", "lgtm"], store_root)
+          *_approval_meta_args(), "-m", "lgtm"], store_root)
     reply = s.messages_for("alpha")[0]
     assert reply.kind == "review-result"
     assert reply.meta.get("status") == "approved"
