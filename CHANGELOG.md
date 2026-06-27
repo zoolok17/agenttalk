@@ -5,6 +5,50 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.1] - 2026-06-27
+
+Supervisor robustness for the current Codex CLI, plus a non-blocking activity
+hook. A field deployment surfaced two issues under unattended supervision; this
+hardens both. No behavior change for wrapped agents or Claude.
+
+### Fixed
+- **Codex launch preflight no longer depends on the volatile `codex sandbox`
+  CLI.** The non-wrapped Codex preflight previously ran `codex sandbox
+  -P :workspace ...`, which fails on Codex builds that restructured the
+  `sandbox` subcommand (platform subcommand required, `-P` dropped),
+  fail-closing a healthy agent. It now runs the same plain `python -m agenttalk
+  --version` import gate the Claude/generic path uses, under the seeded
+  `CODEX_HOME` + `PYTHONPATH`; the seeded config remains the runtime sandbox
+  authority. (Stable npm codex was unaffected; this future-proofs CLI drift.)
+- **`agenttalk heartbeat --hook` soft mode** — the activity-hook command never
+  blocks a tool call. As a PostToolUse hook with unresolved/off-roster identity
+  it exits 0 silently (no stdout/stderr); the manual `agenttalk heartbeat` stays
+  strict (exit 2). `install-activity-hook` now installs `agenttalk heartbeat
+  --hook` and upgrades/dedupes legacy bare entries in `.claude/settings.json`
+  and `.codex/hooks.json`.
+
+### Added
+- **`agenttalk doctor` surfaces the resolved supervised Codex path +
+  `codex --version`**, with a best-effort non-blocking sandbox probe that hints
+  on failure (you may be on an old/alpha/MS-Store codex; agenttalk expects the
+  npm stable). Makes a wrong-executable pick visible instead of a cryptic
+  fail-closed.
+- **Non-wrapped supervised Codex with `activity_hook=true` launches with
+  `--dangerously-bypass-hook-trust`** so the unattended agent does not strand at
+  Codex's "Hooks need review" prompt (which re-triggers when the hook command
+  changes). Scoped to that case only; wrapped/no-hook/Claude agents are
+  unaffected — a deliberate trust bypass for the supervisor's own agenttalk hook
+  in controlled unattended supervision.
+
+### Upgrade
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.31.1"
+```
+Re-run `agenttalk install-skills` (or `supervise --install-activity-hook`) to
+pick up `agenttalk heartbeat --hook`; the installer upgrades legacy bare hook
+entries automatically. For hands-off unattended supervision, prefer wrapped
+agents (`wrapped: true`).
+
 ## [0.31.0] - 2026-06-26
 
 The domain registry foundation, plus the documentation for the supervisor
