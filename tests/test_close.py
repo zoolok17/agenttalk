@@ -381,6 +381,32 @@ def test_cli_post_publish_ack_rejected_until_reopen(tmp_path: Path) -> None:
                  "--from", "codex", "--reason", "late"], root) == 0
 
 
+def test_cli_override_ignored_from_non_lead(tmp_path: Path) -> None:
+    # reviewer-1 blocker: --override is a close-lead privilege. A non-lead passing
+    # --override must NOT self-authorize a lens the open did not allow them.
+    root = _init(tmp_path)  # lens "sec" allowed only to codex; lead has role=lead
+    _open(root)
+    # dev2 (not allowed, not a lead) acks with --override -> ignored -> stays HOLD
+    assert _run(["close", "ack", "--id", "rel", "--lens", "sec", "--status", "na",
+                 "--from", "dev2", "--reason", "x", "--override"], root) == 0
+    assert _run(["close", "check", "--id", "rel"], root) == 3
+    rec = close.load_close(Store(root), "rel")
+    assert rec["lens_acks"]["sec"]["override"] is False
+    result = close.compute_verdict(rec, _gate_go())
+    assert close.HOLD_UNAUTHORIZED_ACK in _codes(result)
+
+
+def test_cli_override_honored_from_lead(tmp_path: Path) -> None:
+    root = _init(tmp_path)  # lead has role=lead -> in the close-lead set
+    _open(root)
+    # the lead overrides the lens (not in allowed_agents) -> authorized -> GO
+    assert _run(["close", "ack", "--id", "rel", "--lens", "sec", "--status", "na",
+                 "--from", "lead", "--reason", "lead sign-off", "--override"], root) == 0
+    rec = close.load_close(Store(root), "rel")
+    assert rec["lens_acks"]["sec"]["override"] is True
+    assert _run(["close", "check", "--id", "rel"], root) == 0
+
+
 def test_cli_open_refuses_duplicate_without_force(tmp_path: Path) -> None:
     root = _init(tmp_path)
     assert _open(root) == 0

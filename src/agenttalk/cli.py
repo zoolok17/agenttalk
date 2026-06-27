@@ -1584,12 +1584,26 @@ def cmd_close(args: argparse.Namespace) -> int:
             counter_id = args.counter or f"ctr-{args.lens}-{record.get('revision','')[:8]}"
             evidence = {"finding": args.finding, "request_id": args.request_id}
             evidence = {k: v for k, v in evidence.items() if v is not None}
+        # An --override authorizes an otherwise-unauthorized ack, so it is a CLOSE
+        # LEAD privilege - honor it ONLY from a recognized close lead (reviewer-1
+        # blocker: any agent could self-authorize a required lens). Fail closed for
+        # the privileged path: with no lead configured there is no one to record it.
+        override = False
+        if args.override:
+            leads = _close_lead_set(store)
+            if agent in leads:
+                override = True
+            else:
+                sys.stderr.write(
+                    f"agenttalk close ack: --override IGNORED - {agent!r} is not a "
+                    f"recognized close lead {sorted(leads)}; the ack stays subject "
+                    "to the lens authorization (override is a lead privilege).\n")
         try:
             close_mod.apply_ack(
                 record, lens_id=args.lens, status=args.status, agent=agent,
                 from_role=from_role, at=_iso_now(), evidence=evidence,
                 reason=args.reason, counter_id=counter_id,
-                override=bool(args.override))
+                override=override)
         except close_mod.CloseError as e:
             sys.stderr.write(f"agenttalk close ack: {e}\n")
             return 2
