@@ -214,6 +214,21 @@ By default this installs two skill families:
 - The dev-discipline devkit, shared by both agents:
   `craft-code`, `test-coverage`, `review-code`, `write-docs`, and
   `review-docs` under both `~/.claude/skills/` and `~/.codex/skills/`.
+- The **assurance review/test pack** (also part of the devkit):
+  `review-failure-injection`, `review-contract-drift`,
+  `review-release-readiness`, `system-review-protocol`, and `tester-qa`.
+  These are generic review/tester skills that PRODUCE the typed
+  `review-result` evidence + `risk_class` the assurance close consumes
+  (see "Milestone/release close" and "Specialist sign-off by risk
+  class"), so a reviewer or tester can sign off through `agenttalk close`.
+  agenttalk ships the generic skeletons + the evidence/honesty rules; the
+  PROJECT supplies the domain checklists, `.agenttalk/signoffs.json` risk
+  policy, and CI gates (e.g. Android a11y/device/GL stays project
+  content). Two rules are baked into every skill: `tests_executed` is what
+  you actually RAN (real command + result, or a CI run id), never a
+  claim — release-blocking evidence anchors to an `automation_ci` gate;
+  and a skill proposes a `risk_class` but never decides the close's risk
+  (the lead-owned risk inventory is authoritative for routing).
 
 Use `agenttalk install-skills --no-devkit` to install only the bus
 skills, or `agenttalk install-skills --devkit-only` to refresh only the

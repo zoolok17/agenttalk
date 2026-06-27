@@ -7,7 +7,13 @@ from pathlib import Path
 from agenttalk import cli
 from agenttalk.install_skills import SKILLS_ROOT, install
 
-DEVKIT_SKILLS = ["craft-code", "review-code", "review-docs", "test-coverage", "write-docs"]
+DEVKIT_SKILLS = [
+    # dev-discipline pack
+    "craft-code", "review-code", "review-docs", "test-coverage", "write-docs",
+    # assurance review/test pack (P4) — emit P2/P3 close-compatible evidence
+    "review-contract-drift", "review-failure-injection", "review-release-readiness",
+    "system-review-protocol", "tester-qa",
+]
 
 
 def _bundled_devkit_file_count() -> int:
@@ -181,7 +187,7 @@ def test_bundled_devkit_skills_exist_in_package() -> None:
     """The dev-discipline pack ships in the package as Agent-Skills folders."""
     root = SKILLS_ROOT / "devkit"
     assert root.is_dir()
-    assert sorted(p.name for p in root.iterdir() if p.is_dir()) == DEVKIT_SKILLS
+    assert sorted(p.name for p in root.iterdir() if p.is_dir()) == sorted(DEVKIT_SKILLS)
     for s in DEVKIT_SKILLS:
         assert (root / s / "SKILL.md").is_file()
     # review-code carries a nested progressive-disclosure reference file
