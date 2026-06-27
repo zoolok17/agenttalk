@@ -142,6 +142,21 @@ def test_hold_active_lane_overlap() -> None:
     assert lanes.HOLD_ACTIVE_LANE_OVERLAP in _codes(v)
 
 
+def test_active_lane_overlap_is_domain_aware() -> None:
+    # reviewer-1 MAJOR: a whole-domain lane in ANOTHER domain must NOT false-overlap
+    # (path_in_subset([]) is "all paths", so without the domain filter it would).
+    other = _lane(lane_id="l2", domain_id="other", path_subset=[])  # whole 'other' domain
+    v = _ev(_lane(), _changed("src/core/a.py"), {"src/core/a.py": _cls(["core"])},
+            active_lanes=[other])
+    assert lanes.HOLD_ACTIVE_LANE_OVERLAP not in _codes(v)
+    assert v["verdict"] == lanes.VERDICT_GO
+    # a SAME-domain whole-domain lane still overlaps
+    same = _lane(lane_id="l3", domain_id="core", path_subset=[])
+    v2 = _ev(_lane(), _changed("src/core/a.py"), {"src/core/a.py": _cls(["core"])},
+             active_lanes=[same])
+    assert lanes.HOLD_ACTIVE_LANE_OVERLAP in _codes(v2)
+
+
 def test_hold_merge_conflict_and_unknown() -> None:
     base = (_lane(), _changed("src/core/a.py"), {"src/core/a.py": _cls(["core"])})
     assert lanes.HOLD_MERGE_CONFLICT in _codes(

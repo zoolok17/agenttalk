@@ -278,9 +278,16 @@ def compute_verdict(lane: dict, *, changed: dict, classifications: dict,
                  f"{disp!r} is owned by domain {domains[0]!r}, not this lane's {domain_id!r}")
             continue
 
-    # real overlap with OTHER active lanes (recomputed from THIS lane's touched paths)
+    # real overlap with OTHER active lanes (recomputed from THIS lane's touched paths).
+    # DOMAIN-AWARE: only a same-domain lane can legitimately claim a path this lane's
+    # domain owns; a different-domain lane touching the same file would show up as
+    # domain_overlap_path (path matches >1 domain) instead. Without this filter a
+    # whole-domain lane (empty subset, which path_in_subset treats as "all paths")
+    # would false-overlap every other lane regardless of domain.
     for other in active_lanes:
         if not isinstance(other, dict) or other.get("lane_id") == lane.get("lane_id"):
+            continue
+        if other.get("domain_id") != lane.get("domain_id"):
             continue
         other_subset = other.get("path_subset") or []
         for entry in touched:
