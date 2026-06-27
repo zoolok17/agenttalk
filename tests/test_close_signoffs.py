@@ -426,6 +426,24 @@ def test_cli_signoff_reopen_to_new_revision_holds_until_reapply(tmp_path: Path) 
     assert _run(["close", "check", "--id", "rel"], root) == 3
 
 
+def test_signoff_policy_rejects_non_int_schema_version() -> None:
+    with pytest.raises(close.CloseError):
+        close.validate_signoff_policy({"schema_version": "bad", "risk_policies": {}})
+
+
+def test_cli_malformed_policy_holds_not_crashes(tmp_path: Path) -> None:
+    # codex finding: a malformed signoffs.json must surface invalid_signoff_policy
+    # HOLD on `close check` (exit 3), never crash with a bare ValueError (exit 2).
+    root = _init_signoff(tmp_path)
+    _open_signoff(root, "security")              # derives a route with a good policy
+    # now corrupt the policy underneath the close
+    (Store(root).dir / "signoffs.json").write_text(
+        json.dumps({"schema_version": "bad", "risk_policies": {}}), encoding="utf-8")
+    assert _run(["close", "check", "--id", "rel"], root) == 3   # HOLD, no crash
+    out = cli.main(["--root", str(root), "close", "check", "--id", "rel", "--json"])
+    assert out == 3
+
+
 def test_cli_signoff_domain_reviewers_additive(tmp_path: Path) -> None:
     pol = {"schema_version": 1, "risk_policies": {"security": [{
         "id": "sec", "required_count": 1, "candidates": {"agents": []},

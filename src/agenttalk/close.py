@@ -502,8 +502,11 @@ def validate_signoff_policy(raw: object) -> dict:
                 "override_counts": bool(s.get("override_counts", False)),
             })
         risk_policies[risk_class] = norm_sets
+    schema_version = raw.get("schema_version", SCHEMA_VERSION)
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+        raise CloseError("signoff policy schema_version must be an integer")
     return {
-        "schema_version": int(raw.get("schema_version", SCHEMA_VERSION)),
+        "schema_version": schema_version,
         "defaults": {"reviewers": default_reviewers},
         "risk_policies": risk_policies,
         "allow_unmapped": bool(raw.get("allow_unmapped", False)),
@@ -606,6 +609,10 @@ def load_signoff_policy(store) -> tuple[dict | None, str | None]:
         return validate_signoff_policy(raw), None
     except CloseError as e:
         return None, str(e)
+    except (ValueError, TypeError, KeyError, AttributeError) as e:
+        # defense-in-depth: ANY malformed policy must fail closed to
+        # invalid_signoff_policy, never crash `close check` (fail-closed contract).
+        return None, f"malformed signoff policy: {type(e).__name__}: {e}"
 
 
 def closes_dir(store):
