@@ -48,7 +48,8 @@ def run_loop(store, agent: str, drive: Callable[[dict], bool], *,
              heartbeat_interval: float = 10.0,
              clock: Callable[[], float] = time.monotonic,
              sleep: Callable[[float], None] = time.sleep,
-             max_turns: int | None = None, max_polls: int | None = None) -> int:
+             max_turns: int | None = None, max_polls: int | None = None,
+             only_request_id: str | None = None) -> int:
     """Run the wrapper listen loop. ``drive(record)`` handles ONE turn (injected).
     Returns the number of turns driven. ``max_turns`` / ``max_polls`` bound the
     loop for tests (both None = run forever)."""
@@ -81,6 +82,12 @@ def run_loop(store, agent: str, drive: Callable[[dict], bool], *,
             # that the model is a pure handler. Consume it and STAND DOWN.
             recv_api.commit(store, agent, record)
             return turns
+        if only_request_id and record.get("request_id") != only_request_id:
+            # One-shot ephemeral reviewers are scoped to the launch request. Leave
+            # unrelated content unread rather than spending the single turn on it.
+            sleep(cur_sleep)
+            cur_sleep = min(max_idle_interval, cur_sleep * 2.0)
+            continue
         # Drive ONE turn. Commit the inbound message ONLY when the turn SUCCEEDS.
         # drive() stamps the heartbeat itself on a clean completed turn (and NOT on
         # a failed turn), so the loop does not stamp here - a failed turn leaves no

@@ -2324,6 +2324,123 @@ class Store:
         except OSError:
             return False
 
+    # ------------------------------------------- launch-request markers
+    #
+    # Evidence-only ephemeral reviewers are queued by data-only markers under
+    # state/launch-requests/<request_id>.json. The supervisor claims exactly one
+    # queued marker, launches a one-shot temporary identity, then archives the
+    # marker by request_id. The archive is audit, not active state.
+
+    @property
+    def launch_requests_dir(self) -> Path:
+        return self.state_dir / "launch-requests"
+
+    @property
+    def launch_requests_archive_dir(self) -> Path:
+        return self.launch_requests_dir / "archive"
+
+    def _launch_request_path(self, request_id: str) -> Path:
+        from agenttalk import ephemeral as _eph
+        if not _eph.is_safe_id(request_id):
+            raise ValueError(f"unsafe launch request_id {request_id!r}")
+        return self.launch_requests_dir / f"{request_id}.json"
+
+    def write_launch_request(self, payload: dict) -> None:
+        """Atomically write a queued ephemeral launch request marker."""
+        from agenttalk import ephemeral as _eph
+        rid = payload.get("request_id") if isinstance(payload, dict) else None
+        if not _eph.is_safe_id(rid):
+            raise ValueError(f"unsafe launch request_id {rid!r}")
+        data = dict(payload)
+        data.setdefault("state", _eph.STATE_QUEUED)
+        _atomic_write_text(self._launch_request_path(rid),
+                           json.dumps(data, indent=2, ensure_ascii=False))
+
+    def read_launch_request(self, request_id: str) -> dict | None:
+        """Return one launch-request marker, or None if absent/corrupt."""
+        try:
+            p = self._launch_request_path(request_id)
+        except ValueError:
+            return None
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, ValueError, OSError):
+            return None
+        if not isinstance(data, dict) or data.get("request_id") != request_id:
+            return None
+        return data
+
+    def list_launch_requests(self) -> list[dict]:
+        """List active launch-request markers. Corrupt files are ignored; doctor
+        style reporting can grow later without making the supervisor brittle."""
+        d = self.launch_requests_dir
+        if not d.exists():
+            return []
+        out: list[dict] = []
+        for p in sorted(d.iterdir()):
+            if p.is_dir() or p.suffix != ".json":
+                continue
+            rid = p.stem
+            data = self.read_launch_request(rid)
+            if data is not None:
+                out.append(data)
+        return out
+
+    def claim_launch_request(self, request_id: str, *, claimed_by: str,
+                             at_epoch: float) -> dict | None:
+        """Atomically move a queued launch request into claimed state.
+
+        Returns the updated marker. Returns None when the marker is absent,
+        already claimed/terminal, or superseded by a different request_id.
+        """
+        from agenttalk import ephemeral as _eph
+        with self._config_lock():
+            marker = self.read_launch_request(request_id)
+            if not marker or marker.get("state", _eph.STATE_QUEUED) != _eph.STATE_QUEUED:
+                return None
+            marker["state"] = _eph.STATE_CLAIMED
+            marker["claimed_by"] = claimed_by
+            marker["claimed_at"] = _now_iso()
+            marker["claimed_at_epoch"] = at_epoch
+            _atomic_write_text(self._launch_request_path(request_id),
+                               json.dumps(marker, indent=2, ensure_ascii=False))
+            return marker
+
+    def update_launch_request(self, request_id: str, updates: dict) -> dict | None:
+        """Request-id checked marker update. None means absent/superseded."""
+        with self._config_lock():
+            marker = self.read_launch_request(request_id)
+            if not marker:
+                return None
+            marker.update(dict(updates))
+            _atomic_write_text(self._launch_request_path(request_id),
+                               json.dumps(marker, indent=2, ensure_ascii=False))
+            return marker
+
+    def archive_launch_request(self, request_id: str, archive_payload: dict) -> bool:
+        """Archive and clear a launch-request marker ONLY if the current active
+        marker has the same request_id. Returns True when archived."""
+        with self._config_lock():
+            marker = self.read_launch_request(request_id)
+            if not marker:
+                return False
+            self.launch_requests_archive_dir.mkdir(parents=True, exist_ok=True)
+            payload = dict(archive_payload)
+            payload.setdefault("original", marker)
+            payload.setdefault("request_id", request_id)
+            dst = self.launch_requests_archive_dir / f"{request_id}.json"
+            if dst.exists():
+                dst = self.launch_requests_archive_dir / (
+                    f"{request_id}.{_now_iso().replace(':', '-')}.json")
+            _atomic_write_text(dst, json.dumps(payload, indent=2, ensure_ascii=False))
+            try:
+                self._launch_request_path(request_id).unlink()
+            except OSError:
+                return False
+            return True
+
     # ------------------------------------------- reply-in-flight markers
     #
     # `state/<agent>.composing.json` records "agent is drafting a reply

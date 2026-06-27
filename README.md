@@ -1089,8 +1089,34 @@ audited, never counted as a specialist sign-off).
 The verdict stays **pure**: the CLI does all the I/O (load the policy, resolve
 refsets against roster/domains, run `git diff`, hash the route) and hands
 `compute_verdict` a resolved evaluation; the core only counts. Rubric content,
-automatic specialist discovery, risk inference from code, and ephemeral reviewers
-remain out of scope (P4+).
+automatic specialist discovery, and risk inference from code remain out of scope.
+
+### Ephemeral evidence reviewers
+
+`agenttalk request-launch --from LEAD --profile PROFILE --skill SKILL --revision REF
+[-m PROMPT | --file PATH] [--path P ...]` queues an evidence-only adversarial
+review for the external supervisor. The command freezes `REF` to a full 40-char
+SHA and writes a data-only marker at
+`.agenttalk/state/launch-requests/<request_id>.json`.
+
+The supervisor must opt in with `ephemeral_reviewers.enabled=true` in
+`.agenttalk/supervisor.json`. It validates the marker before claim: strict
+requester authority (operator-facing agent, else the sole active `role=lead`;
+no zero-lead fallback), allowed profile/skill/role/groups, prompt-size cap,
+rate/concurrency caps, and optional `current_revision` staleness. Denied markers
+are archived and are not retried forever.
+
+Accepted markers roster a fresh `adversary-*` identity, send it one
+`review-request`, launch `agenttalk wrap --loop --one-shot --to-request <id>`,
+and retire the identity immediately after terminal evidence, failure, or timeout.
+The wrapper gets a fresh prompt/session/home in v1; this is prompt/session
+freshness, not hard OS isolation. Reviewed code and marker prompts are untrusted
+data.
+
+Completion is evidence-only: `review-result status=approved` can support a gate
+but is never a counted signoff, `status=rejected` is a counter/remediation
+signal, and `needs-info`, malformed output, or no typed result keeps the request
+on HOLD.
 
 ### Rejoining a session with `sync`
 

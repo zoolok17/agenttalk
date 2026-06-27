@@ -26,10 +26,12 @@ targets for recovery.
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from datetime import datetime, timezone
 
+from agenttalk import ephemeral as eph
 from agenttalk.store import Store, _process_alive
 
 # ---- action vocabulary (the dry-run ACTION PLAN tokens) --------------------
@@ -44,6 +46,12 @@ SNAPSHOT_UNAVAILABLE = "snapshot_unavailable"  # legacy token; no longer emitted
 READINESS_FAILED = "readiness_failed"  # legacy token; folded into stale heartbeat recovery
 READINESS_GAVE_UP = "readiness_gave_up"  # never-ready past the retry cap - STOP relaunching, await operator
 NONE = "none"                    # healthy, nothing to do
+EPHEMERAL_LAUNCH = eph.ACTION_LAUNCH
+EPHEMERAL_DENY = eph.ACTION_DENY
+EPHEMERAL_COMPLETE = eph.ACTION_COMPLETE
+EPHEMERAL_TIMEOUT = eph.ACTION_TIMEOUT
+EPHEMERAL_FAILED = eph.ACTION_FAILED
+EPHEMERAL_JANITOR = eph.ACTION_JANITOR
 
 # Default cadence knobs (config overrides these).
 _DEFAULTS = {
@@ -628,6 +636,46 @@ def build_report(store: Store, *, now_epoch: float,
             "restart_request": store.read_restart_request(a),
             "session_id": st.get("session_id"),  # supervisor-local; None unless state passed
         }
+    launch_requests = store.list_launch_requests()
+    eph_report: dict[str, dict] = {"active": {}, "orphan_agents": []}
+    eph_state = (state or {}).get("ephemeral_reviewers") if isinstance(state, dict) else None
+    active_eph = eph_state.get("active") if isinstance(eph_state, dict) else None
+    active_eph = active_eph if isinstance(active_eph, dict) else {}
+    msgs = None
+    for rid, entry in active_eph.items():
+        if not isinstance(entry, dict):
+            continue
+        agent = entry.get("agent")
+        requester = entry.get("requested_by")
+        completion = {"status": eph.COMPLETION_NONE, "terminal": False,
+                      "hold": True, "reason": "no typed review-result"}
+        if isinstance(agent, str) and isinstance(requester, str):
+            try:
+                if msgs is None:
+                    msgs = store.valid_messages()
+                completion = eph.classify_review_result(
+                    msgs, request_id=str(rid), agent=agent, requester=requester)
+            except (ValueError, OSError, FileNotFoundError) as e:
+                completion = {"status": eph.COMPLETION_MALFORMED, "terminal": False,
+                              "hold": True, "reason": f"could not scan evidence: {e}"}
+        eph_report["active"][rid] = {
+            "request_id": rid,
+            "agent": agent,
+            "requested_by": requester,
+            "phase": entry.get("phase"),
+            "deadline_epoch": entry.get("deadline_epoch"),
+            "launcher_pid": entry.get("launcher_pid"),
+            "launcher_start": entry.get("launcher_start"),
+            "completion": completion,
+        }
+    known_temp = {
+        entry.get("agent") for entry in active_eph.values()
+        if isinstance(entry, dict) and isinstance(entry.get("agent"), str)
+    }
+    eph_report["orphan_agents"] = [
+        a for a in roster if isinstance(a, str) and a.startswith("adversary-")
+        and a not in known_temp
+    ]
     return {
         "schema_version": 1,
         "now_epoch": now_epoch,
@@ -638,6 +686,8 @@ def build_report(store: Store, *, now_epoch: float,
         "sole_lead": store.sole_lead(),
         "stuck_after_seconds": threshold,
         "agents": agents,
+        "launch_requests": launch_requests,
+        "ephemeral_reviewers": eph_report,
     }
 
 
@@ -883,6 +933,190 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     return _result(NONE, state="HEALTHY_IDLE", reason="healthy")
 
 
+def _store_cfg_from_report(report: dict) -> dict:
+    roster = report.get("roster") if isinstance(report.get("roster"), list) else []
+    agents = report.get("agents") if isinstance(report.get("agents"), dict) else {}
+    roles = {
+        a: entry.get("role")
+        for a, entry in agents.items()
+        if isinstance(entry, dict) and isinstance(entry.get("role"), str)
+    }
+    cfg = {"agents": [a for a in roster if isinstance(a, str)], "roles": roles}
+    liaison = report.get("operator_facing")
+    if isinstance(liaison, str):
+        cfg["operator_facing"] = liaison
+    return cfg
+
+
+def _ephemeral_kill_targets(snapshot: list[dict] | None, entry: dict, now_epoch: float) -> list[dict]:
+    if snapshot is None:
+        return []
+    idx = _snap_index(snapshot)
+    pid = entry.get("launcher_pid")
+    start = entry.get("launcher_start")
+    out: list[dict] = []
+    if _pid_alive_guarded(idx, pid, start):
+        out.append({"pid": pid, "start": start})
+    managed = _launcher_managed_set(
+        idx, pid, str(entry.get("agent") or ""), now_epoch,
+        launch_epoch=entry.get("launched_epoch"),
+        prior=entry.get("managed_pids") if isinstance(entry.get("managed_pids"), list) else [],
+    )
+    for m in managed:
+        if isinstance(m.get("pid"), int) and all(t.get("pid") != m["pid"] for t in out):
+            out.append({"pid": m["pid"], "start": m.get("start")})
+    return out
+
+
+def _ephemeral_process_alive(snapshot: list[dict] | None, entry: dict) -> bool | None:
+    if snapshot is None:
+        return None
+    return _pid_alive_guarded(_snap_index(snapshot), entry.get("launcher_pid"),
+                              entry.get("launcher_start"))
+
+
+def _ephemeral_next_without(state: dict, request_id: str) -> dict:
+    copied = copy.deepcopy(state)
+    eph.forget_active(copied, request_id)
+    return copied.get("ephemeral_reviewers", {})
+
+
+def _plan_launch_requests(report: dict, state: dict, config: dict,
+                          *, now_epoch: float) -> dict[str, dict]:
+    store_cfg = _store_cfg_from_report(report)
+    out: dict[str, dict] = {}
+    for marker in report.get("launch_requests") or []:
+        if not isinstance(marker, dict):
+            continue
+        rid = marker.get("request_id")
+        if not isinstance(rid, str):
+            continue
+        if marker.get("state", eph.STATE_QUEUED) != eph.STATE_QUEUED:
+            out[rid] = {
+                "request_id": rid,
+                "action": eph.ACTION_NONE,
+                "state": marker.get("state"),
+                "reason": "request is already claimed or terminal",
+            }
+            continue
+        errors, _profile = eph.validate_launch_request(marker, store_cfg, config)
+        if not errors:
+            errors = eph.capacity_errors(state, config, now_epoch)
+        if errors:
+            out[rid] = {
+                "request_id": rid,
+                "action": eph.ACTION_DENY,
+                "state": eph.STATE_DENIED,
+                "terminal_state": eph.STATE_DENIED,
+                "reason": "; ".join(errors),
+                "archive": True,
+                "notify": True,
+            }
+            continue
+        out[rid] = {
+            "request_id": rid,
+            "action": eph.ACTION_LAUNCH,
+            "state": eph.STATE_QUEUED,
+            "reason": "valid queued ephemeral review request",
+            "profile": marker.get("profile"),
+            "skill": marker.get("skill"),
+            "requested_by": marker.get("requested_by"),
+            "revision": (marker.get("scope") or {}).get("revision")
+            if isinstance(marker.get("scope"), dict) else None,
+        }
+    return out
+
+
+def _plan_ephemeral_active(report: dict, state: dict, config: dict,
+                           *, now_epoch: float,
+                           snapshot: list[dict] | None = None) -> dict[str, dict]:
+    del config  # reserved for future per-profile completion policy
+    state_root = (state or {}).get("ephemeral_reviewers")
+    state_active = state_root.get("active") if isinstance(state_root, dict) else {}
+    state_active = state_active if isinstance(state_active, dict) else {}
+    rpt_root = report.get("ephemeral_reviewers") if isinstance(report.get("ephemeral_reviewers"), dict) else {}
+    rpt_active = rpt_root.get("active") if isinstance(rpt_root.get("active"), dict) else {}
+    out: dict[str, dict] = {}
+    for rid, entry in state_active.items():
+        if not isinstance(entry, dict):
+            continue
+        rpt_entry = rpt_active.get(rid) if isinstance(rpt_active.get(rid), dict) else {}
+        completion = rpt_entry.get("completion") if isinstance(rpt_entry.get("completion"), dict) else {}
+        if completion.get("terminal") is True:
+            kt = _ephemeral_kill_targets(snapshot, entry, now_epoch)
+            out[rid] = {
+                "request_id": rid,
+                "agent": entry.get("agent"),
+                "action": eph.ACTION_COMPLETE,
+                "state": eph.STATE_COMPLETED,
+                "terminal_state": eph.STATE_COMPLETED,
+                "reason": f"typed review-result status={completion.get('status')}",
+                "completion": completion,
+                "kill_first": bool(kt),
+                "kill_targets": kt,
+                "retire": True,
+                "archive": True,
+                "next_state": _ephemeral_next_without(state, rid),
+            }
+            continue
+        deadline = entry.get("deadline_epoch")
+        if isinstance(deadline, (int, float)) and now_epoch >= float(deadline):
+            kt = _ephemeral_kill_targets(snapshot, entry, now_epoch)
+            out[rid] = {
+                "request_id": rid,
+                "agent": entry.get("agent"),
+                "action": eph.ACTION_TIMEOUT,
+                "state": eph.STATE_TIMED_OUT,
+                "terminal_state": eph.STATE_TIMED_OUT,
+                "reason": "ephemeral reviewer timed out without a typed terminal review-result",
+                "completion": completion,
+                "kill_first": bool(kt),
+                "kill_targets": kt,
+                "retire": True,
+                "archive": True,
+                "next_state": _ephemeral_next_without(state, rid),
+            }
+            continue
+        alive = _ephemeral_process_alive(snapshot, entry)
+        if entry.get("phase") == eph.STATE_LAUNCHED and alive is False:
+            out[rid] = {
+                "request_id": rid,
+                "agent": entry.get("agent"),
+                "action": eph.ACTION_FAILED,
+                "state": eph.STATE_FAILED,
+                "terminal_state": eph.STATE_FAILED,
+                "reason": "ephemeral reviewer process exited without typed terminal review-result; no auto-restart",
+                "completion": completion,
+                "kill_first": False,
+                "kill_targets": [],
+                "retire": True,
+                "archive": True,
+                "next_state": _ephemeral_next_without(state, rid),
+            }
+            continue
+        out[rid] = {
+            "request_id": rid,
+            "agent": entry.get("agent"),
+            "action": eph.ACTION_NONE,
+            "state": entry.get("phase", eph.STATE_REQUESTED),
+            "reason": completion.get("reason") or "awaiting typed review-result",
+            "completion": completion,
+            "auto_restart": False,
+        }
+    for agent in rpt_root.get("orphan_agents") or []:
+        if isinstance(agent, str):
+            out[f"janitor:{agent}"] = {
+                "request_id": None,
+                "agent": agent,
+                "action": eph.ACTION_JANITOR,
+                "state": "orphan",
+                "reason": "stale adversary identity has no active launch request",
+                "retire": True,
+                "archive": False,
+            }
+    return out
+
+
 def plan_actions(report: dict, state: dict, config: dict,
                  *, now_epoch: float, snapshot: list[dict] | None = None) -> dict:
     """The SHARED decision table. Returns ``{"now_epoch", "agents": {name: plan}}``
@@ -909,7 +1143,14 @@ def plan_actions(report: dict, state: dict, config: dict,
         liveness = _liveness(snapshot, st, cfg_agent, name, now_epoch)
         out[name] = _plan_one(name, rpt, st, config, cfg_agent, liveness,
                               now_epoch=now_epoch)
-    return {"now_epoch": now_epoch, "agents": out}
+    return {
+        "now_epoch": now_epoch,
+        "agents": out,
+        "launch_requests": _plan_launch_requests(report, state, config,
+                                                 now_epoch=now_epoch),
+        "ephemeral_reviewers": _plan_ephemeral_active(
+            report, state, config, now_epoch=now_epoch, snapshot=snapshot),
+    }
 
 
 def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
@@ -952,6 +1193,165 @@ def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
     return state
 
 
+def prepare_launch_request(store: Store, state: dict, config: dict, request_id: str,
+                           *, now_epoch: float, claimed_by: str = "supervisor") -> dict:
+    """Claim and prepare one queued ephemeral launch request.
+
+    Side effects are deliberately before process launch and are request-id
+    checked: claim marker, roster temporary identity, send the review-request,
+    persist active supervisor state, and return a fully substituted launch spec.
+    """
+    marker0 = store.read_launch_request(request_id)
+    if marker0 is None:
+        raise eph.EphemeralError(f"launch request {request_id!r} is absent")
+    errors, profile = eph.validate_launch_request(marker0, store.load_config(), config)
+    if not errors:
+        errors = eph.capacity_errors(state, config, now_epoch)
+    if errors:
+        raise eph.EphemeralError("; ".join(errors))
+    marker = store.claim_launch_request(request_id, claimed_by=claimed_by,
+                                        at_epoch=now_epoch)
+    if marker is None:
+        raise eph.EphemeralError(f"launch request {request_id!r} is already claimed")
+    # Revalidate after the claim: the marker is untrusted writable state.
+    errors, profile = eph.validate_launch_request(marker, store.load_config(), config)
+    if errors or profile is None:
+        store.archive_launch_request(
+            request_id,
+            eph.terminal_archive(marker, terminal_state=eph.STATE_DENIED,
+                                 reason="; ".join(errors or ["profile is not allowed"]),
+                                 at_epoch=now_epoch),
+        )
+        raise eph.EphemeralError("; ".join(errors or ["profile is not allowed"]))
+    cfg = store.load_config()
+    agent = eph.choose_agent_name(request_id, cfg.get("agents", []) or [],
+                                  store.retired_agents())
+    role = eph.effective_role(marker, profile)
+    groups = eph.effective_groups(marker, profile)
+    timeout = int(marker.get("timeout_seconds")
+                  or eph.config_block(config)["default_timeout_seconds"])
+    marker["timeout_seconds"] = timeout
+    store.add_agent(agent, role=role, groups=groups)
+    try:
+        body = eph.review_request_body(marker, agent)
+        msg = store.send(
+            sender=marker["requested_by"],
+            recipient=agent,
+            kind="review-request",
+            subject=f"ephemeral review {request_id}",
+            body=body,
+            meta={
+                "request_id": request_id,
+                "ephemeral_request_id": request_id,
+                "evidence_only": "true",
+                "counted_signoff": "false",
+                "profile": str(marker.get("profile", "")),
+                "skill": str(marker.get("skill", "")),
+                "revision": str((marker.get("scope") or {}).get("revision", "")),
+            },
+        )
+    except Exception as send_error:
+        extra = {"agent": agent}
+        try:
+            store.retire_agent(agent, reason=f"ephemeral launch {request_id} failed before request send")
+        except ValueError as cleanup_error:
+            extra["cleanup_error"] = str(cleanup_error)
+        store.archive_launch_request(
+            request_id,
+            eph.terminal_archive(
+                marker,
+                terminal_state=eph.STATE_FAILED,
+                reason=f"failed before review request send: {send_error}",
+                at_epoch=now_epoch,
+                extra=extra,
+            ),
+        )
+        raise
+    store.update_launch_request(request_id, {
+        "state": eph.STATE_REQUESTED,
+        "agent": agent,
+        "review_request_msg_id": msg.id,
+        "requested_at": eph.utc_now(),
+        "requested_at_epoch": now_epoch,
+    })
+    eph.record_prepared(
+        state,
+        request_id=request_id,
+        agent=agent,
+        requested_by=marker["requested_by"],
+        profile=str(marker.get("profile", "")),
+        timeout_seconds=timeout,
+        now_epoch=now_epoch,
+        review_request_id=msg.id,
+    )
+    spec = eph.launch_spec(marker, profile, agent)
+    spec["review_request_msg_id"] = msg.id
+    return spec
+
+
+def record_ephemeral_launch(state: dict, request_id: str, *, pid: int | None,
+                            pid_start: str | None = None,
+                            now_epoch: float | None = None,
+                            timeout_seconds: int | None = None) -> dict:
+    """Apply an ephemeral wrapper launch success to supervisor state."""
+    return eph.record_launched(
+        state,
+        request_id=request_id,
+        pid=pid,
+        pid_start=pid_start,
+        now_epoch=now_epoch if now_epoch is not None else datetime.now(timezone.utc).timestamp(),
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def archive_ephemeral_request(store: Store, state: dict, request_id: str, *,
+                              terminal_state: str, reason: str,
+                              now_epoch: float | None = None,
+                              completion: dict | None = None,
+                              retire: bool = True) -> dict:
+    """Archive a terminal launch request and tombstone its temporary identity."""
+    marker = store.read_launch_request(request_id)
+    root = eph.ensure_state(state)
+    entry = root["active"].get(request_id)
+    entry = entry if isinstance(entry, dict) else {}
+    agent = entry.get("agent") or (marker or {}).get("agent")
+    retire_error = None
+    if retire and isinstance(agent, str):
+        try:
+            cfg = store.load_config()
+            if agent in (cfg.get("agents") or []):
+                store.retire_agent(agent, reason=f"ephemeral review {request_id}: {terminal_state}")
+        except ValueError as e:
+            retire_error = str(e)
+    extra = {"completion": completion or {}, "agent": agent}
+    if retire_error:
+        extra["retire_error"] = retire_error
+    payload = eph.terminal_archive(
+        marker,
+        terminal_state=terminal_state,
+        reason=reason,
+        at_epoch=now_epoch,
+        extra=extra,
+    )
+    store.archive_launch_request(request_id, payload)
+    eph.forget_active(state, request_id)
+    return state
+
+
+def janitor_retire_ephemeral_orphan(store: Store, agent: str) -> bool:
+    """Retire a stale active adversary-* identity left without supervisor state."""
+    if not isinstance(agent, str) or not agent.startswith("adversary-"):
+        return False
+    try:
+        cfg = store.load_config()
+        if agent not in (cfg.get("agents") or []):
+            return False
+        store.retire_agent(agent, reason="ephemeral reviewer startup janitor")
+        return True
+    except ValueError:
+        return False
+
+
 # --------------------------------------------------------------- init / scaffold
 
 CONFIG_TEMPLATE = """\
@@ -967,6 +1367,35 @@ CONFIG_TEMPLATE = """\
   "backoff": { "base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180 },
   "notify_sender": null,
   "notify_to": null,
+  "ephemeral_reviewers": {
+    "enabled": false,
+    "max_concurrent": 1,
+    "max_per_hour": 4,
+    "max_per_day": 16,
+    "default_timeout_seconds": 1800,
+    "max_prompt_bytes": 12000,
+    "require_authorized_lead": true,
+    "current_revision": null,
+    "allowed_skills": ["review-code"],
+    "allowed_roles": ["reviewer"],
+    "allowed_groups": ["ephemeral-reviewers"],
+    "allowed_profiles": {
+      "codex-evidence-reviewer": {
+        "cli": "codex",
+        "role": "reviewer",
+        "groups": ["ephemeral-reviewers"],
+        "cwd": "REPLACE_WITH_PROJECT_DIR",
+        "env": {},
+        "codex_home_isolation": true,
+        "windows_sandbox": "unelevated",
+        "launch": {
+          "windows_file": "REPLACE: python.exe that can run `python -m agenttalk`",
+          "windows_args": ["-m", "agenttalk", "wrap", "--for", "{AGENT}", "--cli", "codex", "--loop", "--one-shot", "--to-request", "{REQUEST_ID}", "--", "REPLACE: the REAL codex.exe path", "--disable", "hooks"]
+        }
+      }
+    },
+    "_comment_ephemeral_reviewers": "Evidence-only adversarial reviewers are OFF by default. A lead queues state/launch-requests/<request_id>.json with `agenttalk request-launch`; the supervisor validates strict requester authority (operator-facing agent, else sole active lead; no zero-lead fallback), caps, profile/skill/group/role allowlists, full SHA, and prompt bytes before claiming. The temporary adversary-* identity gets a fresh wrapper session/home and is retired after one typed review-result, failure, or timeout. status=approved is evidence only, never a counted signoff; status=rejected is a counter/remediation signal; needs-info/malformed/no result is HOLD."
+  },
   "_comment_unattended": "A SUPERVISED agent is UNATTENDED (no human to approve a prompt/UAC). The supervisor SEEDS each agent so it launches in a never-prompt, never-elevate, workspace-write mode: Claude gets --permission-mode <claude_permission_mode> (default bypassPermissions) + a seeded .claude/settings.json defaultMode; Codex gets a seeded isolated CODEX_HOME config.toml (approval_policy=never, sandbox_mode=workspace-write, [windows] sandbox=<windows_sandbox>, writable_roots=[repo]). A PREFLIGHT smoke-test runs the EXACT seeded mode before launch and FAILS CLOSED on a bad config instead of relaunch-storming.",
   "agents": {
     "AGENT_NAME": {
@@ -1270,6 +1699,36 @@ function Launch($name, $plan, $codexHome) {
   Write-Warning "supervisor: launch of '$name' returned no PID; not auto-restarting it"; return $null
 }
 
+function Launch-Spec($name, $spec, $codexHome) {
+  $file = $spec.launch.windows_file
+  if (-not $file -or $file -like 'REPLACE:*') {
+    Write-Warning "supervisor: ephemeral '$name' has no real launch.windows_file - fill supervisor.json ephemeral_reviewers.allowed_profiles"; return $null
+  }
+  $argv = @($spec.launch.windows_args)
+  $saved = @{}
+  $applied = @{ AGENTTALK_ROOT = $Root }
+  if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
+  if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }
+  if ($spec.env) { foreach ($k in $spec.env.PSObject.Properties.Name) { $applied[$k] = $spec.env.$k } }
+  foreach ($k in $applied.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item -Path ("Env:" + $k) -Value $applied[$k] }
+  try {
+    $cwd = if ($spec.cwd) { $spec.cwd } else { $Root }
+    if (@($argv).Count -gt 0) {
+      $argline = (@($argv) | ForEach-Object { Quote-Arg ([string]$_) }) -join ' '
+      $proc = Start-Process -FilePath $file -ArgumentList $argline -WorkingDirectory $cwd -PassThru
+    } else {
+      $proc = Start-Process -FilePath $file -WorkingDirectory $cwd -PassThru
+    }
+  } finally {
+    foreach ($k in $saved.Keys) {
+      if ($null -eq $saved[$k]) { Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue }
+      else { Set-Item -Path ("Env:" + $k) -Value $saved[$k] }
+    }
+  }
+  if ($proc -and $proc.Id) { return @{ pid = $proc.Id; start = (Proc-Start $proc.Id) } }
+  Write-Warning "supervisor: ephemeral launch of '$name' returned no PID"; return $null
+}
+
 # Console action log (0.29.0 observability): $lastLogged remembers the last state
 # string we printed per agent, so a steady no-action agent logs only on CHANGE
 # (first sight + transitions) instead of once per poll; real actions always log.
@@ -1378,6 +1837,59 @@ do {
         $state.agents.$name = $p.next_state
       }
       default { $state.agents.$name = $p.next_state }
+    }
+  }
+  foreach ($rid in $plan.launch_requests.PSObject.Properties.Name) {
+    $p = $plan.launch_requests.$rid
+    if ($DryRun) { Write-Host ("launch-request {0}: {1} - {2}" -f $rid, $p.action, $p.reason); continue }
+    switch ($p.action) {
+      'ephemeral_deny' {
+        Write-Warning ("supervisor: launch-request {0}: DENIED - {1}" -f $rid, $p.reason)
+        & $AgenttalkCmd --root $Root supervise --archive-launch-request --request-id $rid --terminal-state denied --reason $p.reason --state-file $StatePath --now $now | Out-Null
+        $state = Load-State
+      }
+      'ephemeral_launch' {
+        $prepText = & $AgenttalkCmd --root $Root supervise --prepare-launch-request --request-id $rid --state-file $StatePath --now $now
+        if ($LASTEXITCODE -ne 0) {
+          Write-Warning ("supervisor: launch-request {0}: prepare failed; will retry/deny on a later poll" -f $rid)
+          continue
+        }
+        $prep = $prepText | ConvertFrom-Json
+        $homeEnv = $null
+        if (($prep.cli -eq 'codex') -and $prep.codex_home_isolation) {
+          $homeEnv = Seed-CodexHome $prep.agent $prep.windows_sandbox
+          if (-not $homeEnv) {
+            & $AgenttalkCmd --root $Root supervise --archive-launch-request --request-id $rid --terminal-state failed --reason "codex home seed failed" --state-file $StatePath --now $now | Out-Null
+            $state = Load-State
+            continue
+          }
+        }
+        $res = Launch-Spec $prep.agent $prep $homeEnv
+        if ($res) {
+          $extra = @(); if ($res.start) { $extra += @('--pid-start', $res.start) }
+          & $AgenttalkCmd --root $Root supervise --record-ephemeral-launch --request-id $rid --pid $res.pid @extra --timeout-seconds $prep.timeout_seconds --state-file $StatePath --now $now | Out-Null
+          $state = Load-State
+        } else {
+          & $AgenttalkCmd --root $Root supervise --archive-launch-request --request-id $rid --terminal-state failed --reason "launch returned no pid" --state-file $StatePath --now $now | Out-Null
+          $state = Load-State
+        }
+      }
+    }
+  }
+  foreach ($rid in $plan.ephemeral_reviewers.PSObject.Properties.Name) {
+    $p = $plan.ephemeral_reviewers.$rid
+    if ($DryRun) { Write-Host ("ephemeral {0}: {1} - {2}" -f $rid, $p.action, $p.reason); continue }
+    switch ($p.action) {
+      { $_ -in 'ephemeral_complete','ephemeral_timeout','ephemeral_failed' } {
+        if ($p.kill_first -and $p.kill_targets) { Stop-Tree $p.kill_targets }
+        $completionJson = '{}'
+        if ($p.completion) { $completionJson = ($p.completion | ConvertTo-Json -Compress -Depth 8) }
+        & $AgenttalkCmd --root $Root supervise --archive-launch-request --request-id $rid --terminal-state $p.terminal_state --reason $p.reason --completion-json $completionJson --state-file $StatePath --now $now | Out-Null
+        $state = Load-State
+      }
+      'ephemeral_janitor' {
+        if ($p.agent) { & $AgenttalkCmd --root $Root supervise --janitor-ephemeral --for $p.agent | Out-Null }
+      }
     }
   }
   # Periodic liveness summary so a long quiet stretch still shows the supervisor

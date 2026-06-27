@@ -26,6 +26,7 @@ from agenttalk.store import (
     validate_rescind,
 )
 from agenttalk import capacity as capmod
+from agenttalk import ephemeral as eph
 from agenttalk import domains as dom
 from agenttalk import transcript as tx
 from agenttalk import codex_config as cxc
@@ -4426,8 +4427,68 @@ def cmd_request_restart(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_request_launch(args: argparse.Namespace) -> int:
+    """Queue an evidence-only ephemeral adversarial review launch."""
+    from agenttalk import close as close_mod
+
+    store = _get_store(args)
+    cfg = store.load_config()
+    roster = cfg.get("agents") or []
+    requested_by = _resolve_self(args.sender, roster=roster)
+    rid = args.request_id or eph.new_request_id()
+    if not eph.is_safe_id(rid):
+        sys.stderr.write(f"agenttalk request-launch: unsafe request_id {rid!r}\n")
+        return 2
+    try:
+        revision, _kind = _resolve_revision(store.root, args.revision)
+    except close_mod.CloseError as e:
+        sys.stderr.write(f"agenttalk request-launch: {e}\n")
+        return 2
+    prompt = _read_body(args)
+    if not prompt.strip():
+        sys.stderr.write("agenttalk request-launch: prompt is required (-m/--file/stdin)\n")
+        return 2
+    marker = {
+        "schema_version": eph.SCHEMA_VERSION,
+        "kind": eph.REQUEST_KIND,
+        "request_id": rid,
+        "state": eph.STATE_QUEUED,
+        "requested_by": requested_by,
+        "at": _iso_now(),
+        "at_epoch": time.time(),
+        "profile": args.profile,
+        "skill": args.skill,
+        "prompt": prompt,
+        "scope": {
+            "revision": revision,
+            "base_revision": args.base_revision,
+            "paths": args.path or [],
+            "summary": args.summary or "",
+        },
+    }
+    if args.timeout_seconds is not None:
+        marker["timeout_seconds"] = args.timeout_seconds
+    if args.role:
+        marker["role"] = args.role
+    if args.group:
+        marker["groups"] = args.group
+    errors = eph.validate_marker(marker)
+    if errors:
+        sys.stderr.write("agenttalk request-launch: " + "; ".join(errors) + "\n")
+        return 2
+    try:
+        store.write_launch_request(marker)
+    except ValueError as e:
+        sys.stderr.write(f"agenttalk request-launch: {e}\n")
+        return 2
+    print(f"request-launch: queued ephemeral review [{rid}] for {revision[:12]} "
+          f"(profile={args.profile}, skill={args.skill})")
+    return 0
+
+
 def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
-                    sender: str, min_interval: float, render: bool) -> int:
+                    sender: str, min_interval: float, render: bool,
+                    one_shot_request_id: str | None = None) -> int:
     """The long-running supervised wrapper loop (design C): own the idle bus-wait +
     heartbeat, drive the CLI ONE turn per inbound message in structured-stream mode
     (session continuity owned here), then return to the wait. Runs until killed -
@@ -4448,7 +4509,13 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         sys.stderr.write(f"agenttalk wrap: {e}\n")
         return 2
     wsession.save_session(store, agent, state)   # persist the (possibly minted) id
-    wloop.run_loop(store, agent, drive)          # runs until the supervisor kills it
+    turns = wloop.run_loop(
+        store, agent, drive,
+        max_turns=1 if one_shot_request_id else None,
+        only_request_id=one_shot_request_id,
+    )
+    if one_shot_request_id and turns < 1:
+        return 1
     return 0
 
 
@@ -4475,12 +4542,19 @@ def cmd_wrap(args: argparse.Namespace) -> int:
     if not argv:
         sys.stderr.write("agenttalk wrap: a launch command is required after `--`\n")
         return 2
+    if args.one_shot and not args.loop:
+        sys.stderr.write("agenttalk wrap: --one-shot requires --loop\n")
+        return 2
+    if args.one_shot and not args.to_request:
+        sys.stderr.write("agenttalk wrap: --one-shot requires --to-request <id>\n")
+        return 2
     sender = (_resolve_self(args.sender, roster=roster)
               if getattr(args, "sender", None) else agent)
     if getattr(args, "loop", False):
         return _wrap_loop_mode(store, agent, cli=args.cli, base_argv=argv,
                                sender=sender, min_interval=args.min_interval,
-                               render=not args.no_render)
+                               render=not args.no_render,
+                               one_shot_request_id=args.to_request if args.one_shot else None)
     try:
         return wrapper_run.run_wrapper(
             cli=args.cli, agent=agent, argv=argv, store=store, sender=sender,
@@ -4553,6 +4627,91 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         sp.write_text(sup.seed_claude_settings(existing, mode=mode), encoding="utf-8")
         print(f"seeded .claude/settings.json (defaultMode={mode}): {sp}")
         return 0
+
+    def _read_state() -> dict:
+        if args.state_file and Path(args.state_file).exists():
+            try:
+                # utf-8-sig tolerates the PowerShell 5.1 Set-Content BOM.
+                return json.loads(Path(args.state_file).read_text(encoding="utf-8-sig"))
+            except (ValueError, OSError):
+                return {}
+        return {}
+
+    def _write_state(state: dict) -> None:
+        if not args.state_file:
+            raise ValueError("need --state-file <path>")
+        Path(args.state_file).write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    if args.prepare_launch_request:
+        if not args.request_id or not args.state_file:
+            sys.stderr.write("agenttalk supervise --prepare-launch-request: need "
+                             "--request-id <rid> and --state-file <path>\n")
+            return 2
+        state = _read_state()
+        config = _load_supervisor_config(store)
+        now = args.now if args.now is not None else time.time()
+        try:
+            spec = sup.prepare_launch_request(store, state, config, args.request_id,
+                                              now_epoch=now)
+        except eph.EphemeralError as e:
+            sys.stderr.write(f"agenttalk supervise --prepare-launch-request: {e}\n")
+            return 3
+        _write_state(state)
+        print(json.dumps(spec, indent=2))
+        return 0
+
+    if args.record_ephemeral_launch:
+        if not args.request_id or not args.state_file:
+            sys.stderr.write("agenttalk supervise --record-ephemeral-launch: need "
+                             "--request-id <rid> and --state-file <path>\n")
+            return 2
+        state = _read_state()
+        sup.record_ephemeral_launch(
+            state, args.request_id, pid=args.pid, pid_start=args.pid_start,
+            now_epoch=(args.now if args.now is not None else time.time()),
+            timeout_seconds=args.timeout_seconds,
+        )
+        _write_state(state)
+        return 0
+
+    if args.archive_launch_request:
+        if not args.request_id or not args.state_file or not args.terminal_state:
+            sys.stderr.write("agenttalk supervise --archive-launch-request: need "
+                             "--request-id <rid>, --terminal-state <state>, and "
+                             "--state-file <path>\n")
+            return 2
+        completion = None
+        if args.completion_json:
+            try:
+                completion = json.loads(args.completion_json)
+            except ValueError:
+                sys.stderr.write("agenttalk supervise --archive-launch-request: "
+                                 "--completion-json must be a JSON object\n")
+                return 2
+            if not isinstance(completion, dict):
+                sys.stderr.write("agenttalk supervise --archive-launch-request: "
+                                 "--completion-json must be a JSON object\n")
+                return 2
+        state = _read_state()
+        sup.archive_ephemeral_request(
+            store, state, args.request_id,
+            terminal_state=args.terminal_state,
+            reason=args.reason or "",
+            now_epoch=(args.now if args.now is not None else time.time()),
+            completion=completion,
+        )
+        _write_state(state)
+        return 0
+
+    if args.janitor_ephemeral:
+        if not args.agent:
+            sys.stderr.write("agenttalk supervise --janitor-ephemeral: need --for <agent>\n")
+            return 2
+        ok = sup.janitor_retire_ephemeral_orphan(store, args.agent)
+        print(f"janitor-ephemeral: retired {args.agent!r}" if ok
+              else f"janitor-ephemeral: no active adversary orphan {args.agent!r}")
+        return 0
+
     if args.record_launch:
         if not args.agent or not args.state_file:
             sys.stderr.write("agenttalk supervise --record-launch: need --for "
@@ -4590,15 +4749,6 @@ def cmd_supervise(args: argparse.Namespace) -> int:
     now = args.now if args.now is not None else time.time()
     stuck = config.get("stuck_after_seconds")
     stuck = float(stuck) if isinstance(stuck, (int, float)) else None
-
-    def _read_state() -> dict:
-        if args.state_file and Path(args.state_file).exists():
-            try:
-                # utf-8-sig tolerates the PowerShell 5.1 Set-Content BOM.
-                return json.loads(Path(args.state_file).read_text(encoding="utf-8-sig"))
-            except (ValueError, OSError):
-                return {}
-        return {}
 
     if args.report:
         print(json.dumps(sup.build_report(store, now_epoch=now,
@@ -5429,6 +5579,33 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Allow restarting a protected (operator_facing/lead) agent.")
     prr.set_defaults(func=cmd_request_restart)
 
+    prl = sub.add_parser(
+        "request-launch",
+        help="Queue an evidence-only ephemeral adversarial review launch marker "
+             "for the supervisor.",
+    )
+    prl.add_argument("--from", dest="sender", required=True,
+                     help="Authorized requester (operator-facing agent or sole lead).")
+    prl.add_argument("--profile", required=True, help="Supervisor-whitelisted profile.")
+    prl.add_argument("--skill", required=True, help="Supervisor-whitelisted review skill/lens.")
+    prl.add_argument("--revision", required=True,
+                     help="Ref or SHA; frozen to a full SHA via git.")
+    prl.add_argument("--base-revision", dest="base_revision",
+                     help="Optional base revision for the review scope.")
+    prl.add_argument("--path", action="append",
+                     help="Changed/scoped path for the review (repeatable).")
+    prl.add_argument("--summary", help="Short scope summary.")
+    prl.add_argument("--request-id", dest="request_id",
+                     help="Explicit launch request id (default: generated lr-*).")
+    prl.add_argument("--timeout-seconds", dest="timeout_seconds", type=int,
+                     help="Requested timeout; must not exceed supervisor default.")
+    prl.add_argument("--role", help="Requested temporary role (must be allowed).")
+    prl.add_argument("--group", action="append",
+                     help="Requested temporary group (repeatable; must be allowed).")
+    prl.add_argument("-m", "--message", help="Review prompt (else --file or stdin).")
+    prl.add_argument("--file", help="Read review prompt from this file path ('-' = stdin).")
+    prl.set_defaults(func=cmd_request_launch)
+
     pwrap = sub.add_parser(
         "wrap",
         help="Run an agent CLI under the progress-adapter wrapper: launch it in "
@@ -5453,6 +5630,10 @@ def build_parser() -> argparse.ArgumentParser:
                             "idle bus-wait + heartbeat and drive the CLI one turn "
                             "per inbound message (design C). Opt-in; manual "
                             "/agenttalk.listen stays the default.")
+    pwrap.add_argument("--one-shot", dest="one_shot", action="store_true",
+                       help="With --loop, exit after one successful turn.")
+    pwrap.add_argument("--to-request", dest="to_request",
+                       help="With --one-shot, only drive the matching request_id.")
     pwrap.add_argument("cmd", nargs=argparse.REMAINDER,
                        help="-- followed by the BASE launch command (the per-turn "
                             "session/stream args are appended), e.g. `-- codex -a "
@@ -5479,6 +5660,19 @@ def build_parser() -> argparse.ArgumentParser:
                       help="(script use) Apply launch-success state for --for: "
                            "Claude pins --session-id; Codex marks launched + no "
                            "pinned id. Needs --state-file.")
+    gsup.add_argument("--prepare-launch-request", dest="prepare_launch_request",
+                      action="store_true",
+                      help="(script use) Claim an ephemeral launch request, roster "
+                           "the temp identity, and print its launch spec.")
+    gsup.add_argument("--record-ephemeral-launch", dest="record_ephemeral_launch",
+                      action="store_true",
+                      help="(script use) Record ephemeral launch pid/deadline.")
+    gsup.add_argument("--archive-launch-request", dest="archive_launch_request",
+                      action="store_true",
+                      help="(script use) Archive a terminal ephemeral launch request.")
+    gsup.add_argument("--janitor-ephemeral", dest="janitor_ephemeral",
+                      action="store_true",
+                      help="(script use) Retire a stale adversary-* identity.")
     gsup.add_argument("--seed-codex-config", dest="seed_codex_config", action="store_true",
                       help="(script use) Overlay the unattended auto-mode keys "
                            "(approval_policy/sandbox_mode/[windows] sandbox/"
@@ -5504,6 +5698,16 @@ def build_parser() -> argparse.ArgumentParser:
                            "(anti-pid-reuse guard).")
     psup.add_argument("--session-id", dest="session_id",
                       help="(--record-launch) the minted session id (Claude).")
+    psup.add_argument("--timeout-seconds", dest="timeout_seconds", type=int,
+                      help="(--record-ephemeral-launch) ephemeral timeout.")
+    psup.add_argument("--terminal-state", dest="terminal_state",
+                      choices=[eph.STATE_COMPLETED, eph.STATE_DENIED,
+                               eph.STATE_FAILED, eph.STATE_TIMED_OUT],
+                      help="(--archive-launch-request) terminal state.")
+    psup.add_argument("--reason", help="(--archive-launch-request) terminal reason.")
+    psup.add_argument("--completion-json", dest="completion_json",
+                      help="(--archive-launch-request) JSON review-result "
+                           "completion evidence from the supervisor plan.")
     psup.add_argument("--snapshot-file", dest="snapshot_file", default=None,
                       help="(--plan) the executor's process snapshot JSON (list of "
                            "{pid,parent_pid,name,command_line,start_time}). Missing "
