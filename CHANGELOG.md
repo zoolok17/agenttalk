@@ -5,6 +5,40 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.39.0] - 2026-06-28
+
+### Changed
+
+- **Stand-down authority: loop-exit (`release` / `end`) now requires a typed,
+  human-origin authority envelope.** Idle agents always keep listening; only a
+  typed `release`/`end` carrying an authority marker from the authorized relay
+  stands an agent down. A lead can no longer take an agent offline with casual
+  prose — and prose, notes, and sign-offs never exit a loop.
+  - New `release` flags: `--relay-human` (relay a human stand-down) XOR
+    `--emergency` (narrow lead override for a malfunctioning agent); both require
+    `--reason`. A bare or unauthorized `release` exits `2` and sends nothing.
+  - Authority metadata: `release_authority=human|emergency`,
+    `operator_decision` / `emergency` / `operator_report_required`, and a
+    required `authority_reason`.
+  - A single shared classifier (`classify_loop_control` →
+    `stop` / `invalid_control` / `ordinary`) replaces the wrapper's old
+    `is_stop_signal` and is mirrored in the listen + sk-loop skills. An invalid,
+    unmarked, or unauthorized `release`/`end` is committed (so it never
+    redelivers) and reported, and the loop **keeps listening**.
+  - Authorized relay = the `operator_facing` liaison if configured, else the sole
+    active `role=lead`; fails closed if neither exists (distinct from the broad
+    kill-protection set).
+- **Behavior narrowing:** a *received* unmarked `end` no longer winds down peers.
+  Previously `kind=end` from any sender stopped a listener; now a received `end`
+  must carry the authority envelope. `agenttalk end` still lets the **caller**
+  leave and export its own transcript (self-exit is unchanged).
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.39.0"
+```
+
 ## [0.38.0] - 2026-06-28
 
 ### Added
