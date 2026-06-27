@@ -5,6 +5,48 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.0] - 2026-06-27
+
+The lane deliver-gate (middle-tier Phase 1). A **lane** scopes an assignee to a
+domain (and optional path subset); `lane deliver` gives a trustworthy
+point-in-time verdict that the work is in-bounds, current, gate-clean, and
+merge-tree-clean — consuming the existing domains registry and assurance gate.
+Advisory by design: it is a coordination gate that produces durable evidence, not
+a file lock, a Git authorization, or a parallel gate.
+
+### Added
+- **`agenttalk lane` (assign / check / deliver / status` + `approve-shared`).**
+  - `assign` opens a lane over a `domain_id` (+ optional repo-relative path
+    prefixes), stamping base/target SHAs, epoch, and the domains registry hash;
+    disjointness vs other active lanes is validated under a lock (read-validate-write).
+  - `check` (read-only) and `deliver` compute changed paths from `git diff
+    --name-status -z -M -C`, classify them with the **same** matcher as domain
+    ownership (segment-aware, casefold-consistent), run **merge-tree** as the
+    conflict authority (honest-degraded → HOLD; never infers clean), check the
+    assurance gate, and return a pure GO/HOLD verdict with stable hold codes
+    (out_of_bounds_path, unowned_path, domain_overlap_path, shared_path_*,
+    active_lane_overlap, stale_epoch/registry, merge_conflict, gate_hold, …).
+    Exit 0=GO / 3=HOLD, composing with `gate check` / `close check`.
+  - `deliver` on GO writes a **durable delivery artifact** outside the
+    reset-cleared lane state *before* clearing the lane (and re-validates the lane
+    fingerprint under the lock — fail-closed on a raced reassign); on HOLD the
+    lane stays active.
+- Lanes **consume** the assurance gate and never mint a green release-blocker
+  gate. `agenttalk reset` clears active lanes (with a warning); malformed lane
+  state fails closed for lane commands only, never bricking send/wait/status.
+
+### Notes
+- Generic and advisory: agenttalk owns schema/verdict/diff-parsing/stale-checks;
+  the project owns `domains.json`, shared-path policy, lane ids, assignees, target
+  refs, path subsets, and required gates. Coexists with spec-kitty (domains
+  constrain WP work; WPs never mint domains; deliver doesn't mutate WP state).
+
+### Upgrade
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.37.0"
+```
+Additive and opt-in; lanes are used only when you `lane assign`.
+
 ## [0.36.0] - 2026-06-27
 
 Ephemeral adversarial reviewers (evidence-only). The lead can ask the supervisor
