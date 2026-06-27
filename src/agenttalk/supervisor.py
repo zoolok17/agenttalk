@@ -1307,12 +1307,12 @@ do {
     # stuck_recover / clear_marker / backoff_wait) with state+reason; a steady
     # no-action agent logs only when its state CHANGES (first sight + transitions),
     # so the window shows events without one HEALTHY line per poll. The warning
-    # actions (warn_only / suspect_warn / refuse_protected / snapshot_unavailable)
-    # are announced by their OWN Write-Warning below - skip them here so a warning
+    # actions (warn_only / suspect_warn / refuse_protected / snapshot_unavailable /
+    # readiness_gave_up) are announced by their OWN Write-Warning below - skip them here so a warning
     # action is logged ONCE, not twice. -Quiet suppresses ALL console output (this
     # log AND the warnings below); the bus notify still fires.
     if (-not $Quiet) {
-      if (($p.action -ne 'none') -and ('warn_only','suspect_warn','refuse_protected','snapshot_unavailable' -notcontains $p.action)) {
+      if (($p.action -ne 'none') -and ('warn_only','suspect_warn','refuse_protected','snapshot_unavailable','readiness_gave_up' -notcontains $p.action)) {
         Write-Host ("supervisor: {0}: {1} -> {2}: {3}" -f $name, $p.state, $p.action, $p.reason)
       } elseif (($p.action -eq 'none') -and ($lastLogged[$name] -ne $p.state)) {
         Write-Host ("supervisor: {0}: {1} ({2})" -f $name, $p.state, $p.reason)
@@ -1370,7 +1370,7 @@ do {
       }
       'clear_marker' { if ($p.clear_marker) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; $state.agents.$name = $p.next_state }
       'refuse_protected' { Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason); if ($p.clear_marker) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; $state.agents.$name = $p.next_state }
-      { $_ -in 'warn_only','suspect_warn','snapshot_unavailable' } {
+      { $_ -in 'warn_only','suspect_warn','snapshot_unavailable','readiness_gave_up' } {
         Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason)
         if ($p.notify -and $cfg.notify_sender -and $cfg.notify_to) {
           & $AgenttalkCmd --root $Root send --from $cfg.notify_sender --to $cfg.notify_to --kind note -m ("supervisor: {0}: {1}" -f $name, $p.reason) --quiet | Out-Null

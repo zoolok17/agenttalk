@@ -322,8 +322,25 @@ def test_ps_template_console_action_log_and_quiet() -> None:
     # helper functions on the relaunch path - so it sets $WarningPreference once
     # (inherited by called functions) rather than gating each Write-Warning. And the
     # warning actions are NOT double-logged by the info Write-Host (excluded there).
-    assert "'warn_only','suspect_warn','refuse_protected','snapshot_unavailable' -notcontains" in ps
+    assert ("'warn_only','suspect_warn','refuse_protected','snapshot_unavailable',"
+            "'readiness_gave_up' -notcontains") in ps
     assert "$WarningPreference = 'SilentlyContinue'" in ps   # -Quiet silences all warnings
+
+
+def test_ps_template_readiness_gave_up_warns_and_notifies() -> None:
+    # 0.31.2 (reviewer-1): the new terminal READINESS_GAVE_UP action must be
+    # surfaced - routed through the SAME Write-Warning + bus-notify branch as the
+    # other warn actions (warn_only/suspect_warn/...), NOT fall through to the
+    # silent `default` that only persists state. The whole point of the cap is to
+    # STOP unattended churn while telling the operator intervention is required.
+    ps = sup.PS_TEMPLATE
+    warn_branch = ps[ps.index("{ $_ -in 'warn_only'"):]
+    warn_branch = warn_branch[:warn_branch.index("default {")]
+    assert "'readiness_gave_up'" in warn_branch              # routed through warn/notify
+    assert "Write-Warning" in warn_branch                    # surfaced to the console
+    # the notify path sends a bus note when notify + notify_sender/notify_to are set
+    assert "$p.notify -and $cfg.notify_sender -and $cfg.notify_to" in warn_branch
+    assert "--kind note" in warn_branch
 
 
 def test_supervise_plan_cli_with_fixtures(tmp_path: Path, capsys) -> None:
