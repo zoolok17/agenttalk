@@ -238,6 +238,12 @@ def test_listen_skills_state_release_end_only_exit_and_antipattern(path) -> None
     # section must be GONE (the bypass codex+reviewer-1 found), not just shadowed.
     assert "The peer sends `kind=end` (graceful shutdown)" not in text
     assert "`kind=release` from an authorized sender (stand down" not in text
+    # the EMERGENCY envelope must state operator_report_required EVERYWHERE it is
+    # described (top authority block + bottom Exiting) - not just somewhere in the
+    # file (reviewer-1: the top block omitted it). Every emergency mention pairs it.
+    assert text.count("operator_report_required") >= text.count("release_authority=emergency")
+    assert "release_authority=emergency`\n+ `emergency=true` + `operator_report_required=true`" in text \
+        or "`emergency=true` + `operator_report_required=true`" in text
 
 
 @pytest.mark.parametrize("path", [
