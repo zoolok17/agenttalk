@@ -52,6 +52,18 @@ That's the whole entry gate — the lead (or you) drives it from there. **Roles
 are free-form labels**, so `developer`, `reviewer`, `tester`, or anything else
 you name works.
 
+**Starting the human-facing lead** is the same move from the other side — tell
+one CLI:
+
+> We use agenttalk in this project. Add yourself as the human-facing lead, then
+> check whether the team is up and running.
+
+It picks a name, runs `agenttalk roster add <name> --role lead` and `agenttalk
+roster set-operator-facing <name>` (so it's the single agent you talk to and
+where escalations route), reads its `/agenttalk.lead` skill, then runs `agenttalk
+roster` / `status` / `sync` to see who's online — and coordinates the team from
+there.
+
 The precise setup below — `init --agents ...` and explicit roster/role/group
 commands — is for when you want names and structure pinned up front. It is *not*
 a prerequisite.
