@@ -91,7 +91,12 @@ def path_under_prefix(path: str, prefix: str, *, casefold: bool) -> bool:
 
 
 def path_in_subset(path: str, prefixes: list[str], *, casefold: bool) -> bool:
-    return any(path_under_prefix(path, pre, casefold=casefold) for pre in (prefixes or []))
+    """An EMPTY prefix list means 'no path-prefix narrowing' — the whole domain —
+    so every path is in subset and the per-path domain classification does the
+    bounding. A non-empty list narrows to those segment-aware prefixes."""
+    if not prefixes:
+        return True
+    return any(path_under_prefix(path, pre, casefold=casefold) for pre in prefixes)
 
 
 def prefixes_disjoint(a: list[str], b: list[str], *, casefold: bool) -> bool:
@@ -361,6 +366,18 @@ def save_lanes(store, data: dict) -> None:
 def active_lanes(data: dict) -> list[dict]:
     return [ln for ln in (data.get("lanes") or {}).values()
             if isinstance(ln, dict) and ln.get("status") == STATUS_ACTIVE]
+
+
+def fingerprint(lane: dict) -> tuple:
+    """A stable identity for the EVALUATED lane. deliver re-checks this under the lock
+    before clearing, so a concurrent `assign --force` of the same id between eval and
+    clear cannot make deliver delete a DIFFERENT (newly assigned) lane."""
+    return (
+        lane.get("lane_id"), lane.get("assigned_at"), lane.get("base_sha"),
+        lane.get("target_ref"), lane.get("target_head_at_assign"),
+        lane.get("registry_hash_at_assign"),
+        tuple(lane.get("path_subset") or []),
+    )
 
 
 def delivery_artifact_path(store, lane_id: str, head_sha: str):

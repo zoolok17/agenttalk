@@ -2186,12 +2186,21 @@ def cmd_lane(args: argparse.Namespace) -> int:
             for other in lane_mod.active_lanes(data):
                 if other.get("lane_id") == lane_id:
                     continue
+                # Disjointness is checked WITHIN a domain (an empty subset = the whole
+                # domain, so it conflicts with any same-domain lane). Different-domain
+                # lanes are allowed at assign; the per-path domain classification +
+                # active_lane_overlap recompute at deliver enforce any real overlap
+                # (which also covers the case of overlapping domain globs). Fail closed
+                # on same-domain overlap.
+                if other.get("domain_id") != args.domain:
+                    continue
                 if not lane_mod.prefixes_disjoint(prefixes, other.get("path_subset") or [],
                                                   casefold=casefold):
                     sys.stderr.write(
-                        f"agenttalk lane assign: path subset overlaps active lane "
-                        f"{other.get('lane_id')!r} {other.get('path_subset')} - refusing "
-                        "(fail closed on overlap).\n")
+                        f"agenttalk lane assign: path subset {prefixes or '[whole domain]'} "
+                        f"overlaps active lane {other.get('lane_id')!r} "
+                        f"{other.get('path_subset') or '[whole domain]'} in domain "
+                        f"{args.domain!r} - refusing (fail closed on overlap).\n")
                     return 2
             lane = lane_mod.new_lane(
                 lane_id, assignee=args.assignee, assigned_by=actor, assigned_at=_iso_now(),
@@ -2210,16 +2219,25 @@ def cmd_lane(args: argparse.Namespace) -> int:
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         leads = _close_lead_set(store)
         reg = _load_domain_registry(store)
-        # authority: a close-lead, OR a default_approver of the matched shared path.
-        approvers = set(leads)
-        for entry in reg.data.get("shared_paths", []):
-            if dom.glob_matches(entry["glob"], args.path, casefold=dom.default_casefold_paths()):
-                approvers |= set(dom.resolve_refset(entry.get("default_reviewers") or {},
-                                                    store.load_config()))
-        if approvers and actor not in approvers:
+        # Authority for a shared-path approval (it gates a shared path to GO, so it is
+        # ENFORCED, not advisory - the P3 bypass lesson): a close lead, OR a
+        # default_APPROVER of a shared path that matches --path. FAIL CLOSED: if the
+        # path matches no shared entry, or no authorized approver resolves, refuse.
+        matched = [e for e in reg.data.get("shared_paths", [])
+                   if dom.glob_matches(e["glob"], args.path, casefold=dom.default_casefold_paths())]
+        if not matched:
             sys.stderr.write(
-                f"agenttalk lane approve-shared: {actor!r} is not authorized "
-                f"(close lead or shared-path default approver) {sorted(approvers)}; "
+                f"agenttalk lane approve-shared: {args.path!r} matches no shared_path "
+                "in domains.json - nothing to approve (fail closed).\n")
+            return 2
+        approvers = set(leads)
+        for entry in matched:
+            approvers |= set(dom.resolve_refset(entry.get("default_approvers") or {},
+                                                store.load_config()))
+        if actor not in approvers:
+            sys.stderr.write(
+                f"agenttalk lane approve-shared: {actor!r} is not an authorized approver "
+                f"(close lead or the shared path's default_approvers) {sorted(approvers) or 'none'}; "
                 "refusing (a shared approval gates a shared path to GO).\n")
             return 2
         with store._config_lock():
@@ -2276,6 +2294,19 @@ def cmd_lane(args: argparse.Namespace) -> int:
             return 2
         with store._config_lock():
             data = lane_mod.load_lanes(store)
+            current = (data.get("lanes") or {}).get(args.id)
+            # Only clear the lane we ACTUALLY evaluated: if a concurrent
+            # `assign --force` replaced it between eval and now, the fingerprint
+            # differs -> leave the new lane active (the artifact is honest evidence
+            # of the old evaluation; the new lane must be re-checked).
+            if not isinstance(current, dict) or lane_mod.fingerprint(current) != lane_mod.fingerprint(lane):
+                sys.stderr.write(
+                    f"agenttalk lane deliver: lane {args.id!r} changed since evaluation "
+                    "(concurrent reassign?) - NOT clearing it; evidence written, re-check "
+                    "the current lane.\n")
+                print(f"delivered evidence for lane {args.id} @ {head[:12]} (GO); "
+                      f"lane left active (changed under us): {artifact}")
+                return 0
             (data.get("lanes") or {}).pop(args.id, None)
             lane_mod.save_lanes(store, data)
         print(f"delivered lane {args.id} @ {head[:12]} (GO); evidence: {artifact}")

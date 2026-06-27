@@ -266,6 +266,39 @@ def test_cli_deliver_hold_leaves_lane_active(tmp_path: Path) -> None:
         not list((Store(root).dir / "lane-deliveries").glob("*.json"))
 
 
+def test_whole_domain_lane_can_go(tmp_path: Path) -> None:
+    # codex blocker 1: an empty path_subset (whole domain) must GO on in-domain paths,
+    # not flag every path out_of_bounds.
+    root, base = _repo(tmp_path)
+    br = _branch(root)
+    assert _run(["lane", "assign", "--id", "l1", "--from", "lead", "--assignee", "dev",
+                 "--domain", "core", "--base", base, "--target", br], root) == 0  # no --path
+    head = _commit(root, "src/core/a.py", "base\nchange\n")
+    assert _run(["lane", "check", "--id", "l1", "--head", head], root) == 0
+
+
+def test_pure_whole_domain_in_subset() -> None:
+    assert lanes.path_in_subset("src/core/a.py", [], casefold=False) is True
+    v = _ev(_lane(path_subset=[]), _changed("src/core/a.py"), {"src/core/a.py": _cls(["core"])})
+    assert v["verdict"] == lanes.VERDICT_GO
+
+
+def test_cli_whole_domain_lanes_different_domains_both_assign(tmp_path: Path) -> None:
+    # codex blocker 1: two whole-domain lanes in DIFFERENT domains must not be refused.
+    root, base = _repo(tmp_path)
+    br = _branch(root)
+    s = Store(root)
+    (s.dir / "domains.json").write_text(json.dumps({
+        "schema_version": 1, "domains": {
+            "core": {"title": "Core", "owners": {"agents": ["dev"]}, "owned_globs": ["src/core/**"]},
+            "other": {"title": "Other", "owners": {"agents": ["dev2"]}, "owned_globs": ["src/other/**"]}},
+        "shared_paths": []}), encoding="utf-8")
+    assert _run(["lane", "assign", "--id", "lc", "--from", "lead", "--assignee", "dev",
+                 "--domain", "core", "--base", base, "--target", br], root) == 0
+    assert _run(["lane", "assign", "--id", "lo", "--from", "lead", "--assignee", "dev2",
+                 "--domain", "other", "--base", base, "--target", br], root) == 0
+
+
 def test_cli_assign_overlap_refused(tmp_path: Path) -> None:
     root, base = _repo(tmp_path)
     br = _branch(root)
@@ -274,6 +307,44 @@ def test_cli_assign_overlap_refused(tmp_path: Path) -> None:
     # overlapping subset on a second lane is refused (fail closed)
     assert _run(["lane", "assign", "--id", "l2", "--from", "lead", "--assignee", "dev2",
                  "--domain", "core", "--base", base, "--target", br, "--path", "src/core/sub"], root) == 2
+
+
+def test_lane_fingerprint_distinguishes_reassign() -> None:
+    # codex blocker 3: a reassigned lane (new base/target/assigned_at) has a different
+    # fingerprint, so deliver will not clear a lane it did not evaluate.
+    a = _lane()
+    b = _lane(base_sha="c" * 40)
+    c = _lane(assigned_at="later")
+    assert lanes.fingerprint(a) != lanes.fingerprint(b)
+    assert lanes.fingerprint(a) != lanes.fingerprint(c)
+    assert lanes.fingerprint(a) == lanes.fingerprint(dict(a))
+
+
+def test_cli_shared_approval_authority_and_fail_closed(tmp_path: Path) -> None:
+    # codex blocker 2: approve-shared uses default_approvers and fails closed.
+    root, base = _repo(tmp_path)
+    br = _branch(root)
+    s = Store(root)
+    (s.dir / "domains.json").write_text(json.dumps({
+        "schema_version": 1,
+        "domains": {"core": {"title": "Core", "owners": {"agents": ["dev"]},
+                             "owned_globs": ["src/core/**"]}},
+        "shared_paths": [{"glob": "shared/**", "category": "schema",
+                          "requires": "lead-approval",
+                          "default_reviewers": {"agents": ["dev2"]},
+                          "default_approvers": {"agents": ["dev2"]}}]}), encoding="utf-8")
+    (root / "shared").mkdir()
+    _run(["lane", "assign", "--id", "l1", "--from", "lead", "--assignee", "dev",
+          "--domain", "core", "--base", base, "--target", br, "--path", "shared"], root)
+    # a non-approver (dev) is refused
+    assert _run(["lane", "approve-shared", "--id", "l1", "--path", "shared/x",
+                 "--from", "dev", "--reason", "no"], root) == 2
+    # the default_approver (dev2) is allowed
+    assert _run(["lane", "approve-shared", "--id", "l1", "--path", "shared/x",
+                 "--from", "dev2", "--reason", "ok"], root) == 0
+    # a path matching no shared entry fails closed
+    assert _run(["lane", "approve-shared", "--id", "l1", "--path", "src/core/x",
+                 "--from", "lead", "--reason", "x"], root) == 2
 
 
 def test_cli_assign_unknown_domain_refused(tmp_path: Path) -> None:
