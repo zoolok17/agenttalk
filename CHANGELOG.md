@@ -5,6 +5,47 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.0] - 2026-06-27
+
+The milestone-close protocol — the assurance spine's HOLD/GO gate for a whole
+release or mission. `agenttalk close` aggregates gate state, typed review
+evidence, required-lens sign-offs, counters, and remediation into one durable,
+audited verdict, so a release can't quietly close while a blocker is red, a
+required reviewer hasn't signed, or an accepted finding has no fix.
+
+### Added
+- **`agenttalk close` (open / ack / draft / counter decide / check / publish /
+  reopen / list / show)** — a per-close, atomic, fail-closed record
+  (`.agenttalk/closes/<id>.json`) that freezes the revision under review (ref →
+  full SHA; a revision change stales prior sign-offs) and aggregates the release
+  decision:
+  - **required lenses** collect `ACCEPT | COUNTER | NA` (NA needs a reason); an
+    ack is rejected unless the sender is authorized for that lens — a non-lead
+    `--override` is ignored (override is a close-lead privilege, fail-closed);
+  - **counters** must each be accepted or rejected by the lead with a reason; an
+    accepted blocker finding becomes a **remediation item that must name a
+    gate**, and GO requires that gate green (from CI) or waived;
+  - **`close check`** is a pure verdict over close + gate state with stable HOLD
+    codes, printing `HOLD`/`GO` and an automation-gateable exit (0=GO, 3=HOLD);
+  - **`close publish --verdict go --bump-barrier`** records the GO durably, then
+    fires the global release barrier (HOLD never bumps; post-publish acks are
+    rejected unless reopened — stale-proof without a team-wide bump).
+- Reuses the 0.32.0 gate/evidence + the epoch barrier; never creates or mutates
+  gates itself.
+
+### Notes
+- Generic and opt-in: which gates and lenses are required, what a lens means,
+  and severity policy are the project's to define; agenttalk core owns the
+  schema, validation, pure verdict, and the advisory authority checks. Coexists
+  with spec-kitty (wraps release/milestone confidence around it). This is P2 of
+  the assurance roadmap; specialist sign-off routing and review rubrics are next.
+
+### Upgrade
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.33.0"
+```
+Additive and opt-in; no migration.
+
 ## [0.32.0] - 2026-06-27
 
 The assurance spine — a lightweight layer that makes unsafe closure hard.
