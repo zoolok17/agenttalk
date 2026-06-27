@@ -5,6 +5,49 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.32.0] - 2026-06-27
+
+The assurance spine — a lightweight layer that makes unsafe closure hard.
+agenttalk now records durable, queryable gate state and typed review evidence, so
+a release/merge/mission-close can be held while a blocker is red, and "looks fine
+/ verified" prose can no longer pass for proof. Generic and opt-in: projects
+declare which gates and risk classes matter; agenttalk core provides the
+mechanism. Born from a field retrospective after an independent review caught
+issues a multi-agent build had shipped past.
+
+### Added
+- **`agenttalk gate` (set / list / check / waive)** — durable, queryable gate
+  state. A `severity=blocker` gate that is `red`/`unknown` yields **HOLD** and
+  blocks release-like closure until it goes green or is waived. A blocker can be
+  set **green only from `automation_ci` evidence** (or an audited operator
+  waiver) — manual assertion is rejected. `gate check [--release]` prints a
+  top-line `HOLD`/`GO` with an automation-gateable exit code (0=GO, 3=HOLD).
+  `gate waive` records an operator waiver (operator, reason, scope, expiration,
+  evidence); expired/wrong-scope waivers don't clear the gate. Gate state is
+  scoped to revision so stale evidence can't satisfy a current gate.
+- **`agenttalk check --gates`** — the pre-irreversible-action check now folds in
+  gate state alongside request-currentness/epoch, so a blocked release/merge
+  surfaces HOLD before you act.
+- **Typed evidence on `review-result`** — approvals carry structured fields
+  (`risk_class`, `release_blocker`, `tests_referenced` vs `tests_executed`,
+  evidence/artifacts with source type, `residual_risk`, `na_reason`). Missing
+  required fields make a result **incomplete, not approved**; `tests_referenced`
+  can't be passed off as `tests_executed`; NA needs a reason. Lightweight reviews
+  stay frictionless via `risk_class=none`.
+
+### Notes
+- **Opt-in and generic.** The required-gates set is empty by default — you only
+  get gating where you declare it. Project-specific gates, evidence commands, and
+  specialist lenses live in your project's config; agenttalk core provides the
+  mechanism. This is the MVP slice; milestone-close, specialist sign-off routing,
+  and the generic review rubrics are planned follow-ups.
+
+### Upgrade
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.32.0"
+```
+No migration; the gate/evidence layer is additive and opt-in.
+
 ## [0.31.2] - 2026-06-27
 
 Supervised-wake reliability — the end of the 0.31.x supervisor line. A
