@@ -40,6 +40,19 @@ def _run_expect_exit(argv: list[str], root: Path, code: int) -> None:
     assert actual == code, f"expected exit code {code}, got {actual}"
 
 
+def _approval_meta_args() -> list[str]:
+    return [
+        "--meta", "status=approved",
+        "--meta", "risk_class=none",
+        "--meta", "release_blocker=no",
+        "--meta", "tests_referenced=n/a",
+        "--meta", "tests_executed=n/a",
+        "--meta", "evidence=n/a",
+        "--meta", "residual_risk=n/a",
+        "--meta", "na_reason=lightweight review",
+    ]
+
+
 # ----------------------------------------------------- init: hint emission
 
 def test_init_prints_concrete_env_hint_for_two_agents(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
@@ -1212,7 +1225,7 @@ def test_reply_review_result_still_echoes_request_id(
           "-m", "review my work"], store_root)
     capsys.readouterr()
     rc = _run(["reply", "--from", "beta", "--kind", "review-result",
-               "--meta", "status=approved", "-m", "looks good"], store_root)
+               *_approval_meta_args(), "-m", "looks good"], store_root)
     assert rc == 0
     assert store.messages_for("alpha")[-1].meta.get("request_id") == "orig-456"
 
@@ -1321,7 +1334,7 @@ def test_reply_to_id_anchors_specific_message(
     capsys.readouterr()
     # Anchor explicitly to the FIRST (older) message, not the most recent.
     rc = _run(["reply", "--from", "alpha", "--to-id", first_id,
-               "--kind", "review-result", "--meta", "status=approved",
+               "--kind", "review-result", *_approval_meta_args(),
                "-m", "verdict for thread one"], store_root)
     assert rc == 0
     reply = store.messages_for("beta")[-1]
@@ -1361,7 +1374,7 @@ def test_reply_to_request_anchors_by_request_id(
           "--meta", "request_id=second", "-m", "thread two"], store_root)
     capsys.readouterr()
     rc = _run(["reply", "--from", "alpha", "--to-request", "first",
-               "--kind", "review-result", "--meta", "status=approved",
+               "--kind", "review-result", *_approval_meta_args(),
                "-m", "verdict"], store_root)
     assert rc == 0
     assert store.messages_for("beta")[-1].meta.get("request_id") == "first"
@@ -2504,6 +2517,205 @@ def test_check_epoch_json_shape(tmp_path: Path, capsys) -> None:
     assert "epoch" not in out2
 
 
+def test_gate_check_empty_required_set_is_go(store_root: Path, capsys) -> None:
+    assert _run(["gate", "check", "--release", "--json"], store_root) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "GO"
+    assert out["required_gates"] == []
+
+
+def test_gate_check_corrupt_state_fails_closed(store_root: Path, capsys) -> None:
+    (store_root / ".agenttalk" / "gates.json").write_text("{not json", encoding="utf-8")
+    assert _run(["gate", "check", "--release", "--json"], store_root) == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "HOLD"
+    assert out["blockers"][0]["name"] == "__gate_state__"
+
+
+def test_gate_check_malformed_state_shape_fails_closed(store_root: Path, capsys) -> None:
+    (store_root / ".agenttalk" / "gates.json").write_text(
+        json.dumps({"required_gates": "connected-l1", "gates": []}),
+        encoding="utf-8",
+    )
+    assert _run(["gate", "check", "--release", "--json"], store_root) == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "HOLD"
+    assert out["blockers"][0]["name"] == "__gate_state__"
+    assert "required_gates" in out["blockers"][0]["reason"]
+
+
+def test_gate_check_invalid_stored_gate_fails_closed(store_root: Path, capsys) -> None:
+    (store_root / ".agenttalk" / "gates.json").write_text(
+        json.dumps({
+            "required_gates": ["connected-l1"],
+            "gates": {
+                "connected-l1": {
+                    "name": "connected-l1",
+                    "status": "banana",
+                    "severity": "blocker",
+                    "scope": "release",
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    assert _run(["gate", "check", "--release", "--json"], store_root) == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "HOLD"
+    assert out["blockers"][0]["name"] == "__gate_state__"
+    assert "invalid status" in out["blockers"][0]["reason"]
+
+
+def test_gate_check_green_blocker_without_stored_evidence_fails_closed(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    (store_root / ".agenttalk" / "gates.json").write_text(
+        json.dumps({
+            "required_gates": ["connected-l1"],
+            "gates": {
+                "connected-l1": {
+                    "name": "connected-l1",
+                    "status": "green",
+                    "severity": "blocker",
+                    "scope": "release",
+                    "evidence_source": "automation_ci",
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    assert _run(["gate", "check", "--release", "--json"], store_root) == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["blockers"][0]["name"] == "__gate_state__"
+    assert "missing evidence" in out["blockers"][0]["reason"]
+
+
+def test_gate_blocker_green_rejects_manual_review_source(store_root: Path, capsys) -> None:
+    _run_expect_exit([
+        "gate", "set", "--from", "alpha",
+        "--name", "connected-l1",
+        "--status", "green",
+        "--severity", "blocker",
+        "--evidence", "ci://connected-l1",
+    ], store_root, 2)
+    assert "automation_ci" in capsys.readouterr().err
+
+
+def test_gate_set_operator_waiver_must_use_waive(store_root: Path, capsys) -> None:
+    _run_expect_exit([
+        "gate", "set", "--from", "alpha",
+        "--name", "connected-l1",
+        "--status", "green",
+        "--severity", "blocker",
+        "--scope", "release",
+        "--evidence-source", "operator_waiver",
+        "--evidence", "operator://approval",
+        "--required",
+    ], store_root, 2)
+    assert "gate waive" in capsys.readouterr().err
+
+
+def test_gate_red_blocker_holds_and_check_gates_blocks(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    _run(["send", "--from", "alpha", "--to", "beta", "--kind", "review-request",
+          "--meta", "request_id=r-gate", "-m", "review", "--quiet"], store_root)
+    assert _run([
+        "gate", "set", "--from", "alpha",
+        "--name", "connected-l1",
+        "--status", "red",
+        "--severity", "blocker",
+        "--scope", "release",
+        "--reason", "connected lane failed",
+        "--required",
+    ], store_root) == 0
+    capsys.readouterr()
+    assert _run(["gate", "check", "--release", "--json"], store_root) == 3
+    gate_out = json.loads(capsys.readouterr().out)
+    assert gate_out["verdict"] == "HOLD"
+    assert gate_out["blockers"][0]["name"] == "connected-l1"
+    assert _run(["check", "--for", "beta", "--to-request", "r-gate",
+                 "--gates", "--json"], store_root) == 3
+    check_out = json.loads(capsys.readouterr().out)
+    assert check_out["gates"]["verdict"] == "HOLD"
+
+
+def test_gate_blocker_green_from_automation_goes_green(store_root: Path, capsys) -> None:
+    assert _run([
+        "gate", "set", "--from", "alpha",
+        "--name", "connected-l1",
+        "--status", "green",
+        "--severity", "blocker",
+        "--scope", "release",
+        "--evidence-source", "automation_ci",
+        "--evidence", "ci://connected-l1/123",
+        "--required",
+        "--json",
+    ], store_root) == 0
+    gate = json.loads(capsys.readouterr().out)
+    assert gate["status"] == "green"
+    assert _run(["gate", "check", "--release", "--json"], store_root) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "GO"
+
+
+def test_gate_waiver_allows_until_expired(store_root: Path, capsys) -> None:
+    assert _run([
+        "gate", "set", "--from", "alpha",
+        "--name", "release-artifact",
+        "--status", "red",
+        "--severity", "blocker",
+        "--scope", "release",
+        "--reason", "debug artifact",
+        "--required",
+    ], store_root) == 0
+    assert _run([
+        "gate", "waive",
+        "--name", "release-artifact",
+        "--operator", "operator",
+        "--reason", "private dogfood only",
+        "--scope", "release",
+        "--expires", "2999-01-01",
+    ], store_root) == 0
+    capsys.readouterr()
+    assert _run(["gate", "check", "--release", "--json"], store_root) == 0
+    assert json.loads(capsys.readouterr().out)["verdict"] == "GO"
+    assert _run([
+        "gate", "waive",
+        "--name", "release-artifact",
+        "--operator", "operator",
+        "--reason", "expired waiver",
+        "--scope", "release",
+        "--expires", "2000-01-01",
+    ], store_root) == 0
+    capsys.readouterr()
+    assert _run(["gate", "check", "--release", "--json"], store_root) == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "HOLD"
+    assert out["blockers"][0]["reason"] == "waiver expired or invalid"
+
+
+def test_review_result_approval_requires_typed_evidence(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    _run(["send", "--from", "alpha", "--to", "beta", "--kind", "review-request",
+          "--meta", "request_id=r-evidence", "-m", "review", "--quiet"], store_root)
+    _run_expect_exit([
+        "reply", "--from", "beta", "--to-request", "r-evidence",
+        "--kind", "review-result", "--meta", "status=approved",
+        "-m", "approved",
+    ], store_root, 2)
+    assert "typed evidence" in capsys.readouterr().err
+    assert _run([
+        "reply", "--from", "beta", "--to-request", "r-evidence",
+        "--kind", "review-result", *_approval_meta_args(),
+        "-m", "approved",
+    ], store_root) == 0
+
+
 def test_threads_json_next_fields(tmp_path: Path, capsys) -> None:
     root = _epoch_team(tmp_path)
     _open_req(root, "r1")
@@ -2512,7 +2724,7 @@ def test_threads_json_next_fields(tmp_path: Path, capsys) -> None:
     assert row["next_action"] == "reply" and row["next_owner"] == "beta"
     # closed thread omits next_*
     _run(["reply", "--to-request", "r1", "--from", "beta",
-          "--kind", "review-result", "--meta", "status=approved",
+          "--kind", "review-result", *_approval_meta_args(),
           "-m", "lgtm"], root)
     _run(["ack", "--for", "beta", "--to-request", "r1"], root)
     rows = _run_json(["threads", "--for", "beta", "--all", "--json"], root, capsys)
