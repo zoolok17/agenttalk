@@ -1400,6 +1400,349 @@ def cmd_gate(args: argparse.Namespace) -> int:
     return 2
 
 
+# ----------------------------------------------------------------- close (P2)
+#
+# `close` aggregates the 0.32.0 assurance signals into ONE auditable release
+# verdict for a frozen revision. The pure core (schema, verdict, transitions)
+# lives in close.py; this is the thin I/O shell: git revision freeze, gate-check
+# reuse, advisory roster authority, and the explicit release barrier bump.
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _git(root, argv: list[str]) -> tuple[int, str]:
+    """Run a read-only git command in ``root``; (rc, stdout) or (-1, "") on any
+    failure. argv is a fixed list (never shell); git is the only tool invoked."""
+    import subprocess  # nosec B404  # local import keeps the dependency optional
+    try:
+        # Fixed git argv in the repo root; never shell, never operator input as a
+        # program. "git" is resolved from PATH on purpose (cross-platform; no fixed
+        # install path), so partial-path (B607) is intentional here.
+        p = subprocess.run(  # noqa: S603,S607  # nosec B603 B607
+            ["git", "-C", str(root), *argv],
+            capture_output=True, text=True, timeout=15,
+            encoding="utf-8", errors="replace",
+        )
+        return p.returncode, (p.stdout or "")
+    except (OSError, ValueError):  # FileNotFoundError, timeout, etc.
+        return -1, ""
+
+
+def _resolve_revision(root, ref: str) -> tuple[str, str]:
+    """Freeze ``ref`` to a full 40-char SHA via git. Returns (sha, kind) where kind
+    is 'sha' (caller passed a full SHA we verified or could not check) or 'ref'
+    (a ref/short-sha git resolved). Fails closed when neither git nor a full SHA
+    can produce a frozen revision."""
+    from agenttalk import close as close_mod
+    rc, out = _git(root, ["rev-parse", "--verify", f"{ref}^{{commit}}"])
+    sha = out.strip()
+    if rc == 0 and close_mod._FULL_SHA_RE.match(sha):
+        return sha, ("sha" if sha == ref else "ref")
+    if close_mod._FULL_SHA_RE.match(ref):
+        return ref, "sha"   # git unavailable but the operator pinned a full SHA
+    raise close_mod.CloseError(
+        f"could not resolve revision {ref!r} to a full SHA (git rc={rc}); "
+        "pass a full 40-char SHA or run inside the repo")
+
+
+def _worktree_clean(root) -> bool | None:
+    """True/False if git could report; None if git is unavailable (caller then
+    relies on the operator's --dirty-artifact / explicit flags)."""
+    rc, out = _git(root, ["status", "--porcelain"])
+    if rc != 0:
+        return None
+    return out.strip() == ""
+
+
+def _close_lead_set(store) -> set[str]:
+    """Advisory close-lead authority: the sole role=lead UNION the operator-facing
+    liaison. agenttalk does not enforce identity (role is advisory; the bus
+    authenticates the sender), so the CLI WARNS on an unrecognized actor but still
+    records the action — close is release-confidence + audit, never an enforced lock."""
+    leads: set[str] = set()
+    sole = store.sole_lead()
+    if sole:
+        leads.add(sole)
+    liaison = store.operator_facing()
+    if liaison:
+        leads.add(liaison)
+    return leads
+
+
+def _check_close_authority(store, actor: str, action: str) -> bool:
+    leads = _close_lead_set(store)
+    authorized = (not leads) or (actor in leads)
+    if leads and not authorized:
+        sys.stderr.write(
+            f"agenttalk close {action}: WARNING - {actor!r} is not a recognized "
+            f"close lead {sorted(leads)}; recording anyway (close authority is "
+            "advisory, not enforced). The action and actor are logged.\n")
+    return authorized
+
+
+def _close_lens_specs(args) -> list[dict]:
+    from agenttalk import close as close_mod
+    # --allow LENS:TOKEN  (TOKEN '@role' -> allowed_roles, else allowed_agents)
+    agents: dict[str, list[str]] = {}
+    roles: dict[str, list[str]] = {}
+    for entry in getattr(args, "allow", None) or []:
+        if ":" not in entry:
+            raise close_mod.CloseError(f"--allow must be LENS:TOKEN (got {entry!r})")
+        lens, token = entry.split(":", 1)
+        if token.startswith("@"):
+            roles.setdefault(lens, []).append(token[1:])
+        else:
+            agents.setdefault(lens, []).append(token)
+    specs = []
+    for lid in getattr(args, "lens", None) or []:
+        specs.append(close_mod.validate_lens_spec({
+            "id": lid, "allowed_agents": agents.get(lid, []),
+            "allowed_roles": roles.get(lid, []), "required": True}))
+    for lid in getattr(args, "optional_lens", None) or []:
+        specs.append(close_mod.validate_lens_spec({
+            "id": lid, "allowed_agents": agents.get(lid, []),
+            "allowed_roles": roles.get(lid, []), "required": False}))
+    return specs
+
+
+def _print_verdict(close_id: str, result: dict) -> None:
+    print(f"{result['verdict']}  ({close_id})")
+    for h in result["holds"]:
+        print(f"  HOLD[{h['code']}]: {h['detail']}")
+
+
+def cmd_close(args: argparse.Namespace) -> int:
+    """Assurance P2 milestone/release close (advisory; see close.py)."""
+    from agenttalk import close as close_mod
+    store = _get_store(args)
+    action = getattr(args, "close_cmd", None)
+    roster = store.load_config().get("agents") or []
+
+    if action == "open":
+        close_id = close_mod.validate_close_id(args.id)
+        try:
+            revision, kind = _resolve_revision(store.root, args.revision)
+        except close_mod.CloseError as e:
+            sys.stderr.write(f"agenttalk close open: {e}\n")
+            return 2
+        clean = _worktree_clean(store.root)
+        if clean is None:  # git could not report; trust the explicit flags
+            clean = not bool(args.dirty_artifact) if not args.allow_dirty else False
+        opener = _resolve_self(getattr(args, "actor", None), roster=roster)
+        record = close_mod.empty_close(
+            close_id, scope=args.scope, revision=revision, revision_kind=kind,
+            gate_scope=args.gate_scope or args.scope, opened_by=opener,
+            opened_at=_iso_now(), epoch_at_open=store.current_epoch(),
+            required_lenses=_close_lens_specs(args),
+            revision_clean=bool(clean), dirty_artifact=args.dirty_artifact)
+        if close_mod.close_path(store, close_id).exists() and not args.force:
+            sys.stderr.write(
+                f"agenttalk close open: {close_id!r} already exists "
+                "(use --force to overwrite, or `close reopen`).\n")
+            return 2
+        close_mod.save_close(store, record)
+        if not clean and not args.dirty_artifact:
+            sys.stderr.write(
+                "agenttalk close open: WARNING - worktree is dirty and no "
+                "--dirty-artifact was recorded; close check will HOLD on revision "
+                "until a clean SHA or a recorded diff artifact is provided.\n")
+        if getattr(args, "json", False):
+            print(json.dumps(record, indent=2))
+        else:
+            print(f"opened close {close_id} @ {revision[:12]} ({kind}, "
+                  f"{'clean' if clean else 'dirty'}); "
+                  f"{len(record['required_lenses'])} required lens(es)")
+        return 0
+
+    if action == "ack":
+        record = close_mod.load_close(store, args.id)
+        agent = _resolve_self(getattr(args, "actor", None), roster=roster)
+        from_role = (store.load_config().get("roles") or {}).get(agent)
+        evidence = None
+        counter_id = None
+        if args.status == close_mod.ACCEPT:
+            # typed-evidence reuse expects scalar string fields (gates._has_value);
+            # join repeatable --evidence into one pointer string (pointer-not-mirror).
+            evidence_str = ", ".join(args.evidence) if args.evidence else None
+            meta = {
+                "risk_class": args.risk_class, "release_blocker": args.release_blocker,
+                "tests_referenced": args.tests_referenced,
+                "tests_executed": args.tests_executed,
+                "residual_risk": args.residual_risk, "na_reason": args.na_reason,
+                "evidence": evidence_str, "request_id": args.request_id,
+            }
+            meta = {k: v for k, v in meta.items() if v is not None}
+            try:
+                gate_mod.validate_review_result_evidence(
+                    "review-result", {**meta, "status": "approved"})
+            except ValueError as e:
+                sys.stderr.write(f"agenttalk close ack: {e}\n")
+                return 2
+            evidence = meta
+        elif args.status == close_mod.COUNTER:
+            counter_id = args.counter or f"ctr-{args.lens}-{record.get('revision','')[:8]}"
+            evidence = {"finding": args.finding, "request_id": args.request_id}
+            evidence = {k: v for k, v in evidence.items() if v is not None}
+        try:
+            close_mod.apply_ack(
+                record, lens_id=args.lens, status=args.status, agent=agent,
+                from_role=from_role, at=_iso_now(), evidence=evidence,
+                reason=args.reason, counter_id=counter_id,
+                override=bool(args.override))
+        except close_mod.CloseError as e:
+            sys.stderr.write(f"agenttalk close ack: {e}\n")
+            return 2
+        close_mod.save_close(store, record)
+        msg = f"ack {args.status} lens {args.lens} by {agent}"
+        print(msg + (f" (counter {counter_id})" if counter_id else ""))
+        return 0
+
+    if action == "draft":
+        record = close_mod.load_close(store, args.id)
+        actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        _check_close_authority(store, actor, "draft")
+        try:
+            close_mod.set_draft(record, body=args.message or "", by=actor, at=_iso_now())
+        except close_mod.CloseError as e:
+            sys.stderr.write(f"agenttalk close draft: {e}\n")
+            return 2
+        close_mod.save_close(store, record)
+        print(f"draft recorded on {args.id} by {actor}")
+        return 0
+
+    if action == "counter":
+        if getattr(args, "counter_cmd", None) != "decide":
+            sys.stderr.write("agenttalk close counter: the only action is `decide`.\n")
+            return 2
+        record = close_mod.load_close(store, args.id)
+        actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        _check_close_authority(store, actor, "counter decide")
+        remediation = None
+        if args.decision == "accept":
+            remediation = {
+                "id": args.rem_id or f"rem-{args.counter}",
+                "owner": args.rem_owner, "severity": args.rem_severity,
+                "affected": args.affected or [], "blocker": bool(args.blocker),
+                "gate": args.gate, "fix": args.rem_fix,
+                "verification": args.rem_verification,
+                "regression_test": args.regression_test, "target": args.target,
+            }
+        try:
+            close_mod.decide_counter(
+                record, counter_id=args.counter, decision=args.decision, by=actor,
+                at=_iso_now(), reason=args.reason, remediation=remediation)
+        except close_mod.CloseError as e:
+            sys.stderr.write(f"agenttalk close counter decide: {e}\n")
+            return 2
+        close_mod.save_close(store, record)
+        print(f"counter {args.counter} {args.decision}ed on {args.id} by {actor}")
+        return 0
+
+    if action == "check":
+        path = close_mod.close_path(store, args.id)
+        if not path.exists():
+            sys.stderr.write(f"agenttalk close check: no close {args.id!r}.\n")
+            return 2
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            record = {"close_id": args.id}  # corrupt -> compute_verdict -> malformed
+        gate_check = gate_mod.check_gates(
+            store.root, scope=record.get("gate_scope") if isinstance(record, dict) else None)
+        result = close_mod.compute_verdict(record if isinstance(record, dict) else {}, gate_check)
+        if getattr(args, "json", False):
+            print(json.dumps({**result, "gate_verdict": gate_check["verdict"]}, indent=2))
+        else:
+            _print_verdict(args.id, result)
+        return 0 if result["verdict"] == close_mod.VERDICT_GO else 3
+
+    if action == "publish":
+        record = close_mod.load_close(store, args.id)
+        actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        _check_close_authority(store, actor, "publish")
+        if record.get("status") == close_mod.PUBLISHED:
+            sys.stderr.write(
+                f"agenttalk close publish: {args.id!r} is already published; "
+                "`close reopen` first.\n")
+            return 2
+        gate_check = gate_mod.check_gates(store.root, scope=record.get("gate_scope"))
+        result = close_mod.compute_verdict(record, gate_check)
+        if args.verdict == "go" and result["verdict"] != close_mod.VERDICT_GO:
+            sys.stderr.write(
+                "agenttalk close publish: refusing GO - close check is HOLD:\n")
+            _print_verdict(args.id, result)
+            return 3
+        barrier_epoch = None
+        if args.verdict == "go" and args.bump_barrier:
+            msg = store.send(
+                sender=actor, recipient=actor, kind="message",
+                subject=f"release barrier: close {args.id}",
+                body=args.reason or f"close {args.id} published GO",
+                meta={"barrier": {"version": 1, "scope": "global",
+                                  "type": "epoch-bump"}, "close_id": args.id})
+            barrier_epoch = msg.id
+        verdict = close_mod.VERDICT_GO if args.verdict == "go" else close_mod.VERDICT_HOLD
+        close_mod.record_publish(
+            record, verdict=verdict, by=actor, at=_iso_now(),
+            reason=args.reason or "", gate_check=gate_check,
+            residual_risk=args.residual_risk, barrier_epoch=barrier_epoch)
+        close_mod.save_close(store, record)
+        print(f"published close {args.id}: {verdict} by {actor}"
+              + (f"; release barrier {barrier_epoch}" if barrier_epoch else ""))
+        return 0 if verdict == close_mod.VERDICT_GO else 3
+
+    if action == "reopen":
+        record = close_mod.load_close(store, args.id)
+        actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        _check_close_authority(store, actor, "reopen")
+        revision = None
+        clean = None
+        if getattr(args, "revision", None):
+            try:
+                revision, _kind = _resolve_revision(store.root, args.revision)
+            except close_mod.CloseError as e:
+                sys.stderr.write(f"agenttalk close reopen: {e}\n")
+                return 2
+            wc = _worktree_clean(store.root)
+            clean = True if wc is None else wc
+        close_mod.reopen(record, by=actor, at=_iso_now(),
+                         revision=revision, revision_clean=clean)
+        close_mod.save_close(store, record)
+        print(f"reopened close {args.id} by {actor}"
+              + (f" @ {revision[:12]} (prior lens acks now stale)" if revision else ""))
+        return 0
+
+    if action == "list":
+        ids = close_mod.list_close_ids(store)
+        if getattr(args, "json", False):
+            print(json.dumps(ids, indent=2))
+            return 0
+        if not ids:
+            print("closes: none")
+            return 0
+        print(f"closes ({len(ids)}):")
+        for cid in ids:
+            try:
+                rec = close_mod.load_close(store, cid)
+                final = rec.get("final") or {}
+                tag = final.get("verdict") or rec.get("status")
+            except close_mod.CloseError:
+                tag = "malformed"
+            print(f"  {cid}: {tag}")
+        return 0
+
+    if action == "show":
+        record = close_mod.load_close(store, args.id)
+        print(json.dumps(record, indent=2))
+        return 0
+
+    sys.stderr.write(
+        "agenttalk close: expected open, ack, draft, counter, check, publish, "
+        "reopen, list, or show.\n")
+    return 2
+
+
 def cmd_prune(args: argparse.Namespace) -> int:
     """Quarantine invalid message files (#17, 0.15.0).
 
@@ -4317,6 +4660,107 @@ def build_parser() -> argparse.ArgumentParser:
     gwaive.add_argument("--date", help="Decision date (defaults to now).")
     gwaive.add_argument("--json", action="store_true", help="Emit the stored gate object.")
     gwaive.set_defaults(func=cmd_gate)
+
+    # ----- close (assurance P2 milestone/release close; advisory, opt-in) -----
+    pclose = sub.add_parser(
+        "close",
+        help="Aggregate gates + review lenses + remediation into one auditable "
+             "HOLD/GO release verdict for a frozen revision (advisory).",
+    )
+    pclose.set_defaults(func=cmd_close, close_cmd=None)
+    csub = pclose.add_subparsers(dest="close_cmd")
+
+    copen = csub.add_parser("open", help="Open a close on a frozen revision.")
+    copen.add_argument("--id", required=True, help="Close id (safe identifier).")
+    copen.add_argument("--from", dest="actor", help="Agent opening the close.")
+    copen.add_argument("--scope", required=True, help="Close scope, e.g. release.")
+    copen.add_argument("--gate-scope", help="Gate scope to check (default: --scope).")
+    copen.add_argument("--revision", required=True, help="Ref or SHA; frozen to a full SHA via git.")
+    copen.add_argument("--lens", action="append", help="Required lens id (repeatable).")
+    copen.add_argument("--optional-lens", action="append", help="Optional lens id (repeatable).")
+    copen.add_argument("--allow", action="append",
+                       help="Authorize a lens ack: LENS:AGENT or LENS:@ROLE (repeatable).")
+    copen.add_argument("--dirty-artifact", help="Pointer to a recorded diff when the worktree is dirty.")
+    copen.add_argument("--allow-dirty", action="store_true", help="Proceed on a dirty worktree (records dirty).")
+    copen.add_argument("--force", action="store_true", help="Overwrite an existing close with this id.")
+    copen.add_argument("--json", action="store_true", help="Emit the opened record.")
+    copen.set_defaults(func=cmd_close)
+
+    cack = csub.add_parser("ack", help="Record a lens ack (accept / counter / na).")
+    cack.add_argument("--id", required=True)
+    cack.add_argument("--lens", required=True, help="Lens id being acked.")
+    cack.add_argument("--status", required=True, choices=["accept", "counter", "na"])
+    cack.add_argument("--from", dest="actor", help="Acking agent.")
+    cack.add_argument("--reason", help="Reason (required for na).")
+    cack.add_argument("--override", action="store_true",
+                      help="Record a lead/operator authorization override.")
+    cack.add_argument("--counter", help="Counter id (for status=counter; auto if omitted).")
+    cack.add_argument("--finding", help="Counter finding summary or pointer.")
+    cack.add_argument("--request-id", help="Pointer to the review-result/request msg id.")
+    cack.add_argument("--risk-class", help="ACCEPT: typed risk_class (reuses 0.32.0 evidence).")
+    cack.add_argument("--release-blocker", help="ACCEPT: yes|no|unknown.")
+    cack.add_argument("--tests-referenced", help="ACCEPT: tests referenced.")
+    cack.add_argument("--tests-executed", help="ACCEPT: tests executed.")
+    cack.add_argument("--residual-risk", help="ACCEPT: residual risk note.")
+    cack.add_argument("--na-reason", help="ACCEPT: reason a field is n/a (per typed-evidence rules).")
+    cack.add_argument("--evidence", action="append", help="ACCEPT: evidence artifact (repeatable).")
+    cack.set_defaults(func=cmd_close)
+
+    cdraft = csub.add_parser("draft", help="Record/replace the merged human draft (lead).")
+    cdraft.add_argument("--id", required=True)
+    cdraft.add_argument("--from", dest="actor", help="Lead recording the draft.")
+    cdraft.add_argument("-m", "--message", help="Draft body.")
+    cdraft.set_defaults(func=cmd_close)
+
+    cctr = csub.add_parser("counter", help="Decide a raised counter (lead).")
+    cctrsub = cctr.add_subparsers(dest="counter_cmd")
+    cdec = cctrsub.add_parser("decide", help="Accept or reject a counter.")
+    cdec.add_argument("--id", required=True)
+    cdec.add_argument("--counter", required=True, help="Counter id to decide.")
+    cdec.add_argument("--decision", required=True, choices=["accept", "reject"])
+    cdec.add_argument("--from", dest="actor", help="Deciding lead.")
+    cdec.add_argument("--reason", required=True, help="Reason for the decision.")
+    cdec.add_argument("--rem-id", help="ACCEPT: remediation item id (auto if omitted).")
+    cdec.add_argument("--rem-owner", help="ACCEPT: remediation owner.")
+    cdec.add_argument("--rem-severity", default="unknown", help="ACCEPT: severity.")
+    cdec.add_argument("--rem-fix", help="ACCEPT: the fix.")
+    cdec.add_argument("--rem-verification", help="ACCEPT: how it is verified.")
+    cdec.add_argument("--blocker", action="store_true", help="ACCEPT: this is a release blocker.")
+    cdec.add_argument("--gate", help="ACCEPT: gate id that resolves a blocker remediation.")
+    cdec.add_argument("--affected", action="append", help="ACCEPT: affected items (repeatable).")
+    cdec.add_argument("--regression-test", help="ACCEPT: regression test reference.")
+    cdec.add_argument("--target", help="ACCEPT: target milestone/close.")
+    cdec.set_defaults(func=cmd_close)
+    cctr.set_defaults(func=cmd_close, counter_cmd=None)
+
+    ccheck = csub.add_parser("check", help="Print HOLD/GO + hold codes (exit 0=GO, 3=HOLD).")
+    ccheck.add_argument("--id", required=True)
+    ccheck.add_argument("--json", action="store_true", help="Emit the structured verdict.")
+    ccheck.set_defaults(func=cmd_close)
+
+    cpub = csub.add_parser("publish", help="Publish the final HOLD/GO (lead).")
+    cpub.add_argument("--id", required=True)
+    cpub.add_argument("--from", dest="actor", help="Publishing lead.")
+    cpub.add_argument("--verdict", required=True, choices=["hold", "go"])
+    cpub.add_argument("--reason", help="Publish reason / release note.")
+    cpub.add_argument("--residual-risk", help="Recorded residual risk.")
+    cpub.add_argument("--bump-barrier", action="store_true",
+                      help="GO only: fire the release barrier AFTER recording GO.")
+    cpub.set_defaults(func=cmd_close)
+
+    creopen = csub.add_parser("reopen", help="Reopen a published close (lead/operator).")
+    creopen.add_argument("--id", required=True)
+    creopen.add_argument("--from", dest="actor", help="Agent reopening.")
+    creopen.add_argument("--revision", help="New ref/SHA (changing it stales prior lens acks).")
+    creopen.set_defaults(func=cmd_close)
+
+    clist = csub.add_parser("list", help="List closes.")
+    clist.add_argument("--json", action="store_true")
+    clist.set_defaults(func=cmd_close)
+
+    cshow = csub.add_parser("show", help="Show one close record (JSON).")
+    cshow.add_argument("--id", required=True)
+    cshow.set_defaults(func=cmd_close)
 
     pbar = sub.add_parser(
         "barrier",

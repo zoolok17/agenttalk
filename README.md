@@ -987,6 +987,53 @@ evidence metadata: `risk_class`, `release_blocker`,
 approval can use `risk_class=none`, `release_blocker=no`, `n/a` evidence
 fields, and a short `na_reason`.
 
+### Milestone/release close (`agenttalk close`)
+
+`agenttalk close {open,ack,draft,counter decide,check,publish,reopen,list,show}`
+aggregates the assurance signals above — gate state, typed review evidence,
+and named-gate-bound remediation — into one auditable `HOLD`/`GO` verdict for a
+frozen revision, gathered from a declared set of required review **lenses** and
+published by a lead. State is a per-close atomic JSON file in
+`.agenttalk/closes/<id>.json`. It is **opt-in** (no required lenses or gates by
+default) and **advisory**: like gates, agenttalk authenticates the sender but
+does not enforce identity, so close records *who acted* and is a strong release
+signal + audit trail, never an enforced lock. The bus carries the evidence text;
+the close file stores pointers, not copies.
+
+`close open --id ID --scope release --revision REF --lens NAME --allow NAME:AGENT`
+freezes `REF` to a full SHA via git (a dirty worktree needs `--dirty-artifact`
+or stays `HOLD` on revision) and declares the required lenses. `--allow
+NAME:AGENT` authorizes an agent, `--allow NAME:@ROLE` a role; an ack from anyone
+else is `HOLD` (`unauthorized_lens_ack`) unless a lead records `--override`.
+
+`close ack --id ID --lens NAME --status accept|counter|na` records a lens
+verdict. `accept` reuses the 0.32.0 typed evidence (`--risk-class`,
+`--release-blocker`, `--tests-executed`, `--evidence`, …); `na` needs a
+`--reason`; `counter` raises a finding that holds the lens until the lead
+decides it with `close counter decide --decision accept|reject --reason …`.
+Accepting a counter records a remediation item; a `--blocker` remediation **must
+name a `--gate`**, and `GO` then requires that gate green from `automation_ci`
+or an operator waiver — gates remain the single resolution authority (close
+never creates or mutates gates).
+
+`close check --id ID` prints `HOLD`/`GO` with stable hold codes and exits
+`0`=GO / `3`=HOLD, matching `gate check` so they compose in automation. The
+verdict is a pure function over (close record, gate check): `GO` requires a
+well-formed record on a frozen, clean (or dirty-with-artifact) revision, a gate
+`GO`, every required lens satisfied by an authorized non-stale ack, every
+counter decided, and every accepted blocker remediation resolved by its gate. A
+revision change stales prior acks (they reviewed different code).
+
+`close publish --id ID --from LEAD --verdict go|hold` records the terminal
+snapshot; a `go` is refused unless `check` is `GO`. Post-publish acks are
+rejected until a lead runs `close reopen`, so a close is stale-proof **without**
+a team-wide epoch bump. The global epoch is audit-only at open; only an explicit
+`close publish --verdict go --bump-barrier` fires the release barrier (after
+recording `GO`), and a `hold` never bumps it.
+
+P3 items — role→member routing, specialist discovery, skill rubrics, severity
+policy, and ephemeral adversarial reviewers — are intentionally out of scope.
+
 ### Rejoining a session with `sync`
 
 Use `agenttalk sync --for A` before an agent acts after a restart,
