@@ -2339,6 +2339,231 @@ def cmd_lane(args: argparse.Namespace) -> int:
     return 2
 
 
+# ----------------------------------------------------------------- knowledge (P2)
+#
+# Knowledge layer: the CLI/git adapter resolves anchor I/O (HEAD, reachability,
+# anchor-path diff, target existence) and hands knowledge.compute_staleness
+# already-resolved data - the staleness derivation stays pure + anchor-relative.
+
+def _kn_full_head(store) -> str | None:
+    rc, out = _git(store.root, ["rev-parse", "HEAD"])
+    out = out.strip()
+    return out if rc == 0 and lane_mod._FULL_SHA_RE.match(out) else None
+
+
+def _knowledge_anchor_status(store, note: dict) -> dict:
+    from agenttalk import knowledge as kn
+    anchor = note.get("anchor") or {}
+    kind = anchor.get("kind")
+    vsha = note.get("verified_against_sha")
+    head = _kn_full_head(store)
+    status = {"sha_reachable": None, "head_moved": False, "anchor_changed": None,
+              "anchor_exists": True, "evidence_match": None, "target_resolvable": True}
+    if vsha:
+        if head:
+            status["head_moved"] = (vsha != head)
+            rc, _ = _git(store.root, ["merge-base", "--is-ancestor", vsha, "HEAD"])
+            status["sha_reachable"] = (rc == 0)
+        else:
+            status["sha_reachable"] = None   # can't determine -> stale
+    p = kn.anchor_path(anchor)
+    if p is not None:
+        rce, _ = _git(store.root, ["cat-file", "-e", f"HEAD:{p}"])
+        status["anchor_exists"] = (rce == 0)
+        if vsha and head and status.get("sha_reachable"):
+            rcd, out = _git(store.root, ["diff", "--name-only", "-M", "-C", f"{vsha}..HEAD", "--", p])
+            status["anchor_changed"] = bool(out.strip()) if rcd == 0 else None
+        elif not vsha:
+            status["anchor_changed"] = False   # no baseline; rely on existence
+        else:
+            status["anchor_changed"] = None
+        if kind == "symbol":
+            status["evidence_match"] = None      # v1: no parser -> weak (caution)
+    elif kind == "sha":
+        rcs, _ = _git(store.root, ["cat-file", "-e", f"{anchor.get('sha', '')}^{{commit}}"])
+        status["target_resolvable"] = (rcs == 0)
+    elif kind == "request":
+        rid = anchor.get("request_id")
+        try:
+            status["target_resolvable"] = any(
+                (getattr(m, "meta", None) or {}).get("request_id") == rid
+                for m in store.valid_messages())
+        except Exception:  # noqa: BLE001 - a scan failure must not crash a read
+            status["target_resolvable"] = True
+    return status
+
+
+def _knowledge_eval(store, note: dict, registry):
+    from agenttalk import knowledge as kn
+    domains = registry.data.get("domains") or {}
+    domain_exists = note.get("domain_id") in domains
+    return kn.compute_staleness(
+        note, domain_exists=domain_exists,
+        current_registry_hash=registry.registry_hash,
+        anchor_status=_knowledge_anchor_status(store, note))
+
+
+def _kn_anchor_from_args(args):
+    from agenttalk import knowledge as kn
+    spec = {"kind": args.anchor_kind}
+    for f in ("path", "symbol", "request_id", "msg_id", "mission", "wp_id", "sha"):
+        v = getattr(args, f, None)
+        if v:
+            spec[f] = v
+    return kn.validate_anchor(spec)
+
+
+def _kn_print_note(note: dict, verdict: dict) -> None:
+    a = note.get("anchor") or {}
+    tag = note.get("authority", {}).get("state", "?")
+    flags = ""
+    if verdict.get("hard_stale"):
+        flags = "  STALE[" + ",".join(verdict["stale_reasons"]) + "]"
+    elif verdict.get("caution_flags"):
+        flags = "  caution[" + ",".join(verdict["caution_flags"]) + "]"
+    body0 = (note.get("body", "") or "").splitlines()
+    print(f"  [{note.get('type')}] {note.get('domain_id')}/{note.get('key')} ({tag}){flags}")
+    print(f"      {(body0[0] if body0 else '')[:200]}")
+    print(f"      -> {a.get('kind')}:{a.get('path') or a.get('request_id') or a.get('sha') or a.get('wp_id') or ''}")
+
+
+def cmd_knowledge(args: argparse.Namespace) -> int:
+    """Knowledge layer MVP (durable pointer notes; see knowledge.py)."""
+    from agenttalk import knowledge as kn
+    store = _get_store(args)
+    action = getattr(args, "knowledge_cmd", None)
+    roster = store.load_config().get("agents") or []
+
+    if action == "publish":
+        actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        reg = _load_domain_registry(store)
+        if args.domain not in (reg.data.get("domains") or {}):
+            sys.stderr.write(f"agenttalk knowledge publish: unknown domain {args.domain!r} "
+                             f"(known: {sorted((reg.data.get('domains') or {}))}).\n")
+            return 2
+        # verified-against defaults to HEAD; capture is OPEN (any active agent).
+        if args.verified_against:
+            try:
+                vsha = _lane_resolve(store, args.verified_against)
+            except lane_mod.LaneError as e:
+                sys.stderr.write(f"agenttalk knowledge publish: {e}\n")
+                return 2
+        else:
+            vsha = _kn_full_head(store)
+        dentry = reg.data["domains"][args.domain]
+        owners = dom.resolve_refset(dentry.get("owners") or {}, store.load_config())
+        curators = dom.resolve_refset(dentry.get("curators") or {}, store.load_config())
+        resolved_from = "curator" if actor in curators else "owner" if actor in owners else \
+            "lead" if actor in _close_lead_set(store) else "active_agent"
+        try:
+            evt = kn.new_publish_event(
+                note_id=kn.new_note_id(), key=args.key, type=args.type,
+                domain_id=args.domain, body=args.message, anchor=_kn_anchor_from_args(args),
+                verified_against_sha=vsha, domain_registry_hash=reg.registry_hash,
+                author=actor, resolved_from=resolved_from, at=_iso_now())
+        except kn.KnowledgeError as e:
+            sys.stderr.write(f"agenttalk knowledge publish: {e}\n")
+            return 2
+        kn.append_event(store, evt)
+        print(f"published note {evt['id']} {args.domain}/{args.key} ({args.type}, uncurated)")
+        return 0
+
+    if action == "curate":
+        sub = getattr(args, "curate_cmd", None)
+        if sub not in ("verify", "retract"):
+            sys.stderr.write("agenttalk knowledge curate: expected verify or retract.\n")
+            return 2
+        actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        reg = _load_domain_registry(store)
+        dom_entry = (reg.data.get("domains") or {}).get(args.domain)
+        if not dom_entry:
+            sys.stderr.write(f"agenttalk knowledge curate: unknown domain {args.domain!r}.\n")
+            return 2
+        owners = dom.resolve_refset(dom_entry.get("owners") or {}, store.load_config())
+        curators = dom.resolve_refset(dom_entry.get("curators") or {}, store.load_config())
+        # CURATION is ENFORCED (it gates the verified/authoritative set): owner/
+        # curator of the domain, or a lead override. Refuse others (fail closed).
+        resolved_from = kn.resolve_curation_authority(
+            actor, owner_agents=owners, curator_agents=curators,
+            is_lead=actor in _close_lead_set(store))
+        if resolved_from is None:
+            sys.stderr.write(
+                f"agenttalk knowledge curate: {actor!r} is not an owner/curator of "
+                f"{args.domain!r} (or a lead) - refusing (curation gates the verified set).\n")
+            return 2
+        with store._config_lock():
+            events, _ = kn.read_events(store)
+            view = kn.current_view(events)
+            base = view.get((args.domain, args.key))
+            if not base or kn.is_retracted(base):
+                sys.stderr.write(f"agenttalk knowledge curate: no live note {args.domain}/{args.key}.\n")
+                return 2
+            try:
+                evt = kn.new_curate_event(base=base, action=sub, curated_by=actor,
+                                          resolved_from=resolved_from, at=_iso_now(),
+                                          reason=args.reason)
+            except kn.KnowledgeError as e:
+                sys.stderr.write(f"agenttalk knowledge curate: {e}\n")
+                return 2
+            kn.knowledge_dir(store).mkdir(parents=True, exist_ok=True)
+            with open(kn.notes_path(store), "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(evt, ensure_ascii=False, sort_keys=True) + "\n")
+        print(f"{sub} {args.domain}/{args.key} by {actor} ({resolved_from})")
+        return 0
+
+    if action in ("pull", "search", "onboard"):
+        events, problems = kn.read_events(store)
+        reg = _load_domain_registry(store)
+        view = kn.current_view(events)
+        rows = []
+        for (domain_id, _key), note in sorted(view.items()):
+            if getattr(args, "domain", None) and domain_id != args.domain:
+                continue
+            rows.append((note, _knowledge_eval(store, note, reg)))
+        include_stale = getattr(args, "include_stale", False)
+        include_uncurated = getattr(args, "include_uncurated", False)
+
+        def visible(note, verdict):
+            if kn.is_retracted(note):
+                return False
+            if verdict["hard_stale"] and not include_stale:
+                return False
+            if not kn.is_curated(note) and not include_uncurated:
+                return False
+            return True
+
+        if action == "search":
+            q = (args.query or "").casefold()
+            rows = [(n, v) for (n, v) in rows if q in json.dumps(
+                {"k": n.get("key"), "b": n.get("body"), "t": n.get("type"),
+                 "a": n.get("anchor")}, ensure_ascii=False).casefold()]
+        shown = [(n, v) for (n, v) in rows if visible(n, v)]
+        if getattr(args, "json", False):
+            print(json.dumps([{**n, "_verdict": v} for (n, v) in shown], indent=2))
+            return 0
+        if action == "onboard":
+            who = (" for " + args.for_agent) if getattr(args, "for_agent", None) else ""
+            print(f"knowledge onboard{who}: {len(shown)} active note(s)")
+            by_domain: dict = {}
+            for n, v in shown:
+                by_domain.setdefault(n["domain_id"], []).append((n, v))
+            for d in sorted(by_domain):
+                print(f"domain {d}:")
+                for n, v in by_domain[d]:
+                    _kn_print_note(n, v)
+            return 0
+        label = "matching" if action == "search" else "active"
+        print(f"knowledge {action}: {len(shown)} {label} note(s)"
+              + (f"; {len(problems)} corrupt line(s) (see doctor)" if problems else ""))
+        for n, v in shown:
+            _kn_print_note(n, v)
+        return 0
+
+    sys.stderr.write(
+        "agenttalk knowledge: expected publish, curate, pull, search, or onboard.\n")
+    return 2
+
+
 def cmd_prune(args: argparse.Namespace) -> int:
     """Quarantine invalid message files (#17, 0.15.0).
 
@@ -2830,6 +3055,64 @@ def cmd_barrier(args: argparse.Namespace) -> int:
     return 0
 
 
+def _roster_expertise(store, *, json_out: bool) -> int:
+    """Per-domain expertise DERIVED from existing evidence (no expertise registry):
+    strong = domain owners/reviewers/curators (domains.json) + lane-delivery history
+    by domain; weak = CURATED note authors by domain (raw uncurated notes are
+    gameable volume, excluded). Knowledge dependency on Phase 0 domains."""
+    from agenttalk import knowledge as kn
+    cfg = store.load_config()
+    reg = _load_domain_registry(store)
+    domains = reg.data.get("domains") or {}
+    # lane delivery history by domain (who actually shipped)
+    delivered: dict[str, list[str]] = {}
+    ddir = store.dir / "lane-deliveries"
+    if ddir.exists():
+        for f in sorted(ddir.glob("*.json")):
+            try:
+                art = json.loads(f.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                continue
+            d = art.get("domain_id")
+            who = art.get("assignee")
+            if isinstance(d, str) and isinstance(who, str):
+                delivered.setdefault(d, []).append(who)
+    # curated note authors by domain (weak; uncurated excluded)
+    events, _ = kn.read_events(store)
+    curated_authors: dict[str, dict] = {}
+    for note in kn.current_view(events).values():
+        if kn.is_curated(note) and not kn.is_retracted(note):
+            d = note.get("domain_id")
+            a = note.get("author")
+            if isinstance(d, str) and isinstance(a, str):
+                curated_authors.setdefault(d, {}).setdefault(a, 0)
+                curated_authors[d][a] += 1
+    out = {}
+    for did, dentry in sorted(domains.items()):
+        out[did] = {
+            "owners": dom.resolve_refset(dentry.get("owners") or {}, cfg),
+            "reviewers": dom.resolve_refset(dentry.get("reviewers") or {}, cfg),
+            "curators": dom.resolve_refset(dentry.get("curators") or {}, cfg),
+            "delivered_lanes": sorted(set(delivered.get(did, []))),
+            "curated_notes_by": curated_authors.get(did, {}),
+        }
+    if json_out:
+        print(json.dumps(out, indent=2))
+        return 0
+    if not out:
+        print("expertise: no domains defined (author .agenttalk/domains.json)")
+        return 0
+    print(f"expertise by domain ({len(out)}):")
+    for did, e in out.items():
+        print(f"  {did}: owners={e['owners'] or '-'} reviewers={e['reviewers'] or '-'} "
+              f"curators={e['curators'] or '-'}")
+        if e["delivered_lanes"]:
+            print(f"      shipped lanes: {', '.join(e['delivered_lanes'])}")
+        if e["curated_notes_by"]:
+            print(f"      curated notes: {', '.join(f'{a}×{n}' for a, n in e['curated_notes_by'].items())}")
+    return 0
+
+
 def cmd_roster(args: argparse.Namespace) -> int:
     """View or manage the roster, roles, and groups.
 
@@ -2967,6 +3250,9 @@ def cmd_roster(args: argparse.Namespace) -> int:
         store.set_operator_facing(args.name)  # ValueError -> exit 2 via main()
         print(f"roster: {args.name} is now operator-facing (the liaison)")
         return 0
+
+    if action is None and getattr(args, "expertise", False):
+        return _roster_expertise(store, json_out=getattr(args, "json", False))
 
     # show
     cfg = store.load_config()
@@ -5155,6 +5441,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     proster.add_argument("--json", action="store_true",
                          help="(show) machine-readable roster/roles/groups.")
+    proster.add_argument("--expertise", action="store_true",
+                         help="(show) per-domain expertise derived from domains.json "
+                              "owners/reviewers/curators + lane-delivery history + "
+                              "curated note authors (no expertise registry).")
     proster.set_defaults(func=cmd_roster, roster_cmd=None)
     rsub = proster.add_subparsers(dest="roster_cmd")
     r_add = rsub.add_parser("add", help="Add an agent (idempotent).")
@@ -5600,6 +5890,71 @@ def build_parser() -> argparse.ArgumentParser:
     lappr.add_argument("--from", dest="actor", help="Approving agent.")
     lappr.add_argument("--reason", required=True, help="Why the shared path is approved.")
     lappr.set_defaults(func=cmd_lane)
+
+    # ----- knowledge (durable pointer notes; capture-open, curate-gated, opt-in) -----
+    pkn = sub.add_parser(
+        "knowledge",
+        help="Durable, pointer-shaped project memory hung off the domain registry: "
+             "publish/curate/pull/search/onboard notes with anchor-relative staleness.",
+    )
+    pkn.set_defaults(func=cmd_knowledge, knowledge_cmd=None)
+    knsub = pkn.add_subparsers(dest="knowledge_cmd")
+
+    def _add_anchor_args(p):
+        p.add_argument("--anchor-kind", required=True, choices=sorted(["path", "symbol", "request", "wp", "sha"]))
+        p.add_argument("--path", help="anchor path (path/symbol/wp).")
+        p.add_argument("--symbol", help="anchor symbol (symbol).")
+        p.add_argument("--request-id", dest="request_id", help="anchor request id (request).")
+        p.add_argument("--msg-id", dest="msg_id", help="anchor message id (request, optional).")
+        p.add_argument("--mission", help="anchor mission (wp).")
+        p.add_argument("--wp-id", dest="wp_id", help="anchor wp id (wp).")
+        p.add_argument("--sha", help="anchor sha (sha).")
+
+    knpub = knsub.add_parser("publish", help="Capture a note (any active agent; uncurated).")
+    knpub.add_argument("--from", dest="actor", help="Publishing agent.")
+    knpub.add_argument("--domain", required=True, help="Domain id (must exist in domains.json).")
+    knpub.add_argument("--type", required=True, choices=sorted(["seam", "gotcha", "decision", "pointer"]))
+    knpub.add_argument("--key", required=True, help="Stable note key (latest-by-key).")
+    knpub.add_argument("-m", "--message", required=True, help="The insight (not a copy of the anchor).")
+    knpub.add_argument("--verified-against", dest="verified_against",
+                       help="Ref/SHA the insight was verified against (default: HEAD).")
+    _add_anchor_args(knpub)
+    knpub.set_defaults(func=cmd_knowledge)
+
+    kncur = knsub.add_parser("curate", help="Verify or retract a note (owner/curator/lead).")
+    kncursub = kncur.add_subparsers(dest="curate_cmd")
+    for sub_name, helptext in (("verify", "Bless a note as verified."),
+                               ("retract", "Tombstone a note (needs --reason).")):
+        c = kncursub.add_parser(sub_name, help=helptext)
+        c.add_argument("--from", dest="actor", help="Curating agent.")
+        c.add_argument("--domain", required=True)
+        c.add_argument("--key", required=True)
+        c.add_argument("--reason", help="Reason (required for retract).")
+        c.set_defaults(func=cmd_knowledge)
+    kncur.set_defaults(func=cmd_knowledge, curate_cmd=None)
+
+    knpull = knsub.add_parser("pull", help="List active notes (default: curated, non-stale).")
+    knpull.add_argument("--domain", help="Limit to a domain.")
+    knpull.add_argument("--include-stale", dest="include_stale", action="store_true")
+    knpull.add_argument("--include-uncurated", dest="include_uncurated", action="store_true")
+    knpull.add_argument("--json", action="store_true")
+    knpull.set_defaults(func=cmd_knowledge)
+
+    knsearch = knsub.add_parser("search", help="Substring search over key/body/type/anchor.")
+    knsearch.add_argument("query", help="Search string.")
+    knsearch.add_argument("--domain")
+    knsearch.add_argument("--include-stale", dest="include_stale", action="store_true")
+    knsearch.add_argument("--include-uncurated", dest="include_uncurated", action="store_true")
+    knsearch.add_argument("--json", action="store_true")
+    knsearch.set_defaults(func=cmd_knowledge)
+
+    knonb = knsub.add_parser("onboard", help="Bounded digest grouped by domain/type.")
+    knonb.add_argument("--domain")
+    knonb.add_argument("--for", dest="for_agent", help="Agent the digest is for (label only).")
+    knonb.add_argument("--include-uncurated", dest="include_uncurated", action="store_true")
+    knonb.add_argument("--include-stale", dest="include_stale", action="store_true")
+    knonb.add_argument("--json", action="store_true")
+    knonb.set_defaults(func=cmd_knowledge)
 
     pbar = sub.add_parser(
         "barrier",

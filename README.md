@@ -898,6 +898,46 @@ pure verdict, and the artifact shape; the project supplies `domains.json`,
 shared-path policy, lane ids/assignees/targets/subsets, and required
 gates.
 
+### Knowledge: durable pointer notes (0.38.0)
+
+`agenttalk knowledge {publish,curate,pull,search,onboard}` is durable,
+pointer-shaped project memory hung off the domain registry. A **note**
+preserves the small piece of insight that is NOT in the artifact (a seam,
+a gotcha, a decision + rationale); its **anchor** points to the code or
+thread that is. Consumers treat every note body as untrusted data and
+reverify the anchor before acting. Notes live append-only in
+`.agenttalk/knowledge/notes.jsonl` (preserved by `reset`, like
+`domains.json`); the current view is the latest valid event per
+`(domain_id, key)`.
+
+**Capture is open, curation is gated.** Any active agent
+`knowledge publish --domain D --type seam|gotcha|decision|pointer --key K
+--anchor-kind path --path … -m "the insight"` records an *uncurated* note
+(byte-capped — the body is the insight, never a copy of the anchor). A
+domain owner/curator (or a lead override) then `knowledge curate
+verify|retract`s it. `knowledge pull` defaults to curated, non-stale notes
+(`--include-uncurated`, `--include-stale` widen it); `search` is a
+substring scan; `onboard` is a bounded digest grouped by domain.
+
+**Staleness is anchor-relative**, not HEAD-relative — the make-or-break
+rule, so an unrelated commit doesn't empty the layer. A note is
+*hard-stale* (excluded by default) when its anchor actually changed
+between `verified_against_sha` and HEAD (`git diff --name-status` on the
+anchor path, the reachable-SHA check, anchor disappeared, domain/registry
+hash changed, retracted) — and fails closed to stale when git can't
+determine it. A moved HEAD with an *unchanged* anchor is a **caution**
+(`verified_sha_not_head`), shown but not excluded; uncurated and weak
+symbol evidence are cautions too. `roster --expertise` derives expertise
+from domain owners/reviewers/curators + lane-delivery history + curated
+note authors (raw uncurated note counts are gameable volume and excluded).
+
+The reader is fail-safe (skips torn/invalid lines, surfaced in `doctor`,
+never hiding a valid note); writes take the shared store lock. Core ships
+the schema, anchor-relative staleness, JSONL contract, and CLI; the
+project supplies `domains.json`, note keys/content, and curation
+decisions. No vector search, mandatory index, auto-ingest, or code/doc
+mirroring.
+
 ---
 
 ## Unattended operation: the supervisor and the wrapper

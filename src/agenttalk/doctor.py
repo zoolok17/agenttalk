@@ -111,7 +111,33 @@ def run(project_root: Path | None = None) -> Report:
         codex_vis = _check_supervised_codex(store)
         if codex_vis is not None:  # additive: absent unless a supervised codex agent
             report.checks.append(codex_vis)
+        kn_check = _check_knowledge(store)
+        if kn_check is not None:  # additive: absent unless a knowledge store exists
+            report.checks.append(kn_check)
     return report
+
+
+def _check_knowledge(store) -> Check | None:
+    """Surface corrupt/torn lines in the knowledge notes.jsonl (fail-safe reader);
+    absent unless the store exists."""
+    from agenttalk import knowledge as kn
+    if not kn.notes_path(store).exists():
+        return None
+    try:
+        events, problems = kn.read_events(store)
+    except Exception as e:  # noqa: BLE001 - doctor never crashes
+        return Check(name="knowledge_notes", status="warn",
+                     details=f"could not scan notes.jsonl: {e}")
+    if problems:
+        return Check(
+            name="knowledge_notes", status="warn",
+            details=(f"{len(problems)} corrupt/torn line(s) in notes.jsonl "
+                     f"(skipped; valid notes unaffected): "
+                     + "; ".join(f"line {p['line']}: {p['error']}" for p in problems[:5])),
+            data={"valid": len(events), "problems": problems},
+        )
+    return Check(name="knowledge_notes", status="ok",
+                 details=f"{len(events)} valid knowledge event(s), no corrupt lines")
 
 
 # ---------------------------------------------------------- individual checks
