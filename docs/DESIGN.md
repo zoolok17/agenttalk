@@ -124,7 +124,10 @@ catastrophic, so it is asserted by the end-to-end regression test.
   never exit a loop. `release --relay-human` (relay a human stand-down) XOR
   `--emergency` (narrow lead override, must be reported to the operator), both
   require `--reason`. The authorized relay = the operator-facing liaison if
-  configured, else the sole active lead; **fails closed** otherwise.
+  configured, else the sole active lead; **fails closed** otherwise. The CLI,
+  store helpers, and wrapper loop all use the same resolver because divergent
+  loop-exit authority is itself a liveness bug: no liaison, multiple leads, or
+  no sole lead means deny rather than guessing.
 - **Why:** agents kept going offline because a lead's casual prose ("stand down
   for the night") leaked outside the typed-signal channel. The rule "only the
   human stands an agent down, relayed by the lead" applies principle #1 (bodies
@@ -143,7 +146,8 @@ adds typed evidence and fail-closed verdicts to the human/agent claim of "done."
 - **`gate` (`gates.py`, v0.32.0):** named gates with HOLD/GO; a `severity=blocker`
   gate can only be green from `automation_ci` or an operator waiver; typed
   review-result evidence (`risk_class`, `release_blocker`, `tests_referenced` vs
-  `tests_executed`, `na_reason`). A corrupt/unreadable gate state HOLDs.
+  `tests_executed`, `na_reason`). Review prose helps humans, but gates consume
+  typed metadata; a corrupt/unreadable gate state HOLDs.
 - **`close` (`close.py`, v0.33.0):** milestone-close with a *pure* `compute_verdict`
   and stable HOLD codes; lens authorization; blocker-gate-must-be-green.
 - **Sign-offs (v0.34.0):** specialist sign-off by risk class, `signoffs.json`,
@@ -170,6 +174,11 @@ two parallel ownership concepts.
   *infers* clean), and gate-clean. Pure `compute_verdict` core + a thin git
   adapter (so verdict logic is unit-testable with no live repo); durable delivery
   artifact written before the lane is cleared; fingerprint re-validated under lock.
+  Shared-path approvals are registry-entry authority, not raw path-prefix
+  authority: the current hardening rule is to resolve the responsible shared
+  entry at verdict time, revalidate the persisted approval against the current
+  epoch/registry, and HOLD on ambiguous overlaps instead of letting a broad glob
+  clear a more-specific path.
 - **Knowledge (`knowledge.py`, v0.38.0):** an append-only **pointer** layer
   (`notes.jsonl`), latest valid event by `(domain_id, key)`. Capture-open +
   curate-gated (anyone publishes `uncurated`; owners/curators/lead verify/
@@ -180,8 +189,10 @@ two parallel ownership concepts.
   roles + lane-delivery history.
 - **Why:** a project needs ownership (who may change/approve what) and memory
   (the durable *why* behind seams/gotchas) that survive resets and don't rot.
-  Pointers + anchor-relative staleness keep memory trustworthy instead of a
-  stale wall of text.
+  The domain registry is the authority spine for both: lanes answer "may this
+  diff move now?", while knowledge answers "what durable context should the next
+  worker load?" Pointers + anchor-relative staleness keep memory trustworthy
+  instead of a stale wall of text.
 
 ### 4.6 Unattended operation — supervisor & wrapper
 - **Supervisor (`supervisor.py`):** generates a PowerShell monitor that launches/
@@ -243,6 +254,15 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
 - **D-10 Per-phase cadence with isolated worktrees.** *Why:* concurrent builders
   on one working tree collide on `git checkout`; each builder uses an isolated
   `git worktree`. (See §6.)
+
+- **D-11 Shared lane approval is entry-based authority.** *Why:* a broad
+   approval for `shared/**` must not clear a sensitive nested path such as
+   `shared/secret.sql` when the registry assigns that nested entry a different
+   approver set. Verdicts resolve the responsible shared entry from the current
+   registry, revalidate persisted approvals against that entry, and fail closed
+   on ambiguous equal-specificity overlaps. *Rejected:* raw path-prefix
+   approval, first-match-wins, and accepting any stored glob that happens to
+   match.
 
 ## 6. How we work (process)
 

@@ -52,9 +52,11 @@ codex, gated by lead, built by dev-2, cross-reviewed by codex + reviewer-1.
   and that `reset` preserves the durable set. Covers the previously-untested
   CLI↔core wiring, git adapter, and reset durability boundary.
 
-Status: built at `c56b626` (1208 tests green); reviewer-1 CHANGES_REQUESTED for
-the overlapping-glob P1 (now being folded into the same branch); codex verdict
-pending. Lead gate (ruff/bandit/3.10+3.14/diff-check) + ship after both approve.
+Status: built at `c56b626` (1208 tests green); reviewer-1 and codex both
+CHANGES_REQUESTED for the overlapping-glob P1 (broad approval can still clear a
+more-specific shared path at verdict time). Fold the most-specific/ambiguous-HOLD
+fix into the same branch, then rerun lead gate
+(ruff/bandit/3.10+3.14/diff-check) and ship only after both approve.
 
 ## PLANNED — v0.40.1 fast-follow
 
