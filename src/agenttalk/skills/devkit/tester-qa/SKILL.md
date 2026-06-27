@@ -51,9 +51,12 @@ Produce a `kind=review-result` the P2/P3 `agenttalk close` consumes:
   tests_executed=<actual command + pass/fail + exit, or a CI run id|n/a> --meta
   residual_risk=<gaps left|n/a> --meta evidence=<output/artifact pointer>`, plus
   `na_reason` for any `n/a`.
-- **COUNTER** → `release_blocker=yes|unknown` + `risk_class` + the failing repro / gap
-  so the lead records a close counter + remediation.
-- **NA** → `risk_class=none`, `release_blocker=no`, n/a fields + a specific `na_reason`.
+- **COUNTER (changes needed)** → `--meta status=rejected --meta risk_class=quality
+  --meta release_blocker=<yes|unknown>` + the failing repro / gap so the lead records a
+  close counter + remediation.
+- **NA (does not apply)** → the lightweight-approved shape: `--meta status=approved
+  --meta risk_class=none --meta release_blocker=no` + n/a evidence fields + `--meta
+  na_reason=<why it does not apply>`.
 
 **HONESTY (hard rule):** `tests_executed` is what you ACTUALLY ran — the real command
 plus its observed result/exit code, or a CI run id. `tests_referenced` is inspected

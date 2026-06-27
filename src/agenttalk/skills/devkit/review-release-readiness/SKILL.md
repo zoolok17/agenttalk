@@ -46,10 +46,12 @@ Produce a `kind=review-result` the P2/P3 `agenttalk close` consumes:
   release_blocker=no --meta tests_referenced=<…|n/a> --meta tests_executed=<CI run id
   / actual command + result|n/a> --meta residual_risk=<…|n/a> --meta
   evidence=<run id / artifact pointer>`, plus `na_reason` for any `n/a`.
-- **COUNTER / HOLD** → `release_blocker=yes` + `risk_class=release`, evidence, and the
-  concrete blocking list so the lead records a close counter/remediation and does NOT
-  publish GO.
-- **NA** → `risk_class=none`, `release_blocker=no`, n/a fields + a specific `na_reason`.
+- **COUNTER / HOLD** → `--meta status=rejected --meta risk_class=release --meta
+  release_blocker=yes` + evidence + the concrete blocking list so the lead records a
+  close counter/remediation and does NOT publish GO.
+- **NA (does not apply)** → the lightweight-approved shape: `--meta status=approved
+  --meta risk_class=none --meta release_blocker=no` + n/a evidence fields + `--meta
+  na_reason=<why it does not apply>`.
 
 **HONESTY (hard rule):** a release-readiness GO is the highest-stakes ACCEPT — its
 `tests_executed`/`evidence` MUST point to a real `automation_ci` run (id/link), never a

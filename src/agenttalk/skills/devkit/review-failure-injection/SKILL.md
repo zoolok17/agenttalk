@@ -50,9 +50,12 @@ Produce a `kind=review-result` the P2/P3 `agenttalk close` consumes:
   tests_executed=<actual command + result/exit, or a CI run id|n/a> --meta
   residual_risk=<…|n/a> --meta evidence=<artifact/pointer>`, plus `--meta
   na_reason=<why>` for any `n/a` field.
-- **COUNTER** → include `risk_class`, `release_blocker`, evidence/artifacts, and a
-  concrete findings list so the lead can record a close counter + remediation.
-- **NA** → `risk_class=none`, `release_blocker=no`, n/a fields, and a specific `na_reason`.
+- **COUNTER (changes needed)** → `--meta status=rejected --meta risk_class=<primary>
+  --meta release_blocker=<yes|unknown>` + evidence/artifacts + a concrete findings list
+  so the lead can record a close counter + remediation.
+- **NA (lens does not apply)** → the lightweight-approved shape: `--meta status=approved
+  --meta risk_class=none --meta release_blocker=no` + n/a evidence fields + `--meta
+  na_reason=<why it does not apply>`.
 
 Pick the **primary** `risk_class` by the worst failure mode found —
 `persistence` (corruption/torn write), `security` (hostile input / fail-open),

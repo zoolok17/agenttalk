@@ -49,9 +49,12 @@ Produce a `kind=review-result` the P2/P3 `agenttalk close` consumes:
   release_blocker=yes|no|unknown --meta tests_referenced=<…|n/a> --meta
   tests_executed=<actual command + result/exit, or a CI run id|n/a> --meta
   residual_risk=<…|n/a> --meta evidence=<artifact/pointer>`, plus `na_reason` for any `n/a`.
-- **COUNTER** → include `risk_class`, `release_blocker`, evidence/artifacts, and a
-  concrete drift list so the lead can record a close counter + remediation.
-- **NA** → `risk_class=none`, `release_blocker=no`, n/a fields, and a specific `na_reason`.
+- **COUNTER (changes needed)** → `--meta status=rejected --meta risk_class=docs-contract
+  --meta release_blocker=<yes|unknown>` + evidence/artifacts + a concrete drift list so
+  the lead can record a close counter + remediation.
+- **NA (lens does not apply)** → the lightweight-approved shape: `--meta status=approved
+  --meta risk_class=none --meta release_blocker=no` + n/a evidence fields + `--meta
+  na_reason=<why it does not apply>`.
 
 Primary `risk_class` is usually `docs-contract`; use a `project:<name>` extension only
 if the project defines a more exact class.
