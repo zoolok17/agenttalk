@@ -1673,8 +1673,17 @@ def cmd_close(args: argparse.Namespace) -> int:
                 "agenttalk close publish: refusing GO - close check is HOLD:\n")
             _print_verdict(args.id, result)
             return 3
+        verdict = close_mod.VERDICT_GO if args.verdict == "go" else close_mod.VERDICT_HOLD
+        # Durably record + persist the final verdict BEFORE any team-wide barrier
+        # bump, so a failed write can never leave the global epoch advanced without
+        # a published GO behind it (reviewer-1/codex finding 2).
+        close_mod.record_publish(
+            record, verdict=verdict, by=actor, at=_iso_now(),
+            reason=args.reason or "", gate_check=gate_check,
+            residual_risk=args.residual_risk, barrier_epoch=None)
+        close_mod.save_close(store, record)
         barrier_epoch = None
-        if args.verdict == "go" and args.bump_barrier:
+        if verdict == close_mod.VERDICT_GO and args.bump_barrier:
             msg = store.send(
                 sender=actor, recipient=actor, kind="message",
                 subject=f"release barrier: close {args.id}",
@@ -1682,12 +1691,9 @@ def cmd_close(args: argparse.Namespace) -> int:
                 meta={"barrier": {"version": 1, "scope": "global",
                                   "type": "epoch-bump"}, "close_id": args.id})
             barrier_epoch = msg.id
-        verdict = close_mod.VERDICT_GO if args.verdict == "go" else close_mod.VERDICT_HOLD
-        close_mod.record_publish(
-            record, verdict=verdict, by=actor, at=_iso_now(),
-            reason=args.reason or "", gate_check=gate_check,
-            residual_risk=args.residual_risk, barrier_epoch=barrier_epoch)
-        close_mod.save_close(store, record)
+            # best-effort stamp the barrier id onto the already-persisted GO
+            record["final"]["barrier_epoch"] = barrier_epoch
+            close_mod.save_close(store, record)
         print(f"published close {args.id}: {verdict} by {actor}"
               + (f"; release barrier {barrier_epoch}" if barrier_epoch else ""))
         return 0 if verdict == close_mod.VERDICT_GO else 3

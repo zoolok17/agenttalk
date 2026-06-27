@@ -55,6 +55,11 @@ COUNTER_REJECTED = "rejected"
 VERDICT_GO = "GO"
 VERDICT_HOLD = "HOLD"
 
+# A named blocker-remediation gate counts as resolved only when its check status
+# is one of these (and it is non-blocking). gates.py guarantees a blocker goes
+# `green` only from automation_ci, and `waived` only with a valid operator waiver.
+RESOLVED_GATE_STATUSES = frozenset({"green", "waived"})
+
 # STABLE hold codes (the public verdict contract - tests assert each one).
 HOLD_MALFORMED = "malformed_state"
 HOLD_REVISION = "revision_dirty_or_unresolved"
@@ -190,9 +195,22 @@ def _verdict(holds: list[dict]) -> dict[str, Any]:
 
 
 def _green_gate_names(gate_check: dict) -> set[str]:
+    """Names of gates a blocker remediation may rely on as RESOLVED: the gate must
+    be GREEN or actively WAIVED *and* non-blocking in this check. gates.py is the
+    single authority that a blocker gate only goes green from automation_ci and
+    that a waiver is valid/unexpired; here we additionally refuse a merely
+    non-blocking gate (e.g. red/warn, skipped, unknown/info) so a blocker
+    remediation is resolved only by a truly green or waived gate, never an
+    unrelated low-severity/skipped one."""
     blocked = {b.get("name") for b in gate_check.get("blockers", [])}
-    return {g.get("name") for g in gate_check.get("gates", [])
-            if g.get("name") not in blocked and not g.get("blocks")}
+    resolved: set[str] = set()
+    for g in gate_check.get("gates", []):
+        name = g.get("name")
+        if name in blocked or g.get("blocks"):
+            continue
+        if str(g.get("status")) in RESOLVED_GATE_STATUSES:
+            resolved.add(name)
+    return resolved
 
 
 def _ack_authorized(ack: dict, lens: dict) -> bool:

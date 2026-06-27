@@ -158,18 +158,41 @@ def test_hold_accepted_counter_missing_remediation() -> None:
         close.compute_verdict(rec, _gate_go()))
 
 
-def test_hold_open_blocker_remediation_until_gate_green() -> None:
+def _blocker_rem_record() -> dict:
     rec = _satisfied()
     rec["counters"]["ctr-1"] = {
         "counter_id": "ctr-1", "lens": "sec", "decision": close.COUNTER_ACCEPTED,
         "remediation_id": "rem-1"}
     rec["remediation_items"]["rem-1"] = {
         "id": "rem-1", "blocker": True, "gate": "fix-gate"}
-    # gate not present/green -> HOLD
+    return rec
+
+
+def test_hold_open_blocker_remediation_until_gate_green() -> None:
+    rec = _blocker_rem_record()
+    # gate not present -> HOLD
     assert close.HOLD_OPEN_BLOCKER in _codes(close.compute_verdict(rec, _gate_go()))
-    # name the gate green -> GO
-    green = _gate_go([{"name": "fix-gate", "blocks": False}])
+    # name the gate green AND non-blocking -> GO
+    green = _gate_go([{"name": "fix-gate", "status": "green", "blocks": False}])
     assert close.compute_verdict(rec, green)["verdict"] == close.VERDICT_GO
+    # a waived (active) gate also resolves the blocker
+    waived = _gate_go([{"name": "fix-gate", "status": "waived", "blocks": False}])
+    assert close.compute_verdict(rec, waived)["verdict"] == close.VERDICT_GO
+
+
+@pytest.mark.parametrize("gate", [
+    {"name": "fix-gate", "status": "red", "severity": "warn", "blocks": False},
+    {"name": "fix-gate", "status": "skipped", "severity": "blocker", "blocks": False},
+    {"name": "fix-gate", "status": "unknown", "severity": "info", "blocks": False},
+    {"name": "fix-gate", "blocks": False},  # status absent
+])
+def test_blocker_remediation_not_resolved_by_merely_nonblocking_gate(gate: dict) -> None:
+    # codex finding: a non-blocking but NOT green/waived gate must NOT resolve a
+    # blocker remediation (else a red/warn or skipped gate would yield a false GO).
+    rec = _blocker_rem_record()
+    result = close.compute_verdict(rec, _gate_go([gate]))
+    assert result["verdict"] == close.VERDICT_HOLD
+    assert close.HOLD_OPEN_BLOCKER in _codes(result)
 
 
 def test_nonblocker_accepted_counter_with_remediation_is_go() -> None:
@@ -313,6 +336,21 @@ def test_cli_publish_go_bump_barrier_fires_release_barrier(tmp_path: Path) -> No
     epoch = rec["final"]["barrier_epoch"]
     assert epoch is not None
     assert Store(root).current_epoch() == epoch  # the release barrier is now current
+
+
+def test_cli_publish_records_go_even_without_barrier_bump(tmp_path: Path) -> None:
+    # the GO snapshot is persisted independently of the barrier bump (ordering
+    # fix): publishing GO without --bump-barrier still records final GO + no epoch.
+    root = _init(tmp_path)
+    store = Store(root)
+    _open(root)
+    _accept(root)
+    assert _run(["close", "publish", "--id", "rel", "--from", "lead",
+                 "--verdict", "go"], root) == 0
+    rec = close.load_close(store, "rel")
+    assert rec["final"]["verdict"] == close.VERDICT_GO
+    assert rec["final"]["barrier_epoch"] is None
+    assert store.current_epoch() is None  # no barrier unless --bump-barrier
 
 
 def test_cli_publish_hold_never_bumps_barrier(tmp_path: Path) -> None:
