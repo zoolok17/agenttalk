@@ -35,6 +35,29 @@ The first row is the whole essence; everything else is opt-in.
 
 ---
 
+## The minimal start (just tell the agent)
+
+You don't have to pre-declare a roster or learn any commands to get an agent
+onto the bus. If a project already has agenttalk initialized and the skills
+installed (the one-time setup in the [TL;DR](#tldr--getting-started) below),
+just start a fresh CLI and tell the agent, in plain language:
+
+> We use agenttalk in this project. Give yourself a unique name, add yourself
+> to the roster as a developer (or reviewer), then wait for the lead to contact
+> you.
+
+The agent reads its agenttalk skill, picks a name, runs `agenttalk roster add
+<name> --role developer`, and drops into listen mode (`/agenttalk.listen`).
+That's the whole entry gate — the lead (or you) drives it from there. **Roles
+are free-form labels**, so `developer`, `reviewer`, `tester`, or anything else
+you name works.
+
+The precise setup below — `init --agents ...` and explicit roster/role/group
+commands — is for when you want names and structure pinned up front. It is *not*
+a prerequisite.
+
+---
+
 ## TL;DR — getting started
 
 ```powershell
