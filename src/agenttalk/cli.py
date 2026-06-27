@@ -1711,7 +1711,23 @@ def _cmd_close_signoffs(args, store, roster) -> int:
     if sub == "override":
         record = close_mod.load_close(store, args.id)
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
-        _check_close_authority(store, actor, "signoffs override")
+        # ENFORCED (not advisory): a signoff override bypasses a REQUIRED specialist
+        # set -> false GO if anyone could record it (reviewer-1 blocker). It is a
+        # close-lead privilege; refuse a non-lead, and fail closed when no lead is
+        # configured (no authority to record the bypass).
+        leads = _close_lead_set(store)
+        if not leads:
+            sys.stderr.write(
+                "agenttalk close signoffs override: no close lead is configured "
+                "(role=lead or operator-facing) - cannot record a signoff override "
+                "(it bypasses a required specialist set). Designate a lead first.\n")
+            return 2
+        if actor not in leads:
+            sys.stderr.write(
+                f"agenttalk close signoffs override: {actor!r} is not a close lead "
+                f"{sorted(leads)}; the override escape is a close-lead privilege. "
+                "Refusing.\n")
+            return 2
         try:
             close_mod.signoff_override(record, set_id=args.set, by=actor,
                                        at=_iso_now(), reason=args.reason)

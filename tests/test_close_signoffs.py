@@ -247,6 +247,21 @@ def test_signoff_override_set_satisfies_unroutable() -> None:
         rec, _gate_go(), _ev(rec, candidates={"security:sec": []}))["verdict"] == close.VERDICT_GO
 
 
+def test_signoff_stale_route_on_revision_change() -> None:
+    # reviewer-1 blocker: a route derived for revision A must HOLD after the close
+    # is reopened to revision B, even with fresh acks, until apply is rerun.
+    rec = _signoff_record(_signoff_policy())
+    rec["revision"] = OTHER_SHA   # reopened to new code; route still pins SHA
+    s = _slots(rec)
+    _sack(rec, s[0], "alice")
+    _sack(rec, s[1], "bob")
+    # the acks are at OTHER_SHA (current) so they are not ack-stale, but the ROUTE
+    # is stale -> HOLD until re-apply
+    ev = _ev(rec)
+    ev["current_risk_inventory_hash"] = rec["signoff_route"]["risk_inventory_hash"]
+    assert close.HOLD_STALE_ROUTE in _codes(close.compute_verdict(rec, _gate_go(), ev))
+
+
 def test_signoff_required_count_zero_is_noop() -> None:
     pol = _signoff_policy(risk_policies={"security": [{
         "id": "sec", "required_count": 0, "candidates": {"roles": ["sec"]}}]})
@@ -371,6 +386,44 @@ def test_cli_signoff_override_escape(tmp_path: Path) -> None:
     assert _run(["close", "signoffs", "override", "--id", "rel", "--set",
                  "security:sec", "--from", "lead", "--reason", "no specialist"], root) == 0
     assert _run(["close", "check", "--id", "rel"], root) == 0   # override resolves
+
+
+def test_cli_signoff_override_refused_from_non_lead(tmp_path: Path) -> None:
+    # reviewer-1 blocker: the override escape is ENFORCED close-lead, not advisory.
+    pol = {"schema_version": 1, "risk_policies": {"security": [{
+        "id": "sec", "required_count": 1, "candidates": {"roles": ["ghost"]}}]},
+        "allow_unmapped": False}
+    root = _init_signoff(tmp_path, policy=pol)
+    _open_signoff(root, "security")
+    assert _run(["close", "check", "--id", "rel"], root) == 3   # unroutable
+    # carol is not a lead -> refused, no override recorded, still HOLD
+    assert _run(["close", "signoffs", "override", "--id", "rel", "--set",
+                 "security:sec", "--from", "carol", "--reason", "sneaky"], root) == 2
+    rec = close.load_close(Store(root), "rel")
+    assert rec.get("signoff_overrides", {}) == {}
+    assert _run(["close", "check", "--id", "rel"], root) == 3   # still HOLD
+    # the lead CAN
+    assert _run(["close", "signoffs", "override", "--id", "rel", "--set",
+                 "security:sec", "--from", "lead", "--reason", "no specialist"], root) == 0
+    assert _run(["close", "check", "--id", "rel"], root) == 0
+
+
+def test_cli_signoff_reopen_to_new_revision_holds_until_reapply(tmp_path: Path) -> None:
+    # full-path version of the route-revision blocker through the CLI.
+    root = _init_signoff(tmp_path)
+    _open_signoff(root, "security")
+    rec = close.load_close(Store(root), "rel")
+    s1, s2 = rec["required_signoffs"][0]["generated_lens_ids"]
+    _sign(root, "alice", s1)
+    _sign(root, "bob", s2)
+    assert _run(["close", "check", "--id", "rel"], root) == 0     # GO at original rev
+    # publish GO then reopen to a new revision (simulates re-review of new code)
+    _run(["close", "publish", "--id", "rel", "--from", "lead", "--verdict", "go"], root)
+    assert _run(["close", "reopen", "--id", "rel", "--from", "lead",
+                 "--revision", OTHER_SHA], root) == 0
+    # route still pinned to the old revision -> stale until re-apply, even though the
+    # prior acks would otherwise be re-collected
+    assert _run(["close", "check", "--id", "rel"], root) == 3
 
 
 def test_cli_signoff_domain_reviewers_additive(tmp_path: Path) -> None:

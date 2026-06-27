@@ -255,11 +255,15 @@ def _evaluate_signoffs(record: dict, ev: dict | None) -> list[tuple[str, str]]:
         out.append((HOLD_UNMAPPED_RISK,
                     f"declared risk {rc!r} has no signoff policy mapping (allow_unmapped is false)"))
     route = record.get("signoff_route") or {}
+    # The route is stale if the policy, the risk inventory, OR the REVISION it was
+    # derived for no longer matches - a reopen to new code can change which files
+    # are touched and therefore which specialists are required (reviewer-1 blocker).
     if (route.get("policy_hash") != ev.get("current_policy_hash")
-            or route.get("risk_inventory_hash") != ev.get("current_risk_inventory_hash")):
+            or route.get("risk_inventory_hash") != ev.get("current_risk_inventory_hash")
+            or route.get("revision") != record.get("revision")):
         out.append((HOLD_STALE_ROUTE,
-                    "signoff route is stale (policy or risk inventory changed since "
-                    "`close signoffs apply`); rerun apply"))
+                    "signoff route is stale (policy, risk inventory, or revision "
+                    "changed since `close signoffs apply`); rerun apply"))
     acks = record.get("lens_acks", {})
     revision = record.get("revision")
     active = set(ev.get("active_agents") or [])
