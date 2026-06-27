@@ -127,23 +127,44 @@ def test_is_terminal_control() -> None:
     assert loop.is_terminal_control({}) is False
 
 
-def test_is_stop_signal_gates_release_on_protected_sender(tmp_path) -> None:
-    # The wrapped model is a pure handler now, so the WRAPPER must obey loop-exit.
-    # release is gated on a lead/operator-facing sender; end is the canonical
-    # shutdown from any sender; ordinary kinds never stop the loop.
-    s = _store(tmp_path)
-    s.set_role("alpha", "lead")                       # alpha is now protected
-    assert loop.is_stop_signal(s, {"kind": "release", "from": "alpha"}) is True
-    assert loop.is_stop_signal(s, {"kind": "release", "from": "beta"}) is False
-    assert loop.is_stop_signal(s, {"kind": "end", "from": "beta"}) is True
-    assert loop.is_stop_signal(s, {"kind": "message", "from": "alpha"}) is False
+def _human_meta(reason="operator says wrap up"):
+    return {"release_authority": "human", "operator_decision": "true",
+            "authority_reason": reason}
 
 
-def test_loop_stops_and_commits_on_release_from_lead(tmp_path) -> None:
+def test_classify_loop_control(tmp_path) -> None:
+    # stand-down authority (0.39.0): stop ONLY on an authorized relay + a valid
+    # authority marker + a reason; everything else is invalid_control or ordinary.
     s = _store(tmp_path)
-    s.set_role("alpha", "lead")
+    s.set_operator_facing("alpha")                    # alpha is the authorized relay
+    stop = {"kind": "release", "from": "alpha", "meta": _human_meta()}
+    assert loop.classify_loop_control(s, stop) == "stop"
+    emer = {"kind": "release", "from": "alpha",
+            "meta": {"release_authority": "emergency", "emergency": "true",
+                     "authority_reason": "alpha looks rogue"}}
+    assert loop.classify_loop_control(s, emer) == "stop"
+    # unauthorized sender -> invalid_control
+    assert loop.classify_loop_control(
+        s, {"kind": "release", "from": "beta", "meta": _human_meta()}) == "invalid_control"
+    # authorized but UNMARKED release -> invalid_control
+    assert loop.classify_loop_control(
+        s, {"kind": "release", "from": "alpha", "meta": {}}) == "invalid_control"
+    # marker but NO reason -> invalid_control
+    assert loop.classify_loop_control(
+        s, {"kind": "release", "from": "alpha",
+            "meta": {"release_authority": "human", "operator_decision": "true"}}) == "invalid_control"
+    # UNMARKED end (the old bypass) -> invalid_control, never stop
+    assert loop.classify_loop_control(s, {"kind": "end", "from": "alpha", "meta": {}}) == "invalid_control"
+    # ordinary kinds never stop
+    assert loop.classify_loop_control(s, {"kind": "message", "from": "alpha"}) == "ordinary"
+
+
+def test_loop_stops_on_marked_authorized_release(tmp_path) -> None:
+    s = _store(tmp_path)
+    s.set_operator_facing("alpha")
     s.send(sender="alpha", recipient="beta", body="do work")
-    rel = s.send(sender="alpha", recipient="beta", kind="release", body="stand down")
+    rel = s.send(sender="alpha", recipient="beta", kind="release", body="stand down",
+                 meta=_human_meta())
     s.send(sender="alpha", recipient="beta", body="after release")  # must NOT be driven
     seen: list[str] = []
 
@@ -153,14 +174,32 @@ def test_loop_stops_and_commits_on_release_from_lead(tmp_path) -> None:
 
     turns = loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
                           max_polls=10)
-    # the real message before the release drove a turn; the release STOPPED the loop
-    # (never driven as a turn) and was committed; the message after was never reached.
     assert seen == ["do work"] and turns == 1
     assert s.cursor("beta") == rel.id                 # committed the release, stopped there
 
 
-def test_loop_stops_on_end(tmp_path) -> None:
+def test_loop_ignores_unmarked_release_and_keeps_listening(tmp_path) -> None:
+    # the actual failure: an UNMARKED (or unauthorized) release must NOT stand the
+    # listener down - it is committed (no redeliver, not driven) and the loop continues.
     s = _store(tmp_path)
+    s.set_operator_facing("alpha")
+    rel = s.send(sender="alpha", recipient="beta", kind="release", body="casual sign-off")
+    seen: list[str] = []
+
+    def drive(rec):
+        seen.append(rec["body"])
+        return True
+
+    turns = loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+                          max_polls=5)
+    assert seen == [] and turns == 0                  # never driven, never stopped early
+    assert s.cursor("beta") == rel.id                 # committed (won't redeliver)
+
+
+def test_loop_ignores_unmarked_end(tmp_path) -> None:
+    # a RECEIVED unmarked end no longer winds a peer down (the narrowing).
+    s = _store(tmp_path)
+    s.set_operator_facing("alpha")
     end = s.send(sender="alpha", recipient="beta", kind="end", body="bye")
     drove = {"n": 0}
 
@@ -170,8 +209,8 @@ def test_loop_stops_on_end(tmp_path) -> None:
 
     turns = loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
                           max_polls=5)
-    assert turns == 0 and drove["n"] == 0             # end is never driven as a turn
-    assert s.cursor("beta") == end.id                 # consumed (committed) on stop
+    assert turns == 0 and drove["n"] == 0             # never driven
+    assert s.cursor("beta") == end.id                 # committed + kept listening
 
 
 def test_loop_drives_each_message_and_commits(tmp_path) -> None:

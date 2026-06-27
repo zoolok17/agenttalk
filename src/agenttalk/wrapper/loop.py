@@ -27,20 +27,47 @@ def is_terminal_control(record: dict) -> bool:
     return bool(sc and (sc.get("closed") or sc.get("superseded")))
 
 
-def is_stop_signal(store, record: dict) -> bool:
-    """A loop-exit control message: ``kind=end`` (graceful shutdown) or
-    ``kind=release`` from a lead / operator-facing sender. The wrapped MODEL is a
-    PURE per-turn handler now (it no longer runs the listen loop), so the WRAPPER
-    must obey a lead's release/end and STAND DOWN - the model never exits the loop
-    itself. ``release`` is gated on a protected sender (operator-facing UNION leads)
-    so a non-lead cannot stand down a supervised wrapper; ``end`` is the canonical
-    shutdown kind and is honored from any (bus-authenticated) sender."""
+LOOP_CONTROL_KINDS = ("release", "end")
+
+
+def _meta_true(meta: dict, key: str) -> bool:
+    v = meta.get(key)
+    return v is True or (isinstance(v, str) and v.strip().lower() in ("true", "1", "yes"))
+
+
+def classify_loop_control(store, record: dict) -> str:
+    """The shared loop-exit classifier (stand-down authority, 0.39.0). REPLACES the
+    old is_stop_signal so a casual/unmarked release/end can no longer stand a
+    listener down. Returns one of:
+
+      * ``"stop"``            - a VALID loop-exit: kind in {release, end}, sender is
+        the authorized relay (operator_facing / sole lead), exactly one authority
+        mode (``human``|``emergency``), and a non-empty ``authority_reason``.
+        Commit + exit.
+      * ``"invalid_control"`` - a release/end whose sender/marker/reason is missing
+        or invalid (incl. an UNMARKED end, the old bypass). The caller COMMITS it
+        (so it never redelivers and is never fed to the model) + reports it +
+        KEEPS LISTENING.
+      * ``"ordinary"``        - everything else (prose, notes, sign-offs, work).
+        Handle normally; it NEVER exits the loop.
+
+    Authority is an auditable trusted-team assertion (the lead relays a human's
+    decision), NOT cryptographic proof a human spoke - see SECURITY.md."""
     kind = record.get("kind")
-    if kind == "end":
-        return True
-    if kind == "release":
-        return record.get("from") in store.protected_agents()
-    return False
+    if kind not in LOOP_CONTROL_KINDS:
+        return "ordinary"
+    if not store.loop_exit_relay_authorized(record.get("from")):
+        return "invalid_control"
+    meta = record.get("meta") or {}
+    reason = meta.get("authority_reason")
+    if not (isinstance(reason, str) and reason.strip()):
+        return "invalid_control"
+    authority = meta.get("release_authority")
+    if authority == "human" and _meta_true(meta, "operator_decision"):
+        return "stop"
+    if authority == "emergency" and _meta_true(meta, "emergency"):
+        return "stop"
+    return "invalid_control"
 
 
 def run_loop(store, agent: str, drive: Callable[[dict], bool], *,
@@ -77,11 +104,18 @@ def run_loop(store, agent: str, drive: Callable[[dict], bool], *,
         if is_terminal_control(record):
             recv_api.commit(store, agent, record)       # consume + skip (control)
             continue
-        if is_stop_signal(store, record):
-            # release (from a lead/liaison) or end: the wrapper owns loop-exit now
-            # that the model is a pure handler. Consume it and STAND DOWN.
+        control = classify_loop_control(store, record)
+        if control == "stop":
+            # a VALID, authorized, human/emergency-marked release/end: the wrapper
+            # owns loop-exit (the model is a pure handler). Consume it + STAND DOWN.
             recv_api.commit(store, agent, record)
             return turns
+        if control == "invalid_control":
+            # an unauthorized / unmarked / reasonless release|end (incl. the old
+            # unmarked-end bypass): COMMIT it so it never redelivers and is never
+            # driven into the model, then KEEP LISTENING (idle stays listening).
+            recv_api.commit(store, agent, record)
+            continue
         if only_request_id and record.get("request_id") != only_request_id:
             # One-shot ephemeral reviewers are scoped to the launch request. Leave
             # unrelated content unread rather than spending the single turn on it.

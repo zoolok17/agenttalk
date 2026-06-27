@@ -271,20 +271,29 @@ agenttalk ack --for "$SELF" --to-request <request_id>
 
 ## Stopping a team member (release vs "done for now")
 
-A listening member exits its loop ONLY on `kind=release` or `kind=end`.
-A prose note — "done for now", "stand by", "nothing more right now",
-"good work" — does **NOT** stop a listener, and you must NOT expect it
-to: write those as normal notes and the member keeps listening, ready
-for the next task.
+**HARD BOUNDARY (stand-down authority, 0.39.0): you NEVER originate a
+normal stand-down, and you NEVER use prose to stand anyone down.** Idle =
+keep listening (just stop sending work). A normal stand-down is the
+HUMAN operator's decision; you only RELAY it. A listening member exits
+ONLY on a `kind=release`/`kind=end` carrying a valid authority marker. A
+prose note — "done for now", "stand by", "good work", "stand down for the
+night" — does **NOT** stop a listener and you must not expect it to (that
+casual prose was the real outage); write those as normal notes and the
+member keeps listening.
 
-- **To stand a member down** (exit its loop; you may restart it later):
+- **To RELAY a human operator's stand-down** (auditable, required reason):
   ```bash
-  agenttalk release --from "$SELF" --to <agent> [-m "reason"]
-  agenttalk release --from "$SELF" --all          # stand down the whole team
-  agenttalk release --from "$SELF" --to-group <g>  # a group
+  agenttalk release --from "$SELF" --to <agent> --relay-human -m "<the human's decision>"
+  agenttalk release --from "$SELF" --all --relay-human -m "..."         # whole team
+  agenttalk release --from "$SELF" --to-group <g> --relay-human -m "..." # a group
   ```
-  `release` does NOT export a transcript (that's `end`). It is
-  authoritative only when you are the `operator_facing` agent or the
-  sole `role=lead` — set one with `roster set-operator-facing` so your
-  releases are obeyed rather than reported-and-ignored.
+- **Narrow EMERGENCY override** (a clearly malfunctioning/rogue member) —
+  then IMMEDIATELY report it to the operator (target, reason, time, scope):
+  ```bash
+  agenttalk release --from "$SELF" --to <agent> --emergency -m "<why it could not wait>"
+  ```
+  Both modes REQUIRE `--reason`; a bare release sends nothing. Release is
+  authoritative only when you are the `operator_facing` agent or the sole
+  `role=lead` (fail-closed otherwise). `release` exports no transcript
+  (that's `end`); a received unmarked `end` no longer stands peers down.
 - **For "done for now"**, send a normal `note` — it never stops anyone.

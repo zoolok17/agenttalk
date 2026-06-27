@@ -4865,30 +4865,54 @@ def cmd_release(args: argparse.Namespace) -> int:
         sys.stderr.write("agenttalk release: specify exactly one of "
                          "--to <agent>, --to-group <group>, or --all\n")
         return 2
-    # The reason is OPTIONAL — only read a body when one was actually given
-    # (-m or --file). Do NOT fall through to _read_body's stdin sniff, which
-    # would block/error when release is run without a reason in a pipeline.
-    if args.message is not None or args.file:
-        body = _read_body(args) or "released — stand down (you may be restarted later)"
-    else:
-        body = "released — stand down (you may be restarted later)"
-    # Advisory authorization: a release only stands a listener down when it
-    # comes from the liaison / sole lead. Warn (never block) otherwise.
-    if not store.is_release_authorized(sender):
+    # Stand-down AUTHORITY envelope (0.39.0): a release only stands a listener down
+    # when it is a typed, authority-marked control from the authorized relay. Exactly
+    # one mode is required - --relay-human (relaying a human operator's decision) or
+    # --emergency (the lead's narrow malfunctioning/rogue override) - and BOTH require
+    # a --reason. A bare/unmarked release sends NOTHING (exit 2).
+    relay_human = bool(getattr(args, "relay_human", False))
+    emergency = bool(getattr(args, "emergency", False))
+    if relay_human == emergency:   # neither or both
         sys.stderr.write(
-            f"warning: {sender!r} is not the operator-facing or sole-lead "
-            f"agent — recipients may report and IGNORE this release. A release "
-            f"only stands a listener down when sent by the liaison or the sole "
-            f"role=lead (set one with `roster set-operator-facing` / "
-            f"`roster set-role ... lead`).\n")
+            "agenttalk release: specify exactly one authority mode - --relay-human "
+            "(you are relaying a human operator's stand-down decision) or --emergency "
+            "(narrow lead override for a malfunctioning/rogue agent). A bare release "
+            "stands no one down.\n")
+        return 2
+    reason = (args.message if args.message is not None else None)
+    if reason is None and args.file:
+        reason = _read_body(args)
+    if not (reason and reason.strip()):
+        sys.stderr.write(
+            "agenttalk release: --reason (-m) is required - record WHY (the human's "
+            "decision, or why an emergency could not wait for human confirmation).\n")
+        return 2
+    # Authority FAILS CLOSED: only the operator-facing liaison, else the sole
+    # role=lead, may relay a loop-exit. No liaison + no sole lead -> exit 2, NO
+    # message (configure one; `roster set-operator-facing` / a single `set-role lead`).
+    if not store.loop_exit_relay_authorized(sender):
+        sys.stderr.write(
+            f"agenttalk release: {sender!r} is not the authorized stand-down relay "
+            "(operator-facing liaison, else the sole role=lead) - refusing, NO message "
+            "sent. Stand-down is a human-relayed act; configure a liaison or a single "
+            "lead.\n")
+        return 2
+    if relay_human:
+        release_meta = {"release_authority": "human", "operator_decision": "true",
+                        "authority_reason": reason}
+    else:
+        release_meta = {"release_authority": "emergency", "emergency": "true",
+                        "operator_report_required": "true", "authority_reason": reason}
+    body = reason
     if args.recipient:
         # Single target: let store.send validate (self-mail / off-roster /
         # retired -> ValueError -> exit 2 via main). Clean meta: kind=release
         # is not an opener, so send() mints no request_id/broadcast_id.
         store.send(sender=sender, recipient=args.recipient, body=body,
-                   kind="release")
+                   kind="release", meta=release_meta)
         if not args.quiet:
-            print(f"released: {args.recipient} (stood down)")
+            mode = "emergency" if emergency else "human-relayed"
+            print(f"released ({mode}): {args.recipient} (stood down)")
         return 0
     # Group / all: resolve to a concrete active recipient list and fan out the
     # same clean signal. No correlation id, so no --resume — re-run to retry.
@@ -4908,7 +4932,7 @@ def cmd_release(args: argparse.Namespace) -> int:
     for r in recipients:
         try:
             sent.append(store.send(sender=sender, recipient=r, body=body,
-                                   kind="release"))
+                                   kind="release", meta=release_meta))
         except Exception as e:  # noqa: BLE001 — account every copy
             failure = e
             break
@@ -6240,17 +6264,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     prel = sub.add_parser(
         "release",
-        help="Signal an agent (or team) to STAND DOWN and exit its listen "
-             "loop. Distinct from `end`: no transcript export, and the agent "
-             "may be restarted later. Only the operator-facing / sole-lead "
-             "sender's release is authoritative (others warn). Target exactly "
-             "one of --to / --to-group / --all.",
+        help="Signal an agent (or team) to STAND DOWN and exit its listen loop. "
+             "Distinct from `end`: no transcript export, restartable later. Requires "
+             "an authority mode - --relay-human (relaying a human's decision) XOR "
+             "--emergency (lead's narrow override) - and --reason; a bare release "
+             "sends nothing. Only the operator-facing / sole-lead sender is "
+             "authorized (fail-closed). Target exactly one of --to/--to-group/--all.",
     )
     prel.add_argument("--from", dest="sender", help="Sender agent name (default: $AGENTTALK_SELF)")
     prel.add_argument("--to", dest="recipient", help="Release ONE agent (point-to-point).")
     prel.add_argument("--to-group", dest="to_group", help="Release every member of this group.")
     prel.add_argument("--all", action="store_true", help="Release all other active agents.")
-    prel.add_argument("-m", "--message", dest="message", help="Optional stand-down reason.")
+    rel_mode = prel.add_mutually_exclusive_group()
+    rel_mode.add_argument("--relay-human", dest="relay_human", action="store_true",
+                          help="You are RELAYING a human operator's stand-down decision.")
+    rel_mode.add_argument("--emergency", dest="emergency", action="store_true",
+                          help="Narrow lead override for a malfunctioning/rogue agent "
+                               "(report to the operator immediately after).")
+    prel.add_argument("-m", "--message", dest="message", help="REQUIRED stand-down reason.")
     prel.add_argument("--file", dest="file", help="Read the reason from this file ('-' = stdin).")
     prel.add_argument("--quiet", action="store_true")
     prel.set_defaults(func=cmd_release)

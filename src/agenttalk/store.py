@@ -1110,6 +1110,24 @@ class Store:
             return False  # ambiguous leadership -> no one is authoritative
         return sender in roster  # zero leads -> plain-team compatibility
 
+    def loop_exit_relay_authorized(self, sender: str) -> bool:
+        """Whether ``sender`` may relay a loop-EXIT control (release/end) that a
+        listener obeys. NARROWER than :meth:`is_release_authorized` on purpose
+        (stand-down authority, 0.39.0): the ``operator_facing`` liaison if set,
+        ELSE the sole ``role=lead``, ELSE FAIL CLOSED. There is NO zero-lead
+        any-active fallback here - taking an agent offline is a human-relayed act,
+        so an un-configured team must designate a liaison or a single lead
+        (doctor/docs say so). Distinct from :meth:`protected_agents` (kill-
+        protection, deliberately broad) - loop-exit authority is a different,
+        narrower concern."""
+        liaison = self.operator_facing()
+        if liaison is not None:
+            return sender == liaison
+        lead = self.sole_lead()
+        if lead is not None:
+            return sender == lead
+        return False  # no liaison + no sole lead -> no one may stand a listener down
+
     def set_operator_facing(self, name: str | None) -> dict:
         """Set (or clear, with None) the operator-facing designation.
 

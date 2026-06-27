@@ -83,28 +83,33 @@ def _sessions_transcripts(s: Store) -> list[Path]:
     return list(d.glob("transcript-*")) if d.is_dir() else []
 
 
-def test_release_single_to_is_clean_and_no_transcript(tmp_path: Path) -> None:
+def test_release_single_carries_authority_meta_and_no_transcript(tmp_path: Path) -> None:
     s = _team(tmp_path)
     s.set_operator_facing("lead")
     before = _sessions_transcripts(s)
-    rc = _run(["release", "--from", "lead", "--to", "worker", "-m", "stand down",
-               "--quiet"], tmp_path)
+    rc = _run(["release", "--from", "lead", "--to", "worker", "--relay-human",
+               "-m", "operator says stand down", "--quiet"], tmp_path)
     assert rc == 0
     msgs = s.messages_for("worker")
     assert len(msgs) == 1 and msgs[0].kind == "release"
-    assert "request_id" not in (msgs[0].meta or {})   # opens no thread
-    assert "broadcast_id" not in (msgs[0].meta or {})
-    assert _sessions_transcripts(s) == before          # NO transcript (unlike `end`)
+    meta = msgs[0].meta or {}
+    assert meta.get("release_authority") == "human"      # authority envelope (0.39.0)
+    assert meta.get("operator_decision") == "true"
+    assert meta.get("authority_reason") == "operator says stand down"
+    assert "request_id" not in meta and "broadcast_id" not in meta  # opens no thread
+    assert _sessions_transcripts(s) == before            # NO transcript (unlike `end`)
 
 
 def test_release_all_fans_out_to_every_other_active(tmp_path: Path) -> None:
     s = _team(tmp_path, "lead,w1,w2,w3")
     s.set_operator_facing("lead")
-    rc = _run(["release", "--from", "lead", "--all", "--quiet"], tmp_path)
+    rc = _run(["release", "--from", "lead", "--all", "--relay-human", "-m", "wrap up",
+               "--quiet"], tmp_path)
     assert rc == 0
     for w in ("w1", "w2", "w3"):
         got = s.messages_for(w)
         assert len(got) == 1 and got[0].kind == "release"
+        assert (got[0].meta or {}).get("release_authority") == "human"
     assert s.messages_for("lead") == []  # sender excluded
 
 
@@ -112,11 +117,23 @@ def test_release_to_group(tmp_path: Path) -> None:
     s = _team(tmp_path, "lead,w1,w2,w3")
     s.set_operator_facing("lead")
     s.set_group("pod", ["w1", "w2"])
-    rc = _run(["release", "--from", "lead", "--to-group", "pod", "--quiet"], tmp_path)
+    rc = _run(["release", "--from", "lead", "--to-group", "pod", "--emergency",
+               "-m", "pod agents rogue", "--quiet"], tmp_path)
     assert rc == 0
-    assert len(s.messages_for("w1")) == 1
+    assert (s.messages_for("w1")[0].meta or {}).get("release_authority") == "emergency"
     assert len(s.messages_for("w2")) == 1
     assert s.messages_for("w3") == []  # not in the group
+
+
+def test_release_requires_authority_mode_and_reason(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    s.set_operator_facing("lead")
+    # bare release (no mode) -> exit 2, no message
+    assert _run(["release", "--from", "lead", "--to", "worker", "--quiet"], tmp_path) == 2
+    # mode but no reason -> exit 2
+    assert _run(["release", "--from", "lead", "--to", "worker", "--relay-human",
+                 "--quiet"], tmp_path) == 2
+    assert s.messages_for("worker") == []   # nothing sent on refusal
 
 
 def test_release_requires_exactly_one_target(tmp_path: Path) -> None:
@@ -176,20 +193,24 @@ def test_is_release_authorized_fails_closed_on_ambiguous_multilead(
     assert s.is_release_authorized("worker") is False
 
 
-def test_release_command_warns_when_unauthorized(tmp_path: Path, capsys) -> None:
+def test_release_unauthorized_sender_fails_closed(tmp_path: Path, capsys) -> None:
+    # 0.39.0: an unauthorized relay now FAILS CLOSED (exit 2, NO message), not a warn.
     s = _team(tmp_path, "lead,worker,other")
     s.set_operator_facing("lead")
-    rc = _run(["release", "--from", "other", "--to", "worker", "--quiet"], tmp_path)
-    assert rc == 0  # non-fatal — still sends
-    assert "not the operator-facing" in capsys.readouterr().err
+    rc = _run(["release", "--from", "other", "--to", "worker", "--relay-human",
+               "-m", "x", "--quiet"], tmp_path)
+    assert rc == 2
+    assert "not the authorized stand-down relay" in capsys.readouterr().err
+    assert s.messages_for("worker") == []   # nothing sent
 
 
-def test_release_command_no_warning_when_authorized(tmp_path: Path, capsys) -> None:
+def test_release_authorized_relay_succeeds(tmp_path: Path, capsys) -> None:
     s = _team(tmp_path, "lead,worker")
     s.set_operator_facing("lead")
-    rc = _run(["release", "--from", "lead", "--to", "worker", "--quiet"], tmp_path)
+    rc = _run(["release", "--from", "lead", "--to", "worker", "--relay-human",
+               "-m", "operator decision", "--quiet"], tmp_path)
     assert rc == 0
-    assert "not the operator-facing" not in capsys.readouterr().err
+    assert len(s.messages_for("worker")) == 1
 
 
 # ------------------------------------------------ (e) skill-text contract
@@ -209,6 +230,10 @@ def test_listen_skills_state_release_end_only_exit_and_antipattern(path) -> None
     assert "KEEP LISTENING" in text
     assert "Anti-pattern" in text                  # the exact-trap example
     assert "done for now" in text                  # the prose that must NOT exit
+    # stand-down authority (0.39.0): the marker contract + the lead-prose trap
+    assert "release_authority" in text
+    assert "authority_reason" in text
+    assert "even from the lead" in text            # lead prose must NOT stop you
 
 
 @pytest.mark.parametrize("path", [
@@ -220,3 +245,7 @@ def test_lead_skills_state_release_to_stop_and_note_for_done(path) -> None:
     assert "agenttalk release" in text             # the way to actually stop a member
     assert "done for now" in text
     assert "never stops anyone" in text            # a note doesn't stop a listener
+    # stand-down authority (0.39.0): lead never originates a normal stand-down
+    assert "--relay-human" in text
+    assert "--emergency" in text
+    assert "NEVER originate a" in text or "never originate a" in text.lower()
