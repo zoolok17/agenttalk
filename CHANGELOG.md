@@ -5,6 +5,53 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.0] - 2026-06-28
+
+### Added
+
+- **`agenttalk knowledge` — a lean append-only pointer layer for durable team
+  memory (middle-tier Phase 2).** Typed pointer-notes (`seam` / `gotcha` /
+  `decision` / `pointer`) anchored to code or threads — not a knowledge database.
+  - `knowledge publish` / `curate (verify|retract)` / `pull` / `search` /
+    `onboard`. Store at `.agenttalk/knowledge/notes.jsonl`, append-only, current
+    view = latest valid event by `(domain_id, key)`, preserved by `reset` like
+    `domains.json`.
+  - **Capture-open, curate-gated.** Any active agent may publish an `uncurated`
+    note; domain owners/curators (and a lead override with a required reason)
+    verify, supersede, or retract. Uncurated notes never shadow verified ones in
+    the default `pull`.
+  - **Anchor-relative staleness.** A note is hard-stale only when its anchor
+    changed between `verified_against_sha` and HEAD (path renamed/deleted/
+    changed), or its domain / registry hash / SHA is gone; HEAD merely moving
+    with the anchor unchanged is a `verified_sha_not_head` caution that is still
+    shown. Fails closed when git cannot determine the anchor delta.
+  - **Pointer-not-mirror.** Bodies are byte-capped, untrusted data carrying the
+    insight not already in the artifact; consumers reverify anchors before acting.
+  - Persisted records are validated **as events** (registry hash, SHA shape,
+    allowed authority states, event-kind/state matrix), so a forged `verified`
+    publish cannot bypass the curate gate and a malformed line cannot hide a
+    valid note.
+  - `roster --expertise` derives from domain roles + lane-delivery history
+    (curated note counts only as a weak secondary; never raw uncurated counts).
+  - `doctor` surfaces corrupt/torn knowledge lines.
+
+### Notes
+
+- **Generic and advisory.** agenttalk owns schema, validation, and staleness; the
+  project owns `domains.json`, note keys, and curation decisions. Coexists with
+  spec-kitty (knowledge may point at WPs but never becomes WP state).
+- Known (fast-follow): a curate event without `curated_at` / `updated_at`
+  timestamps is currently accepted. This is audit-completeness only — it does not
+  affect the curation gate, folding, or staleness.
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.38.0"
+```
+
+Additive and opt-in; knowledge is used only when you `knowledge publish`.
+
 ## [0.37.0] - 2026-06-27
 
 The lane deliver-gate (middle-tier Phase 1). A **lane** scopes an assignee to a
