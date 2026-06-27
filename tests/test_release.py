@@ -234,6 +234,22 @@ def test_listen_skills_state_release_end_only_exit_and_antipattern(path) -> None
     assert "release_authority" in text
     assert "authority_reason" in text
     assert "even from the lead" in text            # lead prose must NOT stop you
+    # NEGATIVE regression: the stale unmarked-exit wording in the bottom Exiting
+    # section must be GONE (the bypass codex+reviewer-1 found), not just shadowed.
+    assert "The peer sends `kind=end` (graceful shutdown)" not in text
+    assert "`kind=release` from an authorized sender (stand down" not in text
+
+
+@pytest.mark.parametrize("path", [
+    ("claude", "agenttalk.sk-loop.md"),
+    ("codex", "agenttalk-sk-loop", "SKILL.md"),
+])
+def test_sk_loop_skills_require_authority_envelope_to_exit(path) -> None:
+    text = _skill(*path)
+    # the sk-loop must NOT say a bare kind=end exits; it must require the envelope.
+    assert "Only exit on\nmission completion, `kind=end`" not in text
+    assert "release_authority" in text and "authority_reason" in text
+    assert "KEEP LISTENING" in text
 
 
 @pytest.mark.parametrize("path", [

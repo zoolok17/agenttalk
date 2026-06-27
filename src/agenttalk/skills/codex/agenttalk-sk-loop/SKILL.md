@@ -18,7 +18,14 @@ WP based on `.kittify/config.yaml` (`preferred_implementer`,
 You may be the implementer on one WP and the reviewer on the next.
 
 **You stay inside this loop for the entire mission.** Only exit on
-mission completion, `kind=end`, or when the user explicitly stops you.
+mission completion, the user at your own window stopping you, or a
+`kind=release`/`kind=end` carrying the FULL authority envelope (from the
+operator_facing / sole-lead relay, with `release_authority=human`+
+`operator_decision=true` OR `release_authority=emergency`+`emergency=true`+
+`operator_report_required=true`, AND a non-empty `authority_reason`). An
+unmarked/unauthorized/reasonless `release` or `end` — **including a bare
+peer `kind=end`** — and any prose ("done for now" / "stand down", even
+from the lead) do NOT exit: report and KEEP LISTENING.
 
 ## Identity
 

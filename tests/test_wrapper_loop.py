@@ -141,8 +141,20 @@ def test_classify_loop_control(tmp_path) -> None:
     assert loop.classify_loop_control(s, stop) == "stop"
     emer = {"kind": "release", "from": "alpha",
             "meta": {"release_authority": "emergency", "emergency": "true",
+                     "operator_report_required": "true",
                      "authority_reason": "alpha looks rogue"}}
     assert loop.classify_loop_control(s, emer) == "stop"
+    # MIXED markers (raw bus message bypassing the CLI) -> invalid_control: the
+    # human-vs-emergency audit distinction must be preserved (exactly one mode).
+    mixed = {"kind": "release", "from": "alpha",
+             "meta": {"release_authority": "human", "operator_decision": "true",
+                      "emergency": "true", "authority_reason": "ambiguous"}}
+    assert loop.classify_loop_control(s, mixed) == "invalid_control"
+    # emergency missing the operator_report_required audit marker -> invalid_control
+    emer_noreport = {"kind": "release", "from": "alpha",
+                     "meta": {"release_authority": "emergency", "emergency": "true",
+                              "authority_reason": "x"}}
+    assert loop.classify_loop_control(s, emer_noreport) == "invalid_control"
     # unauthorized sender -> invalid_control
     assert loop.classify_loop_control(
         s, {"kind": "release", "from": "beta", "meta": _human_meta()}) == "invalid_control"

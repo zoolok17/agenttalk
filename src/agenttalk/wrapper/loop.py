@@ -62,10 +62,19 @@ def classify_loop_control(store, record: dict) -> str:
     reason = meta.get("authority_reason")
     if not (isinstance(reason, str) and reason.strip()):
         return "invalid_control"
+    # EXACTLY ONE authority mode, with the full marker set for that mode and NO
+    # marker from the other mode - so a raw bus message with mixed/ambiguous markers
+    # (which bypasses the CLI) is invalid_control, preserving the human-vs-emergency
+    # audit distinction (reviewer findings).
     authority = meta.get("release_authority")
-    if authority == "human" and _meta_true(meta, "operator_decision"):
-        return "stop"
-    if authority == "emergency" and _meta_true(meta, "emergency"):
+    human_ok = (authority == "human"
+                and _meta_true(meta, "operator_decision")
+                and not _meta_true(meta, "emergency"))
+    emergency_ok = (authority == "emergency"
+                    and _meta_true(meta, "emergency")
+                    and _meta_true(meta, "operator_report_required")
+                    and not _meta_true(meta, "operator_decision"))
+    if human_ok != emergency_ok:   # XOR: exactly one valid mode
         return "stop"
     return "invalid_control"
 

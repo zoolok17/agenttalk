@@ -6281,7 +6281,9 @@ def build_parser() -> argparse.ArgumentParser:
     rel_mode.add_argument("--emergency", dest="emergency", action="store_true",
                           help="Narrow lead override for a malfunctioning/rogue agent "
                                "(report to the operator immediately after).")
-    prel.add_argument("-m", "--message", dest="message", help="REQUIRED stand-down reason.")
+    prel.add_argument("-m", "--message", "--reason", dest="message",
+                      help="REQUIRED stand-down reason (the human's decision, or why an "
+                           "emergency could not wait).")
     prel.add_argument("--file", dest="file", help="Read the reason from this file ('-' = stdin).")
     prel.add_argument("--quiet", action="store_true")
     prel.set_defaults(func=cmd_release)
