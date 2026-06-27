@@ -99,6 +99,8 @@ fix into the same branch, then rerun lead gate
 
 ## Audit findings → disposition (2026-06-28)
 
+Full point-in-time report (methodology, per-reviewer detail, what-held): `docs/audit-2026-06-28.md`.
+
 | # | Finding | Sev | Reviewers | Disposition |
 |---|---|---|---|---|
 | 1 | gates corrupt-overwrite false-GO | P1 | security | C1 / 0.40.0 |
