@@ -24,7 +24,7 @@ exported on session end.
 | Layer | What it gives you |
 | --- | --- |
 | **Talk directly** | `send`/`reply` point-to-point or `broadcast` fan-out; every message is a JSON file both terminals see. |
-| **Review handoffs** | `handoff` (implement → fresh review), `propose`, `consult` — cross-review by an agent that didn't write the code. |
+| **Review handoffs** | the `/agenttalk.handoff` and `/agenttalk.consult` skills (`$agenttalk-…` on Codex) plus the `agenttalk propose` command — fresh cross-review by an agent that didn't write the code. |
 | **Named teams** | roles, groups, a `lead`/operator-liaison; `escalate` routes decisions to one human voice. |
 | **Operator-safety** | supersede/`rescind`, pre-action `check`, epoch barriers — stale or rescinded requests can't quietly close. |
 | **24/7 supervision** | auto-restart agents *with their session intact* across outages; a progress wrapper (`wrap`) for visibility. |
