@@ -166,7 +166,17 @@ The literal `{SESSION_ARGS}` element is spliced by the executor with the
 session tokens — fresh on first launch, `--resume <id>` on relaunch. The
 launch prompt drops the agent straight into `/agenttalk.listen`.
 
-### A wrapped agent (recommended for hands-off codex/claude)
+> **Best-effort / legacy for unattended use.** A manual-listen agent is
+> fine interactively and on a fresh launch, but a **resumed** session may
+> not reliably re-enter the listen loop — so it never heartbeats, never
+> reaches readiness, and the supervisor relaunches it. After
+> `max_readiness_retries` (default 3) such never-ready relaunches the
+> supervisor **stops** and surfaces `READINESS_GAVE_UP` (it will not churn
+> forever; clear it with a fresh heartbeat or a restart-request). For
+> hands-off supervision prefer a **wrapped** agent (below): the wrapper
+> owns the heartbeat regardless of whether the model re-enters a prompt.
+
+### A wrapped agent (RECOMMENDED default for hands-off codex/claude)
 
 ```jsonc
 "codex-dev": {
@@ -182,7 +192,7 @@ launch prompt drops the agent straight into `/agenttalk.listen`.
       "-m", "agenttalk", "wrap", "--for", "codex-dev", "--cli", "codex",
       "--loop", "--",
       "C:\\path\\to\\codex.exe", "-a", "never", "-s", "workspace-write",
-      "-C", "D:\\Projects\\example"
+      "-C", "D:\\Projects\\example", "--disable", "hooks"
     ]
   }
 }
@@ -200,6 +210,11 @@ Key differences for a wrapped agent:
 - No activity hook needed: a wrapped agent is instrumented by
   construction, so a stale heartbeat past grace **recovers** rather than
   warn-only.
+- **`--disable hooks`** on the wrapped **codex** child (the safe default):
+  the wrapper owns the heartbeat, so the codex activity hook is neither
+  needed nor wanted, and disabling it sidesteps codex's hook-trust prompt
+  on every launch. Drop it from the tail only if you intentionally want
+  the child's project hooks.
 
 > **Per-CLI stale thresholds.** A wrapped **Claude** streams thinking,
 > text, and tool deltas, so it stays fresh through reasoning — default

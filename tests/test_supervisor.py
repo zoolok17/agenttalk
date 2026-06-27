@@ -1637,6 +1637,11 @@ def test_config_template_ships_wrapped_example() -> None:
     args = w["launch"]["windows_args"]
     assert "{SESSION_ARGS}" not in args          # wrapper owns session; no splice
     assert args[:3] == ["-m", "agenttalk", "wrap"] and "--loop" in args
+    # 0.31.2: the wrapped codex child is launched with `--disable hooks` by default
+    # (the wrapper owns the heartbeat; sidesteps the codex hook-trust prompt).
+    assert args[-2:] == ["--disable", "hooks"]
+    # steer-to-wrapped: the comment marks wrapped recommended/default + non-wrapped legacy
+    assert "RECOMMENDED" in w["_comment_wrapped"] and "LEGACY" in w["_comment_wrapped"]
 
 
 # ---------- per-CLI wrapped stuck_after defaults + the codex low-threshold guardrail
@@ -1767,6 +1772,63 @@ def test_plan_wrapped_codex_has_no_bypass_flag() -> None:
                    {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
                    snapshot=_wrap_snap())
     assert "--dangerously-bypass-hook-trust" not in (p["session_args"] or [])
+
+
+# ---------- 0.31.2: readiness give-up cap (no infinite churn on never-ready resume)
+
+def _never_ready(**over) -> dict:
+    """State for an agent that LAUNCHED but never produced a first heartbeat
+    (launching, readiness never seen, grace expired)."""
+    st = {"launching": True, "readiness_seen": False, "launch_grace_until": NOW - 1,
+          "backoff_next_epoch": 0, "last_launch_epoch": NOW - 1000}
+    st.update(over)
+    return st
+
+
+def test_readiness_cap_relaunches_below_cap_then_gives_up() -> None:
+    # below the cap (readiness_fails=2 < default 3): still relaunches, counter ++.
+    p2 = _plan_hook(_report(heartbeat_stale=True),
+                    {"agents": {"worker": _never_ready(readiness_fails=2)}}, snapshot=[])
+    assert p2["action"] == sup.STUCK_RECOVER
+    assert p2["next_state"]["readiness_fails"] == 3
+    # AT the cap (3 >= 3): GIVE UP - no relaunch, no kill, manual intervention.
+    p3 = _plan_hook(_report(heartbeat_stale=True),
+                    {"agents": {"worker": _never_ready(readiness_fails=3, last_warn_epoch=0)}},
+                    snapshot=[])
+    assert p3["action"] == sup.READINESS_GAVE_UP and p3["state"] == "READINESS_GAVE_UP"
+    assert p3["kill_first"] is False and p3["notify"] is True
+    assert p3["next_state"]["readiness_fails"] == 3          # sticky (not incremented)
+    # sticky + warn rate-limited: a recent warn -> NONE this tick, still GAVE_UP state
+    p3b = _plan_hook(_report(heartbeat_stale=True),
+                     {"agents": {"worker": _never_ready(readiness_fails=3, last_warn_epoch=NOW - 1)}},
+                     snapshot=[])
+    assert p3b["action"] == sup.NONE and p3b["state"] == "READINESS_GAVE_UP"
+
+
+def test_readiness_cap_resets_on_fresh_heartbeat() -> None:
+    # a fresh heartbeat THIS tick = readiness reached -> counter clears, healthy.
+    p = _plan_hook(_report(heartbeat_stale=False),
+                   {"agents": {"worker": _never_ready(readiness_fails=3)}}, snapshot=[])
+    assert p["action"] == sup.NONE and p["state"] == "HEALTHY_IDLE"
+    assert p["next_state"]["readiness_fails"] == 0
+
+
+def test_manual_restart_clears_readiness_give_up() -> None:
+    # operator restart-request resets the give-up counter (a way out of GAVE_UP).
+    p = _plan_hook(_report(heartbeat_stale=True, restart_request={"request_id": "rr-x"}),
+                   {"agents": {"worker": _never_ready(readiness_fails=9,
+                                                      backoff_next_epoch=NOW + 9999)}},
+                   snapshot=[])
+    assert p["action"] == sup.RELAUNCH and p["next_state"]["readiness_fails"] == 0
+
+
+def test_stuck_recovery_of_ready_agent_is_not_immediately_capped() -> None:
+    # a previously-READY agent that just went stale is a normal stuck-recovery; its
+    # first relaunch starts the readiness counter at 1 (not capped on tick one).
+    p = _plan_hook(_report(heartbeat_stale=True),
+                   {"agents": {"worker": _ready(backoff_next_epoch=0, readiness_fails=0)}},
+                   snapshot=_snap(cli="claude"))
+    assert p["action"] == sup.STUCK_RECOVER and p["next_state"]["readiness_fails"] == 1
 
 
 def _stub_cmd(path: Path, log: Path) -> None:

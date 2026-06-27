@@ -42,6 +42,7 @@ SUSPECT_WARN = "suspect_warn"    # alive + stale but NO activity hook - warn, ne
 CLEAR_MARKER = "clear_marker"    # a consumed restart marker on a now-healthy agent: just clear it
 SNAPSHOT_UNAVAILABLE = "snapshot_unavailable"  # legacy token; no longer emitted by heartbeat liveness
 READINESS_FAILED = "readiness_failed"  # legacy token; folded into stale heartbeat recovery
+READINESS_GAVE_UP = "readiness_gave_up"  # never-ready past the retry cap - STOP relaunching, await operator
 NONE = "none"                    # healthy, nothing to do
 
 # Default cadence knobs (config overrides these).
@@ -50,6 +51,7 @@ _DEFAULTS = {
     "stuck_after_seconds": 120,            # heartbeat older than this = stale
     "suspect_warn_interval_seconds": 300,  # rate-limit for the no-hook warn fallback
     "launch_grace_seconds": 120,           # forking-CLI startup grace (brain discovery + first hb)
+    "max_readiness_retries": 3,            # never-ready relaunches before READINESS_GAVE_UP (no infinite churn)
     "backoff": {"base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180},
 }
 
@@ -654,6 +656,8 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     suspect_interval = float(config.get(
         "suspect_warn_interval_seconds", _DEFAULTS["suspect_warn_interval_seconds"]))
     grace_seconds = float(config.get("launch_grace_seconds", _DEFAULTS["launch_grace_seconds"]))
+    max_readiness_retries = int(config.get(
+        "max_readiness_retries", _DEFAULTS["max_readiness_retries"]))
     activity_hook = bool(cfg_agent.get("activity_hook", False))
     _lcfg = _liveness_cfg(cfg_agent)
     # A WRAPPED agent is instrumented BY CONSTRUCTION: the wrap --loop loop writes
@@ -702,6 +706,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     marker = rpt.get("restart_request") or None
     consumed = list(st.get("consumed_rids", []))
     fails = int(st.get("consecutive_fails", 0))
+    readiness_fails = int(st.get("readiness_fails", 0))
     backoff_next = float(st.get("backoff_next_epoch", 0.0) or 0.0)
     healthy_since = st.get("healthy_since")
     last_warn = float(st.get("last_warn_epoch", 0.0) or 0.0)
@@ -720,6 +725,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     # is intentionally NOT required; it false-killed healthy Codex agents.
     if not hb_stale and not readiness_seen:
         readiness_seen, launching, resume_available = True, False, True
+        readiness_fails = 0   # readiness REACHED -> clear the give-up counter
     in_grace = launching and (not readiness_seen) and now_epoch < grace_until
 
     # carry-forward: ALL supervisor-owned fields pass THROUGH (BLOCKER-3 lesson -
@@ -733,6 +739,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         "brain_pid": brain_pid, "brain_start": brain_start, "managed_pids": managed,
         "launching": launching, "launch_grace_until": grace_until,
         "readiness_seen": readiness_seen, "resume_available": resume_available,
+        "readiness_fails": readiness_fails,
         "last_launch_epoch": st.get("last_launch_epoch"),
         "session_id": st.get("session_id"), "launched": bool(st.get("launched", False)),
     }
@@ -793,6 +800,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             nxt["consumed_rids"] = [*consumed, rid]
             kt = _targets(include_launcher=True)
             _relaunch_state()
+            nxt["readiness_fails"] = 0   # operator restart CLEARS a readiness give-up
             return _result(RELAUNCH, state="MANUAL_RESTART", clear_marker=rid,
                            kill_first=bool(kt), kill_targets=kt, bypass_backoff=True,
                            reason=f"manual restart-request {rid}")
@@ -834,9 +842,32 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                                notify=unsafe_low_codex, reason=warn_reason)
             return _result(NONE, state="ACTIVE_OR_BUSY",
                            reason="suspect (warn rate-limited)")
+        # READINESS GIVE-UP CAP (0.31.2 / codex Fix A): a relaunch of an agent that
+        # has NOT reached readiness since its last launch (launching + never a fresh
+        # heartbeat) is a READINESS-failure relaunch - a resume that never re-enters
+        # the listen loop just churns. Count them; after max_readiness_retries, STOP
+        # relaunching and surface READINESS_GAVE_UP (no kill, manual intervention),
+        # STICKY until a fresh heartbeat (resets the counter above) or an operator
+        # restart/clear. A previously-READY agent that just went stale is a normal
+        # stuck-recovery: its first relaunch starts the counter at 1; it resets the
+        # moment readiness returns.
+        never_ready = launching and not readiness_seen
         if now_epoch >= backoff_next:
+            if never_ready and readiness_fails >= max_readiness_retries:
+                give_up_reason = (
+                    f"resume launch never reached first heartbeat after "
+                    f"{readiness_fails} relaunch(es); STOPPING relaunch - manual "
+                    f"intervention required (restart-request or operator clear). "
+                    f"Consider a WRAPPED agent (the wrapper owns the heartbeat).")
+                if now_epoch - last_warn >= suspect_interval:
+                    nxt["last_warn_epoch"] = now_epoch
+                    return _result(READINESS_GAVE_UP, state="READINESS_GAVE_UP",
+                                   notify=True, reason=give_up_reason)
+                return _result(NONE, state="READINESS_GAVE_UP",
+                               reason="readiness gave up (warn rate-limited)")
             kt = _targets(include_launcher=True)
             _relaunch_state()
+            nxt["readiness_fails"] = (readiness_fails + 1) if never_ready else 1
             return _result(STUCK_RECOVER, state="STUCK_OR_DEAD",
                            kill_first=bool(kt), kill_orphans=True,
                            kill_targets=kt,
@@ -930,6 +961,8 @@ CONFIG_TEMPLATE = """\
   "stuck_after_seconds": 120,
   "suspect_warn_interval_seconds": 300,
   "launch_grace_seconds": 120,
+  "max_readiness_retries": 3,
+  "_comment_max_readiness_retries": "After this many relaunches of an agent that NEVER reaches readiness (no first heartbeat - e.g. a manual resume that does not re-enter the listen loop), the supervisor STOPS relaunching and surfaces READINESS_GAVE_UP (warn/notify, no kill) instead of churning forever. Reset by a fresh heartbeat or an operator restart/clear. A WRAPPED agent avoids this class entirely (the wrapper owns the heartbeat regardless of the model prompt) - prefer wrapped for hands-off supervision.",
   "claude_permission_mode": "bypassPermissions",
   "backoff": { "base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180 },
   "notify_sender": null,
@@ -967,9 +1000,9 @@ CONFIG_TEMPLATE = """\
       "env": { "AGENTTALK_SELF": "AGENT_NAME_WRAPPED" },
       "launch": {
         "windows_file": "REPLACE: the PYTHON exe that runs agenttalk, e.g. C:\\\\Users\\\\you\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python314\\\\python.exe",
-        "windows_args": ["-m", "agenttalk", "wrap", "--for", "AGENT_NAME_WRAPPED", "--cli", "codex", "--loop", "--", "REPLACE: the REAL codex.exe / claude.exe path - the wrapper drives it ONE turn per inbound message"]
+        "windows_args": ["-m", "agenttalk", "wrap", "--for", "AGENT_NAME_WRAPPED", "--cli", "codex", "--loop", "--", "REPLACE: the REAL codex.exe path - the wrapper drives it ONE turn per inbound message", "--disable", "hooks"]
       },
-      "_comment_wrapped": "WRAPPED agent (opt-in; the manual /agenttalk.listen agent above stays the default). Set wrapped=true to supervise the agent THROUGH `agenttalk wrap --loop`: windows_file is the PYTHON exe (NOT the CLI exe), windows_args is the FIXED wrap command, and the REAL codex.exe/claude.exe goes at the tail after '--' (it is what windows_file would be for a manual agent). NO {SESSION_ARGS} token - the wrapper owns session continuity end-to-end (it persists + reloads the codex thread_id / claude session-id across its own turns AND across a supervisor relaunch, so a restart re-runs the identical wrap argv and reload-resumes). The wrapper python IS the long-lived supervised root, so brain discovery is RETIRED for wrapped agents (brain_pid stays null); the per-turn child (codex exec / claude -p) is reaped via the start-guarded managed_pids tree-kill. activity_hook is NOT needed: a wrapped agent is instrumented by construction (heartbeat on every idle bus-wait cycle + on streaming progress), so a stale heartbeat past grace RECOVERS (restart) instead of warn-only.",
+      "_comment_wrapped": "WRAPPED is the RECOMMENDED / default supervised archetype for hands-off agents (the manual /agenttalk.listen agent above is supported but BEST-EFFORT/LEGACY: a resumed manual session may not re-enter the listen loop, never heartbeat, and hit the readiness give-up cap). The wrapped codex child is launched with `--disable hooks` by default (codex's safe default - the wrapper owns the heartbeat, so the codex activity hook is neither needed nor wanted, and disabling it sidesteps hook-trust prompts; remove it from windows_args if you intentionally want the child's project hooks). Set wrapped=true to supervise the agent THROUGH `agenttalk wrap --loop`: windows_file is the PYTHON exe (NOT the CLI exe), windows_args is the FIXED wrap command, and the REAL codex.exe/claude.exe goes at the tail after '--' (it is what windows_file would be for a manual agent). NO {SESSION_ARGS} token - the wrapper owns session continuity end-to-end (it persists + reloads the codex thread_id / claude session-id across its own turns AND across a supervisor relaunch, so a restart re-runs the identical wrap argv and reload-resumes). The wrapper python IS the long-lived supervised root, so brain discovery is RETIRED for wrapped agents (brain_pid stays null); the per-turn child (codex exec / claude -p) is reaped via the start-guarded managed_pids tree-kill. activity_hook is NOT needed: a wrapped agent is instrumented by construction (heartbeat on every idle bus-wait cycle + on streaming progress), so a stale heartbeat past grace RECOVERS (restart) instead of warn-only.",
       "_comment_wrapped_stuck_after": "PER-CLI stuck_after_seconds (a per-agent stuck_after_seconds override ALWAYS wins; the global stuck_after_seconds is only the legacy/unclassified fallback). Defaults when unset: wrapped CLAUDE=180s, wrapped CODEX=900s. WHY they differ: wrapped CLAUDE streams thinking+text+tool deltas and stays fresh through reasoning, so a tight threshold is fine; wrapped CODEX is ITEM-LEVEL (no exec --json event closes the pure-reasoning gap) so a long pure-reasoning stretch is SILENT between turn.started and the final agent_message. These are an OPERATIONAL false-positive tradeoff, NOT a provably-safe bound: pick the threshold above the longest pure-reasoning gap your codex role plausibly hits. For a heavy reasoning/refactor/review codex role (like this sample) 1200-1800s is the right template default - this example uses 1200. GUARDRAIL: for wrapped+codex the supervisor WARNS and REFUSES restart-on-stale (degrades to warn-only) when stuck_after_seconds is below 600s, UNLESS you set allow_low_stuck_after=true to opt in. The value is never silently coerced. DO NOT try to tighten codex with a synthetic active-turn timer heartbeat: no intermediate exec --json event exists to confirm progress, so a timer would mark a silently-wedged turn healthy forever and defeat restart authority - the only levers are the per-CLI threshold + per-agent overrides.",
       "_comment_wrapped_limitation": "KNOWN LIMITATION (banked future dead-letter item): a poison inbound message makes the loop fail the turn -> clear heartbeat -> stale -> supervisor restart -> reload-resume -> re-deliver the same message -> fail again; net is a SLOW restart loop throttled by supervisor backoff (base..cap) until a dead-letter / skip-after-N fix lands or an operator intervenes."
     }
