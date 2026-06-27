@@ -27,6 +27,14 @@ existing flow; never invent a parallel workflow or hand-wave a GO.
       (or `agenttalk close signoffs apply`), which routes specialists by role/group +
       domain reviewers. Otherwise declare explicit lenses at open.
 
+## RISK (hard rule) — the risk inventory routes the specialists
+- [ ] The risk inventory you derive/declare here decides which specialist sign-offs P3
+      requires. List EVERY touched risk class (a milestone touching auth + storage is
+      `security` AND `persistence`, not just one), not the single most obvious one —
+      under-declaring silently under-routes specialists and manufactures a false GO. The
+      lead-owned close risk inventory is authoritative; a lens's self-reported
+      `risk_class` is only an input to it, never the decider.
+
 ## GATHER — one honest verdict per lens
 - [ ] Solicit each lens as a review/tester HANDOFF (use the matching skill:
       review-failure-injection, review-contract-drift, review-release-readiness,
@@ -36,9 +44,13 @@ existing flow; never invent a parallel workflow or hand-wave a GO.
       `agenttalk close ack --id <id> --lens <lens-or-generated-signoff-id>
       --status accept|counter|na --from <agent> …` carrying the typed evidence.
 - [ ] A reviewer raising a **COUNTER** stays unresolved until the lead decides it:
-      `agenttalk close counter decide --id <id> --counter <cid> --decision accept|reject
-      --reason <…>`; an accepted counter records a remediation item (a blocker
-      remediation MUST name a gate that goes green from `automation_ci` or a waiver).
+      - reject: `agenttalk close counter decide --id <id> --counter <cid>
+        --decision reject --reason <…>`.
+      - accept: `agenttalk close counter decide --id <id> --counter <cid>
+        --decision accept --reason <…> --rem-owner <who> --rem-fix <what>
+        --rem-verification <how>` — accepting RECORDS a remediation item, so the
+        remediation fields are required. For a release blocker add `--blocker --gate
+        <gate-id>`; GO then needs that gate green from `automation_ci` or a waiver.
 
 ## CONVERGE — draft, check, publish
 - [ ] Draft the merged conclusion: `agenttalk close draft --id <id> --from <lead> -m <…>`.
@@ -50,8 +62,8 @@ existing flow; never invent a parallel workflow or hand-wave a GO.
       --verdict go` (add `--bump-barrier` only as the deliberate release act). A HOLD is
       published as `--verdict hold` and never bumps the barrier.
 - [ ] The lead-only escape for an unroutable/unavailable specialist is
-      `agenttalk close signoffs override --set <id> --from <lead> --reason <…>` —
-      recorded and audited, NOT counted as a real sign-off. Use sparingly.
+      `agenttalk close signoffs override --id <close-id> --set <set-id> --from <lead>
+      --reason <…>` — recorded and audited, NOT counted as a real sign-off. Use sparingly.
 
 ## HONESTY (hard rule)
 - [ ] The close aggregates CLAIMS into a verdict; it does not verify them. Treat a GO as
