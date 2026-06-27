@@ -5,6 +5,41 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.2] - 2026-06-27
+
+Supervised-wake reliability — the end of the 0.31.x supervisor line. A
+full-team simultaneous wake (e.g. an outage that restarts everything at once)
+no longer churns windows when resumed agents fail to re-enter their listen loop,
+and wrapped agents are now the recommended default for hands-off supervision.
+
+### Added
+- **Readiness give-up cap.** A supervised agent that launches but never reaches
+  its first heartbeat (e.g. a resumed manual agent that doesn't re-enter the
+  listen loop) is retried at most `max_readiness_retries` times (default 3),
+  then the supervisor STOPS relaunching it and surfaces a sticky
+  `READINESS_GAVE_UP` warning (no kill; manual intervention) instead of churning
+  windows forever. This readiness counter is separate from stuck-recovery
+  backoff and resets on the first fresh heartbeat or an operator restart.
+  Previously a never-ready resume could relaunch indefinitely.
+
+### Changed
+- **Wrapped is now the recommended/default supervised archetype.** The
+  supervisor template and tutorial steer hands-off agents to `wrapped: true`
+  (the wrapper owns the listen loop + heartbeat, so a resumed agent re-enters by
+  construction and needs no activity hook); manual non-wrapped resume is
+  documented as best-effort/legacy, protected by the readiness cap.
+- **Wrapped Codex child gets `--disable hooks` by default** so a stray project
+  `.codex/hooks.json` cannot make the wrapped child prompt for hook-trust
+  (operator-overridable).
+
+### Upgrade
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.31.2"
+```
+Regenerate the supervisor scaffold with `agenttalk supervise --init --force` to
+pick up the wrapped-as-default template. For hands-off supervision, prefer
+`wrapped: true`.
+
 ## [0.31.1] - 2026-06-27
 
 Supervisor robustness for the current Codex CLI, plus a non-blocking activity
