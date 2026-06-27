@@ -5,6 +5,54 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.34.0] - 2026-06-27
+
+Specialist sign-off by risk class (assurance P3). A milestone close can now
+**derive its required reviewer sign-offs from the risk classes in play** —
+routed to the right specialists by roster role/group (and domain reviewers) — and
+won't go GREEN until enough distinct qualified reviewers have signed. Opt-in; the
+project owns the risk→reviewer policy.
+
+### Added
+- **`agenttalk close signoffs` (plan / apply / override)** + `close open
+  --derive-signoffs` — derive a close's required specialist sign-offs from a
+  project signoff policy (`.agenttalk/signoffs.json`; missing = empty/opt-in) and
+  the close's risk inventory:
+  - **risk inventory** per close — `risk_class` validated against a core envelope
+    (`none|unknown|release|security|performance|persistence|docs-contract|quality`)
+    plus `project:` extensions; changed paths default from the frozen revision
+    (`git diff`), with audited manual overrides.
+  - **route freeze** stores policy/risk/revision **hashes + refsets**, never
+    concrete people — candidates re-resolve against the current
+    roster/groups/roles + domain reviewers at check time (a role change is honored
+    without reopening; a policy/risk/revision change holds `stale_signoff_route`
+    until re-applied).
+  - **count semantics** — a set is satisfied only by enough **distinct qualifying
+    agents** with countable acks (default `accept`); `NA` counts only if allowed
+    (with a reason); `counter` and lead `--override` don't count unless opted in
+    (and an override is surfaced); one agent can't satisfy `count=2`.
+  - **`signoffs override`** is a close-lead-only escape for an unroutable
+    requirement (fail-closed).
+  - new HOLD codes: `missing_required_signoff`, `unroutable_required_signoff`,
+    `invalid_signoff_policy`, `unmapped_required_risk`, `stale_signoff_route`.
+- Reuses `.agenttalk/domains.json` reviewers as an **additive** candidate source;
+  lens authorization gains `allowed_groups` so the refset vocabulary
+  (agents/groups/roles) matches roster and domains.
+
+### Notes
+- Opt-in and generic: the project decides risk classes, the risk→sign-off
+  mapping, required counts, and candidate refsets; agenttalk core owns the schema,
+  refset resolution, pure verdict, and count enforcement (`compute_verdict` stays
+  pure — the CLI supplies resolved candidate sets + hashes). This is P3 of the
+  assurance roadmap; review rubrics and a tester skill are next (P4).
+
+### Upgrade
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.34.0"
+```
+Additive and opt-in; no migration. Create `.agenttalk/signoffs.json` to use
+derived specialist sign-offs.
+
 ## [0.33.0] - 2026-06-27
 
 The milestone-close protocol — the assurance spine's HOLD/GO gate for a whole
