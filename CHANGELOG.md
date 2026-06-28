@@ -5,6 +5,59 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.0] - 2026-06-28
+
+### Added
+
+- **Dead-letter / poison-message handling for the supervised wrapper loop.**
+  A message that fails *deterministically* at the head of a mailbox no longer drives
+  an unbounded backoff-restart loop (the v0.30.0 known limitation). The continuous
+  wrapper loop keeps a durable per-agent attempt ledger
+  (`.agenttalk/state/dead-letter-attempts/<agent>.json`, write-ahead before each
+  drive so a crash mid-turn still counts), and when a head message exhausts its
+  retry budget it is moved to a recoverable, scan-invisible sink
+  (`.agenttalk/dead-letter/<agent>/`) and the cursor advances — never advancing
+  unless the original bytes are recoverable, never double-delivering. Failures are
+  classified three ways:
+  - **poison-eligible** (explicit terminal turn failure + crash-mid-turn) →
+    auto-dead-letters at a low *consecutive* cap (K=3);
+  - **known-global-infra** (spawn/auth/rate-limit/network/5xx, and a recognized
+    retryable transport drop — including one that arrives after the handshake) →
+    **never** auto-dead-letters; keeps retrying and escalates at a high ceiling (K=20);
+  - **ambiguous/unknown** (partial stream, nonzero-after-start, unattributed
+    terminal) → escalates and auto-dead-letters only at the high ceiling.
+
+  No failure class can silently loop forever. Restore is an explicit **requeue**
+  (a fresh-id message; no cursor rewind, so it cannot immediately re-poison).
+- **CLI + visibility.** `agenttalk dead-letter list` / `show` / `requeue`; the
+  dead-lettered count is additive in `status`; `doctor` goes loud when a message
+  was dead-lettered with no escalation target, when the lead is the only route, or
+  when the sink is unreadable.
+
+### Changed (behavior)
+
+- Failure classification is fail-closed and conservative: poison markers are narrow
+  and qualified (e.g. token-bounded HTTP 413, not bare substrings); an unattributed
+  terminal failure defaults to *ambiguous* (high ceiling, never the low poison cap);
+  and an explicit retryable transport drop — even after a turn has started — is
+  classified **infra** (retry + escalate, never auto-dead-letter).
+- Dead-letter scope is the **supervised wrapper continuous loop only**; manual
+  `listen` and one-shot turns are unchanged (documented v1 boundary).
+
+### Fixed
+
+- A `claude` session that fails to resume now self-heals (fresh session) rather than
+  wedging the loop.
+- Sink writes are collision-safe and recoverable: a pre-existing payload is never
+  overwritten; new bytes land in a uniquely-named sibling, recorded with the original
+  message id.
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.41.0"
+```
+
 ## [0.40.1] - 2026-06-28
 
 ### Fixed (fast-follow hardening; origin: 2026-06-28 audit clusters C4/C5)

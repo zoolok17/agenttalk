@@ -75,11 +75,47 @@ C5a P1 (structural → semantic artifact readback). WP resolver deferred (banked
   clear it); `write_restart_request` + `clear_restart_request` share the config
   lock so a stale clear cannot remove a newer marker.
 
+## SHIPPED v0.41.0 — dead-letter / poison-message handling (`dead-letter-build`)
+
+Origin: the 0.30.0 **poison-message head-of-line** known limitation + the
+2026-06-28 backlog ("do all of them"). A message failing *deterministically* at the
+head of a mailbox drove an unbounded backoff-restart loop. Designed by codex
+(ultracode rubric gate), built by dev-2, cross-reviewed by codex + reviewer-1, and
+lead-gated through **six** adversarial-verify passes — the 6th caught a real
+classification bug that 2/2 reviewers + five passes had missed (folded before ship).
+
+- **Durable attempt ledger + recoverable sink.** Per-agent ledger
+  (`state/dead-letter-attempts/<agent>.json`), write-ahead before each drive so a
+  crash mid-turn counts; on exhaustion the head message moves to a scan-invisible,
+  recoverable sink (`dead-letter/<agent>/`) and the cursor advances **last** — never
+  unless the bytes are recoverable; collision-safe; idempotent replay.
+- **Three-way failure taxonomy.** poison-eligible (terminal turn-failed +
+  crash-mid-turn) → low *consecutive* cap K=3; known-global-infra
+  (spawn/auth/rate-limit/network/5xx + recognized retryable transport drop) →
+  **never** auto-DL, escalate at K=20; ambiguous/unknown → escalate + auto-DL only
+  at K=20. No class loops forever; a sustained outage never false-DLs at the low cap.
+- **6th-verify P2 (folded, `cd39e12` → `b91e400`).** `_classify` checked the
+  started/partial branch *before* the retryable→infra branch, so a retryable
+  transport drop *after* the handshake (codex "Reconnecting…", claude rate-limit
+  mid-stream) was misclassed ambiguous and could false-DL a healthy message at the
+  ceiling during an outage. *Fix:* a recognized retryable signal classifies **infra**
+  before the started branch (terminal-text precedence preserved) + regression tests.
+- **Restore = requeue** (fresh-id message; no cursor rewind). **CLI:**
+  `dead-letter list/show/requeue`; **doctor** loud on no/solo escalation target or
+  unreadable sink; **scope:** supervised continuous loop only (manual `listen` +
+  one-shot untouched — documented v1 boundary).
+
+Status: **SHIPPED as v0.41.0**. 2/2 reviewer-approved on the frozen SHA + lead-gated
+(ruff/bandit/diff-check clean, 1280 passed on 3.10 AND 3.14).
+
 ## BACKLOG
 
-- **Dead-letter / poison-message handling.** A malformed message at the head of a
-  mailbox can drive backoff-restart loops; needs a dead-letter path. (Known
-  limitation since 0.30.0.)
+- **Dead-letter defense-in-depth (P3, fast-follow).** Banked from the dead-letter
+  review/verify: (1) `ack` / `advance_cursor` accept an arbitrary id on write (no
+  `_ID_RE` guard) — an operator cursor-skip vector; (2) the disposal path is not
+  wrapped against a transient IO error mid-move (fail-closed today, but a retry +
+  backoff would be more robust); (3) no idle/startup reconcile of a stuck
+  `in_progress` / orphan-sidecar, and `doctor` does not warn on it.
 - **Model-tiering / routing.** Route work to model tiers by task class.
 - **Restart resilience.** Restart-notice, checkpoint-before-compact skill,
   richer `request-launch`.
@@ -89,7 +125,9 @@ C5a P1 (structural → semantic artifact readback). WP resolver deferred (banked
 
 ## KNOWN LIMITATIONS (shipped & accepted)
 
-- **Poison-message head-of-line blocking** — see dead-letter backlog item.
+- **Poison-message head-of-line blocking** — fixed for the supervised wrapper loop
+  in v0.41.0 (dead-letter). Manual `listen` and one-shot turns remain out of v1
+  scope (documented boundary).
 - **Wrapped-Codex conservative 900s stale threshold** — chosen for safety; may
   delay degraded detection for wrapped Codex.
 - **No explicit visible idle signal** (minor UX).
