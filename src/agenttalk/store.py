@@ -2284,9 +2284,12 @@ class Store:
     # supervisor's own pid/backoff state stays in a script-local file, not here.
 
     def write_restart_request(self, agent: str, payload: dict) -> None:
-        """Atomically write ``agent``'s restart-request marker."""
-        _atomic_write_text(self.state_dir / f"{agent}.restart-request",
-                           json.dumps(payload, ensure_ascii=False))
+        """Atomically write ``agent``'s restart-request marker UNDER the config lock, so
+        a concurrent ``clear_restart_request`` cannot interleave between its read and
+        unlink and drop a newer marker (C5b TOCTOU; mirrors archive_launch_request)."""
+        with self._config_lock():
+            _atomic_write_text(self.state_dir / f"{agent}.restart-request",
+                               json.dumps(payload, ensure_ascii=False))
 
     def read_restart_request(self, agent: str) -> dict | None:
         """Return ``agent``'s restart-request marker, or None if absent/corrupt."""
@@ -2303,15 +2306,20 @@ class Store:
         """Clear ``agent``'s restart-request marker ONLY if its current
         ``request_id`` matches — so a NEWER request written after the relaunch
         decision survives (no lost-wakeup). Returns True when it cleared one.
-        Best-effort, never raises."""
-        marker = self.read_restart_request(agent)
-        if not marker or marker.get("request_id") != request_id:
-            return False
-        try:
-            (self.state_dir / f"{agent}.restart-request").unlink()
-            return True
-        except OSError:
-            return False
+        Best-effort, never raises.
+
+        C5b: the read/compare/unlink runs UNDER the config lock so a concurrent
+        ``write_restart_request`` cannot replace the marker between the compare and the
+        unlink (a stale clearer must never remove a newer request)."""
+        with self._config_lock():
+            marker = self.read_restart_request(agent)
+            if not marker or marker.get("request_id") != request_id:
+                return False
+            try:
+                (self.state_dir / f"{agent}.restart-request").unlink()
+                return True
+            except OSError:
+                return False
 
     # ------------------------------------------- launch-request markers
     #

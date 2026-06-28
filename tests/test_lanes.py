@@ -635,3 +635,88 @@ def test_cli_malformed_lanes_does_not_brick_status(tmp_path: Path) -> None:
     # lane status fails closed (exit 2), but an unrelated command still works
     assert _run(["lane", "status"], root) == 2
     assert _run(["status"], root) == 0
+
+
+# --- C5a (0.40.1): lane delivery artifact readback before clearing the lane ----------
+
+def test_validate_delivery_artifact_pure(tmp_path: Path) -> None:
+    p = tmp_path / "art.json"
+    good = {"schema_version": lanes.SCHEMA_VERSION, "lane_id": "l1", "delivered_head": "H1",
+            "verdict": lanes.VERDICT_GO, "holds": []}
+
+    def write(over=None):
+        p.write_text(json.dumps({**good, **(over or {})}), encoding="utf-8")
+
+    write()
+    assert lanes.validate_delivery_artifact(p, lane_id="l1", head_sha="H1")["lane_id"] == "l1"
+    # wrong lane/head
+    write()
+    with pytest.raises(lanes.LaneError):
+        lanes.validate_delivery_artifact(p, lane_id="other", head_sha="H1")
+    with pytest.raises(lanes.LaneError):
+        lanes.validate_delivery_artifact(p, lane_id="l1", head_sha="OTHER")
+    # SEMANTIC (reviewer-1 P1): valid JSON but wrong schema / non-GO verdict / dirty holds
+    write({"schema_version": 999})
+    with pytest.raises(lanes.LaneError):
+        lanes.validate_delivery_artifact(p, lane_id="l1", head_sha="H1")
+    write({"verdict": "HOLD"})
+    with pytest.raises(lanes.LaneError):
+        lanes.validate_delivery_artifact(p, lane_id="l1", head_sha="H1")
+    write({"holds": [{"code": "x", "detail": "y"}]})       # GO with holds is inconsistent
+    with pytest.raises(lanes.LaneError):
+        lanes.validate_delivery_artifact(p, lane_id="l1", head_sha="H1")
+    # missing field
+    p.write_text(json.dumps({"lane_id": "l1", "delivered_head": "H1"}), encoding="utf-8")
+    with pytest.raises(lanes.LaneError):
+        lanes.validate_delivery_artifact(p, lane_id="l1", head_sha="H1")
+    # unparseable
+    p.write_text("{not json", encoding="utf-8")
+    with pytest.raises(lanes.LaneError):
+        lanes.validate_delivery_artifact(p, lane_id="l1", head_sha="H1")
+
+
+def test_cli_deliver_corrupt_artifact_keeps_lane_active(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # C5a: if the just-written artifact reads back corrupt/wrong, deliver exits nonzero
+    # and the lane stays ACTIVE (no false success on unreadable evidence).
+    root, base = _repo(tmp_path)
+    br = _branch(root)
+    _run(["lane", "assign", "--id", "l1", "--from", "lead", "--assignee", "dev",
+          "--domain", "core", "--base", base, "--target", br, "--path", "src/core"], root)
+    head = _commit(root, "src/core/a.py", "base\nchange\n")
+
+    def bad_write(store, *, lane, head_sha, **kw):
+        p = lanes.delivery_artifact_path(store, lane["lane_id"], head_sha)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{corrupt artifact", encoding="utf-8")
+        return p
+
+    monkeypatch.setattr(lanes, "write_delivery_artifact", bad_write)
+    assert _run(["lane", "deliver", "--id", "l1", "--from", "dev", "--head", head], root) == 2
+    active = {ln["lane_id"] for ln in lanes.active_lanes(lanes.load_lanes(Store(root)))}
+    assert "l1" in active                                       # lane NOT cleared
+
+
+def test_cli_deliver_valid_but_wrong_artifact_keeps_lane_active(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # C5a reviewer-1 P1: a VALID-JSON but semantically-wrong artifact (verdict HOLD) must
+    # NOT clear the lane - the readback is semantic, not just structural.
+    root, base = _repo(tmp_path)
+    br = _branch(root)
+    _run(["lane", "assign", "--id", "l1", "--from", "lead", "--assignee", "dev",
+          "--domain", "core", "--base", base, "--target", br, "--path", "src/core"], root)
+    head = _commit(root, "src/core/a.py", "base\nchange\n")
+
+    def hold_write(store, *, lane, head_sha, **kw):
+        p = lanes.delivery_artifact_path(store, lane["lane_id"], head_sha)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "schema_version": lanes.SCHEMA_VERSION, "lane_id": lane["lane_id"],
+            "delivered_head": head_sha, "verdict": "HOLD",
+            "holds": [{"code": "x", "detail": "tampered"}]}), encoding="utf-8")
+        return p
+
+    monkeypatch.setattr(lanes, "write_delivery_artifact", hold_write)
+    assert _run(["lane", "deliver", "--id", "l1", "--from", "dev", "--head", head], root) == 2
+    active = {ln["lane_id"] for ln in lanes.active_lanes(lanes.load_lanes(Store(root)))}
+    assert "l1" in active                                       # lane NOT cleared on HOLD evidence

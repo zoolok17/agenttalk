@@ -493,3 +493,42 @@ def write_delivery_artifact(store, *, lane: dict, head_sha: str, verdict: dict,
     path = delivery_artifact_path(store, lane["lane_id"], head_sha)
     _atomic.write_text(path, json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True))
     return path
+
+
+def validate_delivery_artifact(path, *, lane_id: str, head_sha: str) -> dict:
+    """Read back + SEMANTICALLY validate the just-written delivery artifact (C5a) before
+    the lane is cleared. Raises :class:`LaneError` on ANY read/parse/shape/semantic
+    mismatch so the caller leaves the lane ACTIVE - a truncated/corrupt/tampered OR
+    valid-JSON-but-wrong artifact must never read as a successful delivery (reviewer-1
+    P1: structural-only checks let a HOLD/unsupported-schema artifact clear the lane).
+    Covers both the atomic and sandbox direct-write paths (we read the exact path
+    returned). Returns the parsed artifact on success."""
+    import json
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise LaneError(f"delivery artifact readback failed ({e})") from e
+    if not isinstance(data, dict):
+        raise LaneError("delivery artifact is not a JSON object")
+    for k in ("schema_version", "lane_id", "delivered_head", "verdict", "holds"):
+        if k not in data:
+            raise LaneError(f"delivery artifact is missing required field {k!r}")
+    # Semantic, not just structural: the artifact must be the CURRENT schema, prove a GO
+    # delivery (verdict==GO with NO holds), and describe THIS lane/head. Anything else is
+    # corrupt/tampered/unsupported -> fail closed (lane stays active).
+    if data.get("schema_version") != SCHEMA_VERSION:
+        raise LaneError(
+            f"delivery artifact schema_version {data.get('schema_version')!r} != "
+            f"{SCHEMA_VERSION} (unsupported)")
+    if data.get("verdict") != VERDICT_GO:
+        raise LaneError(
+            f"delivery artifact verdict is {data.get('verdict')!r}, not {VERDICT_GO} - "
+            "refusing to clear the lane on non-GO evidence")
+    holds = data.get("holds")
+    if not isinstance(holds, list) or holds:
+        raise LaneError("delivery artifact holds must be an empty list for a GO delivery")
+    if data.get("lane_id") != lane_id or data.get("delivered_head") != head_sha:
+        raise LaneError(
+            "delivery artifact lane_id/delivered_head does not match the delivered lane "
+            f"(got {data.get('lane_id')!r}@{str(data.get('delivered_head'))[:12]})")
+    return data

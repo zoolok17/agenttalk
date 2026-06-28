@@ -2357,6 +2357,17 @@ def cmd_lane(args: argparse.Namespace) -> int:
                     f"agenttalk lane deliver: artifact write failed ({e}); lane stays "
                     "active (NOT cleared).\n")
                 return 2
+            # C5a: READ BACK + validate the artifact we just wrote (covers BOTH the atomic
+            # and sandbox direct-write paths) BEFORE clearing the lane. A truncated/corrupt/
+            # wrong artifact -> lane stays ACTIVE + nonzero, so a caller gating on the
+            # printed evidence path can never get a false success on unreadable evidence.
+            try:
+                lane_mod.validate_delivery_artifact(
+                    artifact, lane_id=args.id, head_sha=head)
+            except lane_mod.LaneError as e:
+                sys.stderr.write(
+                    f"agenttalk lane deliver: {e}; lane stays active (NOT cleared).\n")
+                return 2
             (data.get("lanes") or {}).pop(args.id, None)
             lane_mod.save_lanes(store, data)
         print(f"delivered lane {args.id} @ {head[:12]} (GO); evidence: {artifact}")
@@ -2435,12 +2446,26 @@ def _knowledge_anchor_status(store, note: dict) -> dict:
         status["target_resolvable"] = (rcs == 0)
     elif kind == "request":
         rid = anchor.get("request_id")
+        mid = anchor.get("msg_id")
         try:
-            status["target_resolvable"] = any(
-                (getattr(m, "meta", None) or {}).get("request_id") == rid
-                for m in store.valid_messages())
+            msgs = list(store.valid_messages())
+            if mid:
+                # C4b: msg_id is EXACT - resolve that precise message id (NO fallback to
+                # any other same-request message). If request_id is also present it must
+                # match the found message's request_id.
+                match = next((m for m in msgs if getattr(m, "id", None) == mid), None)
+                status["target_resolvable"] = (
+                    match is not None
+                    and (not rid
+                         or (getattr(match, "meta", None) or {}).get("request_id") == rid))
+            elif rid:
+                status["target_resolvable"] = any(
+                    (getattr(m, "meta", None) or {}).get("request_id") == rid for m in msgs)
+            else:
+                status["target_resolvable"] = False   # neither id -> unresolvable
         except Exception:  # noqa: BLE001 - a scan failure must not crash a read
-            status["target_resolvable"] = True
+            # C4b: a scan/read failure is UNRESOLVABLE, never inferred fresh (was True).
+            status["target_resolvable"] = False
     return status
 
 
@@ -2556,9 +2581,10 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
             except kn.KnowledgeError as e:
                 sys.stderr.write(f"agenttalk knowledge curate: {e}\n")
                 return 2
-            kn.knowledge_dir(store).mkdir(parents=True, exist_ok=True)
-            with open(kn.notes_path(store), "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(evt, ensure_ascii=False, sort_keys=True) + "\n")
+            # C4c: route through the SAME durable writer publish uses (one append path,
+            # fsync). We already hold _config_lock (curate is read-view-build-append under
+            # one lock), so call the locked-internal helper - not append_event (re-lock).
+            kn.write_event_locked(store, evt)
         print(f"{sub} {args.domain}/{args.key} by {actor} ({resolved_from})")
         return 0
 
@@ -2597,12 +2623,26 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
                 {"k": n.get("key"), "b": n.get("body"), "t": n.get("type"),
                  "a": n.get("anchor")}, ensure_ascii=False).casefold()]
         shown = [(n, v) for (n, v) in rows if visible(n, v)]
+        # C4d: onboard is a BOUNDED digest, grouped by domain then type, deterministic
+        # order, truncated to --limit. (pull/search are unbounded.) Apply before the JSON
+        # branch so both renderings agree.
+        onboard_total = len(shown)
+        onboard_truncated = False
+        if action == "onboard":
+            shown = sorted(shown, key=lambda nv: (
+                nv[0].get("domain_id") or "", nv[0].get("type") or "", nv[0].get("key") or ""))
+            limit = getattr(args, "limit", 20)
+            if isinstance(limit, int) and limit >= 0 and onboard_total > limit:
+                shown = shown[:limit]
+                onboard_truncated = True
         if getattr(args, "json", False):
             print(json.dumps([{**n, "_verdict": v} for (n, v) in shown], indent=2))
             return 0
         if action == "onboard":
             who = (" for " + args.for_agent) if getattr(args, "for_agent", None) else ""
-            print(f"knowledge onboard{who}: {len(shown)} active note(s)")
+            trunc = (f" (showing {len(shown)} of {onboard_total}; --limit to adjust)"
+                     if onboard_truncated else "")
+            print(f"knowledge onboard{who}: {len(shown)} active note(s){trunc}")
             by_domain: dict = {}
             for n, v in shown:
                 by_domain.setdefault(n["domain_id"], []).append((n, v))
@@ -3136,16 +3176,21 @@ def _roster_expertise(store, *, json_out: bool) -> int:
             who = art.get("assignee")
             if isinstance(d, str) and isinstance(who, str):
                 delivered.setdefault(d, []).append(who)
-    # curated note authors by domain (weak; uncurated excluded)
+    # curated note authors by domain (WEAK secondary signal; raw uncurated notes are
+    # gameable volume, excluded). C4a: use the CURATED view, not latest - so a later
+    # uncurated publish for the same (domain_id,key) cannot erase the verified author's
+    # credit (the curated event survives in resolve_views even when latest is uncurated).
     events, _ = kn.read_events(store)
     curated_authors: dict[str, dict] = {}
-    for note in kn.current_view(events).values():
-        if kn.is_curated(note) and not kn.is_retracted(note):
-            d = note.get("domain_id")
-            a = note.get("author")
-            if isinstance(d, str) and isinstance(a, str):
-                curated_authors.setdefault(d, {}).setdefault(a, 0)
-                curated_authors[d][a] += 1
+    for rec in kn.resolve_views(events).values():
+        note = rec.get("curated")
+        if note is None or rec.get("tombstoned") or kn.is_retracted(note):
+            continue
+        d = note.get("domain_id")
+        a = note.get("author")
+        if isinstance(d, str) and isinstance(a, str):
+            curated_authors.setdefault(d, {}).setdefault(a, 0)
+            curated_authors[d][a] += 1
     out = {}
     for did, dentry in sorted(domains.items()):
         out[did] = {
@@ -6057,6 +6102,9 @@ def build_parser() -> argparse.ArgumentParser:
     knonb.add_argument("--for", dest="for_agent", help="Agent the digest is for (label only).")
     knonb.add_argument("--include-uncurated", dest="include_uncurated", action="store_true")
     knonb.add_argument("--include-stale", dest="include_stale", action="store_true")
+    knonb.add_argument("--limit", type=int, default=20,
+                       help="Max notes in the digest (default 20; deterministic order, "
+                            "grouped by domain then type). Truncated beyond this.")
     knonb.add_argument("--json", action="store_true")
     knonb.set_defaults(func=cmd_knowledge)
 

@@ -277,6 +277,25 @@ def test_clear_restart_only_matching_rid(tmp_path: Path) -> None:
     assert s.read_restart_request("worker") is None
 
 
+def test_clear_restart_request_store_level_compare(tmp_path: Path) -> None:
+    # C5b: clear_restart_request runs read/compare/unlink UNDER store._config_lock so a
+    # concurrent write_restart_request cannot replace the marker between the compare and
+    # the unlink. Behaviorally: a stale clearer (old id) never removes a newer marker;
+    # the matching id does. (Both ops are lock-protected now.)
+    s = _team(tmp_path)
+    s.write_restart_request("worker", {"agent": "worker", "request_id": "rr-1"})
+    # a newer request supersedes the marker
+    s.write_restart_request("worker", {"agent": "worker", "request_id": "rr-2"})
+    # the stale clearer intending rr-1 must NOT remove the newer rr-2 marker
+    assert s.clear_restart_request("worker", "rr-1") is False
+    assert (s.read_restart_request("worker") or {}).get("request_id") == "rr-2"
+    # the matching clearer removes it
+    assert s.clear_restart_request("worker", "rr-2") is True
+    assert s.read_restart_request("worker") is None
+    # clearing an absent marker is a no-op False
+    assert s.clear_restart_request("worker", "rr-2") is False
+
+
 # ----------------------------------------- supervise --init / --plan CLI
 
 def test_supervise_init_generates_and_is_idempotent(tmp_path: Path, capsys) -> None:

@@ -24,6 +24,7 @@ Design (codex knowledge design, lead-gated; dev-2 + reviewer-1 consults folded i
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
 
@@ -62,6 +63,8 @@ STALE_ANCHOR_GONE = "anchor_disappeared"
 STALE_ANCHOR_CHANGED = "anchor_path_changed"
 STALE_SYMBOL_MISMATCH = "symbol_evidence_mismatch"
 STALE_TARGET_UNRESOLVABLE = "anchor_target_unresolvable"
+STALE_MISSING_BASELINE = "missing_verified_baseline"   # path/symbol anchor, null vsha (C4b)
+STALE_UNSUPPORTED_WP = "unsupported_wp_anchor"          # pathless wp, no resolver in 0.40.1 (C4b)
 # caution flags (shown, NOT excluded by default)
 CAUTION_SHA_NOT_HEAD = "verified_sha_not_head"
 CAUTION_UNCURATED = "uncurated"
@@ -388,10 +391,18 @@ def compute_staleness(note: dict, *, domain_exists: bool, current_registry_hash:
             cautions.append(CAUTION_SHA_NOT_HEAD)
 
     if path_bound:
+        if not note.get("verified_against_sha"):
+            # C4b: a path/symbol anchor with NO verified baseline cannot be checked for
+            # change -> fail closed HARD-STALE (was silently fresh). Distinct reason so
+            # `--include-stale` shows WHY (no baseline, not "anchor changed").
+            reasons.append(STALE_MISSING_BASELINE)
         if anchor_status.get("anchor_exists") is False:
             reasons.append(STALE_ANCHOR_GONE)
-        elif anchor_status.get("anchor_changed") is True or anchor_status.get("anchor_changed") is None:
-            # changed OR could-not-be-determined -> hard stale (never infer fresh)
+        elif note.get("verified_against_sha") and (
+                anchor_status.get("anchor_changed") is True
+                or anchor_status.get("anchor_changed") is None):
+            # changed OR could-not-be-determined -> hard stale (never infer fresh). Only
+            # meaningful WITH a baseline; null-baseline is already STALE_MISSING_BASELINE.
             reasons.append(STALE_ANCHOR_CHANGED)
         if kind == "symbol":
             ev = anchor_status.get("evidence_match")
@@ -399,7 +410,13 @@ def compute_staleness(note: dict, *, domain_exists: bool, current_registry_hash:
                 reasons.append(STALE_SYMBOL_MISMATCH)
             elif ev is None:
                 cautions.append(CAUTION_WEAK_SYMBOL)
-    elif kind in ("request", "wp", "sha"):
+    elif kind == "wp":
+        # C4b: a PATHLESS wp anchor has no resolver in 0.40.1 -> unsupported/unresolved,
+        # hard-stale by default with a self-describing reason (a wp WITH a path is
+        # path_bound above and uses the path-bound check). WP identity stays advisory
+        # until a future durable WP resolver exists (documented limitation).
+        reasons.append(STALE_UNSUPPORTED_WP)
+    elif kind in ("request", "sha"):
         if anchor_status.get("target_resolvable") is False:
             reasons.append(STALE_TARGET_UNRESOLVABLE)
 
@@ -434,14 +451,39 @@ def notes_path(store):
     return knowledge_dir(store) / NOTES_FILENAME
 
 
-def append_event(store, event: dict) -> None:
-    """Append exactly one newline-terminated JSON event under the shared store lock
-    (reuse the lane/gate file-lock primitive - no new locking scheme)."""
+def write_event_locked(store, event: dict) -> None:
+    """The SINGLE durable append path for a knowledge event (C4c) - used by BOTH publish
+    and curate. Encodes exactly one event line, appends, flushes, and fsyncs the file so
+    a crash cannot lose a just-recorded note/curation. The CALLER must already hold
+    ``store._config_lock()`` (curate reads-then-appends under one lock to avoid a nested
+    lock; publish goes through :func:`append_event`). Append-only - never whole-file
+    replace, so the reader's skip-invalid/torn-tail tolerance is preserved."""
     knowledge_dir(store).mkdir(parents=True, exist_ok=True)
     line = json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
+    path = notes_path(store)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(line)
+        fh.flush()
+        os.fsync(fh.fileno())
+    # Directory fsync is POSIX durability for the new dir entry; best-effort and guarded
+    # because opening/fsyncing a directory fd is not portable to Windows (the primary
+    # platform) - it raises there, so swallow OSError and rely on the file fsync.
+    try:
+        dfd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def append_event(store, event: dict) -> None:
+    """Append exactly one event under the shared store lock (public publish path).
+    Delegates the durable write to :func:`write_event_locked` so publish and curate share
+    ONE write path (reuse the lane/gate file-lock primitive - no new locking scheme)."""
     with store._config_lock():
-        with open(notes_path(store), "a", encoding="utf-8") as fh:
-            fh.write(line)
+        write_event_locked(store, event)
 
 
 def read_events(store) -> tuple[list[dict], list[dict]]:
