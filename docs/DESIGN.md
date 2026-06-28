@@ -272,6 +272,33 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
    v0.40.0 fix iterated prefix-match → most-specific tuple → all-matching as
    review reproduced progressively deeper bypasses; all-matching ended the class.
 
+- **D-12 Lead-loop lease steal uses a CONFIRMED-dead tri-state liveness.** *Why:*
+  the managed lead-loop lease (Slice 1) must let a crashed controller be taken over
+  at once - gating recovery on the full TTL (900s default) would strand the team
+  mailbox and defeat supervisor auto-recovery. But the immediate steal must NEVER
+  displace a *live* controller. The ordinary `_process_alive` probe is fail-quiet
+  (it collapses *uncertain* - access-denied, ambiguous OpenProcess failures, any
+  exception - into "not alive"), so "not alive" is NOT proof of death. *Decision:*
+  a dedicated tri-state probe `_process_liveness` returns ALIVE / DEAD / UNKNOWN,
+  where **DEAD is only a DEFINITIVE not-running signal** (POSIX `ESRCH`; Windows
+  `GetExitCodeProcess != STILL_ACTIVE`, or `OpenProcess` failing
+  `ERROR_INVALID_PARAMETER`). The lease steal, the `armed` detector, AND the guard
+  all use it: a CONFIRMED-DEAD owner is stealable/unarmed/unguarded IMMEDIATELY
+  regardless of expiry; an ALIVE *or* UNKNOWN owner is treated as probably-alive -
+  armed, guarded, and stealable only once the lease is EXPIRED *and* its heartbeat
+  is stale (a stuck controller). So a long healthy turn is never stolen, and a
+  fail-quiet/uncertain probe can never immediate-steal a live controller; a
+  genuinely-dead-but-unprobeable owner still recovers via the expiry+heartbeat
+  path. *Invariant:* the three authority decisions share one tri-state, so the
+  detector is the EXACT complement of stealability - for a present managed lease,
+  `armed == not stealable` for every case (alive, dead, *and* unknown). *Rejected:*
+  basing immediate steal on `not _process_alive(pid)` - that turns a fail-quiet
+  probe false-negative into a false steal of a live owner. *Evolution:* expiry-for-
+  ALL-steals -> reviewer-1 reproduced a dead-owner-within-TTL limbo (narrowed to
+  dead-owner-immediate) -> codex reproduced a false-steal of a live owner under an
+  uncertain probe (narrowed "dead" to the CONFIRMED tri-state, Option A across
+  steal+armed+guard).
+
 ## 6. How we work (process)
 
 - **Per-phase cadence:** architect designs → lead gates the design → builder

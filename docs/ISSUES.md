@@ -12,6 +12,138 @@ major · `P2` minor · `P3` nit. Each item: what, why, where, disposition.
 
 ---
 
+## IN PROGRESS — lead-loop enforcement, Slice 1 (`lead-loop-slice1`)
+
+Origin: the **operator-raised "the lead stops leading"** failure (every lead, every
+project): a chat-agent lead silently UN-ARMS its control loop — the harness default
+("answer the human, then yield") drops the re-arm even though the discipline is
+documented and in memory. A documented-but-reliably-dropped rule means willpower is
+NOT the fix; we need MECHANICAL enforcement. The operator chose **split-identity
+enforcement**: keep `claude` as the free-form operator-facing liaison, and add a
+separately-supervised managed lead-loop identity that OWNS the team mailbox via a
+wrapped continuous loop and cannot silently un-arm. codex designed (assignment
+`lead-loop-controller`); dev-2 builds; codex + reviewer-1 cross-review; lead gates.
+
+**Slice 1 (this build) = store-level mechanism + visibility + guard (NO controller
+yet; that is Slice 2).** cli-AGNOSTIC by construction — keyed on the agent NAME +
+its `managed_lead_loop` config, never a cli (a codex identity is managed exactly as
+a claude one).
+
+- **Lease (P1, correctness).** `state/<agent>.lead-loop-lease.json` is the ownership
+  state (renewable; `acquire`/`renew`/`release`/`read`). `.waiting` only MIRRORS the
+  live lease for status/UX. STEAL is gated on the CONFIGURED `managed_lead_loop`
+  flag and a CONFIRMED-dead tri-state liveness (see D-12): a CONFIRMED-DEAD owner is
+  stealable IMMEDIATELY regardless of expiry (a crashed controller recovers at
+  once); an ALIVE *or* UNKNOWN owner is treated as probably-alive and stealable only
+  when the lease is EXPIRED *and* its heartbeat is stale. A long HEALTHY turn (within
+  TTL, or heartbeat fresh) is never stolen, an uncertain probe never displaces a live
+  owner, and a manual chat identity is NEVER auto-stolen.
+- **Single-consumer guard (P1).** A live managed lease REJECTS the cursor-CONSUMING
+  verbs (`wait`/`recv`/`drain`/`ack`, exit 7) for a non-owner; read-only
+  (`sync`/`threads`/`status`/`check`) stays allowed. The owner proves itself via the
+  live `lease_id` (`AGENTTALK_LEAD_LOOP_LEASE`). This closes the cursor-loss hole that
+  `--refuse-stacked-wait` alone misses (the model subprocess / a stray window would
+  otherwise race the controller's in-process consumption).
+- **`lead_unarmed` visibility (P2).** doctor + `status` + the supervisor report:
+  a MANAGED identity that is NOT armed is an ERROR (the controller is down).
+  `armed` = a present managed lease that is NOT confirmed-dead AND NOT (EXPIRED *and*
+  heartbeat-stale) — the EXACT complement of the steal predicate, i.e. unarmed only on
+  **no lease, a CONFIRMED-dead owner, or a lease that is EXPIRED *and* heartbeat-stale**.
+  An UNKNOWN-liveness owner (uncertain probe) is NOT `owner_alive` but is treated as
+  probably-alive → armed within TTL (never a false unarmed from a fail-quiet probe).
+  Neither expiry NOR a lapsed heartbeat ALONE is an error: a long healthy turn (within
+  TTL, heartbeat lapsed) and an expired-but-heartbeating lease are both still armed. A LEGACY
+  lead/liaison is a NON-GATING WARN, only with open team work AND no fresh
+  heartbeat/waiter (best-effort; depends on the heartbeat hook, so it is WARN never
+  ERROR — a busy free-form liaison must not false-fire).
+
+**Slice 1b — post-turn turn-end audit — DEFERRED (feasibility verdict).** The
+idea of a post-turn / post-final-answer harness hook that verifies the lead
+re-armed a background wait is **not buildable now**: the repo supports only soft
+PostToolUse hooks (`agenttalk heartbeat --hook`); there is no reliable
+post-final-answer hook that can inspect a backgrounded armed wait. So we **defer**
+Slice 1b and rely on the managed `lead_unarmed` detector (above) as the substitute —
+a wrapped lead-loop is mechanically armed every cycle, so the turn-end audit is moot
+for it, and the liaison no longer owns the team loop. *Disposition:* DEFERRED;
+revisit only if the host harness adds a post-turn hook.
+
+*Where:* `store.py` (lease API + `managed_lead_loop` config + visibility),
+`cli.py` (verb-guard + `managed-lead-loop` command + status), `doctor.py`
+(`_check_lead_unarmed`), `supervisor.py` (report field), `tests/test_lead_loop.py`.
+*Disposition:* built (branch `lead-loop-slice1`), in cross-review.
+
+**Accepted limitations / Slice-2 notes** (from the dev-2 adversarial-verify):
+
+- **PID-reuse in the liveness heuristic (P2, accepted).** `lead_loop_active_owner`
+  (guard), `_lease_stealable` (steal), and `lead_loop_state` (armed) use the tri-state
+  `_process_liveness(owner_pid)` (see D-12) - if the OS recycles a dead owner's pid, the
+  owner can look alive. This matches the existing posture (`foreign_wait_pid` / the
+  `.waiting` marker rely on the fail-quiet `_process_alive`). The `lease_id` (not the pid)
+  is the real ownership token for the guard's owner-bypass, and a recycled pid running a
+  different process will not heartbeat as this agent, so the stale-heartbeat path
+  self-corrects (the lease becomes stealable). `owner_start` is in the lease for a future
+  tighten. Accepted for Slice 1 (consistent with the single-writer model). NOTE: PID-reuse
+  is the *conservative* direction - a recycled pid makes a dead owner look ALIVE, so the
+  worst case is a delayed (expiry+heartbeat) recovery, never a false steal of a live owner.
+- **Lease + .waiting mirror are not atomically coupled (P3, by design).** The lease write
+  is atomic; the observational mirror is a best-effort second write. A crash between them
+  leaves a valid lease without a mirror - fine, readers degrade. Docstring corrected.
+- **Slice-2 note: heartbeat + renewal cadence.** `armed` is NOT confirmed-dead AND
+  NOT (expired AND heartbeat-stale) — so a single lapsed heartbeat on a within-TTL
+  lease no longer flips `armed`. With the defaults (heartbeat window 120s, renewal
+  cadence 300s, TTL 900s) a controller that renews on cadence is never simultaneously
+  expired, so it stays armed even across heartbeat gaps. The wrapped controller
+  (Slice 2) should still stamp the heartbeat frequently (as `_run_continuous` already
+  does each idle cycle) for fresh liveness, but a LIVE/UNKNOWN owner only ERRORs once
+  a lease has BOTH lapsed past TTL AND gone heartbeat-stale (a genuinely down
+  controller); a CONFIRMED-dead owner ERRORs immediately (see D-12).
+
+**Review folds (cross-review on `lead-loop-slice1`):**
+
+- **reviewer-1 round 1 (39589ac→8d923a8):** non-atomic acquire/steal → per-agent
+  O_EXCL lease lock around acquire/renew/release; `lease_id` leak via the `.waiting`
+  mirror → mirror no longer carries the token; `clear` left a live lease → clear
+  force-releases + the guard requires `is_managed_lead_loop`. codex round 1 converged
+  on the same atomic-acquire blocker (+ a doctor docstring nit, folded → 178c9b1).
+- **lead adversarial-verify (folded this pass):** **(P1)** roster `remove`/`rename`/
+  `retire` of a managed agent left a dangling `managed_lead_loop` key → `validate_…`
+  raised → `load_config` exit 2 for EVERY command (un-recoverable in-tool). Fix:
+  `_strip_identity`/`remove_agent` pop the managed key; `rename_agent` carries the
+  spec onto the new name (parity with role/group/liaison); `load_config` SELF-HEALS a
+  dangling key in-memory (prune + warn-once) so an already-bricked config recovers.
+  **(P2)** managed `armed` false-ERRORed on a healthy long turn (hb-only rule was
+  stricter than the guard) → armed dropped the raw-heartbeat gate (this round; later
+  refined to the confirmed-dead tri-state — see the codex bullet below + D-12 for the
+  final predicate). **(P2)** `ttl_seconds`/`cadence_seconds` accepted NaN/inf
+  (`v<=0` is False for both) → reject `not math.isfinite(v)` at the single validate
+  choke point. **(convergence)** `lead_loop_active_owner` is now config-gated on the
+  managed flag (mirrors `_lease_stealable`) so a stray lease for a manual identity
+  never guards its mailbox at the store layer, independent of the CLI guard.
+- **reviewer-1 final-fold review (84babac, release-blocker):** a **dead owner within
+  TTL** was unarmed (detector) AND unguarded (`lead_loop_active_owner` → None) yet
+  **un-stealable** until TTL expiry — a down-but-unrecoverable limbo, and a hole in
+  the "armed = exact complement of stealable" claim. First fix made `_lease_stealable`
+  steal a dead owner immediately, regardless of expiry.
+- **codex final-fold review (2142e84/7bd4a85, release-blocker) → lead D-12 ruling
+  (Option A):** the first fix based immediate steal on `not _process_alive(pid)`, but
+  `_process_alive` is **fail-quiet** — it returns False for *uncertain* probes
+  (access-denied, ambiguous OpenProcess failures, any exception), not only for a
+  confirmed-dead pid. So an uncertain probe could **immediate-steal a LIVE
+  controller** (codex reproduced it by forcing the probe False for a live pid). The
+  safety premise "a live owner can never look dead" was false for this codebase.
+  **Fix (lead Option A):** a dedicated tri-state `_process_liveness` → ALIVE / DEAD /
+  UNKNOWN, where **DEAD is only a DEFINITIVE OS not-running signal** (POSIX ESRCH;
+  Windows `GetExitCodeProcess != STILL_ACTIVE` or `OpenProcess` →
+  `ERROR_INVALID_PARAMETER`). Steal, the `armed` detector, AND the guard all use it:
+  CONFIRMED-DEAD → immediate steal/unarmed/unguarded; ALIVE *or* UNKNOWN →
+  probably-alive (armed, guarded, stealable only when EXPIRED *and* heartbeat-stale).
+  A fail-quiet/uncertain probe can never immediate-steal a live owner; a genuinely-
+  dead-but-unprobeable owner still recovers via expiry+heartbeat. This restores the
+  exact complement for EVERY case (alive, dead, *and* unknown): `not stealable ==
+  armed`. See DESIGN.md **D-12**. Regression tests pin: confirmed-dead steals
+  immediately + recovers; UNKNOWN within TTL is armed/guarded/not-stolen (codex's
+  forced-false-dead repro); UNKNOWN recovers via expiry+stale-heartbeat.
+
 ## SHIPPED v0.40.0 — hardening batch (`hardening-batch-040`)
 
 Origin: the **2026-06-28 fresh-agent audit** (6 independent reviewers; the

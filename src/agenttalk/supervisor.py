@@ -660,6 +660,12 @@ def build_report(store: Store, *, now_epoch: float,
             "restart_request": store.read_restart_request(a),
             "session_id": st.get("session_id"),  # supervisor-local; None unless state passed
         }
+        # Managed lead-loop visibility (lead-loop Slice 1; additive, read-only).
+        # Present only when the agent is managed OR a lease file exists. The planner
+        # does not yet act on this (the controller is Slice 2) - this surfaces the
+        # armed/lease state so the report shows a down managed controller.
+        if store.is_managed_lead_loop(a) or store.read_lead_loop_lease(a) is not None:
+            agents[a]["lead_loop"] = store.lead_loop_state(a, now=now_epoch)
     launch_requests = store.list_launch_requests()
     eph_report: dict[str, dict] = {"active": {}, "orphan_agents": []}
     eph_state = (state or {}).get("ephemeral_reviewers") if isinstance(state, dict) else None

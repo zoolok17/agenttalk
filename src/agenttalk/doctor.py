@@ -120,7 +120,86 @@ def run(project_root: Path | None = None) -> Report:
         esc_check = _check_dead_letter_escalations(store)
         if esc_check is not None:  # additive: absent unless an unrouted backstop exists
             report.checks.append(esc_check)
+        lead_check = _check_lead_unarmed(store)
+        if lead_check is not None:  # additive: absent unless a lead-loop concern exists
+            report.checks.append(lead_check)
     return report
+
+
+def _check_lead_unarmed(store) -> Check | None:
+    """Surface a lead-loop identity not armed to consume its team mailbox.
+
+    MANAGED identities (managed_lead_loop = the wrapped controller) MUST be
+    continuously armed: NOT armed is an ERROR - the controller is down and team
+    messages pile up unhandled. armed = a present lease whose owner is ALIVE and
+    which is NOT stealable (the exact complement of the steal predicate), i.e. the
+    failure cases are: no lease, a dead owner, or a lease that is EXPIRED *and*
+    heartbeat-stale. NOTE: neither dimension ALONE is an error - an expired-but-
+    heartbeating lease and a within-TTL lease whose heartbeat merely lapsed (a long
+    healthy turn) are both still ARMED; only the BOTH-stale case (expired AND
+    heartbeat-stale) is a genuinely down controller (lead P2 - the prior hb-only
+    rule false-ERRORed at the 120s heartbeat window while the lease TTL is 900s).
+    LEGACY identities (a manual role=lead / operator_facing
+    liaison that is NOT managed) get a NON-GATING WARN, and only when they have OPEN
+    team work AND are not currently live (no fresh heartbeat or waiter). The legacy
+    path is best-effort: a free-form liaison that does not run the heartbeat hook
+    writes no heartbeat, so this can over-warn - hence WARN, never ERROR, so it never
+    false-blocks a busy liaison. Absent (None) when there is nothing to flag."""
+    import time as _time
+    from . import threads as _th
+    try:
+        cfg = store.load_config()
+    except Exception:  # noqa: BLE001 - doctor never crashes
+        return None
+    roster = cfg.get("agents", []) or []
+    roles = cfg.get("roles", {}) or {}
+    liaison = store.operator_facing()
+    now = _time.time()
+    errors: list[str] = []
+    warns: list[str] = []
+    data: dict = {"managed": [], "legacy": []}
+
+    def _open_work(a: str) -> int:
+        try:
+            closed = {rid for rid, e in store.read_threadstate(a).items()
+                      if isinstance(e, dict) and e.get("closed") is True}
+            ths = _th.derive_threads(store.valid_messages(), agent=a,
+                                     cursor=store.cursor(a) or "",
+                                     closed_rids=closed,
+                                     retired=set(store.retired_agents()))
+        except Exception:  # noqa: BLE001 - best-effort; never crash doctor
+            return 0
+        return sum(1 for t in ths if getattr(t, "state", None) in _th.ACTIONABLE_STATES)
+
+    for a in roster:
+        if store.is_managed_lead_loop(a):
+            st = store.lead_loop_state(a, now=now)
+            data["managed"].append({"agent": a, "armed": st["armed"], "reason": st["reason"]})
+            if not st["armed"]:
+                errors.append(f"{a}: managed lead-loop NOT armed ({st['reason']})")
+            continue
+        is_lead = isinstance(roles.get(a), str) and roles[a].casefold() == "lead"
+        if not (is_lead or a == liaison):
+            continue
+        if store.agent_active(a, now=now):
+            continue  # fresh heartbeat or fresh waiter -> live, do not warn
+        open_work = _open_work(a)
+        if open_work:
+            warns.append(f"{a}: legacy lead/liaison looks un-armed with {open_work} open "
+                         f"actionable thread(s) (no fresh heartbeat or waiter)")
+            data["legacy"].append({"agent": a, "open_work": open_work})
+    if not errors and not warns:
+        return None
+    return Check(
+        name="lead_loop",
+        status="error" if errors else "warn",
+        details="; ".join(errors + warns),
+        fix=("A MANAGED lead-loop must be running its wrapped controller (it owns the "
+             "mailbox via a renewable lease) - start/restart it, then check "
+             "`agenttalk managed-lead-loop list` + `agenttalk status`. A LEGACY "
+             "lead/liaison warning is advisory: run the heartbeat hook so armed-vs-idle "
+             "is distinguishable, or migrate it to a managed lead-loop."),
+        data=data)
 
 
 def _check_dead_letter_escalations(store) -> Check | None:

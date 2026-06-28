@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -26,6 +27,8 @@ import shutil
 import string
 import threading
 import time
+import uuid
+import warnings
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -272,6 +275,47 @@ def validate_roles(roles: dict, roster: list[str]) -> dict:
                 f"role for {agent!r} must be a printable string of at most 64 chars"
             )
     return roles
+
+
+def validate_managed_lead_loop(managed: object, roster: list[str]) -> dict:
+    """Validate the ``{agent: {enabled, ttl_seconds, cadence_seconds}}`` map.
+
+    Keys must be in the roster; each value an object with an optional bool
+    ``enabled`` and positive-number ``ttl_seconds`` / ``cadence_seconds``. The
+    lease TTL must EXCEED the renew cadence so a single missed renewal (a long
+    turn, a brief stall) cannot expire a healthy controller. Fail-closed so a
+    corrupt config cannot mark a phantom identity managed or smuggle a
+    non-numeric lease bound. Generic by AGENT NAME - never keyed on a cli."""
+    if not isinstance(managed, dict):
+        raise ValueError(f"'managed_lead_loop' must be a dict, got {type(managed).__name__}")
+    rset = set(roster)
+    for agent, spec in managed.items():
+        if agent not in rset:  # fail closed even on an empty roster
+            raise ValueError(
+                f"managed_lead_loop key {agent!r} is not in the roster {sorted(rset)}")
+        if not isinstance(spec, dict):
+            raise ValueError(f"managed_lead_loop[{agent!r}] must be an object")
+        if "enabled" in spec and not isinstance(spec["enabled"], bool):
+            raise ValueError(f"managed_lead_loop[{agent!r}].enabled must be a bool")
+        nums = {}
+        for k in ("ttl_seconds", "cadence_seconds"):
+            if k in spec:
+                v = spec[k]
+                # Reject bool (a bool IS an int), non-numbers, and NON-FINITE values:
+                # `v <= 0` is False for both NaN and +inf, so without the isfinite gate
+                # they slip through -> NaN serializes to an INVALID JSON token and makes
+                # expiry math permanently wrong (NaN -> never-expired diagnostic; +inf ->
+                # an un-stealable dead owner). isfinite only runs after the numeric check.
+                if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                        or not math.isfinite(v) or v <= 0:
+                    raise ValueError(
+                        f"managed_lead_loop[{agent!r}].{k} must be a finite positive number")
+                nums[k] = v
+        if "ttl_seconds" in nums and "cadence_seconds" in nums \
+                and nums["ttl_seconds"] <= nums["cadence_seconds"]:
+            raise ValueError(
+                f"managed_lead_loop[{agent!r}].ttl_seconds must exceed cadence_seconds")
+    return managed
 
 
 def validate_retired(retired: object, active_roster: list[str]) -> list:
@@ -677,6 +721,34 @@ class Store:
                 validate_retired(cfg["retired"], agents)
             except ValueError as e:
                 raise ValueError(f"corrupt config at {self.config_path}: {e}.") from e
+        # Managed lead-loop registry (lead-loop Slice 1). Absent OR null => no
+        # managed identities. Validated fail-closed (positive lease bounds,
+        # TTL > cadence, keys in roster) - generic by agent name, never by cli.
+        if cfg.get("managed_lead_loop") is not None:
+            mll = cfg["managed_lead_loop"]
+            if isinstance(mll, dict):
+                # SELF-HEAL a dangling key: if a roster member that was managed gets
+                # removed/retired/renamed, a stale managed_lead_loop key would make
+                # validate_managed_lead_loop RAISE -> every command exits 2, INCLUDING
+                # the `managed-lead-loop clear` that would fix it (it load_config's
+                # first). Prune non-roster keys IN-MEMORY so the tool stays usable; the
+                # next config write persists the prune. Read-only here by design (this
+                # path is called everywhere, often under a lock). Warn once per process
+                # (default warning filter dedups by call site) for operator visibility.
+                dangling = [k for k in mll if k not in agents]
+                if dangling:
+                    for k in dangling:
+                        mll.pop(k, None)
+                    warnings.warn(
+                        f"config at {self.config_path}: pruned managed_lead_loop "
+                        f"key(s) {sorted(dangling)} not in the roster (self-heal); the "
+                        f"next roster/managed-lead-loop write persists this.",
+                        stacklevel=2,
+                    )
+            try:
+                validate_managed_lead_loop(cfg["managed_lead_loop"], agents)
+            except ValueError as e:
+                raise ValueError(f"corrupt config at {self.config_path}: {e}.") from e
         return cfg
 
     # ------------------------------------------------------- team / roster
@@ -730,10 +802,15 @@ class Store:
         return True
 
     @contextlib.contextmanager
-    def _config_lock(self, *, timeout: float = 10.0, poll: float = 0.05):
-        """Hold an exclusive lock across a config read-modify-write."""
-        lock = self.dir / "config.lock"
-        self.dir.mkdir(parents=True, exist_ok=True)
+    def _exclusive_lock(self, lock: Path, *, timeout: float = 10.0,
+                        poll: float = 0.05, what: str = "lock"):
+        """Hold an exclusive O_EXCL sidecar lock across a read-modify-write.
+
+        Portable on Windows + POSIX (atomic create); breaks a lock held by a
+        provably-dead pid (never a live one); times out otherwise. NOT re-entrant.
+        Shared by ``_config_lock`` (config.json) and the lead-loop lease lock so
+        both get the same battle-tested stale-break behavior."""
+        lock.parent.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + timeout
         fd: int | None = None
         while True:
@@ -745,8 +822,7 @@ class Store:
                     continue  # broke a dead holder — retry create immediately
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
-                        f"could not acquire the config lock at {lock} within "
-                        f"{timeout:g}s — another agent may be mid roster-admin. "
+                        f"could not acquire the {what} at {lock} within {timeout:g}s. "
                         f"If no agent is running, remove the stale lock file."
                     ) from None
                 time.sleep(poll)
@@ -759,10 +835,26 @@ class Store:
                 os.close(fd)
             yield
         finally:
-            try:
-                lock.unlink()
-            except OSError:
-                pass
+            # Release RELIABLY. On Windows a concurrent reader (a peer's
+            # _break_stale_lock reading the pid) holds the lock file open for a
+            # microsecond, and os.unlink of an open file raises PermissionError. If
+            # we swallowed that, the lock would orphan with OUR (live) pid - which no
+            # waiter can break (live pid) - livelocking them to the timeout. Retry
+            # briefly so a colliding read-open never strands the lock.
+            for _ in range(100):
+                try:
+                    lock.unlink()
+                    break
+                except FileNotFoundError:
+                    break
+                except OSError:
+                    time.sleep(0.01)
+
+    def _config_lock(self, *, timeout: float = 10.0, poll: float = 0.05):
+        """Hold an exclusive lock across a config read-modify-write."""
+        return self._exclusive_lock(self.dir / "config.lock", timeout=timeout,
+                                    poll=poll, what="config lock (another agent may be "
+                                    "mid roster-admin)")
 
     @staticmethod
     def _cfg_dict(cfg: dict, key: str) -> dict:
@@ -954,6 +1046,9 @@ class Store:
                 for members in cfg["groups"].values():
                     if name in members:
                         members.remove(name)
+            # Drop any managed_lead_loop entry so a dangling key can't brick load_config.
+            if isinstance(cfg.get("managed_lead_loop"), dict):
+                cfg["managed_lead_loop"].pop(name, None)
             self._write_config(cfg)
         return cfg
 
@@ -1156,6 +1251,11 @@ class Store:
                     members.remove(name)
         if cfg.get("operator_facing") == name:
             cfg.pop("operator_facing", None)
+        # Drop the managed_lead_loop entry too: a left-behind key with no roster
+        # member fails validate_managed_lead_loop -> bricks load_config (reviewer P1).
+        m = cfg.get("managed_lead_loop")
+        if isinstance(m, dict):
+            m.pop(name, None)
 
     def retire_agent(self, name: str, *, reason: str | None = None,
                      renamed_to: str | None = None) -> dict:
@@ -1218,6 +1318,7 @@ class Store:
             old_groups = [g for g, members in (cfg.get("groups") or {}).items()
                           if old in members]
             was_liaison = cfg.get("operator_facing") == old
+            old_managed = (cfg.get("managed_lead_loop") or {}).get(old)
             # Retire old -> tombstone(renamed_to=new), then activate new + carryover.
             self._strip_identity(cfg, old)
             retired = cfg.get("retired")
@@ -1243,6 +1344,11 @@ class Store:
                         members.append(new)
             if was_liaison:
                 cfg["operator_facing"] = new
+            # Carry the managed_lead_loop spec onto `new` (parity with role/group/
+            # liaison). _strip_identity already popped `old`'s key; without this the
+            # rename would SILENTLY DROP the managed flag.
+            if old_managed is not None:
+                self._cfg_dict(cfg, "managed_lead_loop")[new] = old_managed
             # Validate the WHOLE resulting config before writing (fail-closed).
             validate_agent_roster(roster)
             validate_retired(retired, roster)
@@ -1250,6 +1356,8 @@ class Store:
                 validate_roles(cfg["roles"], roster)
             if cfg.get("groups"):
                 validate_groups(cfg["groups"], roster)
+            if cfg.get("managed_lead_loop"):
+                validate_managed_lead_loop(cfg["managed_lead_loop"], roster)
             self._write_config(cfg)
             cur = self.state_dir / f"{new}.cursor"
             if not cur.exists():
@@ -2397,6 +2505,321 @@ class Store:
         except OSError:
             pass
 
+    # ----------------------------------------- managed lead-loop (Slice 1)
+    #
+    # A managed lead-loop identity is a wrapped controller that OWNS its team
+    # mailbox so it can never silently un-arm. Ownership is a renewable LEASE
+    # (state/<agent>.lead-loop-lease.json) - the CORRECTNESS state. The .waiting
+    # marker is only an observational MIRROR of the live lease (status/UX). Slice
+    # 1 ships the lease mechanism + config + guard + visibility; the controller
+    # that acquires/renews it is Slice 2. Everything keys off the AGENT NAME +
+    # its managed_lead_loop config, NEVER the cli (a codex identity can be a
+    # managed lead-loop exactly as a claude one can).
+
+    def managed_lead_loop_agents(self) -> dict:
+        """Return the ``{agent: {enabled, ttl_seconds, cadence_seconds}}`` map
+        ({} if none configured). Read-only; degrade-safe."""
+        return self.load_config().get("managed_lead_loop", {}) or {}
+
+    def managed_lead_loop_spec(self, agent: str) -> dict | None:
+        """Resolved spec for ``agent`` ({enabled, ttl_seconds, cadence_seconds}
+        with defaults filled), or None if not configured. ``enabled`` defaults
+        True so a bare ``{}`` entry means 'managed with default bounds'."""
+        spec = self.managed_lead_loop_agents().get(agent)
+        if not isinstance(spec, dict):
+            return None
+        return {
+            "enabled": bool(spec.get("enabled", True)),
+            "ttl_seconds": float(spec.get("ttl_seconds", LEAD_LOOP_TTL_DEFAULT)),
+            "cadence_seconds": float(spec.get("cadence_seconds", LEAD_LOOP_CADENCE_DEFAULT)),
+        }
+
+    def is_managed_lead_loop(self, agent: str) -> bool:
+        """True iff ``agent`` is configured AND enabled as a managed lead-loop."""
+        spec = self.managed_lead_loop_spec(agent)
+        return bool(spec and spec["enabled"])
+
+    def set_managed_lead_loop(self, agent: str, *, enabled: bool = True,
+                              ttl_seconds: float | None = None,
+                              cadence_seconds: float | None = None) -> None:
+        """Mark ``agent`` as a managed lead-loop (or clear it with enabled=False).
+        Config write under the shared lock (like set_role); validated fail-closed.
+        CLEARING (enabled=False) also FORCE-RELEASES any live lease + mirror so the
+        now-unmanaged identity is not left guarded / un-stealable (reviewer-1)."""
+        with self._config_lock():
+            cfg = self.load_config()
+            roster = cfg.get("agents", []) or []
+            if agent not in roster:
+                raise ValueError(f"agent {agent!r} is not in the roster {sorted(roster)}")
+            managed = self._cfg_dict(cfg, "managed_lead_loop")
+            if enabled:
+                managed[agent] = {
+                    "enabled": True,
+                    "ttl_seconds": float(ttl_seconds if ttl_seconds is not None
+                                         else LEAD_LOOP_TTL_DEFAULT),
+                    "cadence_seconds": float(cadence_seconds if cadence_seconds is not None
+                                             else LEAD_LOOP_CADENCE_DEFAULT),
+                }
+            else:
+                managed.pop(agent, None)
+            validate_managed_lead_loop(managed, roster)
+            self._write_config(cfg)
+        # Outside the config lock (the lease has its own lock): unmanaging an agent
+        # force-releases its lease so it is not left guarded/un-stealable.
+        if not enabled:
+            self.release_lead_loop_lease(agent)
+
+    def lead_loop_lease_path(self, agent: str):
+        return self.state_dir / f"{validate_agent_name(agent)}.lead-loop-lease.json"
+
+    def _lead_loop_lease_lock(self, agent: str):
+        """Exclusive per-agent lock serializing acquire/renew/release/steal so the
+        read-decide-write is ATOMIC - two contenders can never both 'acquire' an
+        empty lease (reviewer-1 blocker). Reuses the O_EXCL stale-break machinery."""
+        return self._exclusive_lock(
+            self.state_dir / f"{validate_agent_name(agent)}.lead-loop-lease.lock",
+            what="lead-loop lease lock")
+
+    def read_lead_loop_lease(self, agent: str) -> dict | None:
+        """Return the parsed lease dict, or None if absent/corrupt. Never raises
+        (a torn write reads as None -> treated as 'no lease', fail-safe)."""
+        p = self.lead_loop_lease_path(agent)
+        if not p.exists():
+            return None
+        try:
+            raw = p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _write_lead_loop_lease(self, agent: str, lease: dict) -> None:
+        """Atomically write the lease (the correctness state), then BEST-EFFORT
+        mirror it into .waiting (observational). The two writes are NOT atomically
+        coupled - a crash between them leaves the lease without a mirror, which is
+        fine: the mirror is observational-only and a lease without a mirror is still
+        valid (readers degrade). The mirror lets status/threads/agent_active see the
+        controller as armed; it carries pid + deadline_epoch (existing readers) plus
+        a ``lead_loop`` flag. It deliberately does NOT carry the lease_id: status
+        returns the .waiting object verbatim, so mirroring the lease_id there would
+        LEAK the guard's owner-bypass token to any read-only inspector (reviewer-1
+        blocker). Callers hold lease_id from acquire()'s return value instead."""
+        _atomic_write_text(self.lead_loop_lease_path(agent),
+                           json.dumps(lease, ensure_ascii=False, indent=2))
+        self.write_waiting(agent, {
+            "agent": agent,
+            "pid": lease.get("owner_pid"),
+            "since": lease.get("acquired_at"),
+            "deadline_epoch": lease.get("expires_at"),
+            "lead_loop": True,
+            "managed": True,
+        })
+
+    def _lease_stealable(self, existing: dict, agent: str, *, now: float,
+                         heartbeat_stale_after: float | None) -> bool:
+        """A managed lease is STEALABLE when the owner is gone, so a replacement
+        controller can recover WITHOUT waiting out the TTL:
+
+          - a CONFIRMED-DEAD owner (a DEFINITIVE OS not-running signal, via the
+            tri-state :func:`_process_liveness`) is stealable IMMEDIATELY, regardless
+            of expiry. The process is gone and nothing will ever renew the lease, so
+            gating recovery on TTL would strand the team mailbox for up to a full TTL
+            (reviewer-1 release-blocker: a dead owner within TTL was unarmed AND
+            unguarded yet un-stealable - a down-but-unrecoverable limbo).
+          - an ALIVE *or* UNKNOWN owner is stealable only once the lease is EXPIRED
+            *and* its heartbeat is stale (a stuck controller). A long HEALTHY turn
+            (within TTL, or heartbeat fresh) is NEVER stolen; it renews instead. An
+            UNKNOWN probe (access-denied / exception / ambiguous) is treated as
+            probably-ALIVE and takes this conservative path - so a fail-quiet probe
+            can NEVER immediate-steal a live controller (codex blocker; lead D-12
+            Option A). Only a DEFINITIVE death authorizes the immediate steal.
+
+        This is the EXACT complement of ``lead_loop_state``'s ``armed`` (= NOT
+        confirmed-dead AND NOT (expired AND heartbeat-stale)): for a present managed
+        lease, not-stealable == armed, for EVERY case (alive, dead, OR unknown).
+        Steal is gated on the CONFIGURED managed_lead_loop flag (not just the lease's
+        own field) so a MANUAL chat identity is NEVER auto-stolen even if a stray
+        lease file exists for it."""
+        if not (existing.get("managed") and self.is_managed_lead_loop(agent)):
+            return False
+        if _process_liveness(existing.get("owner_pid")) == PROC_DEAD:
+            return True  # confirmed dead -> recover now, no TTL wait
+        # ALIVE or UNKNOWN (probably-alive): only a stuck owner past TTL with a stale
+        # heartbeat is stealable; a within-TTL / heartbeating owner is never stolen.
+        expires_at = existing.get("expires_at")
+        if not isinstance(expires_at, (int, float)) or now <= expires_at:
+            return False
+        stale_after = (heartbeat_stale_after if heartbeat_stale_after is not None
+                       else ACTIVE_WITHIN_SECONDS)
+        hb = self.read_heartbeat(agent)
+        hb_stale = hb is None or (now - hb.timestamp()) > stale_after
+        return hb_stale  # expired AND heartbeat-stale = stuck -> stealable
+
+    def acquire_lead_loop_lease(self, agent: str, *, owner_pid: int,
+                                ttl_seconds: float | None = None,
+                                now: float | None = None,
+                                session_id: str | None = None,
+                                lease_id: str | None = None,
+                                heartbeat_stale_after: float | None = None) -> dict | None:
+        """Acquire (or re-acquire / steal) the lease. Returns the lease dict on
+        success, or None when a live lease held by ANOTHER owner is not stealable
+        (the caller is blocked). Re-acquiring with a matching lease_id refreshes.
+        ATOMIC under the per-agent lease lock: the read-decide-write is serialized so
+        two contenders can never both acquire an empty lease (reviewer-1 blocker)."""
+        now = now if now is not None else time.time()
+        ttl = float(ttl_seconds) if ttl_seconds is not None else LEAD_LOOP_TTL_DEFAULT
+        with self._lead_loop_lease_lock(agent):
+            existing = self.read_lead_loop_lease(agent)
+            if existing:
+                same_owner = lease_id is not None and existing.get("lease_id") == lease_id
+                if not same_owner and not self._lease_stealable(
+                        existing, agent, now=now,
+                        heartbeat_stale_after=heartbeat_stale_after):
+                    return None  # a live, non-stealable lease held by another owner
+            lid = lease_id or uuid.uuid4().hex
+            iso = _now_iso()
+            keep_acquired = (existing.get("acquired_at")
+                             if existing and existing.get("lease_id") == lid else iso)
+            keep_start = (existing.get("owner_start")
+                          if existing and existing.get("lease_id") == lid else iso)
+            lease = {
+                "schema_version": 1, "managed": True, "mode": LEAD_LOOP_MODE,
+                "agent": agent, "owner_pid": int(owner_pid), "owner_start": keep_start,
+                "session_id": session_id, "lease_id": lid,
+                "acquired_at": keep_acquired, "renewed_at": iso,
+                "expires_at": float(now) + ttl,
+            }
+            self._write_lead_loop_lease(agent, lease)
+            return lease
+
+    def renew_lead_loop_lease(self, agent: str, *, lease_id: str,
+                              ttl_seconds: float | None = None,
+                              now: float | None = None) -> dict | None:
+        """Extend the lease iff the caller owns it (lease_id matches). Returns the
+        updated lease, or None if there is no lease or the caller is not the owner.
+        Atomic under the per-agent lease lock."""
+        now = now if now is not None else time.time()
+        ttl = float(ttl_seconds) if ttl_seconds is not None else LEAD_LOOP_TTL_DEFAULT
+        with self._lead_loop_lease_lock(agent):
+            existing = self.read_lead_loop_lease(agent)
+            if not existing or existing.get("lease_id") != lease_id:
+                return None
+            existing["renewed_at"] = _now_iso()
+            existing["expires_at"] = float(now) + ttl
+            self._write_lead_loop_lease(agent, existing)
+            return existing
+
+    def release_lead_loop_lease(self, agent: str, *, lease_id: str | None = None) -> bool:
+        """Release the lease. With a lease_id, releases only iff the caller owns it
+        (returns False otherwise); with lease_id=None, force-releases (recovery, e.g.
+        when an agent is un-managed). Atomic under the per-agent lease lock. Clears
+        the .waiting mirror when it is a lead-loop mirror (the mirror no longer
+        carries a lease_id, so it is matched by the lead_loop flag - safe under the
+        lock, which serializes release vs a concurrent acquire's mirror write)."""
+        with self._lead_loop_lease_lock(agent):
+            existing = self.read_lead_loop_lease(agent)
+            if existing and lease_id is not None and existing.get("lease_id") != lease_id:
+                return False
+            try:
+                self.lead_loop_lease_path(agent).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return False
+            mirror = self.read_waiting(agent)
+            if isinstance(mirror, dict) and mirror.get("lead_loop"):
+                self.clear_waiting(agent)
+            return True
+
+    def lead_loop_active_owner(self, agent: str) -> dict | None:
+        """Return the lease unless the owner is CONFIRMED dead - the single-consumer
+        guard's 'is the mailbox owned' test. The mailbox is protected while the owner
+        is ALIVE *or* UNKNOWN (an uncertain probe is treated as probably-alive, so an
+        external consumer never races a possibly-live controller); only a DEFINITIVE
+        not-running signal (tri-state :func:`_process_liveness` == dead) yields None
+        (orphaned lease -> recoverable, not guarded). Independent of expiry: a long
+        healthy turn (lease momentarily expired) still owns the mailbox. CONFIG-GATED
+        on the managed flag (mirrors _lease_stealable): a stray lease file for a
+        MANUAL identity never guards its mailbox, so the store primitive is safe on
+        its own and does not rely on the CLI guard's config short-circuit. Uses the
+        same tri-state as steal/armed so the three never disagree (lead D-12)."""
+        if not self.is_managed_lead_loop(agent):
+            return None
+        lease = self.read_lead_loop_lease(agent)
+        if not lease:
+            return None
+        if _process_liveness(lease.get("owner_pid")) == PROC_DEAD:
+            return None  # confirmed-dead owner -> orphaned -> not guarded
+        return lease
+
+    def lead_loop_state(self, agent: str, *, now: float | None = None,
+                        heartbeat_stale_after: float | None = None) -> dict:
+        """Visibility snapshot for ``agent`` (status/doctor/supervisor). Returns
+        {managed, present, owner_pid, owner_alive, owner_liveness, expired,
+        heartbeat_stale, armed, reason}. ``armed`` (managed health) = a present lease
+        that is NOT stealable, i.e. NOT confirmed-dead AND NOT (expired AND
+        heartbeat-stale). It uses the tri-state :func:`_process_liveness`, mirroring
+        the steal predicate (_lease_stealable) and the guard (lead_loop_active_owner)
+        EXACTLY, so the detector flags precisely the states where another controller
+        could legitimately take over: no lease, a CONFIRMED-dead owner, or a lease
+        that is expired AND heartbeat-stale. A healthy long turn (within TTL) is
+        armed; an expired-but-heartbeating owner is armed (it renews on its next
+        cadence); a fresh-lease owner whose heartbeat merely lapsed (within TTL) is
+        armed; an UNKNOWN-liveness owner (uncertain probe) is treated as probably-
+        alive -> armed within TTL (never a false unarmed from a fail-quiet probe -
+        codex blocker / lead D-12 Option A). Only a confirmed-dead owner or the
+        BOTH-stale case is unarmed. ``owner_alive`` is True only for a CONFIRMED-live
+        probe; ``owner_liveness`` carries the raw tri-state (alive/dead/unknown)."""
+        now = now if now is not None else time.time()
+        stale_after = (heartbeat_stale_after if heartbeat_stale_after is not None
+                       else ACTIVE_WITHIN_SECONDS)
+        lease = self.read_lead_loop_lease(agent)
+        hb = self.read_heartbeat(agent)
+        hb_stale = hb is None or (now - hb.timestamp()) > stale_after
+        st = {
+            "managed": self.is_managed_lead_loop(agent),
+            "present": bool(lease),
+            "owner_pid": lease.get("owner_pid") if lease else None,
+            "owner_alive": False, "owner_liveness": None, "expired": None,
+            "heartbeat_stale": hb_stale, "armed": False, "reason": "",
+        }
+        if not lease:
+            st["reason"] = "no lease"
+            return st
+        liveness = _process_liveness(lease.get("owner_pid"))
+        st["owner_alive"] = liveness == PROC_ALIVE
+        st["owner_liveness"] = liveness
+        exp = lease.get("expires_at")
+        st["expired"] = (not isinstance(exp, (int, float))) or now > exp
+        # armed = NOT confirmed-dead AND NOT (expired AND heartbeat-stale). This is the
+        # EXACT complement of _lease_stealable for EVERY case (alive, dead, OR unknown):
+        # a CONFIRMED-dead owner is unarmed here AND stealable there; an UNKNOWN probe is
+        # probably-alive -> armed here AND not-immediately-stolen there. So the detector,
+        # the steal predicate, and the guard can never disagree (lead D-12 Option A). A
+        # heartbeat that merely lapsed on a within-TTL lease (a long healthy turn) is
+        # STILL armed - only an expired AND heartbeat-stale lease is a genuinely down
+        # controller (lead P2 - the prior hb-only rule false-ERRORed at 120s, TTL 900s).
+        if liveness == PROC_DEAD:
+            st["reason"] = "owner confirmed dead"
+        elif st["expired"] and hb_stale:
+            st["reason"] = "lease expired and heartbeat stale"
+        else:
+            st["armed"] = True
+            if liveness == PROC_UNKNOWN:
+                st["reason"] = "armed (owner liveness unknown, treated as alive)"
+            elif st["expired"]:
+                st["reason"] = "armed (lease expired, heartbeat fresh, pending renewal)"
+            elif hb_stale:
+                st["reason"] = "armed (heartbeat stale, lease within TTL)"
+            else:
+                st["reason"] = "armed"
+        return st
+
     def clear_dead_waiter(self, agent: str, self_pid: int) -> bool:
         """Remove ``agent``'s waiting marker iff it is owned by a CONFIRMED-DEAD
         other process (reap fix #4b). Returns True when it cleared one.
@@ -3021,6 +3444,15 @@ _WAIT_STALE_AFTER_DEFAULT = 300.0
 # self-join guard (`roster add --unique`) to refuse re-binding a live identity.
 ACTIVE_WITHIN_SECONDS = 120.0
 
+# Managed lead-loop (lead-loop Slice 1): a wrapped controller that OWNS a team
+# mailbox via a renewable lease. The lease is the correctness state; the .waiting
+# marker only MIRRORS it for status/UX. The TTL must EXCEED the renew cadence so a
+# single missed renewal (a long turn) never expires a healthy owner; only a
+# sustained gap + a stale heartbeat / dead owner makes the lease stealable.
+LEAD_LOOP_MODE = "lead-loop"
+LEAD_LOOP_CADENCE_DEFAULT = 300.0
+LEAD_LOOP_TTL_DEFAULT = 900.0
+
 
 def _process_alive(pid: int) -> bool:
     """Best-effort, stdlib, fail-quiet liveness check (0.18.0, FR-007).
@@ -3074,6 +3506,85 @@ def _process_alive(pid: int) -> bool:
         return True  # exists, owned by another user
     except OSError:
         return False
+
+
+# Tri-state liveness for AUTHORITY decisions (lead-loop lease steal / armed / guard).
+PROC_ALIVE = "alive"
+PROC_DEAD = "dead"
+PROC_UNKNOWN = "unknown"
+
+
+def _process_liveness(pid: object) -> str:
+    """Tri-state liveness probe for the lead-loop AUTHORITY decisions.
+
+    Returns one of:
+      ``PROC_ALIVE``   - the pid is CONFIRMED running.
+      ``PROC_DEAD``    - a DEFINITIVE not-running signal. This is the ONLY state
+                         that authorizes an immediate lease steal, so it must never
+                         be a guess: POSIX ``os.kill(pid,0)`` raising
+                         ``ProcessLookupError`` (ESRCH); Windows
+                         ``GetExitCodeProcess`` returning an exit code other than
+                         ``STILL_ACTIVE`` (the process has exited), or
+                         ``OpenProcess`` failing with ``ERROR_INVALID_PARAMETER``
+                         (no such pid).
+      ``PROC_UNKNOWN`` - the probe was uncertain: access-denied, any ambiguous
+                         OpenProcess failure, a non-positive/non-int pid, or any
+                         raised exception. Callers MUST treat UNKNOWN as
+                         probably-alive and fall back to the expired-AND-heartbeat-
+                         stale recovery path - NEVER steal on it.
+
+    This is deliberately STRONGER than the fail-quiet :func:`_process_alive`, which
+    collapses unknown into not-alive (False). The lead-loop steal/armed/guard use
+    this so an immediate dead-owner steal can NEVER displace a live controller whose
+    probe merely failed (reviewer-1/codex blocker on the immediate-steal change;
+    lead D-12 ruling = Option A). UNKNOWN errs safe in every direction: probably-
+    alive => armed, guarded, and not stolen until the lease both expires AND its
+    heartbeat goes stale. A non-positive/non-int pid is UNKNOWN (not DEAD): only the
+    enumerated OS signals are definitive enough to authorize a steal."""
+    if not isinstance(pid, int) or pid <= 0:
+        return PROC_UNKNOWN
+    if os.name == "nt":
+        try:
+            import ctypes  # stdlib; lazy so POSIX never pays for it
+            from ctypes import wintypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            ERROR_INVALID_PARAMETER = 87
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                             wintypes.DWORD]
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.GetExitCodeProcess.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                err = ctypes.get_last_error()
+                # No such pid = confirmed dead. Anything else (ACCESS_DENIED, etc.)
+                # means the process may exist -> UNKNOWN, never steal.
+                return PROC_DEAD if err == ERROR_INVALID_PARAMETER else PROC_UNKNOWN
+            try:
+                code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return PROC_UNKNOWN
+                return PROC_ALIVE if code.value == STILL_ACTIVE else PROC_DEAD
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001 - uncertain probe -> UNKNOWN, never steal
+            return PROC_UNKNOWN
+    # POSIX
+    try:
+        os.kill(pid, 0)
+        return PROC_ALIVE
+    except ProcessLookupError:
+        return PROC_DEAD
+    except PermissionError:
+        return PROC_ALIVE  # exists, owned by another user
+    except OSError:
+        return PROC_UNKNOWN  # uncertain -> never steal
 
 
 def _new_id() -> str:

@@ -183,6 +183,36 @@ def _resolve_self(value: str | None, *, roster: list[str] | None = None) -> str:
     return name
 
 
+def _guard_lead_loop_consumer(store: Store, agent: str, *, verb: str) -> int | None:
+    """Reject a cursor-CONSUMING verb (wait/recv/drain/ack) for an agent whose team
+    mailbox is owned by a LIVE managed lead-loop lease, UNLESS the caller is the lease
+    owner (presents the live lease_id via AGENTTALK_LEAD_LOOP_LEASE). Returns exit 7
+    when blocked, else None. Read-only verbs (sync/threads/status/check) are never
+    guarded. CLI-layer only: the controller consumes the bus via recv_api in-process
+    and is never routed through here, so it is never self-blocked; this guard stops an
+    EXTERNAL consumer (a stray window, the model subprocess) from racing/losing the
+    controller's records (closes the cursor-loss hole --refuse-stacked-wait misses)."""
+    try:
+        if not store.is_managed_lead_loop(agent):
+            return None  # only a CONFIGURED managed identity is guarded (a cleared /
+            # never-managed agent is never blocked, even if a stray lease file exists)
+        lease = store.lead_loop_active_owner(agent)
+    except Exception:  # noqa: BLE001 - a guard must never crash the verb on a torn lease
+        return None
+    if not lease:
+        return None  # no live owner -> not guarded
+    presented = os.environ.get(_LEAD_LOOP_LEASE_ENV)
+    if presented and presented == lease.get("lease_id"):
+        return None  # the lease owner -> allowed
+    owner_pid = lease.get("owner_pid")
+    sys.stderr.write(
+        f"agenttalk {verb}: refusing to consume {agent!r}'s mailbox - it is owned by a "
+        f"managed lead-loop controller (PID {owner_pid}) that consumes the bus in-process; "
+        f"an external {verb} would race/lose records. Use read-only sync/threads/status/check "
+        f"to inspect, or set {_LEAD_LOOP_LEASE_ENV}=<lease_id> if you ARE the owner.\n")
+    return _LEAD_LOOP_GUARD_EXIT
+
+
 def _resolve_peer(value: str | None, store_cfg: dict, self_name: str) -> str:
     """Pick peer identity: explicit flag wins, else $AGENTTALK_PEER, else
     the single other agent in the roster (if exactly one). Exits 2 if
@@ -358,6 +388,14 @@ WAITER_SOFTCAP = 8
 # status warning — the peer may have missed it, or you forgot to wait.
 OPEN_OUTBOUND_STALE_SECONDS = 600.0
 
+# Managed lead-loop single-consumer guard (lead-loop Slice 1). A live managed
+# lead-loop lease (the in-process controller) OWNS its team mailbox; an external
+# cursor-CONSUMING CLI call (wait/recv/drain/ack) would race/lose records. The
+# owner proves itself by presenting the live lease_id via this env var; exit 7
+# is the dedicated "rejected: mailbox owned by a managed controller" code.
+_LEAD_LOOP_LEASE_ENV = "AGENTTALK_LEAD_LOOP_LEASE"
+_LEAD_LOOP_GUARD_EXIT = 7
+
 
 def _gather_status(store: Store) -> dict:
     """Build the structured status payload shared by both output modes."""
@@ -409,6 +447,11 @@ def _gather_status(store: Store) -> dict:
         }
         if a == liaison:
             row["operator_facing"] = True  # additive: absent unless set
+        # Managed lead-loop visibility (additive: present only when the agent is
+        # configured managed OR a lease file exists). The doctor check is the
+        # gating signal (managed-unarmed=ERROR); this row is the inspectable state.
+        if store.is_managed_lead_loop(a) or store.read_lead_loop_lease(a) is not None:
+            row["lead_loop"] = store.lead_loop_state(a)
         agents.append(row)
     invalid = store.list_invalid_messages()
     quarantined = store.quarantined_count()
@@ -3610,6 +3653,9 @@ def _do_recv_json(store: Store, agent: str, *, since: str | None, ack: bool,
 def cmd_recv(args: argparse.Namespace) -> int:
     store = _get_store(args)
     agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
+    blocked = _guard_lead_loop_consumer(store, agent, verb="recv")
+    if blocked is not None:
+        return blocked
     if getattr(args, "json", False):
         return _do_recv_json(store, agent, since=args.since, ack=args.ack,
                              include_control=args.include_control)
@@ -3635,6 +3681,9 @@ def cmd_drain(args: argparse.Namespace) -> int:
     """
     store = _get_store(args)
     agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
+    blocked = _guard_lead_loop_consumer(store, agent, verb="drain")
+    if blocked is not None:
+        return blocked
     return _do_recv(
         store,
         agent,
@@ -3887,6 +3936,9 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
 def cmd_wait(args: argparse.Namespace) -> int:
     store = _get_store(args)
     agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
+    blocked = _guard_lead_loop_consumer(store, agent, verb="wait")
+    if blocked is not None:
+        return blocked
     # Scoped wait: --to-request scopes to one thread (--kind optionally
     # refines it). --kind without --to-request is a usage error.
     if getattr(args, "kind", None) and not getattr(args, "to_request", None):
@@ -4084,6 +4136,9 @@ def cmd_wait(args: argparse.Namespace) -> int:
 def cmd_ack(args: argparse.Namespace) -> int:
     store = _get_store(args)
     agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
+    blocked = _guard_lead_loop_consumer(store, agent, verb="ack")
+    if blocked is not None:
+        return blocked
     # Explicit thread closure (the manual escape hatch + the way to close
     # an off-contract/handled thread). Does NOT touch the global cursor.
     if getattr(args, "to_request", None):
@@ -5356,6 +5411,54 @@ def cmd_wrap(args: argparse.Namespace) -> int:
     except ValueError as e:
         sys.stderr.write(f"agenttalk wrap: {e}\n")
         return 2
+
+
+def cmd_managed_lead_loop(args: argparse.Namespace) -> int:
+    """Configure / inspect managed lead-loop identities (lead-loop Slice 1).
+
+    ``set <agent>`` marks an agent a managed lead-loop (its team mailbox is owned
+    by a wrapped controller that cannot silently un-arm); ``clear`` unmarks it;
+    ``list`` shows configured identities + their current armed/lease state. Generic
+    by agent NAME - a codex identity is managed exactly as a claude one (never cli)."""
+    store = _get_store(args)
+    cmd = getattr(args, "managed_cmd", None)
+    if cmd == "set":
+        try:
+            store.set_managed_lead_loop(
+                args.agent, enabled=True,
+                ttl_seconds=getattr(args, "ttl", None),
+                cadence_seconds=getattr(args, "cadence", None))
+        except ValueError as e:
+            sys.stderr.write(f"agenttalk managed-lead-loop set: {e}\n")
+            return 2
+        spec = store.managed_lead_loop_spec(args.agent) or {}
+        print(f"managed-lead-loop: {args.agent} ENABLED "
+              f"(ttl={spec.get('ttl_seconds'):g}s, cadence={spec.get('cadence_seconds'):g}s)")
+        return 0
+    if cmd == "clear":
+        try:
+            store.set_managed_lead_loop(args.agent, enabled=False)
+        except ValueError as e:
+            sys.stderr.write(f"agenttalk managed-lead-loop clear: {e}\n")
+            return 2
+        print(f"managed-lead-loop: {args.agent} cleared")
+        return 0
+    managed = store.managed_lead_loop_agents()
+    if getattr(args, "json", False):
+        out = {a: {**(store.managed_lead_loop_spec(a) or {}),
+                   "state": store.lead_loop_state(a)} for a in managed}
+        print(json.dumps(out, indent=2))
+        return 0
+    if not managed:
+        print("no managed lead-loop identities configured")
+        return 0
+    for a in sorted(managed):
+        spec = store.managed_lead_loop_spec(a) or {}
+        st = store.lead_loop_state(a)
+        flag = "ARMED" if st["armed"] else f"NOT-ARMED ({st['reason']})"
+        print(f"  {a}: {flag}  ttl={spec.get('ttl_seconds')}s "
+              f"cadence={spec.get('cadence_seconds')}s")
+    return 0
 
 
 def cmd_dead_letter(args: argparse.Namespace) -> int:
@@ -6674,6 +6777,26 @@ def build_parser() -> argparse.ArgumentParser:
     dlr.add_argument("--agent", required=True)
     dlr.add_argument("--id", required=True, help="The dead-lettered message id.")
     dlr.set_defaults(func=cmd_dead_letter)
+
+    pmll = sub.add_parser(
+        "managed-lead-loop",
+        help="Configure/inspect managed lead-loop identities: a team mailbox OWNED "
+             "by a wrapped controller that cannot silently un-arm. Generic by agent "
+             "name, never by cli.")
+    pmll.set_defaults(func=cmd_managed_lead_loop, managed_cmd=None)
+    mllsub = pmll.add_subparsers(dest="managed_cmd")
+    mset = mllsub.add_parser("set", help="Mark an agent a managed lead-loop.")
+    mset.add_argument("agent")
+    mset.add_argument("--ttl", type=float, default=None,
+                      help="Lease TTL seconds (must exceed cadence).")
+    mset.add_argument("--cadence", type=float, default=None, help="Renew cadence seconds.")
+    mset.set_defaults(func=cmd_managed_lead_loop)
+    mclr = mllsub.add_parser("clear", help="Unmark a managed lead-loop agent.")
+    mclr.add_argument("agent")
+    mclr.set_defaults(func=cmd_managed_lead_loop)
+    mlst = mllsub.add_parser("list", help="List managed lead-loop identities + state.")
+    mlst.add_argument("--json", action="store_true")
+    mlst.set_defaults(func=cmd_managed_lead_loop)
 
     psup = sub.add_parser(
         "supervise",
