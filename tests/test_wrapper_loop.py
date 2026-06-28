@@ -244,6 +244,8 @@ def test_loop_drives_each_message_and_commits(tmp_path) -> None:
 
 def test_loop_does_not_commit_failed_turn(tmp_path) -> None:
     # a failed turn (drive -> falsy) is NOT committed: the message re-delivers.
+    # dead-letter DISABLED here (k_poison=0) to test the underlying retry mechanics;
+    # the dead-letter-on path is covered in test_dead_letter.py.
     s = _store(tmp_path)
     s.send(sender="alpha", recipient="beta", body="one")
     attempts = {"n": 0}
@@ -253,7 +255,7 @@ def test_loop_does_not_commit_failed_turn(tmp_path) -> None:
         return False                     # turn failed
 
     loop.run_loop(s, "beta", failing_drive, clock=lambda: 0.0, sleep=lambda d: None,
-                  max_polls=3)
+                  max_polls=3, k_poison=0, k_escalate=0)
     assert attempts["n"] >= 1            # the same record was retried, never committed
     assert s.cursor("beta") == ""        # NOT committed -> re-delivered
 
@@ -329,7 +331,7 @@ def test_make_drive_resume_failure_retries_fresh(tmp_path) -> None:
                            clock=lambda: 0.0, render=False)
     ok = drive({"from": "a", "kind": "message", "body": "hi",
                 "correlation_id": None, "request_id": None, "broadcast_id": None})
-    assert ok is True                                  # fresh retry succeeded
+    assert ok.ok is True                               # fresh retry succeeded
     assert spawned[0] == ["codex", "exec", "resume", "--json", "t-old"]  # resume first
     assert spawned[1] == ["codex", "exec", "--json"]                      # then fresh
     assert st.codex_thread_id == "t-new"               # new id observed + persisted
@@ -347,7 +349,7 @@ def test_make_drive_resume_and_fresh_both_fail_returns_false(tmp_path) -> None:
                            clock=lambda: 0.0, render=False)
     ok = drive({"from": "a", "kind": "message", "body": "hi",
                 "correlation_id": None, "request_id": None, "broadcast_id": None})
-    assert ok is False                                 # genuine failure -> no commit
+    assert ok.ok is False                              # genuine failure -> no commit
     assert st.resume_available is False                # marked unavailable
     assert st.turns == 0                               # a failed turn does not advance
 
@@ -377,7 +379,7 @@ def test_make_drive_partial_stream_is_failure(tmp_path) -> None:
                            spawn=lambda a, i: partial, clock=lambda: 0.0, render=False)
     # fresh exec has no resume to retry, so a partial first turn just fails.
     assert drive({"from": "a", "kind": "message", "body": "hi",
-                  "correlation_id": None, "request_id": None, "broadcast_id": None}) is False
+                  "correlation_id": None, "request_id": None, "broadcast_id": None}).ok is False
     assert st.turns == 0
     # reviewer-1 gate: a FAILED turn must NOT leave a fresh heartbeat (so a
     # persistently-crashing child goes stale -> supervisor restart).
@@ -394,8 +396,245 @@ def test_make_drive_nonzero_exit_is_failure(tmp_path) -> None:
         spawn=lambda a, i: _Stream(_codex_turn_lines(), returncode=1),
     )
     assert drive({"from": "a", "kind": "message", "body": "hi",
-                  "correlation_id": None, "request_id": None, "broadcast_id": None}) is False
+                  "correlation_id": None, "request_id": None, "broadcast_id": None}).ok is False
     assert s.read_heartbeat("beta") is None     # reviewer-1 gate: no heartbeat on failure
+
+
+def test_make_drive_classifies_failures_for_dead_letter(tmp_path) -> None:
+    # dead-letter taxonomy. A terminal turn.failed is low-cap POISON ONLY when its error text
+    # POSITIVELY matches a message-content signature (size / content-policy); a 529/rate-limit
+    # or edge-block terminal is an OUTAGE -> INFRA (never false-DL at cap 3), and an
+    # unrecognized terminal cause is AMBIGUOUS (lead-verify P1 + codex ruling). A partial
+    # stream (started, no completion) is AMBIGUOUS; a spawn/exec OSError is INFRA.
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+
+    def _drive(spawn):
+        return run.make_drive(_store(tmp_path), "beta", "codex",
+                              session.SessionState(cli="codex"), ["codex"],
+                              spawn=spawn, clock=lambda: 0.0, render=False)
+
+    # codex unified taxonomy - terminal failure split 3 ways by its error TEXT:
+    # (a) infra signature -> INFRA (never auto-DL). Includes edge/WAF/reverse-proxy blocks
+    #     (lead C4): a gateway/proxy/firewall block is an OUTAGE signature, not message-poison.
+    for msg in ("HTTP 529 overloaded", "rate limit exceeded", "503 service unavailable",
+                "401 unauthorized: invalid api key", "Request blocked by upstream proxy",
+                "blocked by waf", "403 forbidden", "request rejected by firewall"):
+        o = _drive(lambda a, i, m=msg: _failed_turn_lines(m))(rec)
+        assert o.ok is False and o.failure_class == loop.CLASS_INFRA, msg
+    # (b) EXPLICIT message-content-attributable failure -> POISON (the @K_poison fast-path):
+    #     ONLY the size + content-policy families (this message is the deterministic cause).
+    #     "blocked by content policy"/"by safety" stay POISON - the C4 edge tokens above do NOT
+    #     include bare "blocked", so they never SHADOW a real content-policy block (lead C4).
+    #     "violates"/"flagged by" are poison ONLY when QUALIFIED by content/policy/safety/
+    #     filter (codex marker-conservatism ruling #1).
+    for msg in ("context length exceeded", "prompt is too long",
+                "content policy violation", "request blocked by safety policy",
+                "blocked by content policy",
+                "violates content policy", "flagged by content filter"):
+        o = _drive(lambda a, i, m=msg: _failed_turn_lines(m))(rec)
+        assert o.ok is False and o.failure_class == loop.CLASS_POISON, msg
+    # (c) UNKNOWN / unrecognized terminal cause -> AMBIGUOUS, NOT poison (codex ruling:
+    #     an unobserved cause must never false-DL at the low cap). Includes GENERIC
+    #     request-level / GLOBAL CONFIG errors (model-not-found, unsupported-parameter,
+    #     invalid request), bare "too long" (a timeout-ish outage), and UNQUALIFIED
+    #     "violates" (a constraint/quota failure) - none are message-content poison
+    #     (codex re-review P1 + marker-conservatism ruling #1).
+    for msg in ("tool execution failed: bad arg", "",
+                "invalid request: model not found",
+                "invalid request: unsupported parameter 'temperature'",
+                "400 bad request: malformed", "unprocessable entity",
+                "server took too long to respond",          # bare "too long" -> NOT poison
+                "request violates server constraints"):      # unqualified "violates" -> NOT poison
+        o = _drive(lambda a, i, m=msg: _failed_turn_lines(m))(rec)
+        assert o.ok is False and o.failure_class == loop.CLASS_AMBIGUOUS, msg
+    # partial stream (started, never completed) -> AMBIGUOUS
+    partial = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+               json.dumps({"type": "turn.started"})]
+    o_part = _drive(lambda a, i: partial)(rec)
+    assert o_part.ok is False and o_part.failure_class == loop.CLASS_AMBIGUOUS
+
+    def _boom(a, i):
+        raise FileNotFoundError("no codex binary")
+
+    o_spawn = _drive(_boom)(rec)
+    assert o_spawn.ok is False and o_spawn.failure_class == loop.CLASS_INFRA
+
+
+# THE classification CONTRACT (lead 4th-verify "structural cap"): a table of realistic
+# provider error strings -> their REQUIRED dead-letter class. This is the authoritative
+# anti-drift gate for the marker allowlists - the recurring marker-breadth bugs (bare
+# "too long" / "violates" / "maximum number of tokens") were each an overbroad entry this
+# matrix would have caught in ONE pass. Add a row when a new provider string is observed.
+_CLASSIFICATION_MATRIX = [
+    # --- INFRA: global outage / rate-limit / auth / edge - NEVER auto-DL ---
+    ("rate limit exceeded", loop.CLASS_INFRA),
+    ("429 too many requests", loop.CLASS_INFRA),
+    ("HTTP 529 overloaded", loop.CLASS_INFRA),
+    ("the model is overloaded", loop.CLASS_INFRA),
+    ("request timed out", loop.CLASS_INFRA),
+    ("502 bad gateway", loop.CLASS_INFRA),
+    ("503 service unavailable", loop.CLASS_INFRA),
+    ("504 gateway timeout", loop.CLASS_INFRA),
+    ("connection reset by peer", loop.CLASS_INFRA),
+    ("401 unauthorized", loop.CLASS_INFRA),
+    ("403 forbidden", loop.CLASS_INFRA),
+    ("invalid api key", loop.CLASS_INFRA),
+    ("request blocked by upstream proxy", loop.CLASS_INFRA),
+    ("blocked by waf", loop.CLASS_INFRA),
+    # token/quota RATE windows (P1 #2 + codex expansion) - a TPM/daily/quota limit, NOT this
+    # message being too big.
+    ("maximum number of tokens per minute exceeded for this organization", loop.CLASS_INFRA),
+    ("reached your maximum number of tokens per day", loop.CLASS_INFRA),
+    ("maximum tokens per minute reached (TPM)", loop.CLASS_INFRA),
+    ("daily token limit reached", loop.CLASS_INFRA),
+    ("daily token limit exceeded", loop.CLASS_INFRA),       # codex probe: rate-window synonym
+    # --- POISON: positive message-content attribution - DL at the low cap ---
+    ("context length exceeded", loop.CLASS_POISON),
+    ("context window exceeded", loop.CLASS_POISON),
+    ("prompt is too long", loop.CLASS_POISON),
+    ("input too large", loop.CLASS_POISON),
+    ("content policy violation", loop.CLASS_POISON),
+    ("flagged by content filter", loop.CLASS_POISON),
+    ("blocked by safety", loop.CLASS_POISON),
+    ("blocked by content policy", loop.CLASS_POISON),
+    ("violates content policy", loop.CLASS_POISON),
+    # 413 is QUALIFIED poison (HTTP/status/request-entity/payload context), never a bare "413"
+    # substring (codex) - request-size-attributable, retry won't help.
+    ("413 request entity too large", loop.CLASS_POISON),
+    ("HTTP 413", loop.CLASS_POISON),
+    ("status 413", loop.CLASS_POISON),
+    ("payload too large", loop.CLASS_POISON),
+    # --- PRECEDENCE: a terminal matching BOTH families is INFRA (fail-closed, human decides) ---
+    ("context length exceeded (429 rate limit)", loop.CLASS_INFRA),
+    ("payload too large behind upstream proxy", loop.CLASS_INFRA),
+    # --- AMBIGUOUS: not-known-infra, not positive-content - high ceiling, never DL@3 ---
+    ("invalid request: model not found", loop.CLASS_AMBIGUOUS),
+    ("invalid request: unsupported parameter 'temperature'", loop.CLASS_AMBIGUOUS),
+    ("400 bad request: malformed", loop.CLASS_AMBIGUOUS),
+    ("unprocessable entity", loop.CLASS_AMBIGUOUS),
+    ("server took too long to respond", loop.CLASS_AMBIGUOUS),     # bare "too long"
+    ("request violates server constraints", loop.CLASS_AMBIGUOUS),  # unqualified "violates"
+    ("flagged by the fraud detection system", loop.CLASS_AMBIGUOUS),  # "flagged by" unqualified
+    ("exceeds the maximum retries", loop.CLASS_AMBIGUOUS),          # no content-size object
+    # NEGATIVE: "413" must be a STANDALONE token in an HTTP/status/entity/payload context to be
+    # poison - never a substring of a larger number (8413/4130), even when a qualifier word is
+    # ALSO present elsewhere in the text (reviewer-1 blocker: \b413\b token boundary, not substring).
+    ("the response body was 8413 bytes", loop.CLASS_AMBIGUOUS),
+    ("HTTP response body was 8413 bytes", loop.CLASS_AMBIGUOUS),     # qualifier present, 8413 != 413
+    ("status text included 8413 bytes", loop.CLASS_AMBIGUOUS),      # qualifier present, 8413 != 413
+    ("request id req_413 failed", loop.CLASS_AMBIGUOUS),
+    ("opaque error code 4130", loop.CLASS_AMBIGUOUS),               # 4130 != 413 token
+    ("error 413", loop.CLASS_AMBIGUOUS),                            # 413 token but NO qualifier
+    ("tool execution failed: bad arg", loop.CLASS_AMBIGUOUS),
+    ("some totally unknown provider error 9000", loop.CLASS_AMBIGUOUS),
+]
+
+
+def test_classification_contract_matrix(tmp_path) -> None:
+    # the authoritative classification contract: each provider string maps to its REQUIRED
+    # dead-letter class via the real make_drive _classify (terminal turn.failed). The gate
+    # against future marker drift - INFRA-first precedence + the narrow positive-poison allowlist.
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+
+    def _class_of(text):
+        drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                               session.SessionState(cli="codex"), ["codex"],
+                               spawn=lambda a, i, m=text: _failed_turn_lines(m),
+                               clock=lambda: 0.0, render=False)
+        return drive(rec)
+
+    for text, expected in _CLASSIFICATION_MATRIX:
+        o = _class_of(text)
+        assert o.ok is False, text
+        assert o.failure_class == expected, f"{text!r}: got {o.failure_class}, want {expected}"
+
+
+def test_make_drive_retryable_after_start_is_infra(tmp_path) -> None:
+    # lead 6th-verify P2: a RECOGNIZED retryable transport error that arrives AFTER turn-start
+    # (then drops with no terminal) must classify INFRA, NOT be shadowed as the started/partial-
+    # stream AMBIGUOUS - else a homogeneous transport OUTAGE on one head accumulates ambiguous
+    # and false-dead-letters a HEALTHY message at the K_escalate ceiling.
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    # codex: thread.started + turn.started + a top-level {type:error} (retryable), no completion
+    codex_stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+                    json.dumps({"type": "turn.started"}),
+                    json.dumps({"type": "error", "message": "Reconnecting... 2/5"})]
+    d_codex = run.make_drive(_store(tmp_path), "beta", "codex",
+                             session.SessionState(cli="codex"), ["codex"],
+                             spawn=lambda a, i: codex_stream, clock=lambda: 0.0, render=False)
+    o = d_codex(rec)
+    assert o.ok is False and o.failure_class == loop.CLASS_INFRA, o
+    # claude: message_start + a throttled rate_limit_event (retryable), no message_stop
+    claude_stream = [json.dumps({"type": "stream_event", "event": {"type": "message_start"}}),
+                     json.dumps({"type": "rate_limit_event",
+                                 "rate_limit_info": {"status": "throttled"}})]
+    d_claude = run.make_drive(_store(tmp_path), "beta", "claude",
+                              session.SessionState(cli="claude", claude_session_id="sess-1"),
+                              ["claude"], spawn=lambda a, i: claude_stream,
+                              clock=lambda: 0.0, render=False)
+    o2 = d_claude(rec)
+    assert o2.ok is False and o2.failure_class == loop.CLASS_INFRA, o2
+
+
+def _claude_ok_lines():
+    return [json.dumps({"type": "stream_event", "event": {"type": "message_start"}}),
+            json.dumps({"type": "stream_event", "event": {"type": "message_stop"}})]
+
+
+def _claude_fail_lines(msg="session is full"):
+    return [json.dumps({"type": "result", "is_error": True, "result": msg})]
+
+
+def _claude_rec():
+    return {"from": "a", "kind": "message", "body": "x",
+            "correlation_id": None, "request_id": None, "broadcast_id": None}
+
+
+def test_make_drive_claude_resume_failure_self_heals_to_fresh_session(tmp_path) -> None:
+    # codex ruling #2 (d): a failed claude --resume turn (full session) mints a FRESH session
+    # id and retries the SAME record inline ONCE; a healthy message then SUCCEEDS, so the turn
+    # is ok (the loop commits it, 0 dead-letters) - NOT poison. The whole drive() = resume+fresh.
+    calls = []
+
+    def spawn(argv, stdin):
+        calls.append(list(argv))
+        if "--resume" in argv:
+            return _claude_fail_lines("prompt is too long")     # stale, full session
+        return _claude_ok_lines()                                # fresh session succeeds
+
+    state = session.SessionState(cli="claude", claude_session_id="sess-1",
+                                 turns=1, resume_available=True)
+    drive = run.make_drive(_store(tmp_path), "beta", "claude", state, ["claude"],
+                           spawn=spawn, clock=lambda: 0.0, render=False)
+    out = drive(_claude_rec())
+    assert out.ok is True                                        # healthy -> success, NOT poison
+    assert len(calls) == 2 and "--resume" in calls[0] and "--session-id" in calls[1]
+    assert state.claude_session_id != "sess-1"                  # a FRESH session was minted
+    assert state.resume_available is True                       # fresh session is resumable next
+    assert state.resume_unavailable_reason == ""                # stale reason cleared on re-arm
+
+
+def test_make_drive_claude_prompt_too_long_poison_only_after_fresh_retry(tmp_path) -> None:
+    # codex ruling #2 (e) + #1: 'prompt too long' on the --resume turn is NOT poison (a full
+    # session is global session-pressure); only when the FRESH session ALSO fails with a size
+    # marker for the SAME message is it POISON. Proves poison-after-self-heal, not on the first
+    # (stale-session) failure.
+    calls = []
+
+    def spawn(argv, stdin):
+        calls.append(list(argv))
+        return _claude_fail_lines("prompt is too long")          # BOTH resume and fresh fail
+
+    state = session.SessionState(cli="claude", claude_session_id="sess-1",
+                                 turns=1, resume_available=True)
+    drive = run.make_drive(_store(tmp_path), "beta", "claude", state, ["claude"],
+                           spawn=spawn, clock=lambda: 0.0, render=False)
+    out = drive(_claude_rec())
+    assert out.ok is False and out.failure_class == loop.CLASS_POISON
+    assert len(calls) == 2 and "--resume" in calls[0] and "--session-id" in calls[1]
 
 
 def test_make_drive_success_stamps_heartbeat(tmp_path) -> None:
@@ -405,7 +644,7 @@ def test_make_drive_success_stamps_heartbeat(tmp_path) -> None:
     drive = run.make_drive(s, "beta", "codex", st, ["codex"], clock=lambda: 0.0,
                            render=False, spawn=lambda a, i: _codex_turn_lines())
     assert drive({"from": "a", "kind": "message", "body": "hi",
-                  "correlation_id": None, "request_id": None, "broadcast_id": None}) is True
+                  "correlation_id": None, "request_id": None, "broadcast_id": None}).ok is True
     assert s.read_heartbeat("beta") is not None
 
 
@@ -427,7 +666,7 @@ def test_make_drive_stamps_liveness_during_successful_turn(tmp_path) -> None:
     drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=gen_spawn,
                            clock=lambda: 0.0, render=False)
     assert drive({"from": "a", "kind": "message", "body": "hi",
-                  "correlation_id": None, "request_id": None, "broadcast_id": None}) is True
+                  "correlation_id": None, "request_id": None, "broadcast_id": None}).ok is True
     assert mid and mid[0] is not None          # liveness was fresh BEFORE completion
     assert s.read_heartbeat("beta") is not None
 
@@ -457,9 +696,9 @@ def test_make_drive_failed_then_successful_retry_keeps_liveness(tmp_path) -> Non
            "correlation_id": None, "request_id": None, "broadcast_id": None}
     drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=spawn,
                            clock=lambda: 0.0, min_interval=5.0, render=False)
-    assert drive(rec) is False                  # first turn fails (partial)
+    assert drive(rec).ok is False                  # first turn fails (partial)
     assert s.read_heartbeat("beta") is None     # failed turn cleared it
-    assert drive(rec) is True                   # retry succeeds within min_interval
+    assert drive(rec).ok is True                   # retry succeeds within min_interval
     assert mid and mid[0] is not None           # mid-turn liveness of the retry (throttle reset)
     assert s.read_heartbeat("beta") is not None  # final heartbeat present
 
@@ -470,8 +709,11 @@ def test_loop_failed_turn_backs_off_not_hot_spin(tmp_path) -> None:
     s = _store(tmp_path)
     s.send(sender="alpha", recipient="beta", body="poison")
     sleeps: list[float] = []
+    # dead-letter DISABLED (k_poison=0): this test is about the backoff-not-hot-spin
+    # behavior below/without the dead-letter cap (dead-letter dispatch is tested
+    # separately in test_dead_letter.py).
     loop.run_loop(s, "beta", lambda rec: False, clock=lambda: 0.0,
-                  sleep=lambda d: sleeps.append(d), max_polls=4)
+                  sleep=lambda d: sleeps.append(d), max_polls=4, k_poison=0, k_escalate=0)
     assert len(sleeps) >= 3              # backed off on each failed retry (not a hot spin)
     assert s.cursor("beta") == ""        # never committed
     assert s.read_heartbeat("beta") is None  # a failed turn does NOT stamp heartbeat

@@ -61,6 +61,11 @@ _DEFAULTS = {
     "launch_grace_seconds": 120,           # forking-CLI startup grace (brain discovery + first hb)
     "max_readiness_retries": 3,            # never-ready relaunches before READINESS_GAVE_UP (no infinite churn)
     "backoff": {"base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180},
+    # dead-letter caps (wrapper-owned; the supervisor only carries the config so the
+    # planner is unchanged). K_poison = deterministic poison-eligible failures before
+    # auto-dead-letter; K_escalate = class-agnostic high-attempt backstop (escalate +,
+    # for ambiguous/unknown, last-resort dead-letter) so no failure loops forever.
+    "dead_letter": {"max_attempts": 3, "escalate_after_attempts": 20},
 }
 
 # Per-CLI process-discovery defaults (config["agents"][n] overrides). These
@@ -113,6 +118,25 @@ def resolve_stuck_after(config: dict, cfg_agent: dict) -> float:
         cli = cfg_agent.get("cli", "claude")
         return float(_WRAPPED_STUCK_AFTER_DEFAULTS.get(cli, global_threshold))
     return global_threshold
+
+
+def resolve_dead_letter_caps(config: dict, cfg_agent: dict) -> tuple[int, int]:
+    """The per-agent dead-letter caps (PURE): (K_poison, K_escalate). A per-agent
+    ``dead_letter.{max_attempts,escalate_after_attempts}`` wins; else the global config
+    block; else :data:`_DEFAULTS`. ``0`` disables that cap (debug only - the shipped
+    default is ON). Mirrors resolve_stuck_after's per-agent->global->default chain."""
+    defaults = _DEFAULTS["dead_letter"]
+    gcfg = (config or {}).get("dead_letter") or {}
+    acfg = (cfg_agent or {}).get("dead_letter") or {}
+
+    def _pick(key: str) -> int:
+        for src in (acfg, gcfg):
+            v = src.get(key)
+            if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                return v
+        return int(defaults[key])
+
+    return _pick("max_attempts"), _pick("escalate_after_attempts")
 
 # Per-CLI session-argument templates, as LISTS of literal tokens (so the
 # generated PowerShell uses an array-of-literals ArgumentList - single-quoted
@@ -1433,7 +1457,7 @@ CONFIG_TEMPLATE = """\
       },
       "_comment_wrapped": "WRAPPED is the RECOMMENDED / default supervised archetype for hands-off agents (the manual /agenttalk.listen agent above is supported but BEST-EFFORT/LEGACY: a resumed manual session may not re-enter the listen loop, never heartbeat, and hit the readiness give-up cap). The wrapped codex child is launched with `--disable hooks` by default (codex's safe default - the wrapper owns the heartbeat, so the codex activity hook is neither needed nor wanted, and disabling it sidesteps hook-trust prompts; remove it from windows_args if you intentionally want the child's project hooks). Set wrapped=true to supervise the agent THROUGH `agenttalk wrap --loop`: windows_file is the PYTHON exe (NOT the CLI exe), windows_args is the FIXED wrap command, and the REAL codex.exe/claude.exe goes at the tail after '--' (it is what windows_file would be for a manual agent). NO {SESSION_ARGS} token - the wrapper owns session continuity end-to-end (it persists + reloads the codex thread_id / claude session-id across its own turns AND across a supervisor relaunch, so a restart re-runs the identical wrap argv and reload-resumes). The wrapper python IS the long-lived supervised root, so brain discovery is RETIRED for wrapped agents (brain_pid stays null); the per-turn child (codex exec / claude -p) is reaped via the start-guarded managed_pids tree-kill. activity_hook is NOT needed: a wrapped agent is instrumented by construction (heartbeat on every idle bus-wait cycle + on streaming progress), so a stale heartbeat past grace RECOVERS (restart) instead of warn-only.",
       "_comment_wrapped_stuck_after": "PER-CLI stuck_after_seconds (a per-agent stuck_after_seconds override ALWAYS wins; the global stuck_after_seconds is only the legacy/unclassified fallback). Defaults when unset: wrapped CLAUDE=180s, wrapped CODEX=900s. WHY they differ: wrapped CLAUDE streams thinking+text+tool deltas and stays fresh through reasoning, so a tight threshold is fine; wrapped CODEX is ITEM-LEVEL (no exec --json event closes the pure-reasoning gap) so a long pure-reasoning stretch is SILENT between turn.started and the final agent_message. These are an OPERATIONAL false-positive tradeoff, NOT a provably-safe bound: pick the threshold above the longest pure-reasoning gap your codex role plausibly hits. For a heavy reasoning/refactor/review codex role (like this sample) 1200-1800s is the right template default - this example uses 1200. GUARDRAIL: for wrapped+codex the supervisor WARNS and REFUSES restart-on-stale (degrades to warn-only) when stuck_after_seconds is below 600s, UNLESS you set allow_low_stuck_after=true to opt in. The value is never silently coerced. DO NOT try to tighten codex with a synthetic active-turn timer heartbeat: no intermediate exec --json event exists to confirm progress, so a timer would mark a silently-wedged turn healthy forever and defeat restart authority - the only levers are the per-CLI threshold + per-agent overrides.",
-      "_comment_wrapped_limitation": "KNOWN LIMITATION (banked future dead-letter item): a poison inbound message makes the loop fail the turn -> clear heartbeat -> stale -> supervisor restart -> reload-resume -> re-deliver the same message -> fail again; net is a SLOW restart loop throttled by supervisor backoff (base..cap) until a dead-letter / skip-after-N fix lands or an operator intervenes."
+      "_comment_dead_letter": "POISON-MESSAGE HANDLING (0.40.x): a message the model fails DETERMINISTICALLY (poison_eligible) is auto-dead-lettered after dead_letter.max_attempts (default 3) - its bytes move to .agenttalk/dead-letter/<agent>/ (recoverable; `agenttalk dead-letter list/show/requeue`) and the cursor advances past it, so the inbox is never blocked. A transient/global INFRA failure (spawn/API/rate-limit/5xx) is NEVER auto-dead-lettered (it retries under backoff) but escalates to the operator at dead_letter.escalate_after_attempts (default 20); an ambiguous repeated failure escalates AND dead-letters at that ceiling. The supervisor stays DUMB: a dead-letter is PROGRESS (fresh heartbeat), so the agent returns to HEALTHY_IDLE and is never restart-looped. Override per agent or globally with a dead_letter:{max_attempts,escalate_after_attempts} block (0 disables a cap - debug only)."
     }
   }
 }

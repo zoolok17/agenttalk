@@ -412,6 +412,7 @@ def _gather_status(store: Store) -> dict:
         agents.append(row)
     invalid = store.list_invalid_messages()
     quarantined = store.quarantined_count()
+    dead_lettered = store.dead_lettered_count()
     signing_enforced = store.signing_enforced()
     # project_id is path-derived; surfaces here for diagnostics
     project_id = store.project_id()
@@ -428,6 +429,8 @@ def _gather_status(store: Store) -> dict:
     }
     if quarantined:
         payload["quarantined"] = quarantined  # additive: absent when zero
+    if dead_lettered:
+        payload["dead_lettered_count"] = dead_lettered  # additive: absent when zero
     if signing_enforced:
         health = _signing.inspect_key(project_id, store.root)
         payload["hmac_key"] = health.to_dict()
@@ -942,6 +945,9 @@ def cmd_status(args: argparse.Namespace) -> int:
               f"`agenttalk prune --invalid --dry-run` to inspect)")
     if payload.get("quarantined"):
         print(f"quarantined: {payload['quarantined']} file(s) in .agenttalk/quarantine/ (recoverable)")
+    if payload.get("dead_lettered_count"):
+        print(f"dead-letter: {payload['dead_lettered_count']} poison message(s) "
+              "(see `agenttalk dead-letter list`; recoverable via requeue)")
     for a in payload["agents"]:
         cursor = a["cursor"] or "(none)"
         if a["heartbeat"] is None:
@@ -5197,9 +5203,45 @@ def cmd_request_launch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _dead_letter_notifier(store, agent: str):
+    """Operator escalation for the wrapper dead-letter path: route a notice to the
+    operator_facing liaison else the sole lead when a message is dead-lettered or hits the
+    high-attempt backstop. Returns True iff it ROUTED (a target resolved + the send
+    succeeded) so the loop can record whether the operator was actually signalled; when no
+    target resolves it returns False (doctor surfaces the unrouted backstop LOUD).
+    The notice mints an ``esc-`` request_id + needs_operator=true (mirroring `escalate`)
+    so it THREADS and shows in the liaison's `sync` OPERATOR INPUT NEEDED bucket - not as
+    an unread FYI (reviewer-1 blocker). NEVER crashes the loop."""
+    def emit(info: dict, *, disposed: bool) -> bool:
+        try:
+            target = store.operator_facing() or store.sole_lead()
+            if not target or target == agent:
+                return False
+            mid = info.get("msg_id")
+            ag = info.get("agent")
+            verb = "DEAD-LETTERED" if disposed else "repeatedly FAILING (not yet dead-lettered)"
+            body = (f"[dead-letter] agent {ag} {verb} message {mid} from "
+                    f"{info.get('from')} (kind={info.get('kind')}, "
+                    f"attempts={info.get('attempts')}, class={info.get('failure_class')}). "
+                    f"Inspect: agenttalk dead-letter show --agent {ag} --id {mid}")
+            if disposed:
+                body += f"  Requeue: agenttalk dead-letter requeue --agent {ag} --id {mid}"
+            store.send(sender=agent, recipient=target, kind="question",
+                       subject="dead-letter notice", body=body,
+                       meta={"needs_operator": "true", "dead_letter": "true",
+                             "dl_msg_id": str(mid),
+                             "dl_disposed": "true" if disposed else "false",
+                             "request_id": "esc-" + uuid.uuid4().hex[:12]})
+            return True
+        except Exception:  # noqa: BLE001 - a notification must never crash the loop
+            return False   # not routed; dead-letter + doctor visibility remain
+    return emit
+
+
 def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     sender: str, min_interval: float, render: bool,
-                    one_shot_request_id: str | None = None) -> int:
+                    one_shot_request_id: str | None = None,
+                    k_poison: int = 3, k_escalate: int = 20) -> int:
     """The long-running supervised wrapper loop (design C): own the idle bus-wait +
     heartbeat, drive the CLI ONE turn per inbound message in structured-stream mode
     (session continuity owned here), then return to the wait. Runs until killed -
@@ -5232,11 +5274,17 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             max_wall = float(int((marker or {}).get("timeout_seconds") or 1800))
         except (TypeError, ValueError):
             max_wall = 1800.0
+    # dead-letter (CONTINUOUS loop only; the one-shot path ignores these). On
+    # dead-letter / high-attempt backstop the wrapper escalates to the operator.
+    notifier = _dead_letter_notifier(store, agent)
     turns = wloop.run_loop(
         store, agent, drive,
         max_turns=1 if one_shot_request_id else None,
         only_request_id=one_shot_request_id,
         max_wall=max_wall,
+        k_poison=k_poison, k_escalate=k_escalate,
+        on_dead_letter=lambda info: notifier(info, disposed=True),
+        on_escalate=lambda info: notifier(info, disposed=False),
     )
     if one_shot_request_id and turns < 1:
         # Distinguish a dead thread from a never-arriving request for the diagnostic
@@ -5283,10 +5331,23 @@ def cmd_wrap(args: argparse.Namespace) -> int:
     sender = (_resolve_self(args.sender, roster=roster)
               if getattr(args, "sender", None) else agent)
     if getattr(args, "loop", False):
+        # Dead-letter caps: an explicit --dead-letter-* flag wins; otherwise resolve from
+        # supervisor.json (per-agent -> global -> default) so a supervised wrapped agent's
+        # dead_letter:{...} config actually takes effect (codex P1 / lead F3). This makes
+        # supervisor.resolve_dead_letter_caps the single source of truth.
+        from agenttalk import supervisor as _sup
+        sup_cfg = _load_supervisor_config(store)
+        cfg_agent = (sup_cfg.get("agents") or {}).get(agent) or {}
+        res_poison, res_escalate = _sup.resolve_dead_letter_caps(sup_cfg, cfg_agent)
+        flag_poison = getattr(args, "dead_letter_max_attempts", None)
+        flag_escalate = getattr(args, "dead_letter_escalate_after", None)
+        k_poison = flag_poison if flag_poison is not None else res_poison
+        k_escalate = flag_escalate if flag_escalate is not None else res_escalate
         return _wrap_loop_mode(store, agent, cli=args.cli, base_argv=argv,
                                sender=sender, min_interval=args.min_interval,
                                render=not args.no_render,
-                               one_shot_request_id=args.to_request if args.one_shot else None)
+                               one_shot_request_id=args.to_request if args.one_shot else None,
+                               k_poison=k_poison, k_escalate=k_escalate)
     try:
         return wrapper_run.run_wrapper(
             cli=args.cli, agent=agent, argv=argv, store=store, sender=sender,
@@ -5295,6 +5356,84 @@ def cmd_wrap(args: argparse.Namespace) -> int:
     except ValueError as e:
         sys.stderr.write(f"agenttalk wrap: {e}\n")
         return 2
+
+
+def cmd_dead_letter(args: argparse.Namespace) -> int:
+    """Inspect + recover dead-lettered (poison) messages. SEPARATE from `prune
+    --invalid` (that quarantines INVALID/forged files = a trust failure; this handles
+    VALID files the model could not process = a delivery failure). Move-only +
+    recoverable: `requeue` re-injects a FRESH message (new id, own fresh attempt
+    count) - it never rewinds the cursor (would re-poison the loop)."""
+    store = _get_store(args)
+    action = getattr(args, "dead_letter_cmd", None)
+    if action == "list":
+        items = store.list_dead_letters(getattr(args, "agent", None))
+        if getattr(args, "json", False):
+            print(json.dumps(items, indent=2))
+            return 0
+        if not items:
+            print("dead-letter: none")
+            return 0
+        print(f"dead-letter ({len(items)}):")
+        for m in items:
+            print(f"  {m.get('agent')}/{m.get('message_id')}  from={m.get('from')} "
+                  f"kind={m.get('kind')} attempts={m.get('attempts')} "
+                  f"class={m.get('class')} reason={(m.get('last_reason') or '')[:60]}")
+        return 0
+    if action == "show":
+        if not (getattr(args, "agent", None) and getattr(args, "id", None)):
+            sys.stderr.write("agenttalk dead-letter show: --agent and --id are required.\n")
+            return 2
+        meta = next((m for m in store.list_dead_letters(args.agent)
+                     if m.get("message_id") == args.id), None)
+        raw = store.read_dead_letter_payload(args.agent, args.id)
+        if meta is None and raw is None:
+            sys.stderr.write(
+                f"agenttalk dead-letter show: no dead-letter {args.agent}/{args.id}.\n")
+            return 2
+        body = ""
+        if raw is not None:
+            try:
+                body = (json.loads(raw.decode("utf-8")) or {}).get("body", "")
+            except (ValueError, UnicodeDecodeError):
+                body = "<unreadable payload>"
+        out = {"metadata": meta, "body": body}
+        if getattr(args, "json", False):
+            print(json.dumps(out, indent=2))
+        else:
+            print(json.dumps(meta, indent=2))
+            print("---- original body (untrusted data) ----")
+            print(body)
+        return 0
+    if action == "requeue":
+        if not (getattr(args, "agent", None) and getattr(args, "id", None)):
+            sys.stderr.write("agenttalk dead-letter requeue: --agent and --id are required.\n")
+            return 2
+        raw = store.read_dead_letter_payload(args.agent, args.id)
+        if raw is None:
+            sys.stderr.write(
+                f"agenttalk dead-letter requeue: no dead-letter {args.agent}/{args.id}.\n")
+            return 2
+        try:
+            orig = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            sys.stderr.write(f"agenttalk dead-letter requeue: corrupt payload ({e}).\n")
+            return 2
+        meta = dict(orig.get("meta") or {})
+        meta["requeued_from"] = args.id   # provenance; preserves request_id/broadcast_id
+        try:
+            new = store.send(
+                sender=orig.get("from"), recipient=orig.get("to"),
+                body=orig.get("body", ""), kind=orig.get("kind", "message"),
+                subject=orig.get("subject", ""), meta=meta)
+        except (ValueError, FileNotFoundError) as e:
+            sys.stderr.write(f"agenttalk dead-letter requeue: {e}\n")
+            return 2
+        print(f"requeued dead-letter {args.id} as fresh message {new.id} "
+              "(new id, own fresh attempt count; original evidence preserved in the sink)")
+        return 0
+    sys.stderr.write("agenttalk dead-letter: expected list, show, or requeue.\n")
+    return 2
 
 
 def cmd_supervise(args: argparse.Namespace) -> int:
@@ -6494,12 +6633,47 @@ def build_parser() -> argparse.ArgumentParser:
                        help="With --loop, exit after one successful turn.")
     pwrap.add_argument("--to-request", dest="to_request",
                        help="With --one-shot, only drive the matching request_id.")
+    pwrap.add_argument("--dead-letter-max-attempts", dest="dead_letter_max_attempts",
+                       type=int, default=None,
+                       help="(--loop) Auto-dead-letter a POISON message after this many "
+                            "deterministic failures (default 3, or supervisor.json "
+                            "dead_letter.max_attempts; 0 disables - debug only).")
+    pwrap.add_argument("--dead-letter-escalate-after", dest="dead_letter_escalate_after",
+                       type=int, default=None,
+                       help="(--loop) High-attempt backstop: escalate to the operator at "
+                            "this many attempts on one message; ambiguous/unknown repeated "
+                            "failures also dead-letter here (default 20, or supervisor.json "
+                            "dead_letter.escalate_after_attempts; 0 disables).")
     pwrap.add_argument("cmd", nargs=argparse.REMAINDER,
                        help="-- followed by the BASE launch command (the per-turn "
                             "session/stream args are appended), e.g. `-- codex -a "
                             "never -s workspace-write` (loop) or `-- codex ... exec "
                             "--json \"...\"` (one-shot).")
     pwrap.set_defaults(func=cmd_wrap)
+
+    pdl = sub.add_parser(
+        "dead-letter",
+        help="Inspect + recover dead-lettered (poison) messages: valid messages the "
+             "wrapped model failed deterministically, moved out of the inbox so it is "
+             "never blocked. Separate from `prune --invalid` (forged/invalid files).",
+    )
+    pdl.set_defaults(func=cmd_dead_letter, dead_letter_cmd=None)
+    dlsub = pdl.add_subparsers(dest="dead_letter_cmd")
+    dll = dlsub.add_parser("list", help="List dead-lettered messages.")
+    dll.add_argument("--agent", help="Limit to one agent (default: all).")
+    dll.add_argument("--json", action="store_true")
+    dll.set_defaults(func=cmd_dead_letter)
+    dls = dlsub.add_parser("show", help="Show one dead-letter's metadata + original body.")
+    dls.add_argument("--agent", required=True)
+    dls.add_argument("--id", required=True, help="The dead-lettered message id.")
+    dls.add_argument("--json", action="store_true")
+    dls.set_defaults(func=cmd_dead_letter)
+    dlr = dlsub.add_parser("requeue",
+                           help="Re-inject as a FRESH message (new id, own fresh attempt "
+                                "count); original evidence preserved. No cursor rewind.")
+    dlr.add_argument("--agent", required=True)
+    dlr.add_argument("--id", required=True, help="The dead-lettered message id.")
+    dlr.set_defaults(func=cmd_dead_letter)
 
     psup = sub.add_parser(
         "supervise",

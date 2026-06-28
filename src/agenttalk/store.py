@@ -17,6 +17,7 @@ the invariant ``messages_for`` / dashboard rendering relies on.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -43,6 +44,16 @@ _ID_ALPHABET = string.ascii_letters + string.digits
 # but future-dated id from cross-machine clock skew still matches and is
 # a documented constraint, not fixed here.
 _ID_RE = re.compile(r"\A\d{8}-\d{6}-\d{6}-[" + re.escape(_ID_ALPHABET) + r"]{4}\Z")
+
+
+def _safe_int(value: object) -> int:
+    """Coerce a stored counter to int, degrading to 0 on null/non-numeric (a hand-edited
+    or forward-incompatible ledger VALUE must err LOW, never raise - mirrors the
+    degrade-to-empty read)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 # Known message kinds. Receivers should silently skip anything else
 # rather than letting an unfamiliar kind smuggle through to the LLM
@@ -1716,6 +1727,340 @@ class Store:
                 self.quarantine_dir.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(src), str(dst))
         return records
+
+    # ------------------------------------------------- dead-letter (poison)
+    #
+    # A POISON message is a VALID, well-signed message the wrapped model cannot
+    # process: the turn fails DETERMINISTICALLY, so the at-least-once loop
+    # re-delivers it forever (the 0.30.0 supervisor restart-loop limitation).
+    # Dead-lettering MOVES the original bytes into a SCAN-INVISIBLE sink
+    # (.agenttalk/dead-letter/<agent>/, a sibling of messages/ that no scan
+    # walks) and advances the cursor PAST it, so the inbox proceeds. Distinct
+    # from quarantine (an invalid/forged FILE = a TRUST failure); this is a
+    # valid file = a DELIVERY failure -> separate dir + verbs. Recoverable via
+    # `dead-letter list/show/requeue`; reset PRESERVES the sink (like quarantine).
+    #
+    # The per-agent ATTEMPT LEDGER (state/dead-letter-attempts/<agent>.json) is
+    # the DURABLE counter that survives a supervisor RELAUNCH (only `reset`, which
+    # clears state/, resets it). It mirrors the per-agent-state convention exactly:
+    # SINGLE-WRITER (the wrapper is the sole consumer of its inbox, recv_api.py),
+    # UNLOCKED, atomic-write, degrade-to-empty read that NEVER errs high (a torn
+    # ledger reading "lots of attempts" would FALSE-dead-letter a healthy message).
+
+    @property
+    def dead_letter_dir(self) -> Path:
+        return self.dir / "dead-letter"
+
+    def _attempts_path(self, agent: str) -> Path:
+        return self.state_dir / "dead-letter-attempts" / f"{validate_agent_name(agent)}.json"
+
+    def dead_letter_attempts(self, agent: str) -> dict:
+        """The durable attempt ledger for ``agent`` -> ``{schema_version, agent,
+        messages: {msg_id: record}}``. NEVER raises and NEVER errs HIGH: a
+        missing/torn/corrupt/non-dict file reads as no attempts (mirror
+        read_threadstate), so a healthy message is never FALSE-dead-lettered."""
+        empty = {"schema_version": 1, "agent": agent, "messages": {}}
+        p = self._attempts_path(agent)
+        if not p.exists():
+            return empty
+        try:
+            raw = p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return empty
+        if not raw:
+            return empty
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return empty
+        if not isinstance(data, dict) or not isinstance(data.get("messages"), dict):
+            return empty
+        return data
+
+    def _write_attempts(self, agent: str, data: dict) -> None:
+        p = self._attempts_path(agent)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(p, json.dumps(data, indent=2, ensure_ascii=False))
+
+    def attempt_record(self, agent: str, msg_id: str) -> dict | None:
+        rec = self.dead_letter_attempts(agent)["messages"].get(msg_id)
+        return rec if isinstance(rec, dict) else None
+
+    def record_attempt_start(self, agent: str, record: dict, *, attempt_id: str,
+                             at: str) -> dict:
+        """WRITE-AHEAD: increment ``attempts_started`` + mark ``in_progress`` BEFORE
+        ``drive()``. A hard crash mid-turn still leaves a durable started attempt the
+        next run reads (-> crash_mid_turn). EXACTLY one call per drive() = one attempt."""
+        data = self.dead_letter_attempts(agent)
+        mid = record.get("id")
+        rec = data["messages"].get(mid)
+        if not isinstance(rec, dict):
+            rec = {
+                "id": mid, "cursor_before": self.cursor(agent),
+                "request_id": record.get("request_id"),
+                "broadcast_id": record.get("broadcast_id"),
+                "from": record.get("from"), "to": record.get("to"),
+                "kind": record.get("kind"), "subject": record.get("subject"),
+                "first_started_at": at, "attempts_started": 0,
+                "poison_eligible_failures": 0, "infra_failures": 0,
+                "ambiguous_failures": 0, "last_failure_class": None,
+                "last_failure_summary": None, "escalated": False, "in_progress": False,
+            }
+        rec["attempts_started"] = _safe_int(rec.get("attempts_started")) + 1
+        rec["last_started_at"] = at
+        rec["last_attempt_id"] = attempt_id
+        rec["in_progress"] = True
+        data["messages"][mid] = rec
+        self._write_attempts(agent, data)
+        return rec
+
+    def record_attempt_result(self, agent: str, msg_id: str, *, failure_class: str,
+                              summary: str | None, at: str) -> dict | None:
+        """After a FAILED drive: clear ``in_progress``, bump the per-class failure
+        counter, record the last class/summary. (Success calls clear_attempt.)"""
+        data = self.dead_letter_attempts(agent)
+        rec = data["messages"].get(msg_id)
+        if not isinstance(rec, dict):
+            return None
+        rec["in_progress"] = False
+        rec["last_failure_class"] = failure_class
+        rec["last_failure_summary"] = (summary or "")[:500]
+        rec["last_failure_at"] = at
+        key = {"poison_eligible": "poison_eligible_failures",
+               "known_global_infra": "infra_failures"}.get(
+                   failure_class, "ambiguous_failures")
+        rec[key] = _safe_int(rec.get(key)) + 1
+        if failure_class != "poison_eligible":
+            # poison_eligible_failures is CONSECUTIVE (V1 rubric: per-id, reset on progress) -
+            # a non-poison outcome (infra / ambiguous) BREAKS the poison run, so only K
+            # CONSECUTIVE deterministic-poison classifications auto-DL@K_poison. Closes the
+            # interleaved-outage accumulation that could otherwise DL a healthy message at the
+            # low cap (lead 5th-verify P2) + defense-in-depth vs residual marker misclassification.
+            rec["poison_eligible_failures"] = 0
+        data["messages"][msg_id] = rec
+        self._write_attempts(agent, data)
+        return rec
+
+    def reconcile_crash_in_progress(self, agent: str, msg_id: str, *, at: str) -> bool:
+        """On relaunch: a stale ``in_progress`` for ``msg_id`` means the process crashed
+        mid-turn. The CAUSE is UNOBSERVED (could be a healthy-but-slow message the
+        supervisor stale-killed, OOM, power-loss, or genuine message-poison), so codex
+        ruled crash_mid_turn = AMBIGUOUS, not low-cap poison: it disposes only at the high
+        K_escalate ceiling (escalate + last-resort DL), never false-DL@3 a healthy-but-slow
+        message. The already-incremented attempts_started (write-ahead) counts it toward
+        that ceiling; here we just record the class + clear in_progress. Returns True if
+        reconciled."""
+        data = self.dead_letter_attempts(agent)
+        rec = data["messages"].get(msg_id)
+        if not isinstance(rec, dict) or not rec.get("in_progress"):
+            return False
+        rec["in_progress"] = False
+        rec["ambiguous_failures"] = _safe_int(rec.get("ambiguous_failures")) + 1
+        rec["poison_eligible_failures"] = 0   # a crash (ambiguous) breaks the consecutive poison run
+        rec["last_failure_class"] = "ambiguous_or_unknown"
+        rec["last_failure_summary"] = "crash_mid_turn"
+        rec["last_failure_at"] = at
+        data["messages"][msg_id] = rec
+        self._write_attempts(agent, data)
+        return True
+
+    def mark_attempt_escalated(self, agent: str, msg_id: str, *, routed: bool = False) -> None:
+        """Latch that the high-attempt backstop escalation fired for ``msg_id`` and record
+        whether the operator notice actually ROUTED. An escalated-but-unrouted record is
+        the signal doctor surfaces LOUD (no escalation target resolved), so a known-infra
+        outage that loops under backoff is never silent."""
+        data = self.dead_letter_attempts(agent)
+        rec = data["messages"].get(msg_id)
+        if isinstance(rec, dict):
+            rec["escalated"] = True
+            rec["escalation_routed"] = bool(routed)
+            data["messages"][msg_id] = rec
+            self._write_attempts(agent, data)
+
+    def list_unrouted_escalations(self) -> list[dict]:
+        """Every attempt record that hit the escalation backstop but whose operator notice
+        did NOT route (no liaison/lead resolved). Doctor reports these LOUD - a known-infra
+        message can otherwise loop under backoff forever with no operator-visible signal.
+        Reads all per-agent ledgers; degrade-safe (skips unreadable)."""
+        d = self.state_dir / "dead-letter-attempts"
+        if not d.is_dir():
+            return []
+        out: list[dict] = []
+        for p in sorted(d.glob("*.json")):
+            agent = p.stem
+            for mid, rec in (self.dead_letter_attempts(agent).get("messages") or {}).items():
+                if isinstance(rec, dict) and rec.get("escalated") and not rec.get("escalation_routed"):
+                    out.append({"agent": agent, "message_id": mid,
+                                "attempts": rec.get("attempts_started"),
+                                "last_failure_class": rec.get("last_failure_class")})
+        return out
+
+    def clear_attempt(self, agent: str, msg_id: str) -> None:
+        data = self.dead_letter_attempts(agent)
+        if data["messages"].pop(msg_id, None) is not None:
+            self._write_attempts(agent, data)
+
+    def gc_attempts_below(self, agent: str, cursor: str) -> None:
+        """Drop attempt records at/below the committed cursor (bounded ledger)."""
+        if not cursor:
+            return
+        data = self.dead_letter_attempts(agent)
+        drop = [mid for mid in data["messages"] if mid <= cursor]
+        if drop:
+            for mid in drop:
+                data["messages"].pop(mid, None)
+            self._write_attempts(agent, data)
+
+    def dead_letter(self, agent: str, record: dict, *, reason: str | None,
+                    failure_class: str, at: str) -> Path:
+        """Dispose the poison HEAD ``record``: move its bytes to the scan-invisible
+        sink + advance the cursor past it, as ONE ordered, fail-closed sequence
+        (single-writer = serialized): identity-check -> size/SHA256 -> MOVE
+        (collision-safe, never overwrite/delete) -> sidecar -> clear attempt ->
+        advance_cursor(the LIVE head id, never a ledger/sidecar id) LAST + GC.
+
+        INVARIANT: never advance the cursor unless the original bytes are recoverable
+        in the sink - the MOVE precedes the advance, and a write failure fails CLOSED
+        (no advance). A crash mid-dispose is therefore LOSSLESS: the bytes are already
+        in the sink, surfaced by :meth:`list_dead_letters` / :meth:`dead_lettered_count`
+        (as an orphan payload if the crash preceded the sidecar write).
+
+        RECOVERY (honest note): through the production loop this method is NOT re-invoked
+        for the same id after a crash - :func:`recv_api.next_record` scans only
+        ``messages/`` and the file has already moved to the sink, so next_record skips
+        the (now-missing) id and the cursor advances naturally past it once the NEXT
+        message commits. The direct-call idempotent no-op-move replay (re-calling
+        dead_letter for the same id: ``payload.exists() and not src.exists()`` -> just
+        clear+advance) is exercised by tests (test_12) but is NOT the production recovery
+        path. If no further traffic arrives, a lingering attempt-ledger entry / behind
+        cursor is benign (bytes are safe + surfaced); an idle/startup reconcile +
+        doctor-warn-on-stuck-in_progress is a tracked fast-follow."""
+        mid = record.get("id")
+        if not (isinstance(mid, str) and _ID_RE.match(mid)):
+            raise ValueError(f"dead_letter: record id {mid!r} is not a valid message id")
+        sink = self.dead_letter_dir / validate_agent_name(agent)
+        payload = sink / f"{mid}.json"
+        sidecar = sink / f"{mid}.deadletter.json"
+        src = self.messages_dir / f"{mid}.json"
+        sink.mkdir(parents=True, exist_ok=True)
+        attempt = self.attempt_record(agent, mid) or {}
+        if src.exists():
+            # SOURCE-IDENTITY: the live file stem == the record id by construction
+            # (src is messages/<mid>.json). Move bytes FIRST so they are recoverable
+            # before the cursor can ever advance.
+            body = src.read_bytes()
+            dst = payload
+            sidecar_dst = sidecar
+            if dst.exists():   # never overwrite a prior payload OR its sidecar (collision-safe)
+                # Name the collision sibling <mid>.<iso>.json (+ .<iso>.deadletter.json) so the
+                # endswith('.json') readers (count / list / read_payload) still SURFACE it
+                # (lead C1); the file STEM <mid>.<iso> becomes its unique recovery id. The old
+                # <mid>.json.<iso> scheme was invisible to those filters = unrecoverable.
+                suffix = _now_iso().replace(":", "-")
+                dst = sink / f"{mid}.{suffix}.json"
+                sidecar_dst = sink / f"{mid}.{suffix}.deadletter.json"
+            shutil.move(str(src), str(dst))
+            meta = {
+                "schema_version": 1, "message_id": mid, "agent": agent,
+                "from": record.get("from"), "to": record.get("to"),
+                "subject": record.get("subject"), "kind": record.get("kind"),
+                "request_id": record.get("request_id"),
+                "broadcast_id": record.get("broadcast_id"),
+                "attempts": _safe_int(attempt.get("attempts_started")),
+                "class": failure_class, "last_reason": reason,
+                "size_bytes": len(body), "sha256": hashlib.sha256(body).hexdigest(),
+                "first_at": attempt.get("first_started_at"), "last_at": at,
+                "deadlettered_at": at, "cursor_at_deadletter": self.cursor(agent),
+                "payload_path": str(dst),
+            }
+            _atomic_write_text(sidecar_dst, json.dumps(meta, indent=2, ensure_ascii=False))
+        elif not payload.exists():
+            # bytes neither in messages/ nor in the sink -> NOT recoverable -> NEVER
+            # advance the cursor (fail closed).
+            raise FileNotFoundError(
+                f"dead_letter: message {mid} is neither in messages/ nor the sink")
+        # else: replay of a crashed disposition (payload already in sink) -> no-op
+        # move; fall through to complete the clear + advance.
+        self.clear_attempt(agent, mid)
+        self.advance_cursor(agent, mid)   # LAST; only reached once bytes are recoverable
+        self.gc_attempts_below(agent, mid)
+        return payload
+
+    def dead_lettered_count(self, agent: str | None = None) -> int:
+        """Count dead-lettered message payloads (excludes .deadletter.json sidecars)."""
+        root = self.dead_letter_dir
+        if not root.is_dir():
+            return 0
+        agent_dirs = ([root / validate_agent_name(agent)] if agent
+                      else [d for d in root.iterdir() if d.is_dir()])
+        n = 0
+        for d in agent_dirs:
+            if d.is_dir():
+                n += sum(1 for p in d.iterdir()
+                         if p.is_file() and p.name.endswith(".json")
+                         and not p.name.endswith(".deadletter.json"))
+        return n
+
+    def list_dead_letters(self, agent: str | None = None) -> list[dict]:
+        """Return one dict per dead-lettered message, keyed off the PAYLOAD files so the
+        list AGREES with :meth:`dead_lettered_count` (both count payloads) and an ORPHAN
+        payload whose sidecar write was interrupted is still surfaced (metadata recoverable
+        from the payload name), not silently dropped (lead F1). Sidecar metadata is
+        attached when present; degrade-safe. Sorted by message_id (chronological)."""
+        root = self.dead_letter_dir
+        if not root.is_dir():
+            return []
+        agent_dirs = ([root / validate_agent_name(agent)] if agent
+                      else sorted(d for d in root.iterdir() if d.is_dir()))
+        out: list[dict] = []
+        for d in agent_dirs:
+            if not d.is_dir():
+                continue
+            for p in sorted(d.iterdir()):
+                if not (p.is_file() and p.name.endswith(".json")
+                        and not p.name.endswith(".deadletter.json")):
+                    continue
+                # The file STEM is the canonical recovery id (read_dead_letter_payload reads
+                # <stem>.json), so report it AS message_id even when the sidecar records the
+                # original id - else a collision sibling (<mid>.<iso>.json) would list/requeue
+                # under the original <mid> and resolve to the FIRST payload (lead C1).
+                stem = p.name[:-len(".json")]
+                sidecar = d / f"{stem}.deadletter.json"
+                meta: dict = {}
+                meta_loaded = False
+                if sidecar.is_file():
+                    try:
+                        loaded = json.loads(sidecar.read_text(encoding="utf-8"))
+                        if isinstance(loaded, dict):
+                            meta = loaded
+                            meta_loaded = True
+                    except (OSError, ValueError):
+                        meta = {}
+                meta.setdefault("agent", d.name)
+                orig = meta.get("message_id")
+                meta["message_id"] = stem
+                if orig and orig != stem:
+                    meta["original_message_id"] = orig   # collision sibling: audit the source id
+                if not meta_loaded:
+                    # bytes recoverable, but the metadata is lost - flag whether the sidecar was
+                    # MISSING or merely UNREADABLE (corrupt JSON / wrong shape) so the operator
+                    # is not misled into thinking the metadata simply was not there (verify C1).
+                    meta["orphan_no_sidecar"] = True
+                    if sidecar.is_file():
+                        meta["sidecar_unreadable"] = True
+                out.append(meta)
+        out.sort(key=lambda m: str(m.get("message_id") or ""))
+        return out
+
+    def read_dead_letter_payload(self, agent: str, msg_id: str) -> bytes | None:
+        """The original message bytes for a dead-lettered id, or None."""
+        p = self.dead_letter_dir / validate_agent_name(agent) / f"{msg_id}.json"
+        if not p.is_file():
+            return None
+        try:
+            return p.read_bytes()
+        except OSError:
+            return None
 
     def valid_messages(self) -> list[Message]:
         """Return every roster- AND signature-valid message, ALL recipients.

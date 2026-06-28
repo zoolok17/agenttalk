@@ -92,6 +92,19 @@ def mark_resume_unavailable(state: SessionState, reason: str) -> None:
     state.codex_thread_id = None
 
 
+def reset_claude_session(state: SessionState, reason: str) -> None:
+    """A claude ``--resume`` turn failed (typically the session is FULL): mint a FRESH
+    session id and force a ``--session-id`` (fresh) turn next, so the SAME record can be
+    retried on a clean session before we ever classify it as poison. Mirrors the codex
+    resume->fresh self-heal (:func:`mark_resume_unavailable`). A NEW uuid is required:
+    re-running ``--session-id`` with the existing id would not give a clean session."""
+    if state.cli != "claude":
+        return
+    state.claude_session_id = str(uuid.uuid4())
+    state.resume_available = False
+    state.resume_unavailable_reason = reason
+
+
 # --- persistence: the session layer owns its state, written atomically (Codex) ---
 
 def _session_path(store, agent: str):

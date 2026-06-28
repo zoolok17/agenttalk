@@ -114,7 +114,98 @@ def run(project_root: Path | None = None) -> Report:
         kn_check = _check_knowledge(store)
         if kn_check is not None:  # additive: absent unless a knowledge store exists
             report.checks.append(kn_check)
+        dl_check = _check_dead_letter(store)
+        if dl_check is not None:  # additive: absent unless dead-letters exist
+            report.checks.append(dl_check)
+        esc_check = _check_dead_letter_escalations(store)
+        if esc_check is not None:  # additive: absent unless an unrouted backstop exists
+            report.checks.append(esc_check)
     return report
+
+
+def _check_dead_letter_escalations(store) -> Check | None:
+    """LOUD signal for a high-attempt backstop escalation that did NOT route (no
+    operator_facing/sole_lead resolved). A known-infra message NEVER auto-dead-letters, so
+    without this it could loop under backoff forever with no operator-visible signal
+    (codex P2 / lead F2). Absent unless such a record exists."""
+    try:
+        unrouted = store.list_unrouted_escalations()
+    except Exception as e:  # noqa: BLE001 - doctor never crashes
+        return Check(name="dead_letter_escalation", status="warn",
+                     details=f"could not scan attempt ledgers: {e}")
+    if not unrouted:
+        return None
+    summary = "; ".join(f"{u['agent']}/{u['message_id']} "
+                        f"(class={u.get('last_failure_class')}, attempts={u.get('attempts')})"
+                        for u in unrouted[:5])
+    return Check(
+        name="dead_letter_escalation", status="error",
+        details=(f"{len(unrouted)} message(s) hit the dead-letter escalation backstop but "
+                 f"the operator notice could NOT route (no operator_facing liaison and no "
+                 f"sole lead) - a stuck/infra message is retrying with no operator signal. "
+                 f"{summary}"),
+        fix=("Set a liaison (`agenttalk roster --set-operator-facing <agent>`) or a single "
+             "role=lead so the wrapper's dead-letter escalation reaches the operator."),
+        data={"unrouted": unrouted})
+
+
+def _check_dead_letter(store) -> Check | None:
+    """Surface dead-lettered (poison) messages; absent when there are none. WARN that
+    valid messages were dropped (recoverable via `dead-letter list/requeue`), and go to
+    a LOUD ERROR when dead-letters exist but NO escalation target resolves
+    (operator_facing / sole_lead both unset) - the operator notice could not route, so
+    the only signal must not be a silent count."""
+    try:
+        n = store.dead_lettered_count()
+    except Exception as e:  # noqa: BLE001 - doctor never crashes
+        return Check(name="dead_letter", status="warn",
+                     details=f"could not scan dead-letter sink: {e}")
+    if not n:
+        return None
+    items = []
+    try:
+        items = store.list_dead_letters()
+    except Exception:  # noqa: BLE001
+        items = []
+    summary = "; ".join(
+        f"{m.get('agent')}/{m.get('message_id')} (class={m.get('class')}, "
+        f"attempts={m.get('attempts')})" for m in items[:5])
+    target = store.operator_facing() or store.sole_lead()
+    # Mirror the notifier's reachability (cli._dead_letter_notifier): an agent CANNOT escalate
+    # to ITSELF, so a dead-lettering agent that is the only resolvable target gets a notice
+    # that never routes - a SILENT disposal. Go LOUD when no target resolves at all OR when
+    # any agent in the sink could only "escalate" to itself (lead C5, no-silent-disposal).
+    dl_agents = sorted({m.get("agent") for m in items if m.get("agent")})
+    self_only = [a for a in dl_agents if target == a]
+    # If the sink has dead-letters but we could NOT enumerate them (list raised -> items=[]),
+    # we cannot verify any of them routed - fail LOUD rather than infer a benign WARN (a silent
+    # disposal we just can't see is still a silent disposal). C5/verify P1.
+    unreadable = bool(n) and not items
+    data = {"count": n, "messages": items}
+    if target is None or self_only or unreadable:
+        if target is None:
+            why = ("NO escalation target resolves (no operator_facing liaison and no sole "
+                   "lead) - the dead-letter notice cannot route.")
+        elif self_only:
+            why = (f"the only escalation target ({target}) is the dead-lettering agent "
+                   f"itself for {', '.join(self_only)} - an agent cannot escalate to itself, "
+                   "so the notice does not route.")
+        else:
+            why = ("the dead-letter sink could not be enumerated to verify the operator "
+                   "notices routed (the list read failed) - routing is unverifiable.")
+        return Check(
+            name="dead_letter", status="error",
+            details=(f"{n} dead-lettered poison message(s) but {why} " + summary),
+            fix=("Set a DIFFERENT liaison (`agenttalk roster --set-operator-facing "
+                 "<other-agent>`) or add a second non-disposing lead, then review "
+                 "`agenttalk dead-letter list`."),
+            data=data)
+    return Check(
+        name="dead_letter", status="warn",
+        details=(f"{n} dead-lettered poison message(s) (valid messages the model could "
+                 f"not process; moved out of the inbox, recoverable). {summary}"),
+        fix="Review with `agenttalk dead-letter list`; recover with `dead-letter requeue`.",
+        data=data)
 
 
 def _check_knowledge(store) -> Check | None:
