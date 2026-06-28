@@ -12,7 +12,7 @@ major · `P2` minor · `P3` nit. Each item: what, why, where, disposition.
 
 ---
 
-## IN PROGRESS — v0.40.0 hardening batch (`hardening-batch-040`)
+## SHIPPED v0.40.0 — hardening batch (`hardening-batch-040`)
 
 Origin: the **2026-06-28 fresh-agent audit** (6 independent reviewers; the
 operator asked every agent to spawn its own fresh reviewer). The audit found a
@@ -54,11 +54,10 @@ codex, gated by lead, built by dev-2, cross-reviewed by codex + reviewer-1.
   and that `reset` preserves the durable set. Covers the previously-untested
   CLI↔core wiring, git adapter, and reset durability boundary.
 
-Status: final SHA `6e48e60` (all-matching-entries-must-approve + duplicate-glob
-validation; 1212 tests green on 3.10+3.14). The C2 authority fix iterated through
-three reproduced bypasses before review settled on all-matching (D-11); C1/C3/C6
-were cleared by both reviewers. In final re-review on `6e48e60`; then lead gate
-(ruff/bandit/3.10+3.14/diff-check) and ship after both approve.
+Status: **SHIPPED as v0.40.0** (merge SHA `e0e8f7b`). All four clusters approved by
+both reviewers and lead-gated (ruff/bandit/diff-check clean, 1213 passed on 3.10
+AND 3.14). The C2 authority fix iterated through three reproduced bypasses before
+review settled on all-matching (D-11).
 
 ## PLANNED — v0.40.1 fast-follow
 
@@ -132,6 +131,9 @@ corruption, specific mis-use, or are conservative/advisory).
 
 ## Recently shipped (rationale in CHANGELOG.md / docs/DESIGN.md)
 
+- **v0.40.0** — post-audit hardening: gates fail-closed, lane all-matching shared
+  approval [D-11], wrapper one-shot + resolver unification, first e2e regression
+  test. (Origin: the 2026-06-28 fresh audit — `docs/audit-2026-06-28.md`.)
 - **v0.39.0** — stand-down authority (idle = always listening; human-origin
   loop-exit envelope). [D-7]
 - **v0.38.0** — knowledge layer (append-only pointer memory; capture-open +

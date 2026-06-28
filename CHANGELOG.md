@@ -5,6 +5,49 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.0] - 2026-06-28
+
+### Security / hardening
+
+Post-audit hardening batch — origin: the 2026-06-28 fresh independent audit (six
+independent fresh reviewers). Fixes a cluster of fail-open / authority defects the
+normal review cadence had shipped. See `docs/audit-2026-06-28.md`.
+
+- **Gates fail-closed (`gates.py`).** `gate set` / `gate waive` refuse to mutate a
+  corrupt `gates.json` (no longer silently clear a corruption HOLD), serialize the
+  full read-modify-write under a lock, and treat a required gate recorded under a
+  mismatched scope as blocking (not absence=pass). A `severity=blocker` gate now
+  HOLDs on every status except validated `green` / active `waived` — a `skipped`
+  blocker no longer returns GO. New `tests/test_gates.py`.
+- **Lane shared-path approval is all-matching authority (decision D-11).** A touched
+  shared path is cleared only when **every** matching shared entry has a fresh
+  approval recorded against that entry by an authorized approver. The
+  previously-dead `HOLD_SHARED_WRONG_APPROVAL` is now emitted; verdicts revalidate
+  persisted approvals against the current epoch/registry; validation rejects
+  duplicate normalized shared globs. There is no winner-picking between overlapping
+  globs (the ordering heuristic was proven unsound).
+- **Wrapper one-shot + release authority.** The one-shot reviewer loop uses a scoped
+  receive (no starvation behind unrelated traffic) with a bounded timeout, clears
+  its `.waiting` marker on every exit, and `is_release_authorized` delegates to the
+  single `loop_exit_relay_authorized` resolver.
+- **End-to-end regression test.** New `tests/test_e2e_lifecycle.py` drives the real
+  CLI over a temp store + git through the full lifecycle, asserting exit codes, JSON
+  verdicts, on-disk state, the `reset` durability boundary, and negative assertions
+  that the above bugs stay fixed.
+
+### Changed (behavior)
+
+- A `skipped` `severity=blocker` gate no longer reports GO (it HOLDs).
+- Deliberately-overlapping shared lane entries each require their own approval.
+
+Both are stricter (fail-closed) than before.
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.40.0"
+```
+
 ## [0.39.0] - 2026-06-28
 
 ### Changed
