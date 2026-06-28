@@ -118,11 +118,17 @@ jobs:
       - run: pip install 'semgrep>=1.80'
       - name: Run semgrep with local rules
         run: |
+          # --timeout 120: a slow registry rule (e.g. the boto3 rules, which this
+          # codebase never exercises) can exceed semgrep's 5s default on a large file
+          # like cli.py, and --strict turns that rule-execution timeout into a hard
+          # failure even with 0 findings. A generous bound keeps every rule running to
+          # completion (no coverage lost) while eliminating the timeout-flake.
           semgrep scan \
             --config=p/python \
             --config=p/security-audit \
             --config=.semgrep/agenttalk.yml \
             --error \
+            --timeout 120 \
             --strict
 
   # ------------------------------------------------------------ CodeQL
