@@ -5,6 +5,42 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.1] - 2026-06-28
+
+### Fixed (fast-follow hardening; origin: 2026-06-28 audit clusters C4/C5)
+
+- **`roster --expertise`** derives curated-note authorship from the curated view
+  (not the latest event), so a later uncurated publish can no longer drop a
+  verified author's credit. Registry roles + lane-delivery history remain primary.
+- **Knowledge anchor staleness now fails closed.** A path/symbol note with no
+  `verified_against_sha` baseline is hard-stale (`missing_verified_baseline`); a
+  pathless `wp` anchor is hard-stale (`unsupported_wp_anchor`); a `request`
+  anchor's `msg_id` must match exactly (no fallback to `request_id`); any anchor
+  scan/read failure resolves to unresolvable rather than fresh. All excluded by
+  default; visible with `--include-stale`.
+- **Knowledge writes are durable and single-path.** `publish` and `curate` share
+  one append helper (append under lock + `flush` + `fsync`; directory fsync is
+  best-effort and Windows-guarded), preserving append-only history and the
+  reader's torn/invalid-line tolerance.
+- **`knowledge onboard` is bounded** — `--limit` (default 20), grouped by domain
+  then type, deterministic order.
+- **Lane delivery is verified before the lane clears.** `lane deliver` reads the
+  written delivery artifact back and validates its shape *and* that it records a
+  GO verdict with no holds; any mismatch leaves the lane active and exits nonzero.
+- **Restart-marker race fixed.** `write_restart_request` and
+  `clear_restart_request` share the config lock; a stale clear can no longer
+  remove a newer restart marker.
+
+### Changed (behavior)
+
+- `knowledge onboard` output is now capped at `--limit` (default 20).
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.40.1"
+```
+
 ## [0.40.0] - 2026-06-28
 
 ### Security / hardening

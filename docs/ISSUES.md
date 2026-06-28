@@ -59,18 +59,21 @@ both reviewers and lead-gated (ruff/bandit/diff-check clean, 1213 passed on 3.10
 AND 3.14). The C2 authority fix iterated through three reproduced bypasses before
 review settled on all-matching (D-11).
 
-## PLANNED — v0.40.1 fast-follow
+## SHIPPED v0.40.1 — fast-follow (merge SHA `1962b92`)
 
-- **C4 · knowledge gaps (0.38.0).** `roster --expertise` uses the latest view
-  instead of the curated set (a later uncurated publish drops a verified author's
-  credit) [P2]; `wp`/`request`/null-`verified_against_sha` anchors fail *open* on
-  staleness instead of fail-closed [P2/P3]; publish vs curate use *different*
-  append code with no fsync (crash can drop the latest) → centralize on one
-  durable writer [P2]; `onboard` help/README overstate ("bounded digest grouped
-  by domain/type") [P3].
-- **C5 · TOCTOUs (P2).** `lane deliver` clears the lane on the sandbox direct-write
-  path without reading the artifact back; `clear_restart_request` read+unlink is
-  unguarded (sibling uses `_config_lock`).
+Both approved + lead-gated (1227 passed on 3.10 AND 3.14). Review folded one real
+C5a P1 (structural → semantic artifact readback). WP resolver deferred (banked).
+
+- **C4 · knowledge gaps (0.38.0).** `roster --expertise` now uses the curated view;
+  anchor staleness fails closed (`missing_verified_baseline` for a null path/symbol
+  baseline, `unsupported_wp_anchor` for a pathless `wp`, exact `msg_id`, scan
+  failure → unresolvable); `publish`+`curate` share one durable append helper
+  (lock + flush + fsync, Windows-guarded); `knowledge onboard` is bounded
+  (`--limit`, default 20, grouped domain→type).
+- **C5 · TOCTOUs.** `lane deliver` reads back + shape/verdict-validates the delivery
+  artifact before clearing the lane (a HOLD/wrong-schema artifact can no longer
+  clear it); `write_restart_request` + `clear_restart_request` share the config
+  lock so a stale clear cannot remove a newer marker.
 
 ## BACKLOG
 
@@ -131,6 +134,9 @@ corruption, specific mis-use, or are conservative/advisory).
 
 ## Recently shipped (rationale in CHANGELOG.md / docs/DESIGN.md)
 
+- **v0.40.1** — fast-follow hardening: knowledge expertise curated-view, anchor
+  staleness fail-closed, one durable writer, bounded `onboard`; lane delivery
+  artifact verified-before-clear; restart-marker lock.
 - **v0.40.0** — post-audit hardening: gates fail-closed, lane all-matching shared
   approval [D-11], wrapper one-shot + resolver unification, first e2e regression
   test. (Origin: the 2026-06-28 fresh audit — `docs/audit-2026-06-28.md`.)
