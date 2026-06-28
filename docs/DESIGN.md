@@ -175,10 +175,12 @@ two parallel ownership concepts.
   adapter (so verdict logic is unit-testable with no live repo); durable delivery
   artifact written before the lane is cleared; fingerprint re-validated under lock.
   Shared-path approvals are registry-entry authority, not raw path-prefix
-  authority: the current hardening rule is to resolve the responsible shared
-  entry at verdict time, revalidate the persisted approval against the current
-  epoch/registry, and HOLD on ambiguous overlaps instead of letting a broad glob
-  clear a more-specific path.
+  authority: a touched shared path is cleared only when **every** matching shared
+  entry has a fresh approval recorded against that entry by an authorized approver
+  (a close lead or that entry's default approvers). There is no winner-picking
+  between overlapping entries — that ordering heuristic was twice unsound — so a
+  path governed by two entries must satisfy both; duplicate normalized shared
+  globs are rejected at validation.
 - **Knowledge (`knowledge.py`, v0.38.0):** an append-only **pointer** layer
   (`notes.jsonl`), latest valid event by `(domain_id, key)`. Capture-open +
   curate-gated (anyone publishes `uncurated`; owners/curators/lead verify/
@@ -255,14 +257,20 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   on one working tree collide on `git checkout`; each builder uses an isolated
   `git worktree`. (See §6.)
 
-- **D-11 Shared lane approval is entry-based authority.** *Why:* a broad
-   approval for `shared/**` must not clear a sensitive nested path such as
+- **D-11 Shared lane approval requires approval from EVERY matching entry.** *Why:*
+   a broad approval for `shared/**` must not clear a sensitive nested path such as
    `shared/secret.sql` when the registry assigns that nested entry a different
-   approver set. Verdicts resolve the responsible shared entry from the current
-   registry, revalidate persisted approvals against that entry, and fail closed
-   on ambiguous equal-specificity overlaps. *Rejected:* raw path-prefix
-   approval, first-match-wins, and accepting any stored glob that happens to
-   match.
+   approver set. A touched shared path is cleared only when *every* matching shared
+   entry has a fresh, valid approval recorded against that entry by an authorized
+   approver; otherwise HOLD. Verdicts revalidate persisted approvals against the
+   current epoch/registry, and validation rejects duplicate normalized shared
+   globs. *Rejected:* raw path-prefix approval, first-match-wins, and
+   most-specific-entry-wins — picking a winner among overlapping globs imposes a
+   total order on a partial order and was twice proven unsound (a wrong choice on
+   a security boundary is a bypass). Requiring all matching entries removes the
+   ordering question entirely and is provably fail-closed (D-3). *Evolution:* the
+   v0.40.0 fix iterated prefix-match → most-specific tuple → all-matching as
+   review reproduced progressively deeper bypasses; all-matching ended the class.
 
 ## 6. How we work (process)
 

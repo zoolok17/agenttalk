@@ -35,10 +35,12 @@ codex, gated by lead, built by dev-2, cross-reviewed by codex + reviewer-1.
   `schema/secret.sql` whose distinct approvers were never consulted; and the
   verdict never revalidated persisted approvals. *Fix:* drop the prefix arm;
   persist the matched entry glob (not raw path); revalidate at verdict time →
-  emit the previously-dead `HOLD_SHARED_WRONG_APPROVAL`; **most-specific-matching-
-  entry-wins** (reviewer-1 P1, reproduced — *required for 0.40.0*, not a
-  fast-follow) with ties failing closed via new `HOLD_SHARED_AMBIGUOUS_ENTRY`.
-  3 reviewers converged on this.
+  emit the previously-dead `HOLD_SHARED_WRONG_APPROVAL`; and require approval from
+  **every** matching shared entry — a touched path is cleared only when each
+  matching entry has a fresh approval by an authorized approver (no winner-picking
+  between overlapping globs; that ordering was twice unsound). Validation rejects
+  duplicate normalized shared globs. 3 reviewers converged; the fix iterated
+  prefix → most-specific → all-matching as review reproduced deeper bypasses (D-11).
 - **C3 · wrapper one-shot + release authority (P2/P3).** One-shot reviewer could
   starve/hang behind an unrelated unread message; the loop left a stale `.waiting`
   marker on exit; `is_release_authorized` still carried a zero-lead fallback that
@@ -52,11 +54,11 @@ codex, gated by lead, built by dev-2, cross-reviewed by codex + reviewer-1.
   and that `reset` preserves the durable set. Covers the previously-untested
   CLI↔core wiring, git adapter, and reset durability boundary.
 
-Status: built at `c56b626` (1208 tests green); reviewer-1 and codex both
-CHANGES_REQUESTED for the overlapping-glob P1 (broad approval can still clear a
-more-specific shared path at verdict time). Fold the most-specific/ambiguous-HOLD
-fix into the same branch, then rerun lead gate
-(ruff/bandit/3.10+3.14/diff-check) and ship only after both approve.
+Status: final SHA `6e48e60` (all-matching-entries-must-approve + duplicate-glob
+validation; 1212 tests green on 3.10+3.14). The C2 authority fix iterated through
+three reproduced bypasses before review settled on all-matching (D-11); C1/C3/C6
+were cleared by both reviewers. In final re-review on `6e48e60`; then lead gate
+(ruff/bandit/3.10+3.14/diff-check) and ship after both approve.
 
 ## PLANNED — v0.40.1 fast-follow
 
@@ -109,7 +111,7 @@ Full point-in-time report (methodology, per-reviewer detail, what-held): `docs/a
 | 4 | gates skipped-blocker→GO (reproduced) | P1 | reviewer-1 | C1 / 0.40.0 |
 | 5 | gates: no `tests/test_gates.py` | P0(cov) | test-coverage | C1 / 0.40.0 |
 | 6 | lane shared-approval over-grant + no revalidation | P1 | dev-2, test-coverage, reviewer-1 | C2 / 0.40.0 |
-| 7 | lane overlapping-glob most-specific-wins (reproduced) | P1 | reviewer-1 | C2 / 0.40.0 |
+| 7 | lane overlapping-glob authority (all-matching-must-approve) (reproduced) | P1 | reviewer-1, codex | C2 / 0.40.0 |
 | 8 | `kind=end` from any sender | P1 | dev-2 | **fixed in v0.39.0** |
 | 9 | wrapper release-authority drift | P1→cleanup | codex/Kepler | C3 / 0.40.0 |
 | 10 | wrapper one-shot starve/hang | P2 | dev-2, reviewer-1 | C3 / 0.40.0 |
