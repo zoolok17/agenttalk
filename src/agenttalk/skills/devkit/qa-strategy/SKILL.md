@@ -6,7 +6,7 @@ description: >-
   notes, and identify required close evidence. Use when deciding which
   tests/checks/lenses are necessary before implementation, review, or release
   gating. Do NOT use for writing tests directly or replacing test-coverage.
-reviewed-against: "0.44"
+reviewed-against: "0.45"
 category: production
 evidence-profile:
   - planning-artifact

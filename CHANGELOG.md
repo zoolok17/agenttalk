@@ -5,6 +5,37 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.45.0] - 2026-06-30
+
+### Added
+
+- **`qa-strategy` devkit skill (Tier 1).** A planning skill that decides the QA and review coverage a
+  change needs *before* tests are written, a diff is reviewed, or a release is gated: it identifies risk
+  areas, recommends test levels and review lenses, states which checks are NOT needed and why, attaches
+  cost notes (cheap/moderate/expensive), and names the evidence required for close. It emits a
+  `planning-artifact` (a plan, never an approval) and routes implementation to `craft-code`,
+  test-writing to `test-coverage`, an already-failing CI command to `fix-ci`, and final approval to the
+  review lenses. The devkit routing index is updated (the `Decide which tests/lenses a change needs` row
+  is now live, with a precedence rule distinguishing plan-only `qa-strategy` from `test-coverage` /
+  `test-integration` / `review-code`). First of the Tier 1 devkit skills.
+
+### Fixed
+
+- **Test hardening: `test_web` transient Windows socket flake.** The read-only dashboard HTTP tests now
+  route every client request through a bounded-retry helper that retries ONLY transient connection
+  errors (`ConnectionError` / `ConnectionAbortedError` / `ConnectionResetError`, including the
+  `URLError`-wrapped connect-phase form - i.e. WinError 10053/10054) and re-raises `HTTPError` and any
+  non-transient `URLError` immediately, so the status assertions (403/404/405) are unchanged and a real
+  failure is never masked. Bounded attempts; on exhaustion the last transient error is re-raised.
+  Test-only; no runtime change. Fixes the intermittent `ConnectionAbortedError [WinError 10053]` seen on
+  Windows CI.
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.45.0"
+```
+
 ## [0.44.0] - 2026-06-29
 
 ### Changed
