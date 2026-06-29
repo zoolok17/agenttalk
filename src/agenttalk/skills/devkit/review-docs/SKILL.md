@@ -6,6 +6,10 @@ description: >-
   guide, reference, or doc change, or after a code change that touched user-facing
   docs. Do NOT use for writing/updating docs (use write-docs) or reviewing code logic
   (use review-code).
+reviewed-against: "0.42"
+category: assurance
+evidence-profile:
+  - review-result
 ---
 
 # review-docs

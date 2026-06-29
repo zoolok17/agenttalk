@@ -1,6 +1,7 @@
 ---
 description: Enter the persistent spec-kitty implement/review loop for this mission as a Claude Code agent. Use spec-kitty's state machine as source of truth; use agenttalk as a wake signal between persistent CLI windows. Symmetric - you can be implementer or reviewer for any WP.
 argument-hint: "<mission-slug>"
+reviewed-against: "0.42"
 ---
 
 # /agenttalk.sk-loop - Persistent spec-kitty loop with agenttalk wake

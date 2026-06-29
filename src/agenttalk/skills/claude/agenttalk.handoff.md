@@ -1,5 +1,6 @@
 ---
 description: Send a structured handoff, typically a review request, to a named agent and block until the reply arrives. Works for spec-kitty WP reviews and ad-hoc cross-reviews; the receiver mode-detects from meta.
+reviewed-against: "0.42"
 ---
 
 # /agenttalk.handoff - Hand work off to a named agent and wait for reply

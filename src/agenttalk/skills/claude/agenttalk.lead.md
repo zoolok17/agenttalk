@@ -1,5 +1,6 @@
 ---
 description: Coordinate a named multi-agent team over agenttalk as a lead. Use when Claude should decompose work, dispatch to named agents or groups, track replies with threads, and report back without spawning worker processes.
+reviewed-against: "0.42"
 ---
 
 # /agenttalk.lead - Coordinate a named team
@@ -104,9 +105,12 @@ for those.
   `agenttalk sync --for $SELF` lists pending escalations under
   OPERATOR INPUT NEEDED. Surface each to your human with context (who
   asks, what decision, their recommendation), then relay the answer with
-  `agenttalk reply --to-request <esc-id> --meta operator_answer=true
-  -m "..."`. Aggregate rather than forward noise; never leave an
-  escalation pending silently.
+  `agenttalk relay operator-answer --to-request <esc-id> -m "..."` - the
+  0.42.0 typed relay validates the pending needs_operator escalation and
+  stamps operator_answer + operator_origin through the reserved-meta audit
+  guard. Do NOT hand-roll `reply --meta operator_answer=true`; that path
+  bypasses the audit guard. Aggregate rather than forward noise; never
+  leave an escalation pending silently.
 - **Rescind, don't retract in prose (0.14.0).** To cancel a tracked
   request you opened (question / review-request / proposal), use
   `agenttalk rescind --from $SELF --to-request <RID> -m "<why>"`. A prose
@@ -165,6 +169,35 @@ when supported, or a status-line script that writes the latest input
 JSON to that path). The snapshot may contain rate-limit budget,
 context-window fill, or both; treat either signal as useful but never
 authoritative.
+
+## Lead-loop, relay, and review modes (0.42.0)
+
+- **Managed lead-loop ownership.** A managed lead-loop controller OWNS its team mailbox
+  via a renewable LEASE (`agenttalk wrap --loop --lead-loop`, supervised); only one live
+  controller per mailbox, and the lease + heartbeat are the liveness truth, not prose. Do
+  not run a second consumer of a mailbox a controller owns.
+- **Relay, do not hand-roll, the operator boundary.** The operator speaks through you as
+  the liaison. Relay the operator's ANSWER to a pending escalation with
+  `agenttalk relay operator-answer --to-request <esc-id> -m "..."`, and a SPONTANEOUS
+  operator instruction to a managed lead-loop with
+  `agenttalk relay operator-command --to <lead-loop> -m "..."` (a question by default, so
+  the reply correlates). Both are typed wrappers over send/reply that stamp reserved audit
+  metadata through the 0.42.0 audit guard; never hand-roll that metadata. The lead-loop to
+  operator direction stays `agenttalk escalate`.
+- **Fresh-context evidence-only reviewers.** When risk justifies an independent look
+  (gate/close/authority/persistence/security surfaces, a final SHA, or where a standing
+  reviewer helped design the change), request a one-shot fresh reviewer with
+  `agenttalk request-launch` - but ONLY when available: a supervisor is running,
+  `ephemeral_reviewers.enabled=true`, the profile/skill/role/groups are allowed, you are the
+  authorized (operator-facing else sole-lead) requester, and you pass a full revision plus
+  caps. If unavailable, RECORD that and continue with standing reviewers; do not block GO on
+  it. A fresh approval is EVIDENCE ONLY (`evidence_only=true`, `signoff_eligible=false`),
+  never a close signoff; a fresh rejection is a counter to disposition.
+- **Close on unique evidence, not repeated green.** A GO needs each risk class owned and
+  each review/QA item naming an exact ref + scope. Two reviewers citing the same run and the
+  same scope CORROBORATE one evidence item; they are not two proofs. Disposition rejections,
+  needs-info results, and malformed fresh-review output; never rest an approval only on
+  another approval.
 
 ## Procedure
 

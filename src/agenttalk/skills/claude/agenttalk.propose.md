@@ -1,5 +1,6 @@
 ---
 description: Send a concrete proposal to a named agent over agenttalk and wait for an accept, reject, or counter response. Use when Claude should propose a specific design, plan, scope, or decision for agreement before proceeding.
+reviewed-against: "0.42"
 ---
 
 # /agenttalk.propose - Propose a concrete solution

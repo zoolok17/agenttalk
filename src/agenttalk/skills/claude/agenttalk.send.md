@@ -1,5 +1,6 @@
 ---
 description: Send a single message to a named agent, or broadcast a note/question to a group, over agenttalk. Use for short pings that do not require waiting for a reply.
+reviewed-against: "0.42"
 ---
 
 # /agenttalk.send - Send a message to a named agent or group

@@ -7,6 +7,10 @@ description: >-
   when a feature/field/flag is removed, renamed, defaulted differently, or its shape
   changes. Do NOT use for new-feature review (use review-code), pure failure-path review
   (use review-failure-injection), or release packaging (use review-release-readiness).
+reviewed-against: "0.42"
+category: assurance
+evidence-profile:
+  - review-result
 ---
 
 # review-contract-drift

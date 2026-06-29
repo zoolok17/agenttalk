@@ -1,6 +1,7 @@
 ---
 name: agenttalk-send
 description: Send a single message to a named agent, or broadcast a note/question to a group, over agenttalk. Use when the request does not require waiting for a reply. Requires `agenttalk init` in the project root.
+reviewed-against: "0.42"
 ---
 
 # agenttalk-send - Send a message to a named agent or group (codex side)

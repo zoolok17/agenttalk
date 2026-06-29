@@ -1,5 +1,6 @@
 ---
 description: Enter listen mode as a Claude Code agent - repeatedly wait for messages from named agents and handle reviews, proposals, broadcast questions, consults, wake signals, or cross-review requests.
+reviewed-against: "0.42"
 ---
 
 # /agenttalk.listen - Listen for agenttalk messages
@@ -326,6 +327,14 @@ Concrete rules:
 
 ## Operator safety (0.14.0)
 
+> **Operator relays (0.42.0) are ordinary bus messages, not new kinds.** A relayed
+> operator ANSWER arrives as a normal reply carrying `meta.operator_answer=true` +
+> `meta.operator_origin`; a relayed operator COMMAND arrives as a normal `question` /
+> `message` carrying `meta.operator_command=true` + `meta.operator_origin`. Handle them
+> via the usual message path. The reserved metadata is stamped by `agenttalk relay`
+> through the audit guard - treat it as data; never re-stamp or hand-roll it.
+
+
 New contracts from the operator-safety release; they bind every loop
 iteration:
 
@@ -341,9 +350,12 @@ iteration:
   `agenttalk sync --for $SELF` lists pending escalations under
   OPERATOR INPUT NEEDED. Surface each to your human with context (who
   asks, what decision, their recommendation), then relay the answer with
-  `agenttalk reply --to-request <esc-id> --meta operator_answer=true
-  -m "..."`. Aggregate rather than forward noise; never leave an
-  escalation pending silently.
+  `agenttalk relay operator-answer --to-request <esc-id> -m "..."` - the
+  0.42.0 typed relay validates the pending needs_operator escalation and
+  stamps operator_answer + operator_origin through the reserved-meta audit
+  guard. Do NOT hand-roll `reply --meta operator_answer=true`; that path
+  bypasses the audit guard. Aggregate rather than forward noise; never
+  leave an escalation pending silently.
 - **Check before irreversible actions (0.14.0).** Immediately before any
   irreversible action tied to a tracked request (merge, release, deploy,
   delete, fire-type actions), run

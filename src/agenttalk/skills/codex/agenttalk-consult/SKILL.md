@@ -1,6 +1,7 @@
 ---
 name: agenttalk-consult
 description: Confer with a named agent BEFORE answering the user. Send your draft answer + uncertainty, wait for critique, then write a concise final answer that names where you agree/disagree and makes a recommendation. Use for high-impact ambiguous calls and explicit second-opinion requests.
+reviewed-against: "0.42"
 ---
 
 # agenttalk-consult - Confer with a named agent before answering (codex side)

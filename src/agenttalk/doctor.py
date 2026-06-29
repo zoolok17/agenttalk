@@ -88,6 +88,10 @@ def run(project_root: Path | None = None) -> Report:
     # exactly when the user is confused about which store they're on —
     # including when the resolved root has no store at all.
     report.checks.append(_check_multi_store(root))
+    # Source-content currency of the BUNDLED skill files - runs UNCONDITIONALLY (reads the
+    # package's bundled skills, independent of any project store), distinct from the install-
+    # freshness checks (_check_skills / _check_devkit).
+    report.checks.append(_check_skill_currency())
     # Config-dependent checks are gated on a LOADABLE config: `_check_init`
     # already reports a corrupt config as an `error` (e.g. an active∩retired
     # overlap, #19), so running these would just re-raise the same
@@ -662,6 +666,38 @@ def _compare_skill_side(name: str, side: str, target: Path) -> Check:
         details=f"{total}/{total} in sync at {target}",
         data={"target": str(target), "missing": [], "differs": [],
               "total": total},
+    )
+
+
+def _check_skill_currency() -> Check:
+    """Source-content currency of the BUNDLED skill files (distinct from ``_check_skills`` /
+    ``_check_devkit``, which check INSTALL freshness). Mechanical lint only: frontmatter
+    well-formedness + ``reviewed-against`` ratchet + CLI-token validity vs the live argparse
+    surface (``cli.build_parser()``). It proves referenced commands/flags exist and metadata
+    is present; it does NOT prove the prose is semantically correct.
+
+    Severity is WARN: stale skill prose is serious but must not make the bus unusable. CI and
+    the release gate treat bundled-source regressions as failures via the source-tree test.
+    """
+    from agenttalk import skill_currency as skc
+    try:
+        findings = skc.check_bundled_skills(iskl.SKILLS_ROOT, __version__)
+    except Exception as e:  # noqa: BLE001 - a lint failure must never crash doctor
+        return Check(name="skill_currency", status="warn",
+                     details=f"skill-currency lint could not run: {e}",
+                     fix="report this; the lint should degrade, not crash")
+    if not findings:
+        return Check(name="skill_currency", status="ok",
+                     details="bundled skills pass currency lint (frontmatter + stamps + CLI tokens)")
+    sample = "; ".join(f"{f.file}:{f.line} {f.reason}" for f in findings[:5])
+    more = "" if len(findings) <= 5 else f" (+{len(findings) - 5} more)"
+    return Check(
+        name="skill_currency", status="warn",
+        details=f"{len(findings)} skill-currency issue(s): {sample}{more}",
+        fix="refresh flagged skill source + re-stamp reviewed-against "
+            "(see docs/skill-devkit-evolution-design.md)",
+        data={"findings": [{"file": f.file, "line": f.line, "token": f.token,
+                            "reason": f.reason} for f in findings]},
     )
 
 

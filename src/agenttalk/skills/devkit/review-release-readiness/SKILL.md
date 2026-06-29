@@ -7,6 +7,10 @@ description: >-
   publish, deploy, or milestone close. Do NOT use for ordinary diff review (use
   review-code), failure paths (use review-failure-injection), or contract parity (use
   review-contract-drift).
+reviewed-against: "0.42"
+category: assurance
+evidence-profile:
+  - review-result
 ---
 
 # review-release-readiness

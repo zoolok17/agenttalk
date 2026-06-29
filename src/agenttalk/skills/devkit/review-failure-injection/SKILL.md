@@ -7,6 +7,10 @@ description: >-
   resource-holding code, or any error/failure path. Do NOT use for general code
   health (use review-code), documentation (use review-docs), contract/rename parity
   (use review-contract-drift), or release packaging (use review-release-readiness).
+reviewed-against: "0.42"
+category: assurance
+evidence-profile:
+  - review-result
 ---
 
 # review-failure-injection
