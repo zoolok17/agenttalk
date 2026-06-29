@@ -90,33 +90,64 @@ _CMD_RE = re.compile(r"(?:^|\s)(?:python\s+-m\s+)?agenttalk(?=\s)(.*)$")
 def _command_spans(text: str) -> list[tuple[int, str]]:
     """Yield ``(line_no, command_tail)`` for every ``agenttalk`` / ``python -m agenttalk``
     invocation inside a FENCED code block or an inline-backtick span. Free prose is NOT
-    scanned (conservative: avoids false positives on descriptive sentences). Honors the
-    ``ignore-next`` / ``ignore-line`` comments."""
+    scanned (conservative: avoids false positives on descriptive sentences).
+
+    Inside a fence, SHELL LINE CONTINUATIONS are accumulated into one logical command before
+    matching, so a stale flag/subcommand on a continuation line is still validated (the P1
+    false-negative the reviewers caught - continuations are the dominant multi-line style):
+    a line whose trailing non-space char is ``\\`` (bash) or `` ` `` (PowerShell) joins the
+    next physical line; the reported line number is the FIRST physical line of the group.
+    Both ``` and ~~~ toggle fences. (Known limitation: 4-space-indented code blocks are not
+    scanned; no bundled skill uses them.) Honors ``ignore-next`` / ``ignore-line`` comments."""
     out: list[tuple[int, str]] = []
     in_fence = False
     ignore_next = False
-    for i, raw in enumerate(text.splitlines(), start=1):
+    lines = text.splitlines()
+    n = len(lines)
+    i = 0
+    while i < n:
+        raw = lines[i]
         stripped = raw.strip()
         if _IGNORE_LINE in raw:
+            i += 1
             continue
         if _IGNORE_NEXT in raw:
             ignore_next = True
+            i += 1
             continue
-        if stripped.startswith("```"):
+        if stripped.startswith("```") or stripped.startswith("~~~"):
             in_fence = not in_fence
+            i += 1
             continue
         if ignore_next:
             ignore_next = False
+            i += 1
             continue
-        # candidate command sources: whole fenced line, OR each inline-backtick span
+        start_line = i + 1
         candidates: list[str] = []
         if in_fence:
-            candidates.append(raw)
-        candidates.extend(re.findall(r"`([^`]*)`", raw))
+            # accumulate shell continuations (trailing \ or `) into one logical line
+            joined = raw
+            while True:
+                rs = joined.rstrip()
+                if rs.endswith("\\") or rs.endswith("`"):
+                    joined = rs[:-1]
+                    if i + 1 < n:
+                        i += 1
+                        joined = joined + " " + lines[i]
+                    else:
+                        break
+                else:
+                    break
+            candidates.append(joined)
+        else:
+            # prose line: only the inline-backtick spans are candidate commands
+            candidates.extend(re.findall(r"`([^`]*)`", raw))
         for cand in candidates:
             m = _CMD_RE.search(cand)
             if m:
-                out.append((i, m.group(1).strip()))
+                out.append((start_line, m.group(1).strip()))
+        i += 1
     return out
 
 
@@ -145,7 +176,11 @@ def _validate_command(tail: str, root: _Node) -> list[str]:
             break               # a trailing shell comment - rest of the line is not args
         if expecting_value:
             expecting_value = False
-            continue            # this token is the prior flag's value - skip
+            # the prior value-taking flag's value - UNLESS this token is itself a flag, in
+            # which case a stale flag must not be silently swallowed as a value: fall through
+            # to validate it (P3). (`--` and `#` are already handled by the breaks above.)
+            if not (tok.startswith("-") and tok != "-"):
+                continue
         if _is_placeholder(tok):
             if node.subcommands:
                 leaf = True     # a placeholder in subcommand position - stop sub-resolution
@@ -220,11 +255,20 @@ def check_skill_file(path: Path, *, kind: str, inventory: _Node,
     rel = path.name if path.name != "SKILL.md" else f"{path.parent.name}/SKILL.md"
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
+        # UnicodeDecodeError is a ValueError, NOT an OSError - catch it explicitly so an
+        # undecodable file degrades to a Finding instead of crashing check_bundled_skills
+        # (which the source-tree CI test calls unguarded) - the per-file degrade contract (P2).
         return [Finding(rel, 0, "<file>", f"unreadable: {e}")]
 
     findings: list[Finding] = []
-    keys, _ = _frontmatter_keys(text)
+    keys, closed = _frontmatter_keys(text)
+    if not closed:
+        # missing opening --- OR an unterminated block (opening --- + keys but no closing
+        # ---): a loader may not parse it as frontmatter at all, so the stamp/category gate
+        # would be silently void (codex MAJOR). Report it explicitly.
+        findings.append(Finding(rel, 0, "frontmatter",
+                                "missing or unterminated frontmatter block (--- ... ---)"))
     is_skill_md = path.name == "SKILL.md"
     is_devkit = kind == "devkit"
     category = keys.get("category", "")

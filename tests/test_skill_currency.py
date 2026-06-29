@@ -128,9 +128,74 @@ def test_all_bundled_skills_pass_currency() -> None:
         f"{f.file}:{f.line} {f.reason}" for f in findings)
 
 
-def test_doctor_skill_currency_is_warn_only_and_passes() -> None:
+def test_doctor_skill_currency_passes_on_refreshed_source() -> None:
     c = doctor._check_skill_currency()
-    assert c.name == "skill_currency"
-    assert c.status == "ok"          # passes on the refreshed source tree
-    # contract: this check is never an error (warn at worst), so it can't brick the bus
-    assert c.status in ("ok", "warn")
+    assert c.name == "skill_currency" and c.status == "ok"
+
+
+def test_doctor_skill_currency_is_warn_only_never_errors(monkeypatch) -> None:
+    # PIN the safety property (reviewer-1 P2): the check must degrade to WARN, never error
+    # or crash, in BOTH the lint-raises and lint-returns-findings paths - so it can never
+    # brick the bus. (The previous assertion was tautological after asserting ok.)
+    def boom(*a, **k):
+        raise RuntimeError("lint blew up")
+
+    monkeypatch.setattr(sc, "check_bundled_skills", boom)
+    assert doctor._check_skill_currency().status == "warn"            # raise -> warn
+
+    monkeypatch.setattr(sc, "check_bundled_skills",
+                        lambda *a, **k: [sc.Finding("x.md", 1, "tok", "stale token")])
+    c = doctor._check_skill_currency()
+    assert c.status == "warn" and c.data and c.data["findings"]       # findings -> warn
+
+
+# ----------------------------------------------------------- fold regressions (3-reviewer)
+
+def test_continuation_line_stale_token_is_caught() -> None:
+    # P1 (corroborated): a stale flag/subcommand on a SHELL CONTINUATION line - in BOTH bash
+    # backslash and PowerShell backtick forms - must be validated, not silently passed.
+    inv = sc.build_command_inventory()
+    cases = [
+        "```\nagenttalk send \\\n  --bogus-stale-flag value\n```\n",   # bash, stale flag
+        "```\nagenttalk relay \\\n  bogus-subcommand\n```\n",          # bash, stale subcommand
+        "```\nagenttalk send `\n  --bogus-stale-flag value\n```\n",    # PowerShell, stale flag
+        "```\nagenttalk relay `\n  bogus-subcommand\n```\n",           # PowerShell, stale sub
+    ]
+    for text in cases:
+        spans = sc._command_spans(text)
+        assert spans and any(sc._validate_command(t, inv) for _, t in spans), text
+    # the reported line is the FIRST physical line of the joined command
+    assert sc._command_spans(cases[0])[0][0] == 2
+
+
+def test_valid_multiline_continuation_is_clean() -> None:
+    inv = sc.build_command_inventory()
+    good = "```\nagenttalk send \\\n  --to x \\\n  -m y\n```\n"
+    assert all(not sc._validate_command(t, inv) for _, t in sc._command_spans(good))
+
+
+def test_unterminated_frontmatter_is_flagged(tmp_path: Path) -> None:
+    # codex MAJOR: opening --- + all required keys but NO closing --- must be flagged.
+    inv = sc.build_command_inventory()
+    p = tmp_path / "SKILL.md"
+    p.write_text('---\nname: x\ndescription: d\ncategory: production\n'
+                 'evidence-profile:\n  - production-handoff\nreviewed-against: "0.42"\n'
+                 "# body, frontmatter never closed\n", encoding="utf-8")
+    findings = sc.check_skill_file(p, kind="devkit", inventory=inv, current=(0, 42))
+    assert any("unterminated" in f.reason for f in findings)
+
+
+def test_undecodable_file_degrades_to_finding(tmp_path: Path) -> None:
+    # P2: a non-UTF-8 file raises UnicodeDecodeError (a ValueError) - it must degrade to a
+    # Finding, not propagate through check_bundled_skills and red the CI test.
+    inv = sc.build_command_inventory()
+    p = tmp_path / "SKILL.md"
+    p.write_bytes(b"\xff\xfe not valid utf-8 \x00\x80")
+    findings = sc.check_skill_file(p, kind="devkit", inventory=inv, current=(0, 42))  # no raise
+    assert any("unreadable" in f.reason for f in findings)
+
+
+def test_stale_flag_after_value_flag_is_caught() -> None:
+    # P3: a value-taking flag must not swallow a following stale flag as its value.
+    inv = sc.build_command_inventory()
+    assert sc._validate_command("send --to --no-such-flag x", inv)
