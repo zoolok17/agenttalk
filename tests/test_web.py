@@ -36,9 +36,42 @@ def _serve(store: Store, *, host: str = "127.0.0.1"):
     return web.serve_in_thread(store, host=host, port=0)
 
 
+def _urlopen(target, *, timeout: float = 5.0, _attempts: int = 4, _backoff: float = 0.05):
+    """``urllib.request.urlopen`` with a bounded retry on TRANSIENT connection errors.
+
+    Windows CI intermittently aborts the connect/accept against the in-thread
+    dashboard server (``ConnectionAbortedError`` / ``ConnectionResetError`` -
+    WinError 10053/10054). Depending on where the abort lands, urllib surfaces it
+    either as a bare ``ConnectionError`` (raised out of ``getresponse``) or wrapped
+    in a ``URLError`` (raised out of ``do_open``), so retry BOTH of those forms.
+    An ``HTTPError`` is a real HTTP status response - re-raise it IMMEDIATELY so the
+    ``pytest.raises(HTTPError)`` 403/404/405 assertions are unaffected - and any
+    OTHER ``URLError`` is a real failure, never retried. Off Windows the transient
+    errors are not raised, so this is a transparent pass-through (no behavior change).
+    On exhaustion the LAST transient error is re-raised, so a persistent/real failure
+    still fails the test (no masking).
+    """
+    last_exc: BaseException | None = None
+    for attempt in range(1, _attempts + 1):
+        try:
+            return urllib.request.urlopen(target, timeout=timeout)  # noqa: S310  # nosemgrep
+        except urllib.error.HTTPError:
+            raise  # a status response (403/404/405/...), never a transient abort
+        except (ConnectionError, urllib.error.URLError) as exc:
+            if isinstance(exc, urllib.error.URLError) and not isinstance(
+                getattr(exc, "reason", None), ConnectionError
+            ):
+                raise  # a non-transient URLError - do not mask it
+            last_exc = exc
+            if attempt < _attempts:
+                time.sleep(_backoff * attempt)
+    assert last_exc is not None  # unreachable: the loop only exits here via an except
+    raise last_exc
+
+
 def _get(url: str, *, method: str = "GET", timeout: float = 5.0):
     req = urllib.request.Request(url, method=method)  # noqa: S310  # nosemgrep
-    return urllib.request.urlopen(req, timeout=timeout)  # noqa: S310  # nosemgrep
+    return _urlopen(req, timeout=timeout)
 
 
 # --------------------------------------------------------------- routing
@@ -143,7 +176,7 @@ def test_post_returns_405(tmp_path: Path) -> None:
     try:
         req = urllib.request.Request(f"{base}/", method="POST", data=b"x")  # noqa: S310  # nosemgrep
         with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(req, timeout=5)  # noqa: S310  # nosemgrep
+            _urlopen(req, timeout=5)
         assert exc.value.code == 405
         assert exc.value.headers.get("Allow") == "GET, HEAD"
     finally:
@@ -156,7 +189,7 @@ def test_unknown_path_returns_404(tmp_path: Path) -> None:
     srv, _t, base = _serve(s)
     try:
         with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(f"{base}/nope", timeout=5)  # noqa: S310  # nosemgrep
+            _urlopen(f"{base}/nope", timeout=5)
         assert exc.value.code == 404
     finally:
         srv.shutdown()
@@ -171,7 +204,7 @@ def test_message_id_traversal_rejected(tmp_path: Path) -> None:
     srv, _t, base = _serve(s)
     try:
         with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(  # noqa: S310  # nosemgrep
+            _urlopen(
                 f"{base}/messages/..%2F..%2Fetc%2Fpasswd", timeout=5,
             )
         assert exc.value.code == 404
@@ -233,7 +266,7 @@ def test_unknown_kind_message_not_rendered_but_surfaced_in_status(
             status = json.loads(resp.read())
         assert any(inv["id"] == bad_id for inv in status["invalid_messages"])
         with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(  # noqa: S310  # nosemgrep
+            _urlopen(
                 f"{base}/messages/{bad_id}", timeout=5,
             )
         assert exc.value.code == 404
@@ -310,7 +343,7 @@ def test_invalid_signature_body_not_rendered(tmp_path: Path,
                    for inv in status["invalid_messages"])
         # detail route returns 404 for the forged id
         with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(  # noqa: S310  # nosemgrep
+            _urlopen(
                 f"{base}/messages/{forged_id}", timeout=5,
             )
         assert exc.value.code == 404
@@ -382,7 +415,7 @@ def test_non_loopback_peer_gets_403_for_every_method(
                 data=b"x" if method in {"POST", "PUT", "PATCH"} else None,
             )
             with pytest.raises(urllib.error.HTTPError) as exc:
-                urllib.request.urlopen(req, timeout=5)  # noqa: S310  # nosemgrep
+                _urlopen(req, timeout=5)
             assert exc.value.code == 403, f"{method} should 403, got {exc.value.code}"
     finally:
         srv.shutdown()
@@ -890,7 +923,7 @@ def test_dashboard_html_and_root0_only_link_policy(tmp_path: Path) -> None:
         # root[1]'s message ids are NOT resolvable via root[0]'s routes.
         mid_b = b._scan_messages()[0][0].id
         with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(  # noqa: S310  # nosemgrep
+            _urlopen(
                 f"{base}/api/messages/{mid_b}", timeout=5)
         assert exc.value.code == 404
         # index keeps working and now links to the dashboard (additive)
@@ -927,7 +960,7 @@ def test_new_routes_reject_write_methods(tmp_path: Path) -> None:
             req = urllib.request.Request(  # noqa: S310  # nosemgrep
                 f"{base}{path}", method="POST", data=b"x")
             with pytest.raises(urllib.error.HTTPError) as exc:
-                urllib.request.urlopen(req, timeout=5)  # noqa: S310  # nosemgrep
+                _urlopen(req, timeout=5)
             assert exc.value.code == 405
             assert exc.value.headers.get("Allow") == "GET, HEAD"
     finally:
@@ -972,11 +1005,11 @@ def test_no_mutation_full_tree_hash(tmp_path: Path) -> None:
                 resp.read()
         for bad in (f"{base}/messages/zzz-does-not-exist", f"{base}/nope"):
             with pytest.raises(urllib.error.HTTPError):
-                urllib.request.urlopen(bad, timeout=5)  # noqa: S310  # nosemgrep
+                _urlopen(bad, timeout=5)
         req = urllib.request.Request(  # noqa: S310  # nosemgrep
             f"{base}/api/state", method="POST", data=b"x")
         with pytest.raises(urllib.error.HTTPError):
-            urllib.request.urlopen(req, timeout=5)  # noqa: S310  # nosemgrep
+            _urlopen(req, timeout=5)
     finally:
         srv.shutdown()
         srv.server_close()
