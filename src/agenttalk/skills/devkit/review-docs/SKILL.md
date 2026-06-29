@@ -45,3 +45,19 @@ approve on "looks fine".
       blockers = inaccuracies and broken examples.
 - [ ] Confirm the docs-as-code CI gates (markdownlint / prose linter / link check)
       actually **ran** for the changed files — do not approve on green-but-skipped checks.
+
+## Evidence
+
+Emit the `review-result` profile (full rules + bus-validated vs skill-policy: ../_shared/references/evidence.md).
+
+Required fields:
+
+- `risk_class`
+- `release_blocker`
+- `tests_referenced`
+- `tests_executed`
+- `residual_risk`
+- `evidence`
+- `status`
+- `reviewed_ref`
+- `scope`

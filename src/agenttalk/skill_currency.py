@@ -270,8 +270,73 @@ def current_major_minor(version: str) -> tuple[int, int]:
 _DEVKIT_CATEGORIES = {"coordination", "production", "assurance", "reference"}
 
 
+def parse_evidence_profiles(text: str) -> dict[str, list[str]]:
+    """Parse the canonical _shared/references/evidence.md into {profile_id: [field, ...]}.
+
+    A profile is a ``## <id>`` heading; its required fields are the backtick-wrapped tokens of
+    the bullet list under a ``Required fields:`` line, up to the next ``Rules:`` line or the
+    next profile heading. The SAME parser feeds the stub-insertion and the stub-parity check,
+    so the canonical list has exactly one source."""
+    profiles: dict[str, list[str]] = {}
+    cur: str | None = None
+    in_fields = False
+    for ln in text.splitlines():
+        m = re.match(r"^##\s+([a-z][a-z0-9-]*)\s*$", ln)
+        if m:
+            cur = m.group(1)
+            profiles[cur] = []
+            in_fields = False
+            continue
+        if cur is None:
+            continue
+        low = ln.strip().lower()
+        if low.startswith("required fields:"):
+            in_fields = True
+            continue
+        if low.startswith("rules:"):
+            in_fields = False
+            continue
+        if in_fields:
+            fm = re.match(r"^-\s+`([A-Za-z_][A-Za-z0-9_]*)`", ln)
+            if fm:
+                profiles[cur].append(fm.group(1))
+    return profiles
+
+
+def _parse_skill_stub(text: str) -> tuple[str | None, list[str]]:
+    """Parse a skill's in-skill evidence stub: returns ``(profile_id, [field, ...])`` from the
+    ``## Evidence`` section (None / [] if absent). Mirrors the evidence.md field-bullet format
+    so parity is a set comparison."""
+    profile: str | None = None
+    fields: list[str] = []
+    in_evidence = False
+    in_fields = False
+    for ln in text.splitlines():
+        if re.match(r"^##\s+", ln):
+            in_evidence = ln.strip().lower().startswith("## evidence")
+            in_fields = False
+            continue
+        if not in_evidence:
+            continue
+        if profile is None:
+            pm = re.search(r"`([a-z][a-z0-9-]*)`\s+profile", ln)
+            if pm:
+                profile = pm.group(1)
+        if ln.strip().lower().startswith("required fields:"):
+            in_fields = True
+            continue
+        if in_fields:
+            fm = re.match(r"^-\s+`([A-Za-z_][A-Za-z0-9_]*)`", ln)
+            if fm:
+                fields.append(fm.group(1))
+            elif ln.strip() and not ln.strip().startswith("-"):
+                in_fields = False
+    return profile, fields
+
+
 def check_skill_file(path: Path, *, kind: str, inventory: _Node,
-                     current: tuple[int, int], require_stamp: bool = True) -> list[Finding]:
+                     current: tuple[int, int], require_stamp: bool = True,
+                     evidence_profiles: dict[str, list[str]] | None = None) -> list[Finding]:
     """Lint one bundled skill source file. ``kind`` is ``claude`` | ``codex`` | ``devkit``.
     Returns findings (empty = clean). Does NOT raise on read error - reports it as a finding."""
     rel = path.name if path.name != "SKILL.md" else f"{path.parent.name}/SKILL.md"
@@ -298,7 +363,9 @@ def check_skill_file(path: Path, *, kind: str, inventory: _Node,
     # --- frontmatter well-formedness ---
     if is_skill_md and "name" not in keys:
         findings.append(Finding(rel, 0, "name", "missing required frontmatter: name"))
-    if "description" not in keys:
+    if kind != "reference" and "description" not in keys:
+        # reference markdown (evidence.md / routing.md) carries only a reviewed-against stamp;
+        # it is not an invocable skill, so name/description/category/evidence-profile do not apply.
         findings.append(Finding(rel, 0, "description", "missing required frontmatter: description"))
     if is_devkit:
         if "category" not in keys:
@@ -309,6 +376,29 @@ def check_skill_file(path: Path, *, kind: str, inventory: _Node,
         if category != "reference" and "evidence-profile" not in keys:
             findings.append(Finding(rel, 0, "evidence-profile",
                                     "missing required devkit frontmatter: evidence-profile"))
+        # --- in-skill evidence-stub PARITY (Tier 0b) ---
+        # A non-reference devkit skill must carry a small visible evidence stub (a loader may
+        # show only SKILL.md, not the sibling reference), and the stub's profile + field set
+        # must MATCH the canonical evidence.md profile - so the local stub can never drift from
+        # the single source.
+        if category != "reference" and evidence_profiles is not None:
+            stub_profile, stub_fields = _parse_skill_stub(text)
+            if stub_profile is None:
+                findings.append(Finding(rel, 0, "evidence-stub",
+                                        "missing in-skill evidence stub (## Evidence with the "
+                                        "profile + required fields, linking ../_shared/references/evidence.md)"))
+            elif stub_profile not in evidence_profiles:
+                findings.append(Finding(rel, 0, "evidence-stub",
+                                        f"evidence stub names unknown profile {stub_profile!r} "
+                                        f"(not in evidence.md)"))
+            else:
+                canonical = evidence_profiles[stub_profile]
+                if set(stub_fields) != set(canonical):
+                    missing = sorted(set(canonical) - set(stub_fields))
+                    extra = sorted(set(stub_fields) - set(canonical))
+                    findings.append(Finding(rel, 0, "evidence-stub",
+                                            f"evidence stub fields differ from evidence.md "
+                                            f"profile {stub_profile!r} (missing={missing}, extra={extra})"))
 
     # --- reviewed-against stamp + ratchet (bus + devkit; reference skills still stamp) ---
     if require_stamp:
@@ -330,8 +420,8 @@ def check_skill_file(path: Path, *, kind: str, inventory: _Node,
     spans, dangling = _command_spans(text)
     for ln in dangling:
         findings.append(Finding(rel, ln, "agenttalk",
-                                "dangling line-continuation (trailing \\ or `) at a fence "
-                                "boundary or EOF - malformed multi-line command"))
+                                "dangling line-continuation (trailing \\ or `) at a boundary "
+                                "(fence/blank/ignore) or EOF - malformed multi-line command"))
     for line_no, tail in spans:
         for reason in _validate_command(tail, inventory):
             findings.append(Finding(rel, line_no, "agenttalk", reason))
@@ -346,10 +436,24 @@ def check_bundled_skills(skills_root: Path, version: str) -> list[Finding]:
     current = current_major_minor(version)
     findings: list[Finding] = []
 
+    # parse the canonical evidence profiles once, for the in-skill stub-parity check
+    evidence_profiles: dict[str, list[str]] = {}
+    ev_path = skills_root / "devkit" / "_shared" / "references" / "evidence.md"
+    if ev_path.exists():
+        try:
+            evidence_profiles = parse_evidence_profiles(ev_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            evidence_profiles = {}
+
     for p in sorted((skills_root / "claude").glob("*.md")):
         findings.extend(check_skill_file(p, kind="claude", inventory=inventory, current=current))
     for p in sorted((skills_root / "codex").glob("*/SKILL.md")):
         findings.extend(check_skill_file(p, kind="codex", inventory=inventory, current=current))
     for p in sorted((skills_root / "devkit").glob("*/SKILL.md")):
-        findings.extend(check_skill_file(p, kind="devkit", inventory=inventory, current=current))
+        findings.extend(check_skill_file(p, kind="devkit", inventory=inventory, current=current,
+                                         evidence_profiles=evidence_profiles))
+    # shared reference markdown (evidence.md / routing.md): reviewed-against ratchet + CLI-token
+    # lint only - not skills, so no name/category/evidence-profile. Scope: _shared/references/.
+    for p in sorted((skills_root / "devkit" / "_shared" / "references").glob("*.md")):
+        findings.extend(check_skill_file(p, kind="reference", inventory=inventory, current=current))
     return findings

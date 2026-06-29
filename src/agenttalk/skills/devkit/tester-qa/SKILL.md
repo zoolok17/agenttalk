@@ -71,3 +71,19 @@ an `automation_ci` run, not your local say-so.
 **RISK (hard rule):** primary `risk_class=quality`, but LIST every touched/secondary
 class in the body (a gap in auth tests is also `security`). You do NOT decide the
 close's risk — the lead-owned risk inventory is authoritative for P3 routing.
+
+## Evidence
+
+Emit the `qa-result` profile (full rules + bus-validated vs skill-policy: ../_shared/references/evidence.md).
+
+Required fields:
+
+- `status`
+- `reviewed_ref`
+- `scope`
+- `risk_class`
+- `release_blocker`
+- `tests_referenced`
+- `tests_executed`
+- `evidence`
+- `residual_risk`

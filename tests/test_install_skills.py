@@ -13,6 +13,9 @@ DEVKIT_SKILLS = [
     # assurance review/test pack (P4) — emit P2/P3 close-compatible evidence
     "review-contract-drift", "review-failure-injection", "review-release-readiness",
     "system-review-protocol", "tester-qa",
+    # shared reference-holder (Tier 0b): category=reference, not an invocable skill;
+    # carries references/evidence.md + references/routing.md.
+    "_shared",
 ]
 
 
@@ -237,7 +240,14 @@ def test_devkit_skill_frontmatter_is_well_formed() -> None:
         text = (SKILLS_ROOT / "devkit" / s / "SKILL.md").read_text(encoding="utf-8")
         assert f"name: {s}" in text, f"{s}: name must equal dir"
         assert "description:" in text, f"{s}: missing description"
-        assert "Do NOT use" in text, f"{s}: missing 'Do NOT use' disambiguation"
+        if s == "_shared":
+            # the reference-holder (category=reference, Tier 0b) is not an auto-invocable
+            # capability, so it carries a do-not-invoke clause rather than the capability
+            # 'Do NOT use ... (use X)' disambiguation.
+            assert "category: reference" in text, "_shared must be category=reference"
+            assert "do not invoke" in text.lower(), "_shared must say do-not-invoke"
+        else:
+            assert "Do NOT use" in text, f"{s}: missing 'Do NOT use' disambiguation"
 
 
 def test_cli_install_devkit_only(tmp_path: Path) -> None:

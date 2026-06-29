@@ -63,3 +63,19 @@ keep tests deterministic, and prove the failure modes, not just the happy path.
       where cheap confirm they **FAIL when the behavior is deliberately broken** — a
       test that can never fail is not coverage. Use the project's test command from
       `AGENTS.md`/`CLAUDE.md`.
+
+## Evidence
+
+Emit the `qa-result` profile (full rules + bus-validated vs skill-policy: ../_shared/references/evidence.md).
+
+Required fields:
+
+- `status`
+- `reviewed_ref`
+- `scope`
+- `risk_class`
+- `release_blocker`
+- `tests_referenced`
+- `tests_executed`
+- `evidence`
+- `residual_risk`

@@ -17,10 +17,22 @@ evidence-profile:
 Decide whether the change improves the codebase's health on net — not whether it is
 perfect. Verify every claim against the real code; never review on "this looks right".
 
-## VERDICT — the bar
-- [ ] Conclude **APPROVE / APPROVE-WITH-NITS / REQUEST-CHANGES**. Approve if the change
-      improves code health on net; do **not** withhold approval merely because the code
-      isn't perfect, and don't self-loop on nits.
+## VERDICT — machine-visible, mapped to bus status
+- [ ] Conclude exactly one: **APPROVE / APPROVE-WITH-NITS / REQUEST-CHANGES**. Approve if the
+      change improves code health on net; do **not** withhold over imperfection or self-loop on nits.
+- [ ] Map the verdict to the review-result evidence:
+      - **APPROVE** -> `status=approved` (usually `release_blocker=no`).
+      - **APPROVE-WITH-NITS** -> `status=approved`, `release_blocker=no`, nits listed in the body
+        and in `residual_risk`. Use this ONLY for truly non-blocking nits.
+      - **REQUEST-CHANGES** -> `status=rejected`, `release_blocker=unknown` by DEFAULT; use
+        `release_blocker=yes` only when the request is release/close-gated or the finding is
+        proven release-blocking.
+- [ ] Any mandatory follow-up, unresolved major, unverified required test, compatibility risk,
+      or security concern is REQUEST-CHANGES or `needs-info` - never APPROVE-WITH-NITS.
+- [ ] Tag every CONCRETE finding with a `finding_type`: correctness, security, contract-drift,
+      test-gap, docs, performance, architecture, or maintainability (not required for an empty
+      approval). An approval lists the reviewed surfaces and the risk classes considered; concrete
+      code findings keep their file/line references.
 
 ## WALK — findings in priority order
 Spend effort top-down; a naming nit on broken data flow is wasted effort.
@@ -61,3 +73,19 @@ Spend effort top-down; a naming nit on broken data flow is wasted effort.
       focused chunks.
 - [ ] End with a **prioritized summary**: blockers, then majors, then minors/nits — so
       the reader sees what gates merge vs. what is optional.
+
+## Evidence
+
+Emit the `review-result` profile (full rules + bus-validated vs skill-policy: ../_shared/references/evidence.md).
+
+Required fields:
+
+- `risk_class`
+- `release_blocker`
+- `tests_referenced`
+- `tests_executed`
+- `residual_risk`
+- `evidence`
+- `status`
+- `reviewed_ref`
+- `scope`

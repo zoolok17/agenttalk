@@ -75,3 +75,19 @@ existing flow; never invent a parallel workflow or hand-wave a GO.
       `automation_ci` gates, and `tests_executed` must be real (command + result/exit or
       a CI run id), never fabricated. If a lens cannot honestly ACCEPT, it COUNTERs or
       NAs — a milestone close is exactly where a false GO does the most damage.
+
+## Evidence
+
+Emit the `review-result` profile (full rules + bus-validated vs skill-policy: ../_shared/references/evidence.md).
+
+Required fields:
+
+- `risk_class`
+- `release_blocker`
+- `tests_referenced`
+- `tests_executed`
+- `residual_risk`
+- `evidence`
+- `status`
+- `reviewed_ref`
+- `scope`

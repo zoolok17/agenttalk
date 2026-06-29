@@ -62,3 +62,19 @@ Work the checklist top to bottom; don't skip the AFTER gate.
 - [ ] Do not declare done on unverified or "probably works" reasoning. If you changed
       behavior, hand off to **test-coverage** (tests) and **write-docs** (docs) — a
       behavior change is incomplete while its tests or docs still describe the old one.
+
+## Evidence
+
+Emit the `production-handoff` profile (full rules + bus-validated vs skill-policy: ../_shared/references/evidence.md).
+
+Required fields:
+
+- `changed_files`
+- `base_ref`
+- `head_ref`
+- `summary`
+- `tests_referenced`
+- `tests_executed`
+- `residual_risk`
+- `required_review_lenses`
+- `evidence`

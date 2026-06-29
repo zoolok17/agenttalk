@@ -65,3 +65,19 @@ confirm execution, HOLD; do not fabricate a green.
 **RISK (hard rule):** primary `risk_class=release`, but LIST every touched/secondary
 class (a release touching auth is also `security`). You do NOT decide the close's risk —
 the lead-owned risk inventory is authoritative for P3 routing.
+
+## Evidence
+
+Emit the `review-result` profile (full rules + bus-validated vs skill-policy: ../_shared/references/evidence.md).
+
+Required fields:
+
+- `risk_class`
+- `release_blocker`
+- `tests_referenced`
+- `tests_executed`
+- `residual_risk`
+- `evidence`
+- `status`
+- `reviewed_ref`
+- `scope`

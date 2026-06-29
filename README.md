@@ -238,6 +238,15 @@ files are preserved unless you pass `--force`; use `--dry-run --force`
 to preview overwrites first. Restart Claude Code and Codex after
 installing or refreshing skills.
 
+**Upgrading to v0.43.0+ (skill frontmatter migration):** the bundled
+skills now carry currency frontmatter (`reviewed-against`, plus
+`category` / `evidence-profile` on devkit skills). After upgrading,
+`agenttalk doctor` will show the devkit as **stale** (your installed copies
+predate the migration). Refresh with `agenttalk install-skills
+--devkit-only --force` to adopt the new bundled skills; preview first with
+`agenttalk install-skills --devkit-only --dry-run --force` if you have local
+skill edits you want to keep.
+
 If you also want Codex to call agenttalk from inside its sandbox, run
 this once per project root:
 

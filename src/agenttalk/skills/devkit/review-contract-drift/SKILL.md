@@ -71,3 +71,19 @@ Release-blocking claims anchor to an `automation_ci` gate, not self-report.
 **RISK (hard rule):** one primary `risk_class` for the validator, but LIST every
 touched/secondary class in the body (a renamed auth flag is also `security`). You do
 NOT decide the close's risk — the lead-owned risk inventory is authoritative for P3.
+
+## Evidence
+
+Emit the `review-result` profile (full rules + bus-validated vs skill-policy: ../_shared/references/evidence.md).
+
+Required fields:
+
+- `risk_class`
+- `release_blocker`
+- `tests_referenced`
+- `tests_executed`
+- `residual_risk`
+- `evidence`
+- `status`
+- `reviewed_ref`
+- `scope`

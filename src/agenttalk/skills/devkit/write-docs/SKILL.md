@@ -54,3 +54,19 @@ that actually run.
 - [ ] Run / confirm the examples produce the documented output.
 - [ ] Pass the local docs-as-code gates if present (markdownlint, a prose/terminology
       linter like Vale, a link checker) before declaring done.
+
+## Evidence
+
+Emit the `production-handoff` profile (full rules + bus-validated vs skill-policy: ../_shared/references/evidence.md).
+
+Required fields:
+
+- `changed_files`
+- `base_ref`
+- `head_ref`
+- `summary`
+- `tests_referenced`
+- `tests_executed`
+- `residual_risk`
+- `required_review_lenses`
+- `evidence`

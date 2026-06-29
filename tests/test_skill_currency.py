@@ -264,3 +264,68 @@ def test_stale_flag_after_value_flag_is_caught() -> None:
     # P3: a value-taking flag must not swallow a following stale flag as its value.
     inv = sc.build_command_inventory()
     assert sc._validate_command("send --to --no-such-flag x", inv)
+
+
+# ----------------------------------------------------------- Tier 0b: evidence + parity
+
+_EV = iskl.SKILLS_ROOT / "devkit" / "_shared" / "references" / "evidence.md"
+
+
+def test_parse_evidence_profiles_extracts_all_six() -> None:
+    ev = sc.parse_evidence_profiles(_EV.read_text(encoding="utf-8"))
+    assert set(ev) >= {"planning-artifact", "production-handoff", "review-result",
+                       "qa-result", "close-ack", "na-result"}
+    assert "risk_class" in ev["review-result"] and "release_blocker" in ev["review-result"]
+
+
+def test_evidence_review_result_matches_real_gate_schema() -> None:
+    # evidence.md's review-result profile must include the fields the REAL bus validator
+    # enforces, and a meta built from them must pass gates.validate_review_result_evidence
+    # (drop one -> it fails). Ties the canonical doc to the actual gate, not a hardcoded copy.
+    from agenttalk import gates
+    ev = sc.parse_evidence_profiles(_EV.read_text(encoding="utf-8"))
+    rr = set(ev["review-result"])
+    bus_required = {"risk_class", "release_blocker", "tests_referenced",
+                    "tests_executed", "residual_risk", "evidence"}
+    assert bus_required <= rr, f"evidence.md review-result missing bus fields: {bus_required - rr}"
+    meta = {"status": "approved", "risk_class": "quality", "release_blocker": "no",
+            "tests_referenced": "test_x", "tests_executed": "ran test_x: 5 passed",
+            "residual_risk": "low", "evidence": "pytest output"}
+    gates.validate_review_result_evidence("review-result", meta)         # no raise
+    bad = {k: v for k, v in meta.items() if k != "risk_class"}
+    with pytest.raises(ValueError):
+        gates.validate_review_result_evidence("review-result", bad)
+
+
+def test_stub_parity_flags_mismatch_and_missing(tmp_path: Path) -> None:
+    inv = sc.build_command_inventory()
+    cur = sc.current_major_minor(__version__)
+    ev = {"review-result": ["risk_class", "status"]}
+    p = tmp_path / "SKILL.md"
+    fm = ('---\nname: r\ndescription: d\ncategory: assurance\n'
+          'evidence-profile:\n  - review-result\nreviewed-against: "0.42"\n---\n')
+    # mismatched stub fields -> flagged
+    p.write_text(fm + "# r\n\n## Evidence\n\nEmit the `review-result` profile.\n\n"
+                 "Required fields:\n\n- `risk_class`\n- `WRONG_FIELD`\n", encoding="utf-8")
+    f = sc.check_skill_file(p, kind="devkit", inventory=inv, current=cur, evidence_profiles=ev)
+    assert any("differ from evidence.md" in x.reason for x in f)
+    # missing stub entirely -> flagged
+    p.write_text(fm + "# r, no stub\n", encoding="utf-8")
+    f2 = sc.check_skill_file(p, kind="devkit", inventory=inv, current=cur, evidence_profiles=ev)
+    assert any("missing in-skill evidence stub" in x.reason for x in f2)
+    # matching stub -> no parity finding
+    p.write_text(fm + "# r\n\n## Evidence\n\nEmit the `review-result` profile.\n\n"
+                 "Required fields:\n\n- `risk_class`\n- `status`\n", encoding="utf-8")
+    f3 = sc.check_skill_file(p, kind="devkit", inventory=inv, current=cur, evidence_profiles=ev)
+    assert not any("evidence-stub" in x.token for x in f3)
+
+
+def test_shared_references_are_in_the_package_tree() -> None:
+    # package-data regression guard: the _shared reference-holder + its references must live
+    # UNDER the package tree (pyproject packages=["src/agenttalk"]), so hatchling auto-ships
+    # them in the wheel. No packaging-config change is needed; this guards against a move/delete
+    # out of the package that would silently drop them from the built artifact.
+    base = iskl.SKILLS_ROOT / "devkit" / "_shared"
+    for rel in ("SKILL.md", "references/evidence.md", "references/routing.md"):
+        p = base / rel
+        assert p.is_file() and p.stat().st_size > 0, f"missing/empty bundled shared file: {p}"
