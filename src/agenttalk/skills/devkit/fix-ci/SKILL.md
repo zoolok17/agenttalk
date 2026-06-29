@@ -6,7 +6,7 @@ description: >-
   smallest fix, and verifying the result. Use when a concrete test, lint,
   build, security, or CI job is red. Do NOT use for general feature work,
   broad cleanup after CI is green, or guessing at failures without logs.
-reviewed-against: "0.45"
+reviewed-against: "0.46"
 category: production
 evidence-profile:
   - production-handoff
@@ -43,7 +43,8 @@ feature work, drive-by cleanup, or self-approval.
    evidence before editing anything.
 4. Choose the smallest fix that addresses that root cause ONLY. A product-behavior
    change beyond the failure goes to craft-code; broad behavior-preserving
-   restructuring goes to refactor-code (once available).
+   restructuring goes to refactor-code once it exists; until then, craft-code
+   with explicit no-behavior-change tests.
 5. Implement or propose the fix. Avoid unrelated cleanup, drive-by refactors, and
    any widening of scope.
 6. Verify by rerunning the original failing command, or by citing the exact CI

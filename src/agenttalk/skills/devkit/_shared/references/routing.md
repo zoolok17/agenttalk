@@ -1,5 +1,5 @@
 ---
-reviewed-against: "0.45"
+reviewed-against: "0.46"
 ---
 
 # Skill routing index

@@ -5,6 +5,26 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.0] - 2026-06-30
+
+### Added
+
+- **`fix-ci` devkit skill (Tier 1).** A production skill for making an *already-failing* local or CI
+  check green again: read the failing command and its full log first, classify the root cause (code
+  defect, test defect, flaky test, environment, dependency, or CI configuration), apply or propose the
+  *smallest* fix that addresses that cause, verify, and emit a `production-handoff` record. Explicit
+  `Not For` boundaries route pre-failure test planning to `qa-strategy`, broader coverage to
+  `test-coverage`, and product-behavior changes to `craft-code`; it never broadens into feature work,
+  drive-by cleanup, or self-approval. Routed in the devkit routing index (the `Diagnose + fix a failing
+  local/CI check` row is now live, with a precedence rule and a negative trigger against guessing without
+  logs). Second of the Tier 1 devkit skills.
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.46.0"
+```
+
 ## [0.45.0] - 2026-06-30
 
 ### Added
