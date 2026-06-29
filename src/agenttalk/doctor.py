@@ -689,15 +689,21 @@ def _check_skill_currency() -> Check:
     if not findings:
         return Check(name="skill_currency", status="ok",
                      details="bundled skills pass currency lint (frontmatter + stamps + CLI tokens)")
-    sample = "; ".join(f"{f.file}:{f.line} {f.reason}" for f in findings[:5])
-    more = "" if len(findings) <= 5 else f" (+{len(findings) - 5} more)"
+    # split by severity: errors are real drift (red the source-tree gate); warnings are
+    # advisory (e.g. a reviewed-against version lag). Doctor stays WARN when EITHER exists.
+    errors = skc.blocking_findings(findings)
+    warnings = skc.warning_findings(findings)
+    lead = errors or warnings
+    sample = "; ".join(f"{f.file}:{f.line} {f.reason}" for f in lead[:5])
+    more = "" if len(lead) <= 5 else f" (+{len(lead) - 5} more)"
     return Check(
         name="skill_currency", status="warn",
-        details=f"{len(findings)} skill-currency issue(s): {sample}{more}",
-        fix="refresh flagged skill source + re-stamp reviewed-against "
-            "(see docs/skill-devkit-evolution-design.md)",
+        details=f"{len(errors)} blocking + {len(warnings)} advisory skill-currency "
+                f"issue(s): {sample}{more}",
+        fix="fix blocking drift (stamps/CLI tokens/parity); re-stamp reviewed-against on "
+            "review (see docs/skill-devkit-evolution-design.md)",
         data={"findings": [{"file": f.file, "line": f.line, "token": f.token,
-                            "reason": f.reason} for f in findings]},
+                            "reason": f.reason, "level": f.level} for f in findings]},
     )
 
 

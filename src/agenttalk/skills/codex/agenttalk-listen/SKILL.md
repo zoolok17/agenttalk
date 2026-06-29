@@ -1,7 +1,7 @@
 ---
 name: agenttalk-listen
 description: Enter listen mode as a Codex agent - repeatedly wait for messages from named agents and handle reviews, proposals, broadcast questions, consults, wake signals, or cross-review requests.
-reviewed-against: "0.43"
+reviewed-against: "0.44"
 ---
 
 # agenttalk-listen - Listen for agenttalk messages (codex side)
@@ -190,6 +190,44 @@ cursor. Unrelated traffic remains unread for `sync`, `threads`, or
   task output file to investigate. Only exit 0 carries a message to handle;
   routinely reading a timed-out wait's output is a fragile extra tool call
   best skipped (exit 6 still means stacked-waiter, handled as above).
+
+### Persistent wait kills (a liveness handoff, NOT a release)
+
+A bare in-chat wait can be REPEATEDLY terminated by the harness or OS
+without printing a message and without a normal timeout. This is
+distinct from exit 1 (timeout, re-arm) and exit 6 (stacked waiter).
+
+- RECOGNITION (do NOT trust the exit code): a kill may surface as exit
+  1, some other non-zero, or a bare task-failure — the signature is
+  unreliable. The robust signal is FREQUENCY: 2-3 consecutive wait
+  terminations for the SAME identity in a short window, with no printed
+  message and no normal timeout / stacked-waiter handling.
+- ACTION: after that bounded count, STOP tight-loop re-arming in-chat.
+  Do NOT spawn duplicate bare waiters — stacked waits just trip exit 6.
+- LOUD, never silent: stopping the re-arm must not mean going deaf.
+  Surface the liveness problem to the operator at your own window — the
+  only party who can relaunch you under a supervised owner (the bus
+  `escalate` may itself be reaped if pushes are being killed) — and say
+  this identity should be relaunched under supervised `agenttalk wrap
+  --loop` with the SAME identity.
+- NOT A STAND-DOWN: a killed wait is not a `release` or `end`, and
+  stopping the bare loop is NOT a self-stand-down — it is escalating for
+  a more DURABLE listening mode. Do NOT export the transcript, do NOT
+  wind down, do NOT mark the session released. You stay "listening",
+  just via a supervised owner instead of a bare loop with no one to
+  relaunch it.
+- LIVENESS OWNER: a supervised `agenttalk wrap --loop` HAS an owner that
+  relaunches it on stale-heartbeat backoff; a bare wait has NO owner, so
+  local spinning is the wrong recovery — escalate to acquire one. If the
+  identity is ALREADY supervised, do nothing local: let the supervisor
+  recover via heartbeat-staleness relaunch.
+- RECOVERY on the next invocation/rejoin: a kill loses only realtime
+  push, NOT queued data — durable messages remain and the global cursor
+  is monotonic. Run `agenttalk sync --for "$SELF"` then `agenttalk
+  threads --for "$SELF"` to catch up, `agenttalk recv --for "$SELF"` to
+  inspect unread, and `agenttalk drain --for "$SELF"` ONLY when you
+  intend to consume ALL unread (never blind-drain). Scoped-wait
+  seen-state is not equivalent to having handled a thread.
 
 Use a **long** timeout (1800s). The `agenttalk wait` subprocess polls
 the filesystem internally (it starts at ~0.3s and **backs off** up to

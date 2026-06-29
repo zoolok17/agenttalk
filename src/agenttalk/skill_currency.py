@@ -35,11 +35,29 @@ _IGNORE_LINE = "agenttalk-skill-lint: ignore-line"
 
 @dataclass(frozen=True)
 class Finding:
-    """One currency problem in a bundled skill source file."""
+    """One currency problem in a bundled skill source file.
+
+    ``level`` (v0.44.0) splits BLOCKING mechanical drift from ADVISORY signals: ``error`` is
+    real drift that must red the source-tree gate (missing/malformed stamp, dead CLI token,
+    stub/parity drift, dangling continuation, frontmatter failure); ``warn`` is advisory and
+    must NOT red CI (a parseable reviewed-against version LAG - a review signal, not
+    machine-proven prose drift). The source-tree gate asserts no ``error``; doctor surfaces
+    both at WARN severity."""
     file: str
     line: int          # 1-based; 0 = file-level (frontmatter)
     token: str
     reason: str
+    level: str = "error"
+
+
+def blocking_findings(findings: list[Finding]) -> list[Finding]:
+    """The ``error``-level (CI-blocking) subset - real mechanical drift."""
+    return [f for f in findings if f.level == "error"]
+
+
+def warning_findings(findings: list[Finding]) -> list[Finding]:
+    """The ``warn``-level (advisory) subset - e.g. a reviewed-against version lag."""
+    return [f for f in findings if f.level == "warn"]
 
 
 # --------------------------------------------------------------------------- inventory
@@ -457,9 +475,13 @@ def check_skill_file(path: Path, *, kind: str, inventory: _Node,
                 findings.append(Finding(rel, 0, "reviewed-against",
                                         f"malformed reviewed-against stamp {stamp!r}"))
             elif parsed < current:
+                # ADVISORY (v0.44.0): a parseable-but-old stamp is a review signal, not
+                # machine-proven prose drift - it must NOT red the source-tree/CI gate (the
+                # v0.43.0 failure mode, where a package bump alone made every skill lag).
                 findings.append(Finding(rel, 0, "reviewed-against",
                                         f"reviewed-against {parsed[0]}.{parsed[1]} lags package "
-                                        f"{current[0]}.{current[1]} (re-review against current CLI)"))
+                                        f"{current[0]}.{current[1]} (re-review against current CLI)",
+                                        level="warn"))
 
     # --- CLI-token lint ---
     spans, dangling = _command_spans(text)

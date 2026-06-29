@@ -123,11 +123,12 @@ def test_frontmatter_checks_flag_missing_fields(tmp_path: Path) -> None:
 # ----------------------------------------------------------- the atomic source-tree gate
 
 def test_all_bundled_skills_pass_currency() -> None:
-    # THE atomic gate: after the Tier-0a frontmatter migration + v0.42.0 refresh, every
-    # bundled skill must pass the currency lint (valid frontmatter + stamps + CLI tokens).
-    findings = sc.check_bundled_skills(iskl.SKILLS_ROOT, __version__)
-    assert findings == [], "stale bundled skills: " + "; ".join(
-        f"{f.file}:{f.line} {f.reason}" for f in findings)
+    # THE source-tree gate: every bundled skill must have NO BLOCKING currency drift (valid
+    # frontmatter + stamps + CLI tokens + stub parity). Advisory version-lag warnings do NOT
+    # red this gate (v0.44.0 split) - that is the v0.43.0 failure mode, now fixed.
+    blocking = sc.blocking_findings(sc.check_bundled_skills(iskl.SKILLS_ROOT, __version__))
+    assert blocking == [], "blocking skill-currency drift: " + "; ".join(
+        f"{f.file}:{f.line} {f.reason}" for f in blocking)
 
 
 def test_doctor_skill_currency_passes_on_refreshed_source() -> None:
@@ -386,3 +387,69 @@ def test_shared_references_are_in_the_package_tree() -> None:
     for rel in ("SKILL.md", "references/evidence.md", "references/routing.md"):
         p = base / rel
         assert p.is_file() and p.stat().st_size > 0, f"missing/empty bundled shared file: {p}"
+
+
+# ----------------------------------------------------------- v0.44.0: severity split
+
+def test_blocking_warning_partition() -> None:
+    fs = [sc.Finding("a.md", 0, "t", "err"),
+          sc.Finding("b.md", 1, "t", "lag", level="warn"),
+          sc.Finding("c.md", 0, "t", "err2")]
+    assert len(sc.blocking_findings(fs)) == 2
+    assert len(sc.warning_findings(fs)) == 1 and sc.warning_findings(fs)[0].level == "warn"
+
+
+def test_version_lag_is_advisory_not_blocking(tmp_path: Path) -> None:
+    inv = sc.build_command_inventory()
+    p = tmp_path / "SKILL.md"
+    # a parseable but OLD stamp (0.40), current far ahead -> a LAG (warn, not error)
+    p.write_text('---\nname: x\ndescription: d\ncategory: production\n'
+                 'evidence-profile:\n  - production-handoff\nreviewed-against: "0.40"\n---\n# x\n',
+                 encoding="utf-8")
+    findings = sc.check_skill_file(p, kind="devkit", inventory=inv, current=(0, 99))
+    lag = [f for f in findings if "lags package" in f.reason]
+    assert lag and all(f.level == "warn" for f in lag)
+    assert not sc.blocking_findings(lag) and sc.warning_findings(lag) == lag
+
+
+def test_missing_and_malformed_stamp_stay_blocking(tmp_path: Path) -> None:
+    inv = sc.build_command_inventory()
+    p = tmp_path / "SKILL.md"
+    base = "---\nname: x\ndescription: d\ncategory: production\nevidence-profile:\n  - production-handoff\n"
+    p.write_text(base + "---\n# x\n", encoding="utf-8")                       # missing stamp
+    f1 = sc.check_skill_file(p, kind="devkit", inventory=inv, current=(0, 43))
+    assert any(x.token == "reviewed-against" and "missing" in x.reason and x.level == "error"
+               for x in f1) and sc.blocking_findings(f1)
+    p.write_text(base + 'reviewed-against: "garbage"\n---\n# x\n', encoding="utf-8")  # malformed
+    f2 = sc.check_skill_file(p, kind="devkit", inventory=inv, current=(0, 43))
+    assert any("malformed" in x.reason and x.level == "error" for x in f2)
+
+
+def test_stale_cli_token_stays_blocking(tmp_path: Path) -> None:
+    inv = sc.build_command_inventory()
+    p = tmp_path / "SKILL.md"
+    p.write_text('---\nname: x\ndescription: d\ncategory: production\n'
+                 'evidence-profile:\n  - production-handoff\nreviewed-against: "0.43"\n---\n# x\n'
+                 "\n```\nagenttalk frobnicate --bogus\n```\n", encoding="utf-8")
+    f = sc.check_skill_file(p, kind="devkit", inventory=inv, current=(0, 43))
+    cli = [x for x in f if x.line > 0]
+    assert cli and all(x.level == "error" for x in cli) and sc.blocking_findings(f)
+
+
+def test_minor_bump_with_old_stamps_does_not_red_source_tree_gate() -> None:
+    # the v0.43.0 failure mode: a package MINOR bump with the existing (older) skill stamps
+    # must NOT red the source-tree gate; the lag shows up as advisory warnings instead.
+    findings = sc.check_bundled_skills(iskl.SKILLS_ROOT, "0.99.0")   # far ahead of real stamps
+    assert sc.blocking_findings(findings) == []                     # gate stays green
+    assert sc.warning_findings(findings)                            # but lag IS surfaced
+
+
+def test_doctor_warns_on_advisory_only(monkeypatch) -> None:
+    # doctor stays WARN (never error) when only ADVISORY lag findings exist; data carries level.
+    monkeypatch.setattr(sc, "check_bundled_skills",
+                        lambda *a, **k: [sc.Finding("x.md", 0, "reviewed-against",
+                                                    "reviewed-against 0.42 lags package 0.44",
+                                                    level="warn")])
+    c = doctor._check_skill_currency()
+    assert c.status == "warn"
+    assert c.data["findings"][0]["level"] == "warn"
