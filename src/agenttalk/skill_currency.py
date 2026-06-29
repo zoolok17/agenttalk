@@ -92,6 +92,16 @@ def _is_fence(line: str) -> bool:
     return s.startswith("```") or s.startswith("~~~")
 
 
+def _is_boundary_line(line: str) -> bool:
+    """A non-content line a shell continuation must NOT cross: a fence delimiter, a blank
+    line, or a line carrying an ignore marker. ONE definition, used by BOTH the outer scan
+    loop's special-casing AND the inner continuation peek, so the two boundary sets can never
+    diverge - that divergence is exactly what produced the fence edge (fold 2) and the
+    blank/ignore edge (fold 3). Adding a future boundary type updates only this predicate."""
+    return (_is_fence(line) or not line.strip()
+            or _IGNORE_LINE in line or _IGNORE_NEXT in line)
+
+
 def _command_spans(text: str) -> tuple[list[tuple[int, str]], list[int]]:
     """Return ``(spans, dangling_lines)``.
 
@@ -120,15 +130,13 @@ def _command_spans(text: str) -> tuple[list[tuple[int, str]], list[int]]:
     i = 0
     while i < n:
         raw = lines[i]
-        if _IGNORE_LINE in raw:
-            i += 1
-            continue
-        if _IGNORE_NEXT in raw:
-            ignore_next = True
-            i += 1
-            continue
-        if _is_fence(raw):
-            in_fence = not in_fence
+        if _is_boundary_line(raw):
+            # a non-content line: apply its specific effect, never scan it for a command
+            if _is_fence(raw):
+                in_fence = not in_fence
+            elif _IGNORE_NEXT in raw:
+                ignore_next = True
+            # blank or ignore-line: skip with no effect
             i += 1
             continue
         if ignore_next:
@@ -143,10 +151,11 @@ def _command_spans(text: str) -> tuple[list[tuple[int, str]], list[int]]:
                 rs = joined.rstrip()
                 if not (rs.endswith("\\") or rs.endswith("`")):
                     break
-                # peek the next physical line BEFORE consuming it
-                if i + 1 >= n or _is_fence(lines[i + 1]):
-                    # dangling continuation into a fence close / EOF: do NOT consume the
-                    # delimiter; flag it and let the outer loop toggle the fence.
+                # peek the next physical line BEFORE consuming it: a continuation must not
+                # cross ANY boundary (fence close, blank, ignore marker) or EOF - else it
+                # eats the boundary as command text (cascading) and orphans the real
+                # continuation token. Stop, flag the dangling start line, do NOT consume.
+                if i + 1 >= n or _is_boundary_line(lines[i + 1]):
                     dangling.append(start_line)
                     joined = rs[:-1]
                     break

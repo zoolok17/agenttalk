@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agenttalk import __version__
 from agenttalk import doctor
 from agenttalk import install_skills as iskl
@@ -197,6 +199,33 @@ def test_dangling_continuation_at_fence_boundary_does_not_hide_later_command() -
 def test_dangling_continuation_at_eof_is_handled() -> None:
     spans, dangling = sc._command_spans("```\nagenttalk send \\\n")   # dangling at EOF, no crash
     assert dangling
+
+
+@pytest.mark.parametrize("boundary", [
+    "```",                                          # fence close (backticks)
+    "~~~",                                          # fence close (tildes)
+    "",                                             # blank line
+    "<!-- agenttalk-skill-lint: ignore-line -->",   # ignore-line marker
+    "<!-- agenttalk-skill-lint: ignore-next -->",   # ignore-next marker
+    None,                                           # EOF
+])
+def test_continuation_into_any_boundary_flags_dangling_no_misleading(boundary) -> None:
+    # Enumerate the WHOLE boundary set (fold 3): a continuation that runs into ANY boundary
+    # must flag the dangling start line AND must not mis-parse the boundary into a misleading
+    # token (e.g. an HTML-comment terminator read as an unknown flag). The shared
+    # _is_boundary_line predicate makes the inner peek and the outer loop agree, closing the
+    # class rather than patching one more edge.
+    inv = sc.build_command_inventory()
+    if boundary is None:
+        text = "```\nagenttalk send \\\n"                                  # EOF
+    else:
+        text = f"```\nagenttalk send \\\n{boundary}\nmore content\n```\n"
+    spans, dangling = sc._command_spans(text)
+    assert dangling, f"dangling not flagged for boundary={boundary!r}"
+    # no MISLEADING token: every captured span validates clean (the boundary was not eaten
+    # into the command as a bogus flag/subcommand)
+    assert all(not sc._validate_command(t, inv) for _, t in spans), \
+        f"misleading token for boundary={boundary!r}: {spans}"
 
 
 def test_dangling_continuation_reported_as_finding(tmp_path: Path) -> None:
