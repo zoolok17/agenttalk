@@ -5,6 +5,50 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.43.0] - 2026-06-29
+
+### Added
+
+- **Skill-devkit currency + evidence foundation (Tier 0 of the devkit evolution).** The bundled
+  skill set now has a mechanical staleness guard and a single canonical evidence contract, so the
+  devkit can grow without silently drifting from the CLI or the assurance gates.
+  - **`doctor` skill-currency check.** A deterministic lint validates every bundled skill's
+    `agenttalk` / `python -m agenttalk` command and flag tokens against the live argparse surface
+    (recursive, including multi-level subcommands like `relay operator-answer`), enforces
+    frontmatter well-formedness, and applies a `reviewed-against` version-stamp ratchet that warns
+    on a major/minor lag. WARN-only in `doctor` (never bricks the bus); a source-tree CI test fails
+    on bundled-source currency regressions. It scans only fenced code blocks + inline-backtick spans
+    (never prose), accumulates shell line-continuations, and stops at the `--` wrapper passthrough.
+  - **Canonical evidence reference + in-skill stubs.**
+    `skills/devkit/_shared/references/evidence.md` defines the typed evidence profiles
+    (planning-artifact, production-handoff, review-result, qa-result, close-ack, na-result),
+    marking each field BUS-VALIDATED vs SKILL-POLICY-ONLY. Every validator-backed profile is
+    gate-tied by a test against the REAL bus validators (`gates.validate_review_result_evidence`,
+    `close.apply_ack`), so a profile can never claim a bus guarantee it does not have. In-skill
+    stubs are checked for parity against the reference and the skill's frontmatter profile.
+  - **Routing index.** `skills/devkit/_shared/references/routing.md`: a task-to-skill table,
+    negative triggers, capacity guidance, and the dual-review (context-preserving + fresh-context)
+    rules.
+  - **`review-code` tightening.** A machine-visible final verdict (APPROVE / APPROVE-WITH-NITS /
+    REQUEST-CHANGES, mapped to the bus status; REQUEST-CHANGES defaults `release_blocker=unknown`)
+    plus a small finding-type taxonomy.
+
+### Changed
+
+- All bundled skills carry `reviewed-against` frontmatter; devkit capability skills also carry
+  `category` + `evidence-profile`. The `agenttalk-lead` / `agenttalk-listen` skills (Claude + Codex)
+  are refreshed for the v0.42.0 contracts (managed lead-loop ownership, the `relay` flow) and the
+  operator relay now uses `relay operator-answer` instead of the hand-rolled
+  `reply --meta operator_answer=true`, which bypassed the relay audit-integrity guard.
+- After upgrading, existing users should re-run `agenttalk install-skills --devkit-only --force` to
+  refresh installed skills (otherwise `doctor` warns that the bundled vs installed copies differ).
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.43.0"
+```
+
 ## [0.42.0] - 2026-06-29
 
 ### Added
