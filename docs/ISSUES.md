@@ -12,158 +12,110 @@ major · `P2` minor · `P3` nit. Each item: what, why, where, disposition.
 
 ---
 
-## IN PROGRESS — lead-loop Slice 2 / WP4 (the mechanical LIAISON RELAY, `lead-loop-wp4`)
+## SHIPPED v0.42.0 — split-identity lead-loop enforcement (Slice 1 + WP1–4)
 
-The LAST WP of the split-identity lead-loop: a thin typed wrapper so the operator's
-words cross the human<->bus boundary with an audit stamp - NO new message kind, NO new
-transport (reuses reply/send/escalate). Built off master fe6ed6b; cross-review starts
-with codex (reviewer-1 joins when restored). After this merges + reviewer-1 is back,
-v0.42.0 ships the COMPLETE Slice 2 (WP1-4) at strict 2/2.
+Origin: the **operator-raised "the lead stops leading"** failure (every lead, every
+project): a chat-agent lead silently UN-ARMS its control loop — the harness default
+("answer the human, then yield") drops the re-arm even though the discipline is
+documented and in memory. A documented-but-reliably-dropped rule means willpower is
+NOT the fix; we need MECHANICAL enforcement. The operator chose **split-identity
+enforcement** (cli-AGNOSTIC — keyed on the agent NAME + its `managed_lead_loop`
+config, never a cli, so a codex identity is managed exactly as a claude one): keep the
+free-form `<name>` as the operator-facing liaison (manual, never auto-killed), and add
+a separately-supervised managed `<name>-lead-loop` identity that OWNS the team mailbox
+via a renewable lease and cannot silently un-arm. codex designed it as Slice 1 + four
+WPs; dev-2 built each in an isolated worktree; codex + reviewer-1 cross-reviewed; lead
+gated. Rationale + decision log: `docs/DESIGN.md` D-12..D-15.
 
-- **`relay operator-answer --to-request <rid>` (P1).** VALIDATES `<rid>` is a *pending*
-  `needs_operator` opener addressed to *this* liaison (via the ack-independent thread
-  derivation), then sends a normal thread reply stamped `operator_answer=true` +
-  `operator_origin=<liaison>` so it routes back to the asking lead-loop's mailbox and
-  flips the thread to `operator_state=answered`. Refuses a non-escalation thread, a
-  foreign/unknown thread, an already-answered thread, and an empty body.
-- **`relay operator-command [--to <lead-loop>]` (P1).** Sends a `question`/`message`
-  stamped `operator_command=true` + `operator_origin`, minting a fresh `opc-` request_id
-  for the question. INFERS `--to` only when exactly one managed lead-loop exists, else
-  REQUIRES it. FAILS CLOSED unless the sender is the current operator-facing liaison; an
-  `--override --reason` is the only (audited) exception, recorded as
-  `operator_command_override=true` + `override_reason`.
-- **lead-loop -> operator** stays the existing `escalate` (a `needs_operator` question);
-  no new kinds.
-- **Liaison-down (P2).** A relayed message is an ordinary durable bus record - it QUEUES
-  in the target's inbox whether or not the target is up; a pending operator answer is the
-  OPEN THREAD, not a controller block; with no liaison/lead resolvable the controller
-  surfaces via doctor / cadence-health and keeps handling non-operator work.
+- **Slice 1 (61e2ce0) — store-level lease + single-consumer guard + visibility.**
+  `state/<agent>.lead-loop-lease.json` is the ownership truth (acquire/renew/release/
+  read; `.waiting` only mirrors it for UX); a verb-guard rejects a second mailbox
+  consumer (`wait`/`recv`/`drain`/`ack`, exit 7) while read-only verbs stay allowed,
+  the owner proving itself via the live `lease_id` (`AGENTTALK_LEAD_LOOP_LEASE`);
+  `lead_unarmed` is an ERROR in `status`/`doctor`/supervisor for a managed identity
+  that is down. Steal is gated on the configured `managed_lead_loop` flag + a
+  CONFIRMED-dead tri-state liveness probe (D-12): a confirmed-dead owner is stolen
+  immediately (a crashed controller recovers at once), a live/uncertain one only when
+  EXPIRED *and* heartbeat-stale (an uncertain probe never displaces a live owner; a
+  manual chat identity is never auto-stolen).
+- **WP1 (24c39f7) — single authority + timing resolver + corrupt-config class.**
+  One `_lead_loop_authority` computes {managed, present, liveness, expired,
+  heartbeat-stale, stealable, armed, guarded, reason}; `_lease_stealable`,
+  `lead_loop_state`, and `lead_loop_active_owner` ALL derive from it, so the three
+  views can never drift (for a present managed lease `armed == not stealable` in
+  every case). `read_lead_loop_lease` normalizes `expires_at` to a finite float or
+  None (fail-safe NOT-expired). A timing resolver (`lead_loop_runtime.resolve_timing`)
+  gives the steal path and the visibility paths one shared `heartbeat_stale_after`
+  (a duplicate never steals earlier than the supervisor would call the owner stuck),
+  keeping `store.py` free of supervisor imports. A truthy non-dict supervisor config
+  entry (operator typo) coerces to default via `isinstance` instead of crashing
+  status/doctor/supervise/wrap — the corrupt-config coercion class swept across every
+  per-agent reader (D-13).
+- **WP2 (152636e) — the lead-loop CONTROLLER (`wrap --loop --lead-loop`).** A
+  long-running supervised process that owns the mailbox for its whole lifetime:
+  acquire-before-loop, a combined renew+heartbeat on every idle stamp and streaming
+  event, an ownership gate at every cursor-advance boundary (a lost lease stops
+  consumption at once), and three exit states the supervisor reads from an exit
+  marker — blocked-acquire (HOLD, no relaunch), valid human release/end (deliberate
+  stand-down, no relaunch), crash/lost-lease (relaunch + re-acquire). The lease token
+  is never leaked to the model child.
+- **WP3 (fe6ed6b) — the proactive CADENCE TICK.** The idle/timeout branch of the
+  SAME loop (no second consumer/thread) drives a SYNTHETIC sweep over a bounded
+  read-only snapshot (ids + summaries, never transcripts, never the lease token) when
+  the bus is quiet and the cadence interval elapses — nudging stalled outbound threads
+  (once per `(request_id, last_msg_id)`, past `reminder_after_seconds`, no fresh-peer
+  composing marker) and surfacing dead-letter / unrouted escalations (deduped),
+  spending a model turn only when something is actionable. It NEVER records an attempt,
+  advances the cursor, or enters the dead-letter path; a failed sweep is
+  controller-HEALTH (backoff + heartbeat withheld + a single deduped escalation
+  retried until it routes), never message poison (D-14).
+- **WP4 (de2873a) — the mechanical liaison RELAY (`agenttalk relay`).** Carries the
+  operator's words across the human<->bus boundary with an audit stamp and NO new
+  message kind: `relay operator-answer --to-request <rid>` validates a *pending*
+  `needs_operator` escalation addressed to the liaison and routes the answer back to
+  the asking lead-loop (flipping the thread to `operator_state=answered`); `relay
+  operator-command` relays a spontaneous operator instruction to a managed lead-loop,
+  inferring `--to` only when exactly one exists and FAILING CLOSED unless the sender is
+  the operator-facing liaison (an audited `--override --reason` is the only exception).
+  Both handlers are authoritative for the reserved audit meta — a caller `--meta` can
+  never forge an audit marker or graft routing onto a relayed message (D-15). The
+  lead-loop → operator direction stays the existing `escalate`; no new kinds.
+- **Cadence-snapshot threshold-skew fix (8b8e79e) — the v0.42.0 release blocker.**
+  reviewer-1's consolidated strict-2/2 review of the merged arc caught that
+  `build_cadence_snapshot` resolved the supervisor heartbeat window into
+  `snap["timing"]` but built `snap["lead_loop_health"]` via `lead_loop_state(agent)`
+  WITHOUT it, so the cadence health view fell back to the 120s default while
+  steal/guard/supervisor used the resolved window (e.g. 900s) — the *same*
+  threshold-skew class WP1 set out to kill, resurfacing in the visibility snapshot,
+  where it could hand the model a FALSE controller-down state while the controller
+  still owned the lease. *Fix:* thread `now=now_epoch` + the resolved
+  `heartbeat_stale_after` into the health call (None → safe default), inside the
+  existing degrade-guard; pinned by a WP3 regression
+  (`test_snapshot_health_uses_resolved_window_not_default`) that fails unfixed /
+  passes fixed.
 
-**Operator-facing usage (how the liaison relays).** When a lead-loop escalates, its
-question lands in the liaison's `sync` OPERATOR INPUT NEEDED bucket with a `request_id`.
-The human liaison relays the operator's two kinds of input:
+*Where:* `store.py` (lease API + `_lead_loop_authority` + `_process_liveness`
+tri-state + read normalization + confirmed-dead-only lock-break + cadence-state),
+`lead_loop_runtime.py` (NEW, timing resolver), `lead_loop_cadence.py` (NEW, snapshot +
+actionability + cadence state + health), `wrapper/loop.py` + `wrapper/run.py` +
+`wrapper/prompt.py` (controller + per-cursor ownership gate + token-strip + combined
+heartbeat + the idle-branch cadence hook), `cli.py` (`wrap --lead-loop`,
+`managed-lead-loop` set/clear/list, the verb-guard, `cmd_relay` +
+`_RELAY_RESERVED_META`), `supervisor.py` (`_plan_one` no-relaunch rules + report
+field), `doctor.py` (`_check_lead_unarmed`), `docs/DESIGN.md` (D-12..D-15),
+`tests/test_lead_loop*.py` + `tests/test_relay_wp4.py` + `tests/test_supervisor.py`.
 
-```
-# 1) the operator ANSWERS a pending escalation (routes back to the asking lead-loop):
-agenttalk relay operator-answer --from <liaison> --to-request <esc-id> -m "<operator's answer>"
+Process: each WP merged slice-internal on codex review + lead adversarial-verify +
+lead full-suite gate (the independent-verify-different-focus pattern caught a real bug
+at nearly every WP — config-brick, the stale-blocked-marker recovery defeat, audit-meta
+forgeability — complementary to codex's resolver-skew / lost-lease / escalation-latch /
+correlation-id catches). The v0.42.0 release added reviewer-1's consolidated strict-2/2
+on the exact head, which caught the cadence-snapshot threshold-skew blocker; dev-2
+folded it (8b8e79e); BOTH reviewers re-approved the fix on the final SHA.
 
-# 2) the operator issues a SPONTANEOUS command to a managed lead-loop (--to inferred when
-#    exactly one managed lead-loop exists; question by default so the reply correlates):
-agenttalk relay operator-command --from <liaison> --to <lead-loop> -m "<operator's instruction>"
-agenttalk relay operator-command --from <liaison> --kind message -m "<fire-and-forget FYI>"
-```
-
-`operator-answer` refuses anything that is not a pending `needs_operator` escalation
-addressed to you. `operator-command` fails closed unless you are the configured
-operator-facing liaison (an audited `--override --reason` is the only exception).
-
-*Where:* `cli.py` (`cmd_relay` + `_relay_operator_answer` / `_relay_operator_command` +
-the `relay` subparsers), `docs/DESIGN.md` (D-15), `tests/test_relay_wp4.py` (NEW).
-*Disposition:* IN PROGRESS (branch `lead-loop-wp4`); self-gated, in cross-review.
-
----
-
-## SHIPPED (merged fe6ed6b) — lead-loop Slice 2 / WP3 (the CADENCE TICK, `lead-loop-wp3`)
-
-The proactive sweep the controller drives when the bus is QUIET and the cadence
-interval has elapsed - so a lead-loop controller does forward work (nudge stalled
-outbound threads, surface dead-letter / unrouted escalations) instead of only
-reacting to inbound messages. Built off master (WP2 merged); cross-review starts with
-codex (reviewer-1 joins when restored; v0.42.0 ships WP1+WP2[+WP3/WP4] at strict 2/2).
-
-- **Synthetic, dead-letter-isolated (P1; DESIGN.md D-14).** The tick is the
-  *timeout/idle branch* of the SAME `_run_continuous` loop (no second consumer/thread):
-  a message present -> the per-message path; no message + not due -> heartbeat + lease
-  renew + sleep; no message + DUE -> a bounded read-only snapshot, and a model turn ONLY
-  if the snapshot has actionable items. It NEVER calls `record_attempt_start`, NEVER
-  advances the cursor, and NEVER enters the dead-letter path.
-- **Cadence state (controller-owned single-writer).** `state/<agent>.lead-loop-cadence.json`
-  holds `last_tick_epoch` (due-ness), `last_reminded` ((request_id -> last_msg_id) so an
-  outbound nudge fires once per thread state), `escalation_dedup`, and the failure /
-  backoff fields. Degrade-safe read; reset-cleared like the lease (the dead-letter SINK
-  is elsewhere and survives reset).
-- **Actionability (avoid premature reminders).** Unread / reply-waiting / owed-inbound
-  are the message path's job (not cadence). Open-outbound reminders fire only past
-  `reminder_after_seconds`, with no fresh peer composing marker, once per
-  `(request_id, last_msg_id)`. Operator-blocked work is tracked context, not its own
-  nudge. Dead-letter / unrouted-escalation items are due immediately but deduped.
-- **Snapshot contract (P2).** A bounded point-in-time view (self identity, lease/timing
-  [token-free], `derive_threads` summaries, operator-pending, lead-loop health, restart/
-  launch state, dead-letter / unrouted escalation): ids + summaries, NOT transcripts;
-  counts + body lengths capped; per-field degrade so one unreadable subsystem yields an
-  empty field, not a failed snapshot. The lease TOKEN is never serialized into it. The
-  synthetic prompt carries the same verb-guard as a message turn (no sync/threads/recv/
-  wait/drain/ack; fresh data -> a typed question + a one-turn delay).
-- **Cadence failure = controller-HEALTH, not poison (P1).** A failed sweep updates the
-  failure/backoff state (exponential, capped), withholds the heartbeat so the supervisor
-  notices, and after a threshold escalates ONCE to the operator (deduped via
-  `health_escalated`). It leaves the cursor AND the attempt ledger untouched and never
-  dead-letters.
-
-*Where:* `store.py` (cadence-state persistence + consts), `lead_loop_cadence.py` (NEW:
-snapshot + actionability + state transitions), `wrapper/loop.py` (`CadenceResult` +
-the idle-branch `cadence` hook), `wrapper/run.py` (`make_cadence_drive`),
-`wrapper/prompt.py` (`assemble_cadence_prompt`), `cli.py` (`_wrap_loop_mode` wiring +
-`_cadence_health_notifier`), `docs/DESIGN.md` (D-14), `tests/test_lead_loop_wp3.py` (NEW).
-*Disposition:* IN PROGRESS (branch `lead-loop-wp3`); self-gated, in cross-review. WP4
-(relay) stays on HOLD.
-
----
-
-## SHIPPED (merged 24c39f7) — lead-loop Slice 2 / WP1 (opening hardening foundation, `lead-loop-wp1`)
-
-Slice 2 of the lead-loop adds the actual controller + mechanical relay; codex's
-design splits it into 4 WPs, **WP1-first** (cross-reviewed + lead-gated before any
-controller work layers on). WP1 is the pure-core HARDENING FOUNDATION the rest
-builds on - it consolidates the Slice 1 liveness/expiry/steal/armed/guard logic into
-ONE source of truth so the three views can never drift apart again (the bug class
-that bit Slice 1 twice). MERGED at 24c39f7 (codex 2x approved + lead adversarial-verify
-+ gate; reviewer-1 hung during WP1, covers WP2-4 + the v0.42.0 ship at strict 2/2).
-
-- **Single `_lead_loop_authority` (P1).** ONE method computes
-  {managed, present, owner_liveness, owner_alive, expired, heartbeat_stale,
-  stealable, armed, guarded, reason}. `_lease_stealable`, `lead_loop_state`, AND
-  `lead_loop_active_owner` ALL derive from it - no per-caller liveness branch. By
-  construction, for a present managed lease `armed == not stealable` and
-  `guarded == (liveness != CONFIRMED-DEAD)`, for EVERY case (alive/dead/unknown).
-- **Read-boundary expiry normalization.** `read_lead_loop_lease` coerces
-  `expires_at` to a finite float or None (NaN / +-inf / non-numeric / missing ->
-  None); `_lease_expired` treats None as fail-safe NOT-expired. One sanitized shape
-  for every consumer.
-- **Confirmed-dead-only lock-break.** `_break_stale_lock` breaks ONLY a
-  CONFIRMED-dead holder (tri-state `_process_liveness`); an ALIVE or UNKNOWN holder
-  waits out the timeout (no fail-quiet breaking - the lock analogue of the
-  no-false-steal rule).
-- **Config-gated armed.** An UNMANAGED stray lease is inert: managed/guarded/armed
-  all False, never auto-stolen (reason `not managed`).
-- **Timing resolver (non-store module).** `agenttalk.lead_loop_runtime.resolve_timing`
-  resolves {ttl_seconds, cadence_seconds, heartbeat_stale_after} so the controller's
-  acquire/steal AND doctor/state use the SAME window; with a supervisor config it
-  uses the supervisor's per-agent/per-CLI `resolve_stuck_after` (a duplicate never
-  steals earlier than the supervisor would call the owner stuck). Keeps `store.py`
-  free of supervisor imports.
-
-- **Corrupt-config coercion class (robustness; see DESIGN.md D-13).** A per-agent
-  `supervisor.json` entry that is a TRUTHY non-dict (operator typo, e.g.
-  `{"agents": {"beta": "wrapped"}}`) is NOT rescued by a falsy-only `(x or {}).get(...)`
-  - the string reaches `cfg_agent.get(...)` and raises `AttributeError`, crashing the
-  reader. Every per-agent reader now coerces to `{}` only when `isinstance(..., dict)`:
-  `resolve_timing`, `resolve_stuck_after`, `resolve_dead_letter_caps` (config /
-  cfg_agent / nested `dead_letter`), `session_args`, and `cmd_wrap`'s extraction -
-  including the PRE-EXISTING v0.41.0 dead-letter/wrap sites surfaced while closing the
-  class. All fail safe to the defaults (`claude_permission_mode` already used the
-  `isinstance` form). A bool `stuck_after_seconds` is also ignored (bool-is-int). A
-  single per-agent typo must never crash `status` / `doctor` / `supervise --report` /
-  `wrap --loop`. Surfaced by: lead verify P2 (resolve_timing), codex review (wrap/
-  dead-letter sibling), dev-2 sweep (session_args). Pinned by regression tests.
-
-*Where:* `store.py` (authority + `_lease_expired`/`_heartbeat_stale` + read
-normalization + lock-break), `lead_loop_runtime.py` (NEW), `supervisor.py` +
-`cli.py` (resolver wiring + corrupt-config coercion), `doctor.py` (resolver wiring),
-`docs/DESIGN.md` (D-4 threat sentence, D-13 coercion class),
-`tests/test_lead_loop_wp1.py` (NEW).
-*Disposition:* SHIPPED (merged 24c39f7). WP2 (controller) GO off 24c39f7; WP3
-(cadence) + WP4 (relay) stay on HOLD until WP2 is gated + merged.
+Status: **SHIPPED as v0.42.0** (merge SHA `8b8e79e`). Strict 2/2 on the final SHA
+(codex + reviewer-1, no findings) + lead-gated (ruff/bandit/diff-check clean, **1395
+passed on Python 3.10 AND 3.14**).
 
 **Accepted limitation (WP1): the triple-fault edge.** An owner whose liveness probe
 is UNKNOWN *and* whose lease has a corrupt/None expiry *and* whose heartbeat is stale
@@ -172,139 +124,21 @@ with a corrupt lease waits for a valid renewal it cannot make. This is the delib
 fail-safe direction: NEVER a false steal of a maybe-live owner; delayed recovery only
 under a triple fault. Pinned by a regression test.
 
----
+**Accepted limitations (Slice 1).** *PID-reuse in the liveness heuristic (P2):*
+steal / guard / armed use the tri-state `_process_liveness(owner_pid)` (D-12); a
+recycled pid can make a dead owner look ALIVE, but the `lease_id` (not the pid) is the
+real ownership token and a recycled pid won't heartbeat as this agent, so the worst
+case is delayed (expiry+heartbeat) recovery, NEVER a false steal of a live owner.
+*Lease + `.waiting` mirror are not atomically coupled (P3, by design):* the lease
+write is atomic, the observational mirror is best-effort; a crash between them leaves a
+valid lease without a mirror and readers degrade.
 
-## SHIPPED (merged 61e2ce0) — lead-loop enforcement, Slice 1 (`lead-loop-slice1`)
-
-Origin: the **operator-raised "the lead stops leading"** failure (every lead, every
-project): a chat-agent lead silently UN-ARMS its control loop — the harness default
-("answer the human, then yield") drops the re-arm even though the discipline is
-documented and in memory. A documented-but-reliably-dropped rule means willpower is
-NOT the fix; we need MECHANICAL enforcement. The operator chose **split-identity
-enforcement**: keep `claude` as the free-form operator-facing liaison, and add a
-separately-supervised managed lead-loop identity that OWNS the team mailbox via a
-wrapped continuous loop and cannot silently un-arm. codex designed (assignment
-`lead-loop-controller`); dev-2 builds; codex + reviewer-1 cross-review; lead gates.
-
-**Slice 1 (this build) = store-level mechanism + visibility + guard (NO controller
-yet; that is Slice 2).** cli-AGNOSTIC by construction — keyed on the agent NAME +
-its `managed_lead_loop` config, never a cli (a codex identity is managed exactly as
-a claude one).
-
-- **Lease (P1, correctness).** `state/<agent>.lead-loop-lease.json` is the ownership
-  state (renewable; `acquire`/`renew`/`release`/`read`). `.waiting` only MIRRORS the
-  live lease for status/UX. STEAL is gated on the CONFIGURED `managed_lead_loop`
-  flag and a CONFIRMED-dead tri-state liveness (see D-12): a CONFIRMED-DEAD owner is
-  stealable IMMEDIATELY regardless of expiry (a crashed controller recovers at
-  once); an ALIVE *or* UNKNOWN owner is treated as probably-alive and stealable only
-  when the lease is EXPIRED *and* its heartbeat is stale. A long HEALTHY turn (within
-  TTL, or heartbeat fresh) is never stolen, an uncertain probe never displaces a live
-  owner, and a manual chat identity is NEVER auto-stolen.
-- **Single-consumer guard (P1).** A live managed lease REJECTS the cursor-CONSUMING
-  verbs (`wait`/`recv`/`drain`/`ack`, exit 7) for a non-owner; read-only
-  (`sync`/`threads`/`status`/`check`) stays allowed. The owner proves itself via the
-  live `lease_id` (`AGENTTALK_LEAD_LOOP_LEASE`). This closes the cursor-loss hole that
-  `--refuse-stacked-wait` alone misses (the model subprocess / a stray window would
-  otherwise race the controller's in-process consumption).
-- **`lead_unarmed` visibility (P2).** doctor + `status` + the supervisor report:
-  a MANAGED identity that is NOT armed is an ERROR (the controller is down).
-  `armed` = a present managed lease that is NOT confirmed-dead AND NOT (EXPIRED *and*
-  heartbeat-stale) — the EXACT complement of the steal predicate, i.e. unarmed only on
-  **no lease, a CONFIRMED-dead owner, or a lease that is EXPIRED *and* heartbeat-stale**.
-  An UNKNOWN-liveness owner (uncertain probe) is NOT `owner_alive` but is treated as
-  probably-alive → armed within TTL (never a false unarmed from a fail-quiet probe).
-  Neither expiry NOR a lapsed heartbeat ALONE is an error: a long healthy turn (within
-  TTL, heartbeat lapsed) and an expired-but-heartbeating lease are both still armed. A LEGACY
-  lead/liaison is a NON-GATING WARN, only with open team work AND no fresh
-  heartbeat/waiter (best-effort; depends on the heartbeat hook, so it is WARN never
-  ERROR — a busy free-form liaison must not false-fire).
-
-**Slice 1b — post-turn turn-end audit — DEFERRED (feasibility verdict).** The
-idea of a post-turn / post-final-answer harness hook that verifies the lead
-re-armed a background wait is **not buildable now**: the repo supports only soft
-PostToolUse hooks (`agenttalk heartbeat --hook`); there is no reliable
-post-final-answer hook that can inspect a backgrounded armed wait. So we **defer**
-Slice 1b and rely on the managed `lead_unarmed` detector (above) as the substitute —
-a wrapped lead-loop is mechanically armed every cycle, so the turn-end audit is moot
-for it, and the liaison no longer owns the team loop. *Disposition:* DEFERRED;
-revisit only if the host harness adds a post-turn hook.
-
-*Where:* `store.py` (lease API + `managed_lead_loop` config + visibility),
-`cli.py` (verb-guard + `managed-lead-loop` command + status), `doctor.py`
-(`_check_lead_unarmed`), `supervisor.py` (report field), `tests/test_lead_loop.py`.
-*Disposition:* built (branch `lead-loop-slice1`), in cross-review.
-
-**Accepted limitations / Slice-2 notes** (from the dev-2 adversarial-verify):
-
-- **PID-reuse in the liveness heuristic (P2, accepted).** `lead_loop_active_owner`
-  (guard), `_lease_stealable` (steal), and `lead_loop_state` (armed) use the tri-state
-  `_process_liveness(owner_pid)` (see D-12) - if the OS recycles a dead owner's pid, the
-  owner can look alive. This matches the existing posture (`foreign_wait_pid` / the
-  `.waiting` marker rely on the fail-quiet `_process_alive`). The `lease_id` (not the pid)
-  is the real ownership token for the guard's owner-bypass, and a recycled pid running a
-  different process will not heartbeat as this agent, so the stale-heartbeat path
-  self-corrects (the lease becomes stealable). `owner_start` is in the lease for a future
-  tighten. Accepted for Slice 1 (consistent with the single-writer model). NOTE: PID-reuse
-  is the *conservative* direction - a recycled pid makes a dead owner look ALIVE, so the
-  worst case is a delayed (expiry+heartbeat) recovery, never a false steal of a live owner.
-- **Lease + .waiting mirror are not atomically coupled (P3, by design).** The lease write
-  is atomic; the observational mirror is a best-effort second write. A crash between them
-  leaves a valid lease without a mirror - fine, readers degrade. Docstring corrected.
-- **Slice-2 note: heartbeat + renewal cadence.** `armed` is NOT confirmed-dead AND
-  NOT (expired AND heartbeat-stale) — so a single lapsed heartbeat on a within-TTL
-  lease no longer flips `armed`. With the defaults (heartbeat window 120s, renewal
-  cadence 300s, TTL 900s) a controller that renews on cadence is never simultaneously
-  expired, so it stays armed even across heartbeat gaps. The wrapped controller
-  (Slice 2) should still stamp the heartbeat frequently (as `_run_continuous` already
-  does each idle cycle) for fresh liveness, but a LIVE/UNKNOWN owner only ERRORs once
-  a lease has BOTH lapsed past TTL AND gone heartbeat-stale (a genuinely down
-  controller); a CONFIRMED-dead owner ERRORs immediately (see D-12).
-
-**Review folds (cross-review on `lead-loop-slice1`):**
-
-- **reviewer-1 round 1 (39589ac→8d923a8):** non-atomic acquire/steal → per-agent
-  O_EXCL lease lock around acquire/renew/release; `lease_id` leak via the `.waiting`
-  mirror → mirror no longer carries the token; `clear` left a live lease → clear
-  force-releases + the guard requires `is_managed_lead_loop`. codex round 1 converged
-  on the same atomic-acquire blocker (+ a doctor docstring nit, folded → 178c9b1).
-- **lead adversarial-verify (folded this pass):** **(P1)** roster `remove`/`rename`/
-  `retire` of a managed agent left a dangling `managed_lead_loop` key → `validate_…`
-  raised → `load_config` exit 2 for EVERY command (un-recoverable in-tool). Fix:
-  `_strip_identity`/`remove_agent` pop the managed key; `rename_agent` carries the
-  spec onto the new name (parity with role/group/liaison); `load_config` SELF-HEALS a
-  dangling key in-memory (prune + warn-once) so an already-bricked config recovers.
-  **(P2)** managed `armed` false-ERRORed on a healthy long turn (hb-only rule was
-  stricter than the guard) → armed dropped the raw-heartbeat gate (this round; later
-  refined to the confirmed-dead tri-state — see the codex bullet below + D-12 for the
-  final predicate). **(P2)** `ttl_seconds`/`cadence_seconds` accepted NaN/inf
-  (`v<=0` is False for both) → reject `not math.isfinite(v)` at the single validate
-  choke point. **(convergence)** `lead_loop_active_owner` is now config-gated on the
-  managed flag (mirrors `_lease_stealable`) so a stray lease for a manual identity
-  never guards its mailbox at the store layer, independent of the CLI guard.
-- **reviewer-1 final-fold review (84babac, release-blocker):** a **dead owner within
-  TTL** was unarmed (detector) AND unguarded (`lead_loop_active_owner` → None) yet
-  **un-stealable** until TTL expiry — a down-but-unrecoverable limbo, and a hole in
-  the "armed = exact complement of stealable" claim. First fix made `_lease_stealable`
-  steal a dead owner immediately, regardless of expiry.
-- **codex final-fold review (2142e84/7bd4a85, release-blocker) → lead D-12 ruling
-  (Option A):** the first fix based immediate steal on `not _process_alive(pid)`, but
-  `_process_alive` is **fail-quiet** — it returns False for *uncertain* probes
-  (access-denied, ambiguous OpenProcess failures, any exception), not only for a
-  confirmed-dead pid. So an uncertain probe could **immediate-steal a LIVE
-  controller** (codex reproduced it by forcing the probe False for a live pid). The
-  safety premise "a live owner can never look dead" was false for this codebase.
-  **Fix (lead Option A):** a dedicated tri-state `_process_liveness` → ALIVE / DEAD /
-  UNKNOWN, where **DEAD is only a DEFINITIVE OS not-running signal** (POSIX ESRCH;
-  Windows `GetExitCodeProcess != STILL_ACTIVE` or `OpenProcess` →
-  `ERROR_INVALID_PARAMETER`). Steal, the `armed` detector, AND the guard all use it:
-  CONFIRMED-DEAD → immediate steal/unarmed/unguarded; ALIVE *or* UNKNOWN →
-  probably-alive (armed, guarded, stealable only when EXPIRED *and* heartbeat-stale).
-  A fail-quiet/uncertain probe can never immediate-steal a live owner; a genuinely-
-  dead-but-unprobeable owner still recovers via expiry+heartbeat. This restores the
-  exact complement for EVERY case (alive, dead, *and* unknown): `not stealable ==
-  armed`. See DESIGN.md **D-12**. Regression tests pin: confirmed-dead steals
-  immediately + recovers; UNKNOWN within TTL is armed/guarded/not-stolen (codex's
-  forced-false-dead repro); UNKNOWN recovers via expiry+stale-heartbeat.
+**Slice 1b (post-turn turn-end audit) — DEFERRED.** A post-final-answer harness hook
+to verify the lead re-armed a background wait is not buildable on the current host
+(only soft PostToolUse hooks exist, e.g. `agenttalk heartbeat --hook`); the managed
+`lead_unarmed` detector is the substitute (a wrapped lead-loop is mechanically armed
+every cycle, and the liaison no longer owns the team loop). Revisit only if the host
+harness adds a reliable post-turn hook.
 
 ## SHIPPED v0.40.0 — hardening batch (`hardening-batch-040`)
 
@@ -466,6 +300,10 @@ corruption, specific mis-use, or are conservative/advisory).
 
 ## Recently shipped (rationale in CHANGELOG.md / docs/DESIGN.md)
 
+- **v0.42.0** — split-identity lead-loop enforcement: managed lease + single-consumer
+  guard, single authority + timing resolver, the supervised controller, the proactive
+  cadence tick, the mechanical liaison relay; fixes "the lead stops leading"
+  mechanically. [D-12–D-15]
 - **v0.40.1** — fast-follow hardening: knowledge expertise curated-view, anchor
   staleness fail-closed, one durable writer, bounded `onboard`; lane delivery
   artifact verified-before-clear; restart-marker lock.

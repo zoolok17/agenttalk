@@ -5,6 +5,69 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.42.0] - 2026-06-29
+
+### Added
+
+- **Split-identity lead-loop enforcement.** A lead can now run its team-coordination loop as a
+  SEPARATELY-SUPERVISED managed identity that OWNS the team mailbox via a renewable lease - closing
+  the failure where "the lead silently un-arms its own control loop" (the lead drops out of the loop
+  and nothing notices, so the team stalls with no operator-visible signal). Ships as Slice 1 + four
+  work packages (WP1-4), each cross-reviewed + gated:
+  - **Managed lease + single-consumer guard (Slice 1).** `state/<agent>.lead-loop-lease.json` is the
+    ownership truth; a controller acquires/renews it and a verb-guard blocks a second consumer of the
+    same mailbox; `lead_unarmed` is surfaced in status/doctor. Lease steal uses a CONFIRMED-dead
+    tri-state liveness probe, so a crashed controller is taken over at once while a live or merely
+    uncertain one is never displaced (D-12).
+  - **Single authority source (WP1).** One `_lead_loop_authority` computes {managed, liveness,
+    expired, heartbeat-stale, stealable, armed, guarded}; steal, the armed detector, and the guard
+    all derive from it, so they can never drift apart (for a present managed lease,
+    `armed == not stealable` in every case). A timing resolver gives the steal path and the
+    visibility paths one shared `heartbeat_stale_after`, keeping `store.py` free of supervisor imports.
+    A truthy non-dict supervisor config entry coerces to the default via `isinstance` instead of
+    crashing status/doctor/supervise/wrap (the corrupt-config coercion class, D-13).
+  - **The lead-loop CONTROLLER (WP2): `wrap --loop --lead-loop`.** A long-running supervised process
+    that owns the mailbox for its whole lifetime: acquire-before-loop, a combined renew+heartbeat on
+    every idle stamp and streaming event, an ownership gate at every cursor-advance boundary (a lost
+    lease stops consumption at once), and three exit states the supervisor reads from an exit marker -
+    blocked-acquire (HOLD, no relaunch), valid human release/end (deliberate stand-down, no relaunch),
+    and crash/lost-lease (relaunch + re-acquire). The lease token is never leaked to the model child.
+  - **The proactive CADENCE TICK (WP3).** When the bus is quiet and the cadence interval elapses, the
+    controller drives a SYNTHETIC sweep over a bounded, read-only snapshot (ids + summaries, never
+    transcripts, never the lease token): it nudges stalled outbound threads and surfaces dead-letter /
+    unrouted escalations, spending a model turn only when something is actionable. It is the timeout
+    branch of the same loop (no second consumer/thread) and NEVER advances the cursor, records an
+    attempt, or enters the dead-letter path; a failed sweep is controller-HEALTH (backoff + an
+    escalation retried until it routes), never message poison (D-14). The cadence health view
+    evaluates lease-armed state at the SAME resolved heartbeat window the supervisor/guard use (not
+    the bare default), so a wrapped controller is never falsely reported down while it still owns the
+    lease.
+  - **The mechanical liaison RELAY (WP4): `agenttalk relay`.** Carries the operator's words across the
+    human<->bus boundary with an audit stamp and NO new message kind: `relay operator-answer
+    --to-request <rid>` validates a pending needs_operator escalation addressed to the liaison and
+    routes the operator's answer back to the asking lead-loop; `relay operator-command` relays a
+    spontaneous operator instruction to a managed lead-loop, fail-closed to the operator-facing liaison
+    (audited `--override --reason` aside). Both handlers are authoritative for the reserved audit meta -
+    a caller `--meta` can never forge an audit marker or graft routing onto a relayed message (D-15).
+- **Operator-facing surface.** `agenttalk managed-lead-loop set|clear|list`, `agenttalk wrap --loop
+  --lead-loop`, `agenttalk relay operator-answer`, `agenttalk relay operator-command`. The lead-loop ->
+  operator direction stays the existing `agenttalk escalate`. Rationale + decision log: docs/DESIGN.md
+  D-12..D-15.
+
+### Changed (behavior)
+
+- Per-agent supervisor config is read fail-closed: a TRUTHY non-dict entry (an operator typo) coerces
+  to the default via `isinstance`, never crashing status/doctor/supervise/wrap startup (the
+  corrupt-config coercion class, D-13).
+- `reset` clears the lead-loop lease, exit marker, and cadence state (all under `state/`) and PRESERVES
+  the dead-letter sink.
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.42.0"
+```
+
 ## [0.41.0] - 2026-06-28
 
 ### Added
