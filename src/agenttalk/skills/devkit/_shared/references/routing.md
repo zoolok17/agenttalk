@@ -1,5 +1,5 @@
 ---
-reviewed-against: "0.43"
+reviewed-against: "0.44"
 ---
 
 # Skill routing index
@@ -18,7 +18,7 @@ unique evidence).
 | New production code | craft-code |
 | Behavior-preserving cleanup (no behavior change) | refactor-code (Tier 1); until then craft-code with explicit no-behavior-change tests |
 | Diagnose + fix a failing local/CI check | fix-ci (Tier 1); until then craft-code on the identified cause |
-| Decide which tests/lenses a change needs | qa-strategy (Tier 1); until then test-coverage scoped by risk |
+| Decide which tests/lenses a change needs | qa-strategy |
 | Low-level / unit / regression / behavior tests | test-coverage |
 | Cross-module / CLI-plus-store / filesystem / config / migration tests | test-integration (Tier 1b); until then test-coverage + tester-qa scoped by risk |
 | Integrated diff review | review-code |
@@ -37,6 +37,9 @@ unique evidence).
    explicit specialist work with distinct evidence (not a separate skill in Tier 0/1).
 4. Failure-path, contract-drift, release-readiness, and docs reviews use the existing
    specialist skills when their trigger is exact.
+5. When the main task is deciding QA/review coverage, use qa-strategy before invoking
+   test-coverage, test-integration, review-code, or specialist review lenses; qa-strategy
+   emits a plan only - it does not write/run tests and does not replace obvious required tests.
 
 ## Negative triggers (do NOT)
 
