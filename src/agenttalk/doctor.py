@@ -131,14 +131,18 @@ def _check_lead_unarmed(store) -> Check | None:
 
     MANAGED identities (managed_lead_loop = the wrapped controller) MUST be
     continuously armed: NOT armed is an ERROR - the controller is down and team
-    messages pile up unhandled. armed = a present lease whose owner is ALIVE and
-    which is NOT stealable (the exact complement of the steal predicate), i.e. the
-    failure cases are: no lease, a dead owner, or a lease that is EXPIRED *and*
-    heartbeat-stale. NOTE: neither dimension ALONE is an error - an expired-but-
+    messages pile up unhandled. armed = a present managed lease that is NOT stealable
+    (the exact complement of the steal predicate), i.e. NOT confirmed-dead AND NOT
+    (EXPIRED *and* heartbeat-stale). The failure cases are: no lease, a CONFIRMED-dead
+    owner, or a lease that is expired AND heartbeat-stale. An UNKNOWN-liveness owner
+    (uncertain probe) is NOT confirmed-dead, so it is treated as probably-alive and is
+    ARMED within TTL (WP1: only a definitive dead signal unarms on liveness). NOTE:
+    neither expiry NOR a lapsed heartbeat ALONE is an error - an expired-but-
     heartbeating lease and a within-TTL lease whose heartbeat merely lapsed (a long
-    healthy turn) are both still ARMED; only the BOTH-stale case (expired AND
-    heartbeat-stale) is a genuinely down controller (lead P2 - the prior hb-only
-    rule false-ERRORed at the 120s heartbeat window while the lease TTL is 900s).
+    healthy turn) are both still ARMED; only the BOTH-stale case is a genuinely down
+    controller. The heartbeat window is the agent's resolved threshold (the supervisor
+    stuck_after for a wrapped agent via lead_loop_runtime.resolve_timing, else the
+    120s store default), so a wrapped controller is judged against its OWN window.
     LEGACY identities (a manual role=lead / operator_facing
     liaison that is NOT managed) get a NON-GATING WARN, and only when they have OPEN
     team work AND are not currently live (no fresh heartbeat or waiter). The legacy
@@ -146,6 +150,7 @@ def _check_lead_unarmed(store) -> Check | None:
     writes no heartbeat, so this can over-warn - hence WARN, never ERROR, so it never
     false-blocks a busy liaison. Absent (None) when there is nothing to flag."""
     import time as _time
+    from . import lead_loop_runtime as _llr
     from . import threads as _th
     try:
         cfg = store.load_config()
@@ -155,6 +160,18 @@ def _check_lead_unarmed(store) -> Check | None:
     roles = cfg.get("roles", {}) or {}
     liaison = store.operator_facing()
     now = _time.time()
+    # Resolve the lead-loop heartbeat window from supervisor.json (if present) so a
+    # WRAPPED managed agent is judged against its supervisor stuck threshold, not the
+    # 120s store default - else doctor would false-ERROR a within-window wrapped
+    # controller before the supervisor (or a duplicate) would call it stuck (WP1).
+    sup_cfg: dict = {}
+    try:
+        _sp = store.dir / "supervisor.json"
+        if _sp.exists():
+            _data = json.loads(_sp.read_text(encoding="utf-8"))
+            sup_cfg = _data if isinstance(_data, dict) else {}
+    except (ValueError, OSError):
+        sup_cfg = {}
     errors: list[str] = []
     warns: list[str] = []
     data: dict = {"managed": [], "legacy": []}
@@ -173,7 +190,9 @@ def _check_lead_unarmed(store) -> Check | None:
 
     for a in roster:
         if store.is_managed_lead_loop(a):
-            st = store.lead_loop_state(a, now=now)
+            hsa = _llr.resolve_timing(
+                store, a, supervisor_config=sup_cfg or None)["heartbeat_stale_after"]
+            st = store.lead_loop_state(a, now=now, heartbeat_stale_after=hsa)
             data["managed"].append({"agent": a, "armed": st["armed"], "reason": st["reason"]})
             if not st["armed"]:
                 errors.append(f"{a}: managed lead-loop NOT armed ({st['reason']})")

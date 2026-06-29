@@ -237,7 +237,13 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   class the audit found in `gates.py`).
 - **D-4 Advisory, not authz.** *Why:* honest about what a coordination tool can
   guarantee; the real boundary is Git/OS. *Rejected:* claiming lanes/leases are
-  security.
+  security. *Lead-loop scope (Slice 1/WP1):* the single-consumer guard and the
+  plaintext `lease_id` owner-bypass are advisory coordination INSIDE the trusted
+  `.agenttalk/state` domain, NOT authorization. Any process that can read/write
+  `.agenttalk/state` can read the lease, forge a marker, or tamper with the
+  coordination files; the guard stops accidental double-consumption by cooperating
+  windows, not a hostile local process. (See D-2: message bodies, and here the lease
+  files, are untrusted data, never a security boundary.)
 - **D-5 One unified domain registry for lanes + knowledge.** *Why:* avoid two
   ownership models drifting apart. *Rejected:* per-feature ownership.
 - **D-6 Anchor-relative knowledge staleness.** *Why:* HEAD-relative would empty

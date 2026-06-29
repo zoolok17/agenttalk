@@ -34,6 +34,7 @@ from agenttalk import doctor as dr
 from agenttalk import gates as gate_mod
 from agenttalk import lanes as lane_mod
 from agenttalk import install_skills as iskl
+from agenttalk import lead_loop_runtime
 from agenttalk import signing as _signing
 from agenttalk import threads as th
 from agenttalk import supervisor as sup
@@ -404,6 +405,10 @@ def _gather_status(store: Store) -> dict:
     liaison = store.operator_facing()
     msgs = store.all_messages()
     now = datetime.now(timezone.utc)
+    # Resolve the lead-loop heartbeat window from supervisor.json (if present) so the
+    # status view uses the SAME threshold as the steal path - never the 120s default
+    # for a wrapped agent (WP1 contract; avoids armed/heartbeat_stale skew).
+    sup_cfg = _load_supervisor_config(store)
     agents = []
     for a in cfg.get("agents", []):
         hb = store.read_heartbeat(a)
@@ -451,7 +456,9 @@ def _gather_status(store: Store) -> dict:
         # configured managed OR a lease file exists). The doctor check is the
         # gating signal (managed-unarmed=ERROR); this row is the inspectable state.
         if store.is_managed_lead_loop(a) or store.read_lead_loop_lease(a) is not None:
-            row["lead_loop"] = store.lead_loop_state(a)
+            hsa = lead_loop_runtime.resolve_timing(
+                store, a, supervisor_config=sup_cfg or None)["heartbeat_stale_after"]
+            row["lead_loop"] = store.lead_loop_state(a, heartbeat_stale_after=hsa)
         agents.append(row)
     invalid = store.list_invalid_messages()
     quarantined = store.quarantined_count()
@@ -5392,7 +5399,13 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         # supervisor.resolve_dead_letter_caps the single source of truth.
         from agenttalk import supervisor as _sup
         sup_cfg = _load_supervisor_config(store)
-        cfg_agent = (sup_cfg.get("agents") or {}).get(agent) or {}
+        # Coerce to dict only when it IS a dict: a truthy non-dict per-agent entry
+        # (corrupt supervisor.json) must not crash wrapped-controller startup (the
+        # resolver is also hardened, but never feed it a non-dict). Same class as
+        # resolve_timing's extraction.
+        _agents = sup_cfg.get("agents")
+        cfg_agent = _agents.get(agent) if isinstance(_agents, dict) else None
+        cfg_agent = cfg_agent if isinstance(cfg_agent, dict) else {}
         res_poison, res_escalate = _sup.resolve_dead_letter_caps(sup_cfg, cfg_agent)
         flag_poison = getattr(args, "dead_letter_max_attempts", None)
         flag_escalate = getattr(args, "dead_letter_escalate_after", None)
@@ -5444,9 +5457,18 @@ def cmd_managed_lead_loop(args: argparse.Namespace) -> int:
         print(f"managed-lead-loop: {args.agent} cleared")
         return 0
     managed = store.managed_lead_loop_agents()
+    # Resolve each agent's heartbeat window from supervisor.json (if present) so the
+    # listed armed/state matches the steal path for wrapped agents (WP1 contract).
+    sup_cfg = _load_supervisor_config(store)
+
+    def _ll_state(a: str) -> dict:
+        hsa = lead_loop_runtime.resolve_timing(
+            store, a, supervisor_config=sup_cfg or None)["heartbeat_stale_after"]
+        return store.lead_loop_state(a, heartbeat_stale_after=hsa)
+
     if getattr(args, "json", False):
         out = {a: {**(store.managed_lead_loop_spec(a) or {}),
-                   "state": store.lead_loop_state(a)} for a in managed}
+                   "state": _ll_state(a)} for a in managed}
         print(json.dumps(out, indent=2))
         return 0
     if not managed:
@@ -5454,7 +5476,7 @@ def cmd_managed_lead_loop(args: argparse.Namespace) -> int:
         return 0
     for a in sorted(managed):
         spec = store.managed_lead_loop_spec(a) or {}
-        st = store.lead_loop_state(a)
+        st = _ll_state(a)
         flag = "ARMED" if st["armed"] else f"NOT-ARMED ({st['reason']})"
         print(f"  {a}: {flag}  ttl={spec.get('ttl_seconds')}s "
               f"cadence={spec.get('cadence_seconds')}s")

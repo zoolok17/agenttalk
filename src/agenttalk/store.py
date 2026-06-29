@@ -779,16 +779,20 @@ class Store:
         return pid if isinstance(pid, int) else None
 
     def _break_stale_lock(self, lock: Path) -> bool:
-        """Break a lock held by a provably-dead pid; return True if broken.
+        """Break a lock held by a CONFIRMED-dead pid; return True if broken.
 
         The claim is ATOMIC (``os.replace`` the lock onto a per-pid sidecar):
         only one racing stealer wins the rename, the loser's replace raises
         and it re-loops, so two processes can never both break the same lock
         and then both enter the critical section. A lock that is unreadable,
-        garbage, our own pid, or held by a LIVE pid is never broken — we wait
-        out the timeout instead (no mtime-only breaking)."""
+        garbage, our own pid, or held by an ALIVE *or* UNKNOWN pid is never
+        broken — we wait out the timeout instead (no mtime-only breaking). Uses
+        the tri-state :func:`_process_liveness`, NOT the fail-quiet
+        :func:`_process_alive`: an uncertain probe (access-denied / exception)
+        must NOT break a lock whose holder might still be alive (WP1, the lock
+        analogue of the no-false-steal rule)."""
         pid = self._read_lock_pid(lock)
-        if pid is None or pid == os.getpid() or _process_alive(pid):
+        if pid is None or pid == os.getpid() or _process_liveness(pid) != PROC_DEAD:
             return False
         claimed = lock.with_name(f"{lock.name}.stale.{os.getpid()}")
         try:
@@ -2582,7 +2586,13 @@ class Store:
 
     def read_lead_loop_lease(self, agent: str) -> dict | None:
         """Return the parsed lease dict, or None if absent/corrupt. Never raises
-        (a torn write reads as None -> treated as 'no lease', fail-safe)."""
+        (a torn write reads as None -> treated as 'no lease', fail-safe).
+
+        NORMALIZES ``expires_at`` at the read boundary (WP1): it is coerced to a
+        finite float, or None when missing / non-numeric / NaN / +-inf. Every
+        consumer then sees one shape, and ``_lease_expired`` treats None as
+        fail-safe NOT-expired (a garbage expiry never displaces or false-ERRORs a
+        maybe-live owner). This is the SINGLE place expiry is sanitized."""
         p = self.lead_loop_lease_path(agent)
         if not p.exists():
             return None
@@ -2596,7 +2606,16 @@ class Store:
             data = json.loads(raw)
         except (json.JSONDecodeError, ValueError):
             return None
-        return data if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return None
+        exp = data.get("expires_at")
+        data["expires_at"] = (
+            float(exp)
+            if isinstance(exp, (int, float)) and not isinstance(exp, bool)
+            and math.isfinite(exp)
+            else None
+        )
+        return data
 
     def _write_lead_loop_lease(self, agent: str, lease: dict) -> None:
         """Atomically write the lease (the correctness state), then BEST-EFFORT
@@ -2620,45 +2639,89 @@ class Store:
             "managed": True,
         })
 
+    @staticmethod
+    def _lease_expired(lease: dict, now: float) -> bool:
+        """True only when the lease has a FINITE expiry that ``now`` is past.
+        ``read_lead_loop_lease`` normalizes ``expires_at`` to a finite float or None,
+        so a missing/garbage expiry is None here -> fail-safe NOT-expired (a garbage
+        expiry never displaces or false-ERRORs a maybe-live owner). WP1 single
+        expiry predicate shared by the authority."""
+        exp = lease.get("expires_at")
+        return isinstance(exp, (int, float)) and not isinstance(exp, bool) and now > exp
+
+    def _heartbeat_stale(self, agent: str, now: float, stale_after: float) -> bool:
+        """True when ``agent`` has no heartbeat, or its heartbeat is older than
+        ``stale_after`` seconds. WP1 single heartbeat-staleness predicate."""
+        hb = self.read_heartbeat(agent)
+        return hb is None or (now - hb.timestamp()) > stale_after
+
+    def _lead_loop_authority(self, agent: str, lease: dict | None, *, now: float,
+                             heartbeat_stale_after: float) -> dict:
+        """THE single source of truth for every lead-loop AUTHORITY decision (WP1).
+        ``_lease_stealable``, ``lead_loop_state``, AND ``lead_loop_active_owner`` all
+        derive from this one dict - no caller computes its own liveness/expiry branch,
+        so steal, armed, and guard can NEVER disagree (the drift bug class that bit
+        this surface twice). Returns {managed, present, owner_liveness, owner_alive,
+        expired, heartbeat_stale, stealable, armed, guarded, reason}.
+
+        For a present MANAGED lease, by construction:
+          - guarded   = owner liveness is NOT confirmed-dead (ALIVE and UNKNOWN both
+                        guard - an uncertain probe is probably-alive, so an external
+                        consumer never races a possibly-live controller);
+          - stealable = CONFIRMED-dead (immediate recovery, no TTL wait) OR
+                        (expired AND heartbeat-stale) for an ALIVE/UNKNOWN owner;
+          - armed     = NOT stealable (the EXACT complement, for every case).
+        An UNMANAGED stray lease is INERT (config-gated): managed/guarded/armed all
+        False, stealable False - never auto-stolen, never reported armed."""
+        managed = self.is_managed_lead_loop(agent)
+        present = lease is not None
+        out = {
+            "managed": managed, "present": present,
+            "owner_liveness": None, "owner_alive": False,
+            "expired": None, "heartbeat_stale": None,
+            "stealable": False, "armed": False, "guarded": False, "reason": "",
+        }
+        if not present:
+            out["reason"] = "no lease"
+            return out
+        if not managed:
+            out["reason"] = "not managed"  # stray lease for a manual identity -> inert
+            return out
+        liveness = _process_liveness(lease.get("owner_pid"))
+        expired = self._lease_expired(lease, now)
+        hb_stale = self._heartbeat_stale(agent, now, heartbeat_stale_after)
+        out["owner_liveness"] = liveness
+        out["owner_alive"] = liveness == PROC_ALIVE
+        out["expired"] = expired
+        out["heartbeat_stale"] = hb_stale
+        out["guarded"] = liveness != PROC_DEAD
+        out["stealable"] = (liveness == PROC_DEAD) or (expired and hb_stale)
+        out["armed"] = not out["stealable"]
+        if liveness == PROC_DEAD:
+            out["reason"] = "owner confirmed dead"
+        elif out["stealable"]:
+            out["reason"] = "lease expired and heartbeat stale"
+        elif liveness == PROC_UNKNOWN:
+            out["reason"] = "armed (owner liveness unknown, treated as alive)"
+        elif expired:
+            out["reason"] = "armed (lease expired, heartbeat fresh, pending renewal)"
+        elif hb_stale:
+            out["reason"] = "armed (heartbeat stale, lease within TTL)"
+        else:
+            out["reason"] = "armed"
+        return out
+
     def _lease_stealable(self, existing: dict, agent: str, *, now: float,
                          heartbeat_stale_after: float | None) -> bool:
-        """A managed lease is STEALABLE when the owner is gone, so a replacement
-        controller can recover WITHOUT waiting out the TTL:
-
-          - a CONFIRMED-DEAD owner (a DEFINITIVE OS not-running signal, via the
-            tri-state :func:`_process_liveness`) is stealable IMMEDIATELY, regardless
-            of expiry. The process is gone and nothing will ever renew the lease, so
-            gating recovery on TTL would strand the team mailbox for up to a full TTL
-            (reviewer-1 release-blocker: a dead owner within TTL was unarmed AND
-            unguarded yet un-stealable - a down-but-unrecoverable limbo).
-          - an ALIVE *or* UNKNOWN owner is stealable only once the lease is EXPIRED
-            *and* its heartbeat is stale (a stuck controller). A long HEALTHY turn
-            (within TTL, or heartbeat fresh) is NEVER stolen; it renews instead. An
-            UNKNOWN probe (access-denied / exception / ambiguous) is treated as
-            probably-ALIVE and takes this conservative path - so a fail-quiet probe
-            can NEVER immediate-steal a live controller (codex blocker; lead D-12
-            Option A). Only a DEFINITIVE death authorizes the immediate steal.
-
-        This is the EXACT complement of ``lead_loop_state``'s ``armed`` (= NOT
-        confirmed-dead AND NOT (expired AND heartbeat-stale)): for a present managed
-        lease, not-stealable == armed, for EVERY case (alive, dead, OR unknown).
-        Steal is gated on the CONFIGURED managed_lead_loop flag (not just the lease's
-        own field) so a MANUAL chat identity is NEVER auto-stolen even if a stray
-        lease file exists for it."""
-        if not (existing.get("managed") and self.is_managed_lead_loop(agent)):
-            return False
-        if _process_liveness(existing.get("owner_pid")) == PROC_DEAD:
-            return True  # confirmed dead -> recover now, no TTL wait
-        # ALIVE or UNKNOWN (probably-alive): only a stuck owner past TTL with a stale
-        # heartbeat is stealable; a within-TTL / heartbeating owner is never stolen.
-        expires_at = existing.get("expires_at")
-        if not isinstance(expires_at, (int, float)) or now <= expires_at:
-            return False
+        """Whether a managed lease may be STOLEN now. Thin wrapper over the single
+        :meth:`_lead_loop_authority` (WP1) so steal can never drift from armed/guard:
+        a CONFIRMED-dead owner is stealable immediately (no TTL wait); an ALIVE or
+        UNKNOWN owner only once the lease is EXPIRED *and* heartbeat-stale; an
+        unmanaged stray lease is never auto-stolen."""
         stale_after = (heartbeat_stale_after if heartbeat_stale_after is not None
                        else ACTIVE_WITHIN_SECONDS)
-        hb = self.read_heartbeat(agent)
-        hb_stale = hb is None or (now - hb.timestamp()) > stale_after
-        return hb_stale  # expired AND heartbeat-stale = stuck -> stealable
+        return self._lead_loop_authority(
+            agent, existing, now=now, heartbeat_stale_after=stale_after)["stealable"]
 
     def acquire_lead_loop_lease(self, agent: str, *, owner_pid: int,
                                 ttl_seconds: float | None = None,
@@ -2736,89 +2799,59 @@ class Store:
                 self.clear_waiting(agent)
             return True
 
-    def lead_loop_active_owner(self, agent: str) -> dict | None:
-        """Return the lease unless the owner is CONFIRMED dead - the single-consumer
-        guard's 'is the mailbox owned' test. The mailbox is protected while the owner
-        is ALIVE *or* UNKNOWN (an uncertain probe is treated as probably-alive, so an
-        external consumer never races a possibly-live controller); only a DEFINITIVE
-        not-running signal (tri-state :func:`_process_liveness` == dead) yields None
-        (orphaned lease -> recoverable, not guarded). Independent of expiry: a long
-        healthy turn (lease momentarily expired) still owns the mailbox. CONFIG-GATED
-        on the managed flag (mirrors _lease_stealable): a stray lease file for a
-        MANUAL identity never guards its mailbox, so the store primitive is safe on
-        its own and does not rely on the CLI guard's config short-circuit. Uses the
-        same tri-state as steal/armed so the three never disagree (lead D-12)."""
-        if not self.is_managed_lead_loop(agent):
-            return None
+    def lead_loop_active_owner(self, agent: str, *, now: float | None = None,
+                               heartbeat_stale_after: float | None = None) -> dict | None:
+        """Return the lease iff it GUARDS the mailbox (the single-consumer guard's
+        'is the mailbox owned' test), else None. Derives ``guarded`` from the single
+        :meth:`_lead_loop_authority` (WP1): a present managed lease guards unless the
+        owner is CONFIRMED dead - ALIVE *and* UNKNOWN both guard (an uncertain probe
+        is probably-alive, so an external consumer never races a possibly-live
+        controller); a confirmed-dead owner yields None (orphaned -> recoverable). A
+        stray lease for an UNMANAGED identity never guards (config-gated). Independent
+        of expiry. Uses the same authority as steal/armed so the three never disagree."""
+        now = now if now is not None else time.time()
+        stale_after = (heartbeat_stale_after if heartbeat_stale_after is not None
+                       else ACTIVE_WITHIN_SECONDS)
         lease = self.read_lead_loop_lease(agent)
         if not lease:
             return None
-        if _process_liveness(lease.get("owner_pid")) == PROC_DEAD:
-            return None  # confirmed-dead owner -> orphaned -> not guarded
-        return lease
+        auth = self._lead_loop_authority(
+            agent, lease, now=now, heartbeat_stale_after=stale_after)
+        return lease if auth["guarded"] else None
 
     def lead_loop_state(self, agent: str, *, now: float | None = None,
                         heartbeat_stale_after: float | None = None) -> dict:
         """Visibility snapshot for ``agent`` (status/doctor/supervisor). Returns
         {managed, present, owner_pid, owner_alive, owner_liveness, expired,
-        heartbeat_stale, armed, reason}. ``armed`` (managed health) = a present lease
-        that is NOT stealable, i.e. NOT confirmed-dead AND NOT (expired AND
-        heartbeat-stale). It uses the tri-state :func:`_process_liveness`, mirroring
-        the steal predicate (_lease_stealable) and the guard (lead_loop_active_owner)
-        EXACTLY, so the detector flags precisely the states where another controller
-        could legitimately take over: no lease, a CONFIRMED-dead owner, or a lease
-        that is expired AND heartbeat-stale. A healthy long turn (within TTL) is
-        armed; an expired-but-heartbeating owner is armed (it renews on its next
-        cadence); a fresh-lease owner whose heartbeat merely lapsed (within TTL) is
-        armed; an UNKNOWN-liveness owner (uncertain probe) is treated as probably-
-        alive -> armed within TTL (never a false unarmed from a fail-quiet probe -
-        codex blocker / lead D-12 Option A). Only a confirmed-dead owner or the
-        BOTH-stale case is unarmed. ``owner_alive`` is True only for a CONFIRMED-live
+        heartbeat_stale, armed, reason}, ALL derived from the single
+        :meth:`_lead_loop_authority` (WP1) so the detector can never disagree with
+        steal/guard. ``armed`` (managed health) = a present managed lease that is NOT
+        stealable, i.e. NOT confirmed-dead AND NOT (expired AND heartbeat-stale). A
+        healthy long turn (within TTL) is armed; an expired-but-heartbeating owner is
+        armed (it renews on its next cadence); a within-TTL owner whose heartbeat
+        merely lapsed is armed; an UNKNOWN-liveness owner (uncertain probe) is treated
+        as probably-alive -> armed within TTL (never a false unarmed from a fail-quiet
+        probe - codex blocker / lead D-12 Option A). Only a confirmed-dead owner or the
+        both-stale case is unarmed; an UNMANAGED stray lease is present-but-not-armed
+        (reason 'not managed'). ``owner_alive`` is True only for a CONFIRMED-live
         probe; ``owner_liveness`` carries the raw tri-state (alive/dead/unknown)."""
         now = now if now is not None else time.time()
         stale_after = (heartbeat_stale_after if heartbeat_stale_after is not None
                        else ACTIVE_WITHIN_SECONDS)
         lease = self.read_lead_loop_lease(agent)
-        hb = self.read_heartbeat(agent)
-        hb_stale = hb is None or (now - hb.timestamp()) > stale_after
-        st = {
-            "managed": self.is_managed_lead_loop(agent),
-            "present": bool(lease),
+        auth = self._lead_loop_authority(
+            agent, lease, now=now, heartbeat_stale_after=stale_after)
+        return {
+            "managed": auth["managed"],
+            "present": auth["present"],
             "owner_pid": lease.get("owner_pid") if lease else None,
-            "owner_alive": False, "owner_liveness": None, "expired": None,
-            "heartbeat_stale": hb_stale, "armed": False, "reason": "",
+            "owner_alive": auth["owner_alive"],
+            "owner_liveness": auth["owner_liveness"],
+            "expired": auth["expired"],
+            "heartbeat_stale": auth["heartbeat_stale"],
+            "armed": auth["armed"],
+            "reason": auth["reason"],
         }
-        if not lease:
-            st["reason"] = "no lease"
-            return st
-        liveness = _process_liveness(lease.get("owner_pid"))
-        st["owner_alive"] = liveness == PROC_ALIVE
-        st["owner_liveness"] = liveness
-        exp = lease.get("expires_at")
-        st["expired"] = (not isinstance(exp, (int, float))) or now > exp
-        # armed = NOT confirmed-dead AND NOT (expired AND heartbeat-stale). This is the
-        # EXACT complement of _lease_stealable for EVERY case (alive, dead, OR unknown):
-        # a CONFIRMED-dead owner is unarmed here AND stealable there; an UNKNOWN probe is
-        # probably-alive -> armed here AND not-immediately-stolen there. So the detector,
-        # the steal predicate, and the guard can never disagree (lead D-12 Option A). A
-        # heartbeat that merely lapsed on a within-TTL lease (a long healthy turn) is
-        # STILL armed - only an expired AND heartbeat-stale lease is a genuinely down
-        # controller (lead P2 - the prior hb-only rule false-ERRORed at 120s, TTL 900s).
-        if liveness == PROC_DEAD:
-            st["reason"] = "owner confirmed dead"
-        elif st["expired"] and hb_stale:
-            st["reason"] = "lease expired and heartbeat stale"
-        else:
-            st["armed"] = True
-            if liveness == PROC_UNKNOWN:
-                st["reason"] = "armed (owner liveness unknown, treated as alive)"
-            elif st["expired"]:
-                st["reason"] = "armed (lease expired, heartbeat fresh, pending renewal)"
-            elif hb_stale:
-                st["reason"] = "armed (heartbeat stale, lease within TTL)"
-            else:
-                st["reason"] = "armed"
-        return st
 
     def clear_dead_waiter(self, agent: str, self_pid: int) -> bool:
         """Remove ``agent``'s waiting marker iff it is owned by a CONFIRMED-DEAD

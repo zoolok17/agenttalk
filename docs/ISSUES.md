@@ -12,7 +12,54 @@ major · `P2` minor · `P3` nit. Each item: what, why, where, disposition.
 
 ---
 
-## IN PROGRESS — lead-loop enforcement, Slice 1 (`lead-loop-slice1`)
+## IN PROGRESS — lead-loop Slice 2 / WP1 (opening hardening foundation, `lead-loop-wp1`)
+
+Slice 2 of the lead-loop adds the actual controller + mechanical relay; codex's
+design splits it into 4 WPs, **WP1-first** (cross-reviewed + lead-gated before any
+controller work layers on). WP1 is the pure-core HARDENING FOUNDATION the rest
+builds on - it consolidates the Slice 1 liveness/expiry/steal/armed/guard logic into
+ONE source of truth so the three views can never drift apart again (the bug class
+that bit Slice 1 twice).
+
+- **Single `_lead_loop_authority` (P1).** ONE method computes
+  {managed, present, owner_liveness, owner_alive, expired, heartbeat_stale,
+  stealable, armed, guarded, reason}. `_lease_stealable`, `lead_loop_state`, AND
+  `lead_loop_active_owner` ALL derive from it - no per-caller liveness branch. By
+  construction, for a present managed lease `armed == not stealable` and
+  `guarded == (liveness != CONFIRMED-DEAD)`, for EVERY case (alive/dead/unknown).
+- **Read-boundary expiry normalization.** `read_lead_loop_lease` coerces
+  `expires_at` to a finite float or None (NaN / +-inf / non-numeric / missing ->
+  None); `_lease_expired` treats None as fail-safe NOT-expired. One sanitized shape
+  for every consumer.
+- **Confirmed-dead-only lock-break.** `_break_stale_lock` breaks ONLY a
+  CONFIRMED-dead holder (tri-state `_process_liveness`); an ALIVE or UNKNOWN holder
+  waits out the timeout (no fail-quiet breaking - the lock analogue of the
+  no-false-steal rule).
+- **Config-gated armed.** An UNMANAGED stray lease is inert: managed/guarded/armed
+  all False, never auto-stolen (reason `not managed`).
+- **Timing resolver (non-store module).** `agenttalk.lead_loop_runtime.resolve_timing`
+  resolves {ttl_seconds, cadence_seconds, heartbeat_stale_after} so the controller's
+  acquire/steal AND doctor/state use the SAME window; with a supervisor config it
+  uses the supervisor's per-agent/per-CLI `resolve_stuck_after` (a duplicate never
+  steals earlier than the supervisor would call the owner stuck). Keeps `store.py`
+  free of supervisor imports.
+
+*Where:* `store.py` (authority + `_lease_expired`/`_heartbeat_stale` + read
+normalization + lock-break), `lead_loop_runtime.py` (NEW), `docs/DESIGN.md` (D-4
+threat-model sentence), `tests/test_lead_loop_wp1.py` (NEW).
+*Disposition:* built (branch `lead-loop-wp1`), in cross-review. WP2-4 (controller,
+cadence, relay) stay on HOLD until WP1 is gated + merged.
+
+**Accepted limitation (WP1): the triple-fault edge.** An owner whose liveness probe
+is UNKNOWN *and* whose lease has a corrupt/None expiry *and* whose heartbeat is stale
+is NOT stealable (normalized None = not-expired), so a dead-but-unprobeable owner
+with a corrupt lease waits for a valid renewal it cannot make. This is the deliberate
+fail-safe direction: NEVER a false steal of a maybe-live owner; delayed recovery only
+under a triple fault. Pinned by a regression test.
+
+---
+
+## SHIPPED (merged 61e2ce0) — lead-loop enforcement, Slice 1 (`lead-loop-slice1`)
 
 Origin: the **operator-raised "the lead stops leading"** failure (every lead, every
 project): a chat-agent lead silently UN-ARMS its control loop — the harness default

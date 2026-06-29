@@ -107,12 +107,17 @@ def resolve_stuck_after(config: dict, cfg_agent: dict) -> float:
     (:data:`_WRAPPED_STUCK_AFTER_DEFAULTS`); else the global ``stuck_after_seconds``
     (config, then the built-in default). Non-wrapped agents keep the existing
     global behavior."""
-    gt = (config or {}).get("stuck_after_seconds")
-    global_threshold = float(gt) if isinstance(gt, (int, float)) else float(
-        _DEFAULTS["stuck_after_seconds"])
-    cfg_agent = cfg_agent or {}
+    config = config if isinstance(config, dict) else {}
+    gt = config.get("stuck_after_seconds")
+    global_threshold = float(gt) if isinstance(gt, (int, float)) and not isinstance(
+        gt, bool) else float(_DEFAULTS["stuck_after_seconds"])
+    # Coerce to dict only when it IS a dict: a `... or {}` rescues only FALSY values,
+    # so a TRUTHY non-dict cfg_agent (a corrupt/hand-edited supervisor.json per-agent
+    # entry) would slip through and crash cfg_agent.get(...). Fixes the status/doctor
+    # regression (via resolve_timing) AND a pre-existing supervise --report crash.
+    cfg_agent = cfg_agent if isinstance(cfg_agent, dict) else {}
     v = cfg_agent.get("stuck_after_seconds")
-    if isinstance(v, (int, float)):
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
         return float(v)
     if bool(cfg_agent.get("wrapped", False)):
         cli = cfg_agent.get("cli", "claude")
@@ -126,8 +131,16 @@ def resolve_dead_letter_caps(config: dict, cfg_agent: dict) -> tuple[int, int]:
     block; else :data:`_DEFAULTS`. ``0`` disables that cap (debug only - the shipped
     default is ON). Mirrors resolve_stuck_after's per-agent->global->default chain."""
     defaults = _DEFAULTS["dead_letter"]
-    gcfg = (config or {}).get("dead_letter") or {}
-    acfg = (cfg_agent or {}).get("dead_letter") or {}
+    # Coerce to dict only when it IS a dict (a `... or {}` rescues only FALSY values):
+    # a corrupt supervisor.json with a truthy non-dict config / per-agent entry / nested
+    # dead_letter block must NOT crash cap resolution (which would take down `wrap --loop`
+    # startup and the planner). Same corrupt-config class as resolve_stuck_after.
+    config = config if isinstance(config, dict) else {}
+    cfg_agent = cfg_agent if isinstance(cfg_agent, dict) else {}
+    gcfg = config.get("dead_letter")
+    gcfg = gcfg if isinstance(gcfg, dict) else {}
+    acfg = cfg_agent.get("dead_letter")
+    acfg = acfg if isinstance(acfg, dict) else {}
 
     def _pick(key: str) -> int:
         for src in (acfg, gcfg):
@@ -192,9 +205,13 @@ def session_args(cli: str, mode: str, session_id: str | None,
     each token is one argument, so the generated command line is unit-testable
     and quote-safe."""
     cli = cli if cli in _SESSION_DEFAULTS else "claude"
+    # Coerce to dict only when it IS a dict (same corrupt-config class as the other
+    # per-agent resolvers): a truthy non-dict per-agent supervisor.json entry must not
+    # crash launch session-arg resolution on cfg_agent.get(...).
+    cfg_agent = cfg_agent if isinstance(cfg_agent, dict) else {}
     key = "fresh" if mode == "fresh" else "resume"
     tokens = _SESSION_DEFAULTS[cli][key]
-    over = (cfg_agent or {}).get("session")
+    over = cfg_agent.get("session")
     if isinstance(over, dict) and isinstance(over.get(key), list):
         tokens = over[key]
 
@@ -214,7 +231,7 @@ def session_args(cli: str, mode: str, session_id: str | None,
     # un-prompted. A wrapped codex never reaches here (launch_mode=wrap returns
     # session_args=[]); a codex without the activity hook has no prompt to bypass;
     # an operator who already added the flag is not double-flagged.
-    if (cli == "codex" and (cfg_agent or {}).get("activity_hook")
+    if (cli == "codex" and cfg_agent.get("activity_hook")
             and "--dangerously-bypass-hook-trust" not in result):
         result = ["--dangerously-bypass-hook-trust", *result]
     return result
@@ -665,7 +682,12 @@ def build_report(store: Store, *, now_epoch: float,
         # does not yet act on this (the controller is Slice 2) - this surfaces the
         # armed/lease state so the report shows a down managed controller.
         if store.is_managed_lead_loop(a) or store.read_lead_loop_lease(a) is not None:
-            agents[a]["lead_loop"] = store.lead_loop_state(a, now=now_epoch)
+            # Use the SAME per-agent threshold the report uses for the top-level
+            # heartbeat_stale (threshold_a), so the nested lead_loop view never skews
+            # from it - a wrapped agent's armed/stealable must agree with the
+            # supervisor's stuck threshold, not the 120s store default (WP1 contract).
+            agents[a]["lead_loop"] = store.lead_loop_state(
+                a, now=now_epoch, heartbeat_stale_after=threshold_a)
     launch_requests = store.list_launch_requests()
     eph_report: dict[str, dict] = {"active": {}, "orphan_agents": []}
     eph_state = (state or {}).get("ephemeral_reviewers") if isinstance(state, dict) else None
