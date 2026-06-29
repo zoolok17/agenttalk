@@ -87,19 +87,32 @@ def build_command_inventory() -> _Node:
 _CMD_RE = re.compile(r"(?:^|\s)(?:python\s+-m\s+)?agenttalk(?=\s)(.*)$")
 
 
-def _command_spans(text: str) -> list[tuple[int, str]]:
-    """Yield ``(line_no, command_tail)`` for every ``agenttalk`` / ``python -m agenttalk``
-    invocation inside a FENCED code block or an inline-backtick span. Free prose is NOT
-    scanned (conservative: avoids false positives on descriptive sentences).
+def _is_fence(line: str) -> bool:
+    s = line.strip()
+    return s.startswith("```") or s.startswith("~~~")
 
-    Inside a fence, SHELL LINE CONTINUATIONS are accumulated into one logical command before
-    matching, so a stale flag/subcommand on a continuation line is still validated (the P1
-    false-negative the reviewers caught - continuations are the dominant multi-line style):
-    a line whose trailing non-space char is ``\\`` (bash) or `` ` `` (PowerShell) joins the
-    next physical line; the reported line number is the FIRST physical line of the group.
-    Both ``` and ~~~ toggle fences. (Known limitation: 4-space-indented code blocks are not
-    scanned; no bundled skill uses them.) Honors ``ignore-next`` / ``ignore-line`` comments."""
-    out: list[tuple[int, str]] = []
+
+def _command_spans(text: str) -> tuple[list[tuple[int, str]], list[int]]:
+    """Return ``(spans, dangling_lines)``.
+
+    ``spans`` is ``(line_no, command_tail)`` for every ``agenttalk`` / ``python -m agenttalk``
+    invocation inside a FENCED code block or an inline-backtick span. Free prose is NOT
+    scanned (conservative). Inside a fence, SHELL LINE CONTINUATIONS are accumulated into one
+    logical command before matching, so a stale flag/subcommand on a continuation line is
+    still validated (the dominant multi-line style): a line whose trailing non-space char is
+    ``\\`` (bash) or `` ` `` (PowerShell) joins the next physical line; the reported line is
+    the FIRST physical line of the group. Both ``` and ~~~ toggle fences. (Limitation:
+    4-space-indented code blocks are not scanned; no bundled skill uses them.)
+
+    ``dangling_lines`` is the start line of any command whose continuation runs into a FENCE
+    DELIMITER or EOF instead of a real next line - a malformed multi-line command. The
+    accumulator MUST NOT consume the delimiter (else it eats the closing fence as command
+    text, the closing backticks read as another continuation, the fence never toggles, and a
+    LATER fenced command is hidden - the cascade both delta reviewers caught). It stops, flags
+    the dangling line, and leaves the delimiter for the outer loop to toggle the fence.
+    Honors ``ignore-next`` / ``ignore-line`` comments."""
+    spans: list[tuple[int, str]] = []
+    dangling: list[int] = []
     in_fence = False
     ignore_next = False
     lines = text.splitlines()
@@ -107,7 +120,6 @@ def _command_spans(text: str) -> list[tuple[int, str]]:
     i = 0
     while i < n:
         raw = lines[i]
-        stripped = raw.strip()
         if _IGNORE_LINE in raw:
             i += 1
             continue
@@ -115,7 +127,7 @@ def _command_spans(text: str) -> list[tuple[int, str]]:
             ignore_next = True
             i += 1
             continue
-        if stripped.startswith("```") or stripped.startswith("~~~"):
+        if _is_fence(raw):
             in_fence = not in_fence
             i += 1
             continue
@@ -126,29 +138,30 @@ def _command_spans(text: str) -> list[tuple[int, str]]:
         start_line = i + 1
         candidates: list[str] = []
         if in_fence:
-            # accumulate shell continuations (trailing \ or `) into one logical line
             joined = raw
             while True:
                 rs = joined.rstrip()
-                if rs.endswith("\\") or rs.endswith("`"):
-                    joined = rs[:-1]
-                    if i + 1 < n:
-                        i += 1
-                        joined = joined + " " + lines[i]
-                    else:
-                        break
-                else:
+                if not (rs.endswith("\\") or rs.endswith("`")):
                     break
+                # peek the next physical line BEFORE consuming it
+                if i + 1 >= n or _is_fence(lines[i + 1]):
+                    # dangling continuation into a fence close / EOF: do NOT consume the
+                    # delimiter; flag it and let the outer loop toggle the fence.
+                    dangling.append(start_line)
+                    joined = rs[:-1]
+                    break
+                joined = rs[:-1]
+                i += 1
+                joined = joined + " " + lines[i]
             candidates.append(joined)
         else:
-            # prose line: only the inline-backtick spans are candidate commands
             candidates.extend(re.findall(r"`([^`]*)`", raw))
         for cand in candidates:
             m = _CMD_RE.search(cand)
             if m:
-                out.append((start_line, m.group(1).strip()))
+                spans.append((start_line, m.group(1).strip()))
         i += 1
-    return out
+    return spans, dangling
 
 
 def _is_placeholder(tok: str) -> bool:
@@ -305,7 +318,12 @@ def check_skill_file(path: Path, *, kind: str, inventory: _Node,
                                         f"{current[0]}.{current[1]} (re-review against current CLI)"))
 
     # --- CLI-token lint ---
-    for line_no, tail in _command_spans(text):
+    spans, dangling = _command_spans(text)
+    for ln in dangling:
+        findings.append(Finding(rel, ln, "agenttalk",
+                                "dangling line-continuation (trailing \\ or `) at a fence "
+                                "boundary or EOF - malformed multi-line command"))
+    for line_no, tail in spans:
         for reason in _validate_command(tail, inventory):
             findings.append(Finding(rel, line_no, "agenttalk", reason))
     return findings

@@ -74,7 +74,7 @@ def test_command_spans_only_scan_code_not_prose_or_slash_commands() -> None:
         "Run `agenttalk roster` to inspect.\n"
         "```\nagenttalk send --to x -m y\n```\n"
     )
-    spans = sc._command_spans(text)
+    spans, _ = sc._command_spans(text)
     tails = [t for _, t in spans]
     assert "roster" in tails                       # inline-backtick CLI command picked up
     assert any(t.startswith("send") for t in tails)  # fenced command picked up
@@ -85,7 +85,7 @@ def test_command_spans_only_scan_code_not_prose_or_slash_commands() -> None:
 
 def test_ignore_comment_suppresses_next_line() -> None:
     text = "<!-- agenttalk-skill-lint: ignore-next -->\n`agenttalk frobnicate --bogus`\n"
-    assert sc._command_spans(text) == []
+    assert sc._command_spans(text) == ([], [])
 
 
 # ----------------------------------------------------------- reviewed-against ratchet
@@ -162,16 +162,52 @@ def test_continuation_line_stale_token_is_caught() -> None:
         "```\nagenttalk relay `\n  bogus-subcommand\n```\n",           # PowerShell, stale sub
     ]
     for text in cases:
-        spans = sc._command_spans(text)
+        spans, _ = sc._command_spans(text)
         assert spans and any(sc._validate_command(t, inv) for _, t in spans), text
     # the reported line is the FIRST physical line of the joined command
-    assert sc._command_spans(cases[0])[0][0] == 2
+    spans0, _ = sc._command_spans(cases[0])
+    assert spans0[0][0] == 2
 
 
 def test_valid_multiline_continuation_is_clean() -> None:
     inv = sc.build_command_inventory()
     good = "```\nagenttalk send \\\n  --to x \\\n  -m y\n```\n"
-    assert all(not sc._validate_command(t, inv) for _, t in sc._command_spans(good))
+    spans, dangling = sc._command_spans(good)
+    assert not dangling                          # last line has no trailing continuation char
+    assert all(not sc._validate_command(t, inv) for _, t in spans)
+
+
+# -------------------------------------- fence-boundary fold (delta re-review, both reviewers)
+
+def test_dangling_continuation_at_fence_boundary_does_not_hide_later_command() -> None:
+    # A dangling continuation right before a closing fence must NOT consume the delimiter and
+    # cascade past it - a LATER fenced command must still be scanned (the bug the continuation
+    # fix introduced). Verified for both ``` and ~~~ closers.
+    inv = sc.build_command_inventory()
+    for fence in ("```", "~~~"):
+        text = (f"{fence}\nagenttalk send \\\n{fence}\n\n"
+                f"{fence}\nagenttalk frobnicate\n{fence}\n")
+        spans, dangling = sc._command_spans(text)
+        assert dangling, f"dangling not reported ({fence})"
+        tails = [t for _, t in spans]
+        assert any("frobnicate" in t for t in tails), f"later command hidden ({fence})"
+        assert any(sc._validate_command(t, inv) for t in tails)  # the later stale cmd is caught
+
+
+def test_dangling_continuation_at_eof_is_handled() -> None:
+    spans, dangling = sc._command_spans("```\nagenttalk send \\\n")   # dangling at EOF, no crash
+    assert dangling
+
+
+def test_dangling_continuation_reported_as_finding(tmp_path: Path) -> None:
+    inv = sc.build_command_inventory()
+    cur = sc.current_major_minor(__version__)
+    p = tmp_path / "SKILL.md"
+    p.write_text('---\nname: x\ndescription: d\ncategory: production\n'
+                 'evidence-profile:\n  - production-handoff\nreviewed-against: "0.42"\n---\n'
+                 "# body\n\n```\nagenttalk send \\\n```\n", encoding="utf-8")
+    findings = sc.check_skill_file(p, kind="devkit", inventory=inv, current=cur)
+    assert any("dangling line-continuation" in f.reason for f in findings)
 
 
 def test_unterminated_frontmatter_is_flagged(tmp_path: Path) -> None:
