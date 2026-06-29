@@ -17,7 +17,7 @@ unique evidence).
 | Listen for and handle bus messages | the bus skill agenttalk-listen |
 | New production code | craft-code |
 | Behavior-preserving cleanup (no behavior change) | refactor-code (Tier 1); until then craft-code with explicit no-behavior-change tests |
-| Diagnose + fix a failing local/CI check | fix-ci (Tier 1); until then craft-code on the identified cause |
+| Diagnose + fix a failing local/CI check | fix-ci |
 | Decide which tests/lenses a change needs | qa-strategy |
 | Low-level / unit / regression / behavior tests | test-coverage |
 | Cross-module / CLI-plus-store / filesystem / config / migration tests | test-integration (Tier 1b); until then test-coverage + tester-qa scoped by risk |
@@ -40,6 +40,10 @@ unique evidence).
 5. When the main task is deciding QA/review coverage, use qa-strategy before invoking
    test-coverage, test-integration, review-code, or specialist review lenses; qa-strategy
    emits a plan only - it does not write/run tests and does not replace obvious required tests.
+6. When a concrete command/check/job is ALREADY failing, use fix-ci (read the full
+   log/output first, classify the root cause, smallest fix); use craft-code for new
+   production behavior when there is no failing check yet; use qa-strategy when deciding
+   which checks/lenses are needed (plan-only - it does not diagnose logs or edit code).
 
 ## Negative triggers (do NOT)
 
@@ -52,6 +56,7 @@ unique evidence).
   is running; record unavailable and use standing reviewers.
 - Do NOT use a separate docs-QA skill; use review-docs in docs-QA mode.
 - Do NOT use qa-strategy to avoid writing or running obvious tests.
+- Do NOT use fix-ci to guess at a failure without reading the failing log/output.
 - Do NOT let duplicated green evidence count as independent coverage: two reviewers citing the
   same run + scope corroborate ONE evidence item, they are not two proofs.
 
