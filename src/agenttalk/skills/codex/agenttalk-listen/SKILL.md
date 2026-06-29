@@ -204,12 +204,17 @@ distinct from exit 1 (timeout, re-arm) and exit 6 (stacked waiter).
   message and no normal timeout / stacked-waiter handling.
 - ACTION: after that bounded count, STOP tight-loop re-arming in-chat.
   Do NOT spawn duplicate bare waiters — stacked waits just trip exit 6.
-- LOUD, never silent: stopping the re-arm must not mean going deaf.
-  Surface the liveness problem to the operator at your own window — the
-  only party who can relaunch you under a supervised owner (the bus
-  `escalate` may itself be reaped if pushes are being killed) — and say
-  this identity should be relaunched under supervised `agenttalk wrap
-  --loop` with the SAME identity.
+- LOUD, never silent — ESCALATE OVER THE DURABLE BUS FIRST: stopping the
+  re-arm must not mean going deaf. A killed wait loses only realtime
+  push; the durable bus still works, so use it. Obey the escalate-first
+  / single-voice rule below — do NOT report at your own window first.
+  Run `agenttalk escalate --from "$SELF" -m "<liveness problem; relaunch
+  me under supervised wrap --loop>"` to reach the liaison/lead: escalate
+  is a durable SEND, NOT the killed wait, so it goes through even while
+  waits are being reaped. Ask to be relaunched under supervised
+  `agenttalk wrap --loop` with the SAME identity. Report at your OWN
+  window only as a FALLBACK — when escalate refuses (exit 2: no liaison)
+  or the bus command itself cannot run.
 - NOT A STAND-DOWN: a killed wait is not a `release` or `end`, and
   stopping the bare loop is NOT a self-stand-down — it is escalating for
   a more DURABLE listening mode. Do NOT export the transcript, do NOT
