@@ -113,9 +113,20 @@ def build_cadence_snapshot(store, agent: str, *, now_epoch: float,
     except Exception:  # noqa: BLE001
         snap["timing"] = {}
 
-    # lead-loop / health (the WP1 authority view - already token-free)
+    # lead-loop / health (the WP1 authority view - already token-free). Feed the RESOLVED
+    # heartbeat_stale_after (from snap["timing"]) and the snapshot point-in-time so the
+    # health view evaluates armed / heartbeat-stale at the SAME threshold the WP1
+    # steal/guard/supervisor use. Without it the health view falls back to
+    # ACTIVE_WITHIN_SECONDS (120) while a wrapped controller's real window may be 900 - so an
+    # expired lease whose heartbeat is, say, 300s old is ARMED under the WP1 authority but the
+    # snapshot would report armed=false, handing the model a FALSE controller-down state while
+    # the controller still owns the lease (the threshold-skew class WP1 closed, resurfacing in
+    # the cadence visibility view). A None heartbeat_stale_after (timing resolution failed)
+    # safely falls back to the default inside lead_loop_state.
     try:
-        snap["lead_loop_health"] = store.lead_loop_state(agent)
+        hsa = snap["timing"].get("heartbeat_stale_after")
+        snap["lead_loop_health"] = store.lead_loop_state(
+            agent, now=now_epoch, heartbeat_stale_after=hsa)
     except Exception:  # noqa: BLE001
         snap["lead_loop_health"] = {}
 

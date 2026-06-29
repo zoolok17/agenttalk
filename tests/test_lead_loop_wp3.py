@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import agenttalk.store as store_mod
@@ -23,6 +24,13 @@ def _store(tmp_path: Path, agents=("alpha", "beta", "lead")) -> Store:
     s = Store(tmp_path)
     s.init(list(agents))
     return s
+
+
+def _set_hb(s: Store, agent: str, epoch: float) -> None:
+    """Write ``agent``'s heartbeat at a SPECIFIC epoch (mirrors the WP1 test helper)."""
+    iso = (datetime.fromtimestamp(epoch, timezone.utc)
+           .isoformat(timespec="microseconds").replace("+00:00", "Z"))
+    (s.state_dir / f"{agent}.heartbeat").write_text(iso, encoding="utf-8")
 
 
 # ----------------------------------------------------------- cadence STATE (store)
@@ -250,6 +258,34 @@ def test_snapshot_per_field_degrades(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(s, "list_dead_letters", boom)
     snap = cad.build_cadence_snapshot(s, "beta", now_epoch=1000.0)
     assert snap["dead_letters"] == {"count": 0, "items": []}   # degraded, did not crash
+
+
+def test_snapshot_health_uses_resolved_window_not_default(tmp_path, monkeypatch) -> None:
+    # reviewer-1 consolidated blocker: the cadence snapshot's lead_loop_health must use the
+    # RESOLVED heartbeat_stale_after (the WP1 window), NOT the 120s store default - else a
+    # wrapped controller's snapshot false-unarms a still-armed lease (the threshold-skew class
+    # WP1 closed, resurfacing in the cadence visibility view). Mirrors the WP1 skew case.
+    import time
+
+    from agenttalk import supervisor as sup
+    s = _store(tmp_path, agents=("lead", "beta"))
+    s.set_managed_lead_loop("beta")
+    monkeypatch.setattr(store_mod, "_process_liveness", lambda pid: PROC_ALIVE)
+    now = time.time()
+    s.acquire_lead_loop_lease("beta", owner_pid=os.getpid(), ttl_seconds=10,
+                              now=now - 5000, lease_id="owner")        # long expired
+    _set_hb(s, "beta", now - 300.0)                  # hb age 300s: strictly 120 < 300 < 900
+    sup_cfg = {"agents": {"beta": {"wrapped": True, "cli": "codex"}}}
+    window = sup.resolve_stuck_after(sup_cfg, sup_cfg["agents"]["beta"])
+    assert window > 300.0                            # premise: wrapped window exceeds the hb age
+    # control: at the bare 120s default the same lease is UNARMED + heartbeat-stale (skew source)
+    bare = s.lead_loop_state("beta", now=now)
+    assert bare["armed"] is False and bare["heartbeat_stale"] is True
+    # the cadence snapshot health MUST agree with the WP1 resolver at the 900 window, not 120
+    snap = cad.build_cadence_snapshot(s, "beta", now_epoch=now, supervisor_config=sup_cfg)
+    assert snap["timing"]["heartbeat_stale_after"] == window
+    assert snap["lead_loop_health"]["armed"] is True
+    assert snap["lead_loop_health"]["heartbeat_stale"] is False
 
 
 # ----------------------------------------------------------- loop integration (run_loop)
