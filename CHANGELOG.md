@@ -5,6 +5,38 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.44.0] - 2026-06-29
+
+### Changed
+
+- **Skill-currency check: version-stamp lag is advisory, not a hard failure.** A bundled skill whose
+  `reviewed-against` stamp lags the package minor is now a WARN-level finding (a re-review reminder),
+  not an error. `Finding` carries a `level` ("error" | "warn"), and the source-tree currency test
+  fails only on BLOCKING findings. Real drift stays blocking: a missing/malformed stamp,
+  frontmatter/category/evidence-profile failure, evidence stub/profile parity drift, a dangling
+  continuation, an unreadable file, and a stale/nonexistent CLI token. This fixes the v0.43.0 failure
+  mode (a minor bump reddening CI purely via stamp-lag) and removes the chore of re-stamping every
+  skill on every minor release; a stamp now changes only when a skill is actually reviewed/edited
+  against that CLI minor. `doctor` still surfaces lag as a WARN. (A hard freshness gate, if ever
+  wanted, belongs in a release-readiness lens, not generic lint.)
+
+### Added
+
+- **Listen skills: persistent wait-kill guidance.** A new section in `agenttalk.listen` /
+  `agenttalk-listen` (Claude + Codex) for when the harness repeatedly kills an agent's background
+  `wait`: recognize repeated kills (do not rely on a clean exit code), stop tight-loop re-arming, and
+  escalate over the DURABLE bus first (`agenttalk escalate` is a durable send, unaffected by the
+  killed wait) to be relaunched under supervised `wrap --loop` - with own-window reporting only as a
+  fallback. A killed wait loses real-time push, not queued data (the bus is durable, the cursor
+  monotonic); a repeated kill is NOT a `release`/`end`, so the agent stays recoverable rather than
+  winding down.
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.44.0"
+```
+
 ## [0.43.1] - 2026-06-29
 
 ### Fixed
