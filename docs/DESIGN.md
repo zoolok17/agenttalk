@@ -322,6 +322,29 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   by:* WP1 (lead verify P2 = the resolve_timing crash; codex review = the wrap/
   dead-letter sibling; dev-2 proactive sweep = session_args).
 
+- **D-14 The cadence tick is a SYNTHETIC wrapper-owned event, isolated from the
+  dead-letter path.** *Why:* the managed lead-loop controller (Slice 2) must do
+  PROACTIVE work when the bus is quiet (nudge stalled outbound threads, surface
+  dead-letter / unrouted-escalation to the operator) - but a proactive sweep is NOT a
+  bus record, and treating it as one would be a correctness disaster: it would advance
+  the consume cursor (skipping a real message that arrives mid-sweep) or feed the v0.41
+  poison-message machinery (a "failed sweep" would dead-letter, attributing controller
+  trouble to an innocent message). *Decision:* the cadence tick lives in the
+  *timeout/idle branch* of the SAME `_run_continuous` loop (no second consumer/thread),
+  and it NEVER calls `record_attempt_start`, NEVER advances the cursor, and NEVER enters
+  the dead-letter path. It is gated by a controller-owned single-writer cadence state
+  (`state/<agent>.lead-loop-cadence.json`, reset-cleared like the lease; the dead-letter
+  SINK is elsewhere and survives reset) that drives due-ness, reminder dedup (once per
+  `(request_id, last_msg_id)`), and escalation dedup. A sweep fires a model turn ONLY if
+  a bounded, read-only snapshot has actionable items (no actionable items -> no model
+  turn). A FAILED sweep is **controller-HEALTH** trouble, never message poison: it backs
+  off (exponential), withholds the heartbeat so the supervisor notices, and after a
+  threshold escalates ONCE to the operator. *Invariant:* a cadence tick can SEND but can
+  never advance the lead-loop cursor unless it was handling a real record (it never is).
+  *Rejected:* a second consumer thread for the sweep (a duplicate consumer races the
+  bus, the exact failure the lease prevents); a universal "tick failed -> dead-letter"
+  (conflates controller health with message poison). *Built by:* WP3.
+
 ## 6. How we work (process)
 
 - **Per-phase cadence:** architect designs → lead gates the design → builder

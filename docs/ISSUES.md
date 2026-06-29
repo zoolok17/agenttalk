@@ -12,6 +12,53 @@ major · `P2` minor · `P3` nit. Each item: what, why, where, disposition.
 
 ---
 
+## IN PROGRESS — lead-loop Slice 2 / WP3 (the CADENCE TICK, `lead-loop-wp3`)
+
+The proactive sweep the controller drives when the bus is QUIET and the cadence
+interval has elapsed - so a lead-loop controller does forward work (nudge stalled
+outbound threads, surface dead-letter / unrouted escalations) instead of only
+reacting to inbound messages. Built off master (WP2 merged); cross-review starts with
+codex (reviewer-1 joins when restored; v0.42.0 ships WP1+WP2[+WP3/WP4] at strict 2/2).
+
+- **Synthetic, dead-letter-isolated (P1; DESIGN.md D-14).** The tick is the
+  *timeout/idle branch* of the SAME `_run_continuous` loop (no second consumer/thread):
+  a message present -> the per-message path; no message + not due -> heartbeat + lease
+  renew + sleep; no message + DUE -> a bounded read-only snapshot, and a model turn ONLY
+  if the snapshot has actionable items. It NEVER calls `record_attempt_start`, NEVER
+  advances the cursor, and NEVER enters the dead-letter path.
+- **Cadence state (controller-owned single-writer).** `state/<agent>.lead-loop-cadence.json`
+  holds `last_tick_epoch` (due-ness), `last_reminded` ((request_id -> last_msg_id) so an
+  outbound nudge fires once per thread state), `escalation_dedup`, and the failure /
+  backoff fields. Degrade-safe read; reset-cleared like the lease (the dead-letter SINK
+  is elsewhere and survives reset).
+- **Actionability (avoid premature reminders).** Unread / reply-waiting / owed-inbound
+  are the message path's job (not cadence). Open-outbound reminders fire only past
+  `reminder_after_seconds`, with no fresh peer composing marker, once per
+  `(request_id, last_msg_id)`. Operator-blocked work is tracked context, not its own
+  nudge. Dead-letter / unrouted-escalation items are due immediately but deduped.
+- **Snapshot contract (P2).** A bounded point-in-time view (self identity, lease/timing
+  [token-free], `derive_threads` summaries, operator-pending, lead-loop health, restart/
+  launch state, dead-letter / unrouted escalation): ids + summaries, NOT transcripts;
+  counts + body lengths capped; per-field degrade so one unreadable subsystem yields an
+  empty field, not a failed snapshot. The lease TOKEN is never serialized into it. The
+  synthetic prompt carries the same verb-guard as a message turn (no sync/threads/recv/
+  wait/drain/ack; fresh data -> a typed question + a one-turn delay).
+- **Cadence failure = controller-HEALTH, not poison (P1).** A failed sweep updates the
+  failure/backoff state (exponential, capped), withholds the heartbeat so the supervisor
+  notices, and after a threshold escalates ONCE to the operator (deduped via
+  `health_escalated`). It leaves the cursor AND the attempt ledger untouched and never
+  dead-letters.
+
+*Where:* `store.py` (cadence-state persistence + consts), `lead_loop_cadence.py` (NEW:
+snapshot + actionability + state transitions), `wrapper/loop.py` (`CadenceResult` +
+the idle-branch `cadence` hook), `wrapper/run.py` (`make_cadence_drive`),
+`wrapper/prompt.py` (`assemble_cadence_prompt`), `cli.py` (`_wrap_loop_mode` wiring +
+`_cadence_health_notifier`), `docs/DESIGN.md` (D-14), `tests/test_lead_loop_wp3.py` (NEW).
+*Disposition:* IN PROGRESS (branch `lead-loop-wp3`); self-gated, in cross-review. WP4
+(relay) stays on HOLD.
+
+---
+
 ## SHIPPED (merged 24c39f7) — lead-loop Slice 2 / WP1 (opening hardening foundation, `lead-loop-wp1`)
 
 Slice 2 of the lead-loop adds the actual controller + mechanical relay; codex's

@@ -514,3 +514,117 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         return DriveOutcome(ok=False, failure_class=failure_class, summary=summary)
 
     return drive
+
+
+def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: list[str], *,
+                       sender: str | None = None, min_interval: float = 5.0,
+                       render: bool = True, rules: str | None = None,
+                       clock: Callable[[], float] = time.monotonic,
+                       spawn: Callable[[list[str], str | None], Iterable[str]] | None = None,
+                       heartbeat: Callable[[], None] | None = None,
+                       persist: Callable[[object], None] | None = None,
+                       ) -> Callable[[dict, list], bool]:
+    """Build the SYNTHETIC cadence-turn drive for the managed lead-loop controller (WP3).
+
+    ``cadence_drive(snapshot, items) -> bool`` drives ONE CLI turn whose prompt is the
+    bounded read-only SNAPSHOT + the actionable items (NOT a bus record), returning True
+    iff the turn reached a clean COMPLETED boundary. UNLIKE :func:`make_drive` there is NO
+    failure CLASSIFICATION, NO :class:`~.loop.DriveOutcome`, and NO dead-letter path - a
+    cadence failure is just ``False`` (the controller treats it as controller-HEALTH
+    trouble: back off + escalate, never poison).
+
+    It builds its OWN engine/detector (a separate degraded window from the message drive is
+    fine - cadence turns are rare) but SHARES ``session_state`` by reference, so codex
+    ``thread_id`` / claude session-id continuity holds across BOTH message and cadence
+    turns. ``make_drive`` is intentionally left untouched (the reviewed message hot path).
+    ``heartbeat`` is the lead-loop combined renew+stamp - it RAISES on a lost lease, which
+    propagates out so a lost-lease controller stops sweeping at once."""
+    from . import prompt as _prompt
+    from . import session as _session
+
+    mapper = _ADAPTERS.get(cli)
+    if mapper is None:
+        raise ValueError(f"no wrapper adapter for cli {cli!r}")
+    cfg = DegradedConfig(telemetry_only=_TELEMETRY_ONLY.get(cli, False))
+    detector = DegradedDetector(cli, cfg)
+    engine = WrapperEngine(
+        detector=detector,
+        on_heartbeat=((lambda _ev, _ts: heartbeat()) if heartbeat is not None
+                      else _default_heartbeat(store, agent)),
+        on_render=(_default_render if render else None),
+        on_escalate=_default_escalate(store, agent, sender or agent),
+        on_info=_default_info,
+        min_interval=min_interval,
+    )
+    spawner = spawn or _ProcStream
+
+    def _run_one(spec) -> bool:
+        """Spawn ONE CLI invocation for ``spec`` and stream its JSONL through the engine.
+        True only if it reached a COMPLETED boundary, hit no terminal (non-retryable)
+        adapter_error, and the child exited cleanly. A spawn/exec OSError is a False turn
+        (never raised). No classification - cadence only needs ok / not-ok."""
+        argv = list(base_argv) + spec.args
+        started = completed = terminal = False
+        try:
+            stream = spawner(argv, spec.stdin)
+            for line in stream:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    raw = json.loads(s)
+                except (ValueError, TypeError):
+                    continue
+                _session.observe_event(session_state, raw)
+                for ev in mapper(raw):
+                    if ev.type == EventType.TURN_STARTED:
+                        started = True
+                    elif ev.type == EventType.TURN_FINISHED:
+                        completed = True
+                    elif ev.type == EventType.ADAPTER_ERROR and not ev.retryable:
+                        terminal = True
+                    engine.process(ev, clock())
+        except OSError:
+            return False
+        rc = getattr(stream, "returncode", None)
+        _ = started  # observed for parity with make_drive; cadence gates on completed
+        return completed and not terminal and rc in (0, None)
+
+    def cadence_drive(snapshot: dict, items: list) -> bool:
+        prompt = _prompt.assemble_cadence_prompt(snapshot, items, rules=rules)
+        spec = _session.build_turn(session_state, prompt)
+        cli_name = session_state.cli
+        attempted_resume = ((cli_name == "codex" and "resume" in spec.args)
+                            or (cli_name == "claude" and "--resume" in spec.args))
+        ok = _run_one(spec)
+        if not ok and attempted_resume:
+            # mirror make_drive's resume self-heal: a failed RESUME turn forces a FRESH
+            # session for the SAME prompt and retries inline (still ONE cadence attempt).
+            if cli_name == "claude":
+                _session.reset_claude_session(session_state, "resume turn failed")
+            else:
+                _session.mark_resume_unavailable(session_state, "resume turn failed")
+            if persist is not None:
+                persist(session_state)
+            ok = _run_one(_session.build_turn(session_state, prompt))
+        if ok:
+            session_state.turns += 1
+            if cli_name == "claude" and not session_state.resume_available:
+                session_state.resume_available = True
+                session_state.resume_unavailable_reason = ""
+            # a clean cadence turn ends with a fresh heartbeat; route through the injected
+            # lead-loop hook (renew+stamp), which RAISES on a lost lease.
+            if heartbeat is not None:
+                heartbeat()
+            else:
+                store.write_heartbeat(agent)
+        else:
+            # a FAILED cadence turn leaves NO fresh heartbeat (controller-health staleness)
+            # and resets the reused engine throttle - mirrors make_drive's failure path.
+            store.clear_heartbeat(agent)
+            engine.reset_heartbeat_throttle()
+        if persist is not None:
+            persist(session_state)
+        return ok
+
+    return cadence_drive

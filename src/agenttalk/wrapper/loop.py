@@ -52,6 +52,24 @@ def _as_outcome(ret: object) -> DriveOutcome:
     return DriveOutcome(ok=False, failure_class=CLASS_POISON, summary="drive returned False")
 
 
+@dataclass(frozen=True)
+class CadenceResult:
+    """The result of consulting the proactive CADENCE hook on one IDLE poll (WP3).
+
+    ``ran`` False  = the hook was a no-op this poll (no lead-loop, or a sweep was not
+                     yet due) - the loop proceeds with its normal idle heartbeat.
+    ``ran`` True   = a sweep ran (the interval elapsed). ``ok`` False = the sweep FAILED
+                     (a controller-HEALTH failure, NOT message poison): the hook OWNS its
+                     own backoff / escalation and the loop WITHHOLDS the idle heartbeat
+                     this poll (so the controller goes stale and the supervisor notices).
+                     ``ok`` True = the sweep completed (no-op or a driven turn).
+    ``drove_turn`` = a synthetic model turn was actually driven (snapshot had actionable
+                     items). Informational; the loop never advances a cursor for it."""
+    ran: bool = False
+    ok: bool = True
+    drove_turn: bool = False
+
+
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -151,6 +169,7 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              heartbeat: Callable[[], None] | None = None,
              pre_commit: Callable[[], None] | None = None,
              manage_waiting: bool = True,
+             cadence: Callable[[], CadenceResult] | None = None,
              now_iso: Callable[[], str] = _iso_now) -> int:
     """Run the wrapper listen loop. ``drive(record)`` handles ONE turn (injected).
     Returns the number of turns driven. ``max_turns`` / ``max_polls`` / ``max_wall``
@@ -177,7 +196,15 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
 
     ``heartbeat`` overrides the per-idle stamp (default ``store.write_heartbeat``);
     the managed lead-loop passes a combined ``write_heartbeat`` + ``renew lease`` so
-    the lease stays fresh on every idle stamp (WP2 condition 4)."""
+    the lease stays fresh on every idle stamp (WP2 condition 4).
+
+    ``cadence`` (WP3, CONTINUOUS only): the proactive-sweep hook, consulted on each IDLE
+    poll (no inbound message) BEFORE the heartbeat. It is a SYNTHETIC, wrapper-owned turn
+    - it NEVER advances the cursor, records an attempt, or enters the dead-letter path
+    (the loop's commit / attempt / dead-letter machinery is untouched on the idle path).
+    The hook gates due-ness itself (returns ``ran=False`` when not due, so calling it every
+    poll is cheap-by-contract). A FAILED sweep (``ran and not ok``) makes the loop withhold
+    the idle heartbeat this poll (controller-health staleness)."""
     stamp = heartbeat if heartbeat is not None else (lambda: store.write_heartbeat(agent))
     if manage_waiting:
         store.write_waiting(agent, {"agent": agent, "mode": "wrapper-loop"})
@@ -195,7 +222,7 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
             clock=clock, sleep=sleep, max_turns=max_turns, max_polls=max_polls,
             max_wall=max_wall, k_poison=k_poison, k_escalate=k_escalate,
             on_dead_letter=on_dead_letter, on_escalate=on_escalate, stamp=stamp,
-            pre_commit=pre_commit, now_iso=now_iso)
+            pre_commit=pre_commit, cadence=cadence, now_iso=now_iso)
     finally:
         if manage_waiting:
             store.clear_waiting(agent)
@@ -211,6 +238,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     on_escalate: Callable[[dict], None] | None,
                     stamp: Callable[[], None],
                     pre_commit: Callable[[], None] | None,
+                    cadence: Callable[[], CadenceResult] | None,
                     now_iso: Callable[[], str]) -> int:
     turns = 0
 
@@ -288,8 +316,22 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         record = recv_api.next_record(store, agent)
         now = clock()
         if record is None:
-            # IDLE: keep the heartbeat fresh (+ renew the lease for the managed
-            # lead-loop, via the injected stamp), then back off while the bus is quiet.
+            # IDLE. First consult the proactive CADENCE hook (WP3): it gates due-ness
+            # itself and, when due, drives at most ONE synthetic sweep turn - WITHOUT
+            # ever advancing the cursor / recording an attempt / dead-lettering (this
+            # idle branch contains none of that machinery, by construction).
+            res = cadence() if cadence is not None else None
+            if res is not None and res.ran and not res.ok:
+                # FAILED sweep (controller-HEALTH, not poison): the hook already updated its
+                # own backoff + escalation. WITHHOLD the idle heartbeat this poll so a
+                # persistently-failing controller goes stale and the supervisor notices; do
+                # NOT advance any cursor. Back off and keep listening.
+                sleep(cur_sleep)
+                cur_sleep = min(max_idle_interval, cur_sleep * 2.0)
+                continue
+            # No cadence, not due, a no-op sweep, or a SUCCESSFUL sweep: keep the heartbeat
+            # fresh (+ renew the lease for the managed lead-loop, via the injected stamp),
+            # then back off while the bus is quiet.
             if last_hb is None or (now - last_hb) >= heartbeat_interval:
                 stamp()
                 last_hb = now

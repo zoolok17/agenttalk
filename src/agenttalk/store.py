@@ -2623,6 +2623,74 @@ class Store:
         except (FileNotFoundError, OSError):
             pass
 
+    # --- managed lead-loop CADENCE STATE (WP3) ---------------------------------
+    # Controller-owned SINGLE-WRITER per-agent state for the proactive cadence
+    # sweep: when the last sweep ran (drives due-ness), the reminder dedup map
+    # ((request_id -> last_msg_id) so an open-outbound nudge fires once per thread
+    # state), the dead-letter / unrouted-escalation dedup set, and the
+    # failure/backoff fields (a failed tick is controller-HEALTH, not poison: it
+    # backs off and, past a threshold, escalates once). Lives in state_dir so
+    # reset() clears it; the dead-letter SINK is elsewhere and survives reset.
+
+    def lead_loop_cadence_path(self, agent: str) -> Path:
+        return self.state_dir / f"{validate_agent_name(agent)}.lead-loop-cadence.json"
+
+    def _default_cadence_state(self) -> dict:
+        return {"last_tick_epoch": 0.0, "last_reminded": {}, "escalation_dedup": {},
+                "cadence_fails": 0, "backoff_until_epoch": 0.0, "health_escalated": False}
+
+    def read_lead_loop_cadence(self, agent: str) -> dict:
+        """Return the cadence state, DEGRADE-SAFE: a missing / empty / torn / corrupt /
+        forward-incompatible file reads as the fresh default (never raises). Every field
+        is coerced to its expected type so a hand-edited value errs SAFE rather than
+        crashing the controller's idle loop (mirrors ``_safe_int`` in the wrapper loop)."""
+        d = self._default_cadence_state()
+        p = self.lead_loop_cadence_path(agent)
+        if not p.exists():
+            return d
+        try:
+            raw = p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return d
+        if not raw:
+            return d
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return d
+        if not isinstance(data, dict):
+            return d
+
+        def _f(key: str) -> float:
+            try:
+                return float(data.get(key))
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _i(key: str) -> int:
+            try:
+                return int(data.get(key))
+            except (TypeError, ValueError):
+                return 0
+
+        lr = data.get("last_reminded")
+        ed = data.get("escalation_dedup")
+        return {
+            "last_tick_epoch": _f("last_tick_epoch"),
+            "last_reminded": lr if isinstance(lr, dict) else {},
+            "escalation_dedup": ed if isinstance(ed, dict) else {},
+            "cadence_fails": _i("cadence_fails"),
+            "backoff_until_epoch": _f("backoff_until_epoch"),
+            "health_escalated": bool(data.get("health_escalated")),
+        }
+
+    def write_lead_loop_cadence(self, agent: str, state: dict) -> None:
+        """Atomically persist the cadence state. Single-writer (the lease-owning
+        controller is the only writer), so no lock is needed; the atomic replace keeps
+        a concurrent reader from seeing a torn file."""
+        _atomic_write_text(self.lead_loop_cadence_path(agent),
+                           json.dumps(state, indent=2))
+
     def _lead_loop_lease_lock(self, agent: str):
         """Exclusive per-agent lock serializing acquire/renew/release/steal so the
         read-decide-write is ATOMIC - two contenders can never both 'acquire' an
@@ -3539,6 +3607,19 @@ LEAD_LOOP_TTL_DEFAULT = 900.0
 # authz (D-4): never log it, never expose it via a read-only command, never pass it to the
 # model child.
 LEAD_LOOP_LEASE_ENV = "AGENTTALK_LEAD_LOOP_LEASE"
+
+# Managed lead-loop CADENCE TICK (lead-loop Slice 2 WP3): the proactive sweep the
+# controller drives when the bus is QUIET and the cadence interval has elapsed - a
+# SYNTHETIC, wrapper-owned turn that never consumes a bus record (no cursor advance,
+# no attempt ledger, no dead-letter path). The per-agent cadence STATE
+# (state/<agent>.lead-loop-cadence.json) is controller-owned single-writer and is
+# reset-cleared like the lease (reset() deletes state_dir wholesale; the dead-letter
+# SINK lives elsewhere and is preserved).
+LEAD_LOOP_REMINDER_AFTER_DEFAULT = 1800.0     # open-outbound reminder window (s)
+LEAD_LOOP_CADENCE_FAIL_BACKOFF_BASE = 60.0    # first failed-tick backoff (s)
+LEAD_LOOP_CADENCE_FAIL_BACKOFF_MAX = 1800.0   # backoff ceiling (s)
+LEAD_LOOP_CADENCE_HEALTH_THRESHOLD = 5        # consecutive failed ticks -> escalate
+#                                               controller-HEALTH (NOT message poison)
 
 
 def _process_alive(pid: int) -> bool:

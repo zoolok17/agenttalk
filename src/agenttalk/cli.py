@@ -18,7 +18,11 @@ from agenttalk.display import render
 from agenttalk.store import (
     COMPOSING_INTENT_STALE_SECONDS,
     CONTROL_KINDS,
+    LEAD_LOOP_CADENCE_FAIL_BACKOFF_BASE,
+    LEAD_LOOP_CADENCE_FAIL_BACKOFF_MAX,
+    LEAD_LOOP_CADENCE_HEALTH_THRESHOLD,
     LEAD_LOOP_LEASE_ENV,
+    LEAD_LOOP_REMINDER_AFTER_DEFAULT,
     OPENER_KINDS,
     Store,
     find_root,
@@ -5318,6 +5322,34 @@ def _dead_letter_notifier(store, agent: str):
     return emit
 
 
+def _cadence_health_notifier(store, agent: str):
+    """Operator escalation for a FAILING cadence sweep (WP3 condition 6): controller-HEALTH
+    trouble, NOT message poison. Routes a notice to the operator_facing liaison else the
+    sole lead when the controller's proactive sweep has failed repeatedly. Mirrors
+    :func:`_dead_letter_notifier` (esc- request_id + needs_operator=true so it THREADS into
+    the liaison's OPERATOR INPUT NEEDED bucket); the caller dedupes via the cadence state's
+    ``health_escalated`` latch, so this fires ONCE per failure run. NEVER crashes the loop."""
+    def emit(fails: int, reason: str) -> bool:
+        try:
+            target = store.operator_facing() or store.sole_lead()
+            if not target or target == agent:
+                return False
+            body = (f"[controller-health] lead-loop controller {agent} cadence sweep has "
+                    f"FAILED {fails} consecutive times ({reason}). This is a CONTROLLER "
+                    f"health problem, not a poisoned message. Inspect: agenttalk doctor / "
+                    f"agenttalk status --json; consider agenttalk request-restart "
+                    f"--for {agent} if it does not recover.")
+            store.send(sender=agent, recipient=target, kind="question",
+                       subject="cadence controller-health notice", body=body,
+                       meta={"needs_operator": "true", "cadence_health": "true",
+                             "cadence_fails": str(fails),
+                             "request_id": "esc-" + uuid.uuid4().hex[:12]})
+            return True
+        except Exception:  # noqa: BLE001 - a notification must never crash the loop
+            return False
+    return emit
+
+
 def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     sender: str, min_interval: float, render: bool,
                     one_shot_request_id: str | None = None,
@@ -5439,6 +5471,83 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     # dead-letter (CONTINUOUS loop only; the one-shot path ignores these). On
     # dead-letter / high-attempt backstop the wrapper escalates to the operator.
     notifier = _dead_letter_notifier(store, agent)
+
+    # --- managed lead-loop CADENCE TICK (WP3): the proactive sweep ----------------
+    # Built ONLY for the lead-loop controller (not the plain wrapper / one-shot). The
+    # hook is consulted by run_loop on each IDLE poll; it gates due-ness itself and, when
+    # due, drives at most ONE synthetic snapshot turn - never advancing the cursor /
+    # recording an attempt / dead-lettering (condition 1). A failed sweep is controller-
+    # HEALTH: back off + (past the threshold, once) escalate to the operator.
+    cadence_hook = None
+    if lead_loop and not one_shot_request_id:
+        from . import lead_loop_cadence as _cad
+        cadence_drive = wrapper_run.make_cadence_drive(
+            store, agent, cli, state, base_argv, sender=sender,
+            min_interval=min_interval, render=render, heartbeat=heartbeat,
+            persist=lambda st: wsession.save_session(store, agent, st))
+        cadence_health = _cadence_health_notifier(store, agent)
+
+        def _cadence() -> "wloop.CadenceResult":
+            now_epoch = time.time()   # WALL clock: cadence state persists across restarts
+            cstate = store.read_lead_loop_cadence(agent)
+            timing = lead_loop_runtime.resolve_timing(
+                store, agent, supervisor_config=supervisor_config)
+            if not _cad.cadence_due(cstate, now_epoch=now_epoch,
+                                    cadence_seconds=timing["cadence_seconds"]):
+                return wloop.CadenceResult(ran=False)
+            # DUE. Ownership gate first - a lost-lease controller must not sweep/send; a
+            # raise propagates out (run_loop -> _wrap_loop_mode handles lease-loss exit).
+            _renew_or_lost()
+
+            def _fail() -> "wloop.CadenceResult":
+                new, esc = _cad.apply_tick_failure(
+                    cstate, now_epoch=now_epoch,
+                    base=LEAD_LOOP_CADENCE_FAIL_BACKOFF_BASE,
+                    max_backoff=LEAD_LOOP_CADENCE_FAIL_BACKOFF_MAX,
+                    health_threshold=LEAD_LOOP_CADENCE_HEALTH_THRESHOLD)
+                if esc and cadence_health(new["cadence_fails"], "snapshot/sweep failure"):
+                    # latch the controller-health escalation ONLY after it ROUTED. An
+                    # unrouted notice (no operator-facing / sole-lead target) leaves
+                    # health_escalated False so the NEXT failure RETRIES it - never
+                    # silently dropping the durable operator signal (codex WP3 MAJOR;
+                    # mirrors the dead-letter escalation_routed discipline).
+                    new["health_escalated"] = True
+                store.write_lead_loop_cadence(agent, new)
+                return wloop.CadenceResult(ran=True, ok=False)
+
+            try:
+                snap = _cad.build_cadence_snapshot(
+                    store, agent, now_epoch=now_epoch, supervisor_config=supervisor_config)
+                items = _cad.cadence_actionable(
+                    snap, cstate, now_epoch=now_epoch,
+                    reminder_after_seconds=LEAD_LOOP_REMINDER_AFTER_DEFAULT)
+            except _LeadLoopLeaseLost:
+                raise
+            except Exception:  # noqa: BLE001 - snapshot/actionability failure == cadence failure
+                return _fail()
+            if not items:
+                # due but nothing actionable: record the sweep (no model turn spent).
+                store.write_lead_loop_cadence(agent, _cad.apply_tick_success(
+                    cstate, now_epoch=now_epoch, reminded_keys=[], escalation_keys=[]))
+                return wloop.CadenceResult(ran=True, ok=True, drove_turn=False)
+            try:
+                ok = bool(cadence_drive(snap, items))
+            except _LeadLoopLeaseLost:
+                raise
+            except Exception:  # noqa: BLE001 - any drive error is a cadence failure
+                ok = False
+            if not ok:
+                return _fail()
+            reminded_keys = [(it["request_id"], it.get("last_msg_id"))
+                             for it in items if it.get("type") == "outbound_reminder"]
+            escalation_keys = [it["key"] for it in items
+                               if it.get("type") in ("dead_letter", "unrouted_escalation")]
+            store.write_lead_loop_cadence(agent, _cad.apply_tick_success(
+                cstate, now_epoch=now_epoch, reminded_keys=reminded_keys,
+                escalation_keys=escalation_keys))
+            return wloop.CadenceResult(ran=True, ok=True, drove_turn=True)
+
+        cadence_hook = _cadence
     try:
         turns = wloop.run_loop(
             store, agent, drive,
@@ -5451,6 +5560,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             heartbeat=heartbeat,
             pre_commit=pre_commit,  # lead-loop ownership gate at every cursor advance
             manage_waiting=not lead_loop,  # the lead-loop LEASE owns the .waiting mirror
+            cadence=cadence_hook,  # WP3 proactive sweep (lead-loop only)
         )
     except _LeadLoopLeaseLost:
         # LOST the lease mid-run (stolen / torn / force-released): the ownership gate /
