@@ -20,7 +20,7 @@ unique evidence).
 | Diagnose + fix a failing local/CI check | fix-ci (Tier 1); until then craft-code on the identified cause |
 | Decide which tests/lenses a change needs | qa-strategy (Tier 1); until then test-coverage scoped by risk |
 | Low-level / unit / regression / behavior tests | test-coverage |
-| Cross-module / CLI-plus-store / filesystem / config / migration tests | test-integration (Tier 1b); until then qa-strategy + test-coverage |
+| Cross-module / CLI-plus-store / filesystem / config / migration tests | test-integration (Tier 1b); until then test-coverage + tester-qa scoped by risk |
 | Integrated diff review | review-code |
 | Documentation | write-docs |
 | Documentation accuracy review (+ run documented commands) | review-docs (docs-QA mode) |
@@ -30,8 +30,9 @@ unique evidence).
 ## Core precedence
 
 1. Bus/team coordination uses agenttalk-lead/-listen/-handoff/-send/-sk-loop. Never team-lead.
-2. New production code uses craft-code; behavior-preserving cleanup uses refactor-code; if
-   behavior changes it is craft-code.
+2. New production code uses craft-code; behavior-preserving cleanup uses refactor-code
+   (Tier 1; until it exists, craft-code with explicit no-behavior-change tests); if behavior
+   changes it is craft-code.
 3. Architecture / security / performance are SUB-LENSES under review-code unless routed as
    explicit specialist work with distinct evidence (not a separate skill in Tier 0/1).
 4. Failure-path, contract-drift, release-readiness, and docs reviews use the existing

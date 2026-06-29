@@ -252,6 +252,37 @@ def _frontmatter_keys(text: str) -> tuple[dict[str, str], bool]:
     return keys, False   # unterminated frontmatter
 
 
+def _frontmatter_profiles(text: str) -> list[str]:
+    """Parse the frontmatter ``evidence-profile`` LIST (YAML block items, or an inline scalar)
+    - the scalar :func:`_frontmatter_keys` cannot, since it is a list. Reads only within the
+    leading ``---`` ... ``---`` block. Returns [] if absent."""
+    profs: list[str] = []
+    in_block = False
+    in_ep = False
+    for ln in text.splitlines():
+        if ln.strip() == "---":
+            if in_block:
+                break
+            in_block = True
+            continue
+        if not in_block:
+            continue
+        if re.match(r"^evidence-profile:", ln):
+            inline = ln.split(":", 1)[1].strip()
+            if inline:
+                profs.append(inline)
+            else:
+                in_ep = True
+            continue
+        if in_ep:
+            m = re.match(r"^\s+-\s+(\S+)", ln)
+            if m:
+                profs.append(m.group(1).strip())
+            elif ln.strip() and not ln.startswith(" "):
+                in_ep = False
+    return profs
+
+
 def parse_reviewed_against(value: str) -> tuple[int, int] | None:
     """Parse a ``reviewed-against`` stamp (optional leading ``v``, optional quotes) into a
     ``(major, minor)`` tuple, or None if unparseable."""
@@ -306,7 +337,13 @@ def parse_evidence_profiles(text: str) -> dict[str, list[str]]:
 def _parse_skill_stub(text: str) -> tuple[str | None, list[str]]:
     """Parse a skill's in-skill evidence stub: returns ``(profile_id, [field, ...])`` from the
     ``## Evidence`` section (None / [] if absent). Mirrors the evidence.md field-bullet format
-    so parity is a set comparison."""
+    so parity is a set comparison.
+
+    Terminator convention (fresh P3): the field-bullet list runs until the first non-bullet,
+    non-blank line or the next heading; :func:`parse_evidence_profiles` instead ends at the
+    profile's ``Rules:`` line. The terminators differ but extract the SAME bullet set for the
+    two file shapes, and any divergence is fail-safe - it can only produce a false-positive
+    parity mismatch (a loud finding), never a silent equate. Keep field bullets contiguous."""
     profile: str | None = None
     fields: list[str] = []
     in_evidence = False
@@ -383,22 +420,30 @@ def check_skill_file(path: Path, *, kind: str, inventory: _Node,
         # the single source.
         if category != "reference" and evidence_profiles is not None:
             stub_profile, stub_fields = _parse_skill_stub(text)
+            fm_profiles = _frontmatter_profiles(text)
             if stub_profile is None:
                 findings.append(Finding(rel, 0, "evidence-stub",
                                         "missing in-skill evidence stub (## Evidence with the "
                                         "profile + required fields, linking ../_shared/references/evidence.md)"))
-            elif stub_profile not in evidence_profiles:
-                findings.append(Finding(rel, 0, "evidence-stub",
-                                        f"evidence stub names unknown profile {stub_profile!r} "
-                                        f"(not in evidence.md)"))
             else:
-                canonical = evidence_profiles[stub_profile]
-                if set(stub_fields) != set(canonical):
-                    missing = sorted(set(canonical) - set(stub_fields))
-                    extra = sorted(set(stub_fields) - set(canonical))
+                # the stub profile must match the FRONTMATTER evidence-profile (else a skill can
+                # declare one profile and stub another - reviewer-1 P1).
+                if fm_profiles and stub_profile not in fm_profiles:
                     findings.append(Finding(rel, 0, "evidence-stub",
-                                            f"evidence stub fields differ from evidence.md "
-                                            f"profile {stub_profile!r} (missing={missing}, extra={extra})"))
+                                            f"in-skill stub profile {stub_profile!r} is not in the "
+                                            f"frontmatter evidence-profile {fm_profiles}"))
+                if stub_profile not in evidence_profiles:
+                    findings.append(Finding(rel, 0, "evidence-stub",
+                                            f"evidence stub names unknown profile {stub_profile!r} "
+                                            f"(not in evidence.md)"))
+                else:
+                    canonical = evidence_profiles[stub_profile]
+                    if set(stub_fields) != set(canonical):
+                        missing = sorted(set(canonical) - set(stub_fields))
+                        extra = sorted(set(stub_fields) - set(canonical))
+                        findings.append(Finding(rel, 0, "evidence-stub",
+                                                f"evidence stub fields differ from evidence.md "
+                                                f"profile {stub_profile!r} (missing={missing}, extra={extra})"))
 
     # --- reviewed-against stamp + ratchet (bus + devkit; reference skills still stamp) ---
     if require_stamp:

@@ -121,7 +121,8 @@ Required fields:
 - `counter_id` (BUS-VALIDATED) - when `status=counter`.
 - `remediation_id` (BUS-VALIDATED) - when accepting a counter (with owner, fix, verification,
   blocker flag, optional gate via `--rem-owner`/`--rem-fix`/`--rem-verification`/`--blocker`/`--gate`).
-- `reason` (SKILL-POLICY) - when `status=na` or recording an override/counter context.
+- `reason` (BUS-VALIDATED when `status=na`) - `close.py apply_ack` REQUIRES a non-empty reason
+  for an NA ack (and for a counter decision); skill-policy otherwise.
 
 Rules: an accept recorded through the CLI also carries the review evidence fields
 (`risk_class`, `release_blocker`, `tests_referenced`, `tests_executed`, `residual_risk`,
@@ -137,7 +138,14 @@ Required fields:
 - `status` (BUS-VALIDATED) - `approved`.
 - `risk_class` (BUS-VALIDATED) - `none`.
 - `release_blocker` (BUS-VALIDATED) - `no`.
+- `tests_referenced` (BUS-VALIDATED) - `n/a` (the bus validator requires it on ANY approved
+  review-result; cover it with `na_reason`).
+- `tests_executed` (BUS-VALIDATED) - `n/a` + `na_reason`.
+- `residual_risk` (BUS-VALIDATED) - `n/a` + `na_reason`.
+- `evidence` (BUS-VALIDATED) - `n/a` + `na_reason` (or `artifacts`).
 - `scope` (SKILL-POLICY)
 - `na_reason` (SKILL-POLICY)
 
-Rules: every `n/a` value in a close-compatible field needs a `na_reason`.
+Rules: na-result IS sent as an approved review-result, so it must carry the same bus-required
+fields as review-result - as `n/a` covered by a single `na_reason`. Every `n/a` value in a
+close-compatible field needs that `na_reason`.

@@ -278,23 +278,80 @@ def test_parse_evidence_profiles_extracts_all_six() -> None:
     assert "risk_class" in ev["review-result"] and "release_blocker" in ev["review-result"]
 
 
-def test_evidence_review_result_matches_real_gate_schema() -> None:
-    # evidence.md's review-result profile must include the fields the REAL bus validator
-    # enforces, and a meta built from them must pass gates.validate_review_result_evidence
-    # (drop one -> it fails). Ties the canonical doc to the actual gate, not a hardcoded copy.
-    from agenttalk import gates
-    ev = sc.parse_evidence_profiles(_EV.read_text(encoding="utf-8"))
-    rr = set(ev["review-result"])
-    bus_required = {"risk_class", "release_blocker", "tests_referenced",
-                    "tests_executed", "residual_risk", "evidence"}
-    assert bus_required <= rr, f"evidence.md review-result missing bus fields: {bus_required - rr}"
-    meta = {"status": "approved", "risk_class": "quality", "release_blocker": "no",
+# --- every validator-backed profile is tied to the REAL validator (the systematic fix:
+#     na-result shipped bus-rejected because only review-result had a gate-tied test) ---
+
+_GATE_REQUIRED = ["risk_class", "release_blocker", "tests_referenced",
+                  "tests_executed", "residual_risk", "evidence"]
+
+
+def _review_meta() -> dict:
+    return {"status": "approved", "risk_class": "quality", "release_blocker": "no",
             "tests_referenced": "test_x", "tests_executed": "ran test_x: 5 passed",
             "residual_risk": "low", "evidence": "pytest output"}
-    gates.validate_review_result_evidence("review-result", meta)         # no raise
-    bad = {k: v for k, v in meta.items() if k != "risk_class"}
+
+
+def _na_meta() -> dict:
+    return {"status": "approved", "risk_class": "none", "release_blocker": "no",
+            "tests_referenced": "n/a", "tests_executed": "n/a", "residual_risk": "n/a",
+            "evidence": "n/a", "na_reason": "lens not applicable", "scope": "x"}
+
+
+def test_evidence_profile_review_result_includes_bus_fields() -> None:
+    ev = sc.parse_evidence_profiles(_EV.read_text(encoding="utf-8"))
+    for prof in ("review-result", "qa-result", "na-result"):
+        missing = set(_GATE_REQUIRED) - set(ev[prof])
+        assert not missing, f"evidence.md {prof} missing bus-validated fields: {missing}"
+
+
+@pytest.mark.parametrize("builder", [_review_meta, _na_meta], ids=["review-result", "na-result"])
+def test_validator_backed_profile_passes_real_gate(builder) -> None:
+    # a meta built from the profile's BUS-VALIDATED fields must PASS the REAL validator.
+    from agenttalk import gates
+    gates.validate_review_result_evidence("review-result", builder())   # no raise
+
+
+@pytest.mark.parametrize("builder", [_review_meta, _na_meta], ids=["review-result", "na-result"])
+@pytest.mark.parametrize("drop", _GATE_REQUIRED)
+def test_validator_backed_profile_rejects_each_dropped_bus_field(builder, drop) -> None:
+    # parametrized over EVERY bus-required field (not just risk_class) so a REMOVED gate
+    # requirement is caught, not just an added/dropped evidence.md field (fresh P3 #6).
+    from agenttalk import gates
+    meta = builder()
+    meta.pop(drop, None)
     with pytest.raises(ValueError):
-        gates.validate_review_result_evidence("review-result", bad)
+        gates.validate_review_result_evidence("review-result", meta)
+
+
+def test_close_ack_profile_matches_real_close_validator() -> None:
+    # close-ack maps to close.apply_ack: NA needs a reason (BUS-VALIDATED when status=na),
+    # COUNTER needs a counter_id. Tie the profile to the real validator.
+    from agenttalk import close as cl
+    rec = {"status": "open", "lens_acks": {}, "counters": {}, "revision": "abc1234"}
+    with pytest.raises(cl.CloseError):                       # NA without a reason
+        cl.apply_ack(rec, lens_id="security", status="na", agent="lead",
+                     from_role="lead", at="t")
+    cl.apply_ack(rec, lens_id="security", status="na", agent="lead",
+                 from_role="lead", at="t", reason="lens not applicable")   # no raise
+    rec2 = {"status": "open", "lens_acks": {}, "counters": {}, "revision": "abc1234"}
+    with pytest.raises(cl.CloseError):                       # COUNTER without a counter_id
+        cl.apply_ack(rec2, lens_id="security", status="counter", agent="lead",
+                     from_role="lead", at="t", reason="r")
+
+
+def test_stub_profile_must_match_frontmatter(tmp_path: Path) -> None:
+    # reviewer-1 P1: frontmatter evidence-profile=qa-result + a stub claiming review-result
+    # must be flagged (the stub profile must be in the frontmatter profiles).
+    inv = sc.build_command_inventory()
+    cur = sc.current_major_minor(__version__)
+    ev = {"review-result": ["risk_class"], "qa-result": ["risk_class"]}
+    p = tmp_path / "SKILL.md"
+    p.write_text('---\nname: r\ndescription: d\ncategory: assurance\n'
+                 'evidence-profile:\n  - qa-result\nreviewed-against: "0.42"\n---\n# r\n\n'
+                 "## Evidence\n\nEmit the `review-result` profile.\n\n"
+                 "Required fields:\n\n- `risk_class`\n", encoding="utf-8")
+    f = sc.check_skill_file(p, kind="devkit", inventory=inv, current=cur, evidence_profiles=ev)
+    assert any("not in the frontmatter evidence-profile" in x.reason for x in f)
 
 
 def test_stub_parity_flags_mismatch_and_missing(tmp_path: Path) -> None:
