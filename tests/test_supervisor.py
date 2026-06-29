@@ -1667,9 +1667,12 @@ def test_config_template_ships_wrapped_example() -> None:
     cfg = json.loads(sup.CONFIG_TEMPLATE)
     w = cfg["agents"]["AGENT_NAME_WRAPPED"]
     assert w["wrapped"] is True
-    # the codex sample ships a conservative heavy-reasoning threshold (Codex
-    # ruling: 1200 for a known implementer/reviewer role, not the bare 900)
-    assert w["stuck_after_seconds"] == 1200
+    # the codex sample ships a threshold ABOVE the per-turn watchdog deadline +
+    # margin (v0.46.0: 1800 + 300 -> default 2400) so the supervisor never preempts
+    # the watchdog; it also ships a turn_watchdog block (default-ON for wrapped codex).
+    assert w["stuck_after_seconds"] == 2400
+    assert w["turn_watchdog"]["enabled"] is True
+    assert w["turn_watchdog"]["turn_elapsed_seconds"] == 1800
     args = w["launch"]["windows_args"]
     assert "{SESSION_ARGS}" not in args          # wrapper owns session; no splice
     assert args[:3] == ["-m", "agenttalk", "wrap"] and "--loop" in args
@@ -1685,7 +1688,7 @@ def test_config_template_ships_wrapped_example() -> None:
 def test_resolve_stuck_after_per_cli_defaults_and_override() -> None:
     # per-CLI wrapped defaults
     assert sup.resolve_stuck_after({}, {"cli": "claude", "wrapped": True}) == 180.0
-    assert sup.resolve_stuck_after({}, {"cli": "codex", "wrapped": True}) == 900.0
+    assert sup.resolve_stuck_after({}, {"cli": "codex", "wrapped": True}) == 2400.0
     # an explicit per-agent override always wins
     assert sup.resolve_stuck_after(
         {}, {"cli": "codex", "wrapped": True, "stuck_after_seconds": 1500}) == 1500.0
@@ -1696,7 +1699,7 @@ def test_resolve_stuck_after_per_cli_defaults_and_override() -> None:
 
 def test_wrapped_codex_default_threshold_tolerates_reasoning_gap() -> None:
     # A 300s silent pure-reasoning gap is STALE under the global 120s threshold,
-    # but a wrapped codex re-derives against its 900s default -> NOT stale -> the
+    # but a wrapped codex re-derives against its 2400s default -> NOT stale -> the
     # planner does NOT false-kill it mid-reasoning.
     p = _plan_wrap(_report(heartbeat_stale=True, heartbeat_age_seconds=300.0),
                    {"agents": {"worker": _wrap_ready()}}, snapshot=_wrap_snap())
@@ -1743,11 +1746,74 @@ def test_wrapped_claude_has_no_codex_floor() -> None:
     assert p["action"] == sup.STUCK_RECOVER
 
 
+# ---------- the per-turn watchdog TIMING-INVARIANT guard (v0.46.0, gate #3)
+
+def test_wrapped_codex_stuck_after_below_watchdog_deadline_refuses_restart() -> None:
+    # stuck_after=1500 is ABOVE the 600s floor but <= turn_elapsed(1800)+margin(300)=2100,
+    # so the supervisor would PREEMPT the per-turn watchdog (relaunch into the same wedge).
+    # REFUSE restart-on-stale (warn-only) with the watchdog-specific reason.
+    cfg = {**_WRAP_CONFIG,
+           "agents": {"worker": {"auto_restart": True, "cli": "codex",
+                                 "wrapped": True, "stuck_after_seconds": 1500}}}
+    p = _plan_wrap(_report(heartbeat_stale=True, heartbeat_age_seconds=3000.0),
+                   {"agents": {"worker": _wrap_ready(last_warn_epoch=0,
+                                                     backoff_next_epoch=0)}},
+                   snapshot=_wrap_snap(), config=cfg)
+    assert p["action"] == sup.SUSPECT_WARN and p["kill_first"] is False
+    assert "turn watchdog deadline" in p["reason"]
+
+
+def test_wrapped_codex_above_watchdog_deadline_recovers() -> None:
+    # the DEFAULT wrapped-codex stuck_after (2400) sits above 2100 -> NOT preempted -> a
+    # genuinely stale wrapper still recovers normally.
+    p = _plan_wrap(_report(heartbeat_stale=True, heartbeat_age_seconds=3000.0),
+                   {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
+                   snapshot=_wrap_snap())
+    assert p["action"] == sup.STUCK_RECOVER
+
+
+def test_wrapped_codex_watchdog_guard_opt_out_restarts() -> None:
+    # allow_low_stuck_after=true opts out of BOTH the floor guard and the watchdog guard.
+    cfg = {**_WRAP_CONFIG,
+           "agents": {"worker": {"auto_restart": True, "cli": "codex", "wrapped": True,
+                                 "stuck_after_seconds": 1500, "allow_low_stuck_after": True}}}
+    p = _plan_wrap(_report(heartbeat_stale=True, heartbeat_age_seconds=3000.0),
+                   {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
+                   snapshot=_wrap_snap(), config=cfg)
+    assert p["action"] == sup.STUCK_RECOVER
+
+
+def test_wrapped_codex_watchdog_disabled_uses_only_floor_guard() -> None:
+    # turn_watchdog.enabled=false -> no watchdog -> the timing guard does NOT apply; a
+    # stuck_after of 1500 (above the 600 floor) recovers normally.
+    cfg = {**_WRAP_CONFIG,
+           "agents": {"worker": {"auto_restart": True, "cli": "codex", "wrapped": True,
+                                 "stuck_after_seconds": 1500,
+                                 "turn_watchdog": {"enabled": False}}}}
+    p = _plan_wrap(_report(heartbeat_stale=True, heartbeat_age_seconds=3000.0),
+                   {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
+                   snapshot=_wrap_snap(), config=cfg)
+    assert p["action"] == sup.STUCK_RECOVER
+
+
+def test_config_template_documents_watchdog_and_provenance() -> None:
+    # gate #4/#5 doc tests: the wrapped-codex template must surface the per-turn watchdog,
+    # its known limitation, and the codex_home_isolation config-provenance risk.
+    cfg = json.loads(sup.CONFIG_TEMPLATE)
+    w = cfg["agents"]["AGENT_NAME_WRAPPED"]
+    wd_comment = w["_comment_turn_watchdog"]
+    assert "two-factor" in wd_comment.lower() and "KNOWN LIMITATION" in wd_comment
+    prov = w["_comment_codex_home_isolation_provenance"]
+    assert "approval_policy=never" in prov and "MCP" in prov and "headless" in prov.lower()
+    # the timing-invariant is documented in the stuck_after comment
+    assert "watchdog" in w["_comment_wrapped_stuck_after"].lower()
+
+
 def test_report_parity_wrapped_codex_uses_per_cli_threshold(tmp_path: Path) -> None:
     # REPORT PARITY: the operator-facing build_report must match the planner's
     # per-CLI decision (the operator watches the supervisor console during the
     # dogfood). A 300s-old heartbeat is STALE under the global 120s default but
-    # FRESH under the wrapped-codex 900s threshold - the report must show fresh.
+    # FRESH under the wrapped-codex 2400s threshold - the report must show fresh.
     s = _team(tmp_path)
     s.write_heartbeat("worker")
     hb_ts = s.read_heartbeat("worker").timestamp()
@@ -1755,11 +1821,11 @@ def test_report_parity_wrapped_codex_uses_per_cli_threshold(tmp_path: Path) -> N
     # global view (no supervisor_config): stale at 120s
     glob = sup.build_report(s, now_epoch=hb_ts + 300, stuck_after_seconds=120)
     assert glob["agents"]["worker"]["heartbeat_stale"] is True
-    # parity view (supervisor_config passed): fresh under the per-CLI 900s
+    # parity view (supervisor_config passed): fresh under the per-CLI 2400s
     parity = sup.build_report(s, now_epoch=hb_ts + 300, stuck_after_seconds=120,
                               supervisor_config=sup_cfg)
     assert parity["agents"]["worker"]["heartbeat_stale"] is False
-    assert parity["agents"]["worker"]["stuck_after_seconds"] == 900.0
+    assert parity["agents"]["worker"]["stuck_after_seconds"] == 2400.0
     # a non-wrapped agent in the same report keeps the global threshold
     assert parity["agents"]["lead"]["stuck_after_seconds"] == 120.0
 

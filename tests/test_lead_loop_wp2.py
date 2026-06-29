@@ -170,11 +170,13 @@ def test_lead_loop_acquire_uses_resolved_window(tmp_path, monkeypatch):
         return real_acquire(agent, **kw)
     monkeypatch.setattr(s, "acquire_lead_loop_lease", spy)
     monkeypatch.setattr(wloop, "run_loop", lambda *a, **k: 0)
-    sup_cfg = {"agents": {"beta": {"wrapped": True, "cli": "codex"}}}  # codex window 900
+    sup_cfg = {"agents": {"beta": {"wrapped": True, "cli": "codex"}}}  # codex window 2400 (v0.46.0)
     cli._wrap_loop_mode(s, "beta", cli="codex", base_argv=["python", "-c", "pass"],
                         sender="beta", min_interval=5.0, render=False, lead_loop=True,
                         supervisor_config=sup_cfg)
-    assert captured.get("heartbeat_stale_after") == 900.0  # resolved, not the 120 default
+    # the steal-window tracks the wrapped-codex stuck_after (raised to 2400 so the supervisor
+    # never preempts the per-turn watchdog), NOT the 120s default.
+    assert captured.get("heartbeat_stale_after") == 2400.0
 
 
 # ----------------------------------------------------------- token-strip (condition 3, security)

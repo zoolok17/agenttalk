@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -5528,7 +5529,8 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     one_shot_request_id: str | None = None,
                     k_poison: int = 3, k_escalate: int = 20,
                     lead_loop: bool = False,
-                    supervisor_config: dict | None = None) -> int:
+                    supervisor_config: dict | None = None,
+                    turn_watchdog: object | None = None) -> int:
     """The long-running supervised wrapper loop (design C): own the idle bus-wait +
     heartbeat, drive the CLI ONE turn per inbound message in structured-stream mode
     (session continuity owned here), then return to the wait. Runs until killed -
@@ -5613,6 +5615,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             store, agent, cli, state, base_argv, sender=sender,
             min_interval=min_interval, render=render, heartbeat=heartbeat,
             persist=lambda st: wsession.save_session(store, agent, st),
+            turn_watchdog=turn_watchdog,
         )
     except ValueError as e:
         _release()
@@ -5833,12 +5836,31 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         flag_escalate = getattr(args, "dead_letter_escalate_after", None)
         k_poison = flag_poison if flag_poison is not None else res_poison
         k_escalate = flag_escalate if flag_escalate is not None else res_escalate
+        # Per-turn watchdog (wrapped-codex hung-tool-descendant hang). DEFAULT-ON for a
+        # CONTINUOUS wrapped-codex loop only (not one-shot, not claude); config can flip it.
+        from agenttalk.wrapper import turn_watchdog as _twd
+        default_wd_on = (args.cli == "codex" and not args.one_shot)
+        watchdog_cfg = _twd.resolve_turn_watchdog(
+            sup_cfg, cfg_agent, default_enabled=default_wd_on)
+        # Low-floor guard (mirrors allow_low_stuck_after): refuse an unsafe-low turn_elapsed
+        # unless explicitly opted in - never silently coerce. The two-factor discriminator
+        # is mandatory regardless, so disabling here is the safe response to a misconfig.
+        if (watchdog_cfg.enabled
+                and watchdog_cfg.turn_elapsed_seconds < _twd.SAFE_TURN_ELAPSED_FLOOR
+                and not watchdog_cfg.allow_low_turn_elapsed):
+            sys.stderr.write(
+                f"agenttalk wrap: turn_watchdog.turn_elapsed_seconds="
+                f"{watchdog_cfg.turn_elapsed_seconds:.0f}s is below the "
+                f"{_twd.SAFE_TURN_ELAPSED_FLOOR:.0f}s floor; set allow_low_turn_elapsed=true "
+                f"to opt in. Disabling the turn watchdog for this run.\n")
+            watchdog_cfg = dataclasses.replace(watchdog_cfg, enabled=False)
         return _wrap_loop_mode(store, agent, cli=args.cli, base_argv=argv,
                                sender=sender, min_interval=args.min_interval,
                                render=not args.no_render,
                                one_shot_request_id=args.to_request if args.one_shot else None,
                                k_poison=k_poison, k_escalate=k_escalate,
-                               lead_loop=lead_loop, supervisor_config=sup_cfg)
+                               lead_loop=lead_loop, supervisor_config=sup_cfg,
+                               turn_watchdog=watchdog_cfg)
     try:
         return wrapper_run.run_wrapper(
             cli=args.cli, agent=agent, argv=argv, store=store, sender=sender,

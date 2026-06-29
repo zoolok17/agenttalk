@@ -218,8 +218,8 @@ def test_resolve_timing_supervised_matches_stuck_after(tmp_path: Path) -> None:
 def test_visibility_paths_use_resolved_window_not_default(tmp_path: Path, monkeypatch) -> None:
     # codex P1 regression: build_report / status / doctor must use the resolver's
     # window for a WRAPPED agent, not the 120s store default - else they false-unarm a
-    # within-window controller. Setup: wrapped codex (window 900), an EXPIRED lease, a
-    # heartbeat ~300s old -> stale@120 (would be unarmed) but fresh@900 (armed).
+    # within-window controller. Setup: wrapped codex (window 2400), an EXPIRED lease, a
+    # heartbeat ~300s old -> stale@120 (would be unarmed) but fresh@2400 (armed).
     s = _store(tmp_path)
     s.set_managed_lead_loop("beta")
     monkeypatch.setattr(store_mod, "_process_liveness", lambda pid: PROC_ALIVE)

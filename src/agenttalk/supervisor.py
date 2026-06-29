@@ -92,13 +92,52 @@ _LIVENESS_DEFAULTS = {
 # pure-reasoning stretch is SILENT and the threshold must be loose enough not to
 # false-kill it mid-reasoning. These are an OPERATIONAL false-positive tradeoff,
 # NOT a provably-safe bound (reviewer-1 wording).
-_WRAPPED_STUCK_AFTER_DEFAULTS = {"claude": 180.0, "codex": 900.0}
+# Wrapped CODEX rose from 900s to 2400s in v0.46.0: the per-turn watchdog
+# (wrapper/turn_watchdog.py) now kills a HUNG TOOL DESCENDANT at the
+# turn_elapsed deadline (default 1800s), so the supervisor's stale-recovery
+# must sit ABOVE that deadline + margin (see ``_WATCHDOG_STUCK_AFTER_MARGIN``).
+# Otherwise the supervisor would relaunch the wrapper into the same wedge before
+# the watchdog ever fires (the timing-invariant the watchdog depends on).
+_WRAPPED_STUCK_AFTER_DEFAULTS = {"claude": 180.0, "codex": 2400.0}
 # Below this, a wrapped CODEX restart-on-stale is too aggressive (likely to
 # false-kill mid-reasoning): the planner WARNS + REFUSES restart authority
 # (degrades to warn-only) unless the operator opts in with
 # ``allow_low_stuck_after=true``. We never SILENTLY coerce the value (no
 # ``max(configured, 900)``) - that would make config surprising.
 _WRAPPED_CODEX_MIN_STUCK_AFTER = 600.0
+# The wrapped-codex per-turn watchdog deadline (turn_elapsed_seconds) the supervisor
+# assumes when one is not explicitly configured, + the margin its stale threshold must
+# clear. A wrapped-codex stuck_after_seconds <= turn_elapsed + margin would let the
+# supervisor preempt the watchdog -> the planner REFUSES restart-on-stale (warn-only)
+# unless allow_low_stuck_after=true. Keep in sync with TurnWatchdogConfig defaults.
+_WATCHDOG_TURN_ELAPSED_DEFAULT = 1800.0
+_WATCHDOG_STUCK_AFTER_MARGIN = 300.0
+
+
+def _watchdog_turn_elapsed(config: dict, cfg_agent: dict) -> float:
+    """Effective turn_watchdog.turn_elapsed_seconds (per-agent -> global -> default), PURE
+    and corrupt-config tolerant. Read directly from the config block so the supervisor does
+    not import the wrapper module."""
+    for src in (cfg_agent, config):
+        src = src if isinstance(src, dict) else {}
+        blk = src.get("turn_watchdog")
+        if isinstance(blk, dict):
+            v = blk.get("turn_elapsed_seconds")
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+                return float(v)
+    return _WATCHDOG_TURN_ELAPSED_DEFAULT
+
+
+def _watchdog_enabled_for(config: dict, cfg_agent: dict, wrapped: bool, cli_name: str) -> bool:
+    """Whether the per-turn watchdog is effectively ON for this agent. DEFAULT-ON for a
+    wrapped codex (matches cmd_wrap); an explicit ``turn_watchdog.enabled`` in the per-agent
+    or global block overrides. PURE / corrupt-config tolerant."""
+    for src in (cfg_agent, config):
+        src = src if isinstance(src, dict) else {}
+        blk = src.get("turn_watchdog")
+        if isinstance(blk, dict) and isinstance(blk.get("enabled"), bool):
+            return blk["enabled"]
+    return bool(wrapped and cli_name == "codex")
 
 
 def resolve_stuck_after(config: dict, cfg_agent: dict) -> float:
@@ -789,7 +828,17 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     unsafe_low_codex = (wrapped and cli_name == "codex"
                         and stuck_after < _WRAPPED_CODEX_MIN_STUCK_AFTER
                         and not allow_low_stuck_after)
-    can_confirm_stuck = (activity_hook or wrapped) and not unsafe_low_codex
+    # TIMING-INVARIANT GUARD (v0.46.0): a wrapped codex with the per-turn watchdog ON must
+    # have stuck_after ABOVE the watchdog deadline + margin, else the supervisor would kill
+    # + relaunch the wrapper into the same wedge BEFORE the watchdog fires. REFUSE
+    # restart-on-stale (warn-only) when it would preempt, unless allow_low_stuck_after.
+    watchdog_on = _watchdog_enabled_for(config, cfg_agent, wrapped, cli_name)
+    watchdog_turn_elapsed = _watchdog_turn_elapsed(config, cfg_agent)
+    watchdog_preempted = (wrapped and cli_name == "codex" and watchdog_on
+                          and stuck_after <= watchdog_turn_elapsed + _WATCHDOG_STUCK_AFTER_MARGIN
+                          and not allow_low_stuck_after)
+    can_confirm_stuck = ((activity_hook or wrapped)
+                         and not unsafe_low_codex and not watchdog_preempted)
     # the EFFECTIVE isolation flag (per-CLI default merged) - emitted in the plan
     # so the executor seeds CODEX_HOME exactly when the planner assumed it, even
     # if the raw config omits the field (codex impl-review MAJOR).
@@ -972,6 +1021,13 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                     "restart-on-stale (item-level stream would risk a false-kill "
                     "mid-reasoning); raise stuck_after_seconds or set "
                     "allow_low_stuck_after=true to opt in")
+            elif watchdog_preempted:
+                warn_reason = (
+                    f"wrapped codex stuck_after_seconds={stuck_after:.0f} <= turn watchdog "
+                    f"deadline {watchdog_turn_elapsed:.0f}s + {_WATCHDOG_STUCK_AFTER_MARGIN:.0f}s "
+                    "margin - REFUSING restart-on-stale (it would relaunch into the same "
+                    "wedge before the per-turn watchdog fires); raise stuck_after_seconds "
+                    "above the deadline+margin or set allow_low_stuck_after=true to opt in")
             else:
                 warn_reason = ("heartbeat stale but NO activity hook - cannot "
                                "confirm stuck; not killed")
@@ -1513,7 +1569,9 @@ CONFIG_TEMPLATE = """\
       "auto_restart": true,
       "auto_restart_protected": false,
       "wrapped": true,
-      "stuck_after_seconds": 1200,
+      "stuck_after_seconds": 2400,
+      "allow_low_stuck_after": false,
+      "turn_watchdog": { "enabled": true, "turn_elapsed_seconds": 1800, "tool_descendant_alive_seconds": 600, "poll_seconds": 10, "allow_low_turn_elapsed": false },
       "cwd": "REPLACE_WITH_PROJECT_DIR",
       "env": { "AGENTTALK_SELF": "AGENT_NAME_WRAPPED" },
       "launch": {
@@ -1521,9 +1579,11 @@ CONFIG_TEMPLATE = """\
         "windows_args": ["-m", "agenttalk", "wrap", "--for", "AGENT_NAME_WRAPPED", "--cli", "codex", "--loop", "--", "REPLACE: the REAL codex.exe path - the wrapper drives it ONE turn per inbound message", "--disable", "hooks"]
       },
       "_comment_wrapped": "WRAPPED is the RECOMMENDED / default supervised archetype for hands-off agents (the manual /agenttalk.listen agent above is supported but BEST-EFFORT/LEGACY: a resumed manual session may not re-enter the listen loop, never heartbeat, and hit the readiness give-up cap). The wrapped codex child is launched with `--disable hooks` by default (codex's safe default - the wrapper owns the heartbeat, so the codex activity hook is neither needed nor wanted, and disabling it sidesteps hook-trust prompts; remove it from windows_args if you intentionally want the child's project hooks). Set wrapped=true to supervise the agent THROUGH `agenttalk wrap --loop`: windows_file is the PYTHON exe (NOT the CLI exe), windows_args is the FIXED wrap command, and the REAL codex.exe/claude.exe goes at the tail after '--' (it is what windows_file would be for a manual agent). NO {SESSION_ARGS} token - the wrapper owns session continuity end-to-end (it persists + reloads the codex thread_id / claude session-id across its own turns AND across a supervisor relaunch, so a restart re-runs the identical wrap argv and reload-resumes). The wrapper python IS the long-lived supervised root, so brain discovery is RETIRED for wrapped agents (brain_pid stays null); the per-turn child (codex exec / claude -p) is reaped via the start-guarded managed_pids tree-kill. activity_hook is NOT needed: a wrapped agent is instrumented by construction (heartbeat on every idle bus-wait cycle + on streaming progress), so a stale heartbeat past grace RECOVERS (restart) instead of warn-only.",
-      "_comment_wrapped_stuck_after": "PER-CLI stuck_after_seconds (a per-agent stuck_after_seconds override ALWAYS wins; the global stuck_after_seconds is only the legacy/unclassified fallback). Defaults when unset: wrapped CLAUDE=180s, wrapped CODEX=900s. WHY they differ: wrapped CLAUDE streams thinking+text+tool deltas and stays fresh through reasoning, so a tight threshold is fine; wrapped CODEX is ITEM-LEVEL (no exec --json event closes the pure-reasoning gap) so a long pure-reasoning stretch is SILENT between turn.started and the final agent_message. These are an OPERATIONAL false-positive tradeoff, NOT a provably-safe bound: pick the threshold above the longest pure-reasoning gap your codex role plausibly hits. For a heavy reasoning/refactor/review codex role (like this sample) 1200-1800s is the right template default - this example uses 1200. GUARDRAIL: for wrapped+codex the supervisor WARNS and REFUSES restart-on-stale (degrades to warn-only) when stuck_after_seconds is below 600s, UNLESS you set allow_low_stuck_after=true to opt in. The value is never silently coerced. DO NOT try to tighten codex with a synthetic active-turn timer heartbeat: no intermediate exec --json event exists to confirm progress, so a timer would mark a silently-wedged turn healthy forever and defeat restart authority - the only levers are the per-CLI threshold + per-agent overrides.",
+      "_comment_wrapped_stuck_after": "PER-CLI stuck_after_seconds (a per-agent stuck_after_seconds override ALWAYS wins; the global stuck_after_seconds is only the legacy/unclassified fallback). Defaults when unset: wrapped CLAUDE=180s, wrapped CODEX=2400s. WHY they differ: wrapped CLAUDE streams thinking+text+tool deltas and stays fresh through reasoning, so a tight threshold is fine; wrapped CODEX is ITEM-LEVEL (no exec --json event closes the pure-reasoning gap) so a long pure-reasoning stretch is SILENT between turn.started and the final agent_message. These are an OPERATIONAL false-positive tradeoff, NOT a provably-safe bound. TIMING-INVARIANT (v0.46.0): the per-turn watchdog (see turn_watchdog below) kills a HUNG TOOL DESCENDANT at turn_elapsed_seconds (default 1800); the supervisor stale-recovery MUST sit ABOVE that deadline + a 300s margin, else it would relaunch the wrapper into the same wedge before the watchdog fires. So the wrapped-codex default rose to 2400s and the planner now WARNS+REFUSES restart-on-stale (degrades to warn-only) when stuck_after_seconds <= turn_elapsed_seconds + 300, UNLESS allow_low_stuck_after=true. The older 600s floor guard also still applies. The value is never silently coerced. DO NOT try to tighten codex with a synthetic active-turn timer heartbeat: no intermediate exec --json event exists to confirm progress, so a timer would mark a silently-wedged turn healthy forever and defeat restart authority - the only levers are the per-CLI threshold + per-agent overrides + the per-turn watchdog.",
+      "_comment_turn_watchdog": "PER-TURN WATCHDOG (v0.46.0, wrapped codex; default-ON for a continuous `wrap --loop --cli codex`). Fixes the wrapped-codex hang where Codex launches a tool descendant (codex.exe -> pwsh -> node REPL) that never exits, so the turn wedges forever. TWO-FACTOR fire (BOTH required, never a pure no-output timer): the turn has run >= turn_elapsed_seconds (default 1800) AND a LIVE non-codex tool descendant has been alive >= tool_descendant_alive_seconds (default 600). On fire it kills ONLY that per-turn child tree (start-time guarded) and the turn fails as ambiguous_or_unknown - the inbound message stays pending and rides the escalate/dead-letter ceiling; it is never poison. KNOWN LIMITATION: a LEGITIMATELY long-running tool (a real build/test alive > tool_descendant_alive_seconds inside a turn > turn_elapsed_seconds) WILL also be killed - the discriminator cannot tell a hung tool from a busy-legit long one. If your codex role runs genuinely long tools, RAISE turn_elapsed_seconds / tool_descendant_alive_seconds (and keep stuck_after_seconds above turn_elapsed_seconds + 300). Below the 1200s turn_elapsed floor the wrapper REFUSES the watchdog unless allow_low_turn_elapsed=true (never silently coerced). Set turn_watchdog.enabled=false to disable; a CPU-idle/no-progress refinement is a future enhancement.",
+      "_comment_codex_home_isolation_provenance": "CONFIG PROVENANCE WARNING (codex_home_isolation): a seeded/isolated CODEX_HOME COPIES your operator BASE Codex config (including MCP servers and tool definitions) and then runs the agent UNATTENDED with approval_policy=never. So any inherited MCP server or tool will execute HEADLESSLY with no human prompt - an interactive/REPL-style MCP entry (or a tool that spawns a long-lived REPL) can wedge a turn (this is the failure mode the per-turn watchdog backstops). Audit the inherited config and keep ONLY headless-safe MCP/tools for an unattended supervised codex. The supervisor does NOT strip inherited config (a future doctor rule may flag known-interactive patterns).",
       "_comment_dead_letter": "POISON-MESSAGE HANDLING (0.40.x): a message the model fails DETERMINISTICALLY (poison_eligible) is auto-dead-lettered after dead_letter.max_attempts (default 3) - its bytes move to .agenttalk/dead-letter/<agent>/ (recoverable; `agenttalk dead-letter list/show/requeue`) and the cursor advances past it, so the inbox is never blocked. A transient/global INFRA failure (spawn/API/rate-limit/5xx) is NEVER auto-dead-lettered (it retries under backoff) but escalates to the operator at dead_letter.escalate_after_attempts (default 20); an ambiguous repeated failure escalates AND dead-letters at that ceiling. The supervisor stays DUMB: a dead-letter is PROGRESS (fresh heartbeat), so the agent returns to HEALTHY_IDLE and is never restart-looped. Override per agent or globally with a dead_letter:{max_attempts,escalate_after_attempts} block (0 disables a cap - debug only).",
-      "_comment_lead_loop": "MANAGED LEAD-LOOP CONTROLLER (Slice 2 / WP2): to make a wrapped agent OWN its team mailbox so an external consumer or a duplicate window cannot race the bus, add '--lead-loop' to windows_args RIGHT AFTER '--loop' (e.g. [..., 'wrap', '--for', 'NAME', '--cli', 'codex', '--loop', '--lead-loop', '--', <real cli>, ...]) AND run `agenttalk managed-lead-loop set NAME` so the identity is a configured managed_lead_loop. The controller acquires a renewable LEASE before its loop and renews it on every heartbeat; the model child NEVER sees the lease token. EXIT semantics the supervisor honors via the controller's exit marker: a VALID human release/end stands it DOWN and the supervisor does NOT relaunch it (the v0.39 stand-down sticks against auto_restart until you re-arm with `agenttalk request-restart` - which overrides the HOLD and clears the marker on the confirmed relaunch; NOT request-launch, which queues an ephemeral evidence-only review and would leave the controller down); a BLOCKED acquire (another LIVE owner) HOLDS only while that owner stays alive (once it dies/wedges the supervisor auto-recovers); a CRASH writes no marker and relaunches normally (recovery). If this identity holds role=lead (so it is protected), set auto_restart_protected=true for THIS identity ONLY so a stale lead controller still recovers - do NOT broaden protected auto-restart globally. Keep the wrapped stuck_after_seconds guidance above (codex 1200-1800)."
+      "_comment_lead_loop": "MANAGED LEAD-LOOP CONTROLLER (Slice 2 / WP2): to make a wrapped agent OWN its team mailbox so an external consumer or a duplicate window cannot race the bus, add '--lead-loop' to windows_args RIGHT AFTER '--loop' (e.g. [..., 'wrap', '--for', 'NAME', '--cli', 'codex', '--loop', '--lead-loop', '--', <real cli>, ...]) AND run `agenttalk managed-lead-loop set NAME` so the identity is a configured managed_lead_loop. The controller acquires a renewable LEASE before its loop and renews it on every heartbeat; the model child NEVER sees the lease token. EXIT semantics the supervisor honors via the controller's exit marker: a VALID human release/end stands it DOWN and the supervisor does NOT relaunch it (the v0.39 stand-down sticks against auto_restart until you re-arm with `agenttalk request-restart` - which overrides the HOLD and clears the marker on the confirmed relaunch; NOT request-launch, which queues an ephemeral evidence-only review and would leave the controller down); a BLOCKED acquire (another LIVE owner) HOLDS only while that owner stays alive (once it dies/wedges the supervisor auto-recovers); a CRASH writes no marker and relaunches normally (recovery). If this identity holds role=lead (so it is protected), set auto_restart_protected=true for THIS identity ONLY so a stale lead controller still recovers - do NOT broaden protected auto-restart globally. Keep the wrapped stuck_after_seconds guidance above (codex >= turn_elapsed_seconds + 300, default 2400)."
     }
   }
 }

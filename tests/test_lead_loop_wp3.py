@@ -281,7 +281,7 @@ def test_snapshot_health_uses_resolved_window_not_default(tmp_path, monkeypatch)
     # control: at the bare 120s default the same lease is UNARMED + heartbeat-stale (skew source)
     bare = s.lead_loop_state("beta", now=now)
     assert bare["armed"] is False and bare["heartbeat_stale"] is True
-    # the cadence snapshot health MUST agree with the WP1 resolver at the 900 window, not 120
+    # the cadence snapshot health MUST agree with the WP1 resolver at the 2400 window, not 120
     snap = cad.build_cadence_snapshot(s, "beta", now_epoch=now, supervisor_config=sup_cfg)
     assert snap["timing"]["heartbeat_stale_after"] == window
     assert snap["lead_loop_health"]["armed"] is True

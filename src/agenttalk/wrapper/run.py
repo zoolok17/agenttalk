@@ -21,6 +21,10 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .turn_watchdog import TurnWatchdogConfig
 from datetime import datetime, timezone
 
 from agenttalk.store import LEAD_LOOP_LEASE_ENV
@@ -263,7 +267,10 @@ class _ProcStream:
     inject their own spawner (a plain list = unknown exit, an object with
     ``.returncode`` = a controlled exit)."""
 
-    def __init__(self, argv: list[str], stdin_text: str | None) -> None:
+    def __init__(self, argv: list[str], stdin_text: str | None, *,
+                 watchdog: "TurnWatchdogConfig | None" = None,
+                 watchdog_snapshot_fn=None, watchdog_kill_fn=None,
+                 watchdog_clock=time.monotonic, watchdog_wall_clock=time.time) -> None:
         # argv is the operator-provided launch command; never shell=True.
         # Explicit encoding/errors (see run_wrapper): UTF-8 child output must not be
         # decoded as cp1252 on Windows (crash on the first non-ASCII byte), and a
@@ -280,11 +287,26 @@ class _ProcStream:
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
             bufsize=1, env=child_env,
         )
+        # Record the per-turn root start-time right after spawn (~ the OS-reported create
+        # time, within spawn jitter) so the watchdog can start-time-guard the kill against
+        # pid reuse. Wall clock, to match the snapshot adapter's create_epoch.
+        self._root_start = watchdog_wall_clock()
         if self._proc.stdin is not None:
             if stdin_text is not None:
                 self._proc.stdin.write(stdin_text)
             self._proc.stdin.close()
         self.returncode: int | None = None
+        # Per-turn watchdog (off unless an ENABLED config is passed). A structured result
+        # lands on .watchdog_result iff it fires (the kill closes stdout -> __iter__ ends).
+        self.watchdog_result: dict | None = None
+        self._watchdog = None
+        if watchdog is not None and watchdog.enabled:
+            from .turn_watchdog import TurnWatchdog
+            self._watchdog = TurnWatchdog(
+                root_pid=self._proc.pid, root_start=self._root_start, cfg=watchdog,
+                snapshot_fn=watchdog_snapshot_fn, kill_fn=watchdog_kill_fn,
+                clock=watchdog_clock, wall_clock=watchdog_wall_clock)
+            self._watchdog.start()
 
     def __iter__(self) -> Iterator[str]:
         try:
@@ -293,6 +315,13 @@ class _ProcStream:
             if self._proc.stdout:
                 self._proc.stdout.close()
             self.returncode = self._proc.wait()
+            # Stop + join the watchdog AFTER the child has exited: a normal turn completion
+            # makes the thread exit its wait immediately (no kill race), and a watchdog that
+            # already fired published its result before we read it here.
+            if self._watchdog is not None:
+                self._watchdog.stop()
+                self._watchdog.join(timeout=10.0)
+                self.watchdog_result = self._watchdog.result
 
 
 def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str], *,
@@ -301,7 +330,9 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                clock: Callable[[], float] = time.monotonic,
                spawn: Callable[[list[str], str | None], Iterable[str]] | None = None,
                heartbeat: Callable[[], None] | None = None,
-               persist: Callable[[object], None] | None = None) -> Callable[[dict], object]:
+               persist: Callable[[object], None] | None = None,
+               turn_watchdog: "TurnWatchdogConfig | None" = None,
+               watchdog_snapshot_fn=None, watchdog_kill_fn=None) -> Callable[[dict], object]:
     """Build the per-turn ``drive(record)`` callback for loop.run_loop. Each call
     drives ONE real CLI turn and returns a :class:`loop.DriveOutcome` (ok + a failure
     CLASS on failure, for dead-letter). A turn fails if it produced no progress event or
@@ -355,7 +386,15 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         on_info=_default_info,
         min_interval=min_interval,
     )
-    spawner = spawn or _ProcStream
+    if spawn is not None:
+        spawner = spawn                     # tests inject their own (argv, stdin) spawner
+    else:
+        def spawner(argv, stdin_text):
+            # Bind the per-turn watchdog onto the real spawner. When turn_watchdog is None
+            # or disabled, _ProcStream starts no thread (zero overhead, behavior unchanged).
+            return _ProcStream(argv, stdin_text, watchdog=turn_watchdog,
+                               watchdog_snapshot_fn=watchdog_snapshot_fn,
+                               watchdog_kill_fn=watchdog_kill_fn)
 
     def _run_one(spec) -> dict:
         """Spawn ONE CLI invocation for ``spec`` and process its JSONL via the engine.
@@ -401,6 +440,10 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         # rc is None for an injected list spawn (unknown -> trust the boundary); a real
         # _ProcStream reports the child exit code (nonzero = failed turn).
         sig["rc"] = getattr(stream, "returncode", None)
+        # A fired per-turn watchdog (hung tool descendant killed) is the AUTHORITATIVE
+        # cause of this turn's death - it closed the stream, so rc/partial-stream signals
+        # are downstream noise. Carry it for _classify to check FIRST.
+        sig["watchdog"] = getattr(stream, "watchdog_result", None)
         sig["ok"] = sig["completed"] and not sig["terminal"] and sig["rc"] in (0, None)
         return sig
 
@@ -411,6 +454,13 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         infra-looking terminal error, and any unrecognized/ambiguous partial/nonzero
         outcome, gets the high K_escalate ceiling so a sustained INFRA outage (or an
         unobserved cause) can never false-dead-letter a healthy message (lead verify P1)."""
+        wd = sig.get("watchdog")
+        if wd:
+            # the per-turn watchdog killed a hung tool descendant: AMBIGUOUS (never poison),
+            # checked BEFORE rc/terminal noise it caused. The message stays pending and rides
+            # the K_escalate ceiling - a persistently-wedging head escalates, never auto-DLs.
+            summary = wd.get("summary") if isinstance(wd, dict) else None
+            return CLASS_AMBIGUOUS, summary or "turn watchdog killed hung tool descendant"
         if sig.get("error"):                       # spawn/exec OS error (missing binary, ...)
             return CLASS_INFRA, sig["error"]
         if sig.get("terminal"):
@@ -511,6 +561,16 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         if persist is not None:
             persist(session_state)
         failure_class, summary = _classify(sig)
+        # WATCHDOG-RECOVERY ONLY (narrow path): the hung tool tree was killed and the
+        # wrapper is alive + ready for the next turn, so re-stamp a fresh heartbeat (undoing
+        # the clear above) - otherwise the supervisor would ALSO relaunch a healthy wrapper.
+        # Ordinary failures keep the cleared heartbeat. A lost-lease raise from the injected
+        # hook is NOT masked (reviewer-1 ask) - it propagates exactly like the success path.
+        if sig.get("watchdog"):
+            if heartbeat is not None:
+                heartbeat()
+            else:
+                store.write_heartbeat(agent)
         return DriveOutcome(ok=False, failure_class=failure_class, summary=summary)
 
     return drive
