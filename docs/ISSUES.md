@@ -12,7 +12,58 @@ major · `P2` minor · `P3` nit. Each item: what, why, where, disposition.
 
 ---
 
-## IN PROGRESS — lead-loop Slice 2 / WP3 (the CADENCE TICK, `lead-loop-wp3`)
+## IN PROGRESS — lead-loop Slice 2 / WP4 (the mechanical LIAISON RELAY, `lead-loop-wp4`)
+
+The LAST WP of the split-identity lead-loop: a thin typed wrapper so the operator's
+words cross the human<->bus boundary with an audit stamp - NO new message kind, NO new
+transport (reuses reply/send/escalate). Built off master fe6ed6b; cross-review starts
+with codex (reviewer-1 joins when restored). After this merges + reviewer-1 is back,
+v0.42.0 ships the COMPLETE Slice 2 (WP1-4) at strict 2/2.
+
+- **`relay operator-answer --to-request <rid>` (P1).** VALIDATES `<rid>` is a *pending*
+  `needs_operator` opener addressed to *this* liaison (via the ack-independent thread
+  derivation), then sends a normal thread reply stamped `operator_answer=true` +
+  `operator_origin=<liaison>` so it routes back to the asking lead-loop's mailbox and
+  flips the thread to `operator_state=answered`. Refuses a non-escalation thread, a
+  foreign/unknown thread, an already-answered thread, and an empty body.
+- **`relay operator-command [--to <lead-loop>]` (P1).** Sends a `question`/`message`
+  stamped `operator_command=true` + `operator_origin`, minting a fresh `opc-` request_id
+  for the question. INFERS `--to` only when exactly one managed lead-loop exists, else
+  REQUIRES it. FAILS CLOSED unless the sender is the current operator-facing liaison; an
+  `--override --reason` is the only (audited) exception, recorded as
+  `operator_command_override=true` + `override_reason`.
+- **lead-loop -> operator** stays the existing `escalate` (a `needs_operator` question);
+  no new kinds.
+- **Liaison-down (P2).** A relayed message is an ordinary durable bus record - it QUEUES
+  in the target's inbox whether or not the target is up; a pending operator answer is the
+  OPEN THREAD, not a controller block; with no liaison/lead resolvable the controller
+  surfaces via doctor / cadence-health and keeps handling non-operator work.
+
+**Operator-facing usage (how the liaison relays).** When a lead-loop escalates, its
+question lands in the liaison's `sync` OPERATOR INPUT NEEDED bucket with a `request_id`.
+The human liaison relays the operator's two kinds of input:
+
+```
+# 1) the operator ANSWERS a pending escalation (routes back to the asking lead-loop):
+agenttalk relay operator-answer --from <liaison> --to-request <esc-id> -m "<operator's answer>"
+
+# 2) the operator issues a SPONTANEOUS command to a managed lead-loop (--to inferred when
+#    exactly one managed lead-loop exists; question by default so the reply correlates):
+agenttalk relay operator-command --from <liaison> --to <lead-loop> -m "<operator's instruction>"
+agenttalk relay operator-command --from <liaison> --kind message -m "<fire-and-forget FYI>"
+```
+
+`operator-answer` refuses anything that is not a pending `needs_operator` escalation
+addressed to you. `operator-command` fails closed unless you are the configured
+operator-facing liaison (an audited `--override --reason` is the only exception).
+
+*Where:* `cli.py` (`cmd_relay` + `_relay_operator_answer` / `_relay_operator_command` +
+the `relay` subparsers), `docs/DESIGN.md` (D-15), `tests/test_relay_wp4.py` (NEW).
+*Disposition:* IN PROGRESS (branch `lead-loop-wp4`); self-gated, in cross-review.
+
+---
+
+## SHIPPED (merged fe6ed6b) — lead-loop Slice 2 / WP3 (the CADENCE TICK, `lead-loop-wp3`)
 
 The proactive sweep the controller drives when the bus is QUIET and the cadence
 interval has elapsed - so a lead-loop controller does forward work (nudge stalled

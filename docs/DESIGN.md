@@ -345,6 +345,42 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   bus, the exact failure the lease prevents); a universal "tick failed -> dead-letter"
   (conflates controller health with message poison). *Built by:* WP3.
 
+- **D-15 The operator<->lead-loop relay is a THIN typed wrapper, not a new transport or
+  kind.** *Why:* a split-identity lead-loop runs headless - the operator speaks through
+  a liaison. Two crossings need to be auditable: the operator's ANSWER to an escalation,
+  and a SPONTANEOUS operator instruction. The temptation is a new message kind or a
+  side-channel; both fragment the bus (threading, validation, and the supersession/ack
+  machinery all key off the existing kinds + meta). *Decision:* `agenttalk relay` reuses
+  the existing `reply`/`send` plumbing and adds only META: (1) `relay operator-answer
+  --to-request <rid>` VALIDATES that `<rid>` is a *pending* `needs_operator` opener
+  addressed to *this* liaison, then sends a normal thread reply stamped
+  `operator_answer=true` + `operator_origin=<liaison>` so it routes back to the asking
+  lead-loop's own mailbox and flips the thread to `operator_state=answered`; (2) `relay
+  operator-command` sends a `question`/`message` stamped `operator_command=true` +
+  `operator_origin`, minting a fresh `request_id` for the question (a caller-supplied
+  `--meta request_id` is REFUSED - the command owns its correlation id), INFERRING `--to`
+  only when exactly one managed lead-loop exists (else requiring it; an EXPLICIT `--to` may
+  be any roster agent - the managed-only restriction is for inference, not the explicit
+  choice), and FAILING CLOSED unless the sender is the current operator-facing liaison (an
+  `--override --reason` is the only, audited, exception). Both handlers are AUTHORITATIVE
+  for the reserved control/audit/routing meta: they SCRUB any caller-supplied
+  `operator_*` / `needs_operator` / `broadcast_id` / `in_reply_to` / `target_msg_id` and
+  re-stamp only what each command owns, so a caller `--meta` can never forge an audit
+  marker (e.g. a fake `operator_command_override`) or graft routing onto a relayed message.
+  The lead-loop->operator direction stays the existing `escalate` (a `needs_operator`
+  question). *Liaison-down:* a relayed message is an ordinary durable
+  bus record - it QUEUES in the target's inbox whether or not the target is up; a pending
+  operator answer is represented by the OPEN THREAD, never by blocking the controller
+  (the cadence sweep treats `operator_pending` as tracked-not-blocking, D-14); with no
+  liaison/lead resolvable the controller does not spin - it surfaces via doctor /
+  cadence-health and keeps handling work that needs no operator input. *Rejected:* new
+  `operator_answer`/`operator_command` KINDS (the bus skips unknown kinds and every
+  thread/validation path would need teaching); liaison "memory" instead of a mechanical
+  relay (unauditable, and it puts operator authority in an agent's prose). *Honest limit:*
+  `operator_origin` is an auditable trusted-team assertion, NOT cryptographic proof the
+  human spoke (D-4 / SECURITY.md). *Built by:* WP4 (completes the Slice 2 split-identity
+  lead-loop: WP1 authority foundation, WP2 controller, WP3 cadence, WP4 relay).
+
 ## 6. How we work (process)
 
 - **Per-phase cadence:** architect designs → lead gates the design → builder

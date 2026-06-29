@@ -2875,6 +2875,179 @@ def cmd_escalate(args: argparse.Namespace) -> int:
     return 0
 
 
+# The relay handlers are AUTHORITATIVE for every control / audit / routing meta key on
+# this operator-authority surface (lead WP4 P3 - audit-trail integrity). A caller --meta
+# can never forge an audit discriminator (e.g. operator_command_override on a non-override
+# command, or a sibling operator_command on an answer) nor graft a routing/threading key
+# onto a relayed message: we SCRUB the full reserved set after parsing, then stamp ONLY
+# what each command owns. (request_id is handled separately: operator-command REJECTS a
+# caller one outright; operator-answer fixes it to the answered thread's id.)
+_RELAY_RESERVED_META = (
+    "operator_command", "operator_answer", "operator_origin",
+    "operator_command_override", "override_reason", "needs_operator",
+    "broadcast_id", "in_reply_to", "target_msg_id",
+)
+
+
+def cmd_relay(args: argparse.Namespace) -> int:
+    """The MECHANICAL LIAISON RELAY (lead-loop Slice 2 WP4): typed wrappers over the
+    EXISTING reply/send plumbing so the operator's words cross the human<->bus boundary
+    with an audit stamp - NO new message KIND, NO new transport. The lead-loop->operator
+    direction stays the existing `agenttalk escalate` (a needs_operator question).
+
+      * operator-answer: the liaison relays the OPERATOR's answer to a PENDING
+        needs_operator escalation back to the asking lead-loop (a VALIDATED
+        reply-on-thread carrying meta.operator_answer + operator_origin).
+      * operator-command: the liaison relays a SPONTANEOUS operator instruction to a
+        managed lead-loop (a question/message carrying meta.operator_command +
+        operator_origin). FAIL-CLOSED to the current operator-facing liaison.
+    """
+    store = _get_store(args)
+    cfg = store.load_config()
+    roster = cfg.get("agents") or []
+    sender = _resolve_self(args.sender, roster=roster)
+    sub = getattr(args, "relay_cmd", None)
+    if sub == "operator-answer":
+        return _relay_operator_answer(store, sender, roster, args)
+    if sub == "operator-command":
+        return _relay_operator_command(store, sender, roster, args)
+    sys.stderr.write("agenttalk relay: a subcommand is required "
+                     "(operator-answer | operator-command).\n")
+    return 2
+
+
+def _relay_operator_answer(store, sender: str, roster: list, args) -> int:
+    """relay operator-answer: VALIDATE that ``--to-request`` is a PENDING needs_operator
+    opener addressed to this liaison, then send a normal reply on that thread stamped
+    with operator_answer + operator_origin so it routes back to the asking lead-loop's
+    own mailbox (the structural escalate -> operator-answers -> lead-loop path)."""
+    rid = args.to_request
+    body = _read_body(args)
+    if not body:
+        sys.stderr.write("agenttalk relay operator-answer: empty body (use -m TEXT, "
+                         "--file PATH, or pipe stdin) - relay the operator's answer.\n")
+        return 2
+    row = _thread_row_for(store, sender, rid)
+    if row is None:
+        sys.stderr.write(f"agenttalk relay operator-answer: no thread {rid!r} involving "
+                         f"{sender!r} (unknown id or not your thread).\n")
+        return 2
+    if not row.needs_operator:
+        sys.stderr.write(f"agenttalk relay operator-answer: thread {rid!r} is not an operator "
+                         f"escalation (needs_operator). Use `agenttalk reply` for an ordinary "
+                         f"thread.\n")
+        return 2
+    if row.opener_recipient != sender:
+        sys.stderr.write(f"agenttalk relay operator-answer: escalation {rid!r} is addressed to "
+                         f"{row.opener_recipient!r}, not {sender!r} - only the addressed liaison "
+                         f"relays its answer.\n")
+        return 2
+    if row.operator_state != "pending":
+        sys.stderr.write(f"agenttalk relay operator-answer: escalation {rid!r} is already "
+                         f"{row.operator_state!r} - nothing pending to answer.\n")
+        return 2
+    target = row.opener_sender                       # back to the asking lead-loop / agent
+    meta = _parse_meta(args.meta)
+    for k in _RELAY_RESERVED_META:
+        meta.pop(k, None)                            # SCRUB: handler-authoritative audit meta
+    meta["request_id"] = rid                         # echo -> routes back on the SAME thread
+    meta["operator_answer"] = "true"
+    meta["operator_origin"] = sender
+    msg = store.send(sender=sender, recipient=target, kind="message",
+                     subject=args.subject or f"operator answer ({rid})", body=body, meta=meta)
+    if not args.quiet:
+        print(render(msg, header=f"AGENTTALK :: RELAY operator-answer  {sender} -> {target}"))
+    print(f"request_id={rid}")
+    return 0
+
+
+def _relay_operator_command(store, sender: str, roster: list, args) -> int:
+    """relay operator-command: send a SPONTANEOUS operator instruction to a managed
+    lead-loop, stamped operator_command + operator_origin. FAIL-CLOSED to the current
+    operator-facing liaison (an audited --override + --reason is the only exception).
+    INFER --to only when exactly ONE managed lead-loop exists; otherwise REQUIRE it."""
+    body = _read_body(args)
+    if not body:
+        sys.stderr.write("agenttalk relay operator-command: empty body (use -m TEXT, "
+                         "--file PATH, or pipe stdin) - relay the operator's instruction.\n")
+        return 2
+    kind = args.kind or "question"
+    if kind not in ("question", "message"):
+        sys.stderr.write("agenttalk relay operator-command: --kind must be question or message.\n")
+        return 2
+    # FAIL CLOSED: only the configured operator-facing liaison relays an operator command
+    # (the mechanical relay, not liaison memory). An audited override needs a reason.
+    liaison = store.operator_facing()
+    override = bool(getattr(args, "override", False))
+    if sender != liaison:
+        if not override:
+            sys.stderr.write(
+                f"agenttalk relay operator-command: {sender!r} is not the current "
+                f"operator-facing liaison ({liaison!r}); relaying an operator command "
+                f"requires the configured liaison (or --override --reason for an audited "
+                f"exception).\n")
+            return 2
+        if not (getattr(args, "reason", None) or "").strip():
+            sys.stderr.write("agenttalk relay operator-command: --override requires --reason "
+                             "(an audited exception must record why).\n")
+            return 2
+    # Resolve --to: infer ONLY when exactly one managed lead-loop exists, else require it.
+    managed = sorted(a for a in store.managed_lead_loop_agents()
+                     if store.is_managed_lead_loop(a))
+    if args.to:
+        try:
+            validate_agent_name(args.to)
+        except ValueError as e:
+            sys.stderr.write(f"agenttalk relay operator-command: {e}\n")
+            return 2
+        _ensure_in_roster(args.to, roster, label="operator-command target")
+        target = args.to
+    elif len(managed) == 1:
+        target = managed[0]
+    elif not managed:
+        sys.stderr.write("agenttalk relay operator-command: no managed lead-loop is "
+                         "configured; pass --to <agent>.\n")
+        return 2
+    else:
+        sys.stderr.write(f"agenttalk relay operator-command: {len(managed)} managed lead-loops "
+                         f"({managed}); pass --to <agent> to disambiguate.\n")
+        return 2
+    if target == sender:
+        sys.stderr.write(f"agenttalk relay operator-command: target {target!r} is the sender - "
+                         f"a liaison does not relay a command to itself.\n")
+        return 2
+    meta = _parse_meta(args.meta)
+    if "request_id" in meta:
+        # operator-command OWNS its correlation id - reject a caller-supplied one outright
+        # (codex WP4 MAJOR). Otherwise a spontaneous command could GRAFT onto an existing
+        # thread (question) or a fire-and-forget message could carry a tracked id. The
+        # command-owned contract: a question always mints a FRESH opc- id; a message has none.
+        sys.stderr.write("agenttalk relay operator-command: --meta request_id is not allowed "
+                         "- the command owns its correlation id (a question mints a fresh "
+                         "opc- id; a message has none).\n")
+        return 2
+    for k in _RELAY_RESERVED_META:
+        meta.pop(k, None)                            # SCRUB: handler-authoritative audit meta
+    meta["operator_command"] = "true"
+    meta["operator_origin"] = sender
+    if override and sender != liaison:
+        # the audited-exception markers are stamped ONLY on the real --override path, so a
+        # caller --meta can never forge an authz exception on a normal command (P3).
+        meta["operator_command_override"] = "true"
+        meta["override_reason"] = args.reason
+    # A question opens its OWN tracked thread (the lead-loop's response correlates back);
+    # a message is fire-and-forget with no id.
+    if kind == "question":
+        meta["request_id"] = "opc-" + uuid.uuid4().hex[:12]
+    msg = store.send(sender=sender, recipient=target, kind=kind,
+                     subject=args.subject or "operator command", body=body, meta=meta)
+    if not args.quiet:
+        print(render(msg, header=f"AGENTTALK :: RELAY operator-command  {sender} -> {target}"))
+    if meta.get("request_id"):
+        print(f"request_id={meta['request_id']}")
+    return 0
+
+
 def cmd_propose(args: argparse.Namespace) -> int:
     """Send a `proposal`: a concrete solution/approach for the peer to
     accept / reject / counter.
@@ -6561,6 +6734,51 @@ def build_parser() -> argparse.ArgumentParser:
     lappr.add_argument("--from", dest="actor", help="Approving agent.")
     lappr.add_argument("--reason", required=True, help="Why the shared path is approved.")
     lappr.set_defaults(func=cmd_lane)
+
+    # ----- relay (mechanical liaison relay, lead-loop Slice 2 WP4) -----
+    prelay = sub.add_parser(
+        "relay",
+        help="Mechanical liaison relay: carry the operator's words across the "
+             "human<->bus boundary with an audit stamp (operator-answer / "
+             "operator-command). A thin typed wrapper over reply/send - no new kind.",
+    )
+    prelay.set_defaults(func=cmd_relay, relay_cmd=None)
+    relaysub = prelay.add_subparsers(dest="relay_cmd")
+
+    roa = relaysub.add_parser(
+        "operator-answer",
+        help="Relay the operator's answer to a PENDING needs_operator escalation back "
+             "to the asking lead-loop (validated reply on the thread).")
+    roa.add_argument("--from", dest="sender", help="Relaying liaison (default: resolved self).")
+    roa.add_argument("--to-request", dest="to_request", required=True,
+                     help="The pending escalation request_id to answer.")
+    roa.add_argument("--subject")
+    roa.add_argument("-m", "--message", dest="message", help="The operator's answer text.")
+    roa.add_argument("--file", help="Read the answer body from a file (`-` = stdin).")
+    roa.add_argument("--meta", action="append", help="Extra meta key=value (repeatable).")
+    roa.add_argument("--quiet", action="store_true")
+    roa.set_defaults(func=cmd_relay)
+
+    roc = relaysub.add_parser(
+        "operator-command",
+        help="Relay a SPONTANEOUS operator instruction to a managed lead-loop "
+             "(fail-closed to the operator-facing liaison).")
+    roc.add_argument("--from", dest="sender", help="Relaying liaison (default: resolved self).")
+    roc.add_argument("--to", dest="to",
+                     help="Target agent: an EXPLICIT --to may be ANY roster agent; --to is "
+                          "INFERRED only when exactly one MANAGED lead-loop exists, else required.")
+    roc.add_argument("--kind", choices=["question", "message"], default=None,
+                     help="Message kind (default question; a question mints a request_id).")
+    roc.add_argument("--subject")
+    roc.add_argument("-m", "--message", dest="message", help="The operator's command text.")
+    roc.add_argument("--file", help="Read the command body from a file (`-` = stdin).")
+    roc.add_argument("--meta", action="append", help="Extra meta key=value (repeatable).")
+    roc.add_argument("--override", action="store_true",
+                     help="Audited exception: relay even if you are not the configured "
+                          "liaison (requires --reason).")
+    roc.add_argument("--reason", help="Reason for --override (audited).")
+    roc.add_argument("--quiet", action="store_true")
+    roc.set_defaults(func=cmd_relay)
 
     # ----- knowledge (durable pointer notes; capture-open, curate-gated, opt-in) -----
     pkn = sub.add_parser(
