@@ -12,14 +12,15 @@ major · `P2` minor · `P3` nit. Each item: what, why, where, disposition.
 
 ---
 
-## IN PROGRESS — lead-loop Slice 2 / WP1 (opening hardening foundation, `lead-loop-wp1`)
+## SHIPPED (merged 24c39f7) — lead-loop Slice 2 / WP1 (opening hardening foundation, `lead-loop-wp1`)
 
 Slice 2 of the lead-loop adds the actual controller + mechanical relay; codex's
 design splits it into 4 WPs, **WP1-first** (cross-reviewed + lead-gated before any
 controller work layers on). WP1 is the pure-core HARDENING FOUNDATION the rest
 builds on - it consolidates the Slice 1 liveness/expiry/steal/armed/guard logic into
 ONE source of truth so the three views can never drift apart again (the bug class
-that bit Slice 1 twice).
+that bit Slice 1 twice). MERGED at 24c39f7 (codex 2x approved + lead adversarial-verify
++ gate; reviewer-1 hung during WP1, covers WP2-4 + the v0.42.0 ship at strict 2/2).
 
 - **Single `_lead_loop_authority` (P1).** ONE method computes
   {managed, present, owner_liveness, owner_alive, expired, heartbeat_stale,
@@ -44,11 +45,27 @@ that bit Slice 1 twice).
   steals earlier than the supervisor would call the owner stuck). Keeps `store.py`
   free of supervisor imports.
 
+- **Corrupt-config coercion class (robustness; see DESIGN.md D-13).** A per-agent
+  `supervisor.json` entry that is a TRUTHY non-dict (operator typo, e.g.
+  `{"agents": {"beta": "wrapped"}}`) is NOT rescued by a falsy-only `(x or {}).get(...)`
+  - the string reaches `cfg_agent.get(...)` and raises `AttributeError`, crashing the
+  reader. Every per-agent reader now coerces to `{}` only when `isinstance(..., dict)`:
+  `resolve_timing`, `resolve_stuck_after`, `resolve_dead_letter_caps` (config /
+  cfg_agent / nested `dead_letter`), `session_args`, and `cmd_wrap`'s extraction -
+  including the PRE-EXISTING v0.41.0 dead-letter/wrap sites surfaced while closing the
+  class. All fail safe to the defaults (`claude_permission_mode` already used the
+  `isinstance` form). A bool `stuck_after_seconds` is also ignored (bool-is-int). A
+  single per-agent typo must never crash `status` / `doctor` / `supervise --report` /
+  `wrap --loop`. Surfaced by: lead verify P2 (resolve_timing), codex review (wrap/
+  dead-letter sibling), dev-2 sweep (session_args). Pinned by regression tests.
+
 *Where:* `store.py` (authority + `_lease_expired`/`_heartbeat_stale` + read
-normalization + lock-break), `lead_loop_runtime.py` (NEW), `docs/DESIGN.md` (D-4
-threat-model sentence), `tests/test_lead_loop_wp1.py` (NEW).
-*Disposition:* built (branch `lead-loop-wp1`), in cross-review. WP2-4 (controller,
-cadence, relay) stay on HOLD until WP1 is gated + merged.
+normalization + lock-break), `lead_loop_runtime.py` (NEW), `supervisor.py` +
+`cli.py` (resolver wiring + corrupt-config coercion), `doctor.py` (resolver wiring),
+`docs/DESIGN.md` (D-4 threat sentence, D-13 coercion class),
+`tests/test_lead_loop_wp1.py` (NEW).
+*Disposition:* SHIPPED (merged 24c39f7). WP2 (controller) GO off 24c39f7; WP3
+(cadence) + WP4 (relay) stay on HOLD until WP2 is gated + merged.
 
 **Accepted limitation (WP1): the triple-fault edge.** An owner whose liveness probe
 is UNKNOWN *and* whose lease has a corrupt/None expiry *and* whose heartbeat is stale

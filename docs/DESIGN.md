@@ -305,6 +305,23 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   uncertain probe (narrowed "dead" to the CONFIRMED tri-state, Option A across
   steal+armed+guard).
 
+- **D-13 Corrupt-config coercion: `isinstance`, never falsy-only `or {}`.** *Why:* a
+  per-agent `supervisor.json` entry that is a TRUTHY non-dict (an operator typo like
+  `{"agents": {"beta": "wrapped"}}`) is not rescued by `(x or {}).get(...)` - the
+  string slips through and `cfg_agent.get(...)` raises `AttributeError`, crashing the
+  reader. *Decision:* every per-agent config reader coerces to `{}` only when the
+  value `isinstance(..., dict)`, never via falsy-only `or {}`. Applied uniformly at
+  `lead_loop_runtime.resolve_timing`, `supervisor.resolve_stuck_after`,
+  `supervisor.resolve_dead_letter_caps` (config / cfg_agent / nested `dead_letter`),
+  `supervisor.session_args`, and `cmd_wrap`'s extraction - including the pre-existing
+  v0.41.0 dead-letter/wrap sites surfaced while closing the class. All fail safe to
+  the defaults; `claude_permission_mode` already used the `isinstance` form.
+  *Rationale:* a single per-agent typo must NEVER crash `status` / `doctor` /
+  `supervise --report` / `wrap --loop` startup - config is untrusted data (D-2), so a
+  malformed entry degrades to the default, it does not take down the tool. *Surfaced
+  by:* WP1 (lead verify P2 = the resolve_timing crash; codex review = the wrap/
+  dead-letter sibling; dev-2 proactive sweep = session_args).
+
 ## 6. How we work (process)
 
 - **Per-phase cadence:** architect designs → lead gates the design → builder
