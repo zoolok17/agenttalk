@@ -679,8 +679,8 @@ def build_report(store: Store, *, now_epoch: float,
         }
         # Managed lead-loop visibility (lead-loop Slice 1; additive, read-only).
         # Present only when the agent is managed OR a lease file exists. The planner
-        # does not yet act on this (the controller is Slice 2) - this surfaces the
-        # armed/lease state so the report shows a down managed controller.
+        # acts on the EXIT marker (WP2) - this surfaces the armed/lease state so the
+        # report shows a down managed controller.
         if store.is_managed_lead_loop(a) or store.read_lead_loop_lease(a) is not None:
             # Use the SAME per-agent threshold the report uses for the top-level
             # heartbeat_stale (threshold_a), so the nested lead_loop view never skews
@@ -688,6 +688,13 @@ def build_report(store: Store, *, now_epoch: float,
             # supervisor's stuck threshold, not the 120s store default (WP1 contract).
             agents[a]["lead_loop"] = store.lead_loop_state(
                 a, now=now_epoch, heartbeat_stale_after=threshold_a)
+        # The controller's EXIT marker (WP2): how a managed lead-loop controller last
+        # exited - the planner uses it to NOT relaunch a deliberate stand-down / a
+        # blocked acquire (vs a crash, which relaunches). Additive; present only when
+        # a marker exists.
+        _ll_exit = store.read_lead_loop_exit(a)
+        if isinstance(_ll_exit, dict):
+            agents[a]["lead_loop_exit"] = _ll_exit
     launch_requests = store.list_launch_requests()
     eph_report: dict[str, dict] = {"active": {}, "orphan_agents": []}
     eph_state = (state or {}).get("ephemeral_reviewers") if isinstance(state, dict) else None
@@ -923,6 +930,36 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     # working turn would not heartbeat, so keep the existing warn-only safety
     # behavior.
     if hb_stale:
+        # WP2: a managed lead-loop controller that exited DELIBERATELY leaves an EXIT
+        # marker the planner honors instead of relaunching (the SYMMETRIC TWIN of the
+        # manual-restart override above). A manual request-RESTART (section 0, above) is
+        # checked first and OVERRIDES either HOLD; a CRASH writes NO marker, so a crashed
+        # controller still relaunches (recovery).
+        #   * `stood_down` (a VALID human release/end) -> HOLD UNCONDITIONALLY: relaunching
+        #     would defeat the v0.39 stand-down under auto_restart (D-7). It sticks until an
+        #     operator request-RESTART re-arms (which clears the marker on the confirmed
+        #     relaunch).
+        #   * `blocked` (acquire found another owner) -> HOLD ONLY WHILE THAT OWNER IS A
+        #     LIVE GUARD (rpt['lead_loop'].armed). If the incumbent has since died / wedged
+        #     past TTL / released (not armed), the block has CLEARED -> fall through to
+        #     STUCK_RECOVER so this controller relaunches + takes over. (Without the
+        #     liveness gate a stale `blocked` marker would PERMANENTLY HOLD - reachable
+        #     under default config since wrapped stuck_after < lease TTL - defeating
+        #     auto-recovery for a wedged/crashed lead-loop. lead verify P2.)
+        ll_exit = rpt.get("lead_loop_exit")
+        ll_state = ll_exit.get("state") if isinstance(ll_exit, dict) else None
+        if ll_state == "stood_down":
+            return _result(NONE, state="LEAD_LOOP_STOOD_DOWN",
+                           reason="deliberate lead-loop stand-down (valid human release/"
+                                  "end); NOT relaunching until an operator request-restart "
+                                  "re-arms")
+        if ll_state == "blocked":
+            ll_view = rpt.get("lead_loop")
+            if isinstance(ll_view, dict) and ll_view.get("armed"):
+                return _result(NONE, state="LEAD_LOOP_BLOCKED",
+                               reason="lead-loop acquire blocked: another LIVE owner holds "
+                                      "the lease; HOLDING (no relaunch)")
+            # incumbent owner is gone/dead/wedged -> block cleared -> fall through to recover
         if protected:
             nxt["last_warn_epoch"] = now_epoch
             return _result(WARN_ONLY, state="STUCK_OR_DEAD", notify=True,
@@ -1485,7 +1522,8 @@ CONFIG_TEMPLATE = """\
       },
       "_comment_wrapped": "WRAPPED is the RECOMMENDED / default supervised archetype for hands-off agents (the manual /agenttalk.listen agent above is supported but BEST-EFFORT/LEGACY: a resumed manual session may not re-enter the listen loop, never heartbeat, and hit the readiness give-up cap). The wrapped codex child is launched with `--disable hooks` by default (codex's safe default - the wrapper owns the heartbeat, so the codex activity hook is neither needed nor wanted, and disabling it sidesteps hook-trust prompts; remove it from windows_args if you intentionally want the child's project hooks). Set wrapped=true to supervise the agent THROUGH `agenttalk wrap --loop`: windows_file is the PYTHON exe (NOT the CLI exe), windows_args is the FIXED wrap command, and the REAL codex.exe/claude.exe goes at the tail after '--' (it is what windows_file would be for a manual agent). NO {SESSION_ARGS} token - the wrapper owns session continuity end-to-end (it persists + reloads the codex thread_id / claude session-id across its own turns AND across a supervisor relaunch, so a restart re-runs the identical wrap argv and reload-resumes). The wrapper python IS the long-lived supervised root, so brain discovery is RETIRED for wrapped agents (brain_pid stays null); the per-turn child (codex exec / claude -p) is reaped via the start-guarded managed_pids tree-kill. activity_hook is NOT needed: a wrapped agent is instrumented by construction (heartbeat on every idle bus-wait cycle + on streaming progress), so a stale heartbeat past grace RECOVERS (restart) instead of warn-only.",
       "_comment_wrapped_stuck_after": "PER-CLI stuck_after_seconds (a per-agent stuck_after_seconds override ALWAYS wins; the global stuck_after_seconds is only the legacy/unclassified fallback). Defaults when unset: wrapped CLAUDE=180s, wrapped CODEX=900s. WHY they differ: wrapped CLAUDE streams thinking+text+tool deltas and stays fresh through reasoning, so a tight threshold is fine; wrapped CODEX is ITEM-LEVEL (no exec --json event closes the pure-reasoning gap) so a long pure-reasoning stretch is SILENT between turn.started and the final agent_message. These are an OPERATIONAL false-positive tradeoff, NOT a provably-safe bound: pick the threshold above the longest pure-reasoning gap your codex role plausibly hits. For a heavy reasoning/refactor/review codex role (like this sample) 1200-1800s is the right template default - this example uses 1200. GUARDRAIL: for wrapped+codex the supervisor WARNS and REFUSES restart-on-stale (degrades to warn-only) when stuck_after_seconds is below 600s, UNLESS you set allow_low_stuck_after=true to opt in. The value is never silently coerced. DO NOT try to tighten codex with a synthetic active-turn timer heartbeat: no intermediate exec --json event exists to confirm progress, so a timer would mark a silently-wedged turn healthy forever and defeat restart authority - the only levers are the per-CLI threshold + per-agent overrides.",
-      "_comment_dead_letter": "POISON-MESSAGE HANDLING (0.40.x): a message the model fails DETERMINISTICALLY (poison_eligible) is auto-dead-lettered after dead_letter.max_attempts (default 3) - its bytes move to .agenttalk/dead-letter/<agent>/ (recoverable; `agenttalk dead-letter list/show/requeue`) and the cursor advances past it, so the inbox is never blocked. A transient/global INFRA failure (spawn/API/rate-limit/5xx) is NEVER auto-dead-lettered (it retries under backoff) but escalates to the operator at dead_letter.escalate_after_attempts (default 20); an ambiguous repeated failure escalates AND dead-letters at that ceiling. The supervisor stays DUMB: a dead-letter is PROGRESS (fresh heartbeat), so the agent returns to HEALTHY_IDLE and is never restart-looped. Override per agent or globally with a dead_letter:{max_attempts,escalate_after_attempts} block (0 disables a cap - debug only)."
+      "_comment_dead_letter": "POISON-MESSAGE HANDLING (0.40.x): a message the model fails DETERMINISTICALLY (poison_eligible) is auto-dead-lettered after dead_letter.max_attempts (default 3) - its bytes move to .agenttalk/dead-letter/<agent>/ (recoverable; `agenttalk dead-letter list/show/requeue`) and the cursor advances past it, so the inbox is never blocked. A transient/global INFRA failure (spawn/API/rate-limit/5xx) is NEVER auto-dead-lettered (it retries under backoff) but escalates to the operator at dead_letter.escalate_after_attempts (default 20); an ambiguous repeated failure escalates AND dead-letters at that ceiling. The supervisor stays DUMB: a dead-letter is PROGRESS (fresh heartbeat), so the agent returns to HEALTHY_IDLE and is never restart-looped. Override per agent or globally with a dead_letter:{max_attempts,escalate_after_attempts} block (0 disables a cap - debug only).",
+      "_comment_lead_loop": "MANAGED LEAD-LOOP CONTROLLER (Slice 2 / WP2): to make a wrapped agent OWN its team mailbox so an external consumer or a duplicate window cannot race the bus, add '--lead-loop' to windows_args RIGHT AFTER '--loop' (e.g. [..., 'wrap', '--for', 'NAME', '--cli', 'codex', '--loop', '--lead-loop', '--', <real cli>, ...]) AND run `agenttalk managed-lead-loop set NAME` so the identity is a configured managed_lead_loop. The controller acquires a renewable LEASE before its loop and renews it on every heartbeat; the model child NEVER sees the lease token. EXIT semantics the supervisor honors via the controller's exit marker: a VALID human release/end stands it DOWN and the supervisor does NOT relaunch it (the v0.39 stand-down sticks against auto_restart until you re-arm with `agenttalk request-restart` - which overrides the HOLD and clears the marker on the confirmed relaunch; NOT request-launch, which queues an ephemeral evidence-only review and would leave the controller down); a BLOCKED acquire (another LIVE owner) HOLDS only while that owner stays alive (once it dies/wedges the supervisor auto-recovers); a CRASH writes no marker and relaunches normally (recovery). If this identity holds role=lead (so it is protected), set auto_restart_protected=true for THIS identity ONLY so a stale lead controller still recovers - do NOT broaden protected auto-restart globally. Keep the wrapped stuck_after_seconds guidance above (codex 1200-1800)."
     }
   }
 }

@@ -18,6 +18,7 @@ from agenttalk.display import render
 from agenttalk.store import (
     COMPOSING_INTENT_STALE_SECONDS,
     CONTROL_KINDS,
+    LEAD_LOOP_LEASE_ENV,
     OPENER_KINDS,
     Store,
     find_root,
@@ -394,8 +395,25 @@ OPEN_OUTBOUND_STALE_SECONDS = 600.0
 # cursor-CONSUMING CLI call (wait/recv/drain/ack) would race/lose records. The
 # owner proves itself by presenting the live lease_id via this env var; exit 7
 # is the dedicated "rejected: mailbox owned by a managed controller" code.
-_LEAD_LOOP_LEASE_ENV = "AGENTTALK_LEAD_LOOP_LEASE"
+_LEAD_LOOP_LEASE_ENV = LEAD_LOOP_LEASE_ENV  # single source: store.LEAD_LOOP_LEASE_ENV
 _LEAD_LOOP_GUARD_EXIT = 7
+# Dedicated NON-CRASH exit codes for the wrapped lead-loop controller (WP2). They are
+# DIAGNOSTIC (operator/logs); the supervisor acts on the matching exit MARKER (read via
+# build_report), not the captured exit code. Distinct from a crash (the supervisor
+# RELAUNCHES a crash) so a deliberate stand-down / blocked-acquire does not relaunch.
+_LEAD_LOOP_BLOCKED_EXIT = 8       # acquire blocked: another live owner holds the lease
+_LEAD_LOOP_STOOD_DOWN_EXIT = 9    # clean valid human release/end: stand-down sticks
+_LEAD_LOOP_LEASE_LOST_EXIT = 10   # lost the lease mid-run (stolen/torn/force-released)
+
+
+class _LeadLoopLeaseLost(Exception):
+    """Raised when the lead-loop controller has LOST its mailbox lease mid-run (renew
+    returned None: stolen / torn / force-released). A HARD loss-of-ownership signal
+    that STOPS the loop immediately (no record is consumed without the lease) - the
+    controller exits with NO exit marker so the supervisor relaunches it (which
+    re-acquires, or HOLDS if another owner is now live). Codex WP2 blocker: a controller
+    that lost the lease must not keep consuming the mailbox unguarded until it goes
+    stale."""
 
 
 def _gather_status(store: Store) -> dict:
@@ -5303,26 +5321,108 @@ def _dead_letter_notifier(store, agent: str):
 def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     sender: str, min_interval: float, render: bool,
                     one_shot_request_id: str | None = None,
-                    k_poison: int = 3, k_escalate: int = 20) -> int:
+                    k_poison: int = 3, k_escalate: int = 20,
+                    lead_loop: bool = False,
+                    supervisor_config: dict | None = None) -> int:
     """The long-running supervised wrapper loop (design C): own the idle bus-wait +
     heartbeat, drive the CLI ONE turn per inbound message in structured-stream mode
     (session continuity owned here), then return to the wait. Runs until killed -
     the supervisor supervises THIS process. Manual /agenttalk.listen stays the
-    default; this is the opt-in supervised mode."""
+    default; this is the opt-in supervised mode.
+
+    ``lead_loop`` (WP2): become the managed lead-loop CONTROLLER for ``agent`` - own
+    the team mailbox via a renewable LEASE (acquired BEFORE the loop, renewed on every
+    heartbeat) so an external consumer / a duplicate window cannot race the bus. Exit
+    states the supervisor distinguishes via the exit MARKER: BLOCKED acquire (another
+    live owner) -> ``_LEAD_LOOP_BLOCKED_EXIT`` + blocked marker (HOLD, no relaunch);
+    a clean VALID human release/end -> release lease + ``_LEAD_LOOP_STOOD_DOWN_EXIT`` +
+    stood-down marker (no relaunch, v0.39 authority sticks); a crash -> best-effort
+    release + re-raise + NO marker (the supervisor relaunches and re-acquires)."""
     from .wrapper import loop as wloop
     from .wrapper import run as wrapper_run
     from .wrapper import session as wsession
+
+    # --- managed lead-loop CONTROLLER lease lifecycle (WP2) -------------------
+    lease_id: str | None = None
+    heartbeat = None     # Callable[[], None] | None - combined stamp (lead-loop)
+    pre_commit = None    # Callable[[], None] | None - ownership gate at consume boundaries
+    if lead_loop:
+        if not store.is_managed_lead_loop(agent):
+            sys.stderr.write(
+                f"agenttalk wrap --lead-loop: {agent!r} is not a configured managed "
+                f"lead-loop identity (run `agenttalk managed-lead-loop set {agent}`)\n")
+            return 2
+        timing = lead_loop_runtime.resolve_timing(
+            store, agent, supervisor_config=supervisor_config)
+        ttl = timing["ttl_seconds"]
+        # Thread the RESOLVED heartbeat window into acquire (WP2 residual #3): a
+        # duplicate controller must not steal earlier than the supervisor would call
+        # the owner stuck - and the steal threshold must match the visibility paths.
+        lease = store.acquire_lead_loop_lease(
+            agent, owner_pid=os.getpid(), ttl_seconds=ttl,
+            heartbeat_stale_after=timing["heartbeat_stale_after"])
+        if lease is None:
+            existing = store.read_lead_loop_lease(agent) or {}
+            store.write_lead_loop_exit(
+                agent, state=store.LEAD_LOOP_EXIT_BLOCKED,
+                owner_pid=existing.get("owner_pid"),
+                reason="acquire blocked: another live managed lead-loop owner holds the lease")
+            sys.stderr.write(
+                f"agenttalk wrap --lead-loop: {agent!r} mailbox is already owned by a live "
+                f"controller (PID {existing.get('owner_pid')}); standing down "
+                f"(supervisor HOLD, no relaunch).\n")
+            return _LEAD_LOOP_BLOCKED_EXIT
+        lease_id = lease["lease_id"]
+        store.clear_lead_loop_exit(agent)  # a live controller makes any prior exit state moot
+
+        def _renew_or_lost() -> None:
+            # Renew the lease; a None result means we have LOST ownership (stolen / torn /
+            # force-released). That is a HARD signal: RAISE so the loop STOPS at once - a
+            # controller that no longer owns the mailbox must NOT keep consuming it
+            # unguarded (else, in the stolen-owner case, both consume = the duplicate-
+            # consumer race the lease prevents). Caught in _wrap_loop_mode -> release +
+            # exit with NO marker -> supervisor relaunches (re-acquire, or HOLD if another
+            # owner is now live). lease_id lives in this LOCAL closure - never os.environ,
+            # so it is never leaked to the model child (codex WP2 blockers).
+            if store.renew_lead_loop_lease(agent, lease_id=lease_id, ttl_seconds=ttl) is None:
+                raise _LeadLoopLeaseLost(agent)
+
+        def heartbeat() -> None:
+            # Combined stamp on BOTH the idle stamp and make_drive streaming (WP2 cond 4):
+            # renew the lease (hard-fail on loss) THEN refresh the supervisor heartbeat.
+            _renew_or_lost()
+            store.write_heartbeat(agent)
+
+        # the SAME hard ownership check guards every cursor-advance boundary in the loop
+        # (commit on success/control/invalid + dead-letter dispose), so a lost lease can
+        # never advance the cursor / consume a record unguarded (codex WP2 blocker).
+        pre_commit = _renew_or_lost
+
+    def _release() -> None:
+        if lease_id is not None:
+            store.release_lead_loop_lease(agent, lease_id=lease_id)
 
     state = wsession.load_session(store, agent, cli)
     try:
         drive = wrapper_run.make_drive(
             store, agent, cli, state, base_argv, sender=sender,
-            min_interval=min_interval, render=render,
+            min_interval=min_interval, render=render, heartbeat=heartbeat,
             persist=lambda st: wsession.save_session(store, agent, st),
         )
     except ValueError as e:
+        _release()
         sys.stderr.write(f"agenttalk wrap: {e}\n")
         return 2
+    if lead_loop:
+        # OWNERSHIP GATE: re-verify the lease BEFORE consuming EACH record, so a lost
+        # lease stops consumption IMMEDIATELY (not after the supervisor's stale
+        # threshold) - the hard loss-of-ownership signal codex required.
+        _model_drive = drive
+
+        def _lead_loop_drive(record):
+            _renew_or_lost()
+            return _model_drive(record)
+        drive = _lead_loop_drive
     wsession.save_session(store, agent, state)   # persist the (possibly minted) id
     # ONE-SHOT: bound the wait in-process so an ephemeral reviewer whose request
     # never arrives (or is closed/superseded) exits NONZERO with a diagnostic well
@@ -5339,15 +5439,35 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     # dead-letter (CONTINUOUS loop only; the one-shot path ignores these). On
     # dead-letter / high-attempt backstop the wrapper escalates to the operator.
     notifier = _dead_letter_notifier(store, agent)
-    turns = wloop.run_loop(
-        store, agent, drive,
-        max_turns=1 if one_shot_request_id else None,
-        only_request_id=one_shot_request_id,
-        max_wall=max_wall,
-        k_poison=k_poison, k_escalate=k_escalate,
-        on_dead_letter=lambda info: notifier(info, disposed=True),
-        on_escalate=lambda info: notifier(info, disposed=False),
-    )
+    try:
+        turns = wloop.run_loop(
+            store, agent, drive,
+            max_turns=1 if one_shot_request_id else None,
+            only_request_id=one_shot_request_id,
+            max_wall=max_wall,
+            k_poison=k_poison, k_escalate=k_escalate,
+            on_dead_letter=lambda info: notifier(info, disposed=True),
+            on_escalate=lambda info: notifier(info, disposed=False),
+            heartbeat=heartbeat,
+            pre_commit=pre_commit,  # lead-loop ownership gate at every cursor advance
+            manage_waiting=not lead_loop,  # the lead-loop LEASE owns the .waiting mirror
+        )
+    except _LeadLoopLeaseLost:
+        # LOST the lease mid-run (stolen / torn / force-released): the ownership gate /
+        # heartbeat raised to stop consuming AT ONCE. Release is lease_id-guarded (a no-op
+        # if another owner now holds it). NO exit marker -> the supervisor relaunches and
+        # the relaunch re-acquires (or HOLDS if the new owner is live). Clean nonzero exit
+        # (not a traceback) - the supervisor recovers via the stale heartbeat, not the code.
+        _release()
+        sys.stderr.write(f"agenttalk wrap --lead-loop: {agent!r} lost the mailbox lease "
+                         f"(stolen / torn / force-released); exiting for supervisor recovery.\n")
+        return _LEAD_LOOP_LEASE_LOST_EXIT
+    except BaseException:
+        # CRASH / interruption: best-effort release (fast handoff; a SIGKILL skips this
+        # but the owner pid is then CONFIRMED-dead -> immediately stealable, D-12). NO
+        # exit marker is written -> the supervisor relaunches + the relaunch re-acquires.
+        _release()
+        raise
     if one_shot_request_id and turns < 1:
         # Distinguish a dead thread from a never-arriving request for the diagnostic
         # (read-only scoped poll; either way it is a nonzero one-shot exit).
@@ -5358,6 +5478,17 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                else f"no message on request {one_shot_request_id!r} within the one-shot bound")
         sys.stderr.write(f"agenttalk wrap --one-shot: no turn driven ({why}).\n")
         return 1
+    if lead_loop:
+        # A CLEAN return from the unbounded continuous lead-loop == a VALID human
+        # release/end (classify_loop_control "stop"): a DELIBERATE stand-down. Release
+        # the lease + record it so the supervisor does NOT relaunch (the v0.39 stand-down
+        # sticks until an operator request-restart re-arms - which overrides the HOLD and
+        # clears the marker on the confirmed relaunch).
+        _release()
+        store.write_lead_loop_exit(agent, state=store.LEAD_LOOP_EXIT_STOOD_DOWN,
+                                   owner_pid=os.getpid(),
+                                   reason="valid human release/end (deliberate stand-down)")
+        return _LEAD_LOOP_STOOD_DOWN_EXIT
     return 0
 
 
@@ -5390,6 +5521,14 @@ def cmd_wrap(args: argparse.Namespace) -> int:
     if args.one_shot and not args.to_request:
         sys.stderr.write("agenttalk wrap: --one-shot requires --to-request <id>\n")
         return 2
+    lead_loop = getattr(args, "lead_loop", False)
+    if lead_loop and not args.loop:
+        sys.stderr.write("agenttalk wrap: --lead-loop requires --loop\n")
+        return 2
+    if lead_loop and args.one_shot:
+        sys.stderr.write("agenttalk wrap: --lead-loop is a continuous controller; "
+                         "it cannot be combined with --one-shot\n")
+        return 2
     sender = (_resolve_self(args.sender, roster=roster)
               if getattr(args, "sender", None) else agent)
     if getattr(args, "loop", False):
@@ -5415,7 +5554,8 @@ def cmd_wrap(args: argparse.Namespace) -> int:
                                sender=sender, min_interval=args.min_interval,
                                render=not args.no_render,
                                one_shot_request_id=args.to_request if args.one_shot else None,
-                               k_poison=k_poison, k_escalate=k_escalate)
+                               k_poison=k_poison, k_escalate=k_escalate,
+                               lead_loop=lead_loop, supervisor_config=sup_cfg)
     try:
         return wrapper_run.run_wrapper(
             cli=args.cli, agent=agent, argv=argv, store=store, sender=sender,
@@ -5737,6 +5877,14 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                              "<agent> and --request-id <rid>\n")
             return 2
         cleared = store.clear_restart_request(args.agent, args.request_id)
+        # ONLY a CONFIRMED restart (a marker actually matched + was cleared) supersedes
+        # the lead-loop exit marker - so an operator re-arm is not defeated by a stale
+        # stand-down/blocked marker if the relaunched child fails before acquire (the
+        # .ps1 calls this right after a confirmed Start-Process). A clear-restart that
+        # matched NOTHING (stale/typo rid) must NOT delete a deliberate stand-down
+        # marker (codex: no re-arm without a confirmed restart).
+        if cleared:
+            store.clear_lead_loop_exit(args.agent)
         print(f"cleared restart-request for {args.agent!r}" if cleared
               else f"no matching restart-request for {args.agent!r} "
                    f"[{args.request_id}] (already cleared or superseded)")
@@ -6754,6 +6902,12 @@ def build_parser() -> argparse.ArgumentParser:
                             "idle bus-wait + heartbeat and drive the CLI one turn "
                             "per inbound message (design C). Opt-in; manual "
                             "/agenttalk.listen stays the default.")
+    pwrap.add_argument("--lead-loop", dest="lead_loop", action="store_true",
+                       help="With --loop, run as the managed lead-loop CONTROLLER: "
+                            "acquire a renewable team-mailbox LEASE (the agent must be "
+                            "a configured managed-lead-loop identity) so an external "
+                            "consumer cannot race the bus; renew it on every heartbeat; "
+                            "a valid human release/end stands it down without relaunch.")
     pwrap.add_argument("--one-shot", dest="one_shot", action="store_true",
                        help="With --loop, exit after one successful turn.")
     pwrap.add_argument("--to-request", dest="to_request",

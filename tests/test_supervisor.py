@@ -1919,3 +1919,57 @@ def test_preflight_wrapped_codex_validates_python_not_codex_sandbox(tmp_path: Pa
     # the $file stub is never invoked, so its log has no 'sandbox'. (codexOk depends
     # on the ambient python having agenttalk importable, so it is not asserted.)
     assert "sandbox" not in codex_args
+
+
+# ----------------------------------------- WP2: lead-loop controller exit-marker rules
+
+def test_lead_loop_stood_down_marker_suppresses_relaunch() -> None:
+    # A stale wrapped controller that exited via a VALID human release/end leaves a
+    # `stood_down` exit marker -> the supervisor must NOT relaunch it (else auto_restart
+    # defeats the v0.39 stand-down). Without the marker the same stale state relaunches.
+    p = _plan(_report(heartbeat_stale=True, lead_loop_exit={"state": "stood_down"}),
+              {"agents": {"worker": _ready()}}, snapshot=_snap(),
+              config=_HOOK_CODEX_CONFIG)
+    assert p["action"] == sup.NONE and p["state"] == "LEAD_LOOP_STOOD_DOWN"
+
+
+def test_lead_loop_blocked_marker_holds_only_while_owner_live() -> None:
+    # A `blocked` exit marker HOLDs (no relaunch) ONLY while the incumbent is a LIVE
+    # guarding owner (lead_loop view armed) - relaunching would fight the live owner.
+    p = _plan(_report(heartbeat_stale=True, lead_loop_exit={"state": "blocked"},
+                      lead_loop={"armed": True, "owner_liveness": "alive", "present": True}),
+              {"agents": {"worker": _ready()}}, snapshot=_snap(),
+              config=_HOOK_CODEX_CONFIG)
+    assert p["action"] == sup.NONE and p["state"] == "LEAD_LOOP_BLOCKED"
+
+
+def test_lead_loop_blocked_marker_recovers_when_owner_dead() -> None:
+    # lead verify P2: once the blocking owner DIES/wedges (lead_loop view not armed), a
+    # stale `blocked` marker must NOT permanently HOLD - the block has cleared, so the
+    # controller RELAUNCHES + takes over (auto-recovery). Without the liveness gate this
+    # was a permanent HOLD reachable under default config (wrapped stuck_after < TTL).
+    p = _plan(_report(heartbeat_stale=True, lead_loop_exit={"state": "blocked"},
+                      lead_loop={"armed": False, "owner_liveness": "dead", "present": True}),
+              {"agents": {"worker": _ready()}}, snapshot=_snap(),
+              config=_HOOK_CODEX_CONFIG)
+    assert p["action"] == sup.STUCK_RECOVER and p["state"] == "STUCK_OR_DEAD"
+
+
+def test_lead_loop_crash_no_marker_still_relaunches() -> None:
+    # A CRASH writes NO exit marker -> the stale controller still relaunches (recovery);
+    # this is the contrast that proves the marker is what suppresses relaunch.
+    p = _plan(_report(heartbeat_stale=True),  # no lead_loop_exit
+              {"agents": {"worker": _ready()}}, snapshot=_snap(),
+              config=_HOOK_CODEX_CONFIG)
+    assert p["action"] == sup.STUCK_RECOVER and p["state"] == "STUCK_OR_DEAD"
+
+
+def test_lead_loop_manual_restart_overrides_stood_down_marker() -> None:
+    # An operator request-RESTART (section 0, highest priority) overrides the stand-down
+    # HOLD: the operator deliberately wants the controller back -> RELAUNCH.
+    marker = {"request_id": "rr-ll", "force_protected": False}
+    p = _plan(_report(heartbeat_stale=True, restart_request=marker,
+                      lead_loop_exit={"state": "stood_down"}),
+              {"agents": {"worker": _ready(backoff_next_epoch=NOW + 9999)}},
+              snapshot=_snap(), config=_HOOK_CODEX_CONFIG)
+    assert p["action"] == sup.RELAUNCH and p["state"] == "MANUAL_RESTART"

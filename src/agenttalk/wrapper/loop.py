@@ -148,6 +148,9 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              k_poison: int = 3, k_escalate: int = 20,
              on_dead_letter: Callable[[dict], None] | None = None,
              on_escalate: Callable[[dict], None] | None = None,
+             heartbeat: Callable[[], None] | None = None,
+             pre_commit: Callable[[], None] | None = None,
+             manage_waiting: bool = True,
              now_iso: Callable[[], str] = _iso_now) -> int:
     """Run the wrapper listen loop. ``drive(record)`` handles ONE turn (injected).
     Returns the number of turns driven. ``max_turns`` / ``max_polls`` / ``max_wall``
@@ -166,23 +169,36 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
         forever if its request never arrives.
 
     The ``.waiting`` marker is ALWAYS cleared on exit (try/finally) so a normal
-    stand-down / one-shot completion does not leave a stale waiting marker."""
-    store.write_waiting(agent, {"agent": agent, "mode": "wrapper-loop"})
+    stand-down / one-shot completion does not leave a stale waiting marker - UNLESS
+    ``manage_waiting`` is False (the managed lead-loop controller: its LEASE owns the
+    ``.waiting`` mirror, so the loop must neither write the generic wrapper-loop marker
+    at start - which would clobber the lease mirror - nor clear it on exit; the
+    controller's lease release handles the mirror, WP2).
+
+    ``heartbeat`` overrides the per-idle stamp (default ``store.write_heartbeat``);
+    the managed lead-loop passes a combined ``write_heartbeat`` + ``renew lease`` so
+    the lease stays fresh on every idle stamp (WP2 condition 4)."""
+    stamp = heartbeat if heartbeat is not None else (lambda: store.write_heartbeat(agent))
+    if manage_waiting:
+        store.write_waiting(agent, {"agent": agent, "mode": "wrapper-loop"})
     try:
         if only_request_id is not None:
             return _run_one_shot(
                 store, agent, drive, rid=only_request_id,
                 idle_interval=idle_interval, max_idle_interval=max_idle_interval,
                 heartbeat_interval=heartbeat_interval, clock=clock, sleep=sleep,
-                max_turns=max_turns, max_polls=max_polls, max_wall=max_wall)
+                max_turns=max_turns, max_polls=max_polls, max_wall=max_wall,
+                stamp=stamp)
         return _run_continuous(
             store, agent, drive, idle_interval=idle_interval,
             max_idle_interval=max_idle_interval, heartbeat_interval=heartbeat_interval,
             clock=clock, sleep=sleep, max_turns=max_turns, max_polls=max_polls,
             max_wall=max_wall, k_poison=k_poison, k_escalate=k_escalate,
-            on_dead_letter=on_dead_letter, on_escalate=on_escalate, now_iso=now_iso)
+            on_dead_letter=on_dead_letter, on_escalate=on_escalate, stamp=stamp,
+            pre_commit=pre_commit, now_iso=now_iso)
     finally:
-        store.clear_waiting(agent)
+        if manage_waiting:
+            store.clear_waiting(agent)
 
 
 def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
@@ -193,8 +209,24 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     k_poison: int, k_escalate: int,
                     on_dead_letter: Callable[[dict], None] | None,
                     on_escalate: Callable[[dict], None] | None,
+                    stamp: Callable[[], None],
+                    pre_commit: Callable[[], None] | None,
                     now_iso: Callable[[], str]) -> int:
     turns = 0
+
+    def _guard_advance() -> None:
+        # Called at EVERY cursor-advancing boundary (commit on success/control/invalid,
+        # AND dead-letter dispose) BEFORE the advance. The managed lead-loop passes a
+        # renew-or-raise ownership check here: a controller that has LOST the lease must
+        # NOT advance the cursor / consume a record while unguarded (codex WP2 consume-
+        # boundary blocker). A raise propagates out of run_loop and the controller exits
+        # lease-lost (no marker -> relaunch). Default (no lead-loop): a no-op.
+        if pre_commit is not None:
+            pre_commit()
+
+    def _commit(rec: dict) -> None:
+        _guard_advance()
+        recv_api.commit(store, agent, rec)
     polls = 0
     last_hb: float | None = None
     cur_sleep = idle_interval
@@ -214,9 +246,12 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         the failure backoff resets - the supervisor sees progress + never restarts."""
         nonlocal last_hb, fail_sleep
         rec = store.attempt_record(agent, record.get("id")) or {}
+        _guard_advance()                      # dead-letter ADVANCES the cursor - verify
+        #                                       lease ownership first (lead-loop), else a
+        #                                       lost-lease controller could dispose unguarded
         store.dead_letter(agent, record, reason=reason, failure_class=failure_class,
                           at=now_iso())
-        store.write_heartbeat(agent)          # DL is progress (bypasses drive's stamp)
+        stamp()                               # DL is progress (bypasses drive's stamp)
         last_hb = clock()
         fail_sleep = idle_interval
         if on_dead_letter is not None:
@@ -253,28 +288,29 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         record = recv_api.next_record(store, agent)
         now = clock()
         if record is None:
-            # IDLE: keep the heartbeat fresh, then back off while the bus is quiet.
+            # IDLE: keep the heartbeat fresh (+ renew the lease for the managed
+            # lead-loop, via the injected stamp), then back off while the bus is quiet.
             if last_hb is None or (now - last_hb) >= heartbeat_interval:
-                store.write_heartbeat(agent)
+                stamp()
                 last_hb = now
             sleep(cur_sleep)
             cur_sleep = min(max_idle_interval, cur_sleep * 2.0)
             continue
         cur_sleep = idle_interval                       # reset backoff on activity
         if is_terminal_control(record):
-            recv_api.commit(store, agent, record)       # consume + skip (control)
+            _commit(record)                             # consume + skip (control)
             continue
         control = classify_loop_control(store, record)
         if control == "stop":
             # a VALID, authorized, human/emergency-marked release/end: the wrapper
             # owns loop-exit (the model is a pure handler). Consume it + STAND DOWN.
-            recv_api.commit(store, agent, record)
+            _commit(record)
             return turns
         if control == "invalid_control":
             # an unauthorized / unmarked / reasonless release|end (incl. the old
             # unmarked-end bypass): COMMIT it so it never redelivers and is never
             # driven into the model, then KEEP LISTENING (idle stays listening).
-            recv_api.commit(store, agent, record)
+            _commit(record)
             continue
 
         # ---- dead-letter: bound the at-least-once retry of a POISON head message ----
@@ -310,7 +346,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                    at=now_iso())
         outcome = _as_outcome(drive(record))
         if outcome.ok:
-            recv_api.commit(store, agent, record)
+            _commit(record)                             # guards lease ownership first
             store.clear_attempt(agent, head_id)
             store.gc_attempts_below(agent, store.cursor(agent))
             last_hb = clock()                           # drive already stamped on success
@@ -347,7 +383,8 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                   idle_interval: float, max_idle_interval: float,
                   heartbeat_interval: float, clock: Callable[[], float],
                   sleep: Callable[[float], None], max_turns: int | None,
-                  max_polls: int | None, max_wall: float | None) -> int:
+                  max_polls: int | None, max_wall: float | None,
+                  stamp: Callable[[], None] | None = None) -> int:
     """SCOPED one-shot loop for an ephemeral reviewer (see run_loop). Receives only
     messages on ``rid`` so unrelated traffic neither starves it nor is consumed from
     the global inbox; bounded so it always terminates."""
@@ -357,6 +394,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
     cur_sleep = idle_interval
     fail_sleep = idle_interval
     start = clock()
+    _stamp = stamp if stamp is not None else (lambda: store.write_heartbeat(agent))
     while True:
         if max_polls is not None and polls >= max_polls:
             return turns                # bound hit: caller maps turns==0 -> nonzero
@@ -377,7 +415,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
             # message is NOT returned here (scoped floor) and is NOT committed, so it
             # cannot starve us and stays unread for a later global sync.
             if last_hb is None or (now - last_hb) >= heartbeat_interval:
-                store.write_heartbeat(agent)
+                _stamp()
                 last_hb = now
             sleep(cur_sleep)
             cur_sleep = min(max_idle_interval, cur_sleep * 2.0)

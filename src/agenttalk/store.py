@@ -2576,6 +2576,53 @@ class Store:
     def lead_loop_lease_path(self, agent: str):
         return self.state_dir / f"{validate_agent_name(agent)}.lead-loop-lease.json"
 
+    # --- managed lead-loop CONTROLLER exit marker (WP2) -----------------------
+    #
+    # The wrapped controller records WHY it exited so the supervisor can tell a
+    # deliberate non-crash exit (do NOT relaunch) from a crash (relaunch + recover):
+    #   * ``blocked``     - acquire found another LIVE owner; this duplicate stood
+    #     down without ever owning the lease (supervisor HOLD, no relaunch).
+    #   * ``stood_down``  - a VALID human release/end (v0.39 authority); the
+    #     stand-down must STICK against auto_restart (supervisor NO relaunch until an
+    #     operator request-launch re-arms).
+    # A crash/exception/SIGKILL writes NO marker -> the supervisor relaunches as
+    # usual. The marker lives in state/ (cleared by reset like the lease) and is
+    # cleared when a controller next ACQUIRES (a live controller makes any prior
+    # exit state moot). Degrade-safe: a torn/absent marker reads as None.
+    LEAD_LOOP_EXIT_BLOCKED = "blocked"
+    LEAD_LOOP_EXIT_STOOD_DOWN = "stood_down"
+
+    def lead_loop_exit_path(self, agent: str):
+        return self.state_dir / f"{validate_agent_name(agent)}.lead-loop-exit.json"
+
+    def write_lead_loop_exit(self, agent: str, *, state: str,
+                             owner_pid: int | None = None, reason: str = "") -> None:
+        """Record the controller's exit reason (atomic). ``state`` is one of
+        ``LEAD_LOOP_EXIT_BLOCKED`` / ``LEAD_LOOP_EXIT_STOOD_DOWN``."""
+        _atomic_write_text(self.lead_loop_exit_path(agent), json.dumps({
+            "agent": agent, "state": state,
+            "owner_pid": owner_pid if isinstance(owner_pid, int) else None,
+            "reason": str(reason or ""), "at": _now_iso(),
+        }, ensure_ascii=False, indent=2))
+
+    def read_lead_loop_exit(self, agent: str) -> dict | None:
+        """The parsed exit marker, or None if absent/corrupt (never raises)."""
+        p = self.lead_loop_exit_path(agent)
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8").strip() or "null")
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def clear_lead_loop_exit(self, agent: str) -> None:
+        """Remove the exit marker (best-effort; never raises)."""
+        try:
+            self.lead_loop_exit_path(agent).unlink()
+        except (FileNotFoundError, OSError):
+            pass
+
     def _lead_loop_lease_lock(self, agent: str):
         """Exclusive per-agent lock serializing acquire/renew/release/steal so the
         read-decide-write is ATOMIC - two contenders can never both 'acquire' an
@@ -3485,6 +3532,13 @@ ACTIVE_WITHIN_SECONDS = 120.0
 LEAD_LOOP_MODE = "lead-loop"
 LEAD_LOOP_CADENCE_DEFAULT = 300.0
 LEAD_LOOP_TTL_DEFAULT = 900.0
+# The owner-bypass env token for the single-consumer guard (cli._guard_lead_loop_consumer
+# reads it; the wrapped controller presents it for its OWN in-process consumption). SINGLE
+# source so the wrapper can STRIP it from the model child's environment (WP2) without
+# duplicating the literal. It is advisory coordination inside the trusted state dir, NOT
+# authz (D-4): never log it, never expose it via a read-only command, never pass it to the
+# model child.
+LEAD_LOOP_LEASE_ENV = "AGENTTALK_LEAD_LOOP_LEASE"
 
 
 def _process_alive(pid: int) -> bool:

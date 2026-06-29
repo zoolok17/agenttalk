@@ -13,6 +13,7 @@ a restart-request marker.
 from __future__ import annotations
 
 import json
+import os
 import re
 # subprocess spawns ONLY the operator-provided CLI launch command; never shell=True.
 import subprocess  # nosec B404
@@ -21,6 +22,8 @@ import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, timezone
+
+from agenttalk.store import LEAD_LOOP_LEASE_ENV
 
 from . import claude_adapter, codex_adapter
 from .degraded import DegradedConfig, DegradedDetector
@@ -236,9 +239,13 @@ def run_wrapper(
     # on the first non-ASCII byte (e.g. a smart quote). errors="replace" means a
     # genuinely malformed byte renders a replacement char instead of killing the
     # wrapper. In text mode this also governs the stdin prompt write.
+    # Strip the lead-loop owner-bypass token from the child env here too (parity with
+    # _ProcStream), so "the model child never sees the token" holds on EVERY spawn path,
+    # not only the loop path (defense-in-depth + comment accuracy).
+    child_env = {k: v for k, v in os.environ.items() if k != LEAD_LOOP_LEASE_ENV}
     proc = subprocess.Popen(  # noqa: S603  # nosec B603
         argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        encoding="utf-8", errors="replace", bufsize=1,
+        encoding="utf-8", errors="replace", bufsize=1, env=child_env,
     )
     try:
         engine.run(parse_lines(proc.stdout or [], mapper), clock)
@@ -261,10 +268,17 @@ class _ProcStream:
         # Explicit encoding/errors (see run_wrapper): UTF-8 child output must not be
         # decoded as cp1252 on Windows (crash on the first non-ASCII byte), and a
         # malformed byte must be replaced, not fatal. Governs the stdin prompt too.
+        # STRIP the lead-loop owner-bypass token from the child env (WP2 condition 3 /
+        # reviewer-1 Slice-1 residual): the wrapper consumes the bus IN-PROCESS, so the
+        # model child never needs AGENTTALK_LEAD_LOOP_LEASE - and leaking it would let
+        # an accidental model-side `agenttalk drain` bypass the single-consumer guard.
+        # Always stripped (harmless for non-lead-loop children; defense-in-depth even
+        # if a future parent sets it). The child otherwise inherits the parent env.
+        child_env = {k: v for k, v in os.environ.items() if k != LEAD_LOOP_LEASE_ENV}
         self._proc = subprocess.Popen(  # noqa: S603  # nosec B603
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-            bufsize=1,
+            bufsize=1, env=child_env,
         )
         if self._proc.stdin is not None:
             if stdin_text is not None:
@@ -286,6 +300,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                render: bool = True, rules: str | None = None,
                clock: Callable[[], float] = time.monotonic,
                spawn: Callable[[list[str], str | None], Iterable[str]] | None = None,
+               heartbeat: Callable[[], None] | None = None,
                persist: Callable[[object], None] | None = None) -> Callable[[dict], object]:
     """Build the per-turn ``drive(record)`` callback for loop.run_loop. Each call
     drives ONE real CLI turn and returns a :class:`loop.DriveOutcome` (ok + a failure
@@ -328,8 +343,13 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         # before it completes (in-turn liveness). A FAILED turn may also stamp here
         # mid-stream, so drive() CLEARS the heartbeat when the turn ends failed -
         # net: live during a successful turn, no fresh heartbeat after a failed one
-        # (reviewer-1 gate: both, via stamp-during + clear-on-failure).
-        on_heartbeat=_default_heartbeat(store, agent),
+        # (reviewer-1 gate: both, via stamp-during + clear-on-failure). The managed
+        # lead-loop injects a combined stamp (write_heartbeat + renew lease) so the
+        # lease stays fresh on streaming progress too, not only on the idle stamp
+        # (WP2 condition 4); the failure-path heartbeat-clear below does not touch the
+        # lease (the controller is alive while streaming, even on a turn that fails).
+        on_heartbeat=((lambda _ev, _ts: heartbeat()) if heartbeat is not None
+                      else _default_heartbeat(store, agent)),
         on_render=(_default_render if render else None),
         on_escalate=_default_escalate(store, agent, sender or agent),
         on_info=_default_info,
@@ -469,8 +489,15 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 session_state.resume_unavailable_reason = ""
             # Unconditional: a clean completed turn ALWAYS ends with a fresh
             # heartbeat, even if the engine's min_interval throttled the in-turn
-            # stamps (e.g. a quick retry right after a failure).
-            store.write_heartbeat(agent)
+            # stamps (e.g. a quick retry right after a failure). Route through the
+            # INJECTED hook when present (the lead-loop's renew+heartbeat), so the
+            # final stamp also re-verifies lease ownership: a lost lease RAISES here
+            # instead of stamping a fresh heartbeat with no live lease (codex WP2
+            # consume-boundary blocker).
+            if heartbeat is not None:
+                heartbeat()
+            else:
+                store.write_heartbeat(agent)
             if persist is not None:
                 persist(session_state)
             return DriveOutcome(ok=True)
