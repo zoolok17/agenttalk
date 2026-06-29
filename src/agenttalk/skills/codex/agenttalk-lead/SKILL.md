@@ -1,7 +1,7 @@
 ---
 name: agenttalk-lead
 description: Coordinate a named multi-agent team over agenttalk as a lead. Use when Codex should decompose work, dispatch to named agents or groups, track replies with threads, and report back without spawning worker processes.
-reviewed-against: "0.42"
+reviewed-against: "0.43"
 ---
 
 # agenttalk-lead - Coordinate a named team (codex side)

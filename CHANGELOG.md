@@ -5,6 +5,15 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.43.1] - 2026-06-29
+
+### Fixed
+
+- Bundled-skill `reviewed-against` stamps bumped to `0.43` so the skill-currency check passes on the
+  0.43 release line. The v0.43.0 release commit bumped the package version but not the skill stamps, so
+  the version-stamp ratchet flagged every bundled skill as minor-lagged and the source-tree currency
+  test failed in CI. No functional change to the skills, the lint, or the evidence schema.
+
 ## [0.43.0] - 2026-06-29
 
 ### Added

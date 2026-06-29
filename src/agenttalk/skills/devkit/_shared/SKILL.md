@@ -5,7 +5,7 @@ description: >-
   routing index). This is NOT an invocable capability skill - do not run it; the other
   devkit skills link to its references/ files.
 category: reference
-reviewed-against: "0.42"
+reviewed-against: "0.43"
 ---
 
 # _shared (reference holder - do NOT invoke)

@@ -5,7 +5,7 @@ description: >-
   surrounding codebase. Use when implementing a feature, fixing a bug, or
   refactoring production code. Do NOT use for writing tests (use test-coverage),
   reviewing an existing diff (use review-code), or documentation (use write-docs).
-reviewed-against: "0.42"
+reviewed-against: "0.43"
 category: production
 evidence-profile:
   - production-handoff

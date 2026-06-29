@@ -6,7 +6,7 @@ description: >-
   PR/diff/change or to self-review code before merging. Do NOT use for writing new
   code (use craft-code), reviewing documentation (use review-docs), or general code
   questions unrelated to a specific diff.
-reviewed-against: "0.42"
+reviewed-against: "0.43"
 category: assurance
 evidence-profile:
   - review-result

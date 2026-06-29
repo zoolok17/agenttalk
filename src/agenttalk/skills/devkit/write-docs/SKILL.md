@@ -6,7 +6,7 @@ description: >-
   or updating a README, guide, reference, or any user-facing doc, or when a code
   change alters how users build/configure/call the software. Do NOT use for inline
   code comments (use craft-code) or for reviewing existing docs (use review-docs).
-reviewed-against: "0.42"
+reviewed-against: "0.43"
 category: production
 evidence-profile:
   - production-handoff

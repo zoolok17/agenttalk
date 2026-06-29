@@ -8,7 +8,7 @@ description: >-
   handoff (use agenttalk-handoff), team routing (use agenttalk-lead), or anything that
   is not a multi-lens close. This skill ORCHESTRATES the existing `agenttalk close`
   (P2/P3) flow — it invents no new commands.
-reviewed-against: "0.42"
+reviewed-against: "0.43"
 category: assurance
 evidence-profile:
   - review-result
