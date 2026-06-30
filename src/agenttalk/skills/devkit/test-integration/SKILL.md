@@ -9,7 +9,7 @@ description: >-
   full user journeys that require unstable sleeps or external services, fixing
   an already-failing check (use fix-ci), product implementation/refactoring (use
   craft-code or refactor-code), or reviewing an existing diff (use review-code).
-reviewed-against: "0.48"
+reviewed-against: "0.49"
 category: assurance
 evidence-profile:
   - qa-result

@@ -5,6 +5,25 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.49.0] - 2026-06-30
+
+### Added
+
+- **`test-integration` devkit skill (Tier 1b) — completes Tier 1.** An assurance skill for validating
+  behavior across *real* integration boundaries (CLI + store, filesystem, config loading, migrations,
+  multiple modules, process/supervisor interactions): prefer real boundaries where deterministic and
+  cheap, use isolated temp roots, never fake the boundary under test, avoid unstable sleeps / live
+  services, and record the exact command/result. It runs in two modes — emit `qa-result` evidence when
+  reporting QA, or `production-handoff` when handing off production test changes. With it landed, all four
+  Tier 1 devkit skills (`qa-strategy`, `fix-ci`, `refactor-code`, `test-integration`) are live and the
+  devkit routing index is fully de-interimed.
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.49.0"
+```
+
 ## [0.48.0] - 2026-06-30
 
 ### Added
