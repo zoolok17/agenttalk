@@ -5,6 +5,41 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.47.0] - 2026-06-30
+
+### Fixed
+
+- **Wrapped-codex turn-1 hang (supervised hung-tool recovery).** A supervised `wrap --loop --cli codex`
+  agent whose turn wedged on a hung tool subprocess (e.g. a pwsh that spawned a bare `node` REPL waiting
+  on stdin) would never complete the turn, never heartbeat again, and became alive-but-permanently-silent
+  with no self-recovery. A new per-turn watchdog (`agenttalk.wrapper.turn_watchdog`, default-on for
+  continuous wrapped codex) detects this with a TWO-FACTOR signal -- the turn has run past
+  `turn_elapsed_seconds` (1800) AND a non-codex tool descendant has been alive past
+  `tool_descendant_alive_seconds` (600), which distinguishes a hung tool from long pure reasoning -- then
+  kills the per-turn process tree (leaves-first, START-TIME-GUARDED: it re-reads each target's live start
+  immediately before the kill and skips a reused PID; fail-open if the snapshot is unavailable) and
+  converts the wedge into a recoverable `ambiguous` turn failure (the message stays pending; repeated
+  wedges escalate then dead-letter, never poison). It stamps a narrow recovery heartbeat so the supervisor
+  does not preempt the in-wrapper recovery. Reported by the orbit launcher team.
+
+### Changed
+
+- **Wrapped-codex `stuck_after_seconds` default raised 900 -> 2400** so the supervisor's stale-recovery
+  never preempts the new turn watchdog (which fires at ~`turn_elapsed_seconds` + margin). The supervisor
+  now refuses restart-on-stale (warn-only) for a wrapped codex whose `stuck_after_seconds <=
+  turn_elapsed_seconds + 300` unless `allow_low_stuck_after` is set; a single shared predicate decides
+  whether the watchdog is effectively live so the wrapper and supervisor can never disagree (a sub-floor
+  `turn_elapsed_seconds` without `allow_low_turn_elapsed` disables the watchdog AND keeps normal supervisor
+  recovery). Known limitation: a legitimately long-running tool (alive past `tool_descendant_alive_seconds`
+  within a turn past `turn_elapsed_seconds`) can be killed; raise the thresholds (or set
+  `allow_low_turn_elapsed`) for such agents.
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.47.0"
+```
+
 ## [0.46.0] - 2026-06-30
 
 ### Added
