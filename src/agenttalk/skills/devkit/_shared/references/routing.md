@@ -1,5 +1,5 @@
 ---
-reviewed-against: "0.49"
+reviewed-against: "0.51"
 ---
 
 # Skill routing index
@@ -21,9 +21,12 @@ unique evidence).
 | Decide which tests/lenses a change needs | qa-strategy |
 | Low-level / unit / regression / behavior tests | test-coverage |
 | Cross-module / CLI-plus-store / filesystem / config / migration tests | test-integration |
+| Executed performance benchmark evidence | test-performance |
+| Executable security tests / abuse cases | test-security |
 | Integrated diff review | review-code |
 | Documentation | write-docs |
-| Documentation accuracy review (+ run documented commands) | review-docs (docs-QA mode) |
+| Executable documentation checks | test-docs |
+| Documentation accuracy / audience / prose review | review-docs |
 | Failure-path / contract-drift / release-readiness assurance | review-failure-injection / review-contract-drift / review-release-readiness |
 | Release / milestone multi-lens close | system-review-protocol |
 
@@ -33,7 +36,8 @@ unique evidence).
 2. New production code uses craft-code; behavior-preserving cleanup uses refactor-code;
    if behavior changes it is craft-code.
 3. Architecture / security / performance are SUB-LENSES under review-code unless routed as
-   explicit specialist work with distinct evidence (not a separate skill in Tier 0/1).
+   explicit executable specialist work with distinct evidence. Use test-performance for
+   benchmark evidence and test-security for threat-model-backed abuse-case evidence.
 4. Failure-path, contract-drift, release-readiness, and docs reviews use the existing
    specialist skills when their trigger is exact.
 5. When the main task is deciding QA/review coverage, use qa-strategy before invoking
@@ -46,14 +50,18 @@ unique evidence).
 
 ## Negative triggers (do NOT)
 
-- Do NOT call a performance review without a workload, budget, dataset, complexity change, or
-  measurement plan.
-- Do NOT call a security review for cosmetic changes that do not touch auth, input,
-  filesystem/process/env, dependency, sandbox, or secret surfaces.
+- Do NOT call test-performance without a workload, budget or baseline, dataset or fixture,
+  environment notes, repetitions, variance policy, and a regression threshold.
+- Do NOT call test-security for cosmetic changes that do not touch auth, input,
+  filesystem/process/env, dependency, sandbox, serialization, or secret surfaces.
 - Do NOT request fresh-context review merely to accumulate approvals.
 - Do NOT require fresh-context review when ephemeral reviewers are disabled or no supervisor
   is running; record unavailable and use standing reviewers.
-- Do NOT use a separate docs-QA skill; use review-docs in docs-QA mode.
+- Do NOT use test-docs for adversarial docs accuracy, audience, prose, or completeness review;
+  use review-docs.
+- Do NOT use review-docs as the executable-docs QA lane when the task is specifically to run
+  docs examples, doctests, link checks, command snippets, generated-reference drift checks,
+  or code-vs-doc assertions; use test-docs.
 - Do NOT use qa-strategy to avoid writing or running obvious tests.
 - Do NOT use fix-ci to guess at a failure without reading the failing log/output.
 - Do NOT let duplicated green evidence count as independent coverage: two reviewers citing the
