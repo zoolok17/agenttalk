@@ -114,6 +114,8 @@ SK_LOOP_FORBIDDEN = [
     "planned -> in_progress",   # in_progress is only an alias for doing, never emitted
     "for_review -> approved",   # wrong approve transition
     "--to planned --force",     # reject must NOT default to --force
+    "python -m spec_kitty",     # broken fallback - spec-kitty has no runnable module
+    "python -m specify_cli",    # also broken - entry point specify_cli:main is a function
 ]
 
 

@@ -402,8 +402,14 @@ implements or reviews; the lead coordinates around that state.
 
 If `agenttalk` or `spec-kitty` is not on PATH inside the Codex
 sandbox:
-- Both ship as Python entry points. Fallback: `python -m agenttalk
-  ...` and `python -m spec_kitty ...`.
+- `agenttalk` ships a runnable module: fall back to `python -m agenttalk ...`.
+- `spec-kitty` has NO working `python -m` form - its console-script entry point
+  is `specify_cli:main`, a FUNCTION rather than a runnable module, so no
+  module-execution invocation resolves. Prefer the `spec-kitty` console script
+  (on PATH, or its full path in the Python Scripts/bin dir). If you genuinely
+  need a pure-python fallback, the ONLY working form is
+  `python -c 'from specify_cli import main; main()'` (append the spec-kitty
+  args, e.g. `--version`).
 - If `python` itself isn't on PATH, find your Python install:
   - Windows: `(Get-Command python).Source` or check
     `$env:LOCALAPPDATA\Programs\Python\`
