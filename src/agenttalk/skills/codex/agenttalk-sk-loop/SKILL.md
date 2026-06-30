@@ -1,7 +1,7 @@
 ---
 name: agenttalk-sk-loop
 description: Enter the persistent spec-kitty implement/review loop for this mission as a Codex agent. Use spec-kitty's state machine as source of truth; use agenttalk as a wake signal between persistent CLI windows. Symmetric - you can be implementer or reviewer for any WP.
-reviewed-against: "0.49"
+reviewed-against: "0.50"
 ---
 
 # agenttalk-sk-loop - Persistent spec-kitty loop with agenttalk wake (codex side)

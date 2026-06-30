@@ -5,6 +5,41 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.50.0] - 2026-06-30
+
+### Added
+
+- **spec-kitty lane seam in the `sk-loop` skill — one ordered, validated transition recipe.** Replaces the
+  manual two-step seam (`move-task`, then a separate wake) that left tasks half-moved and the loose review note
+  that could block a lane move. The skill now: probes the installed spec-kitty CLI + lane set first and fails
+  loud rather than emitting a lane the CLI may reject (real 1.0.2 lanes `planned`/`doing`/`for_review`/`done`,
+  with `in_progress` only an observed alias for `doing`); re-derives the agent's exact transition from
+  `spec-kitty next`; **moves the spec-kitty lane FIRST, then wakes** (never wakes on a failed move; `move-task`
+  exit is the sole authority); and routes review feedback onto the agenttalk bus as the durable record, with the
+  spec-kitty `--review-feedback-file` written to the OS temp dir **outside** the mission tree so a stray review
+  note can never block the move. Approve is `for_review -> done` (the invalid `--to approved` is removed); reject
+  is `for_review -> planned` with no default `--force` (operator escape hatch only). Wakes carry a structured
+  `transition_key=sk:<mission>:<wp>:<from>:<to>:<verdict>`; a wake missed by a crash self-heals on the ~30s
+  sk-loop poll (named as the repair mechanism — do not lengthen the in-loop wait to listen-mode 1800s). A
+  cleanliness diagnostic is advisory only and fails open. Skill-only — nothing in the generic core learns
+  spec-kitty lanes or flags. New skill-lint guards pin the corrected lanes and forbid the stale forms.
+  Docs: `docs/AGENT-MANUAL.md`.
+
+### Fixed
+
+- **`sk-loop` spec-kitty PATH fallback corrected.** The Codex sk-loop sandbox note told agents to fall back to
+  `python -m spec_kitty` when `spec-kitty` is not on PATH, but that module does not exist — the console-script
+  entry point is `specify_cli:main` (a function), so no `python -m` form resolves. The skill now prefers the
+  `spec-kitty` console script (on PATH or its full Scripts/bin path) and documents
+  `python -c "from specify_cli import main; main()"` as the only working pure-python fallback; the valid
+  `python -m agenttalk` fallback is retained. A lint guard forbids the broken module forms from regressing.
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.50.0"
+```
+
 ## [0.49.1] - 2026-06-30
 
 ### Fixed
