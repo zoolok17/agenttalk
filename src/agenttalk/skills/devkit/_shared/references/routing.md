@@ -1,5 +1,5 @@
 ---
-reviewed-against: "0.46"
+reviewed-against: "0.47"
 ---
 
 # Skill routing index
@@ -16,7 +16,7 @@ unique evidence).
 | Coordinate a team / route / collect evidence / close | the bus skill agenttalk-lead (do NOT create team-lead) |
 | Listen for and handle bus messages | the bus skill agenttalk-listen |
 | New production code | craft-code |
-| Behavior-preserving cleanup (no behavior change) | refactor-code (Tier 1); until then craft-code with explicit no-behavior-change tests |
+| Behavior-preserving cleanup (no behavior change) | refactor-code |
 | Diagnose + fix a failing local/CI check | fix-ci |
 | Decide which tests/lenses a change needs | qa-strategy |
 | Low-level / unit / regression / behavior tests | test-coverage |
@@ -30,9 +30,8 @@ unique evidence).
 ## Core precedence
 
 1. Bus/team coordination uses agenttalk-lead/-listen/-handoff/-send/-sk-loop. Never team-lead.
-2. New production code uses craft-code; behavior-preserving cleanup uses refactor-code
-   (Tier 1; until it exists, craft-code with explicit no-behavior-change tests); if behavior
-   changes it is craft-code.
+2. New production code uses craft-code; behavior-preserving cleanup uses refactor-code;
+   if behavior changes it is craft-code.
 3. Architecture / security / performance are SUB-LENSES under review-code unless routed as
    explicit specialist work with distinct evidence (not a separate skill in Tier 0/1).
 4. Failure-path, contract-drift, release-readiness, and docs reviews use the existing
