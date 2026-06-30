@@ -1,6 +1,6 @@
 ---
 description: Enter listen mode as a Claude Code agent - repeatedly wait for messages from named agents and handle reviews, proposals, broadcast questions, consults, wake signals, or cross-review requests.
-reviewed-against: "0.50"
+reviewed-against: "0.51"
 ---
 
 # /agenttalk.listen - Listen for agenttalk messages

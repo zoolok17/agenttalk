@@ -5,6 +5,27 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.51.0] - 2026-06-30
+
+### Changed
+
+- **Durable-listening guidance: supervised `wrap --loop` is now the documented default for unattended
+  listening.** A chat-window listener is best-effort — the host CLI, a compaction, or the terminal lifecycle
+  can interrupt it (Claude Code reaps in-window background `agenttalk wait` tasks, notably across compaction;
+  Codex windows tolerate manual listening only as a human-supervised stopgap). The `agenttalk-listen` skills
+  (both Claude and Codex copies, in lockstep) now state this, require agents to represent listening as
+  best-effort unless running under supervised `wrap --loop`, and forbid claiming always-on listening from a
+  chat window — framed via the existing wakes-are-latency-not-state principle (a missed wake costs time, not
+  message durability; recovery is via `sync`/`threads` after a restart or compaction). README, the agent
+  manual (`docs/AGENT-MANUAL.md`), and the supervisor tutorial are updated to match, and new skill-lint
+  content asserts pin the durable-listening contract. Docs / skill / test-content only — no runtime change.
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.51.0"
+```
+
 ## [0.50.0] - 2026-06-30
 
 ### Added
