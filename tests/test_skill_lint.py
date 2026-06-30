@@ -118,6 +118,20 @@ SK_LOOP_FORBIDDEN = [
     "python -m specify_cli",    # also broken - entry point specify_cli:main is a function
 ]
 
+LISTEN_DURABLE_CONTRACT = [
+    "manual chat-window listener is best-effort",
+    "must NOT claim always-on listening from a chat window",
+    "Claude Code unattended listening should run under supervised `agenttalk wrap --loop`",
+    "Codex manual listening is a tolerable stopgap",
+    "Listening is latency, not correctness state",
+    "wakes are latency optimization, not state",
+    "After context compaction, re-arm the wait and rerun sync",
+]
+
+LISTEN_DURABLE_FORBIDDEN = [
+    "Idle = always listening",
+]
+
 
 # ------------------------------------------------------- bundled file presence
 
@@ -153,6 +167,33 @@ def test_required_content_present_on_both_sides(
     if codex_missing:
         msg.append(f"Codex {subdir}/SKILL.md missing: {codex_missing}")
     assert not msg, "; ".join(msg)
+
+
+# -------------------------------------------- listen durable-listening contract
+
+def test_listen_skills_state_durable_listening_honestly() -> None:
+    """The listen skills must not promise daemon-grade listening from a chat window."""
+    claude = _normalize(
+        (SKILLS_ROOT / "claude" / "agenttalk.listen.md").read_text(encoding="utf-8")
+    )
+    codex = _normalize(
+        (SKILLS_ROOT / "codex" / "agenttalk-listen" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+    )
+    for body, label in ((claude, "claude"), (codex, "codex")):
+        missing = [
+            required
+            for required in LISTEN_DURABLE_CONTRACT
+            if _normalize(required) not in body
+        ]
+        assert not missing, f"{label} listen skill missing durable contract: {missing}"
+        present = [
+            forbidden
+            for forbidden in LISTEN_DURABLE_FORBIDDEN
+            if _normalize(forbidden) in body
+        ]
+        assert not present, f"{label} listen skill still claims durable manual listening: {present}"
 
 
 # ------------------------------------------- spec-kitty seam: forbidden content

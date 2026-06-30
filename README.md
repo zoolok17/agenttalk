@@ -981,6 +981,17 @@ Three ideas carry it:
   or the wrapper's own persisted id/`thread_id` for wrapped agents. The
   tutorial spells out all four paths.
 
+For durable unattended listening, use a supervised `agenttalk wrap
+--loop` process as the documented default. A manual chat-window listener
+is best-effort: host CLI behavior, context compaction, and terminal
+lifecycle can interrupt the wait loop. This matters most for Claude Code,
+where in-window background waits can be reaped; unattended Claude agents
+should be wrapped. Codex manual listening is a tolerable stopgap when a
+human is watching, but the honest unattended pattern is still the
+wrapper. Listening and wakes affect latency, not correctness state:
+queued messages stay durable, and `sync` / `threads` rebuild obligations
+after a restart.
+
 Quick start:
 
 ```powershell
@@ -1018,11 +1029,14 @@ agenttalk wrap --for codex-dev --cli codex --loop -- `
 
 A wrapped agent is instrumented by construction (no activity hook
 needed) and owns session continuity end-to-end, so a supervisor relaunch
-re-runs the identical command and reload-resumes the session. Wrapping is
-**opt-in** — manual `/agenttalk.listen` stays the default. Per-CLI stale
-thresholds differ on purpose (wrapped Claude streams through reasoning →
-180s; wrapped Codex is item-level and silent during pure reasoning →
-900s+); see the tutorial for the threshold guidance and the guardrails.
+re-runs the identical command and reload-resumes the session. For
+hands-off durable listening, wrapping is the documented default. Manual
+`/agenttalk.listen` remains supported for interactive work, and a Codex
+chat window is a tolerable supervised-by-human stopgap, but it is not a
+daemon. Per-CLI stale thresholds differ on purpose (wrapped Claude
+streams through reasoning → 180s; wrapped Codex is item-level and silent
+during pure reasoning → 900s+); see the tutorial for the threshold
+guidance and the guardrails.
 
 Protected agents — the operator-facing liaison and every active
 `role=lead` — are **never auto-killed** (warn/note only), and a manual
@@ -1063,7 +1077,7 @@ Protected agents — the operator-facing liaison and every active
 | `agenttalk release --from A (--to B \| --to-group G \| --all) [-m reason]` | Signal an agent (or team) to **stand down and exit its listen loop** — distinct from `end`: no transcript export, and the agent may be restarted later. A listener exits ONLY on `kind=release` or `kind=end`; a prose "done for now" never stops it. A single `--to` opens no thread (no `request_id`/`broadcast_id`); `--to-group`/`--all` fan out the same signal (re-run to retry any missed — no `--resume`). Authoritative only from the `operator_facing`/sole-`lead` sender; the command warns otherwise and the listen skill reports-and-ignores an unauthorized release. |
 | `agenttalk reset [--archive]` | Clear **active bus state** (messages + cursors + heartbeats); preserves historical transcripts under `.agenttalk/sessions/` so past exports aren't lost. Bumps `session_id`. With `--archive`, instead moves **everything** (messages + state + sessions) under `.agenttalk/archived/<old_session>/`. Preserves config (roster) either way. |
 | `agenttalk supervise (--init \| --report \| --plan \| --install-activity-hook \| --clear-restart)` | Thin support for the **external agent supervisor** (24/7 outage auto-restart + stuck-recovery). `--init` scaffolds `.agenttalk/supervisor.{json,ps1}` (a config you fill with per-agent launch commands + a generated PowerShell monitor script; POSIX is a follow-up). `--report`/`--plan` emit the read-only liveness JSON and the **action plan** (the shared decision table the script executes). Heartbeat freshness is the liveness authority: a fresh heartbeat is healthy even when process discovery is missing or misleading; a stale heartbeat becomes `stuck_recover` (best-effort kill + resume) only when the activity hook is installed (`activity_hook=true`), else it is warn-only (`suspect_warn`), never a kill. `--install-activity-hook` merges the `agenttalk heartbeat` PostToolUse hook into the **project** `.claude/settings.json` (`--codex` for `.codex/hooks.json`; never global, never clobbers). Every recovery **resumes the pinned session** so context survives a force-kill. Protected agents (`operator_facing` ∪ every active `role=lead`) are never auto-killed (warn/note). |
-| `agenttalk wrap --for A --cli claude\|codex [--loop] [--no-render] [--from S] [--min-interval N] -- <real-exe> <base-args>` | Run agent `A` through the **progress wrapper** (0.30.0): a per-CLI structured-stream adapter giving **visibility** (echoes the agent's stream — token/thinking deltas for Claude, item-level events for Codex; `--no-render` to silence), a **working-turn heartbeat** (stays fresh while the agent works, not just idles), and **degraded-output detection** (confirmed garble-then-silence can request a self-restart, recorded as `--from`). `--loop` makes it the long-running **supervised** wrapper: it owns the idle bus-wait + heartbeat and drives the CLI **one turn per inbound message**, persisting+reloading the Codex `thread_id`/Claude `session-id` so a relaunch reload-resumes. The real CLI exe + its base args go after `--`; the wrapper appends the per-turn session/stream args. Opt-in — manual `/agenttalk.listen` stays the default. |
+| `agenttalk wrap --for A --cli claude\|codex [--loop] [--no-render] [--from S] [--min-interval N] -- <real-exe> <base-args>` | Run agent `A` through the **progress wrapper** (0.30.0): a per-CLI structured-stream adapter giving **visibility** (echoes the agent's stream — token/thinking deltas for Claude, item-level events for Codex; `--no-render` to silence), a **working-turn heartbeat** (stays fresh while the agent works, not just idles), and **degraded-output detection** (confirmed garble-then-silence can request a self-restart, recorded as `--from`). `--loop` makes it the long-running **supervised** wrapper: it owns the idle bus-wait + heartbeat and drives the CLI **one turn per inbound message**, persisting+reloading the Codex `thread_id`/Claude `session-id` so a relaunch reload-resumes. The real CLI exe + its base args go after `--`; the wrapper appends the per-turn session/stream args. For durable unattended listening, this is the documented default; manual `/agenttalk.listen` is best-effort for interactive use. |
 | `agenttalk request-restart --for A [--from L] [--reason ...] [--force-protected]` | Queue a **manual** restart of agent `A`: writes an atomic, request-id-scoped `state/<A>.restart-request` marker the supervisor relaunches (resuming the session) from and clears. Restarting a protected agent requires `--force-protected`. |
 | `agenttalk heartbeat [--for A] [--min-interval 5]` | Stamp this agent's **activity heartbeat** (the supervisor's stuck signal). Wire as a Claude PostToolUse / Codex hook so it's stamped at **tool boundaries** (PostToolUse) **plus** the wait-loop heartbeat while idle — so it stays fresh whether the agent is waiting or running tools, and goes stale only when the model is genuinely stuck. Choose `stuck_after_seconds` generously for the longest expected no-tool model/API turn or long-running tool call; production configs may need a larger value than the 120s default. **Throttled** — a no-op if the heartbeat is younger than `--min-interval`, so the per-tool-call hook costs almost nothing. |
 | `agenttalk compact [--dry-run] [--keep-count N] [--keep-age-days D] [--json]` | Bound live-store growth by archiving a **safe prefix** of old messages (`id < keep_floor`) into the cold `.agenttalk/archived/compacted/` dir. `keep_floor` is the MIN of: the lowest active cursor (never archive a message unread by an active recipient), the current epoch barrier, the earliest message of any **protected** thread (owed-inbound / reply-waiting / open-outbound / closed-superseded — kept whole), and a keep-tail (`keep_count` newest + everything younger than `keep_age_days`). Any undeterminable component fails safe to **archive nothing**. Never archives invalid files (they stay for `prune`/`doctor`). Diagnostics name which component capped the floor; `--dry-run` plans without moving. |

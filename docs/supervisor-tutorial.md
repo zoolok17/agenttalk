@@ -14,7 +14,8 @@ By the end you will have:
 
 - a background monitor watching one or more agents,
 - agents that auto-restart on crash/outage and resume their session,
-- (optionally) agents wrapped for live visibility plus stuck-recovery.
+- wrapped agents for the recommended hands-off durable-listening path,
+  with manual-listen agents still available for interactive or legacy use.
 
 > **Platform.** The generated monitor is **PowerShell** (`supervisor.ps1`)
 > on Windows. A POSIX monitor is a follow-up; the CLI surface
@@ -121,8 +122,9 @@ and it's safe to delete while the monitor isn't running.
 The scaffold ships **two example agent blocks** so you can copy whichever
 archetype you need:
 
-- `AGENT_NAME` — a **manual-listen** agent (the default).
-- `AGENT_NAME_WRAPPED` — a **wrapped** agent driven through `wrap --loop`.
+- `AGENT_NAME` — a **manual-listen** agent for interactive or legacy use.
+- `AGENT_NAME_WRAPPED` — a **wrapped** agent driven through `wrap --loop`,
+  the recommended default for hands-off durable listening.
 
 ---
 
