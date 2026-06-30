@@ -5,6 +5,24 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.49.1] - 2026-06-30
+
+### Fixed
+
+- **Test flake: `test_config_lock_breaks_stale_dead_pid` de-flaked at the root.** The test mocked
+  `store._process_alive`, but the config-lock stale-break path (`_break_stale_lock`) decides via
+  `store._process_liveness` — a *separate* function — so the mock was ineffective. On a CI runner where
+  the planted dead-pid (4242) happened to be a live process, the stale-break correctly refused and the 2s
+  acquire timed out (the intermittent CI red seen on some OS/Python jobs). The test now mocks
+  `_process_liveness -> PROC_DEAD`, making the stale-break deterministic regardless of the runner's live
+  pids. Test-only; no production change (the never-break-a-live-holder behavior is unchanged).
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.49.1"
+```
+
 ## [0.49.0] - 2026-06-30
 
 ### Added
