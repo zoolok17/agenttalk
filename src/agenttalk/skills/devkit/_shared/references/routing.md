@@ -20,7 +20,7 @@ unique evidence).
 | Diagnose + fix a failing local/CI check | fix-ci |
 | Decide which tests/lenses a change needs | qa-strategy |
 | Low-level / unit / regression / behavior tests | test-coverage |
-| Cross-module / CLI-plus-store / filesystem / config / migration tests | test-integration (Tier 1b); until then test-coverage + tester-qa scoped by risk |
+| Cross-module / CLI-plus-store / filesystem / config / migration tests | test-integration |
 | Integrated diff review | review-code |
 | Documentation | write-docs |
 | Documentation accuracy review (+ run documented commands) | review-docs (docs-QA mode) |
