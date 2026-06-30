@@ -193,12 +193,18 @@ def normalize(
     if state not in HEALTH_STATES or updated_at is None or since is None:
         return unknown(agent, "health_invalid")
     last_progress = raw.get("last_progress_at")
-    if last_progress is not None and parse_iso(last_progress) is None:
+    last_progress_at = parse_iso(last_progress) if last_progress is not None else None
+    if last_progress is not None and last_progress_at is None:
         return unknown(agent, "health_invalid")
     now = time.time() if now_epoch is None else float(now_epoch)
-    age = max(0.0, now - updated_at.timestamp())
     ttl = float(ttl_seconds)
-    skew = float(heartbeat_skew_seconds)
+    skew = max(0.0, float(heartbeat_skew_seconds))
+    future_cutoff = now + skew
+    for dt in (updated_at, since, last_progress_at):
+        if dt is not None and dt.timestamp() > future_cutoff:
+            return unknown(agent, "health_future_timestamp")
+
+    age = max(0.0, now - updated_at.timestamp())
     if ttl >= 0 and age > ttl:
         return unknown(agent, "health_stale_ttl")
     if heartbeat is not None and updated_at.timestamp() < heartbeat.timestamp() - skew:

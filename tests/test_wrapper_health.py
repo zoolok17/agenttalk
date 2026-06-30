@@ -131,6 +131,55 @@ def test_stale_health_with_fresh_heartbeat_is_ignored_with_warning(tmp_path: Pat
     assert plan["state"] == "HEALTHY_IDLE"
 
 
+def test_future_dated_working_health_degrades_unknown_and_does_not_delay_recovery(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    _set_hb(s, "beta", NOW - 1000)
+    s.write_health("beta", hm.build_snapshot(
+        agent="beta",
+        cli="claude",
+        mode="wrapper-loop",
+        state=hm.STATE_WORKING_SILENT,
+        updated_at=_iso(NOW + 86400),
+        since=_iso(NOW + 86400),
+        last_progress_at=_iso(NOW + 86400),
+        reason_code="turn_spawned",
+    ))
+
+    cfg = _wrapped_cfg()
+    report = sup.build_report(s, now_epoch=NOW, supervisor_config=cfg)
+    h = report["agents"]["beta"]["health"]
+    assert h["state"] == hm.STATE_UNKNOWN
+    assert "health_future_timestamp" in h["warnings"]
+
+    plan = sup.plan_actions(report, _ready_state(), cfg, now_epoch=NOW,
+                            snapshot=[])["agents"]["beta"]
+    assert plan["action"] == sup.STUCK_RECOVER
+    assert plan["state"] == "STUCK_OR_DEAD"
+
+
+def test_small_future_health_within_skew_is_accepted(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    _set_hb(s, "beta", NOW - 1000)
+    s.write_health("beta", hm.build_snapshot(
+        agent="beta",
+        cli="claude",
+        mode="wrapper-loop",
+        state=hm.STATE_WORKING_SILENT,
+        updated_at=_iso(NOW + 5),
+        since=_iso(NOW + 5),
+        last_progress_at=_iso(NOW + 5),
+        reason_code="turn_spawned",
+    ))
+
+    h = s.read_health("beta", now_epoch=NOW, ttl_seconds=300,
+                      heartbeat_skew_seconds=30)
+    assert h["state"] == hm.STATE_WORKING_SILENT
+    assert h["age_seconds"] == 0.0
+    assert h["stale"] is False
+
+
 def test_working_health_delays_auto_recovery_but_not_manual_restart(tmp_path: Path) -> None:
     s = _store(tmp_path)
     _set_hb(s, "beta", NOW - 1000)
