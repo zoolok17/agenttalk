@@ -27,7 +27,7 @@ SEMANTICS (leaves-first, start-time guarded) are mirrored here in pure Python.
 """
 from __future__ import annotations
 
-import subprocess  # nosec B404 - fixed argv, no shell; see snapshot/kill adapters below
+import subprocess  # nosec B404
 import sys
 import threading
 import time
@@ -56,6 +56,20 @@ class TurnWatchdogConfig:
 # long reasoning+tool turn): cmd_wrap/resolve REFUSE it unless allow_low_turn_elapsed is
 # set, mirroring the supervisor's allow_low_stuck_after guard. Never silently coerced.
 SAFE_TURN_ELAPSED_FLOOR = 1200.0
+
+
+def watchdog_effectively_live(cfg: TurnWatchdogConfig) -> bool:
+    """The SINGLE source of truth for "will the per-turn watchdog actually run for this
+    resolved config" - imported by BOTH cmd_wrap (its start/disable decision) AND the
+    supervisor planner (apply the restart-preemption guard ONLY when the watchdog is live),
+    so the two layers can NEVER disagree (the bug where the wrapper disabled the watchdog but
+    the supervisor still refused restart-on-stale, leaving a wedge with no recovery). A
+    sub-floor turn_elapsed WITHOUT allow_low_turn_elapsed is NOT live (cmd_wrap disables it)."""
+    if not cfg.enabled:
+        return False
+    return not (cfg.turn_elapsed_seconds < SAFE_TURN_ELAPSED_FLOOR
+                and not cfg.allow_low_turn_elapsed)
+
 
 # Names that are the Codex brain / its internal runner / a console host - NEVER candidates
 # (killing them is killing the turn's own engine, not a hung tool). Everything else that
@@ -170,8 +184,13 @@ def evaluate(snapshot: Snapshot | None, *, root_pid: int, root_start: object,
     if trigger is None:
         return WatchdogDecision(False, "no aged tool descendant")
     # Leaves-first: descendants_of yields a pre-order (parents before children); reversing
-    # kills the deepest first, then the root last - the supervisor Stop-Tree semantics.
-    kill_order = list(reversed(desc)) + [root_pid]
+    # kills the deepest first, then the root last - the supervisor Stop-Tree semantics. EACH
+    # target carries its OBSERVED start so the kill adapter can re-verify it at KILL time
+    # (the snapshot->kill window is otherwise a pid-reuse hole), exactly like the supervisor
+    # Proc-Start recheck.
+    kill_order = [{"pid": pid, "start": snapshot[pid].get("create_epoch")}
+                  for pid in reversed(desc)]
+    kill_order.append({"pid": root_pid, "start": root_info.get("create_epoch")})
     return WatchdogDecision(True, "two-factor fire", trigger=trigger, kill_order=kill_order)
 
 
@@ -191,7 +210,7 @@ def snapshot_processes(timeout: float = 5.0) -> Snapshot | None:
 
 def _run(argv: list[str], timeout: float) -> str | None:
     try:
-        out = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, bounded
+        out = subprocess.run(  # noqa: S603  # nosec B603
             argv, capture_output=True, text=True, timeout=timeout, check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -250,26 +269,60 @@ def _snapshot_posix(timeout: float) -> Snapshot | None:
     return snap
 
 
-def kill_pids(pids: list[int]) -> list[int]:
-    """Best-effort kill of each pid in order (leaves-first). Returns the pids we believe we
-    killed; a pid already gone is silently fine."""
+def proc_start(pid: int) -> float | None:
+    """LIVE create_epoch (POSIX seconds) for a SINGLE pid, or None if it is gone / unknown /
+    the query errors. Used to re-verify a kill target the instant before killing it, so a pid
+    that exited and was REUSED between the firing snapshot and the kill is not killed. Fails
+    closed (None) - the caller then skips the target."""
+    try:
+        if sys.platform.startswith("win"):
+            ps = (f"Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}' | "
+                  "ForEach-Object { ([datetimeoffset]$_.CreationDate).ToUnixTimeSeconds() }")
+            out = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], 5.0)
+            if not out or not out.strip():
+                return None
+            return float(out.strip().splitlines()[0])
+        out = _run(["ps", "-o", "etimes=", "-p", str(int(pid))], 5.0)
+        if not out or not out.strip():
+            return None
+        return time.time() - int(out.strip().split()[0])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def _kill_one(pid: int) -> bool:
+    try:
+        if sys.platform.startswith("win"):
+            return subprocess.run(  # noqa: S603,S607  # nosec
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True, text=True, timeout=10, check=False,
+            ).returncode == 0
+        import os
+        import signal
+        os.kill(pid, signal.SIGKILL)
+        return True
+    except (OSError, subprocess.SubprocessError, ProcessLookupError):
+        return False
+
+
+def kill_targets(targets: list, *, start_fn=proc_start, killer=None) -> list[int]:
+    """Best-effort kill of each ``{pid, start}`` target in order (leaves-first). For EACH
+    target re-read the LIVE start-time and kill ONLY if it still matches the observed start;
+    on mismatch (pid reuse) OR an unavailable/missing start, SKIP the target (fail-open - we
+    never kill a pid we cannot positively confirm is still the same process). Mirrors the
+    supervisor Stop-Tree Proc-Start recheck. Returns the pids actually killed."""
+    killer = killer or _kill_one
     killed: list[int] = []
-    for pid in pids:
-        try:
-            if sys.platform.startswith("win"):
-                rc = subprocess.run(  # noqa: S603,S607  # nosec - system tool on PATH, fixed argv, no shell
-                    ["taskkill", "/F", "/PID", str(pid)],
-                    capture_output=True, text=True, timeout=10, check=False,
-                ).returncode
-                if rc == 0:
-                    killed.append(pid)
-            else:
-                import os
-                import signal
-                os.kill(pid, signal.SIGKILL)
-                killed.append(pid)
-        except (OSError, subprocess.SubprocessError, ProcessLookupError):
+    for t in targets:
+        pid = t.get("pid")
+        expected = t.get("start")
+        if pid is None:
             continue
+        live = start_fn(pid)
+        if live is None or expected is None or not _start_matches(live, expected):
+            continue                       # gone / reused / unconfirmable -> never kill
+        if killer(pid):
+            killed.append(pid)
     return killed
 
 
@@ -291,7 +344,7 @@ class TurnWatchdog:
         self._root_start = root_start
         self._cfg = cfg
         self._snapshot_fn = snapshot_fn or snapshot_processes
-        self._kill_fn = kill_fn or kill_pids
+        self._kill_fn = kill_fn or kill_targets
         self._clock = clock
         self._wall = wall_clock
         self._stop = threading.Event()

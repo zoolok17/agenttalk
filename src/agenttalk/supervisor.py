@@ -105,39 +105,13 @@ _WRAPPED_STUCK_AFTER_DEFAULTS = {"claude": 180.0, "codex": 2400.0}
 # ``allow_low_stuck_after=true``. We never SILENTLY coerce the value (no
 # ``max(configured, 900)``) - that would make config surprising.
 _WRAPPED_CODEX_MIN_STUCK_AFTER = 600.0
-# The wrapped-codex per-turn watchdog deadline (turn_elapsed_seconds) the supervisor
-# assumes when one is not explicitly configured, + the margin its stale threshold must
-# clear. A wrapped-codex stuck_after_seconds <= turn_elapsed + margin would let the
-# supervisor preempt the watchdog -> the planner REFUSES restart-on-stale (warn-only)
-# unless allow_low_stuck_after=true. Keep in sync with TurnWatchdogConfig defaults.
-_WATCHDOG_TURN_ELAPSED_DEFAULT = 1800.0
+# The margin a wrapped-codex stale threshold must clear above the per-turn watchdog
+# deadline. A wrapped-codex stuck_after <= turn_elapsed + margin would let the supervisor
+# preempt the watchdog -> the planner REFUSES restart-on-stale (warn-only) unless
+# allow_low_stuck_after=true. The watchdog deadline + live/disabled decision come from the
+# SHARED turn_watchdog.resolve_turn_watchdog + watchdog_effectively_live (single source of
+# truth, imported in _plan_one so the two layers can never drift).
 _WATCHDOG_STUCK_AFTER_MARGIN = 300.0
-
-
-def _watchdog_turn_elapsed(config: dict, cfg_agent: dict) -> float:
-    """Effective turn_watchdog.turn_elapsed_seconds (per-agent -> global -> default), PURE
-    and corrupt-config tolerant. Read directly from the config block so the supervisor does
-    not import the wrapper module."""
-    for src in (cfg_agent, config):
-        src = src if isinstance(src, dict) else {}
-        blk = src.get("turn_watchdog")
-        if isinstance(blk, dict):
-            v = blk.get("turn_elapsed_seconds")
-            if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
-                return float(v)
-    return _WATCHDOG_TURN_ELAPSED_DEFAULT
-
-
-def _watchdog_enabled_for(config: dict, cfg_agent: dict, wrapped: bool, cli_name: str) -> bool:
-    """Whether the per-turn watchdog is effectively ON for this agent. DEFAULT-ON for a
-    wrapped codex (matches cmd_wrap); an explicit ``turn_watchdog.enabled`` in the per-agent
-    or global block overrides. PURE / corrupt-config tolerant."""
-    for src in (cfg_agent, config):
-        src = src if isinstance(src, dict) else {}
-        blk = src.get("turn_watchdog")
-        if isinstance(blk, dict) and isinstance(blk.get("enabled"), bool):
-            return blk["enabled"]
-    return bool(wrapped and cli_name == "codex")
 
 
 def resolve_stuck_after(config: dict, cfg_agent: dict) -> float:
@@ -828,13 +802,20 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     unsafe_low_codex = (wrapped and cli_name == "codex"
                         and stuck_after < _WRAPPED_CODEX_MIN_STUCK_AFTER
                         and not allow_low_stuck_after)
-    # TIMING-INVARIANT GUARD (v0.46.0): a wrapped codex with the per-turn watchdog ON must
-    # have stuck_after ABOVE the watchdog deadline + margin, else the supervisor would kill
-    # + relaunch the wrapper into the same wedge BEFORE the watchdog fires. REFUSE
-    # restart-on-stale (warn-only) when it would preempt, unless allow_low_stuck_after.
-    watchdog_on = _watchdog_enabled_for(config, cfg_agent, wrapped, cli_name)
-    watchdog_turn_elapsed = _watchdog_turn_elapsed(config, cfg_agent)
-    watchdog_preempted = (wrapped and cli_name == "codex" and watchdog_on
+    # TIMING-INVARIANT GUARD (v0.47.0): a wrapped codex with the per-turn watchdog
+    # EFFECTIVELY LIVE must have stuck_after ABOVE the watchdog deadline + margin, else the
+    # supervisor would kill + relaunch the wrapper into the same wedge BEFORE the watchdog
+    # fires. REFUSE restart-on-stale (warn-only) when it would preempt, unless
+    # allow_low_stuck_after. CRITICAL: gate this on the SHARED watchdog_effectively_live
+    # predicate (the same one cmd_wrap uses) - if the watchdog is effectively DISABLED
+    # (sub-floor turn_elapsed without opt-in), the supervisor KEEPS its normal
+    # recover-on-stale authority, so the agent is never left with neither.
+    from agenttalk.wrapper import turn_watchdog as _twd
+    _wd_cfg = _twd.resolve_turn_watchdog(
+        config, cfg_agent, default_enabled=(wrapped and cli_name == "codex"))
+    watchdog_live = _twd.watchdog_effectively_live(_wd_cfg)
+    watchdog_turn_elapsed = _wd_cfg.turn_elapsed_seconds
+    watchdog_preempted = (wrapped and cli_name == "codex" and watchdog_live
                           and stuck_after <= watchdog_turn_elapsed + _WATCHDOG_STUCK_AFTER_MARGIN
                           and not allow_low_stuck_after)
     can_confirm_stuck = ((activity_hook or wrapped)

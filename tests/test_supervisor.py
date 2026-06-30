@@ -1796,6 +1796,36 @@ def test_wrapped_codex_watchdog_disabled_uses_only_floor_guard() -> None:
     assert p["action"] == sup.STUCK_RECOVER
 
 
+def test_wrapped_codex_subfloor_watchdog_disabled_supervisor_still_recovers() -> None:
+    # Issue B (reviewer-1 repro): enabled=true but turn_elapsed=1100 (< 1200 floor) with NO
+    # allow_low_turn_elapsed -> the WRAPPER disables the watchdog. The supervisor must NOT
+    # then refuse restart-on-stale (else the wedge is silent with NO recovery). Both layers
+    # share watchdog_effectively_live, so the planner sees it as NOT live -> recovers on stale.
+    cfg = {**_WRAP_CONFIG,
+           "agents": {"worker": {"auto_restart": True, "cli": "codex", "wrapped": True,
+                                 "stuck_after_seconds": 1300,
+                                 "turn_watchdog": {"enabled": True,
+                                                   "turn_elapsed_seconds": 1100}}}}
+    p = _plan_wrap(_report(heartbeat_stale=True, heartbeat_age_seconds=3000.0),
+                   {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
+                   snapshot=_wrap_snap(), config=cfg)
+    assert p["action"] == sup.STUCK_RECOVER             # never left with neither
+
+
+def test_wrapped_codex_subfloor_watchdog_with_optin_preempts() -> None:
+    # the SAME sub-floor turn_elapsed but WITH allow_low_turn_elapsed -> the watchdog IS live,
+    # so the supervisor again refuses restart-on-stale (the watchdog will handle the wedge).
+    cfg = {**_WRAP_CONFIG,
+           "agents": {"worker": {"auto_restart": True, "cli": "codex", "wrapped": True,
+                                 "stuck_after_seconds": 1300,
+                                 "turn_watchdog": {"enabled": True, "turn_elapsed_seconds": 1100,
+                                                   "allow_low_turn_elapsed": True}}}}
+    p = _plan_wrap(_report(heartbeat_stale=True, heartbeat_age_seconds=3000.0),
+                   {"agents": {"worker": _wrap_ready(last_warn_epoch=0, backoff_next_epoch=0)}},
+                   snapshot=_wrap_snap(), config=cfg)
+    assert p["action"] == sup.SUSPECT_WARN and "turn watchdog deadline" in p["reason"]
+
+
 def test_config_template_documents_watchdog_and_provenance() -> None:
     # gate #4/#5 doc tests: the wrapped-codex template must surface the per-turn watchdog,
     # its known limitation, and the codex_home_isolation config-provenance risk.

@@ -5843,11 +5843,11 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         watchdog_cfg = _twd.resolve_turn_watchdog(
             sup_cfg, cfg_agent, default_enabled=default_wd_on)
         # Low-floor guard (mirrors allow_low_stuck_after): refuse an unsafe-low turn_elapsed
-        # unless explicitly opted in - never silently coerce. The two-factor discriminator
-        # is mandatory regardless, so disabling here is the safe response to a misconfig.
-        if (watchdog_cfg.enabled
-                and watchdog_cfg.turn_elapsed_seconds < _twd.SAFE_TURN_ELAPSED_FLOOR
-                and not watchdog_cfg.allow_low_turn_elapsed):
+        # unless explicitly opted in - never silently coerce. Routed through the SHARED
+        # watchdog_effectively_live predicate so the supervisor planner makes the SAME
+        # live/disabled decision (else the wrapper disables it but the supervisor still
+        # refuses restart-on-stale -> a wedge with no recovery).
+        if watchdog_cfg.enabled and not _twd.watchdog_effectively_live(watchdog_cfg):
             sys.stderr.write(
                 f"agenttalk wrap: turn_watchdog.turn_elapsed_seconds="
                 f"{watchdog_cfg.turn_elapsed_seconds:.0f}s is below the "

@@ -69,8 +69,11 @@ def test_non_codex_descendant_above_age_fires_and_kills_leaves_first() -> None:
                  (2002, 2001, "node.exe", 9000.0))
     d = evaluate(snap, root_pid=ROOT, root_start=0.0, elapsed=9999.0, now=10_000.0, cfg=CFG)
     assert d.fire and d.trigger["name"] in ("pwsh.exe", "node.exe")
-    assert d.kill_order[-1] == ROOT                      # root is killed LAST
-    assert d.kill_order.index(2002) < d.kill_order.index(2001)  # deepest first
+    pids = [t["pid"] for t in d.kill_order]
+    assert pids[-1] == ROOT                              # root is killed LAST
+    assert pids.index(2002) < pids.index(2001)           # deepest first
+    # each target carries its observed start for the kill-time recheck
+    assert all("start" in t for t in d.kill_order)
 
 
 def test_only_deep_descendant_aged_fires_on_it() -> None:
@@ -179,7 +182,8 @@ def test_controller_fires_and_kills_when_descendant_hangs() -> None:
         root_pid=ROOT, root_start=0.0,
         # turn_elapsed=0 -> skip the initial wait, poll immediately and fire on the first snap
         cfg=TurnWatchdogConfig(enabled=True, turn_elapsed_seconds=0.0, poll_seconds=0.01),
-        snapshot_fn=lambda: snap, kill_fn=lambda pids: killed.extend(pids) or pids,
+        snapshot_fn=lambda: snap,
+        kill_fn=lambda targets: [killed.append(t["pid"]) or t["pid"] for t in targets],
         wall_clock=lambda: 10_000.0)
     wd.start()
     wd.join(timeout=5.0)
@@ -187,6 +191,63 @@ def test_controller_fires_and_kills_when_descendant_hangs() -> None:
     assert wd.result["trigger"]["name"] in ("pwsh.exe", "node.exe")
     assert killed[-1] == ROOT and 2002 in killed       # root killed, leaves included
     assert "watchdog killed" in wd.result["summary"]
+
+
+# ----------------------------------------------------------- kill-time start guard (Issue A)
+
+def test_kill_targets_kills_matching_start() -> None:
+    killed: list = []
+    out = twd.kill_targets([{"pid": 42, "start": 100.0}],
+                           start_fn=lambda pid: 100.0,           # live start MATCHES
+                           killer=lambda pid: killed.append(pid) or True)
+    assert out == [42] and killed == [42]
+
+
+def test_kill_targets_skips_reused_pid() -> None:
+    killed: list = []
+    twd.kill_targets([{"pid": 42, "start": 100.0}],
+                     start_fn=lambda pid: 999.0,                 # live start CHANGED (reuse)
+                     killer=lambda pid: killed.append(pid) or True)
+    assert killed == []                                          # NOT killed
+
+
+def test_kill_targets_skips_when_live_start_unavailable() -> None:
+    killed: list = []
+    twd.kill_targets([{"pid": 42, "start": 100.0}],
+                     start_fn=lambda pid: None,                  # gone / unconfirmable
+                     killer=lambda pid: killed.append(pid) or True)
+    assert killed == []
+
+
+def test_kill_targets_skips_when_expected_start_missing() -> None:
+    killed: list = []
+    twd.kill_targets([{"pid": 42, "start": None}],              # no observed start to verify
+                     start_fn=lambda pid: 100.0,
+                     killer=lambda pid: killed.append(pid) or True)
+    assert killed == []
+
+
+def test_kill_targets_leaves_first_only_matching() -> None:
+    # a 3-target tree where the middle pid was reused -> it is skipped, the others killed
+    killed: list = []
+    starts = {2002: 9000.0, 2001: 7777.0, ROOT: 0.0}            # 2001 live start differs below
+    twd.kill_targets(
+        [{"pid": 2002, "start": 9000.0}, {"pid": 2001, "start": 0.0}, {"pid": ROOT, "start": 0.0}],
+        start_fn=lambda pid: starts[pid], killer=lambda pid: killed.append(pid) or True)
+    assert killed == [2002, ROOT]                               # 2001 (reused) skipped
+
+
+# ----------------------------------------------------------- shared live predicate (Issue B)
+
+def test_watchdog_effectively_live() -> None:
+    live = twd.watchdog_effectively_live
+    assert live(TurnWatchdogConfig(enabled=True)) is True
+    assert live(TurnWatchdogConfig(enabled=False)) is False
+    # sub-floor turn_elapsed WITHOUT opt-in -> NOT live (cmd_wrap disables it)
+    assert live(TurnWatchdogConfig(enabled=True, turn_elapsed_seconds=1100.0)) is False
+    # sub-floor WITH opt-in -> live
+    assert live(TurnWatchdogConfig(enabled=True, turn_elapsed_seconds=1100.0,
+                                   allow_low_turn_elapsed=True)) is True
 
 
 # ----------------------------------------------------------- make_drive wiring
