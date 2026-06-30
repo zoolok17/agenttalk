@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk.store import Store
+from agenttalk.store import PROC_DEAD, Store
 
 
 def test_concurrent_threads_send_no_loss(tmp_path: Path) -> None:
@@ -105,7 +105,12 @@ def test_config_lock_breaks_stale_dead_pid(
     lockf = s.dir / "config.lock"
     lockf.write_text(json.dumps({"pid": 4242, "at": "x", "root": str(s.root)}),
                      encoding="utf-8")
-    monkeypatch.setattr("agenttalk.store._process_alive", lambda pid: False)
+    # _break_stale_lock decides via the tri-state _process_liveness (store.py:795), NOT the
+    # fail-quiet _process_alive - so mocking _process_alive was INEFFECTIVE for this path and
+    # the test relied on pid 4242 happening to be dead on the runner (the intermittent CI
+    # flake: it timed out wherever 4242 was a LIVE pid). Mock the function the code actually
+    # uses, forced DEFINITIVELY dead, so the stale-break is deterministic on every runner.
+    monkeypatch.setattr("agenttalk.store._process_liveness", lambda pid: PROC_DEAD)
     with s._config_lock(timeout=2.0):
         pass
     assert not lockf.exists()  # broken + released
