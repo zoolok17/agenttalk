@@ -1,7 +1,7 @@
 ---
 name: agenttalk-sk-loop
 description: Enter the persistent spec-kitty implement/review loop for this mission as a Codex agent. Use spec-kitty's state machine as source of truth; use agenttalk as a wake signal between persistent CLI windows. Symmetric - you can be implementer or reviewer for any WP.
-reviewed-against: "0.43"
+reviewed-against: "0.49"
 ---
 
 # agenttalk-sk-loop - Persistent spec-kitty loop with agenttalk wake (codex side)
@@ -100,6 +100,42 @@ forever:
   5. On ambiguity / safety wall    -> stop and ask the user.
 ```
 
+### Step 0 - version + lane guard (run once at loop start)
+
+spec-kitty is the source of truth, so before emitting ANY lane name confirm the
+installed CLI uses the lane set this skill knows. Probe it:
+
+```bash
+spec-kitty --version
+spec-kitty agent tasks status --mission "$MISSION"
+```
+
+Documented baseline (spec-kitty-cli 1.0.2): the lanes are `planned`, `doing`,
+`for_review`, `done`. Treat `in_progress` ONLY as an observed alias for `doing`
+(never a lane this skill emits). If the observed lane set does NOT match that
+baseline, **FAIL LOUD**: print the observed version + lane set and tell the lead
+this skill needs updating for that version. NEVER emit a lane name the installed
+CLI may not accept - a wrong `--to` silently breaks the move.
+
+### Step 0.5 - reconcile move/wake drift (on start / rejoin)
+
+The seam is two systems: a `move-task` can succeed and the agent can die before
+the wake sends (the crash window). sk-loop's ~30s poll is the correctness
+backstop - a lost wake costs about one poll cycle - so reconciliation stays
+LIGHT. On start or rejoin (and when the lead's cadence note asks), re-derive the
+lane from `spec-kitty next`/`status` and compare it to your last action. If a
+lane clearly advanced from your last transition with NO corresponding wake on
+the bus (match by the `transition_key` `sk:<mission>:<wp>:<from>:<to>:<verdict>`),
+re-send ONLY that missing wake/note. Narrow repair rules for this move/wake
+drift:
+
+- Re-send the missing wake/note keyed by its `transition_key`; do NOT blindly
+  duplicate a review-result.
+- Reply on an existing `request_id` only if that thread is still open AND owed;
+  otherwise send a non-closing `wake`/`note`.
+- Skill behavior only - no state machine, no sweep, no core command. Rest on the
+  poll as the correctness backstop.
+
 ### Step 1 - query spec-kitty
 
 ```bash
@@ -111,8 +147,32 @@ cycle number), `arbiter`, `wait`, or a mission-complete sentinel.
 
 ### Step 2 - if it's my action
 
-Both `implement` and `review` are equally normal. Handle whichever
-spec-kitty returns.
+Both `implement` and `review` are equally normal. First **verify you own THIS
+exact transition** for THIS WP from `spec-kitty next`/`status` - the EXACT
+assignee, not just the role class (in a multi-agent mission another agent may
+hold it). Implementer: `doing -> for_review`. Reviewer approve:
+`for_review -> done`. Reviewer reject: `for_review -> planned`. If you are not
+the assignee for this transition, do not move it.
+
+**Ordering invariant (binding): move before wake.** spec-kitty is the source of
+truth, so the lane must actually advance before you announce it. If `move-task`
+fails, STOP and print the diagnostic guidance - do NOT wake on a move that
+failed.
+
+#### Cleanliness diagnostic (advisory UX only - NEVER gates the move)
+
+Before a move to `for_review` or `done` you MAY run this for a friendlier
+message; it is advisory and must NEVER gate the move (fail open):
+
+```bash
+git status --porcelain -- kitty-specs/"$MISSION"
+```
+
+Allowed-dirty (anything else is a LIKELY blocker): any `.md` whose path contains
+`/tasks/`, the root `tasks.md`, `status.events.jsonl`, `status.json`. If the
+diagnostic errors or is uncertain, proceed to `move-task` anyway - spec-kitty
+`move-task`'s exit is the ONLY authority, and a passing diagnostic never
+justifies `--force`.
 
 #### Action: implement WP##
 
@@ -120,17 +180,21 @@ spec-kitty returns.
 2. `cd` into the workspace path printed by the claim.
 3. Read the prompt file. Execute the work (read existing code first,
    write code, write tests, run the project's validation command).
-4. Commit: `git add -A && git commit -m "feat(WP##): <description>"`
+4. Commit your work (stage the changed files; `git commit -m "feat(WP##): <description>"`).
 5. Mark subtasks done: `spec-kitty agent tasks mark-status T001 T002 ... --status done`
-6. Transition: `spec-kitty agent tasks move-task WP## --to for_review --note "Ready for review"`
-7. **Wake the peer:**
+6. (Advisory) run the cleanliness diagnostic above.
+7. MOVE FIRST: `spec-kitty agent tasks move-task WP## --to for_review --note "Ready for review"`.
+   If it fails, STOP, print the blocking paths + the fix, do NOT wake.
+8. Only after the move succeeds, **wake the peer** (carry the transition key):
    ```bash
    agenttalk send --from "$SELF" --to "$PEER" --kind wake \
      --subject "WP## ready for review" \
      --meta mission="$MISSION" --meta wp_id=WP## --meta new_lane=for_review --meta actor="$SELF" \
+     --meta transition_key="sk:${MISSION}:WP##:doing:for_review:submit" \
      -m "WP## is in for_review. Run spec-kitty next."
    ```
-8. Loop back to step 1.
+9. Run `agenttalk sync` / `agenttalk threads --for "$SELF"` to confirm the
+   obligation, then loop back to step 1.
 
 #### Action: review WP##
 
@@ -139,18 +203,32 @@ spec-kitty returns.
 3. Read the review prompt file. Run the diff commands inside it.
 4. Verify acceptance criteria, owned_files boundary, dead-code check
    (e.g. `grep -r "from.*<new_module>" src/`).
-5. Issue verdict:
-   - **Approve:** `spec-kitty agent tasks move-task WP## --to approved --note "Review passed: <summary>"`
-   - **Reject:** write structured feedback to a temp file, then
-     `spec-kitty agent tasks move-task WP## --to planned --force --review-feedback-file <path>`
-6. **Wake the peer:**
+5. Issue the verdict. MOVE FIRST, then wake; never `--force` in the normal recipe.
+   - **Approve** (`for_review -> done`): send the detailed review evidence on the
+     bus FIRST (the durable record), then
+     `spec-kitty agent tasks move-task WP## --to done --note "Review passed: <short summary>"`.
+   - **Reject** (`for_review -> planned`): put the FULL feedback on the bus FIRST
+     (the durable conversation record). Then write that feedback to a temp file
+     in the OS temp dir - OUTSIDE the repo AND OUTSIDE kitty-specs, so it can
+     never be the loose file that blocks the move - and pass it to spec-kitty
+     WITHOUT `--force`:
+     ```bash
+     spec-kitty agent tasks move-task WP## --to planned --review-feedback-file <os-temp-path>
+     ```
+     DELETE the temp file immediately after `move-task` succeeds (spec-kitty
+     reads it synchronously into memory during the command).
+   - If `move-task` fails: STOP, print the blocking paths + the fix (move review
+     notes under `kitty-specs/"$MISSION"/tasks/WP##/...`, or clean/stash the
+     unrelated file), do NOT wake.
+6. Only after the move succeeds, **wake the peer** (carry the transition key):
    ```bash
    agenttalk send --from "$SELF" --to "$PEER" --kind wake \
      --subject "WP## review verdict" \
-     --meta mission="$MISSION" --meta wp_id=WP## --meta new_lane=<approved|planned> --meta actor="$SELF" \
+     --meta mission="$MISSION" --meta wp_id=WP## --meta new_lane=<done|planned> --meta actor="$SELF" \
+     --meta transition_key="sk:${MISSION}:WP##:for_review:<done|planned>:<approve|reject>" \
      -m "WP## moved to <lane>. Run spec-kitty next."
    ```
-7. Loop back to step 1.
+7. Run `agenttalk sync` / `agenttalk threads --for "$SELF"`, then loop back to step 1.
 
 #### Action: re-implement WP## (cycle N)
 
@@ -279,10 +357,22 @@ implements or reviews; the lead coordinates around that state.
   pending-review state from `spec-kitty next`, the repo, the operator,
   and agenttalk sync/threads, never from stale prose in an old body.
 - **You own only your current transition.** Implementer moves
-  `planned -> in_progress -> for_review`. Reviewer moves
-  `for_review -> approved` or `for_review -> planned`. Don't
-  cross-write.
-- **Wakes are latency optimization, not state.**
+  `planned -> doing -> for_review`. Reviewer moves
+  `for_review -> done` (approve) or `for_review -> planned` (reject).
+  Don't cross-write. (`in_progress` is only an observed alias for
+  `doing`, never a lane this skill emits.)
+- **Move before wake; `move-task` is the only authority.** Always move
+  the spec-kitty lane FIRST and wake only after it succeeds; if the move
+  fails, stop and do not wake. The cleanliness diagnostic is advisory and
+  never gates the move, and a passing diagnostic never justifies `--force`.
+- **`--force` is an operator escape hatch only.** The normal reject recipe
+  is `move-task WP## --to planned --review-feedback-file <temp>` with NO
+  `--force`. Reject feedback goes on the bus FIRST (durable record); the
+  `--review-feedback-file` temp lives in the OS temp dir OUTSIDE the mission
+  tree and is deleted after the move.
+- **Wakes are latency optimization, not state.** If a wake is lost, the
+  next poll catches the change (and Step 0.5 reconciles move/wake drift
+  on start/rejoin by the transition key).
 - **Never hand-roll inbox polling.** Plain `agenttalk wait` consumes
   the next real message and advances your global cursor;
   `agenttalk wait --to-request <id>` advances only thread-local

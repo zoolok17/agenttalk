@@ -94,7 +94,23 @@ SKILL_INVARIANTS = [
         "Roles are symmetric",             # role symmetry
         "3 reject cycles = stop",          # escalation gate
         "agenttalk threads --for",         # thread-hygiene before idle/done
+        # --- spec-kitty seam fix (v0.49.x): the real 1.0.2 lanes + ordering ---
+        "--to done",                       # approve = for_review -> done (real lane)
+        "doing",                           # implement lane (not in_progress)
+        "move before wake",                # ordering invariant
+        "reconcile move/wake drift",       # crash-window reconciliation (Step 0.5)
+        "OS temp dir OUTSIDE the mission tree",  # reject feedback file placement
+        "transition_key",                  # structured idempotence key on the wake
     ]),
+]
+
+# Stale/invalid lane names + the default-force reject that the spec-kitty seam fix
+# (v0.49.x) removes. These must NOT appear in EITHER sk-loop copy.
+SK_LOOP_FORBIDDEN = [
+    "--to approved",            # invalid lane - approve is for_review -> done
+    "planned -> in_progress",   # in_progress is only an alias for doing, never emitted
+    "for_review -> approved",   # wrong approve transition
+    "--to planned --force",     # reject must NOT default to --force
 ]
 
 
@@ -132,6 +148,22 @@ def test_required_content_present_on_both_sides(
     if codex_missing:
         msg.append(f"Codex {subdir}/SKILL.md missing: {codex_missing}")
     assert not msg, "; ".join(msg)
+
+
+# ------------------------------------------- spec-kitty seam: forbidden content
+
+def test_sk_loop_has_no_stale_lane_names_or_default_force() -> None:
+    """The spec-kitty seam fix (v0.49.x): BOTH sk-loop copies must use the real
+    spec-kitty 1.0.2 lanes (done/doing, never approved/in_progress) and must NOT
+    default the reject recipe to --force. This is a narrow content guard - it does
+    NOT teach the generic command-token validator any spec-kitty flags."""
+    claude = _normalize(
+        (SKILLS_ROOT / "claude" / "agenttalk.sk-loop.md").read_text(encoding="utf-8"))
+    codex = _normalize(
+        (SKILLS_ROOT / "codex" / "agenttalk-sk-loop" / "SKILL.md").read_text(encoding="utf-8"))
+    for body, label in ((claude, "claude"), (codex, "codex")):
+        present = [bad for bad in SK_LOOP_FORBIDDEN if _normalize(bad) in body]
+        assert not present, f"{label} sk-loop still contains stale/forbidden: {present}"
 
 
 # -------------------------------------------------- frontmatter consistency
