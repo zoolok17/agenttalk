@@ -33,6 +33,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from agenttalk import health as _health
 from agenttalk._atomic import write_text as _atomic_write_text
 from agenttalk import signing as _signing
 
@@ -2508,6 +2509,62 @@ class Store:
             pass
         except OSError:
             pass
+
+    # ------------------------------------------------------ wrapper health
+
+    def health_path(self, agent: str) -> Path:
+        """Adjacent advisory health marker for a wrapped agent."""
+        return self.state_dir / f"{agent}.health.json"
+
+    def write_health(self, agent: str, snapshot: dict) -> None:
+        """Atomically write ``state/<agent>.health.json``.
+
+        Health is advisory only. The heartbeat remains the liveness authority.
+        The schema itself is closed and redacted by ``agenttalk.health``; callers
+        must pass only sanitized snapshots.
+        """
+        _atomic_write_text(
+            self.health_path(agent),
+            json.dumps(snapshot, indent=2, ensure_ascii=False),
+        )
+
+    def read_health_raw(self, agent: str) -> dict | None:
+        """Return the raw health marker, or None if absent/corrupt/unreadable."""
+        p = self.health_path(agent)
+        if not p.exists():
+            return None
+        try:
+            raw = p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def read_health(self, agent: str, *, now_epoch: float | None = None,
+                    heartbeat: datetime | None = None,
+                    ttl_seconds: float = _health.DEFAULT_TTL_SECONDS,
+                    heartbeat_skew_seconds: float = _health.DEFAULT_HEARTBEAT_SKEW_SECONDS
+                    ) -> dict:
+        """Return a degrade-safe advisory health view.
+
+        Missing, malformed, stale, or heartbeat-skewed health reads as
+        ``state=unknown`` with a local warning. This never raises and never
+        derives liveness authority.
+        """
+        raw = self.read_health_raw(agent)
+        return _health.normalize(
+            raw,
+            agent=agent,
+            now_epoch=now_epoch,
+            heartbeat=heartbeat,
+            ttl_seconds=ttl_seconds,
+            heartbeat_skew_seconds=heartbeat_skew_seconds,
+        )
 
     # ----------------------------------------- managed lead-loop (Slice 1)
     #

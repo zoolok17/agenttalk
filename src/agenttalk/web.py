@@ -663,11 +663,20 @@ def status_payload(store: Store) -> dict:
     cfg = _safe_load_config(store)
     invalid = store.list_invalid_messages()
     health = _signing.inspect_key(store.project_id(), store.root)
+    now = datetime.now(timezone.utc).timestamp()
+    agents = cfg.get("agents", []) or []
+    agent_health = {}
+    for a in agents:
+        if not isinstance(a, str):
+            continue
+        hb = store.read_heartbeat(a)
+        agent_health[a] = store.read_health(a, now_epoch=now, heartbeat=hb)
     return {
         "agenttalk_version": __version__,
         "project_root": str(store.root),
         "project_id": store.project_id(),
-        "agents": cfg.get("agents", []) or [],
+        "agents": agents,
+        "agent_health": agent_health,
         "signing_enforced": store.signing_enforced(),
         "hmac_key": health.to_dict(),
         "invalid_messages": [
@@ -926,6 +935,7 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
         if hb is not None:
             e["last_seen"] = hb.isoformat()
             e["last_seen_age_seconds"] = round((now - hb).total_seconds(), 3)
+        e["health"] = store.read_health(a, now_epoch=now.timestamp(), heartbeat=hb)
         e["unread"] = _unread_count(msgs, a, store.cursor(a))
         e["sent"] = sent_counts.get(a, 0)
         e["received"] = recv_counts.get(a, 0)

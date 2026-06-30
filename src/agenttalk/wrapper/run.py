@@ -27,12 +27,14 @@ if TYPE_CHECKING:
     from .turn_watchdog import TurnWatchdogConfig
 from datetime import datetime, timezone
 
+from agenttalk import health as health_model
 from agenttalk.store import LEAD_LOOP_LEASE_ENV
 
 from . import claude_adapter, codex_adapter
 from .degraded import DegradedConfig, DegradedDetector
 from .events import Event, EventType
 from .framework import WrapperEngine
+from .health import WrapperHealthWriter
 
 # cli -> event mapper.
 _ADAPTERS: dict[str, Callable[[object], list[Event]]] = {
@@ -214,6 +216,11 @@ def run_wrapper(
         telemetry_only=_TELEMETRY_ONLY.get(cli, False)
     )
     detector = DegradedDetector(cli, cfg)
+    health_writer = (
+        WrapperHealthWriter(store, agent, cli, mode="wrapper-one-shot",
+                            min_interval=min_interval)
+        if store is not None else None
+    )
 
     if heartbeat_fn is None:
         heartbeat_fn = _default_heartbeat(store, agent)
@@ -224,17 +231,38 @@ def run_wrapper(
     if info_fn is None:
         info_fn = _default_info
 
+    def _restart(signal) -> None:
+        if health_writer is not None:
+            health_writer.degraded(signal)
+        restart_fn(signal)
+
+    def _info(signal) -> None:
+        if health_writer is not None:
+            health_writer.degraded(signal)
+        info_fn(signal)
+
     engine = WrapperEngine(
         detector=detector,
         on_heartbeat=heartbeat_fn,
         on_render=render_fn,
-        on_escalate=restart_fn,
-        on_info=info_fn,
+        on_escalate=_restart,
+        on_info=_info,
         min_interval=min_interval,
     )
 
+    def _health_events(events: Iterable[Event]) -> Iterator[Event]:
+        for ev in events:
+            if health_writer is not None:
+                health_writer.event(ev)
+            yield ev
+
     if line_source is not None:
-        engine.run(parse_lines(line_source, mapper), clock)
+        if health_writer is not None:
+            health_writer.turn_start(None)
+        engine.run(_health_events(parse_lines(line_source, mapper)), clock)
+        if (health_writer is not None
+                and health_writer.state != health_model.STATE_DEGRADED_OUTPUT):
+            health_writer.idle(reason_code="wrapper_completed")
         return 0
 
     # argv is the operator-provided launch command; never shell=True.
@@ -252,11 +280,20 @@ def run_wrapper(
         encoding="utf-8", errors="replace", bufsize=1, env=child_env,
     )
     try:
-        engine.run(parse_lines(proc.stdout or [], mapper), clock)
+        if health_writer is not None:
+            health_writer.turn_start(None)
+        engine.run(_health_events(parse_lines(proc.stdout or [], mapper)), clock)
     finally:
         if proc.stdout:
             proc.stdout.close()
-    return proc.wait()
+    rc = proc.wait()
+    if health_writer is not None:
+        if rc == 0:
+            if health_writer.state != health_model.STATE_DEGRADED_OUTPUT:
+                health_writer.idle(reason_code="wrapper_completed")
+        else:
+            health_writer.crashed_or_exited(reason_code="wrapper_child_nonzero_exit")
+    return rc
 
 
 class _ProcStream:
@@ -332,7 +369,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                heartbeat: Callable[[], None] | None = None,
                persist: Callable[[object], None] | None = None,
                turn_watchdog: "TurnWatchdogConfig | None" = None,
-               watchdog_snapshot_fn=None, watchdog_kill_fn=None) -> Callable[[dict], object]:
+               watchdog_snapshot_fn=None, watchdog_kill_fn=None,
+               health_writer: WrapperHealthWriter | None = None) -> Callable[[dict], object]:
     """Build the per-turn ``drive(record)`` callback for loop.run_loop. Each call
     drives ONE real CLI turn and returns a :class:`loop.DriveOutcome` (ok + a failure
     CLASS on failure, for dead-letter). A turn fails if it produced no progress event or
@@ -368,6 +406,19 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         raise ValueError(f"no wrapper adapter for cli {cli!r}")
     cfg = DegradedConfig(telemetry_only=_TELEMETRY_ONLY.get(cli, False))
     detector = DegradedDetector(cli, cfg)
+    if health_writer is None:
+        health_writer = WrapperHealthWriter(
+            store, agent, cli, mode="wrapper-loop", min_interval=min_interval)
+    restart = _default_escalate(store, agent, sender or agent)
+
+    def _health_escalate(signal) -> None:
+        health_writer.degraded(signal)
+        restart(signal)
+
+    def _health_info(signal) -> None:
+        health_writer.degraded(signal)
+        _default_info(signal)
+
     engine = WrapperEngine(
         detector=detector,
         # Stamp heartbeat on streaming progress so a long SUCCESSFUL turn stays live
@@ -382,8 +433,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         on_heartbeat=((lambda _ev, _ts: heartbeat()) if heartbeat is not None
                       else _default_heartbeat(store, agent)),
         on_render=(_default_render if render else None),
-        on_escalate=_default_escalate(store, agent, sender or agent),
-        on_info=_default_info,
+        on_escalate=_health_escalate,
+        on_info=_health_info,
         min_interval=min_interval,
     )
     if spawn is not None:
@@ -431,6 +482,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                             # carry an INFRA message (529/rate-limit/5xx/auth), which must NOT
                             # be classed poison (lead verify P1).
                             sig["terminal_text"] = ev.text or sig["terminal_text"]
+                    health_writer.event(ev)
                     engine.process(ev, clock())
         except OSError as e:
             # spawn/exec/transport OS error (missing binary, broken pipe, ...): a
@@ -516,6 +568,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         # failure is attributable to the record.
         attempted_resume = ((cli == "codex" and "resume" in spec.args)
                             or (cli == "claude" and "--resume" in spec.args))
+        health_writer.turn_start(record)
         sig = _run_one(spec)
         if not sig["ok"] and attempted_resume:
             # the resume turn failed -> force a FRESH session for the SAME record and retry
@@ -527,6 +580,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 _session.mark_resume_unavailable(session_state, "resume turn failed")
             if persist is not None:
                 persist(session_state)
+            health_writer.turn_start(record)
             sig = _run_one(_session.build_turn(session_state, prompt))
         if sig["ok"]:
             session_state.turns += 1
@@ -550,6 +604,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 store.write_heartbeat(agent)
             if persist is not None:
                 persist(session_state)
+            if health_writer.state != health_model.STATE_DEGRADED_OUTPUT:
+                health_writer.idle(reason_code="turn_completed")
             return DriveOutcome(ok=True)
         # the turn FAILED (no completed boundary / nonzero exit / spawn error, after
         # any resume->fresh retry): undo any heartbeat its streaming progress stamped,
@@ -560,7 +616,12 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         engine.reset_heartbeat_throttle()
         if persist is not None:
             persist(session_state)
-        failure_class, summary = _classify(sig)
+        try:
+            failure_class, summary = _classify(sig)
+        except Exception:  # noqa: BLE001 - publish unknown before preserving failure
+            health_writer.unknown()
+            raise
+        health_writer.failure(sig, failure_class)
         # WATCHDOG-RECOVERY ONLY (narrow path): the hung tool tree was killed and the
         # wrapper is alive + ready for the next turn, so re-stamp a fresh heartbeat (undoing
         # the clear above) - otherwise the supervisor would ALSO relaunch a healthy wrapper.

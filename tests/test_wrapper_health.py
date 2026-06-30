@@ -1,0 +1,266 @@
+"""Advisory wrapper-health contract."""
+
+from __future__ import annotations
+
+import json
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from agenttalk import cli, health as hm, supervisor as sup, web
+from agenttalk.store import Store
+from agenttalk.wrapper import run, session
+
+
+NOW = 1_000_000.0
+
+
+def _iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _store(root: Path) -> Store:
+    s = Store(root)
+    s.init(["alpha", "beta"])
+    return s
+
+
+def _set_hb(store: Store, agent: str, epoch: float) -> None:
+    (store.state_dir / f"{agent}.heartbeat").write_text(_iso(epoch), encoding="utf-8")
+
+
+def _wrapped_cfg(**agent_overrides) -> dict:
+    agent = {"auto_restart": True, "cli": "claude", "wrapped": True}
+    agent.update(agent_overrides)
+    return {
+        "agents": {"beta": agent},
+        "backoff": {"base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180},
+        "suspect_warn_interval_seconds": 300,
+        "launch_grace_seconds": 120,
+        "health": {"ttl_seconds": 300, "heartbeat_skew_seconds": 30},
+    }
+
+
+def _ready_state(**overrides) -> dict:
+    st = {"readiness_seen": True, "resume_available": True, "launching": False}
+    st.update(overrides)
+    return {"agents": {"beta": st}}
+
+
+def _rec(body: str = "body") -> dict:
+    return {
+        "id": "20990101-000000-000000-HEAL",
+        "from": "alpha",
+        "kind": "message",
+        "subject": "s",
+        "body": body,
+        "correlation_id": None,
+        "request_id": "rq-1",
+        "broadcast_id": None,
+    }
+
+
+def _codex_lines(*objs: dict) -> list[str]:
+    return [json.dumps(o) for o in objs]
+
+
+def _health_state(store: Store) -> str:
+    return store.read_health("beta", ttl_seconds=999999)["state"]
+
+
+def test_health_write_read_schema_is_stable_and_atomic(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    snap = hm.build_snapshot(
+        agent="beta",
+        cli="codex",
+        mode="wrapper-loop",
+        state=hm.STATE_IDLE_WAITING,
+        updated_at=_iso(NOW),
+        since=_iso(NOW),
+        last_progress_at=None,
+        reason_code="idle_waiting",
+    )
+    s.write_health("beta", snap)
+
+    raw = json.loads(s.health_path("beta").read_text(encoding="utf-8"))
+    assert list(raw.keys()) == list(hm.SCHEMA_KEYS)
+    assert raw["state"] == hm.STATE_IDLE_WAITING
+    assert not [p for p in s.state_dir.iterdir() if p.name.startswith("beta.health.") and p.suffix != ".json"]
+
+    view = s.read_health("beta", now_epoch=NOW + 5, ttl_seconds=60)
+    assert view["state"] == hm.STATE_IDLE_WAITING
+    assert view["age_seconds"] == 5.0
+    assert view["advisory"] is True
+
+
+def test_corrupt_health_degrades_unknown_and_supervisor_does_not_crash(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    s.health_path("beta").write_text('{"schema_version":', encoding="utf-8")
+
+    report = sup.build_report(s, now_epoch=NOW, supervisor_config=_wrapped_cfg())
+    assert report["agents"]["beta"]["health"]["state"] == hm.STATE_UNKNOWN
+
+    plan = sup.plan_actions(report, _ready_state(), _wrapped_cfg(), now_epoch=NOW,
+                            snapshot=[])["agents"]["beta"]
+    assert plan["action"] == sup.STUCK_RECOVER
+    assert plan["health"]["state"] == hm.STATE_UNKNOWN
+
+
+def test_stale_health_with_fresh_heartbeat_is_ignored_with_warning(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    _set_hb(s, "beta", NOW - 5)
+    s.write_health("beta", hm.build_snapshot(
+        agent="beta",
+        cli="claude",
+        mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN,
+        updated_at=_iso(NOW - 100),
+        since=_iso(NOW - 100),
+        last_progress_at=_iso(NOW - 100),
+        reason_code="progress_event",
+    ))
+
+    report = sup.build_report(s, now_epoch=NOW, supervisor_config=_wrapped_cfg())
+    h = report["agents"]["beta"]["health"]
+    assert h["state"] == hm.STATE_UNKNOWN
+    assert "health_older_than_heartbeat" in h["warnings"]
+
+    plan = sup.plan_actions(report, _ready_state(), _wrapped_cfg(), now_epoch=NOW,
+                            snapshot=[])["agents"]["beta"]
+    assert plan["action"] == sup.NONE
+    assert plan["state"] == "HEALTHY_IDLE"
+
+
+def test_working_health_delays_auto_recovery_but_not_manual_restart(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    _set_hb(s, "beta", NOW - 1000)
+    s.write_health("beta", hm.build_snapshot(
+        agent="beta",
+        cli="claude",
+        mode="wrapper-loop",
+        state=hm.STATE_WORKING_SILENT,
+        updated_at=_iso(NOW - 10),
+        since=_iso(NOW - 10),
+        last_progress_at=None,
+        reason_code="turn_spawned",
+    ))
+
+    cfg = _wrapped_cfg()
+    report = sup.build_report(s, now_epoch=NOW, supervisor_config=cfg)
+    plan = sup.plan_actions(report, _ready_state(), cfg, now_epoch=NOW,
+                            snapshot=[])["agents"]["beta"]
+    assert plan["action"] == sup.SUSPECT_WARN
+    assert plan["state"] == "ACTIVE_OR_BUSY"
+    assert plan["kill_first"] is False
+    assert plan["health"]["state"] == hm.STATE_WORKING_SILENT
+
+    s.write_restart_request("beta", {"request_id": "rr-1"})
+    report2 = sup.build_report(s, now_epoch=NOW, supervisor_config=cfg)
+    plan2 = sup.plan_actions(report2, _ready_state(), cfg, now_epoch=NOW,
+                             snapshot=[])["agents"]["beta"]
+    assert plan2["action"] == sup.RELAUNCH
+    assert plan2["clear_marker"] == "rr-1"
+
+
+class _Stream:
+    def __init__(self, lines: list[str], returncode: int | None = None) -> None:
+        self._lines = lines
+        self.returncode = returncode
+
+    def __iter__(self):
+        return iter(self._lines)
+
+
+def test_health_failure_and_degraded_mappings(tmp_path: Path) -> None:
+    cases = [
+        ("poison", _codex_lines({"type": "turn.failed",
+                                  "error": {"message": "prompt is too long"}}),
+         hm.STATE_ERRORED_POISON),
+        ("ambiguous", _codex_lines({"type": "turn.started"}), hm.STATE_ERRORED_AMBIGUOUS),
+        ("outage", _codex_lines({"type": "turn.started"},
+                                  {"type": "error", "message": "rate limit exceeded"}),
+         hm.STATE_RATE_LIMITED_OR_OUTAGE),
+        ("crashed", _Stream(_codex_lines({"type": "turn.started"},
+                                          {"type": "turn.completed"}), returncode=7),
+         hm.STATE_CRASHED_OR_EXITED),
+    ]
+    for name, stream, expected in cases:
+        s = _store(tmp_path / name)
+        st = session.SessionState(cli="codex")
+        drive = run.make_drive(s, "beta", "codex", st, ["codex"],
+                               spawn=lambda _a, _i, stream=stream: stream,
+                               clock=lambda: 0.0, render=False)
+        out = drive(_rec())
+        assert out.ok is False
+        assert _health_state(s) == expected
+
+    s = _store(tmp_path / "degraded")
+    st = session.SessionState(cli="codex")
+    leak = '<invoke name="Read"><parameter name="file_path">x</parameter></invoke>'
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"],
+                           spawn=lambda _a, _i: _codex_lines(
+                               {"type": "turn.started"},
+                               {"type": "item.completed",
+                                "item": {"type": "agent_message", "text": leak}},
+                               {"type": "turn.completed"}),
+                           clock=lambda: 0.0, render=False)
+    assert drive(_rec()).ok is True
+    assert _health_state(s) == hm.STATE_DEGRADED_OUTPUT
+
+
+def test_health_json_never_contains_message_or_output_content(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    secret = "SECRET_HEALTH_LEAK_74f78b"
+    st = session.SessionState(cli="codex")
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"],
+                           spawn=lambda _a, _i: _codex_lines(
+                               {"type": "turn.started"},
+                               {"type": "item.started",
+                                "item": {"type": "command_execution",
+                                         "command": f"echo {secret}"}},
+                               {"type": "item.completed",
+                                "item": {"type": "command_execution",
+                                         "aggregated_output": secret}},
+                               {"type": "item.completed",
+                                "item": {"type": "agent_message", "text": "done"}},
+                               {"type": "turn.completed"}),
+                           clock=lambda: 0.0, render=False)
+    assert drive(_rec(secret)).ok is True
+    raw = s.health_path("beta").read_text(encoding="utf-8")
+    assert secret not in raw
+    assert "done" not in raw
+
+
+def test_status_report_plan_and_web_surface_health_as_advisory(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    s = _store(tmp_path)
+    _set_hb(s, "beta", time.time())
+    s.write_health("beta", hm.build_snapshot(
+        agent="beta",
+        cli="codex",
+        mode="wrapper-loop",
+        state=hm.STATE_IDLE_WAITING,
+        reason_code="idle_waiting",
+    ))
+
+    report = sup.build_report(s, now_epoch=time.time(), supervisor_config=_wrapped_cfg())
+    assert report["agents"]["beta"]["health"]["state"] == hm.STATE_IDLE_WAITING
+    plan = sup.plan_actions(report, _ready_state(), _wrapped_cfg(), now_epoch=time.time(),
+                            snapshot=[])["agents"]["beta"]
+    assert plan["health"] == {
+        "state": hm.STATE_IDLE_WAITING,
+        "age_seconds": plan["health"]["age_seconds"],
+        "warnings": [],
+        "advisory": True,
+    }
+    assert plan["action"] == sup.NONE
+
+    assert cli.main(["--root", str(tmp_path), "status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    beta = next(a for a in payload["agents"] if a["name"] == "beta")
+    assert beta["health"]["state"] == hm.STATE_IDLE_WAITING
+
+    web_status = web.status_payload(s)
+    assert web_status["agent_health"]["beta"]["state"] == hm.STATE_IDLE_WAITING

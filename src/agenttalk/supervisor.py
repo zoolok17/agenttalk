@@ -32,6 +32,7 @@ import sys
 from datetime import datetime, timezone
 
 from agenttalk import ephemeral as eph
+from agenttalk import health as health_model
 from agenttalk.store import Store, _process_alive
 
 # ---- action vocabulary (the dry-run ACTION PLAN tokens) --------------------
@@ -61,6 +62,8 @@ _DEFAULTS = {
     "launch_grace_seconds": 120,           # forking-CLI startup grace (brain discovery + first hb)
     "max_readiness_retries": 3,            # never-ready relaunches before READINESS_GAVE_UP (no infinite churn)
     "backoff": {"base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180},
+    "health": {"ttl_seconds": health_model.DEFAULT_TTL_SECONDS,
+               "heartbeat_skew_seconds": health_model.DEFAULT_HEARTBEAT_SKEW_SECONDS},
     # dead-letter caps (wrapper-owned; the supervisor only carries the config so the
     # planner is unchanged). K_poison = deterministic poison-eligible failures before
     # auto-dead-letter; K_escalate = class-agnostic high-attempt backstop (escalate +,
@@ -163,6 +166,36 @@ def resolve_dead_letter_caps(config: dict, cfg_agent: dict) -> tuple[int, int]:
         return int(defaults[key])
 
     return _pick("max_attempts"), _pick("escalate_after_attempts")
+
+
+def resolve_health_timing(config: dict, cfg_agent: dict) -> dict:
+    """Resolve advisory health freshness bounds.
+
+    Per-agent ``health.{ttl_seconds,heartbeat_skew_seconds}`` wins over global
+    ``health``. Legacy flat keys are accepted for operators hand-editing early
+    configs. Health is advisory; these bounds only decide whether a health file
+    reads as ``unknown``.
+    """
+    defaults = _DEFAULTS["health"]
+    config = config if isinstance(config, dict) else {}
+    cfg_agent = cfg_agent if isinstance(cfg_agent, dict) else {}
+    g = config.get("health")
+    g = g if isinstance(g, dict) else {}
+    a = cfg_agent.get("health")
+    a = a if isinstance(a, dict) else {}
+
+    def _pick(key: str, flat: str) -> float:
+        for src, src_key in ((a, key), (cfg_agent, flat), (g, key), (config, flat)):
+            v = src.get(src_key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+                return float(v)
+        return float(defaults[key])
+
+    return {
+        "ttl_seconds": _pick("ttl_seconds", "health_ttl_seconds"),
+        "heartbeat_skew_seconds": _pick(
+            "heartbeat_skew_seconds", "health_heartbeat_skew_seconds"),
+    }
 
 # Per-CLI session-argument templates, as LISTS of literal tokens (so the
 # generated PowerShell uses an array-of-literals ArgumentList - single-quoted
@@ -672,6 +705,14 @@ def build_report(store: Store, *, now_epoch: float,
         else:
             hb_age = max(0.0, now_epoch - hb.timestamp())
             stale = hb_age > threshold_a
+        health_timing = resolve_health_timing(sup_cfg or {}, sup_agents.get(a) or {})
+        health = store.read_health(
+            a,
+            now_epoch=now_epoch,
+            heartbeat=hb,
+            ttl_seconds=health_timing["ttl_seconds"],
+            heartbeat_skew_seconds=health_timing["heartbeat_skew_seconds"],
+        )
         marker = store.read_waiting(a)
         w_pid = marker.get("pid") if isinstance(marker, dict) else None
         w_pid = w_pid if isinstance(w_pid, int) else None
@@ -682,6 +723,7 @@ def build_report(store: Store, *, now_epoch: float,
             "heartbeat_age_seconds": hb_age,
             "heartbeat_stale": stale,
             "stuck_after_seconds": threshold_a,
+            "health": health,
             "waiting": marker is not None,
             "waiting_pid": w_pid,
             "waiting_pid_alive": bool(w_pid is not None and _process_alive(w_pid)),
@@ -760,6 +802,18 @@ def build_report(store: Store, *, now_epoch: float,
         "agents": agents,
         "launch_requests": launch_requests,
         "ephemeral_reviewers": eph_report,
+    }
+
+
+def _health_brief(view: dict | None) -> dict:
+    state = health_model.label(view)
+    age = view.get("age_seconds") if isinstance(view, dict) else None
+    warnings = view.get("warnings") if isinstance(view, dict) else []
+    return {
+        "state": state,
+        "age_seconds": age if isinstance(age, (int, float)) else None,
+        "warnings": warnings if isinstance(warnings, list) else [],
+        "advisory": True,
     }
 
 
@@ -842,6 +896,13 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         hb_age = rpt.get("heartbeat_age_seconds")
         if isinstance(hb_age, (int, float)):
             hb_stale = float(hb_age) > stuck_after
+    health = rpt.get("health") if isinstance(rpt.get("health"), dict) else {}
+    health_state = health_model.label(health)
+    health_working = (
+        health_state in (health_model.STATE_WORKING_TURN,
+                         health_model.STATE_WORKING_SILENT)
+        and not bool(health.get("stale", True))
+    )
     marker = rpt.get("restart_request") or None
     consumed = list(st.get("consumed_rids", []))
     fails = int(st.get("consecutive_fails", 0))
@@ -921,6 +982,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                "windows_sandbox": windows_sandbox, "perm_mode": perm_mode,
                "reason": reason, "cli": None, "launch_mode": None,
                "resume_mode": None, "session_id": None, "session_args": None,
+               "health": _health_brief(health),
                "next_state": nxt}
         if action in (RELAUNCH, STUCK_RECOVER):
             res.update(_launch_detail({**st, "resume_available": resume_available},
@@ -994,6 +1056,15 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             nxt["last_warn_epoch"] = now_epoch
             return _result(WARN_ONLY, state="STUCK_OR_DEAD", notify=True,
                            reason="protected agent heartbeat stale - recover manually")
+        if health_working:
+            reason = (
+                f"heartbeat stale but advisory health={health_state}; delaying "
+                "automatic recovery until health goes unknown/stale or the heartbeat recovers")
+            if now_epoch - last_warn >= suspect_interval:
+                nxt["last_warn_epoch"] = now_epoch
+                return _result(SUSPECT_WARN, state="ACTIVE_OR_BUSY", reason=reason)
+            return _result(NONE, state="ACTIVE_OR_BUSY",
+                           reason="advisory working health delay (warn rate-limited)")
         if not can_confirm_stuck:
             if unsafe_low_codex:
                 warn_reason = (

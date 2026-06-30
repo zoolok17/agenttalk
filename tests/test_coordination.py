@@ -755,7 +755,7 @@ def test_backcompat_json_shapes_without_new_features(tmp_path: Path, capsys) -> 
                            "stale_threshold_seconds", "warnings"}
     for a in status["agents"]:
         assert set(a) == {"name", "role", "cursor", "unread", "heartbeat",
-                          "last_seen_seconds", "stale", "waiting",
+                          "last_seen_seconds", "stale", "health", "waiting",
                           "waiting_stale"}  # operator_facing ABSENT
     who = _json_of(["whoami", "--for", "alpha", "--json"], root, capsys)
     assert set(who) == {"root", "self", "self_in_roster", "peer", "role",

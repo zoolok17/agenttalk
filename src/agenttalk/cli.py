@@ -432,6 +432,10 @@ def _gather_status(store: Store) -> dict:
     # status view uses the SAME threshold as the steal path - never the 120s default
     # for a wrapped agent (WP1 contract; avoids armed/heartbeat_stale skew).
     sup_cfg = _load_supervisor_config(store)
+    from agenttalk import supervisor as _sup
+    sup_agents = (
+        sup_cfg.get("agents") if isinstance(sup_cfg.get("agents"), dict) else {}
+    )
     agents = []
     for a in cfg.get("agents", []):
         hb = store.read_heartbeat(a)
@@ -461,6 +465,15 @@ def _gather_status(store: Store) -> dict:
                 isinstance(dl, (int, float))
                 and time.time() > dl + STALE_THRESHOLD_SECONDS
             )
+        cfg_agent = sup_agents.get(a) if isinstance(sup_agents.get(a), dict) else {}
+        health_timing = _sup.resolve_health_timing(sup_cfg or {}, cfg_agent)
+        health = store.read_health(
+            a,
+            now_epoch=now.timestamp(),
+            heartbeat=hb,
+            ttl_seconds=health_timing["ttl_seconds"],
+            heartbeat_skew_seconds=health_timing["heartbeat_skew_seconds"],
+        )
         row = {
             "name": a,
             "role": roles.get(a),
@@ -470,6 +483,7 @@ def _gather_status(store: Store) -> dict:
             "last_seen_seconds": (round(last_seen_s, 3)
                                   if last_seen_s is not None else None),
             "stale": stale,
+            "health": health,
             "waiting": waiting,
             "waiting_stale": waiting_stale,
         }
@@ -1031,6 +1045,12 @@ def cmd_status(args: argparse.Namespace) -> int:
                 seen += " (stale)"
         if a.get("waiting"):
             seen += " waiting(stale)" if a.get("waiting_stale") else " waiting"
+        h = a.get("health") if isinstance(a.get("health"), dict) else {}
+        h_state = h.get("state") if isinstance(h.get("state"), str) else "unknown"
+        h_age = h.get("age_seconds")
+        seen += f" health={h_state}"
+        if isinstance(h_age, (int, float)):
+            seen += f"/{_format_age(h_age)}"
         role = f" role={a['role']}" if a.get("role") else ""
         of = " [operator-facing]" if a.get("operator_facing") else ""
         print(f"  {a['name']:<10}{role}{of} cursor={cursor:<32} unread={a['unread']:<3} {seen}")
@@ -5547,6 +5567,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     release + re-raise + NO marker (the supervisor relaunches and re-acquires)."""
     from .wrapper import loop as wloop
     from .wrapper import run as wrapper_run
+    from .wrapper.health import WrapperHealthWriter
     from .wrapper import session as wsession
 
     # --- managed lead-loop CONTROLLER lease lifecycle (WP2) -------------------
@@ -5610,12 +5631,20 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             store.release_lead_loop_lease(agent, lease_id=lease_id)
 
     state = wsession.load_session(store, agent, cli)
+    health_mode = (
+        "lead-loop" if lead_loop else
+        "wrapper-one-shot" if one_shot_request_id else
+        "wrapper-loop"
+    )
+    health_writer = WrapperHealthWriter(
+        store, agent, cli, mode=health_mode, min_interval=min_interval)
     try:
         drive = wrapper_run.make_drive(
             store, agent, cli, state, base_argv, sender=sender,
             min_interval=min_interval, render=render, heartbeat=heartbeat,
             persist=lambda st: wsession.save_session(store, agent, st),
             turn_watchdog=turn_watchdog,
+            health_writer=health_writer,
         )
     except ValueError as e:
         _release()
@@ -5737,6 +5766,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             pre_commit=pre_commit,  # lead-loop ownership gate at every cursor advance
             manage_waiting=not lead_loop,  # the lead-loop LEASE owns the .waiting mirror
             cadence=cadence_hook,  # WP3 proactive sweep (lead-loop only)
+            on_health_idle=health_writer.idle,
         )
     except _LeadLoopLeaseLost:
         # LOST the lease mid-run (stolen / torn / force-released): the ownership gate /

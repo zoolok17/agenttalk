@@ -170,6 +170,7 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              pre_commit: Callable[[], None] | None = None,
              manage_waiting: bool = True,
              cadence: Callable[[], CadenceResult] | None = None,
+             on_health_idle: Callable[[], None] | None = None,
              now_iso: Callable[[], str] = _iso_now) -> int:
     """Run the wrapper listen loop. ``drive(record)`` handles ONE turn (injected).
     Returns the number of turns driven. ``max_turns`` / ``max_polls`` / ``max_wall``
@@ -208,6 +209,8 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
     stamp = heartbeat if heartbeat is not None else (lambda: store.write_heartbeat(agent))
     if manage_waiting:
         store.write_waiting(agent, {"agent": agent, "mode": "wrapper-loop"})
+    if on_health_idle is not None:
+        on_health_idle()
     try:
         if only_request_id is not None:
             return _run_one_shot(
@@ -215,14 +218,15 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
                 idle_interval=idle_interval, max_idle_interval=max_idle_interval,
                 heartbeat_interval=heartbeat_interval, clock=clock, sleep=sleep,
                 max_turns=max_turns, max_polls=max_polls, max_wall=max_wall,
-                stamp=stamp)
+                stamp=stamp, on_health_idle=on_health_idle)
         return _run_continuous(
             store, agent, drive, idle_interval=idle_interval,
             max_idle_interval=max_idle_interval, heartbeat_interval=heartbeat_interval,
             clock=clock, sleep=sleep, max_turns=max_turns, max_polls=max_polls,
             max_wall=max_wall, k_poison=k_poison, k_escalate=k_escalate,
             on_dead_letter=on_dead_letter, on_escalate=on_escalate, stamp=stamp,
-            pre_commit=pre_commit, cadence=cadence, now_iso=now_iso)
+            pre_commit=pre_commit, cadence=cadence, on_health_idle=on_health_idle,
+            now_iso=now_iso)
     finally:
         if manage_waiting:
             store.clear_waiting(agent)
@@ -239,6 +243,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     stamp: Callable[[], None],
                     pre_commit: Callable[[], None] | None,
                     cadence: Callable[[], CadenceResult] | None,
+                    on_health_idle: Callable[[], None] | None,
                     now_iso: Callable[[], str]) -> int:
     turns = 0
 
@@ -280,6 +285,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         store.dead_letter(agent, record, reason=reason, failure_class=failure_class,
                           at=now_iso())
         stamp()                               # DL is progress (bypasses drive's stamp)
+        if on_health_idle is not None:
+            on_health_idle()
         last_hb = clock()
         fail_sleep = idle_interval
         if on_dead_letter is not None:
@@ -334,6 +341,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             # then back off while the bus is quiet.
             if last_hb is None or (now - last_hb) >= heartbeat_interval:
                 stamp()
+                if on_health_idle is not None:
+                    on_health_idle()
                 last_hb = now
             sleep(cur_sleep)
             cur_sleep = min(max_idle_interval, cur_sleep * 2.0)
@@ -426,7 +435,8 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                   heartbeat_interval: float, clock: Callable[[], float],
                   sleep: Callable[[float], None], max_turns: int | None,
                   max_polls: int | None, max_wall: float | None,
-                  stamp: Callable[[], None] | None = None) -> int:
+                  stamp: Callable[[], None] | None = None,
+                  on_health_idle: Callable[[], None] | None = None) -> int:
     """SCOPED one-shot loop for an ephemeral reviewer (see run_loop). Receives only
     messages on ``rid`` so unrelated traffic neither starves it nor is consumed from
     the global inbox; bounded so it always terminates."""
@@ -458,6 +468,8 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
             # cannot starve us and stays unread for a later global sync.
             if last_hb is None or (now - last_hb) >= heartbeat_interval:
                 _stamp()
+                if on_health_idle is not None:
+                    on_health_idle()
                 last_hb = now
             sleep(cur_sleep)
             cur_sleep = min(max_idle_interval, cur_sleep * 2.0)
