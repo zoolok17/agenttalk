@@ -63,10 +63,13 @@ stop and escalate to the operator before taking action.
    If the test would reach outside this repository or require network attack,
    denial-of-service, exploit-development, or detection-evasion activity, stop
    and escalate to the operator.
-4. Run deterministic checks. Examples include unit or integration abuse cases,
-   CLI probes with hostile input, dependency or supply-chain scans available in
-   the project, and targeted static checks. Avoid live network or destructive
-   probes unless the operator approved the environment.
+4. Run deterministic in-repo checks. Examples include unit or integration abuse
+   cases, CLI probes with hostile input against local fixtures, dependency or
+   supply-chain scans available in the project, and targeted static checks.
+   Operator approval can cover only the in-repo test environment. It is never a
+   license for external targets, network or denial-of-service activity, exploit
+   development beyond this repository's test surface, or detection-evasion
+   techniques; those are out of bounds, so stop and escalate.
 5. Triage findings as real defect, test bug, false positive, environment issue,
    or unresolved. Include enough output for a reviewer to reproduce the result.
 6. Emit `qa-result` evidence. Use `status=rejected` for a proven exploitable
