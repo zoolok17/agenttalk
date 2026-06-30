@@ -9,7 +9,7 @@ description: >-
   implementation, architecture review, or performance tuning without measured
   evidence; route production changes to craft-code after the measurement proves
   the need.
-reviewed-against: "0.51"
+reviewed-against: "0.52"
 category: assurance
 evidence-profile:
   - qa-result

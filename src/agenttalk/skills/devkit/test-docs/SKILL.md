@@ -8,7 +8,7 @@ description: >-
   write-docs), adversarial documentation accuracy, audience, or prose review
   (use review-docs), integrated code review, or green claims based only on
   reading documentation.
-reviewed-against: "0.51"
+reviewed-against: "0.52"
 category: assurance
 evidence-profile:
   - qa-result

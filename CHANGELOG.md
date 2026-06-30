@@ -5,6 +5,36 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.52.0] - 2026-06-30
+
+### Added
+
+- **Three new assurance devkit skills - performance, security, and documentation testing.** Fill the
+  executable-evidence gaps in the devkit (which already covered code, review, unit/integration QA, and doc
+  writing/review):
+  - **`test-performance`** - executed benchmark evidence (workload, dataset, budget/baseline, environment,
+    warmup, repetitions, variance policy, regression threshold, commands, artifacts, residual risk). Returns
+    needs-info rather than a green claim when no stable workload/budget exists; routes optimization to
+    `craft-code` after measurement, never optimizes in-skill.
+  - **`test-security`** - executable security/abuse-case testing (authz, input validation, injection,
+    path/env/command handling, unsafe deserialization, secrets/log hygiene, dependency/supply-chain),
+    distinct from `review-code`'s security review. Carries a prominent hard safety boundary: authorized,
+    defensive, in-repo testing of this project only - no external targets, no network/DoS, no exploit
+    development beyond the repo test surface, no detection-evasion; stop and escalate outside that boundary.
+  - **`test-docs`** - executable documentation checks (doctests, snippet runners, link checks,
+    generated-reference drift, code-vs-doc assertions), complementing `review-docs` (which stays adversarial
+    prose/accuracy review). `routing.md` is corrected accordingly (it previously said not to use a separate
+    docs-QA skill).
+  All three are `category: assurance`, emit the existing `qa-result` evidence profile (no new profile), and
+  install to both the Claude and Codex Agent-Skills dirs. No new generic testing skills were added
+  (`test-coverage`/`test-integration`/`qa-strategy`/`tester-qa` already cover unit/integration/automation).
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.52.0"
+```
+
 ## [0.51.0] - 2026-06-30
 
 ### Changed
