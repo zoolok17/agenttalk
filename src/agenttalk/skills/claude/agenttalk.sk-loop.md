@@ -103,21 +103,27 @@ CLI may not accept - a wrong `--to` silently breaks the move.
 ### Step 0.5 - reconcile move/wake drift (on start / rejoin)
 
 The seam is two systems: a `move-task` can succeed and the agent can die before
-the wake sends (the crash window). sk-loop's ~30s poll is the correctness
-backstop - a lost wake costs about one poll cycle - so reconciliation stays
-LIGHT. On start or rejoin (and when the lead's cadence note asks), re-derive the
-lane from `spec-kitty next`/`status` and compare it to your last action. If a
-lane clearly advanced from your last transition with NO corresponding wake on
-the bus (match by the `transition_key` `sk:<mission>:<wp>:<from>:<to>:<verdict>`),
-re-send ONLY that missing wake/note. Narrow repair rules for this move/wake
-drift:
+the wake sends (the crash window). THE REPAIR MECHANISM is the sk-loop poll:
+every participant actively in this loop runs the SHORT ~30s `wait` (Step 3) and
+re-runs `spec-kitty next`, so a missed wake self-heals on the peer's NEXT poll - a
+lost wake costs about one poll cycle. spec-kitty `move-task` stays the source of
+truth. That poll is exactly why reconciliation stays LIGHT.
 
-- Re-send the missing wake/note keyed by its `transition_key`; do NOT blindly
-  duplicate a review-result.
-- Reply on an existing `request_id` only if that thread is still open AND owed;
-  otherwise send a non-closing `wake`/`note`.
-- Skill behavior only - no state machine, no sweep, no core command. Rest on the
-  poll as the correctness backstop.
+- **Do NOT lengthen the sk-loop `wait` to the listen-mode 1800s while in the
+  loop.** The short 30s poll IS the repair mechanism; a long wait reopens the
+  crash window.
+- On start or rejoin (and when the lead's cadence note asks), re-derive the lane
+  from `spec-kitty next`/`status` and compare it to your last action. If a lane
+  clearly advanced from your last transition with NO corresponding wake on the
+  bus (match by the `transition_key` `sk:<mission>:<wp>:<from>:<to>:<verdict>`),
+  re-send ONLY that missing wake/note keyed by its `transition_key`; do NOT
+  blindly duplicate a review-result. Reply on an existing `request_id` only if
+  that thread is still open AND owed; otherwise send a non-closing `wake`/`note`.
+- **Limitation:** poll-self-heal only covers participants ACTIVELY running
+  sk-loop polling. If a participant sits in listen-mode (a long wait) instead of
+  the sk-loop, a missed wake is NOT auto-covered - the LEAD should reconcile
+  (light, prose-level: re-send the missing wake by its `transition_key`).
+- Skill behavior only - no state machine, no sweep, no core command.
 
 ### Step 1 - query spec-kitty
 

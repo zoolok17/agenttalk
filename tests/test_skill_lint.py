@@ -101,6 +101,9 @@ SKILL_INVARIANTS = [
         "reconcile move/wake drift",       # crash-window reconciliation (Step 0.5)
         "OS temp dir OUTSIDE the mission tree",  # reject feedback file placement
         "transition_key",                  # structured idempotence key on the wake
+        # C1 refinement (binding): the poll IS the repair mechanism; don't widen it.
+        "Do NOT lengthen the sk-loop",     # keep the short poll = repair mechanism
+        "poll-self-heal only covers participants",  # listen-mode limitation + lead reconciles
     ]),
 ]
 
