@@ -5,6 +5,32 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.53.0] - 2026-06-30
+
+### Added
+
+- **Advisory wrapper agent-health signal (supervisor recovery aid).** The wrapper now classifies an agent's
+  recent activity - from the data it already sees (normalized events, the INFRA/POISON/AMBIGUOUS drive-failure
+  taxonomy, the turn watchdog, adapter rate-limit signals) - into a small health enum (`idle_waiting`,
+  `working_turn`, `working_silent`, `stuck_suspected`, `rate_limited_or_outage`, `degraded_output`,
+  `errored_poison`, `errored_ambiguous`, `crashed_or_exited`, `unknown`) and writes it to an adjacent,
+  atomically-written `state/<agent>.health.json`. The heartbeat format is untouched and remains the sole
+  liveness authority. The supervisor consumes health **advisory-only**: a fresh working state may *delay* an
+  automatic recovery, but health is **never the sole reason to kill** - every existing kill prerequisite
+  (stale heartbeat, can-confirm-stuck, protected/operator-facing/lead, backoff, readiness cap,
+  start-time-guarded targets, wrapped-codex watchdog precedence) still applies, and an explicit human
+  `request-restart` is never blocked. Missing/corrupt/stale health (including impossible future-dated
+  timestamps beyond a small clock skew) degrades to `unknown` and never vetoes recovery indefinitely. The
+  health schema is redacted by construction: no message bodies, prompts, model output, tool output, or
+  transcript text. Surfaced as advisory metadata in `status`/`report`/`plan` and the web status. No terminal
+  scraping, no spec-kitty coupling.
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.53.0"
+```
+
 ## [0.52.0] - 2026-06-30
 
 ### Added
