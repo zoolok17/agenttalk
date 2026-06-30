@@ -5,6 +5,24 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.0] - 2026-06-30
+
+### Added
+
+- **`refactor-code` devkit skill (Tier 1).** A production skill for behavior-preserving restructuring:
+  state the behavior-preservation scope first, make no behavior change without explicit approval, keep
+  changes local and reviewable, and prove preservation with tests (or explain the exact gap). It emits a
+  `production-handoff` record and routes behavior changes to `craft-code`, a red baseline to `fix-ci`, and
+  broader test work to `test-coverage`. With this, the devkit routing index is fully de-interimed (the
+  `Behavior-preserving cleanup` row and `fix-ci`'s step 4 now route directly to `refactor-code`, with no
+  remaining "until it exists" fallbacks). Third of the Tier 1 devkit skills.
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.48.0"
+```
+
 ## [0.47.0] - 2026-06-30
 
 ### Fixed

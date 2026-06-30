@@ -10,7 +10,7 @@ description: >-
   craft-code), writing tests directly as the primary task (use test-coverage),
   reviewing an existing diff (use review-code), or opportunistic broad cleanup
   mixed into behavior-changing work.
-reviewed-against: "0.47"
+reviewed-against: "0.48"
 category: production
 evidence-profile:
   - production-handoff

@@ -6,7 +6,7 @@ description: >-
   smallest fix, and verifying the result. Use when a concrete test, lint,
   build, security, or CI job is red. Do NOT use for general feature work,
   broad cleanup after CI is green, or guessing at failures without logs.
-reviewed-against: "0.47"
+reviewed-against: "0.48"
 category: production
 evidence-profile:
   - production-handoff
