@@ -5,6 +5,38 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.54.0] - 2026-07-01
+
+### Fixed
+
+- **Wrapped-Codex bus commands no longer denied by the Codex Windows sandbox (field P0).** A wrapped Codex
+  managed lead-loop could never complete a turn: the sandbox denied executing the agenttalk console-script
+  shim, and Codex tended to reach for an out-of-workspace agenttalk source checkout (a sibling of the
+  workspace, outside the sandbox) which was also denied. The denial was misclassified as transient infra and
+  retried, so the loop never progressed. The wrapper prompt (`_DEFAULT_RULES` + `_CADENCE_RULES`) and the
+  bundled Codex bus skills now anchor all bus writes to `python -m agenttalk` run from the workspace /
+  `AGENTTALK_ROOT`, and explicitly forbid cd/import/referencing an out-of-workspace or sibling agenttalk
+  source checkout.
+
+### Added
+
+- **`config_blocked` failure class for deterministic exec/permission denials.** Spawn `PermissionError` /
+  `EACCES` / `WinError 5`, tight terminal bus-denial text, and `command_execution` bus-denial output now
+  classify as `config_blocked` (evaluated before infra/poison). The loop PARKS the head - no cursor commit,
+  no dead-letter, no retry storm - escalates once with command/error/remediation, and keeps the heartbeat and
+  lead-loop lease fresh until an operator repairs the config and requests a restart. A resume-side denial is
+  classified before the fresh-session self-heal, so a bus denial can never be masked by a clean retry and
+  committed. Rate-limit (429/529/5xx) stays infra; content-policy stays poison. Wrapper health surfaces the
+  parked `config_blocked` state (classified before the generic spawn-error branch) instead of an outage.
+
+### Changed
+
+- **`agenttalk-send` skill no longer suggests an editable source install as an in-turn remedy.** A missing
+  `python -m agenttalk` now directs the operator to install agenttalk non-editable into the runtime Python or
+  intentionally run from the agenttalk workspace, instead of `pip install -e <path>` (the misconfiguration
+  behind the field denial). The skill-currency lint was also extended to catch bare multi-line inline
+  `agenttalk` snippets and wrapper cadence prompt text.
+
 ## [0.53.1] - 2026-07-01
 
 ### Fixed
