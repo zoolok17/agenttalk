@@ -259,7 +259,7 @@ def test_health_failure_and_degraded_mappings(tmp_path: Path) -> None:
 
 def test_health_json_never_contains_message_or_output_content(tmp_path: Path) -> None:
     s = _store(tmp_path)
-    secret = "SECRET_HEALTH_LEAK_74f78b"
+    secret = "SECRET_HEALTH_LEAK_74f78b"  # gitleaks:allow
     st = session.SessionState(cli="codex")
     drive = run.make_drive(s, "beta", "codex", st, ["codex"],
                            spawn=lambda _a, _i: _codex_lines(
