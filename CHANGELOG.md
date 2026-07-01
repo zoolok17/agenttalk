@@ -5,6 +5,44 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.55.0] - 2026-07-02
+
+Wrapped-Codex now works out-of-the-box on Windows. This release closes a whole
+class of launch/runtime failures found in the field and a follow-up sweep, across
+three coordinated layers. (Subsumes the proactive launch preflight deferred from
+0.54.1.)
+
+### Fixed
+
+- **Unspawnable base CLI no longer causes a silent retry-storm (spawn resolution).**
+  On Windows there is no `codex.exe` on `PATH` (only an npm shim), so
+  `subprocess(['codex', ...])` failed with `WinError 2` / `FileNotFoundError` and
+  was misclassified as a transient outage and retried forever. The wrapper now
+  resolves the base CLI (`PATH`/relative/absolute + an `AGENTTALK_CODEX` override;
+  the npm-Codex shim is followed to the exact vendored native `codex.exe`, else it
+  fails closed), and a pre-loop launch preflight blocks before consuming any
+  message. Spawn `FileNotFoundError`/`ENOENT`/`ENOEXEC`/`WinError 2/3/193/267` now
+  classify as `config_blocked` (launch); `WinError 5`/`EACCES`/`EPERM` as
+  exec-denied. A durable, agent+state-validated `config_blocked` hold parks the
+  agent (no kill/relaunch) across the health TTL until the operator repairs the
+  config; `request-restart` overrides and a clean preflight self-clears.
+- **Bus writes work under `-s workspace-write` (interpreter pinning).** `python -m
+  agenttalk` assumed `python` was on the sandbox `PATH`, which Codex's
+  `workspace-write` tool shell strips. The wrapper now pins an absolute interpreter
+  via `AGENTTALK_PY` (plus `AGENTTALK_ROOT`) in the child env, and the prompt and
+  the seven Codex bus skills invoke it (with a `python -m` fallback for unwrapped
+  use). An out-of-workspace interpreter needs a one-time operator `--add-dir` (the
+  sandbox is never auto-widened); `-s danger-full-access` remains a documented
+  last resort.
+- **A failed required bus write can no longer be masked and committed (bus-write
+  classifier).** The Codex adapter now carries `command_execution` exit status; a
+  required durable write (`reply`/`send`/`escalate`) that positively fails is
+  classified fail-closed and parked/redelivered instead of reported as success and
+  losing the reply. Recognition models Python's CLI grammar (interpreter + `-m
+  agenttalk` vs script/`-c`/terminating options) and fails open on any unrecognized
+  token, so a normal command (e.g. `rg agenttalk reply`) is never false-matched as
+  a bus write and a healthy message is never wrongly dead-lettered.
+
 ## [0.54.0] - 2026-07-01
 
 ### Fixed

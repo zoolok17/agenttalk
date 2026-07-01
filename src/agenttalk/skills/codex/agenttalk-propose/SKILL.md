@@ -1,7 +1,7 @@
 ---
 name: agenttalk-propose
 description: Send a concrete proposal to a named agent over agenttalk and wait for an accept, reject, or counter response. Use when Codex should propose a specific design, plan, scope, or decision for agreement before proceeding.
-reviewed-against: "0.54"
+reviewed-against: "0.55"
 ---
 
 # agenttalk-propose - Propose a concrete solution (codex side)

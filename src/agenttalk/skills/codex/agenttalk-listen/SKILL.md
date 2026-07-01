@@ -1,7 +1,7 @@
 ---
 name: agenttalk-listen
 description: Enter listen mode as a Codex agent - repeatedly wait for messages from named agents and handle reviews, proposals, broadcast questions, consults, wake signals, or cross-review requests.
-reviewed-against: "0.54"
+reviewed-against: "0.55"
 ---
 
 # agenttalk-listen - Listen for agenttalk messages (codex side)
