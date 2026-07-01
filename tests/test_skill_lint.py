@@ -121,7 +121,7 @@ SK_LOOP_FORBIDDEN = [
 LISTEN_DURABLE_CONTRACT = [
     "manual chat-window listener is best-effort",
     "must NOT claim always-on listening from a chat window",
-    "Claude Code unattended listening should run under supervised `agenttalk wrap --loop`",
+    "Claude Code unattended listening should run under supervised",
     "Codex manual listening is a tolerable stopgap",
     "Listening is latency, not correctness state",
     "wakes are latency optimization, not state",
@@ -130,6 +130,15 @@ LISTEN_DURABLE_CONTRACT = [
 
 LISTEN_DURABLE_FORBIDDEN = [
     "Idle = always listening",
+]
+
+CODEX_SANDBOX_INVOCATION_REQUIRED = [
+    "Invoking agenttalk under the Codex sandbox",
+    "python -m agenttalk <subcommand> ...",
+    "current project WORKSPACE cwd",
+    "installed/runtime package",
+    "Do NOT cd to, import from, or reference an agenttalk SOURCE checkout outside the workspace",
+    "Do NOT bake an absolute python path",
 ]
 
 
@@ -210,6 +219,97 @@ def test_sk_loop_has_no_stale_lane_names_or_default_force() -> None:
     for body, label in ((claude, "claude"), (codex, "codex")):
         present = [bad for bad in SK_LOOP_FORBIDDEN if _normalize(bad) in body]
         assert not present, f"{label} sk-loop still contains stale/forbidden: {present}"
+
+
+def _fenced_bare_agenttalk_lines(text: str) -> list[tuple[int, str]]:
+    offenders: list[tuple[int, str]] = []
+    in_fence = False
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence and re.search(r"(?<!python -m )\bagenttalk\s+", line):
+            offenders.append((lineno, line.strip()))
+    return offenders
+
+
+def _inline_bare_agenttalk_snippets(text: str) -> list[tuple[int, str]]:
+    offenders: list[tuple[int, str]] = []
+    in_fence = False
+    in_inline = False
+    start_line = 0
+    buf: list[str] = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        for char in line:
+            if char == "`":
+                if in_inline:
+                    snippet = "".join(buf)
+                    if re.search(r"(?<!python -m )\bagenttalk\s+", snippet):
+                        offenders.append((start_line, " ".join(snippet.split())))
+                    in_inline = False
+                    buf = []
+                else:
+                    in_inline = True
+                    start_line = lineno
+                    buf = []
+                continue
+            if in_inline:
+                buf.append(char)
+        if in_inline:
+            buf.append("\n")
+    return offenders
+
+
+def _fenced_source_checkout_bus_fixes(text: str) -> list[tuple[int, str]]:
+    offenders: list[tuple[int, str]] = []
+    in_fence = False
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            continue
+        if re.search(r"\bcd\b.*agenttalk", line, re.IGNORECASE):
+            offenders.append((lineno, line.strip()))
+        if re.search(r"\bpip\s+install\s+-e\b.*agenttalk", line, re.IGNORECASE):
+            offenders.append((lineno, line.strip()))
+    return offenders
+
+
+def test_inline_bare_agenttalk_lint_catches_multiline_snippets() -> None:
+    text = (
+        "safe `python -m agenttalk sync --for \"$SELF\"`\n"
+        "bad `python -m agenttalk sync --for \"$SELF\" and agenttalk\n"
+        "threads --for \"$SELF\"`\n"
+    )
+    assert _inline_bare_agenttalk_snippets(text) == [
+        (2, 'python -m agenttalk sync --for "$SELF" and agenttalk threads --for "$SELF"')
+    ]
+
+
+def test_codex_bus_skills_use_sandbox_safe_runnable_invocation() -> None:
+    """Codex agents copy snippets into a sandbox where bare agenttalk is denied."""
+    for _, subdir, _ in SKILL_INVARIANTS:
+        path = SKILLS_ROOT / "codex" / subdir / "SKILL.md"
+        text = path.read_text(encoding="utf-8")
+        missing = [s for s in CODEX_SANDBOX_INVOCATION_REQUIRED if s not in text]
+        assert not missing, f"{subdir}/SKILL.md missing sandbox invocation section: {missing}"
+        offenders = _fenced_bare_agenttalk_lines(text)
+        assert not offenders, f"{subdir}/SKILL.md has bare runnable agenttalk lines: {offenders}"
+        inline = _inline_bare_agenttalk_snippets(text)
+        assert not inline, f"{subdir}/SKILL.md has bare inline agenttalk snippets: {inline}"
+        source_fixes = _fenced_source_checkout_bus_fixes(text)
+        assert not source_fixes, (
+            f"{subdir}/SKILL.md instructs in-turn source checkout bus fixes: {source_fixes}"
+        )
 
 
 # -------------------------------------------------- frontmatter consistency

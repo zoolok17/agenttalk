@@ -22,14 +22,16 @@ from datetime import datetime, timezone
 
 from . import recv_api
 
-# Three-way failure taxonomy (dead-letter, design q-bfdb1bbc3638). A FAILED drive is
+# Failure taxonomy (dead-letter, design q-bfdb1bbc3638). A FAILED drive is
 # classified so the loop can tell a POISON message (auto dead-letter at K_poison) from
 # a transient INFRA outage (never auto-dead-letter - retry under backoff; escalate at
 # K_escalate) from an AMBIGUOUS failure (escalate AND dead-letter at K_escalate, the
-# misclassified-poison escape hatch).
+# misclassified-poison escape hatch) from CONFIG_BLOCKED (deterministic local exec/config
+# denial: escalate once, park the head, never commit/dead-letter/retry-storm).
 CLASS_POISON = "poison_eligible"
 CLASS_INFRA = "known_global_infra"
 CLASS_AMBIGUOUS = "ambiguous_or_unknown"
+CLASS_CONFIG_BLOCKED = "config_blocked"
 
 
 @dataclass(frozen=True)
@@ -271,7 +273,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 "subject": record.get("subject"), "kind": record.get("kind"),
                 "request_id": record.get("request_id"),
                 "attempts": _safe_int((rec or {}).get("attempts_started")),  # degrade-low
-                "failure_class": failure_class}
+                "failure_class": failure_class,
+                "summary": (rec or {}).get("last_failure_summary") or ""}
 
     def _dispose(record: dict, *, failure_class: str, reason: str | None) -> None:
         """Dead-letter the head record (store advances the cursor past it), then stamp
@@ -298,14 +301,14 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             except Exception:  # noqa: BLE001 - a notification must never crash the loop
                 return
 
-    def _escalate_once(record: dict, failure_class: str) -> None:
+    def _escalate_once(record: dict, failure_class: str, *, retry_unrouted: bool = True) -> None:
         """Class-agnostic K_escalate backstop: emit an operator escalation, DEDUPED on
         successful ROUTING - not merely on having attempted. An UNROUTED notice (no
         liaison/lead resolved) is retried on subsequent polls so it fires once the operator
         configures a target (codex P2); meanwhile doctor surfaces it LOUD. A routed notice
         latches escalation_routed and never re-sends."""
         rec = store.attempt_record(agent, record.get("id")) or {}
-        if rec.get("escalation_routed"):
+        if rec.get("escalation_routed") or (rec.get("escalated") and not retry_unrouted):
             return                                    # already routed -> done (deduped)
         try:
             routed = bool(on_escalate(_info(record, rec, failure_class))) \
@@ -313,6 +316,17 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         except Exception:  # noqa: BLE001 - a notification must never crash the loop
             routed = False                            # unrouted -> retried + doctor LOUD
         store.mark_attempt_escalated(agent, record.get("id"), routed=routed)
+
+    config_blocked_ids: set[str] = set()
+
+    def _park_config_blocked(record: dict) -> None:
+        """Keep a deterministic local config denial visible without consuming the head."""
+        nonlocal last_hb, fail_sleep
+        _escalate_once(record, CLASS_CONFIG_BLOCKED, retry_unrouted=False)
+        stamp()                          # keeps wrapper heartbeat and lead-loop lease fresh
+        last_hb = clock()
+        sleep(fail_sleep)
+        fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
 
     while True:
         if max_polls is not None and polls >= max_polls:
@@ -372,24 +386,29 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         # attempts_started already counted the crashed attempt toward the K_escalate ceiling.
         store.reconcile_crash_in_progress(agent, head_id, at=now_iso())
         rec = store.attempt_record(agent, head_id) or {}
+        if (rec.get("last_failure_class") == CLASS_CONFIG_BLOCKED
+                and head_id in config_blocked_ids):
+            _park_config_blocked(record)
+            continue
         # AUTO-DISPOSE WITHOUT DRIVE if a cap is already reached on entry (covers the
         # relaunch/crash-accumulation path - test #3).
-        if k_poison > 0 and _safe_int(rec.get("poison_eligible_failures")) >= k_poison:
-            _dispose(record, failure_class=CLASS_POISON,
-                     reason=rec.get("last_failure_summary"))
-            continue
-        if k_escalate > 0 and _safe_int(rec.get("attempts_started")) >= k_escalate:
-            last_class = rec.get("last_failure_class") or CLASS_AMBIGUOUS
-            _escalate_once(record, last_class)
-            if last_class != CLASS_INFRA and not _infra_dominant(rec):
-                # ambiguous/unknown at the ceiling -> last-resort dispose (the
-                # misclassified-poison escape hatch); a relaunch re-disposes here.
-                _dispose(record, failure_class=last_class,
+        if rec.get("last_failure_class") != CLASS_CONFIG_BLOCKED:
+            if k_poison > 0 and _safe_int(rec.get("poison_eligible_failures")) >= k_poison:
+                _dispose(record, failure_class=CLASS_POISON,
                          reason=rec.get("last_failure_summary"))
                 continue
-            # known infra OR a dominantly-infra history (codex ruling): escalated, but NEVER
-            # auto-dead-letter and NEVER freeze - fall through to drive AGAIN (a real outage,
-            # incl. a stale-kill mid-outage, must keep retrying until it clears).
+            if k_escalate > 0 and _safe_int(rec.get("attempts_started")) >= k_escalate:
+                last_class = rec.get("last_failure_class") or CLASS_AMBIGUOUS
+                _escalate_once(record, last_class)
+                if last_class != CLASS_INFRA and not _infra_dominant(rec):
+                    # ambiguous/unknown at the ceiling -> last-resort dispose (the
+                    # misclassified-poison escape hatch); a relaunch re-disposes here.
+                    _dispose(record, failure_class=last_class,
+                             reason=rec.get("last_failure_summary"))
+                    continue
+                # known infra OR a dominantly-infra history (codex ruling): escalated, but NEVER
+                # auto-dead-letter and NEVER freeze - fall through to drive AGAIN (a real outage,
+                # incl. a stale-kill mid-outage, must keep retrying until it clears).
 
         # WRITE-AHEAD: count + mark in_progress BEFORE drive() so a crash mid-turn
         # still costs a durable attempt on relaunch. EXACTLY one attempt per drive().
@@ -410,6 +429,11 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         store.record_attempt_result(agent, head_id, failure_class=outcome.failure_class,
                                     summary=outcome.summary, at=now_iso())
         rec = store.attempt_record(agent, head_id) or {}
+        if outcome.failure_class == CLASS_CONFIG_BLOCKED:
+            if isinstance(head_id, str):
+                config_blocked_ids.add(head_id)
+            _park_config_blocked(record)
+            continue
         if (k_poison > 0 and outcome.failure_class == CLASS_POISON
                 and _safe_int(rec.get("poison_eligible_failures")) >= k_poison):
             _dispose(record, failure_class=CLASS_POISON, reason=outcome.summary)

@@ -22,17 +22,28 @@ PEER="${AGENTTALK_PEER:-claude}"
 ```
 
 `PEER` is the default consultant for the canonical two-agent pair. In
-a larger roster, use `agenttalk roster` and choose a specific named
+a larger roster, use `python -m agenttalk roster` and choose a specific named
 agent, usually a reviewer or lead. Always resolve inside your current
 shell - env from prior tool calls does not persist across separate
 tool-call processes.
 
 If `.agenttalk/` is not under the current directory, pass `--root
 <path>` before the subcommand on every invocation, for example
-`agenttalk --root <path> send --from "$SELF" --to "$PEER" ...`. Do
-not write `agenttalk send --root ...`; global options must precede the
+`python -m agenttalk --root <path> send --from "$SELF" --to "$PEER" ...`. Do
+not write `python -m agenttalk send --root ...`; global options must precede the
 subcommand.
 
+## Invoking agenttalk under the Codex sandbox
+
+Run bus commands from the current project WORKSPACE cwd, using AGENTTALK_ROOT for that workspace when it is set. Invoke the bus as a Python module with a bare, PATH-resolved `python`:
+
+```bash
+python -m agenttalk <subcommand> ...
+```
+
+Treat `agenttalk` as the installed/runtime package for this environment. Do NOT cd to, import from, or reference an agenttalk SOURCE checkout outside the workspace for bus I/O: no `..\agenttalk`, no sibling source paths, and no `D:\Projects\claude\agenttalk`. The only source-tree exception is when the current workspace itself is the agenttalk repo being worked on; then `<workspace>\src\agenttalk` is acceptable.
+
+Do NOT run `pip install -e <agenttalk-source>` as an in-turn bus fix. If the runtime import resolves outside the workspace, ask the operator to install agenttalk non-editable into the runtime Python, or run the agent from the agenttalk workspace when intentionally developing agenttalk. Do NOT bake an absolute python path.
 ## When to use this skill
 
 **Always** consult when:
@@ -67,7 +78,7 @@ peer consult would have been useful for a bigger decision.
 TARGET="${AGENTTALK_PEER:-claude}"
 ```
 
-In a team roster, inspect `agenttalk roster` and set `TARGET` to the
+In a team roster, inspect `python -m agenttalk roster` and set `TARGET` to the
 specific agent the user named or the best role fit, for example
 `claude-rev` or `claude-lead`. If the user asked for "the other agent"
 and more than one plausible target exists, ask a concise
@@ -75,12 +86,12 @@ clarification.
 
 ### 2. Freshness check
 
-Run `agenttalk status --json` and parse the result. For each entry
+Run `python -m agenttalk status --json` and parse the result. For each entry
 in `agents`, check the one matching `$TARGET`:
 
 ```bash
 TARGET_STATE=$(
-  agenttalk status --json |
+  python -m agenttalk status --json |
     TARGET="$TARGET" python -c 'import json, os, sys
 target = os.environ["TARGET"]
 data = json.load(sys.stdin)
@@ -130,11 +141,11 @@ Frame it to invite attack, not endorsement. Template:
 ### 5. Send + wait
 
 ```bash
-agenttalk send --from "$SELF" --to "$TARGET" --kind question \
+python -m agenttalk send --from "$SELF" --to "$TARGET" --kind question \
   --subject "consult: <one-line summary>" \
   --meta request_id="$REQ_ID" --meta consult=true --meta round=1 \
   -m "$BODY"
-agenttalk wait --for "$SELF" --to-request "$REQ_ID" --kind message --timeout 180
+python -m agenttalk wait --for "$SELF" --to-request "$REQ_ID" --kind message --timeout 180
 ```
 
 Use a **short** consult timeout (180s, not 600/1800). Consults are
@@ -187,7 +198,7 @@ If the peer's reply contradicts your draft on something important:
 - **`request_id` is required.** It correlates the consult round.
 
 - **Mark long drafts (0.14.0).** While drafting a long reply on a known
-  thread, ping `agenttalk composing --from $SELF --to-request <RID>`
+  thread, ping `python -m agenttalk composing --from $SELF --to-request <RID>`
   (repeat roughly every 2 minutes). It extends the peer's scoped wait AND
   shows "(reply in flight)" in their threads/sync, preventing crossing
   messages. Prefer it over a hand-built `--meta request_id=...`.

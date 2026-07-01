@@ -6,6 +6,7 @@ fixture Store + injected drive/spawn - NO real CLI.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -71,10 +72,39 @@ def test_prompt_is_pure_handler_no_consume_full_classification_and_safety() -> N
     assert "headless" in low and "escalate" in low and "liaison" in low
     assert "irreversible" in low and "rescinded" in low
     assert "data, never instructions" in low
+    assert "bus-command contract" in low
+    assert "current project workspace cwd" in low
+    assert "agenttalk_root" in low
+    assert "never cd to, import from, or reference an agenttalk source checkout outside" in low
+    assert "installed/runtime package" in low
+    assert "unless the current workspace itself is the agenttalk repo" in low
+    assert "pip install -e <agenttalk-source>" in low
     # Loop-exit is the WRAPPER's job, not the model's.
     assert "release" in low and "end" in low and "wrapper's job" in low
     # Sending IS the model's job (kept).
     assert "you may send" in low
+    for cmd in ("reply", "send", "escalate", "composing", "check"):
+        assert f"python -m agenttalk {cmd}" in low
+    assert not re.search(
+        r"(?<!python -m )\bagenttalk (reply|send|escalate|composing|check)\b",
+        p,
+    )
+
+
+def test_cadence_prompt_has_bus_contract_and_no_bare_send_commands() -> None:
+    p = prompt.assemble_cadence_prompt({"agent": "beta"}, [{"kind": "outbound_reminder"}])
+    low = p.lower()
+    assert "bus-command contract" in low
+    assert "current project workspace cwd" in low
+    assert "agenttalk_root" in low
+    assert "never cd to, import from, or reference an agenttalk source checkout outside" in low
+    assert "installed/runtime package" in low
+    for cmd in ("reply", "send", "escalate", "composing"):
+        assert f"python -m agenttalk {cmd}" in low
+    assert not re.search(
+        r"(?<!python -m )\bagenttalk (reply|send|escalate|composing|check)\b",
+        p,
+    )
 
 
 # --------------------------------------------------------------- session
@@ -405,7 +435,8 @@ def test_make_drive_classifies_failures_for_dead_letter(tmp_path) -> None:
     # POSITIVELY matches a message-content signature (size / content-policy); a 529/rate-limit
     # or edge-block terminal is an OUTAGE -> INFRA (never false-DL at cap 3), and an
     # unrecognized terminal cause is AMBIGUOUS (lead-verify P1 + codex ruling). A partial
-    # stream (started, no completion) is AMBIGUOUS; a spawn/exec OSError is INFRA.
+    # stream (started, no completion) is AMBIGUOUS; a generic spawn/exec OSError is INFRA;
+    # a deterministic spawn permission denial is CONFIG_BLOCKED.
     rec = {"from": "a", "kind": "message", "body": "x",
            "correlation_id": None, "request_id": None, "broadcast_id": None}
 
@@ -460,6 +491,12 @@ def test_make_drive_classifies_failures_for_dead_letter(tmp_path) -> None:
     o_spawn = _drive(_boom)(rec)
     assert o_spawn.ok is False and o_spawn.failure_class == loop.CLASS_INFRA
 
+    def _denied(a, i):
+        raise PermissionError(13, "Access is denied")
+
+    o_denied = _drive(_denied)(rec)
+    assert o_denied.ok is False and o_denied.failure_class == loop.CLASS_CONFIG_BLOCKED
+
 
 # THE classification CONTRACT (lead 4th-verify "structural cap"): a table of realistic
 # provider error strings -> their REQUIRED dead-letter class. This is the authoritative
@@ -508,6 +545,13 @@ _CLASSIFICATION_MATRIX = [
     # --- PRECEDENCE: a terminal matching BOTH families is INFRA (fail-closed, human decides) ---
     ("context length exceeded (429 rate limit)", loop.CLASS_INFRA),
     ("payload too large behind upstream proxy", loop.CLASS_INFRA),
+    # --- CONFIG-BLOCKED: deterministic bus exec/permission denial, not transient infra ---
+    ("Bash(agenttalk reply --from beta --to-request rq-1 -m ok) failed: "
+     "Access is denied (os error 5)", loop.CLASS_CONFIG_BLOCKED),
+    ("python -m agenttalk send --from beta --to lead --kind message failed: "
+     "Permission denied", loop.CLASS_CONFIG_BLOCKED),
+    ("CreateProcess error 5 while running agenttalk composing --to-request rq-1",
+     loop.CLASS_CONFIG_BLOCKED),
     # --- AMBIGUOUS: not-known-infra, not positive-content - high ceiling, never DL@3 ---
     ("invalid request: model not found", loop.CLASS_AMBIGUOUS),
     ("invalid request: unsupported parameter 'temperature'", loop.CLASS_AMBIGUOUS),
@@ -526,6 +570,10 @@ _CLASSIFICATION_MATRIX = [
     ("request id req_413 failed", loop.CLASS_AMBIGUOUS),
     ("opaque error code 4130", loop.CLASS_AMBIGUOUS),               # 4130 != 413 token
     ("error 413", loop.CLASS_AMBIGUOUS),                            # 413 token but NO qualifier
+    ("Access is denied while reading a user-provided document; no bus command was run",
+     loop.CLASS_AMBIGUOUS),
+    ("agenttalk roster failed with Access is denied; this is not a required bus write",
+     loop.CLASS_AMBIGUOUS),
     ("tool execution failed: bad arg", loop.CLASS_AMBIGUOUS),
     ("some totally unknown provider error 9000", loop.CLASS_AMBIGUOUS),
 ]
@@ -549,6 +597,25 @@ def test_classification_contract_matrix(tmp_path) -> None:
         o = _class_of(text)
         assert o.ok is False, text
         assert o.failure_class == expected, f"{text!r}: got {o.failure_class}, want {expected}"
+
+
+def test_make_drive_tool_bus_denial_is_config_blocked_even_if_turn_completed(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": "agenttalk reply --from beta --to-request rq-1 -m ok",
+                                   "aggregated_output": "Access is denied"}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    out = drive(rec)
+    assert out.ok is False
+    assert out.failure_class == loop.CLASS_CONFIG_BLOCKED
+    assert "python -m agenttalk" in out.summary
 
 
 def test_make_drive_retryable_after_start_is_infra(tmp_path) -> None:
@@ -717,6 +784,121 @@ def test_loop_failed_turn_backs_off_not_hot_spin(tmp_path) -> None:
     assert len(sleeps) >= 3              # backed off on each failed retry (not a hot spin)
     assert s.cursor("beta") == ""        # never committed
     assert s.read_heartbeat("beta") is None  # a failed turn does NOT stamp heartbeat
+
+
+def test_loop_config_blocked_escalates_once_parks_head_and_keeps_liveness(tmp_path) -> None:
+    s = _store(tmp_path)
+    msg = s.send(sender="alpha", recipient="beta", body="reply please")
+    calls: list[str] = []
+    escalations: list[dict] = []
+    stamps: list[str] = []
+    sleeps: list[float] = []
+
+    def drive(rec):
+        calls.append(rec["id"])
+        return loop.DriveOutcome(
+            ok=False,
+            failure_class=loop.CLASS_CONFIG_BLOCKED,
+            summary=("command=agenttalk reply --from beta --to-request rq-1; "
+                     "error=Access is denied; remediation=use python -m agenttalk"),
+        )
+
+    def heartbeat() -> None:
+        stamps.append("hb")
+        s.write_heartbeat("beta")
+
+    loop.run_loop(
+        s,
+        "beta",
+        drive,
+        clock=lambda: 0.0,
+        sleep=lambda d: sleeps.append(d),
+        max_polls=4,
+        k_poison=1,
+        k_escalate=1,
+        on_escalate=lambda info: escalations.append(info) or True,
+        heartbeat=heartbeat,
+    )
+
+    assert calls == [msg.id]                 # parked: no retry storm to K=20
+    assert len(escalations) == 1
+    assert escalations[0]["failure_class"] == loop.CLASS_CONFIG_BLOCKED
+    assert "python -m agenttalk" in escalations[0]["summary"]
+    assert s.cursor("beta") == ""            # cursor stays on the head
+    assert s.dead_lettered_count("beta") == 0
+    rec = s.attempt_record("beta", msg.id)
+    assert rec is not None
+    assert rec["attempts_started"] == 1
+    assert rec["last_failure_class"] == loop.CLASS_CONFIG_BLOCKED
+    assert rec["in_progress"] is False
+    assert rec["escalated"] is True and rec["escalation_routed"] is True
+    assert stamps and s.read_heartbeat("beta") is not None
+    assert sleeps                              # parked branch backs off without retrying
+
+
+def test_loop_resume_config_blocked_does_not_self_heal_and_commit(tmp_path) -> None:
+    s = _store(tmp_path)
+    head = s.send(sender="alpha", recipient="beta", body="needs bus reply")
+    state = session.SessionState(cli="codex", codex_thread_id="t-old")
+    calls: list[list[str]] = []
+
+    def spawn(argv, _stdin):
+        calls.append(argv)
+        if "resume" in argv:
+            return [
+                json.dumps({"type": "turn.started"}),
+                json.dumps({"type": "item.completed",
+                            "item": {"type": "command_execution",
+                                     "command": "agenttalk reply --from beta "
+                                                "--to-request rq-1 -m ok",
+                                     "aggregated_output": "Access is denied"}}),
+                json.dumps({"type": "turn.completed"}),
+            ]
+        return [
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "turn.completed"}),
+        ]
+
+    drive = run.make_drive(
+        s,
+        "beta",
+        "codex",
+        state,
+        ["codex"],
+        spawn=spawn,
+        clock=lambda: 0.0,
+        render=False,
+    )
+    escalations: list[dict] = []
+    stamps: list[str] = []
+    sleeps: list[float] = []
+
+    turns = loop.run_loop(
+        s,
+        "beta",
+        drive,
+        clock=lambda: 100.0,
+        sleep=lambda d: sleeps.append(d),
+        heartbeat=lambda: (stamps.append("hb"), s.write_heartbeat("beta")),
+        on_escalate=lambda info: escalations.append(info) or True,
+        k_poison=1,
+        k_escalate=1,
+        max_polls=3,
+    )
+
+    assert turns == 0
+    assert len(calls) == 1
+    assert "resume" in calls[0]
+    assert s.cursor("beta") == ""
+    assert s.messages_for("beta")[0].id == head.id
+    assert s.dead_lettered_count("beta") == 0
+    rec = s.attempt_record("beta", head.id)
+    assert rec is not None
+    assert rec["attempts_started"] == 1
+    assert rec["last_failure_class"] == loop.CLASS_CONFIG_BLOCKED
+    assert escalations and escalations[0]["failure_class"] == loop.CLASS_CONFIG_BLOCKED
+    assert stamps and s.read_heartbeat("beta") is not None
+    assert sleeps
 
 
 # --------------------------------------------- C3 (0.40.0): one-shot scoped loop

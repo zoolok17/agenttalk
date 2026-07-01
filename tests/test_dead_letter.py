@@ -538,6 +538,33 @@ def test_28_notifier_unrouted_when_no_target(tmp_path: Path) -> None:
                      "attempts": 20, "failure_class": CLASS_INFRA}, disposed=False) is False
 
 
+def test_config_blocked_notice_includes_command_error_and_remediation(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    s.set_operator_facing("lead")
+    p = _send(s, "needs reply")
+    notifier = cli._dead_letter_notifier(s, "beta")
+    routed = notifier(
+        {
+            "agent": "beta",
+            "msg_id": p.id,
+            "from": "lead",
+            "kind": "message",
+            "attempts": 1,
+            "failure_class": loop.CLASS_CONFIG_BLOCKED,
+            "summary": ("command=agenttalk reply --from beta --to-request rq-1; "
+                        "error=Access is denied; remediation=use python -m agenttalk"),
+        },
+        disposed=False,
+    )
+    assert routed is True
+    notice = s.messages_for("lead")[-1]
+    assert notice.subject == "wrapper config-blocked"
+    assert "agenttalk reply --from beta" in notice.body
+    assert "Access is denied" in notice.body
+    assert "python -m agenttalk" in notice.body
+    assert "dead-lettered" not in notice.body.lower()
+
+
 def test_29_f2_doctor_loud_on_unrouted_escalation(tmp_path: Path) -> None:
     # F2/codex-P2: an escalated-but-UNROUTED backstop record makes doctor go LOUD ERROR -
     # a known-infra message can't silently loop with no operator signal.

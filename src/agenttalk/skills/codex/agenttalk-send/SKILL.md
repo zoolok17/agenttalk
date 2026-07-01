@@ -1,6 +1,6 @@
 ---
 name: agenttalk-send
-description: Send a single message to a named agent, or broadcast a note/question to a group, over agenttalk. Use when the request does not require waiting for a reply. Requires `agenttalk init` in the project root.
+description: Send a single message to a named agent, or broadcast a note/question to a group, over agenttalk. Use when the request does not require waiting for a reply. Requires `python -m agenttalk init` in the project root.
 reviewed-against: "0.43"
 ---
 
@@ -20,7 +20,7 @@ PEER="${AGENTTALK_PEER:-claude}"
 ```
 
 `PEER` is only the compatibility default for the canonical two-agent
-pair. In a roster with more than two agents, inspect `agenttalk roster`
+pair. In a roster with more than two agents, inspect `python -m agenttalk roster`
 and use an explicit `--to <agent>`, `--to-group <group>`, or `--all`.
 If the user is running two Codexes (or any same-kind team), they will
 have set distinct `AGENTTALK_SELF` per terminal and may set
@@ -30,10 +30,21 @@ not persist.
 
 If `.agenttalk/` is not under the current directory, pass `--root
 <path>` before the subcommand on every invocation, for example
-`agenttalk --root <path> send --from "$SELF" --to "$PEER" ...`. Do
-not write `agenttalk send --root ...`; global options must precede the
+`python -m agenttalk --root <path> send --from "$SELF" --to "$PEER" ...`. Do
+not write `python -m agenttalk send --root ...`; global options must precede the
 subcommand.
 
+## Invoking agenttalk under the Codex sandbox
+
+Run bus commands from the current project WORKSPACE cwd, using AGENTTALK_ROOT for that workspace when it is set. Invoke the bus as a Python module with a bare, PATH-resolved `python`:
+
+```bash
+python -m agenttalk <subcommand> ...
+```
+
+Treat `agenttalk` as the installed/runtime package for this environment. Do NOT cd to, import from, or reference an agenttalk SOURCE checkout outside the workspace for bus I/O: no `..\agenttalk`, no sibling source paths, and no `D:\Projects\claude\agenttalk`. The only source-tree exception is when the current workspace itself is the agenttalk repo being worked on; then `<workspace>\src\agenttalk` is acceptable.
+
+Do NOT run `pip install -e <agenttalk-source>` as an in-turn bus fix. If the runtime import resolves outside the workspace, ask the operator to install agenttalk non-editable into the runtime Python, or run the agent from the agenttalk workspace when intentionally developing agenttalk. Do NOT bake an absolute python path.
 ## When to trigger
 
 When the user asks Codex to send, ping, message, notify a named agent,
@@ -42,7 +53,7 @@ a reply before continuing.
 
 For true fire-and-forget traffic, use `kind=message` or `kind=note`.
 `kind=question` opens a tracked `q-` request thread for point-to-point
-sends. `agenttalk broadcast --kind question` opens a tracked
+sends. `python -m agenttalk broadcast --kind question` opens a tracked
 broadcast thread with one obligation per recipient. Use either only
 when the recipient(s) really owe an answer, and tell the user the
 question is now pending. If the answer is needed before you continue,
@@ -62,10 +73,11 @@ approved, every piece MUST be cross-reviewed via `$agenttalk-handoff`.
 ## Prerequisites
 
 1. Verify `.agenttalk/` exists in the project root. Otherwise tell
-   the user `agenttalk init --here --agents <agent-list>` is needed.
-2. Confirm `agenttalk --help` runs. If missing, install:
-   `python -m pip install -e <path-to-agenttalk>`.
-3. For team sends, run `agenttalk roster` if the target or group is
+   the user `python -m agenttalk init --here --agents <agent-list>` is needed.
+2. Confirm `python -m agenttalk --help` runs. If missing, stop and ask the
+   operator to install agenttalk non-editable into the runtime Python, or to run
+   the agent from the agenttalk workspace if intentionally developing agenttalk.
+3. For team sends, run `python -m agenttalk roster` if the target or group is
    not obvious.
 
 ## Procedure
@@ -77,7 +89,7 @@ SELF="${AGENTTALK_SELF:-codex}"
 PEER="${AGENTTALK_PEER:-claude}"
 TARGET="<agent-name-or-$PEER>"
 BODY="<body>"
-printf '%s\n' "$BODY" | agenttalk send --from "$SELF" --to "$TARGET" --kind <kind> \
+printf '%s\n' "$BODY" | python -m agenttalk send --from "$SELF" --to "$TARGET" --kind <kind> \
   --subject "<one line>" --file -
 ```
 
@@ -86,10 +98,10 @@ Broadcast:
 ```bash
 SELF="${AGENTTALK_SELF:-codex}"
 BODY="<body>"
-printf '%s\n' "$BODY" | agenttalk broadcast --from "$SELF" --to-group <group> --kind <message|note|question> \
+printf '%s\n' "$BODY" | python -m agenttalk broadcast --from "$SELF" --to-group <group> --kind <message|note|question> \
   --subject "<one line>" --file -
 # or:
-printf '%s\n' "$BODY" | agenttalk broadcast --from "$SELF" --all --kind <message|note|question> \
+printf '%s\n' "$BODY" | python -m agenttalk broadcast --from "$SELF" --all --kind <message|note|question> \
   --subject "<one line>" --file -
 ```
 
@@ -112,21 +124,21 @@ printf '%s\n' "$BODY" | agenttalk broadcast --from "$SELF" --all --kind <message
 
 After sending, return control to the user with a one-line summary
 including the message id or broadcast id. If you sent `kind=question`,
-also mention that it is tracked by `agenttalk threads` until answered.
-Do **not** call `agenttalk wait` from this skill - that is
+also mention that it is tracked by `python -m agenttalk threads` until answered.
+Do **not** call `python -m agenttalk wait` from this skill - that is
 `agenttalk-listen` or `agenttalk-handoff`.
 
 ## Do not
 
 - Do not send `--kind end`. The user should explicitly ask to end the
-  session, after which run `agenttalk end --from "$SELF" --reason "..."`.
+  session, after which run `python -m agenttalk end --from "$SELF" --reason "..."`.
 - Do not modify project files; this skill only sends a message.
 - Do not guess a target in a multi-agent roster. Ask the user or use a
   named group they already requested.
 
 - **Rescind, don't retract in prose (0.14.0).** To cancel a tracked
   request you opened (question / review-request / proposal), use
-  `agenttalk rescind --from $SELF --to-request <RID> -m "<why>"`. A prose
+  `python -m agenttalk rescind --from $SELF --to-request <RID> -m "<why>"`. A prose
   "ignore my last message" moves no thread state — the peer's `wait`
   cannot see it and `check` still reports current. A rescind wakes a
   blocked scoped waiter with exit 3 and flips the thread to
@@ -135,7 +147,7 @@ Do **not** call `agenttalk wait` from this skill - that is
 
 - **Not-applicable beats placeholder acks (0.15.0).** A broadcast
   question that does not concern your role gets
-  `agenttalk reply --to-request <bid> --na` — it closes your obligation
+  `python -m agenttalk reply --to-request <bid> --na` — it closes your obligation
   and shows the asker "(n/a)" instead of a fake answer. Never
   placeholder-ack, never go silent. (Refused on review-request/proposal
   threads — those need their typed responses.)

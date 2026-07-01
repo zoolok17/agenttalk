@@ -12,6 +12,7 @@ a restart-request marker.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -73,6 +74,90 @@ _INFRA_ERROR_MARKERS = (
     # rate window. ("quota" + "usage limit" are already infra markers above.)
     "per minute", "per day", "per hour", "tokens per", "tpm", "daily token",
 )
+
+
+_BUS_WRITE_COMMAND_RE = re.compile(
+    r"\b(?:python\s+-m\s+)?agenttalk\s+(reply|send|escalate|composing|check)\b",
+    re.IGNORECASE,
+)
+_EXEC_DENIAL_MARKERS = (
+    "access is denied",
+    "permission denied",
+    "winerror 5",
+    "win error 5",
+    "createprocess error 5",
+    "os error 5",
+    "error 5",
+    "eacces",
+)
+
+
+def _compact_text(value: object, limit: int = 240) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _format_argv(argv: list[str]) -> str:
+    return " ".join(str(part) for part in argv)
+
+
+def _child_env() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k != LEAD_LOOP_LEASE_ENV}
+
+
+def _looks_like_exec_denied(text: str | None) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in _EXEC_DENIAL_MARKERS)
+
+
+def _is_exec_denied_exception(exc: OSError) -> bool:
+    return (
+        isinstance(exc, PermissionError)
+        or getattr(exc, "errno", None) in (errno.EACCES, errno.EPERM)
+        or getattr(exc, "winerror", None) == 5
+        or _looks_like_exec_denied(str(exc))
+    )
+
+
+def _spawn_config_blocked_summary(argv: list[str], exc: OSError) -> str | None:
+    if not _is_exec_denied_exception(exc):
+        return None
+    return (
+        f"command={_compact_text(_format_argv(argv))}; "
+        f"error={_compact_text(exc)}; "
+        "remediation=use python -m agenttalk for in-sandbox bus calls"
+    )
+
+
+def _terminal_config_blocked_summary(text: str | None) -> str | None:
+    """Detect an OS exec denial tightly attached to a required bus write command."""
+    if not _looks_like_exec_denied(text):
+        return None
+    lines = str(text or "").splitlines() or [str(text or "")]
+    for idx, line in enumerate(lines):
+        match = _BUS_WRITE_COMMAND_RE.search(line)
+        if match is None:
+            continue
+        window = "\n".join(lines[max(0, idx - 1):idx + 2])
+        if _looks_like_exec_denied(window):
+            return (
+                f"command={_compact_text(match.group(0))}; "
+                f"error={_compact_text(window)}; "
+                "remediation=use python -m agenttalk for in-sandbox bus calls"
+            )
+    return None
+
+
+def _tool_config_blocked_summary(tool: object, output: object) -> str | None:
+    command = str(tool or "")
+    if _BUS_WRITE_COMMAND_RE.search(command) is None:
+        return None
+    if not _looks_like_exec_denied(str(output or "")):
+        return None
+    return (
+        f"command={_compact_text(command)}; "
+        f"error={_compact_text(output)}; "
+        "remediation=use python -m agenttalk for in-sandbox bus calls"
+    )
 
 
 def _looks_like_infra(text: str | None) -> bool:
@@ -274,10 +359,9 @@ def run_wrapper(
     # Strip the lead-loop owner-bypass token from the child env here too (parity with
     # _ProcStream), so "the model child never sees the token" holds on EVERY spawn path,
     # not only the loop path (defense-in-depth + comment accuracy).
-    child_env = {k: v for k, v in os.environ.items() if k != LEAD_LOOP_LEASE_ENV}
     proc = subprocess.Popen(  # noqa: S603  # nosec B603
         argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        encoding="utf-8", errors="replace", bufsize=1, env=child_env,
+        encoding="utf-8", errors="replace", bufsize=1, env=_child_env(),
     )
     try:
         if health_writer is not None:
@@ -318,11 +402,10 @@ class _ProcStream:
         # an accidental model-side `agenttalk drain` bypass the single-consumer guard.
         # Always stripped (harmless for non-lead-loop children; defense-in-depth even
         # if a future parent sets it). The child otherwise inherits the parent env.
-        child_env = {k: v for k, v in os.environ.items() if k != LEAD_LOOP_LEASE_ENV}
         self._proc = subprocess.Popen(  # noqa: S603  # nosec B603
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-            bufsize=1, env=child_env,
+            bufsize=1, env=_child_env(),
         )
         # Record the per-turn root start-time right after spawn (~ the OS-reported create
         # time, within spawn jitter) so the watchdog can start-time-guard the kill against
@@ -399,7 +482,13 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
     subprocess); ``persist`` is called after each turn to save session state."""
     from . import prompt as _prompt
     from . import session as _session
-    from .loop import CLASS_AMBIGUOUS, CLASS_INFRA, CLASS_POISON, DriveOutcome
+    from .loop import (
+        CLASS_AMBIGUOUS,
+        CLASS_CONFIG_BLOCKED,
+        CLASS_INFRA,
+        CLASS_POISON,
+        DriveOutcome,
+    )
 
     mapper = _ADAPTERS.get(cli)
     if mapper is None:
@@ -446,7 +535,6 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             return _ProcStream(argv, stdin_text, watchdog=turn_watchdog,
                                watchdog_snapshot_fn=watchdog_snapshot_fn,
                                watchdog_kill_fn=watchdog_kill_fn)
-
     def _run_one(spec) -> dict:
         """Spawn ONE CLI invocation for ``spec`` and process its JSONL via the engine.
         Returns the raw turn SIGNALS for classification: ``{ok, started, completed,
@@ -456,7 +544,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         as ``error`` (infra), never raised, so the turn fails GRACEFULLY (no wrapper crash)."""
         argv = list(base_argv) + spec.args
         sig = {"ok": False, "started": False, "completed": False, "terminal": False,
-               "retryable": False, "rc": None, "error": None, "terminal_text": ""}
+               "retryable": False, "rc": None, "error": None, "terminal_text": "",
+               "config_blocked": False, "config_blocked_text": ""}
         try:
             stream = spawner(argv, spec.stdin)
             for line in stream:
@@ -482,12 +571,24 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                             # carry an INFRA message (529/rate-limit/5xx/auth), which must NOT
                             # be classed poison (lead verify P1).
                             sig["terminal_text"] = ev.text or sig["terminal_text"]
+                    elif ev.type == EventType.TOOL_FINISHED:
+                        blocked = _tool_config_blocked_summary(ev.tool, ev.text)
+                        if blocked:
+                            sig["config_blocked"] = True
+                            sig["config_blocked_text"] = blocked
                     health_writer.event(ev)
                     engine.process(ev, clock())
         except OSError as e:
             # spawn/exec/transport OS error (missing binary, broken pipe, ...): a
-            # GLOBAL/infra failure, not poison. Never crash the wrapper.
-            sig["error"] = f"spawn/exec error: {e}"
+            # GLOBAL/infra failure unless it is a deterministic local permission/config
+            # denial. Never crash the wrapper.
+            blocked = _spawn_config_blocked_summary(argv, e)
+            if blocked:
+                sig["config_blocked"] = True
+                sig["config_blocked_text"] = blocked
+                sig["error"] = blocked
+            else:
+                sig["error"] = f"spawn/exec error running {_compact_text(_format_argv(argv))}: {e}"
             return sig
         # rc is None for an injected list spawn (unknown -> trust the boundary); a real
         # _ProcStream reports the child exit code (nonzero = failed turn).
@@ -496,7 +597,12 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         # cause of this turn's death - it closed the stream, so rc/partial-stream signals
         # are downstream noise. Carry it for _classify to check FIRST.
         sig["watchdog"] = getattr(stream, "watchdog_result", None)
-        sig["ok"] = sig["completed"] and not sig["terminal"] and sig["rc"] in (0, None)
+        sig["ok"] = (
+            sig["completed"]
+            and not sig["terminal"]
+            and not sig["config_blocked"]
+            and sig["rc"] in (0, None)
+        )
         return sig
 
     def _classify(sig: dict) -> tuple[str, str]:
@@ -513,10 +619,16 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             # the K_escalate ceiling - a persistently-wedging head escalates, never auto-DLs.
             summary = wd.get("summary") if isinstance(wd, dict) else None
             return CLASS_AMBIGUOUS, summary or "turn watchdog killed hung tool descendant"
+        if sig.get("config_blocked"):
+            summary = sig.get("config_blocked_text")
+            return CLASS_CONFIG_BLOCKED, summary or "deterministic exec permission denied"
         if sig.get("error"):                       # spawn/exec OS error (missing binary, ...)
             return CLASS_INFRA, sig["error"]
         if sig.get("terminal"):
             text = sig.get("terminal_text") or ""
+            blocked = _terminal_config_blocked_summary(text)
+            if blocked:
+                return CLASS_CONFIG_BLOCKED, blocked
             if _looks_like_infra(text):
                 # a terminal carrying an infra message (overloaded/rate-limit/5xx/auth/edge
                 # block) is a GLOBAL outage, not poison -> never auto-DL. INFRA is checked
@@ -571,6 +683,22 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         health_writer.turn_start(record)
         sig = _run_one(spec)
         if not sig["ok"] and attempted_resume:
+            try:
+                resume_failure_class, resume_summary = _classify(sig)
+            except Exception:  # noqa: BLE001 - publish unknown before preserving failure
+                health_writer.unknown()
+                raise
+            if resume_failure_class == CLASS_CONFIG_BLOCKED:
+                store.clear_heartbeat(agent)
+                engine.reset_heartbeat_throttle()
+                if persist is not None:
+                    persist(session_state)
+                health_writer.failure(sig, resume_failure_class)
+                return DriveOutcome(
+                    ok=False,
+                    failure_class=resume_failure_class,
+                    summary=resume_summary,
+                )
             # the resume turn failed -> force a FRESH session for the SAME record and retry
             # inline (codex: a new thread_id will be observed + persisted; claude: a new
             # session id is minted). The whole drive() (resume -> fresh) is EXACTLY ONE attempt.

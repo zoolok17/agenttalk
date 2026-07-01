@@ -68,6 +68,10 @@ def _health_state(store: Store) -> str:
     return store.read_health("beta", ttl_seconds=999999)["state"]
 
 
+def _health_reason(store: Store) -> str:
+    return store.read_health("beta", ttl_seconds=999999)["reason_code"]
+
+
 def test_health_write_read_schema_is_stable_and_atomic(tmp_path: Path) -> None:
     s = _store(tmp_path)
     snap = hm.build_snapshot(
@@ -242,6 +246,19 @@ def test_health_failure_and_degraded_mappings(tmp_path: Path) -> None:
         out = drive(_rec())
         assert out.ok is False
         assert _health_state(s) == expected
+
+    s = _store(tmp_path / "config_blocked_spawn")
+    st = session.SessionState(cli="codex")
+
+    def denied_spawn(_argv, _stdin):
+        raise PermissionError(13, "Access is denied")
+
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"],
+                           spawn=denied_spawn, clock=lambda: 0.0, render=False)
+    out = drive(_rec())
+    assert out.ok is False
+    assert _health_state(s) == hm.STATE_ERRORED_AMBIGUOUS
+    assert _health_reason(s) == "config_blocked"
 
     s = _store(tmp_path / "degraded")
     st = session.SessionState(cli="codex")

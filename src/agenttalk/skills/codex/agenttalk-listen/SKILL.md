@@ -20,10 +20,10 @@ A manual chat-window listener is best-effort. Host CLI behavior, context
 compaction, and terminal lifecycle can interrupt a bare in-chat wait
 loop, so you must NOT claim always-on listening from a chat window. Say
 best-effort unless this identity is running under supervised
-`agenttalk wrap --loop`.
+`python -m agenttalk wrap --loop`.
 
 Claude Code unattended listening should run under supervised
-`agenttalk wrap --loop`: Claude Code can reap in-window background waits,
+`python -m agenttalk wrap --loop`: Claude Code can reap in-window background waits,
 especially across compaction. Codex manual listening is a tolerable
 stopgap because Codex windows tolerate manual waiting better, but the
 honest unattended pattern is still the wrapper.
@@ -36,7 +36,7 @@ latency optimization, not state: recover by deriving state from
 
 If the user, lead, or operator asks for durable or unattended listening
 and you are not wrapped, escalate/request that the same identity be run
-under supervised `agenttalk wrap --loop` instead of pretending this chat
+under supervised `python -m agenttalk wrap --loop` instead of pretending this chat
 window is a daemon. After context compaction, re-arm the wait and rerun
 sync before acting.
 
@@ -84,39 +84,28 @@ PEER="${AGENTTALK_PEER:-claude}"
 
 `PEER` is only the default partner for the canonical two-agent pair.
 In a team roster, use the sender, `meta.request_id`, and
-`agenttalk roster` / `agenttalk threads --for "$SELF"` to decide what
+`python -m agenttalk roster` / `python -m agenttalk threads --for "$SELF"` to decide what
 is owed; do not assume every message comes from one peer. Always
 resolve inside your current shell - env from prior tool calls does
 not persist across separate tool-call processes.
 
 If `.agenttalk/` is not under the current directory, pass `--root
 <path>` before the subcommand on every invocation, for example
-`agenttalk --root <path> sync --for "$SELF"`. Do not write
-`agenttalk sync --root ...`; global options must precede the
+`python -m agenttalk --root <path> sync --for "$SELF"`. Do not write
+`python -m agenttalk sync --root ...`; global options must precede the
 subcommand.
 
 ## Invoking agenttalk under the Codex sandbox
 
-Inside Codex's workspace sandbox, **bare `agenttalk` is DENIED** - it resolves
-to the Windows App Execution Alias under `...\WindowsApps`, which the sandbox
-blocks ("Access is denied") - and the `.agenttalk\bin\agenttalk.cmd` shim
-cannot exec in-sandbox either. ALWAYS invoke the bus as a Python module with a
-bare, PATH-resolved `python`:
+Run bus commands from the current project WORKSPACE cwd, using AGENTTALK_ROOT for that workspace when it is set. Invoke the bus as a Python module with a bare, PATH-resolved `python`:
 
 ```bash
 python -m agenttalk <subcommand> ...
 ```
 
-A supervised launch already sets `AGENTTALK_ROOT`, `AGENTTALK_SELF`, and (for a
-source checkout) `PYTHONPATH=<repo>\src`, so `python -m agenttalk` resolves and
-WRITES to the in-workspace `.agenttalk/` (allowed; only OUTSIDE-workspace reads
-are denied). Do NOT bake an absolute python path - use bare `python`.
+Treat `agenttalk` as the installed/runtime package for this environment. Do NOT cd to, import from, or reference an agenttalk SOURCE checkout outside the workspace for bus I/O: no `..\agenttalk`, no sibling source paths, and no `D:\Projects\claude\agenttalk`. The only source-tree exception is when the current workspace itself is the agenttalk repo being worked on; then `<workspace>\src\agenttalk` is acceptable.
 
-Bare `agenttalk` / the `.cmd` shim are fine for a HUMAN at a normal terminal,
-out-of-sandbox use, or the external supervisor's OWN calls - but NOT for an
-in-sandbox agent. Everywhere this skill shows `agenttalk <cmd>`, run it as
-`python -m agenttalk <cmd>` while you are inside the sandbox.
-
+Do NOT run `pip install -e <agenttalk-source>` as an in-turn bus fix. If the runtime import resolves outside the workspace, ask the operator to install agenttalk non-editable into the runtime Python, or run the agent from the agenttalk workspace when intentionally developing agenttalk. Do NOT bake an absolute python path.
 ## Self-join: claim a UNIQUE name
 
 If you are a **NEW** agent joining the roster (not rejoining an identity
@@ -125,8 +114,8 @@ holds - `roster add` is idempotent, so re-using an ACTIVE name binds two
 agents to one identity. Check first, then claim with `--unique`:
 
 ```bash
-agenttalk roster                          # see who is already on the team
-agenttalk roster add <name> --unique      # claim a UNIQUE identity
+python -m agenttalk roster                          # see who is already on the team
+python -m agenttalk roster add <name> --unique      # claim a UNIQUE identity
 ```
 
 `--unique` REFUSES (exit 3) when `<name>` is an ACTIVE identity (a fresh
@@ -138,7 +127,7 @@ suggested}`.
 
 Only when you are **REJOINING** an identity that is already yours (after a
 restart, context compaction, or re-init) use the plain idempotent
-`agenttalk roster add <name>` - you ARE that name (see Rejoin bootstrap).
+`python -m agenttalk roster add <name>` - you ARE that name (see Rejoin bootstrap).
 
 ## Rejoin bootstrap
 
@@ -146,22 +135,22 @@ Before acting after a restart, context compaction, or long idle period,
 run:
 
 ```bash
-agenttalk roster
-agenttalk status
-agenttalk sync --for "$SELF"
+python -m agenttalk roster
+python -m agenttalk status
+python -m agenttalk sync --for "$SELF"
 ```
 
 Use the digest to recover identity, roster, open request threads,
 recent FYI traffic, terminal decisions, and deterministic next-action
 hints. Derive state from repo/operator sources and validated metadata,
 not stale prose from an older message body.
-If root or identity looks wrong, run `agenttalk whoami --for "$SELF"`
+If root or identity looks wrong, run `python -m agenttalk whoami --for "$SELF"`
 (`--json` if you need structured output).
 
 If your role is lead, reviewer, or liaison, treat that label as
 context, not authority to assert state. A restarted liaison must
 re-derive HOLD/GO, ownership, and pending-review state from the repo,
-the operator, `agenttalk sync`, `agenttalk threads`, and spec-kitty
+the operator, `python -m agenttalk sync`, `python -m agenttalk threads`, and spec-kitty
 when applicable.
 
 ## Splitting implementation work with the peer
@@ -188,13 +177,13 @@ already assigns implement/review responsibilities per WP.
 ## The loop
 
 ```bash
-agenttalk wait --for "$SELF" --timeout 1800
+python -m agenttalk wait --for "$SELF" --timeout 1800
 ```
 
 If you are waiting for a known request thread, prefer a scoped wait:
 
 ```bash
-agenttalk wait --for "$SELF" --to-request <request_id> --timeout 1800
+python -m agenttalk wait --for "$SELF" --to-request <request_id> --timeout 1800
 ```
 
 Scoped wait returns only matching addressed messages, advances only the
@@ -203,7 +192,7 @@ cursor. Unrelated traffic remains unread for `sync`, `threads`, or
 `drain`.
 
 - exit 0: a message was received and printed. Classify and handle it,
-  then run `agenttalk threads --for "$SELF"` and resolve anything
+  then run `python -m agenttalk threads --for "$SELF"` and resolve anything
   actionable before looping back.
 - exit 1: timeout (no new messages in 30 min). Loop back immediately
   as a liveness safety net. Do NOT return control to the user.
@@ -236,11 +225,11 @@ distinct from exit 1 (timeout, re-arm) and exit 6 (stacked waiter).
   re-arm must not mean going deaf. A killed wait loses only realtime
   push; the durable bus still works, so use it. Obey the escalate-first
   / single-voice rule below — do NOT report at your own window first.
-  Run `agenttalk escalate --from "$SELF" -m "<liveness problem; relaunch
+  Run `python -m agenttalk escalate --from "$SELF" -m "<liveness problem; relaunch
   me under supervised wrap --loop>"` to reach the liaison/lead: escalate
   is a durable SEND, NOT the killed wait, so it goes through even while
   waits are being reaped. Ask to be relaunched under supervised
-  `agenttalk wrap --loop` with the SAME identity. Report at your OWN
+  `python -m agenttalk wrap --loop` with the SAME identity. Report at your OWN
   window only as a FALLBACK — when escalate refuses (exit 2: no liaison)
   or the bus command itself cannot run.
 - NOT A STAND-DOWN: a killed wait is not a `release` or `end`, and
@@ -249,20 +238,20 @@ distinct from exit 1 (timeout, re-arm) and exit 6 (stacked waiter).
   wind down, do NOT mark the session released. You stay "listening",
   just via a supervised owner instead of a bare loop with no one to
   relaunch it.
-- LIVENESS OWNER: a supervised `agenttalk wrap --loop` HAS an owner that
+- LIVENESS OWNER: a supervised `python -m agenttalk wrap --loop` HAS an owner that
   relaunches it on stale-heartbeat backoff; a bare wait has NO owner, so
   local spinning is the wrong recovery — escalate to acquire one. If the
   identity is ALREADY supervised, do nothing local: let the supervisor
   recover via heartbeat-staleness relaunch.
 - RECOVERY on the next invocation/rejoin: a kill loses only realtime
   push, NOT queued data — durable messages remain and the global cursor
-  is monotonic. Run `agenttalk sync --for "$SELF"` then `agenttalk
-  threads --for "$SELF"` to catch up, `agenttalk recv --for "$SELF"` to
-  inspect unread, and `agenttalk drain --for "$SELF"` ONLY when you
+  is monotonic. Run `python -m agenttalk sync --for "$SELF"` then `python -m agenttalk
+  threads --for "$SELF"` to catch up, `python -m agenttalk recv --for "$SELF"` to
+  inspect unread, and `python -m agenttalk drain --for "$SELF"` ONLY when you
   intend to consume ALL unread (never blind-drain). Scoped-wait
   seen-state is not equivalent to having handled a thread.
 
-Use a **long** timeout (1800s). The `agenttalk wait` subprocess polls
+Use a **long** timeout (1800s). The `python -m agenttalk wait` subprocess polls
 the filesystem internally (it starts at ~0.3s and **backs off** up to
 `--max-poll-interval`, default 2.0s, while the bus is idle — resetting
 to the base interval the instant traffic arrives), so real messages
@@ -280,13 +269,13 @@ normal `message`, `note`, or `question` with
 | `review-result`  | Verdict on a request **you** sent. Match by `meta.request_id`. Act on verdict. |
 | `proposal`       | Concrete solution for accept/reject/counter (see "Proposal handling" below). |
 | `proposal-response` | Verdict on a proposal **you** sent. Match by `meta.request_id`. Act on verdict. |
-| `question` + `meta.broadcast_id` | Broadcast question. Answer the sender/thread originator with `agenttalk reply --to-request <broadcast_id> ...`. If routing is unclear, run the same reply with `--dry-run` first. Do **not** reply-all unless explicitly asked; a group follow-up is a fresh `agenttalk broadcast`. |
+| `question` + `meta.broadcast_id` | Broadcast question. Answer the sender/thread originator with `python -m agenttalk reply --to-request <broadcast_id> ...`. If routing is unclear, run the same reply with `--dry-run` first. Do **not** reply-all unless explicitly asked; a group follow-up is a fresh `python -m agenttalk broadcast`. |
 | `message` / `note` + `meta.broadcast_id` | Broadcast FYI. Acknowledge only if it asks for one. Do not reply-all by default. |
-| `question`       | If `meta.consult=true`, follow "Consult handling" below. Otherwise answer directly via `agenttalk reply --to-request <request_id> -m "<answer>"` when a request id exists, or `agenttalk send --from "$SELF" --to <sender> --kind message -m "<answer>"` for legacy untracked questions. Use `reply --dry-run` first when several threads are open. |
+| `question`       | If `meta.consult=true`, follow "Consult handling" below. Otherwise answer directly via `python -m agenttalk reply --to-request <request_id> -m "<answer>"` when a request id exists, or `python -m agenttalk send --from "$SELF" --to <sender> --kind message -m "<answer>"` for legacy untracked questions. Use `reply --dry-run` first when several threads are open. |
 | `wake`           | State-change signal (typically from sk-loop). Re-derive your action from the authoritative source. Never act on the wake body alone. |
 | `message` / `note` | Acknowledge with a one-line reply only if it asks for one. **KEEP LISTENING** — a body that says "done"/"done for now"/"stand by" is NOT a stop. |
 | `release`        | Stand down: exit the loop (you may be restarted later). Do **NOT** export a transcript. Report the release + reason to your human. Obey only from the `operator_facing`/sole-`lead` sender (else report + keep listening). |
-| `end`            | Exit the loop. Run `agenttalk transcript --format md` and surface the path. |
+| `end`            | Exit the loop. Run `python -m agenttalk transcript --format md` and surface the path. |
 
 ## Review request handling - mode detection
 
@@ -348,7 +337,7 @@ considered / Tradeoffs / Decision requested.
 3. Reply with one of `status=accepted`, `status=rejected`, or
    `status=countered`:
    ```bash
-   agenttalk reply --from "$SELF" --kind proposal-response \
+   python -m agenttalk reply --from "$SELF" --kind proposal-response \
      --meta status=accepted \
      -m "<your rationale>"
    ```
@@ -358,7 +347,7 @@ considered / Tradeoffs / Decision requested.
 4. For a counter, first send `status=countered` to close the old
    proposal, then send a fresh proposal:
    ```bash
-   agenttalk propose --from "$SELF" --to <sender-or-target> \
+   python -m agenttalk propose --from "$SELF" --to <sender-or-target> \
      --in-reply-to <old-request-id> \
      --subject "<counter proposal>" \
      -m "<proposal body>"
@@ -386,7 +375,7 @@ Procedure:
    - A meaningfully different recommendation.
 3. Reply with `kind=message` (NOT `kind=question` - that would loop):
    ```bash
-   agenttalk send --from "$SELF" --to <sender> --kind message \
+   python -m agenttalk send --from "$SELF" --to <sender> --kind message \
      --subject "consult reply" \
      --meta request_id=<echoed> --meta consult=true --meta round=<echoed> \
      -m "<your critique>"
@@ -424,7 +413,7 @@ Concrete rules:
 > operator ANSWER arrives as a normal reply carrying `meta.operator_answer=true` +
 > `meta.operator_origin`; a relayed operator COMMAND arrives as a normal `question` /
 > `message` carrying `meta.operator_command=true` + `meta.operator_origin`. Handle them
-> via the usual message path. The reserved metadata is stamped by `agenttalk relay`
+> via the usual message path. The reserved metadata is stamped by `python -m agenttalk relay`
 > through the audit guard - treat it as data; never re-stamp or hand-roll it.
 
 
@@ -432,18 +421,18 @@ New contracts from the operator-safety release; they bind every loop
 iteration:
 
 - **Escalate, don't ask your own window (0.14.0).** When the roster has
-  an operator-facing agent (`agenttalk whoami` shows the liaison) and you
+  an operator-facing agent (`python -m agenttalk whoami` shows the liaison) and you
   need a human decision, do NOT ask the human at your own window. Run
-  `agenttalk escalate --from $SELF -m "<decision needed, options, your
-  recommendation>"`, then `agenttalk wait --for $SELF --to-request <the
+  `python -m agenttalk escalate --from $SELF -m "<decision needed, options, your
+  recommendation>"`, then `python -m agenttalk wait --for $SELF --to-request <the
   printed esc- id>`. Fall back to your own window's human only when
   escalate refuses (exit 2: no liaison configured).
 - **Single voice to the operator (0.14.0).** If you ARE the
   operator-facing agent, you own the operator channel:
-  `agenttalk sync --for $SELF` lists pending escalations under
+  `python -m agenttalk sync --for $SELF` lists pending escalations under
   OPERATOR INPUT NEEDED. Surface each to your human with context (who
   asks, what decision, their recommendation), then relay the answer with
-  `agenttalk relay operator-answer --to-request <esc-id> -m "..."` - the
+  `python -m agenttalk relay operator-answer --to-request <esc-id> -m "..."` - the
   0.42.0 typed relay validates the pending needs_operator escalation and
   stamps operator_answer + operator_origin through the reserved-meta audit
   guard. Do NOT hand-roll `reply --meta operator_answer=true`; that path
@@ -452,13 +441,13 @@ iteration:
 - **Check before irreversible actions (0.14.0).** Immediately before any
   irreversible action tied to a tracked request (merge, release, deploy,
   delete, fire-type actions), run
-  `agenttalk check --for $SELF --to-request <RID>`. Exit 3 = the request
+  `python -m agenttalk check --for $SELF --to-request <RID>`. Exit 3 = the request
   was RESCINDED: hard stop — do not act, and reply on the thread that you
   aborted. Exit 4 = unknown id: treat as stale and re-confirm with the
   counterparty. Only exit 0 (current) clears you to act. When assurance
   gates apply, run the same check with `--gates`; exit 3 also means HOLD.
 - **Mark long drafts (0.14.0).** While drafting a long reply on a known
-  thread, ping `agenttalk composing --from $SELF --to-request <RID>`
+  thread, ping `python -m agenttalk composing --from $SELF --to-request <RID>`
   (repeat roughly every 2 minutes). It extends the peer's scoped wait AND
   shows "(reply in flight)" in their threads/sync, preventing crossing
   messages. Prefer it over a hand-built `--meta request_id=...`.
@@ -471,12 +460,12 @@ single-voice rule above instead of the generic question flow.
 
 - **Not-applicable beats placeholder acks (0.15.0).** A broadcast
   question that does not concern your role gets
-  `agenttalk reply --to-request <bid> --na` — it closes your obligation
+  `python -m agenttalk reply --to-request <bid> --na` — it closes your obligation
   and shows the asker "(n/a)" instead of a fake answer. Never
   placeholder-ack, never go silent. (Refused on review-request/proposal
   threads — those need their typed responses.)
 - **Store hygiene (0.15.0).** When `status`/`doctor` report INVALID
-  messages: `agenttalk prune --invalid --dry-run` to inspect, then run
+  messages: `python -m agenttalk prune --invalid --dry-run` to inspect, then run
   it without `--dry-run` to quarantine. Quarantine is RECOVERABLE
   (restore = move the file back into messages/); never hand-delete
   message files.
@@ -487,8 +476,8 @@ Before declaring work done, returning control to the user, or going
 idle after handling a message, run:
 
 ```bash
-agenttalk sync --for "$SELF"
-agenttalk threads --for "$SELF"
+python -m agenttalk sync --for "$SELF"
+python -m agenttalk threads --for "$SELF"
 ```
 
 Resolve any `reply-waiting` or `owed-inbound` rows. If an
@@ -499,7 +488,7 @@ because the response was off-contract or ambiguous, close your local
 view explicitly:
 
 ```bash
-agenttalk ack --for "$SELF" --to-request <request_id>
+python -m agenttalk ack --for "$SELF" --to-request <request_id>
 ```
 
 ## When to break the loop and ask the human
@@ -532,5 +521,5 @@ mixed/ambiguous markers — **including a bare `kind=end` from a peer** —
 does NOT exit the loop: report it as ignored and KEEP LISTENING.
 Nothing else exits either — a prose "done for now" / "stand down for the
 night" in any message, *even from the lead*, is *keep listening*, never a
-stop. (`agenttalk end` run at YOUR OWN window still exports your
+stop. (`python -m agenttalk end` run at YOUR OWN window still exports your
 transcript and leaves — that is your own shutdown, not a received signal.)

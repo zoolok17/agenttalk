@@ -5497,6 +5497,24 @@ def _dead_letter_notifier(store, agent: str):
                 return False
             mid = info.get("msg_id")
             ag = info.get("agent")
+            if info.get("failure_class") == "config_blocked":
+                summary = str(info.get("summary") or "deterministic exec/permission denial")
+                body = (
+                    f"[wrapper-config-blocked] agent {ag} is PARKED on message {mid} "
+                    f"from {info.get('from')} (kind={info.get('kind')}, "
+                    f"attempts={info.get('attempts')}). Cursor is unchanged; the message "
+                    "was NOT committed or disposed. "
+                    f"Command/error/remediation: {summary}. After repairing the child "
+                    f"bus invocation/config, run: agenttalk request-restart --for {ag}"
+                )
+                store.send(sender=agent, recipient=target, kind="question",
+                           subject="wrapper config-blocked", body=body,
+                           meta={"needs_operator": "true", "dead_letter": "true",
+                                 "config_blocked": "true",
+                                 "dl_msg_id": str(mid),
+                                 "dl_disposed": "false",
+                                 "request_id": "esc-" + uuid.uuid4().hex[:12]})
+                return True
             verb = "DEAD-LETTERED" if disposed else "repeatedly FAILING (not yet dead-lettered)"
             body = (f"[dead-letter] agent {ag} {verb} message {mid} from "
                     f"{info.get('from')} (kind={info.get('kind')}, "

@@ -8,7 +8,7 @@ from typing import Any
 from agenttalk import health as health_model
 
 from .events import Event, EventType
-from .loop import CLASS_AMBIGUOUS, CLASS_INFRA, CLASS_POISON
+from .loop import CLASS_AMBIGUOUS, CLASS_CONFIG_BLOCKED, CLASS_INFRA, CLASS_POISON
 
 
 class WrapperHealthWriter:
@@ -154,6 +154,8 @@ def classify_failure(sig: dict[str, Any], failure_class: str | None) -> tuple[st
     """Map turn signals to an advisory state plus safe reason code."""
     if sig.get("watchdog"):
         return health_model.STATE_STUCK_SUSPECTED, "turn_watchdog_fired"
+    if failure_class == CLASS_CONFIG_BLOCKED:
+        return health_model.STATE_ERRORED_AMBIGUOUS, "config_blocked"
     if sig.get("error"):
         return health_model.STATE_RATE_LIMITED_OR_OUTAGE, "spawn_exec_error"
     rc = sig.get("rc")

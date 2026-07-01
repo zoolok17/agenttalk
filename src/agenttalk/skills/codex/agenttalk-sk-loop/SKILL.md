@@ -46,43 +46,21 @@ mission coordinator wants a specific spec-kitty model label.
 
 If `.agenttalk/` is not under the current directory, pass `--root
 <path>` before the subcommand on every invocation, for example
-`agenttalk --root <path> sync --for "$SELF"`. Do not write
-`agenttalk sync --root ...`; global options must precede the
+`python -m agenttalk --root <path> sync --for "$SELF"`. Do not write
+`python -m agenttalk sync --root ...`; global options must precede the
 subcommand.
 
 ## Invoking agenttalk under the Codex sandbox
 
-Inside Codex's workspace sandbox, **bare `agenttalk` is DENIED** - it resolves
-to the Windows App Execution Alias under `...\WindowsApps`, which the sandbox
-blocks ("Access is denied") - and the `.agenttalk\bin\agenttalk.cmd` shim
-cannot exec in-sandbox either. ALWAYS invoke the bus as a Python module with a
-bare, PATH-resolved `python`:
+Run bus commands from the current project WORKSPACE cwd, using AGENTTALK_ROOT for that workspace when it is set. Invoke the bus as a Python module with a bare, PATH-resolved `python`:
 
 ```bash
 python -m agenttalk <subcommand> ...
 ```
 
-A supervised launch already sets `AGENTTALK_ROOT`, `AGENTTALK_SELF`, and (for a
-source checkout) `PYTHONPATH=<repo>\src`, so `python -m agenttalk` resolves and
-WRITES to the in-workspace `.agenttalk/` (allowed; only OUTSIDE-workspace reads
-are denied). Do NOT bake an absolute python path - use bare `python`. Bare
-`agenttalk` / the `.cmd` shim are fine for a HUMAN, out-of-sandbox use, or the
-external supervisor's OWN calls - NOT for an in-sandbox agent. Everywhere this
-skill shows `agenttalk <cmd>`, run it as `python -m agenttalk <cmd>` in-sandbox.
+Treat `agenttalk` as the installed/runtime package for this environment. Do NOT cd to, import from, or reference an agenttalk SOURCE checkout outside the workspace for bus I/O: no `..\agenttalk`, no sibling source paths, and no `D:\Projects\claude\agenttalk`. The only source-tree exception is when the current workspace itself is the agenttalk repo being worked on; then `<workspace>\src\agenttalk` is acceptable.
 
-On start or rejoin, run:
-
-```bash
-agenttalk roster
-agenttalk status
-agenttalk sync --for "$SELF"
-```
-
-Use it to recover open non-wake obligations and recent terminal
-decisions, but still derive WP state from `spec-kitty next`. If root
-or identity looks wrong, run `agenttalk whoami --for "$SELF"` (`--json`
-if you need structured output).
-
+Do NOT run `pip install -e <agenttalk-source>` as an in-turn bus fix. If the runtime import resolves outside the workspace, ask the operator to install agenttalk non-editable into the runtime Python, or run the agent from the agenttalk workspace when intentionally developing agenttalk. Do NOT bake an absolute python path.
 ## Required argument
 
 The user passes the mission slug as the argument (e.g.
@@ -193,13 +171,13 @@ justifies `--force`.
    If it fails, STOP, print the blocking paths + the fix, do NOT wake.
 8. Only after the move succeeds, **wake the peer** (carry the transition key):
    ```bash
-   agenttalk send --from "$SELF" --to "$PEER" --kind wake \
+   python -m agenttalk send --from "$SELF" --to "$PEER" --kind wake \
      --subject "WP## ready for review" \
      --meta mission="$MISSION" --meta wp_id=WP## --meta new_lane=for_review --meta actor="$SELF" \
      --meta transition_key="sk:${MISSION}:WP##:doing:for_review:submit" \
      -m "WP## is in for_review. Run spec-kitty next."
    ```
-9. Run `agenttalk sync` / `agenttalk threads --for "$SELF"` to confirm the
+9. Run `python -m agenttalk sync` / `python -m agenttalk threads --for "$SELF"` to confirm the
    obligation, then loop back to step 1.
 
 #### Action: review WP##
@@ -228,13 +206,13 @@ justifies `--force`.
      unrelated file), do NOT wake.
 6. Only after the move succeeds, **wake the peer** (carry the transition key):
    ```bash
-   agenttalk send --from "$SELF" --to "$PEER" --kind wake \
+   python -m agenttalk send --from "$SELF" --to "$PEER" --kind wake \
      --subject "WP## review verdict" \
      --meta mission="$MISSION" --meta wp_id=WP## --meta new_lane=<done|planned> --meta actor="$SELF" \
      --meta transition_key="sk:${MISSION}:WP##:for_review:<done|planned>:<approve|reject>" \
      -m "WP## moved to <lane>. Run spec-kitty next."
    ```
-7. Run `agenttalk sync` / `agenttalk threads --for "$SELF"`, then loop back to step 1.
+7. Run `python -m agenttalk sync` / `python -m agenttalk threads --for "$SELF"`, then loop back to step 1.
 
 #### Action: re-implement WP## (cycle N)
 
@@ -248,13 +226,13 @@ reviewer's feedback. Address every blocker.
   `question` first instead of guessing into another rejection:
   ```bash
   REQ_ID="q-${MISSION}-WP##-cycle-${N}"
-  agenttalk send --from "$SELF" --to "$PEER" --kind question \
+  python -m agenttalk send --from "$SELF" --to "$PEER" --kind question \
     --subject "WP## cycle N: request example" \
     --meta request_id="$REQ_ID" --meta mission="$MISSION" --meta wp_id=WP## --meta round=$N \
     -m "Reviewer feedback says <quote>. Can you sketch the shape
        you expect - a signature, a 5-line diff, a one-paragraph
        contract? Trying to avoid a wasted cycle on guesswork."
-  agenttalk wait --for "$SELF" --to-request "$REQ_ID" --timeout 600
+  python -m agenttalk wait --for "$SELF" --to-request "$REQ_ID" --timeout 600
   ```
   This is asking for clarification - not asking the reviewer to do
   the work. After the reply, re-implement.
@@ -270,8 +248,8 @@ auto-arbitrate.
 Before blocking, check for non-wake obligations:
 
 ```bash
-agenttalk sync --for "$SELF"
-agenttalk threads --for "$SELF"
+python -m agenttalk sync --for "$SELF"
+python -m agenttalk threads --for "$SELF"
 ```
 
 Resolve any `reply-waiting` or `owed-inbound` rows first. For
@@ -283,10 +261,10 @@ multiple threads are open; add `--dry-run` first if you need to
 confirm the recipient/request id/kind without sending.
 
 ```bash
-agenttalk wait --for "$SELF" --timeout 30
+python -m agenttalk wait --for "$SELF" --timeout 30
 ```
 
-- Exit code 0 -> a message arrived; re-run `agenttalk threads --for
+- Exit code 0 -> a message arrived; re-run `python -m agenttalk threads --for
   "$SELF"` if it is not a wake, then loop back to step 1.
 - Exit code 1 -> timeout. Loop back to step 1 anyway (self-healing).
 
@@ -296,14 +274,14 @@ Use a **short** timeout (30s, not 1800).
 
 When you're the one composing a substantive reply - a review with
 multiple findings, a sketched example, a multi-paragraph
-re-implementation outline - your peer is blocked in `agenttalk wait`
+re-implementation outline - your peer is blocked in `python -m agenttalk wait`
 with a finite timeout. If your reply takes longer than that to write,
 their wait may fire before the reply lands.
 
 Send a `composing` ping every ~2 min while drafting:
 
 ```bash
-agenttalk composing --from "$SELF" --to "$PEER" \
+python -m agenttalk composing --from "$SELF" --to "$PEER" \
   --meta mission="$MISSION" --meta wp_id=WP## \
   -m "still drafting cycle-N review notes"
 ```
@@ -319,11 +297,11 @@ If `spec-kitty next` returns mission complete:
 
 1. If a merge step is still pending and is your action: run
    `spec-kitty merge --mission "$MISSION"` from the project root.
-2. Otherwise: run `agenttalk threads --for "$SELF"` and resolve any
+2. Otherwise: run `python -m agenttalk threads --for "$SELF"` and resolve any
    `reply-waiting` or `owed-inbound` rows before calling the session
    done.
-3. Then: `agenttalk transcript --format md` and tell the user the
-   path. Send `agenttalk end --from "$SELF" --reason "mission
+3. Then: `python -m agenttalk transcript --format md` and tell the user the
+   path. Send `python -m agenttalk end --from "$SELF" --reason "mission
    $MISSION complete"`.
 4. Exit the loop.
 
@@ -341,8 +319,8 @@ the new plan, then resume.
 
 ## Multi-agent lead coordination
 
-The lead role sits above this loop. A lead may use `agenttalk roster`,
-point-to-point messages, broadcast questions, and `agenttalk threads`
+The lead role sits above this loop. A lead may use `python -m agenttalk roster`,
+point-to-point messages, broadcast questions, and `python -m agenttalk threads`
 to coordinate people and agents, but it must not create a second
 spec-kitty lane model. In a mission, `spec-kitty next` decides who
 implements or reviews; the lead coordinates around that state.
@@ -379,14 +357,14 @@ implements or reviews; the lead coordinates around that state.
 - **Wakes are latency optimization, not state.** If a wake is lost, the
   next poll catches the change (and Step 0.5 reconciles move/wake drift
   on start/rejoin by the transition key).
-- **Never hand-roll inbox polling.** Plain `agenttalk wait` consumes
+- **Never hand-roll inbox polling.** Plain `python -m agenttalk wait` consumes
   the next real message and advances your global cursor;
-  `agenttalk wait --to-request <id>` advances only thread-local
-  `seen_msg_id`; `agenttalk drain --for $SELF` consumes everything
+  `python -m agenttalk wait --to-request <id>` advances only thread-local
+  `seen_msg_id`; `python -m agenttalk drain --for $SELF` consumes everything
   unread at once. Do NOT compare message timestamps against a baseline
-  to detect new activity. If you suspect a stall, run `agenttalk
-  status` or `agenttalk sync --for $SELF`.
-- **Before going idle or declaring done, run `agenttalk threads --for
+  to detect new activity. If you suspect a stall, run `python -m agenttalk
+  status` or `python -m agenttalk sync --for $SELF`.
+- **Before going idle or declaring done, run `python -m agenttalk threads --for
   "$SELF"`.** Resolve `reply-waiting` and `owed-inbound` rows so open
   reviews, questions, broadcast questions, and proposals are not left
   unread.
@@ -415,28 +393,28 @@ sandbox:
     `$env:LOCALAPPDATA\Programs\Python\`
   - POSIX: `which python3`
 - If nothing works, ask the user to run
-  `agenttalk codex-config --enable` from the project root, which sets
+  `python -m agenttalk codex-config --enable` from the project root, which sets
   `approval_policy = "never"` and `sandbox_mode = "workspace-write"`
   for this project in `~/.codex/config.toml`. Then restart Codex.
 
 - **Check before irreversible actions (0.14.0).** Immediately before any
   irreversible action tied to a tracked request (merge, release, deploy,
   delete, fire-type actions), run
-  `agenttalk check --for $SELF --to-request <RID>`. Exit 3 = the request
+  `python -m agenttalk check --for $SELF --to-request <RID>`. Exit 3 = the request
   was RESCINDED: hard stop — do not act, and reply on the thread that you
   aborted. Exit 4 = unknown id: treat as stale and re-confirm with the
   counterparty. Only exit 0 (current) clears you to act.
 - **Escalate, don't ask your own window (0.14.0).** When the roster has
-  an operator-facing agent (`agenttalk whoami` shows the liaison) and you
+  an operator-facing agent (`python -m agenttalk whoami` shows the liaison) and you
   need a human decision, do NOT ask the human at your own window. Run
-  `agenttalk escalate --from $SELF -m "<decision needed, options, your
-  recommendation>"`, then `agenttalk wait --for $SELF --to-request <the
+  `python -m agenttalk escalate --from $SELF -m "<decision needed, options, your
+  recommendation>"`, then `python -m agenttalk wait --for $SELF --to-request <the
   printed esc- id>`. Fall back to your own window's human only when
   escalate refuses (exit 2: no liaison configured).
 
 - **Not-applicable beats placeholder acks (0.15.0).** A broadcast
   question that does not concern your role gets
-  `agenttalk reply --to-request <bid> --na` — it closes your obligation
+  `python -m agenttalk reply --to-request <bid> --na` — it closes your obligation
   and shows the asker "(n/a)" instead of a fake answer. Never
   placeholder-ack, never go silent. (Refused on review-request/proposal
   threads — those need their typed responses.)
