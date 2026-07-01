@@ -714,3 +714,40 @@ def test_doctor_supervised_codex_wrapped_resolves_base_argv_tail(tmp_path: Path)
     chk = doctor._check_supervised_codex(s, runner=runner)
     assert seen["exe"] == "C:/real-codex.exe"   # NOT python (windows_file)
     assert chk.status == "ok"
+
+
+def test_doctor_supervised_wrapped_codex_errors_on_bad_agenttalk_runtime(
+    tmp_path: Path,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["wcdx"])
+    _write_supervisor(s, {"wcdx": {
+        "cli": "codex", "wrapped": True,
+        "launch": {"windows_file": "C:/python.exe",
+                   "windows_args": ["-m", "agenttalk", "wrap", "--for", "wcdx",
+                                    "--cli", "codex", "--loop", "--", "C:/real-codex.exe"]}}})
+
+    def runner(exe, args, timeout):
+        return (0, "codex-cli 0.142.3") if args == ["--version"] else (0, "ok")
+
+    seen: dict[str, Path] = {}
+
+    def runtime_checker(root: Path) -> str:
+        seen["root"] = root
+        return (
+            "command=python -c import agenttalk; resolved_path=D:\\Projects\\claude\\"
+            "agenttalk\\src\\agenttalk\\__init__.py; error=agenttalk runtime resolved "
+            "to an out-of-workspace source checkout; remediation=install agenttalk "
+            "non-editable into the runtime Python"
+        )
+
+    chk = doctor._check_supervised_codex(
+        s,
+        runner=runner,
+        runtime_checker=runtime_checker,
+    )
+    assert seen["root"] == tmp_path.resolve()
+    assert chk.status == "error"
+    assert "agenttalk runtime preflight FAILED" in chk.details
+    assert "out-of-workspace source checkout" in chk.fix
+    assert chk.data["agenttalk_runtime"] == chk.fix

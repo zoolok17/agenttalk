@@ -5562,6 +5562,66 @@ def _cadence_health_notifier(store, agent: str):
     return emit
 
 
+def _launch_config_blocked_notifier(store, agent: str):
+    """Operator escalation for a pre-loop wrapper launch preflight failure."""
+    def emit(summary: str) -> bool:
+        try:
+            target = store.operator_facing() or store.sole_lead()
+            if not target or target == agent:
+                return False
+            body = (
+                f"[wrapper-launch-config-blocked] agent {agent} did not enter the "
+                "wrapper loop because launch/runtime preflight failed before any "
+                "message was consumed. Cursor, attempts, and dead-letter state are "
+                f"unchanged. Command/error/remediation: {summary}. After repairing "
+                f"the launch config, run: agenttalk request-restart --for {agent}"
+            )
+            store.send(
+                sender=agent,
+                recipient=target,
+                kind="question",
+                subject="wrapper launch config-blocked",
+                body=body,
+                meta={
+                    "needs_operator": "true",
+                    "config_blocked": "true",
+                    "launch_config_blocked": "true",
+                    "request_id": "esc-" + uuid.uuid4().hex[:12],
+                },
+            )
+            return True
+        except Exception:  # noqa: BLE001 - a launch notice must never crash the wrapper
+            return False
+    return emit
+
+
+def _handle_launch_config_blocked(store, agent: str, cli_name: str, *,
+                                  mode: str, min_interval: float,
+                                  summary: str) -> int:
+    from agenttalk import health as health_model
+    from .wrapper import loop as wloop
+    from .wrapper.health import WrapperHealthWriter
+
+    raw = store.read_health_raw(agent) or {}
+    already_reported = (
+        raw.get("state") == health_model.STATE_ERRORED_AMBIGUOUS
+        and raw.get("reason_code") == "config_blocked"
+    )
+    health_writer = WrapperHealthWriter(
+        store, agent, cli_name, mode=mode, min_interval=min_interval)
+    sig = {"error": summary, "config_blocked": True, "config_blocked_text": summary}
+    store.write_config_blocked_hold(agent, summary=summary)
+    health_writer.failure(sig, wloop.CLASS_CONFIG_BLOCKED)
+    try:
+        store.write_heartbeat(agent)
+    except Exception as exc:  # noqa: BLE001 - health/escalation still carry the failure
+        _ = exc
+    if not already_reported:
+        _launch_config_blocked_notifier(store, agent)(summary)
+    sys.stderr.write(f"agenttalk wrap: launch config-blocked: {summary}\n")
+    return 1
+
+
 def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     sender: str, min_interval: float, render: bool,
                     one_shot_request_id: str | None = None,
@@ -5849,6 +5909,9 @@ def cmd_wrap(args: argparse.Namespace) -> int:
     if not argv:
         sys.stderr.write("agenttalk wrap: a launch command is required after `--`\n")
         return 2
+    if args.cli not in ("codex", "claude"):
+        sys.stderr.write(f"agenttalk wrap: no wrapper adapter for cli {args.cli!r}\n")
+        return 2
     if args.one_shot and not args.loop:
         sys.stderr.write("agenttalk wrap: --one-shot requires --loop\n")
         return 2
@@ -5865,6 +5928,21 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         return 2
     sender = (_resolve_self(args.sender, roster=roster)
               if getattr(args, "sender", None) else agent)
+    child_env = wrapper_run._child_env(store.root)
+    launch = wrapper_run.preflight_launch_runtime(
+        argv, args.cli, store.root, child_env)
+    if launch.blocked:
+        mode = (
+            "lead-loop" if lead_loop else
+            "wrapper-one-shot" if args.one_shot else
+            "wrapper-loop" if getattr(args, "loop", False) else
+            "wrapper"
+        )
+        return _handle_launch_config_blocked(
+            store, agent, args.cli, mode=mode, min_interval=args.min_interval,
+            summary=launch.blocked)
+    store.clear_config_blocked_hold(agent)
+    argv = launch.argv
     if getattr(args, "loop", False):
         # Dead-letter caps: an explicit --dead-letter-* flag wins; otherwise resolve from
         # supervisor.json (per-agent -> global -> default) so a supervised wrapped agent's

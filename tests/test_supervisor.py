@@ -11,11 +11,12 @@ import json
 import os
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from agenttalk import cli, supervisor as sup
+from agenttalk import cli, health as hm, supervisor as sup
 from agenttalk.store import Store
 
 
@@ -30,6 +31,10 @@ def _team(tmp_path: Path, agents: str = "lead,worker") -> Store:
 
 
 NOW = 1_000_000.0
+
+
+def _iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace("+00:00", "Z")
 _CONFIG = {
     "agents": {"worker": {"auto_restart": True, "cli": "codex"}},
     "backoff": {"base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180},
@@ -530,15 +535,14 @@ def test_agenttalk_shim_resolves_both_install_modes() -> None:
 
 
 def test_ps_template_applies_and_restores_env() -> None:
-    """The executor applies the agent env (AGENTTALK_ROOT + PYTHONPATH-src +
-    per-agent env + CODEX_HOME) around Start-Process and RESTORES the
-    supervisor's own env afterward. It does NOT bake the absolute
-    AGENTTALK_PYTHON into the AGENT env (blocker #2 point 8 - in-sandbox uses
-    `python -m`); that stays supervisor-only."""
+    """The executor applies the agent env (AGENTTALK_ROOT + AGENTTALK_PY +
+    PYTHONPATH-src + per-agent env + CODEX_HOME) around Start-Process and
+    RESTORES the supervisor's own env afterward. AGENTTALK_PYTHON stays
+    supervisor-only for the shim."""
     ps = sup.PS_TEMPLATE
-    assert "$applied = @{ AGENTTALK_ROOT = $Root }" in ps   # lean agent env
+    assert "$applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }" in ps
     assert "$a.env" in ps                                  # applies per-agent env
-    assert "'src') + ';' + $env:PYTHONPATH" in ps          # src on PYTHONPATH for `python -m`
+    assert "'src') + ';' + $env:PYTHONPATH" in ps          # src on PYTHONPATH for module import
     assert "finally" in ps                                 # restore in a finally
     assert "Remove-Item -Path (\"Env:\"" in ps             # restore: unset what wasn't set
     assert "Invoke-Expression" not in ps
@@ -906,6 +910,8 @@ def test_codex_config_overlay_sets_keys_preserves_others_idempotent() -> None:
     fresh = sup.codex_config_overlay("", repo_path="C:\\x", windows_sandbox="elevated")
     assert 'approval_policy = "never"' in fresh and 'sandbox_mode = "workspace-write"' in fresh
     assert 'sandbox = "elevated"' in fresh and "[sandbox_workspace_write]" in fresh
+    assert "AGENTTALK_PY" not in out
+    assert "shell_environment_policy" not in out
 
 
 def test_seed_claude_settings_merges_default_mode() -> None:
@@ -980,9 +986,9 @@ def test_claude_session_args_carry_bypass_permissions_fresh_and_resume() -> None
 
 def test_ps_template_seeds_preflights_and_drops_baked_python_for_agent() -> None:
     ps = sup.PS_TEMPLATE
-    # the agent env no longer carries the absolute AGENTTALK_PYTHON nor the
-    # .agenttalk/bin shim PATH prepend (in-sandbox agent uses `python -m`).
-    assert "$applied = @{ AGENTTALK_ROOT = $Root }" in ps
+    # the agent env carries AGENTTALK_PY, while AGENTTALK_PYTHON and the
+    # .agenttalk/bin shim remain supervisor-only.
+    assert "$applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }" in ps
     assert "AGENTTALK_PYTHON = $AgenttalkPython" not in ps   # not in the AGENT env
     # Seed-CodexHome copies config.toml then overlays via the python core
     assert "function Seed-CodexHome" in ps
@@ -990,7 +996,7 @@ def test_ps_template_seeds_preflights_and_drops_baked_python_for_agent() -> None
     # claude settings seed + the PREFLIGHT fail-closed gate
     assert "supervise --seed-claude-settings" in ps
     assert "function Preflight" in ps
-    assert "python -m agenttalk --version" in ps            # the smoke-test
+    assert "AGENTTALK_PY -m agenttalk --version" in ps      # the smoke-test
     assert "fail closed" in ps.lower()
     # reviewer-1 r1: the CODEX preflight must set PYTHONPATH the SAME way Launch
     # does (src on a checkout) so it tests the agent's REAL import env and does
@@ -1005,13 +1011,14 @@ def test_ps_template_seeds_preflights_and_drops_baked_python_for_agent() -> None
     # the sandbox flags drift across Codex CLI releases and a hard-coded probe
     # false-fail-closed on valid agents.
     assert "$env:CODEX_HOME = $codexHome" in codex_branch    # still under the codex home
-    assert "& python -m agenttalk --version" in codex_branch
+    assert "& $AgenttalkPython -m agenttalk --version" in codex_branch
     assert "& $file sandbox" not in codex_branch             # no codex sandbox probe
     assert "-P :workspace" not in codex_branch               # the drift-prone flag is gone
     # Phase C: a WRAPPED agent ($file is python, not the CLI) is preflighted BEFORE
     # the codex branch and validates the python wrapper, NOT the codex sandbox.
     wrap_branch = pf[pf.index("$plan.launch_mode -eq 'wrap'"):ci]
     assert "& $file -m agenttalk --version" in wrap_branch
+    assert "Test-WrappedBaseCli" in wrap_branch
     assert "& $file sandbox" not in wrap_branch    # never treats $file as the codex CLI
 
 
@@ -1630,6 +1637,136 @@ def test_wrapped_restart_on_stale_without_hook() -> None:
     assert p["next_state"]["brain_pid"] is None
 
 
+def test_wrapped_config_blocked_hold_marker_holds_when_stale_until_restart() -> None:
+    hold = {"agent": "worker", "state": "config_blocked"}
+    p = _plan_wrap(_report(heartbeat_stale=True, config_blocked_hold=hold),
+                   {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
+                   snapshot=_wrap_snap())
+    assert p["action"] == sup.NONE and p["state"] == "CONFIG_BLOCKED"
+    assert p["kill_first"] is False
+    assert p["kill_targets"] == []
+    assert "config_blocked" in p["reason"]
+
+    marker = {"request_id": "rr-config-fix"}
+    p2 = _plan_wrap(_report(heartbeat_stale=True, config_blocked_hold=hold,
+                            restart_request=marker),
+                    {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
+                    snapshot=_wrap_snap())
+    assert p2["action"] == sup.RELAUNCH and p2["state"] == "MANUAL_RESTART"
+    assert p2["clear_marker"] == "rr-config-fix"
+    assert p2["kill_first"] is True
+
+
+def _write_config_blocked_health(store: Store, agent: str, at_epoch: float) -> None:
+    store.write_health(agent, hm.build_snapshot(
+        agent=agent,
+        cli="codex",
+        mode="wrapper-loop",
+        state=hm.STATE_ERRORED_AMBIGUOUS,
+        updated_at=_iso(at_epoch),
+        since=_iso(at_epoch),
+        last_progress_at=None,
+        reason_code="config_blocked",
+    ))
+
+
+def _write_raw_config_blocked_hold(store: Store, agent: str, payload: object) -> None:
+    p = store.config_blocked_hold_path(agent)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_config_blocked_hold_marker_survives_health_ttl_end_to_end(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    (s.state_dir / "worker.heartbeat").write_text(_iso(NOW), encoding="utf-8")
+    _write_config_blocked_health(s, "worker", NOW)
+    s.write_config_blocked_hold("worker", summary="command=codex; error=shim")
+
+    report = sup.build_report(s, now_epoch=NOW + 2500, supervisor_config=_WRAP_CONFIG)
+    worker = report["agents"]["worker"]
+    assert worker["heartbeat_stale"] is True
+    assert worker["health"]["state"] == hm.STATE_UNKNOWN
+    assert worker["health"]["reason_code"] == "health_stale_ttl"
+    assert worker["config_blocked_hold"]["agent"] == "worker"
+
+    plan = sup.plan_actions(report,
+                            {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
+                            _WRAP_CONFIG, now_epoch=NOW + 2500,
+                            snapshot=_wrap_snap())["agents"]["worker"]
+    assert plan["action"] == sup.NONE and plan["state"] == "CONFIG_BLOCKED"
+    assert plan["kill_first"] is False
+    assert plan["kill_targets"] == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"agent": "other", "state": "config_blocked"},
+        {"agent": "worker", "state": "wrong_state"},
+        {"agent": "worker"},
+        [],
+    ],
+)
+def test_malformed_config_blocked_hold_marker_does_not_suppress_recovery(
+    tmp_path: Path,
+    payload: object,
+) -> None:
+    s = _team(tmp_path)
+    (s.state_dir / "worker.heartbeat").write_text(_iso(NOW), encoding="utf-8")
+    _write_config_blocked_health(s, "worker", NOW)
+    _write_raw_config_blocked_hold(s, "worker", payload)
+
+    report = sup.build_report(s, now_epoch=NOW + 2500, supervisor_config=_WRAP_CONFIG)
+    assert report["agents"]["worker"].get("config_blocked_hold") is None
+    plan = sup.plan_actions(report,
+                            {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
+                            _WRAP_CONFIG, now_epoch=NOW + 2500,
+                            snapshot=_wrap_snap())["agents"]["worker"]
+    assert plan["action"] == sup.STUCK_RECOVER and plan["state"] == "STUCK_OR_DEAD"
+    assert plan["kill_first"] is True
+
+
+def test_config_blocked_hold_request_restart_overrides_and_clear_preserves_hold(
+    tmp_path: Path,
+) -> None:
+    s = _team(tmp_path)
+    (s.state_dir / "worker.heartbeat").write_text(_iso(NOW), encoding="utf-8")
+    _write_config_blocked_health(s, "worker", NOW)
+    s.write_config_blocked_hold("worker", summary="command=codex; error=shim")
+    s.write_restart_request("worker", {"agent": "worker", "request_id": "rr-fix"})
+
+    report = sup.build_report(s, now_epoch=NOW + 2500, supervisor_config=_WRAP_CONFIG)
+    plan = sup.plan_actions(report,
+                            {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
+                            _WRAP_CONFIG, now_epoch=NOW + 2500,
+                            snapshot=_wrap_snap())["agents"]["worker"]
+    assert plan["action"] == sup.RELAUNCH and plan["state"] == "MANUAL_RESTART"
+    assert plan["clear_marker"] == "rr-fix"
+
+    assert _run(["supervise", "--clear-restart", "--for", "worker",
+                 "--request-id", "rr-fix"], tmp_path) == 0
+    assert s.read_restart_request("worker") is None
+    assert s.read_config_blocked_hold("worker") is not None
+
+
+def test_wrapped_codex_without_config_blocked_marker_still_recovers_end_to_end(
+    tmp_path: Path,
+) -> None:
+    s = _team(tmp_path)
+    (s.state_dir / "worker.heartbeat").write_text(_iso(NOW), encoding="utf-8")
+    _write_config_blocked_health(s, "worker", NOW)
+
+    report = sup.build_report(s, now_epoch=NOW + 2500, supervisor_config=_WRAP_CONFIG)
+    assert report["agents"]["worker"].get("config_blocked_hold") is None
+    plan = sup.plan_actions(report,
+                            {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
+                            _WRAP_CONFIG, now_epoch=NOW + 2500,
+                            snapshot=_wrap_snap())["agents"]["worker"]
+    assert plan["action"] == sup.STUCK_RECOVER and plan["state"] == "STUCK_OR_DEAD"
+    assert plan["kill_first"] is True
+
+
 def test_wrapped_claude_also_recovers_on_stale_without_hook() -> None:
     cfg = {**_WRAP_CONFIG,
            "agents": {"worker": {"auto_restart": True, "cli": "claude",
@@ -1981,17 +2118,28 @@ def test_preflight_wrapped_codex_validates_python_not_codex_sandbox(tmp_path: Pa
     helpers = _exec_helpers(tmp_path)        # includes function Preflight
     wlog, clog = tmp_path / "wrap.log", tmp_path / "codex.log"
     wstub, cstub = tmp_path / "pywrap.cmd", tmp_path / "codexcli.cmd"
+    native_codex = tmp_path / "codex.exe"
     _stub_cmd(wstub, wlog)
     _stub_cmd(cstub, clog)
+    native_codex.write_text("", encoding="utf-8")
     out = tmp_path / "pf.json"
-    preamble = [f"$Root = {_pslit(str(tmp_path))}", "$SrcOnPyPath = $false"]
+    preamble = [
+        f"$Root = {_pslit(str(tmp_path))}",
+        "$SrcOnPyPath = $false",
+        f"$AgenttalkPython = {_pslit(str(wstub))}",
+        (
+            "$cfg = @{ agents = @{ 'wrapped-codex' = @{ launch = @{ "
+            f"windows_args = @('-m','agenttalk','wrap','--loop','--',{_pslit(str(native_codex))}) "
+            "} } } }"
+        ),
+    ]
     harness = "\n".join([
         helpers, *preamble,
         # wrapped codex: $file is the python wrapper stub; launch_mode 'wrap'
         f"$wrapOk = Preflight 'wrapped-codex' (@{{ cli='codex'; launch_mode='wrap' }}) {_pslit(str(wstub))} $null",
         # non-wrapped codex (0.31.1): must NOT call `$file sandbox ...` - it runs the
-        # ambient `python -m agenttalk --version` gate, so the $file stub is never
-        # invoked (its log stays empty / has no 'sandbox').
+        # AGENTTALK_PY gate, so the $file stub is never invoked as a codex CLI
+        # (its log stays empty / has no 'sandbox').
         f"$codexOk = Preflight 'plain-codex' (@{{ cli='codex'; launch_mode='resume' }}) {_pslit(str(cstub))} $null",
         # only the return values via JSON; the stubs logged their argv to files we
         # read directly in Python (Get-Content -Raw decorates the string, which

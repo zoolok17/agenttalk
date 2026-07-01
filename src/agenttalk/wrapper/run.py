@@ -15,13 +15,16 @@ from __future__ import annotations
 import errno
 import json
 import os
+from pathlib import Path
 import re
+import shutil
 # subprocess spawns ONLY the operator-provided CLI launch command; never shell=True.
 import subprocess  # nosec B404
 import sys
 import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -76,9 +79,60 @@ _INFRA_ERROR_MARKERS = (
 )
 
 
-_BUS_WRITE_COMMAND_RE = re.compile(
-    r"\b(?:python\s+-m\s+)?agenttalk\s+(reply|send|escalate|composing|check)\b",
+_AGENTTALK_COMMAND_TOKENS = frozenset({"agenttalk", "agenttalk.cmd", "agenttalk.exe"})
+_PYTHON_COMMAND_TOKENS = frozenset({"python", "python.exe", "python3", "python3.exe", "py", "py.exe"})
+_PYTHON_ENV_COMMAND_TOKENS = frozenset({"$env:agenttalk_py", "%agenttalk_py%"})
+_PY_LAUNCHER_COMMAND_TOKENS = frozenset({"py", "py.exe"})
+_POWERSHELL_COMMAND_TOKENS = frozenset({"pwsh", "pwsh.exe", "powershell", "powershell.exe"})
+_CMD_COMMAND_TOKENS = frozenset({"cmd", "cmd.exe"})
+_POSIX_SHELL_COMMAND_TOKENS = frozenset({"sh", "sh.exe", "bash", "bash.exe"})
+_PYTHON_SEPARATED_VALUE_OPTIONS = frozenset({"-X", "-W", "-Q", "--check-hash-based-pycs"})
+_PYTHON_TERMINATING_OPTIONS = frozenset({
+    "-?", "-h", "--help", "--help-all", "--help-env", "--help-xoptions", "-V", "--version",
+})
+_PYTHON_FLAG_CHARS = frozenset("bBdEiIOPqRsSuvx")
+_PY_LAUNCHER_SELECTOR_RE = re.compile(r"^-(?:0|32|64|\d+(?:\.\d+)?(?:-(?:32|64))?)$")
+_REQUIRED_BUS_WRITE_VERBS = frozenset({"reply", "send", "escalate"})
+_BEST_EFFORT_BUS_VERBS = frozenset({"composing"})
+_CHECK_BUS_VERBS = frozenset({"check"})
+_CLASSIFIED_BUS_VERBS = _REQUIRED_BUS_WRITE_VERBS | _BEST_EFFORT_BUS_VERBS | _CHECK_BUS_VERBS
+_BUS_GLOBAL_OPTIONS_WITH_VALUE = frozenset({"--root"})
+BUS_KIND_OK_OR_NO_SIGNAL = "ok_or_no_signal"
+BUS_KIND_CONFIG_BLOCKED = "config_blocked"
+BUS_KIND_SEMANTIC_FAILURE = "bus_write_semantic_failure"
+BUS_KIND_UNKNOWN_FAILURE = "bus_write_unknown_failure"
+BUS_KIND_AMBIGUOUS_TRANSIENT = "ambiguous_transient"
+_FAILED_TOOL_STATUSES = frozenset({
+    "failed", "failure", "error", "errored", "cancelled", "canceled",
+    "timeout", "timed_out",
+})
+_INTERPRETER_NOT_FOUND_RE = re.compile(
+    r"(python(?:3)?|py).*(not recognized|command not found|no such file|"
+    r"filenotfounderror|winerror 2|createprocess error 2|could not be started)|"
+    r"(not recognized|command not found|no such file).*python(?:3)?",
     re.IGNORECASE,
+)
+_AGENTTALK_ARGPARSE_RE = re.compile(
+    r"usage:\s*(?:python\s+-m\s+)?agenttalk\s+[a-z0-9_-]+.*"
+    r"(error:|invalid choice|unrecognized arguments)",
+    re.IGNORECASE | re.DOTALL,
+)
+_AGENTTALK_VALIDATION_MARKERS = (
+    "unknown request id",
+    "no validated message carries that request_id",
+    "no validated message carries",
+    "recipient-domain",
+    "recipient domain",
+    "hmac",
+    "signing",
+    "retired-recipient",
+    "retired recipient",
+)
+_AGENTTALK_CHECK_SAFETY_MARKERS = (
+    "rescinded",
+    "superseded",
+    "unknown request",
+    "unknown request id",
 )
 _EXEC_DENIAL_MARKERS = (
     "access is denied",
@@ -86,10 +140,45 @@ _EXEC_DENIAL_MARKERS = (
     "winerror 5",
     "win error 5",
     "createprocess error 5",
-    "os error 5",
-    "error 5",
     "eacces",
 )
+_EXEC_DENIAL_CODE_RE = re.compile(r"\b(?:os error|error)\s+5\b", re.IGNORECASE)
+_AGENTTALK_RUNTIME_RE = re.compile(
+    r"\b(import\s+agenttalk|agenttalk\.__file__|agenttalk runtime|agenttalk source|"
+    r"agenttalk package|src[\\/]+agenttalk[\\/]+__init__\.py|"
+    r"agenttalk[\\/]+__init__\.py)\b",
+    re.IGNORECASE,
+)
+_OUT_OF_WORKSPACE_SOURCE_MARKERS = (
+    "out-of-workspace",
+    "outside the workspace",
+    "outside workspace",
+    "sibling source",
+)
+_AGENTTALK_IMPORT_PROBE = (
+    "import agenttalk,json; "
+    "print(json.dumps({'file': getattr(agenttalk, '__file__', None)}))"
+)
+_AGENTTALK_MISSING_MODULE_RE = re.compile(
+    r"(modulenotfounderror:.*no module named ['\"]?agenttalk['\"]?|"
+    r"no module named ['\"]?agenttalk['\"]?)",
+    re.IGNORECASE,
+)
+_AGENTTALK_BROKEN_IMPORT_RE = re.compile(
+    r"(syntaxerror|importerror|traceback).*"
+    r"(agenttalk[\\/]+__init__\.py|src[\\/]+agenttalk[\\/]+__init__\.py|"
+    r"import\s+agenttalk)",
+    re.IGNORECASE | re.DOTALL,
+)
+_WINDOWS_SHIM_EXTENSIONS = frozenset({".cmd", ".bat", ".ps1"})
+_SPAWN_CONFIG_WINERRORS = frozenset({2, 3, 193, 267})
+_NPM_CODEX_WIN32_X64_TRIPLES = frozenset({"x86_64-pc-windows-msvc"})
+
+
+@dataclass(frozen=True)
+class LaunchPreflightResult:
+    argv: list[str]
+    blocked: str | None = None
 
 
 def _compact_text(value: object, limit: int = 240) -> str:
@@ -100,13 +189,473 @@ def _format_argv(argv: list[str]) -> str:
     return " ".join(str(part) for part in argv)
 
 
-def _child_env() -> dict[str, str]:
-    return {k: v for k, v in os.environ.items() if k != LEAD_LOOP_LEASE_ENV}
+def _command_text(command: object) -> str:
+    if isinstance(command, (list, tuple)):
+        return " ".join(str(part) for part in command)
+    return str(command or "")
+
+
+def _split_command_string(text: str) -> list[str] | None:
+    tokens: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    in_token = False
+    idx = 0
+    while idx < len(text):
+        ch = text[idx]
+        if quote is not None:
+            if ch == "\\" and idx + 1 < len(text) and text[idx + 1] == quote:
+                buf.append(text[idx + 1])
+                idx += 2
+                continue
+            if ch == quote:
+                if idx + 1 < len(text) and text[idx + 1] == quote:
+                    buf.append(ch)
+                    idx += 2
+                    continue
+                quote = None
+            else:
+                buf.append(ch)
+            idx += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            in_token = True
+        elif ch.isspace():
+            if in_token:
+                tokens.append("".join(buf))
+                buf = []
+                in_token = False
+        else:
+            buf.append(ch)
+            in_token = True
+        idx += 1
+    if quote is not None:
+        return None
+    if in_token:
+        tokens.append("".join(buf))
+    return tokens
+
+
+def _command_tokens(command: object) -> list[str] | None:
+    if isinstance(command, (list, tuple)):
+        return [str(part) for part in command]
+    return _split_command_string(str(command or ""))
+
+
+def _clean_argument_token(token: str) -> str:
+    return token.strip().strip("'\"").strip("),;")
+
+
+def _clean_program_token(token: str) -> str:
+    clean = _clean_argument_token(token).lstrip("&")
+    if "(" in clean:
+        clean = clean.rsplit("(", 1)[-1]
+    return clean.strip("'\"()[]{}")
+
+
+def _program_basename(token: str) -> str:
+    clean = _clean_program_token(token)
+    return clean.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+
+
+def _python_program_kind(token: str) -> str | None:
+    clean = _clean_program_token(token).casefold()
+    base = _program_basename(token)
+    if clean in _PYTHON_ENV_COMMAND_TOKENS:
+        return "python"
+    if base in _PY_LAUNCHER_COMMAND_TOKENS:
+        return "py"
+    if base in _PYTHON_COMMAND_TOKENS:
+        return "python"
+    return None
+
+
+def _is_agenttalk_program(token: str) -> bool:
+    return _program_basename(token) in _AGENTTALK_COMMAND_TOKENS
+
+
+def _drop_shell_call_prefix(tokens: list[str]) -> list[str]:
+    while tokens and _clean_argument_token(tokens[0]) == "&":
+        tokens = tokens[1:]
+    return tokens
+
+
+def _is_python_attached_value_option(arg: str) -> bool:
+    return (
+        (arg.startswith("-X") and arg != "-X")
+        or (arg.startswith("-W") and arg != "-W")
+        or (arg.startswith("-Q") and arg != "-Q")
+        or arg.startswith("--check-hash-based-pycs=")
+    )
+
+
+def _is_python_flag_cluster(arg: str) -> bool:
+    return (
+        len(arg) > 1
+        and arg.startswith("-")
+        and not arg.startswith("--")
+        and all(ch in _PYTHON_FLAG_CHARS for ch in arg[1:])
+    )
+
+
+def _is_py_launcher_selector(arg: str) -> bool:
+    return _PY_LAUNCHER_SELECTOR_RE.match(arg) is not None or arg.startswith("-V:")
+
+
+def _bus_command_verb_after_agenttalk(args: list[str]) -> str | None:
+    idx = 0
+    while idx < len(args):
+        token = _clean_argument_token(args[idx])
+        if not token:
+            idx += 1
+            continue
+        low = token.casefold()
+        if any(low.startswith(f"{opt}=") for opt in _BUS_GLOBAL_OPTIONS_WITH_VALUE):
+            idx += 1
+            continue
+        if low in _BUS_GLOBAL_OPTIONS_WITH_VALUE:
+            if idx + 1 >= len(args):
+                return None
+            idx += 2
+            continue
+        if low.startswith("-"):
+            return None
+        return low
+    return None
+
+
+def _python_module_agenttalk_verb(args: list[str], program_kind: str) -> str | None:
+    # Scan only until Python's execution target is known. "-m agenttalk" counts
+    # before any target; "-m" after a script, "-c", "--", or stdin belongs to
+    # that target and must not classify a normal Python command as a bus write.
+    # Unknown dash-options fail open instead of scanning past them to a later "-m".
+    idx = 0
+    while idx < len(args):
+        arg = _clean_argument_token(args[idx])
+        if arg == "-m":
+            if idx + 1 >= len(args):
+                return None
+            if _clean_argument_token(args[idx + 1]).casefold() != "agenttalk":
+                return None
+            return _bus_command_verb_after_agenttalk(args[idx + 2:])
+        if arg.startswith("-m") and arg != "-m":
+            if arg[2:].casefold() != "agenttalk":
+                return None
+            return _bus_command_verb_after_agenttalk(args[idx + 1:])
+        if arg == "-c" or (arg.startswith("-c") and arg != "-c"):
+            return None
+        if arg in _PYTHON_TERMINATING_OPTIONS:
+            return None
+        if arg in ("--", "-"):
+            return None
+        if program_kind == "py" and _is_py_launcher_selector(arg):
+            idx += 1
+            continue
+        if arg in _PYTHON_SEPARATED_VALUE_OPTIONS:
+            if idx + 1 >= len(args):
+                return None
+            idx += 2
+            continue
+        if _is_python_attached_value_option(arg):
+            idx += 1
+            continue
+        if _is_python_flag_cluster(arg):
+            idx += 1
+            continue
+        if arg.startswith("-"):
+            return None
+        return None
+    return None
+
+
+def _launcher_payload_tokens(program: str, args: list[str]) -> list[str] | None:
+    base = _program_basename(program)
+    if base in _POWERSHELL_COMMAND_TOKENS:
+        switches = {"-command", "-c"}
+    elif base in _CMD_COMMAND_TOKENS:
+        switches = {"/c"}
+    elif base in _POSIX_SHELL_COMMAND_TOKENS:
+        switches = {"-c"}
+    else:
+        return None
+    for idx, arg in enumerate(args):
+        if _clean_argument_token(arg).casefold() in switches:
+            return args[idx + 1:] or None
+    return None
+
+
+def _bus_command_verb_from_tokens(tokens: list[str], depth: int = 0) -> str | None:
+    tokens = _drop_shell_call_prefix(tokens)
+    if not tokens:
+        return None
+    program, args = tokens[0], tokens[1:]
+    if _is_agenttalk_program(program):
+        return _bus_command_verb_after_agenttalk(args)
+    python_kind = _python_program_kind(program)
+    if python_kind is not None:
+        return _python_module_agenttalk_verb(args, python_kind)
+    if depth >= 3:
+        return None
+    payload = _launcher_payload_tokens(program, args)
+    if payload is None:
+        return None
+    if len(payload) == 1:
+        payload = _split_command_string(payload[0])
+        if payload is None:
+            return None
+    # Recognition completeness line: standard direct/python -m/py/one-level launcher
+    # forms with --root and normal \" / "" quoting are classified. Unknown globals,
+    # unknown interpreters, multi-level mixed escaping, pathological quotes, and
+    # launcher payloads that only echo/search an agenttalk string deliberately fail
+    # open; a masked odd reply is safer than false-disposing a healthy message.
+    return _bus_command_verb_from_tokens(payload, depth + 1)
+
+
+def _agenttalk_py() -> str:
+    return str(Path(sys.executable).resolve())
+
+
+def _child_env(workspace_root: str | os.PathLike[str] | None = None) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k != LEAD_LOOP_LEASE_ENV}
+    workspace = Path(workspace_root).resolve() if workspace_root else _workspace_root()
+    env["AGENTTALK_PY"] = _agenttalk_py()
+    env["AGENTTALK_ROOT"] = str(workspace)
+    return env
+
+
+def _workspace_root() -> Path:
+    root = os.environ.get("AGENTTALK_ROOT")
+    return Path(root).resolve() if root else Path.cwd().resolve()
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _looks_like_site_package_path(path: Path) -> bool:
+    parts = {p.lower() for p in path.parts}
+    return "site-packages" in parts or "dist-packages" in parts
+
+
+def _is_windows_shim(path: Path) -> bool:
+    return path.suffix.casefold() in _WINDOWS_SHIM_EXTENSIONS
+
+
+def _resolve_path_candidate(value: str, *, workspace_root: Path) -> Path | None:
+    raw = Path(value)
+    if raw.is_absolute():
+        candidate = raw
+    elif any(sep in value for sep in ("\\", "/")):
+        candidate = workspace_root / raw
+    else:
+        resolved = shutil.which(value)
+        candidate = Path(resolved) if resolved else None
+    if candidate is None:
+        return None
+    try:
+        candidate = candidate.resolve()
+    except OSError:
+        candidate = candidate.absolute()
+    return candidate
+
+
+def _resolve_known_npm_codex_shim(shim: Path) -> Path | None:
+    """Resolve only the known npm @openai/codex native Windows package layout."""
+    starts: list[Path] = []
+    parent = shim.parent
+    if parent.name.casefold() == ".bin":
+        starts.append(parent.parent / "@openai" / "codex")
+    else:
+        starts.append(parent / "node_modules" / "@openai" / "codex")
+    matches: list[Path] = []
+    for package_root in starts:
+        vendor = package_root / "node_modules" / "@openai" / "codex-win32-x64" / "vendor"
+        for triple in _NPM_CODEX_WIN32_X64_TRIPLES:
+            candidate = vendor / triple / "bin" / "codex.exe"
+            try:
+                is_file = candidate.is_file()
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if is_file:
+                matches.append(resolved)
+    unique = sorted({str(m): m for m in matches}.values(), key=str)
+    return unique[0] if len(unique) == 1 else None
+
+
+def _launch_blocked_summary(command: str, error: str, remediation: str) -> str:
+    return (
+        f"command={_compact_text(command)}; error={_compact_text(error)}; "
+        f"remediation={remediation}"
+    )
+
+
+def _self_probe_blocked_summary(argv: list[str], rc: int | None, output: str) -> str | None:
+    if rc == 0:
+        return None
+    return _launch_blocked_summary(
+        _format_argv(argv),
+        output or f"exit={rc if rc is not None else 'unknown'}",
+        "ensure AGENTTALK_PY names the Python executable that can run -m agenttalk; "
+        "for Codex workspace-write, explicitly opt in to the Python install directory "
+        "with codex --add-dir or an equivalent operator-managed writable_roots entry",
+    )
+
+
+def preflight_launch_runtime(
+    base_argv: list[str],
+    cli: str,
+    workspace_root: str | os.PathLike[str] | None = None,
+    child_env: dict[str, str] | None = None,
+    *,
+    runner: Callable[[list[str], str, dict[str, str], float], tuple[int | None, str]] | None = None,
+    timeout: float = 5.0,
+) -> LaunchPreflightResult:
+    """Resolve the per-turn CLI and probe the pinned agenttalk interpreter before any turn."""
+    workspace = Path(workspace_root).resolve() if workspace_root else _workspace_root()
+    env = dict(child_env) if child_env is not None else _child_env(workspace)
+    if not base_argv:
+        return LaunchPreflightResult([], _launch_blocked_summary(
+            "",
+            "missing base launch command",
+            "pass the real CLI executable after --",
+        ))
+
+    raw0 = str(base_argv[0])
+    override = env.get("AGENTTALK_CODEX") if cli == "codex" else None
+    candidate = _resolve_path_candidate(str(override or raw0), workspace_root=workspace)
+    if candidate is None:
+        return LaunchPreflightResult(list(base_argv), _launch_blocked_summary(
+            raw0,
+            "executable not found on PATH",
+            "pass an absolute real CLI executable after -- or set AGENTTALK_CODEX to the native codex.exe",
+        ))
+    if candidate.is_dir():
+        return LaunchPreflightResult(list(base_argv), _launch_blocked_summary(
+            str(candidate),
+            "resolved launch command is a directory",
+            "pass the real CLI executable file after --",
+        ))
+    if not candidate.exists():
+        return LaunchPreflightResult(list(base_argv), _launch_blocked_summary(
+            str(candidate),
+            "resolved executable does not exist",
+            "pass an absolute real CLI executable after --",
+        ))
+    if _is_windows_shim(candidate):
+        native = _resolve_known_npm_codex_shim(candidate) if cli == "codex" else None
+        if native is None:
+            return LaunchPreflightResult(list(base_argv), _launch_blocked_summary(
+                str(candidate),
+                "resolved launch command is a .cmd/.bat/.ps1 shim, which is not directly spawnable with shell=False",
+                "pass the native executable after -- or set AGENTTALK_CODEX to the native codex.exe",
+            ))
+        candidate = native
+
+    resolved_argv = [str(candidate), *base_argv[1:]]
+    py = env.get("AGENTTALK_PY") or _agenttalk_py()
+    probe_argv = [py, "-m", "agenttalk", "--version"]
+
+    def _default_runner(a: list[str], cwd: str, e: dict[str, str], t: float):
+        try:
+            proc = subprocess.run(  # noqa: S603  # nosec B603
+                a, cwd=cwd, env=e, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=t,
+            )
+            return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        except OSError as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+        except subprocess.SubprocessError as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+
+    run_probe = runner or _default_runner
+    rc, out = run_probe(probe_argv, str(workspace), env, timeout)
+    blocked = _self_probe_blocked_summary(probe_argv, rc, out)
+    return LaunchPreflightResult(resolved_argv, blocked)
+
+
+def agenttalk_runtime_config_blocked_summary(
+    resolved_file: str | None,
+    workspace_root: str | os.PathLike[str] | None = None,
+) -> str | None:
+    """Return a config-blocked summary when the pinned bus Python resolves badly."""
+    workspace = Path(workspace_root).resolve() if workspace_root else _workspace_root()
+    if not resolved_file:
+        return (
+            "command=$env:AGENTTALK_PY -c import agenttalk; error=agenttalk import resolved no "
+            "module file; remediation=install agenttalk non-editable into the runtime "
+            "Python used by AGENTTALK_PY, or run from the agenttalk workspace when "
+            "intentionally developing agenttalk"
+        )
+    path = Path(resolved_file).resolve()
+    if _looks_like_site_package_path(path):
+        return None
+    if _is_relative_to(path, workspace):
+        return None
+    return (
+        f"command=$env:AGENTTALK_PY -c import agenttalk; resolved_path={_compact_text(path)}; "
+        f"workspace={_compact_text(workspace)}; "
+        "error=agenttalk runtime resolved to an out-of-workspace source checkout; "
+        "remediation=install agenttalk non-editable into the runtime Python used by "
+        "AGENTTALK_PY, or run the agent from the agenttalk workspace when "
+        "intentionally developing agenttalk"
+    )
+
+
+def preflight_agenttalk_runtime(
+    *,
+    workspace_root: str | os.PathLike[str] | None = None,
+    runner: Callable[[list[str], str, dict[str, str], float], tuple[int | None, str]] | None = None,
+    timeout: float = 5.0,
+) -> str | None:
+    """Probe the pinned Python the child will use for bus commands."""
+    workspace = Path(workspace_root).resolve() if workspace_root else _workspace_root()
+    env = _child_env(workspace)
+    argv = [env["AGENTTALK_PY"], "-c", _AGENTTALK_IMPORT_PROBE]
+
+    def _default_runner(a: list[str], cwd: str, e: dict[str, str], t: float):
+        try:
+            proc = subprocess.run(  # noqa: S603,S607  # nosec B603
+                a, cwd=cwd, env=e, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=t,
+            )
+            return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        except OSError as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+        except subprocess.SubprocessError as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+
+    run_probe = runner or _default_runner
+    try:
+        rc, out = run_probe(argv, str(workspace), env, timeout)
+    except OSError as exc:
+        blocked = _runtime_config_blocked_summary(str(exc))
+        return blocked
+    if rc != 0:
+        blocked = _runtime_config_blocked_summary(out)
+        return blocked
+    resolved: str | None = None
+    for line in reversed((out or "").splitlines()):
+        try:
+            data = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        value = data.get("file") if isinstance(data, dict) else None
+        resolved = str(value) if value else None
+        break
+    if resolved is None:
+        return None
+    return agenttalk_runtime_config_blocked_summary(resolved, workspace)
 
 
 def _looks_like_exec_denied(text: str | None) -> bool:
     t = (text or "").lower()
-    return any(m in t for m in _EXEC_DENIAL_MARKERS)
+    return any(m in t for m in _EXEC_DENIAL_MARKERS) or _EXEC_DENIAL_CODE_RE.search(t) is not None
 
 
 def _is_exec_denied_exception(exc: OSError) -> bool:
@@ -118,45 +667,243 @@ def _is_exec_denied_exception(exc: OSError) -> bool:
     )
 
 
+def _spawn_config_blocked_subtype(exc: OSError) -> str | None:
+    if _is_exec_denied_exception(exc):
+        return "exec_denied"
+    if (
+        isinstance(exc, (FileNotFoundError, NotADirectoryError))
+        or getattr(exc, "errno", None) in (errno.ENOENT, errno.ENOEXEC)
+        or getattr(exc, "winerror", None) in _SPAWN_CONFIG_WINERRORS
+    ):
+        return "launch_cli"
+    return None
+
+
 def _spawn_config_blocked_summary(argv: list[str], exc: OSError) -> str | None:
-    if not _is_exec_denied_exception(exc):
+    subtype = _spawn_config_blocked_subtype(exc)
+    if subtype is None:
         return None
     return (
+        f"subtype={subtype}; "
         f"command={_compact_text(_format_argv(argv))}; "
         f"error={_compact_text(exc)}; "
-        "remediation=use python -m agenttalk for in-sandbox bus calls"
+        "remediation=use $env:AGENTTALK_PY -m agenttalk for in-sandbox bus calls and "
+        "configure the real CLI executable after --"
     )
+
+
+def _terminal_bus_command_candidates(line: str) -> list[str]:
+    candidates = [line]
+    low = line.casefold()
+    for marker in (" while running ", " running "):
+        idx = low.find(marker)
+        if idx >= 0:
+            candidates.append(line[idx + len(marker):])
+    return candidates
 
 
 def _terminal_config_blocked_summary(text: str | None) -> str | None:
     """Detect an OS exec denial tightly attached to a required bus write command."""
-    if not _looks_like_exec_denied(text):
-        return None
     lines = str(text or "").splitlines() or [str(text or "")]
     for idx, line in enumerate(lines):
-        match = _BUS_WRITE_COMMAND_RE.search(line)
-        if match is None:
+        command = next(
+            (candidate for candidate in _terminal_bus_command_candidates(line)
+             if _bus_command_verb(candidate) in _CLASSIFIED_BUS_VERBS),
+            None,
+        )
+        if command is None:
             continue
         window = "\n".join(lines[max(0, idx - 1):idx + 2])
+        bus = classify_bus_execution(command, window)
+        if bus["kind"] == BUS_KIND_CONFIG_BLOCKED:
+            return bus["summary"]
         if _looks_like_exec_denied(window):
             return (
-                f"command={_compact_text(match.group(0))}; "
+                f"command={_compact_text(command)}; "
                 f"error={_compact_text(window)}; "
-                "remediation=use python -m agenttalk for in-sandbox bus calls"
+                "remediation=use $env:AGENTTALK_PY -m agenttalk for in-sandbox bus calls"
             )
     return None
 
 
+def _runtime_config_blocked_summary(text: str | None) -> str | None:
+    t = str(text or "")
+    low = t.lower()
+    if "agenttalk" not in low:
+        return None
+    source_blocked = any(m in low for m in _OUT_OF_WORKSPACE_SOURCE_MARKERS)
+    import_denied = _looks_like_exec_denied(low) and _AGENTTALK_RUNTIME_RE.search(t)
+    missing_module = _AGENTTALK_MISSING_MODULE_RE.search(t) is not None
+    broken_import = _AGENTTALK_BROKEN_IMPORT_RE.search(t) is not None
+    if not source_blocked and not import_denied and not missing_module and not broken_import:
+        return None
+    return (
+        f"command=$env:AGENTTALK_PY -c import agenttalk; error={_compact_text(t)}; "
+        "remediation=install agenttalk non-editable into the runtime Python used by "
+        "AGENTTALK_PY, or run from the agenttalk workspace when intentionally "
+        "developing agenttalk"
+    )
+
+
+def _bus_command_verb(command: object) -> str | None:
+    tokens = _command_tokens(command)
+    if tokens is None:
+        return None
+    return _bus_command_verb_from_tokens(tokens)
+
+
+def _raw_command_item(raw_event: object) -> dict:
+    if not isinstance(raw_event, dict):
+        return {}
+    item = raw_event.get("item")
+    return item if isinstance(item, dict) else {}
+
+
+def _raw_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _raw_str(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _bus_exit_code(exit_status: object, raw_event: object) -> int | None:
+    code = _raw_int(exit_status)
+    if code is not None:
+        return code
+    item = _raw_command_item(raw_event)
+    for key in ("exit_code", "exitCode", "return_code", "returncode"):
+        code = _raw_int(item.get(key))
+        if code is not None:
+            return code
+    return None
+
+
+def _bus_tool_status(exit_status: object, raw_event: object) -> str | None:
+    status = _raw_str(exit_status)
+    if status is not None:
+        return status
+    item = _raw_command_item(raw_event)
+    for key in ("status", "state", "outcome"):
+        status = _raw_str(item.get(key))
+        if status is not None:
+            return status
+    return None
+
+
+def _bus_execution_failed(exit_status: object, raw_event: object) -> bool:
+    code = _bus_exit_code(exit_status, raw_event)
+    if code is not None:
+        return code != 0
+    item = _raw_command_item(raw_event)
+    for key in ("success", "ok"):
+        value = item.get(key)
+        if isinstance(value, bool):
+            return not value
+    status = _bus_tool_status(exit_status, raw_event)
+    return bool(status and status.casefold() in _FAILED_TOOL_STATUSES)
+
+
+def _semantic_bus_failure_subtype(verb: str, output: str, exit_code: int | None) -> str | None:
+    low = output.lower()
+    if verb in _CHECK_BUS_VERBS and exit_code in (3, 4):
+        return "check_safety_result"
+    if verb in _CHECK_BUS_VERBS and any(m in low for m in _AGENTTALK_CHECK_SAFETY_MARKERS):
+        return "check_safety_result"
+    if _AGENTTALK_ARGPARSE_RE.search(output):
+        return "argparse"
+    if any(m in low for m in _AGENTTALK_VALIDATION_MARKERS):
+        return "agenttalk_validation"
+    return None
+
+
+def _bus_result(kind: str, subtype: str, summary: str) -> dict[str, str]:
+    return {"kind": kind, "subtype": subtype, "summary": summary}
+
+
+def classify_bus_execution(
+    command: object,
+    output: object,
+    exit_status: object = None,
+    raw_event: object = None,
+) -> dict[str, str]:
+    """Classify a completed agenttalk bus command without inferring failure from text alone."""
+    command_text = _command_text(command)
+    verb = _bus_command_verb(command)
+    if verb is None:
+        return _bus_result(BUS_KIND_OK_OR_NO_SIGNAL, "out_of_scope", "")
+    if verb not in _CLASSIFIED_BUS_VERBS:
+        return _bus_result(BUS_KIND_OK_OR_NO_SIGNAL, "out_of_scope", "")
+    text = str(output or "")
+    runtime_blocked = _runtime_config_blocked_summary(text)
+    if runtime_blocked:
+        return _bus_result(BUS_KIND_CONFIG_BLOCKED, "agenttalk_runtime", runtime_blocked)
+    if _INTERPRETER_NOT_FOUND_RE.search(text):
+        return _bus_result(
+            BUS_KIND_CONFIG_BLOCKED,
+            "interpreter_not_found",
+            (
+                f"command={_compact_text(command_text)}; error={_compact_text(output)}; "
+                "remediation=install agenttalk non-editable into the runtime Python "
+                "used by AGENTTALK_PY, or fix AGENTTALK_PY for agenttalk bus commands"
+            ),
+        )
+    if _looks_like_exec_denied(text):
+        return _bus_result(
+            BUS_KIND_CONFIG_BLOCKED,
+            "exec_denied",
+            (
+                f"command={_compact_text(command_text)}; error={_compact_text(output)}; "
+                "remediation=use $env:AGENTTALK_PY -m agenttalk and fix sandbox/runtime "
+                "permissions for the agenttalk bus command"
+            ),
+        )
+    if verb in _BEST_EFFORT_BUS_VERBS:
+        return _bus_result(BUS_KIND_OK_OR_NO_SIGNAL, "best_effort", "")
+    exit_code = _bus_exit_code(exit_status, raw_event)
+    failed = _bus_execution_failed(exit_status, raw_event)
+    semantic = _semantic_bus_failure_subtype(verb, text, exit_code)
+    if semantic is not None and failed:
+        return _bus_result(
+            BUS_KIND_SEMANTIC_FAILURE,
+            semantic,
+            (
+                f"bus_write_semantic_failure subtype={semantic}; "
+                f"command={_compact_text(command_text)}; error={_compact_text(output)}; "
+                "remediation=correct the agenttalk bus command/request metadata and retry"
+            ),
+        )
+    if verb in _CHECK_BUS_VERBS:
+        return _bus_result(BUS_KIND_OK_OR_NO_SIGNAL, "check_non_config", "")
+    if verb not in _REQUIRED_BUS_WRITE_VERBS:
+        return _bus_result(BUS_KIND_OK_OR_NO_SIGNAL, "out_of_scope", "")
+    if failed:
+        return _bus_result(
+            BUS_KIND_UNKNOWN_FAILURE,
+            "required_write_unknown",
+            (
+                f"bus_write_failed_unknown; command={_compact_text(command_text)}; "
+                f"exit_status={exit_code if exit_code is not None else 'failed'}; "
+                f"error={_compact_text(output)}; remediation=inspect the bus command "
+                "output and retry with a corrected durable write"
+            ),
+        )
+    return _bus_result(BUS_KIND_OK_OR_NO_SIGNAL, "no_failed_execution_signal", "")
+
+
 def _tool_config_blocked_summary(tool: object, output: object) -> str | None:
-    command = str(tool or "")
-    if _BUS_WRITE_COMMAND_RE.search(command) is None:
+    command = _command_text(tool)
+    classification = classify_bus_execution(command, output)
+    if classification["kind"] == BUS_KIND_CONFIG_BLOCKED:
+        return classification["summary"]
+    if _bus_command_verb(command) not in _CLASSIFIED_BUS_VERBS:
         return None
     if not _looks_like_exec_denied(str(output or "")):
         return None
     return (
         f"command={_compact_text(command)}; "
         f"error={_compact_text(output)}; "
-        "remediation=use python -m agenttalk for in-sandbox bus calls"
+        "remediation=use $env:AGENTTALK_PY -m agenttalk for in-sandbox bus calls"
     )
 
 
@@ -449,6 +1196,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                render: bool = True, rules: str | None = None,
                clock: Callable[[], float] = time.monotonic,
                spawn: Callable[[list[str], str | None], Iterable[str]] | None = None,
+               agenttalk_preflight: Callable[[], str | None] | None = None,
                heartbeat: Callable[[], None] | None = None,
                persist: Callable[[object], None] | None = None,
                turn_watchdog: "TurnWatchdogConfig | None" = None,
@@ -535,6 +1283,11 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             return _ProcStream(argv, stdin_text, watchdog=turn_watchdog,
                                watchdog_snapshot_fn=watchdog_snapshot_fn,
                                watchdog_kill_fn=watchdog_kill_fn)
+    preflight = agenttalk_preflight
+    if preflight is None and cli == "codex" and spawn is None:
+        preflight = preflight_agenttalk_runtime
+    preflight_ok = False
+
     def _run_one(spec) -> dict:
         """Spawn ONE CLI invocation for ``spec`` and process its JSONL via the engine.
         Returns the raw turn SIGNALS for classification: ``{ok, started, completed,
@@ -545,7 +1298,16 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         argv = list(base_argv) + spec.args
         sig = {"ok": False, "started": False, "completed": False, "terminal": False,
                "retryable": False, "rc": None, "error": None, "terminal_text": "",
-               "config_blocked": False, "config_blocked_text": ""}
+               "config_blocked": False, "config_blocked_text": "", "bus_failure": None}
+        nonlocal preflight_ok
+        if preflight is not None and not preflight_ok:
+            blocked = preflight()
+            if blocked:
+                sig["config_blocked"] = True
+                sig["config_blocked_text"] = blocked
+                sig["error"] = blocked
+                return sig
+            preflight_ok = True
         try:
             stream = spawner(argv, spec.stdin)
             for line in stream:
@@ -572,10 +1334,15 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                             # be classed poison (lead verify P1).
                             sig["terminal_text"] = ev.text or sig["terminal_text"]
                     elif ev.type == EventType.TOOL_FINISHED:
-                        blocked = _tool_config_blocked_summary(ev.tool, ev.text)
-                        if blocked:
+                        bus = classify_bus_execution(ev.tool, ev.text, ev.exit_code, ev.raw)
+                        if bus["kind"] == BUS_KIND_CONFIG_BLOCKED:
                             sig["config_blocked"] = True
-                            sig["config_blocked_text"] = blocked
+                            sig["config_blocked_text"] = bus["summary"]
+                        elif bus["kind"] in (
+                            BUS_KIND_SEMANTIC_FAILURE,
+                            BUS_KIND_UNKNOWN_FAILURE,
+                        ):
+                            sig["bus_failure"] = bus
                     health_writer.event(ev)
                     engine.process(ev, clock())
         except OSError as e:
@@ -601,6 +1368,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             sig["completed"]
             and not sig["terminal"]
             and not sig["config_blocked"]
+            and sig["bus_failure"] is None
             and sig["rc"] in (0, None)
         )
         return sig
@@ -622,11 +1390,16 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         if sig.get("config_blocked"):
             summary = sig.get("config_blocked_text")
             return CLASS_CONFIG_BLOCKED, summary or "deterministic exec permission denied"
+        bus_failure = sig.get("bus_failure")
+        if isinstance(bus_failure, dict):
+            return CLASS_AMBIGUOUS, bus_failure.get("summary") or "bus write failed"
         if sig.get("error"):                       # spawn/exec OS error (missing binary, ...)
             return CLASS_INFRA, sig["error"]
         if sig.get("terminal"):
             text = sig.get("terminal_text") or ""
             blocked = _terminal_config_blocked_summary(text)
+            if blocked is None:
+                blocked = _runtime_config_blocked_summary(text)
             if blocked:
                 return CLASS_CONFIG_BLOCKED, blocked
             if _looks_like_infra(text):
@@ -770,6 +1543,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                        render: bool = True, rules: str | None = None,
                        clock: Callable[[], float] = time.monotonic,
                        spawn: Callable[[list[str], str | None], Iterable[str]] | None = None,
+                       agenttalk_preflight: Callable[[], str | None] | None = None,
                        heartbeat: Callable[[], None] | None = None,
                        persist: Callable[[object], None] | None = None,
                        ) -> Callable[[dict, list], bool]:
@@ -806,14 +1580,25 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
         min_interval=min_interval,
     )
     spawner = spawn or _ProcStream
+    preflight = agenttalk_preflight
+    if preflight is None and cli == "codex" and spawn is None:
+        preflight = preflight_agenttalk_runtime
+    preflight_ok = False
 
     def _run_one(spec) -> bool:
         """Spawn ONE CLI invocation for ``spec`` and stream its JSONL through the engine.
         True only if it reached a COMPLETED boundary, hit no terminal (non-retryable)
-        adapter_error, and the child exited cleanly. A spawn/exec OSError is a False turn
-        (never raised). No classification - cadence only needs ok / not-ok."""
+        adapter_error, produced no config-blocked bus tool output, and the child exited
+        cleanly. A spawn/exec OSError is a False turn (never raised). Cadence still returns
+        only ok / not-ok; classification is used only to avoid false success."""
         argv = list(base_argv) + spec.args
         started = completed = terminal = False
+        bus_failed = False
+        nonlocal preflight_ok
+        if preflight is not None and not preflight_ok:
+            if preflight():
+                return False
+            preflight_ok = True
         try:
             stream = spawner(argv, spec.stdin)
             for line in stream:
@@ -832,12 +1617,21 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                         completed = True
                     elif ev.type == EventType.ADAPTER_ERROR and not ev.retryable:
                         terminal = True
+                    elif ev.type == EventType.TOOL_FINISHED:
+                        bus = classify_bus_execution(ev.tool, ev.text, ev.exit_code, ev.raw)
+                        if bus["kind"] in (
+                            BUS_KIND_CONFIG_BLOCKED,
+                            BUS_KIND_SEMANTIC_FAILURE,
+                            BUS_KIND_UNKNOWN_FAILURE,
+                        ):
+                            bus_failed = True
                     engine.process(ev, clock())
-        except OSError:
+        except OSError as exc:
+            _ = _spawn_config_blocked_summary(argv, exc)
             return False
         rc = getattr(stream, "returncode", None)
         _ = started  # observed for parity with make_drive; cadence gates on completed
-        return completed and not terminal and rc in (0, None)
+        return completed and not terminal and not bus_failed and rc in (0, None)
 
     def cadence_drive(snapshot: dict, items: list) -> bool:
         prompt = _prompt.assemble_cadence_prompt(snapshot, items, rules=rules)

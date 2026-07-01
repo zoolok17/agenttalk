@@ -730,6 +730,7 @@ def build_report(store: Store, *, now_epoch: float,
             "waiting_deadline_epoch": (marker.get("deadline_epoch")
                                        if isinstance(marker, dict) else None),
             "restart_request": store.read_restart_request(a),
+            "config_blocked_hold": store.read_config_blocked_hold(a),
             "session_id": st.get("session_id"),  # supervisor-local; None unless state passed
         }
         # Managed lead-loop visibility (lead-loop Slice 1; additive, read-only).
@@ -1022,6 +1023,14 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     # working turn would not heartbeat, so keep the existing warn-only safety
     # behavior.
     if hb_stale:
+        config_blocked_hold = (
+            rpt.get("config_blocked_hold")
+            if isinstance(rpt.get("config_blocked_hold"), dict) else None
+        )
+        if config_blocked_hold is not None:
+            return _result(NONE, state="CONFIG_BLOCKED",
+                           reason="durable config_blocked hold marker is present; "
+                                  "HOLDING until operator repair or request-restart")
         # WP2: a managed lead-loop controller that exited DELIBERATELY leaves an EXIT
         # marker the planner honors instead of relaunching (the SYMMETRIC TWIN of the
         # manual-restart override above). A manual request-RESTART (section 0, above) is
@@ -1612,7 +1621,7 @@ CONFIG_TEMPLATE = """\
         "windows_args": ["{SESSION_ARGS}"],
         "_windows_args_codex": ["-C", "<cwd>", "{SESSION_ARGS}"]
       },
-      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS. The native codex.exe is also a FORKING launcher whose pid dies after handoff, so the supervisor records a discovered long-lived brain_pid only for session repair and scoped cleanup; heartbeat freshness is the liveness authority. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor runs Start-Process -FilePath <file> -ArgumentList <args> -WorkingDirectory <cwd> -PassThru AFTER applying env (AGENTTALK_ROOT + PYTHONPATH=<repo>/src on a source checkout + the per-agent env). The in-sandbox agent reaches the bus via `python -m agenttalk` (bare python + src on PYTHONPATH), NOT a baked absolute python and NOT the .agenttalk/bin shim - those stay SUPERVISOR-only (the supervisor's own bus calls). No Invoke-Expression.",
+      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS. The native codex.exe is also a FORKING launcher whose pid dies after handoff, so the supervisor records a discovered long-lived brain_pid only for session repair and scoped cleanup; heartbeat freshness is the liveness authority. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor runs Start-Process -FilePath <file> -ArgumentList <args> -WorkingDirectory <cwd> -PassThru AFTER applying env (AGENTTALK_ROOT + AGENTTALK_PY + PYTHONPATH=<repo>/src on a source checkout + the per-agent env). The in-sandbox agent reaches the bus via `& $env:AGENTTALK_PY -m agenttalk`; the .agenttalk/bin shim and AGENTTALK_PYTHON stay SUPERVISOR-only for the supervisor's own bus calls. If Codex workspace-write cannot execute the pinned Python path, opt in explicitly by adding the Python install directory to the Codex launch with `--add-dir <python-dir>` or equivalent config; do not grant that directory automatically. No Invoke-Expression.",
       "_comment_liveness": "heartbeat freshness is the liveness authority: fresh heartbeat is healthy; stale heartbeat recovers only when activity_hook=true, otherwise warn-only. Process snapshots, brain_pattern, and allow_launcher_self only help record session metadata and choose scoped kill targets. requires_brain_pid is retained as an accepted legacy key and no longer gates restart decisions. codex_home_isolation=true (recommended for codex when other codex run in the same project dir): launch with a per-agent SEEDED CODEX_HOME so `resume --last` is unambiguous. allow_launcher_self: set FALSE for a FORKING launcher (codex.exe spawns the real TUI then exits); TRUE when the launched exe IS the long-lived process.",
       "_comment_activity_hook": "Set activity_hook=true ONLY after installing the PostToolUse/Codex hook (supervise --install-activity-hook). Until then a stale heartbeat is warn-only (suspect), never a kill - so an un-instrumented agent is never mistaken for stuck. The hook runs `agenttalk heartbeat --hook` (soft: it can never block a tool call). For a NON-wrapped codex agent with activity_hook=true, the supervisor adds the GLOBAL --dangerously-bypass-hook-trust to the codex launch: the installed agenttalk hook changes codex's hook-trust hash and would otherwise PROMPT to re-trust on every unattended launch and strand the agent. This bypasses hook-trust for the supervisor's OWN hook, for controlled UNATTENDED supervision only (a wrapped codex does not use the activity hook and is unaffected)."
     },
@@ -1630,7 +1639,7 @@ CONFIG_TEMPLATE = """\
         "windows_file": "REPLACE: the PYTHON exe that runs agenttalk, e.g. C:\\\\Users\\\\you\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python314\\\\python.exe",
         "windows_args": ["-m", "agenttalk", "wrap", "--for", "AGENT_NAME_WRAPPED", "--cli", "codex", "--loop", "--", "REPLACE: the REAL codex.exe path - the wrapper drives it ONE turn per inbound message", "--disable", "hooks"]
       },
-      "_comment_wrapped": "WRAPPED is the RECOMMENDED / default supervised archetype for hands-off agents (the manual /agenttalk.listen agent above is supported but BEST-EFFORT/LEGACY: a resumed manual session may not re-enter the listen loop, never heartbeat, and hit the readiness give-up cap). The wrapped codex child is launched with `--disable hooks` by default (codex's safe default - the wrapper owns the heartbeat, so the codex activity hook is neither needed nor wanted, and disabling it sidesteps hook-trust prompts; remove it from windows_args if you intentionally want the child's project hooks). Set wrapped=true to supervise the agent THROUGH `agenttalk wrap --loop`: windows_file is the PYTHON exe (NOT the CLI exe), windows_args is the FIXED wrap command, and the REAL codex.exe/claude.exe goes at the tail after '--' (it is what windows_file would be for a manual agent). NO {SESSION_ARGS} token - the wrapper owns session continuity end-to-end (it persists + reloads the codex thread_id / claude session-id across its own turns AND across a supervisor relaunch, so a restart re-runs the identical wrap argv and reload-resumes). The wrapper python IS the long-lived supervised root, so brain discovery is RETIRED for wrapped agents (brain_pid stays null); the per-turn child (codex exec / claude -p) is reaped via the start-guarded managed_pids tree-kill. activity_hook is NOT needed: a wrapped agent is instrumented by construction (heartbeat on every idle bus-wait cycle + on streaming progress), so a stale heartbeat past grace RECOVERS (restart) instead of warn-only.",
+      "_comment_wrapped": "WRAPPED is the RECOMMENDED / default supervised archetype for hands-off agents (the manual /agenttalk.listen agent above is supported but BEST-EFFORT/LEGACY: a resumed manual session may not re-enter the listen loop, never heartbeat, and hit the readiness give-up cap). The wrapped codex child is launched with `--disable hooks` by default (codex's safe default - the wrapper owns the heartbeat, so the codex activity hook is neither needed nor wanted, and disabling it sidesteps hook-trust prompts; remove it from windows_args if you intentionally want the child's project hooks). Set wrapped=true to supervise the agent THROUGH `agenttalk wrap --loop`: windows_file is the PYTHON exe (NOT the CLI exe), windows_args is the FIXED wrap command, and the REAL codex.exe/claude.exe goes at the tail after '--' (it is what windows_file would be for a manual agent). NO {SESSION_ARGS} token - the wrapper owns session continuity end-to-end (it persists + reloads the codex thread_id / claude session-id across its own turns AND across a supervisor relaunch, so a restart re-runs the identical wrap argv and reload-resumes). The wrapper injects AGENTTALK_PY for model-side bus writes; for Codex workspace-write, add `--add-dir <python-dir>` to the codex tail only after auditing that explicit operator opt-in. The wrapper python IS the long-lived supervised root, so brain discovery is RETIRED for wrapped agents (brain_pid stays null); the per-turn child (codex exec / claude -p) is reaped via the start-guarded managed_pids tree-kill. activity_hook is NOT needed: a wrapped agent is instrumented by construction (heartbeat on every idle bus-wait cycle + on streaming progress), so a stale heartbeat past grace RECOVERS (restart) instead of warn-only.",
       "_comment_wrapped_stuck_after": "PER-CLI stuck_after_seconds (a per-agent stuck_after_seconds override ALWAYS wins; the global stuck_after_seconds is only the legacy/unclassified fallback). Defaults when unset: wrapped CLAUDE=180s, wrapped CODEX=2400s. WHY they differ: wrapped CLAUDE streams thinking+text+tool deltas and stays fresh through reasoning, so a tight threshold is fine; wrapped CODEX is ITEM-LEVEL (no exec --json event closes the pure-reasoning gap) so a long pure-reasoning stretch is SILENT between turn.started and the final agent_message. These are an OPERATIONAL false-positive tradeoff, NOT a provably-safe bound. TIMING-INVARIANT (v0.46.0): the per-turn watchdog (see turn_watchdog below) kills a HUNG TOOL DESCENDANT at turn_elapsed_seconds (default 1800); the supervisor stale-recovery MUST sit ABOVE that deadline + a 300s margin, else it would relaunch the wrapper into the same wedge before the watchdog fires. So the wrapped-codex default rose to 2400s and the planner now WARNS+REFUSES restart-on-stale (degrades to warn-only) when stuck_after_seconds <= turn_elapsed_seconds + 300, UNLESS allow_low_stuck_after=true. The older 600s floor guard also still applies. The value is never silently coerced. DO NOT try to tighten codex with a synthetic active-turn timer heartbeat: no intermediate exec --json event exists to confirm progress, so a timer would mark a silently-wedged turn healthy forever and defeat restart authority - the only levers are the per-CLI threshold + per-agent overrides + the per-turn watchdog.",
       "_comment_turn_watchdog": "PER-TURN WATCHDOG (v0.46.0, wrapped codex; default-ON for a continuous `wrap --loop --cli codex`). Fixes the wrapped-codex hang where Codex launches a tool descendant (codex.exe -> pwsh -> node REPL) that never exits, so the turn wedges forever. TWO-FACTOR fire (BOTH required, never a pure no-output timer): the turn has run >= turn_elapsed_seconds (default 1800) AND a LIVE non-codex tool descendant has been alive >= tool_descendant_alive_seconds (default 600). On fire it kills ONLY that per-turn child tree (start-time guarded) and the turn fails as ambiguous_or_unknown - the inbound message stays pending and rides the escalate/dead-letter ceiling; it is never poison. KNOWN LIMITATION: a LEGITIMATELY long-running tool (a real build/test alive > tool_descendant_alive_seconds inside a turn > turn_elapsed_seconds) WILL also be killed - the discriminator cannot tell a hung tool from a busy-legit long one. If your codex role runs genuinely long tools, RAISE turn_elapsed_seconds / tool_descendant_alive_seconds (and keep stuck_after_seconds above turn_elapsed_seconds + 300). Below the 1200s turn_elapsed floor the wrapper REFUSES the watchdog unless allow_low_turn_elapsed=true (never silently coerced). Set turn_watchdog.enabled=false to disable; a CPU-idle/no-progress refinement is a future enhancement.",
       "_comment_codex_home_isolation_provenance": "CONFIG PROVENANCE WARNING (codex_home_isolation): a seeded/isolated CODEX_HOME COPIES your operator BASE Codex config (including MCP servers and tool definitions) and then runs the agent UNATTENDED with approval_policy=never. So any inherited MCP server or tool will execute HEADLESSLY with no human prompt - an interactive/REPL-style MCP entry (or a tool that spawns a long-lived REPL) can wedge a turn (this is the failure mode the per-turn watchdog backstops). Audit the inherited config and keep ONLY headless-safe MCP/tools for an unattended supervised codex. The supervisor does NOT strip inherited config (a future doctor rule may flag known-interactive patterns).",
@@ -1786,6 +1795,32 @@ function Seed-CodexHome($name, $sandbox) {
   if (-not $ok) { Write-Warning ("supervisor: {0}: seeded CODEX_HOME missing auth/config/agenttalk-listen skill - failing closed" -f $name); return $null }
   return $isoHome
 }
+function Test-WrappedBaseCli($name) {
+  $a = $cfg.agents.$name
+  $args = @($a.launch.windows_args)
+  $sep = [array]::IndexOf($args, '--')
+  if ($sep -lt 0 -or ($sep + 1) -ge $args.Count) {
+    Write-Warning ("supervisor: {0}: CONFIG ERROR - wrapped launch has no real CLI tail after --; NOT launching (fail closed)" -f $name)
+    return $false
+  }
+  $base = [string]$args[$sep + 1]
+  if (-not $base -or $base -like 'REPLACE:*') {
+    Write-Warning ("supervisor: {0}: CONFIG ERROR - wrapped launch CLI tail is not filled in; NOT launching (fail closed)" -f $name)
+    return $false
+  }
+  $cmd = Get-Command $base -ErrorAction SilentlyContinue
+  $resolved = if ($cmd) { $cmd.Source } else { $base }
+  $ext = [IO.Path]::GetExtension([string]$resolved).ToLowerInvariant()
+  if ($ext -in @('.cmd','.bat','.ps1')) {
+    Write-Warning ("supervisor: {0}: CONFIG ERROR - wrapped launch CLI tail resolves to shim '{1}', not a native executable; NOT launching (fail closed)" -f $name, $resolved)
+    return $false
+  }
+  if (-not (Test-Path $resolved -PathType Leaf -ErrorAction SilentlyContinue)) {
+    Write-Warning ("supervisor: {0}: CONFIG ERROR - wrapped launch CLI tail '{1}' was not found; NOT launching (fail closed)" -f $name, $resolved)
+    return $false
+  }
+  return $true
+}
 function Preflight($name, $plan, $file, $codexHome) {
   # Smoke-test that the agent can invoke agenttalk in the EXACT seeded mode
   # BEFORE we launch - so a broken config FAILS CLOSED here instead of burning
@@ -1793,29 +1828,31 @@ function Preflight($name, $plan, $file, $codexHome) {
   try {
     if ($plan.launch_mode -eq 'wrap') {
       # WRAPPED agent: $file is the PYTHON wrapper exe (it runs `agenttalk wrap
-      # --loop`), NOT the CLI - so smoke-test that THIS python can import agenttalk
-      # in the launch env (PYTHONPATH src on a checkout; the seeded CODEX_HOME
-      # applied for a wrapped codex so the env matches what the wrapper's child
-      # codex inherits). Do NOT run the codex CLI smoke-test here - $file is
-      # python, not codex (using $file also validates the CONFIGURED wrapper
-      # python for a wrapped claude, not the ambient python).
+      # --loop`), NOT the CLI. Smoke-test both the configured wrapper python and
+      # the pinned AGENTTALK_PY interpreter, then validate that the fixed argv tail
+      # after -- names a real CLI executable instead of a shim.
       $saved = $env:CODEX_HOME; $savedPP = $env:PYTHONPATH
       if ($codexHome) { $env:CODEX_HOME = $codexHome }
       if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
       try {
         & $file -m agenttalk --version | Out-Null
         $rc = $LASTEXITCODE
+        if ($rc -eq 0) {
+          & $AgenttalkPython -m agenttalk --version | Out-Null
+          $rc = $LASTEXITCODE
+        }
       } finally {
         if ($null -eq $saved) { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue } else { $env:CODEX_HOME = $saved }
         if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP }
       }
-      if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - wrapped preflight (python -m agenttalk --version) exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
+      if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - wrapped preflight (AGENTTALK_PY -m agenttalk --version) exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
+      if (-not (Test-WrappedBaseCli $name)) { return $false }
       return $true
     }
     if ($plan.cli -eq 'codex') {
       # Plain import hard gate under the Codex launch env: set the seeded CODEX_HOME
       # + PYTHONPATH (src on a checkout, the SAME way Launch() does) and run
-      # `python -m agenttalk --version` - exactly how the supervised agent reaches
+      # `AGENTTALK_PY -m agenttalk --version` - exactly how the supervised agent reaches
       # the bus. We deliberately do NOT run `codex sandbox ...` as a launch gate:
       # that subcommand's flags drift across Codex CLI releases (field Codex moved
       # to `sandbox windows ...` / `--permissions-profile` and dropped `-P`), and a
@@ -1825,21 +1862,21 @@ function Preflight($name, $plan, $file, $codexHome) {
       $saved = $env:CODEX_HOME; $savedPP = $env:PYTHONPATH
       if ($codexHome) { $env:CODEX_HOME = $codexHome }
       if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
-      try { & python -m agenttalk --version | Out-Null; $rc = $LASTEXITCODE }
+      try { & $AgenttalkPython -m agenttalk --version | Out-Null; $rc = $LASTEXITCODE }
       finally {
         if ($null -eq $saved) { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue } else { $env:CODEX_HOME = $saved }
         if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP }
       }
-      if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - preflight `python -m agenttalk --version` exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
+      if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - preflight `AGENTTALK_PY -m agenttalk --version` exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
       return $true
     } else {
-      # claude / generic: confirm `python -m agenttalk` resolves with the src on
+      # claude / generic: confirm `AGENTTALK_PY -m agenttalk` resolves with the src on
       # PYTHONPATH (the in-sandbox-robust invocation the skills use).
       $savedPP = $env:PYTHONPATH
       if ($SrcOnPyPath) { $env:PYTHONPATH = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
-      try { & python -m agenttalk --version | Out-Null; $rc = $LASTEXITCODE }
+      try { & $AgenttalkPython -m agenttalk --version | Out-Null; $rc = $LASTEXITCODE }
       finally { if ($null -eq $savedPP) { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $savedPP } }
-      if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - preflight `python -m agenttalk --version` exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
+      if ($rc -ne 0) { Write-Warning ("supervisor: {0}: CONFIG ERROR - preflight `AGENTTALK_PY -m agenttalk --version` exited {1}; NOT launching (fail closed)" -f $name, $rc); return $false }
       return $true
     }
   } catch {
@@ -1869,13 +1906,11 @@ function Launch($name, $plan, $codexHome) {
     if ($x -eq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ($x -replace '<cwd>', $a.cwd) }
   }
   # Apply the agent's env, launch the REAL executable directly with -PassThru,
-  # then RESTORE the supervisor's own env. The IN-SANDBOX agent reaches the bus
-  # via `python -m agenttalk` (bare python + src on PYTHONPATH) - so we do NOT
-  # bake the absolute AGENTTALK_PYTHON into the AGENT's env (it's an
-  # outside-workspace path the sandbox DENIES; blocker #2 point 8). The baked
-  # shim + AGENTTALK_PYTHON stay SUPERVISOR-only (the supervisor's own bus calls).
+  # then RESTORE the supervisor's own env. The in-sandbox agent reaches the bus
+  # via the explicit AGENTTALK_PY pin; AGENTTALK_PYTHON remains supervisor-only
+  # for the .agenttalk/bin shim.
   $saved = @{}
-  $applied = @{ AGENTTALK_ROOT = $Root }
+  $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }
   if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }  # per-agent isolated home
   if ($a.env) { foreach ($k in $a.env.PSObject.Properties.Name) { $applied[$k] = $a.env.$k } }
@@ -1908,7 +1943,7 @@ function Launch-Spec($name, $spec, $codexHome) {
   }
   $argv = @($spec.launch.windows_args)
   $saved = @{}
-  $applied = @{ AGENTTALK_ROOT = $Root }
+  $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }
   if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }
   if ($spec.env) { foreach ($k in $spec.env.PSObject.Properties.Name) { $applied[$k] = $spec.env.$k } }

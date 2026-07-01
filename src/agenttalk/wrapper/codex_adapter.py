@@ -51,9 +51,13 @@ def _map_item(etype: str, item: object, obj: dict) -> list[Event]:
     if itype == "command_execution":
         cmd = item.get("command")
         if etype == "item.started":
-            return [Event(EventType.TOOL_STARTED, tool=cmd, raw=obj)]
+            return [Event(EventType.TOOL_STARTED, tool=cmd,
+                          exit_code=_int_or_none(item.get("exit_code")),
+                          tool_status=_str_or_none(item.get("status")), raw=obj)]
         return [Event(EventType.TOOL_FINISHED, tool=cmd,
-                      text=item.get("aggregated_output"), raw=obj)]
+                      text=item.get("aggregated_output"),
+                      exit_code=_int_or_none(item.get("exit_code")),
+                      tool_status=_str_or_none(item.get("status")), raw=obj)]
     if itype == "agent_message":
         # only the COMPLETED message carries text (item-level; no deltas). This
         # text is the degraded detector's scan target.
@@ -67,3 +71,11 @@ def _map_item(etype: str, item: object, obj: dict) -> list[Event]:
                       retryable=True, raw=obj)]
     # unknown item type: ignore (a telemetry layer could log it).
     return []
+
+
+def _int_or_none(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _str_or_none(value: object) -> str | None:
+    return value if isinstance(value, str) else None

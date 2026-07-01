@@ -79,6 +79,8 @@ def test_codex_adapter_tool_sample() -> None:
     # thread.started maps to nothing; tool carries the command + finished output.
     assert evs[1].tool == "<powershell python --version>"
     assert evs[2].text == "Python 3.10.11\r\n"
+    assert evs[2].exit_code == 0
+    assert evs[2].tool_status == "completed"
     assert evs[3].text == "catalog complete."
 
 

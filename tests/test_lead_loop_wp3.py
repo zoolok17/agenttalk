@@ -369,6 +369,21 @@ def _codex_completed_lines() -> list[str]:
     ]]
 
 
+def _codex_cadence_bus_output_lines(output: str, exit_code: int | None = None) -> list[str]:
+    item = {"type": "command_execution",
+            "command": "python -m agenttalk reply --to-request rq-1 --file out.md",
+            "aggregated_output": output}
+    if exit_code is not None:
+        item["exit_code"] = exit_code
+        item["status"] = "completed"
+    return [json.dumps(o) for o in [
+        {"type": "thread.started", "thread_id": "t-cad"},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": item},
+        {"type": "turn.completed"},
+    ]]
+
+
 def test_make_cadence_drive_completed_true_no_ledger(tmp_path: Path) -> None:
     s = _store(tmp_path)
     st = session.SessionState(cli="codex")
@@ -389,6 +404,93 @@ def test_make_cadence_drive_incomplete_false(tmp_path: Path) -> None:
                                 spawn=lambda a, i: [], clock=lambda: 0.0, render=False)
     assert cd({"agent": "beta"}, [{"type": "dead_letter"}]) is False   # no completed boundary
     assert s.dead_letter_attempts("beta")["messages"] == {}            # still no ledger touch
+
+
+def test_make_cadence_drive_bus_config_blocked_output_false_no_heartbeat(
+    tmp_path: Path,
+) -> None:
+    for output in (
+        "Access is denied",
+        "ModuleNotFoundError: No module named 'agenttalk'",
+    ):
+        s = _store(tmp_path / output.split(":", 1)[0].replace(" ", "_").replace("'", ""))
+        st = session.SessionState(cli="codex")
+        cd = run.make_cadence_drive(
+            s,
+            "beta",
+            "codex",
+            st,
+            ["codex"],
+            spawn=lambda _a, _i, o=output: _codex_cadence_bus_output_lines(o),
+            clock=lambda: 0.0,
+            render=False,
+        )
+        assert cd({"agent": "beta"}, [{"type": "dead_letter"}]) is False
+        assert s.read_heartbeat("beta") is None
+        assert s.dead_letter_attempts("beta")["messages"] == {}
+
+
+def test_make_cadence_drive_required_bus_unknown_nonzero_false_no_heartbeat(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex")
+    cd = run.make_cadence_drive(
+        s,
+        "beta",
+        "codex",
+        st,
+        ["codex"],
+        spawn=lambda _a, _i: _codex_cadence_bus_output_lines(
+            "novel durable write failure", exit_code=17),
+        clock=lambda: 0.0,
+        render=False,
+    )
+    assert cd({"agent": "beta"}, [{"type": "dead_letter"}]) is False
+    assert s.read_heartbeat("beta") is None
+    assert s.dead_letter_attempts("beta")["messages"] == {}
+
+
+def test_make_cadence_drive_required_bus_semantic_nonzero_false_no_heartbeat(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex")
+    cd = run.make_cadence_drive(
+        s,
+        "beta",
+        "codex",
+        st,
+        ["codex"],
+        spawn=lambda _a, _i: _codex_cadence_bus_output_lines(
+            "usage: agenttalk reply [-h]\nerror: unrecognized arguments: --bad-flag",
+            exit_code=2,
+        ),
+        clock=lambda: 0.0,
+        render=False,
+    )
+    assert cd({"agent": "beta"}, [{"type": "dead_letter"}]) is False
+    assert s.read_heartbeat("beta") is None
+
+
+def test_make_cadence_drive_required_bus_unknown_without_signal_success(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex")
+    cd = run.make_cadence_drive(
+        s,
+        "beta",
+        "codex",
+        st,
+        ["codex"],
+        spawn=lambda _a, _i: _codex_cadence_bus_output_lines(
+            "novel durable write failure"),
+        clock=lambda: 0.0,
+        render=False,
+    )
+    assert cd({"agent": "beta"}, [{"type": "dead_letter"}]) is True
+    assert s.read_heartbeat("beta") is not None
 
 
 # ----------------------------------------------------------- cli wiring (the real hook)

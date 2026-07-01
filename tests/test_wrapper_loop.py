@@ -6,7 +6,9 @@ fixture Store + injected drive/spawn - NO real CLI.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import re
+import sys
 
 import pytest
 
@@ -84,9 +86,9 @@ def test_prompt_is_pure_handler_no_consume_full_classification_and_safety() -> N
     # Sending IS the model's job (kept).
     assert "you may send" in low
     for cmd in ("reply", "send", "escalate", "composing", "check"):
-        assert f"python -m agenttalk {cmd}" in low
+        assert f'& "$env:agenttalk_py" -m agenttalk {cmd}' in low
     assert not re.search(
-        r"(?<!python -m )\bagenttalk (reply|send|escalate|composing|check)\b",
+        r"(?<!-m )\bagenttalk (reply|send|escalate|composing|check)\b",
         p,
     )
 
@@ -100,9 +102,9 @@ def test_cadence_prompt_has_bus_contract_and_no_bare_send_commands() -> None:
     assert "never cd to, import from, or reference an agenttalk source checkout outside" in low
     assert "installed/runtime package" in low
     for cmd in ("reply", "send", "escalate", "composing"):
-        assert f"python -m agenttalk {cmd}" in low
+        assert f'& "$env:agenttalk_py" -m agenttalk {cmd}' in low
     assert not re.search(
-        r"(?<!python -m )\bagenttalk (reply|send|escalate|composing|check)\b",
+        r"(?<!-m )\bagenttalk (reply|send|escalate|composing|check)\b",
         p,
     )
 
@@ -435,8 +437,8 @@ def test_make_drive_classifies_failures_for_dead_letter(tmp_path) -> None:
     # POSITIVELY matches a message-content signature (size / content-policy); a 529/rate-limit
     # or edge-block terminal is an OUTAGE -> INFRA (never false-DL at cap 3), and an
     # unrecognized terminal cause is AMBIGUOUS (lead-verify P1 + codex ruling). A partial
-    # stream (started, no completion) is AMBIGUOUS; a generic spawn/exec OSError is INFRA;
-    # a deterministic spawn permission denial is CONFIG_BLOCKED.
+    # stream (started, no completion) is AMBIGUOUS; launch-spawn lookup errors and
+    # deterministic spawn permission denials are CONFIG_BLOCKED.
     rec = {"from": "a", "kind": "message", "body": "x",
            "correlation_id": None, "request_id": None, "broadcast_id": None}
 
@@ -489,13 +491,413 @@ def test_make_drive_classifies_failures_for_dead_letter(tmp_path) -> None:
         raise FileNotFoundError("no codex binary")
 
     o_spawn = _drive(_boom)(rec)
-    assert o_spawn.ok is False and o_spawn.failure_class == loop.CLASS_INFRA
+    assert o_spawn.ok is False and o_spawn.failure_class == loop.CLASS_CONFIG_BLOCKED
+    assert "subtype=launch_cli" in o_spawn.summary
 
     def _denied(a, i):
         raise PermissionError(13, "Access is denied")
 
     o_denied = _drive(_denied)(rec)
     assert o_denied.ok is False and o_denied.failure_class == loop.CLASS_CONFIG_BLOCKED
+
+
+def test_agenttalk_runtime_path_preflight_classifies_install_and_source_paths(
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    site_pkg = tmp_path / "venv" / "Lib" / "site-packages" / "agenttalk" / "__init__.py"
+    site_pkg.parent.mkdir(parents=True)
+    site_pkg.write_text("# installed\n", encoding="utf-8")
+    assert run.agenttalk_runtime_config_blocked_summary(str(site_pkg), workspace) is None
+
+    outside = tmp_path / "sibling-agenttalk" / "src" / "agenttalk" / "__init__.py"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("# source\n", encoding="utf-8")
+    blocked = run.agenttalk_runtime_config_blocked_summary(str(outside), workspace)
+    assert blocked is not None
+    assert "out-of-workspace source checkout" in blocked
+    assert "install agenttalk non-editable" in blocked
+
+    in_workspace = workspace / "vendor" / "agenttalk-src" / "src" / "agenttalk" / "__init__.py"
+    in_workspace.parent.mkdir(parents=True)
+    in_workspace.write_text("# editable inside workspace\n", encoding="utf-8")
+    assert run.agenttalk_runtime_config_blocked_summary(str(in_workspace), workspace) is None
+
+    repo = tmp_path / "agenttalk"
+    (repo / "src" / "agenttalk").mkdir(parents=True)
+    (repo / "src" / "agenttalk" / "__init__.py").write_text("# source\n", encoding="utf-8")
+    (repo / "pyproject.toml").write_text('[project]\nname = "agenttalk"\n', encoding="utf-8")
+    assert run.agenttalk_runtime_config_blocked_summary(
+        str(repo / "src" / "agenttalk" / "__init__.py"),
+        repo,
+    ) is None
+
+
+def test_agenttalk_runtime_preflight_uses_workspace_cwd_and_reports_bad_source(
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "sibling-agenttalk" / "src" / "agenttalk" / "__init__.py"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("# source\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    def runner(argv, cwd, env, timeout):
+        seen["argv"] = argv
+        seen["cwd"] = cwd
+        seen["env"] = env
+        seen["timeout"] = timeout
+        return 0, json.dumps({"file": str(outside)})
+
+    blocked = run.preflight_agenttalk_runtime(workspace_root=workspace, runner=runner)
+    assert seen["argv"][0] == seen["env"]["AGENTTALK_PY"]
+    assert seen["argv"][1] == "-c"
+    assert seen["cwd"] == str(workspace.resolve())
+    assert "AGENTTALK_LEAD_LOOP_LEASE" not in seen["env"]
+    assert seen["env"]["AGENTTALK_ROOT"] == str(workspace.resolve())
+    assert blocked is not None
+    assert str(outside.resolve()) in blocked
+    assert "install agenttalk non-editable" in blocked
+
+
+def test_child_env_stamps_pin_root_and_strips_lease(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENTTALK_LEAD_LOOP_LEASE", "secret")
+    env = run._child_env(tmp_path)
+    assert env["AGENTTALK_PY"] == str(Path(sys.executable).resolve())
+    assert env["AGENTTALK_ROOT"] == str(tmp_path.resolve())
+    assert "AGENTTALK_LEAD_LOOP_LEASE" not in env
+
+
+def test_launch_preflight_resolves_known_npm_codex_shim_and_blocks_unknown(
+    tmp_path,
+) -> None:
+    shim = tmp_path / "node_modules" / ".bin" / "codex.cmd"
+    shim.parent.mkdir(parents=True)
+    shim.write_text("@echo off\r\n", encoding="utf-8")
+    native = (
+        tmp_path
+        / "node_modules"
+        / "@openai"
+        / "codex"
+        / "node_modules"
+        / "@openai"
+        / "codex-win32-x64"
+        / "vendor"
+        / "x86_64-pc-windows-msvc"
+        / "bin"
+        / "codex.exe"
+    )
+    native.parent.mkdir(parents=True)
+    native.write_text("", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    def ok_runner(argv, cwd, env, timeout):
+        seen["argv"] = argv
+        seen["cwd"] = cwd
+        seen["env"] = env
+        seen["timeout"] = timeout
+        return 0, "agenttalk 0.test"
+
+    env = {"AGENTTALK_PY": sys.executable, "AGENTTALK_ROOT": str(tmp_path)}
+    res = run.preflight_launch_runtime(
+        [str(shim), "exec"], "codex", tmp_path, env, runner=ok_runner)
+    assert res.blocked is None
+    assert res.argv == [str(native.resolve()), "exec"]
+    assert seen["argv"] == [sys.executable, "-m", "agenttalk", "--version"]
+
+    unknown = tmp_path / "other" / "codex.cmd"
+    unknown.parent.mkdir()
+    unknown.write_text("@echo off\r\n", encoding="utf-8")
+    blocked = run.preflight_launch_runtime(
+        [str(unknown)], "codex", tmp_path, env, runner=ok_runner)
+    assert blocked.blocked is not None
+    assert ".cmd/.bat/.ps1 shim" in blocked.blocked
+
+
+def test_launch_preflight_rejects_planted_nested_vendor_codex(tmp_path) -> None:
+    shim = tmp_path / "node_modules" / ".bin" / "codex.cmd"
+    shim.parent.mkdir(parents=True)
+    shim.write_text("@echo off\r\n", encoding="utf-8")
+    planted = (
+        tmp_path
+        / "node_modules"
+        / "@openai"
+        / "codex"
+        / "node_modules"
+        / "@openai"
+        / "codex-win32-x64"
+        / "vendor"
+        / "OTHER"
+        / "bin"
+        / "codex.exe"
+    )
+    planted.parent.mkdir(parents=True)
+    planted.write_text("", encoding="utf-8")
+
+    def ok_runner(_argv, _cwd, _env, _timeout):
+        return 0, "agenttalk 0.test"
+
+    env = {"AGENTTALK_PY": sys.executable, "AGENTTALK_ROOT": str(tmp_path)}
+    res = run.preflight_launch_runtime(
+        [str(shim)], "codex", tmp_path, env, runner=ok_runner)
+    assert res.blocked is not None
+    assert ".cmd/.bat/.ps1 shim" in res.blocked
+
+
+def test_launch_preflight_uses_agenttalk_codex_override(tmp_path) -> None:
+    native = tmp_path / "codex.exe"
+    native.write_text("", encoding="utf-8")
+    env = {
+        "AGENTTALK_PY": sys.executable,
+        "AGENTTALK_ROOT": str(tmp_path),
+        "AGENTTALK_CODEX": str(native),
+    }
+
+    def ok_runner(_argv, _cwd, _env, _timeout):
+        return 0, "agenttalk 0.test"
+
+    res = run.preflight_launch_runtime(
+        ["codex", "exec"], "codex", tmp_path, env, runner=ok_runner)
+    assert res.blocked is None
+    assert res.argv == [str(native.resolve()), "exec"]
+
+
+def test_agenttalk_runtime_preflight_ignores_ambiguous_probe_failures(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def os_error_runner(_argv, _cwd, _env, _timeout):
+        raise OSError("temporary process launch failure")
+
+    assert run.preflight_agenttalk_runtime(
+        workspace_root=workspace,
+        runner=os_error_runner,
+    ) is None
+
+    def transient_rc_runner(_argv, _cwd, _env, _timeout):
+        return 1, "temporary import timeout"
+
+    assert run.preflight_agenttalk_runtime(
+        workspace_root=workspace,
+        runner=transient_rc_runner,
+    ) is None
+
+    def malformed_runner(_argv, _cwd, _env, _timeout):
+        return 0, "not json"
+
+    assert run.preflight_agenttalk_runtime(
+        workspace_root=workspace,
+        runner=malformed_runner,
+    ) is None
+
+
+def test_agenttalk_runtime_preflight_parks_denied_source_probe(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    denied = tmp_path / "sibling-agenttalk" / "src" / "agenttalk" / "__init__.py"
+    text = (
+        "Traceback: import agenttalk failed: Access is denied: "
+        f"{denied}"
+    )
+
+    def denied_runner(_argv, _cwd, _env, _timeout):
+        return 1, text
+
+    blocked = run.preflight_agenttalk_runtime(
+        workspace_root=workspace,
+        runner=denied_runner,
+    )
+    assert blocked is not None
+    assert "Access is denied" in blocked
+    assert "install agenttalk non-editable" in blocked
+
+
+def test_agenttalk_runtime_preflight_parks_missing_module_probe(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def missing_runner(_argv, _cwd, _env, _timeout):
+        return 1, "ModuleNotFoundError: No module named 'agenttalk'"
+
+    blocked = run.preflight_agenttalk_runtime(
+        workspace_root=workspace,
+        runner=missing_runner,
+    )
+    assert blocked is not None
+    assert "No module named" in blocked
+    assert "install agenttalk non-editable" in blocked
+
+
+def test_classify_bus_execution_contract_matrix() -> None:
+    cases = [
+        ("python -m agenttalk reply --to-request rq-1", "Access is denied", None,
+         run.BUS_KIND_CONFIG_BLOCKED),
+        ("python -m agenttalk reply --to-request rq-1",
+         "ModuleNotFoundError: No module named 'agenttalk'", None,
+         run.BUS_KIND_CONFIG_BLOCKED),
+        ("python -m agenttalk reply --to-request rq-1",
+         "python is not recognized as an internal or external command", None,
+         run.BUS_KIND_CONFIG_BLOCKED),
+        ("python -m agenttalk reply --to-request rq-1",
+         "agenttalk runtime preflight failed: resolved_path=D:\\sibling\\agenttalk\\src\\"
+         "agenttalk\\__init__.py is outside the workspace", None,
+         run.BUS_KIND_CONFIG_BLOCKED),
+        ("python -m agenttalk reply --to-request rq-1",
+         "Traceback: SyntaxError in D:\\sibling\\agenttalk\\src\\agenttalk\\__init__.py",
+         None, run.BUS_KIND_CONFIG_BLOCKED),
+        ("python -m agenttalk reply --to-request rq-1",
+         "CreateProcess error 2: python.exe could not be started", None,
+         run.BUS_KIND_CONFIG_BLOCKED),
+        ("python -m agenttalk reply --to-request rq-1", "novel durable write failure", 7,
+         run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -magenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("py -3 -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("py -3.14 -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("py -V:3.14 -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -X utf8 -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -Xutf8 -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -X=utf8 -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -W ignore -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -Wignore -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -bb -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -OO -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -vvv -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -Es -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -P -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -EP -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -I -P -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("py -3.14 -P -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -m agenttalk --root D:\\repo reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -m agenttalk --root=D:\\repo send --to lead",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ('python -m agenttalk --root="D:\\Repo Root" reply --to-request rq-1',
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -m agenttalk --root 'D:\\Repo Root' reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        (["python", "-m", "agenttalk", "--root", "D:\\Repo Root", "reply",
+          "--to-request", "rq-1"],
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("agenttalk.cmd --root D:\\repo reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("cmd.exe /c python -m agenttalk --root D:\\repo escalate --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ('cmd.exe /c "python -m agenttalk --root D:\\repo reply --to-request rq-1"',
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ('cmd.exe /c "python -m agenttalk --root=\'D:\\Repo Root\' reply --to-request rq-1"',
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ('cmd.exe /c "python -m agenttalk --root \\"D:\\Repo Root\\" reply --to-request rq-1"',
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ('cmd.exe /c "python -m agenttalk --root ""D:\\Repo Root"" reply --to-request rq-1"',
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        (["cmd.exe", "/c", "python", "-m", "agenttalk", "--root", "D:\\Repo Root",
+          "reply", "--to-request", "rq-1"],
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ('pwsh.exe -Command "python -m agenttalk --root=\'D:\\Repo Root\' reply --to-request rq-1"',
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ('bash -c "python -m agenttalk --root=\'/tmp/Repo Root\' reply --to-request rq-1"',
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        (["powershell", "-Command", "& $env:AGENTTALK_PY -m agenttalk reply --to-request rq-1"],
+         "novel durable write failure", 7, run.BUS_KIND_UNKNOWN_FAILURE),
+        (["powershell", "-Command",
+          "& $env:AGENTTALK_PY -m agenttalk --root D:\\repo reply --to-request rq-1"],
+         "novel durable write failure", 17, run.BUS_KIND_UNKNOWN_FAILURE),
+        ('& "$env:AGENTTALK_PY" -m "agenttalk" reply --to-request rq-1',
+         "novel durable write failure", 7, run.BUS_KIND_UNKNOWN_FAILURE),
+        ("python -m agenttalk reply --to-request rq-1", "novel durable write failure", None,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -m agenttalk reply --bad-flag",
+         "usage: agenttalk reply [-h]\nerror: unrecognized arguments: --bad-flag", 2,
+         run.BUS_KIND_SEMANTIC_FAILURE),
+        ("python -m agenttalk send --to ghost",
+         "agenttalk validation failed: retired recipient", 2,
+         run.BUS_KIND_SEMANTIC_FAILURE),
+        ("python -m agenttalk check --for beta --to-request rq-1", "superseded", 3,
+         run.BUS_KIND_SEMANTIC_FAILURE),
+        ("python -m agenttalk composing --to-request rq-1", "novel composing failure", 9,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -m agenttalk composing --to-request rq-1",
+         "ModuleNotFoundError: No module named agenttalk", 1,
+         run.BUS_KIND_CONFIG_BLOCKED),
+        ("python -m agenttalk sync --for beta", "novel read failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -m agenttalk sync --for beta -m 'please reply/send/escalate'",
+         "novel read failure", 17, run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -m agenttalk sync --for beta -m 'please reply/send/escalate'",
+         "Access is denied", 17, run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("rg agenttalk reply src", "novel grep failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("grep agenttalk reply src", "novel grep failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -m pytest -k agenttalk reply", "novel pytest failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python script.py -m agenttalk reply", "novel script failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ('python -c "print(1)" -m agenttalk reply', "novel command failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -c -m agenttalk reply", "novel command failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -cprint(1) -m agenttalk reply", "novel command failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -- -m agenttalk reply", "novel script failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python - -m agenttalk reply", "novel stdin failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python --help -m agenttalk reply", "novel help failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python --version -m agenttalk reply", "novel version failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -h -m agenttalk reply", "novel help failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -V -m agenttalk reply", "novel version failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -VV -m agenttalk reply", "novel version failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -V:3.14 -m agenttalk reply", "novel selector failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -Z -m agenttalk reply", "novel option failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python --frobnicate -m agenttalk reply", "novel option failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -m other -m agenttalk --root D:\\repo reply", "novel module failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("echo agenttalk --root D:\\repo reply", "novel echo failure", 1,
+         run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -m other -m 'agenttalk --root D:\\repo reply --to-request rq-1'",
+         "Access is denied", 17, run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -m agenttalk --unknown D:\\repo reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -m agenttalk --root \"D:\\Repo Root reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -W -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python -X -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_OK_OR_NO_SIGNAL),
+        ("python --check-hash-based-pycs -m agenttalk reply --to-request rq-1",
+         "novel durable write failure", 17, run.BUS_KIND_OK_OR_NO_SIGNAL),
+    ]
+    for command, output, exit_status, expected in cases:
+        got = run.classify_bus_execution(command, output, exit_status)
+        assert got["kind"] == expected, (command, output, got)
 
 
 # THE classification CONTRACT (lead 4th-verify "structural cap"): a table of realistic
@@ -552,6 +954,12 @@ _CLASSIFICATION_MATRIX = [
      "Permission denied", loop.CLASS_CONFIG_BLOCKED),
     ("CreateProcess error 5 while running agenttalk composing --to-request rq-1",
      loop.CLASS_CONFIG_BLOCKED),
+    ("agenttalk runtime preflight failed: resolved_path=D:\\Projects\\claude\\agenttalk\\src\\"
+     "agenttalk\\__init__.py is outside the workspace", loop.CLASS_CONFIG_BLOCKED),
+    ("import agenttalk failed: Access is denied: D:\\Projects\\claude\\agenttalk\\src\\"
+     "agenttalk\\__init__.py", loop.CLASS_CONFIG_BLOCKED),
+    ("ModuleNotFoundError: No module named 'agenttalk'", loop.CLASS_CONFIG_BLOCKED),
+    ("python -m agenttalk reply failed: error 503 service unavailable", loop.CLASS_INFRA),
     # --- AMBIGUOUS: not-known-infra, not positive-content - high ceiling, never DL@3 ---
     ("invalid request: model not found", loop.CLASS_AMBIGUOUS),
     ("invalid request: unsupported parameter 'temperature'", loop.CLASS_AMBIGUOUS),
@@ -615,7 +1023,432 @@ def test_make_drive_tool_bus_denial_is_config_blocked_even_if_turn_completed(tmp
     out = drive(rec)
     assert out.ok is False
     assert out.failure_class == loop.CLASS_CONFIG_BLOCKED
-    assert "python -m agenttalk" in out.summary
+    assert "$env:AGENTTALK_PY -m agenttalk" in out.summary
+
+
+def test_make_drive_tool_bus_missing_module_is_config_blocked_even_if_turn_completed(
+    tmp_path,
+) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": "python -m agenttalk reply --to-request rq-1",
+                                   "aggregated_output": (
+                                       "ModuleNotFoundError: No module named 'agenttalk'"
+                                   )}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    out = drive(rec)
+    assert out.ok is False
+    assert out.failure_class == loop.CLASS_CONFIG_BLOCKED
+    assert "install agenttalk non-editable" in out.summary
+
+
+def test_make_drive_tool_bus_usage_error_is_not_config_blocked(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": "python -m agenttalk reply --bad-flag",
+                                   "aggregated_output": (
+                                       "usage: agenttalk reply [-h]; "
+                                       "error: unrecognized arguments: --bad-flag"
+                                   )}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    out = drive(rec)
+    assert out.ok is True
+
+
+def test_make_drive_required_bus_unknown_without_exit_signal_is_success(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": "python -m agenttalk reply --to-request rq-1",
+                                   "aggregated_output": "novel durable write failure"}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    assert drive(rec).ok is True
+
+
+def test_make_drive_required_bus_semantic_failure_is_ambiguous(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": "python -m agenttalk reply --bad-flag",
+                                   "aggregated_output": (
+                                       "usage: agenttalk reply [-h]; "
+                                       "error: unrecognized arguments: --bad-flag"
+                                   ),
+                                   "exit_code": 2, "status": "completed"}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    out = drive(rec)
+    assert out.ok is False
+    assert out.failure_class == loop.CLASS_AMBIGUOUS
+    assert "bus_write_semantic_failure" in out.summary
+
+
+def test_make_drive_required_bus_unknown_nonzero_is_ambiguous(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": "python -m agenttalk reply --to-request rq-1",
+                                   "aggregated_output": "novel durable write failure",
+                                   "exit_code": 19, "status": "completed"}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    out = drive(rec)
+    assert out.ok is False
+    assert out.failure_class == loop.CLASS_AMBIGUOUS
+    assert "bus_write_failed_unknown" in out.summary
+
+
+def test_make_drive_required_bus_with_global_root_unknown_nonzero_is_ambiguous(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": (
+                                       "python -m agenttalk --root D:\\repo "
+                                       "reply --to-request rq-1"
+                                   ),
+                                   "aggregated_output": "novel durable write failure",
+                                   "exit_code": 17, "status": "completed"}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    out = drive(rec)
+    assert out.ok is False
+    assert out.failure_class == loop.CLASS_AMBIGUOUS
+    assert "bus_write_failed_unknown" in out.summary
+
+
+def test_make_drive_required_bus_with_spaced_global_root_unknown_nonzero_is_ambiguous(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": ["python", "-m", "agenttalk", "--root",
+                                               "D:\\Repo Root", "reply",
+                                               "--to-request", "rq-1"],
+                                   "aggregated_output": "novel durable write failure",
+                                   "exit_code": 17, "status": "completed"}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    out = drive(rec)
+    assert out.ok is False
+    assert out.failure_class == loop.CLASS_AMBIGUOUS
+    assert "bus_write_failed_unknown" in out.summary
+
+
+def test_make_drive_required_bus_with_python_option_unknown_nonzero_is_ambiguous(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": (
+                                       "python -X utf8 -m agenttalk "
+                                       "reply --to-request rq-1"
+                                   ),
+                                   "aggregated_output": "novel durable write failure",
+                                   "exit_code": 17, "status": "completed"}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    out = drive(rec)
+    assert out.ok is False
+    assert out.failure_class == loop.CLASS_AMBIGUOUS
+    assert "bus_write_failed_unknown" in out.summary
+
+
+def test_make_drive_required_bus_with_attached_python_option_unknown_nonzero_is_ambiguous(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": (
+                                       "python -Xutf8 -m agenttalk "
+                                       "reply --to-request rq-1"
+                                   ),
+                                   "aggregated_output": "novel durable write failure",
+                                   "exit_code": 17, "status": "completed"}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    out = drive(rec)
+    assert out.ok is False
+    assert out.failure_class == loop.CLASS_AMBIGUOUS
+    assert "bus_write_failed_unknown" in out.summary
+
+
+def test_make_drive_required_bus_with_safe_path_flag_unknown_nonzero_is_ambiguous(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": (
+                                       "python -P -m agenttalk "
+                                       "reply --to-request rq-1"
+                                   ),
+                                   "aggregated_output": "novel durable write failure",
+                                   "exit_code": 17, "status": "completed"}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    out = drive(rec)
+    assert out.ok is False
+    assert out.failure_class == loop.CLASS_AMBIGUOUS
+    assert "bus_write_failed_unknown" in out.summary
+
+
+def test_make_drive_required_bus_with_escaped_launcher_root_unknown_nonzero_is_ambiguous(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": (
+                                       'cmd.exe /c "python -m agenttalk --root '
+                                       '\\"D:\\Repo Root\\" reply --to-request rq-1"'
+                                   ),
+                                   "aggregated_output": "novel durable write failure",
+                                   "exit_code": 17, "status": "completed"}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    out = drive(rec)
+    assert out.ok is False
+    assert out.failure_class == loop.CLASS_AMBIGUOUS
+    assert "bus_write_failed_unknown" in out.summary
+
+
+def test_make_drive_non_bus_command_mentioning_agenttalk_reply_stays_success(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": "rg agenttalk reply src",
+                                   "aggregated_output": "novel grep failure",
+                                   "exit_code": 1, "status": "completed"}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    assert drive(rec).ok is True
+
+
+def test_make_drive_python_script_argument_mentioning_agenttalk_reply_stays_success(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": "python script.py -m agenttalk reply",
+                                   "aggregated_output": "novel script failure",
+                                   "exit_code": 1, "status": "completed"}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    assert drive(rec).ok is True
+
+
+def test_make_drive_python_attached_command_mentioning_agenttalk_reply_stays_success(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": "python -cprint(1) -m agenttalk reply",
+                                   "aggregated_output": "novel command failure",
+                                   "exit_code": 1, "status": "completed"}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    assert drive(rec).ok is True
+
+
+def test_make_drive_python_invalid_selector_mentioning_agenttalk_reply_stays_success(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": "python -V:3.14 -m agenttalk reply",
+                                   "aggregated_output": "novel selector failure",
+                                   "exit_code": 2, "status": "completed"}}),
+              json.dumps({"type": "turn.completed"})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    assert drive(rec).ok is True
+
+
+def test_make_drive_preflight_bad_runtime_is_config_blocked_without_spawn(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+
+    def spawn(_argv, _stdin):
+        raise AssertionError("codex child should not spawn after a bad bus preflight")
+
+    drive = run.make_drive(
+        _store(tmp_path),
+        "beta",
+        "codex",
+        session.SessionState(cli="codex"),
+        ["codex"],
+        spawn=spawn,
+        agenttalk_preflight=lambda: (
+            "command=$env:AGENTTALK_PY -c import agenttalk; resolved_path=D:\\Projects\\claude\\"
+            "agenttalk\\src\\agenttalk\\__init__.py; error=agenttalk runtime resolved "
+            "to an out-of-workspace source checkout; remediation=install agenttalk "
+            "non-editable into the runtime Python used by AGENTTALK_PY"
+        ),
+        clock=lambda: 0.0,
+        render=False,
+    )
+    out = drive(rec)
+    assert out.ok is False
+    assert out.failure_class == loop.CLASS_CONFIG_BLOCKED
+    assert "out-of-workspace source checkout" in out.summary
+
+
+def test_make_drive_spawn_missing_executable_is_config_blocked(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+
+    def missing_spawn(_argv, _stdin):
+        raise FileNotFoundError(2, "No such file or directory")
+
+    drive = run.make_drive(
+        _store(tmp_path),
+        "beta",
+        "codex",
+        session.SessionState(cli="codex"),
+        ["missing-codex.exe"],
+        spawn=missing_spawn,
+        clock=lambda: 0.0,
+        render=False,
+    )
+    out = drive(rec)
+    assert out.ok is False
+    assert out.failure_class == loop.CLASS_CONFIG_BLOCKED
+    assert "subtype=launch_cli" in out.summary
+
+
+def test_cmd_wrap_launch_preflight_blocks_before_consuming_message(tmp_path) -> None:
+    s = _store(tmp_path)
+    s.set_operator_facing("alpha")
+    msg = s.send(sender="alpha", recipient="beta", body="do work")
+    missing = tmp_path / "missing-codex.exe"
+
+    rc = cli.main([
+        "--root", str(tmp_path),
+        "wrap", "--for", "beta", "--cli", "codex", "--loop",
+        "--", str(missing),
+    ])
+
+    assert rc == 1
+    assert s.cursor("beta") == ""
+    assert s.messages_for("beta")[0].id == msg.id
+    assert s.attempt_record("beta", msg.id) is None
+    assert s.dead_lettered_count("beta") == 0
+    health = s.read_health("beta", ttl_seconds=999999)
+    assert health["reason_code"] == "config_blocked"
+    hold = s.read_config_blocked_hold("beta")
+    assert hold is not None
+    assert hold["agent"] == "beta"
+    assert "missing-codex.exe" in hold["summary"]
+    notice = s.messages_for("alpha")[-1]
+    assert notice.subject == "wrapper launch config-blocked"
+    assert "before any message was consumed" in notice.body
+    assert "missing-codex.exe" in notice.body
+
+
+def test_cmd_wrap_preflight_success_clears_config_blocked_hold(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    s = _store(tmp_path)
+    s.write_config_blocked_hold("beta", summary="old launch failure")
+    native = tmp_path / "codex.exe"
+    native.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        run,
+        "preflight_launch_runtime",
+        lambda argv, _cli, _root, _env: run.LaunchPreflightResult(list(argv)),
+    )
+
+    seen: dict[str, object] = {}
+
+    def fake_loop(store, agent, **kwargs):
+        seen["store"] = store
+        seen["agent"] = agent
+        seen["base_argv"] = kwargs["base_argv"]
+        return 0
+
+    monkeypatch.setattr(cli, "_wrap_loop_mode", fake_loop)
+
+    rc = cli.main([
+        "--root", str(tmp_path),
+        "wrap", "--for", "beta", "--cli", "codex", "--loop",
+        "--", str(native), "exec",
+    ])
+
+    assert rc == 0
+    assert seen["agent"] == "beta"
+    assert seen["base_argv"] == [str(native), "exec"]
+    assert s.read_config_blocked_hold("beta") is None
 
 
 def test_make_drive_retryable_after_start_is_infra(tmp_path) -> None:
@@ -800,7 +1633,7 @@ def test_loop_config_blocked_escalates_once_parks_head_and_keeps_liveness(tmp_pa
             ok=False,
             failure_class=loop.CLASS_CONFIG_BLOCKED,
             summary=("command=agenttalk reply --from beta --to-request rq-1; "
-                     "error=Access is denied; remediation=use python -m agenttalk"),
+                     "error=Access is denied; remediation=use $env:AGENTTALK_PY -m agenttalk"),
         )
 
     def heartbeat() -> None:
@@ -823,7 +1656,7 @@ def test_loop_config_blocked_escalates_once_parks_head_and_keeps_liveness(tmp_pa
     assert calls == [msg.id]                 # parked: no retry storm to K=20
     assert len(escalations) == 1
     assert escalations[0]["failure_class"] == loop.CLASS_CONFIG_BLOCKED
-    assert "python -m agenttalk" in escalations[0]["summary"]
+    assert "$env:AGENTTALK_PY -m agenttalk" in escalations[0]["summary"]
     assert s.cursor("beta") == ""            # cursor stays on the head
     assert s.dead_lettered_count("beta") == 0
     rec = s.attempt_record("beta", msg.id)
@@ -899,6 +1732,221 @@ def test_loop_resume_config_blocked_does_not_self_heal_and_commit(tmp_path) -> N
     assert escalations and escalations[0]["failure_class"] == loop.CLASS_CONFIG_BLOCKED
     assert stamps and s.read_heartbeat("beta") is not None
     assert sleeps
+
+
+def test_loop_runtime_denied_sibling_agenttalk_import_parks_without_commit(tmp_path) -> None:
+    s = _store(tmp_path)
+    head = s.send(sender="alpha", recipient="beta", body="needs bus reply")
+    sibling = tmp_path.parent / "sibling-agenttalk" / "src" / "agenttalk" / "__init__.py"
+    error = (
+        "Traceback (most recent call last): import agenttalk failed: "
+        f"PermissionError: [Errno 13] Access is denied: '{sibling}'"
+    )
+    calls: list[list[str]] = []
+
+    def spawn(argv, _stdin):
+        calls.append(argv)
+        return _failed_turn_lines(error)
+
+    drive = run.make_drive(
+        s,
+        "beta",
+        "codex",
+        session.SessionState(cli="codex"),
+        ["codex"],
+        spawn=spawn,
+        clock=lambda: 0.0,
+        render=False,
+    )
+    escalations: list[dict] = []
+    stamps: list[str] = []
+    sleeps: list[float] = []
+
+    turns = loop.run_loop(
+        s,
+        "beta",
+        drive,
+        clock=lambda: 100.0,
+        sleep=lambda d: sleeps.append(d),
+        heartbeat=lambda: (stamps.append("hb"), s.write_heartbeat("beta")),
+        on_escalate=lambda info: escalations.append(info) or True,
+        k_poison=1,
+        k_escalate=1,
+        max_polls=3,
+    )
+
+    assert turns == 0
+    assert len(calls) == 1
+    assert s.cursor("beta") == ""
+    assert s.messages_for("beta")[0].id == head.id
+    assert s.dead_lettered_count("beta") == 0
+    rec = s.attempt_record("beta", head.id)
+    assert rec is not None
+    assert rec["attempts_started"] == 1
+    assert rec["last_failure_class"] == loop.CLASS_CONFIG_BLOCKED
+    assert escalations and escalations[0]["failure_class"] == loop.CLASS_CONFIG_BLOCKED
+    assert "install agenttalk non-editable" in escalations[0]["summary"]
+    assert stamps and s.read_heartbeat("beta") is not None
+    assert sleeps
+
+
+def test_loop_runtime_missing_agenttalk_module_parks_without_commit(tmp_path) -> None:
+    s = _store(tmp_path)
+    head = s.send(sender="alpha", recipient="beta", body="needs bus reply")
+    calls: list[list[str]] = []
+
+    def spawn(argv, _stdin):
+        calls.append(argv)
+        return [
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "item.completed",
+                        "item": {"type": "command_execution",
+                                 "command": "python -m agenttalk reply --to-request rq-1",
+                                 "aggregated_output": (
+                                     "ModuleNotFoundError: No module named agenttalk"
+                                 )}}),
+            json.dumps({"type": "turn.completed"}),
+        ]
+
+    drive = run.make_drive(
+        s,
+        "beta",
+        "codex",
+        session.SessionState(cli="codex"),
+        ["codex"],
+        spawn=spawn,
+        clock=lambda: 0.0,
+        render=False,
+    )
+    escalations: list[dict] = []
+    stamps: list[str] = []
+    sleeps: list[float] = []
+
+    turns = loop.run_loop(
+        s,
+        "beta",
+        drive,
+        clock=lambda: 100.0,
+        sleep=lambda d: sleeps.append(d),
+        heartbeat=lambda: (stamps.append("hb"), s.write_heartbeat("beta")),
+        on_escalate=lambda info: escalations.append(info) or True,
+        k_poison=1,
+        k_escalate=1,
+        max_polls=3,
+    )
+
+    assert turns == 0
+    assert len(calls) == 1
+    assert s.cursor("beta") == ""
+    assert s.messages_for("beta")[0].id == head.id
+    assert s.dead_lettered_count("beta") == 0
+    rec = s.attempt_record("beta", head.id)
+    assert rec is not None
+    assert rec["attempts_started"] == 1
+    assert rec["last_failure_class"] == loop.CLASS_CONFIG_BLOCKED
+    assert escalations and escalations[0]["failure_class"] == loop.CLASS_CONFIG_BLOCKED
+    assert "install agenttalk non-editable" in escalations[0]["summary"]
+    assert stamps and s.read_heartbeat("beta") is not None
+    assert sleeps
+
+
+def test_loop_required_bus_semantic_failure_does_not_commit(tmp_path) -> None:
+    s = _store(tmp_path)
+    head = s.send(sender="alpha", recipient="beta", body="needs bus reply")
+    calls: list[list[str]] = []
+
+    def spawn(argv, _stdin):
+        calls.append(argv)
+        return [
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "item.completed",
+                        "item": {"type": "command_execution",
+                                 "command": "python -m agenttalk reply --bad-flag",
+                                 "aggregated_output": (
+                                     "usage: agenttalk reply [-h]; "
+                                     "error: unrecognized arguments: --bad-flag"
+                                 ),
+                                 "exit_code": 2, "status": "completed"}}),
+            json.dumps({"type": "turn.completed"}),
+        ]
+
+    drive = run.make_drive(
+        s,
+        "beta",
+        "codex",
+        session.SessionState(cli="codex"),
+        ["codex"],
+        spawn=spawn,
+        clock=lambda: 0.0,
+        render=False,
+    )
+    turns = loop.run_loop(
+        s,
+        "beta",
+        drive,
+        clock=lambda: 100.0,
+        sleep=lambda _d: None,
+        k_poison=0,
+        k_escalate=0,
+        max_polls=1,
+    )
+
+    assert turns == 0
+    assert len(calls) == 1
+    assert s.cursor("beta") == ""
+    assert s.messages_for("beta")[0].id == head.id
+    rec = s.attempt_record("beta", head.id)
+    assert rec is not None
+    assert rec["last_failure_class"] == loop.CLASS_AMBIGUOUS
+    assert "semantic" in rec["last_failure_summary"]
+
+
+def test_loop_required_bus_unknown_nonzero_does_not_commit(tmp_path) -> None:
+    s = _store(tmp_path)
+    head = s.send(sender="alpha", recipient="beta", body="needs bus reply")
+    calls: list[list[str]] = []
+
+    def spawn(argv, _stdin):
+        calls.append(argv)
+        return [
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "item.completed",
+                        "item": {"type": "command_execution",
+                                 "command": "python -m agenttalk reply --to-request rq-1",
+                                 "aggregated_output": "novel durable write failure",
+                                 "exit_code": 17, "status": "completed"}}),
+            json.dumps({"type": "turn.completed"}),
+        ]
+
+    drive = run.make_drive(
+        s,
+        "beta",
+        "codex",
+        session.SessionState(cli="codex"),
+        ["codex"],
+        spawn=spawn,
+        clock=lambda: 0.0,
+        render=False,
+    )
+    turns = loop.run_loop(
+        s,
+        "beta",
+        drive,
+        clock=lambda: 100.0,
+        sleep=lambda _d: None,
+        k_poison=0,
+        k_escalate=0,
+        max_polls=1,
+    )
+
+    assert turns == 0
+    assert len(calls) == 1
+    assert s.cursor("beta") == ""
+    assert s.messages_for("beta")[0].id == head.id
+    rec = s.attempt_record("beta", head.id)
+    assert rec is not None
+    assert rec["last_failure_class"] == loop.CLASS_AMBIGUOUS
+    assert "unknown" in rec["last_failure_summary"]
 
 
 # --------------------------------------------- C3 (0.40.0): one-shot scoped loop

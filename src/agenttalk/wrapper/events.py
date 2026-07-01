@@ -55,6 +55,8 @@ class Event:
     ``text``      - model/tool output text (rendered; MODEL_OUTPUT text is the
                     ONLY thing the degraded detector scans).
     ``tool``      - the tool/command name for TOOL_* events.
+    ``exit_code`` - structured command-execution exit code, when the CLI reports it.
+    ``tool_status`` - structured command-execution status, when the CLI reports it.
     ``retryable`` - tiers an ADAPTER_ERROR: a transient/transport error the CLI
                     self-recovers from (e.g. a WebSocket->HTTPS fallback) is
                     retryable=True (log only, never act); a terminal failure
@@ -69,6 +71,8 @@ class Event:
     type: EventType
     text: str | None = None
     tool: str | None = None
+    exit_code: int | None = None
+    tool_status: str | None = None
     retryable: bool = False
     channel: str | None = None
     raw: dict = field(default_factory=dict)

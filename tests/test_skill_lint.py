@@ -134,11 +134,14 @@ LISTEN_DURABLE_FORBIDDEN = [
 
 CODEX_SANDBOX_INVOCATION_REQUIRED = [
     "Invoking agenttalk under the Codex sandbox",
+    'AGENTTALK_PY',
+    '& "$env:AGENTTALK_PY" -m agenttalk <subcommand> ...',
     "python -m agenttalk <subcommand> ...",
+    "fall back to the runnable module form",
     "current project WORKSPACE cwd",
     "installed/runtime package",
     "Do NOT cd to, import from, or reference an agenttalk SOURCE checkout outside the workspace",
-    "Do NOT bake an absolute python path",
+    "opt in to the Python install directory with Codex `--add-dir`",
 ]
 
 
@@ -229,7 +232,7 @@ def _fenced_bare_agenttalk_lines(text: str) -> list[tuple[int, str]]:
         if stripped.startswith("```") or stripped.startswith("~~~"):
             in_fence = not in_fence
             continue
-        if in_fence and re.search(r"(?<!python -m )\bagenttalk\s+", line):
+        if in_fence and re.search(r"(?<!-m )\bagenttalk\s+", line):
             offenders.append((lineno, line.strip()))
     return offenders
 
@@ -251,7 +254,7 @@ def _inline_bare_agenttalk_snippets(text: str) -> list[tuple[int, str]]:
             if char == "`":
                 if in_inline:
                     snippet = "".join(buf)
-                    if re.search(r"(?<!python -m )\bagenttalk\s+", snippet):
+                    if re.search(r"(?<!-m )\bagenttalk\s+", snippet):
                         offenders.append((start_line, " ".join(snippet.split())))
                     in_inline = False
                     buf = []

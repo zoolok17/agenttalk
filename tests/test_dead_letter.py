@@ -552,7 +552,7 @@ def test_config_blocked_notice_includes_command_error_and_remediation(tmp_path: 
             "attempts": 1,
             "failure_class": loop.CLASS_CONFIG_BLOCKED,
             "summary": ("command=agenttalk reply --from beta --to-request rq-1; "
-                        "error=Access is denied; remediation=use python -m agenttalk"),
+                        "error=Access is denied; remediation=use $env:AGENTTALK_PY -m agenttalk"),
         },
         disposed=False,
     )
@@ -561,7 +561,7 @@ def test_config_blocked_notice_includes_command_error_and_remediation(tmp_path: 
     assert notice.subject == "wrapper config-blocked"
     assert "agenttalk reply --from beta" in notice.body
     assert "Access is denied" in notice.body
-    assert "python -m agenttalk" in notice.body
+    assert "$env:AGENTTALK_PY -m agenttalk" in notice.body
     assert "dead-lettered" not in notice.body.lower()
 
 

@@ -2566,6 +2566,59 @@ class Store:
             heartbeat_skew_seconds=heartbeat_skew_seconds,
         )
 
+    # ----------------------------------------- durable config-blocked hold
+    #
+    # A wrapper launch/runtime config_blocked failure exits before it can refresh
+    # health. Health is advisory and TTL-degrades, so supervisor recovery authority
+    # needs a durable hold marker that survives until operator repair/restart.
+
+    def config_blocked_hold_path(self, agent: str) -> Path:
+        return self.state_dir / "config-blocked-hold" / f"{validate_agent_name(agent)}.json"
+
+    def write_config_blocked_hold(self, agent: str, *, summary: str = "") -> None:
+        """Atomically record that ``agent`` is held on launch config repair."""
+        payload = {
+            "agent": validate_agent_name(agent),
+            "state": "config_blocked",
+            "summary": str(summary or ""),
+            "at": _now_iso(),
+        }
+        with self._config_lock():
+            p = self.config_blocked_hold_path(agent)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(p, json.dumps(payload, ensure_ascii=False, indent=2))
+
+    def read_config_blocked_hold(self, agent: str) -> dict | None:
+        """Return the validated config-blocked hold marker, or None if invalid."""
+        expected = validate_agent_name(agent)
+        p = self.config_blocked_hold_path(agent)
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8").strip() or "null")
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        if data.get("agent") != expected or data.get("state") != "config_blocked":
+            return None
+        summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
+        at = data.get("at") if isinstance(data.get("at"), str) else None
+        return {
+            "agent": expected,
+            "state": "config_blocked",
+            "summary": summary,
+            "at": at,
+        }
+
+    def clear_config_blocked_hold(self, agent: str) -> None:
+        """Remove the config-blocked hold marker (best-effort; never raises)."""
+        with self._config_lock():
+            try:
+                self.config_blocked_hold_path(agent).unlink()
+            except (FileNotFoundError, OSError):
+                pass
+
     # ----------------------------------------- managed lead-loop (Slice 1)
     #
     # A managed lead-loop identity is a wrapped controller that OWNS its team

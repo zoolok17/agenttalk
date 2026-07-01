@@ -112,7 +112,7 @@ def run(project_root: Path | None = None) -> Report:
         waiters = _check_active_waiters(store)
         if waiters is not None:  # additive: absent unless a live waiter exists
             report.checks.append(waiters)
-        codex_vis = _check_supervised_codex(store)
+        codex_vis = _check_supervised_codex(store, runtime_checker=_check_agenttalk_runtime)
         if codex_vis is not None:  # additive: absent unless a supervised codex agent
             report.checks.append(codex_vis)
         kn_check = _check_knowledge(store)
@@ -960,7 +960,12 @@ def _default_codex_runner(exe: str, args: list[str], timeout: float):
         return None, type(e).__name__
 
 
-def _check_supervised_codex(store: Store, *, runner=None) -> Check | None:
+def _check_agenttalk_runtime(project_root: Path) -> str | None:
+    from agenttalk.wrapper import run as wrapper_run
+    return wrapper_run.preflight_agenttalk_runtime(workspace_root=project_root)
+
+
+def _check_supervised_codex(store: Store, *, runner=None, runtime_checker=None) -> Check | None:
     """0.31.1: surface the RESOLVED codex exe + its ``codex --version`` for each
     supervised codex agent, with a best-effort, NON-blocking ``codex sandbox
     --help`` probe whose failure prints a hint (an old/alpha build - e.g. the
@@ -977,8 +982,10 @@ def _check_supervised_codex(store: Store, *, runner=None) -> Check | None:
         return None  # the supervisor's own --init/validate owns a malformed config
     agents = cfg.get("agents") if isinstance(cfg.get("agents"), dict) else {}
     exes: dict[str, list[str]] = {}   # resolved exe -> agent names using it
+    has_wrapped_codex = False
     for name, a in agents.items():
         if isinstance(a, dict) and a.get("cli") == "codex":
+            has_wrapped_codex = has_wrapped_codex or bool(a.get("wrapped"))
             exe = _resolve_supervised_codex_exe(a)
             if exe:
                 exes.setdefault(exe, []).append(name)
@@ -986,6 +993,9 @@ def _check_supervised_codex(store: Store, *, runner=None) -> Check | None:
         return None
     entries: list[dict] = []
     any_warn = False
+    runtime_blocked = None
+    if has_wrapped_codex and runtime_checker is not None:
+        runtime_blocked = runtime_checker(store.root)
     for exe, names in exes.items():
         rc, out = runner(exe, ["--version"], 5.0)
         version = out.strip().splitlines()[0].strip() if (rc == 0 and out) else None
@@ -1000,19 +1010,31 @@ def _check_supervised_codex(store: Store, *, runner=None) -> Check | None:
         v = e["version"] or "UNVERSIONED (codex --version did not run)"
         lines.append(f"{', '.join(e['agents'])} -> {e['exe']} [{v}]"
                      + ("" if e["sandbox_probe_ok"] else " · sandbox probe FAILED"))
+    details = "; ".join(lines)
+    if runtime_blocked:
+        details += "; agenttalk runtime preflight FAILED"
     if any_warn:
         return Check(
             name="supervised_codex",
-            status="warn",
-            details="; ".join(lines),
-            fix=("a sandbox probe / version failure may mean a wrong or old/alpha "
+            status="error" if runtime_blocked else "warn",
+            details=details,
+            fix=(runtime_blocked or
+                 "a sandbox probe / version failure may mean a wrong or old/alpha "
                  "codex (e.g. the MS-Store build) - agenttalk expects the npm "
                  "stable codex; check the launch.windows_file / wrap base path"),
-            data={"codex": entries},
+            data={"codex": entries, "agenttalk_runtime": runtime_blocked},
+        )
+    if runtime_blocked:
+        return Check(
+            name="supervised_codex",
+            status="error",
+            details=details,
+            fix=runtime_blocked,
+            data={"codex": entries, "agenttalk_runtime": runtime_blocked},
         )
     return Check(
         name="supervised_codex",
         status="ok",
-        details="; ".join(lines),
-        data={"codex": entries},
+        details=details,
+        data={"codex": entries, "agenttalk_runtime": runtime_blocked},
     )

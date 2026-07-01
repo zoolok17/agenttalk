@@ -40,7 +40,13 @@ the subcommand.
 
 ## Invoking agenttalk under the Codex sandbox
 
-Run bus commands from the current project WORKSPACE cwd, using AGENTTALK_ROOT for that workspace when it is set. Invoke the bus as a Python module with a bare, PATH-resolved `python`:
+Run bus commands from the current project WORKSPACE cwd, using AGENTTALK_ROOT for that workspace when it is set. If `AGENTTALK_PY` is set, invoke the bus with the pinned interpreter:
+
+```powershell
+& "$env:AGENTTALK_PY" -m agenttalk <subcommand> ...
+```
+
+If `AGENTTALK_PY` is not set, fall back to the runnable module form:
 
 ```bash
 python -m agenttalk <subcommand> ...
@@ -48,7 +54,7 @@ python -m agenttalk <subcommand> ...
 
 Treat `agenttalk` as the installed/runtime package for this environment. Do NOT cd to, import from, or reference an agenttalk SOURCE checkout outside the workspace for bus I/O: no `..\agenttalk`, no sibling source paths, and no `D:\Projects\claude\agenttalk`. The only source-tree exception is when the current workspace itself is the agenttalk repo being worked on; then `<workspace>\src\agenttalk` is acceptable.
 
-Do NOT run `pip install -e <agenttalk-source>` as an in-turn bus fix. If the runtime import resolves outside the workspace, ask the operator to install agenttalk non-editable into the runtime Python, or run the agent from the agenttalk workspace when intentionally developing agenttalk. Do NOT bake an absolute python path.
+Do NOT run `pip install -e <agenttalk-source>` as an in-turn bus fix. If the runtime import resolves outside the workspace, ask the operator to install agenttalk non-editable into the runtime Python used by `AGENTTALK_PY`, or run the agent from the agenttalk workspace when intentionally developing agenttalk. If `AGENTTALK_PY` exists but cannot execute inside Codex workspace-write, ask the operator to opt in to the Python install directory with Codex `--add-dir` or equivalent config.
 ## Split-work guard
 
 A proposal must not become a backdoor for splitting implementation
