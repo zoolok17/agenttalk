@@ -5,6 +5,26 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.53.1] - 2026-07-01
+
+### Fixed
+
+- **`test-security` skill: Procedure step 4 aligned with the Hard Safety Boundary.** The step-4 wording
+  previously allowed live network / destructive probes "unless the operator approved the environment," which
+  contradicted the skill's hard boundary. It now states operator approval covers only the in-repo test
+  environment and is never a license for external targets, network/DoS activity, exploit development beyond
+  the repo test surface, or detection-evasion - consistent with the boundary section.
+- **CI: gitleaks false positive on a test fixture.** The redaction test's deliberate fake secret
+  (`SECRET_HEALTH_LEAK_74f78b` in `tests/test_wrapper_health.py`, injected and then asserted ABSENT from the
+  health output) tripped the `generic-api-key` rule; a targeted inline `# gitleaks:allow` suppresses it
+  without weakening the test or broadening secret scanning (no `.gitleaks.toml` / no scanner-wide allowlist).
+
+### Upgrade
+
+```powershell
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.53.1"
+```
+
 ## [0.53.0] - 2026-06-30
 
 ### Added

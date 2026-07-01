@@ -8,7 +8,7 @@ description: >-
   abuse cases. Do NOT use as a second review-code security pass, for general
   code review, for speculative vulnerability hunting without scoped tests, or
   for production fixes without an assigned implementation task.
-reviewed-against: "0.52"
+reviewed-against: "0.53"
 category: assurance
 evidence-profile:
   - qa-result
