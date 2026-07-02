@@ -5,6 +5,38 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.57.0] - 2026-07-02
+
+**Supervisor hardening**: the external supervisor gains the safety controls that make real,
+unattended auto-recovery (kill + relaunch of a stale agent) tolerable to run on a live
+machine — an operator kill-switch, an independent dead-man's-switch mail-age alarm, and a
+durable OS-level host — plus PID-reuse and restart-reconciliation fixes.
+
+### Added
+
+- **Kill switch** — `.agenttalk/supervisor.kill` (presence-only). While armed, every mutating
+  supervisor action is frozen: process kills, launches, state/snapshot writes, and
+  notifications all refuse; read-only paths (`--report`, `--plan`, `deadman`, `status`) keep
+  working. The guard is re-checked at each mutation boundary (not only at tick start), so a
+  switch flipped mid-tick stops the rest of the action. `supervise --report` surfaces
+  `kill_switch_active`.
+- **`agenttalk deadman`** — an independent mail-age SLO alarm, deliberately separate from the
+  supervisor. It is content-blind (envelope only) and fails **closed**: unparseable message
+  files or unknown/unparseable actionable ages raise and exit non-zero rather than silently
+  passing, so a stalled or corrupted mailbox can never read as healthy. Exit 3 = stale owed
+  work or a fail-safe error. Ships with a `deadman.ps1` wrapper for scheduled hosting.
+- **Durable hosting** — `supervisor-task.ps1` installs a current-user Scheduled Task that runs
+  the supervisor at logon with auto-restart on failure; `docs/supervisor-hosting.md` documents
+  the hosting recipe (semantic/content-blind output, no supervisor-state dependency).
+
+### Fixed
+
+- **Start-time-guarded kills** — the planner never emits a kill target without a recorded
+  process start time, and `Stop-Tree` skips any target missing a start time, so a recycled
+  PID can never be mistaken for a supervised process.
+- **Restart reconciliation** — after the supervisor itself restarts, liveness is re-derived
+  from the bus heartbeat rather than trusting stale recorded PIDs.
+
 ## [0.56.0] - 2026-07-02
 
 The **operator attention queue**: a derived, ranked, deduped read-only view over the
