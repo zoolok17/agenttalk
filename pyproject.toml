@@ -52,3 +52,8 @@ agenttalk = "agenttalk.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agenttalk"]
+# Ship the Team Console's served static assets (console.css/console.js) as
+# package data. Files inside the package dir are included by default, but this
+# force-include makes the console asset dir an explicit, non-optional part of
+# the wheel so /static/<name> can serve them from an installed package.
+force-include = { "src/agenttalk/web_static" = "agenttalk/web_static" }

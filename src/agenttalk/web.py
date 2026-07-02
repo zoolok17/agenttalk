@@ -47,9 +47,11 @@ Routes
 - ``GET  /api/messages``        — JSON list of all validated messages
 - ``GET  /api/messages/<id>``   — single message JSON
 - ``GET  /favicon.ico``         — 204 (no icon shipped; suppress browser noise)
-- ``GET  /dashboard``           — obligation dashboard HTML (all roots; 0.17.0)
-- ``GET  /static/dashboard.js`` — the dashboard's polling script (0.17.0)
+- ``GET  /dashboard``           — the Team Console HTML shell (all roots; 0.58.0)
+- ``GET  /static/<name>``       — allowlisted console assets (console.css/js; 0.58.0)
 - ``GET  /api/state``           — multi-root obligation aggregate, schema v1 (0.17.0)
+- ``GET  /api/attention``       — ranked "needs a human" queue for root[0] (0.58.0)
+- ``GET  /api/thread/<rid>``    — one thread's full transcript, CARRIES bodies (0.58.0)
 
 Multi-root (0.17.0)
 ===================
@@ -62,10 +64,13 @@ root degrades to an ``errors`` entry in the payload; it cannot 5xx the
 aggregate or affect sibling roots.
 
 CSP note: ``/dashboard`` is the ONLY route whose Content-Security-Policy
-allows (self-hosted) script + fetch — it renders no message-derived HTML
-server-side and its client builds DOM via ``textContent`` only. Routes
-that render hostile message bodies (``/messages/<id>``) keep the stricter
-no-script policy byte-identical.
+allows (self-hosted) script + stylesheet + fetch — it renders no
+message-derived HTML server-side and its client builds DOM via
+``textContent`` only. The console CSS/JS ship as served files, so the console
+CSP drops ``'unsafe-inline'`` entirely (``script-src 'self'; style-src
+'self'``). Routes that render hostile message bodies (``/messages/<id>``) and
+every JSON feed (``/api/state``, ``/api/attention``, ``/api/thread/<rid>``)
+keep the stricter no-script policy byte-identical.
 """
 
 from __future__ import annotations
@@ -85,6 +90,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agenttalk import __version__
+from agenttalk import attention as _attention
+from agenttalk import capacity as _capacity
+from agenttalk import domains as _domains
 from agenttalk import signing as _signing
 from agenttalk.store import COMPOSING_INTENT_STALE_SECONDS, Message, Store
 from agenttalk.threads import Thread, derive_threads
@@ -128,10 +136,13 @@ STATE_SCHEMA_VERSION = 1
 # module docstring's CSP note).
 _DEFAULT_CSP = ("default-src 'none'; style-src 'unsafe-inline'; "
                 "img-src 'none'; frame-ancestors 'none'")
-# /dashboard only: allow the self-hosted polling script and same-origin
-# fetch. Still no inline script, no eval, no remote anything.
+# The console document routes (/dashboard) only: allow the self-hosted
+# script + stylesheet and same-origin fetch. Still no inline script, no inline
+# style, no eval, no remote anything. CHANGED (0.58.0): the CSS moved to a
+# served file (/static/console.css), so 'unsafe-inline' for style is dropped in
+# favor of 'self' — the console carries zero inline <style> and zero style= attrs.
 _DASHBOARD_CSP = ("default-src 'none'; script-src 'self'; "
-                  "connect-src 'self'; style-src 'unsafe-inline'; "
+                  "connect-src 'self'; style-src 'self'; "
                   "img-src 'none'; frame-ancestors 'none'")
 
 # Thread states that owe nothing (mirror threads._derive_next's gate).
@@ -141,6 +152,21 @@ _TERMINAL_STATES = ("closed", "closed-superseded")
 # than this many distinct (from,to) pairs exist, the list is capped and the
 # root carries an additive truncation signal.
 _EDGE_LIMIT = 50
+
+# /api/state per-root recent-activity feed cap (0.58.0). Envelope-only rows
+# (never body) for the live "what's happening" feed on the dashboard.
+_RECENT_LIMIT = 25
+
+# Health-timeline ring (0.58.0, §5): a per-(root,agent) window of recent
+# health-state samples, kept IN-MEMORY on the server instance only (never a
+# file — the read-only invariant). Samples older than this window are pruned;
+# contiguous same-state samples collapse into {state, seconds} segments.
+_HEALTH_TIMELINE_WINDOW_SECONDS = 30 * 60  # ~last 30 minutes
+
+# Meta keys safe to surface in a thread transcript's `meta_line` (§4b). A
+# strict whitelist — arbitrary meta may carry body-ish sender text, which must
+# never leak; only these envelope-level decision markers are shown.
+_META_LINE_WHITELIST = ("status", "head", "base")
 
 
 @dataclass(frozen=True)
@@ -349,258 +375,98 @@ def render_message(store: Store, m: Message) -> bytes:
 
 
 def render_dashboard(roots: list[RootDescriptor]) -> bytes:
-    """The obligation dashboard shell (0.17.0).
+    """The Team Console shell (0.58.0) — a fixed 3-region skeleton.
 
-    Deliberately near-empty: ALL dynamic content is rendered client-side
-    from ``/api/state`` by ``/static/dashboard.js`` — one renderer, not
-    two. Only operator-supplied labels land here, escaped anyway.
+    Deliberately near-empty: ALL dynamic content is rendered client-side from
+    ``/api/state`` / ``/api/attention`` / ``/api/thread/<rid>`` by the served
+    ``/static/console.js`` — one renderer. The document carries **zero** inline
+    ``<style>`` and **zero** inline event handlers (``onclick=`` / ``style=``);
+    styling is a linked ``/static/console.css`` and behavior a linked
+    ``/static/console.js``, so the console CSP can drop ``'unsafe-inline'``
+    entirely (``script-src 'self'; style-src 'self'``).
+
+    Only operator-supplied labels (root labels) land here, escaped anyway; the
+    client picks the active root from ``/api/state.roots`` (a multi-root
+    switcher is JS-hydrated). Everything else is client-rendered.
     """
-    sections = "".join(
-        "<section class=\"root\" "
-        f"data-root-label=\"{html.escape(d.label, quote=True)}\">"
-        f"<h2>{html.escape(d.label)}</h2>"
-        "<p class=\"muted\">loading…</p>"
-        "</section>"
-        for d in roots
-    )
     body = (
-        "<h1>agenttalk :: obligation dashboard</h1>"
-        "<p><a href=\"/\">message log</a></p>"
-        # Refresh controls (0.19.0). No inline handlers — dashboard.js wires
-        # them with addEventListener, keeping the script-src 'self' CSP intact.
-        "<div id=\"controls\">"
-        "<button id=\"refresh-btn\" type=\"button\">Refresh</button> "
-        "<label><input type=\"checkbox\" id=\"autorefresh\" checked> "
-        "auto-refresh</label>"
+        "<div id=\"app\">"
+        "<header id=\"topbar\"></header>"
+        "<div id=\"body\">"
+        "<nav id=\"sidebar\"></nav>"
+        "<main id=\"main\"></main>"
         "</div>"
-        "<noscript><p>This view needs JavaScript (it polls "
+        "</div>"
+        "<noscript><p>This console needs JavaScript (it polls "
         "<code>/api/state</code> every 2 seconds). Poll "
         "<code>GET /api/state</code> directly instead.</p></noscript>"
-        f"<div id=\"roots\">{sections}</div>"
-        "<script src=\"/static/dashboard.js\"></script>"
+        "<link rel=\"stylesheet\" href=\"/static/console.css\">"
+        "<script src=\"/static/console.js\"></script>"
     )
-    return _html_page("agenttalk :: obligation dashboard", body)
+    return _console_page("agenttalk :: team console", body)
 
 
-# The dashboard's polling renderer. Served from /static/dashboard.js (a
-# server-owned constant — no file on disk, no path interpolation). DOM is
-# built exclusively via createElement/textContent: subjects and agent
-# names are bus data and must never reach innerHTML (research D11).
-# Detail links are created for ROOT[0] rows only — the pre-0.17.0 message
-# routes bind to the first root, so a cross-root href would point at the
-# wrong store (Codex pre-code finding #1; FR-003).
-_DASHBOARD_JS = r"""
-'use strict';
-(function () {
-  var POLL_MS = 2000;
-  function el(tag, cls, text) {
-    var n = document.createElement(tag);
-    if (cls) n.className = cls;
-    if (text !== undefined && text !== null) n.textContent = String(text);
-    return n;
-  }
-  function fmtAge(s) {
-    if (s === undefined || s === null) return '';
-    if (s < 90) return Math.round(s) + 's';
-    if (s < 5400) return Math.round(s / 60) + 'm';
-    return (s / 3600).toFixed(1) + 'h';
-  }
-  function threadRow(t, rootIndex) {
-    var tr = el('tr');
-    var subjCell = el('td');
-    if (rootIndex === 0 && t.last_msg_id) {
-      var aEl = document.createElement('a');
-      aEl.href = '/messages/' + encodeURIComponent(t.last_msg_id);
-      aEl.textContent = t.subject || t.request_id;
-      subjCell.appendChild(aEl);
-    } else {
-      // non-root[0]: id/subject as PLAIN TEXT — no cross-root links (v1)
-      subjCell.appendChild(el('span', null, t.subject || t.request_id));
-    }
-    tr.appendChild(subjCell);
-    tr.appendChild(el('td', null, t.opener_kind || ''));
-    tr.appendChild(el('td', null, t.state || ''));
-    var owner = t.next_owner;
-    if (Object.prototype.toString.call(owner) === '[object Array]') {
-      owner = owner.join(', ');
-    }
-    var next = (owner || '') + (t.next_action ? ' → ' + t.next_action : '');
-    tr.appendChild(el('td', null, next));
-    var tags = [];
-    if (t.mission) tags.push(t.mission + (t.wp_id ? '/' + t.wp_id : ''));
-    else if (t.wp_id) tags.push(t.wp_id);
-    if (t.epoch_status && t.epoch_status !== 'current') tags.push(t.epoch_status);
-    tr.appendChild(el('td', null, tags.join(' · ')));
-    tr.appendChild(el('td', 'muted', fmtAge(t.age_seconds)));
-    return tr;
-  }
-  // Role -> layout column (0.19.0, FR-004/005). Convention documented in
-  // data-model.md; case-insensitive substring, FIRST match wins in order.
-  function classify(a) {
-    var role = (a.role || '').toLowerCase();
-    if (a.operator_facing === true || role.indexOf('lead') >= 0) return 'top';
-    if (role.indexOf('dev') >= 0 || role.indexOf('eng') >= 0 ||
-        role.indexOf('impl') >= 0) return 'left';
-    if (role.indexOf('review') >= 0 || role.indexOf('qa') >= 0 ||
-        role.indexOf('audit') >= 0) return 'right';
-    return 'center';
-  }
-  // owes = open threads in THIS root whose next_owner is this agent (a string,
-  // or membership when next_owner is a broadcast pending list). Client-side
-  // (the threads array is already on the wire) — no server field.
-  function owesCount(root, name) {
-    var n = 0, threads = root.threads || [];
-    for (var i = 0; i < threads.length; i++) {
-      var o = threads[i].next_owner;
-      if (o === name) n++;
-      else if (Object.prototype.toString.call(o) === '[object Array]' &&
-               o.indexOf(name) >= 0) n++;
-    }
-    return n;
-  }
-  function agentCard(a, owes) {
-    var card = el('div', 'agent-card');
-    card.appendChild(el('div', 'agent-name', a.name));
-    var meta = [];
-    if (a.operator_facing) meta.push('liaison');
-    if (a.role) meta.push(a.role);
-    if (a.groups && a.groups.length) meta.push('[' + a.groups.join(', ') + ']');
-    if (meta.length) card.appendChild(el('div', 'muted', meta.join(' · ')));
-    var stats = [];
-    if (a.last_seen_age_seconds !== undefined && a.last_seen_age_seconds !== null) {
-      stats.push('seen ' + fmtAge(a.last_seen_age_seconds) + ' ago');
-    } else {
-      stats.push('never seen');
-    }
-    stats.push('sent ' + (a.sent || 0));
-    stats.push('recv ' + (a.received || 0));
-    // Always show owes (FR-006): "owes 0" is meaningful — distinct from a
-    // card that doesn't expose the field.
-    stats.push('owes ' + (owes || 0));
-    if (a.unread) stats.push(a.unread + ' unread');
-    card.appendChild(el('div', 'stats', stats.join('  ·  ')));
-    if (a.composing && a.composing.length) {
-      card.appendChild(el('div', 'badge', 'composing… (' + a.composing.length + ')'));
-    }
-    return card;
-  }
-  function renderRoot(section, root, rootIndex) {
-    while (section.firstChild) section.removeChild(section.firstChild);
-    section.appendChild(el('h2', null, root.label));
-    section.appendChild(el('p', 'muted', root.path || ''));
-    if (root.errors && root.errors.length) {
-      section.appendChild(el('p', 'invalid', 'degraded: ' + root.errors.join('; ')));
-      return;
-    }
-    // --- hierarchical roster: liaison/lead on top, role-grouped columns below
-    var agents = root.agents || [];
-    var top = el('div', 'roster-top');
-    var colLeft = el('div', 'col col-left');
-    var colCenter = el('div', 'col col-center');
-    var colRight = el('div', 'col col-right');
-    colLeft.appendChild(el('div', 'col-head', 'developers'));
-    colCenter.appendChild(el('div', 'col-head', 'team'));
-    colRight.appendChild(el('div', 'col-head', 'reviewers'));
-    for (var i = 0; i < agents.length; i++) {
-      var a = agents[i];
-      var card = agentCard(a, owesCount(root, a.name));
-      var col = classify(a);
-      if (col === 'top') top.appendChild(card);
-      else if (col === 'left') colLeft.appendChild(card);
-      else if (col === 'right') colRight.appendChild(card);
-      else colCenter.appendChild(card);
-    }
-    if (top.firstChild) section.appendChild(top);
-    var cols = el('div', 'roster-cols');
-    cols.appendChild(colLeft);
-    cols.appendChild(colCenter);
-    cols.appendChild(colRight);
-    section.appendChild(cols);
-    if (root.retired && root.retired.length) {
-      section.appendChild(el('p', 'muted', 'retired: ' + root.retired.join(', ')));
-    }
-    // --- conversation panel: who talks to whom (edges)
-    var edges = root.edges || [];
-    section.appendChild(el('h3', null, 'conversations'));
-    if (!edges.length) {
-      section.appendChild(el('p', 'muted', 'no traffic yet'));
-    } else {
-      var eul = el('ul', 'edges');
-      for (var e = 0; e < edges.length; e++) {
-        eul.appendChild(el('li', null,
-          edges[e].from + ' → ' + edges[e].to + '  (' + edges[e].count + ')'));
-      }
-      section.appendChild(eul);
-      if (root.edges_truncated) {
-        section.appendChild(el('p', 'muted',
-          'showing top ' + (root.edge_limit || edges.length) +
-          ' pairs (more exist)'));
-      }
-    }
-    // --- open threads (the obligation table, unchanged)
-    var threads = root.threads || [];
-    section.appendChild(el('h3', null, 'open threads'));
-    if (!threads.length) {
-      section.appendChild(el('p', 'muted', 'no open threads'));
-    } else {
-      var table = el('table');
-      var head = el('tr');
-      var hcols = ['subject', 'kind', 'state', 'next', 'tags', 'age'];
-      for (var c = 0; c < hcols.length; c++) head.appendChild(el('th', null, hcols[c]));
-      table.appendChild(head);
-      for (var r = 0; r < threads.length; r++) {
-        table.appendChild(threadRow(threads[r], rootIndex));
-      }
-      section.appendChild(table);
-    }
-    var bcs = root.broadcasts || [];
-    if (bcs.length) {
-      section.appendChild(el('h3', null, 'broadcasts'));
-      var bul = el('ul');
-      for (var b = 0; b < bcs.length; b++) {
-        var bc = bcs[b];
-        bul.appendChild(el('li', null,
-          (bc.subject || bc.request_id) + ' — pending: ' +
-          ((bc.pending || []).join(', ') || 'none')));
-      }
-      section.appendChild(bul);
-    }
-    if (root.spec_kitty) {
-      section.appendChild(el('p', 'muted',
-        'spec-kitty missions: ' + (root.spec_kitty.missions || []).join(', ')));
-    }
-  }
-  function render(state) {
-    var container = document.getElementById('roots');
-    var sections = container.getElementsByTagName('section');
-    var roots = state.roots || [];
-    for (var i = 0; i < roots.length && i < sections.length; i++) {
-      renderRoot(sections[i], roots[i], i);
-    }
-  }
-  function poll() {
-    fetch('/api/state').then(function (resp) { return resp.json(); })
-      .then(render)
-      .catch(function () { /* transient; retry next tick */ });
-  }
-  // Refresh controls (0.19.0, FR-008): a manual button forces one poll; the
-  // auto-refresh toggle starts/clears the interval. Wired with
-  // addEventListener ONLY (no inline handlers — keeps script-src 'self').
-  // Toggling never reloads the page; renderRoot updates in place so scroll
-  // position is preserved.
-  var timer = null;
-  function startAuto() { if (!timer) timer = setInterval(poll, POLL_MS); }
-  function stopAuto() { if (timer) { clearInterval(timer); timer = null; } }
-  var btn = document.getElementById('refresh-btn');
-  if (btn) btn.addEventListener('click', poll);
-  var chk = document.getElementById('autorefresh');
-  if (chk) chk.addEventListener('change', function () {
-    if (chk.checked) startAuto(); else stopAuto();
-  });
-  poll();
-  if (!chk || chk.checked) startAuto();
-})();
-""".strip().encode("utf-8")
+def _console_page(title: str, body: str) -> bytes:
+    """A minimal HTML document for the console shell.
+
+    Unlike :func:`_html_page`, this carries NO inline ``<style>`` block — the
+    console's CSS is served from ``/static/console.css`` so the document can run
+    under a ``style-src 'self'`` policy with no ``'unsafe-inline'``. All markup
+    here is server-authored (only the escaped ``<title>``), so nothing bus-
+    derived reaches the document.
+    """
+    return (
+        "<!doctype html>\n"
+        "<html lang=\"en\"><head>"
+        "<meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        f"<title>{html.escape(title)}</title>"
+        "</head><body>"
+        f"{body}"
+        "</body></html>\n"
+    ).encode("utf-8")
+
+
+# ---------------------------------------------------------- static assets
+#
+# The console's CSS and JS ship as real, editable, lintable files under the
+# package's ``web_static/`` dir (NOT a giant inline string constant). They are
+# served via an ALLOWLISTED-FILENAME route — an exact dict lookup, never a
+# ``pathlib`` join on request input — so the traversal guarantee is preserved
+# byte-for-byte (a request path can only ever match a literal key here).
+#
+# Bytes are loaded once at import from the package dir. Loading is TOLERANT: a
+# missing asset (e.g. during a partial build, or while the CSS/JS are still
+# being authored) simply omits that key — import never errors and the route
+# 404s the missing name instead of crashing the server.
+_WEB_STATIC_DIR = Path(__file__).parent / "web_static"
+
+# Allowlisted static assets: filename -> (content-type, bytes). Exact-match
+# lookup only. A name not in this dict 404s (see the /static/<name> route).
+_STATIC_ASSETS: dict[str, tuple[str, bytes]] = {}
+
+
+def _load_static_assets() -> dict[str, tuple[str, bytes]]:
+    """Load the allowlisted console assets from the package ``web_static`` dir.
+
+    Tolerant by design: a missing/unreadable file is skipped (its route then
+    404s) so importing this module never fails on a partial checkout or a
+    mid-authoring asset. The filename allowlist is fixed here — request input
+    is never joined onto a path.
+    """
+    assets: dict[str, tuple[str, bytes]] = {}
+    for name, ctype in (
+        ("console.css", "text/css; charset=utf-8"),
+        ("console.js", "application/javascript; charset=utf-8"),
+    ):
+        try:
+            assets[name] = (ctype, (_WEB_STATIC_DIR / name).read_bytes())
+        except OSError:
+            continue  # not present yet — route 404s until the file lands
+    return assets
+
+
+_STATIC_ASSETS = _load_static_assets()
 
 
 # ------------------------------------------------------------ data shaping
@@ -809,6 +675,24 @@ def _inject_next(d: dict, t: Thread) -> None:
         d["next_owner"] = t.next_owner
 
 
+def _thread_verdict(m: Message) -> str | None:
+    """The decision a single message carries, or None (§3b). SAFE: reads only
+    the envelope kind + ``meta.status`` — never the body. A ``review-result``
+    forwards its status verbatim; a ``proposal-response`` only when the status
+    is one of the known proposal outcomes; a ``gate`` marker maps to its status
+    or a bare "gate". Anything else carries no verdict."""
+    kind = m.kind
+    status = (m.meta or {}).get("status")
+    status = status if isinstance(status, str) and status else None
+    if kind == "review-result":
+        return status  # e.g. "approved" / "changes_requested" — verbatim envelope
+    if kind == "proposal-response":
+        return status if status in ("accepted", "rejected", "countered") else None
+    if kind == "gate":
+        return status or "gate"
+    return None
+
+
 def _derive_root_threads(
     store: Store, msgs: list[Message], roster: list[str],
     current: str | None,
@@ -832,10 +716,16 @@ def _derive_root_threads(
     """
     msgs_sorted = sorted(msgs, key=lambda m: m.id)
     openers: dict[str, Message] = {}
+    verdicts: dict[str, str] = {}  # rid -> latest decision (0.58.0, §3b)
     for m in msgs_sorted:
         rid = (m.meta or {}).get("request_id")
-        if isinstance(rid, str) and rid and rid not in openers:
+        if not (isinstance(rid, str) and rid):
+            continue
+        if rid not in openers:
             openers[rid] = m
+        v = _thread_verdict(m)
+        if v is not None:
+            verdicts[rid] = v  # msgs_sorted is ascending → last write is newest
 
     retired = set(store.retired_agents())  # 0.18.0: tombstones aren't owed moves
     views: dict[str, list[tuple[str, Thread]]] = {}
@@ -891,6 +781,14 @@ def _derive_root_threads(
             # (absent / null / id) must survive serialization.
             d["epoch_at_send"] = ometa["epoch_at_send"]
         d["epoch_status"] = _epoch_status(ometa, current)
+        # 0.58.0 (§3b): the thread's latest decision, if any (absent-not-null);
+        # meta.status only — never body. Omitted when the thread has no verdict.
+        if rid in verdicts:
+            d["verdict"] = verdicts[rid]
+        # active_review: emit ONLY when true (absent-not-null) — a non-terminal
+        # review-request/proposal thread drives the dashed/animated graph edge.
+        if d.get("opener_kind") in ("review-request", "proposal"):
+            d["active_review"] = True
         rows.append(d)
         if d.get("is_broadcast"):
             broadcasts.append({
@@ -908,12 +806,197 @@ def _derive_root_threads(
     return rows, broadcasts, closed
 
 
+# ------------------------------------------------- 0.58.0 per-agent enrichers
+#
+# All are absent-not-null: an undeterminable field is OMITTED entirely (§3a).
+# None reads the message dir — they compose the already-loaded `cfg`/`msgs` plus
+# cheap per-agent state reads, so the single-scan perf discipline holds. The
+# owned-domains map is built ONCE per root (not per agent).
+
+_CLI_VALUES = ("claude", "codex")
+
+
+def _infer_cli(agent: str, health: dict, capacity_snap: dict | None) -> str | None:
+    """Best-effort ``"claude" | "codex"`` for an agent (§3a). Order: a fresh
+    health ``cli`` field, else the capacity snapshot ``source`` prefix, else the
+    agent-name prefix. Omit (None) if nothing is determinable."""
+    hc = health.get("cli") if isinstance(health, dict) else None
+    if hc in _CLI_VALUES:
+        return hc
+    src = capacity_snap.get("source") if isinstance(capacity_snap, dict) else None
+    if isinstance(src, str):
+        # capacity `source` is e.g. "claude_statusline" / "codex_rollout".
+        for cli in _CLI_VALUES:
+            if src.startswith(cli):
+                return cli
+    prefix = agent.split("-", 1)[0]
+    if prefix in _CLI_VALUES:
+        return prefix
+    return None
+
+
+def _capacity_entry(snap: dict | None, *, now: datetime) -> dict | None:
+    """The `capacity` object (§3a) or None when no snapshot exists. `null`
+    percents are allowed INSIDE this object (a snapshot may carry only one
+    signal); the absent-not-null rule is about the `capacity` KEY itself."""
+    if not isinstance(snap, dict):
+        return None
+    rate = snap.get("primary_used_percent")
+    ctx = snap.get("context_used_percent")
+    return {
+        "rate_used_pct": rate if isinstance(rate, (int, float)) else None,
+        "context_used_pct": ctx if isinstance(ctx, (int, float)) else None,
+        "confidence": _map_confidence(_capacity.effective_confidence(snap, now=now)),
+    }
+
+
+def _map_confidence(eff: str) -> str:
+    """Map capacity's reader-confidence vocabulary (observed|stale|unknown) onto
+    the wire enum the console expects (fresh|stale|unknown)."""
+    if eff == "observed":
+        return "fresh"
+    if eff == "stale":
+        return "stale"
+    return "unknown"
+
+
+def _is_wrapped(health: dict) -> bool | None:
+    """True when the agent is determinably wrapped/supervised (§3a): the health
+    snapshot's ``mode`` names a wrapped loop. Omit (None) when unknown — an
+    `unknown` health view carries no mode we can trust."""
+    if not isinstance(health, dict):
+        return None
+    mode = health.get("mode")
+    if not isinstance(mode, str) or not mode:
+        return None
+    m = mode.lower()
+    if "wrapped" in m or "loop" in m:
+        return True
+    if "manual" in m or "listen" in m:
+        return False
+    return None
+
+
+def _owned_domains_map(store: Store, cfg: dict) -> dict[str, list[dict]]:
+    """Invert the domain registry into ``{agent: [{name, globs}, ...]}`` ONCE
+    per root (§3a). Reuses the same resolution the CLI's `_roster_expertise`
+    uses (``domains.resolve_refset`` over each domain's owners). A missing or
+    malformed registry degrades to an empty map (never raises up)."""
+    out: dict[str, list[dict]] = {}
+    try:
+        reg = _domains.load_registry(store.dir / _domains.FILENAME, cfg)
+    except _domains.DomainError:
+        return out  # malformed registry is advisory here — no owned_domains
+    for did, dentry in (reg.data.get("domains") or {}).items():
+        if not isinstance(dentry, dict):
+            continue
+        globs = dentry.get("owned_globs") or []
+        name = dentry.get("title") or did
+        for owner in _domains.resolve_refset(dentry.get("owners") or {}, cfg):
+            out.setdefault(owner, []).append({"name": name, "globs": list(globs)})
+    return out
+
+
+def _agent_task(agent: str, threads_rows: list[dict], composing: list[dict]) -> str | None:
+    """A synthesized "current work" line (§3a), envelope-derived (subjects/meta
+    already on the wire — no body). First match wins:
+      (a) the subject of the agent's newest non-terminal open thread where it is
+          ``next_owner``;
+      (b) else ``mission · <m> · <wp>`` from such a thread;
+      (c) else, if composing, ``composing a reply to <peer>``;
+      (d) else omit.
+    ``threads_rows`` is already newest-first (sorted by last_msg_id desc)."""
+    for row in threads_rows:
+        owner = row.get("next_owner")
+        owns = owner == agent or (isinstance(owner, list) and agent in owner)
+        if not owns:
+            continue
+        subj = row.get("subject")
+        if isinstance(subj, str) and subj.strip():
+            return subj
+        mission, wp = row.get("mission"), row.get("wp_id")
+        if isinstance(mission, str) and mission:
+            return f"mission · {mission}" + (f" · {wp}" if isinstance(wp, str) and wp else "")
+        break  # newest owned thread had no usable label — fall through to composing
+    if composing:
+        peer = composing[0].get("peer")
+        if isinstance(peer, str) and peer:
+            return f"composing a reply to {peer}"
+        return "composing a reply"
+    return None
+
+
+class HealthTimelineRing:
+    """Server-instance-owned, IN-MEMORY health-state history (§5).
+
+    Never a file (the read-only invariant) and never a module global (avoids
+    cross-test leakage — one instance per server, created in ``_make_handler``).
+    Records ``(now, state)`` per (root-label, agent) into a bounded deque,
+    prunes entries older than the ~30-min window, and collapses contiguous
+    same-state samples into ``{state, seconds}`` segments oldest→newest.
+
+    Best-effort: sampling and rendering both swallow errors so a timeline glitch
+    can never affect the /api/state payload's core fields.
+    """
+
+    def __init__(self, *, window_seconds: float = _HEALTH_TIMELINE_WINDOW_SECONDS) -> None:
+        self._window = float(window_seconds)
+        self._samples: dict[tuple[str, str], list[tuple[float, str]]] = {}
+        self._lock = threading.Lock()
+
+    def record(self, root_label: str, agent: str, state: str, *, now: float) -> None:
+        try:
+            key = (root_label, agent)
+            with self._lock:
+                seq = self._samples.setdefault(key, [])
+                seq.append((now, state))
+                cutoff = now - self._window
+                # prune from the front (oldest first); keep at most a bounded tail
+                while seq and seq[0][0] < cutoff:
+                    seq.pop(0)
+        except Exception:  # noqa: BLE001, S110 — a ring glitch must never affect the payload
+            pass
+
+    def segments(self, root_label: str, agent: str, *, now: float) -> list[dict]:
+        """Contiguous ``{state, seconds}`` segments over the window, oldest→newest.
+        Returns [] when no samples (client shows a "building history…" placeholder)."""
+        try:
+            with self._lock:
+                seq = list(self._samples.get((root_label, agent), ()))
+            if not seq:
+                return []
+            segs: list[dict] = []
+            for i, (ts, state) in enumerate(seq):
+                end = seq[i + 1][0] if i + 1 < len(seq) else now
+                dur = max(0.0, end - ts)
+                if segs and segs[-1]["state"] == state:
+                    segs[-1]["seconds"] = round(segs[-1]["seconds"] + dur, 3)
+                else:
+                    segs.append({"state": state, "seconds": round(dur, 3)})
+            return segs
+        except Exception:  # noqa: BLE001
+            return []
+
+
 def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
-                   liaison: str | None) -> list[dict]:
-    """Per-agent presence rows (data-model §3). Absent-not-null keys."""
+                   liaison: str | None, *,
+                   threads_rows: list[dict] | None = None,
+                   owned_domains: dict[str, list[dict]] | None = None,
+                   history: "HealthTimelineRing | None" = None,
+                   root_label: str | None = None) -> list[dict]:
+    """Per-agent presence rows (data-model §3). Absent-not-null keys.
+
+    0.58.0 additive fields (all OMITTED when not determinable): ``cli``,
+    ``capacity``, ``wrapped``, ``restartable``, ``owned_domains``, ``task``,
+    and (best-effort) ``health_timeline``. ``threads_rows`` / ``owned_domains``
+    are precomputed ONCE per root by the caller so no per-agent re-scan happens.
+    """
     roles = cfg.get("roles", {}) or {}
     groups = cfg.get("groups", {}) or {}
+    threads_rows = threads_rows or []
+    owned_domains = owned_domains or {}
     now = datetime.now(timezone.utc)
+    now_epoch = now.timestamp()
     # 0.19.0 (FR-001): per-agent message counts from the SAME validated `msgs`
     # already passed in — no extra scan. Always-present integers (0 is data).
     sent_counts: Counter = Counter(m.sender for m in msgs)
@@ -935,7 +1018,8 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
         if hb is not None:
             e["last_seen"] = hb.isoformat()
             e["last_seen_age_seconds"] = round((now - hb).total_seconds(), 3)
-        e["health"] = store.read_health(a, now_epoch=now.timestamp(), heartbeat=hb)
+        health = store.read_health(a, now_epoch=now_epoch, heartbeat=hb)
+        e["health"] = health
         e["unread"] = _unread_count(msgs, a, store.cursor(a))
         e["sent"] = sent_counts.get(a, 0)
         e["received"] = recv_counts.get(a, 0)
@@ -964,17 +1048,57 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
                 })
         if composing:
             e["composing"] = composing
+
+        # --- 0.58.0 additive fields (absent-not-null) ---
+        snap = store.read_capacity(a)
+        cli = _infer_cli(a, health, snap)
+        if cli is not None:
+            e["cli"] = cli
+        cap = _capacity_entry(snap, now=now)
+        if cap is not None:
+            e["capacity"] = cap
+        wrapped = _is_wrapped(health)
+        if wrapped is not None:
+            e["wrapped"] = wrapped
+            # restartable mirrors wrapped for v1 (only wrapped agents restart).
+            e["restartable"] = wrapped
+        owned = owned_domains.get(a)
+        if owned:
+            e["owned_domains"] = owned
+        task = _agent_task(a, threads_rows, composing)
+        if task is not None:
+            e["task"] = task
+        # health_timeline: best-effort in-memory ring (§5). Record this tick,
+        # then emit the collapsed segments — omitted entirely when history is
+        # None (build_state stays pure) or no meaningful samples have
+        # accumulated. A bare `unknown` (no/stale health snapshot at all) is NOT
+        # recorded: the timeline plots OBSERVED health states, and recording
+        # `unknown` would make the field appear for every agent on the first
+        # poll (defeating the client's "building history…" placeholder).
+        if history is not None and root_label is not None:
+            state = health.get("state") if isinstance(health, dict) else None
+            if isinstance(state, str) and state != "unknown":
+                history.record(root_label, a, state, now=now_epoch)
+            segs = history.segments(root_label, a, now=now_epoch)
+            if segs:
+                e["health_timeline"] = segs
         out.append(e)
     return out
 
 
-def _root_state(desc: RootDescriptor) -> dict:
+def _root_state(desc: RootDescriptor,
+                history: "HealthTimelineRing | None" = None) -> dict:
     """One root's full snapshot — or its degraded errors-as-data form.
 
     A failure ANYWHERE in this root's collection yields
     ``{label, path, errors:[...]}`` with no partial data fields; it must
     never escape (one corrupt root would 500 the whole aggregate,
     violating FR-005).
+
+    ``history`` (0.58.0, §5): the server's in-memory health-timeline ring,
+    passed only from the /api/state route handler. None (the default, and every
+    direct ``build_state`` unit-test call) omits ``health_timeline`` and keeps
+    the build pure.
     """
     label, path = desc.label, str(desc.store.root)
     try:
@@ -986,6 +1110,9 @@ def _root_state(desc: RootDescriptor) -> dict:
         current = _epoch_from(msgs)
         threads_rows, broadcasts, closed_count = _derive_root_threads(
             store, msgs, roster, current)
+        # Domain-owner map: built ONCE per root (not per agent) so the
+        # single-scan discipline holds (§3a).
+        owned_domains = _owned_domains_map(store, cfg)
         out: dict[str, Any] = {
             "label": label,
             "path": path,
@@ -1003,7 +1130,10 @@ def _root_state(desc: RootDescriptor) -> dict:
         liaison = store.operator_facing()
         if liaison:
             out["operator_facing"] = liaison
-        out["agents"] = _agent_entries(store, cfg, msgs, liaison)
+        out["agents"] = _agent_entries(
+            store, cfg, msgs, liaison,
+            threads_rows=threads_rows, owned_domains=owned_domains,
+            history=history, root_label=label)
         out["retired"] = store.retired_agents()
         out["threads"] = threads_rows
         out["broadcasts"] = broadcasts
@@ -1025,6 +1155,15 @@ def _root_state(desc: RootDescriptor) -> dict:
         if len(pairs) > _EDGE_LIMIT:
             out["edges_truncated"] = True
             out["edge_limit"] = _EDGE_LIMIT
+        # Recent-activity feed (0.58.0, additive): the last messages ENVELOPE-ONLY
+        # (id/ts/from/to/kind/subject — NEVER body; /api/state carries no bus body
+        # text, test-enforced). `msgs` is sorted ascending by id, so the tail is the
+        # most recent; emit most-recent-first, capped at _RECENT_LIMIT.
+        out["recent"] = [
+            {"id": m.id, "ts": m.ts, "from": m.sender, "to": m.recipient,
+             "kind": m.kind, "subject": m.subject or ""}
+            for m in reversed(msgs[-_RECENT_LIMIT:])
+        ]
         kdir = store.root / "kitty-specs"
         if kdir.is_dir():
             # Filesystem detection ONLY (FR-008): never import spec-kitty.
@@ -1043,18 +1182,288 @@ def _root_state(desc: RootDescriptor) -> dict:
         return {"label": label, "path": path, "errors": [str(e)]}
 
 
-def build_state(roots: list[RootDescriptor]) -> dict:
+def build_state(roots: list[RootDescriptor],
+                *, history: "HealthTimelineRing | None" = None) -> dict:
     """The /api/state aggregate (data-model.md, schema v1).
 
     ``generated_at`` is informational only — message ids remain the
     bus's sole ordering primitive.
+
+    PURE by default: ``history`` is None unless the /api/state route handler
+    passes the server's in-memory ring, so every unit/perf test that calls
+    ``build_state(roots)`` directly gets a deterministic payload with no
+    ``health_timeline`` and no ring side effects (§5).
     """
     return {
         "schema_version": STATE_SCHEMA_VERSION,
         "agenttalk_version": __version__,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "roots": [_root_state(d) for d in roots],
+        "roots": [_root_state(d, history) for d in roots],
     }
+
+
+# --------------------------------------------------- /api/attention (§4a)
+#
+# The ranked "needs a human" queue for root[0]. Composed from the PURE
+# attention.build_queue (escalations / gate HOLD / dead-letter / lead-unarmed /
+# capacity / config-blocked / close HOLD) PLUS a derived STUCK item per agent
+# whose advisory health.state == "stuck_suspected" (stuck is NOT a build_queue
+# source). READ-ONLY: it lists items; it never disposes them (no writes in v1).
+# web.py does NOT import the CLI layer, so the source collection mirrors
+# cli._collect_attention_items here, each source INDEPENDENTLY fail-safe.
+
+# Internal attention source -> the design's coarse wire source + label + severity.
+_ATTENTION_SOURCE_MAP: dict[str, tuple[str, str, str]] = {
+    _attention.SOURCE_NEEDS_OPERATOR: ("escalation", "ESCALATION", "high"),
+    _attention.SOURCE_CONFIG_BLOCKED: ("gate", "GATE HOLD", "high"),
+    _attention.SOURCE_GATE_HOLD: ("gate", "GATE HOLD", "high"),
+    _attention.SOURCE_CLOSE_HOLD: ("gate", "GATE HOLD", "high"),
+    _attention.SOURCE_DEAD_LETTER: ("deadletter", "DEAD LETTER", "med"),
+    _attention.SOURCE_LEAD_UNARMED: ("supervisor", "SUPERVISOR", "low"),
+    _attention.SOURCE_CAPACITY: ("supervisor", "SUPERVISOR", "low"),
+    _attention.SOURCE_ERROR: ("supervisor", "SUPERVISOR", "low"),
+}
+
+
+def _attention_agent(item: dict) -> str | None:
+    """Best-effort agent the item concerns, from its envelope source_refs
+    (never body). Returns None when the source is not agent-scoped."""
+    for ref in item.get("source_refs") or []:
+        if isinstance(ref, dict) and isinstance(ref.get("agent"), str):
+            return ref["agent"]
+    return None
+
+
+def _collect_web_attention_items(store: Store, roster: list[str],
+                                 for_agent: str | None) -> list[dict]:
+    """Mirror of cli._collect_attention_items, in-process (web must not import
+    the CLI). Each source read is INDEPENDENTLY fail-safe — one bad source
+    yields a bounded source_error item, never blanks the queue. needs_operator
+    is skipped (not an error) when no liaison/sole-lead resolved (read-only view)."""
+    A = _attention
+    items: list[dict] = []
+    if for_agent:
+        try:
+            items += A.needs_operator_items(_web_needs_operator(store, for_agent))
+        except Exception as e:  # noqa: BLE001
+            items.append(A.source_error_item("needs_operator", str(e)))
+    try:
+        holds = [h for a in roster if (h := store.read_config_blocked_hold(a))]
+        items += A.config_blocked_items(holds)
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("config_blocked", str(e)))
+    try:
+        items += A.dead_letter_items(
+            [{"agent": d.get("agent"), "message_id": d.get("message_id")}
+             for d in store.list_dead_letters()])
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("dead_letter", str(e)))
+    try:
+        from agenttalk import gates as _gates
+        items += A.gate_hold_items(_gates.check_gates(store.root).get("blockers", []))
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("gate_hold", str(e)))
+    try:
+        signals = []
+        for a in store.managed_lead_loop_agents():
+            st = store.lead_loop_state(a)
+            if st.get("managed") and not st.get("armed"):
+                signals.append({"agent": a, "reason": st.get("reason") or "lead-loop unarmed"})
+        items += A.lead_unarmed_items(signals)
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("lead_unarmed", str(e)))
+    return items
+
+
+def _web_needs_operator(store: Store, for_agent: str) -> list[dict]:
+    """Pending needs_operator escalations from ``for_agent``'s thread view, each
+    as {request_id, subject, sender, age_seconds, meta}. Parity with the CLI's
+    ``_needs_operator_items``: an escalation is an opener carrying
+    ``meta.needs_operator == "true"`` whose derived thread is still
+    ``operator_state == "pending"``. Envelope-only — the opener meta (incl.
+    meta.attention) feeds the fail-safe parser; the body is never read."""
+    now = datetime.now(timezone.utc)
+    cfg = store.load_config()
+    msgs, _ = _validated_for_state(store, cfg)
+    msgs_sorted = sorted(msgs, key=lambda m: m.id)
+    opener_meta: dict[str, dict] = {}
+    opener_sender: dict[str, str] = {}
+    for m in msgs_sorted:
+        rid = (m.meta or {}).get("request_id")
+        if rid and (m.meta or {}).get("needs_operator") == "true" and rid not in opener_meta:
+            opener_meta[rid] = m.meta or {}
+            opener_sender[rid] = m.sender
+    retired = set(store.retired_agents())
+    rows = derive_threads(msgs_sorted, agent=for_agent,
+                          cursor=store.cursor(for_agent) or "", now=now,
+                          closed_rids=_closed_rids_for(store, for_agent),
+                          retired=retired)
+    return [{"request_id": t.request_id, "subject": t.subject,
+             "sender": opener_sender.get(t.request_id, ""),
+             "age_seconds": t.age_seconds, "meta": opener_meta.get(t.request_id, {})}
+            for t in rows if t.needs_operator and t.operator_state == "pending"]
+
+
+def _derive_stuck_items(agents: list[dict], *, now: datetime) -> list[dict]:
+    """One STUCK attention item per agent whose advisory health.state ==
+    ``stuck_suspected`` (§4a — NOT a build_queue source). Envelope-derived; the
+    detail line names the agent, never any body."""
+    stuck: list[dict] = []
+    for a in agents:
+        health = a.get("health") or {}
+        if health.get("state") != "stuck_suspected":
+            continue
+        name = a.get("name")
+        age = a.get("last_seen_age_seconds")
+        stuck.append({
+            "id": f"stuck:{name}",
+            "source": "stuck",
+            "source_label": "STUCK",
+            "severity": "med",
+            "title": f"{name} looks stuck",
+            "agent": name,
+            "detail": "no forward progress on this agent's turn (advisory health)",
+            "age_seconds": float(age) if isinstance(age, (int, float)) else 0.0,
+            "human_can_unblock_now": True,
+        })
+    return stuck
+
+
+def build_attention(desc: RootDescriptor,
+                    agents: list[dict] | None = None) -> dict:
+    """The /api/attention payload for one root (§4a). Envelope-only: every
+    string here is envelope-derived — a raw message body NEVER lands in a
+    field. ``agents`` (root[0]'s /api/state agent rows) supplies the derived
+    STUCK items; when omitted they are computed from a fresh scan."""
+    store = desc.store
+    now = datetime.now(timezone.utc)
+    cfg = _safe_load_config(store)
+    roster = cfg.get("agents", []) or []
+    for_agent = store.operator_facing() or store.sole_lead()
+    items = _collect_web_attention_items(store, roster, for_agent)
+    disps, _problems = _attention.read_dispositions(store)
+    queue = _attention.build_queue(items, disps,
+                                   now_iso=now.isoformat().replace("+00:00", "Z"))
+    wire: list[dict] = []
+    for it in queue.get("items", []):
+        src = it.get("source", "")
+        mapped = _ATTENTION_SOURCE_MAP.get(src)
+        if mapped is None:
+            continue  # unknown internal source — skip rather than mislabel
+        wire_source, source_label, severity = mapped
+        title = it.get("title") or "attention needed"
+        detail = it.get("why_it_matters") or ""
+        wire.append({
+            "id": it.get("item_id", ""),
+            "source": wire_source,
+            "source_label": source_label,
+            "severity": severity,
+            "title": _envelope_str(title),
+            "agent": _attention_agent(it),
+            "detail": _envelope_str(detail),
+            "age_seconds": float(it.get("age_seconds") or 0),
+            "human_can_unblock_now": bool(it.get("human_can_unblock_now")),
+        })
+    if agents is None:
+        try:
+            agents = _agent_entries(store, cfg, _validated_for_state(store, cfg)[0],
+                                    for_agent)
+        except Exception:  # noqa: BLE001 — stuck items are best-effort
+            agents = []
+    wire.extend(_derive_stuck_items(agents, now=now))
+    return {"root": desc.label, "items": wire, "count": len(wire)}
+
+
+# NEEDS_OPERATOR titles/details are typed single-line fields the attention layer
+# already caps; but as defense-in-depth for §4a's "NEVER raw message body"
+# contract we bound every surfaced string to one line and a hard length so no
+# multi-paragraph prose can ride a field. Envelope summaries are short by design.
+_ENVELOPE_MAX = 300
+
+
+def _envelope_str(value: Any) -> str:
+    """Coerce an envelope-derived value to a short, single-line summary string.
+    Strips newlines and truncates — belt-and-braces so no body-ish prose leaks
+    through a field that is contractually envelope-only (§4a)."""
+    s = "" if value is None else str(value)
+    s = s.replace("\r", " ").replace("\n", " ").strip()
+    if len(s) > _ENVELOPE_MAX:
+        s = s[: _ENVELOPE_MAX - 1].rstrip() + "…"
+    return s
+
+
+# ------------------------------------------------ /api/thread/<rid> (§4b)
+
+def _cli_from_prefix(name: str) -> str | None:
+    """Infer ``"claude" | "codex"`` from an agent-name prefix, else None (§4b)."""
+    prefix = (name or "").split("-", 1)[0]
+    return prefix if prefix in _CLI_VALUES else None
+
+
+def _thread_meta_line(meta: dict) -> str:
+    """A SAFE, pre-formatted meta summary from a strict whitelist (§4b). Only
+    ``status``/``head``/``base`` are surfaced — never arbitrary meta, which may
+    carry body-ish sender text. Empty string when none are present."""
+    parts: list[str] = []
+    for key in _META_LINE_WHITELIST:
+        v = meta.get(key)
+        if isinstance(v, str) and v.strip():
+            parts.append(f"{key}={v.strip()}" if key == "status" else f"{key} {v.strip()}")
+        elif isinstance(v, (int, float, bool)):
+            parts.append(f"{key}={v}")
+    return " · ".join(parts)
+
+
+def build_thread(store: Store, rid: str) -> dict | None:
+    """One thread's full transcript, CARRYING RAW BODIES (§4b). Returns None
+    when no validated message has ``meta.request_id == rid`` (the route 404s).
+
+    Messages are the validated set (roster + kind + HMAC when enforced) — the
+    same surface /api/state derives from — ordered by id ascending. Bodies are
+    RAW (JSON transport); the client MUST render them via ``textContent``. The
+    caller validates ``rid`` against ``_MESSAGE_ID_RE`` BEFORE this touches disk.
+    """
+    now = datetime.now(timezone.utc)
+    msgs = [m for m in _all_messages(store)
+            if (m.meta or {}).get("request_id") == rid]
+    if not msgs:
+        return None
+    msgs.sort(key=lambda m: m.id)
+    opener = msgs[0]
+    participants: list[str] = []
+    for m in msgs:
+        for who in (m.sender, m.recipient):
+            if who and who not in participants:
+                participants.append(who)
+    out_msgs: list[dict] = []
+    for m in msgs:
+        age = _age_seconds_of(m.ts, now=now)
+        out_msgs.append({
+            "id": m.id,
+            "from": m.sender,
+            "to": m.recipient,
+            "kind": m.kind,
+            "ts": m.ts,
+            "age_seconds": age,
+            "cli": _cli_from_prefix(m.sender),
+            "body": m.body or "",  # RAW — client renders via textContent
+            "meta_line": _thread_meta_line(m.meta or {}),
+        })
+    return {
+        "request_id": rid,
+        "subject": opener.subject or "",
+        "participants": participants,
+        "kind": opener.kind,
+        "messages": out_msgs,
+    }
+
+
+def _age_seconds_of(ts: Any, *, now: datetime) -> float | None:
+    """Seconds since a message ``ts`` (ISO-8601), or None if unparseable."""
+    dt = _parse_iso(ts)
+    if dt is None:
+        return None
+    return round((now - dt).total_seconds(), 3)
 
 
 # ------------------------------------------------------------ HTTP handler
@@ -1067,6 +1476,12 @@ def _make_handler(roots: list[RootDescriptor]) -> type[BaseHTTPRequestHandler]:
     for every pre-0.17.0 route (FR-009).
     """
     store = roots[0].store
+    # Health-timeline ring (§5): one instance per SERVER (closed over here, not
+    # a module global) so parallel test servers never share history. In-memory
+    # only — never a file (the read-only invariant). Handler instances are
+    # created per connection, so the ring lives on this closure, shared across
+    # them for the lifetime of the server.
+    health_history = HealthTimelineRing()
 
     class Handler(BaseHTTPRequestHandler):
         server_version = f"agenttalk/{__version__}"
@@ -1182,15 +1597,49 @@ def _make_handler(roots: list[RootDescriptor]) -> type[BaseHTTPRequestHandler]:
                 self._send_json(HTTPStatus.OK, status_payload(store))
                 return
             if path == "/api/state":
-                self._send_json(HTTPStatus.OK, build_state(roots))
+                # Pass the server's in-memory ring so /api/state records a
+                # health sample this tick and emits health_timeline (§5). JSON
+                # feed keeps the strict _DEFAULT_CSP.
+                self._send_json(HTTPStatus.OK,
+                                build_state(roots, history=health_history))
+                return
+            if path == "/api/attention":
+                # Ranked "needs a human" queue for root[0] (§4a). Envelope-only,
+                # read-only, strict _DEFAULT_CSP (JSON is not executed).
+                self._send_json(HTTPStatus.OK, build_attention(roots[0]))
                 return
             if path == "/dashboard":
                 self._send_html(HTTPStatus.OK, render_dashboard(roots),
                                 csp=_DASHBOARD_CSP)
                 return
-            if path == "/static/dashboard.js":
-                self._send(HTTPStatus.OK, _DASHBOARD_JS,
-                           "application/javascript; charset=utf-8")
+            if path.startswith("/static/"):
+                # Allowlisted-filename static assets (§2): EXACT dict lookup,
+                # NEVER a path join on request input — the name can only ever
+                # match a literal key, so traversal is impossible. Unknown /
+                # not-yet-present name -> 404.
+                name = path[len("/static/"):]
+                asset = _STATIC_ASSETS.get(name)
+                if asset is None:
+                    self._error_html(HTTPStatus.NOT_FOUND, "not found")
+                    return
+                ctype, data = asset
+                self._send(HTTPStatus.OK, data, ctype)
+                return
+            if path.startswith("/api/thread/"):
+                # One thread's full transcript — the ONLY route that carries
+                # message bodies (§4b). Validate the rid BEFORE any disk touch
+                # (traversal parity with /messages/<id>). JSON feed → strict CSP.
+                rid = path[len("/api/thread/"):]
+                if not _MESSAGE_ID_RE.match(rid):
+                    self._send_json(HTTPStatus.NOT_FOUND,
+                                    {"error": "thread not found"})
+                    return
+                thread = build_thread(store, rid)
+                if thread is None:
+                    self._send_json(HTTPStatus.NOT_FOUND,
+                                    {"error": "thread not found"})
+                    return
+                self._send_json(HTTPStatus.OK, thread)
                 return
             if path == "/api/messages":
                 msgs = _all_messages(store)
@@ -1333,8 +1782,11 @@ def serve_in_thread(store: Store, *, host: str = "127.0.0.1", port: int = 0,
 __all__ = [
     "LOOPBACK_HOSTS",
     "STATE_SCHEMA_VERSION",
+    "HealthTimelineRing",
     "RootDescriptor",
+    "build_attention",
     "build_state",
+    "build_thread",
     "make_descriptors",
     "make_server",
     "render_dashboard",

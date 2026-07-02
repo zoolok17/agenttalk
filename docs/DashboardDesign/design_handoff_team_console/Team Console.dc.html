@@ -1,0 +1,855 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{font-family:'Geist',system-ui,-apple-system,sans-serif;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+  ::selection{background:rgba(120,132,168,.28)}
+  *::-webkit-scrollbar{width:11px;height:11px}
+  *::-webkit-scrollbar-thumb{background:rgba(130,138,150,.42);border-radius:9px;border:3px solid transparent;background-clip:content-box}
+  @keyframes liveDot{0%,100%{opacity:1}50%{opacity:.32}}
+  @keyframes dashmove{to{stroke-dashoffset:-24}}
+  @keyframes fadeInUp{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
+</style>
+</helmet>
+<div style="{{rootStyle}}">
+
+  <header style="height:56px;flex:none;display:flex;align-items:center;gap:18px;padding:0 22px;background:{{c.surface}};border-bottom:1px solid {{c.border}};position:relative;z-index:5">
+    <div style="display:flex;align-items:center;gap:10px">
+      <div style="{{brandMark}}"></div>
+      <div style="display:flex;flex-direction:column;line-height:1.05">
+        <span style="font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:16px;letter-spacing:-.01em;color:{{c.ink}}">agenttalk</span>
+        <span style="font-size:10.5px;color:{{c.ink3}};letter-spacing:.04em;text-transform:uppercase">Team Console</span>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 12px;border-radius:8px;background:{{c.surface2}};border:1px solid {{c.border}};font-size:12px;color:{{c.ink2}}">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+      <span style="font-weight:500">spec-kitty · lanes</span>
+      <span style="font-family:'Geist Mono',monospace;color:{{c.ink3}}">WP 7/12</span>
+    </div>
+    <div style="flex:1"></div>
+    <div style="display:flex;align-items:center;gap:8px;font-size:12px;color:{{c.ink2}}">
+      <span style="width:8px;height:8px;border-radius:50%;background:{{c.ok}};animation:liveDot 1.8s ease-in-out infinite"></span>
+      <span style="font-weight:500">Live</span>
+      <span style="font-family:'Geist Mono',monospace;color:{{c.ink3}}">{{clock}}</span>
+    </div>
+    <div style="width:1px;height:24px;background:{{c.border}}"></div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <div style="width:26px;height:26px;border-radius:7px;background:{{c.accentSoft}};color:{{c.accent}};display:flex;align-items:center;justify-content:center;font-family:'Geist Mono',monospace;font-size:11px;font-weight:500">yo</div>
+      <div style="display:flex;flex-direction:column;line-height:1.15">
+        <span style="font-size:12px;font-weight:500;color:{{c.ink}}">you</span>
+        <span style="font-size:10px;color:{{c.ink3}}">operator · lead-liaison</span>
+      </div>
+    </div>
+  </header>
+
+  <div style="flex:1;display:flex;min-height:0">
+
+    <aside style="width:238px;flex:none;background:{{c.surface}};border-right:1px solid {{c.border}};display:flex;flex-direction:column;padding:14px 12px">
+      <div style="font-size:10px;font-weight:600;letter-spacing:.09em;color:{{c.ink4}};text-transform:uppercase;padding:6px 10px 8px">Views</div>
+      <nav style="display:flex;flex-direction:column;gap:3px">
+        <sc-for list="{{nav}}" as="n" hint-placeholder-count="4">
+          <a onClick="{{n.go}}" style="{{n.style}}" style-hover="{{n.hover}}">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="{{n.icon}}"></path></svg>
+            <span style="flex:1;font-weight:500">{{n.label}}</span>
+            <sc-if value="{{n.badge}}" hint-placeholder-val="{{true}}"><span style="{{n.badgeStyle}}">{{n.badge}}</span></sc-if>
+          </a>
+        </sc-for>
+      </nav>
+      <div style="flex:1"></div>
+      <div style="border-top:1px solid {{c.border2}};padding:14px 10px 4px">
+        <div style="font-size:10px;font-weight:600;letter-spacing:.09em;color:{{c.ink4}};text-transform:uppercase;margin-bottom:10px">Status legend</div>
+        <div style="display:flex;flex-direction:column;gap:9px">
+          <sc-for list="{{legend}}" as="l" hint-placeholder-count="4">
+            <div style="display:flex;align-items:center;gap:9px">
+              <span style="width:9px;height:9px;border-radius:50%;flex:none;background:{{l.color}}"></span>
+              <span style="font-size:12px;color:{{c.ink2}};flex:1">{{l.label}}</span>
+              <span style="font-family:'Geist Mono',monospace;font-size:11px;color:{{c.ink3}}">{{l.count}}</span>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </aside>
+
+    <main style="flex:1;min-width:0;overflow:auto;padding:26px 30px 40px">
+
+      <sc-if value="{{isOverview}}" hint-placeholder-val="{{true}}">
+      <div>
+        <div style="display:flex;align-items:flex-end;gap:16px;margin-bottom:20px">
+          <div>
+            <h1 style="margin:0;font-family:'Space Grotesk',sans-serif;font-size:23px;font-weight:600;letter-spacing:-.015em;color:{{c.ink}}">Who's doing what</h1>
+            <p style="margin:5px 0 0;color:{{c.ink3}};font-size:13px">{{overviewSub}}</p>
+          </div>
+          <div style="flex:1"></div>
+          <div style="display:flex;gap:6px">
+            <sc-for list="{{filters}}" as="f" hint-placeholder-count="4">
+              <button onClick="{{f.set}}" style="{{f.style}}">{{f.label}}<span style="{{f.countStyle}}">{{f.count}}</span></button>
+            </sc-for>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px">
+          <sc-for list="{{stats}}" as="s" hint-placeholder-count="4">
+            <div style="background:{{c.surface}};border:1px solid {{c.border}};border-radius:12px;padding:16px 18px;box-shadow:0 1px 2px {{c.shadow}}">
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+                <span style="width:9px;height:9px;border-radius:50%;background:{{s.color}}"></span>
+                <span style="font-size:12px;color:{{c.ink3}};font-weight:500">{{s.label}}</span>
+              </div>
+              <div style="font-family:'Space Grotesk',sans-serif;font-size:30px;font-weight:600;letter-spacing:-.02em;line-height:1;color:{{c.ink}}">{{s.value}}</div>
+            </div>
+          </sc-for>
+        </div>
+
+        <div style="display:grid;grid-template-columns:minmax(0,1fr) 336px;gap:20px;align-items:start">
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(258px,1fr));gap:14px">
+            <sc-for list="{{agents}}" as="a" hint-placeholder-count="10">
+              <div onClick="{{a.open}}" style="{{a.cardStyle}}" style-hover="{{a.cardHover}}">
+                <div style="display:flex;align-items:center;gap:8px">
+                  <span style="{{a.dotStyle}}"></span>
+                  <span style="font-family:'Geist Mono',monospace;font-size:13px;font-weight:500;letter-spacing:-.01em;color:{{c.ink}}">{{a.name}}</span>
+                  <span style="{{a.cliStyle}}">{{a.cliLabel}}</span>
+                  <span style="flex:1"></span>
+                  <sc-if value="{{a.wrapped}}" hint-placeholder-val="{{true}}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" style="color:{{c.ink5}}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2"/></svg></sc-if>
+                </div>
+                <div style="font-size:11.5px;color:{{c.ink3}}">{{a.roleLine}}</div>
+                <div style="font-size:12.5px;line-height:1.42;color:{{c.ink2}};min-height:36px">{{a.task}}</div>
+                <div style="display:flex;align-items:center;gap:8px">
+                  <span style="{{a.chipStyle}}">{{a.statusLabel}}</span>
+                  <span style="flex:1"></span>
+                  <span style="font-family:'Geist Mono',monospace;font-size:11px;color:{{c.ink4}}">{{a.ageLabel}}</span>
+                </div>
+                <div style="display:flex;gap:14px;padding-top:10px;border-top:1px solid {{c.hairline}}">
+                  <div style="flex:1;display:flex;flex-direction:column;gap:5px">
+                    <div style="display:flex;justify-content:space-between;font-size:9.5px;letter-spacing:.05em;color:{{c.ink4}};font-family:'Geist Mono',monospace"><span>RATE</span><span>{{a.rateLabel}}</span></div>
+                    <div style="height:4px;background:{{c.track}};border-radius:3px;overflow:hidden"><div style="{{a.rateBar}}"></div></div>
+                  </div>
+                  <div style="flex:1;display:flex;flex-direction:column;gap:5px">
+                    <div style="display:flex;justify-content:space-between;font-size:9.5px;letter-spacing:.05em;color:{{c.ink4}};font-family:'Geist Mono',monospace"><span>CTX</span><span>{{a.ctxLabel}}</span></div>
+                    <div style="height:4px;background:{{c.track}};border-radius:3px;overflow:hidden"><div style="{{a.ctxBar}}"></div></div>
+                  </div>
+                </div>
+              </div>
+            </sc-for>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:16px;position:sticky;top:0">
+            <div style="background:{{c.surface}};border:1px solid {{c.border}};border-radius:12px;box-shadow:0 1px 2px {{c.shadow}};overflow:hidden">
+              <div style="display:flex;align-items:center;gap:8px;padding:13px 16px;border-bottom:1px solid {{c.hairline}}">
+                <span style="font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:13.5px;color:{{c.ink}}">Live activity</span>
+                <span style="width:7px;height:7px;border-radius:50%;background:{{c.ok}};animation:liveDot 1.8s ease-in-out infinite"></span>
+                <span style="flex:1"></span>
+                <span style="font-size:11px;color:{{c.ink4}}">bus messages</span>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:2px;padding:8px;max-height:520px;overflow:auto">
+                <sc-for list="{{feed}}" as="f" hint-placeholder-count="6">
+                  <div style="{{f.style}}">
+                    <div style="display:flex;align-items:center;gap:6px">
+                      <span style="font-family:'Geist Mono',monospace;font-size:11.5px;font-weight:500;color:{{c.ink2}}">{{f.from}}</span>
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" style="color:{{c.ink5}}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+                      <span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:{{c.ink3}}">{{f.to}}</span>
+                      <span style="flex:1"></span>
+                      <span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:{{c.ink5}}">{{f.age}}</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:7px">
+                      <span style="{{f.kindStyle}}">{{f.kindLabel}}</span>
+                      <span style="font-size:12px;color:{{c.ink2}};overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{f.subject}}</span>
+                    </div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{isFlow}}" hint-placeholder-val="{{true}}">
+      <div>
+        <div style="margin-bottom:20px">
+          <h1 style="margin:0;font-family:'Space Grotesk',sans-serif;font-size:23px;font-weight:600;letter-spacing:-.015em;color:{{c.ink}}">Who's talking to whom</h1>
+          <p style="margin:5px 0 0;color:{{c.ink3}};font-size:13px">Message flow across the team · line weight = volume · dashed = active review</p>
+        </div>
+        <div style="display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:20px;align-items:start">
+          <div style="background:{{c.surface}};border:1px solid {{c.border}};border-radius:12px;box-shadow:0 1px 2px {{c.shadow}};padding:18px;overflow:auto">
+            <div style="position:relative;width:640px;height:480px;margin:0 auto">
+              <svg width="640" height="480" style="display:block;position:absolute;inset:0">
+                <sc-for list="{{edges}}" as="e" hint-placeholder-count="8">
+                  <line x1="{{e.x1}}" y1="{{e.y1}}" x2="{{e.x2}}" y2="{{e.y2}}" style="{{e.style}}"></line>
+                </sc-for>
+              </svg>
+              <div style="position:absolute;inset:0">
+                <sc-for list="{{nodes}}" as="nd" hint-placeholder-count="10">
+                  <div onClick="{{nd.open}}" style="{{nd.wrap}}">
+                    <span style="{{nd.dotStyle}}"></span>
+                    <span style="{{nd.pill}}">{{nd.name}}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+          </div>
+          <div style="background:{{c.surface}};border:1px solid {{c.border}};border-radius:12px;box-shadow:0 1px 2px {{c.shadow}};overflow:hidden">
+            <div style="padding:13px 16px;border-bottom:1px solid {{c.hairline}};font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:13.5px;color:{{c.ink}}">Active threads</div>
+            <div style="display:flex;flex-direction:column">
+              <sc-for list="{{threads}}" as="t" hint-placeholder-count="5">
+                <div onClick="{{t.open}}" style="{{t.rowStyle}}" style-hover="{{threadHover}}">
+                  <div style="display:flex;align-items:center;gap:7px">
+                    <span style="{{t.kindStyle}}">{{t.kindLabel}}</span>
+                    <span style="flex:1"></span>
+                    <span style="{{t.statusStyle}}">{{t.statusLabel}}</span>
+                  </div>
+                  <div style="font-size:13px;font-weight:500;color:{{c.ink}}">{{t.subject}}</div>
+                  <div style="display:flex;align-items:center;gap:6px">
+                    <span style="font-family:'Geist Mono',monospace;font-size:11px;color:{{c.ink3}}">{{t.parts}}</span>
+                    <span style="flex:1"></span>
+                    <span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:{{c.ink5}}">{{t.age}}</span>
+                  </div>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+        </div>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{isAttention}}" hint-placeholder-val="{{true}}">
+      <div style="max-width:920px">
+        <div style="display:flex;align-items:flex-end;gap:12px;margin-bottom:20px">
+          <div>
+            <h1 style="margin:0;font-family:'Space Grotesk',sans-serif;font-size:23px;font-weight:600;letter-spacing:-.015em;color:{{c.ink}}">Needs a human</h1>
+            <p style="margin:5px 0 0;color:{{c.ink3}};font-size:13px">Ranked queue — escalations, gate holds, stuck agents, dead letters</p>
+          </div>
+          <div style="flex:1"></div>
+          <span style="{{attnCountStyle}}">{{attnCount}} open</span>
+        </div>
+        <sc-if value="{{hasAttn}}" hint-placeholder-val="{{true}}">
+        <div style="display:flex;flex-direction:column;gap:12px">
+          <sc-for list="{{attn}}" as="i" hint-placeholder-count="4">
+            <div style="{{i.cardStyle}}">
+              <div style="display:flex;flex-direction:column;gap:9px;flex:1;min-width:0">
+                <div style="display:flex;align-items:center;gap:9px">
+                  <span style="{{i.sourceStyle}}">{{i.sourceLabel}}</span>
+                  <span style="{{i.sevStyle}}">{{i.sevLabel}}</span>
+                  <span style="flex:1"></span>
+                  <span style="font-family:'Geist Mono',monospace;font-size:11px;color:{{c.ink4}}">{{i.age}} ago</span>
+                </div>
+                <div style="font-size:14.5px;font-weight:500;color:{{c.ink}};letter-spacing:-.005em">{{i.title}}</div>
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                  <span style="font-family:'Geist Mono',monospace;font-size:11px;background:{{c.inset}};border:1px solid {{c.border}};border-radius:6px;padding:2px 7px;color:{{c.ink2}}">{{i.agent}}</span>
+                  <span style="font-size:12px;color:{{c.ink3}}">{{i.detail}}</span>
+                </div>
+              </div>
+              <div style="display:flex;gap:8px;align-items:center;flex:none">
+                <sc-for list="{{i.actions}}" as="ac" hint-placeholder-count="2">
+                  <button onClick="{{ac.do}}" style="{{ac.style}}" style-hover="{{ac.hover}}">{{ac.label}}</button>
+                </sc-for>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+        </sc-if>
+        <sc-if value="{{noAttn}}" hint-placeholder-val="{{true}}">
+          <div style="background:{{c.surface}};border:1px solid {{c.border}};border-radius:12px;padding:56px;text-align:center;box-shadow:0 1px 2px {{c.shadow}}">
+            <div style="width:44px;height:44px;border-radius:50%;background:{{c.okSoft}};color:{{c.ok}};display:flex;align-items:center;justify-content:center;margin:0 auto 14px"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg></div>
+            <div style="font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:16px;margin-bottom:4px;color:{{c.ink}}">All clear</div>
+            <div style="color:{{c.ink3}};font-size:13px">Nothing is waiting on you right now.</div>
+          </div>
+        </sc-if>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{isSessions}}" hint-placeholder-val="{{true}}">
+      <div>
+        <div style="margin-bottom:20px">
+          <h1 style="margin:0;font-family:'Space Grotesk',sans-serif;font-size:23px;font-weight:600;letter-spacing:-.015em;color:{{c.ink}}">Sessions</h1>
+          <p style="margin:5px 0 0;color:{{c.ink3}};font-size:13px">Full transcripts of message threads on the bus</p>
+        </div>
+        <div style="display:grid;grid-template-columns:264px minmax(0,1fr);gap:20px;align-items:start">
+          <div style="background:{{c.surface}};border:1px solid {{c.border}};border-radius:12px;box-shadow:0 1px 2px {{c.shadow}};overflow:hidden">
+            <div style="padding:12px 15px;border-bottom:1px solid {{c.hairline}};font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:13px;color:{{c.ink}}">Threads</div>
+            <sc-for list="{{sessionList}}" as="s" hint-placeholder-count="2">
+              <div onClick="{{s.select}}" style="{{s.style}}">
+                <div style="display:flex;align-items:center;gap:6px;margin-bottom:5px">
+                  <span style="{{s.kindStyle}}">{{s.kindLabel}}</span>
+                  <span style="flex:1"></span>
+                  <span style="{{s.statusStyle}}">{{s.statusLabel}}</span>
+                </div>
+                <div style="font-size:12.5px;font-weight:500;color:{{c.ink}};margin-bottom:3px">{{s.subject}}</div>
+                <div style="font-family:'Geist Mono',monospace;font-size:10.5px;color:{{c.ink3}}">{{s.parts}}</div>
+              </div>
+            </sc-for>
+          </div>
+          <div style="background:{{c.surface}};border:1px solid {{c.border}};border-radius:12px;box-shadow:0 1px 2px {{c.shadow}};overflow:hidden;display:flex;flex-direction:column">
+            <div style="padding:15px 20px;border-bottom:1px solid {{c.hairline}};display:flex;align-items:center;gap:12px">
+              <div style="flex:1;min-width:0">
+                <div style="font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:15px;color:{{c.ink}}">{{curSession.subject}}</div>
+                <div style="font-family:'Geist Mono',monospace;font-size:11px;color:{{c.ink3}};margin-top:3px">{{curSession.id}} · {{curSession.parts}}</div>
+              </div>
+              <span style="{{curSession.statusStyle}}">{{curSession.statusLabel}}</span>
+            </div>
+            <div style="padding:22px 26px;display:flex;flex-direction:column;gap:16px;background:{{c.surface2}};max-height:600px;overflow:auto">
+              <sc-for list="{{transcript}}" as="m" hint-placeholder-count="5">
+                <div style="{{m.rowStyle}}">
+                  <sc-if value="{{m.isSystem}}" hint-placeholder-val="{{true}}">
+                    <div style="display:flex;align-items:center;gap:8px;color:{{c.ink5}}">
+                      <span style="flex:1;height:1px;background:{{c.border}}"></span>
+                      <span style="{{m.kindStyle}}">{{m.kindLabel}}</span>
+                      <span style="font-family:'Geist Mono',monospace;font-size:10.5px">{{m.from}}</span>
+                      <span style="flex:1;height:1px;background:{{c.border}}"></span>
+                    </div>
+                  </sc-if>
+                  <sc-if value="{{m.isBubble}}" hint-placeholder-val="{{true}}">
+                    <div style="{{m.bubble}}">
+                      <div style="display:flex;align-items:center;gap:7px;margin-bottom:8px">
+                        <span style="{{m.cliStyle}}">{{m.cliLabel}}</span>
+                        <span style="font-family:'Geist Mono',monospace;font-size:12px;font-weight:500;color:{{c.ink2}}">{{m.from}}</span>
+                        <span style="{{m.kindStyle}}">{{m.kindLabel}}</span>
+                        <span style="flex:1"></span>
+                        <span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:{{c.ink5}}">{{m.age}}</span>
+                      </div>
+                      <div style="font-size:13px;line-height:1.5;color:{{c.ink}};white-space:pre-wrap">{{m.body}}</div>
+                      <sc-if value="{{m.meta}}" hint-placeholder-val="meta"><div style="font-family:'Geist Mono',monospace;font-size:10.5px;color:{{c.ink4}};margin-top:8px;padding-top:8px;border-top:1px solid {{c.border2}}">{{m.meta}}</div></sc-if>
+                    </div>
+                  </sc-if>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+        </div>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{isAgent}}" hint-placeholder-val="{{true}}">
+      <div>
+        <button onClick="{{back}}" style="display:flex;align-items:center;gap:6px;background:none;border:none;cursor:pointer;color:{{c.ink3}};font-size:12.5px;font-family:'Geist',sans-serif;padding:0;margin-bottom:16px" style-hover="{{backHover}}">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M11 18l-6-6 6-6"/></svg>
+          Back to overview
+        </button>
+
+        <div style="background:{{c.surface}};border:1px solid {{c.border}};border-radius:14px;box-shadow:0 1px 2px {{c.shadow}};padding:22px 24px;margin-bottom:18px;display:flex;align-items:center;gap:18px">
+          <span style="{{det.bigDot}}"></span>
+          <div style="min-width:0">
+            <div style="display:flex;align-items:center;gap:10px">
+              <span style="font-family:'Geist Mono',monospace;font-size:20px;font-weight:500;letter-spacing:-.01em;color:{{c.ink}}">{{det.name}}</span>
+              <span style="{{det.cliStyle}}">{{det.cliLabel}}</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;margin-top:7px;font-size:12.5px;color:{{c.ink3}}">
+              <span style="{{det.chipStyle}}">{{det.statusLabel}}</span>
+              <span>·</span><span>{{det.roleLine}}</span>
+              <span>·</span><span>since {{det.since}}</span>
+            </div>
+          </div>
+          <div style="flex:1"></div>
+          <div style="display:flex;gap:9px">
+            <sc-if value="{{det.showRestart}}" hint-placeholder-val="{{true}}"><button onClick="{{det.restart}}" style="{{primaryBtn}}" style-hover="{{primaryBtnHover}}">Restart with context</button></sc-if>
+            <button onClick="{{det.openTranscript}}" style="{{ghostBtn}}" style-hover="{{ghostBtnHover}}">Open transcript</button>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:minmax(0,1fr) 306px;gap:18px;align-items:start">
+          <div style="display:flex;flex-direction:column;gap:18px">
+            <div style="background:{{c.surface}};border:1px solid {{c.border}};border-radius:12px;box-shadow:0 1px 2px {{c.shadow}};padding:18px 20px">
+              <div style="font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:{{c.ink4}};margin-bottom:12px">Current work</div>
+              <div style="font-size:15px;line-height:1.5;color:{{c.ink}};margin-bottom:14px">{{det.task}}</div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <span style="{{tagStyle}}">mission · {{det.mission}}</span>
+                <span style="{{tagStyle}}">{{det.wp}}</span>
+                <span style="{{tagStyle}}">peer · {{det.peer}}</span>
+              </div>
+            </div>
+
+            <div style="background:{{c.surface}};border:1px solid {{c.border}};border-radius:12px;box-shadow:0 1px 2px {{c.shadow}};padding:18px 20px">
+              <div style="font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:{{c.ink4}};margin-bottom:14px">Health timeline · last 30m</div>
+              <div style="display:flex;height:26px;border-radius:7px;overflow:hidden;gap:2px;margin-bottom:8px">
+                <sc-for list="{{det.timeline}}" as="seg" hint-placeholder-count="5">
+                  <div style="{{seg.style}}" title="{{seg.title}}"></div>
+                </sc-for>
+              </div>
+              <div style="display:flex;gap:16px;flex-wrap:wrap">
+                <sc-for list="{{det.timelineLegend}}" as="tl" hint-placeholder-count="3">
+                  <div style="display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:2px;background:{{tl.color}}"></span><span style="font-size:11px;color:{{c.ink3}}">{{tl.label}}</span></div>
+                </sc-for>
+              </div>
+            </div>
+
+            <div style="background:{{c.surface}};border:1px solid {{c.border}};border-radius:12px;box-shadow:0 1px 2px {{c.shadow}};overflow:hidden">
+              <div style="padding:14px 20px;border-bottom:1px solid {{c.hairline}};font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:{{c.ink4}}">Recent messages</div>
+              <sc-if value="{{det.hasMsgs}}" hint-placeholder-val="{{true}}">
+              <div style="display:flex;flex-direction:column">
+                <sc-for list="{{det.msgs}}" as="m" hint-placeholder-count="4">
+                  <div style="padding:12px 20px;border-bottom:1px solid {{c.hairline}};display:flex;align-items:center;gap:10px">
+                    <span style="{{m.kindStyle}}">{{m.kindLabel}}</span>
+                    <span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:{{c.ink2}}">{{m.dir}}</span>
+                    <span style="font-size:12.5px;color:{{c.ink2}};flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{m.subject}}</span>
+                    <span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:{{c.ink5}}">{{m.age}}</span>
+                  </div>
+                </sc-for>
+              </div>
+              </sc-if>
+              <sc-if value="{{det.noMsgs}}" hint-placeholder-val="{{true}}"><div style="padding:24px 20px;color:{{c.ink4}};font-size:13px">No recent traffic on the bus.</div></sc-if>
+            </div>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:18px">
+            <div style="background:{{c.surface}};border:1px solid {{c.border}};border-radius:12px;box-shadow:0 1px 2px {{c.shadow}};padding:18px 20px">
+              <div style="font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:{{c.ink4}};margin-bottom:16px">Capacity</div>
+              <div style="margin-bottom:16px">
+                <div style="display:flex;justify-content:space-between;margin-bottom:7px"><span style="font-size:12.5px;color:{{c.ink2}}">5-hour rate limit</span><span style="font-family:'Geist Mono',monospace;font-size:12px;color:{{c.ink2}}">{{det.rateLabel}}</span></div>
+                <div style="height:7px;background:{{c.track}};border-radius:4px;overflow:hidden"><div style="{{det.rateBar}}"></div></div>
+                <div style="font-size:11px;color:{{c.ink4}};margin-top:6px">{{det.rateNote}}</div>
+              </div>
+              <div>
+                <div style="display:flex;justify-content:space-between;margin-bottom:7px"><span style="font-size:12.5px;color:{{c.ink2}}">Context window</span><span style="font-family:'Geist Mono',monospace;font-size:12px;color:{{c.ink2}}">{{det.ctxLabel}}</span></div>
+                <div style="height:7px;background:{{c.track}};border-radius:4px;overflow:hidden"><div style="{{det.ctxBar}}"></div></div>
+                <div style="font-size:11px;color:{{c.ink4}};margin-top:6px">{{det.ctxNote}}</div>
+              </div>
+            </div>
+
+            <div style="background:{{c.surface}};border:1px solid {{c.border}};border-radius:12px;box-shadow:0 1px 2px {{c.shadow}};padding:18px 20px">
+              <div style="font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:{{c.ink4}};margin-bottom:14px">Supervisor</div>
+              <div style="display:flex;flex-direction:column;gap:11px">
+                <sc-for list="{{det.supervisor}}" as="sv" hint-placeholder-count="4">
+                  <div style="display:flex;align-items:center;gap:8px"><span style="font-size:12px;color:{{c.ink3}};flex:1">{{sv.k}}</span><span style="{{sv.style}}">{{sv.v}}</span></div>
+                </sc-for>
+              </div>
+            </div>
+
+            <div style="background:{{c.surface}};border:1px solid {{c.border}};border-radius:12px;box-shadow:0 1px 2px {{c.shadow}};padding:18px 20px">
+              <div style="font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:{{c.ink4}};margin-bottom:13px">Owned domains</div>
+              <div style="display:flex;flex-direction:column;gap:8px">
+                <sc-for list="{{det.domains}}" as="d" hint-placeholder-count="2">
+                  <div><div style="font-size:12.5px;font-weight:500;color:{{c.ink}};margin-bottom:3px">{{d.title}}</div><div style="font-family:'Geist Mono',monospace;font-size:10.5px;color:{{c.ink4}}">{{d.glob}}</div></div>
+                </sc-for>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      </sc-if>
+
+    </main>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1320,&quot;height&quot;:860},&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;light&quot;,&quot;options&quot;:[&quot;light&quot;,&quot;dark&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;},&quot;accent&quot;:{&quot;editor&quot;:&quot;color&quot;,&quot;default&quot;:&quot;#4457E6&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;options&quot;:[&quot;#4457E6&quot;,&quot;#2F7D6B&quot;,&quot;#B0532C&quot;,&quot;#6D4AC0&quot;,&quot;#2563C9&quot;],&quot;section&quot;:&quot;Theme&quot;},&quot;simulate&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Behavior&quot;},&quot;density&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;comfortable&quot;,&quot;options&quot;:[&quot;comfortable&quot;,&quot;compact&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Behavior&quot;}}">
+class Component extends DCLogic {
+  constructor(props){
+    super(props);
+    const t = Date.now();
+    this.t0 = t;
+    this.lastInject = t;
+    this.injIx = 0;
+    this.archRecoverAt = null;
+    this.state = { view:'overview', selected:null, filter:'all', session:'rq-7a1', nowMs:t, arch:'stuck', dismissed:[] };
+
+    this.agentsBase = [
+      {id:'claude-lead',cli:'claude',role:'lead',group:'operator-facing',state:'working_turn',task:'Coordinating the release close for m-4.2 — tracking three open review threads.',rate:41,ctx:62,wrapped:false,peer:'—',mission:'—',wp:'—',ageSec:3},
+      {id:'claude-dev',cli:'claude',role:'implementer',group:'devs',state:'working_turn',task:'Implementing WP-07 — the lane deliver-gate bounds check.',rate:58,ctx:74,wrapped:true,peer:'codex-rev',mission:'lanes',wp:'WP-07',ageSec:8},
+      {id:'codex-dev',cli:'codex',role:'implementer',group:'devs',state:'working_silent',task:'Refactoring the attention-queue collector (silent reasoning turn).',rate:33,ctx:48,wrapped:true,peer:'claude-rev',mission:'lanes',wp:'WP-05',ageSec:22},
+      {id:'claude-rev',cli:'claude',role:'reviewer',group:'reviewers',state:'idle_waiting',task:'Awaiting a handoff from codex-dev on WP-05.',rate:20,ctx:30,wrapped:true,peer:'codex-dev',mission:'lanes',wp:'—',ageSec:46},
+      {id:'codex-rev',cli:'codex',role:'reviewer',group:'reviewers',state:'working_turn',task:'Cross-reviewing WP-07 (rq-7a1) — verifying the rename bounds path.',rate:69,ctx:81,wrapped:true,peer:'claude-dev',mission:'lanes',wp:'WP-07',ageSec:5},
+      {id:'codex-test',cli:'codex',role:'tester',group:'devs',state:'working_turn',task:'Running the failure-injection suite against the lane gate.',rate:44,ctx:55,wrapped:true,peer:'—',mission:'lanes',wp:'WP-07',ageSec:12},
+      {id:'claude-docs',cli:'claude',role:'docs',group:'devs',state:'idle_waiting',task:'Waiting on a review-result for the docs migration PR.',rate:12,ctx:22,wrapped:true,peer:'codex-rev',mission:'—',wp:'—',ageSec:88},
+      {id:'codex-infra',cli:'codex',role:'infra',group:'devs',state:'rate_limited_or_outage',task:'Paused — the 5-hour rate window resets in 34m.',rate:98,ctx:40,wrapped:true,peer:'—',mission:'—',wp:'WP-11',ageSec:214},
+      {id:'claude-arch',cli:'claude',role:'implementer',group:'devs',state:'stuck_suspected',task:'No heartbeat progress for 6m on WP-09.',rate:51,ctx:93,wrapped:true,peer:'codex-rev',mission:'knowledge',wp:'WP-09',ageSec:372},
+      {id:'codex-scout',cli:'codex',role:'reviewer',group:'reviewers',state:'unknown',task:'Heartbeat missing — health is unknown.',rate:0,ctx:0,wrapped:false,peer:'—',mission:'—',wp:'—',ageSec:1260}
+    ];
+
+    this.feed = [
+      {from:'codex-rev',to:'claude-dev',kind:'review-result',subject:'WP-07: GO — rename bounds verified',ageSec:14,fresh:false},
+      {from:'claude-lead',to:'reviewers',kind:'broadcast',subject:'API naming — “lane” vs “deliver-gate”?',ageSec:40,fresh:false},
+      {from:'claude-dev',to:'codex-rev',kind:'wake',subject:'nudge: WP-07 ready for re-review',ageSec:62,fresh:false},
+      {from:'codex-test',to:'claude-lead',kind:'note',subject:'Failure-injection: 42/42 green',ageSec:135,fresh:false},
+      {from:'claude-arch',to:'codex-rev',kind:'review-request',subject:'WP-09 first pass',ageSec:300,fresh:false},
+      {from:'codex-infra',to:'claude-lead',kind:'escalate',subject:'Rate-limit — reassign WP-11?',ageSec:480,fresh:false}
+    ].map(m=>({...m,at:t-m.ageSec*1000}));
+
+    this.extra = [
+      {from:'codex-dev',to:'claude-rev',kind:'review-request',subject:'attention collector refactor',ageSec:180},
+      {from:'claude-rev',to:'codex-dev',kind:'reply',subject:'ack — starting review',ageSec:150},
+      {from:'claude-docs',to:'codex-rev',kind:'review-request',subject:'docs migration PR',ageSec:900},
+      {from:'codex-rev',to:'claude-docs',kind:'note',subject:'queued behind WP-07',ageSec:840},
+      {from:'claude-arch',to:'codex-rev',kind:'proposal',subject:'split WP-09 / WP-10',ageSec:900},
+      {from:'codex-rev',to:'claude-arch',kind:'proposal-response',subject:'countered — split ownership',ageSec:700},
+      {from:'claude-lead',to:'codex-rev',kind:'question',subject:'naming check',ageSec:40},
+      {from:'claude-lead',to:'claude-rev',kind:'question',subject:'naming check',ageSec:40},
+      {from:'codex-test',to:'claude-lead',kind:'note',subject:'contract-drift check clean',ageSec:60}
+    ].map(m=>({...m,at:t-m.ageSec*1000}));
+
+    this.pool = [
+      {from:'codex-rev',to:'claude-dev',kind:'review-result',subject:'WP-07: GO — bounds fix confirmed'},
+      {from:'claude-rev',to:'claude-lead',kind:'reply',subject:'concern: prefer “lane” over “deliver-gate”'},
+      {from:'codex-test',to:'claude-lead',kind:'note',subject:'contract-drift check: clean'},
+      {from:'claude-dev',to:'codex-rev',kind:'wake',subject:'nudge: ready for re-review'},
+      {from:'claude-lead',to:'codex-infra',kind:'reply',subject:'deferred WP-11 until reset'},
+      {from:'codex-dev',to:'claude-rev',kind:'review-request',subject:'attention collector — pass 2'}
+    ];
+
+    this.threadsBase = [
+      {id:'rq-7a1',kind:'review-request',subject:'WP-07 · lane deliver-gate',a:'claude-dev',b:'codex-rev',status:'GO',ageSec:14},
+      {id:'b-9f2',kind:'broadcast',subject:'API naming check',a:'claude-lead',b:'reviewers',status:'1/2 replied',ageSec:40},
+      {id:'pp-3',kind:'proposal',subject:'Split WP-09 / WP-10',a:'claude-arch',b:'codex-rev',status:'countered',ageSec:700},
+      {id:'gate-m42',kind:'gate',subject:'Release close m-4.2',a:'claude-lead',b:'—',status:'HOLD',ageSec:720},
+      {id:'rq-docs2',kind:'review-request',subject:'Docs migration',a:'claude-docs',b:'codex-rev',status:'GO',ageSec:3600}
+    ];
+
+    this.edgesBase = [
+      ['claude-dev','codex-rev',3,true],['codex-dev','claude-rev',2,false],['claude-arch','codex-rev',2,false],
+      ['claude-lead','codex-rev',1,false],['claude-lead','claude-rev',1,false],['codex-infra','claude-lead',1,false],
+      ['codex-test','claude-lead',1,false],['claude-docs','codex-rev',1,false],['codex-scout','codex-rev',1,false]
+    ];
+
+    this.sessions = {
+      'rq-7a1':{id:'rq-7a1',subject:'WP-07 · lane deliver-gate review',a:'claude-dev',b:'codex-rev',status:'GO',kind:'review-request',msgs:[
+        {from:'claude-dev',kind:'review-request',body:'## Goal\nImplement WP-07 — the lane deliver-gate.\n\n## Files changed\nsrc/agenttalk/lanes.py · tests/test_lanes.py\n\n## How to verify\npytest tests/test_lanes.py -q\n\n## Focus\nBounds-check on renamed / copied paths.',meta:'rq-7a1 · base 4e74e0e · head a19c3f2',ageSec:600},
+        {from:'codex-rev',kind:'wake',body:'',meta:'',ageSec:596},
+        {from:'codex-rev',kind:'review-result',body:'1 blocker — out_of_bounds_path isn’t evaluated for a rename’s OLD path, so a move out of the lane subset would slip through. Everything else is clean; suite green locally.',meta:'status=blocked',ageSec:540},
+        {from:'claude-dev',kind:'reply',body:'Fixed. The rename old-path is now bounds-checked and treated as removed. Re-ran the suite — 61 passed.',meta:'head 7b2d9c1',ageSec:300},
+        {from:'codex-rev',kind:'review-result',body:'GO — bounds handling is correct now, rename + copy cases both covered. Nice work.',meta:'status=approved',ageSec:120}
+      ]},
+      'pp-3':{id:'pp-3',subject:'Proposal · split WP-09 / WP-10',a:'claude-arch',b:'codex-rev',status:'countered',kind:'proposal',msgs:[
+        {from:'claude-arch',kind:'proposal',body:'## Problem\nWP-09 mixes lane state and knowledge notes in one unit.\n\n## Proposed solution\nSplit into WP-09 (lanes) + WP-10 (knowledge); I take both.\n\n## Decision requested\nApprove the split and the ownership.',meta:'pp-3',ageSec:900},
+        {from:'codex-rev',kind:'proposal-response',body:'Countered — the split is right, but ownership shouldn’t land on one agent. Suggest claude-arch → WP-09, codex-dev → WP-10, and cross-review each.',meta:'status=countered',ageSec:700},
+        {from:'claude-arch',kind:'note',body:'Ack. This needs operator sign-off on the split before we proceed — escalating.',meta:'',ageSec:650}
+      ]}
+    };
+
+    this.attnBase = [
+      {id:'esc-1',sev:'high',source:'escalation',sourceLabel:'ESCALATION',title:'Rate-limit outage — reassign WP-11 owner?',agent:'codex-infra',detail:'needs_operator · 5h window resets in 34m',ageSec:480,actions:[{label:'Answer',kind:'primary'},{label:'Reassign',kind:'ghost'},{label:'Defer',kind:'ghost'}]},
+      {id:'gate-1',sev:'high',source:'gate',sourceLabel:'GATE HOLD',title:'Release close m-4.2 is blocked',agent:'claude-lead',detail:'automation_ci gate not satisfied · 1 of 3 evidences',ageSec:720,actions:[{label:'View evidence',kind:'primary'},{label:'Defer',kind:'ghost'}]},
+      {id:'stuck-1',sev:'med',source:'stuck',sourceLabel:'STUCK',title:'claude-arch — no progress for 6m on WP-09',agent:'claude-arch',detail:'heartbeat stale · wrapped · restartable with context',ageSec:372,actions:[{label:'Restart with context',kind:'primary',act:'restart'},{label:'Inspect',kind:'ghost',act:'inspect'}]},
+      {id:'dl-1',sev:'med',source:'deadletter',sourceLabel:'DEAD LETTER',title:'Poison message in codex-scout inbox',agent:'codex-scout',detail:'schema validation failed · payload preserved',ageSec:1200,actions:[{label:'Inspect',kind:'ghost'},{label:'Requeue',kind:'ghost'},{label:'Resolve',kind:'primary',act:'dismiss'}]},
+      {id:'sup-1',sev:'low',source:'supervisor',sourceLabel:'SUPERVISOR',title:'Lead-loop is not armed',agent:'claude-lead',detail:'advisory · warn-only',ageSec:180,actions:[{label:'Arm',kind:'primary',act:'dismiss'},{label:'Dismiss',kind:'ghost',act:'dismiss'}]}
+    ];
+
+    const cx=320, cy=240, r=178;
+    this.pos={};
+    this.agentsBase.forEach((a,i)=>{
+      const ang=(-90+i*36)*Math.PI/180;
+      this.pos[a.id]={x:Math.round(cx+r*Math.cos(ang)),y:Math.round(cy+r*Math.sin(ang))};
+    });
+  }
+
+  componentDidMount(){ if(this.props.simulate!==false){ this.timer=setInterval(()=>this.tick(),1000); } }
+  componentWillUnmount(){ if(this.timer) clearInterval(this.timer); }
+  tick(){
+    const now=Date.now();
+    if(now-this.lastInject>7000){
+      const p=this.pool[this.injIx%this.pool.length]; this.injIx++;
+      this.feed.forEach(f=>f.fresh=false);
+      this.feed.unshift({...p,at:now,fresh:true});
+      if(this.feed.length>7) this.feed.pop();
+      this.lastInject=now;
+    }
+    this.setState({nowMs:now});
+  }
+
+  _palette(dark, A){
+    const C = dark ? {
+      canvas:'#0E1116',surface:'#161A21',surface2:'#1B2029',border:'#2A313D',border2:'#232A34',hairline:'#21272F',track:'#252B35',inset:'#1B2029',edge:'#39414D',chipNeutral:'#9BA3B0',chipNeutralBg:'#252B35',ink:'#E8EBEF',ink2:'#AEB6C2',ink3:'#7F8895',ink4:'#6A7280',ink5:'#58606D',ok:'#3DBE8B',okSoft:'rgba(61,190,139,.16)',info:'#5AA0E0',infoSoft:'rgba(90,160,224,.16)',warn:'#D9A22E',warnSoft:'rgba(217,162,46,.16)',attn:'#F0803F',attnSoft:'rgba(240,128,63,.16)',danger:'#E86560',dangerSoft:'rgba(232,101,96,.18)',violet:'#9E82E0',violetSoft:'rgba(158,130,224,.18)',teal:'#42B9A8',tealSoft:'rgba(66,185,168,.16)',gray:'#8A929E',graySoft:'rgba(138,146,158,.16)',claude:'#D08A5E',claudeBg:'rgba(208,138,94,.16)',codex:'#4FB3A0',codexBg:'rgba(79,179,160,.16)',shadow:'rgba(0,0,0,.4)',shadowLg:'rgba(0,0,0,.55)'
+    } : {
+      canvas:'#F1F3F6',surface:'#FFFFFF',surface2:'#F8F9FB',border:'#E7E9EE',border2:'#EDEEF2',hairline:'#F0F1F4',track:'#EEF0F3',inset:'#F1F3F6',edge:'#C7CCD6',chipNeutral:'#6B7280',chipNeutralBg:'#EEF0F3',ink:'#1B1E24',ink2:'#5B616E',ink3:'#8A909C',ink4:'#A2A8B4',ink5:'#B0B6C0',ok:'#12996A',okSoft:'#E4F5EE',info:'#2F7AC7',infoSoft:'#E7F1FB',warn:'#B4820A',warnSoft:'#FBF2DA',attn:'#E4681F',attnSoft:'#FCEBDE',danger:'#D8443F',dangerSoft:'#FBE7E6',violet:'#6D4AC0',violetSoft:'#EEE8FA',teal:'#2E9E8F',tealSoft:'#E1F2EF',gray:'#98A0AE',graySoft:'#EFF1F4',claude:'#B0532C',claudeBg:'#F6EBE3',codex:'#2C7A6B',codexBg:'#E4F1EE',shadow:'rgba(20,25,40,.04)',shadowLg:'rgba(20,25,40,.10)'
+    };
+    C.accent = A; C.accentSoft = this._rgba(A, dark?0.22:0.12);
+    return C;
+  }
+  _rgba(hex,a){const h=(hex||'#4457E6').replace('#','');const s=h.length===3?h.split('').map(c=>c+c).join(''):h;const n=parseInt(s,16);return 'rgba('+((n>>16)&255)+','+((n>>8)&255)+','+(n&255)+','+a+')';}
+  _fmt(sec){sec=Math.max(0,Math.floor(sec));if(sec<60)return sec+'s';if(sec<3600){const m=Math.floor(sec/60),s=sec%60;return (m<10&&s)?m+'m '+s+'s':m+'m';}const h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60);return m?h+'h '+m+'m':h+'h';}
+  _sm(state){const C=this._C;const M={
+    working_turn:{label:'Working',color:C.ok,soft:C.okSoft},
+    working_silent:{label:'Working · quiet',color:C.info,soft:C.infoSoft},
+    idle_waiting:{label:'Idle · waiting',color:C.warn,soft:C.warnSoft},
+    stuck_suspected:{label:'Stuck?',color:C.attn,soft:C.attnSoft},
+    rate_limited_or_outage:{label:'Rate-limited',color:C.danger,soft:C.dangerSoft},
+    degraded_output:{label:'Degraded',color:C.danger,soft:C.dangerSoft},
+    crashed_or_exited:{label:'Exited',color:C.chipNeutral,soft:C.chipNeutralBg},
+    unknown:{label:'Unknown',color:C.gray,soft:C.graySoft}
+  };return M[state]||M.unknown;}
+  _cli(cli){const C=this._C;return cli==='claude'?{label:'CLAUDE',color:C.claude,bg:C.claudeBg}:{label:'CODEX',color:C.codex,bg:C.codexBg};}
+  _km(kind){const C=this._C;const M={
+    'review-request':{label:'review-request',color:C.accent,bg:C.accentSoft},
+    'review-result':{label:'review-result',color:C.ok,bg:C.okSoft},
+    'proposal':{label:'proposal',color:C.violet,bg:C.violetSoft},
+    'proposal-response':{label:'proposal-response',color:C.violet,bg:C.violetSoft},
+    'question':{label:'question',color:C.info,bg:C.infoSoft},
+    'note':{label:'note',color:C.chipNeutral,bg:C.chipNeutralBg},
+    'message':{label:'message',color:C.chipNeutral,bg:C.chipNeutralBg},
+    'reply':{label:'reply',color:C.chipNeutral,bg:C.chipNeutralBg},
+    'wake':{label:'wake',color:C.teal,bg:C.tealSoft},
+    'end':{label:'end',color:C.chipNeutral,bg:C.chipNeutralBg},
+    'escalate':{label:'escalate',color:C.danger,bg:C.dangerSoft},
+    'broadcast':{label:'broadcast',color:C.info,bg:C.infoSoft},
+    'gate':{label:'gate',color:C.danger,bg:C.dangerSoft}
+  };return M[kind]||M.message;}
+  _chip(color,bg){return {display:'inline-flex',alignItems:'center',fontFamily:"'Geist Mono',monospace",fontSize:'10px',fontWeight:'500',letterSpacing:'.02em',color:color,background:bg,borderRadius:'5px',padding:'2px 7px',whiteSpace:'nowrap'};}
+  _barColor(p){const C=this._C;return p>=85?C.danger:p>=60?C.warn:C.ok;}
+  _bar(p){return {height:'100%',width:Math.max(2,p)+'%',background:this._barColor(p),borderRadius:'3px',transition:'width .5s ease'};}
+  _statusChip(status){const C=this._C;
+    const m={GO:[C.ok,C.okSoft],HOLD:[C.danger,C.dangerSoft],countered:[C.violet,C.violetSoft]};
+    let c=m[status];
+    if(!c){ c = status.indexOf('replied')>=0?[C.info,C.infoSoft]:[C.chipNeutral,C.chipNeutralBg]; }
+    return this._chip(c[0],c[1]);
+  }
+
+  _eff(a){
+    if(a.id==='claude-arch' && this.state.arch==='working'){
+      const at=this.archRecoverAt||this.state.nowMs;
+      return {...a,state:'working_turn',task:'Resumed WP-09 — restarted with context, re-deriving lane state.',_hbAt:at};
+    }
+    return {...a,_hbAt:this.t0-a.ageSec*1000};
+  }
+
+  dispose(id){ this.setState(s=>({dismissed:[...s.dismissed,id]})); }
+  restartArch(){ this.archRecoverAt=Date.now(); this.setState(s=>({arch:'working',dismissed:[...s.dismissed,'stuck-1']})); }
+
+  renderVals(){
+    const now=this.state.nowMs;
+    const A=this.props.accent||'#4457E6';
+    const dark=this.props.theme==='dark';
+    const comp=this.props.density==='compact';
+    const pad=comp?'13px 14px':'15px 16px';
+    const C=this._palette(dark,A); this._C=C;
+
+    const full=this.agentsBase.map(a=>this._eff(a));
+    const mapAgent=(a)=>{
+      const sm=this._sm(a.state);
+      const cli=this._cli(a.cli);
+      const age=(now-a._hbAt)/1000;
+      const attn=['stuck_suspected','rate_limited_or_outage','degraded_output','crashed_or_exited'].indexOf(a.state)>=0;
+      const dot={width:'10px',height:'10px',borderRadius:'50%',flex:'none',background:sm.color};
+      if(a.state==='working_turn') dot.animation='liveDot 1.8s ease-in-out infinite';
+      const card={background:C.surface,border:'1px solid '+C.border,borderRadius:'12px',padding:pad,cursor:'pointer',display:'flex',flexDirection:'column',gap:'9px',transition:'box-shadow .15s,border-color .15s',boxShadow:'inset 3px 0 0 '+sm.color+', 0 1px 2px '+C.shadow};
+      return {
+        id:a.id,name:a.id,cliLabel:cli.label,cliStyle:this._chip(cli.color,cli.bg),
+        roleLine:a.role+' · '+a.group, task:a.task, statusLabel:sm.label,
+        dotStyle:dot, chipStyle:this._chip(sm.color,sm.soft),
+        ageLabel: a.state==='unknown'?'no hb':this._fmt(age),
+        rateLabel:a.rate+'%', ctxLabel:a.ctx+'%', rateBar:this._bar(a.rate), ctxBar:this._bar(a.ctx),
+        wrapped:a.wrapped, cardStyle:card, cardHover:{boxShadow:'inset 3px 0 0 '+sm.color+', 0 4px 16px '+C.shadowLg,borderColor:C.border},
+        open:()=>this.setState({view:'agent',selected:a.id}), _state:a.state, _attn:attn
+      };
+    };
+    let agents=full.map(mapAgent);
+
+    const nWorking=full.filter(a=>a.state==='working_turn'||a.state==='working_silent').length;
+    const nIdle=full.filter(a=>a.state==='idle_waiting').length;
+    const nAttn=full.filter(a=>['stuck_suspected','rate_limited_or_outage','degraded_output','crashed_or_exited'].indexOf(a.state)>=0).length;
+    const nUnknown=full.filter(a=>a.state==='unknown').length;
+
+    const filter=this.state.filter;
+    if(filter==='working') agents=agents.filter(a=>a._state==='working_turn'||a._state==='working_silent');
+    else if(filter==='idle') agents=agents.filter(a=>a._state==='idle_waiting');
+    else if(filter==='attention') agents=agents.filter(a=>a._attn||a._state==='unknown');
+
+    const attn=this.attnBase.filter(i=>this.state.dismissed.indexOf(i.id)<0);
+    const attnCount=attn.length;
+
+    const V=this.state.view;
+    const navItem=(key,label,icon,badge)=>{
+      const active=(V===key)||(key==='overview'&&V==='agent');
+      return {label,icon,badge:badge||0,
+        go:()=>this.setState({view:key,selected:null}),
+        style:{display:'flex',alignItems:'center',gap:'11px',padding:'9px 11px',borderRadius:'8px',cursor:'pointer',fontSize:'13px',textDecoration:'none',color:active?C.accent:C.ink2,background:active?C.accentSoft:'transparent',fontWeight:active?'500':'400'},
+        hover:active?{}:{background:C.hairline,color:C.ink},
+        badgeStyle:{fontFamily:"'Geist Mono',monospace",fontSize:'10.5px',fontWeight:'500',minWidth:'18px',textAlign:'center',color:'#fff',background:C.danger,borderRadius:'9px',padding:'1px 5px'}
+      };
+    };
+    const nav=[
+      navItem('overview','Team overview','M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z',0),
+      navItem('flow','Conversations','M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z',0),
+      navItem('attention','Attention','M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01',attnCount),
+      navItem('sessions','Sessions','M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zM14 2v6h6M9 13h6M9 17h6',0)
+    ];
+
+    const legend=[
+      {label:'Working',color:C.ok,count:nWorking},
+      {label:'Idle · waiting',color:C.warn,count:nIdle},
+      {label:'Needs attention',color:C.attn,count:nAttn},
+      {label:'Unknown / offline',color:C.gray,count:nUnknown}
+    ];
+
+    const stats=[
+      {label:'Working',color:C.ok,value:nWorking},
+      {label:'Idle',color:C.warn,value:nIdle},
+      {label:'Needs attention',color:C.attn,value:nAttn},
+      {label:'Unknown',color:C.gray,value:nUnknown}
+    ];
+
+    const fChip=(key,label,count)=>{
+      const on=filter===key;
+      return {label,count:count,set:()=>this.setState({filter:key}),
+        style:{display:'inline-flex',alignItems:'center',gap:'7px',padding:'6px 11px',borderRadius:'8px',border:'1px solid '+(on?'transparent':C.border),background:on?C.accent:C.surface,color:on?'#fff':C.ink2,fontSize:'12px',fontWeight:'500',cursor:'pointer',fontFamily:"'Geist',sans-serif"},
+        countStyle:{fontFamily:"'Geist Mono',monospace",fontSize:'10.5px',color:on?'rgba(255,255,255,.78)':C.ink4}
+      };
+    };
+    const filters=[fChip('all','All',full.length),fChip('working','Working',nWorking),fChip('idle','Idle',nIdle),fChip('attention','Attention',nAttn+nUnknown)];
+
+    const feed=this.feed.map((f)=>{
+      const km=this._km(f.kind);
+      return {from:f.from,to:f.to,subject:f.subject||'—',age:this._fmt((now-f.at)/1000),
+        kindLabel:km.label, kindStyle:this._chip(km.color,km.bg),
+        style:{display:'flex',flexDirection:'column',gap:'5px',padding:'10px 11px',borderRadius:'9px',background:f.fresh?C.accentSoft:C.surface2,borderLeft:f.fresh?('2px solid '+C.accent):'2px solid transparent',animation:f.fresh?'fadeInUp .45s ease':'none'}
+      };
+    });
+
+    const threads=this.threadsBase.map(t=>{
+      const km=this._km(t.kind);
+      return {id:t.id,kindLabel:km.label,kindStyle:this._chip(km.color,km.bg),subject:t.subject,
+        parts:t.a+(t.b==='—'?'':' ⇄ '+t.b), statusLabel:t.status, statusStyle:this._statusChip(t.status),
+        age:this._fmt((now-(this.t0-t.ageSec*1000))/1000),
+        rowStyle:{padding:'13px 16px',borderBottom:'1px solid '+C.hairline,cursor:'pointer',display:'flex',flexDirection:'column',gap:'7px'},
+        open:()=>{ const sid=this.sessions[t.id]?t.id:'rq-7a1'; this.setState({view:'sessions',session:sid}); }
+      };
+    });
+
+    const nodes=full.map(a=>{
+      const p=this.pos[a.id], sm=this._sm(a.state);
+      const dot={width:'13px',height:'13px',borderRadius:'50%',background:sm.color,boxShadow:'0 0 0 3px '+C.surface};
+      if(a.state==='working_turn') dot.animation='liveDot 1.8s ease-in-out infinite';
+      return {name:a.id,
+        wrap:{position:'absolute',left:p.x+'px',top:p.y+'px',transform:'translate(-50%,-50%)',display:'flex',flexDirection:'column',alignItems:'center',gap:'5px',cursor:'pointer'},
+        dotStyle:dot,
+        pill:{fontFamily:"'Geist Mono',monospace",fontSize:'10.5px',color:C.ink2,background:C.surface,border:'1px solid '+C.border,borderRadius:'6px',padding:'2px 7px',whiteSpace:'nowrap',boxShadow:'0 1px 2px '+C.shadow},
+        open:()=>this.setState({view:'agent',selected:a.id})
+      };
+    });
+    const edges=this.edgesBase.map(([x,y,w,hot])=>{
+      const p1=this.pos[x], p2=this.pos[y];
+      const st={stroke:hot?C.accent:C.edge,strokeWidth:String(w*1.4+0.6),opacity:hot?0.9:0.55,strokeLinecap:'round'};
+      if(hot){st.strokeDasharray='5 7';st.animation='dashmove 1s linear infinite';st.opacity=0.9;}
+      return {x1:p1.x,y1:p1.y,x2:p2.x,y2:p2.y,style:st};
+    });
+
+    const sessionList=Object.values(this.sessions).map(s=>{
+      const on=this.state.session===s.id; const km=this._km(s.kind);
+      return {select:()=>this.setState({session:s.id}), kindLabel:km.label, kindStyle:this._chip(km.color,km.bg),
+        subject:s.subject, parts:s.a+' ⇄ '+s.b, statusLabel:s.status, statusStyle:this._statusChip(s.status),
+        style:{padding:'13px 15px',borderBottom:'1px solid '+C.hairline,cursor:'pointer',background:on?C.accentSoft:'transparent',borderLeft:on?('3px solid '+C.accent):'3px solid transparent'}
+      };
+    });
+    const cs=this.sessions[this.state.session]||this.sessions['rq-7a1'];
+    const curSession={subject:cs.subject,id:cs.id,parts:cs.a+' ⇄ '+cs.b,statusLabel:cs.status,statusStyle:this._statusChip(cs.status)};
+    const transcript=cs.msgs.map(m=>{
+      const km=this._km(m.kind), cli=this._cli(m.from.split('-')[0]==='claude'?'claude':'codex');
+      const sys=(m.kind==='wake'||m.kind==='end');
+      const left=m.from===cs.a;
+      const bubble={maxWidth:'82%',alignSelf:left?'flex-start':'flex-end',background:left?C.surface:C.accentSoft,border:'1px solid '+C.border,borderRadius:'12px',padding:'13px 15px',boxShadow:'0 1px 2px '+C.shadow};
+      return {isSystem:sys,isBubble:!sys,from:m.from,body:m.body,meta:m.meta||'',
+        kindLabel:km.label,kindStyle:this._chip(km.color,km.bg),cliLabel:cli.label,cliStyle:this._chip(cli.color,cli.bg),
+        age:this._fmt((now-(this.t0-m.ageSec*1000))/1000),
+        rowStyle:{display:'flex',flexDirection:'column'}, bubble:bubble
+      };
+    });
+
+    const sevMeta={high:{c:C.danger,bg:C.dangerSoft,l:'HIGH'},med:{c:C.warn,bg:C.warnSoft,l:'MED'},low:{c:C.chipNeutral,bg:C.chipNeutralBg,l:'LOW'}};
+    const srcColor={escalation:C.danger,gate:C.danger,stuck:C.attn,deadletter:C.violet,supervisor:C.chipNeutral};
+    const attnView=attn.map(i=>{
+      const sv=sevMeta[i.sev];
+      const actions=i.actions.map(ac=>{
+        const primary=ac.kind==='primary';
+        let handler=()=>{};
+        if(ac.act==='restart') handler=()=>this.restartArch();
+        else if(ac.act==='dismiss') handler=()=>this.dispose(i.id);
+        else if(ac.act==='inspect') handler=()=>this.setState({view:'agent',selected:i.agent});
+        else handler=()=>this.dispose(i.id);
+        return {label:ac.label,do:handler,
+          style:primary?{padding:'7px 13px',borderRadius:'8px',border:'none',background:C.accent,color:'#fff',fontSize:'12px',fontWeight:'500',cursor:'pointer',fontFamily:"'Geist',sans-serif",whiteSpace:'nowrap'}
+            :{padding:'7px 13px',borderRadius:'8px',border:'1px solid '+C.border,background:C.surface,color:C.ink2,fontSize:'12px',fontWeight:'500',cursor:'pointer',fontFamily:"'Geist',sans-serif",whiteSpace:'nowrap'},
+          hover:primary?{filter:'brightness(1.06)'}:{background:C.hairline,borderColor:C.border}
+        };
+      });
+      return {title:i.title,agent:i.agent,detail:i.detail,age:this._fmt((now-(this.t0-i.ageSec*1000))/1000),
+        sourceLabel:i.sourceLabel, sourceStyle:this._chip('#fff',srcColor[i.source]),
+        sevLabel:sv.l, sevStyle:this._chip(sv.c,sv.bg),
+        cardStyle:{background:C.surface,border:'1px solid '+C.border,borderRadius:'12px',padding:'16px 18px',display:'flex',alignItems:'center',gap:'18px',boxShadow:'inset 3px 0 0 '+sv.c+', 0 1px 2px '+C.shadow},
+        actions:actions
+      };
+    });
+
+    let det=null;
+    const selA=full.find(a=>a.id===this.state.selected);
+    if(selA){
+      const sm=this._sm(selA.state), cli=this._cli(selA.cli);
+      const raw=this.agentsBase.find(a=>a.id===selA.id);
+      const bigDot={width:'16px',height:'16px',borderRadius:'50%',flex:'none',background:sm.color,boxShadow:'0 0 0 5px '+sm.soft};
+      if(selA.state==='working_turn') bigDot.animation='liveDot 1.8s ease-in-out infinite';
+      const msgs=[...this.feed,...this.extra].filter(m=>m.from===selA.id||m.to===selA.id)
+        .sort((x,y)=>y.at-x.at).slice(0,5).map(m=>{
+          const km=this._km(m.kind);
+          return {kindLabel:km.label,kindStyle:this._chip(km.color,km.bg),
+            dir:(m.from===selA.id?'→ '+m.to:'← '+m.from), subject:m.subject||'—', age:this._fmt((now-m.at)/1000)};
+        });
+      const tlDefs={working_turn:C.ok,working_silent:C.info,idle_waiting:C.warn,stuck_suspected:C.attn,unknown:C.gray,rate_limited_or_outage:C.danger};
+      const tlRaw = selA.state==='stuck_suspected'
+        ? [['idle_waiting',3],['working_turn',10],['working_turn',9],['stuck_suspected',8]]
+        : selA.state==='rate_limited_or_outage'
+        ? [['working_turn',12],['working_turn',10],['rate_limited_or_outage',8]]
+        : selA.state==='unknown'
+        ? [['working_turn',8],['unknown',22]]
+        : [['idle_waiting',4],['working_turn',13],['idle_waiting',3],['working_turn',10]];
+      const timeline=tlRaw.map(([st,w])=>({style:{flex:String(w),background:tlDefs[st]||C.gray,borderRadius:'3px'},title:this._sm(st).label+' · ~'+w+'m'}));
+      const tlKinds=[...new Set(tlRaw.map(x=>x[0]))].map(st=>({label:this._sm(st).label,color:tlDefs[st]}));
+      const domainsByRole={
+        implementer:[{title:'CLI surface',glob:'src/agenttalk/cli.py'},{title:'Lanes',glob:'src/agenttalk/lanes.py'}],
+        reviewer:[{title:'Review assurance',glob:'src/agenttalk/gates.py'}],
+        lead:[{title:'Coordination',glob:'.agenttalk/config.json'}],
+        docs:[{title:'Docs',glob:'docs/**, README.md'}],
+        infra:[{title:'Supervisor',glob:'src/agenttalk/deadman.py'}],
+        tester:[{title:'Test suites',glob:'tests/**'}]
+      };
+      det={
+        name:selA.id, cliLabel:cli.label, cliStyle:this._chip(cli.color,cli.bg), bigDot,
+        statusLabel:sm.label, chipStyle:this._chip(sm.color,sm.soft), roleLine:selA.role+' · '+selA.group,
+        since:this._fmt((now-selA._hbAt)/1000), task:selA.task,
+        mission:raw.mission, wp:raw.wp==='—'?'no WP':raw.wp, peer:raw.peer,
+        showRestart:selA.state==='stuck_suspected',
+        restart:()=>this.restartArch(),
+        openTranscript:()=>this.setState({view:'sessions',session:'rq-7a1'}),
+        rateLabel:raw.rate+'%', ctxLabel:raw.ctx+'%', rateBar:this._bar(raw.rate), ctxBar:this._bar(raw.ctx),
+        rateNote: raw.rate>=85?'Near cap — steer long work elsewhere':'Headroom for new work',
+        ctxNote: raw.ctx>=85?'Compaction risk — avoid heavy context':'Comfortable context budget',
+        msgs, hasMsgs:msgs.length>0, noMsgs:msgs.length===0,
+        timeline, timelineLegend:tlKinds,
+        supervisor:[
+          {k:'CLI',v:selA.cli, style:this._chip(cli.color,cli.bg)},
+          {k:'Mode',v:raw.wrapped?'wrapped · loop':'manual listen', style:this._chip(C.chipNeutral,C.chipNeutralBg)},
+          {k:'Heartbeat',v: selA.state==='unknown'?'missing':this._fmt((now-selA._hbAt)/1000)+' ago', style:this._chip(sm.color,sm.soft)},
+          {k:'Restartable',v:raw.wrapped?'yes':'no', style:this._chip(raw.wrapped?C.ok:C.gray,raw.wrapped?C.okSoft:C.graySoft)}
+        ],
+        domains: domainsByRole[selA.role]||[{title:'—',glob:'no owned globs'}]
+      };
+    }
+
+    return {
+      c:C,
+      rootStyle:{background:C.canvas,color:C.ink,height:'100vh',display:'flex',flexDirection:'column',overflow:'hidden',fontSize:'14px'},
+      brandMark:{width:'28px',height:'28px',borderRadius:'8px',background:'linear-gradient(135deg,'+A+','+this._rgba(A,0.7)+')',boxShadow:'0 2px 6px '+this._rgba(A,0.3)},
+      clock:new Date(now).toLocaleTimeString('en-US',{hour12:false}),
+      nav, legend, filters, stats, agents, feed, threads, nodes, edges, sessionList, curSession, transcript,
+      attn:attnView, attnCount, hasAttn:attnCount>0, noAttn:attnCount===0,
+      attnCountStyle:this._chip(C.danger,C.dangerSoft),
+      overviewSub:full.length+' agents · 1 mission active · '+nAttn+' need attention',
+      isOverview:V==='overview', isFlow:V==='flow', isAttention:V==='attention', isSessions:V==='sessions', isAgent:V==='agent',
+      det, back:()=>this.setState({view:'overview',selected:null}),
+      backHover:{color:C.ink}, threadHover:{background:C.surface2},
+      primaryBtn:{padding:'9px 15px',borderRadius:'8px',border:'none',background:C.accent,color:'#fff',fontSize:'12.5px',fontWeight:'500',cursor:'pointer',fontFamily:"'Geist',sans-serif"},
+      primaryBtnHover:{filter:'brightness(1.06)'},
+      ghostBtn:{padding:'9px 15px',borderRadius:'8px',border:'1px solid '+C.border,background:C.surface,color:C.ink2,fontSize:'12.5px',fontWeight:'500',cursor:'pointer',fontFamily:"'Geist',sans-serif"},
+      ghostBtnHover:{background:C.hairline,borderColor:C.border},
+      tagStyle:{fontFamily:"'Geist Mono',monospace",fontSize:'11px',color:C.ink2,background:C.inset,border:'1px solid '+C.border,borderRadius:'6px',padding:'4px 9px'}
+    };
+  }
+}
+</script>
+</body>
+</html>

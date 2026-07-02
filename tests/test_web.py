@@ -474,7 +474,7 @@ def test_head_returns_headers_no_body(tmp_path: Path) -> None:
 _LEGACY_CSP = ("default-src 'none'; style-src 'unsafe-inline'; "
                "img-src 'none'; frame-ancestors 'none'")
 _DASH_CSP = ("default-src 'none'; script-src 'self'; "
-             "connect-src 'self'; style-src 'unsafe-inline'; "
+             "connect-src 'self'; style-src 'self'; "
              "img-src 'none'; frame-ancestors 'none'")
 
 
@@ -900,7 +900,10 @@ def test_api_state_spec_kitty_detection(tmp_path: Path) -> None:
         srv.server_close()
 
 
-def test_dashboard_html_and_root0_only_link_policy(tmp_path: Path) -> None:
+def test_dashboard_shell_links_console_assets(tmp_path: Path) -> None:
+    """0.58.0: /dashboard serves the 3-region console shell that LINKS the
+    served console.css/console.js (no inline style/script), under the new
+    console CSP. Cross-root message ids remain unresolvable via root[0]."""
     a, b = _make_two_stores(tmp_path)
     b.send(sender="lead", recipient="dev", kind="question",
            subject="b-side", body="y", meta={"request_id": "rid-b"})
@@ -910,23 +913,30 @@ def test_dashboard_html_and_root0_only_link_policy(tmp_path: Path) -> None:
             assert resp.status == 200
             page = resp.read().decode("utf-8")
             assert resp.headers["Content-Security-Policy"] == _DASH_CSP
-        assert "/static/dashboard.js" in page
-        assert "proj-a" in page and "proj-b" in page
-        with _get(f"{base}/static/dashboard.js") as resp:
-            js = resp.read().decode("utf-8")
-            assert resp.headers["Content-Type"].startswith(
-                "application/javascript")
-        # the renderer must gate detail hrefs on root index 0 (FR-003):
-        assert "rootIndex === 0" in js
-        assert "textContent" in js and "innerHTML" not in js
-        # and the server gives a cross-root client nothing to link to:
-        # root[1]'s message ids are NOT resolvable via root[0]'s routes.
+        # the new shell links the served assets, not an inline blob
+        assert "/static/console.css" in page
+        assert "/static/console.js" in page
+        assert "/static/dashboard.js" not in page  # old asset gone
+        # the fixed 3-region skeleton is present, hydrated by console.js
+        assert 'id="topbar"' in page
+        assert 'id="sidebar"' in page
+        assert 'id="main"' in page
+        # zero inline style / handlers in the shell (CSP-safe)
+        assert "<style" not in page
+        assert "onclick=" not in page and "style=" not in page
+        # the assets serve with the right content types
+        with _get(f"{base}/static/console.js") as resp:
+            assert resp.headers["Content-Type"].startswith("application/javascript")
+        with _get(f"{base}/static/console.css") as resp:
+            assert resp.headers["Content-Type"].startswith("text/css")
+        # the server gives a cross-root client nothing to link to: root[1]'s
+        # message ids are NOT resolvable via root[0]'s routes (FR-003).
         mid_b = b._scan_messages()[0][0].id
         with pytest.raises(urllib.error.HTTPError) as exc:
             _urlopen(
                 f"{base}/api/messages/{mid_b}", timeout=5)
         assert exc.value.code == 404
-        # index keeps working and now links to the dashboard (additive)
+        # index keeps working and still links to the dashboard (additive)
         with _get(f"{base}/") as resp:
             assert "/dashboard" in resp.read().decode("utf-8")
     finally:
@@ -934,19 +944,47 @@ def test_dashboard_html_and_root0_only_link_policy(tmp_path: Path) -> None:
         srv.server_close()
 
 
-def test_csp_split_per_route(tmp_path: Path) -> None:
-    """The hostile-body routes keep the pre-0.17.0 CSP byte-identical;
-    only /dashboard gets the script-capable policy (research D1)."""
+def test_static_unknown_name_404_and_no_traversal(tmp_path: Path) -> None:
+    """The /static/<name> route is an EXACT allowlist lookup — an unknown name
+    404s and a traversal attempt cannot escape the two known assets."""
     s = _make_store(tmp_path)
-    s.send(sender="alpha", recipient="beta", body="<script>x</script>")
+    srv, _t, base = _serve(s)
+    try:
+        for bad in ("nope.js", "..%2F..%2Fweb.py", "console.css.bak", ""):
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                _urlopen(f"{base}/static/{bad}", timeout=5)
+            assert exc.value.code == 404, bad
+        # the old dashboard.js name is gone (404), not silently aliased
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _urlopen(f"{base}/static/dashboard.js", timeout=5)
+        assert exc.value.code == 404
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_csp_split_per_route(tmp_path: Path) -> None:
+    """The hostile-body routes AND every JSON feed keep the pre-0.17.0 CSP
+    byte-identical; only the console document (/dashboard) gets the
+    script+style-capable policy (research D1 / §1). 0.58.0: the console CSP
+    drops 'unsafe-inline' for style in favor of 'self'; /api/attention and
+    /api/thread/<rid> stay on the strict legacy policy."""
+    s = _make_store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="<script>x</script>",
+           meta={"request_id": "rid-c"})
     mid = s._scan_messages()[0][0].id
     srv, _t, base = _serve(s)
     try:
-        for path in ("/", f"/messages/{mid}", "/api/status", "/api/state"):
+        for path in ("/", f"/messages/{mid}", "/api/status", "/api/state",
+                     "/api/attention", "/api/thread/rid-c"):
             with _get(f"{base}{path}") as resp:
                 assert resp.headers["Content-Security-Policy"] == _LEGACY_CSP, path
         with _get(f"{base}/dashboard") as resp:
             assert resp.headers["Content-Security-Policy"] == _DASH_CSP
+        # the served assets are not documents; they carry the default policy too
+        for path in ("/static/console.js", "/static/console.css"):
+            with _get(f"{base}{path}") as resp:
+                assert resp.headers["Content-Security-Policy"] == _LEGACY_CSP, path
     finally:
         srv.shutdown()
         srv.server_close()
@@ -954,14 +992,18 @@ def test_csp_split_per_route(tmp_path: Path) -> None:
 
 def test_new_routes_reject_write_methods(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="x",
+           meta={"request_id": "rid-w"})
     srv, _t, base = _serve(s)
     try:
-        for path in ("/api/state", "/dashboard", "/static/dashboard.js"):
+        for path in ("/api/state", "/dashboard", "/api/attention",
+                     "/api/thread/rid-w", "/static/console.js",
+                     "/static/console.css"):
             req = urllib.request.Request(  # noqa: S310  # nosemgrep
                 f"{base}{path}", method="POST", data=b"x")
             with pytest.raises(urllib.error.HTTPError) as exc:
                 _urlopen(req, timeout=5)
-            assert exc.value.code == 405
+            assert exc.value.code == 405, path
             assert exc.value.headers.get("Allow") == "GET, HEAD"
     finally:
         srv.shutdown()
@@ -997,13 +1039,17 @@ def test_no_mutation_full_tree_hash(tmp_path: Path) -> None:
     before_a, before_b = _tree_hashes(a.root), _tree_hashes(b.root)
     srv, _t, base = _serve_multi(a, b)
     try:
+        # Poll several times so the in-memory health-timeline ring is exercised
+        # (§5): it must record samples WITHOUT ever touching disk.
         for _ in range(3):
             _state(base)
-        for path in ("/dashboard", "/static/dashboard.js", "/",
-                     f"/messages/{mid}"):
+        for path in ("/dashboard", "/static/console.js", "/static/console.css",
+                     "/", f"/messages/{mid}", "/api/attention",
+                     "/api/thread/r1"):
             with _get(f"{base}{path}") as resp:
                 resp.read()
-        for bad in (f"{base}/messages/zzz-does-not-exist", f"{base}/nope"):
+        for bad in (f"{base}/messages/zzz-does-not-exist", f"{base}/nope",
+                    f"{base}/api/thread/no-such-thread"):
             with pytest.raises(urllib.error.HTTPError):
                 _urlopen(bad, timeout=5)
         req = urllib.request.Request(  # noqa: S310  # nosemgrep
@@ -1211,36 +1257,398 @@ def test_api_state_additive_keys_no_removal(tmp_path: Path) -> None:
         srv.server_close()
 
 
-def test_dashboard_renderer_controls_and_safety() -> None:
-    """FR-008 / C-005: the served JS wires refresh controls with
-    addEventListener and never uses innerHTML; the shell has no inline
-    handlers."""
-    js = web._DASHBOARD_JS.decode("utf-8")
+def test_console_renderer_safety(tmp_path: Path) -> None:
+    """0.58.0 / invariant §0.8: the served console.js builds DOM via
+    createElement/textContent and NEVER via innerHTML — message bodies and all
+    bus-derived strings are untrusted, and textContent under script-src 'self'
+    is safe. Read the ASSET AS SERVED (not a code constant), so the security
+    property is checked on the exact bytes the browser receives."""
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/static/console.js") as resp:
+            assert resp.headers["Content-Type"].startswith("application/javascript")
+            js = resp.read().decode("utf-8")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert "textContent" in js
     assert "addEventListener" in js
-    assert "refresh-btn" in js and "autorefresh" in js
-    assert "startAuto" in js and "clearInterval" in js
     assert "innerHTML" not in js
     assert "location.reload" not in js
-    # owes is rendered UNCONDITIONALLY (FR-006): "owes 0" must not be hidden
-    # behind a truthiness gate.
-    assert "owes ' + (owes || 0)" in js
-    assert "if (owes)" not in js
-    # role-classifier convention pinned (FR-005) so it can't silently drift
-    for term in ("lead", "dev", "eng", "impl", "review", "qa", "audit"):
-        assert term in js, term
+    assert "eval(" not in js
 
 
 def test_dashboard_shell_no_inline_handlers(tmp_path: Path) -> None:
-    """C-004: the /dashboard HTML shell carries no inline event handlers
-    (which would require 'unsafe-inline' and weaken the CSP)."""
+    """§1 / §6: the /dashboard console shell carries no inline <style>, no
+    inline event handlers, and no style= attributes — all of which would
+    require 'unsafe-inline' and weaken the CSP. Styling/behavior are linked
+    assets only."""
     s = _make_store(tmp_path)
     srv, _t, base = _serve(s)
     try:
         with _get(f"{base}/dashboard") as resp:
             shell = resp.read().decode("utf-8")
             assert resp.headers["Content-Security-Policy"] == _DASH_CSP
+        assert "<style" not in shell
         assert "onclick=" not in shell and "onchange=" not in shell
-        assert "refresh-btn" in shell and "autorefresh" in shell
+        assert "style=" not in shell
+        assert "/static/console.css" in shell and "/static/console.js" in shell
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# =============================================== 0.58.0 Team Console fields
+#
+# Contract under test: docs/DashboardDesign/BUILD-SPEC.md §3 (additive
+# /api/state fields), §4a (/api/attention), §4b (/api/thread/<rid>).
+
+import agenttalk.health as _hm  # noqa: E402
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _write_health(store: Store, agent: str, state: str, *,
+                  cli: str | None = None, mode: str | None = None) -> None:
+    ts = _now_iso()
+    store.write_health(agent, _hm.build_snapshot(
+        agent=agent, cli=cli, mode=mode, state=state,
+        updated_at=ts, since=ts, last_progress_at=ts, reason_code=state))
+
+
+def test_api_state_capacity_cli_wrapped_present_when_data_exists(tmp_path: Path) -> None:
+    """§3a: per-agent capacity/cli/wrapped/restartable are present when their
+    source data exists, and the capacity object carries the frozen wire keys."""
+    s = _make_store(tmp_path)
+    s.write_heartbeat("alpha")
+    _write_health(s, "alpha", _hm.STATE_WORKING_TURN, cli="claude", mode="wrapper-loop")
+    s.write_capacity("alpha", {
+        "schema_version": 1, "source_agent": "alpha", "observed_at": _now_iso(),
+        "source": "claude_statusline", "primary_used_percent": 42.0,
+        "context_used_percent": 71.5, "confidence": "observed",
+    })
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        assert alpha["cli"] == "claude"
+        cap = alpha["capacity"]
+        assert set(cap) == {"rate_used_pct", "context_used_pct", "confidence"}
+        assert cap["rate_used_pct"] == 42.0
+        assert cap["context_used_pct"] == 71.5
+        assert cap["confidence"] == "fresh"
+        assert alpha["wrapped"] is True
+        assert alpha["restartable"] is True
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_capacity_null_percent_allowed_inside_object(tmp_path: Path) -> None:
+    """§3a: a capacity snapshot with only one signal keeps the OTHER percent as
+    null INSIDE the capacity object (the absent-not-null rule is about the
+    `capacity` key itself, not the percents within)."""
+    s = _make_store(tmp_path)
+    s.write_capacity("alpha", {
+        "schema_version": 1, "source_agent": "alpha", "observed_at": _now_iso(),
+        "source": "codex_rollout", "primary_used_percent": 55.0,
+        "context_used_percent": None, "confidence": "observed",
+    })
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        assert "capacity" in alpha
+        assert alpha["capacity"]["rate_used_pct"] == 55.0
+        assert alpha["capacity"]["context_used_pct"] is None
+        # cli inferred from the snapshot source when no fresh health.cli
+        assert alpha["cli"] == "codex"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_new_agent_fields_absent_when_no_data(tmp_path: Path) -> None:
+    """§3a / invariant §0.5: with no capacity/health/domains, the new per-agent
+    fields are OMITTED (never null)."""
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        for agent in root["agents"]:
+            for absent in ("capacity", "cli", "wrapped", "restartable",
+                           "owned_domains", "task", "health_timeline"):
+                assert absent not in agent, absent
+        _assert_no_body_keys(_state(base))
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_owned_domains_grouped_per_agent(tmp_path: Path) -> None:
+    """§3a: owned_domains inverts the domain registry via resolve_refset(owners),
+    present only for an agent that owns >=1 domain, carrying name + globs."""
+    s = _make_store(tmp_path)
+    (s.dir / "domains.json").write_text(json.dumps({
+        "schema_version": 1,
+        "domains": {
+            "web": {"title": "Web layer", "owners": {"agents": ["alpha"]},
+                    "owned_globs": ["src/agenttalk/web.py", "src/agenttalk/web_static/*"]},
+        },
+        "shared_paths": [],
+    }), encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        by = {a["name"]: a for a in root["agents"]}
+        assert by["alpha"]["owned_domains"] == [
+            {"name": "Web layer",
+             "globs": ["src/agenttalk/web.py", "src/agenttalk/web_static/*"]},
+        ]
+        # a non-owner has no owned_domains key (absent-not-null)
+        assert "owned_domains" not in by["beta"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_task_from_owned_thread_subject(tmp_path: Path) -> None:
+    """§3a: task is the subject of the agent's newest non-terminal open thread
+    where it is next_owner (envelope-derived, textContent-rendered)."""
+    s = _make_store(tmp_path)
+    s.send(sender="alpha", recipient="beta", kind="review-request",
+           subject="review the parser change", body="please",
+           meta={"request_id": "q-task"})
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        beta = next(a for a in root["agents"] if a["name"] == "beta")
+        # beta is next_owner of q-task -> its task is that thread's subject
+        assert beta["task"] == "review the parser change"
+        # alpha is not the ball-holder on any thread and isn't composing
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        assert "task" not in alpha
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_thread_verdict_and_active_review(tmp_path: Path) -> None:
+    """§3b: per-thread verdict from the newest review-result meta.status, and
+    active_review true for a non-terminal review-request thread (emit-when-true).
+    verdict reads ONLY meta.status — never body."""
+    s = _make_store(tmp_path)
+    s.send(sender="alpha", recipient="beta", kind="review-request",
+           subject="rev", body="x", meta={"request_id": "rid-v"})
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        row = next(r for r in root["threads"] if r["request_id"] == "rid-v")
+        assert row["active_review"] is True   # open review-request
+        assert "verdict" not in row           # no decision yet
+        # the review-result lands -> verdict appears (still active until closed)
+        s.send(sender="beta", recipient="alpha", kind="review-result",
+               subject="done", body="lgtm",
+               meta={"request_id": "rid-v", "status": "approved"})
+        (root,) = _state(base)["roots"]
+        row = next(r for r in root["threads"] if r["request_id"] == "rid-v")
+        assert row["verdict"] == "approved"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_active_review_absent_for_plain_thread(tmp_path: Path) -> None:
+    """§3b: active_review is emitted only when true; a plain question thread has
+    no active_review key."""
+    s = _make_store(tmp_path)
+    s.send(sender="alpha", recipient="beta", kind="question",
+           subject="q", body="x", meta={"request_id": "rid-q"})
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        row = next(r for r in root["threads"] if r["request_id"] == "rid-q")
+        assert "active_review" not in row
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_health_timeline_builds_over_polls(tmp_path: Path) -> None:
+    """§5: the in-memory ring accumulates samples across /api/state polls and
+    emits collapsed {state, seconds} segments. It is server-owned, never a file
+    (proven by test_no_mutation_full_tree_hash)."""
+    s = _make_store(tmp_path)
+    s.write_heartbeat("alpha")
+    _write_health(s, "alpha", _hm.STATE_WORKING_TURN, cli="claude", mode="wrapper-loop")
+    srv, _t, base = _serve(s)
+    try:
+        seen = None
+        for _ in range(3):
+            (root,) = _state(base)["roots"]
+            alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+            seen = alpha.get("health_timeline")
+        assert seen  # after several polls the ring has >=1 segment
+        assert all(set(seg) == {"state", "seconds"} for seg in seen)
+        assert seen[0]["state"] == "working_turn"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_build_state_is_pure_without_history(tmp_path: Path) -> None:
+    """§5: build_state(roots) with no history omits health_timeline entirely,
+    so the perf/unit surface stays deterministic (no ring side effects)."""
+    s = _make_store(tmp_path)
+    s.write_heartbeat("alpha")
+    _write_health(s, "alpha", _hm.STATE_WORKING_TURN, cli="claude", mode="wrapper-loop")
+    roots = [web.RootDescriptor(store=s, label="pure")]
+    state = web.build_state(roots)  # no history=
+    (root,) = state["roots"]
+    for a in root["agents"]:
+        assert "health_timeline" not in a
+
+
+# ---------------------------------------------------------- /api/attention
+
+def _attention(base: str) -> dict:
+    with _get(f"{base}/api/attention") as resp:
+        assert resp.status == 200
+        assert resp.headers["Content-Type"].startswith("application/json")
+        return json.loads(resp.read())
+
+
+def test_api_attention_shape_and_gate_hold(tmp_path: Path) -> None:
+    """§4a: /api/attention returns the ranked envelope, and a gate HOLD surfaces
+    with the frozen wire fields. Envelope-only — no raw body leaks."""
+    from agenttalk import gates as gmod
+    s = _make_store(tmp_path)
+    # a required, red blocker gate => a HOLD in check_gates().blockers, which
+    # attention.gate_hold_items turns into a gate-source queue item.
+    gmod.set_gate(s.root, name="ci", status="red", severity="blocker",
+                  scope="release", actor="alpha", evidence_source="automation_ci",
+                  reason="pipeline red", required=True)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _attention(base)
+        assert set(payload) == {"root", "items", "count"}
+        assert payload["count"] == len(payload["items"])
+        assert payload["root"] == s.root.name
+        for it in payload["items"]:
+            assert set(it) >= {"id", "source", "source_label", "severity",
+                               "title", "agent", "detail", "age_seconds",
+                               "human_can_unblock_now"}
+            assert it["source"] in ("escalation", "gate", "stuck",
+                                    "deadletter", "supervisor")
+            assert it["severity"] in ("high", "med", "low")
+        gate_items = [it for it in payload["items"] if it["source"] == "gate"]
+        assert gate_items, "the gate HOLD should surface"
+        assert gate_items[0]["severity"] == "high"
+        _assert_no_body_keys(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_attention_derived_stuck_item(tmp_path: Path) -> None:
+    """§4a: a per-agent STUCK item is derived for any agent whose advisory
+    health.state == stuck_suspected (stuck is NOT a build_queue source)."""
+    s = _make_store(tmp_path)
+    s.write_heartbeat("alpha")
+    _write_health(s, "alpha", _hm.STATE_STUCK_SUSPECTED, cli="claude", mode="wrapper-loop")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _attention(base)
+        stuck = [it for it in payload["items"] if it["source"] == "stuck"]
+        assert len(stuck) == 1
+        assert stuck[0]["source_label"] == "STUCK"
+        assert stuck[0]["severity"] == "med"
+        assert stuck[0]["agent"] == "alpha"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_attention_empty_is_all_clear(tmp_path: Path) -> None:
+    """§4a: a clean project yields an empty queue (the client shows 'All clear')."""
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        payload = _attention(base)
+        assert payload["items"] == []
+        assert payload["count"] == 0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# --------------------------------------------------------- /api/thread/<rid>
+
+def test_api_thread_returns_raw_bodies_and_safe_meta_line(tmp_path: Path) -> None:
+    """§4b: /api/thread/<rid> carries RAW (un-escaped) bodies for textContent
+    rendering, and a meta_line derived from a whitelist (status/head/base) only —
+    never arbitrary meta."""
+    s = _make_store(tmp_path)
+    s.send(sender="alpha", recipient="beta", kind="review-request",
+           subject="please review", body="## Goal\n<b>not escaped</b>",
+           meta={"request_id": "rid-t"})
+    s.send(sender="beta", recipient="alpha", kind="review-result",
+           subject="done", body="looks good",
+           meta={"request_id": "rid-t", "status": "approved",
+                 "head": "7b2d9c1", "secret_prose": "SHOULD NOT LEAK"})
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/api/thread/rid-t") as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Security-Policy"] == _LEGACY_CSP
+            payload = json.loads(resp.read())
+        assert payload["request_id"] == "rid-t"
+        assert payload["subject"] == "please review"
+        assert payload["kind"] == "review-request"
+        assert payload["participants"] == ["alpha", "beta"]
+        msgs = payload["messages"]
+        assert [m["id"] for m in msgs] == sorted(m["id"] for m in msgs)  # id asc
+        # body is RAW — NOT html-escaped (client renders via textContent)
+        assert msgs[0]["body"] == "## Goal\n<b>not escaped</b>"
+        # cli is inferred from the sender-name PREFIX only; 'alpha' has no
+        # claude-/codex- prefix, so it is null (not guessed).
+        assert msgs[0]["cli"] is None
+        # meta_line: whitelist only; the non-whitelisted key must NOT appear
+        ml = msgs[1]["meta_line"]
+        assert "status=approved" in ml
+        assert "7b2d9c1" in ml
+        assert "SHOULD NOT LEAK" not in json.dumps(payload)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_thread_unknown_rid_404(tmp_path: Path) -> None:
+    """§4b: an unknown rid (no messages) 404s with the error envelope."""
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _urlopen(f"{base}/api/thread/does-not-exist", timeout=5)
+        assert exc.value.code == 404
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_thread_rejects_traversal_rid(tmp_path: Path) -> None:
+    """§4b: the rid is validated against _MESSAGE_ID_RE BEFORE any disk touch —
+    a traversal attempt 404s (parity with /messages/<id>)."""
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _urlopen(f"{base}/api/thread/..%2F..%2Fetc%2Fpasswd", timeout=5)
+        assert exc.value.code == 404
     finally:
         srv.shutdown()
         srv.server_close()
