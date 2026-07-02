@@ -310,6 +310,8 @@ def test_supervise_init_generates_and_is_idempotent(tmp_path: Path, capsys) -> N
     assert "written" in out
     assert (s.dir / "supervisor.json").exists()
     assert (s.dir / "supervisor.ps1").exists()
+    assert (s.dir / "supervisor-task.ps1").exists()
+    assert (s.dir / "deadman.ps1").exists()
     assert (s.dir / "bin" / "agenttalk.cmd").exists()   # the project-local shim
     assert not (s.dir / "supervisor.sh").exists()  # v1: PowerShell only
     # script anchors: calls the Python plan (NO invalid --json flag), launches
@@ -323,9 +325,66 @@ def test_supervise_init_generates_and_is_idempotent(tmp_path: Path, capsys) -> N
     assert "windows_file" in ps                     # launches the real exe
     assert "DryRun" in ps
     assert "keeping marker/state for retry" in ps   # clear-only-on-success path
+    task = (s.dir / "supervisor-task.ps1").read_text(encoding="utf-8-sig")
+    assert "New-ScheduledTaskTrigger -AtLogOn" in task
+    assert "StartWhenAvailable" in task
+    assert "MultipleInstances IgnoreNew" in task
+    assert "RestartCount" in task and "ExecutionTimeLimit" in task
+    assert "WorkingDirectory" in task
+    assert "LastRunTime" in task and "LastTaskResult" in task
+    assert "-NoProfile -ExecutionPolicy Bypass -File" in task
+    assert "supervisor.ps1" in task and "-Quiet" in task
+    deadman_ps = (s.dir / "deadman.ps1").read_text(encoding="utf-8-sig")
+    assert "deadman" in deadman_ps
+    assert "supervisor-state.json" not in deadman_ps
     # idempotent: a second --init overwrites nothing
     assert _run(["supervise", "--init"], tmp_path) == 0
     assert "all files already exist" in capsys.readouterr().out
+
+
+def test_supervisor_report_surfaces_kill_switch_and_mutations_refuse(
+    tmp_path: Path, capsys,
+) -> None:
+    s = _team(tmp_path)
+    s.write_restart_request("worker", {"agent": "worker", "request_id": "rr-1"})
+    (s.dir / "supervisor.kill").write_text("anything", encoding="utf-8")
+
+    rc = _run(["supervise", "--clear-restart", "--for", "worker",
+               "--request-id", "rr-1"], tmp_path)
+    assert rc == 3
+    assert (s.read_restart_request("worker") or {}).get("request_id") == "rr-1"
+
+    rc = _run(["supervise", "--report", "--now", str(NOW)], tmp_path)
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["kill_switch_active"] is True
+
+
+def test_ps_template_kill_switch_guards_mutating_boundaries() -> None:
+    ps = sup.PS_TEMPLATE
+    assert "$KillSwitchPath" in ps
+    assert "function Actions-Enabled" in ps
+    assert "function Assert-ActionsEnabled" in ps
+    assert "function Save-State($state)" in ps
+    assert "if (-not (Actions-Enabled)) { return }" in ps
+    assert "Get-ProcSnapshot $SnapPath" in ps
+    assert "if (Actions-Enabled)" in ps
+    assert "Assert-ActionsEnabled (\"agent {0} {1}\"" in ps
+    assert "Assert-ActionsEnabled (\"launch-request {0} {1}\"" in ps
+    assert "Assert-ActionsEnabled (\"ephemeral {0} {1}\"" in ps
+    assert "supervisor.kill" in ps
+
+
+def test_supervisor_hosting_doc_covers_degraded_mode_and_services() -> None:
+    text = Path("docs/supervisor-hosting.md").read_text(encoding="utf-8")
+    assert "Scheduled Task" in text
+    assert "supervisor.kill" in text
+    assert "Degraded Mode" in text
+    assert "agenttalk threads --for <agent>" in text
+    assert "agenttalk wait --for <agent> --timeout 1800" in text
+    assert "WinSW" in text and "NSSM" in text
+    assert "session 0" in text
+    assert "sc.exe" not in text.lower()
 
 
 def test_ps_template_console_action_log_and_quiet() -> None:
@@ -1179,6 +1238,31 @@ def test_generated_ps1_is_bom_ascii_and_parses(tmp_path: Path) -> None:
                              capture_output=True, text=True, timeout=60)
         assert res.returncode == 0, (
             f"supervisor.ps1 failed to parse under {sh}: {res.stdout}{res.stderr}")
+
+def test_generated_helper_ps1_are_bom_ascii_and_parse(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    ps_files = [s.dir / "supervisor-task.ps1", s.dir / "deadman.ps1"]
+    for ps1 in ps_files:
+        raw = ps1.read_bytes()
+        assert raw[:3] == b"\xef\xbb\xbf", f"{ps1.name} must have a UTF-8 BOM"
+        body = raw[3:]
+        non_ascii = [b for b in body if b > 0x7F]
+        assert not non_ascii, f"{ps1.name} body must be ASCII-only; found {non_ascii[:5]}"
+
+    shells = [sh for sh in (shutil.which("powershell"), shutil.which("pwsh")) if sh]
+    if not shells:
+        return
+    for sh in shells:
+        for ps1 in ps_files:
+            check = (
+                "$e=$null; "
+                f"[void][System.Management.Automation.Language.Parser]::ParseFile('{ps1}',"
+                "[ref]$null,[ref]$e); if($e -and $e.Count){ $e[0].Message; exit 1 }")
+            res = subprocess.run([sh, "-NoProfile", "-Command", check],
+                                 capture_output=True, text=True, timeout=60)
+            assert res.returncode == 0, (
+                f"{ps1.name} failed to parse under {sh}: {res.stdout}{res.stderr}")
 
 
 def test_supervise_plan_exact_generated_command_runs(tmp_path: Path, capsys) -> None:

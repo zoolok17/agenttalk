@@ -581,6 +581,7 @@ class Store:
             "agents": agents,
             "created_at": _now_iso(),
             "session_id": _new_session_id(),
+            "deadman": {"mail_age_slo_seconds": 900, "alarm_unread_response": False},
             # NOTE: no project_id in config.json. The HMAC key file
             # is addressed by `signing.project_id_for_root(self.root)`,
             # a path-derived hash that an attacker writing into

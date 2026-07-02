@@ -32,6 +32,7 @@ from agenttalk.store import (
     validate_rescind,
 )
 from agenttalk import capacity as capmod
+from agenttalk import deadman as deadman_mod
 from agenttalk import ephemeral as eph
 from agenttalk import domains as dom
 from agenttalk import transcript as tx
@@ -6634,6 +6635,25 @@ def cmd_supervise(args: argparse.Namespace) -> int:
     emits the read-only liveness JSON; --plan emits the action plan (the shared
     decision table); --clear-restart clears a restart marker by request_id."""
     store = _get_store(args)
+    supervisor_mutations = (
+        "archive_launch_request",
+        "clear_restart",
+        "janitor_ephemeral",
+        "prepare_launch_request",
+        "record_ephemeral_launch",
+        "record_launch",
+        "seed_claude_settings",
+        "seed_codex_config",
+    )
+    if (
+        any(bool(getattr(args, name, False)) for name in supervisor_mutations)
+        and (store.dir / "supervisor.kill").exists()
+    ):
+        sys.stderr.write(
+            "agenttalk supervise: supervisor.kill is present; refusing "
+            "script-use supervisor mutation\n"
+        )
+        return 3
     if args.init:
         res = sup.init(store, force=args.force)
         for path, status in res.items():
@@ -6851,6 +6871,42 @@ def cmd_supervise(args: argparse.Namespace) -> int:
     sys.stderr.write("agenttalk supervise: choose --init, --report, --plan, "
                      "--install-activity-hook, or --clear-restart\n")
     return 2
+
+
+def cmd_deadman(args: argparse.Namespace) -> int:
+    store = _get_store(args)
+    if args.threshold_seconds is not None and args.threshold_seconds <= 0:
+        sys.stderr.write("agenttalk deadman: --threshold-seconds must be positive\n")
+        return 2
+    now = (
+        datetime.fromtimestamp(args.now, timezone.utc)
+        if getattr(args, "now", None) is not None else None
+    )
+    try:
+        rc, report = deadman_mod.check(
+            store,
+            threshold_seconds=args.threshold_seconds,
+            alarm_unread_response=args.alarm_unread_response,
+            now=now,
+        )
+    except ValueError as e:
+        sys.stderr.write(f"agenttalk deadman: {e}\n")
+        return 2
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        status = report.get("status", "unknown")
+        counts = report.get("counts") or {}
+        print(
+            "deadman: "
+            f"{status} "
+            f"stale_obligation={counts.get('stale_obligation', 0)} "
+            f"stale_unread_response={counts.get('stale_unread_response', 0)} "
+            f"stale_control={counts.get('stale_control', 0)}"
+        )
+        for err in report.get("errors") or []:
+            print(f"  error: {err.get('class', 'unknown')}")
+    return rc
 
 
 def cmd_end(args: argparse.Namespace) -> int:
@@ -8118,6 +8174,21 @@ def build_parser() -> argparse.ArgumentParser:
     psup.add_argument("--for", dest="agent", help="(--clear-restart) agent name.")
     psup.add_argument("--request-id", dest="request_id", help="(--clear-restart) rid to clear.")
     psup.set_defaults(func=cmd_supervise)
+
+    pdm = sub.add_parser(
+        "deadman",
+        help="Content-blind mail-age SLO check for stale actionable inbox work.",
+    )
+    pdm.add_argument("--threshold-seconds", dest="threshold_seconds", type=float,
+                     default=None,
+                     help="Override deadman.mail_age_slo_seconds for this check.")
+    pdm.add_argument("--json", action="store_true",
+                     help="Emit the content-blind JSON report.")
+    pdm.add_argument("--alarm-unread-response", dest="alarm_unread_response",
+                     action="store_true", default=None,
+                     help="Treat stale unread responses as alarming, not advisory.")
+    pdm.add_argument("--now", type=float, default=None, help=argparse.SUPPRESS)
+    pdm.set_defaults(func=cmd_deadman)
 
     prpl = sub.add_parser(
         "reply",
