@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -646,11 +647,29 @@ def test_doctor_escalation_target_absent_for_solo(tmp_path: Path) -> None:
     assert _esc_check(doctor.run(tmp_path)) is None
 
 
-# ----- 0.31.1: supervised-codex visibility (resolved exe + version + sandbox hint) ----
+# ----- 0.55.1: supervised-codex L4 observability -----------------------
 
 def _write_supervisor(store: Store, agents: dict) -> None:
     (store.dir / "supervisor.json").write_text(
         json.dumps({"agents": agents}), encoding="utf-8")
+
+
+def _fake_exe(path: Path) -> str:
+    path.write_text("fake", encoding="utf-8")
+    return str(path)
+
+
+def _write_agenttalk_cmd(store: Store, py: str) -> None:
+    p = store.dir / "bin" / "agenttalk.cmd"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(f'@echo off\r\nif not defined AGENTTALK_PYTHON set "AGENTTALK_PYTHON={py}"\r\n',
+                 encoding="utf-8")
+
+
+def _seed_codex_home(store: Store, agent: str) -> Path:
+    p = store.dir / "codex-home" / agent
+    p.mkdir(parents=True)
+    return p
 
 
 def test_doctor_supervised_codex_absent_without_supervisor_json(tmp_path: Path) -> None:
@@ -659,95 +678,288 @@ def test_doctor_supervised_codex_absent_without_supervisor_json(tmp_path: Path) 
     assert doctor._check_supervised_codex(s) is None     # no supervisor.json -> additive absent
 
 
-def test_doctor_supervised_codex_surfaces_path_and_version(tmp_path: Path) -> None:
+@pytest.mark.parametrize("payload", [[1, 2, 3], "not an object"])
+def test_doctor_supervised_codex_ignores_non_dict_supervisor_json(tmp_path: Path, payload: object) -> None:
     s = Store(tmp_path)
     s.init(["cdx"])
-    _write_supervisor(s, {"cdx": {"cli": "codex",
-                                  "launch": {"windows_file": "C:/codex.exe"}}})
+    (s.dir / "supervisor.json").write_text(json.dumps(payload), encoding="utf-8")
 
-    def runner(exe, args, timeout):
+    assert doctor._check_supervised_codex(s) is None
+    report = doctor.run(tmp_path)
+    assert not any(c.name == "supervised_codex" for c in report.checks)
+
+
+def test_doctor_supervised_codex_ok_requires_full_env_mirror(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["cdx"])
+    codex = _fake_exe(tmp_path / "codex.exe")
+    py = _fake_exe(tmp_path / "python.exe")
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    (tmp_path / "src" / "agenttalk").mkdir(parents=True)
+    (tmp_path / "src" / "agenttalk" / "__init__.py").write_text("", encoding="utf-8")
+    home = _seed_codex_home(s, "cdx")
+    _write_agenttalk_cmd(s, py)
+    _write_supervisor(s, {"cdx": {"cli": "codex",
+                                  "cwd": str(cwd),
+                                  "launch": {"windows_file": codex}}})
+    calls: list[dict] = []
+
+    def runner(exe, args, timeout, call_cwd, env):
+        assert timeout == 5.0
+        calls.append({"exe": exe, "args": args, "cwd": call_cwd, "env": env})
+        assert args != ["sandbox", "--help"]
         if args == ["--version"]:
             return (0, "codex-cli 0.142.3\n")
-        if args == ["sandbox", "--help"]:
-            return (0, "Usage: codex sandbox ...")
-        return (None, "unexpected")
+        if args == ["-m", "agenttalk", "--version"]:
+            return (0, "agenttalk 0.55.1\n")
+        raise AssertionError(args)
 
     chk = doctor._check_supervised_codex(s, runner=runner)
     assert chk.status == "ok"
-    assert "C:/codex.exe" in chk.details and "0.142.3" in chk.details
-    assert chk.data["codex"][0]["version"] == "codex-cli 0.142.3"
-    assert chk.data["codex"][0]["sandbox_probe_ok"] is True
+    entry = chk.data["codex"][0]
+    assert entry["base_cli"] == codex
+    assert entry["version"] == "codex-cli 0.142.3"
+    assert entry["agenttalk_py"] == py
+    assert entry["agenttalk_py_provenance"] == "agenttalk.cmd"
+    assert entry["codex_home_status"] == "existing"
+    assert entry["env_mirror"] == "full"
+    assert entry["sandbox_probe_status"] == "skipped"
+    assert {tuple(c["args"]) for c in calls} == {
+        ("--version",), ("-m", "agenttalk", "--version"),
+    }
+    for c in calls:
+        assert c["cwd"] == cwd
+        assert c["env"]["AGENTTALK_ROOT"] == str(tmp_path.resolve())
+        assert c["env"]["AGENTTALK_PY"] == py
+        assert c["env"]["CODEX_HOME"] == str(home)
+        assert c["env"]["PYTHONPATH"].split(os.pathsep)[0] == str(tmp_path / "src")
 
 
-def test_doctor_supervised_codex_warns_and_hints_on_probe_failure(tmp_path: Path) -> None:
+@pytest.mark.parametrize("env_key", ["AGENTTALK_PY", "agenttalk_py", "Agenttalk_Py"])
+def test_doctor_supervised_codex_agent_env_agenttalk_py_override_warns(
+    tmp_path: Path, env_key: str,
+) -> None:
     s = Store(tmp_path)
     s.init(["cdx"])
-    _write_supervisor(s, {"cdx": {"cli": "codex",
-                                  "launch": {"windows_file": "C:/old-codex.exe"}}})
+    codex = _fake_exe(tmp_path / "codex.exe")
+    py = _fake_exe(tmp_path / "python.exe")
+    missing_py = str(tmp_path / "missing-python.exe")
+    _write_agenttalk_cmd(s, py)
+    _seed_codex_home(s, "cdx")
+    _write_supervisor(s, {"cdx": {
+        "cli": "codex",
+        "env": {env_key: missing_py},
+        "launch": {"windows_file": codex},
+    }})
+    agenttalk_probe_exes: list[str] = []
 
-    def runner(exe, args, timeout):
+    def runner(exe, args, timeout, cwd, env):
+        assert env["AGENTTALK_PY"] == missing_py
         if args == ["--version"]:
-            return (0, "codex-cli 0.129.0-alpha.15\n")
-        return (None, "OSError")             # sandbox --help fails (alpha/MS-Store shape)
+            return (0, "codex-cli 0.142.3\n")
+        if args == ["-m", "agenttalk", "--version"]:
+            agenttalk_probe_exes.append(exe)
+            return (None, "FileNotFoundError")
+        raise AssertionError(args)
 
     chk = doctor._check_supervised_codex(s, runner=runner)
+    entry = chk.data["codex"][0]
     assert chk.status == "warn"
-    assert "sandbox probe FAILED" in chk.details
-    assert "npm stable" in chk.fix and "MS-Store" in chk.fix
-    assert chk.data["codex"][0]["sandbox_probe_ok"] is False
+    assert entry["agenttalk_py"] == py
+    assert entry["agenttalk_probe_status"] == "warn"
+    assert entry["env_mirror"] == "partial"
+    assert agenttalk_probe_exes == [missing_py]
+    assert "AGENTTALK_PY" in chk.details
 
 
-def test_doctor_supervised_codex_wrapped_resolves_base_argv_tail(tmp_path: Path) -> None:
+@pytest.mark.parametrize("env_key", ["CODEX_HOME", "codex_home"])
+def test_doctor_supervised_codex_agent_env_codex_home_override_warns(
+    tmp_path: Path, env_key: str,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["cdx"])
+    codex = _fake_exe(tmp_path / "codex.exe")
+    py = _fake_exe(tmp_path / "python.exe")
+    expected_home = _seed_codex_home(s, "cdx")
+    override_home = tmp_path / "override-codex-home"
+    override_home.mkdir()
+    _write_agenttalk_cmd(s, py)
+    _write_supervisor(s, {"cdx": {
+        "cli": "codex",
+        "env": {env_key: str(override_home)},
+        "launch": {"windows_file": codex},
+    }})
+    seen_homes: list[str] = []
+
+    def runner(exe, args, timeout, cwd, env):
+        seen_homes.append(env["CODEX_HOME"])
+        return (0, "codex-cli 0.142.3\n") if args == ["--version"] else (0, "agenttalk 0.55.1\n")
+
+    chk = doctor._check_supervised_codex(s, runner=runner)
+    entry = chk.data["codex"][0]
+    assert chk.status == "warn"
+    assert entry["codex_home_path"] == str(expected_home)
+    assert entry["env_mirror"] == "partial"
+    assert seen_homes == [str(override_home), str(override_home)]
+    assert "CODEX_HOME" in chk.details
+
+
+def test_doctor_supervised_codex_wrapped_probes_base_tail_and_wrapper_python(tmp_path: Path) -> None:
     s = Store(tmp_path)
     s.init(["wcdx"])
+    codex = _fake_exe(tmp_path / "real-codex.exe")
+    wrapper_py = _fake_exe(tmp_path / "wrapper-python.exe")
+    _seed_codex_home(s, "wcdx")
     _write_supervisor(s, {"wcdx": {
         "cli": "codex", "wrapped": True,
-        "launch": {"windows_file": "C:/python.exe",
+        "launch": {"windows_file": wrapper_py,
                    "windows_args": ["-m", "agenttalk", "wrap", "--for", "wcdx",
-                                    "--cli", "codex", "--loop", "--", "C:/real-codex.exe"]}}})
-    seen: dict = {}
+                                    "--cli", "codex", "--loop", "--", codex,
+                                    "--disable", "hooks"]}}})
+    calls: list[tuple[str, tuple[str, ...]]] = []
 
-    def runner(exe, args, timeout):
-        seen["exe"] = exe                    # the wrapped codex exe = the base argv tail
-        return (0, "codex-cli 0.142.3") if args == ["--version"] else (0, "ok")
+    def runner(exe, args, timeout, cwd, env):
+        calls.append((exe, tuple(args)))
+        if args == ["--version"]:
+            return (0, "codex-cli 0.142.3\n")
+        if args == ["-m", "agenttalk", "--version"]:
+            return (0, "agenttalk 0.55.1\n")
+        raise AssertionError(args)
 
     chk = doctor._check_supervised_codex(s, runner=runner)
-    assert seen["exe"] == "C:/real-codex.exe"   # NOT python (windows_file)
     assert chk.status == "ok"
+    entry = chk.data["codex"][0]
+    assert entry["base_cli"] == codex
+    assert entry["wrapper_python"] == wrapper_py
+    assert entry["agenttalk_py"] == wrapper_py
+    assert entry["agenttalk_py_provenance"] == "launch.windows_file"
+    assert (codex, ("--version",)) in calls
+    assert (wrapper_py, ("-m", "agenttalk", "--version")) in calls
 
 
-def test_doctor_supervised_wrapped_codex_errors_on_bad_agenttalk_runtime(
-    tmp_path: Path,
+@pytest.mark.parametrize("windows_args, expected", [
+    (["-m", "agenttalk", "wrap"], "missing --"),
+    (["-m", "agenttalk", "wrap", "--"], "no real CLI tail"),
+    (["-m", "agenttalk", "wrap", "--", "REPLACE: codex.exe"], "REPLACE"),
+    (["-m", "agenttalk", "wrap", "--", "missing-codex.exe"], "not found"),
+])
+def test_doctor_supervised_codex_wrapped_bad_tail_warns(
+    tmp_path: Path, windows_args: list[str], expected: str,
 ) -> None:
     s = Store(tmp_path)
     s.init(["wcdx"])
+    wrapper_py = _fake_exe(tmp_path / "wrapper-python.exe")
+    _seed_codex_home(s, "wcdx")
     _write_supervisor(s, {"wcdx": {
         "cli": "codex", "wrapped": True,
-        "launch": {"windows_file": "C:/python.exe",
-                   "windows_args": ["-m", "agenttalk", "wrap", "--for", "wcdx",
-                                    "--cli", "codex", "--loop", "--", "C:/real-codex.exe"]}}})
+        "launch": {"windows_file": wrapper_py, "windows_args": windows_args}}})
 
-    def runner(exe, args, timeout):
-        return (0, "codex-cli 0.142.3") if args == ["--version"] else (0, "ok")
+    def runner(exe, args, timeout, cwd, env):
+        return (0, "agenttalk 0.55.1\n")
 
-    seen: dict[str, Path] = {}
+    chk = doctor._check_supervised_codex(s, runner=runner)
+    assert chk.status == "warn"
+    assert expected in chk.details
+    assert chk.data["codex"][0]["base_cli_status"] == "warn"
 
-    def runtime_checker(root: Path) -> str:
-        seen["root"] = root
-        return (
-            "command=python -c import agenttalk; resolved_path=D:\\Projects\\claude\\"
-            "agenttalk\\src\\agenttalk\\__init__.py; error=agenttalk runtime resolved "
-            "to an out-of-workspace source checkout; remediation=install agenttalk "
-            "non-editable into the runtime Python"
-        )
 
-    chk = doctor._check_supervised_codex(
-        s,
-        runner=runner,
-        runtime_checker=runtime_checker,
-    )
-    assert seen["root"] == tmp_path.resolve()
-    assert chk.status == "error"
-    assert "agenttalk runtime preflight FAILED" in chk.details
-    assert "out-of-workspace source checkout" in chk.fix
-    assert chk.data["agenttalk_runtime"] == chk.fix
+def test_doctor_supervised_codex_wrapped_shim_tail_warns(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["wcdx"])
+    wrapper_py = _fake_exe(tmp_path / "wrapper-python.exe")
+    shim = _fake_exe(tmp_path / "codex.cmd")
+    _seed_codex_home(s, "wcdx")
+    _write_supervisor(s, {"wcdx": {
+        "cli": "codex", "wrapped": True,
+        "launch": {"windows_file": wrapper_py,
+                   "windows_args": ["-m", "agenttalk", "wrap", "--", shim]}}})
+
+    def runner(exe, args, timeout, cwd, env):
+        return (0, "agenttalk 0.55.1\n")
+
+    chk = doctor._check_supervised_codex(s, runner=runner)
+    assert chk.status == "warn"
+    assert "shim" in chk.details
+    assert chk.data["codex"][0]["base_cli_status"] == "warn"
+
+
+def test_doctor_supervised_codex_missing_codex_home_warns_partial_env(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["cdx"])
+    codex = _fake_exe(tmp_path / "codex.exe")
+    py = _fake_exe(tmp_path / "python.exe")
+    _write_agenttalk_cmd(s, py)
+    _write_supervisor(s, {"cdx": {"cli": "codex", "launch": {"windows_file": codex}}})
+
+    def runner(exe, args, timeout, cwd, env):
+        return (0, "codex-cli 0.142.3\n") if args == ["--version"] else (0, "agenttalk 0.55.1\n")
+
+    chk = doctor._check_supervised_codex(s, runner=runner)
+    entry = chk.data["codex"][0]
+    assert chk.status == "warn"
+    assert entry["codex_home_status"] == "missing_expected"
+    assert entry["env_mirror"] == "partial"
+
+
+def test_doctor_supervised_codex_fallback_python_warns_doctor_fallback(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["cdx"])
+    codex = _fake_exe(tmp_path / "codex.exe")
+    _write_supervisor(s, {"cdx": {
+        "cli": "codex", "codex_home_isolation": False,
+        "launch": {"windows_file": codex}}})
+
+    def runner(exe, args, timeout, cwd, env):
+        if args == ["-m", "agenttalk", "--version"]:
+            assert env["AGENTTALK_PY"] == exe
+        return (0, "codex-cli 0.142.3\n") if args == ["--version"] else (0, "agenttalk 0.55.1\n")
+
+    chk = doctor._check_supervised_codex(s, runner=runner)
+    entry = chk.data["codex"][0]
+    assert chk.status == "warn"
+    assert entry["agenttalk_py_provenance"] == "sys.executable"
+    assert entry["env_mirror"] == "doctor_fallback"
+
+
+@pytest.mark.parametrize("result, expected", [
+    ((0, ""), "UNVERSIONED"),
+    ((7, "boom"), "failed"),
+])
+def test_doctor_supervised_codex_runtime_probe_failures_warn_never_error(
+    tmp_path: Path, result: tuple[int, str], expected: str,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["cdx"])
+    codex = _fake_exe(tmp_path / "codex.exe")
+    py = _fake_exe(tmp_path / "python.exe")
+    _write_agenttalk_cmd(s, py)
+    _seed_codex_home(s, "cdx")
+    _write_supervisor(s, {"cdx": {"cli": "codex", "launch": {"windows_file": codex}}})
+
+    def runner(exe, args, timeout, cwd, env):
+        if args == ["--version"]:
+            return result
+        return (0, "agenttalk 0.55.1\n")
+
+    chk = doctor._check_supervised_codex(s, runner=runner)
+    assert chk.status == "warn"
+    assert "error" not in chk.status
+    assert expected in chk.details
+
+
+def test_doctor_config_blocked_holds_warns_separately_and_ignores_malformed(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["worker", "other"])
+    s.write_config_blocked_hold("worker", summary="missing native codex path")
+    bad = s.config_blocked_hold_path("other")
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text(json.dumps({"agent": "other", "state": "wrong"}), encoding="utf-8")
+
+    chk = doctor._check_config_blocked_holds(s)
+    assert chk.status == "warn"
+    assert chk.name == "config_blocked_holds"
+    assert "worker" in chk.details and "missing native codex path" in chk.details
+    assert "request-restart" in chk.fix
+    assert [h["agent"] for h in chk.data["holds"]] == ["worker"]
+    assert any(c.name == "config_blocked_holds" for c in doctor.run(tmp_path).checks)

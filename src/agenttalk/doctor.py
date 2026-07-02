@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import filecmp
 import json
-# subprocess is used ONLY to run the operator-configured codex exe `--version` /
-# `sandbox --help` as a best-effort, timeout-bounded diagnostic probe; never shell.
+import os
+import re
+import shutil
+# subprocess is used ONLY for timeout-bounded diagnostic runtime probes; never shell.
 import subprocess  # nosec B404
 import sys
 from dataclasses import dataclass, field
@@ -112,9 +114,12 @@ def run(project_root: Path | None = None) -> Report:
         waiters = _check_active_waiters(store)
         if waiters is not None:  # additive: absent unless a live waiter exists
             report.checks.append(waiters)
-        codex_vis = _check_supervised_codex(store, runtime_checker=_check_agenttalk_runtime)
+        codex_vis = _check_supervised_codex(store)
         if codex_vis is not None:  # additive: absent unless a supervised codex agent
             report.checks.append(codex_vis)
+        holds = _check_config_blocked_holds(store)
+        if holds is not None:  # additive: absent unless a valid config-blocked hold exists
+            report.checks.append(holds)
         kn_check = _check_knowledge(store)
         if kn_check is not None:  # additive: absent unless a knowledge store exists
             report.checks.append(kn_check)
@@ -926,34 +931,222 @@ def _check_active_waiters(store: Store) -> Check | None:
     )
 
 
-def _resolve_supervised_codex_exe(agent_cfg: dict) -> str | None:
-    """The codex executable a supervised codex agent will actually run: the base
-    argv tail after ``--`` for a wrapped agent (windows_file is python there), else
-    ``launch.windows_file``. None when unset / still a REPLACE placeholder."""
+_SHIM_EXTENSIONS = frozenset({".cmd", ".bat", ".ps1"})
+_AGENTTALK_CMD_PIN_RE = re.compile(
+    r'^\s*(?:if\s+not\s+defined\s+AGENTTALK_PYTHON\s+)?'
+    r'set\s+"AGENTTALK_PYTHON=([^"]+)"\s*$',
+    re.IGNORECASE | re.MULTILINE,
+)
+_SUPERVISOR_PS1_PIN_RE = re.compile(
+    r"^\s*\$AgenttalkPython\s*=\s*'((?:''|[^'])*)'\s*$",
+    re.MULTILINE,
+)
+
+
+def _resolve_configured_executable(raw: object, *, label: str) -> tuple[str | None, str, str]:
+    """Resolve a configured executable enough for doctor observability.
+
+    Returns (candidate, status, reason). Candidate is retained for display even
+    when it is not runnable; callers only probe when status == "ok".
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None, "warn", f"{label} is missing"
+    text = raw.strip()
+    if text.startswith("REPLACE"):
+        return text, "warn", f"{label} is still a REPLACE placeholder"
+    resolved = shutil.which(text) or text
+    suffix = Path(resolved).suffix.lower()
+    if suffix in _SHIM_EXTENSIONS:
+        return resolved, "warn", f"{label} resolves to shim {resolved}"
+    p = Path(resolved)
+    if not p.exists() or not p.is_file():
+        return resolved, "warn", f"{label} was not found"
+    return str(p), "ok", "resolved"
+
+
+def _wrapped_base_tail(agent_cfg: dict) -> tuple[object | None, str | None]:
     launch = agent_cfg.get("launch") if isinstance(agent_cfg.get("launch"), dict) else {}
-    if agent_cfg.get("wrapped"):
-        args = launch.get("windows_args") or []
-        if isinstance(args, list) and "--" in args:
-            tail = args[args.index("--") + 1:]
-            exe = tail[0] if tail else None
-        else:
-            exe = None
-    else:
-        exe = launch.get("windows_file")
-    if not isinstance(exe, str) or not exe or exe.startswith("REPLACE"):
+    args = launch.get("windows_args")
+    if not isinstance(args, list):
+        return None, "wrapped launch.windows_args is missing or not a list"
+    if "--" not in args:
+        return None, "wrapped launch is missing -- before the real Codex executable"
+    tail = args[args.index("--") + 1:]
+    if not tail:
+        return None, "wrapped launch has no real CLI tail after --"
+    return tail[0], None
+
+
+def _read_agenttalk_cmd_pin(store: Store) -> str | None:
+    p = store.dir / "bin" / "agenttalk.cmd"
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError:
         return None
-    return exe
+    m = _AGENTTALK_CMD_PIN_RE.search(text)
+    return m.group(1).strip() if m else None
 
 
-def _default_codex_runner(exe: str, args: list[str], timeout: float):
-    """Run ``exe args`` best-effort; return (returncode, combined_output) or
-    (None, reason) on any failure. Timeout-bounded so `doctor` never hangs; never
+def _read_supervisor_ps1_pin(store: Store) -> str | None:
+    p = store.dir / "supervisor.ps1"
+    try:
+        text = p.read_text(encoding="utf-8-sig")
+    except OSError:
+        return None
+    m = _SUPERVISOR_PS1_PIN_RE.search(text)
+    return m.group(1).replace("''", "'").strip() if m else None
+
+
+def _resolve_agenttalk_pin(store: Store | None, *, wrapped: bool,
+                           wrapper_python: str | None) -> tuple[str, str, str | None]:
+    if wrapped and wrapper_python:
+        return wrapper_python, "launch.windows_file", None
+    if store is not None:
+        cmd_pin = _read_agenttalk_cmd_pin(store)
+        if cmd_pin:
+            return cmd_pin, "agenttalk.cmd", None
+        ps_pin = _read_supervisor_ps1_pin(store)
+        if ps_pin:
+            return ps_pin, "supervisor.ps1", "agenttalk pin fell back to supervisor.ps1 parse"
+    return sys.executable, "sys.executable", "agenttalk pin fell back to doctor sys.executable"
+
+
+def _codex_home_info(store: Store | None, agent: str, agent_cfg: dict) -> tuple[str | None, str, str | None]:
+    if store is None:
+        return None, "not_checked", None
+    isolation = bool(agent_cfg.get("codex_home_isolation", True))
+    if not isolation:
+        return None, "not_expected", None
+    p = store.dir / "codex-home" / agent
+    if p.is_dir():
+        return str(p), "existing", None
+    return str(p), "missing_expected", f"expected seeded CODEX_HOME is missing for {agent}"
+
+
+def _source_checkout_src(root: Path) -> Path | None:
+    src = root / "src"
+    return src if (src / "agenttalk" / "__init__.py").exists() else None
+
+
+_CRITICAL_LAUNCH_ENV_KEYS = frozenset({"AGENTTALK_ROOT", "AGENTTALK_PY", "PYTHONPATH", "CODEX_HOME"})
+
+
+def _set_env_case_insensitive(env: dict[str, str], key: str, value: str) -> None:
+    for existing in list(env):
+        if existing.casefold() == key.casefold() and existing != key:
+            env.pop(existing, None)
+    env[key] = value
+
+
+def _probe_env(store: Store, launch: dict, agent_cfg: dict) -> tuple[dict[str, str], list[str]]:
+    env = os.environ.copy()
+    managed = {
+        "AGENTTALK_ROOT": str(store.root),
+        "AGENTTALK_PY": str(launch["agenttalk_py"]),
+    }
+    src = _source_checkout_src(store.root)
+    if src is not None:
+        old = env.get("PYTHONPATH")
+        managed["PYTHONPATH"] = str(src) + (os.pathsep + old if old else "")
+    if launch.get("codex_home_status") == "existing" and launch.get("codex_home_path"):
+        managed["CODEX_HOME"] = str(launch["codex_home_path"])
+    for key, value in managed.items():
+        _set_env_case_insensitive(env, key, value)
+
+    warnings: list[str] = []
+    managed_by_casefold = {key.casefold(): key for key in managed}
+    overrides = agent_cfg.get("env") if isinstance(agent_cfg.get("env"), dict) else {}
+    for key, raw_value in overrides.items():
+        if not isinstance(key, str):
+            continue
+        value = "" if raw_value is None else str(raw_value)
+        managed_key = managed_by_casefold.get(key.casefold())
+        target_key = managed_key or key
+        _set_env_case_insensitive(env, target_key, value)
+        if managed_key in _CRITICAL_LAUNCH_ENV_KEYS and managed[managed_key] != value:
+            warnings.append(f"agent.env overrides managed {managed_key}; doctor probes the effective override")
+    return env, warnings
+
+
+def resolve_supervised_codex_launch(agent: str, agent_cfg: dict,
+                                    store: Store | None = None) -> dict:
+    """Structured doctor view of the launch facts for one supervised Codex agent."""
+    launch_cfg = agent_cfg.get("launch") if isinstance(agent_cfg.get("launch"), dict) else {}
+    wrapped = bool(agent_cfg.get("wrapped"))
+    warnings: list[str] = []
+
+    wrapper_python = None
+    wrapper_python_status = "not_wrapped"
+    wrapper_python_reason = ""
+    if wrapped:
+        wrapper_python, wrapper_python_status, wrapper_python_reason = _resolve_configured_executable(
+            launch_cfg.get("windows_file"), label="wrapped launch.windows_file",
+        )
+        if wrapper_python_status != "ok":
+            warnings.append(wrapper_python_reason)
+        raw_base, tail_warning = _wrapped_base_tail(agent_cfg)
+        if tail_warning:
+            base_cli, base_cli_status, base_cli_reason = None, "warn", tail_warning
+        else:
+            base_cli, base_cli_status, base_cli_reason = _resolve_configured_executable(
+                raw_base, label="wrapped Codex tail",
+            )
+    else:
+        base_cli, base_cli_status, base_cli_reason = _resolve_configured_executable(
+            launch_cfg.get("windows_file"), label="launch.windows_file",
+        )
+    if base_cli_status != "ok":
+        warnings.append(base_cli_reason)
+
+    codex_home_path, codex_home_status, codex_home_warning = _codex_home_info(store, agent, agent_cfg)
+    if codex_home_warning:
+        warnings.append(codex_home_warning)
+    agenttalk_py, pin_provenance, pin_warning = _resolve_agenttalk_pin(
+        store, wrapped=wrapped, wrapper_python=wrapper_python if wrapper_python_status == "ok" else None,
+    )
+    env_mirror = "full"
+    if codex_home_status == "missing_expected":
+        env_mirror = "partial"
+    if pin_provenance == "sys.executable":
+        env_mirror = "doctor_fallback"
+    if pin_warning:
+        warnings.append(pin_warning)
+
+    return {
+        "agent": agent,
+        "wrapped": wrapped,
+        "wrapper_python": wrapper_python,
+        "wrapper_python_status": wrapper_python_status,
+        "wrapper_python_reason": wrapper_python_reason,
+        "base_cli": base_cli,
+        "base_cli_status": base_cli_status,
+        "base_cli_reason": base_cli_reason,
+        "codex_home_path": codex_home_path,
+        "codex_home_status": codex_home_status,
+        "agenttalk_py": agenttalk_py,
+        "agenttalk_py_provenance": pin_provenance,
+        "env_mirror": env_mirror,
+        "warnings": warnings,
+    }
+
+
+def _resolve_supervised_codex_exe(agent_cfg: dict) -> str | None:
+    """Compatibility adapter for the old private str/None contract."""
+    rec = resolve_supervised_codex_launch("agent", agent_cfg, None)
+    return rec["base_cli"] if rec["base_cli_status"] == "ok" else None
+
+
+def _default_codex_runner(exe: str, args: list[str], timeout: float,
+                          cwd: str | Path | None = None, env: dict[str, str] | None = None):
+    """Run exe args best-effort; return (returncode, combined_output) or
+    (None, reason) on any failure. Timeout-bounded so doctor never hangs; never
     shell (operator-configured exe path)."""
     try:
         # operator-configured codex exe path; argv is a list, never shell.
         p = subprocess.run(  # noqa: S603  # nosec B603
             [exe, *args], capture_output=True, text=True,
             timeout=timeout, encoding="utf-8", errors="replace",
+            cwd=str(cwd) if cwd is not None else None, env=env,
         )
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except (OSError, subprocess.SubprocessError) as e:
@@ -965,13 +1158,40 @@ def _check_agenttalk_runtime(project_root: Path) -> str | None:
     return wrapper_run.preflight_agenttalk_runtime(workspace_root=project_root)
 
 
+def _call_probe(runner, exe: str, args: list[str], timeout: float,
+                cwd: Path, env: dict[str, str]) -> tuple[object | None, str]:
+    try:
+        res = runner(exe, args, timeout, cwd, env)
+    except Exception as e:  # noqa: BLE001 - doctor probe must degrade, not crash
+        return None, type(e).__name__
+    if not isinstance(res, tuple) or len(res) != 2:
+        return None, "invalid runner result"
+    rc, out = res
+    return rc, str(out or "")
+
+
+def _probe_version(runner, exe: str | None, args: list[str], *,
+                   cwd: Path, env: dict[str, str], label: str) -> dict:
+    if not exe:
+        return {"status": "warn", "version": None, "reason": f"{label} executable is unresolved"}
+    rc, out = _call_probe(runner, exe, args, 5.0, cwd, env)
+    if rc != 0:
+        return {"status": "warn", "version": None,
+                "reason": f"{label} probe failed ({rc if rc is not None else out})"}
+    version = next((ln.strip() for ln in out.splitlines() if ln.strip()), "")
+    if not version:
+        return {"status": "warn", "version": None, "reason": f"{label} probe returned UNVERSIONED"}
+    return {"status": "ok", "version": version, "reason": ""}
+
+
 def _check_supervised_codex(store: Store, *, runner=None, runtime_checker=None) -> Check | None:
-    """0.31.1: surface the RESOLVED codex exe + its ``codex --version`` for each
-    supervised codex agent, with a best-effort, NON-blocking ``codex sandbox
-    --help`` probe whose failure prints a hint (an old/alpha build - e.g. the
-    MS-Store codex - vs the npm stable codex agenttalk expects). A diagnostic only:
-    it can WARN but never errors, and never hangs (each probe is timeout-bounded).
-    Returns None when there is no supervisor.json or no codex agent configured."""
+    """Surface supervised Codex launch/probe observability.
+
+    L4 is advisory: absent when there is no configured supervised Codex, otherwise
+    OK only when resolution, runtime probes, and env mirror are complete; WARN for
+    every drift/failure. It never returns ERROR and never mutates launch state.
+    """
+    _ = runtime_checker  # kept only for source compatibility with older private tests
     runner = runner or _default_codex_runner
     sup_path = store.dir / "supervisor.json"
     if not sup_path.exists():
@@ -980,61 +1200,124 @@ def _check_supervised_codex(store: Store, *, runner=None, runtime_checker=None) 
         cfg = json.loads(sup_path.read_text(encoding="utf-8-sig"))
     except (ValueError, OSError):
         return None  # the supervisor's own --init/validate owns a malformed config
-    agents = cfg.get("agents") if isinstance(cfg.get("agents"), dict) else {}
-    exes: dict[str, list[str]] = {}   # resolved exe -> agent names using it
-    has_wrapped_codex = False
-    for name, a in agents.items():
-        if isinstance(a, dict) and a.get("cli") == "codex":
-            has_wrapped_codex = has_wrapped_codex or bool(a.get("wrapped"))
-            exe = _resolve_supervised_codex_exe(a)
-            if exe:
-                exes.setdefault(exe, []).append(name)
-    if not exes:
+    if not isinstance(cfg, dict):
         return None
+    agents = cfg.get("agents") if isinstance(cfg.get("agents"), dict) else {}
+    codex_agents: list[tuple[str, dict]] = [
+        (name, a) for name, a in agents.items()
+        if isinstance(a, dict) and a.get("cli") == "codex"
+    ]
+    if not codex_agents:
+        return None
+
     entries: list[dict] = []
     any_warn = False
-    runtime_blocked = None
-    if has_wrapped_codex and runtime_checker is not None:
-        runtime_blocked = runtime_checker(store.root)
-    for exe, names in exes.items():
-        rc, out = runner(exe, ["--version"], 5.0)
-        version = out.strip().splitlines()[0].strip() if (rc == 0 and out) else None
-        sbx_rc, _ = runner(exe, ["sandbox", "--help"], 5.0)
-        sandbox_ok = sbx_rc == 0
-        if version is None or not sandbox_ok:
+    for name, agent_cfg in codex_agents:
+        rec = resolve_supervised_codex_launch(name, agent_cfg, store)
+        cwd = Path(agent_cfg.get("cwd") if isinstance(agent_cfg.get("cwd"), str) else store.root)
+        env, env_warnings = _probe_env(store, rec, agent_cfg)
+        if env_warnings and rec["env_mirror"] == "full":
+            rec = {**rec, "env_mirror": "partial"}
+        warnings = list(rec["warnings"])
+        warnings.extend(env_warnings)
+        codex_probe = (
+            _probe_version(runner, rec["base_cli"], ["--version"], cwd=cwd, env=env, label="codex")
+            if rec["base_cli_status"] == "ok"
+            else {"status": "warn", "version": None, "reason": rec["base_cli_reason"]}
+        )
+        if codex_probe["status"] != "ok":
+            warnings.append(str(codex_probe["reason"]))
+        wrapper_probe = {"status": "skipped", "version": None, "reason": ""}
+        if rec["wrapped"]:
+            wrapper_probe = (
+                _probe_version(runner, rec["wrapper_python"], ["-m", "agenttalk", "--version"],
+                               cwd=cwd, env=env, label="wrapper python")
+                if rec["wrapper_python_status"] == "ok"
+                else {"status": "warn", "version": None, "reason": rec["wrapper_python_reason"]}
+            )
+            if wrapper_probe["status"] != "ok":
+                warnings.append(str(wrapper_probe["reason"]))
+        agenttalk_probe = _probe_version(
+            runner, env.get("AGENTTALK_PY") or rec["agenttalk_py"], ["-m", "agenttalk", "--version"],
+            cwd=cwd, env=env, label="AGENTTALK_PY",
+        )
+        if agenttalk_probe["status"] != "ok":
+            warnings.append(str(agenttalk_probe["reason"]))
+        if rec["env_mirror"] != "full":
+            warnings.append(f"env_mirror={rec['env_mirror']}")
+        entry = {
+            **rec,
+            "version": codex_probe["version"],
+            "codex_probe_status": codex_probe["status"],
+            "codex_probe_reason": codex_probe["reason"],
+            "wrapper_probe_status": wrapper_probe["status"],
+            "wrapper_version": wrapper_probe["version"],
+            "wrapper_probe_reason": wrapper_probe["reason"],
+            "agenttalk_probe_status": agenttalk_probe["status"],
+            "agenttalk_version": agenttalk_probe["version"],
+            "agenttalk_probe_reason": agenttalk_probe["reason"],
+            "sandbox_probe_status": "skipped",
+            "warnings": warnings,
+        }
+        if warnings:
             any_warn = True
-        entries.append({"exe": exe, "agents": sorted(names),
-                        "version": version, "sandbox_probe_ok": sandbox_ok})
+        entries.append(entry)
+
     lines = []
     for e in entries:
-        v = e["version"] or "UNVERSIONED (codex --version did not run)"
-        lines.append(f"{', '.join(e['agents'])} -> {e['exe']} [{v}]"
-                     + ("" if e["sandbox_probe_ok"] else " · sandbox probe FAILED"))
+        version = e["version"] or "UNVERSIONED"
+        target = e["base_cli"] or "UNRESOLVED"
+        line = (f"{e['agent']} -> {target} [{version}] env_mirror={e['env_mirror']} "
+                f"agenttalk_py={e['agenttalk_py_provenance']}")
+        if e["warnings"]:
+            line += " WARN: " + "; ".join(dict.fromkeys(e["warnings"]))
+        lines.append(line)
     details = "; ".join(lines)
-    if runtime_blocked:
-        details += "; agenttalk runtime preflight FAILED"
     if any_warn:
         return Check(
             name="supervised_codex",
-            status="error" if runtime_blocked else "warn",
+            status="warn",
             details=details,
-            fix=(runtime_blocked or
-                 "a sandbox probe / version failure may mean a wrong or old/alpha "
-                 "codex (e.g. the MS-Store build) - agenttalk expects the npm "
-                 "stable codex; check the launch.windows_file / wrap base path"),
-            data={"codex": entries, "agenttalk_runtime": runtime_blocked},
-        )
-    if runtime_blocked:
-        return Check(
-            name="supervised_codex",
-            status="error",
-            details=details,
-            fix=runtime_blocked,
-            data={"codex": entries, "agenttalk_runtime": runtime_blocked},
+            fix=("fill the native codex.exe path in supervisor.json (or the wrapped tail after --), "
+                 "avoid .cmd/.bat/.ps1 shims, ensure AGENTTALK_PY can run -m agenttalk, seed the "
+                 "per-agent CODEX_HOME when isolation is enabled, and use explicit Codex --add-dir "
+                 "<python-dir> / writable_roots opt-in if workspace-write denies the pinned Python."),
+            data={"codex": entries},
         )
     return Check(
         name="supervised_codex",
         status="ok",
         details=details,
-        data={"codex": entries, "agenttalk_runtime": runtime_blocked},
+        data={"codex": entries},
+    )
+
+
+def _check_config_blocked_holds(store: Store) -> Check | None:
+    try:
+        cfg = store.load_config()
+    except Exception:  # noqa: BLE001 - init check owns corrupt config
+        return None
+    holds: list[dict] = []
+    for agent in cfg.get("agents", []) or []:
+        try:
+            hold = store.read_config_blocked_hold(str(agent))
+        except Exception:  # noqa: BLE001 - doctor never crashes on state files
+            hold = None
+        if hold is not None:
+            holds.append(hold)
+    if not holds:
+        return None
+    details = "; ".join(
+        f"{h['agent']}: {h.get('summary') or 'config_blocked launch/runtime hold'}"
+        for h in holds
+    )
+    return Check(
+        name="config_blocked_holds",
+        status="warn",
+        details=details,
+        fix=("repair supervisor launch config, fill the native codex.exe path or set AGENTTALK_CODEX "
+             "where supported, explicitly opt in to the pinned Python directory with Codex --add-dir "
+             "<python-dir> / writable_roots if workspace-write denies it, then run "
+             "`agenttalk request-restart --for <agent>`."),
+        data={"holds": holds},
     )

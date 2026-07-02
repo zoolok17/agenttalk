@@ -178,47 +178,68 @@ def test_scoped_wait_composing_extends_mid_wait(tmp_path: Path) -> None:
 
 def test_scoped_wait_composing_extends_when_cursor_exceeds_baseline(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Perf-fix edge: a concurrent same-agent consumer advances the GLOBAL
     cursor above the wait's baseline, so floor = max(thread_seen, cursor) >
     baseline. Scanning only from floor would skip a composing in
     (baseline, floor]; scanning from min(floor, baseline) still sees it. The
-    composing here (id < the advanced cursor) must still extend the deadline."""
+    composing here (id < the advanced cursor) must still extend the deadline.
+
+    The clock/sleep hooks make the original deadline pass before the reply is
+    sent, so this fails deterministically if the composing is skipped."""
     root = _init_team(tmp_path, "lead,exec")
     _run(["send", "--from", "lead", "--to", "exec", "--kind", "question",
           "--meta", "request_id=q-fire", "-m", "fire", "--quiet"], root)
     assert _run(["drain", "--for", "exec", "--quiet"], root) == 0
     s = Store(root)
-    result: list[int] = []
+    baseline = s.cursor("exec")
+    now = 1_000.0
+    sleep_calls = 0
+    sent_reply = False
 
-    def _waiter() -> None:
-        result.append(cli.main([
-            "--root", str(root), "wait", "--for", "exec", "--to-request", "q-fire",
-            "--timeout", "0.5", "--grace", "0", "--interval", "0.05",
-            "--composing-extend", "10", "--heartbeat-interval", "0", "--quiet",
-        ]))
+    def fake_sleep(_duration: float) -> None:
+        nonlocal now, sent_reply, sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 1:
+            # The waiter has captured `baseline`. Now place a composing in
+            # (baseline, floor] and advance time beyond the original deadline.
+            _run(["send", "--from", "lead", "--to", "exec", "--kind", "composing",
+                  "-m", "drafting", "--quiet"], root)
+            r1 = s.send(sender="lead", recipient="exec", kind="note", body="other")
+            s.advance_cursor("exec", r1.id)
+            assert baseline < r1.id
+            assert s.cursor("exec") == r1.id
+            now = 1_001.0
+            return
+        if sleep_calls == 2:
+            _run(["send", "--from", "lead", "--to", "exec", "--kind", "review-result",
+                  "--meta", "request_id=q-fire", *_approval_meta_args(),
+                  "-m", "lgtm", "--quiet"], root)
+            sent_reply = True
+            return
+        raise AssertionError("wait loop kept sleeping after the deterministic reply")
 
-    t = threading.Thread(target=_waiter)
-    t.start()
-    _time.sleep(0.2)  # waiter arms; baseline = the q-fire id
-    # composing lands first (id just above baseline)...
-    _run(["send", "--from", "lead", "--to", "exec", "--kind", "composing",
-          "-m", "drafting", "--quiet"], root)
-    # ...then a later unrelated message, which a concurrent consumer drains,
-    # dragging the GLOBAL cursor ABOVE both baseline and the composing id.
-    r1 = s.send(sender="lead", recipient="exec", kind="note", body="other")
-    s.advance_cursor("exec", r1.id)
-    assert s.cursor("exec") == r1.id  # floor now exceeds baseline
-    _time.sleep(0.6)  # past base deadline — survives only if the composing extended
-    _run(["send", "--from", "lead", "--to", "exec", "--kind", "review-result",
-          "--meta", "request_id=q-fire", *_approval_meta_args(),
-          "-m", "lgtm", "--quiet"], root)
-    t.join(timeout=15)
-    assert not t.is_alive(), "waiter never returned"
-    assert result == [0], (
+    class FakeTime:
+        def time(self) -> float:
+            return now
+
+        def sleep(self, duration: float) -> None:
+            fake_sleep(duration)
+
+    monkeypatch.setattr(cli, "time", FakeTime())
+
+    rc = cli.main([
+        "--root", str(root), "wait", "--for", "exec", "--to-request", "q-fire",
+        "--timeout", "0.5", "--grace", "0", "--interval", "0.05",
+        "--composing-extend", "10", "--heartbeat-interval", "0", "--quiet",
+    ])
+
+    assert rc == 0, (
         "composing in (baseline, floor] was skipped — scan bound regressed "
         "from min(floor, baseline) to floor"
     )
+    assert sent_reply
 
 
 def test_scoped_wait_rescind_wakes_when_cursor_exceeds_baseline(
