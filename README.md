@@ -949,6 +949,52 @@ mirroring.
 
 ---
 
+### Operator attention queue (0.56.0)
+
+`agenttalk attention` is one ranked, read-only view of everything that
+currently needs a human: pending `needs_operator` escalations,
+config-blocked holds, dead letters, gate/close HOLDs, and unarmed
+lead-loops. It **derives** the view from cheap state reads — it creates no
+work object and adds no message kind — so a degraded source becomes a
+bounded warning row rather than blanking the queue, and the default path
+does no `git`/lane recompute.
+
+**Escalations can carry typed decision fields.** `agenttalk escalate`
+takes `--decision`, `--why`, `--option` (repeatable), `--recommendation`,
+`--risk-if-ignored`, `--risk-severity`, `--confidence`, `--priority`,
+`--needed-by`, and `--affected`, stored as a canonical nested
+`meta.attention` block. Validation is strict at the CLI boundary (a
+malformed field exits 2 and sends nothing); the reader is fail-safe (an
+unparseable block downgrades to an untyped item with a warning, never
+hiding the escalation).
+
+**Dispositions make a decision stick.** The operator-facing liaison (or the
+sole lead) runs `agenttalk attention defer|dismiss|answered-elsewhere
+--item <id> --reason <text>` (`defer` also needs `--until <ISO>`); authority
+resolves from `--from`/`$AGENTTALK_SELF`, no `--by`. Dispositions are
+**snapshot-bound** — they hide an item only while its identifying *content*
+is unchanged, so a different fault for the same agent, or an expired defer,
+resurfaces automatically. `dismiss` is refused for blocking sources
+(`needs_operator`, `dead_letter`, non-advisory holds): blockers get
+repaired, answered, or deferred, never silenced. `--all` /
+`--include-deferred` / `--include-dismissed` / `--include-resolved` widen
+the view.
+
+**Dead letters get a distinct `resolve`.** `agenttalk dead-letter resolve
+--agent A --id ID --reason …` records that a poison message was handled
+out-of-band, **preserving** the payload and dropping it from the default
+`dead-letter list`, the doctor warning, and the attention queue. The
+central disposition log is authoritative (a best-effort `.resolved.json`
+sidecar aids copied sinks); `dead-letter requeue --force-resolved --reason`
+reopens a resolved item, audited.
+
+Dispositions live append-only in `.agenttalk/attention/dispositions.jsonl`
+(latest-valid per item + action-family, fsync under the store lock,
+skip-invalid on read with torn lines surfaced in `doctor`, preserved by
+`reset`). v1 has no bulk/group dispositions and dedupe is display-only.
+
+---
+
 ## Unattended operation: the supervisor and the wrapper
 
 Everything above assumes you're at the keyboard, one terminal per agent.

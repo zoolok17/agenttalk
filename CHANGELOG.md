@@ -5,6 +5,64 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.56.0] - 2026-07-02
+
+The **operator attention queue**: a derived, ranked, deduped read-only view over the
+signals that already need a human — pending `needs_operator` escalations, config-blocked
+holds, dead letters, gate/close HOLDs, unarmed lead-loops — plus durable operator
+*dispositions* (defer / dismiss / answered-elsewhere) so a decision, once made, stays made
+until the underlying situation actually changes. Creates no new message kind and no new
+work objects; mutates nothing except its own append-only disposition log.
+
+### Added
+
+- **`agenttalk attention`** — a single ranked view of everything awaiting the operator,
+  built from cheap state reads (no git/lane recompute; a degraded source becomes a bounded
+  warning row rather than blanking the queue). Sources include capacity (threshold-tripped
+  only) and published close HOLDs. `--all` / `--include-deferred` / `--include-dismissed` /
+  `--include-resolved` widen the view; `--source`, `--limit`, `--json`, and `attention show
+  --item` narrow it. The read-only view works even with no liaison/sole-lead configured
+  (global sources surface with a `no_liaison` warning; only per-recipient escalations are
+  skipped).
+- **Operator dispositions** — `attention defer|dismiss|answered-elsewhere --item <id>
+  --reason <text>` (defer also needs `--until <ISO>`, validated on write and re-checked on
+  read so a bad timestamp never hides a blocking item). Authority is the operator-facing
+  liaison, or the sole lead when none is configured, resolved from `--from`/`$AGENTTALK_SELF`
+  (no `--by`). Dispositions are **snapshot-bound**: they hide an item only while its
+  identifying *content* is unchanged, so a changed source (e.g. a different config fault for
+  the same agent, or an expired defer) resurfaces automatically. The legitimacy guard is
+  re-enforced on read (the disposition log is untrusted), so a forged/hand-edited line cannot
+  hide a blocking item. `dismiss` is refused for blocking sources (`needs_operator`,
+  `dead_letter`, and non-advisory holds) — those must be repaired, answered, or deferred,
+  never dismissed.
+- **Typed escalation fields.** `agenttalk escalate` gains `--decision`, `--why`, `--option`
+  (repeatable), `--recommendation`, `--risk-if-ignored`, `--risk-severity`, `--confidence`,
+  `--priority`, `--needed-by`, and `--affected`, written as a canonical nested
+  `meta.attention` block. Validation is strict at the CLI write boundary (exit 2 on a
+  malformed field, nothing sent); the reader is fail-safe (an unparseable block downgrades to
+  an untyped item with a warning and never hides the escalation).
+- **`agenttalk dead-letter resolve`** — an operator decision distinct from `requeue`: marks a
+  poison message handled out-of-band, **preserving** the payload, and drops it from the
+  default `dead-letter list`, the doctor dead-letter warning, and the attention queue. The
+  central disposition log is authoritative; a best-effort `.resolved.json` sidecar aids
+  copied-sink readability. `dead-letter list` gains `--resolved`/`--all`; `dead-letter
+  requeue` gains `--force-resolved --reason` to reopen a resolved item (audited).
+- **Doctor** surfaces torn/invalid disposition lines (`attention_dispositions`, WARN-only)
+  and its dead-letter check is now resolved-aware.
+
+### Notes
+
+- The disposition log (`.agenttalk/attention/dispositions.jsonl`) is append-only,
+  latest-valid-by-(item, action-family), fsync'd under the store lock, skip-invalid on read,
+  and preserved by `reset` and `reset --archive`.
+- Capacity surfaces only when a snapshot is threshold-tripped (a rate limit reached, or
+  primary-budget/context ≥ 90%); close HOLDs surface for PUBLISHED closes whose snapshotted
+  verdict is HOLD (read cheaply, no gate recompute). Routine headroom and in-progress closes
+  stay silent.
+- v1 limitations: no bulk/group dispositions (one `--item` at a time); dedupe is
+  display-only (duplicate signals collapse in the view but each keeps its own id and can be
+  dispositioned independently).
+
 ## [0.55.1] - 2026-07-02
 
 Follow-up to 0.55.0: observability for the supervised-Codex launch path, plus a

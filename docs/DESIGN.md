@@ -380,6 +380,34 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   `operator_origin` is an auditable trusted-team assertion, NOT cryptographic proof the
   human spoke (D-4 / SECURITY.md). *Built by:* WP4 (completes the Slice 2 split-identity
   lead-loop: WP1 authority foundation, WP2 controller, WP3 cadence, WP4 relay).
+- **D-16 The operator attention queue is a DERIVED read-only projection + a durable
+  disposition log — no new work objects, no new message kind (0.56.0).** *Why:* the signals
+  a human must act on already exist (pending `needs_operator` threads, config-blocked holds,
+  dead letters, gate/close HOLDs, unarmed lead-loops); the gap was that they were scattered
+  and that a decision to defer/dismiss one didn't *stick*. `agenttalk attention` PROJECTS
+  those sources into one ranked view and records operator decisions in an append-only
+  `attention/dispositions.jsonl` (latest-valid-by-(item, action-family), fsync under the
+  store lock, skip-invalid on read, preserved by reset — the knowledge/dead-letter log
+  pattern). Two invariants make it safe to trust: (1) dispositions are **snapshot-bound** —
+  an item's `source_hash` folds its identifying *content*, not just its key, so a defer/dismiss
+  hides it only while the situation is unchanged; a different config fault for the same agent,
+  or an expired defer, resurfaces (D-3 fail-safe: when in doubt, surface). (2) the projection
+  is **fail-safe and cheap** — each source read is independently guarded (a failure becomes a
+  bounded `source_error` row, never a blank queue), it reuses the pure derivation helpers
+  rather than scraping doctor/status text, and it does no git/lane recompute on the default
+  path (gate 8). `dismiss` is refused for blocking sources (fail-closed: blockers get
+  repaired/answered/deferred, never silenced); disposition authority is the operator-facing
+  liaison / sole-lead resolved from identity (no `--by`), matching the single-voice operator
+  contract. Dead-letter `resolve` is a sibling operator decision (payload-preserving) whose
+  authority is the *central* log, with a best-effort `.resolved.json` sidecar for copied
+  sinks. *Rejected:* a new message kind or work object (the bus skips unknown kinds and every
+  thread/validation path would need teaching; the queue is a *view*, not a new noun);
+  mirroring flat `meta.*` escalation fields (one canonical nested `meta.attention` block
+  avoids drift); recomputing gates/lanes on view (cost + a coupling that would make a heavy
+  source stall the whole queue). *Honest limit:* the queue reflects what the sources report;
+  a disposition is an audit assertion by the resolved actor, not cryptographic proof (D-4).
+  *v1 scope:* no bulk/group dispositions; dedupe is display-only; capacity/close-hold rows
+  are wired fail-safe but surface only on a cheap threshold-tripped read.
 
 ## 6. How we work (process)
 
@@ -409,6 +437,7 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
 | Domain registry | `domains.py` |
 | Lanes (deliver-gate) | `lanes.py` |
 | Knowledge (durable memory) | `knowledge.py` |
+| Operator attention queue + dispositions | `attention.py` |
 | Unattended supervisor | `supervisor.py` |
 | Wrapper (loop, run, session, degraded, adapters, recv) | `wrapper/` |
 | Signing | `signing.py` |

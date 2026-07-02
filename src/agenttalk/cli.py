@@ -2799,6 +2799,34 @@ def cmd_prune(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_attention_block(args: argparse.Namespace) -> dict | None:
+    """Build the typed meta.attention block from the escalate flags, or None if the caller
+    supplied no typed fields (an untyped escalation stays valid). schema_version is always
+    stamped so a present block is versioned."""
+    fields = {
+        "decision": getattr(args, "decision", None),
+        "why_it_matters": getattr(args, "why", None),
+        "recommendation": getattr(args, "recommendation", None),
+        "risk_if_ignored": getattr(args, "risk_if_ignored", None),
+        "risk_severity": getattr(args, "risk_severity", None),
+        "confidence": getattr(args, "confidence", None),
+        "priority": getattr(args, "priority", None),
+        "needed_by": getattr(args, "needed_by", None),
+    }
+    options = getattr(args, "option", None) or []
+    affected = getattr(args, "affected", None) or []
+    present = [v for v in fields.values() if v is not None] + list(options) + list(affected)
+    if not present:
+        return None
+    block = {"schema_version": 1}
+    block.update({k: v for k, v in fields.items() if v is not None})
+    if options:
+        block["options"] = list(options)
+    if affected:
+        block["affected"] = list(affected)
+    return block
+
+
 def cmd_escalate(args: argparse.Namespace) -> int:
     """Route an operator-input question to the operator-facing agent (#18).
 
@@ -2878,6 +2906,19 @@ def cmd_escalate(args: argparse.Namespace) -> int:
         return 2
     meta = _parse_meta(args.meta)
     meta["needs_operator"] = "true"  # force-set: the bucket discriminator
+    # Typed attention enrichment (0.56.0): escalate OWNS meta.attention - build it ONLY from
+    # the typed flags (a caller --meta attention=... is not a supported typed input). Strict
+    # CLI validation: a malformed typed block exits 2 BEFORE any write (gate 4); the reader
+    # side is separately fail-safe. An escalation with no typed flags stays valid + untyped.
+    from agenttalk import attention as _attn
+    att_block = _build_attention_block(args)
+    if att_block is not None:
+        errs = _attn.validate_attention_meta({"attention": att_block})
+        if errs:
+            sys.stderr.write("agenttalk escalate: invalid typed attention field(s):\n  - "
+                             + "\n  - ".join(errs) + "\n")
+            return 2
+        meta["attention"] = att_block
     if "request_id" not in meta:
         meta["request_id"] = "esc-" + uuid.uuid4().hex[:12]
     msg = store.send(
@@ -2893,6 +2934,332 @@ def cmd_escalate(args: argparse.Namespace) -> int:
     # Always print the machine-parseable correlation line: the caller's
     # next move is `agenttalk wait --to-request <this>`.
     print(f"request_id={meta['request_id']}")
+    return 0
+
+
+def _attn_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _wrapper_notice_has_canonical_row(store: Store, meta: dict, sender: str) -> bool:
+    """True iff this needs_operator escalation is a WRAPPER dead-letter/config-blocked notice
+    whose CANONICAL source row already exists (reviewer-2 F6). Fail-safe: any doubt (not a
+    wrapper notice, or the canonical row can't be confirmed) returns False so a lone signal
+    is NEVER dropped - only a proven-redundant twin is coalesced away.
+
+      * config_blocked notice -> canonical = the config_blocked hold for the sender agent.
+      * dead-lettered notice (dl_disposed=true) -> canonical = the sink row (sender, dl_msg_id).
+      * a not-yet-disposed dead-letter notice has no sink row yet -> keep it (return False)."""
+    if str((meta or {}).get("dead_letter", "")).lower() != "true":
+        return False
+    try:
+        if str(meta.get("config_blocked", "")).lower() == "true":
+            return sender is not None and store.read_config_blocked_hold(sender) is not None
+        if str(meta.get("dl_disposed", "")).lower() == "true":
+            dl_id = str(meta.get("dl_msg_id") or "")
+            return any(d.get("agent") == sender and d.get("message_id") == dl_id
+                       for d in store.list_dead_letters(sender))
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def _needs_operator_items(store: Store, for_agent: str, now) -> list[dict]:
+    """Pending needs_operator escalations from the liaison's thread view + the opener meta,
+    with wrapper dead-letter/config-blocked twins coalesced (reviewer-2 F6). Requires a
+    resolved for-agent (the caller guards None)."""
+    from agenttalk import attention as A
+    msgs = store.valid_messages()
+    opener_meta: dict[str, dict] = {}
+    opener_sender: dict[str, str] = {}
+    for m in msgs:
+        rid = (m.meta or {}).get("request_id")
+        if rid and (m.meta or {}).get("needs_operator") == "true" and rid not in opener_meta:
+            opener_meta[rid] = m.meta or {}
+            opener_sender[rid] = m.sender
+    rows = th.derive_threads(
+        msgs, agent=for_agent, cursor=store.cursor(for_agent), now=now,
+        closed_rids=_closed_rids(store, for_agent), retired=set(store.retired_agents()))
+    pending = [{"request_id": t.request_id, "subject": t.subject,
+                "sender": opener_sender.get(t.request_id, ""),
+                "age_seconds": t.age_seconds, "meta": opener_meta.get(t.request_id, {})}
+               for t in rows if t.needs_operator and t.operator_state == "pending"]
+    # COALESCE wrapper dead-letter / config-blocked notices: the wrapper emits a needs_operator
+    # TWIN of a message it dead-lettered or parked. That twin is redundant with the canonical
+    # dead_letter sink row / config_blocked hold row, so SUPPRESS it - but ONLY when the
+    # canonical row actually exists (else the notice is the sole signal and must be kept).
+    # Coalescing means a resolve/disposition on the canonical row removes BOTH.
+    pending = [p for p in pending
+               if not _wrapper_notice_has_canonical_row(store, p["meta"], p["sender"])]
+    return A.needs_operator_items(pending)
+
+
+def _collect_attention_items(store: Store, *, for_agent: str | None, roster: list[str]) -> list[dict]:
+    """Read every attention source, each INDEPENDENTLY FAIL-SAFE: one bad source yields a
+    bounded source_error item, never blanks the queue (gate 8). Reuses PURE derivations
+    (derive_threads, read_config_blocked_hold, list_dead_letters, check_gates,
+    lead_loop_state) - never scrapes doctor/status text. ``for_agent`` may be None (no
+    liaison/sole-lead resolved): the per-recipient needs_operator branch is then SKIPPED and
+    only the global sources are projected (codex F4, read-only view)."""
+    from agenttalk import attention as A
+    items: list[dict] = []
+    now = datetime.now(timezone.utc)
+    # needs_operator: pending escalations from the liaison's thread view + the opener meta.
+    # SKIPPED (not an error) when no for-agent resolved - cmd_attention adds a no_liaison
+    # warning instead, so the read-only view still surfaces the global sources (codex F4).
+    if for_agent:
+        try:
+            items += _needs_operator_items(store, for_agent, now)
+        except Exception as e:  # noqa: BLE001 - a source read must never crash the queue
+            items.append(A.source_error_item("needs_operator", str(e)))
+    # config_blocked holds (per roster agent)
+    try:
+        holds = [h for a in roster if (h := store.read_config_blocked_hold(a))]
+        items += A.config_blocked_items(holds)
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("config_blocked", str(e)))
+    # dead-letter (ALL; build_queue hides resolved via the resolve_dead_letter disposition)
+    try:
+        items += A.dead_letter_items(
+            [{"agent": d.get("agent"), "message_id": d.get("message_id")}
+             for d in store.list_dead_letters()])
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("dead_letter", str(e)))
+    # gate HOLDs (cheap state read, no git/lane recompute)
+    try:
+        items += A.gate_hold_items(gate_mod.check_gates(store.root).get("blockers", []))
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("gate_hold", str(e)))
+    # lead-loop unarmed (managed agents; PURE lead_loop_state, not doctor text)
+    try:
+        signals = []
+        for a in store.managed_lead_loop_agents():
+            st = store.lead_loop_state(a)
+            if st.get("managed") and not st.get("armed"):
+                signals.append({"agent": a, "reason": st.get("reason") or "lead-loop unarmed"})
+        items += A.lead_unarmed_items(signals)
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("lead_unarmed", str(e)))
+    # capacity (threshold-tripped only, from the cheap persisted snapshots - gate 8)
+    try:
+        items += A.capacity_items(_tripped_capacity_signals(store))
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("capacity", str(e)))
+    # close HOLDs (published closes whose snapshotted final verdict is HOLD - a CHEAP read of
+    # the persisted record, NO gate recompute; a malformed record degrades to a warning row)
+    try:
+        holds, degraded = _published_close_holds(store)
+        items += A.close_hold_items(holds)
+        if degraded:
+            items.append(A.source_error_item(
+                "close_hold", f"{degraded} close record(s) unreadable/malformed (skipped)"))
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("close_hold", str(e)))
+    return items
+
+
+# Threshold above which a capacity snapshot is worth an operator's attention (gate 8: cheap,
+# no recompute). Below this a snapshot is routine headroom and is NOT surfaced.
+_CAPACITY_TRIP_PCT = 90.0
+
+
+def _tripped_capacity_signals(store: Store) -> list[dict]:
+    """Threshold-tripped capacity signals from the cheap persisted snapshots. A signal fires
+    ONLY when an agent actually hit a rate limit or is near budget/context exhaustion - not
+    for routine headroom - so the queue is not flooded with passive telemetry (gate 8)."""
+    signals: list[dict] = []
+    for agent, snap in (store.read_all_capacities() or {}).items():
+        if not isinstance(snap, dict):
+            continue
+        rl = snap.get("rate_limit_reached_type")
+        prim = snap.get("primary_used_percent")
+        ctx = snap.get("context_used_percent")
+        if isinstance(rl, str) and rl.strip():
+            signals.append({"agent": agent, "kind": "rate_limit",
+                            "detail": f"rate limit reached: {rl}"})
+        elif isinstance(prim, (int, float)) and prim >= _CAPACITY_TRIP_PCT:
+            signals.append({"agent": agent, "kind": "budget",
+                            "detail": f"primary budget {prim:.0f}% used"})
+        elif isinstance(ctx, (int, float)) and ctx >= _CAPACITY_TRIP_PCT:
+            signals.append({"agent": agent, "kind": "context",
+                            "detail": f"context window {ctx:.0f}% full"})
+    return signals
+
+
+def _published_close_holds(store: Store) -> tuple[list[dict], int]:
+    """Return ([{close_id, scope, verdict, reason, revision}], degraded_count) for PUBLISHED
+    closes whose snapshotted final verdict is HOLD. CHEAP: reads each persisted record's own
+    published snapshot (record['final']), NO gate recompute (gate 8). A malformed/unreadable
+    record is counted as degraded and skipped, never crashing the projection."""
+    from agenttalk import close as close_mod
+    holds: list[dict] = []
+    degraded = 0
+    cdir = close_mod.closes_dir(store)
+    if not cdir.is_dir():
+        return holds, degraded
+    for p in sorted(cdir.glob("*.json")):
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            degraded += 1
+            continue
+        if not isinstance(rec, dict):
+            degraded += 1
+            continue
+        final = rec.get("final")
+        if rec.get("status") == close_mod.PUBLISHED and isinstance(final, dict) \
+                and final.get("verdict") == close_mod.VERDICT_HOLD:
+            holds.append({"close_id": rec.get("close_id") or p.stem,
+                          "scope": rec.get("scope"), "verdict": "HOLD",
+                          "reason": final.get("reason"), "revision": rec.get("revision")})
+    return holds, degraded
+
+
+def _resolve_disposition_actor(store: Store, args: argparse.Namespace) -> str | None:
+    """The disposition actor is the OPERATOR-FACING liaison (or the sole lead when no
+    liaison is configured), resolved from --from / $AGENTTALK_SELF. NO --by flag (gate 5):
+    a disposition is an operator-attention decision and only the liaison/sole-lead may make
+    it. Returns the actor, or None (caller exits 2) when the resolved identity is not
+    authorized."""
+    roster = store.load_config().get("agents") or []
+    who = _resolve_self(getattr(args, "sender", None), roster=roster)
+    liaison = store.operator_facing()
+    if liaison is not None:
+        return who if who == liaison else None
+    sole = store.sole_lead()
+    return who if (sole is not None and who == sole) else None
+
+
+def cmd_attention(args: argparse.Namespace) -> int:
+    """Operator attention queue: a derived, ranked, deduped read-only view over existing
+    signals, plus operator dispositions. Creates no work objects and mutates nothing except
+    the disposition log."""
+    from agenttalk import attention as A
+    store = _get_store(args)
+    sub = getattr(args, "attn_cmd", None)
+    if sub in ("defer", "dismiss", "answered-elsewhere"):
+        return _cmd_attention_disposition(store, args, sub)
+    roster = store.load_config().get("agents") or []
+    for_agent = (getattr(args, "for_agent", None) or store.operator_facing()
+                 or store.sole_lead())
+    # READ-ONLY (view/show) SURFACES even with no liaison/sole-lead (codex F4): the global
+    # sources (config_blocked, dead_letter, gate/close HOLDs, capacity, lead_unarmed) do not
+    # need a for-agent; only per-recipient needs_operator escalations are skipped, with a
+    # WARNING. Exit 2 is reserved for the disposition WRITE subcommands (they gate on an
+    # authorized actor in _cmd_attention_disposition), never the read-only view.
+    no_liaison = for_agent is None
+    items = _collect_attention_items(store, for_agent=for_agent, roster=roster)
+    disps, problems = A.read_dispositions(store)
+    all_flag = getattr(args, "all", False)
+    q = A.build_queue(items, disps, now_iso=_attn_now_iso(),
+                      include_deferred=all_flag or getattr(args, "include_deferred", False),
+                      include_dismissed=all_flag or getattr(args, "include_dismissed", False),
+                      include_resolved=all_flag or getattr(args, "include_resolved", False))
+    if problems:
+        q.setdefault("warnings", []).append(
+            {"disposition_log": f"{len(problems)} torn/invalid line(s)"})
+    if no_liaison:
+        q.setdefault("warnings", []).append(
+            {"no_liaison": "no operator-facing liaison or sole lead is configured; "
+                           "needs_operator escalations are not shown - pass --for <agent>. "
+                           "Dispositions require an authorized liaison/sole-lead."})
+    rows = q["items"]
+    if sub == "show":
+        rows = [it for it in rows if it["item_id"] == getattr(args, "item", None)]
+        if not rows:
+            sys.stderr.write(f"agenttalk attention show: no active item {getattr(args, 'item', None)!r}\n")
+            return 1
+    if getattr(args, "source", None):
+        rows = [it for it in rows if it["source"] == args.source]
+    if getattr(args, "limit", None):
+        rows = rows[: args.limit]
+    if getattr(args, "json", False):
+        print(json.dumps({**q, "items": rows, "for": for_agent}, ensure_ascii=False, indent=2))
+        return 0
+    _print_attention(rows, q["summary"], for_agent, q.get("warnings") or [])
+    return 0
+
+
+def _print_attention(rows: list[dict], summary: dict, for_agent: str | None,
+                     warnings: list | None = None) -> None:
+    print(f"attention for {for_agent or '(no liaison configured)'}  "
+          f"(active={summary.get('active_count', 0)}, "
+          f"deferred={summary.get('deferred_count', 0)})")
+    for w in warnings or []:
+        for msg in (w.values() if isinstance(w, dict) else [w]):
+            print(f"  ! {msg}")
+    if not rows:
+        print("  (nothing needs the operator right now)")
+        return
+    for it in rows:
+        prio = it.get("priority", "unknown")
+        title = it.get("title") or it.get("decision") or it["item_id"]
+        line = f"  [{prio:<6}] {it['source']:<15} {title}"
+        if it.get("state") != "active":
+            line += f"  ({it['state']})"
+        dups = len(it.get("duplicates", []))
+        if dups:
+            line += f"  (+{dups} dup)"
+        print(line)
+        if it.get("recommendation"):
+            print(f"           rec: {it['recommendation']}")
+        for w in it.get("warnings", []):
+            print(f"           ! {w}")
+        print(f"           id: {it['item_id']}")
+
+
+def _cmd_attention_disposition(store: Store, args: argparse.Namespace, sub: str) -> int:
+    from agenttalk import attention as A
+    actor = _resolve_disposition_actor(store, args)
+    if actor is None:
+        sys.stderr.write("agenttalk attention: only the operator-facing liaison (or the "
+                         "sole lead when none is configured) may disposition an item; "
+                         "resolve --from/$AGENTTALK_SELF to that identity.\n")
+        return 2
+    reason = getattr(args, "reason", None)
+    if not reason or not reason.strip():
+        sys.stderr.write(f"agenttalk attention {sub}: --reason is required.\n")
+        return 2
+    roster = store.load_config().get("agents") or []
+    for_agent = store.operator_facing() or store.sole_lead() or actor
+    item = next((it for it in _collect_attention_items(store, for_agent=for_agent, roster=roster)
+                 if it["item_id"] == getattr(args, "item", None)), None)
+    if item is None:
+        sys.stderr.write(f"agenttalk attention {sub}: unknown item "
+                         f"{getattr(args, 'item', None)!r} (see `agenttalk attention`).\n")
+        return 2
+    action = {"defer": A.ACTION_DEFER, "dismiss": A.ACTION_DISMISS,
+              "answered-elsewhere": A.ACTION_ANSWERED_ELSEWHERE}[sub]
+    if not A.allowed_action_for_source(action, item["source"], advisory=item.get("advisory", False)):
+        sys.stderr.write(f"agenttalk attention {sub}: '{sub}' is not allowed for a "
+                         f"{item['source']} item (blocking items must be repaired, answered, "
+                         f"or deferred - not dismissed).\n")
+        return 2
+    if sub == "defer":
+        until = getattr(args, "until", None)
+        if not until:
+            sys.stderr.write("agenttalk attention defer: --until <ISO> is required.\n")
+            return 2
+        # Normalize/validate the ISO on WRITE so a malformed value can never be persisted
+        # and later hide a blocking item (codex F2). Store the canonical form.
+        until_dt = A.parse_iso_dt(until)
+        if until_dt is None:
+            sys.stderr.write(f"agenttalk attention defer: --until {until!r} is not a valid "
+                             "ISO-8601 date/datetime.\n")
+            return 2
+        until_canonical = until_dt.isoformat().replace("+00:00", "Z")
+    else:
+        until_canonical = None
+    event = {
+        "schema_version": A.SCHEMA_VERSION, "event_id": "att-" + uuid.uuid4().hex[:12],
+        "item_id": item["item_id"], "source": item["source"], "action": action,
+        "actor": actor, "reason": reason, "at": _attn_now_iso(),
+        "until": until_canonical,
+        "evidence": getattr(args, "evidence", None),
+        "source_snapshot": {"source_hash": item["source_hash"], "refs": item.get("source_refs", [])},
+    }
+    A.append_disposition(store, event)
+    print(f"attention {sub}: {item['item_id']} by {actor}")
     return 0
 
 
@@ -6054,6 +6421,86 @@ def cmd_managed_lead_loop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _dead_letter_resolution_state(store: Store) -> dict[tuple[str, str], str]:
+    """{(agent, message_id): 'resolved'|'requeued'} from the central disposition log
+    (latest dead_letter_resolution event per item wins). A resolve_dead_letter marks it
+    resolved; a later requeued_after_resolve reopens it. Central log is authoritative."""
+    from agenttalk import attention as A
+    events, _ = A.read_dispositions(store)
+    folded = A.fold_dispositions(events)
+    out: dict[tuple[str, str], str] = {}
+    for iid, fams in folded.items():
+        dl = fams.get("dead_letter_resolution")
+        if not dl or not iid.startswith(A.SOURCE_DEAD_LETTER + ":"):
+            continue
+        parts = iid.split(":", 2)
+        if len(parts) != 3:
+            continue
+        key = (parts[1], parts[2])
+        out[key] = "resolved" if dl["action"] == A.ACTION_RESOLVE_DEAD_LETTER else "requeued"
+    return out
+
+
+def _is_listed_dead_letter(store: Store, agent: str, msg_id: str) -> bool:
+    """SECURITY guard (reviewer-2 F5): the --id must be an EXACT message_id currently in the
+    agent's sink. Blocks a path-traversal id (e.g. ..\\..\\config) from reaching ANY payload
+    read or sidecar write, and gives a clean 'no such dead-letter' for a stale/typo id. Used
+    as the single choke point by resolve / show / requeue before touching the filesystem."""
+    if not (agent and msg_id):
+        return False
+    try:
+        return any(m.get("message_id") == msg_id for m in store.list_dead_letters(agent))
+    except (OSError, ValueError):
+        return False
+
+
+def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
+    """dead-letter resolve: an operator decision distinct from requeue. Preserves the
+    payload + sidecar; appends an AUTHORITATIVE resolve_dead_letter event to the central
+    disposition log, then best-effort writes a .resolved.json sidecar for copied-sink
+    readability (central wins on conflict - gate 6). Actor = liaison/sole-lead (no --by)."""
+    from agenttalk import attention as A
+    if not (getattr(args, "agent", None) and getattr(args, "id", None)):
+        sys.stderr.write("agenttalk dead-letter resolve: --agent and --id are required.\n")
+        return 2
+    reason = getattr(args, "reason", None)
+    if not reason or not reason.strip():
+        sys.stderr.write("agenttalk dead-letter resolve: --reason is required.\n")
+        return 2
+    actor = _resolve_disposition_actor(store, args)
+    if actor is None:
+        sys.stderr.write("agenttalk dead-letter resolve: only the operator-facing liaison "
+                         "(or the sole lead) may resolve; resolve --from/$AGENTTALK_SELF.\n")
+        return 2
+    if not _is_listed_dead_letter(store, args.agent, args.id):
+        sys.stderr.write(f"agenttalk dead-letter resolve: no dead-letter "
+                         f"{args.agent}/{args.id}.\n")
+        return 2
+    src_hash = A.source_hash({"agent": args.agent, "message_id": args.id})
+    event_id = "att-" + uuid.uuid4().hex[:12]
+    A.append_disposition(store, {
+        "schema_version": A.SCHEMA_VERSION, "event_id": event_id,
+        "item_id": A.item_id(A.SOURCE_DEAD_LETTER, args.agent, args.id),
+        "source": A.SOURCE_DEAD_LETTER, "action": A.ACTION_RESOLVE_DEAD_LETTER,
+        "actor": actor, "reason": reason, "at": _attn_now_iso(),
+        "evidence": getattr(args, "evidence", None),
+        "source_snapshot": {"source_hash": src_hash,
+                            "refs": [{"kind": "dead_letter", "agent": args.agent,
+                                      "message_id": args.id}]}})
+    # best-effort sidecar (central log already durable + authoritative)
+    try:
+        side = store.dead_letter_dir / args.agent / f"{args.id}.resolved.json"
+        side.write_text(json.dumps({"event_id": event_id, "actor": actor, "reason": reason,
+                                    "evidence": getattr(args, "evidence", None),
+                                    "at": _attn_now_iso(), "source_hash": src_hash},
+                                   ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+    print(f"resolved dead-letter {args.agent}/{args.id} by {actor} "
+          "(payload preserved; requeue with --force-resolved --reason to reopen)")
+    return 0
+
+
 def cmd_dead_letter(args: argparse.Namespace) -> int:
     """Inspect + recover dead-lettered (poison) messages. SEPARATE from `prune
     --invalid` (that quarantines INVALID/forged files = a trust failure; this handles
@@ -6062,8 +6509,17 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
     count) - it never rewinds the cursor (would re-poison the loop)."""
     store = _get_store(args)
     action = getattr(args, "dead_letter_cmd", None)
+    if action == "resolve":
+        return _cmd_dead_letter_resolve(store, args)
     if action == "list":
         items = store.list_dead_letters(getattr(args, "agent", None))
+        # resolved-aware (0.56.0): default shows UNRESOLVED only; --resolved / --all audit.
+        res = _dead_letter_resolution_state(store)
+        show_resolved = getattr(args, "resolved", False)
+        show_all = getattr(args, "all", False)
+        if not show_all:
+            items = [m for m in items
+                     if (res.get((m.get("agent"), m.get("message_id"))) == "resolved") == show_resolved]
         if getattr(args, "json", False):
             print(json.dumps(items, indent=2))
             return 0
@@ -6105,11 +6561,48 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         if not (getattr(args, "agent", None) and getattr(args, "id", None)):
             sys.stderr.write("agenttalk dead-letter requeue: --agent and --id are required.\n")
             return 2
+        if not _is_listed_dead_letter(store, args.agent, args.id):   # F5 traversal/typo guard
+            sys.stderr.write(
+                f"agenttalk dead-letter requeue: no dead-letter {args.agent}/{args.id}.\n")
+            return 2
         raw = store.read_dead_letter_payload(args.agent, args.id)
         if raw is None:
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: no dead-letter {args.agent}/{args.id}.\n")
             return 2
+        # A RESOLVED dead-letter requires an explicit --force-resolved + a non-empty --reason
+        # to requeue. We VALIDATE + resolve authority here, but BUILD the reopen audit event
+        # without appending it yet - it is appended only AFTER the payload parse + send SUCCEED
+        # (fable-max #6), so a corrupt-payload / send failure can never leave the item
+        # audit-reopened with no requeued message.
+        reopen_event = None
+        if _dead_letter_resolution_state(store).get((args.agent, args.id)) == "resolved":
+            reason = getattr(args, "reason", None)
+            # reason must be NON-EMPTY AFTER STRIP, exactly like resolve + attention
+            # dispositions (codex F7): a whitespace-only reason folds to an INVALID disposition
+            # line, so it must exit 2 and SEND NOTHING rather than requeue with a blank audit.
+            if not getattr(args, "force_resolved", False) or not reason or not reason.strip():
+                sys.stderr.write("agenttalk dead-letter requeue: this item is RESOLVED; "
+                                 "pass --force-resolved --reason TEXT (non-empty) to requeue it.\n")
+                return 2
+            # Reopening a resolved dead-letter is an operator-authority disposition write, so
+            # it MUST go through the SAME liaison/sole-lead resolver as resolve (codex F1) -
+            # NOT _resolve_self, which any roster identity satisfies (authority bypass, gate 5).
+            reopen_actor = _resolve_disposition_actor(store, args)
+            if reopen_actor is None:
+                sys.stderr.write("agenttalk dead-letter requeue: only the operator-facing "
+                                 "liaison (or the sole lead) may reopen a RESOLVED "
+                                 "dead-letter; set --from/$AGENTTALK_SELF to that identity.\n")
+                return 2
+            from agenttalk import attention as A
+            reopen_event = {
+                "schema_version": A.SCHEMA_VERSION, "event_id": "att-" + uuid.uuid4().hex[:12],
+                "item_id": A.item_id(A.SOURCE_DEAD_LETTER, args.agent, args.id),
+                "source": A.SOURCE_DEAD_LETTER, "action": A.ACTION_REQUEUED_AFTER_RESOLVE,
+                "actor": reopen_actor,
+                "reason": reason, "at": _attn_now_iso(),
+                "source_snapshot": {"source_hash": A.source_hash(
+                    {"agent": args.agent, "message_id": args.id}), "refs": []}}
         try:
             orig = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as e:
@@ -6125,6 +6618,10 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         except (ValueError, FileNotFoundError) as e:
             sys.stderr.write(f"agenttalk dead-letter requeue: {e}\n")
             return 2
+        # Send SUCCEEDED - NOW record the reopen audit (ordering closes fable-max #6).
+        if reopen_event is not None:
+            from agenttalk import attention as A
+            A.append_disposition(store, reopen_event)
         print(f"requeued dead-letter {args.id} as fresh message {new.id} "
               "(new id, own fresh attempt count; original evidence preserved in the sink)")
         return 0
@@ -7060,7 +7557,69 @@ def build_parser() -> argparse.ArgumentParser:
     pesc.add_argument("--file", help="Read body from this file path ('-' = stdin)")
     pesc.add_argument("--quiet", action="store_true",
                       help="Print only the request_id line.")
+    # Typed attention fields (0.56.0) -> nested meta.attention, for the ranked attention
+    # queue. All optional; a malformed field exits 2 before any write.
+    pesc.add_argument("--decision", help="Single-line decision needed (typed attention).")
+    pesc.add_argument("--why", help="Single-line why-it-matters / impact.")
+    pesc.add_argument("--option", action="append", help="An option to choose (repeatable).")
+    pesc.add_argument("--recommendation", help="Your recommended option/action.")
+    pesc.add_argument("--risk-if-ignored", dest="risk_if_ignored",
+                      help="What happens if no operator decision arrives.")
+    pesc.add_argument("--risk-severity", choices=["low", "medium", "high"],
+                      help="Risk severity if ignored.")
+    pesc.add_argument("--confidence", choices=["low", "medium", "high"],
+                      help="Your confidence in the recommendation.")
+    pesc.add_argument("--priority", choices=["low", "normal", "high", "urgent"],
+                      help="Operator priority.")
+    pesc.add_argument("--needed-by", dest="needed_by",
+                      help="ISO-8601 date or timezone-bearing datetime.")
+    pesc.add_argument("--affected", action="append",
+                      help="An affected ref e.g. agent:beta / request:esc-.. (repeatable).")
     pesc.set_defaults(func=cmd_escalate)
+
+    # attention: the ranked/deduped operator queue over existing signals (0.56.0).
+    pattn = sub.add_parser(
+        "attention",
+        description="Operator attention queue: a derived, ranked, deduped read-only view "
+                    "over pending escalations, config-blocked holds, dead letters, gate "
+                    "HOLDs, and lead-loop-unarmed signals, plus operator dispositions. "
+                    "Creates no work objects; mutates only the disposition log.",
+        help="Ranked operator attention queue + dispositions (defer/dismiss/answered).")
+    pattn.add_argument("--for", dest="for_agent",
+                       help="Whose queue (default: the operator-facing liaison, else the sole lead).")
+    pattn.add_argument("--json", action="store_true", help="Machine-readable output.")
+    pattn.add_argument("--include-deferred", action="store_true", dest="include_deferred")
+    pattn.add_argument("--include-dismissed", action="store_true", dest="include_dismissed")
+    pattn.add_argument("--include-resolved", action="store_true", dest="include_resolved")
+    pattn.add_argument("--all", action="store_true",
+                       help="Show active + deferred + dismissed + resolved.")
+    pattn.add_argument("--source", help="Filter to one source (e.g. needs_operator).")
+    pattn.add_argument("--limit", type=int, help="Show at most N items.")
+    pattn.set_defaults(func=cmd_attention, attn_cmd=None)
+    attn_sub = pattn.add_subparsers(dest="attn_cmd")
+
+    a_show = attn_sub.add_parser("show", help="Show one item by id.")
+    a_show.add_argument("--item", required=True, help="item_id")
+    a_show.add_argument("--for", dest="for_agent")
+    a_show.add_argument("--json", action="store_true")
+    a_show.set_defaults(func=cmd_attention, attn_cmd="show")
+
+    def _disp_parser(name: str, *, until: bool = False, evidence: bool = False):
+        p = attn_sub.add_parser(name, help=f"{name} an attention item (operator disposition).")
+        p.add_argument("--item", required=True, help="item_id")
+        p.add_argument("--reason", required=True, help="Required non-empty reason (audited).")
+        p.add_argument("--from", dest="sender",
+                       help="Actor (default $AGENTTALK_SELF); must resolve to the liaison "
+                            "or sole lead. There is no --by.")
+        if until:
+            p.add_argument("--until", required=True, help="ISO-8601 defer-until.")
+        if evidence:
+            p.add_argument("--evidence", help="Optional pointer to where the answer landed.")
+        p.set_defaults(func=cmd_attention, attn_cmd=name)
+
+    _disp_parser("defer", until=True)
+    _disp_parser("dismiss")
+    _disp_parser("answered-elsewhere", evidence=True)
 
     ppro = sub.add_parser(
         "propose",
@@ -7414,9 +7973,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pdl.set_defaults(func=cmd_dead_letter, dead_letter_cmd=None)
     dlsub = pdl.add_subparsers(dest="dead_letter_cmd")
-    dll = dlsub.add_parser("list", help="List dead-lettered messages.")
+    dll = dlsub.add_parser("list", help="List dead-lettered messages (unresolved by default).")
     dll.add_argument("--agent", help="Limit to one agent (default: all).")
     dll.add_argument("--json", action="store_true")
+    dll.add_argument("--resolved", action="store_true", help="Show RESOLVED entries only.")
+    dll.add_argument("--all", action="store_true", help="Show resolved + unresolved.")
     dll.set_defaults(func=cmd_dead_letter)
     dls = dlsub.add_parser("show", help="Show one dead-letter's metadata + original body.")
     dls.add_argument("--agent", required=True)
@@ -7428,7 +7989,23 @@ def build_parser() -> argparse.ArgumentParser:
                                 "count); original evidence preserved. No cursor rewind.")
     dlr.add_argument("--agent", required=True)
     dlr.add_argument("--id", required=True, help="The dead-lettered message id.")
+    dlr.add_argument("--force-resolved", dest="force_resolved", action="store_true",
+                     help="Requeue an item that was RESOLVED (requires --reason).")
+    dlr.add_argument("--reason", help="Reason (required with --force-resolved).")
+    dlr.add_argument("--from", dest="sender", help="Actor for the audit event.")
     dlr.set_defaults(func=cmd_dead_letter)
+    dlres = dlsub.add_parser("resolve",
+                             help="Operator decision distinct from requeue: mark a "
+                                  "dead-letter handled (payload preserved; audited). "
+                                  "Removes it from the default list/doctor nagging.")
+    dlres.add_argument("--agent", required=True)
+    dlres.add_argument("--id", required=True, help="The dead-lettered message id.")
+    dlres.add_argument("--reason", required=True, help="Required non-empty reason (audited).")
+    dlres.add_argument("--evidence", help="Optional pointer to where it was handled.")
+    dlres.add_argument("--from", dest="sender",
+                       help="Actor (default $AGENTTALK_SELF); must resolve to the "
+                            "liaison or sole lead. No --by.")
+    dlres.set_defaults(func=cmd_dead_letter, dead_letter_cmd="resolve")
 
     pmll = sub.add_parser(
         "managed-lead-loop",

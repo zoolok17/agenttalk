@@ -126,6 +126,9 @@ def run(project_root: Path | None = None) -> Report:
         dl_check = _check_dead_letter(store)
         if dl_check is not None:  # additive: absent unless dead-letters exist
             report.checks.append(dl_check)
+        ad_check = _check_attention_dispositions(store)
+        if ad_check is not None:  # additive: absent unless torn disposition lines exist
+            report.checks.append(ad_check)
         esc_check = _check_dead_letter_escalations(store)
         if esc_check is not None:  # additive: absent unless an unrouted backstop exists
             report.checks.append(esc_check)
@@ -256,6 +259,47 @@ def _check_dead_letter_escalations(store) -> Check | None:
         data={"unrouted": unrouted})
 
 
+def _check_attention_dispositions(store) -> Check | None:
+    """Surface torn/invalid lines in the attention disposition log (0.56.0). WARN-only and
+    additive (absent when the log is clean or missing): a torn line is skipped by the
+    fail-safe reader and never hides an active item, but the operator should know the log
+    has damage. Never errors/crashes doctor."""
+    try:
+        from agenttalk import attention as _attn
+        _valid, problems = _attn.read_dispositions(store)
+    except Exception as e:  # noqa: BLE001 - doctor never crashes
+        return Check(name="attention_dispositions", status="warn",
+                     details=f"could not read the attention disposition log: {e}")
+    if not problems:
+        return None
+    sample = "; ".join(f"line {p.get('line')}: {p.get('error')}" for p in problems[:3])
+    return Check(name="attention_dispositions", status="warn",
+                 details=f"{len(problems)} torn/invalid disposition line(s) (skipped, never "
+                         f"hide an active item): {sample}",
+                 fix="inspect .agenttalk/attention/dispositions.jsonl; the log is append-only "
+                     "+ skip-invalid, so a torn tail is safe but worth noting",
+                 data={"problems": problems})
+
+
+def _drop_resolved_dead_letters(store, items: list) -> list:
+    """Filter out operator-RESOLVED dead-letters (0.56.0). The central disposition log is
+    authoritative. Fail-safe: any read/parse error returns the list UNCHANGED (treat all as
+    unresolved) so resolved-awareness can never hide a real dead-letter or crash doctor."""
+    try:
+        from agenttalk import attention as _attn
+        folded = _attn.fold_dispositions(_attn.read_dispositions(store)[0])
+        resolved = {
+            tuple(iid.split(":", 2)[1:]) for iid, fams in folded.items()
+            if iid.startswith(_attn.SOURCE_DEAD_LETTER + ":")
+            and fams.get("dead_letter_resolution", {}).get("action")
+            == _attn.ACTION_RESOLVE_DEAD_LETTER
+        }
+    except Exception:  # noqa: BLE001 - resolved-awareness must never crash doctor
+        return items
+    return [m for m in items
+            if (m.get("agent"), m.get("message_id")) not in resolved]
+
+
 def _check_dead_letter(store) -> Check | None:
     """Surface dead-lettered (poison) messages; absent when there are none. WARN that
     valid messages were dropped (recoverable via `dead-letter list/requeue`), and go to
@@ -263,17 +307,28 @@ def _check_dead_letter(store) -> Check | None:
     (operator_facing / sole_lead both unset) - the operator notice could not route, so
     the only signal must not be a silent count."""
     try:
-        n = store.dead_lettered_count()
+        raw_n = store.dead_lettered_count()
     except Exception as e:  # noqa: BLE001 - doctor never crashes
         return Check(name="dead_letter", status="warn",
                      details=f"could not scan dead-letter sink: {e}")
-    if not n:
+    if not raw_n:
         return None
-    items = []
+    items: list = []
+    list_ok = True
     try:
         items = store.list_dead_letters()
     except Exception:  # noqa: BLE001
+        list_ok = False
         items = []
+    if list_ok:
+        # Resolved-aware (0.56.0): an operator-RESOLVED dead-letter is no longer nagged.
+        # Central disposition log is authoritative; fail-safe (a read error keeps all items).
+        items = _drop_resolved_dead_letters(store, items)
+        if not items:
+            return None       # nothing unresolved left to nag about
+        n = len(items)
+    else:
+        n = raw_n             # unreadable sink -> LOUD path below with the raw count
     summary = "; ".join(
         f"{m.get('agent')}/{m.get('message_id')} (class={m.get('class')}, "
         f"attempts={m.get('attempts')})" for m in items[:5])

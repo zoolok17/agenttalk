@@ -140,6 +140,16 @@ _AGENT_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 # a random suffix) so old configs from 0.3.x still validate.
 _SESSION_ID_RE = re.compile(r"\A[0-9]{8}T[0-9]{6}(-[A-Za-z0-9]{4})?Z\Z")
 
+# Sidecars that share the dead-letter sink alongside the <stem>.json payloads. They also
+# end in .json, so every payload scan (list_dead_letters / dead_lettered_count) MUST exclude
+# them or a sidecar leaks in as a phantom dead-letter with a bogus stem message_id. The
+# .resolved.json sidecar was added in 0.56.0 (dead-letter resolve).
+_DEAD_LETTER_SIDECAR_SUFFIXES = (".deadletter.json", ".resolved.json")
+
+
+def _is_dead_letter_payload(name: str) -> bool:
+    return name.endswith(".json") and not name.endswith(_DEAD_LETTER_SIDECAR_SUFFIXES)
+
 
 def validate_agent_name(name: str) -> str:
     """Return ``name`` if it's a safe agent identifier, else raise ValueError.
@@ -822,8 +832,16 @@ class Store:
             try:
                 fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 break
-            except FileExistsError:
-                if self._break_stale_lock(lock):
+            except (FileExistsError, PermissionError) as e:
+                # FileExistsError: a holder exists — break it iff its pid is dead.
+                # PermissionError (Windows only): the lock file is in DELETE-PENDING
+                # state (a peer just unlink()ed it and the last handle is still
+                # closing), which makes O_EXCL create raise PermissionError, NOT
+                # FileExistsError. It clears in microseconds; the RELEASE side already
+                # documents+retries the same Windows behavior. Treat it as transient
+                # and poll to the SAME deadline rather than surfacing a spurious failure
+                # (else a disposition/config RMW can silently fail under contention).
+                if isinstance(e, FileExistsError) and self._break_stale_lock(lock):
                     continue  # broke a dead holder — retry create immediately
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
@@ -2110,8 +2128,7 @@ class Store:
         for d in agent_dirs:
             if d.is_dir():
                 n += sum(1 for p in d.iterdir()
-                         if p.is_file() and p.name.endswith(".json")
-                         and not p.name.endswith(".deadletter.json"))
+                         if p.is_file() and _is_dead_letter_payload(p.name))
         return n
 
     def list_dead_letters(self, agent: str | None = None) -> list[dict]:
@@ -2130,8 +2147,7 @@ class Store:
             if not d.is_dir():
                 continue
             for p in sorted(d.iterdir()):
-                if not (p.is_file() and p.name.endswith(".json")
-                        and not p.name.endswith(".deadletter.json")):
+                if not (p.is_file() and _is_dead_letter_payload(p.name)):
                     continue
                 # The file STEM is the canonical recovery id (read_dead_letter_payload reads
                 # <stem>.json), so report it AS message_id even when the sidecar records the
@@ -2166,8 +2182,17 @@ class Store:
         return out
 
     def read_dead_letter_payload(self, agent: str, msg_id: str) -> bytes | None:
-        """The original message bytes for a dead-lettered id, or None."""
-        p = self.dead_letter_dir / validate_agent_name(agent) / f"{msg_id}.json"
+        """The original message bytes for a dead-lettered id, or None.
+
+        SECURITY (reviewer-2 F5): msg_id is caller-supplied. PATH-BIND the resolved payload
+        inside the agent sink so a traversal id (e.g. ``..\\..\\config``) can never escape to
+        read an arbitrary .agenttalk file; an escaping id degrades to None (not found)."""
+        sink = self.dead_letter_dir / validate_agent_name(agent)
+        p = sink / f"{msg_id}.json"
+        try:
+            p.resolve().relative_to(sink.resolve())
+        except ValueError:
+            return None
         if not p.is_file():
             return None
         try:
