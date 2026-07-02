@@ -45,10 +45,12 @@ writes. Remove the file to re-enable automation.
 ## Deadman
 
 `agenttalk deadman --threshold-seconds 900 --json` checks actionable mail age
-without reading message bodies or `supervisor-state.json`. It alarms on stale
-owed inbound work and stale control messages such as `wake`. Stale unread
-responses are reported separately and become alarming only when configured or
-when `--alarm-unread-response` is passed.
+without emitting or semantically inspecting message bodies or subjects. It
+reuses the normal queue scan, but its report is content-blind and it does not
+read `supervisor-state.json`. It alarms on stale owed inbound work and stale
+control messages such as `wake`. Stale unread responses are reported separately
+and become alarming only when configured or when `--alarm-unread-response` is
+passed.
 
 The generated wrapper is:
 

@@ -206,6 +206,18 @@ def test_consumed_marker_now_alive_clears() -> None:
     assert p["clear_marker"] == "rr-1"
 
 
+def test_kill_targets_skip_legacy_missing_start_times() -> None:
+    report = _report(restart_request={"request_id": "rr-1"})
+    state = {"agents": {"worker": _ready(
+        launcher_pid=111,
+        launcher_start=None,
+        managed_pids=[{"pid": 222}, {"pid": 333, "start": "t333"}],
+    )}}
+    plan = sup.plan_actions(report, state, _CONFIG, now_epoch=NOW, snapshot=None)
+    targets = plan["agents"]["worker"]["kill_targets"]
+    assert targets == [{"pid": 333, "start": "t333"}]
+
+
 def test_only_auto_restart_agents_are_planned() -> None:
     cfg = {"agents": {"worker": {"auto_restart": False}}}
     plan = sup.plan_actions(_report(), {"agents": {"worker": _ready()}},
@@ -1497,11 +1509,54 @@ def _exec_helpers(tmp_path: Path) -> str:
     text = (s.dir / "supervisor.ps1").read_text(encoding="utf-8-sig")
     block = text[text.index("# region exec-helpers"):text.index("# endregion exec-helpers")]
     assert "function Stop-Tree" in block and "function Seed-CodexHome" in block
-    return block
+    return "function Assert-ActionsEnabled([string]$what) { return $true }\n" + block
 
 
 def _pslit(v: str) -> str:
     return "'" + str(v).replace("'", "''") + "'"
+
+
+def test_launch_rechecks_kill_switch_after_branch_guard(tmp_path: Path) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    s = _team(tmp_path)
+    (s.dir / "supervisor.json").write_text(json.dumps(_CONFIG), encoding="utf-8")
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    text = (s.dir / "supervisor.ps1").read_text(encoding="utf-8-sig")
+    start = text.index("function Launch($name")
+    end = text.index("function Launch-Spec", start)
+    launch_fn = text[start:end]
+    out = tmp_path / "launch_guard.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$Root = {_pslit(str(tmp_path))}",
+        f"$KillSwitchPath = {_pslit(str(s.dir / 'supervisor.kill'))}",
+        "function Actions-Enabled { return -not (Test-Path $KillSwitchPath) }",
+        "function Assert-ActionsEnabled([string]$what) { "
+        "if (Actions-Enabled) { return $true }; return $false }",
+        "function Start-Process { throw 'Start-Process should not run after kill switch' }",
+        "$cfg = [pscustomobject]@{ agents = [pscustomobject]@{ worker = "
+        "[pscustomobject]@{ cwd = $Root; env = $null; launch = "
+        "[pscustomobject]@{ windows_file = 'dummy.exe'; windows_args = @() } } } }",
+        "$AgenttalkPython = 'python'; $SrcOnPyPath = $false",
+        "$branchOk = Assert-ActionsEnabled 'branch guard'",
+        "New-Item -ItemType File -Force -Path $KillSwitchPath | Out-Null",
+        launch_fn,
+        "$plan = [pscustomobject]@{ session_id = $null; session_args = @(); "
+        "launch_mode = 'fresh' }",
+        "$res = Launch 'worker' $plan $null",
+        f"@{{ branchOk = $branchOk; resultIsNull = ($null -eq $res); "
+        f"killExists = (Test-Path $KillSwitchPath) }} | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(out))} -Encoding utf8",
+    ])
+    hp = tmp_path / "launch_guard.ps1"
+    hp.write_text(harness, encoding="utf-8-sig")
+    res = subprocess.run([shell, "-NoProfile", "-File", str(hp)],
+                         capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, f"{res.stdout}{res.stderr}"
+    data = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert data == {"branchOk": True, "resultIsNull": True, "killExists": True}
 
 
 def test_stop_tree_kills_real_two_level_tree_start_guarded(tmp_path: Path) -> None:
@@ -1541,11 +1596,16 @@ def test_stop_tree_kills_real_two_level_tree_start_guarded(tmp_path: Path) -> No
             "Stop-Tree $guard",
             "Start-Sleep -Milliseconds 200",
             "$guardStill = (Proc-Start $PID) -ne $null",
+            "$missing = @( @{ pid = $PID } )",
+            "Stop-Tree $missing",
+            "Start-Sleep -Milliseconds 200",
+            "$missingStill = (Proc-Start $PID) -ne $null",
             "Stop-Tree $targets",
             "Start-Sleep -Milliseconds 400",
             "$alive = @(); foreach($id in $parent,$child){ if(Get-Process -Id $id "
             "-ErrorAction SilentlyContinue){ $alive += $id } }",
-            f"@{{ alive = $alive; guard_survived = ($guardStill -and $guardAlive) }} | "
+            f"@{{ alive = $alive; guard_survived = ($guardStill -and $guardAlive); "
+            f"missing_survived = ($missingStill -and $guardAlive) }} | "
             f"ConvertTo-Json | Set-Content {_pslit(str(out))} -Encoding utf8",
         ])
         hp = tmp_path / "tree_harness.ps1"
@@ -1558,6 +1618,7 @@ def test_stop_tree_kills_real_two_level_tree_start_guarded(tmp_path: Path) -> No
         alive = [] if alive is None else ([alive] if isinstance(alive, int) else alive)
         assert alive == [], f"tree not fully reaped: {alive}"
         assert data["guard_survived"] is True   # start-time guard spared the recycled pid
+        assert data["missing_survived"] is True  # missing start is never a kill target
     finally:
         try:
             parent.kill()

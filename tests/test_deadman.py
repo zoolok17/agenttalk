@@ -28,6 +28,13 @@ def _set_msg_time(store: Store, msg_id: str, epoch: float) -> None:
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def _set_msg_ts_text(store: Store, msg_id: str, ts: str) -> None:
+    path = store.messages_dir / f"{msg_id}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["ts"] = ts
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
 def _question(store: Store, rid: str, *, epoch: float) -> str:
     msg = store.send(
         sender="lead",
@@ -101,6 +108,32 @@ def test_deadman_stale_wake_is_control_alarm(tmp_path: Path) -> None:
     assert report["buckets"]["stale_control"][0]["kind"] == "wake"
 
 
+def test_deadman_fails_closed_on_unknown_owed_age(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    msg_id = _question(store, "q-1", epoch=NOW - 1000)
+    _set_msg_ts_text(store, msg_id, "not-a-timestamp")
+
+    rc, report = deadman.check(store, threshold_seconds=100, now=datetime.fromtimestamp(
+        NOW, timezone.utc))
+
+    assert rc == 3
+    assert report["status"] == "error"
+    assert report["errors"][0]["class"] == "DeadmanUnknownAgeError"
+
+
+def test_deadman_fails_closed_on_unknown_control_age(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    wake = store.send(sender="lead", recipient="worker", kind="wake", body="wake up")
+    _set_msg_ts_text(store, wake.id, "not-a-timestamp")
+
+    rc, report = deadman.check(store, threshold_seconds=100, now=datetime.fromtimestamp(
+        NOW, timezone.utc))
+
+    assert rc == 3
+    assert report["status"] == "error"
+    assert report["errors"][0]["class"] == "DeadmanUnknownAgeError"
+
+
 def test_deadman_closed_and_rescinded_threads_do_not_alarm(tmp_path: Path) -> None:
     store = _store(tmp_path)
     closed_id = _question(store, "q-closed", epoch=NOW - 1000)
@@ -136,6 +169,19 @@ def test_deadman_fails_closed_on_malformed_config(tmp_path: Path) -> None:
     assert report["status"] == "error"
     assert report["counts"]["errors"] == 1
     assert report["errors"][0]["class"] in {"JSONDecodeError", "ValueError"}
+
+
+def test_deadman_fails_closed_on_invalid_message_file(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    (store.messages_dir / "bad.json").write_text("{", encoding="utf-8")
+
+    rc, report = deadman.check(store, threshold_seconds=100, now=datetime.fromtimestamp(
+        NOW, timezone.utc))
+
+    assert rc == 3
+    assert report["status"] == "error"
+    assert report["errors"][0]["class"] == "DeadmanInvalidMessagesError"
+    assert report["errors"][0]["count"] == 1
 
 
 def test_deadman_fails_closed_on_malformed_deadman_config(tmp_path: Path) -> None:

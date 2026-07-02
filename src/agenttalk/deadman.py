@@ -18,6 +18,16 @@ DEFAULT_THRESHOLD_SECONDS = 900.0
 CONTROL_ALARM_KINDS = frozenset({"wake"})
 
 
+class DeadmanInvalidMessagesError(RuntimeError):
+    def __init__(self, count: int) -> None:
+        super().__init__("invalid message files present")
+        self.count = count
+
+
+class DeadmanUnknownAgeError(RuntimeError):
+    pass
+
+
 def _parse_ts(ts: str) -> datetime | None:
     if not isinstance(ts, str) or not ts:
         return None
@@ -120,6 +130,17 @@ def _control_item(agent: str, msg: Message, age: float) -> dict[str, Any]:
     return item
 
 
+def _fail_safe(report: dict[str, Any], exc: Exception) -> tuple[int, dict[str, Any]]:
+    report["status"] = "error"
+    report["counts"]["errors"] = 1
+    item = {"class": type(exc).__name__}
+    count = getattr(exc, "count", None)
+    if isinstance(count, int):
+        item["count"] = count
+    report["errors"].append(item)
+    return 3, report
+
+
 def check(
     store: Store,
     *,
@@ -161,59 +182,62 @@ def check(
         cfg = opts["config"]
         threshold = float(opts["threshold_seconds"])
         alarm_replies = bool(opts["alarm_unread_response"])
+        invalid = store.list_invalid_messages()
+        if invalid:
+            raise DeadmanInvalidMessagesError(len(invalid))
         messages = store.valid_messages()
-    except Exception as exc:  # noqa: BLE001 - deadman must fail safe, not crash
-        base_report["status"] = "error"
-        base_report["counts"]["errors"] = 1
-        base_report["errors"].append({"class": type(exc).__name__})
-        return 3, base_report
 
-    base_report["threshold_seconds"] = threshold
-    base_report["alarm_unread_response"] = alarm_replies
-    agents = [a for a in (cfg.get("agents") or []) if isinstance(a, str)]
-    retired = set(store.retired_agents())
-    by_recipient: dict[str, list[Message]] = {a: [] for a in agents}
-    for msg in messages:
-        if msg.recipient in by_recipient:
-            by_recipient[msg.recipient].append(msg)
+        base_report["threshold_seconds"] = threshold
+        base_report["alarm_unread_response"] = alarm_replies
+        agents = [a for a in (cfg.get("agents") or []) if isinstance(a, str)]
+        retired = set(store.retired_agents())
+        by_recipient: dict[str, list[Message]] = {a: [] for a in agents}
+        for msg in messages:
+            if msg.recipient in by_recipient:
+                by_recipient[msg.recipient].append(msg)
 
-    for agent in agents:
-        cursor = store.cursor(agent)
-        rows = th.derive_threads(
-            messages,
-            agent=agent,
-            cursor=cursor,
-            now=now_dt,
-            closed_rids=_closed_rids(store, agent),
-            retired=retired,
+        for agent in agents:
+            cursor = store.cursor(agent)
+            rows = th.derive_threads(
+                messages,
+                agent=agent,
+                cursor=cursor,
+                now=now_dt,
+                closed_rids=_closed_rids(store, agent),
+                retired=retired,
+            )
+            for row in rows:
+                if row.state in ("owed-inbound", "reply-waiting") and row.age_seconds is None:
+                    raise DeadmanUnknownAgeError
+                if row.age_seconds is None or row.age_seconds < threshold:
+                    continue
+                if row.state == "owed-inbound":
+                    base_report["buckets"]["stale_obligation"].append(
+                        _thread_item(agent, row, "stale_obligation"))
+                elif row.state == "reply-waiting":
+                    base_report["buckets"]["stale_unread_response"].append(
+                        _thread_item(agent, row, "stale_unread_response"))
+            for msg in by_recipient.get(agent, []):
+                if msg.id <= cursor or msg.kind not in CONTROL_ALARM_KINDS:
+                    continue
+                ts = _parse_ts(msg.ts)
+                if ts is None:
+                    raise DeadmanUnknownAgeError
+                age = (now_dt - ts).total_seconds()
+                if age >= threshold:
+                    base_report["buckets"]["stale_control"].append(
+                        _control_item(agent, msg, age))
+
+        for key in ("stale_obligation", "stale_unread_response", "stale_control"):
+            base_report["counts"][key] = len(base_report["buckets"][key])
+        alarm = (
+            base_report["counts"]["stale_obligation"] > 0
+            or base_report["counts"]["stale_control"] > 0
+            or (alarm_replies and base_report["counts"]["stale_unread_response"] > 0)
         )
-        for row in rows:
-            if row.age_seconds is None or row.age_seconds < threshold:
-                continue
-            if row.state == "owed-inbound":
-                base_report["buckets"]["stale_obligation"].append(
-                    _thread_item(agent, row, "stale_obligation"))
-            elif row.state == "reply-waiting":
-                base_report["buckets"]["stale_unread_response"].append(
-                    _thread_item(agent, row, "stale_unread_response"))
-        for msg in by_recipient.get(agent, []):
-            if msg.id <= cursor or msg.kind not in CONTROL_ALARM_KINDS:
-                continue
-            ts = _parse_ts(msg.ts)
-            if ts is None:
-                continue
-            age = (now_dt - ts).total_seconds()
-            if age >= threshold:
-                base_report["buckets"]["stale_control"].append(_control_item(agent, msg, age))
-
-    for key in ("stale_obligation", "stale_unread_response", "stale_control"):
-        base_report["counts"][key] = len(base_report["buckets"][key])
-    alarm = (
-        base_report["counts"]["stale_obligation"] > 0
-        or base_report["counts"]["stale_control"] > 0
-        or (alarm_replies and base_report["counts"]["stale_unread_response"] > 0)
-    )
-    if alarm:
-        base_report["status"] = "alarm"
-        return 3, base_report
-    return 0, base_report
+        if alarm:
+            base_report["status"] = "alarm"
+            return 3, base_report
+        return 0, base_report
+    except Exception as exc:  # noqa: BLE001 - deadman must fail safe, not crash
+        return _fail_safe(base_report, exc)

@@ -964,11 +964,16 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         # EVERY kill target carries its start-time so the executor can refuse to
         # kill a recycled pid (codex discipline note 2).
         out: list[dict] = []
-        if include_launcher and isinstance(st.get("launcher_pid"), int):
+        if (
+            include_launcher
+            and isinstance(st.get("launcher_pid"), int)
+            and isinstance(st.get("launcher_start"), str)
+            and st.get("launcher_start")
+        ):
             out.append({"pid": st.get("launcher_pid"),
                         "start": st.get("launcher_start")})
         for m in managed:
-            if isinstance(m.get("pid"), int):
+            if isinstance(m.get("pid"), int) and isinstance(m.get("start"), str) and m.get("start"):
                 out.append({"pid": m["pid"], "start": m.get("start")})
         return out
 
@@ -1813,7 +1818,7 @@ function Quote-Arg([string]$a) {
   return $sb.ToString()
 }
 # endregion quote-arg
-# region exec-helpers  (extracted verbatim by the test harness - self-contained)
+# region exec-helpers  (extracted verbatim by the test harness with kill-switch stubs)
 function Proc-Start($procId) {
   # The live start-time of a pid in the SAME ISO format Get-ProcSnapshot emits,
   # so recorded start-times compare exactly (anti-pid-reuse). $null if gone.
@@ -1849,19 +1854,22 @@ function Get-ProcSnapshot($path) {
   }
 }
 function Stop-Tree($targets) {
+  if (-not (Assert-ActionsEnabled 'stop-tree')) { return }
   # Leaves-first, start-time-guarded kill. Python lists kill_targets brain-first,
   # so we kill in REVERSE (managed descendants/leaves before the brain). A target
   # whose live start-time no longer matches is a RECYCLED pid -> never killed.
   $arr = @($targets); [array]::Reverse($arr)
   foreach ($t in $arr) {
     if (-not $t.pid) { continue }
+    if (-not $t.start) { continue }
     $live = Proc-Start $t.pid
     if ($null -eq $live) { continue }                 # already gone
-    if ($t.start -and ($live -ne $t.start)) { continue }  # pid reused - DO NOT kill
+    if ($live -ne $t.start) { continue }              # pid reused - DO NOT kill
     Stop-Process -Id $t.pid -Force -ErrorAction SilentlyContinue
   }
 }
 function Seed-CodexHome($name, $sandbox) {
+  if (-not (Assert-ActionsEnabled ("seed-codex-home {0}" -f $name))) { return $null }
   # Provision a per-agent ISOLATED CODEX_HOME so `resume --last` is unambiguous
   # AND so it launches UNATTENDED (config.toml overlaid with approval=never /
   # sandbox=workspace-write / [windows] sandbox=<sandbox> / writable_roots=repo).
@@ -1986,6 +1994,7 @@ function Preflight($name, $plan, $file, $codexHome) {
 }
 # endregion exec-helpers
 function Launch($name, $plan, $codexHome) {
+  if (-not (Assert-ActionsEnabled ("launch {0}" -f $name))) { return $null }
   $a = $cfg.agents.$name
   $file = $a.launch.windows_file
   if (-not $file -or $file -like 'REPLACE:*') {
@@ -2038,6 +2047,7 @@ function Launch($name, $plan, $codexHome) {
 }
 
 function Launch-Spec($name, $spec, $codexHome) {
+  if (-not (Assert-ActionsEnabled ("launch-spec {0}" -f $name))) { return $null }
   $file = $spec.launch.windows_file
   if (-not $file -or $file -like 'REPLACE:*') {
     Write-Warning "supervisor: ephemeral '$name' has no real launch.windows_file - fill supervisor.json ephemeral_reviewers.allowed_profiles"; return $null
@@ -2145,9 +2155,11 @@ do {
         $a = $cfg.agents.$name
         if ($p.cli -eq 'claude') {
           $launchDir = if ($a.cwd) { $a.cwd } else { $Root }
+          if (-not (Assert-ActionsEnabled ("seed-claude-settings {0}" -f $name))) { continue }
           & $AgenttalkCmd --root $Root supervise --seed-claude-settings --dir $launchDir --mode $p.perm_mode | Out-Null
         }
         $file = $a.launch.windows_file
+        if ($seedOk -and -not (Assert-ActionsEnabled ("preflight {0}" -f $name))) { $seedOk = $false }
         if ($seedOk -and -not (Preflight $name $p $file $homeEnv)) { $seedOk = $false }
         if (-not $seedOk) {
           Write-Warning ("supervisor: {0}: seed/preflight failed - skipping relaunch this tick (fail closed)" -f $name)
@@ -2161,20 +2173,21 @@ do {
             # (authoritative: claude pins the minted id; codex resumes by --last).
             $extra = @(); if ($res.session_id) { $extra += @('--session-id', $res.session_id) }
             if ($res.start) { $extra += @('--pid-start', $res.start) }
+            if (-not (Assert-ActionsEnabled ("record-launch {0}" -f $name))) { continue }
             & $AgenttalkCmd --root $Root supervise --record-launch --for $name --cli $p.cli --pid $res.pid @extra --now $now --state-file $StatePath | Out-Null
             $state = Load-State
             # Clear the manual marker ONLY after a CONFIRMED relaunch.
-            if ($p.clear_marker) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }
+            if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }
           } else {
             Write-Warning ("supervisor: {0}: {1} FAILED (no PID) - keeping marker/state for retry" -f $name, $p.action)
           }
         }
       }
-      'clear_marker' { if ($p.clear_marker) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; $state.agents.$name = $p.next_state }
-      'refuse_protected' { Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason); if ($p.clear_marker) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; $state.agents.$name = $p.next_state }
+      'clear_marker' { if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; $state.agents.$name = $p.next_state }
+      'refuse_protected' { Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason); if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; $state.agents.$name = $p.next_state }
       { $_ -in 'warn_only','suspect_warn','snapshot_unavailable','readiness_gave_up' } {
         Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason)
-        if ($p.notify -and $cfg.notify_sender -and $cfg.notify_to) {
+        if ($p.notify -and $cfg.notify_sender -and $cfg.notify_to -and (Assert-ActionsEnabled ("notify {0}" -f $name))) {
           & $AgenttalkCmd --root $Root send --from $cfg.notify_sender --to $cfg.notify_to --kind note -m ("supervisor: {0}: {1}" -f $name, $p.reason) --quiet | Out-Null
         }
         $state.agents.$name = $p.next_state
@@ -2189,10 +2202,12 @@ do {
     switch ($p.action) {
       'ephemeral_deny' {
         Write-Warning ("supervisor: launch-request {0}: DENIED - {1}" -f $rid, $p.reason)
+        if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
         & $AgenttalkCmd --root $Root supervise --archive-launch-request --request-id $rid --terminal-state denied --reason $p.reason --state-file $StatePath --now $now | Out-Null
         $state = Load-State
       }
       'ephemeral_launch' {
+        if (-not (Assert-ActionsEnabled ("prepare-launch-request {0}" -f $rid))) { continue }
         $prepText = & $AgenttalkCmd --root $Root supervise --prepare-launch-request --request-id $rid --state-file $StatePath --now $now
         if ($LASTEXITCODE -ne 0) {
           Write-Warning ("supervisor: launch-request {0}: prepare failed; will retry/deny on a later poll" -f $rid)
@@ -2203,6 +2218,7 @@ do {
         if (($prep.cli -eq 'codex') -and $prep.codex_home_isolation) {
           $homeEnv = Seed-CodexHome $prep.agent $prep.windows_sandbox
           if (-not $homeEnv) {
+            if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
             & $AgenttalkCmd --root $Root supervise --archive-launch-request --request-id $rid --terminal-state failed --reason "codex home seed failed" --state-file $StatePath --now $now | Out-Null
             $state = Load-State
             continue
@@ -2211,9 +2227,11 @@ do {
         $res = Launch-Spec $prep.agent $prep $homeEnv
         if ($res) {
           $extra = @(); if ($res.start) { $extra += @('--pid-start', $res.start) }
+          if (-not (Assert-ActionsEnabled ("record-ephemeral-launch {0}" -f $rid))) { continue }
           & $AgenttalkCmd --root $Root supervise --record-ephemeral-launch --request-id $rid --pid $res.pid @extra --timeout-seconds $prep.timeout_seconds --state-file $StatePath --now $now | Out-Null
           $state = Load-State
         } else {
+          if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
           & $AgenttalkCmd --root $Root supervise --archive-launch-request --request-id $rid --terminal-state failed --reason "launch returned no pid" --state-file $StatePath --now $now | Out-Null
           $state = Load-State
         }
@@ -2229,11 +2247,12 @@ do {
         if ($p.kill_first -and $p.kill_targets) { Stop-Tree $p.kill_targets }
         $completionJson = '{}'
         if ($p.completion) { $completionJson = ($p.completion | ConvertTo-Json -Compress -Depth 8) }
+        if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
         & $AgenttalkCmd --root $Root supervise --archive-launch-request --request-id $rid --terminal-state $p.terminal_state --reason $p.reason --completion-json $completionJson --state-file $StatePath --now $now | Out-Null
         $state = Load-State
       }
       'ephemeral_janitor' {
-        if ($p.agent) { & $AgenttalkCmd --root $Root supervise --janitor-ephemeral --for $p.agent | Out-Null }
+        if ($p.agent -and (Assert-ActionsEnabled ("janitor-ephemeral {0}" -f $p.agent))) { & $AgenttalkCmd --root $Root supervise --janitor-ephemeral --for $p.agent | Out-Null }
       }
     }
   }
