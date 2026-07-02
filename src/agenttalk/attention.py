@@ -110,10 +110,15 @@ def validate_attention_meta(meta: dict | None) -> list[str]:
     """STRICT validation of a typed ``meta.attention`` block for the CLI-write path.
     Returns a list of error strings ([] == valid). An ABSENT block is valid (returns []);
     only a PRESENT block is validated. The reader side (:func:`parse_attention_meta`) is
-    separately fail-safe - it never rejects, only downgrades."""
+    separately fail-safe - it never rejects, only downgrades.
+
+    Requires the WRAPPED form (``meta`` with an ``attention`` key). A ``meta`` WITHOUT an
+    ``attention`` key means 'no typed block' and validates clean - we never treat an arbitrary
+    unwrapped dict AS the attention block, so a future caller passing a full message ``meta``
+    with unrelated ``priority``/``options`` keys does not get spurious errors (fable-max #3)."""
     if not meta:
         return []
-    att = meta.get("attention") if "attention" in meta else meta
+    att = meta.get("attention")
     if att is None:
         return []
     errs: list[str] = []
@@ -172,7 +177,8 @@ def validate_attention_meta(meta: dict | None) -> list[str]:
 
     nb = att.get("needed_by")
     if nb is not None and not _is_valid_needed_by(nb):
-        errs.append("needed_by must be an ISO-8601 date or timezone-bearing datetime")
+        errs.append("needed_by must be an ISO-8601 date or datetime "
+                    "(a naive datetime is treated as UTC)")
     return errs
 
 
@@ -409,17 +415,16 @@ def apply_disposition(item: dict, folded: dict[str, dict], *, now_iso: str) -> d
 # ----------------------------------------------------------- ranking
 
 def rank_key(item: dict) -> tuple:
-    """Deterministic sort key (descending on the weights, ascending on the final id
-    tie-break). No prose scoring, no model inference - only validated meta + observed
-    state. Callers sort with reverse=True on the weight tuple, then id ascending; we encode
-    the id ascending by negating nothing and appending it as the last element with reverse
-    handled by the caller. To keep it a single sortable tuple, id is inverted via a wrapper."""
+    """Deterministic rank tuple where HIGHER is more urgent, computed only from validated
+    meta + observed state (no prose scoring, no model inference). :func:`sort_items` orders by
+    the NEGATED tuple (so every weight sorts descending) then ``item_id`` ascending, giving a
+    stable, fully deterministic order under tied inputs."""
     state = item.get("state", "active")
     active = state in ("active",)  # deferred/dismissed/resolved sink below active
     prio = {"urgent": 4, "high": 3, "normal": 2, "low": 1}.get(item.get("priority"), 1)
     risk = {"high": 3, "medium": 2, "low": 1}.get(item.get("risk_severity"), 0)
     src = _SOURCE_WEIGHT.get(item.get("source"), 0)
-    needed = _needed_by_weight(item.get("needed_by"), item.get("_now_iso"))
+    needed = _needed_by_weight(item.get("needed_by"))
     age_bucket = min(int(item.get("age_seconds", 0) // 3600), 72)
     return (
         1 if active else 0,
@@ -428,23 +433,15 @@ def rank_key(item: dict) -> tuple:
     )
 
 
-def _needed_by_weight(needed_by: Any, now_iso: Any) -> int:
-    if not isinstance(needed_by, str) or not needed_by:
+def _needed_by_weight(needed_by: Any) -> int:
+    """Urgency bucket from a ``needed_by`` deadline vs now: 3 overdue, 2 due within 24h,
+    1 later, 0 absent/unparseable. Reuses the shared :func:`parse_iso_dt` (a naive datetime
+    is treated as UTC)."""
+    nb = parse_iso_dt(needed_by)
+    if nb is None:
         return 0
     from datetime import datetime, timezone
-    try:
-        nb = datetime.fromisoformat(needed_by.replace("Z", "+00:00"))
-    except ValueError:
-        return 0
-    if nb.tzinfo is None:
-        nb = nb.replace(tzinfo=timezone.utc)
-    try:
-        now = datetime.fromisoformat(str(now_iso).replace("Z", "+00:00")) if now_iso else datetime.now(timezone.utc)
-    except (ValueError, TypeError):
-        now = datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    delta_h = (nb - now).total_seconds() / 3600.0
+    delta_h = (nb - datetime.now(timezone.utc)).total_seconds() / 3600.0
     if delta_h < 0:
         return 3      # overdue
     if delta_h <= 24:
@@ -699,6 +696,41 @@ def build_queue(items: list[dict], dispositions: list[dict], *, now_iso: str,
             default=None),
     }
     return {"schema_version": SCHEMA_VERSION, "items": ordered, "summary": summary}
+
+
+def compute_stats(items: list[dict], dispositions: list[dict], *, now_iso: str) -> dict:
+    """NORTH-STAR instrumentation: derived counts of what the queue routes. Same inputs as
+    build_queue - adds NO reads beyond the existing attention-queue collector, NO new state,
+    NO writes, and does not inspect, print, or semantically use message-body content (the
+    shared collector validates message envelopes; stats derive only from the collected item
+    metadata). Counts the APPLIED source items across ALL states (raw signal volume, no
+    display-dedup): what surfaced active (total + by source), what has been dispositioned
+    (deferred/dismissed/resolved/answered_elsewhere), and dwell (oldest active age). Never
+    raises."""
+    folded = fold_dispositions(dispositions)
+    applied = [apply_disposition(it, folded, now_iso=now_iso) for it in items]
+    by_state: dict[str, int] = {}
+    active_by_source: dict[str, int] = {}
+    for it in applied:
+        st = it.get("state", "active")
+        by_state[st] = by_state.get(st, 0) + 1
+        if st == "active":
+            src = str(it.get("source"))
+            active_by_source[src] = active_by_source.get(src, 0) + 1
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "surfaced_active": by_state.get("active", 0),
+        "active_by_source": dict(sorted(active_by_source.items())),
+        "dispositioned": {
+            "deferred": by_state.get("deferred", 0),
+            "dismissed": by_state.get("dismissed", 0),
+            "resolved": by_state.get("resolved", 0),
+            "answered_elsewhere": by_state.get("answered_elsewhere", 0),
+        },
+        "oldest_active_age_seconds": max(
+            [int(it.get("age_seconds") or 0) for it in applied if it.get("state") == "active"],
+            default=0),
+    }
 
 
 def _count_by(items: list[dict], key: str) -> dict:

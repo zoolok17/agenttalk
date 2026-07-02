@@ -27,6 +27,32 @@ def test_validate_accepts_full_valid_and_absent() -> None:
     assert att.validate_attention_meta(ok) == []
 
 
+def test_validate_requires_wrapped_form_no_spurious_errors_on_full_meta() -> None:
+    # fable-max #3: a full message meta WITHOUT an `attention` key is 'no typed block' and
+    # validates clean - unrelated priority/options keys must NOT be read as an attention block.
+    assert att.validate_attention_meta({"priority": "not-an-enum", "options": ["x"] * 99,
+                                        "request_id": "esc-1"}) == []
+    # the wrapped form is still validated
+    assert att.validate_attention_meta({"attention": {"priority": "not-an-enum"}})
+
+
+def test_needed_by_weight_reuses_parse_iso_dt_naive_as_utc() -> None:
+    # fable-max #5: naive datetime accepted (treated as UTC), unparseable -> 0.
+    from datetime import datetime, timedelta, timezone
+    soon = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")  # naive
+    assert att._needed_by_weight(soon) == 2          # due within 24h, naive parsed as UTC
+    assert att._needed_by_weight("2000-01-01") == 3  # long overdue
+    assert att._needed_by_weight("not-a-date") == 0
+    assert att._needed_by_weight(None) == 0
+
+
+def test_rank_key_ignores_absent_now_iso_plumbing() -> None:
+    # fable-max #4: _now_iso plumbing removed; rank_key must not depend on it.
+    item = {"item_id": "x", "source": att.SOURCE_NEEDS_OPERATOR, "state": "active",
+            "priority": "high", "risk_severity": "high", "human_can_unblock_now": True}
+    assert isinstance(att.rank_key(item), tuple)     # no KeyError / no _now_iso dependency
+
+
 def test_validate_rejects_bad_enum_multiline_oversize_counts() -> None:
     assert att.validate_attention_meta({"attention": {"priority": "sometime"}})
     assert att.validate_attention_meta({"attention": {"risk_severity": "critical"}})
@@ -63,6 +89,27 @@ def test_dedupe_key_distinguishes_decisions() -> None:
     k2 = att.dedupe_key("needs_operator", identity="beta|subj", decision_hash="d2")
     assert k1 != k2                                # distinct decisions do not merge
     assert att.dedupe_key("config_blocked", identity="beta") == "config_blocked:beta"
+
+
+def test_compute_stats_counts_active_dispositioned_and_dwell() -> None:
+    # north-star: derived counts over applied items - active by source, dispositioned by
+    # state, dwell = oldest active age. No new state, no body reads.
+    items = [
+        {"item_id": "needs_operator:e1", "source": att.SOURCE_NEEDS_OPERATOR, "source_hash": "H1",
+         "state": "active", "warnings": [], "advisory": False, "age_seconds": 7200},
+        {"item_id": "needs_operator:e2", "source": att.SOURCE_NEEDS_OPERATOR, "source_hash": "H2",
+         "state": "active", "warnings": [], "advisory": False, "age_seconds": 100},
+        {"item_id": "dead_letter:beta:m1", "source": att.SOURCE_DEAD_LETTER, "source_hash": "H3",
+         "state": "active", "warnings": [], "advisory": False},
+    ]
+    # answer e2 elsewhere; the rest stay active
+    disps = [_disp("needs_operator:e2", att.SOURCE_NEEDS_OPERATOR,
+                   att.ACTION_ANSWERED_ELSEWHERE, "H2")]
+    s = att.compute_stats(items, disps, now_iso="2026-06-01T00:00:00Z")
+    assert s["surfaced_active"] == 2                       # e1 + dead_letter (e2 answered)
+    assert s["active_by_source"] == {att.SOURCE_DEAD_LETTER: 1, att.SOURCE_NEEDS_OPERATOR: 1}
+    assert s["dispositioned"]["answered_elsewhere"] == 1
+    assert s["oldest_active_age_seconds"] == 7200          # dwell = oldest active
 
 
 def test_close_hold_item_is_content_bound_on_verdict_and_reason() -> None:

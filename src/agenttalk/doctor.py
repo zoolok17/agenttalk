@@ -366,7 +366,9 @@ def _check_dead_letter(store) -> Check | None:
         name="dead_letter", status="warn",
         details=(f"{n} dead-lettered poison message(s) (valid messages the model could "
                  f"not process; moved out of the inbox, recoverable). {summary}"),
-        fix="Review with `agenttalk dead-letter list`; recover with `dead-letter requeue`.",
+        fix="Review with `agenttalk dead-letter list`; recover with `dead-letter requeue` "
+            "(re-injects a fresh copy but keeps the original here), then `dead-letter resolve "
+            "--reason ...` once handled to quiet this warning.",
         data=data)
 
 

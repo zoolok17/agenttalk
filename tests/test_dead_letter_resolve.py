@@ -181,6 +181,22 @@ def test_read_dead_letter_payload_path_bind(tmp_path: Path) -> None:
     assert s.read_dead_letter_payload("beta", "..\\..\\config") is None
 
 
+def test_list_shows_resolve_flow_tip_for_unresolved(tmp_path: Path, capsys) -> None:
+    # fable-max #2: don't auto-quiet a requeued-not-resolved dead-letter; the list points at
+    # the resolve flow instead. Tip shown for the unresolved view, NOT the --resolved view.
+    s = _store(tmp_path)
+    mid = _dead_letter(s)
+    capsys.readouterr()
+    assert _run(tmp_path, "dead-letter", "list") == 0
+    assert "dead-letter resolve" in capsys.readouterr().out          # flow tip present
+    # once resolved, the --resolved audit view does not nag with the tip
+    _run(tmp_path, "dead-letter", "resolve", "--from", "claude",
+         "--agent", "beta", "--id", mid, "--reason", "handled")
+    capsys.readouterr()
+    assert _run(tmp_path, "dead-letter", "list", "--resolved") == 0
+    assert "tip:" not in capsys.readouterr().out
+
+
 def test_force_requeue_whitespace_reason_exits_2_sends_nothing(tmp_path: Path) -> None:
     # codex F7: a whitespace-only --reason on force-requeue folds to an INVALID disposition
     # line, so it must exit 2 and SEND NOTHING (not requeue with a blank audit).

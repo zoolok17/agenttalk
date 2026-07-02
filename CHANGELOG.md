@@ -5,6 +5,43 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.57.1] - 2026-07-02
+
+Fast-follow polish for the operator attention queue: the fresh-review nits, the north-star
+`--stats` instrumentation, and the F8/F9 review fold (degraded-input warnings now carried on
+`--stats`, and an honest no-body-reads claim).
+
+### Added
+
+- **`agenttalk attention --stats`** (add `--json`) — derived counts of what the queue
+  routes: surfaced-active total + by source, dispositioned counts
+  (deferred/dismissed/resolved/answered-elsewhere), and the oldest active dwell. Same reads
+  as the queue (no new state, no writes); it adds no reads beyond the attention-queue
+  collector and does not inspect message-body content. The stats view carries the same
+  degraded-input warnings as the queue (torn disposition log / no liaison), so a partial read
+  never looks complete.
+- **`attention show --item`** gains `--include-deferred` / `--include-dismissed` /
+  `--include-resolved` / `--all`, so a dispositioned item stays auditable by id (previously
+  `show` could only display an active item).
+
+### Changed
+
+- `attention` typed-field validation now requires the **wrapped form** (`meta` with an
+  `attention` key); a `meta` without that key is "no typed block" and validates clean, so a
+  caller passing a full message `meta` with unrelated keys gets no spurious errors.
+- `needed_by` accepts a naive datetime (treated as UTC); the validation message and
+  `--needed-by` help now say so (they previously said "timezone-bearing", contradicting the
+  parser). Internals now share one ISO parser (`parse_iso_dt`).
+- `dead-letter list` and the doctor dead-letter warning now point at the requeue-then-resolve
+  flow: a `requeue` re-injects a fresh copy but preserves the original, so a handled
+  dead-letter stays listed until you `dead-letter resolve` it. We deliberately do not
+  auto-quiet (it could hide a real unhandled poison). README documents the flow.
+
+### Internal
+
+- Removed dead `_now_iso` rank plumbing (never populated) and corrected the `rank_key`
+  docstring to describe `sort_items`' actual ordering.
+
 ## [0.57.0] - 2026-07-02
 
 **Supervisor hardening**: the external supervisor gains the safety controls that make real,

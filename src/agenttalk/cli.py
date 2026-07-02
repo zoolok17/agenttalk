@@ -3131,6 +3131,21 @@ def _resolve_disposition_actor(store: Store, args: argparse.Namespace) -> str | 
     return who if (sole is not None and who == sole) else None
 
 
+def _attention_input_warnings(problems: list, no_liaison: bool) -> list[dict]:
+    """The degraded-input warning envelope, shared by the queue view and --stats so a
+    stats read can never look complete while its inputs are partial (a torn disposition
+    log) or the needs_operator source is skipped (no liaison)."""
+    warnings: list[dict] = []
+    if problems:
+        warnings.append({"disposition_log": f"{len(problems)} torn/invalid line(s)"})
+    if no_liaison:
+        warnings.append(
+            {"no_liaison": "no operator-facing liaison or sole lead is configured; "
+                           "needs_operator escalations are not shown - pass --for <agent>. "
+                           "Dispositions require an authorized liaison/sole-lead."})
+    return warnings
+
+
 def cmd_attention(args: argparse.Namespace) -> int:
     """Operator attention queue: a derived, ranked, deduped read-only view over existing
     signals, plus operator dispositions. Creates no work objects and mutates nothing except
@@ -3151,24 +3166,29 @@ def cmd_attention(args: argparse.Namespace) -> int:
     no_liaison = for_agent is None
     items = _collect_attention_items(store, for_agent=for_agent, roster=roster)
     disps, problems = A.read_dispositions(store)
+    input_warnings = _attention_input_warnings(problems, no_liaison)
+    if getattr(args, "stats", False):
+        stats = A.compute_stats(items, disps, now_iso=_attn_now_iso())
+        if getattr(args, "json", False):
+            print(json.dumps({"stats": stats, "warnings": input_warnings, "for": for_agent},
+                             ensure_ascii=False, indent=2))
+        else:
+            _print_attention_stats(stats, for_agent, input_warnings)
+        return 0
     all_flag = getattr(args, "all", False)
     q = A.build_queue(items, disps, now_iso=_attn_now_iso(),
                       include_deferred=all_flag or getattr(args, "include_deferred", False),
                       include_dismissed=all_flag or getattr(args, "include_dismissed", False),
                       include_resolved=all_flag or getattr(args, "include_resolved", False))
-    if problems:
-        q.setdefault("warnings", []).append(
-            {"disposition_log": f"{len(problems)} torn/invalid line(s)"})
-    if no_liaison:
-        q.setdefault("warnings", []).append(
-            {"no_liaison": "no operator-facing liaison or sole lead is configured; "
-                           "needs_operator escalations are not shown - pass --for <agent>. "
-                           "Dispositions require an authorized liaison/sole-lead."})
+    for w in input_warnings:
+        q.setdefault("warnings", []).append(w)
     rows = q["items"]
     if sub == "show":
         rows = [it for it in rows if it["item_id"] == getattr(args, "item", None)]
         if not rows:
-            sys.stderr.write(f"agenttalk attention show: no active item {getattr(args, 'item', None)!r}\n")
+            sys.stderr.write(f"agenttalk attention show: no item {getattr(args, 'item', None)!r} "
+                             "in view (a deferred/dismissed/resolved item needs --all or the "
+                             "matching --include-* flag).\n")
             return 1
     if getattr(args, "source", None):
         rows = [it for it in rows if it["source"] == args.source]
@@ -3179,6 +3199,23 @@ def cmd_attention(args: argparse.Namespace) -> int:
         return 0
     _print_attention(rows, q["summary"], for_agent, q.get("warnings") or [])
     return 0
+
+
+def _print_attention_stats(stats: dict, for_agent: str | None,
+                           warnings: list | None = None) -> None:
+    print(f"attention stats for {for_agent or '(no liaison configured)'}")
+    print(f"  surfaced active: {stats.get('surfaced_active', 0)}")
+    for src, n in (stats.get("active_by_source") or {}).items():
+        print(f"    {src:<15} {n}")
+    disp = stats.get("dispositioned") or {}
+    print(f"  dispositioned: deferred={disp.get('deferred', 0)} "
+          f"dismissed={disp.get('dismissed', 0)} resolved={disp.get('resolved', 0)} "
+          f"answered_elsewhere={disp.get('answered_elsewhere', 0)}")
+    dwell = stats.get("oldest_active_age_seconds") or 0
+    print(f"  oldest active dwell: {dwell}s")
+    for w in warnings or []:
+        for msg in (w.values() if isinstance(w, dict) else [w]):
+            print(f"  ! {msg}")
 
 
 def _print_attention(rows: list[dict], summary: dict, for_agent: str | None,
@@ -6532,6 +6569,12 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             print(f"  {m.get('agent')}/{m.get('message_id')}  from={m.get('from')} "
                   f"kind={m.get('kind')} attempts={m.get('attempts')} "
                   f"class={m.get('class')} reason={(m.get('last_reason') or '')[:60]}")
+        # A `requeue` re-injects a FRESH copy but PRESERVES the original here, so a handled
+        # dead-letter keeps showing until you `resolve` it. We deliberately do NOT auto-quiet
+        # (that could hide a real unhandled poison) - we point at the flow instead (fable-max #2).
+        if not show_resolved:
+            print("  tip: `requeue` leaves the original listed; run `agenttalk dead-letter "
+                  "resolve --agent A --id ID --reason ...` once handled to quiet it.")
         return 0
     if action == "show":
         if not (getattr(args, "agent", None) and getattr(args, "id", None)):
@@ -7628,7 +7671,7 @@ def build_parser() -> argparse.ArgumentParser:
     pesc.add_argument("--priority", choices=["low", "normal", "high", "urgent"],
                       help="Operator priority.")
     pesc.add_argument("--needed-by", dest="needed_by",
-                      help="ISO-8601 date or timezone-bearing datetime.")
+                      help="ISO-8601 date or datetime (a naive datetime is treated as UTC).")
     pesc.add_argument("--affected", action="append",
                       help="An affected ref e.g. agent:beta / request:esc-.. (repeatable).")
     pesc.set_defaults(func=cmd_escalate)
@@ -7651,13 +7694,22 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Show active + deferred + dismissed + resolved.")
     pattn.add_argument("--source", help="Filter to one source (e.g. needs_operator).")
     pattn.add_argument("--limit", type=int, help="Show at most N items.")
+    pattn.add_argument("--stats", action="store_true",
+                       help="Show derived counts (surfaced/dispositioned/dwell) instead of the "
+                            "item list. Content-blind, no new state.")
     pattn.set_defaults(func=cmd_attention, attn_cmd=None)
     attn_sub = pattn.add_subparsers(dest="attn_cmd")
 
-    a_show = attn_sub.add_parser("show", help="Show one item by id.")
+    a_show = attn_sub.add_parser("show", help="Show one item by id (incl. dispositioned).")
     a_show.add_argument("--item", required=True, help="item_id")
     a_show.add_argument("--for", dest="for_agent")
     a_show.add_argument("--json", action="store_true")
+    # mirror the main view so a DISPOSITIONED item is auditable by id (fable-max #1)
+    a_show.add_argument("--include-deferred", action="store_true", dest="include_deferred")
+    a_show.add_argument("--include-dismissed", action="store_true", dest="include_dismissed")
+    a_show.add_argument("--include-resolved", action="store_true", dest="include_resolved")
+    a_show.add_argument("--all", action="store_true",
+                        help="Look across active + deferred + dismissed + resolved.")
     a_show.set_defaults(func=cmd_attention, attn_cmd="show")
 
     def _disp_parser(name: str, *, until: bool = False, evidence: bool = False):

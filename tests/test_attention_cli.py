@@ -103,6 +103,88 @@ def test_attention_defer_rejects_malformed_until(tmp_path: Path) -> None:
     assert valid == []                     # nothing persisted
 
 
+def test_attention_show_deferred_item_by_id(tmp_path: Path) -> None:
+    # fable-max #1: a DISPOSITIONED item must be auditable via `show --item` + an include flag.
+    import io
+    from contextlib import redirect_stdout
+    _team(tmp_path)
+    rid = _escalate(tmp_path, decision="ship or hold?")
+    item = f"needs_operator:{rid}"
+    assert cli.main([*_root(tmp_path), "attention", "defer", "--from", "claude",
+                     "--item", item, "--until", "2099-01-01T00:00:00Z", "--reason", "later"]) == 0
+    # default show cannot see the deferred item
+    assert cli.main([*_root(tmp_path), "attention", "show", "--item", item]) == 1
+    # --include-deferred (and --all) make it auditable by id
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli.main([*_root(tmp_path), "attention", "show", "--item", item,
+                       "--include-deferred", "--json"])
+    assert rc == 0
+    import json as _json
+    q = _json.loads(buf.getvalue())
+    assert len(q["items"]) == 1 and q["items"][0]["state"] == "deferred"
+    assert cli.main([*_root(tmp_path), "attention", "show", "--item", item, "--all"]) == 0
+
+
+def test_attention_stats_view(tmp_path: Path) -> None:
+    # north-star CLI: --stats reports derived counts (surfaced + dispositioned) as JSON.
+    import io
+    from contextlib import redirect_stdout
+    _team(tmp_path)
+    r1 = _escalate(tmp_path, decision="a")
+    _escalate(tmp_path, decision="b")           # a second active escalation
+    # defer one -> dispositioned; the other stays active
+    assert cli.main([*_root(tmp_path), "attention", "defer", "--from", "claude",
+                     "--item", f"needs_operator:{r1}", "--until", "2099-01-01T00:00:00Z",
+                     "--reason", "later"]) == 0
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli.main([*_root(tmp_path), "attention", "--stats", "--json"])
+    assert rc == 0
+    import json as _json
+    s = _json.loads(buf.getvalue())["stats"]
+    assert s["surfaced_active"] == 1                       # r2 active (r1 deferred)
+    assert s["active_by_source"].get("needs_operator") == 1
+    assert s["dispositioned"]["deferred"] == 1
+
+
+def test_attention_stats_surfaces_torn_disposition_warning(tmp_path: Path) -> None:
+    # F8 (reviewer-1): --stats must carry the SAME degraded-input warnings as the queue view,
+    # so a torn disposition log can never make a stats read look complete.
+    import io
+    import json as _json
+    from contextlib import redirect_stdout
+    from agenttalk import attention as A
+    s = _team(tmp_path)
+    dp = A.dispositions_path(s)                             # append a torn/invalid line
+    dp.parent.mkdir(parents=True, exist_ok=True)
+    dp.write_text("{not valid json\n", encoding="utf-8")
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli.main([*_root(tmp_path), "attention", "--stats", "--json"])
+    assert rc == 0
+    out = _json.loads(buf.getvalue())
+    assert any("disposition_log" in w for w in out.get("warnings", []))
+
+
+def test_attention_stats_surfaces_no_liaison_warning(tmp_path: Path) -> None:
+    # F8 (reviewer-1): --stats carries the no_liaison warning too (parity with the queue view),
+    # so counts never look complete while the needs_operator source is being skipped.
+    import io
+    import json as _json
+    from contextlib import redirect_stdout
+    s = Store(tmp_path)
+    s.init(["beta", "claude"])                              # no roles -> no liaison / no sole-lead
+    assert s.operator_facing() is None and s.sole_lead() is None
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli.main([*_root(tmp_path), "attention", "--stats", "--json"])
+    assert rc == 0
+    out = _json.loads(buf.getvalue())
+    assert out["for"] is None
+    assert any("no_liaison" in w for w in out.get("warnings", []))
+
+
 def test_attention_dismiss_forbidden_for_needs_operator(tmp_path: Path) -> None:
     _team(tmp_path)
     rid = _escalate(tmp_path, decision="d")

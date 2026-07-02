@@ -74,7 +74,7 @@ a prerequisite.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.57.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.57.1"
 agenttalk install-skills          # installs bus skills + the dev-discipline devkit
 
 # in your project root, once per project
@@ -179,7 +179,7 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.57.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.57.1"
 ```
 
 Pin to a specific tag so you control upgrades. Replace `v0.37.0` with
@@ -957,7 +957,14 @@ config-blocked holds, dead letters, gate/close HOLDs, and unarmed
 lead-loops. It **derives** the view from cheap state reads — it creates no
 work object and adds no message kind — so a degraded source becomes a
 bounded warning row rather than blanking the queue, and the default path
-does no `git`/lane recompute.
+does no `git`/lane recompute. `agenttalk attention --stats` (add `--json`
+for machine output) reports derived counts — what surfaced active by source,
+what has been dispositioned, and the oldest active dwell — so you can see what
+the queue is routing. It adds no reads beyond the attention-queue collector and
+does not inspect message-body content (the collector validates message
+envelopes; the counts derive only from the collected item metadata). The stats
+view carries the same degraded-input warnings as the queue (a torn disposition
+log or a missing liaison), so a partial read never looks complete.
 
 **Escalations can carry typed decision fields.** `agenttalk escalate`
 takes `--decision`, `--why`, `--option` (repeatable), `--recommendation`,
@@ -987,6 +994,16 @@ out-of-band, **preserving** the payload and dropping it from the default
 central disposition log is authoritative (a best-effort `.resolved.json`
 sidecar aids copied sinks); `dead-letter requeue --force-resolved --reason`
 reopens a resolved item, audited.
+
+`requeue` and `resolve` are complementary, not the same: **`requeue`
+re-injects a fresh copy** (new id, own fresh attempt count) so the work gets
+another try, but it **preserves the original in the sink** — so a
+requeued-but-not-resolved dead letter *keeps showing* in `dead-letter list`,
+`doctor`, and the attention queue. That is deliberate: we never auto-quiet a
+poison message (it could hide a real unhandled failure). Once you have
+actually handled it, run `dead-letter resolve --reason …` to quiet it.
+Typical flow: `list` → `show` (inspect) → `requeue` (retry) → `resolve`
+(when done).
 
 Dispositions live append-only in `.agenttalk/attention/dispositions.jsonl`
 (latest-valid per item + action-family, fsync under the store lock,
