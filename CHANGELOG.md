@@ -5,6 +5,37 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.55.1] - 2026-07-02
+
+Follow-up to 0.55.0: observability for the supervised-Codex launch path, plus a
+test de-flake. Advisory only — no supervisor planner/executor/classifier behavior
+changes.
+
+### Added
+
+- **Doctor L4 visibility for supervised Codex launches.** A new advisory
+  `supervised_codex` check resolves each configured Codex agent's launch (base CLI
+  + pinned interpreter) and runs timeout-bounded, exception-safe probes against an
+  env that mirrors the *actual* launch — per-agent `agent.env` overlaid on the
+  managed pins, with case-insensitive collision detection on the critical launch
+  keys (`AGENTTALK_PY`/`CODEX_HOME`/`PYTHONPATH`/`AGENTTALK_ROOT`), matching the
+  Windows PowerShell launcher. It reports OK only when the env mirror is genuinely
+  full and every required probe passes; a drifted/broken override or a failed probe
+  is `WARN` (never a false OK, never a silent `None`). A separate read-only
+  `config_blocked_holds` check surfaces parked agents with remediation. Advisory
+  (OK/WARN only, no ERROR).
+
+### Fixed
+
+- **Doctor no longer crashes on a corrupt `supervisor.json`.** A valid-JSON but
+  non-dict config (a top-level array/string/number) previously raised through
+  `doctor.run()` and lost every other check; it now degrades cleanly. Malformed
+  per-agent `env` shapes are likewise handled without crashing.
+- **Deterministic composing-wait regression test.**
+  `test_scoped_wait_composing_extends_when_cursor_exceeds_baseline` now drives a
+  fake clock instead of real sleeps, removing a Windows CI flake while still
+  failing if the `scan_since = min(floor, baseline)` guard regresses.
+
 ## [0.55.0] - 2026-07-02
 
 Wrapped-Codex now works out-of-the-box on Windows. This release closes a whole
