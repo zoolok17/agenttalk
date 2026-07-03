@@ -116,6 +116,38 @@ _WRAPPED_CODEX_MIN_STUCK_AFTER = 600.0
 # truth, imported in _plan_one so the two layers can never drift).
 _WATCHDOG_STUCK_AFTER_MARGIN = 300.0
 
+_WINDOW_STYLE_DEFAULT = "Hidden"
+_WINDOW_STYLES = {
+    "hidden": "Hidden",
+    "minimized": "Minimized",
+    "normal": "Normal",
+}
+
+
+def resolve_window_style(config: dict, cfg_agent: dict) -> tuple[str, str | None]:
+    """Resolve the supervised Windows launch style.
+
+    Per-agent ``window_style`` wins over the global setting. Invalid values are
+    rejected visibly by returning a warning and falling back to Hidden, which is
+    the least-clutter default for unattended fleets.
+    """
+    config = config if isinstance(config, dict) else {}
+    cfg_agent = cfg_agent if isinstance(cfg_agent, dict) else {}
+    for source_name, src in (("per-agent", cfg_agent), ("global", config)):
+        if "window_style" not in src:
+            continue
+        raw = src.get("window_style")
+        if isinstance(raw, str):
+            normalized = raw.strip().lower()
+            if normalized in _WINDOW_STYLES:
+                return _WINDOW_STYLES[normalized], None
+        return (
+            _WINDOW_STYLE_DEFAULT,
+            f"invalid {source_name} window_style={raw!r}; expected hidden|minimized|normal; "
+            "defaulting to hidden",
+        )
+    return _WINDOW_STYLE_DEFAULT, None
+
 
 def resolve_stuck_after(config: dict, cfg_agent: dict) -> float:
     """The per-agent heartbeat-stale threshold (PURE). An explicit per-agent
@@ -882,6 +914,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     codex_home_isolation = bool(_lcfg.get("codex_home_isolation", False))
     windows_sandbox = _lcfg.get("windows_sandbox", "unelevated")  # UAC fix (codex)
     perm_mode = claude_permission_mode(config, cfg_agent)  # Claude unattended mode
+    window_style, window_style_warning = resolve_window_style(config, cfg_agent)
 
     protected = bool(rpt.get("protected"))
     # build_report computes heartbeat_stale per-agent when it is given the
@@ -987,6 +1020,8 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                "discover_brain": bool(discover_brain),
                "codex_home_isolation": codex_home_isolation,
                "windows_sandbox": windows_sandbox, "perm_mode": perm_mode,
+               "window_style": window_style,
+               "window_style_warning": window_style_warning,
                "reason": reason, "cli": None, "launch_mode": None,
                "resume_mode": None, "session_id": None, "session_args": None,
                "health": _health_brief(health),
@@ -1497,6 +1532,9 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
         review_request_id=msg.id,
     )
     spec = eph.launch_spec(marker, profile, agent)
+    window_style, warning = resolve_window_style(config, profile)
+    spec["window_style"] = window_style
+    spec["window_style_warning"] = warning
     spec["review_request_msg_id"] = msg.id
     return spec
 
@@ -1573,6 +1611,8 @@ CONFIG_TEMPLATE = """\
   "stuck_after_seconds": 120,
   "suspect_warn_interval_seconds": 300,
   "launch_grace_seconds": 120,
+  "window_style": "hidden",
+  "_comment_window_style": "Windows launch window style for supervised agents: hidden (default), minimized, or normal. Per-agent entries and ephemeral allowed_profiles may override it. hidden also tells wrapped agents to create their per-turn CLI child with no visible console.",
   "max_readiness_retries": 3,
   "_comment_max_readiness_retries": "After this many relaunches of an agent that NEVER reaches readiness (no first heartbeat - e.g. a manual resume that does not re-enter the listen loop), the supervisor STOPS relaunching and surfaces READINESS_GAVE_UP (warn/notify, no kill) instead of churning forever. Reset by a fresh heartbeat or an operator restart/clear. A WRAPPED agent avoids this class entirely (the wrapper owns the heartbeat regardless of the model prompt) - prefer wrapped for hands-off supervision.",
   "claude_permission_mode": "bypassPermissions",
@@ -2000,6 +2040,8 @@ function Launch($name, $plan, $codexHome) {
   if (-not $file -or $file -like 'REPLACE:*') {
     Write-Warning "supervisor: agent '$name' has no real launch.windows_file (the agent EXECUTABLE) - fill supervisor.json"; return $null
   }
+  $windowStyle = if ($plan.window_style) { [string]$plan.window_style } else { 'Hidden' }
+  if ($plan.window_style_warning) { Write-Warning ("supervisor: {0}: {1}" -f $name, $plan.window_style_warning) }
   # Build the argument array by splicing the session tokens into windows_args
   # wherever the literal '{SESSION_ARGS}' element appears. Array-element splice
   # (NOT string interpolation): each token is exactly one argument and nothing
@@ -2023,6 +2065,7 @@ function Launch($name, $plan, $codexHome) {
   $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }
   if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }  # per-agent isolated home
+  if ($windowStyle -eq 'Hidden') { $applied['AGENTTALK_NO_CHILD_WINDOW'] = '1' }
   if ($a.env) { foreach ($k in $a.env.PSObject.Properties.Name) { $applied[$k] = $a.env.$k } }
   foreach ($k in $applied.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item -Path ("Env:" + $k) -Value $applied[$k] }
   try {
@@ -2032,9 +2075,9 @@ function Launch($name, $plan, $codexHome) {
     # the Start-Process handoff (so a path/arg WITH SPACES survives as one arg).
     if (@($argv).Count -gt 0) {
       $argline = (@($argv) | ForEach-Object { Quote-Arg ([string]$_) }) -join ' '
-      $proc = Start-Process -FilePath $file -ArgumentList $argline -WorkingDirectory $cwd -PassThru
+      $proc = Start-Process -FilePath $file -ArgumentList $argline -WorkingDirectory $cwd -WindowStyle $windowStyle -PassThru
     } else {
-      $proc = Start-Process -FilePath $file -WorkingDirectory $cwd -PassThru
+      $proc = Start-Process -FilePath $file -WorkingDirectory $cwd -WindowStyle $windowStyle -PassThru
     }
   } finally {
     foreach ($k in $saved.Keys) {
@@ -2052,20 +2095,23 @@ function Launch-Spec($name, $spec, $codexHome) {
   if (-not $file -or $file -like 'REPLACE:*') {
     Write-Warning "supervisor: ephemeral '$name' has no real launch.windows_file - fill supervisor.json ephemeral_reviewers.allowed_profiles"; return $null
   }
+  $windowStyle = if ($spec.window_style) { [string]$spec.window_style } else { 'Hidden' }
+  if ($spec.window_style_warning) { Write-Warning ("supervisor: ephemeral {0}: {1}" -f $name, $spec.window_style_warning) }
   $argv = @($spec.launch.windows_args)
   $saved = @{}
   $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }
   if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
   if ($codexHome) { $applied['CODEX_HOME'] = $codexHome }
+  if ($windowStyle -eq 'Hidden') { $applied['AGENTTALK_NO_CHILD_WINDOW'] = '1' }
   if ($spec.env) { foreach ($k in $spec.env.PSObject.Properties.Name) { $applied[$k] = $spec.env.$k } }
   foreach ($k in $applied.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item -Path ("Env:" + $k) -Value $applied[$k] }
   try {
     $cwd = if ($spec.cwd) { $spec.cwd } else { $Root }
     if (@($argv).Count -gt 0) {
       $argline = (@($argv) | ForEach-Object { Quote-Arg ([string]$_) }) -join ' '
-      $proc = Start-Process -FilePath $file -ArgumentList $argline -WorkingDirectory $cwd -PassThru
+      $proc = Start-Process -FilePath $file -ArgumentList $argline -WorkingDirectory $cwd -WindowStyle $windowStyle -PassThru
     } else {
-      $proc = Start-Process -FilePath $file -WorkingDirectory $cwd -PassThru
+      $proc = Start-Process -FilePath $file -WorkingDirectory $cwd -WindowStyle $windowStyle -PassThru
     }
   } finally {
     foreach ($k in $saved.Keys) {

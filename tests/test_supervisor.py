@@ -626,6 +626,14 @@ def test_ps_template_applies_and_restores_env() -> None:
     assert "-ArgumentList $argv" not in ps
 
 
+def test_ps_template_applies_resolved_window_style_to_all_launches() -> None:
+    ps = sup.PS_TEMPLATE
+    assert ps.count("-WindowStyle $windowStyle") == 4
+    assert "$windowStyle = if ($plan.window_style)" in ps
+    assert "$windowStyle = if ($spec.window_style)" in ps
+    assert "AGENTTALK_NO_CHILD_WINDOW" in ps
+
+
 def test_ps_template_uses_utc_epoch_for_now() -> None:
     """The `--now` epoch passed to `supervise --plan` MUST be UTC: heartbeats are
     stamped in UTC and the plan compares now-vs-heartbeat for staleness. On
@@ -999,6 +1007,42 @@ def test_claude_permission_mode_resolution() -> None:
     assert sup.claude_permission_mode({"claude_permission_mode": "plan"}, {}) == "plan"  # top
     assert sup.claude_permission_mode({"claude_permission_mode": "plan"},
                                       {"claude_permission_mode": "dontAsk"}) == "dontAsk"  # per-agent wins
+
+
+def test_window_style_resolution_default_global_agent_and_invalid() -> None:
+    assert sup.resolve_window_style({}, {}) == ("Hidden", None)
+    assert sup.resolve_window_style({"window_style": "normal"}, {}) == ("Normal", None)
+    assert sup.resolve_window_style(
+        {"window_style": "normal"}, {"window_style": "minimized"}) == ("Minimized", None)
+
+    style, warning = sup.resolve_window_style(
+        {"window_style": "normal"}, {"window_style": "maximized"})
+    assert style == "Hidden"
+    assert warning is not None and "invalid per-agent window_style" in warning
+    assert "defaulting to hidden" in warning
+
+
+def test_plan_carries_resolved_window_style_and_visible_warning() -> None:
+    cfg = {
+        "window_style": "normal",
+        "agents": {"worker": {"auto_restart": True, "activity_hook": True,
+                              "cli": "codex", "window_style": "minimized"}},
+    }
+    p = _plan(_report(heartbeat_stale=True),
+              {"agents": {"worker": _ready(backoff_next_epoch=0)}},
+              config=cfg)
+    assert p["action"] == sup.STUCK_RECOVER
+    assert p["window_style"] == "Minimized"
+    assert p["window_style_warning"] is None
+
+    bad_cfg = {"window_style": "sideways",
+               "agents": {"worker": {"auto_restart": True, "activity_hook": True,
+                                      "cli": "codex"}}}
+    p_bad = _plan(_report(heartbeat_stale=True),
+                  {"agents": {"worker": _ready(backoff_next_epoch=0)}},
+                  config=bad_cfg)
+    assert p_bad["window_style"] == "Hidden"
+    assert "invalid global window_style" in p_bad["window_style_warning"]
 
 
 def test_seed_codex_config_cli_overlays_in_place(tmp_path: Path) -> None:

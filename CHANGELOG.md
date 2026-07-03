@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Supervisor Windows launches now default to hidden windows.** `supervisor.json`
+  accepts `window_style` globally and per agent/profile (`hidden`, `minimized`,
+  `normal`; per-agent/profile wins). Invalid values default to `hidden` with a
+  supervisor warning. The generated PowerShell passes `-WindowStyle` on every
+  managed launch path, and hidden wrapped agents set a wrapper marker so the
+  per-turn CLI child is spawned with Windows `CREATE_NO_WINDOW` instead of
+  opening its own console.
+
 ## [0.58.4] - 2026-07-03
 
 ### Added

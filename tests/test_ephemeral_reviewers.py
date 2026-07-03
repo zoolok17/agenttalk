@@ -166,6 +166,19 @@ def test_prepare_rosters_unique_identity_sends_request_and_completion_retires(tm
     assert agent in s.retired_agents()
 
 
+def test_prepare_launch_request_resolves_ephemeral_window_style(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    s.write_launch_request(_marker("lr-style"))
+    cfg = _cfg()
+    cfg["window_style"] = "normal"
+    cfg["ephemeral_reviewers"]["allowed_profiles"]["codex-evidence-reviewer"]["window_style"] = "minimized"
+
+    spec = sup.prepare_launch_request(s, {}, cfg, "lr-style", now_epoch=NOW)
+
+    assert spec["window_style"] == "Minimized"
+    assert spec["window_style_warning"] is None
+
+
 def test_cli_archive_launch_request_preserves_completion_evidence(tmp_path: Path) -> None:
     s = _store(tmp_path)
     agent = "adversary-lr-cli-archive"

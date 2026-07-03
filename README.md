@@ -1065,6 +1065,14 @@ agenttalk supervise --install-activity-hook  # (manual-listen agents) unlock stu
 agenttalk request-restart --for codex-dev  # bounce an agent on demand (resumes its session)
 ```
 
+On Windows, supervised agents launch hidden by default to keep unattended fleets
+from opening a console per agent. Set top-level `"window_style": "minimized"` or
+`"normal"` in `.agenttalk/supervisor.json` to change the default, or set
+`window_style` inside an agent block (or ephemeral reviewer profile) to override
+one agent. Valid values are `hidden`, `minimized`, and `normal`; invalid values
+fall back to `hidden` with a supervisor warning. For wrapped agents, hidden mode
+also tells the wrapper to spawn its CLI child without a visible console.
+
 An agent becomes stuck-recoverable in one of two ways: a normal
 `/agenttalk.listen` agent **with the activity hook installed**, or an
 agent run **through the progress wrapper**. Until an agent can confirm

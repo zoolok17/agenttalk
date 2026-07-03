@@ -49,6 +49,7 @@ _ADAPTERS: dict[str, Callable[[object], list[Event]]] = {
 # escalate. Claude's leak (tool-call markup as assistant text) is the cataloged
 # high-confidence signature -> escalation-enabled.
 _TELEMETRY_ONLY = {"codex": True, "claude": False}
+_NO_CHILD_WINDOW_ENV = "AGENTTALK_NO_CHILD_WINDOW"
 
 # Known GLOBAL/INFRA signatures in a terminal turn-failure error message. A terminal
 # turn.failed / is_error carrying one of these is an OUTAGE (overload, rate-limit, 5xx,
@@ -422,6 +423,34 @@ def _child_env(workspace_root: str | os.PathLike[str] | None = None) -> dict[str
     env["AGENTTALK_PY"] = _agenttalk_py()
     env["AGENTTALK_ROOT"] = str(workspace)
     return env
+
+
+def _child_creationflags(
+    env: dict[str, str] | None = None,
+    *,
+    is_windows: bool | None = None,
+    create_no_window: int | None = None,
+) -> int:
+    """Windows creation flags for wrapper-spawned CLI children.
+
+    The supervisor uses ``Start-Process -WindowStyle Hidden`` for the wrapper
+    process and sets ``AGENTTALK_NO_CHILD_WINDOW=1`` so the wrapper's own Popen
+    child cannot create a visible console.
+    """
+    if is_windows is None:
+        is_windows = os.name == "nt"
+    if not is_windows:
+        return 0
+    marker = (env or os.environ).get(_NO_CHILD_WINDOW_ENV)
+    if str(marker or "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return 0
+    flag = create_no_window if create_no_window is not None else getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return int(flag or 0)
+
+
+def _child_window_kwargs(env: dict[str, str] | None = None) -> dict[str, int]:
+    flags = _child_creationflags(env)
+    return {"creationflags": flags} if flags else {}
 
 
 def _workspace_root() -> Path:
@@ -1106,9 +1135,11 @@ def run_wrapper(
     # Strip the lead-loop owner-bypass token from the child env here too (parity with
     # _ProcStream), so "the model child never sees the token" holds on EVERY spawn path,
     # not only the loop path (defense-in-depth + comment accuracy).
+    child_env = _child_env()
     proc = subprocess.Popen(  # noqa: S603  # nosec B603
         argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        encoding="utf-8", errors="replace", bufsize=1, env=_child_env(),
+        encoding="utf-8", errors="replace", bufsize=1, env=child_env,
+        **_child_window_kwargs(child_env),
     )
     try:
         if health_writer is not None:
@@ -1152,10 +1183,11 @@ class _ProcStream:
         # an accidental model-side `agenttalk drain` bypass the single-consumer guard.
         # Always stripped (harmless for non-lead-loop children; defense-in-depth even
         # if a future parent sets it). The child otherwise inherits the parent env.
+        child_env = _child_env()
         self._proc = subprocess.Popen(  # noqa: S603  # nosec B603
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-            bufsize=1, env=_child_env(),
+            bufsize=1, env=child_env, **_child_window_kwargs(child_env),
         )
         # Record the per-turn root start-time right after spawn (~ the OS-reported create
         # time, within spawn jitter) so the watchdog can start-time-guard the kill against

@@ -570,6 +570,74 @@ def test_child_env_stamps_pin_root_and_strips_lease(tmp_path, monkeypatch) -> No
     assert "AGENTTALK_LEAD_LOOP_LEASE" not in env
 
 
+def test_child_creationflags_set_no_window_only_for_hidden_windows() -> None:
+    flag = 0x08000000
+    assert run._child_creationflags(
+        {run._NO_CHILD_WINDOW_ENV: "1"},
+        is_windows=True,
+        create_no_window=flag,
+    ) == flag
+    assert run._child_creationflags(
+        {run._NO_CHILD_WINDOW_ENV: "true"},
+        is_windows=True,
+        create_no_window=flag,
+    ) == flag
+    assert run._child_creationflags(
+        {run._NO_CHILD_WINDOW_ENV: "0"},
+        is_windows=True,
+        create_no_window=flag,
+    ) == 0
+    assert run._child_creationflags(
+        {run._NO_CHILD_WINDOW_ENV: "1"},
+        is_windows=False,
+        create_no_window=flag,
+    ) == 0
+
+
+def test_hidden_wrapper_spawn_paths_pass_creationflags(monkeypatch) -> None:
+    monkeypatch.setenv(run._NO_CHILD_WINDOW_ENV, "1")
+    calls: list[dict] = []
+
+    class _Stdin:
+        def write(self, text):
+            _ = text
+
+        def close(self):
+            pass
+
+    class _Stdout:
+        def __iter__(self):
+            return iter(())
+
+        def close(self):
+            pass
+
+    class _Popen:
+        def __init__(self, argv, **kwargs):
+            calls.append({"argv": argv, **kwargs})
+            self.stdin = _Stdin()
+            self.stdout = _Stdout()
+            self.pid = 123
+
+        def poll(self):
+            return None
+
+        def wait(self):
+            return 0
+
+    def fake_window_kwargs(env):
+        assert env[run._NO_CHILD_WINDOW_ENV] == "1"
+        return {"creationflags": 99}
+
+    monkeypatch.setattr(run, "_child_window_kwargs", fake_window_kwargs)
+    monkeypatch.setattr(run.subprocess, "Popen", _Popen)
+
+    run.run_wrapper(cli="codex", agent="beta", argv=["codex"], store=None, render=False)
+    run._ProcStream(["codex"], "prompt")
+
+    assert [c["creationflags"] for c in calls] == [99, 99]
+
+
 def test_launch_preflight_resolves_known_npm_codex_shim_and_blocks_unknown(
     tmp_path,
 ) -> None:

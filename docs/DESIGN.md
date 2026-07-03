@@ -200,7 +200,11 @@ two parallel ownership concepts.
 - **Supervisor (`supervisor.py`):** generates a PowerShell monitor that launches/
   relaunches agents and watches **heartbeat staleness** for liveness (not fragile
   PID/brain discovery). Protected agents (all leads + the liaison) are never
-  auto-killed. Restart-with-context via `request-restart`.
+  auto-killed. Restart-with-context via `request-restart`. Windows launches default
+  to `window_style=hidden` (global setting, per-agent/profile override) so a
+  supervised fleet does not cover the operator's desktop; hidden wrapped agents
+  also pass a no-child-window marker into the wrapper so its CLI child uses
+  Windows `CREATE_NO_WINDOW`.
 - **Wrapper (`wrapper/`):** `agenttalk wrap` runs an agent's listen loop *for* it
   (`loop.py`), giving visibility, a working-turn heartbeat, degraded-output
   detection (`degraded.py`), and session continuity (`session.py`; codex
