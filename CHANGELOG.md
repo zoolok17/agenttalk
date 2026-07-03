@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.58.4] - 2026-07-03
+
 ### Added
 
 - **Bounded in-turn work heartbeat (wrapped-Claude false-STUCK fix).** During a long
