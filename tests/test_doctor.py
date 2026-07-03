@@ -875,7 +875,7 @@ def test_doctor_supervised_codex_errors_on_runtime_preflight_blocker(tmp_path: P
         s, runner=_wrapped_codex_runner, runtime_checker=runtime_checker)
     assert seen["root"] == s.root                       # passed store.root
     assert chk.status == "error"                        # launch-blocking, not warn
-    assert "agenttalk runtime preflight FAILED" in chk.details
+    assert "agenttalk-runtime-preflight-FAILED" in chk.details
     assert blocker in chk.details
     assert chk.fix == blocker
     assert chk.data["agenttalk_runtime"] == blocker

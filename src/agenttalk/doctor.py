@@ -1340,7 +1340,7 @@ def _check_supervised_codex(store: Store, *, runner=None, runtime_checker=None) 
             return Check(
                 name="supervised_codex",
                 status="error",
-                details=("agenttalk runtime preflight FAILED: " + str(blocker)
+                details=("agenttalk-runtime-preflight-FAILED: " + str(blocker)
                          + (f" | {details}" if details else "")),
                 fix=str(blocker),
                 data={"codex": entries, "agenttalk_runtime": blocker},
