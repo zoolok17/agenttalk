@@ -110,6 +110,11 @@ def test_api_status_returns_json(tmp_path: Path) -> None:
         assert payload["agents"] == ["alpha", "beta"]
         assert payload["invalid_messages"] == []
         assert "agenttalk_version" in payload
+        # 0.58.x (P2): per-agent health is keyed by the exact roster, and the
+        # signing-key inspection is surfaced as hmac_key.
+        assert "agent_health" in payload
+        assert set(payload["agent_health"]) == set(payload["agents"])
+        assert "hmac_key" in payload
     finally:
         srv.shutdown()
         srv.server_close()
@@ -1244,7 +1249,7 @@ def test_api_state_additive_keys_no_removal(tmp_path: Path) -> None:
         # every pre-0.19.0 root key still present
         for k in ("label", "path", "project_id", "errors", "signing_enforced",
                   "epoch", "counts", "agents", "retired", "threads",
-                  "broadcasts"):
+                  "broadcasts", "recent"):
             assert k in root, k
         # additive
         assert "edges" in root
@@ -1649,6 +1654,169 @@ def test_api_thread_rejects_traversal_rid(tmp_path: Path) -> None:
         with pytest.raises(urllib.error.HTTPError) as exc:
             _urlopen(f"{base}/api/thread/..%2F..%2Fetc%2Fpasswd", timeout=5)
         assert exc.value.code == 404
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_thread_excludes_forged_and_out_of_roster(tmp_path: Path) -> None:
+    """§4b (P1): /api/thread applies the SAME validation surface as /api/state —
+    roster + kind (+ HMAC when enforced). A forged out-of-roster message and an
+    unknown-kind message that both carry the thread's request_id must NEVER enter
+    the transcript, even though they share the rid."""
+    s = _make_store(tmp_path)
+    s.send(sender="alpha", recipient="beta", kind="review-request",
+           subject="review X", body="LEGIT_THREAD_BODY_TOKEN",
+           meta={"request_id": "rid-x"})
+    # Forged out-of-roster sender AND unknown kind — both tagged with the rid.
+    _hand_write_message(s, {
+        "id": "20990101-000000-000001-FRGx", "ts": "2099-01-01T00:00:00Z",
+        "from": "mallory", "to": "beta", "kind": "message",
+        "subject": "", "body": "FORGED_ROSTER_BODY_TOKEN",
+        "meta": {"request_id": "rid-x"},
+    })
+    _hand_write_message(s, {
+        "id": "20990101-000000-000002-UNKx", "ts": "2099-01-01T00:00:00Z",
+        "from": "alpha", "to": "beta", "kind": "execute-now",
+        "subject": "", "body": "UNKNOWN_KIND_BODY_TOKEN",
+        "meta": {"request_id": "rid-x"},
+    })
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/api/thread/rid-x") as resp:
+            assert resp.status == 200
+            payload = json.loads(resp.read())
+        ids = [m["id"] for m in payload["messages"]]
+        assert len(ids) == 1  # only the legit review-request
+        assert "20990101-000000-000001-FRGx" not in ids
+        assert "20990101-000000-000002-UNKx" not in ids
+        dumped = json.dumps(payload)
+        assert "LEGIT_THREAD_BODY_TOKEN" in dumped
+        assert "FORGED_ROSTER_BODY_TOKEN" not in dumped
+        assert "UNKNOWN_KIND_BODY_TOKEN" not in dumped
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_thread_excludes_unsigned_when_hmac_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§4b (P1, HMAC variant): with signing enforced, an unsigned message
+    carrying the thread's rid must NOT enter the transcript. Mirrors
+    test_invalid_signature_body_not_rendered on the /api/thread surface."""
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(tmp_path / "k.key"))
+    s = _make_store(tmp_path)
+    signing.init_key(s.project_id())
+    s.send(sender="alpha", recipient="beta", kind="review-request",
+           subject="review X", body="SIGNED_THREAD_BODY_TOKEN",
+           meta={"request_id": "rid-x"})
+    _hand_write_message(s, {
+        "id": "20990101-000000-000003-UNSx", "ts": "2099-01-01T00:00:00Z",
+        "from": "alpha", "to": "beta", "kind": "message",
+        "subject": "", "body": "UNSIGNED_THREAD_BODY_TOKEN",
+        "meta": {"request_id": "rid-x"},
+    })
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/api/thread/rid-x") as resp:
+            payload = json.loads(resp.read())
+        ids = [m["id"] for m in payload["messages"]]
+        assert "20990101-000000-000003-UNSx" not in ids
+        dumped = json.dumps(payload)
+        assert "SIGNED_THREAD_BODY_TOKEN" in dumped
+        assert "UNSIGNED_THREAD_BODY_TOKEN" not in dumped
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_recent_feed(tmp_path: Path) -> None:
+    """0.58.0 (P1): root.recent is the last _RECENT_LIMIT (25) messages,
+    ENVELOPE-ONLY (no body), most-recent-first (ids descending)."""
+    s = _make_store(tmp_path)
+    for i in range(30):
+        s.send(sender="alpha", recipient="beta",
+               subject=f"subj-{i:02d}", body=f"RECENT_BODY_TOKEN_{i:02d}")
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        recent = root["recent"]
+        assert len(recent) == 25
+        ids = [r["id"] for r in recent]
+        assert ids == sorted(ids, reverse=True)  # most-recent-first
+        for r in recent:
+            assert set(r) == {"id", "ts", "from", "to", "kind", "subject"}
+            assert "body" not in r
+        assert "RECENT_BODY_TOKEN" not in json.dumps(recent)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_verdict_latest_wins(tmp_path: Path) -> None:
+    """0.58.0 §3b: the thread verdict is the LATEST decision on the rid; a
+    proposal-response verdict is emitted only for an allowlisted status."""
+    s = _make_store(tmp_path)
+    # review-results: latest-wins (approved then changes_requested).
+    s.send(sender="alpha", recipient="beta", kind="review-request",
+           subject="r", body="please review", meta={"request_id": "rid-v"})
+    s.send(sender="beta", recipient="alpha", kind="review-result",
+           subject="v1", body="ok", meta={"request_id": "rid-v", "status": "approved"})
+    s.send(sender="beta", recipient="alpha", kind="review-result",
+           subject="v2", body="wait", meta={"request_id": "rid-v",
+                                            "status": "changes_requested"})
+    # proposal-response: allowlisted status accepted -> verdict; unknown -> omit.
+    s.send(sender="alpha", recipient="beta", kind="proposal",
+           subject="p", body="do X", meta={"request_id": "rid-p"})
+    s.send(sender="beta", recipient="alpha", kind="proposal-response",
+           subject="pr", body="sure", meta={"request_id": "rid-p", "status": "accepted"})
+    s.send(sender="alpha", recipient="beta", kind="proposal",
+           subject="p2", body="do Y", meta={"request_id": "rid-q"})
+    s.send(sender="beta", recipient="alpha", kind="proposal-response",
+           subject="pr2", body="hmm", meta={"request_id": "rid-q", "status": "maybe"})
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        by_rid = {t["request_id"]: t for t in root["threads"]}
+        assert by_rid["rid-v"]["verdict"] == "changes_requested"
+        assert by_rid["rid-p"]["verdict"] == "accepted"
+        assert "verdict" not in by_rid["rid-q"]  # unknown status -> omitted
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_wrapper_one_shot_is_wrapped(tmp_path: Path) -> None:
+    """0.58.x (P3): a 'wrapper-one-shot' health mode must count as wrapped
+    (and therefore restartable), not fall through to omitted."""
+    s = _make_store(tmp_path)
+    s.write_heartbeat("alpha")
+    _write_health(s, "alpha", _hm.STATE_WORKING_TURN,
+                  cli="claude", mode="wrapper-one-shot")
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        assert alpha["wrapped"] is True
+        assert alpha["restartable"] is True
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_thread_carries_opener(tmp_path: Path) -> None:
+    """0.58.x (P1): a thread row carries its two fixed endpoints — opener and
+    opener_peer — perspective-independent envelope-safe agent names."""
+    s = _make_store(tmp_path)
+    s.send(sender="alpha", recipient="beta", kind="review-request",
+           subject="review X", body="please review", meta={"request_id": "rid-o"})
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        (row,) = root["threads"]
+        assert row["opener"] == "alpha"
+        assert row["opener_peer"] == "beta"
     finally:
         srv.shutdown()
         srv.server_close()

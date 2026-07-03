@@ -679,8 +679,11 @@ def _thread_verdict(m: Message) -> str | None:
     """The decision a single message carries, or None (§3b). SAFE: reads only
     the envelope kind + ``meta.status`` — never the body. A ``review-result``
     forwards its status verbatim; a ``proposal-response`` only when the status
-    is one of the known proposal outcomes; a ``gate`` marker maps to its status
-    or a bare "gate". Anything else carries no verdict."""
+    is one of the known proposal outcomes. Anything else carries no verdict.
+
+    Gate verdicts are NOT thread messages: "gate" is not a bus message kind, so
+    gate HOLDs never reach here. They surface via /api/attention (file-based),
+    not thread transcripts."""
     kind = m.kind
     status = (m.meta or {}).get("status")
     status = status if isinstance(status, str) and status else None
@@ -688,8 +691,6 @@ def _thread_verdict(m: Message) -> str | None:
         return status  # e.g. "approved" / "changes_requested" — verbatim envelope
     if kind == "proposal-response":
         return status if status in ("accepted", "rejected", "countered") else None
-    if kind == "gate":
-        return status or "gate"
     return None
 
 
@@ -776,6 +777,14 @@ def _derive_root_threads(
             d["mission"] = ometa["mission"]
         if isinstance(ometa.get("wp_id"), str):
             d["wp_id"] = ometa["wp_id"]
+        # 0.58.x (P1): the thread's two fixed endpoints, perspective-independent
+        # (the client renders "a ⇄ b" + the active-review graph edge from them).
+        # Both are envelope-safe agent-name strings, absent-not-null.
+        if opener is not None:
+            d["opener"] = opener.sender
+            peer = opener.recipient
+            if isinstance(peer, str) and peer and peer != opener.sender:
+                d["opener_peer"] = peer
         if "epoch_at_send" in ometa:
             # forwarded EXACTLY as stored: the 0.16.0 three-state
             # (absent / null / id) must survive serialization.
@@ -863,14 +872,18 @@ def _map_confidence(eff: str) -> str:
 def _is_wrapped(health: dict) -> bool | None:
     """True when the agent is determinably wrapped/supervised (§3a): the health
     snapshot's ``mode`` names a wrapped loop. Omit (None) when unknown — an
-    `unknown` health view carries no mode we can trust."""
+    `unknown` health view carries no mode we can trust.
+
+    Wrapped modes: anything starting with ``wrapper`` (``wrapper-loop`` /
+    ``wrapper-one-shot``) or the exact ``lead-loop``. ``manual``/``listen`` are
+    explicitly unwrapped."""
     if not isinstance(health, dict):
         return None
     mode = health.get("mode")
     if not isinstance(mode, str) or not mode:
         return None
     m = mode.lower()
-    if "wrapped" in m or "loop" in m:
+    if m.startswith("wrapper") or m == "lead-loop":
         return True
     if "manual" in m or "listen" in m:
         return False
@@ -1408,9 +1421,12 @@ def _thread_meta_line(meta: dict) -> str:
     for key in _META_LINE_WHITELIST:
         v = meta.get(key)
         if isinstance(v, str) and v.strip():
-            parts.append(f"{key}={v.strip()}" if key == "status" else f"{key} {v.strip()}")
+            # Belt-and-braces (§4a): coerce to a single line + hard cap so no
+            # multi-line/multi-paragraph value can ride a whitelisted field.
+            sv = _envelope_str(v)
+            parts.append(f"{key}={sv}" if key == "status" else f"{key} {sv}")
         elif isinstance(v, (int, float, bool)):
-            parts.append(f"{key}={v}")
+            parts.append(f"{key}={_envelope_str(v)}")
     return " · ".join(parts)
 
 

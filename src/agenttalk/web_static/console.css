@@ -1191,6 +1191,8 @@ body {
 .tc-timeline-seg.status-rate_limited_or_outage { background: var(--danger); }
 .tc-timeline-seg.status-degraded_output { background: var(--danger); }
 .tc-timeline-seg.status-crashed_or_exited { background: var(--chip-neutral); }
+.tc-timeline-seg.status-errored_recoverable { background: var(--attn); }
+.tc-timeline-seg.status-errored_fatal { background: var(--danger); }
 .tc-timeline-seg.status-unknown { background: var(--gray); }
 .tc-timeline-legend { display: flex; gap: 16px; flex-wrap: wrap; }
 .tc-timeline-legend-item { display: flex; align-items: center; gap: 6px; }

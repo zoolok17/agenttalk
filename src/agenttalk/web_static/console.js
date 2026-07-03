@@ -166,6 +166,21 @@
     return { label: v, cls: 'tstatus-neutral' };
   }
 
+  // The status chip for a thread row. Show a chip ONLY when the thread carries a
+  // real verdict (§3b), or — for a broadcast with an audience — a synthesized
+  // "x/y replied" label. A raw FSM state (e.g. "open-outbound") is NEVER a
+  // verdict, so there is no fallback to t.state.
+  function threadChip(t) {
+    if (!t) return null;
+    if (t.verdict) return verdictInfo(t.verdict);
+    var audience = t.audience || [];
+    if (t.is_broadcast && audience.length) {
+      var responded = (t.responded || []).length;
+      return { label: responded + '/' + audience.length + ' replied', cls: 'tstatus-replied' };
+    }
+    return null;
+  }
+
   // Meter threshold color: <60 ok / 60-84 warn / >=85 danger (§7). Returns the
   // .tc-meter-fill state class; caller applies the 2% minimum width. The CSS has
   // no gray meter, so an unknown/None value renders as .is-ok (empty, min-width).
@@ -705,11 +720,13 @@
     main.appendChild(body);
   }
 
-  // Compute node positions on the circle (angle -90 + i*36 deg).
+  // Compute node positions on the circle. Step is count-derived so any team
+  // size lays out evenly (a 10-agent team is still exactly 36 deg).
   function nodePositions(agents) {
     var pos = {};
+    var step = agents.length ? 360 / agents.length : 36;
     for (var i = 0; i < agents.length; i++) {
-      var ang = (-90 + i * 36) * Math.PI / 180;
+      var ang = (-90 + i * step) * Math.PI / 180;
       pos[agents[i].name] = {
         x: Math.round(GRAPH_CX + GRAPH_R * Math.cos(ang)),
         y: Math.round(GRAPH_CY + GRAPH_R * Math.sin(ang)),
@@ -719,20 +736,18 @@
   }
 
   // Which agent pairs have an active_review thread connecting them (dashed edge).
+  // A thread's two fixed endpoints are `opener` and `opener_peer` (perspective-
+  // independent); mark the pair hot only when BOTH are present.
   function activeReviewPairs(root) {
     var pairs = {};
     var threads = root.threads || [];
     for (var i = 0; i < threads.length; i++) {
       var t = threads[i];
       if (!t.active_review) continue;
-      var a = t.opener, b = t.next_owner;
-      // next_owner may be an array (broadcast) — pair the opener with each.
-      var others = isArray(b) ? b : [b];
-      for (var j = 0; j < others.length; j++) {
-        if (a && others[j]) {
-          pairs[a + '|' + others[j]] = true;
-          pairs[others[j] + '|' + a] = true;
-        }
+      var a = t.opener, b = t.opener_peer;
+      if (a && b) {
+        pairs[a + '|' + b] = true;
+        pairs[b + '|' + a] = true;
       }
     }
     return pairs;
@@ -791,7 +806,7 @@
     var top = el('div', 'tc-thread-row-head');
     top.appendChild(kindChip(t.opener_kind || t.kind));
     top.appendChild(el('span', 'tc-spacer'));
-    var vi = verdictInfo(t.verdict) || verdictInfo(t.state);
+    var vi = threadChip(t);
     if (vi) top.appendChild(el('span', 'tc-chip ' + vi.cls, vi.label));
     row.appendChild(top);
     row.appendChild(el('div', 'tc-thread-subject', t.subject || t.request_id || ''));
@@ -803,12 +818,11 @@
     on(row, 'click', function () { openThread(t.request_id); });
     return row;
   }
+  // "a ⇄ b" from the thread's two fixed endpoints. opener_peer may be absent
+  // (single-party / broadcast) — then show just the opener, never a blank side.
   function threadParts(t) {
     var a = t.opener || '';
-    var b = t.next_owner;
-    if (isArray(b)) b = b.join(', ');
-    if (!b || b === '—') return a;
-    return a + ' ⇄ ' + b;
+    return a + (t.opener_peer ? ' ⇄ ' + t.opener_peer : '');
   }
 
   // ------------------------------------------------------------ VIEW 3: attention
@@ -939,7 +953,7 @@
     var top = el('div', 'tc-session-row-head');
     top.appendChild(kindChip(t.opener_kind || t.kind));
     top.appendChild(el('span', 'tc-spacer'));
-    var vi = verdictInfo(t.verdict) || verdictInfo(t.state);
+    var vi = threadChip(t);
     if (vi) top.appendChild(el('span', 'tc-chip ' + vi.cls, vi.label));
     row.appendChild(top);
     row.appendChild(el('div', 'tc-session-subject', t.subject || t.request_id || ''));
@@ -978,7 +992,7 @@
     head.appendChild(hbox);
     // Verdict chip from the matching thread, if we have it.
     var t = findThreadMeta(rid);
-    var vi = t ? (verdictInfo(t.verdict) || verdictInfo(t.state)) : null;
+    var vi = threadChip(t);
     if (vi) head.appendChild(el('span', 'tc-chip ' + vi.cls, vi.label));
     card.appendChild(head);
 
@@ -1295,14 +1309,10 @@
       if (!best) best = t;   // threads are newest-first on the wire
     }
     if (!best) return null;
-    var peer = null;
-    if (best.opener === name) {
-      var o = best.next_owner;
-      peer = isArray(o) ? o.join(', ') : o;
-    } else {
-      peer = best.opener;
-    }
-    if (peer === '—') peer = null;
+    // The peer is the OTHER of the thread's two fixed endpoints. Falls back to
+    // omitting the tag (falsy) when there is no distinct peer.
+    var peer = (name === best.opener) ? best.opener_peer : best.opener;
+    if (!peer) peer = null;
     return { mission: best.mission, wp_id: best.wp_id, peer: peer };
   }
 
