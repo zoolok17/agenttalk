@@ -6056,7 +6056,8 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     k_poison: int = 3, k_escalate: int = 20,
                     lead_loop: bool = False,
                     supervisor_config: dict | None = None,
-                    turn_watchdog: object | None = None) -> int:
+                    turn_watchdog: object | None = None,
+                    work_heartbeat: object | None = None) -> int:
     """The long-running supervised wrapper loop (design C): own the idle bus-wait +
     heartbeat, drive the CLI ONE turn per inbound message in structured-stream mode
     (session continuity owned here), then return to the wait. Runs until killed -
@@ -6151,6 +6152,12 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             persist=lambda st: wsession.save_session(store, agent, st),
             turn_watchdog=turn_watchdog,
             health_writer=health_writer,
+            work_heartbeat=work_heartbeat,
+            # the lead-loop combined stamp raises _LeadLoopLeaseLost on a lost lease:
+            # the ticker treats it as TYPED loss (permanent stop for the turn, status
+            # lost_lease, never a bus heartbeat without the lease), while the
+            # pre_commit gate remains the consume-boundary authority.
+            lease_lost_exceptions=(_LeadLoopLeaseLost,) if lead_loop else (),
         )
     except ValueError as e:
         _release()
@@ -6195,7 +6202,9 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         cadence_drive = wrapper_run.make_cadence_drive(
             store, agent, cli, state, base_argv, sender=sender,
             min_interval=min_interval, render=render, heartbeat=heartbeat,
-            persist=lambda st: wsession.save_session(store, agent, st))
+            persist=lambda st: wsession.save_session(store, agent, st),
+            work_heartbeat=work_heartbeat,
+            lease_lost_exceptions=(_LeadLoopLeaseLost,))
         cadence_health = _cadence_health_notifier(store, agent)
 
         def _cadence() -> "wloop.CadenceResult":
@@ -6414,13 +6423,40 @@ def cmd_wrap(args: argparse.Namespace) -> int:
                 f"{_twd.SAFE_TURN_ELAPSED_FLOOR:.0f}s floor; set allow_low_turn_elapsed=true "
                 f"to opt in. Disabling the turn watchdog for this run.\n")
             watchdog_cfg = dataclasses.replace(watchdog_cfg, enabled=False)
+        # Bounded in-turn work heartbeat (wrapped-Claude false-STUCK fix). Default-ON
+        # only for wrapped CLAUDE continuous loop + managed lead-loop; codex and
+        # one-shot default-OFF (no codex stuck_after / watchdog-preemption change).
+        # An ENABLED-but-invalid config FAILS VISIBLY through the launch config-blocked
+        # path (durable hold + escalation, no silent coercion, no churn).
+        from agenttalk.wrapper import work_heartbeat as _whb
+        whb_mode = (
+            "lead-loop" if lead_loop else
+            "wrapper-one-shot" if args.one_shot else
+            "wrapper-loop"
+        )
+        whb_cfg = _whb.resolve_work_heartbeat(
+            sup_cfg, cfg_agent, cli=args.cli, mode=whb_mode)
+        if whb_cfg.enabled:
+            problems = list(whb_cfg.config_errors)
+            violation = _whb.interval_violation(
+                whb_cfg, stuck_after_seconds=_sup.resolve_stuck_after(sup_cfg, cfg_agent))
+            if violation:
+                problems.append(violation)
+            if problems:
+                summary = ("invalid work_heartbeat config (never silently coerced): "
+                           + "; ".join(problems))
+                sys.stderr.write(f"agenttalk wrap: {summary}\n")
+                return _handle_launch_config_blocked(
+                    store, agent, args.cli, mode=whb_mode,
+                    min_interval=args.min_interval, summary=summary)
         return _wrap_loop_mode(store, agent, cli=args.cli, base_argv=argv,
                                sender=sender, min_interval=args.min_interval,
                                render=not args.no_render,
                                one_shot_request_id=args.to_request if args.one_shot else None,
                                k_poison=k_poison, k_escalate=k_escalate,
                                lead_loop=lead_loop, supervisor_config=sup_cfg,
-                               turn_watchdog=watchdog_cfg)
+                               turn_watchdog=watchdog_cfg,
+                               work_heartbeat=whb_cfg)
     try:
         return wrapper_run.run_wrapper(
             cli=args.cli, agent=agent, argv=argv, store=store, sender=sender,

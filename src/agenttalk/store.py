@@ -2536,6 +2536,38 @@ class Store:
         except OSError:
             pass
 
+    # ------------------------------------------------ work-heartbeat diagnostics
+
+    def work_heartbeat_status_path(self, agent: str) -> Path:
+        return self.state_dir / "work-heartbeat" / f"{validate_agent_name(agent)}.json"
+
+    def write_work_heartbeat_status(self, agent: str, status: dict) -> None:
+        """Best-effort DIAGNOSTICS record of the in-turn work-heartbeat ticker
+        (disabled/active/stopped reason + stamp/error counts). NOT a supervisor
+        input in v1 - doctor/status may read it to explain why a long silent turn
+        went stale. Never raises (a diagnostics write must not fail a turn); lives
+        in state_dir so ``reset`` clears it with the other liveness state."""
+        try:
+            p = self.work_heartbeat_status_path(agent)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(p, json.dumps(status, ensure_ascii=False))
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def read_work_heartbeat_status(self, agent: str) -> dict | None:
+        """The last work-heartbeat diagnostics record, or None if absent/corrupt."""
+        try:
+            p = self.work_heartbeat_status_path(agent)
+        except ValueError:
+            return None
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else None
+        except (OSError, ValueError):
+            return None
+
     # ------------------------------------------------------ wrapper health
 
     def health_path(self, agent: str) -> Path:

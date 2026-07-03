@@ -1101,6 +1101,30 @@ streams through reasoning → 180s; wrapped Codex is item-level and silent
 during pure reasoning → 900s+); see the tutorial for the threshold
 guidance and the guardrails.
 
+**Bounded work heartbeat (wrapped Claude).** Streaming progress is not
+the only legitimate quiet: a long non-streaming stretch (a big tool call,
+a slow API turn) stamps nothing, and a wrapped Claude could be falsely
+stuck-recovered mid-turn at its tight 180s threshold. The wrapper
+therefore runs a small **bounded ticker** during each turn: it stamps the
+same supervisor heartbeat every `interval_seconds` (default 30) while the
+per-turn child process is alive, but only up to `max_turn_seconds`
+(default 900) — past that cap only real progress refreshes liveness, so a
+genuinely hung silent turn is still recovered at
+`max_turn_seconds + stuck_after_seconds`, never masked forever. A failed
+turn still ends with **no** fresh heartbeat (the ticker is stopped, with
+in-flight stamps synchronized, before the failure-path clear). Default-ON
+for wrapped Claude (`wrap --loop`, `--lead-loop`); default-OFF for
+wrapped Codex (its long thresholds and turn-watchdog math are unchanged)
+and for `--one-shot`. Configure per agent (or globally) in
+`supervisor.json`: `"work_heartbeat": {"enabled": true,
+"interval_seconds": 30, "max_turn_seconds": 900}`. Guards fail visibly
+at launch (config-blocked hold) — a non-positive/non-numeric value, or an
+interval above `min(60, stuck_after/3)` without
+`allow_high_interval=true`, is refused, never silently coerced. A
+best-effort diagnostics record lands in
+`state/work-heartbeat/<agent>.json` for doctor/status forensics; the
+supervisor does not read it.
+
 Protected agents — the operator-facing liaison and every active
 `role=lead` — are **never auto-killed** (warn/note only), and a manual
 `request-restart` of one needs `--force-protected`.

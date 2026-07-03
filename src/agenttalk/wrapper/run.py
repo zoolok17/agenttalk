@@ -1138,7 +1138,10 @@ class _ProcStream:
     def __init__(self, argv: list[str], stdin_text: str | None, *,
                  watchdog: "TurnWatchdogConfig | None" = None,
                  watchdog_snapshot_fn=None, watchdog_kill_fn=None,
-                 watchdog_clock=time.monotonic, watchdog_wall_clock=time.time) -> None:
+                 watchdog_clock=time.monotonic, watchdog_wall_clock=time.time,
+                 work_heartbeat=None, work_heartbeat_stamp=None,
+                 work_heartbeat_status=None,
+                 lease_lost_exceptions: tuple = ()) -> None:
         # argv is the operator-provided launch command; never shell=True.
         # Explicit encoding/errors (see run_wrapper): UTF-8 child output must not be
         # decoded as cp1252 on Windows (crash on the first non-ASCII byte), and a
@@ -1174,11 +1177,37 @@ class _ProcStream:
                 snapshot_fn=watchdog_snapshot_fn, kill_fn=watchdog_kill_fn,
                 clock=watchdog_clock, wall_clock=watchdog_wall_clock)
             self._watchdog.start()
+        # Bounded in-turn work heartbeat (wrapped-Claude false-STUCK fix): stamps the
+        # supervisor heartbeat while THIS child is alive, capped at max_turn_seconds.
+        # Started LAST (after stdin close, before stdout iteration) so a constructor
+        # failure never leaks a live ticker. A structured result lands on
+        # .work_heartbeat_result once the stream is exhausted.
+        self.work_heartbeat_result: dict | None = None
+        self._work_hb = None
+        if (work_heartbeat is not None and work_heartbeat_stamp is not None):
+            from .work_heartbeat import WorkHeartbeatTicker, work_heartbeat_effectively_live
+            if work_heartbeat_effectively_live(work_heartbeat):
+                self._work_hb = WorkHeartbeatTicker(
+                    cfg=work_heartbeat, stamp=work_heartbeat_stamp,
+                    child_alive=lambda: self._proc.poll() is None,
+                    lease_lost_exceptions=lease_lost_exceptions,
+                    on_status=work_heartbeat_status)
+                self._work_hb.start()
 
     def __iter__(self) -> Iterator[str]:
         try:
             yield from (self._proc.stdout or [])
         finally:
+            # Stop the work-heartbeat ticker FIRST - before this stream reads as
+            # exhausted to the caller - so drive()'s failed-turn clear_heartbeat
+            # (which runs after stream exhaustion) can never be overwritten by a
+            # late tick: stop() synchronizes with any in-flight stamp under the
+            # ticker's lock (hard no-stamp-after-stop), so even a thread that
+            # outlives the bounded join below cannot stamp again.
+            if self._work_hb is not None:
+                self._work_hb.stop()
+                self._work_hb.join(timeout=10.0)
+                self.work_heartbeat_result = dict(self._work_hb.result)
             if self._proc.stdout:
                 self._proc.stdout.close()
             self.returncode = self._proc.wait()
@@ -1201,7 +1230,9 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                persist: Callable[[object], None] | None = None,
                turn_watchdog: "TurnWatchdogConfig | None" = None,
                watchdog_snapshot_fn=None, watchdog_kill_fn=None,
-               health_writer: WrapperHealthWriter | None = None) -> Callable[[dict], object]:
+               health_writer: WrapperHealthWriter | None = None,
+               work_heartbeat=None,
+               lease_lost_exceptions: tuple = ()) -> Callable[[dict], object]:
     """Build the per-turn ``drive(record)`` callback for loop.run_loop. Each call
     drives ONE real CLI turn and returns a :class:`loop.DriveOutcome` (ok + a failure
     CLASS on failure, for dead-letter). A turn fails if it produced no progress event or
@@ -1277,12 +1308,27 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
     if spawn is not None:
         spawner = spawn                     # tests inject their own (argv, stdin) spawner
     else:
+        # The work-heartbeat ticker stamps the SAME callable as the progress/success
+        # paths (the lead-loop's injected renew-then-stamp included, so the lease is
+        # never outlived by a bus heartbeat) and persists a best-effort diagnostics
+        # record - NOT a supervisor input in v1.
+        _whb_stamp = (heartbeat if heartbeat is not None
+                      else (lambda: store.write_heartbeat(agent)))
+
+        def _whb_status(status: dict) -> None:
+            store.write_work_heartbeat_status(agent, status)
+
         def spawner(argv, stdin_text):
             # Bind the per-turn watchdog onto the real spawner. When turn_watchdog is None
             # or disabled, _ProcStream starts no thread (zero overhead, behavior unchanged).
+            # Same for a disabled/invalid work_heartbeat config.
             return _ProcStream(argv, stdin_text, watchdog=turn_watchdog,
                                watchdog_snapshot_fn=watchdog_snapshot_fn,
-                               watchdog_kill_fn=watchdog_kill_fn)
+                               watchdog_kill_fn=watchdog_kill_fn,
+                               work_heartbeat=work_heartbeat,
+                               work_heartbeat_stamp=_whb_stamp,
+                               work_heartbeat_status=_whb_status,
+                               lease_lost_exceptions=lease_lost_exceptions)
     preflight = agenttalk_preflight
     if preflight is None and cli == "codex" and spawn is None:
         preflight = preflight_agenttalk_runtime
@@ -1546,6 +1592,8 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                        agenttalk_preflight: Callable[[], str | None] | None = None,
                        heartbeat: Callable[[], None] | None = None,
                        persist: Callable[[object], None] | None = None,
+                       work_heartbeat=None,
+                       lease_lost_exceptions: tuple = (),
                        ) -> Callable[[dict, list], bool]:
     """Build the SYNTHETIC cadence-turn drive for the managed lead-loop controller (WP3).
 
@@ -1579,7 +1627,23 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
         on_info=_default_info,
         min_interval=min_interval,
     )
-    spawner = spawn or _ProcStream
+    if spawn is not None:
+        spawner = spawn
+    else:
+        # Cadence turns are the lead-loop controller's OWN quiet turns: the same
+        # bounded work-heartbeat applies (same stamp, same diagnostics record).
+        _whb_stamp = (heartbeat if heartbeat is not None
+                      else (lambda: store.write_heartbeat(agent)))
+
+        def _whb_status(status: dict) -> None:
+            store.write_work_heartbeat_status(agent, status)
+
+        def spawner(argv, stdin_text):
+            return _ProcStream(argv, stdin_text,
+                               work_heartbeat=work_heartbeat,
+                               work_heartbeat_stamp=_whb_stamp,
+                               work_heartbeat_status=_whb_status,
+                               lease_lost_exceptions=lease_lost_exceptions)
     preflight = agenttalk_preflight
     if preflight is None and cli == "codex" and spawn is None:
         preflight = preflight_agenttalk_runtime

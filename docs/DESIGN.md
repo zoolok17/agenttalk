@@ -409,6 +409,31 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   *v1 scope:* no bulk/group dispositions; dedupe is display-only; capacity/close-hold rows
   are wired fail-safe but surface only on a cheap threshold-tripped read.
 
+- **D-17 In-turn liveness is a BOUNDED work-heartbeat ticker, never an unbounded one —
+  and it does not write health.** *Why:* during a long non-streaming turn the wrapper's
+  idle heartbeat is blocked and the framework heartbeat stamps only on streaming progress,
+  so a wrapped Claude (stuck_after=180s) could be false-STUCK_RECOVERed mid-turn during
+  legitimate >180s silent work. `wrapper/work_heartbeat.py` stamps the SAME supervisor
+  heartbeat (the lead-loop's combined renew-then-stamp included) while the per-turn child
+  is alive, but only until `max_turn_seconds` (default 900s for wrapped Claude) — past the
+  cap only real progress refreshes liveness and the supervisor's stale recovery applies, so
+  the worst-case silent-hang recovery is `max_turn_seconds + stuck_after_seconds`, never
+  masked forever. **Semantics change (deliberate, bounded):** with the ticker live, a fresh
+  in-turn heartbeat means "wrapper + child alive", not "turn observably progressing"; a
+  wedged stream reader with a live child is masked only until the cap. The ticker does NOT
+  refresh health: the planner's health-delays-recovery branch would otherwise stretch the
+  true recovery bound past the documented cap+stale. HARD invariant: one lock guards stamp
+  execution and stop state — `stop()` synchronizes with any in-flight stamp before drive()'s
+  failed-turn `clear_heartbeat`, so a failed turn can never end with a fresh ticker stamp.
+  *Rejected:* enabling for wrapped Codex / changing codex `stuck_after` or the
+  watchdog-preemption math in the same release (a coupled two-knob safety change; the
+  supervisor would be trusting a config-says-live ticker without runtime evidence — the
+  0.58.2 drift class); a supervisor-visible effectively-live predicate as a planner input in
+  v1 (diagnostics only); one-shot default-ON (the ephemeral lifecycle is
+  deadline/completion/process-liveness driven — no stale-heartbeat consumer, so ticker
+  writes would be dead liveness). *Honest limit:* enabled-config vs running-ticker drift is
+  surfaced only via the diagnostics status record, not enforced, in v1.
+
 ## 6. How we work (process)
 
 - **Per-phase cadence:** architect designs → lead gates the design → builder

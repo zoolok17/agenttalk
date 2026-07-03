@@ -5,6 +5,31 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Bounded in-turn work heartbeat (wrapped-Claude false-STUCK fix).** During a long
+  non-streaming turn the idle heartbeat is blocked and the framework heartbeat stamps only
+  on streaming progress, so a wrapped Claude (`stuck_after_seconds=180`) could be falsely
+  STUCK_RECOVERed mid-turn during legitimate >180s silent work. A new wrapper-side ticker
+  (`agenttalk.wrapper.work_heartbeat`) stamps the same supervisor heartbeat while the
+  per-turn child is alive — immediate first stamp, then every `interval_seconds` (default
+  30) — bounded by `max_turn_seconds` (default 900): past the cap only real progress
+  refreshes liveness, so a genuinely hung silent turn is still recovered at
+  `max_turn_seconds + stuck_after_seconds`. Default-ON for wrapped **Claude** continuous
+  loop + managed lead-loop; **default-OFF for wrapped Codex** (its 2400s threshold and
+  watchdog-preemption math are unchanged) and for one-shot (the ephemeral lifecycle has no
+  stale-heartbeat consumer). Config: `work_heartbeat: { enabled, interval_seconds,
+  max_turn_seconds, allow_high_interval }` in `supervisor.json` (per-agent block wins over
+  global). Guards fail visibly (launch config-blocked path), never silently coerce: an
+  enabled config with a non-numeric/non-positive value, or an interval above
+  `min(60, stuck_after/3)` without `allow_high_interval=true`, refuses the launch. A failed
+  turn still ends with NO fresh heartbeat (the ticker stops, synchronized against in-flight
+  stamps, before the failure-path clear). The ticker never writes health and never kills
+  anything; a best-effort diagnostics record lands in `state/work-heartbeat/<agent>.json`
+  (not a supervisor input).
+
 ## [0.58.3] - 2026-07-03
 
 ### Fixed
