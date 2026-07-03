@@ -5,6 +5,19 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.58.3] - 2026-07-03
+
+### Fixed
+
+- **Packaging: the wheel is installable again.** v0.58.0–v0.58.2 could not be
+  `pip install`ed from a tag — the wheel build failed with *"A second file is being added
+  to the wheel archive at the same path: `agenttalk/web_static/console.css`"*. The Team
+  Console's static assets live under the packaged `src/agenttalk/` dir (so they already ship
+  as package data), and a redundant `force-include` in `pyproject.toml` added them a second
+  time. Removed the `force-include`; the assets still ship, verified by an actual wheel build
+  + install. (CI ran pytest + bandit but not a wheel build, which is why this slipped through
+  three releases — a wheel-build gate is being added to CI.)
+
 ## [0.58.2] - 2026-07-03
 
 ### Fixed

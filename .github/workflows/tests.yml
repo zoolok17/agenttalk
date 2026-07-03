@@ -28,3 +28,31 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest -q
+
+  build:
+    name: wheel builds and installs (packaging gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip build
+      # Build sdist + wheel. Fails fast on packaging breaks like a force-include
+      # double-adding a package-data path (the v0.58.0-0.58.2 install regression).
+      - run: python -m build
+      # Install the built wheel (NOT editable) so the real packaged layout is exercised.
+      - run: python -m pip install dist/*.whl
+      # The Team Console's served static assets must ship in the installed wheel.
+      - name: wheel ships the console static assets
+        run: |
+          python - <<'PY'
+          import importlib.resources as r
+          import agenttalk
+          base = r.files("agenttalk") / "web_static"
+          assert (base / "console.css").is_file(), "console.css missing from installed wheel"
+          assert (base / "console.js").is_file(), "console.js missing from installed wheel"
+          print("wheel ok:", agenttalk.__version__)
+          PY
