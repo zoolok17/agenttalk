@@ -3522,6 +3522,338 @@ class Store:
                 return False
             return True
 
+    # ------------------------------------------- dashboard intent queue (0.59.0)
+    #
+    # The web console can ONLY append a typed intent envelope here (architecture
+    # C, docs/DASHBOARD-CONTROL-PLANE-ROADMAP.md): `state/intents/active/<id>.json`
+    # holds queued/claimed/recent-terminal intents (reset-CLEARED - a queued
+    # intent references current-session state, so firing it into a fresh session
+    # would be wrong), while `.agenttalk/control-audit/intents/` holds the
+    # rotated TERMINAL audit records (reset-PRESERVED, like the dead-letter
+    # sink). The EXECUTOR (`supervise --drain-intents`) is the authorization
+    # boundary: it re-resolves the acting identity server-side and never trusts
+    # origin/browser claims. write_intent is the only web-reachable mutation;
+    # claim / attempt / terminal transitions are executor-only, under
+    # `_config_lock` (the launch-request marker discipline).
+
+    INTENT_QUEUED = "queued"
+    INTENT_CLAIMED = "claimed"
+    INTENT_APPLIED = "applied"
+    INTENT_DENIED = "denied"
+    INTENT_FAILED = "failed"
+    INTENT_TERMINAL_STATES = frozenset({"applied", "denied", "failed"})
+    # Persistent flood caps (roadmap: send/broadcast is the cheap-to-flood
+    # surface). Refuse NEW intents (no write) once the active dir holds this
+    # many files / bytes; the web layer maps the refusal to 429/507.
+    INTENT_MAX_ACTIVE = 1000
+    INTENT_MAX_ACTIVE_BYTES = 10 * 1024 * 1024
+    # Terminal-audit retention (control-audit/intents): rotate_intents keeps at
+    # most this window/size, oldest terminal records dropped first.
+    INTENT_AUDIT_MAX_AGE_SECONDS = 7 * 24 * 3600.0
+    INTENT_AUDIT_MAX_BYTES = 50 * 1024 * 1024
+
+    @property
+    def intents_active_dir(self) -> Path:
+        return self.state_dir / "intents" / "active"
+
+    @property
+    def control_audit_dir(self) -> Path:
+        """Top-level reset-PRESERVED control-plane audit sink."""
+        return self.dir / "control-audit"
+
+    def _intent_path(self, intent_id: str) -> Path:
+        from agenttalk import ephemeral as _eph
+        if not _eph.is_safe_id(intent_id):
+            raise ValueError(f"unsafe intent id {intent_id!r}")
+        return self.intents_active_dir / f"{intent_id}.json"
+
+    class IntentCapacityError(RuntimeError):
+        """Active intent dir is at its flood cap - nothing was written."""
+
+        def __init__(self, message: str, *, code: str) -> None:
+            super().__init__(message)
+            self.code = code
+
+    def _intent_active_usage(self) -> tuple[int, int]:
+        d = self.intents_active_dir
+        if not d.is_dir():
+            return 0, 0
+        n = size = 0
+        for p in d.iterdir():
+            if p.suffix != ".json":
+                continue
+            n += 1
+            try:
+                size += p.stat().st_size
+            except OSError:
+                continue
+        return n, size
+
+    def write_intent(self, kind: str, payload: dict, *,
+                     origin: dict | None = None) -> dict:
+        """Append ONE queued intent envelope (the only web-tier mutation).
+
+        Validates the typed schema fail-closed (unknown kind / reserved or
+        control keys REJECTED with ValueError - never silently stripped),
+        enforces the active-dir flood caps (IntentCapacityError, no write),
+        then atomically writes exactly one queued intent file under
+        ``_config_lock``. ``origin`` is recorded as DIAGNOSTICS ONLY - it is
+        an auditable assertion, never authority; the executor re-resolves."""
+        from agenttalk import intents as _intents
+        errors = _intents.validate_intent(kind, payload)
+        if errors:
+            raise ValueError("; ".join(errors))
+        with self._config_lock():
+            count, size = self._intent_active_usage()
+            if count >= self.INTENT_MAX_ACTIVE:
+                raise self.IntentCapacityError(
+                    f"active intent cap reached ({count} >= "
+                    f"{self.INTENT_MAX_ACTIVE}); drain or rotate first",
+                    code="max_active")
+            if size >= self.INTENT_MAX_ACTIVE_BYTES:
+                raise self.IntentCapacityError(
+                    "active intent byte cap reached; drain or rotate first",
+                    code="max_bytes")
+            intent_id = "wi-" + secrets.token_hex(6)
+            record = {
+                "schema_version": 1,
+                "intent_id": intent_id,
+                "kind": kind,
+                "payload": dict(payload),
+                "origin": dict(origin or {}),   # diagnostics only, NOT authority
+                "created_at": _now_iso(),
+                "state": self.INTENT_QUEUED,
+                "attempts": 0,
+                "deliveries": [],
+            }
+            self.intents_active_dir.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(self._intent_path(intent_id),
+                               json.dumps(record, indent=2, ensure_ascii=False))
+            return record
+
+    def read_intent(self, intent_id: str) -> dict | None:
+        try:
+            p = self._intent_path(intent_id)
+        except ValueError:
+            return None
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return None
+        if not isinstance(data, dict) or data.get("intent_id") != intent_id:
+            return None
+        return data
+
+    def list_intents(self, *, limit: int = 100,
+                     include_terminal: bool = True) -> list[dict]:
+        """Recent intents from the ACTIVE dir, newest first. Corrupt files are
+        skipped (doctor-style fail-safe reading)."""
+        d = self.intents_active_dir
+        if not d.is_dir():
+            return []
+        out: list[dict] = []
+        for p in sorted(d.iterdir()):
+            if p.suffix != ".json":
+                continue
+            rec = self.read_intent(p.stem)
+            if rec is None:
+                continue
+            if not include_terminal and rec.get("state") in self.INTENT_TERMINAL_STATES:
+                continue
+            out.append(rec)
+        out.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+        return out[: max(0, int(limit))]
+
+    def _write_intent_locked(self, record: dict) -> None:
+        _atomic_write_text(self._intent_path(record["intent_id"]),
+                           json.dumps(record, indent=2, ensure_ascii=False))
+
+    def claim_intent(self, intent_id: str, *, pid: int,
+                     pid_start: object = None,
+                     claim_stale_after: float = 900.0,
+                     now_epoch: float | None = None) -> dict | None:
+        """Atomically claim a queued intent (executor-only).
+
+        A CLAIMED intent is reclaimable ONLY when its recorded owner pid is
+        CONFIRMED dead (:func:`_process_liveness` == PROC_DEAD) - live, unknown,
+        access-denied, or unprobeable owners are NEVER stolen (the D-12
+        confirmed-dead discipline), so a descheduled-but-live drainer blocks a
+        reclaim instead of racing it into a double-send. ``claim_stale_after``
+        only bounds how soon we even probe a claim's owner. Returns the updated
+        record, or None (absent / terminal / validly claimed)."""
+        now = now_epoch if now_epoch is not None else time.time()
+        with self._config_lock():
+            rec = self.read_intent(intent_id)
+            if not rec:
+                return None
+            state = rec.get("state")
+            if state in self.INTENT_TERMINAL_STATES:
+                return None
+            if state == self.INTENT_CLAIMED:
+                claim = rec.get("claim") if isinstance(rec.get("claim"), dict) else {}
+                owner = claim.get("pid")
+                age = now - float(claim.get("at_epoch") or 0.0)
+                if owner == pid:
+                    pass                       # our own claim: refresh below
+                elif age < claim_stale_after:
+                    return None                # fresh claim: never contested
+                elif _process_liveness(owner) != PROC_DEAD:
+                    return None                # live/unknown owner: NEVER stolen
+            rec["state"] = self.INTENT_CLAIMED
+            rec["attempts"] = int(rec.get("attempts") or 0) + 1
+            rec["claim"] = {"pid": pid, "pid_start": pid_start,
+                            "claim_id": secrets.token_hex(8),
+                            "at": _now_iso(), "at_epoch": now}
+            self._write_intent_locked(rec)
+            return rec
+
+    def update_intent(self, intent_id: str, mutate) -> dict | None:
+        """Executor-only locked read-modify-write: ``mutate(record)`` edits in
+        place; the result is atomically persisted. None = absent/corrupt."""
+        with self._config_lock():
+            rec = self.read_intent(intent_id)
+            if not rec:
+                return None
+            mutate(rec)
+            self._write_intent_locked(rec)
+            return rec
+
+    def mark_intent_terminal(self, intent_id: str, *, state: str,
+                             code: str | None = None,
+                             error: str | None = None) -> dict | None:
+        if state not in self.INTENT_TERMINAL_STATES:
+            raise ValueError(f"not a terminal intent state: {state!r}")
+
+        def _mut(rec: dict) -> None:
+            rec["state"] = state
+            rec["terminal_at"] = _now_iso()
+            if code:
+                rec["code"] = code
+            if error:
+                rec["error"] = error
+
+        return self.update_intent(intent_id, _mut)
+
+    def rotate_intents(self, *, now_epoch: float | None = None,
+                       terminal_linger_seconds: float = 600.0) -> dict:
+        """Move settled TERMINAL intents from the active dir into the
+        reset-preserved control-audit sink, then enforce the audit retention
+        caps (age + bytes, oldest first). Best-effort; returns counts."""
+        from agenttalk.health import parse_iso as _parse_iso_dt
+        now = now_epoch if now_epoch is not None else time.time()
+        moved = dropped = 0
+        with self._config_lock():
+            d = self.intents_active_dir
+            if d.is_dir():
+                audit = self.control_audit_dir / "intents"
+                for p in sorted(d.iterdir()):
+                    if p.suffix != ".json":
+                        continue
+                    rec = self.read_intent(p.stem)
+                    if not rec or rec.get("state") not in self.INTENT_TERMINAL_STATES:
+                        continue
+                    ts = _parse_iso_dt(rec.get("terminal_at") or rec.get("created_at"))
+                    age = (now - ts.timestamp()) if ts is not None else None
+                    if age is None or age < terminal_linger_seconds:
+                        continue
+                    audit.mkdir(parents=True, exist_ok=True)
+                    _atomic_write_text(audit / p.name,
+                                       json.dumps(rec, indent=2, ensure_ascii=False))
+                    try:
+                        p.unlink()
+                        moved += 1
+                    except OSError:
+                        continue
+        # Retention on the audit sink (outside the config lock: audit-only).
+        audit = self.control_audit_dir / "intents"
+        if audit.is_dir():
+            entries = []
+            total = 0
+            for p in sorted(audit.iterdir()):
+                if p.suffix != ".json":
+                    continue
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                entries.append((p, st.st_mtime, st.st_size))
+                total += st.st_size
+            for p, mtime, size in entries:
+                too_old = (now - mtime) > self.INTENT_AUDIT_MAX_AGE_SECONDS
+                if too_old or total > self.INTENT_AUDIT_MAX_BYTES:
+                    try:
+                        p.unlink()
+                        dropped += 1
+                        total -= size
+                    except OSError:
+                        pass
+        return {"rotated": moved, "audit_dropped": dropped}
+
+    # ---------------------------------- supervisor kill-switch + instance lock
+
+    def supervisor_kill_switch(self) -> bool | None:
+        """Tri-state kill-switch read for the web fast-fail: True = present,
+        False = absent, None = UNREADABLE (callers fail closed, e.g. 423)."""
+        try:
+            return (self.dir / "supervisor.kill").exists()
+        except OSError:
+            return None
+
+    def supervisor_instance_path(self) -> Path:
+        return self.dir / "supervisor.instance.lock"
+
+    def read_supervisor_instance(self) -> dict | None:
+        p = self.supervisor_instance_path()
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def claim_supervisor_instance(self, *, pid: int,
+                                  pid_start: object = None) -> dict | None:
+        """Claim the SINGLETON supervisor/executor instance lock.
+
+        Held for the supervisor process lifetime (released in the .ps1
+        ``finally``). A held lock is broken ONLY when its recorded pid is
+        CONFIRMED dead (never on age - a process-lifetime lock has no honest
+        age bound; the confirmed-dead tri-state is the D-12 discipline). The
+        returned record carries the random ``token`` the PS loop passes back
+        to every ``--drain-intents`` tick. ANTI-ACCIDENT, not a security
+        boundary: the token rides the command line and the pid is the
+        caller's own claim (documented in SECURITY.md)."""
+        with self._config_lock():
+            existing = self.read_supervisor_instance()
+            if existing is not None and _process_liveness(existing.get("pid")) != PROC_DEAD:
+                return None
+            record = {
+                "root": str(self.root),
+                "pid": int(pid),
+                "pid_start": pid_start,
+                "token": secrets.token_hex(16),
+                "started_at": _now_iso(),
+            }
+            _atomic_write_text(self.supervisor_instance_path(),
+                               json.dumps(record, indent=2, ensure_ascii=False))
+            return record
+
+    def release_supervisor_instance(self, *, token: str) -> bool:
+        """Token-checked release. A mismatched/absent token releases nothing
+        (a stale releaser can never evict a newer live instance)."""
+        with self._config_lock():
+            existing = self.read_supervisor_instance()
+            if not existing or not token or existing.get("token") != token:
+                return False
+            try:
+                self.supervisor_instance_path().unlink()
+            except OSError:
+                return False
+            return True
+
     # ------------------------------------------- reply-in-flight markers
     #
     # `state/<agent>.composing.json` records "agent is drafting a reply
