@@ -189,3 +189,30 @@ def test_run_wrapper_claude_clean_run_no_escalation() -> None:
     assert rc == 0
     assert restarts == []          # clean probe -> no degraded escalation
     assert len(stamps) >= 1        # thinking/turn/clean-text progress stamped
+
+
+def test_inject_claude_permission_mode():
+    """Wrapped Claude write-grant fix: a wrapped Claude child must receive the
+    resolved --permission-mode (its supervisor session_args is empty, so the
+    {PERM_MODE} substitution never fires and it would launch read-only). No-op
+    for codex, an empty mode, or when the operator already passed
+    --permission-mode in the tail."""
+    from agenttalk import cli
+    # wrapped claude, no explicit mode in tail -> mode appended
+    assert cli._inject_claude_permission_mode(
+        ["claude", "-p"], "claude", "bypassPermissions"
+    ) == ["claude", "-p", "--permission-mode", "bypassPermissions"]
+    # operator already set --permission-mode -> unchanged (explicit tail wins)
+    argv = ["claude", "--permission-mode", "acceptEdits", "-p"]
+    assert cli._inject_claude_permission_mode(
+        argv, "claude", "bypassPermissions") == argv
+    # non-claude cli -> unchanged
+    assert cli._inject_claude_permission_mode(
+        ["codex", "exec"], "codex", "bypassPermissions") == ["codex", "exec"]
+    # empty / None mode -> unchanged
+    assert cli._inject_claude_permission_mode(["claude"], "claude", "") == ["claude"]
+    assert cli._inject_claude_permission_mode(["claude"], "claude", None) == ["claude"]
+    # original argv is not mutated
+    orig = ["claude", "-p"]
+    cli._inject_claude_permission_mode(orig, "claude", "bypassPermissions")
+    assert orig == ["claude", "-p"]

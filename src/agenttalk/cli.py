@@ -6027,6 +6027,25 @@ def _handle_launch_config_blocked(store, agent: str, cli_name: str, *,
     return 1
 
 
+def _inject_claude_permission_mode(argv: list[str], cli: str,
+                                   perm_mode: str | None) -> list[str]:
+    """Ensure a wrapped Claude child receives the resolved ``--permission-mode``.
+
+    A wrapped agent's supervisor ``session_args`` is empty, so the supervisor's
+    ``{PERM_MODE}`` substitution never reaches the child — a supervised wrapped
+    Claude would otherwise launch read-only (auto-denying every write). Apply the
+    SAME resolved mode the supervisor uses for a non-wrapped Claude
+    (``supervisor.claude_permission_mode``) to the child argv. No-op for a
+    non-Claude CLI, an empty/None mode, or when ``--permission-mode`` is already
+    present — an explicit operator tail always wins.
+    """
+    if cli != "claude" or not perm_mode:
+        return argv
+    if "--permission-mode" in argv:
+        return argv
+    return [*argv, "--permission-mode", perm_mode]
+
+
 def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     sender: str, min_interval: float, render: bool,
                     one_shot_request_id: str | None = None,
@@ -6362,6 +6381,12 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         _agents = sup_cfg.get("agents")
         cfg_agent = _agents.get(agent) if isinstance(_agents, dict) else None
         cfg_agent = cfg_agent if isinstance(cfg_agent, dict) else {}
+        # Wrapped Claude write-grant fix: session_args is empty for a wrapped agent,
+        # so the supervisor never substitutes {PERM_MODE} into the child tail — a
+        # supervised wrapped Claude would launch read-only. Apply the same resolved
+        # mode here (no-op if an explicit --permission-mode is already in the tail).
+        argv = _inject_claude_permission_mode(
+            argv, args.cli, _sup.claude_permission_mode(sup_cfg, cfg_agent))
         res_poison, res_escalate = _sup.resolve_dead_letter_caps(sup_cfg, cfg_agent)
         flag_poison = getattr(args, "dead_letter_max_attempts", None)
         flag_escalate = getattr(args, "dead_letter_escalate_after", None)
