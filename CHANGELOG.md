@@ -5,6 +5,21 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.58.1] - 2026-07-03
+
+### Fixed
+
+- **Supervised wrapped Claude agents now receive write grants automatically.** A wrapped
+  agent's supervisor `session_args` is empty, so the `{PERM_MODE}` substitution never
+  reached the child — a supervised wrapped Claude launched read-only and auto-denied every
+  write (previously worked around by putting `--permission-mode` in the supervisor tail).
+  `agenttalk wrap --loop` now applies the same resolved `claude_permission_mode` (default
+  `bypassPermissions`) the supervisor uses for a non-wrapped Claude to the child argv. It is
+  a no-op for codex, for an empty mode, and when the operator already set `--permission-mode`
+  in the tail — in both the separated (`--permission-mode <mode>`) and GNU
+  (`--permission-mode=<mode>`) forms, so an explicit operator tail always wins. Retires the
+  interim config workaround.
+
 ## [0.58.0] - 2026-07-03
 
 The web dashboard is now the **Team Console** — a five-view operator console for observing a
