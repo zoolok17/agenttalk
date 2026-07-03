@@ -838,6 +838,88 @@ def test_doctor_supervised_codex_wrapped_probes_base_tail_and_wrapper_python(tmp
     assert (wrapper_py, ("-m", "agenttalk", "--version")) in calls
 
 
+def _wrapped_codex_runner(exe, args, timeout, cwd, env):
+    if args == ["--version"]:
+        return (0, "codex-cli 0.142.3\n")
+    if args == ["-m", "agenttalk", "--version"]:
+        return (0, "agenttalk 0.58.1\n")
+    raise AssertionError(args)
+
+
+def _write_wrapped_codex(s: Store, tmp_path: Path) -> None:
+    codex = _fake_exe(tmp_path / "real-codex.exe")
+    wrapper_py = _fake_exe(tmp_path / "wrapper-python.exe")
+    _seed_codex_home(s, "wcdx")
+    _write_supervisor(s, {"wcdx": {
+        "cli": "codex", "wrapped": True,
+        "launch": {"windows_file": wrapper_py,
+                   "windows_args": ["-m", "agenttalk", "wrap", "--for", "wcdx",
+                                    "--cli", "codex", "--loop", "--", codex]}}})
+
+
+def test_doctor_supervised_codex_errors_on_runtime_preflight_blocker(tmp_path: Path) -> None:
+    """dev-3 sign-off / launch-hardening wiring: a WRAPPED supervised Codex whose
+    agenttalk runtime preflight returns a blocker makes supervised_codex an ERROR
+    (launch-blocking) — blocker in details + fix + data[agenttalk_runtime], entries kept."""
+    s = Store(tmp_path)
+    s.init(["wcdx"])
+    _write_wrapped_codex(s, tmp_path)
+    blocker = "agenttalk import failed: out-of-workspace source checkout"
+    seen: dict = {}
+
+    def runtime_checker(root):
+        seen["root"] = root
+        return blocker
+
+    chk = doctor._check_supervised_codex(
+        s, runner=_wrapped_codex_runner, runtime_checker=runtime_checker)
+    assert seen["root"] == s.root                       # passed store.root
+    assert chk.status == "error"                        # launch-blocking, not warn
+    assert "agenttalk runtime preflight FAILED" in chk.details
+    assert blocker in chk.details
+    assert chk.fix == blocker
+    assert chk.data["agenttalk_runtime"] == blocker
+    assert chk.data["codex"]                            # entries preserved for observability
+
+
+def test_doctor_supervised_codex_clean_runtime_preflight_no_error(tmp_path: Path) -> None:
+    """A clean runtime preflight (checker returns None) does NOT force an error — the
+    check falls through to its usual ok/warn verdict."""
+    s = Store(tmp_path)
+    s.init(["wcdx"])
+    _write_wrapped_codex(s, tmp_path)
+    chk = doctor._check_supervised_codex(
+        s, runner=_wrapped_codex_runner, runtime_checker=lambda root: None)
+    assert chk.status != "error"
+
+
+def test_doctor_supervised_codex_non_wrapped_skips_runtime_preflight(tmp_path: Path) -> None:
+    """The runtime preflight only gates WRAPPED codex agents — a non-wrapped agent is
+    never launch-blocked by it, and the checker is not even consulted."""
+    s = Store(tmp_path)
+    s.init(["cdx"])
+    codex = _fake_exe(tmp_path / "codex.exe")
+    py = _fake_exe(tmp_path / "python.exe")
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    (tmp_path / "src" / "agenttalk").mkdir(parents=True)
+    (tmp_path / "src" / "agenttalk" / "__init__.py").write_text("", encoding="utf-8")
+    _seed_codex_home(s, "cdx")
+    _write_agenttalk_cmd(s, py)
+    _write_supervisor(s, {"cdx": {"cli": "codex", "cwd": str(cwd),
+                                  "launch": {"windows_file": codex}}})
+    called = {"n": 0}
+
+    def runtime_checker(root):
+        called["n"] += 1
+        return "should-not-block-a-non-wrapped-agent"
+
+    chk = doctor._check_supervised_codex(
+        s, runner=_wrapped_codex_runner, runtime_checker=runtime_checker)
+    assert called["n"] == 0                             # not consulted for a non-wrapped agent
+    assert chk.status != "error"
+
+
 @pytest.mark.parametrize("windows_args, expected", [
     (["-m", "agenttalk", "wrap"], "missing --"),
     (["-m", "agenttalk", "wrap", "--"], "no real CLI tail"),

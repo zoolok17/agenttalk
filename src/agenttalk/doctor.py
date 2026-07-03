@@ -114,7 +114,7 @@ def run(project_root: Path | None = None) -> Report:
         waiters = _check_active_waiters(store)
         if waiters is not None:  # additive: absent unless a live waiter exists
             report.checks.append(waiters)
-        codex_vis = _check_supervised_codex(store)
+        codex_vis = _check_supervised_codex(store, runtime_checker=_check_agenttalk_runtime)
         if codex_vis is not None:  # additive: absent unless a supervised codex agent
             report.checks.append(codex_vis)
         holds = _check_config_blocked_holds(store)
@@ -1244,11 +1244,12 @@ def _probe_version(runner, exe: str | None, args: list[str], *,
 def _check_supervised_codex(store: Store, *, runner=None, runtime_checker=None) -> Check | None:
     """Surface supervised Codex launch/probe observability.
 
-    L4 is advisory: absent when there is no configured supervised Codex, otherwise
-    OK only when resolution, runtime probes, and env mirror are complete; WARN for
-    every drift/failure. It never returns ERROR and never mutates launch state.
+    Absent when there is no configured supervised Codex; OK when resolution, runtime
+    probes, and env mirror are complete; WARN for probe/env drift. Returns ERROR when a
+    WRAPPED supervised Codex fails the ``agenttalk`` runtime preflight (launch-blocking,
+    via ``runtime_checker``) — the child cannot run agenttalk in the workspace so the
+    supervised loop would wedge. Never mutates launch state.
     """
-    _ = runtime_checker  # kept only for source compatibility with older private tests
     runner = runner or _default_codex_runner
     sup_path = store.dir / "supervisor.json"
     if not sup_path.exists():
@@ -1330,6 +1331,20 @@ def _check_supervised_codex(store: Store, *, runner=None, runtime_checker=None) 
             line += " WARN: " + "; ".join(dict.fromkeys(e["warnings"]))
         lines.append(line)
     details = "; ".join(lines)
+    # Runtime preflight (dev-3 sign-off): a WRAPPED supervised Codex can only launch if
+    # `agenttalk` actually runs in the workspace. A blocker here is launch-blocking, so
+    # surface it as an ERROR (doctor holds the agent) rather than an advisory WARN.
+    if runtime_checker is not None and any(e.get("wrapped") for e in entries):
+        blocker = runtime_checker(store.root)
+        if blocker:
+            return Check(
+                name="supervised_codex",
+                status="error",
+                details=("agenttalk runtime preflight FAILED: " + str(blocker)
+                         + (f" | {details}" if details else "")),
+                fix=str(blocker),
+                data={"codex": entries, "agenttalk_runtime": blocker},
+            )
     if any_warn:
         return Check(
             name="supervised_codex",
