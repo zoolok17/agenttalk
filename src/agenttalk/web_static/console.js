@@ -15,6 +15,18 @@
  * spec suggests; the lead reconciles any drift with Owner B's console.css.
  */
 (function () {
+  // A prototype-less lookup table: copies own keys onto a null-prototype object
+  // so a lookup by UNTRUSTED wire data (severity/kind/source) can never resolve
+  // to an inherited Object member (constructor, __proto__, …) and yield a
+  // garbage value. Function-declaration hoisted, so callable from var inits.
+  function nullMap(src) {
+    var m = Object.create(null);
+    for (var k in src) {
+      if (Object.prototype.hasOwnProperty.call(src, k)) m[k] = src[k];
+    }
+    return m;
+  }
+
   // ------------------------------------------------------------ constants
   var POLL_MS = 2000;   // /api/state data poll
   var CLOCK_MS = 1000;  // relative-age recompute + wall clock tick
@@ -33,8 +45,11 @@
 
   // Attention severity → left-bar CSS color token (feeds --sev-color). The chip
   // and source-tag colors are owned by the CSS .sev-<level> / .src-<source> rules.
-  var SEV_COLOR = { high: 'danger', med: 'warn', low: 'gray' };
-  var SEV_LABEL = { high: 'HIGH', med: 'MED', low: 'LOW' };
+  // Null-prototype maps (P3): the key is UNTRUSTED wire data, so a severity like
+  // "constructor" must miss cleanly (fall back to the default) rather than hit an
+  // inherited Object property and produce a garbage className.
+  var SEV_COLOR = nullMap({ high: 'danger', med: 'warn', low: 'gray' });
+  var SEV_LABEL = nullMap({ high: 'HIGH', med: 'MED', low: 'LOW' });
 
   // ------------------------------------------------------------ client state
   var state = {
@@ -52,8 +67,12 @@
   var lastState = null;               // /api/state
   var attentionData = null;           // /api/attention (per open)
   var attentionPending = false;
-  var threadCache = {};               // rid -> /api/thread payload
-  var threadPending = {};             // rid -> bool (fetch in flight)
+  var statePending = false;           // /api/state in-flight guard (P2-4)
+  var stateSeq = 0;                   // request sequence id (issued)
+  var stateCommitted = 0;             // newest committed sequence id (stale-drop)
+  var threadCache = {};               // rootKey(label,rid) -> /api/thread payload (200 only)
+  var threadNotFound = {};            // rootKey -> true (transient; cleared/re-validated each poll)
+  var threadPending = {};             // rootKey -> bool (fetch in flight)
   var freshFeedIds = {};              // msg id -> true (animate-in one cycle)
   var seenFeedIds = {};               // msg id -> true (to detect fresh)
 
@@ -107,6 +126,75 @@
     return null;
   }
 
+  // A relative-age span that the 1 Hz clock ticker updates IN PLACE (B2a) —
+  // NOT via a DOM rebuild, which would destroy inner-scroll and text selection
+  // in the transcript/feed every second. The node is tagged with the raw inputs
+  // (`data-age-ts` / `data-age-sec`) plus formatting opts so `updateAges` can
+  // recompute textContent from the current `state.now` without re-rendering.
+  //   opts.suffix   — appended after the formatted age (e.g. ' ago')
+  //   opts.prefix   — prepended before it (e.g. 'since ')
+  //   opts.nullText — shown when age is null / noHb (e.g. 'no hb', 'missing')
+  //   opts.noHb     — force the nullText branch (unknown health, no heartbeat)
+  function ageEl(cls, item, opts) {
+    var n = el('span', cls);
+    opts = opts || {};
+    n.setAttribute('data-tc-age', '1');
+    if (item && item.ts) n.setAttribute('data-age-ts', String(item.ts));
+    if (item && typeof item.age_seconds === 'number') {
+      n.setAttribute('data-age-sec', String(item.age_seconds));
+    }
+    if (opts.suffix) n.setAttribute('data-age-suffix', opts.suffix);
+    if (opts.prefix) n.setAttribute('data-age-prefix', opts.prefix);
+    if (opts.nullText) n.setAttribute('data-age-null', opts.nullText);
+    if (opts.noHb) n.setAttribute('data-age-nohb', '1');
+    n.textContent = ageText(n);
+    return n;
+  }
+  // Format the current text for a tagged age node from its data-* inputs + the
+  // live `state.now`. Shared by `ageEl` (initial render) and `updateAges` (tick).
+  function ageText(n) {
+    var pfx = n.getAttribute('data-age-prefix') || '';
+    var sfx = n.getAttribute('data-age-suffix') || '';
+    var nullText = n.getAttribute('data-age-null');
+    if (n.getAttribute('data-age-nohb') === '1') return nullText || '';
+    var item = {};
+    var ts = n.getAttribute('data-age-ts');
+    if (ts) item.ts = ts;
+    var sec = n.getAttribute('data-age-sec');
+    if (sec !== null && sec !== '') item.age_seconds = Number(sec);
+    var age = liveAge(item);
+    if (age === null) return nullText || '';
+    return pfx + fmtAge(age) + sfx;
+  }
+  // The 1 Hz in-place age refresh (B2a): recompute every tagged node from the
+  // updated `state.now`. No renderActiveView, so inner scroll + selection live.
+  function updateAges() {
+    var nodes = document.querySelectorAll('[data-tc-age]');
+    for (var i = 0; i < nodes.length; i++) nodes[i].textContent = ageText(nodes[i]);
+  }
+
+  // Snapshot/restore inner-scroller offsets across a 2s data re-render (B2b):
+  // #main.scrollTop alone is not enough — the transcript scrolls inside a nested
+  // .tc-transcript-body (max-height; overflow:auto) and the rail inside .tc-feed,
+  // so those would jump to top every poll. Capture before clear(), restore after.
+  var INNER_SCROLLERS = ['.tc-transcript-body', '.tc-feed'];
+  function snapshotScroll(root) {
+    var out = {};
+    for (var i = 0; i < INNER_SCROLLERS.length; i++) {
+      var sel = INNER_SCROLLERS[i];
+      var n = root.querySelector(sel);
+      if (n) out[sel] = n.scrollTop;
+    }
+    return out;
+  }
+  function restoreScroll(root, snap) {
+    for (var sel in snap) {
+      if (!Object.prototype.hasOwnProperty.call(snap, sel)) continue;
+      var n = root.querySelector(sel);
+      if (n) n.scrollTop = snap[sel];
+    }
+  }
+
   // ------------------------------------------------------------ vocab tables
   // health.state -> { label, key (raw state), cls (status-<state>), color
   // (semantic color token: ok/info/warn/attn/danger/violet/teal/gray), grp }.
@@ -142,14 +230,16 @@
 
   // kind -> { label, cls (kind-<kind>) }. The CSS owns kind→color via the raw
   // kind key; kinds without a dedicated rule fall back to the neutral .kind-note.
+  var KNOWN_KINDS = nullMap({
+    'review-request': 1, 'review-result': 1, 'proposal': 1, 'proposal-response': 1,
+    'question': 1, 'note': 1, 'message': 1, 'reply': 1, 'wake': 1, 'end': 1,
+    'escalate': 1, 'broadcast': 1, 'gate': 1,
+  });
   function kindInfo(kind) {
     var k = kind || 'message';
-    var known = {
-      'review-request': 1, 'review-result': 1, 'proposal': 1, 'proposal-response': 1,
-      'question': 1, 'note': 1, 'message': 1, 'reply': 1, 'wake': 1, 'end': 1,
-      'escalate': 1, 'broadcast': 1, 'gate': 1,
-    };
-    return { label: k, cls: 'kind-' + (known[k] ? k : 'note') };
+    // Null-proto lookup (P3): an untrusted kind like "constructor" misses and
+    // falls back to the neutral .kind-note rather than a garbage className.
+    return { label: k, cls: 'kind-' + (KNOWN_KINDS[k] ? k : 'note') };
   }
 
   // Thread verdict/status -> chip class. `verdict` (§3b) maps to the CSS
@@ -243,6 +333,14 @@
     for (var i = 0; i < as.length; i++) if (as[i].name === name) return as[i];
     return null;
   }
+  // Selected root's label (drives the root-scoped /api/thread fetch, P2-5).
+  function currentRootLabel() {
+    var r = currentRoot();
+    return (r && r.label) || '';
+  }
+  // Thread cache key: root-label + rid (P2-5). Keying by rid ALONE would let a
+  // same-request_id thread in another root leak / cross-bleed once cached.
+  function threadKey(rid) { return currentRootLabel() + ' ' + rid; }
 
   // Agent bucket counts by health group (work/idle/attn/unknown).
   function agentCounts(root) {
@@ -504,8 +602,10 @@
   function renderActiveView() {
     var main = document.getElementById('main');
     if (!main) return;
-    // Preserve scroll across in-place re-render.
+    // Preserve scroll across the 2s data re-render (B2b): #main AND every inner
+    // scroller (transcript body / activity feed), else they jump to top on poll.
     var scrollTop = main.scrollTop;
+    var innerScroll = snapshotScroll(main);
     clear(main);
 
     var root = currentRoot();
@@ -529,6 +629,7 @@
       default: renderOverview(main, root);
     }
     main.scrollTop = scrollTop;
+    restoreScroll(main, innerScroll);
   }
 
   // ------------------------------------------------------------ VIEW 1: overview
@@ -634,8 +735,9 @@
     var r4 = el('div', 'tc-agent-status-row');
     r4.appendChild(statusChip(st));
     r4.appendChild(el('span', 'tc-spacer'));
-    var age = liveAge({ ts: a.last_seen, age_seconds: a.last_seen_age_seconds });
-    r4.appendChild(el('span', 'tc-agent-hb', info.noHb || age === null ? 'no hb' : fmtAge(age)));
+    r4.appendChild(ageEl('tc-agent-hb',
+      { ts: a.last_seen, age_seconds: a.last_seen_age_seconds },
+      { nullText: 'no hb', noHb: info.noHb }));
     card.appendChild(r4);
 
     // Row 5: RATE + CTX mini-meters.
@@ -674,7 +776,7 @@
         top.appendChild(arrowIcon());
         top.appendChild(el('span', 'tc-feed-to', m.to || '?'));
         top.appendChild(el('span', 'tc-spacer'));
-        top.appendChild(el('span', 'tc-feed-age', fmtAge(liveAge(m))));
+        top.appendChild(ageEl('tc-feed-age', m));
         item.appendChild(top);
         var bot = el('div', 'tc-feed-row2');
         bot.appendChild(kindChip(m.kind));
@@ -813,7 +915,7 @@
     var bot = el('div', 'tc-thread-meta');
     bot.appendChild(el('span', 'tc-thread-parts', threadParts(t)));
     bot.appendChild(el('span', 'tc-spacer'));
-    bot.appendChild(el('span', 'tc-thread-age', fmtAge(liveAge(t))));
+    bot.appendChild(ageEl('tc-thread-age', t));
     row.appendChild(bot);
     on(row, 'click', function () { openThread(t.request_id); });
     return row;
@@ -862,7 +964,7 @@
     tagRow.appendChild(el('span', 'tc-src src-' + item.source, item.source_label || (item.source || '').toUpperCase()));
     tagRow.appendChild(el('span', 'tc-chip sev-' + item.severity, SEV_LABEL[item.severity] || (item.severity || '').toUpperCase()));
     tagRow.appendChild(el('span', 'tc-spacer'));
-    tagRow.appendChild(el('span', 'tc-attn-age', fmtAge(liveAge(item)) + ' ago'));
+    tagRow.appendChild(ageEl('tc-attn-age', item, { suffix: ' ago' }));
     body.appendChild(tagRow);
     body.appendChild(el('div', 'tc-attn-title', item.title || ''));
     var detailRow = el('div', 'tc-attn-detailrow');
@@ -970,16 +1072,18 @@
       card.appendChild(transcriptEmpty('Select a thread', 'Pick a thread on the left to read its transcript.'));
       return card;
     }
-    var data = threadCache[rid];
-    if (!data) {
-      // Fetch in flight (or not yet requested).
-      card.appendChild(transcriptEmpty('Loading transcript…', ''));
-      fetchThread(rid);
+    var key = threadKey(rid);
+    var data = threadCache[key];
+    if (!data && threadNotFound[key]) {
+      // Real "no transcript" empty state — do NOT fall back to another thread.
+      // Re-fetchable: the poll clears this marker so new replies appear (P2-2).
+      card.appendChild(transcriptEmpty('No transcript', 'This thread has no messages on the bus.'));
       return card;
     }
-    if (data.__notfound) {
-      // Real "no transcript" empty state — do NOT fall back to another thread.
-      card.appendChild(transcriptEmpty('No transcript', 'This thread has no messages on the bus.'));
+    if (!data) {
+      // Fetch in flight (or not yet requested) — for the SELECTED root (P2-5).
+      card.appendChild(transcriptEmpty('Loading transcript…', ''));
+      fetchThread(rid);
       return card;
     }
 
@@ -1040,7 +1144,7 @@
     bh.appendChild(el('span', 'tc-bubble-from', m.from || ''));
     bh.appendChild(kindChip(kind));
     bh.appendChild(el('span', 'tc-spacer'));
-    bh.appendChild(el('span', 'tc-bubble-age', fmtAge(liveAge(m))));
+    bh.appendChild(ageEl('tc-bubble-age', m));
     bubble.appendChild(bh);
 
     // Body: RAW untrusted text rendered pre-wrap via textContent (never parsed).
@@ -1104,7 +1208,9 @@
     var since = liveAge({ ts: a.last_seen, age_seconds: a.last_seen_age_seconds });
     if (since !== null && !info.noHb) {
       metaRow.appendChild(el('span', null, '·'));
-      metaRow.appendChild(el('span', null, 'since ' + fmtAge(since)));
+      metaRow.appendChild(ageEl(null,
+        { ts: a.last_seen, age_seconds: a.last_seen_age_seconds },
+        { prefix: 'since ' }));
     }
     hInfo.appendChild(metaRow);
     headerCard.appendChild(hInfo);
@@ -1196,7 +1302,7 @@
         var dir = (msg.from === a.name) ? ('→ ' + (msg.to || '?')) : ('← ' + (msg.from || '?'));
         mrow.appendChild(el('span', 'tc-recent-dir', dir));
         mrow.appendChild(el('span', 'tc-recent-subject', msg.subject || '—'));
-        mrow.appendChild(el('span', 'tc-recent-age', fmtAge(liveAge(msg))));
+        mrow.appendChild(ageEl('tc-recent-age', msg));
         mlist.appendChild(mrow);
       }
       recentCard.appendChild(mlist);
@@ -1227,9 +1333,14 @@
     supRows.appendChild(supRow('Mode', mode, 'tc-chip'));
     var st = (a.health || {}).state;
     var info = stateInfo(st);
-    var hbAge = liveAge({ ts: a.last_seen, age_seconds: a.last_seen_age_seconds });
-    var hbText = (info.noHb || hbAge === null) ? 'missing' : (fmtAge(hbAge) + ' ago');
-    supRows.appendChild(supRow('Heartbeat', hbText, 'tc-chip ' + statusClass(st)));
+    // Heartbeat age is a live-ticked chip (B2a): build the row with an ageEl
+    // chip so the 1 Hz ticker advances it without a DOM rebuild.
+    var hbRow = el('div', 'tc-sup-row');
+    hbRow.appendChild(el('span', 'tc-sup-key', 'Heartbeat'));
+    hbRow.appendChild(ageEl('tc-chip ' + statusClass(st),
+      { ts: a.last_seen, age_seconds: a.last_seen_age_seconds },
+      { suffix: ' ago', nullText: 'missing', noHb: info.noHb }));
+    supRows.appendChild(hbRow);
     if (a.wrapped !== undefined) {
       var restartable = a.restartable !== undefined ? a.restartable : a.wrapped;
       supRows.appendChild(supRow('Restartable', restartable ? 'yes' : 'no',
@@ -1404,15 +1515,36 @@
 
   // ------------------------------------------------------------ data fetching
   function fetchState() {
-    fetch('/api/state').then(function (r) { return r.json(); }).then(function (data) {
+    // In-flight guard (P2-4): only one /api/state at a time. If a scan takes
+    // >2s, stacked requests could commit out of arrival order and move the
+    // console backwards; the guard + the per-response sequence check below
+    // (drop anything older than the newest committed) prevent that.
+    if (statePending) return;
+    statePending = true;
+    var seq = ++stateSeq;
+    fetch('/api/state').then(function (r) {
+      // r.ok guard (P3): on a non-2xx, keep the last-good lastState rather than
+      // blanking the view to an error object / "Loading…".
+      if (!r.ok) return null;
+      return r.json();
+    }).then(function (data) {
+      statePending = false;
+      if (!data) return;                       // non-ok — keep last-good
+      if (seq < stateCommitted) return;        // stale response — drop (P2-4)
+      stateCommitted = seq;
       data._fetchedAt = Date.now();
       updateFreshFeed(data);
       lastState = data;
       // Clamp selectedRoot.
       if (state.selectedRoot >= (data.roots || []).length) state.selectedRoot = 0;
+      // Refetch the open transcript so new replies land (P2-2): force past the
+      // cache; the fetch caches only 200s and re-validates a prior 404.
+      if (state.view === 'sessions' && state.sessionRid) {
+        fetchThread(state.sessionRid, true);
+      }
       renderChrome();
       renderActiveView();
-    }).catch(function () { /* transient — retry next tick */ });
+    }).catch(function () { statePending = false; /* transient — retry next tick */ });
   }
 
   // Track which recent-feed ids are newly-arrived, so the rail can animate them
@@ -1444,18 +1576,38 @@
     }).catch(function () { attentionPending = false; });
   }
 
-  function fetchThread(rid) {
-    if (!rid || threadCache[rid] || threadPending[rid]) return;
-    threadPending[rid] = true;
-    fetch('/api/thread/' + encodeURIComponent(rid)).then(function (r) {
+  // Fetch the SELECTED root's transcript (P2-5): pass ?root=<label> and key the
+  // cache by root+rid so a same-request_id thread in another root can't bleed.
+  // Only successful 200 payloads are cached (P2-2); a 404 sets a transient
+  // not-found marker that the data poll re-validates, so new replies appear.
+  // `force` (used by the poll refresh) bypasses the cache/pending short-circuit.
+  function fetchThread(rid, force) {
+    if (!rid) return;
+    var label = currentRootLabel();
+    var key = label + ' ' + rid;
+    if (!force && (threadCache[key] || threadPending[key])) return;
+    threadPending[key] = true;
+    var url = '/api/thread/' + encodeURIComponent(rid) + '?root=' + encodeURIComponent(label);
+    fetch(url).then(function (r) {
       if (r.status === 404) return { __notfound: true };
+      if (!r.ok) return { __error: true };
       return r.json();
     }).then(function (data) {
-      threadCache[rid] = data || { __notfound: true };
-      threadPending[rid] = false;
+      threadPending[key] = false;
+      if (!data || data.__notfound) {
+        // 404 → transient not-found; never cached as a permanent transcript.
+        delete threadCache[key];
+        threadNotFound[key] = true;
+      } else if (data.__error) {
+        // Non-404 error: keep any last-good payload; do NOT cache the error.
+        return;
+      } else {
+        threadCache[key] = data;
+        delete threadNotFound[key];
+      }
       if (state.view === 'sessions' && state.sessionRid === rid) renderActiveView();
     }).catch(function () {
-      threadPending[rid] = false;
+      threadPending[key] = false;
     });
   }
 
@@ -1465,8 +1617,10 @@
     // Recompute the wall clock + relative ages without a network round-trip.
     var clock = document.querySelector('#topbar .tc-clock');
     if (clock) clock.textContent = new Date(state.now).toLocaleTimeString('en-US', { hour12: false });
-    // Re-render the active view in place so age counters advance every second.
-    renderActiveView();
+    // Advance age counters IN PLACE (B2a) — NEVER rebuild the DOM here, or the
+    // transcript inner-scroll and any in-progress text selection are destroyed
+    // every second. Only the 2s DATA poll re-renders the view.
+    updateAges();
   }
 
   // ------------------------------------------------------------ boot
@@ -1475,8 +1629,12 @@
     applyPrefs();
     renderChrome();
     fetchState();
-    if (state.view === 'attention') fetchAttention();
+    // Fetch attention at boot AND poll it (P2-3), regardless of the initial
+    // view: the sidebar count badge is the open-attention count and must be
+    // current from the start, not blank until the Attention view is opened.
+    fetchAttention();
     setInterval(fetchState, POLL_MS);
+    setInterval(fetchAttention, POLL_MS);
     setInterval(clockTick, CLOCK_MS);
   }
 

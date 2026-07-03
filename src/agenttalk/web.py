@@ -81,7 +81,8 @@ import json
 import re
 import socket
 import threading
-from collections import Counter
+import urllib.parse
+from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -162,6 +163,10 @@ _RECENT_LIMIT = 25
 # file — the read-only invariant). Samples older than this window are pruned;
 # contiguous same-state samples collapse into {state, seconds} segments.
 _HEALTH_TIMELINE_WINDOW_SECONDS = 30 * 60  # ~last 30 minutes
+# Hard per-(root,agent) sample cap (P2-6): a maxlen deque so the stored sequence
+# can never grow unboundedly regardless of poll rate. At the ~2s /api/state
+# cadence a 30-min window is ~900 samples; this bounds a pathological rate.
+_HEALTH_TIMELINE_MAX_SAMPLES = 4096
 
 # Meta keys safe to surface in a thread transcript's `meta_line` (§4b). A
 # strict whitelist — arbitrary meta may carry body-ish sender text, which must
@@ -954,34 +959,49 @@ class HealthTimelineRing:
 
     def __init__(self, *, window_seconds: float = _HEALTH_TIMELINE_WINDOW_SECONDS) -> None:
         self._window = float(window_seconds)
-        self._samples: dict[tuple[str, str], list[tuple[float, str]]] = {}
+        self._samples: dict[tuple[str, str], deque[tuple[float, str]]] = {}
         self._lock = threading.Lock()
 
     def record(self, root_label: str, agent: str, state: str, *, now: float) -> None:
         try:
             key = (root_label, agent)
             with self._lock:
-                seq = self._samples.setdefault(key, [])
+                seq = self._samples.get(key)
+                if seq is None:
+                    # Hard length bound (P2-6): a maxlen deque can never grow
+                    # unboundedly even under a pathological poll rate; the window
+                    # cutoff below is the primary prune, this is the safety cap.
+                    seq = deque(maxlen=_HEALTH_TIMELINE_MAX_SAMPLES)
+                    self._samples[key] = seq
                 seq.append((now, state))
                 cutoff = now - self._window
-                # prune from the front (oldest first); keep at most a bounded tail
+                # prune from the front (oldest first) — window cutoff.
                 while seq and seq[0][0] < cutoff:
-                    seq.pop(0)
-        except Exception:  # noqa: BLE001, S110 — a ring glitch must never affect the payload
+                    seq.popleft()
+        except Exception:  # noqa: BLE001, S110 — a ring glitch must never affect the payload  # nosec B110
             pass
 
     def segments(self, root_label: str, agent: str, *, now: float) -> list[dict]:
         """Contiguous ``{state, seconds}`` segments over the window, oldest→newest.
-        Returns [] when no samples (client shows a "building history…" placeholder)."""
+        Returns [] when no samples (client shows a "building history…" placeholder).
+
+        Applies the window cutoff HERE too (P2-6): a caller may render long after
+        the last ``record``, so drop samples older than ``now - window`` before
+        building, and clamp the final (open) segment so it never stretches a
+        stale sample beyond the window. Total span is capped at the window."""
         try:
+            cutoff = now - self._window
             with self._lock:
-                seq = list(self._samples.get((root_label, agent), ()))
+                seq = [(ts, st) for (ts, st) in self._samples.get((root_label, agent), ())
+                       if ts >= cutoff]
             if not seq:
                 return []
             segs: list[dict] = []
             for i, (ts, state) in enumerate(seq):
+                # Clamp the OPEN (last) segment's end to the window edge so an
+                # agent that stopped reporting can't accrue a growing stale span.
                 end = seq[i + 1][0] if i + 1 < len(seq) else now
-                dur = max(0.0, end - ts)
+                dur = max(0.0, end - max(ts, cutoff))
                 if segs and segs[-1]["state"] == state:
                     segs[-1]["seconds"] = round(segs[-1]["seconds"] + dur, 3)
                 else:
@@ -996,18 +1016,26 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
                    threads_rows: list[dict] | None = None,
                    owned_domains: dict[str, list[dict]] | None = None,
                    history: "HealthTimelineRing | None" = None,
-                   root_label: str | None = None) -> list[dict]:
+                   root_label: str | None = None,
+                   managed_loop: set[str] | None = None) -> list[dict]:
     """Per-agent presence rows (data-model §3). Absent-not-null keys.
 
     0.58.0 additive fields (all OMITTED when not determinable): ``cli``,
     ``capacity``, ``wrapped``, ``restartable``, ``owned_domains``, ``task``,
     and (best-effort) ``health_timeline``. ``threads_rows`` / ``owned_domains``
     are precomputed ONCE per root by the caller so no per-agent re-scan happens.
+
+    ``managed_loop`` (review P2-1): the set of agents the store reports as
+    supervisor-managed / in a lead-loop, computed ONCE per root by the caller.
+    An agent in this set is wrapped/restartable even when its health mode is
+    unknown (stale/missing snapshot) — that is exactly when the restart signal
+    matters most, so health mode must not be the sole arm.
     """
     roles = cfg.get("roles", {}) or {}
     groups = cfg.get("groups", {}) or {}
     threads_rows = threads_rows or []
     owned_domains = owned_domains or {}
+    managed_loop = managed_loop or set()
     now = datetime.now(timezone.utc)
     now_epoch = now.timestamp()
     # 0.19.0 (FR-001): per-agent message counts from the SAME validated `msgs`
@@ -1070,7 +1098,14 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
         cap = _capacity_entry(snap, now=now)
         if cap is not None:
             e["capacity"] = cap
+        # wrapped/restartable arm on EITHER the health mode OR the managed
+        # lead-loop set (review P2-1): health mode alone omits the field exactly
+        # when a wrapped agent's health goes stale/missing (mode unknown),
+        # losing the restart signal when the agent is down. Keep absent-not-null
+        # only when NEITHER signal is determinable.
         wrapped = _is_wrapped(health)
+        if a in managed_loop:
+            wrapped = True
         if wrapped is not None:
             e["wrapped"] = wrapped
             # restartable mirrors wrapped for v1 (only wrapped agents restart).
@@ -1126,6 +1161,16 @@ def _root_state(desc: RootDescriptor,
         # Domain-owner map: built ONCE per root (not per agent) so the
         # single-scan discipline holds (§3a).
         owned_domains = _owned_domains_map(store, cfg)
+        # Managed lead-loop set: computed ONCE per root (P2-1), same source
+        # _collect_web_attention_items reads. Feeds the health-independent
+        # wrapped/restartable arm. Best-effort — a bad read never blanks a root.
+        managed_loop: set[str] = set()
+        try:
+            for a in store.managed_lead_loop_agents():
+                if store.lead_loop_state(a).get("managed"):
+                    managed_loop.add(a)
+        except Exception:  # noqa: BLE001 — advisory arm; never fail the root
+            managed_loop = set()
         out: dict[str, Any] = {
             "label": label,
             "path": path,
@@ -1146,7 +1191,7 @@ def _root_state(desc: RootDescriptor,
         out["agents"] = _agent_entries(
             store, cfg, msgs, liaison,
             threads_rows=threads_rows, owned_domains=owned_domains,
-            history=history, root_label=label)
+            history=history, root_label=label, managed_loop=managed_loop)
         out["retired"] = store.retired_agents()
         out["threads"] = threads_rows
         out["broadcasts"] = broadcasts
@@ -1347,44 +1392,58 @@ def build_attention(desc: RootDescriptor,
     """The /api/attention payload for one root (§4a). Envelope-only: every
     string here is envelope-derived — a raw message body NEVER lands in a
     field. ``agents`` (root[0]'s /api/state agent rows) supplies the derived
-    STUCK items; when omitted they are computed from a fresh scan."""
+    STUCK items; when omitted they are computed from a fresh scan.
+
+    FAIL-SAFE (parity with /api/state's errors-as-data, review B1): a corrupt or
+    uninitialized root must NOT 500 this JSON route. ANY exception raised while
+    building the payload — including the ``operator_facing()``/``sole_lead()``
+    config reads that back the needs_operator source — degrades to a 200 body
+    ``{"root", "items": [], "count": 0, "errors": ["<str(e)>"]}``.
+    """
     store = desc.store
     now = datetime.now(timezone.utc)
-    cfg = _safe_load_config(store)
-    roster = cfg.get("agents", []) or []
-    for_agent = store.operator_facing() or store.sole_lead()
-    items = _collect_web_attention_items(store, roster, for_agent)
-    disps, _problems = _attention.read_dispositions(store)
-    queue = _attention.build_queue(items, disps,
-                                   now_iso=now.isoformat().replace("+00:00", "Z"))
-    wire: list[dict] = []
-    for it in queue.get("items", []):
-        src = it.get("source", "")
-        mapped = _ATTENTION_SOURCE_MAP.get(src)
-        if mapped is None:
-            continue  # unknown internal source — skip rather than mislabel
-        wire_source, source_label, severity = mapped
-        title = it.get("title") or "attention needed"
-        detail = it.get("why_it_matters") or ""
-        wire.append({
-            "id": it.get("item_id", ""),
-            "source": wire_source,
-            "source_label": source_label,
-            "severity": severity,
-            "title": _envelope_str(title),
-            "agent": _attention_agent(it),
-            "detail": _envelope_str(detail),
-            "age_seconds": float(it.get("age_seconds") or 0),
-            "human_can_unblock_now": bool(it.get("human_can_unblock_now")),
-        })
-    if agents is None:
+    try:
+        cfg = _safe_load_config(store)
+        roster = cfg.get("agents", []) or []
         try:
-            agents = _agent_entries(store, cfg, _validated_for_state(store, cfg)[0],
-                                    for_agent)
-        except Exception:  # noqa: BLE001 — stuck items are best-effort
-            agents = []
-    wire.extend(_derive_stuck_items(agents, now=now))
-    return {"root": desc.label, "items": wire, "count": len(wire)}
+            for_agent = store.operator_facing() or store.sole_lead()
+        except Exception:  # noqa: BLE001 — a corrupt root can't resolve a liaison
+            for_agent = None  # needs_operator source skips cleanly when None
+        items = _collect_web_attention_items(store, roster, for_agent)
+        disps, _problems = _attention.read_dispositions(store)
+        queue = _attention.build_queue(items, disps,
+                                       now_iso=now.isoformat().replace("+00:00", "Z"))
+        wire: list[dict] = []
+        for it in queue.get("items", []):
+            src = it.get("source", "")
+            mapped = _ATTENTION_SOURCE_MAP.get(src)
+            if mapped is None:
+                continue  # unknown internal source — skip rather than mislabel
+            wire_source, source_label, severity = mapped
+            title = it.get("title") or "attention needed"
+            detail = it.get("why_it_matters") or ""
+            wire.append({
+                "id": it.get("item_id", ""),
+                "source": wire_source,
+                "source_label": source_label,
+                "severity": severity,
+                "title": _envelope_str(title),
+                "agent": _attention_agent(it),
+                "detail": _envelope_str(detail),
+                "age_seconds": float(it.get("age_seconds") or 0),
+                "human_can_unblock_now": bool(it.get("human_can_unblock_now")),
+            })
+        if agents is None:
+            try:
+                agents = _agent_entries(store, cfg,
+                                        _validated_for_state(store, cfg)[0],
+                                        for_agent)
+            except Exception:  # noqa: BLE001 — stuck items are best-effort
+                agents = []
+        wire.extend(_derive_stuck_items(agents, now=now))
+        return {"root": desc.label, "items": wire, "count": len(wire)}
+    except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500 (B1)
+        return {"root": desc.label, "items": [], "count": 0, "errors": [str(e)]}
 
 
 # NEEDS_OPERATOR titles/details are typed single-line fields the attention layer
@@ -1600,6 +1659,25 @@ def _make_handler(roots: list[RootDescriptor]) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+        # ---- root resolution for the root-scoped thread route (P2-5)
+        def _thread_store(self) -> Store:
+            """The Store for the ``?root=<label>`` query arg, else ``roots[0]``.
+
+            The client fetches the SELECTED root's transcript; binding
+            ``roots[0]`` unconditionally would 404 a non-primary-root thread —
+            or, worse, LEAK ``roots[0]``'s transcript when both roots happen to
+            carry the same request_id. Match by label (the same label the wire
+            exposes); an absent or unmatched ``root`` degrades to ``roots[0]``.
+            """
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            params = urllib.parse.parse_qs(query)
+            wanted = (params.get("root") or [None])[0]
+            if wanted:
+                for d in roots:
+                    if d.label == wanted:
+                        return d.store
+            return roots[0].store
+
         # ---- routing
         def _route(self) -> None:
             path = self.path.split("?", 1)[0].split("#", 1)[0]
@@ -1650,7 +1728,11 @@ def _make_handler(roots: list[RootDescriptor]) -> type[BaseHTTPRequestHandler]:
                     self._send_json(HTTPStatus.NOT_FOUND,
                                     {"error": "thread not found"})
                     return
-                thread = build_thread(store, rid)
+                # Root-scoped (review P2-5): the client fetches the SELECTED
+                # root's thread via ?root=<label>. Bind that root's store so a
+                # non-primary-root thread resolves — and a same-rid thread in
+                # root[0] can NOT leak across roots. Absent/unmatched → root[0].
+                thread = build_thread(self._thread_store(), rid)
                 if thread is None:
                     self._send_json(HTTPStatus.NOT_FOUND,
                                     {"error": "thread not found"})

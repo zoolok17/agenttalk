@@ -1353,6 +1353,30 @@ def test_api_state_capacity_cli_wrapped_present_when_data_exists(tmp_path: Path)
         srv.server_close()
 
 
+def test_api_state_wrapped_from_managed_lead_loop_when_health_unknown(tmp_path: Path) -> None:
+    """§3a (review P2-1): wrapped/restartable arm on the managed-lead-loop set even
+    when health mode is unknown (stale/missing snapshot). Health mode alone would
+    OMIT the field exactly when a wrapped agent is down — losing the restart signal
+    when it matters most."""
+    s = _make_store(tmp_path)
+    # 'alpha' is in a managed lead-loop but has NO health snapshot -> mode unknown.
+    s.set_managed_lead_loop("alpha")
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        # No health snapshot => _is_wrapped(health) is None; the managed set arms it.
+        assert alpha.get("wrapped") is True
+        assert alpha.get("restartable") is True
+        # 'beta' is neither wrapped-by-health nor managed -> field OMITTED.
+        beta = next(a for a in root["agents"] if a["name"] == "beta")
+        assert "wrapped" not in beta
+        assert "restartable" not in beta
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_state_capacity_null_percent_allowed_inside_object(tmp_path: Path) -> None:
     """§3a: a capacity snapshot with only one signal keeps the OTHER percent as
     null INSIDE the capacity object (the absent-not-null rule is about the
@@ -1518,6 +1542,20 @@ def test_build_state_is_pure_without_history(tmp_path: Path) -> None:
         assert "health_timeline" not in a
 
 
+def test_health_timeline_ring_window_expiry() -> None:
+    """§5 (review P2-6): segments() applies the window cutoff at RENDER time — an
+    agent that stopped reporting can't accrue a growing stale segment past the
+    window, and a sample older than the window is dropped entirely."""
+    ring = web.HealthTimelineRing(window_seconds=1)
+    ring.record("root", "alpha", "working_turn", now=1000.0)
+    # Within the window: the (open) segment is clamped to the window, never longer.
+    segs = ring.segments("root", "alpha", now=1000.5)
+    assert segs and segs[0]["state"] == "working_turn"
+    assert sum(seg["seconds"] for seg in segs) <= 1.0 + 1e-6
+    # >1s later with no new sample: the stale sample falls outside the window.
+    assert ring.segments("root", "alpha", now=1002.0) == []
+
+
 # ---------------------------------------------------------- /api/attention
 
 def _attention(base: str) -> dict:
@@ -1586,6 +1624,40 @@ def test_api_attention_empty_is_all_clear(tmp_path: Path) -> None:
         payload = _attention(base)
         assert payload["items"] == []
         assert payload["count"] == 0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_attention_degrades_on_corrupt_root(tmp_path: Path) -> None:
+    """§4a (review B1): a corrupt/uninitialized root must NOT 500 /api/attention.
+
+    Parity with /api/state's errors-as-data (test_api_state_corrupt_root_isolated):
+    the config reads that back the queue — chiefly ``operator_facing()``/
+    ``sole_lead()``, which raise ``JSONDecodeError`` on this corrupt config — sit
+    behind a fail-safe, so the route returns a well-formed 200 JSON envelope, never
+    an HTTP 500 with an HTML traceback. The remaining per-source reads degrade to
+    bounded ``source_error`` items (the pre-existing granular fail-safe), so the
+    queue is either empty-with-errors or carries only supervisor-severity source
+    errors — in every case a valid, body-free envelope."""
+    s = _make_store(tmp_path)
+    cfg_path = s.dir / "config.json"
+    cfg_path.write_text("{not json", encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        # 200, not 500 (the fix: for_agent resolution can no longer escape).
+        with _get(f"{base}/api/attention") as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("application/json")
+            payload = json.loads(resp.read())
+        # Well-formed envelope; count matches; body-free.
+        assert set(payload) >= {"root", "items", "count"}
+        assert payload["count"] == len(payload["items"])
+        _assert_no_body_keys(payload)
+        # Degraded either to an empty queue + errors field OR to bounded
+        # source_error items — never a partial/garbage item, never a 500.
+        assert payload["items"] == [] or all(
+            it["id"].startswith("source_error:") for it in payload["items"])
     finally:
         srv.shutdown()
         srv.server_close()
@@ -1699,6 +1771,60 @@ def test_api_thread_excludes_forged_and_out_of_roster(tmp_path: Path) -> None:
         srv.server_close()
 
 
+def test_api_thread_root_scoped(tmp_path: Path) -> None:
+    """§4b (review P2-5): /api/thread is root-scoped via ?root=<label>. Two roots
+    carrying the SAME request_id but different bodies must NOT bleed across each
+    other, and a rid that exists ONLY in root1 is not resolvable without the
+    correct ?root (binding root[0] unconditionally would 404 it or leak root[0])."""
+    a, b = _make_two_stores(tmp_path)
+    label0, label1 = a.root.name, b.root.name
+    # Same request_id "rid-shared" in BOTH roots, distinct bodies.
+    a.send(sender="alpha", recipient="beta", kind="note",
+           subject="root0 subject", body="ROOT0_BODY_TOKEN",
+           meta={"request_id": "rid-shared"})
+    b.send(sender="lead", recipient="dev", kind="note",
+           subject="root1 subject", body="ROOT1_BODY_TOKEN",
+           meta={"request_id": "rid-shared"})
+    # A rid that exists ONLY in root1.
+    b.send(sender="lead", recipient="dev", kind="note",
+           subject="only root1", body="ONLY_ROOT1_BODY",
+           meta={"request_id": "rid-only1"})
+    srv, _t, base = _serve_multi(a, b)
+    try:
+        # ?root=<label1> resolves root1's copy of the shared rid.
+        with _get(f"{base}/api/thread/rid-shared?root={label1}") as resp:
+            assert resp.status == 200
+            p1 = json.loads(resp.read())
+        assert p1["subject"] == "root1 subject"
+        assert "ROOT1_BODY_TOKEN" in json.dumps(p1)
+        assert "ROOT0_BODY_TOKEN" not in json.dumps(p1)
+
+        # ?root=<label0> (and the no-root default) resolves root0's copy — no bleed.
+        with _get(f"{base}/api/thread/rid-shared?root={label0}") as resp:
+            assert resp.status == 200
+            p0 = json.loads(resp.read())
+        assert p0["subject"] == "root0 subject"
+        assert "ROOT0_BODY_TOKEN" in json.dumps(p0)
+        assert "ROOT1_BODY_TOKEN" not in json.dumps(p0)
+        with _get(f"{base}/api/thread/rid-shared") as resp:  # no ?root -> root[0]
+            assert resp.status == 200
+            pdef = json.loads(resp.read())
+        assert pdef["subject"] == "root0 subject"
+
+        # A root1-only rid is NOT resolvable against root[0] (404), but IS with
+        # the correct ?root — proves the binding follows the selected root.
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _urlopen(f"{base}/api/thread/rid-only1", timeout=5)
+        assert exc.value.code == 404
+        with _get(f"{base}/api/thread/rid-only1?root={label1}") as resp:
+            assert resp.status == 200
+            ponly = json.loads(resp.read())
+        assert ponly["subject"] == "only root1"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_thread_excludes_unsigned_when_hmac_enforced(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1749,6 +1875,24 @@ def test_api_state_recent_feed(tmp_path: Path) -> None:
             assert set(r) == {"id", "ts", "from", "to", "kind", "subject"}
             assert "body" not in r
         assert "RECENT_BODY_TOKEN" not in json.dumps(recent)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_no_body_content_sentinel(tmp_path: Path) -> None:
+    """0.58.0 (review P2-7): the 'no body on /api/state' contract is enforced by
+    CONTENT, not just key name. A message whose BODY is a distinctive sentinel
+    must not appear ANYWHERE in the serialized /api/state (subject/meta/etc.)."""
+    sentinel = "ZZZ_BODY_SENTINEL_QWE"
+    s = _make_store(tmp_path)
+    s.send(sender="alpha", recipient="beta", kind="review-request",
+           subject="ordinary subject", body=sentinel,
+           meta={"request_id": "rid-s"})
+    srv, _t, base = _serve(s)
+    try:
+        state = _state(base)
+        assert sentinel not in json.dumps(state)
     finally:
         srv.shutdown()
         srv.server_close()
