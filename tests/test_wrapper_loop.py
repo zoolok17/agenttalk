@@ -5,6 +5,8 @@ fixture Store + injected drive/spawn - NO real CLI.
 
 from __future__ import annotations
 
+import errno
+import gc
 import json
 from pathlib import Path
 import re
@@ -397,6 +399,19 @@ class _Stream:
         return iter(self._lines)
 
 
+class _PipeTeardownStream:
+    """A spawner result that raises a benign pipe error after its last line."""
+
+    def __init__(self, lines, exc: OSError, returncode=0):
+        self._lines = lines
+        self._exc = exc
+        self.returncode = returncode
+
+    def __iter__(self):
+        yield from self._lines
+        raise self._exc
+
+
 def test_make_drive_partial_stream_is_failure(tmp_path) -> None:
     # codex r2 MAJOR 1: a stream that started a turn but never reached a COMPLETED
     # boundary (no turn.completed / message_stop) is NOT success - the message must
@@ -430,6 +445,44 @@ def test_make_drive_nonzero_exit_is_failure(tmp_path) -> None:
     assert drive({"from": "a", "kind": "message", "body": "hi",
                   "correlation_id": None, "request_id": None, "broadcast_id": None}).ok is False
     assert s.read_heartbeat("beta") is None     # reviewer-1 gate: no heartbeat on failure
+
+
+def test_make_drive_ignores_benign_einval_after_completed_turn(tmp_path) -> None:
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex")
+    stream = _PipeTeardownStream(
+        _codex_turn_lines(), OSError(errno.EINVAL, "Invalid argument"), returncode=0)
+    drive = run.make_drive(
+        s, "beta", "codex", st, ["codex"], clock=lambda: 0.0, render=False,
+        spawn=lambda a, i: stream,
+    )
+
+    out = drive({"from": "a", "kind": "message", "body": "hi",
+                 "correlation_id": None, "request_id": None, "broadcast_id": None})
+
+    assert out.ok is True
+    assert st.turns == 1
+    assert s.read_heartbeat("beta") is not None
+
+
+def test_make_drive_benign_broken_pipe_is_not_classified_infra(tmp_path) -> None:
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex")
+    partial = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+               json.dumps({"type": "turn.started"})]
+    stream = _PipeTeardownStream(
+        partial, OSError(errno.EPIPE, "Broken pipe"), returncode=0)
+    drive = run.make_drive(
+        s, "beta", "codex", st, ["codex"], clock=lambda: 0.0, render=False,
+        spawn=lambda a, i: stream,
+    )
+
+    out = drive({"from": "a", "kind": "message", "body": "hi",
+                 "correlation_id": None, "request_id": None, "broadcast_id": None})
+
+    assert out.ok is False
+    assert out.failure_class == loop.CLASS_AMBIGUOUS
+    assert "partial stream" in out.summary
 
 
 def test_make_drive_classifies_failures_for_dead_letter(tmp_path) -> None:
@@ -636,6 +689,64 @@ def test_hidden_wrapper_spawn_paths_pass_creationflags(monkeypatch) -> None:
     run._ProcStream(["codex"], "prompt")
 
     assert [c["creationflags"] for c in calls] == [99, 99]
+
+
+def _patch_procstream_popen(monkeypatch, lines, *, close_exc: OSError | None = None) -> None:
+    class _Stdin:
+        def write(self, text):
+            _ = text
+
+        def close(self):
+            pass
+
+    class _Stdout:
+        def __iter__(self):
+            return iter(lines)
+
+        def close(self):
+            if close_exc is not None:
+                raise close_exc
+
+    class _Popen:
+        def __init__(self, argv, **kwargs):
+            _ = argv, kwargs
+            self.stdin = _Stdin()
+            self.stdout = _Stdout()
+            self.pid = 123
+
+        def poll(self):
+            return None
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(run.subprocess, "Popen", _Popen)
+
+
+def test_procstream_stdout_close_einval_is_swallowed(monkeypatch) -> None:
+    lines = _codex_turn_lines()
+    _patch_procstream_popen(
+        monkeypatch, lines, close_exc=OSError(errno.EINVAL, "Invalid argument"))
+
+    stream = run._ProcStream(["codex"], "prompt")
+
+    assert list(stream) == lines
+    assert stream.returncode == 0
+
+
+def test_procstream_generator_finalizer_einval_is_quiet(monkeypatch, capsys) -> None:
+    lines = _codex_turn_lines()
+    _patch_procstream_popen(
+        monkeypatch, lines, close_exc=OSError(errno.EINVAL, "Invalid argument"))
+    stream = run._ProcStream(["codex"], "prompt")
+    gen = iter(stream)
+    assert next(gen) == lines[0]
+
+    del gen
+    gc.collect()
+
+    assert stream.returncode == 0
+    assert "Exception ignored" not in capsys.readouterr().err
 
 
 def test_launch_preflight_resolves_known_npm_codex_shim_and_blocks_unknown(

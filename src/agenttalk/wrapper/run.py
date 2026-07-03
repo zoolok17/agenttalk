@@ -50,6 +50,7 @@ _ADAPTERS: dict[str, Callable[[object], list[Event]]] = {
 # high-confidence signature -> escalation-enabled.
 _TELEMETRY_ONLY = {"codex": True, "claude": False}
 _NO_CHILD_WINDOW_ENV = "AGENTTALK_NO_CHILD_WINDOW"
+_BENIGN_PIPE_TEARDOWN_ERRNOS = {errno.EINVAL, errno.EPIPE}
 
 # Known GLOBAL/INFRA signatures in a terminal turn-failure error message. A terminal
 # turn.failed / is_error carrying one of these is an OUTAGE (overload, rate-limit, 5xx,
@@ -451,6 +452,19 @@ def _child_creationflags(
 def _child_window_kwargs(env: dict[str, str] | None = None) -> dict[str, int]:
     flags = _child_creationflags(env)
     return {"creationflags": flags} if flags else {}
+
+
+def _is_benign_pipe_teardown_error(exc: OSError) -> bool:
+    """Windows overlapped stdout pipes can raise during EOF teardown."""
+    return exc.errno in _BENIGN_PIPE_TEARDOWN_ERRNOS
+
+
+def _iter_suppressing_benign_pipe_teardown(lines: Iterable[str]) -> Iterator[str]:
+    try:
+        yield from lines
+    except OSError as exc:
+        if not _is_benign_pipe_teardown_error(exc):
+            raise
 
 
 def _workspace_root() -> Path:
@@ -1228,7 +1242,7 @@ class _ProcStream:
 
     def __iter__(self) -> Iterator[str]:
         try:
-            yield from (self._proc.stdout or [])
+            yield from _iter_suppressing_benign_pipe_teardown(self._proc.stdout or [])
         finally:
             # Stop the work-heartbeat ticker FIRST - before this stream reads as
             # exhausted to the caller - so drive()'s failed-turn clear_heartbeat
@@ -1241,7 +1255,11 @@ class _ProcStream:
                 self._work_hb.join(timeout=10.0)
                 self.work_heartbeat_result = dict(self._work_hb.result)
             if self._proc.stdout:
-                self._proc.stdout.close()
+                try:
+                    self._proc.stdout.close()
+                except OSError as exc:
+                    if not _is_benign_pipe_teardown_error(exc):
+                        raise
             self.returncode = self._proc.wait()
             # Stop + join the watchdog AFTER the child has exited: a normal turn completion
             # makes the thread exit its wait immediately (no kill race), and a watchdog that
@@ -1388,7 +1406,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             preflight_ok = True
         try:
             stream = spawner(argv, spec.stdin)
-            for line in stream:
+            for line in _iter_suppressing_benign_pipe_teardown(stream):
                 s = line.strip()
                 if not s:
                     continue

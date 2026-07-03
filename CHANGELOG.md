@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-turn CLI child is spawned with Windows `CREATE_NO_WINDOW` instead of
   opening its own console.
 
+### Fixed
+
+- **Wrapped Windows agents suppress benign child-stdout pipe teardown errors.**
+  Windows overlapped stdout pipes can raise `OSError: [Errno 22] Invalid
+  argument` or broken-pipe errors during normal end-of-stream teardown. The
+  wrapper now treats those as ordinary stream exhaustion instead of logging
+  finalizer noise or classifying a completed turn as an infra/outage failure.
+
 ## [0.58.4] - 2026-07-03
 
 ### Added
