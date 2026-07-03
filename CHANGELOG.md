@@ -5,6 +5,19 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.58.2] - 2026-07-03
+
+### Fixed
+
+- **`agenttalk doctor` now surfaces a wrapped supervised-Codex runtime-preflight failure as
+  an error.** `_check_supervised_codex` accepted a runtime checker but discarded it, so a
+  wrapped supervised Codex that can't run `agenttalk` in its workspace was never flagged — the
+  supervised loop could wedge silently. Doctor now runs the runtime preflight for a wrapped
+  Codex and reports a blocker as an `error` (details carry the greppable marker
+  `agenttalk-runtime-preflight-FAILED`, with the blocker in `fix` and `data[agenttalk_runtime]`),
+  so it holds the agent. The preflight itself (`preflight_agenttalk_runtime`) already shipped in
+  a prior release; this closes the last wiring gap.
+
 ## [0.58.1] - 2026-07-03
 
 ### Fixed
