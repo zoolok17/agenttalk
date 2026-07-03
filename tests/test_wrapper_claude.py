@@ -206,6 +206,11 @@ def test_inject_claude_permission_mode():
     argv = ["claude", "--permission-mode", "acceptEdits", "-p"]
     assert cli._inject_claude_permission_mode(
         argv, "claude", "bypassPermissions") == argv
+    # GNU equals form counts as explicit too — must NOT double-add + widen the
+    # operator's narrower mode (reviewer-1 P2 / fable N1)
+    eq = ["claude", "--permission-mode=acceptEdits", "-p"]
+    assert cli._inject_claude_permission_mode(
+        eq, "claude", "bypassPermissions") == eq
     # non-claude cli -> unchanged
     assert cli._inject_claude_permission_mode(
         ["codex", "exec"], "codex", "bypassPermissions") == ["codex", "exec"]

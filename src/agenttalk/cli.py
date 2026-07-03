@@ -6041,7 +6041,11 @@ def _inject_claude_permission_mode(argv: list[str], cli: str,
     """
     if cli != "claude" or not perm_mode:
         return argv
-    if "--permission-mode" in argv:
+    # An explicit operator tail always wins — in EITHER form: the separated
+    # `--permission-mode <mode>` or the GNU single-token `--permission-mode=<mode>`.
+    # (Checking only exact-token membership would double-add on the equals form and,
+    # if Claude is last-flag-wins, silently widen a narrower operator mode.)
+    if any(a == "--permission-mode" or a.startswith("--permission-mode=") for a in argv):
         return argv
     return [*argv, "--permission-mode", perm_mode]
 
