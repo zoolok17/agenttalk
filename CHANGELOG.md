@@ -5,6 +5,48 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.58.0] - 2026-07-03
+
+The web dashboard is now the **Team Console** — a five-view operator console for observing a
+live multi-agent team, recreated from the operator's high-fidelity design. Read-only this
+release; operator write-actions (restart / defer / dismiss / requeue) land later behind an
+explicit `--enable-actions` opt-in with a CSRF token.
+
+### Added
+
+- **Team Console at `/dashboard`** — five client-switched views: **Team overview** (per-agent
+  status / capacity / heartbeat cards + a live activity rail), **Conversations** (a
+  who-talks-to-whom graph + active-thread list), **Attention** (a ranked "needs a human"
+  queue), **Sessions** (full message-thread transcripts), and **Agent detail** (current work,
+  a ~30-minute health timeline, capacity meters, supervisor state, owned domains). Light/dark
+  themes, five accents, and a comfortable/compact density toggle, persisted in `localStorage`.
+- **`GET /api/attention`** — the ranked attention queue (escalations, gate holds, dead
+  letters, lead-loop-unarmed, plus derived stuck agents) as JSON. Envelope-only and
+  fail-safe: a corrupt/uninitialized root degrades to `errors`-as-data, never a 500.
+- **`GET /api/thread/<rid>`** — one thread's full transcript, the only route that carries
+  message bodies. `rid` is validated before any disk touch; messages pass the same
+  roster/kind/HMAC validation as the rest of the dashboard; bodies render via `textContent`
+  only. Root-aware via `?root=<label>`.
+- **`/api/state` per-agent additions** (all absent-not-null): `cli`, `capacity` (rate /
+  context %), `wrapped` / `restartable`, `owned_domains`, a synthesized `task` line, and a
+  best-effort in-memory `health_timeline`. Per-thread: `verdict`, `active_review`, `opener` /
+  `opener_peer`. Schema stays v1 (additive only).
+
+### Changed
+
+- The dashboard's CSS and JS are now **served static assets** (`/static/console.css`,
+  `/static/console.js`) rather than an inline string, which lets the console
+  Content-Security-Policy drop `style-src 'unsafe-inline'` for `style-src 'self'` — a net
+  tightening. The console builds all DOM via `createElement` / `textContent` (never
+  `innerHTML`); message bodies and every bus-derived string are treated as untrusted.
+
+### Internal
+
+- `/api/state` remains body-free, now regression-enforced by a body-content sentinel over the
+  whole payload (not just key names). The server stays read-only (GET/HEAD only; the
+  full-tree-hash no-mutation regression covers the new routes). System font stack (no remote
+  fonts) keeps `default-src 'none'` intact.
+
 ## [0.57.1] - 2026-07-02
 
 Fast-follow polish for the operator attention queue: the fresh-review nits, the north-star
