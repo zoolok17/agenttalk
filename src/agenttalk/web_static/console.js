@@ -340,7 +340,7 @@
   }
   // Thread cache key: root-label + rid (P2-5). Keying by rid ALONE would let a
   // same-request_id thread in another root leak / cross-bleed once cached.
-  function threadKey(rid) { return currentRootLabel() + ' ' + rid; }
+  function threadKey(rid) { return currentRootLabel() + '|' + rid; }
 
   // Agent bucket counts by health group (work/idle/attn/unknown).
   function agentCounts(root) {
@@ -1584,7 +1584,7 @@
   function fetchThread(rid, force) {
     if (!rid) return;
     var label = currentRootLabel();
-    var key = label + ' ' + rid;
+    var key = threadKey(rid);  // single source of truth (matches transcriptCard read)
     if (!force && (threadCache[key] || threadPending[key])) return;
     threadPending[key] = true;
     var url = '/api/thread/' + encodeURIComponent(rid) + '?root=' + encodeURIComponent(label);

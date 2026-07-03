@@ -1284,6 +1284,27 @@ def test_console_renderer_safety(tmp_path: Path) -> None:
     assert "eval(" not in js
 
 
+def test_console_js_thread_cache_key_single_source(tmp_path: Path) -> None:
+    """Regression (reviewer-1, fold-3): the transcript cache READ (transcriptCard)
+    and WRITE (fetchThread) must derive the key identically, or every Sessions
+    transcript stays stuck on "Loading…". A NUL byte had crept into threadKey's
+    delimiter — rendering the file binary AND mismatching fetchThread's space key,
+    so the read always missed. Guard the served bytes: no NUL, and the key is
+    derived in exactly one place (threadKey) with no ad-hoc `+ ' ' + rid` site."""
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/static/console.js") as resp:
+            raw = resp.read()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert b"\x00" not in raw, "console.js must not contain a NUL byte"
+    js = raw.decode("utf-8")
+    assert "function threadKey(" in js
+    assert "label + ' ' + rid" not in js, "cache key must go through threadKey(), not an ad-hoc build"
+
+
 def test_dashboard_shell_no_inline_handlers(tmp_path: Path) -> None:
     """§1 / §6: the /dashboard console shell carries no inline <style>, no
     inline event handlers, and no style= attributes — all of which would
