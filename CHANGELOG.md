@@ -5,6 +5,21 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.60.2] - 2026-07-04
+
+### Fixed
+
+- **Team Console compose/inbox forms no longer reset every 2 seconds.** The
+  console's 2-second `/api/state` poll rebuilt the whole view, wiping in-progress
+  dropdown selections, typed text, and focus in the action composer (and the inbox
+  answer composer). The poll now skips re-rendering while an action field is
+  focused, and composer field values persist across any rebuild. Actions-disabled
+  (read-only) behavior is unchanged.
+- **Flow-graph line thickness is capped.** Edge width scaled linearly by raw
+  message count with no cap, so a heavily-used pair on a busy bus rendered as a
+  solid blob. Thickness is now a gentle capped log scale (~1px floor, ~6px cap) so
+  edges read as lines regardless of volume. Frontend-only (`web_static/console.js`).
+
 ## [0.60.1] - 2026-07-04
 
 ### Fixed
