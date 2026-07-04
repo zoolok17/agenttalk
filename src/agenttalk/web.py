@@ -98,6 +98,7 @@ from agenttalk import attention as _attention
 from agenttalk import capacity as _capacity
 from agenttalk import domains as _domains
 from agenttalk import signing as _signing
+from agenttalk import threads as th
 from agenttalk.store import COMPOSING_INTENT_STALE_SECONDS, Message, Store
 from agenttalk.threads import Thread, derive_threads
 
@@ -1550,10 +1551,14 @@ def _web_needs_operator(store: Store, for_agent: str) -> list[dict]:
                           cursor=store.cursor(for_agent) or "", now=now,
                           closed_rids=_closed_rids_for(store, for_agent),
                           retired=retired)
-    return [{"request_id": t.request_id, "subject": t.subject,
-             "sender": opener_sender.get(t.request_id, ""),
-             "age_seconds": t.age_seconds, "meta": opener_meta.get(t.request_id, {})}
-            for t in rows if t.needs_operator and t.operator_state == "pending"]
+    pending = [{"request_id": t.request_id, "subject": t.subject,
+                "sender": opener_sender.get(t.request_id, ""),
+                "age_seconds": t.age_seconds, "meta": opener_meta.get(t.request_id, {})}
+               for t in rows
+               if t.needs_operator and t.operator_state == "pending"
+               and t.opener_recipient == for_agent and t.opener_sender != for_agent]
+    return [p for p in pending
+            if not th.wrapper_notice_has_canonical_row(store, p["meta"], p["sender"])]
 
 
 def _derive_stuck_items(agents: list[dict], *, now: datetime) -> list[dict]:
@@ -1581,8 +1586,34 @@ def _derive_stuck_items(agents: list[dict], *, now: datetime) -> list[dict]:
     return stuck
 
 
+def _answer_action_for_item(item: dict, for_agent: str | None) -> dict | None:
+    if not for_agent or item.get("source") != _attention.SOURCE_NEEDS_OPERATOR:
+        return None
+    rid = ""
+    for ref in item.get("source_refs") or []:
+        if isinstance(ref, dict) and ref.get("kind") == "message":
+            maybe_rid = ref.get("request_id")
+            if isinstance(maybe_rid, str):
+                rid = maybe_rid
+                break
+    if not rid:
+        iid = str(item.get("item_id") or "")
+        prefix = f"{_attention.SOURCE_NEEDS_OPERATOR}:"
+        if iid.startswith(prefix):
+            rid = iid[len(prefix):]
+    if not rid:
+        return None
+    return {
+        "kind": "answer_escalation",
+        "to_request": rid,
+        "requester": _envelope_str(item.get("requester") or ""),
+    }
+
+
 def build_attention(desc: RootDescriptor,
-                    agents: list[dict] | None = None) -> dict:
+                    agents: list[dict] | None = None,
+                    *,
+                    actions_enabled: bool = False) -> dict:
     """The /api/attention payload for one root (§4a). Envelope-only: every
     string here is envelope-derived — a raw message body NEVER lands in a
     field. ``agents`` (root[0]'s /api/state agent rows) supplies the derived
@@ -1616,7 +1647,7 @@ def build_attention(desc: RootDescriptor,
             wire_source, source_label, severity = mapped
             title = it.get("title") or "attention needed"
             detail = it.get("why_it_matters") or ""
-            wire.append({
+            entry = {
                 "id": it.get("item_id", ""),
                 "source": wire_source,
                 "source_label": source_label,
@@ -1626,7 +1657,28 @@ def build_attention(desc: RootDescriptor,
                 "detail": _envelope_str(detail),
                 "age_seconds": float(it.get("age_seconds") or 0),
                 "human_can_unblock_now": bool(it.get("human_can_unblock_now")),
-            })
+            }
+            if actions_enabled:
+                action = _answer_action_for_item(it, for_agent)
+                if action is not None:
+                    entry["answerable"] = True
+                    entry["answer_escalation"] = {
+                        "to_request": action["to_request"],
+                        "requester": action["requester"],
+                    }
+                    entry["actions"] = {"answer_escalation": dict(action)}
+                    entry["available_actions"] = [dict(action)]
+                    if it.get("priority") not in (None, "unknown"):
+                        entry["priority"] = _envelope_str(it.get("priority"))
+                    if it.get("risk_severity") not in (None, "unknown"):
+                        entry["risk_severity"] = _envelope_str(it.get("risk_severity"))
+                    if it.get("recommendation"):
+                        entry["recommendation"] = _envelope_str(it.get("recommendation"))
+                    if isinstance(it.get("options"), list):
+                        entry["options"] = [
+                            _envelope_str(o) for o in it["options"] if isinstance(o, str)
+                        ]
+            wire.append(entry)
         if agents is None:
             try:
                 agents = _agent_entries(store, cfg,
@@ -2124,7 +2176,9 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
             if path == "/api/attention":
                 # Ranked "needs a human" queue for root[0] (§4a). Envelope-only,
                 # read-only, strict _DEFAULT_CSP (JSON is not executed).
-                self._send_json(HTTPStatus.OK, build_attention(roots[0]))
+                self._send_json(HTTPStatus.OK,
+                                build_attention(roots[0],
+                                                actions_enabled=enable_actions))
                 return
             if path == "/dashboard":
                 self._send_html(HTTPStatus.OK, render_dashboard(roots),

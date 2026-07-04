@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import intents
+from agenttalk import intents, threads
 from agenttalk.store import PROC_ALIVE, PROC_DEAD, Store, _new_id
 
 
@@ -21,6 +21,32 @@ def _write_raw_intent(store: Store, record: dict) -> None:
     store.intents_active_dir.mkdir(parents=True, exist_ok=True)
     (store.intents_active_dir / f"{record['intent_id']}.json").write_text(
         json.dumps(record, indent=2), encoding="utf-8")
+
+
+def _operator_question(store: Store, *, sender: str = "dev",
+                       recipient: str = "lead", rid: str = "esc-help") -> str:
+    msg = store.send(
+        sender=sender,
+        recipient=recipient,
+        kind="question",
+        subject="operator input needed",
+        body="body stays out of attention",
+        meta={"request_id": rid, "needs_operator": "true"},
+    )
+    return msg.id
+
+
+def _answer_plan(store: Store, rec: dict, actor: str = "lead") -> tuple[dict, dict, str]:
+    plan = intents.build_plan(store, actor, rec)
+    delivery = plan["deliveries"][0]
+    iid = rec["intent_id"]
+    fp = intents.delivery_fingerprint(
+        intent_id=iid, delivery_index=0, actor=actor,
+        recipient=delivery["recipient"], bus_kind=delivery["bus_kind"],
+        subject=delivery["subject"], body=delivery["body"],
+        stable_meta=delivery["stable_meta"],
+    )
+    return plan, delivery, fp
 
 
 def test_write_intent_rejects_reserved_payload_without_file(tmp_path: Path) -> None:
@@ -74,6 +100,263 @@ def test_disallowed_bus_kinds_are_unrepresentable(tmp_path: Path) -> None:
         s.write_intent("escalate", {"target": "dev", "body": "x"})
 
     assert s.list_intents() == []
+
+
+def test_answer_escalation_schema_rejects_reserved_and_extra_payload_keys(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+
+    good = s.write_intent("answer_escalation", {"to_request": "esc-help", "body": "yes"})
+    assert good["kind"] == "answer_escalation"
+    for key in ("operator_origin", "operator_answer", "request_id"):
+        with pytest.raises(ValueError, match="reserved/control"):
+            s.write_intent(
+                "answer_escalation",
+                {"to_request": "esc-help", "body": "yes", key: "x"},
+            )
+    with pytest.raises(ValueError, match="unknown field"):
+        s.write_intent(
+            "answer_escalation",
+            {"to_request": "esc-help", "body": "yes", "subject": "nope"},
+        )
+    with pytest.raises(ValueError, match="safe esc"):
+        s.write_intent("answer_escalation", {"to_request": "q-help", "body": "yes"})
+
+
+def test_answer_escalation_applies_with_terminal_correlation_direction(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    _operator_question(s, rid="esc-help")
+    rec = s.write_intent(
+        "answer_escalation", {"to_request": "esc-help", "body": "approved"}
+    )
+
+    summary = intents.drain_intents(s, pid=123, max_per_tick=1)
+
+    assert summary["applied"] == 1
+    answers = [
+        m for m in s.valid_messages()
+        if m.sender == "lead" and m.recipient == "dev"
+        and (m.meta or {}).get("operator_answer") == "true"
+    ]
+    assert len(answers) == 1
+    answer = answers[0]
+    assert answer.kind == "message"
+    assert answer.meta["request_id"] == "esc-help"
+    assert answer.meta["operator_origin"] == "lead"
+    assert "needs_operator" not in answer.meta
+    rows = threads.derive_threads(s.valid_messages(), agent="lead",
+                                  cursor="", closed_rids=set())
+    row = next(t for t in rows if t.request_id == "esc-help")
+    assert row.operator_state == "answered"
+    assert s.read_intent(rec["intent_id"])["state"] == Store.INTENT_APPLIED
+
+
+def test_answer_escalation_denies_not_owed_and_self_answer(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    _operator_question(s, rid="esc-help")
+    s.set_operator_facing("dev")
+    rec = s.write_intent(
+        "answer_escalation", {"to_request": "esc-help", "body": "not yours"}
+    )
+
+    summary = intents.drain_intents(s, pid=123, max_per_tick=1)
+
+    assert summary["denied"] == 1
+    assert s.read_intent(rec["intent_id"])["code"] == "not_owed"
+    assert not [
+        m for m in s.valid_messages()
+        if m.sender == "dev" and m.recipient == "dev"
+    ]
+
+    s2 = _store(tmp_path / "self")
+    _operator_question(s2, sender="lead", recipient="lead", rid="esc-self")
+    rec2 = s2.write_intent(
+        "answer_escalation", {"to_request": "esc-self", "body": "self"}
+    )
+    summary2 = intents.drain_intents(s2, pid=123, max_per_tick=1)
+    assert summary2["denied"] == 1
+    assert s2.read_intent(rec2["intent_id"])["code"] == "self_answer"
+
+
+def test_answer_escalation_second_queued_intent_denied_pending_only(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    _operator_question(s, rid="esc-help")
+    first = s.write_intent(
+        "answer_escalation", {"to_request": "esc-help", "body": "first"}
+    )
+    second = s.write_intent(
+        "answer_escalation", {"to_request": "esc-help", "body": "second"}
+    )
+
+    summary = intents.drain_intents(s, pid=123, max_per_tick=10)
+
+    assert summary["applied"] == 1
+    assert summary["denied"] == 1
+    assert s.read_intent(first["intent_id"])["state"] == Store.INTENT_APPLIED
+    assert s.read_intent(second["intent_id"])["code"] == "not_pending"
+    answers = [
+        m for m in s.valid_messages()
+        if m.sender == "lead" and m.recipient == "dev"
+        and (m.meta or {}).get("operator_answer") == "true"
+    ]
+    assert [m.body for m in answers] == ["first"]
+
+
+def test_answer_escalation_reconciles_send_before_delivered_record(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    _operator_question(s, rid="esc-help")
+    rec = s.write_intent(
+        "answer_escalation", {"to_request": "esc-help", "body": "answer"}
+    )
+    plan, delivery, fp = _answer_plan(s, rec)
+    iid = rec["intent_id"]
+    floor = _new_id()
+    s.update_intent(iid, lambda r: r.update({"plan": plan, "deliveries": [{
+        "delivery_index": 0, "state": "attempting", "attempt_floor": floor,
+        "fingerprint": fp, "recipient": delivery["recipient"],
+        "bus_kind": delivery["bus_kind"],
+    }]}))
+    meta = dict(delivery["stable_meta"])
+    meta.update({
+        "web_intent_id": iid,
+        "web_intent_delivery_index": "0",
+        "web_intent_fingerprint": fp,
+        "web_intent_attempt_floor": floor,
+        "executor_marker": intents.EXECUTOR_MARKER,
+    })
+    sent = s.send(sender="lead", recipient=delivery["recipient"],
+                  kind=delivery["bus_kind"], subject=delivery["subject"],
+                  body=delivery["body"], meta=meta)
+
+    summary = intents.drain_intents(s, pid=124, max_per_tick=1)
+
+    assert summary["applied"] == 1
+    assert [m.id for m in s.valid_messages()
+            if m.sender == "lead" and m.recipient == "dev"] == [sent.id]
+    stored = s.read_intent(iid)
+    assert stored["state"] == Store.INTENT_APPLIED
+    assert stored["deliveries"][0]["message_id"] == sent.id
+
+
+def test_answer_escalation_reconciles_delivered_record_before_terminal_applied(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    _operator_question(s, rid="esc-help")
+    rec = s.write_intent(
+        "answer_escalation", {"to_request": "esc-help", "body": "answer"}
+    )
+    plan, delivery, fp = _answer_plan(s, rec)
+    iid = rec["intent_id"]
+    floor = _new_id()
+    meta = dict(delivery["stable_meta"])
+    meta.update({
+        "web_intent_id": iid,
+        "web_intent_delivery_index": "0",
+        "web_intent_fingerprint": fp,
+        "web_intent_attempt_floor": floor,
+        "executor_marker": intents.EXECUTOR_MARKER,
+    })
+    sent = s.send(sender="lead", recipient=delivery["recipient"],
+                  kind=delivery["bus_kind"], subject=delivery["subject"],
+                  body=delivery["body"], meta=meta)
+    s.update_intent(iid, lambda r: r.update({"plan": plan, "deliveries": [{
+        "delivery_index": 0, "state": "delivered", "attempt_floor": floor,
+        "fingerprint": fp, "message_id": sent.id,
+    }]}))
+
+    summary = intents.drain_intents(s, pid=124, max_per_tick=1)
+
+    assert summary["applied"] == 1
+    assert len([m for m in s.valid_messages()
+                if m.sender == "lead" and m.recipient == "dev"]) == 1
+
+
+def test_answer_escalation_actor_drift_reconciles_prior_send_only(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    _operator_question(s, rid="esc-help")
+    rec = s.write_intent(
+        "answer_escalation", {"to_request": "esc-help", "body": "answer"}
+    )
+    plan, delivery, fp = _answer_plan(s, rec)
+    iid = rec["intent_id"]
+    floor = _new_id()
+    s.update_intent(iid, lambda r: r.update({"plan": plan, "deliveries": [{
+        "delivery_index": 0, "state": "attempting", "attempt_floor": floor,
+        "fingerprint": fp, "recipient": delivery["recipient"],
+        "bus_kind": delivery["bus_kind"],
+    }]}))
+    meta = dict(delivery["stable_meta"])
+    meta.update({
+        "web_intent_id": iid,
+        "web_intent_delivery_index": "0",
+        "web_intent_fingerprint": fp,
+        "web_intent_attempt_floor": floor,
+        "executor_marker": intents.EXECUTOR_MARKER,
+    })
+    sent = s.send(sender="lead", recipient=delivery["recipient"],
+                  kind=delivery["bus_kind"], subject=delivery["subject"],
+                  body=delivery["body"], meta=meta)
+    s.set_operator_facing("reviewer")
+
+    summary = intents.drain_intents(s, pid=124, max_per_tick=1)
+
+    assert summary["applied"] == 1
+    assert s.read_intent(iid)["deliveries"][0]["message_id"] == sent.id
+
+    s2 = _store(tmp_path / "drift-no-send")
+    _operator_question(s2, rid="esc-help")
+    rec2 = s2.write_intent(
+        "answer_escalation", {"to_request": "esc-help", "body": "answer"}
+    )
+    plan2, _delivery2, _fp2 = _answer_plan(s2, rec2)
+    s2.update_intent(rec2["intent_id"], lambda r: r.update({"plan": plan2}))
+    s2.set_operator_facing("reviewer")
+    summary2 = intents.drain_intents(s2, pid=124, max_per_tick=1)
+    assert summary2["denied"] == 1
+    assert s2.read_intent(rec2["intent_id"])["code"] == "actor_changed"
+    assert not [m for m in s2.valid_messages()
+                if m.sender == "lead" and m.recipient == "dev"
+                and (m.meta or {}).get("operator_answer") == "true"]
+
+
+def test_answer_escalation_kill_switch_pauses_then_revalidates_stale(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    _operator_question(s, rid="esc-help")
+    rec = s.write_intent(
+        "answer_escalation", {"to_request": "esc-help", "body": "queued"}
+    )
+    kill = s.dir / "supervisor.kill"
+    kill.write_text("paused", encoding="utf-8")
+
+    paused = intents.drain_intents(s, pid=123, max_per_tick=1)
+
+    assert paused["disabled"] is True
+    assert s.read_intent(rec["intent_id"])["state"] == Store.INTENT_QUEUED
+    s.send(sender="lead", recipient="dev", kind="message",
+           subject="manual", body="manual",
+           meta={"request_id": "esc-help", "operator_answer": "true",
+                 "operator_origin": "lead"})
+    kill.unlink()
+
+    resumed = intents.drain_intents(s, pid=124, max_per_tick=1)
+
+    assert resumed["denied"] == 1
+    assert s.read_intent(rec["intent_id"])["code"] == "not_pending"
+    assert [m.body for m in s.valid_messages()
+            if m.sender == "lead" and m.recipient == "dev"
+            and (m.meta or {}).get("operator_answer") == "true"] == ["manual"]
 
 
 def test_broadcast_plan_is_frozen_in_intent_file(tmp_path: Path) -> None:

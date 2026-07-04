@@ -78,6 +78,7 @@
   var freshFeedIds = {};              // msg id -> true (animate-in one cycle)
   var seenFeedIds = {};               // msg id -> true (to detect fresh)
   var actionSession = { enabled: false, token: null, pending: false, error: '' };
+  var queuedAnswers = {};             // to_request -> true (optimistic queued marker)
 
   // ------------------------------------------------------------ tiny helpers
   function el(tag, cls, text) {
@@ -1058,6 +1059,9 @@
     if (item.agent) detailRow.appendChild(el('span', 'tc-attn-agent', item.agent));
     detailRow.appendChild(el('span', 'tc-attn-detail', item.detail || ''));
     body.appendChild(detailRow);
+    if (actionSession.enabled && item.answerable) {
+      body.appendChild(attentionAnswerComposer(item));
+    }
     card.appendChild(body);
 
     // Right block: action buttons. In v0.58.0 all disposition actions render
@@ -1082,6 +1086,50 @@
     }
     card.appendChild(right);
     return card;
+  }
+
+  function attentionAnswerComposer(item) {
+    var action = item.answer_escalation || {};
+    var toRequest = action.to_request || '';
+    var box = el('div', 'tc-attn-answer');
+    var meta = el('div', 'tc-attn-answer-meta');
+    var requester = action.requester || '';
+    if (requester) meta.appendChild(el('span', 'tc-attn-agent', 'requester ' + requester));
+    var priority = item.priority && item.priority !== 'unknown' ? item.priority : '';
+    if (priority) meta.appendChild(el('span', 'tc-chip', 'priority ' + priority));
+    var recommendation = item.recommendation || '';
+    if (recommendation) meta.appendChild(el('span', 'tc-attn-detail', recommendation));
+    box.appendChild(meta);
+    var opts = item.options || [];
+    if (opts.length) {
+      var optWrap = el('div', 'tc-attn-options');
+      for (var i = 0; i < opts.length; i++) optWrap.appendChild(el('span', 'tc-chip', opts[i]));
+      box.appendChild(optWrap);
+    }
+    var form = el('div', 'tc-attn-answer-form');
+    var textarea = document.createElement('textarea');
+    textarea.rows = 3;
+    textarea.placeholder = 'Write the operator answer';
+    var send = el('button', 'tc-btn tc-btn-primary', queuedAnswers[toRequest] ? 'Queued' : 'Queue answer');
+    send.disabled = !toRequest || queuedAnswers[toRequest] || actionSession.pending;
+    on(textarea, 'input', function () {
+      send.disabled = !toRequest || queuedAnswers[toRequest] || actionSession.pending || !textarea.value.trim();
+    });
+    on(send, 'click', function () {
+      var body = textarea.value.trim();
+      if (!body || !toRequest) return;
+      postIntent({ kind: 'answer_escalation', payload: { to_request: toRequest, body: body } },
+        false, function () {
+          queuedAnswers[toRequest] = true;
+          fetchAttention();
+        });
+      send.disabled = true;
+    });
+    send.disabled = true;
+    form.appendChild(textarea);
+    form.appendChild(send);
+    box.appendChild(form);
+    return box;
   }
 
   // Action set per source (read-only release: disposition actions disabled).
@@ -1783,7 +1831,7 @@
     }).catch(function () { intentsPending = false; });
   }
 
-  function postIntent(envelope, retried) {
+  function postIntent(envelope, retried, onQueued) {
     if (!actionSession.enabled || !actionSession.token || actionSession.pending) return;
     actionSession.pending = true;
     actionSession.error = '';
@@ -1801,20 +1849,22 @@
     }).then(function (res) {
       actionSession.pending = false;
       if (res.status === 403 && res.data && res.data.error === 'bad_csrf' && !retried) {
-        fetchSession(function () { postIntent(envelope, true); });
+        fetchSession(function () { postIntent(envelope, true, onQueued); });
         return;
       }
       if (!res.ok) {
         actionSession.error = (res.data && (res.data.detail || res.data.error)) || 'intent rejected';
       } else {
         actionSession.error = 'Queued ' + (res.data.intent_id || 'intent');
+        if (onQueued) onQueued(res.data);
         fetchIntents();
+        fetchAttention();
       }
-      if (state.view === 'sessions') renderActiveView();
+      if (state.view === 'sessions' || state.view === 'attention') renderActiveView();
     }).catch(function () {
       actionSession.pending = false;
       actionSession.error = 'network error';
-      if (state.view === 'sessions') renderActiveView();
+      if (state.view === 'sessions' || state.view === 'attention') renderActiveView();
     });
   }
 

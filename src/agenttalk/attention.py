@@ -528,7 +528,8 @@ def needs_operator_items(pending: list[dict]) -> list[dict]:
                                      "subject": e.get("subject")},
                       human_can_unblock_now=True, age_seconds=float(e.get("age_seconds") or 0),
                       source_refs=[{"kind": "message", "request_id": rid}],
-                      fields=fields, warnings=warns)
+                      fields={**fields, "requester": e.get("sender", "")},
+                      warnings=warns)
         it["dedupe_key"] = dedupe_key(SOURCE_NEEDS_OPERATOR,
                                       identity=f"{e.get('sender', '')}|{e.get('subject', '')}",
                                       decision_hash=dh)

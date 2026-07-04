@@ -2945,26 +2945,7 @@ def _attn_now_iso() -> str:
 
 
 def _wrapper_notice_has_canonical_row(store: Store, meta: dict, sender: str) -> bool:
-    """True iff this needs_operator escalation is a WRAPPER dead-letter/config-blocked notice
-    whose CANONICAL source row already exists (reviewer-2 F6). Fail-safe: any doubt (not a
-    wrapper notice, or the canonical row can't be confirmed) returns False so a lone signal
-    is NEVER dropped - only a proven-redundant twin is coalesced away.
-
-      * config_blocked notice -> canonical = the config_blocked hold for the sender agent.
-      * dead-lettered notice (dl_disposed=true) -> canonical = the sink row (sender, dl_msg_id).
-      * a not-yet-disposed dead-letter notice has no sink row yet -> keep it (return False)."""
-    if str((meta or {}).get("dead_letter", "")).lower() != "true":
-        return False
-    try:
-        if str(meta.get("config_blocked", "")).lower() == "true":
-            return sender is not None and store.read_config_blocked_hold(sender) is not None
-        if str(meta.get("dl_disposed", "")).lower() == "true":
-            dl_id = str(meta.get("dl_msg_id") or "")
-            return any(d.get("agent") == sender and d.get("message_id") == dl_id
-                       for d in store.list_dead_letters(sender))
-    except (OSError, ValueError):
-        return False
-    return False
+    return th.wrapper_notice_has_canonical_row(store, meta, sender)
 
 
 def _needs_operator_items(store: Store, for_agent: str, now) -> list[dict]:
@@ -2986,7 +2967,9 @@ def _needs_operator_items(store: Store, for_agent: str, now) -> list[dict]:
     pending = [{"request_id": t.request_id, "subject": t.subject,
                 "sender": opener_sender.get(t.request_id, ""),
                 "age_seconds": t.age_seconds, "meta": opener_meta.get(t.request_id, {})}
-               for t in rows if t.needs_operator and t.operator_state == "pending"]
+               for t in rows
+               if t.needs_operator and t.operator_state == "pending"
+               and t.opener_recipient == for_agent and t.opener_sender != for_agent]
     # COALESCE wrapper dead-letter / config-blocked notices: the wrapper emits a needs_operator
     # TWIN of a message it dead-lettered or parked. That twin is redundant with the canonical
     # dead_letter sink row / config_blocked hold row, so SUPPRESS it - but ONLY when the
@@ -3355,26 +3338,26 @@ def _relay_operator_answer(store, sender: str, roster: list, args) -> int:
         sys.stderr.write("agenttalk relay operator-answer: empty body (use -m TEXT, "
                          "--file PATH, or pipe stdin) - relay the operator's answer.\n")
         return 2
-    row = _thread_row_for(store, sender, rid)
-    if row is None:
-        sys.stderr.write(f"agenttalk relay operator-answer: no thread {rid!r} involving "
-                         f"{sender!r} (unknown id or not your thread).\n")
+    resolved = th.resolve_operator_answer_target(store, sender, rid)
+    if not resolved.ok:
+        code = resolved.denial_code or "denied"
+        if code == "not_found":
+            sys.stderr.write(f"agenttalk relay operator-answer: no thread {rid!r} involving "
+                             f"{sender!r} (unknown id or not your thread).\n")
+        elif code == "not_operator":
+            sys.stderr.write(f"agenttalk relay operator-answer: thread {rid!r} is not an operator "
+                             f"escalation (needs_operator). Use `agenttalk reply` for an ordinary "
+                             f"thread.\n")
+        elif code == "not_owed":
+            sys.stderr.write(f"agenttalk relay operator-answer: {resolved.detail} - only the "
+                             "addressed liaison relays its answer.\n")
+        elif code == "self_answer":
+            sys.stderr.write(f"agenttalk relay operator-answer: {resolved.detail}.\n")
+        else:
+            sys.stderr.write(f"agenttalk relay operator-answer: escalation {rid!r} is not pending "
+                             f"({resolved.detail}) - nothing pending to answer.\n")
         return 2
-    if not row.needs_operator:
-        sys.stderr.write(f"agenttalk relay operator-answer: thread {rid!r} is not an operator "
-                         f"escalation (needs_operator). Use `agenttalk reply` for an ordinary "
-                         f"thread.\n")
-        return 2
-    if row.opener_recipient != sender:
-        sys.stderr.write(f"agenttalk relay operator-answer: escalation {rid!r} is addressed to "
-                         f"{row.opener_recipient!r}, not {sender!r} - only the addressed liaison "
-                         f"relays its answer.\n")
-        return 2
-    if row.operator_state != "pending":
-        sys.stderr.write(f"agenttalk relay operator-answer: escalation {rid!r} is already "
-                         f"{row.operator_state!r} - nothing pending to answer.\n")
-        return 2
-    target = row.opener_sender                       # back to the asking lead-loop / agent
+    target = resolved.recipient or ""                # back to the asking lead-loop / agent
     meta = _parse_meta(args.meta)
     for k in _RELAY_RESERVED_META:
         meta.pop(k, None)                            # SCRUB: handler-authoritative audit meta

@@ -1110,6 +1110,29 @@ def test_valid_action_post_appends_exactly_one_intent_file(tmp_path: Path) -> No
         srv.server_close()
 
 
+def test_valid_answer_escalation_post_appends_payload_only(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    s.set_operator_facing("beta")
+    s.send(sender="alpha", recipient="beta", kind="question",
+           subject="operator input needed", body="body",
+           meta={"request_id": "esc-help", "needs_operator": "true"})
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        with _post_intent(base, token, {
+            "kind": "answer_escalation",
+            "payload": {"to_request": "esc-help", "body": "use option A"},
+        }) as resp:
+            assert resp.status == 202
+            accepted = json.loads(resp.read())
+        rec = s.read_intent(accepted["intent_id"])
+        assert rec["kind"] == "answer_escalation"
+        assert rec["payload"] == {"to_request": "esc-help", "body": "use option A"}
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_rejected_action_post_mutates_nothing(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
     before = _tree_hashes(s.root)
@@ -2222,6 +2245,80 @@ def test_api_attention_shape_and_gate_hold(tmp_path: Path) -> None:
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_api_attention_actions_off_escalation_shape_is_legacy_fixture(
+    tmp_path: Path,
+) -> None:
+    s = _make_store(tmp_path)
+    s.set_operator_facing("beta")
+    s.send(sender="alpha", recipient="beta", kind="question",
+           subject="operator input needed", body="body must not leak",
+           meta={"request_id": "esc-help", "needs_operator": "true",
+                 "attention": {"priority": "urgent",
+                               "decision": "Choose release path",
+                               "recommendation": "ship the narrow fix",
+                               "options": ["ship", "hold"]}})
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/api/attention") as resp:
+            raw = resp.read()
+        payload = json.loads(raw)
+        item = next(it for it in payload["items"] if it["source"] == "escalation")
+        assert set(item) == {
+            "id", "source", "source_label", "severity", "title", "agent",
+            "detail", "age_seconds", "human_can_unblock_now",
+        }
+        assert item["title"] == "Choose release path"
+        assert item["source_label"] == "ESCALATION"
+        assert "body must not leak" not in raw.decode("utf-8")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_attention_actions_on_adds_answer_annotations_for_liaison_only(
+    tmp_path: Path,
+) -> None:
+    s = _make_store(tmp_path)
+    s.set_operator_facing("beta")
+    s.send(sender="alpha", recipient="beta", kind="question",
+           subject="operator input needed", body="body",
+           meta={"request_id": "esc-help", "needs_operator": "true",
+                 "attention": {"priority": "urgent",
+                               "decision": "Choose release path",
+                               "recommendation": "ship the narrow fix",
+                               "options": ["ship", "hold"]}})
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        payload = _attention(base)
+        item = next(it for it in payload["items"] if it["source"] == "escalation")
+        assert item["answerable"] is True
+        assert item["answer_escalation"] == {
+            "to_request": "esc-help",
+            "requester": "alpha",
+        }
+        assert item["actions"]["answer_escalation"]["kind"] == "answer_escalation"
+        assert item["available_actions"] == [item["actions"]["answer_escalation"]]
+        assert item["priority"] == "urgent"
+        assert item["recommendation"] == "ship the narrow fix"
+        assert item["options"] == ["ship", "hold"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    s2 = _make_store(tmp_path / "requester-view")
+    s2.set_operator_facing("alpha")
+    s2.send(sender="alpha", recipient="beta", kind="question",
+            subject="operator input needed", body="body",
+            meta={"request_id": "esc-help", "needs_operator": "true"})
+    srv2, _t2, base2 = _serve(s2, enable_actions=True)
+    try:
+        payload2 = _attention(base2)
+        assert not [it for it in payload2["items"] if it.get("answerable")]
+    finally:
+        srv2.shutdown()
+        srv2.server_close()
 
 
 def test_api_attention_derived_stuck_item(tmp_path: Path) -> None:

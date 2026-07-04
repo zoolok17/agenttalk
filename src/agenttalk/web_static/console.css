@@ -961,6 +961,35 @@ body {
 }
 .tc-attn-detail { font-size: 12px; color: var(--ink3); }
 .tc-attn-actions { display: flex; gap: 8px; align-items: center; flex: none; }
+.tc-attn-answer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 2px;
+}
+.tc-attn-answer-meta,
+.tc-attn-options {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+.tc-attn-answer-form {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto;
+  gap: 8px;
+  align-items: end;
+}
+.tc-attn-answer-form textarea {
+  width: 100%;
+  min-height: 68px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface2);
+  color: var(--ink);
+  padding: 8px 10px;
+}
 
 /* Source tags: solid-colored pill, white text */
 .tc-src {
@@ -1540,6 +1569,14 @@ body {
   .tc-detail-actions {
     flex-wrap: wrap;
   }
+  .tc-attn-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .tc-attn-actions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
   .tc-operator {
     display: none;
   }
@@ -1558,9 +1595,14 @@ body {
   .tc-detail-name,
   .tc-agent-name,
   .tc-feed-subject,
-  .tc-recent-subject {
+  .tc-recent-subject,
+  .tc-attn-title,
+  .tc-attn-detail {
     overflow-wrap: anywhere;
     white-space: normal;
+  }
+  .tc-attn-answer-form {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

@@ -215,6 +215,20 @@ STATUS: in progress for `v0.59.3`.
   than publishing another thread's observed budget. Supervised wrapped Codex remains isolated to
   that agent's `CODEX_HOME/sessions`.
 
+## P2 · IN PROGRESS (v0.60.0 operator inbox) — answer escalation intent (2026-07-04)
+
+Add the first operator-inbox write action: an `answer_escalation` intent that queues an
+operator answer for a pending `needs_operator` escalation, then the executor re-derives
+the recipient at drain time and emits a normal non-control message back to the requester.
+This increment does **not** add attention dispositions; defer/dismiss/resolve remain a
+fast-follow for v0.60.1.
+
+Kill-switch invariant for this increment: the web tier rejects new queued writes while
+`supervisor.kill` is active, the executor pauses without mutating queued intents, and any
+queued `answer_escalation` is fully revalidated when the switch clears. If the escalation
+was answered/closed/rescinded or the operator-facing actor drifted during the pause, drain
+fails closed with zero sends; the kill-switch never purges queued intents by itself.
+
 ### Historical review record — shipped in v0.59.1 / `9d88dc1`
 
 Second, independent fresh review of the v0.59.0 write spine (`5b8203a..72660b3`): 2 codex +

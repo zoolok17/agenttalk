@@ -38,11 +38,12 @@ import secrets
 import time
 from typing import Callable
 
+from agenttalk import threads as th
 from agenttalk.store import CONTROL_KINDS, Store, _new_id
 
 EXECUTOR_MARKER = "dashboard_intent_v2"
 
-INTENT_KINDS = ("send", "reply", "propose", "broadcast")
+INTENT_KINDS = ("send", "reply", "propose", "broadcast", "answer_escalation")
 
 # Message kinds a browser intent may produce, per intent kind. Everything else
 # (release, end, rescind, wake, composing, review-result, gate, ...) is
@@ -58,7 +59,7 @@ RESERVED_KEYS = frozenset({
     "meta",                      # no free-form meta surface in v0.59 at all
     "from", "sender",            # authority is resolve_web_actor, never payload
     "request_id", "broadcast_id", "epoch_at_send",
-    "needs_operator", "human_authorized",
+    "needs_operator", "human_authorized", "operator_answer", "operator_origin",
     "release", "end", "rescind", "wake", "composing",
 })
 # Reserved prefixes (executor-computed namespaces).
@@ -132,8 +133,10 @@ def validate_intent(kind: object, payload: object) -> list[str]:
         allowed = {"to_request", "body", "reply_kind", "status"}
     elif kind == "propose":
         allowed = {"target", "subject", "body"}
-    else:  # broadcast
+    elif kind == "broadcast":
         allowed = {"audience", "subject", "body", "message_kind"}
+    else:  # answer_escalation
+        allowed = {"to_request", "body"}
     for k in payload:
         if k not in allowed:
             errors.append(f"unknown field {k!r} for intent kind {kind!r}")
@@ -162,6 +165,11 @@ def validate_intent(kind: object, payload: object) -> list[str]:
         elif status is not None:
             errors.append("field 'status' is only valid with "
                           "reply_kind='proposal-response'")
+    if kind == "answer_escalation":
+        to_request = _str_field(
+            payload, "to_request", required=True, max_len=256, errors=errors)
+        if to_request and not _safe_prefixed_id(to_request, "esc-"):
+            errors.append("field 'to_request' must be a safe esc-* bus id")
     if kind == "broadcast":
         aud = payload.get("audience")
         if not isinstance(aud, dict):
@@ -341,6 +349,18 @@ def _resolve_plan_semantics(store: Store, actor: str, record: dict) -> dict:
                                f"recipients (excluding the actor)")
         bus_kind = payload.get("message_kind") or "message"
         meta_shape = "broadcast_question" if bus_kind == "question" else "broadcast"
+    elif kind == "answer_escalation":
+        rid = payload.get("to_request") or ""
+        resolved = th.resolve_operator_answer_target(store, actor, rid)
+        if not resolved.ok:
+            raise IntentDenied(
+                resolved.denial_code or "operator_answer_denied",
+                resolved.detail,
+            )
+        recipients = [resolved.recipient or ""]
+        bus_kind = "message"
+        subject = f"operator answer ({rid})"
+        meta_shape = "operator_answer"
     else:
         raise IntentDenied("invalid_payload", f"unknown intent kind {kind!r}")
 
@@ -352,6 +372,7 @@ def _resolve_plan_semantics(store: Store, actor: str, record: dict) -> dict:
         "subject": subject,
         "body": body,
         "meta_shape": meta_shape,
+        "actor": actor,
     }
 
 
@@ -380,6 +401,12 @@ def _mint_stable_meta(store: Store, semantic: dict) -> dict:
         return {
             "request_id": payload.get("to_request") or "",
             "status": payload.get("status") or "",
+        }
+    if shape == "operator_answer":
+        return {
+            "request_id": payload.get("to_request") or "",
+            "operator_answer": "true",
+            "operator_origin": semantic.get("actor") or "",
         }
     if shape in {"broadcast", "broadcast_question"}:
         bid = "b-" + secrets.token_hex(6)
@@ -432,6 +459,8 @@ def _stable_meta_error(semantic: dict, meta: object) -> str | None:
         allowed = {"request_id"}
     elif shape == "reply_proposal_response":
         allowed = {"request_id", "status"}
+    elif shape == "operator_answer":
+        allowed = {"request_id", "operator_answer", "operator_origin"}
     elif shape == "broadcast":
         allowed = {
             "broadcast_id", "request_id", "audience_kind",
@@ -475,6 +504,14 @@ def _stable_meta_error(semantic: dict, meta: object) -> str | None:
             return "proposal-response request_id does not match payload.to_request"
         if meta.get("status") != payload.get("status"):
             return "proposal-response status does not match payload.status"
+        return None
+    if shape == "operator_answer":
+        if meta.get("request_id") != payload.get("to_request"):
+            return "operator-answer request_id does not match payload.to_request"
+        if meta.get("operator_answer") != "true":
+            return "operator_answer must be the string 'true'"
+        if meta.get("operator_origin") != semantic.get("actor"):
+            return "operator_origin does not match the frozen actor"
         return None
     if not _safe_prefixed_id(meta.get("broadcast_id"), "b-"):
         return "broadcast_id must be a safe b-* id"
@@ -584,9 +621,224 @@ def _find_completed_send(store: Store, *, intent_id: str, delivery_index: int,
     return None
 
 
+def _answer_static_semantic(actor: str, record: dict, delivery: dict) -> dict:
+    payload = record.get("payload") or {}
+    rid = payload.get("to_request") or ""
+    return {
+        "kind": "answer_escalation",
+        "payload": payload,
+        "recipients": [delivery.get("recipient")],
+        "bus_kind": "message",
+        "subject": f"operator answer ({rid})",
+        "body": payload.get("body") or "",
+        "meta_shape": "operator_answer",
+        "actor": actor,
+    }
+
+
+def _validate_answer_escalation_static_plan(record: dict, plan: object) -> tuple[str, dict]:
+    if not isinstance(plan, dict):
+        raise _plan_revalidation_failed("plan_shape", "plan must be an object")
+    actor = plan.get("actor")
+    if not isinstance(actor, str) or not actor:
+        raise _plan_revalidation_failed("actor_changed", "plan actor is missing")
+    deliveries = plan.get("deliveries")
+    if not isinstance(deliveries, list):
+        raise _plan_revalidation_failed("plan_shape",
+                                        "plan.deliveries must be a list")
+    if len(deliveries) != 1:
+        raise _plan_revalidation_failed(
+            "recipient_drift", "operator answer plan must have exactly one delivery")
+    delivery = deliveries[0]
+    if not isinstance(delivery, dict):
+        raise _plan_revalidation_failed("plan_shape", "delivery 0 must be an object")
+    extras = set(delivery) - {"recipient", "bus_kind", "subject", "body", "stable_meta"}
+    if extras:
+        raise _plan_revalidation_failed(
+            "plan_shape", f"delivery 0 has unexpected keys {sorted(extras)}")
+    recipient = delivery.get("recipient")
+    if not isinstance(recipient, str) or not recipient:
+        raise _plan_revalidation_failed(
+            "recipient_drift", "delivery 0 recipient must be a non-empty string")
+    semantic = _answer_static_semantic(actor, record, delivery)
+    if delivery.get("bus_kind") != "message":
+        raise _plan_revalidation_failed(
+            "bus_kind_drift", "operator answer delivery must be a message")
+    subject = delivery.get("subject")
+    body = delivery.get("body")
+    if not isinstance(subject, str) or len(subject) > _MAX_SUBJECT_CHARS:
+        raise _plan_revalidation_failed(
+            "body_subject_drift", "delivery 0 subject has invalid shape")
+    if not isinstance(body, str) or len(body) > _MAX_BODY_CHARS:
+        raise _plan_revalidation_failed(
+            "body_subject_drift", "delivery 0 body has invalid shape")
+    if subject != semantic["subject"] or body != semantic["body"]:
+        raise _plan_revalidation_failed(
+            "body_subject_drift", "delivery 0 content does not match payload")
+    meta_error = _stable_meta_error(semantic, delivery.get("stable_meta"))
+    if meta_error is not None:
+        raise _plan_revalidation_failed(
+            "stable_meta_shape", f"delivery 0: {meta_error}")
+    return actor, delivery
+
+
+def _delivery_fp(intent_id: str, delivery_index: int, actor: str, delivery: dict) -> str:
+    return delivery_fingerprint(
+        intent_id=intent_id, delivery_index=delivery_index, actor=actor,
+        recipient=delivery["recipient"], bus_kind=delivery["bus_kind"],
+        subject=delivery.get("subject") or "", body=delivery.get("body") or "",
+        stable_meta=delivery.get("stable_meta") or {},
+    )
+
+
+def _delivered_record_matches(store: Store, *, intent_id: str, delivery_index: int,
+                              actor: str, delivery: dict, state: dict,
+                              fingerprint: str) -> bool:
+    if state.get("fingerprint") != fingerprint:
+        return False
+    message_id = state.get("message_id")
+    if not isinstance(message_id, str) or not message_id:
+        return False
+    floor = state.get("attempt_floor")
+    if isinstance(floor, str) and floor and message_id <= floor:
+        return False
+    for m in store.valid_messages():
+        if m.id != message_id:
+            continue
+        if (
+            m.sender != actor
+            or m.recipient != delivery["recipient"]
+            or m.kind != delivery["bus_kind"]
+            or (m.subject or "") != (delivery.get("subject") or "")
+            or (m.body or "") != (delivery.get("body") or "")
+        ):
+            return False
+        meta = m.meta or {}
+        stable_meta = delivery.get("stable_meta") or {}
+        if any(meta.get(k) != v for k, v in stable_meta.items()):
+            return False
+        return (
+            meta.get("web_intent_id") == intent_id
+            and str(meta.get("web_intent_delivery_index")) == str(delivery_index)
+            and meta.get("web_intent_fingerprint") == fingerprint
+        )
+    return False
+
+
+def _deny_intent(store: Store, intent_id: str, code: str, error: str) -> str:
+    store.mark_intent_terminal(
+        intent_id, state=Store.INTENT_DENIED, code=code, error=error[:500])
+    return Store.INTENT_DENIED
+
+
+def _drain_answer_escalation(store: Store, rec: dict) -> str:
+    iid = rec["intent_id"]
+    errors = validate_intent(rec.get("kind"), rec.get("payload"))
+    if errors:
+        return _deny_intent(store, iid, "invalid_payload", "; ".join(errors))
+
+    actor = resolve_web_actor(store)
+    plan = rec.get("plan") if isinstance(rec.get("plan"), dict) else None
+    if plan is None:
+        if actor is None:
+            code, detail = web_actor_denial(store)
+            return _deny_intent(store, iid, code, detail)
+        try:
+            plan = build_plan(store, actor, rec)
+        except IntentDenied as e:
+            return _deny_intent(store, iid, e.code, e.detail)
+        frozen = plan
+
+        def _freeze(r: dict) -> None:
+            r["plan"] = frozen
+
+        rec = store.update_intent(iid, _freeze) or rec
+
+    try:
+        frozen_actor, delivery = _validate_answer_escalation_static_plan(rec, plan)
+    except IntentDenied as e:
+        return _deny_intent(store, iid, e.code, e.detail)
+
+    states = list(rec.get("deliveries") or [])
+    while len(states) < 1:
+        states.append({})
+    st = states[0] if isinstance(states[0], dict) else {}
+    fp = _delivery_fp(iid, 0, frozen_actor, delivery)
+    if st.get("state") == "delivered":
+        if not _delivered_record_matches(
+            store, intent_id=iid, delivery_index=0, actor=frozen_actor,
+            delivery=delivery, state=st, fingerprint=fp,
+        ):
+            return _deny_intent(
+                store, iid, "plan_revalidation_failed",
+                "delivered_record_mismatch: stored delivery does not match log")
+        store.mark_intent_terminal(iid, state=Store.INTENT_APPLIED)
+        return Store.INTENT_APPLIED
+
+    prior_floor = st.get("attempt_floor")
+    if isinstance(prior_floor, str) and prior_floor:
+        done = _find_completed_send(
+            store, intent_id=iid, delivery_index=0, attempt_floor=prior_floor,
+            actor=frozen_actor, delivery=delivery,
+        )
+        if done is not None:
+            _record_delivery(store, iid, 0, state="delivered",
+                             message_id=done, fingerprint=fp,
+                             attempt_floor=prior_floor)
+            store.mark_intent_terminal(iid, state=Store.INTENT_APPLIED)
+            return Store.INTENT_APPLIED
+
+    if actor is None:
+        code, detail = web_actor_denial(store)
+        return _deny_intent(store, iid, code, detail)
+    if actor != frozen_actor:
+        return _deny_intent(
+            store, iid, "actor_changed",
+            f"resolved actor {actor!r} differs from the frozen plan's "
+            f"{frozen_actor!r}; requeue a fresh intent",
+        )
+    try:
+        semantic = _resolve_plan_semantics(store, actor, rec)
+    except IntentDenied as e:
+        return _deny_intent(store, iid, e.code, e.detail)
+    if semantic["recipients"] != [delivery["recipient"]]:
+        return _deny_intent(
+            store, iid, "plan_revalidation_failed",
+            "recipient_drift: live recipient does not match frozen plan")
+
+    floor = _new_id()
+    _record_delivery(store, iid, 0, state="attempting", fingerprint=fp,
+                     attempt_floor=floor, recipient=delivery["recipient"],
+                     bus_kind=delivery["bus_kind"])
+    meta = dict(delivery.get("stable_meta") or {})
+    meta.update({
+        "web_intent_id": iid,
+        "web_intent_delivery_index": "0",
+        "web_intent_fingerprint": fp,
+        "web_intent_attempt_floor": floor,
+        "executor_marker": EXECUTOR_MARKER,
+    })
+    try:
+        msg = store.send(
+            sender=actor, recipient=delivery["recipient"],
+            body=delivery.get("body") or "", kind=delivery["bus_kind"],
+            subject=delivery.get("subject") or "", meta=meta,
+        )
+    except ValueError as e:
+        store.mark_intent_terminal(iid, state=Store.INTENT_FAILED,
+                                   code="send_rejected", error=str(e)[:500])
+        return Store.INTENT_FAILED
+    _record_delivery(store, iid, 0, state="delivered", message_id=msg.id,
+                     fingerprint=fp, attempt_floor=floor)
+    store.mark_intent_terminal(iid, state=Store.INTENT_APPLIED)
+    return Store.INTENT_APPLIED
+
+
 def _drain_one(store: Store, rec: dict) -> str:
     """Execute one CLAIMED intent to a terminal state. Returns the terminal
     state string. Every authority decision happens HERE, server-side."""
+    if rec.get("kind") == "answer_escalation":
+        return _drain_answer_escalation(store, rec)
     iid = rec["intent_id"]
     errors = validate_intent(rec.get("kind"), rec.get("payload"))
     if errors:

@@ -289,6 +289,94 @@ def _needs_operator(opener: Message) -> bool:
     return v is True or (isinstance(v, str) and v.lower() == "true")
 
 
+@dataclass(frozen=True)
+class OperatorAnswerResolution:
+    ok: bool
+    recipient: str | None = None
+    denial_code: str | None = None
+    detail: str = ""
+
+
+def wrapper_notice_has_canonical_row(store, meta: dict, sender: str) -> bool:
+    """True iff a wrapper dead-letter/config-blocked escalation is redundant.
+
+    Fail-safe: any doubt returns False so a lone needs_operator signal is kept.
+    Only a proven twin of an existing canonical sink/hold row is coalesced.
+    """
+    if str((meta or {}).get("dead_letter", "")).lower() != "true":
+        return False
+    try:
+        if str(meta.get("config_blocked", "")).lower() == "true":
+            return sender is not None and store.read_config_blocked_hold(sender) is not None
+        if str(meta.get("dl_disposed", "")).lower() == "true":
+            dl_id = str(meta.get("dl_msg_id") or "")
+            return any(
+                d.get("agent") == sender and d.get("message_id") == dl_id
+                for d in store.list_dead_letters(sender)
+            )
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def _operator_opener_for(messages: list[Message], row: Thread) -> Message | None:
+    for m in messages:
+        if (
+            (m.meta or {}).get("request_id") == row.request_id
+            and m.sender == row.opener_sender
+            and m.recipient == row.opener_recipient
+            and m.kind == row.opener_kind
+        ):
+            return m
+    return None
+
+
+def resolve_operator_answer_target(store, actor: str,
+                                   request_id: str) -> OperatorAnswerResolution:
+    """Resolve the only valid target for an operator answer.
+
+    This is the shared authority boundary used by CLI relay, dashboard drain,
+    and read-only action annotations. It deliberately uses validated messages
+    only, and each fail-closed predicate returns a distinct denial code.
+    """
+    messages = store.valid_messages()
+    rows = derive_threads(messages, agent=actor, cursor="", closed_rids=set())
+    row = next((t for t in rows if t.request_id == request_id), None)
+    if row is None:
+        return OperatorAnswerResolution(
+            False, denial_code="not_found",
+            detail=f"no validated thread {request_id!r} involving {actor!r}",
+        )
+    opener = _operator_opener_for(messages, row)
+    if opener is None:
+        return OperatorAnswerResolution(
+            False, denial_code="not_found",
+            detail=f"thread {request_id!r} has no validated opener",
+        )
+    if not _needs_operator(opener):
+        return OperatorAnswerResolution(
+            False, denial_code="not_operator",
+            detail=f"thread {request_id!r} is not an operator escalation",
+        )
+    if row.opener_recipient != actor:
+        return OperatorAnswerResolution(
+            False, denial_code="not_owed",
+            detail=(f"escalation {request_id!r} is addressed to "
+                    f"{row.opener_recipient!r}, not {actor!r}"),
+        )
+    if row.opener_sender == actor:
+        return OperatorAnswerResolution(
+            False, denial_code="self_answer",
+            detail=f"escalation {request_id!r} cannot be answered by its opener",
+        )
+    if row.operator_state != "pending":
+        return OperatorAnswerResolution(
+            False, denial_code="not_pending",
+            detail=f"escalation {request_id!r} is {row.operator_state!r}",
+        )
+    return OperatorAnswerResolution(True, recipient=row.opener_sender)
+
+
 def _parse_ts(ts: str) -> datetime | None:
     """Parse a message ``ts`` (ISO-8601, trailing Z) to an aware datetime."""
     if not isinstance(ts, str) or not ts:

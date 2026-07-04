@@ -1753,6 +1753,35 @@ def test_escalation_lifecycle_in_sync_bucket(tmp_path: Path, capsys) -> None:
     assert row["operator_state"] == "answered"
 
 
+def test_relay_operator_answer_uses_shared_resolver_parity(tmp_path: Path, capsys) -> None:
+    root = _team_root(tmp_path)
+    assert _run(["roster", "set-operator-facing", "lead"], root) == 0
+    assert _run(["escalate", "--from", "w1", "-m", "Need a decision",
+                 "--quiet"], root) == 0
+    capsys.readouterr()
+    assert _run(["sync", "--for", "lead", "--json"], root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    rid = payload["escalations"][0]["request_id"]
+
+    rc = _run(["relay", "operator-answer", "--from", "lead",
+               "--to-request", rid, "-m", "Operator says go.",
+               "--meta", "request_id=q-forged",
+               "--meta", "operator_origin=forged",
+               "--quiet"], root)
+
+    assert rc == 0
+    msgs = [json.loads(p.read_text(encoding="utf-8"))
+            for p in (root / ".agenttalk" / "messages").glob("*.json")]
+    answer = next(m for m in msgs if m["from"] == "lead" and m["to"] == "w1"
+                  and m["meta"].get("operator_answer") == "true")
+    assert answer["kind"] == "message"
+    assert answer["meta"]["request_id"] == rid
+    assert answer["meta"]["operator_origin"] == "lead"
+    row = next(t for t in json.loads(_threads_json(root, "w1"))["threads"]
+               if t["request_id"] == rid)
+    assert row["operator_state"] == "answered"
+
+
 def test_sync_escalations_key_only_for_liaison(tmp_path: Path, capsys) -> None:
     root = _team_root(tmp_path)
     assert _run(["roster", "set-operator-facing", "lead"], root) == 0
