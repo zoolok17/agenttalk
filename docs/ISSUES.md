@@ -109,20 +109,32 @@ Mitigation until then: project-DISTINCT agent names across concurrent projects.
 
 The fix is broader than root-scoping a name match. The supervisor planner now produces typed
 ownership records first, then emits a closed kill target set from those records. A row is killable
-only when it is a confirmed recorded launcher, a direct same-root owning wrapper, a direct same-root
-owning wait row, the bounded same-agent brain/TUI reached from that wait row, a strict live-chain
-descendant from a seed, launch-time child provenance, first-confirmed child provenance, an exact
-versioned prior, or a freshly re-derived legacy row. Generic same-root CLI rows, same-root rows for
-another agent, foreign-root rows, shell/terminal hosts, and ambiguous rows are diagnostic/branch-cut
-only.
+only when it is a nonce-confirmed recorded launcher, a direct same-root owning wrapper, a direct
+same-root owning wait row, the bounded same-agent brain/TUI reached from that wait row, a strict
+live-chain descendant from a seed, launch-time child provenance, first-confirmed child provenance,
+an exact versioned prior, or a freshly re-derived legacy row. Generic same-root CLI rows, same-root
+rows for another agent, foreign-root rows, shell/terminal hosts, and ambiguous rows are
+diagnostic/branch-cut only.
+
+A recorded launcher is not confirmed by pid/start alone. Supported supervised `python -m agenttalk`
+and `agenttalk` console-script wrapper launches get a hidden top-level
+`--supervisor-launch-nonce` marker in the command line. Launcher confirmation requires the live row
+to be branch-clean for the current root/agent, have a readable command line, parse as this
+`wrap --for <agent> --loop`, and carry the exact current nonce before the subcommand. Unsupported
+native launches and pre-upgrade launchers without a nonce are intentionally suppressed as
+`confirmed_launcher` until a supported relaunch writes the marker. That can miss cleanup for the
+launcher itself, but it is fail-safe: it does not authorize a generic pid/start-colliding process.
 
 Operator-visible diagnostics are emitted from the same attribution decisions that build kill
 targets: `equal_start_edge`, `unparseable_start_edge`, `inverted_start_edge`,
 `foreign_root_branch`, `same_root_other_agent_branch`, `shell_boundary`, `unknown_root_cli`,
 `pid_reuse_suppressed`, `legacy_unverifiable_dropped`, `prior_ttl_expired`,
-`prior_field_missing`, `prior_request_mismatch`, `snapshot_unavailable_no_descendants`, and
-`torn_provenance_read`. Every kill target carries a `reason`/`source` so reviews can trace why it
-was included.
+`prior_field_missing`, `prior_request_mismatch`, `snapshot_unavailable_no_descendants`,
+`torn_provenance_read`, `foreign_launcher_suppressed`, `launcher_nonce_missing_state`,
+`launcher_nonce_unsupported_argv`, `launcher_nonce_cmdline_unreadable`, `launcher_nonce_absent`,
+`launcher_nonce_mismatch`, `launcher_nonce_malformed`, `launcher_nonce_duplicate`,
+`launcher_nonce_after_subcommand_or_tail`, and `launcher_wrap_parse_failed`. Every kill target
+carries a `reason`/`source` so reviews can trace why it was included.
 
 `managed_pids` migration is intentionally fail-closed. New entries are versioned as
 `process_ownership_v1` and include exact `root_key`, `agent`, explicit `request_id` (including
@@ -138,7 +150,9 @@ PID reuse; a backward NTP/VM clock step that straddles PID reuse is outside this
 cross-project-kill fix. Deliberate parent PID spoofing with
 `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` is also out of scope. This is a correctness boundary against
 accidental cross-project kills and stale PID/PPID reuse, not a security boundary against a malicious
-local process.
+local process. The launcher nonce is likewise an accidental-collision marker visible in
+`Win32_Process.CommandLine`, not a secret; a same-user malicious process that can read or spoof
+command lines remains out of scope.
 
 ## P2 · PLANNED — supervisor: don't give up on a rate-limited agent (2026-07-04)
 

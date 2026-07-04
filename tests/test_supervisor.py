@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import cli, health as hm, supervisor as sup
+from agenttalk import cli, ephemeral as eph, health as hm, supervisor as sup
 from agenttalk.store import Store
 
 
@@ -32,6 +32,8 @@ def _team(tmp_path: Path, agents: str = "lead,worker") -> Store:
 
 NOW = 1_000_000.0
 TEST_ROOT = r"D:\agenttalk-test-root"
+SUPERVISOR_NONCE = "A" * 32
+OTHER_NONCE = "B" * 32
 
 
 def _iso(epoch: float) -> str:
@@ -273,10 +275,16 @@ def test_snapshot_unavailable_uses_only_versioned_provenanced_priors() -> None:
         "captured_at_epoch": NOW - 1,
         "last_fresh_attribution_epoch": NOW - 1,
         "seed_descendants": True,
+        "source_launcher_pid": 111,
+        "source_launcher_start": LAUNCHER_START,
+        "source_launcher_nonce": SUPERVISOR_NONCE,
     }
     state = {"agents": {"worker": _ready(
         launcher_pid=111,
-        launcher_start=None,
+        launcher_start=LAUNCHER_START,
+        launcher_nonce=SUPERVISOR_NONCE,
+        launcher_nonce_injected=True,
+        launcher_nonce_source="agenttalk_global_arg",
         managed_pids=[{"pid": 222}, {"pid": 444, "start": WAIT_START}, prior],
     )}}
     plan = sup.plan_actions(report, state, _CONFIG, now_epoch=NOW, snapshot=None)
@@ -1690,6 +1698,41 @@ def _pslit(v: str) -> str:
     return "'" + str(v).replace("'", "''") + "'"
 
 
+def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)
+    out = tmp_path / "nonce_injection.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        helpers,
+        f"$nonce = {_pslit(SUPERVISOR_NONCE)}",
+        "$py = Add-SupervisorLaunchNonce 'python.exe' @('-m','agenttalk','--root','R','wrap') $nonce",
+        "$console = Add-SupervisorLaunchNonce 'agenttalk.exe' @('--root','R','wrap') $nonce",
+        "$native = Add-SupervisorLaunchNonce 'codex.exe' @('exec') $nonce",
+        "@{ py = $py; console = $console; native = $native } | ConvertTo-Json -Depth 6 | "
+        f"Set-Content {_pslit(str(out))} -Encoding utf8",
+    ])
+    hp = tmp_path / "nonce_injection.ps1"
+    hp.write_text(harness, encoding="utf-8-sig")
+    res = subprocess.run([shell, "-NoProfile", "-File", str(hp)],
+                         capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, f"{res.stdout}{res.stderr}"
+    data = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert data["py"]["injected"] is True
+    assert data["py"]["argv"] == [
+        "-m", "agenttalk", "--supervisor-launch-nonce", SUPERVISOR_NONCE,
+        "--root", "R", "wrap",
+    ]
+    assert data["console"]["injected"] is True
+    assert data["console"]["argv"] == [
+        "--supervisor-launch-nonce", SUPERVISOR_NONCE, "--root", "R", "wrap",
+    ]
+    assert data["native"]["injected"] is False
+    assert data["native"]["missing_reason"] == "unsupported_launch_argv"
+
+
 def test_launch_rechecks_kill_switch_after_branch_guard(tmp_path: Path) -> None:
     shell = _pick_powershell()
     if not shell:
@@ -1886,7 +1929,8 @@ _WRAP_CONFIG = {
 
 
 def _wrap_snap(*, cli="codex", launcher_pid=WRAP_LAUNCHER_PID,
-               child_pid=WRAP_CHILD_PID, child_start="t-child"):
+               child_pid=WRAP_CHILD_PID, child_start="t-child",
+               root: str = TEST_ROOT):
     """A wrapped-agent snapshot: the python wrapper (launcher) + its per-turn CLI
     child. The child is a real codex.exe/claude.exe row, so WITHOUT wrapping the
     brain-discovery would mistake it for the long-lived brain - the wrapped path
@@ -1896,7 +1940,11 @@ def _wrap_snap(*, cli="codex", launcher_pid=WRAP_LAUNCHER_PID,
         child_start = WRAP_CHILD_START
     return [
         {"pid": launcher_pid, "parent_pid": 1, "name": "python.exe",
-         "command_line": f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --cli {cli} --loop",
+         "command_line": (
+             "python -m agenttalk "
+             f"--supervisor-launch-nonce {SUPERVISOR_NONCE} "
+             f"--root {root} wrap --for worker --cli {cli} --loop"
+         ),
          "start_time": WRAP_START},
         {"pid": child_pid, "parent_pid": launcher_pid, "name": name,
          "command_line": f"{name} exec --json", "start_time": child_start},
@@ -1905,6 +1953,9 @@ def _wrap_snap(*, cli="codex", launcher_pid=WRAP_LAUNCHER_PID,
 
 def _wrap_ready(**over) -> dict:
     st = {"launcher_pid": WRAP_LAUNCHER_PID, "launcher_start": WRAP_START,
+          "launcher_nonce": SUPERVISOR_NONCE,
+          "launcher_nonce_injected": True,
+          "launcher_nonce_source": "agenttalk_global_arg",
           "readiness_seen": True, "launching": False,
           "last_launch_epoch": NOW - 1000}
     st.update(over)
@@ -2014,7 +2065,7 @@ def test_config_blocked_hold_marker_survives_health_ttl_end_to_end(tmp_path: Pat
     plan = sup.plan_actions(report,
                             {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
                             _WRAP_CONFIG, now_epoch=NOW + 2500,
-                            snapshot=_wrap_snap())["agents"]["worker"]
+                            snapshot=_wrap_snap(root=str(tmp_path)))["agents"]["worker"]
     assert plan["action"] == sup.NONE and plan["state"] == "CONFIG_BLOCKED"
     assert plan["kill_first"] is False
     assert plan["kill_targets"] == []
@@ -2044,7 +2095,7 @@ def test_malformed_config_blocked_hold_marker_does_not_suppress_recovery(
     plan = sup.plan_actions(report,
                             {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
                             _WRAP_CONFIG, now_epoch=NOW + 2500,
-                            snapshot=_wrap_snap())["agents"]["worker"]
+                            snapshot=_wrap_snap(root=str(tmp_path)))["agents"]["worker"]
     assert plan["action"] == sup.STUCK_RECOVER and plan["state"] == "STUCK_OR_DEAD"
     assert plan["kill_first"] is True
 
@@ -2062,7 +2113,7 @@ def test_config_blocked_hold_request_restart_overrides_and_clear_preserves_hold(
     plan = sup.plan_actions(report,
                             {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
                             _WRAP_CONFIG, now_epoch=NOW + 2500,
-                            snapshot=_wrap_snap())["agents"]["worker"]
+                            snapshot=_wrap_snap(root=str(tmp_path)))["agents"]["worker"]
     assert plan["action"] == sup.RELAUNCH and plan["state"] == "MANUAL_RESTART"
     assert plan["clear_marker"] == "rr-fix"
 
@@ -2084,7 +2135,7 @@ def test_wrapped_codex_without_config_blocked_marker_still_recovers_end_to_end(
     plan = sup.plan_actions(report,
                             {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
                             _WRAP_CONFIG, now_epoch=NOW + 2500,
-                            snapshot=_wrap_snap())["agents"]["worker"]
+                            snapshot=_wrap_snap(root=str(tmp_path)))["agents"]["worker"]
     assert plan["action"] == sup.STUCK_RECOVER and plan["state"] == "STUCK_OR_DEAD"
     assert plan["kill_first"] is True
 
@@ -2307,6 +2358,14 @@ def _ownership_report(stale: bool = True) -> dict:
 def _ownership_state(**over) -> dict:
     st = _wrap_ready(backoff_next_epoch=0)
     st.update(over)
+    if (
+        isinstance(st.get("launcher_pid"), int)
+        and isinstance(st.get("launcher_start"), str)
+        and "launcher_nonce_injected" not in over
+    ):
+        st["launcher_nonce"] = SUPERVISOR_NONCE
+        st["launcher_nonce_injected"] = True
+        st["launcher_nonce_source"] = "agenttalk_global_arg"
     return {"agents": {"worker": st}}
 
 
@@ -2321,6 +2380,15 @@ def _proc(pid: int, parent: int, name: str, command_line: str | None,
     }
 
 
+def _wrap_cmd(*, root: str = TEST_ROOT, agent: str = "worker",
+              nonce: str = SUPERVISOR_NONCE) -> str:
+    return (
+        "python -m agenttalk "
+        f"--supervisor-launch-nonce {nonce} "
+        f"--root {root} wrap --for {agent} --loop"
+    )
+
+
 def test_process_ownership_iso_epoch_parses_real_powershell_o_and_strict_edges() -> None:
     parent_start = "2026-07-04T07:20:31.5767870+00:00"
     child_start = "2026-07-04T07:20:31.5767880+00:00"
@@ -2330,7 +2398,7 @@ def test_process_ownership_iso_epoch_parses_real_powershell_o_and_strict_edges()
     snap = [
         _proc(
             10, 1, "python.exe",
-            "python -m agenttalk --root D:\\agenttalk-test-root wrap --for worker --loop",
+            _wrap_cmd(),
             parent_start,
         ),
         _proc(11, 10, "codex.exe", "codex exec --json", child_start),
@@ -2364,7 +2432,7 @@ def test_process_ownership_iso_epoch_parses_real_powershell_o_and_strict_edges()
 
 def test_process_ownership_strict_live_chain_reaps_multi_hop_when_ordered() -> None:
     snap = [
-        _proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", _ps_iso(100000)),
+        _proc(10, 1, "python.exe", _wrap_cmd(), _ps_iso(100000)),
         _proc(11, 10, "codex.exe", "codex exec --json", _ps_iso(200000)),
         _proc(12, 11, "node.exe", "node build.js", _ps_iso(300000)),
     ]
@@ -2383,7 +2451,7 @@ def test_process_ownership_strict_live_chain_reaps_multi_hop_when_ordered() -> N
 def test_process_ownership_equal_start_graft_needs_independent_provenance() -> None:
     start = _ps_iso(100000)
     snap = [
-        _proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", start),
+        _proc(10, 1, "python.exe", _wrap_cmd(), start),
         _proc(11, 10, "codex.exe", "codex exec --json", start),
     ]
     p = sup.plan_actions(
@@ -2399,7 +2467,7 @@ def test_process_ownership_equal_start_graft_needs_independent_provenance() -> N
 
 def test_process_ownership_launch_time_same_tick_child_absent_from_baseline_is_provenanced() -> None:
     start = _ps_iso(100000)
-    pre = [_proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", start)]
+    pre = [_proc(10, 1, "python.exe", _wrap_cmd(), start)]
     post = [*pre, _proc(11, 10, "codex.exe", "codex exec --json", start)]
     state = {"agents": {"worker": {}}}
     sup.record_launch(
@@ -2413,6 +2481,9 @@ def test_process_ownership_launch_time_same_tick_child_absent_from_baseline_is_p
         post_snapshot=post,
         cfg_agent={"cli": "codex", "wrapped": True},
         root_key=sup._root_key(TEST_ROOT),
+        launcher_nonce=SUPERVISOR_NONCE,
+        launcher_nonce_injected=True,
+        launcher_nonce_source="agenttalk_global_arg",
     )
     managed = state["agents"]["worker"]["managed_pids"]
     assert managed[0]["source"] == "launch_child_provenance"
@@ -2429,7 +2500,7 @@ def test_process_ownership_launch_time_same_tick_child_present_in_baseline_is_no
     start = _ps_iso(100000)
     child = _proc(11, 10, "codex.exe", "codex exec --json", start)
     pre = [
-        _proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", start),
+        _proc(10, 1, "python.exe", _wrap_cmd(), start),
         child,
     ]
     state = {"agents": {"worker": {}}}
@@ -2444,6 +2515,9 @@ def test_process_ownership_launch_time_same_tick_child_present_in_baseline_is_no
         post_snapshot=pre,
         cfg_agent={"cli": "codex", "wrapped": True},
         root_key=sup._root_key(TEST_ROOT),
+        launcher_nonce=SUPERVISOR_NONCE,
+        launcher_nonce_injected=True,
+        launcher_nonce_source="agenttalk_global_arg",
     )
     assert state["agents"]["worker"]["managed_pids"] == []
     p = sup.plan_actions(_ownership_report(), state, _WRAP_CONFIG,
@@ -2453,7 +2527,7 @@ def test_process_ownership_launch_time_same_tick_child_present_in_baseline_is_no
 
 def test_process_ownership_stale_ppid_grafts_are_excluded_single_and_multi_hop() -> None:
     snap = [
-        _proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", _ps_iso(300000)),
+        _proc(10, 1, "python.exe", _wrap_cmd(), _ps_iso(300000)),
         _proc(11, 10, "codex.exe", "codex exec --json", _ps_iso(200000)),
         _proc(12, 11, "node.exe", "node build.js", _ps_iso(400000)),
     ]
@@ -2470,7 +2544,7 @@ def test_process_ownership_stale_ppid_grafts_are_excluded_single_and_multi_hop()
 
 def test_process_ownership_branch_cuts_same_root_foreign_shell_and_generic_cli() -> None:
     snap = [
-        _proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", _ps_iso(100000)),
+        _proc(10, 1, "python.exe", _wrap_cmd(), _ps_iso(100000)),
         _proc(11, 10, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wait --for other", _ps_iso(200000)),
         _proc(12, 10, "python.exe", f"python -m agenttalk --root {TEST_ROOT} send --to worker -m hi", _ps_iso(210000)),
         _proc(13, 10, "python.exe", "python -m agenttalk --root D:\\other wrap --for worker --loop", _ps_iso(220000)),
@@ -2513,19 +2587,39 @@ def test_process_ownership_root_wait_brain_stops_at_windows_shell_hosts() -> Non
 def test_process_ownership_parse_agenttalk_wrap_fail_closed_matrix() -> None:
     good = f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop -- codex"
     assert sup.parse_agenttalk_wrap_invocation(good, sup._root_key(TEST_ROOT), "worker") is True
+    good_nonce = (
+        f"python -m agenttalk --supervisor-launch-nonce {SUPERVISOR_NONCE} "
+        f"--root {TEST_ROOT} wrap --for worker --loop -- codex"
+    )
+    assert sup.parse_agenttalk_wrap_invocation(
+        good_nonce, sup._root_key(TEST_ROOT), "worker") is True
+    assert sup.parse_agenttalk_wait_invocation(
+        f"python -m agenttalk --supervisor-launch-nonce {SUPERVISOR_NONCE} "
+        f"--root {TEST_ROOT} wait --for worker",
+        sup._root_key(TEST_ROOT),
+        "worker",
+    ) is True
     bad = [
         f"cmd.exe /c python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop",
         f"python -m agenttalk wrap --root {TEST_ROOT} --for worker --loop",
+        f"python -m agenttalk --root {TEST_ROOT} wrap --supervisor-launch-nonce {SUPERVISOR_NONCE} --for worker --loop",
         f"python -m agenttalk --root {TEST_ROOT} wrap --for worker -- --loop",
         f"python -m agenttalk --root \"{TEST_ROOT} wrap --for worker --loop",
         "python -m agenttalk --root D:\\other wrap --for worker --loop",
         f"python -m agenttalk --root {TEST_ROOT} wrap --for other --loop",
         f"python -m agenttalk --root {TEST_ROOT} wrap --for worker",
         f"python -m agenttalk --root {TEST_ROOT} wrap --for worker -- codex --loop",
+        f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop "
+        f"-- codex --supervisor-launch-nonce {SUPERVISOR_NONCE}",
     ]
     for command_line in bad:
         assert sup.parse_agenttalk_wrap_invocation(
             command_line, sup._root_key(TEST_ROOT), "worker") is False
+    assert sup.parse_agenttalk_wait_invocation(
+        f"python -m agenttalk --root {TEST_ROOT} wait --supervisor-launch-nonce {SUPERVISOR_NONCE} --for worker",
+        sup._root_key(TEST_ROOT),
+        "worker",
+    ) is False
 
 
 def test_process_ownership_launcher_pid_reuse_cannot_be_rescued_by_wrap_text() -> None:
@@ -2543,6 +2637,181 @@ def test_process_ownership_launcher_pid_reuse_cannot_be_rescued_by_wrap_text() -
     assert p["diagnostics"]["pid_reuse_suppressed"] == 1
 
 
+def _launcher_plan(command_line: str | None, *, name: str = "python.exe",
+                   state_over: dict | None = None) -> dict:
+    start = _ps_iso(100000)
+    state_fields = {"launcher_pid": 10, "launcher_start": start}
+    if state_over:
+        state_fields.update(state_over)
+    snap = [_proc(10, 1, name, command_line, start)]
+    return sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(**state_fields),
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+
+
+def test_process_ownership_confirmed_launcher_requires_branch_clean_wrapper_nonce() -> None:
+    legitimate = [
+        _wrap_cmd(),
+        f"python -m agenttalk --root {TEST_ROOT} --supervisor-launch-nonce {SUPERVISOR_NONCE} wrap --for worker --loop",
+        f"python -m agenttalk --supervisor-launch-nonce={SUPERVISOR_NONCE} --root {TEST_ROOT} wrap --for worker --loop",
+        f"agenttalk --supervisor-launch-nonce {SUPERVISOR_NONCE} --root {TEST_ROOT} wrap --for worker --loop",
+    ]
+    for command_line in legitimate:
+        name = "agenttalk.exe" if command_line.startswith("agenttalk ") else "python.exe"
+        p = _launcher_plan(command_line, name=name)
+        assert [t["pid"] for t in p["kill_targets"]] == [10]
+        assert p["kill_targets"][0]["reason"] == "confirmed_launcher"
+
+    for command_line in [
+        _wrap_cmd(root=r"D:\foreign-root"),
+        _wrap_cmd(agent="other"),
+    ]:
+        p = _launcher_plan(command_line)
+        assert p["kill_targets"] == []
+        assert p["diagnostics"]["foreign_launcher_suppressed"] == 1
+
+
+def test_process_ownership_launcher_nonce_blocks_generic_and_unreadable_collisions() -> None:
+    generic = _launcher_plan("notepad.exe --some-arg", name="notepad.exe")
+    assert generic["kill_targets"] == []
+    assert generic["diagnostics"]["launcher_wrap_parse_failed"] == 1
+
+    unreadable = _launcher_plan(None)
+    assert unreadable["kill_targets"] == []
+    assert unreadable["diagnostics"]["launcher_nonce_cmdline_unreadable"] == 1
+
+
+def test_process_ownership_launcher_nonce_fail_closed_matrix() -> None:
+    cases = [
+        (
+            f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop",
+            "launcher_nonce_absent",
+        ),
+        (_wrap_cmd(nonce=OTHER_NONCE), "launcher_nonce_mismatch"),
+        (
+            f"python -m agenttalk --supervisor-launch-nonce short --root {TEST_ROOT} wrap --for worker --loop",
+            "launcher_nonce_malformed",
+        ),
+        (
+            "python -m agenttalk "
+            f"--supervisor-launch-nonce {SUPERVISOR_NONCE} "
+            f"--supervisor-launch-nonce {OTHER_NONCE} "
+            f"--root {TEST_ROOT} wrap --for worker --loop",
+            "launcher_nonce_duplicate",
+        ),
+        (
+            f"python -m agenttalk --root {TEST_ROOT} wrap "
+            f"--supervisor-launch-nonce {SUPERVISOR_NONCE} --for worker --loop",
+            "launcher_nonce_after_subcommand_or_tail",
+        ),
+        (
+            f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop "
+            f"-- codex --supervisor-launch-nonce {SUPERVISOR_NONCE}",
+            "launcher_nonce_after_subcommand_or_tail",
+        ),
+    ]
+    for command_line, counter in cases:
+        p = _launcher_plan(command_line)
+        assert p["kill_targets"] == []
+        assert p["diagnostics"][counter] == 1
+
+
+def test_process_ownership_pre_upgrade_launcher_without_nonce_is_cleanup_miss_not_cross_kill() -> None:
+    p = _launcher_plan(
+        f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop",
+        state_over={"launcher_nonce_injected": False},
+    )
+    assert p["kill_targets"] == []
+    assert p["diagnostics"]["launcher_nonce_missing_state"] == 1
+
+
+def test_process_ownership_unsupported_launch_argv_records_unusable_nonce_state() -> None:
+    state = {"agents": {"worker": {}}}
+    sup.record_launch(
+        state,
+        "worker",
+        cli="codex",
+        pid=10,
+        pid_start=_ps_iso(100000),
+        now_epoch=NOW,
+        cfg_agent={"cli": "codex"},
+        root_key=sup._root_key(TEST_ROOT),
+        launcher_nonce_injected=False,
+        launcher_nonce_missing_reason="unsupported_launch_argv",
+    )
+    entry = state["agents"]["worker"]
+    assert entry["launcher_nonce_injected"] is False
+    assert entry["launcher_nonce_missing_reason"] == "unsupported_launch_argv"
+    assert "launcher_nonce" not in entry
+
+    p = sup.plan_actions(
+        _ownership_report(),
+        state,
+        _WRAP_CONFIG,
+        now_epoch=NOW + 1,
+        snapshot=[_proc(10, 1, "codex.exe", "codex exec", _ps_iso(100000))],
+    )["agents"]["worker"]
+    assert p["kill_targets"] == []
+    assert p["diagnostics"]["launcher_nonce_unsupported_argv"] == 1
+
+
+def test_process_ownership_ephemeral_launch_spec_records_and_checks_nonce() -> None:
+    state = {
+        "ephemeral_reviewers": {
+            "active": {
+                "R1": {
+                    "request_id": "R1",
+                    "agent": "worker",
+                    "phase": eph.STATE_REQUESTED,
+                }
+            }
+        }
+    }
+    start = _ps_iso(100000)
+    sup.record_ephemeral_launch(
+        state,
+        "R1",
+        pid=10,
+        pid_start=start,
+        now_epoch=NOW,
+        timeout_seconds=1,
+        root_key=sup._root_key(TEST_ROOT),
+        launcher_nonce=SUPERVISOR_NONCE,
+        launcher_nonce_injected=True,
+        launcher_nonce_source="agenttalk_global_arg",
+    )
+    entry = state["ephemeral_reviewers"]["active"]["R1"]
+    assert entry["launcher_nonce"] == SUPERVISOR_NONCE
+    assert entry["launcher_nonce_injected"] is True
+
+    report = {
+        "root_key": sup._root_key(TEST_ROOT),
+        "agents": {},
+        "launch_requests": [],
+        "ephemeral_reviewers": {"active": {"R1": {}}},
+    }
+    snap = [_proc(10, 1, "python.exe", _wrap_cmd(), start)]
+    plan = sup.plan_actions(report, state, _WRAP_CONFIG,
+                            now_epoch=NOW + 2, snapshot=snap)
+    timeout = plan["ephemeral_reviewers"]["R1"]
+    assert timeout["action"] == eph.ACTION_TIMEOUT
+    assert [t["pid"] for t in timeout["kill_targets"]] == [10]
+
+    missing = json.loads(json.dumps(state))
+    missing["ephemeral_reviewers"]["active"]["R1"].pop("launcher_nonce")
+    missing["ephemeral_reviewers"]["active"]["R1"]["launcher_nonce_injected"] = False
+    suppressed = sup.plan_actions(report, missing, _WRAP_CONFIG,
+                                  now_epoch=NOW + 2, snapshot=snap)
+    timeout_suppressed = suppressed["ephemeral_reviewers"]["R1"]
+    assert timeout_suppressed["kill_targets"] == []
+    diag = missing["ephemeral_reviewers"]["active"]["R1"]["provenance_diagnostics"]
+    assert diag["launcher_nonce_missing_state"] == 1
+
+
 def test_process_ownership_provenanced_prior_exact_fields_request_and_ttl() -> None:
     base = {
         "attribution_model": "process_ownership_v1",
@@ -2555,11 +2824,18 @@ def test_process_ownership_provenanced_prior_exact_fields_request_and_ttl() -> N
         "captured_at_epoch": NOW - 10,
         "last_fresh_attribution_epoch": NOW - 10,
         "seed_descendants": False,
+        "source_launcher_pid": 10,
+        "source_launcher_start": _ps_iso(100000),
+        "source_launcher_nonce": SUPERVISOR_NONCE,
     }
     snap = [_proc(11, 1, "codex.exe", "codex exec --json", _ps_iso(200000))]
     p = sup.plan_actions(
         _ownership_report(),
-        _ownership_state(managed_pids=[json.loads(json.dumps(base))]),
+        _ownership_state(
+            launcher_pid=10,
+            launcher_start=_ps_iso(100000),
+            managed_pids=[json.loads(json.dumps(base))],
+        ),
         _WRAP_CONFIG,
         now_epoch=NOW,
         snapshot=snap,
@@ -2569,7 +2845,11 @@ def test_process_ownership_provenanced_prior_exact_fields_request_and_ttl() -> N
                                   "source": "launch_child_provenance"}]
     p_fresh = sup.plan_actions(
         _ownership_report(stale=False),
-        _ownership_state(managed_pids=[json.loads(json.dumps(base))]),
+        _ownership_state(
+            launcher_pid=10,
+            launcher_start=_ps_iso(100000),
+            managed_pids=[json.loads(json.dumps(base))],
+        ),
         _WRAP_CONFIG,
         now_epoch=NOW,
         snapshot=snap,
@@ -2579,7 +2859,11 @@ def test_process_ownership_provenanced_prior_exact_fields_request_and_ttl() -> N
     mismatch = {**base, "request_id": "R1"}
     p_bad = sup.plan_actions(
         _ownership_report(),
-        _ownership_state(managed_pids=[mismatch]),
+        _ownership_state(
+            launcher_pid=10,
+            launcher_start=_ps_iso(100000),
+            managed_pids=[mismatch],
+        ),
         _WRAP_CONFIG,
         now_epoch=NOW,
         snapshot=snap,
@@ -2592,7 +2876,11 @@ def test_process_ownership_provenanced_prior_exact_fields_request_and_ttl() -> N
     expired = {**base, "last_fresh_attribution_epoch": NOW - 4000}
     p_missing = sup.plan_actions(
         _ownership_report(),
-        _ownership_state(managed_pids=[missing, expired]),
+        _ownership_state(
+            launcher_pid=10,
+            launcher_start=_ps_iso(100000),
+            managed_pids=[missing, expired],
+        ),
         _WRAP_CONFIG,
         now_epoch=NOW,
         snapshot=snap,
@@ -2602,9 +2890,78 @@ def test_process_ownership_provenanced_prior_exact_fields_request_and_ttl() -> N
     assert p_missing["diagnostics"]["prior_ttl_expired"] == 1
 
 
+def test_process_ownership_stale_launcher_prior_does_not_rescue_row_without_nonce() -> None:
+    prior = {
+        "attribution_model": "process_ownership_v1",
+        "root_key": sup._root_key(TEST_ROOT),
+        "agent": "worker",
+        "request_id": None,
+        "pid": 10,
+        "start": _ps_iso(100000),
+        "source": "launch_child_provenance",
+        "captured_at_epoch": NOW - 10,
+        "last_fresh_attribution_epoch": NOW - 10,
+        "seed_descendants": True,
+        "source_launcher_pid": 10,
+        "source_launcher_start": _ps_iso(100000),
+        "source_launcher_nonce": SUPERVISOR_NONCE,
+    }
+    state = _ownership_state(
+        launcher_pid=10,
+        launcher_start=_ps_iso(100000),
+        managed_pids=[prior],
+    )
+    snap = [
+        _proc(
+            10, 1, "python.exe",
+            f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop",
+            _ps_iso(100000),
+        )
+    ]
+    p = sup.plan_actions(_ownership_report(), state, _WRAP_CONFIG,
+                         now_epoch=NOW, snapshot=snap)["agents"]["worker"]
+    assert p["kill_targets"] == []
+    assert p["next_state"]["managed_pids"] == []
+    assert p["diagnostics"]["launcher_nonce_absent"] == 1
+
+
+def test_process_ownership_prior_source_specific_launcher_nonce_requirement() -> None:
+    launcher_prior = {
+        "attribution_model": "process_ownership_v1",
+        "root_key": sup._root_key(TEST_ROOT),
+        "agent": "worker",
+        "request_id": None,
+        "pid": 11,
+        "start": _ps_iso(200000),
+        "source": "launch_child_provenance",
+        "captured_at_epoch": NOW - 10,
+        "last_fresh_attribution_epoch": NOW - 10,
+        "seed_descendants": False,
+    }
+    wait_prior = {
+        **launcher_prior,
+        "pid": 12,
+        "start": _ps_iso(300000),
+        "source": "first_confirmed_child_provenance",
+    }
+    snap = [
+        _proc(11, 1, "codex.exe", "codex exec", _ps_iso(200000)),
+        _proc(12, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wait --for worker", _ps_iso(300000)),
+    ]
+    p = sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(managed_pids=[launcher_prior, wait_prior]),
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    assert p["diagnostics"]["prior_field_missing"] == 1
+    assert {t["pid"] for t in p["kill_targets"]} == {12}
+
+
 def test_process_ownership_legacy_managed_pids_rederive_only_when_freshly_attributable() -> None:
     snap = [
-        _proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", _ps_iso(100000)),
+        _proc(10, 1, "python.exe", _wrap_cmd(), _ps_iso(100000)),
         _proc(11, 10, "codex.exe", "codex exec --json", _ps_iso(200000)),
         _proc(12, 99, "node.exe", "node old.js", _ps_iso(200000)),
     ]

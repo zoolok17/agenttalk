@@ -13,6 +13,8 @@ from agenttalk.wrapper import loop
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
 NOW = 1000.0
+TEST_ROOT = r"D:\agenttalk-test-root"
+SUPERVISOR_NONCE = "A" * 32
 
 
 def _store(tmp_path: Path) -> Store:
@@ -260,13 +262,22 @@ def test_timeout_plans_process_tree_kill_targets() -> None:
         "lr-timeout": {"agent": "adversary-lr-timeout", "requested_by": "lead",
                        "phase": eph.STATE_LAUNCHED, "launcher_pid": 10,
                        "launcher_start": launcher_start, "launched_epoch": NOW - 100,
-                       "deadline_epoch": NOW - 1}
+                       "deadline_epoch": NOW - 1,
+                       "launcher_nonce": SUPERVISOR_NONCE,
+                       "launcher_nonce_injected": True,
+                       "launcher_nonce_source": "agenttalk_global_arg"}
     }}}
     report = _report(active={"lr-timeout": {
         "completion": {"status": eph.COMPLETION_NONE, "terminal": False, "hold": True}
     }})
+    report["root_key"] = sup._root_key(TEST_ROOT)
     snap = [
-        {"pid": 10, "parent_pid": 1, "name": "python.exe", "command_line": "wrap",
+        {"pid": 10, "parent_pid": 1, "name": "python.exe",
+         "command_line": (
+             "python -m agenttalk "
+             f"--supervisor-launch-nonce {SUPERVISOR_NONCE} "
+             f"--root {TEST_ROOT} wrap --for adversary-lr-timeout --loop"
+         ),
          "start_time": launcher_start},
         {"pid": 11, "parent_pid": 10, "name": "codex.exe", "command_line": "codex exec",
          "start_time": child_start},

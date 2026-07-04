@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import shlex
 import sys
 from datetime import datetime, timezone
@@ -127,6 +128,10 @@ _WINDOW_STYLES = {
 
 _ATTRIBUTION_MODEL = "process_ownership_v1"
 _PROVENANCE_TTL_SECONDS = 3600.0
+_SUPERVISOR_LAUNCH_NONCE_ARG = "--supervisor-launch-nonce"
+_SUPERVISOR_LAUNCH_NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_AGENTTALK_SUBCOMMANDS = {"wrap", "wait", "send", "status", "supervise"}
+_LAUNCHER_DERIVED_PRIOR_SOURCES = {"launch_child_provenance"}
 _DIAGNOSTIC_COUNTERS = (
     "equal_start_edge",
     "unparseable_start_edge",
@@ -142,6 +147,16 @@ _DIAGNOSTIC_COUNTERS = (
     "prior_request_mismatch",
     "snapshot_unavailable_no_descendants",
     "torn_provenance_read",
+    "foreign_launcher_suppressed",
+    "launcher_nonce_missing_state",
+    "launcher_nonce_unsupported_argv",
+    "launcher_nonce_cmdline_unreadable",
+    "launcher_nonce_absent",
+    "launcher_nonce_mismatch",
+    "launcher_nonce_malformed",
+    "launcher_nonce_duplicate",
+    "launcher_nonce_after_subcommand_or_tail",
+    "launcher_wrap_parse_failed",
 )
 
 
@@ -554,6 +569,14 @@ def _option_value(tokens: list[str], index: int) -> tuple[str | None, int]:
     return tokens[index + 1], index + 2
 
 
+def _valid_launch_nonce(value: object) -> bool:
+    return isinstance(value, str) and bool(_SUPERVISOR_LAUNCH_NONCE_RE.fullmatch(value))
+
+
+def _has_option_token(tokens: list[str], option: str) -> bool:
+    return any(arg == option or arg.startswith(option + "=") for arg in tokens)
+
+
 def _agenttalk_invocation(command_line: object, root_key: str | None) -> dict | None:
     argv = _agenttalk_argv(command_line)
     if argv is None:
@@ -566,11 +589,15 @@ def _agenttalk_invocation(command_line: object, root_key: str | None) -> dict | 
         if arg == "--":
             return {"root": root, "root_match": _same_root(root, root_key),
                     "subcommand": None, "args": [], "tail": argv[i + 1:]}
-        if arg in {"wrap", "wait", "send", "status", "supervise"}:
+        if arg in _AGENTTALK_SUBCOMMANDS:
             sub_i = i
             break
         if arg == "--root" or arg.startswith("--root="):
             root, i = _option_value(argv, i)
+            continue
+        if arg == _SUPERVISOR_LAUNCH_NONCE_ARG or arg.startswith(
+                _SUPERVISOR_LAUNCH_NONCE_ARG + "="):
+            _nonce, i = _option_value(argv, i)
             continue
         i += 1
     if sub_i is None:
@@ -583,6 +610,43 @@ def _agenttalk_invocation(command_line: object, root_key: str | None) -> dict | 
         "args": argv[sub_i + 1:],
         "tail": [],
     }
+
+
+def _parse_supervisor_launch_nonce(command_line: object) -> tuple[str | None, str | None]:
+    argv = _agenttalk_argv(command_line)
+    if argv is None:
+        return None, "launcher_wrap_parse_failed"
+    nonce = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            if _has_option_token(argv[i + 1:], _SUPERVISOR_LAUNCH_NONCE_ARG):
+                return None, "launcher_nonce_after_subcommand_or_tail"
+            break
+        if arg in _AGENTTALK_SUBCOMMANDS:
+            if _has_option_token(argv[i + 1:], _SUPERVISOR_LAUNCH_NONCE_ARG):
+                return None, "launcher_nonce_after_subcommand_or_tail"
+            break
+        if arg == _SUPERVISOR_LAUNCH_NONCE_ARG or arg.startswith(
+                _SUPERVISOR_LAUNCH_NONCE_ARG + "="):
+            value, i_next = _option_value(argv, i)
+            if value is None or not _valid_launch_nonce(value):
+                return None, "launcher_nonce_malformed"
+            if nonce is not None:
+                return None, "launcher_nonce_duplicate"
+            nonce = value
+            i = i_next
+            continue
+        i += 1
+    if nonce is None:
+        return None, "launcher_nonce_absent"
+    return nonce, None
+
+
+def parse_supervisor_launch_nonce(command_line: object) -> str | None:
+    nonce, reason = _parse_supervisor_launch_nonce(command_line)
+    return nonce if reason is None else None
 
 
 def _agent_option(args: list[str], option: str) -> str | None:
@@ -603,7 +667,10 @@ def parse_agenttalk_wait_invocation(command_line: object, root_key: str | None,
     inv = _agenttalk_invocation(command_line, root_key)
     if not inv or inv.get("subcommand") != "wait" or not inv.get("root_match"):
         return False
-    return _agent_option(inv.get("args") or [], "--for") == agent
+    args = inv.get("args") or []
+    if _has_option_token(args, _SUPERVISOR_LAUNCH_NONCE_ARG):
+        return False
+    return _agent_option(args, "--for") == agent
 
 
 def parse_agenttalk_wrap_invocation(command_line: object, root_key: str | None,
@@ -612,6 +679,8 @@ def parse_agenttalk_wrap_invocation(command_line: object, root_key: str | None,
     if not inv or inv.get("subcommand") != "wrap" or not inv.get("root_match"):
         return False
     args = inv.get("args") or []
+    if _has_option_token(args, _SUPERVISOR_LAUNCH_NONCE_ARG):
+        return False
     agent_value = _agent_option(args, "--for")
     if agent_value != agent:
         return False
@@ -643,19 +712,114 @@ def _row_branch_reason(row: dict, root_key: str | None, agent: str) -> str | Non
     return "unknown_root_cli"
 
 
+def _state_launcher_source(st: dict) -> dict | None:
+    nonce = st.get("launcher_nonce") if isinstance(st, dict) else None
+    pid = st.get("launcher_pid") if isinstance(st, dict) else None
+    start = st.get("launcher_start") if isinstance(st, dict) else None
+    if (
+        st.get("launcher_nonce_injected") is True
+        and _valid_launch_nonce(nonce)
+        and isinstance(pid, int)
+        and isinstance(start, str)
+        and start
+    ):
+        return {"pid": pid, "start": start, "nonce": nonce}
+    return None
+
+
+def _entry_launcher_source(entry: dict) -> dict | None:
+    pid = entry.get("source_launcher_pid")
+    start = entry.get("source_launcher_start")
+    nonce = entry.get("source_launcher_nonce")
+    if isinstance(pid, int) and isinstance(start, str) and _valid_launch_nonce(nonce):
+        return {"pid": pid, "start": start, "nonce": nonce}
+    return None
+
+
+def _target_launcher_source(target: dict) -> dict | None:
+    pid = target.get("source_launcher_pid")
+    start = target.get("source_launcher_start")
+    nonce = target.get("source_launcher_nonce")
+    if isinstance(pid, int) and isinstance(start, str) and _valid_launch_nonce(nonce):
+        return {"pid": pid, "start": start, "nonce": nonce}
+    return None
+
+
+def _is_confirmed_launcher(
+    idx: dict[int, dict],
+    row: dict,
+    st: dict,
+    root_key: str | None,
+    agent: str,
+    diagnostics: dict[str, int],
+) -> tuple[bool, dict | None]:
+    pid = st.get("launcher_pid")
+    start = st.get("launcher_start")
+    if not _pid_alive_guarded(idx, pid, start):
+        return False, None
+    branch = _row_branch_reason(row, root_key, agent)
+    if branch is not None:
+        _bump(diagnostics, "foreign_launcher_suppressed")
+        return False, None
+    if st.get("launcher_nonce_injected") is not True:
+        if (
+            st.get("launcher_nonce_injected") is False
+            and st.get("launcher_nonce_missing_reason") == "unsupported_launch_argv"
+        ):
+            _bump(diagnostics, "launcher_nonce_unsupported_argv")
+        else:
+            _bump(diagnostics, "launcher_nonce_missing_state")
+        return False, None
+    expected = st.get("launcher_nonce")
+    if not _valid_launch_nonce(expected):
+        _bump(diagnostics, "launcher_nonce_malformed")
+        return False, None
+    command_line = row.get("command_line")
+    if not isinstance(command_line, str) or not command_line.strip():
+        _bump(diagnostics, "launcher_nonce_cmdline_unreadable")
+        return False, None
+    actual, nonce_reason = _parse_supervisor_launch_nonce(command_line)
+    if nonce_reason in {
+        "launcher_nonce_malformed",
+        "launcher_nonce_duplicate",
+        "launcher_nonce_after_subcommand_or_tail",
+        "launcher_wrap_parse_failed",
+    }:
+        _bump(diagnostics, nonce_reason)
+        return False, None
+    if not parse_agenttalk_wrap_invocation(command_line, root_key, agent):
+        _bump(diagnostics, "launcher_wrap_parse_failed")
+        return False, None
+    if nonce_reason == "launcher_nonce_absent":
+        _bump(diagnostics, "launcher_nonce_absent")
+        return False, None
+    if actual != expected:
+        _bump(diagnostics, "launcher_nonce_mismatch")
+        return False, None
+    return True, {"pid": pid, "start": start, "nonce": expected}
+
+
 def _record_target(targets: dict[int, dict], row: dict, reason: str,
-                   *, seed_descendants: bool = False) -> None:
+                   *, seed_descendants: bool = False,
+                   launcher_source: dict | None = None) -> None:
     pid = row.get("pid")
     start = _start_of(row)
     if not isinstance(pid, int) or not isinstance(start, str) or not start:
         return
-    targets[pid] = {
+    target = {
         "pid": pid,
         "start": start,
         "reason": reason,
         "source": reason,
         "seed_descendants": bool(seed_descendants),
     }
+    if isinstance(launcher_source, dict):
+        target.update({
+            "source_launcher_pid": launcher_source.get("pid"),
+            "source_launcher_start": launcher_source.get("start"),
+            "source_launcher_nonce": launcher_source.get("nonce"),
+        })
+    targets[pid] = target
 
 
 def _is_expected_seed_row(row: dict, cfg_agent: dict, agent: str,
@@ -675,7 +839,8 @@ def _is_expected_seed_row(row: dict, cfg_agent: dict, agent: str,
 def _new_provenance_entry(row: dict, *, root_key: str | None, agent: str,
                           request_id: str | None, source: str,
                           now_epoch: float, seed_descendants: bool,
-                          anchor: dict | None = None) -> dict | None:
+                          anchor: dict | None = None,
+                          launcher_source: dict | None = None) -> dict | None:
     pid = row.get("pid")
     start = _start_of(row)
     if not isinstance(pid, int) or not isinstance(start, str) or not start:
@@ -698,12 +863,18 @@ def _new_provenance_entry(row: dict, *, root_key: str | None, agent: str,
             "anchor_start": anchor.get("start"),
             "anchor_source": anchor.get("source"),
         })
+    if isinstance(launcher_source, dict):
+        entry.update({
+            "source_launcher_pid": launcher_source.get("pid"),
+            "source_launcher_start": launcher_source.get("start"),
+            "source_launcher_nonce": launcher_source.get("nonce"),
+        })
     return entry
 
 
 def _prior_valid(entry: dict, *, root_key: str | None, agent: str,
                  request_id: str | None, now_epoch: float,
-                 diagnostics: dict[str, int]) -> bool:
+                 st: dict, diagnostics: dict[str, int]) -> bool:
     required = (
         "attribution_model",
         "root_key",
@@ -740,12 +911,35 @@ def _prior_valid(entry: dict, *, root_key: str | None, agent: str,
     if now_epoch - float(last) > _PROVENANCE_TTL_SECONDS:
         _bump(diagnostics, "prior_ttl_expired")
         return False
+    if (
+        entry.get("source") in _LAUNCHER_DERIVED_PRIOR_SOURCES
+        or "source_launcher_nonce" in entry
+        or "source_launcher_pid" in entry
+        or "source_launcher_start" in entry
+    ):
+        entry_source = _entry_launcher_source(entry)
+        state_source = _state_launcher_source(st)
+        if entry_source is None:
+            _bump(diagnostics, "prior_field_missing")
+            return False
+        if state_source is None:
+            if (
+                st.get("launcher_nonce_injected") is False
+                and st.get("launcher_nonce_missing_reason") == "unsupported_launch_argv"
+            ):
+                _bump(diagnostics, "launcher_nonce_unsupported_argv")
+            else:
+                _bump(diagnostics, "launcher_nonce_missing_state")
+            return False
+        if entry_source != state_source:
+            _bump(diagnostics, "launcher_nonce_mismatch")
+            return False
     return True
 
 
 def _usable_priors(raw: object, *, root_key: str | None, agent: str,
                    request_id: str | None, now_epoch: float,
-                   diagnostics: dict[str, int]) -> tuple[list[dict], list[dict]]:
+                   st: dict, diagnostics: dict[str, int]) -> tuple[list[dict], list[dict]]:
     if raw is None:
         return [], []
     if not isinstance(raw, list):
@@ -760,7 +954,7 @@ def _usable_priors(raw: object, *, root_key: str | None, agent: str,
         if item.get("attribution_model") == _ATTRIBUTION_MODEL:
             if _prior_valid(item, root_key=root_key, agent=agent,
                             request_id=request_id, now_epoch=now_epoch,
-                            diagnostics=diagnostics):
+                            st=st, diagnostics=diagnostics):
                 valid.append(item)
         else:
             legacy.append(item)
@@ -852,6 +1046,7 @@ def _attribution(
         agent=agent,
         request_id=request_id,
         now_epoch=now_epoch,
+        st=st,
         diagnostics=diagnostics,
     )
     if snapshot is None:
@@ -882,6 +1077,7 @@ def _attribution(
     kids = _children_map(idx)
     targets_by_pid: dict[int, dict] = {}
     seed_pids: set[int] = set()
+    seed_launcher_sources: dict[int, dict] = {}
     launcher_pid = st.get("launcher_pid")
     launcher_start = st.get("launcher_start")
     launcher_row = idx.get(launcher_pid) if isinstance(launcher_pid, int) else None
@@ -893,20 +1089,26 @@ def _attribution(
         and _start_of(launcher_row) != launcher_start
     )
     confirmed_launcher = False
+    launcher_source = None
     if launcher_mismatch:
         _bump(diagnostics, "pid_reuse_suppressed")
-    if isinstance(launcher_row, dict) and _pid_alive_guarded(idx, launcher_pid, launcher_start):
+    if isinstance(launcher_row, dict):
+        confirmed_launcher, launcher_source = _is_confirmed_launcher(
+            idx, launcher_row, st, root_key, agent, diagnostics)
+    if confirmed_launcher:
         confirmed_launcher = True
         _record_target(targets_by_pid, launcher_row, "confirmed_launcher",
-                       seed_descendants=True)
+                       seed_descendants=True, launcher_source=launcher_source)
         seed_pids.add(launcher_pid)
+        if isinstance(launcher_pid, int) and launcher_source is not None:
+            seed_launcher_sources[launcher_pid] = launcher_source
 
     own_wait_rows: list[dict] = []
     for row in idx.values():
         pid = row.get("pid")
         if not isinstance(pid, int):
             continue
-        if (launcher_mismatch or confirmed_launcher) and pid == launcher_pid:
+        if isinstance(launcher_pid, int) and pid == launcher_pid:
             continue
         branch = _row_branch_reason(row, root_key, agent)
         if branch is not None:
@@ -938,6 +1140,8 @@ def _attribution(
             seed_pids.add(brain_row["pid"])
 
     for entry in valid_priors:
+        if entry.get("pid") == launcher_pid:
+            continue
         row = idx.get(entry.get("pid"))
         if not isinstance(row, dict) or _start_of(row) != entry.get("start"):
             continue
@@ -949,11 +1153,15 @@ def _attribution(
             row,
             reason,
             seed_descendants=bool(entry.get("seed_descendants")),
+            launcher_source=_entry_launcher_source(entry),
         )
         if entry["pid"] in targets_by_pid:
             targets_by_pid[entry["pid"]]["prior_only"] = True
         if entry.get("seed_descendants") and isinstance(entry.get("pid"), int):
             seed_pids.add(entry["pid"])
+            prior_source = _entry_launcher_source(entry)
+            if prior_source is not None:
+                seed_launcher_sources[entry["pid"]] = prior_source
 
     queue = list(seed_pids)
     visited_seed: set[int] = set()
@@ -974,8 +1182,12 @@ def _attribution(
             if not _strict_child_edge(parent, child, root_key=root_key,
                                       agent=agent, diagnostics=diagnostics):
                 continue
+            child_launcher_source = seed_launcher_sources.get(parent_pid)
             _record_target(targets_by_pid, child, "live_chain_descendant",
-                           seed_descendants=True)
+                           seed_descendants=True,
+                           launcher_source=child_launcher_source)
+            if child_launcher_source is not None:
+                seed_launcher_sources[child_pid] = child_launcher_source
             queue.append(child_pid)
 
     fresh_pids = set(targets_by_pid)
@@ -1006,12 +1218,15 @@ def _attribution(
                 "start": launcher_start,
                 "source": "confirmed_launcher",
             },
+            launcher_source=_target_launcher_source(target),
         )
         if entry is not None:
             entry["fresh_reason"] = target["reason"]
             managed_by_pid[entry["pid"]] = entry
 
     for entry in valid_priors:
+        if entry.get("pid") == launcher_pid:
+            continue
         if entry["pid"] in managed_by_pid:
             continue
         row = idx.get(entry["pid"])
@@ -1042,6 +1257,7 @@ def _attribution(
                     "start": launcher_start,
                     "source": "legacy",
                 },
+                launcher_source=_target_launcher_source(targets_by_pid.get(pid, {})),
             )
             if entry is not None:
                 managed_by_pid[pid] = entry
@@ -1075,6 +1291,8 @@ def capture_launch_child_provenance(
     root_key: str | None,
     request_id: str | None,
     now_epoch: float,
+    launcher_nonce: str | None = None,
+    launcher_nonce_injected: bool = False,
 ) -> tuple[list[dict], dict[str, int]]:
     diagnostics = _diag()
     if not isinstance(launcher_pid, int):
@@ -1082,6 +1300,13 @@ def capture_launch_child_provenance(
     launcher_epoch = _iso_epoch(launcher_start)
     if launcher_epoch is None or not isinstance(post_snapshot, list):
         return [], diagnostics
+    launcher_source = None
+    if launcher_nonce_injected and _valid_launch_nonce(launcher_nonce):
+        launcher_source = {
+            "pid": launcher_pid,
+            "start": launcher_start,
+            "nonce": launcher_nonce,
+        }
     baseline: set[tuple[int, str]] = set()
     for row in pre_snapshot or []:
         if not isinstance(row, dict):
@@ -1126,6 +1351,7 @@ def capture_launch_child_provenance(
                 "start": launcher_start,
                 "source": "confirmed_launcher",
             },
+            launcher_source=launcher_source,
         )
         if entry is not None:
             out.append(entry)
@@ -2147,7 +2373,11 @@ def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
                   pre_snapshot: list[dict] | None = None,
                   post_snapshot: list[dict] | None = None,
                   cfg_agent: dict | None = None,
-                  root_key: str | None = None) -> dict:
+                  root_key: str | None = None,
+                  launcher_nonce: str | None = None,
+                  launcher_nonce_injected: bool = False,
+                  launcher_nonce_source: str | None = None,
+                  launcher_nonce_missing_reason: str | None = None) -> dict:
     """Apply a launch-SUCCESS to ``state`` IN PLACE - the rule the generated
     script defers to Python (testable, not PS-internal). ``pid`` is the
     LAUNCHER pid from Start-Process (the short-lived bootstrap for a forking CLI;
@@ -2164,6 +2394,19 @@ def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
         entry = agents[agent] = {}
     entry["launcher_pid"] = pid
     entry["launcher_start"] = pid_start
+    if launcher_nonce_injected and _valid_launch_nonce(launcher_nonce):
+        entry["launcher_nonce"] = launcher_nonce
+        entry["launcher_nonce_injected"] = True
+        entry["launcher_nonce_source"] = launcher_nonce_source or "agenttalk_global_arg"
+        entry.pop("launcher_nonce_missing_reason", None)
+    else:
+        entry.pop("launcher_nonce", None)
+        entry.pop("launcher_nonce_source", None)
+        entry["launcher_nonce_injected"] = False
+        if launcher_nonce_missing_reason:
+            entry["launcher_nonce_missing_reason"] = launcher_nonce_missing_reason
+        else:
+            entry.pop("launcher_nonce_missing_reason", None)
     entry["launching"] = True
     entry["readiness_seen"] = False
     entry["brain_pid"] = None
@@ -2177,6 +2420,8 @@ def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
         post_snapshot,
         launcher_pid=pid,
         launcher_start=pid_start,
+        launcher_nonce=entry.get("launcher_nonce"),
+        launcher_nonce_injected=entry.get("launcher_nonce_injected") is True,
         cfg_agent=lcfg,
         agent=agent,
         root_key=root_key,
@@ -2306,7 +2551,11 @@ def record_ephemeral_launch(state: dict, request_id: str, *, pid: int | None,
                             pre_snapshot: list[dict] | None = None,
                             post_snapshot: list[dict] | None = None,
                             cfg_agent: dict | None = None,
-                            root_key: str | None = None) -> dict:
+                            root_key: str | None = None,
+                            launcher_nonce: str | None = None,
+                            launcher_nonce_injected: bool = False,
+                            launcher_nonce_source: str | None = None,
+                            launcher_nonce_missing_reason: str | None = None) -> dict:
     """Apply an ephemeral wrapper launch success to supervisor state."""
     now = now_epoch if now_epoch is not None else datetime.now(timezone.utc).timestamp()
     result = eph.record_launched(
@@ -2320,6 +2569,19 @@ def record_ephemeral_launch(state: dict, request_id: str, *, pid: int | None,
     root = eph.ensure_state(result)
     entry = root["active"].get(request_id)
     if isinstance(entry, dict):
+        if launcher_nonce_injected and _valid_launch_nonce(launcher_nonce):
+            entry["launcher_nonce"] = launcher_nonce
+            entry["launcher_nonce_injected"] = True
+            entry["launcher_nonce_source"] = launcher_nonce_source or "agenttalk_global_arg"
+            entry.pop("launcher_nonce_missing_reason", None)
+        else:
+            entry.pop("launcher_nonce", None)
+            entry.pop("launcher_nonce_source", None)
+            entry["launcher_nonce_injected"] = False
+            if launcher_nonce_missing_reason:
+                entry["launcher_nonce_missing_reason"] = launcher_nonce_missing_reason
+            else:
+                entry.pop("launcher_nonce_missing_reason", None)
         agent = entry.get("agent")
         lcfg = {"cli": "codex", "wrapped": True}
         if isinstance(cfg_agent, dict):
@@ -2330,6 +2592,8 @@ def record_ephemeral_launch(state: dict, request_id: str, *, pid: int | None,
                 post_snapshot,
                 launcher_pid=pid,
                 launcher_start=pid_start,
+                launcher_nonce=entry.get("launcher_nonce"),
+                launcher_nonce_injected=entry.get("launcher_nonce_injected") is True,
                 cfg_agent=lcfg,
                 agent=agent,
                 root_key=root_key,
@@ -2761,6 +3025,59 @@ function Test-WrappedBaseCli($name) {
   }
   return $true
 }
+function File-LeafLower([string]$path) {
+  try { return ([IO.Path]::GetFileName($path)).ToLowerInvariant() }
+  catch { return ([string]$path).ToLowerInvariant() }
+}
+function File-StemLower([string]$path) {
+  try { return ([IO.Path]::GetFileNameWithoutExtension($path)).ToLowerInvariant() }
+  catch { return ([string]$path).ToLowerInvariant() }
+}
+function Add-SupervisorLaunchNonce($file, $argv, $nonce) {
+  $args = @($argv)
+  $unsupported = [pscustomobject]@{
+    argv = $args
+    injected = $false
+    nonce = $null
+    source = $null
+    missing_reason = 'unsupported_launch_argv'
+  }
+  if (-not $nonce) { return $unsupported }
+  $stem = File-StemLower ([string]$file)
+  if ($stem -in @('python','python3','py')) {
+    for ($i = 0; $i -lt ($args.Count - 1); $i++) {
+      if (($args[$i] -eq '-m') -and ($args[$i + 1] -eq 'agenttalk')) {
+        $out = @()
+        for ($j = 0; $j -lt $args.Count; $j++) {
+          $out += $args[$j]
+          if ($j -eq ($i + 1)) { $out += @('--supervisor-launch-nonce', $nonce) }
+        }
+        return [pscustomobject]@{
+          argv = $out
+          injected = $true
+          nonce = $nonce
+          source = 'agenttalk_global_arg'
+          missing_reason = $null
+        }
+      }
+    }
+    return $unsupported
+  }
+  $leaf = File-LeafLower ([string]$file)
+  if ($leaf -in @('agenttalk','agenttalk.exe','agenttalk.cmd','agenttalk.bat')) {
+    if ($args.Count -gt 0 -and (File-LeafLower ([string]$args[0])) -in @('agenttalk','agenttalk.exe','agenttalk.cmd','agenttalk.bat')) {
+      return $unsupported
+    }
+    return [pscustomobject]@{
+      argv = @('--supervisor-launch-nonce', $nonce) + $args
+      injected = $true
+      nonce = $nonce
+      source = 'agenttalk_global_arg'
+      missing_reason = $null
+    }
+  }
+  return $unsupported
+}
 function Preflight($name, $plan, $file, $codexHome) {
   # Smoke-test that the agent can invoke agenttalk in the EXACT seeded mode
   # BEFORE we launch - so a broken config FAILS CLOSED here instead of burning
@@ -2849,6 +3166,9 @@ function Launch($name, $plan, $codexHome) {
   foreach ($x in @($a.launch.windows_args)) {
     if ($x -eq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ([string]$x).Replace('{ROOT}', $Root).Replace('<cwd>', $cwdToken) }
   }
+  $launchNonce = [guid]::NewGuid().ToString('N')
+  $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce
+  $argv = @($nonceResult.argv)
   # Apply the agent's env, launch the REAL executable directly with -PassThru,
   # then RESTORE the supervisor's own env. The in-sandbox agent reaches the bus
   # via the explicit AGENTTALK_PY pin; AGENTTALK_PYTHON remains supervisor-only
@@ -2877,7 +3197,14 @@ function Launch($name, $plan, $codexHome) {
       else { Set-Item -Path ("Env:" + $k) -Value $saved[$k] }
     }
   }
-  if ($proc -and $proc.Id) { return @{ pid = $proc.Id; session_id = $sid; start = (Proc-Start $proc.Id) } }
+  if ($proc -and $proc.Id) {
+    $out = @{ pid = $proc.Id; session_id = $sid; start = (Proc-Start $proc.Id);
+              launcher_nonce_injected = [bool]$nonceResult.injected;
+              launcher_nonce_source = $nonceResult.source;
+              launcher_nonce_missing_reason = $nonceResult.missing_reason }
+    if ($nonceResult.injected -and $nonceResult.nonce) { $out.launcher_nonce = $nonceResult.nonce }
+    return $out
+  }
   Write-Warning "supervisor: launch of '$name' returned no PID; not auto-restarting it"; return $null
 }
 
@@ -2892,6 +3219,9 @@ function Launch-Spec($name, $spec, $codexHome) {
   $specCwdToken = if ($spec.cwd) { [string]$spec.cwd } else { '' }
   $argv = @($spec.launch.windows_args)
   $argv = $argv | ForEach-Object { ([string]$_).Replace('{ROOT}', $Root).Replace('<cwd>', $specCwdToken) }
+  $launchNonce = [guid]::NewGuid().ToString('N')
+  $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce
+  $argv = @($nonceResult.argv)
   $saved = @{}
   $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }
   if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
@@ -2913,7 +3243,14 @@ function Launch-Spec($name, $spec, $codexHome) {
       else { Set-Item -Path ("Env:" + $k) -Value $saved[$k] }
     }
   }
-  if ($proc -and $proc.Id) { return @{ pid = $proc.Id; start = (Proc-Start $proc.Id) } }
+  if ($proc -and $proc.Id) {
+    $out = @{ pid = $proc.Id; start = (Proc-Start $proc.Id);
+              launcher_nonce_injected = [bool]$nonceResult.injected;
+              launcher_nonce_source = $nonceResult.source;
+              launcher_nonce_missing_reason = $nonceResult.missing_reason }
+    if ($nonceResult.injected -and $nonceResult.nonce) { $out.launcher_nonce = $nonceResult.nonce }
+    return $out
+  }
   Write-Warning "supervisor: ephemeral launch of '$name' returned no PID"; return $null
 }
 
@@ -3034,6 +3371,11 @@ do {
             # (authoritative: claude pins the minted id; codex resumes by --last).
             $extra = @(); if ($res.session_id) { $extra += @('--session-id', $res.session_id) }
             if ($res.start) { $extra += @('--pid-start', $res.start) }
+            if ($res.launcher_nonce_injected -and $res.launcher_nonce) {
+              $extra += @('--launcher-nonce', $res.launcher_nonce, '--launcher-nonce-injected', '--launcher-nonce-source', $res.launcher_nonce_source)
+            } elseif ($res.launcher_nonce_missing_reason) {
+              $extra += @('--launcher-nonce-missing-reason', $res.launcher_nonce_missing_reason)
+            }
             if (-not (Assert-ActionsEnabled ("record-launch {0}" -f $name))) { continue }
             & $AgenttalkCmd --root $Root supervise --record-launch --for $name --cli $p.cli --pid $res.pid @extra --pre-snapshot-file $preLaunchPath --post-snapshot-file $postLaunchPath --now $now --state-file $StatePath | Out-Null
             $state = Load-State
@@ -3092,6 +3434,11 @@ do {
         if ($res) { Get-ProcSnapshot $postLaunchPath | Out-Null }
         if ($res) {
           $extra = @(); if ($res.start) { $extra += @('--pid-start', $res.start) }
+          if ($res.launcher_nonce_injected -and $res.launcher_nonce) {
+            $extra += @('--launcher-nonce', $res.launcher_nonce, '--launcher-nonce-injected', '--launcher-nonce-source', $res.launcher_nonce_source)
+          } elseif ($res.launcher_nonce_missing_reason) {
+            $extra += @('--launcher-nonce-missing-reason', $res.launcher_nonce_missing_reason)
+          }
           if (-not (Assert-ActionsEnabled ("record-ephemeral-launch {0}" -f $rid))) { continue }
           & $AgenttalkCmd --root $Root supervise --record-ephemeral-launch --request-id $rid --pid $res.pid @extra --pre-snapshot-file $preLaunchPath --post-snapshot-file $postLaunchPath --timeout-seconds $prep.timeout_seconds --state-file $StatePath --now $now | Out-Null
           $state = Load-State

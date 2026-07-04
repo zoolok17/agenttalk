@@ -7009,6 +7009,10 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             pre_snapshot=_read_snapshot_file(args.pre_snapshot_file),
             post_snapshot=_read_snapshot_file(args.post_snapshot_file),
             root_key=root_key,
+            launcher_nonce=args.launcher_nonce,
+            launcher_nonce_injected=bool(args.launcher_nonce_injected),
+            launcher_nonce_source=args.launcher_nonce_source,
+            launcher_nonce_missing_reason=args.launcher_nonce_missing_reason,
         )
         _write_state(state)
         return 0
@@ -7079,7 +7083,11 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                           pre_snapshot=_read_snapshot_file(args.pre_snapshot_file),
                           post_snapshot=_read_snapshot_file(args.post_snapshot_file),
                           cfg_agent=cfg_agent,
-                          root_key=sup._root_key(str(store.root.resolve())))
+                          root_key=sup._root_key(str(store.root.resolve())),
+                          launcher_nonce=args.launcher_nonce,
+                          launcher_nonce_injected=bool(args.launcher_nonce_injected),
+                          launcher_nonce_source=args.launcher_nonce_source,
+                          launcher_nonce_missing_reason=args.launcher_nonce_missing_reason)
         p.write_text(json.dumps(state, indent=2), encoding="utf-8")
         return 0
     if args.clear_restart:
@@ -7202,6 +7210,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "$AGENTTALK_ROOT > walk up from CWD looking for "
                         ".agenttalk/. A pinned root (flag or env) that has no "
                         "store fails loudly — it never falls back to the walk.")
+    p.add_argument("--supervisor-launch-nonce", help=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pi = sub.add_parser("init", help="Initialize a fresh .agenttalk/ store in the current dir.")
@@ -8438,6 +8447,14 @@ def build_parser() -> argparse.ArgumentParser:
     psup.add_argument("--post-snapshot-file", dest="post_snapshot_file", default=None,
                       help="(--record-launch/--record-ephemeral-launch) process snapshot "
                            "captured immediately after Start-Process.")
+    psup.add_argument("--launcher-nonce", dest="launcher_nonce",
+                      help=argparse.SUPPRESS)
+    psup.add_argument("--launcher-nonce-injected", dest="launcher_nonce_injected",
+                      action="store_true", help=argparse.SUPPRESS)
+    psup.add_argument("--launcher-nonce-source", dest="launcher_nonce_source",
+                      help=argparse.SUPPRESS)
+    psup.add_argument("--launcher-nonce-missing-reason",
+                      dest="launcher_nonce_missing_reason", help=argparse.SUPPRESS)
     gsup.add_argument("--install-activity-hook", dest="install_activity_hook",
                       action="store_true",
                       help="MERGE the activity heartbeat hook into the project "

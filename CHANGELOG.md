@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starts, foreign roots, same-root other agents, shell boundaries, unknown rooted
   CLIs, PID reuse, dropped legacy entries, prior TTL/field/request mismatches,
   snapshot-unavailable degraded cleanup, and torn provenance reads.
+- **Supervisor launcher cleanup now requires a launch nonce marker.** Supported
+  `python -m agenttalk ... wrap --loop` and `agenttalk` console-script launchers
+  receive a hidden `--supervisor-launch-nonce` global argument, and a recorded
+  launcher is confirmed only when the live command line is readable, parses as
+  this root/agent wrapper, passes branch checks, and carries the current nonce.
+  Generic pid/start collisions, unreadable command lines, unsupported native
+  launch argv, missing/mismatched/malformed/duplicate nonce values, and nonce
+  placement after the subcommand or child tail fail closed.
 - **Wrapped launch cleanup preserves same-tick children without weakening strict
   edges.** The generated PowerShell captures a pre-launch process snapshot, starts
   the agent, captures a post-launch snapshot, and records new direct children as
