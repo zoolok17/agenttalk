@@ -5,6 +5,37 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Supervisor process cleanup now uses typed process ownership instead of same-name
+  process matching.** The planner no longer treats a matching `--for <agent>` or
+  same-root CLI row as a kill target by itself. It emits explicit kill targets
+  only from confirmed launchers, direct same-root `wrap --for <agent> --loop`
+  wrappers, direct same-root waits plus a bounded brain climb, strict live
+  parent/child chains, or exact versioned provenance. Every target carries a
+  `reason`/`source`, and suppression counters report equal/unparseable/inverted
+  starts, foreign roots, same-root other agents, shell boundaries, unknown rooted
+  CLIs, PID reuse, dropped legacy entries, prior TTL/field/request mismatches,
+  snapshot-unavailable degraded cleanup, and torn provenance reads.
+- **Wrapped launch cleanup preserves same-tick children without weakening strict
+  edges.** The generated PowerShell captures a pre-launch process snapshot, starts
+  the agent, captures a post-launch snapshot, and records new direct children as
+  `process_ownership_v1` `launch_child_provenance`. Strict descendant traversal
+  still requires parseable starts and `child_start > parent_start`; equality only
+  succeeds through launch-baseline provenance.
+- **Supervisor PID provenance is versioned and exact.** `managed_pids` entries now
+  include `attribution_model`, `root_key`, `agent`, explicit `request_id`, `pid`,
+  `start`, `source`, capture/fresh epochs, and `seed_descendants`. Snapshot
+  unavailable cleanup uses only TTL-valid exact priors and never derives new
+  descendants. Legacy unversioned entries are re-derived only when independently
+  attributable on the current tick; unverifiable legacy entries are intentionally
+  dropped.
+- **PowerShell `Stop-Tree` remains a closed-set executor.** It still stops only
+  the target list supplied by Python after pid/start checks; it does not rediscover
+  descendants with `Get-CimInstance` or expand by raw `ParentProcessId`.
+
 ## [0.59.1] - 2026-07-04
 
 ### Fixed

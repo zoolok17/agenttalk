@@ -40,8 +40,8 @@ auto-recovery), so it needs the design pass. Also audit `_discover_brain` strate
 from the cross-matched wait row) and the brain name-pattern match (every `claude.exe` matches)
 for the same leak.
 
-STATUS: investigated + reported to operator 2026-07-03; fix approach pending operator go
-(fast-track on lead budget vs normal team cadence once the global token cap lifts).
+STATUS: investigated + reported to operator 2026-07-03; fixed in the Unreleased
+supervisor process-ownership build pending review/gate/merge.
 
 **P0 UPDATE — investigation complete (workflow `wrnuxcwka`, 2026-07-03).**
 
@@ -102,9 +102,43 @@ a stale/foreign recorded `launcher_pid` is a separate cross-kill vector the wait
 cover (state hygiene); normalized-path comparison must handle PS quoting / mixed slashes /
 drive-case / trailing slash (too-loose re-opens the bypass, too-strict re-breaks own-reaping).
 
-STATUS: fix spec READY. NORMAL CADENCE — hand to codex (design-refine over this spec) → dev-2
-build (isolated worktree) → 2-reviewer → gate → ship, when the token cap lifts. Mitigation until
-then: project-DISTINCT agent names across concurrent projects.
+STATUS: fixed in the Unreleased supervisor process-ownership build pending review/gate/merge.
+Mitigation until then: project-DISTINCT agent names across concurrent projects.
+
+**IMPLEMENTATION UPDATE - process ownership model (2026-07-04).**
+
+The fix is broader than root-scoping a name match. The supervisor planner now produces typed
+ownership records first, then emits a closed kill target set from those records. A row is killable
+only when it is a confirmed recorded launcher, a direct same-root owning wrapper, a direct same-root
+owning wait row, the bounded same-agent brain/TUI reached from that wait row, a strict live-chain
+descendant from a seed, launch-time child provenance, first-confirmed child provenance, an exact
+versioned prior, or a freshly re-derived legacy row. Generic same-root CLI rows, same-root rows for
+another agent, foreign-root rows, shell/terminal hosts, and ambiguous rows are diagnostic/branch-cut
+only.
+
+Operator-visible diagnostics are emitted from the same attribution decisions that build kill
+targets: `equal_start_edge`, `unparseable_start_edge`, `inverted_start_edge`,
+`foreign_root_branch`, `same_root_other_agent_branch`, `shell_boundary`, `unknown_root_cli`,
+`pid_reuse_suppressed`, `legacy_unverifiable_dropped`, `prior_ttl_expired`,
+`prior_field_missing`, `prior_request_mismatch`, `snapshot_unavailable_no_descendants`, and
+`torn_provenance_read`. Every kill target carries a `reason`/`source` so reviews can trace why it
+was included.
+
+`managed_pids` migration is intentionally fail-closed. New entries are versioned as
+`process_ownership_v1` and include exact `root_key`, `agent`, explicit `request_id` (including
+JSON null for ordinary supervised agents), `pid`, `start`, `source`, capture/fresh epochs, and
+`seed_descendants`. Snapshot-unavailable cleanup uses only TTL-valid exact priors and never starts
+new descendant traversal. Legacy unversioned rows are re-derived only if independently attributable
+on the current tick; otherwise they are dropped from next state and counted. The residual one-tick
+self-healing gap is accepted: unverifiable legacy rows are intentionally lost, while healthy
+verifiable rows are re-tagged.
+
+Accepted limitations: the strict-edge proof assumes wall-clock start ordering is monotonic across
+PID reuse; a backward NTP/VM clock step that straddles PID reuse is outside this accidental
+cross-project-kill fix. Deliberate parent PID spoofing with
+`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` is also out of scope. This is a correctness boundary against
+accidental cross-project kills and stale PID/PPID reuse, not a security boundary against a malicious
+local process.
 
 ## P2 · PLANNED — supervisor: don't give up on a rate-limited agent (2026-07-04)
 

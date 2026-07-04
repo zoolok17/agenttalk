@@ -44,7 +44,7 @@ def _cfg(**overrides) -> dict:
                     "launch": {
                         "windows_file": "python.exe",
                         "windows_args": [
-                            "-m", "agenttalk", "wrap", "--for", "{AGENT}",
+                            "-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for", "{AGENT}",
                             "--cli", "codex", "--loop", "--one-shot",
                             "--to-request", "{REQUEST_ID}", "--", "codex",
                         ],
@@ -254,10 +254,12 @@ def test_launched_exit_without_result_fails_without_restart() -> None:
 
 
 def test_timeout_plans_process_tree_kill_targets() -> None:
+    launcher_start = "2026-07-04T07:20:31.1000000+00:00"
+    child_start = "2026-07-04T07:20:31.2000000+00:00"
     state = {"ephemeral_reviewers": {"active": {
         "lr-timeout": {"agent": "adversary-lr-timeout", "requested_by": "lead",
                        "phase": eph.STATE_LAUNCHED, "launcher_pid": 10,
-                       "launcher_start": "t-start", "launched_epoch": NOW - 100,
+                       "launcher_start": launcher_start, "launched_epoch": NOW - 100,
                        "deadline_epoch": NOW - 1}
     }}}
     report = _report(active={"lr-timeout": {
@@ -265,9 +267,9 @@ def test_timeout_plans_process_tree_kill_targets() -> None:
     }})
     snap = [
         {"pid": 10, "parent_pid": 1, "name": "python.exe", "command_line": "wrap",
-         "start_time": "t-start"},
+         "start_time": launcher_start},
         {"pid": 11, "parent_pid": 10, "name": "codex.exe", "command_line": "codex exec",
-         "start_time": "t-child"},
+         "start_time": child_start},
     ]
     plan = sup.plan_actions(report, state, _cfg(), now_epoch=NOW, snapshot=snap)
     timeout = plan["ephemeral_reviewers"]["lr-timeout"]

@@ -31,11 +31,27 @@ def _team(tmp_path: Path, agents: str = "lead,worker") -> Store:
 
 
 NOW = 1_000_000.0
+TEST_ROOT = r"D:\agenttalk-test-root"
 
 
 def _iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _ps_iso(microsecond: int) -> str:
+    return f"2026-07-04T07:20:31.{microsecond:06d}0+00:00"
+
+
+LAUNCHER_START = _ps_iso(100000)
+BRAIN_START = _ps_iso(200000)
+RUNNER_START = _ps_iso(300000)
+WAIT_START = _ps_iso(400000)
+WRAP_START = _ps_iso(500000)
+WRAP_CHILD_START = _ps_iso(600000)
+
+
 _CONFIG = {
+    "root": TEST_ROOT,
     "agents": {"worker": {"auto_restart": True, "cli": "codex"}},
     "backoff": {"base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180},
     "suspect_warn_interval_seconds": 300,
@@ -86,7 +102,7 @@ def test_supervise_claim_instance_refuses_kill_switch_and_release_allows_cleanup
     assert s.read_supervisor_instance() is None
 
 # ---- snapshot-model fixtures (the 8-state classifier reads a process snapshot) ----
-BRAIN_PID, BRAIN_START, LAUNCHER_PID, WAIT_PID = 200, "t-brain", 199, 400
+BRAIN_PID, LAUNCHER_PID, WAIT_PID = 200, 199, 400
 
 
 def _snap(*, cli="codex", brain=True, wait=True, agent="worker",
@@ -102,8 +118,8 @@ def _snap(*, cli="codex", brain=True, wait=True, agent="worker",
     if wait:
         rows.append({"pid": WAIT_PID, "parent_pid": brain_pid if brain else 1,
                      "name": "python.exe",
-                     "command_line": f"... agenttalk wait --for {agent} --timeout 1800",
-                     "start_time": "t-wait"})
+                     "command_line": f"python -m agenttalk --root {TEST_ROOT} wait --for {agent} --timeout 1800",
+                     "start_time": WAIT_START})
     return rows
 
 
@@ -244,16 +260,31 @@ def test_consumed_marker_now_alive_clears() -> None:
     assert p["clear_marker"] == "rr-1"
 
 
-def test_kill_targets_skip_legacy_missing_start_times() -> None:
+def test_snapshot_unavailable_uses_only_versioned_provenanced_priors() -> None:
     report = _report(restart_request={"request_id": "rr-1"})
+    prior = {
+        "attribution_model": "process_ownership_v1",
+        "root_key": sup._root_key(TEST_ROOT),
+        "agent": "worker",
+        "request_id": None,
+        "pid": 333,
+        "start": WAIT_START,
+        "source": "launch_child_provenance",
+        "captured_at_epoch": NOW - 1,
+        "last_fresh_attribution_epoch": NOW - 1,
+        "seed_descendants": True,
+    }
     state = {"agents": {"worker": _ready(
         launcher_pid=111,
         launcher_start=None,
-        managed_pids=[{"pid": 222}, {"pid": 333, "start": "t333"}],
+        managed_pids=[{"pid": 222}, {"pid": 444, "start": WAIT_START}, prior],
     )}}
     plan = sup.plan_actions(report, state, _CONFIG, now_epoch=NOW, snapshot=None)
     targets = plan["agents"]["worker"]["kill_targets"]
-    assert targets == [{"pid": 333, "start": "t333"}]
+    assert targets == [{"pid": 333, "start": WAIT_START,
+                        "reason": "provenanced_prior", "source": "provenanced_prior"}]
+    assert plan["agents"]["worker"]["diagnostics"]["legacy_unverifiable_dropped"] == 2
+    assert plan["agents"]["worker"]["diagnostics"]["snapshot_unavailable_no_descendants"] == 1
 
 
 def test_only_auto_restart_agents_are_planned() -> None:
@@ -495,6 +526,7 @@ def test_supervise_plan_cli_with_fixtures(tmp_path: Path, capsys) -> None:
 
 
 _HOOK_CONFIG = {
+    "root": TEST_ROOT,
     "agents": {"worker": {"auto_restart": True, "activity_hook": True, "cli": "claude"}},
     "backoff": {"base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180},
     "launch_grace_seconds": 120,
@@ -949,14 +981,25 @@ def test_allow_launcher_self_default_is_false_for_codex() -> None:
 
 
 def test_stale_heartbeat_reaps_carried_managed_pid_null_cmdline(tmp_path: Path) -> None:
-    """A prior start-matching managed wait pid with a now-null command line is
+    """A versioned start-matching managed pid with a now-null command line is
     still a safe cleanup target when heartbeat staleness triggers recovery."""
     snap = [{"pid": WAIT_PID, "parent_pid": 1, "name": "python.exe",
-             "command_line": None, "start_time": "wait-start"}]
+             "command_line": None, "start_time": WAIT_START}]
+    prior = {
+        "attribution_model": "process_ownership_v1",
+        "root_key": sup._root_key(TEST_ROOT),
+        "agent": "worker",
+        "request_id": None,
+        "pid": WAIT_PID,
+        "start": WAIT_START,
+        "source": "first_confirmed_child_provenance",
+        "captured_at_epoch": NOW - 1,
+        "last_fresh_attribution_epoch": NOW - 1,
+        "seed_descendants": False,
+    }
     st = {"agents": {"worker": _ready(
         backoff_next_epoch=0,
-        managed_pids=[{"pid": WAIT_PID, "start": "wait-start", "kind": "wait",
-                       "last_seen": 0}])}}
+        managed_pids=[prior])}}
     p = _plan(_report(heartbeat_stale=True), st, snapshot=snap,
               config=_HOOK_CODEX_CONFIG)
     assert p["state"] == "STUCK_OR_DEAD" and p["kill_orphans"] is True
@@ -1835,6 +1878,7 @@ def test_seed_codex_home_provisions_and_fails_closed(tmp_path: Path) -> None:
 WRAP_LAUNCHER_PID, WRAP_CHILD_PID = 300, 301
 
 _WRAP_CONFIG = {
+    "root": TEST_ROOT,
     "agents": {"worker": {"auto_restart": True, "cli": "codex", "wrapped": True}},
     "backoff": {"base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180},
     "launch_grace_seconds": 120,
@@ -1848,17 +1892,19 @@ def _wrap_snap(*, cli="codex", launcher_pid=WRAP_LAUNCHER_PID,
     brain-discovery would mistake it for the long-lived brain - the wrapped path
     must instead treat it as just a managed (reapable) descendant."""
     name = "codex.exe" if cli == "codex" else "claude.exe"
+    if child_start == "t-child":
+        child_start = WRAP_CHILD_START
     return [
         {"pid": launcher_pid, "parent_pid": 1, "name": "python.exe",
-         "command_line": f"python -m agenttalk wrap --for worker --cli {cli} --loop",
-         "start_time": "t-wrap"},
+         "command_line": f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --cli {cli} --loop",
+         "start_time": WRAP_START},
         {"pid": child_pid, "parent_pid": launcher_pid, "name": name,
          "command_line": f"{name} exec --json", "start_time": child_start},
     ]
 
 
 def _wrap_ready(**over) -> dict:
-    st = {"launcher_pid": WRAP_LAUNCHER_PID, "launcher_start": "t-wrap",
+    st = {"launcher_pid": WRAP_LAUNCHER_PID, "launcher_start": WRAP_START,
           "readiness_seen": True, "launching": False,
           "last_launch_epoch": NOW - 1000}
     st.update(over)
@@ -1874,7 +1920,7 @@ def _plan_wrap(report, state, *, now=NOW, snapshot=None, config=_WRAP_CONFIG):
 def test_wrapped_liveness_retires_brain_keeps_managed() -> None:
     snap = _wrap_snap()
     lv = sup._liveness(snap, _wrap_ready(), {"cli": "codex", "wrapped": True},
-                       "worker", NOW)
+                       "worker", NOW, root_key=sup._root_key(TEST_ROOT))
     assert lv["brain_pid"] is None and lv["brain_start"] is None
     assert lv["discovered_brain"] is False
     # the per-turn child is still tracked for the start-guarded tree-kill
@@ -2088,7 +2134,7 @@ def test_config_template_ships_wrapped_example() -> None:
     assert w["turn_watchdog"]["turn_elapsed_seconds"] == 1800
     args = w["launch"]["windows_args"]
     assert "{SESSION_ARGS}" not in args          # wrapper owns session; no splice
-    assert args[:3] == ["-m", "agenttalk", "wrap"] and "--loop" in args
+    assert args[:5] == ["-m", "agenttalk", "--root", "{ROOT}", "wrap"] and "--loop" in args
     # 0.31.2: the wrapped codex child is launched with `--disable hooks` by default
     # (the wrapper owns the heartbeat; sidesteps the codex hook-trust prompt).
     assert args[-2:] == ["--disable", "hooks"]
@@ -2250,6 +2296,340 @@ def test_config_template_documents_watchdog_and_provenance() -> None:
     assert "approval_policy=never" in prov and "MCP" in prov and "headless" in prov.lower()
     # the timing-invariant is documented in the stuck_after comment
     assert "watchdog" in w["_comment_wrapped_stuck_after"].lower()
+
+
+def _ownership_report(stale: bool = True) -> dict:
+    rpt = _report(heartbeat_stale=stale)
+    rpt["root_key"] = sup._root_key(TEST_ROOT)
+    return rpt
+
+
+def _ownership_state(**over) -> dict:
+    st = _wrap_ready(backoff_next_epoch=0)
+    st.update(over)
+    return {"agents": {"worker": st}}
+
+
+def _proc(pid: int, parent: int, name: str, command_line: str | None,
+          start: str) -> dict:
+    return {
+        "pid": pid,
+        "parent_pid": parent,
+        "name": name,
+        "command_line": command_line,
+        "start_time": start,
+    }
+
+
+def test_process_ownership_iso_epoch_parses_real_powershell_o_and_strict_edges() -> None:
+    parent_start = "2026-07-04T07:20:31.5767870+00:00"
+    child_start = "2026-07-04T07:20:31.5767880+00:00"
+    assert sup._iso_epoch(parent_start) is not None
+    assert sup._iso_epoch(child_start) > sup._iso_epoch(parent_start)
+
+    snap = [
+        _proc(
+            10, 1, "python.exe",
+            "python -m agenttalk --root D:\\agenttalk-test-root wrap --for worker --loop",
+            parent_start,
+        ),
+        _proc(11, 10, "codex.exe", "codex exec --json", child_start),
+    ]
+    p = sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(launcher_pid=10, launcher_start=parent_start),
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    assert {t["pid"] for t in p["kill_targets"]} == {10, 11}
+
+    for bad_start, counter in [
+        (parent_start, "equal_start_edge"),
+        ("2026-07-04T07:20:31.5767860+00:00", "inverted_start_edge"),
+        (None, "unparseable_start_edge"),
+        ("not-a-date", "unparseable_start_edge"),
+    ]:
+        bad_snap = [snap[0], {**snap[1], "start_time": bad_start}]
+        p_bad = sup.plan_actions(
+            _ownership_report(),
+            _ownership_state(launcher_pid=10, launcher_start=parent_start),
+            _WRAP_CONFIG,
+            now_epoch=NOW,
+            snapshot=bad_snap,
+        )["agents"]["worker"]
+        assert {t["pid"] for t in p_bad["kill_targets"]} == {10}
+        assert p_bad["diagnostics"][counter] == 1
+
+
+def test_process_ownership_strict_live_chain_reaps_multi_hop_when_ordered() -> None:
+    snap = [
+        _proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", _ps_iso(100000)),
+        _proc(11, 10, "codex.exe", "codex exec --json", _ps_iso(200000)),
+        _proc(12, 11, "node.exe", "node build.js", _ps_iso(300000)),
+    ]
+    p = sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(launcher_pid=10, launcher_start=_ps_iso(100000)),
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    assert [t["pid"] for t in p["kill_targets"]] == [10, 11, 12]
+    assert p["kill_targets"][1]["reason"] == "live_chain_descendant"
+    assert p["kill_targets"][2]["reason"] == "live_chain_descendant"
+
+
+def test_process_ownership_equal_start_graft_needs_independent_provenance() -> None:
+    start = _ps_iso(100000)
+    snap = [
+        _proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", start),
+        _proc(11, 10, "codex.exe", "codex exec --json", start),
+    ]
+    p = sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(launcher_pid=10, launcher_start=start),
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    assert {t["pid"] for t in p["kill_targets"]} == {10}
+    assert p["diagnostics"]["equal_start_edge"] == 1
+
+
+def test_process_ownership_launch_time_same_tick_child_absent_from_baseline_is_provenanced() -> None:
+    start = _ps_iso(100000)
+    pre = [_proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", start)]
+    post = [*pre, _proc(11, 10, "codex.exe", "codex exec --json", start)]
+    state = {"agents": {"worker": {}}}
+    sup.record_launch(
+        state,
+        "worker",
+        cli="codex",
+        pid=10,
+        pid_start=start,
+        now_epoch=NOW,
+        pre_snapshot=pre,
+        post_snapshot=post,
+        cfg_agent={"cli": "codex", "wrapped": True},
+        root_key=sup._root_key(TEST_ROOT),
+    )
+    managed = state["agents"]["worker"]["managed_pids"]
+    assert managed[0]["source"] == "launch_child_provenance"
+    assert managed[0]["pid"] == 11
+    assert managed[0]["seed_descendants"] is True
+
+    p = sup.plan_actions(_ownership_report(), state, _WRAP_CONFIG,
+                         now_epoch=NOW + 1, snapshot=post)["agents"]["worker"]
+    assert {t["pid"] for t in p["kill_targets"]} == {10, 11}
+    assert any(t["source"] == "launch_child_provenance" for t in p["kill_targets"])
+
+
+def test_process_ownership_launch_time_same_tick_child_present_in_baseline_is_not_provenanced() -> None:
+    start = _ps_iso(100000)
+    child = _proc(11, 10, "codex.exe", "codex exec --json", start)
+    pre = [
+        _proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", start),
+        child,
+    ]
+    state = {"agents": {"worker": {}}}
+    sup.record_launch(
+        state,
+        "worker",
+        cli="codex",
+        pid=10,
+        pid_start=start,
+        now_epoch=NOW,
+        pre_snapshot=pre,
+        post_snapshot=pre,
+        cfg_agent={"cli": "codex", "wrapped": True},
+        root_key=sup._root_key(TEST_ROOT),
+    )
+    assert state["agents"]["worker"]["managed_pids"] == []
+    p = sup.plan_actions(_ownership_report(), state, _WRAP_CONFIG,
+                         now_epoch=NOW + 1, snapshot=pre)["agents"]["worker"]
+    assert {t["pid"] for t in p["kill_targets"]} == {10}
+
+
+def test_process_ownership_stale_ppid_grafts_are_excluded_single_and_multi_hop() -> None:
+    snap = [
+        _proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", _ps_iso(300000)),
+        _proc(11, 10, "codex.exe", "codex exec --json", _ps_iso(200000)),
+        _proc(12, 11, "node.exe", "node build.js", _ps_iso(400000)),
+    ]
+    p = sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(launcher_pid=10, launcher_start=_ps_iso(300000)),
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    assert {t["pid"] for t in p["kill_targets"]} == {10}
+    assert p["diagnostics"]["inverted_start_edge"] == 1
+
+
+def test_process_ownership_branch_cuts_same_root_foreign_shell_and_generic_cli() -> None:
+    snap = [
+        _proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", _ps_iso(100000)),
+        _proc(11, 10, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wait --for other", _ps_iso(200000)),
+        _proc(12, 10, "python.exe", f"python -m agenttalk --root {TEST_ROOT} send --to worker -m hi", _ps_iso(210000)),
+        _proc(13, 10, "python.exe", "python -m agenttalk --root D:\\other wrap --for worker --loop", _ps_iso(220000)),
+        _proc(14, 10, "python.exe", f"python -m agenttalk --root {TEST_ROOT} frob", _ps_iso(230000)),
+        _proc(15, 10, "cmd.exe", "cmd.exe /c something", _ps_iso(240000)),
+    ]
+    p = sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(launcher_pid=10, launcher_start=_ps_iso(100000)),
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    assert {t["pid"] for t in p["kill_targets"]} == {10}
+    assert p["diagnostics"]["same_root_other_agent_branch"] >= 1
+    assert p["diagnostics"]["unknown_root_cli"] >= 2
+    assert p["diagnostics"]["foreign_root_branch"] >= 1
+    assert p["diagnostics"]["shell_boundary"] >= 1
+
+
+def test_process_ownership_root_wait_brain_stops_at_windows_shell_hosts() -> None:
+    for shell_name in ["conhost.exe", "WindowsTerminal.exe", "powershell.exe",
+                       "cmd.exe", "OpenConsole.exe", "explorer.exe"]:
+        snap = [
+            _proc(5, 1, shell_name, shell_name, _ps_iso(100000)),
+            _proc(6, 5, "codex.exe", "codex tui", _ps_iso(200000)),
+            _proc(7, 6, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wait --for worker", _ps_iso(300000)),
+        ]
+        p = sup.plan_actions(
+            _ownership_report(),
+            {"agents": {"worker": _ready(backoff_next_epoch=0)}},
+            _HOOK_CODEX_CONFIG,
+            now_epoch=NOW,
+            snapshot=snap,
+        )["agents"]["worker"]
+        assert {t["pid"] for t in p["kill_targets"]} == {6, 7}
+        assert p["diagnostics"]["shell_boundary"] >= 1
+
+
+def test_process_ownership_parse_agenttalk_wrap_fail_closed_matrix() -> None:
+    good = f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop -- codex"
+    assert sup.parse_agenttalk_wrap_invocation(good, sup._root_key(TEST_ROOT), "worker") is True
+    bad = [
+        f"cmd.exe /c python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop",
+        f"python -m agenttalk wrap --root {TEST_ROOT} --for worker --loop",
+        f"python -m agenttalk --root {TEST_ROOT} wrap --for worker -- --loop",
+        f"python -m agenttalk --root \"{TEST_ROOT} wrap --for worker --loop",
+        "python -m agenttalk --root D:\\other wrap --for worker --loop",
+        f"python -m agenttalk --root {TEST_ROOT} wrap --for other --loop",
+        f"python -m agenttalk --root {TEST_ROOT} wrap --for worker",
+        f"python -m agenttalk --root {TEST_ROOT} wrap --for worker -- codex --loop",
+    ]
+    for command_line in bad:
+        assert sup.parse_agenttalk_wrap_invocation(
+            command_line, sup._root_key(TEST_ROOT), "worker") is False
+
+
+def test_process_ownership_launcher_pid_reuse_cannot_be_rescued_by_wrap_text() -> None:
+    snap = [
+        _proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", _ps_iso(200000)),
+    ]
+    p = sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(launcher_pid=10, launcher_start=_ps_iso(100000)),
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    assert p["kill_targets"] == []
+    assert p["diagnostics"]["pid_reuse_suppressed"] == 1
+
+
+def test_process_ownership_provenanced_prior_exact_fields_request_and_ttl() -> None:
+    base = {
+        "attribution_model": "process_ownership_v1",
+        "root_key": sup._root_key(TEST_ROOT),
+        "agent": "worker",
+        "request_id": None,
+        "pid": 11,
+        "start": _ps_iso(200000),
+        "source": "launch_child_provenance",
+        "captured_at_epoch": NOW - 10,
+        "last_fresh_attribution_epoch": NOW - 10,
+        "seed_descendants": False,
+    }
+    snap = [_proc(11, 1, "codex.exe", "codex exec --json", _ps_iso(200000))]
+    p = sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(managed_pids=[json.loads(json.dumps(base))]),
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    assert p["kill_targets"] == [{"pid": 11, "start": _ps_iso(200000),
+                                  "reason": "launch_child_provenance",
+                                  "source": "launch_child_provenance"}]
+    p_fresh = sup.plan_actions(
+        _ownership_report(stale=False),
+        _ownership_state(managed_pids=[json.loads(json.dumps(base))]),
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    assert p_fresh["next_state"]["managed_pids"][0]["last_fresh_attribution_epoch"] == NOW - 10
+
+    mismatch = {**base, "request_id": "R1"}
+    p_bad = sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(managed_pids=[mismatch]),
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    assert p_bad["kill_targets"] == []
+    assert p_bad["diagnostics"]["prior_request_mismatch"] == 1
+
+    missing = dict(base)
+    missing.pop("request_id")
+    expired = {**base, "last_fresh_attribution_epoch": NOW - 4000}
+    p_missing = sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(managed_pids=[missing, expired]),
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    assert p_missing["kill_targets"] == []
+    assert p_missing["diagnostics"]["prior_field_missing"] == 1
+    assert p_missing["diagnostics"]["prior_ttl_expired"] == 1
+
+
+def test_process_ownership_legacy_managed_pids_rederive_only_when_freshly_attributable() -> None:
+    snap = [
+        _proc(10, 1, "python.exe", f"python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop", _ps_iso(100000)),
+        _proc(11, 10, "codex.exe", "codex exec --json", _ps_iso(200000)),
+        _proc(12, 99, "node.exe", "node old.js", _ps_iso(200000)),
+    ]
+    state = _ownership_state(
+        launcher_pid=10,
+        launcher_start=_ps_iso(100000),
+        managed_pids=[
+            {"pid": 11, "start": _ps_iso(200000), "kind": "legacy"},
+            {"pid": 12, "start": _ps_iso(200000), "kind": "legacy"},
+        ],
+    )
+    p = sup.plan_actions(_ownership_report(stale=False), state, _WRAP_CONFIG,
+                         now_epoch=NOW, snapshot=snap)["agents"]["worker"]
+    managed = {m["pid"]: m for m in p["next_state"]["managed_pids"]}
+    assert managed[11]["source"] == "legacy_rederived"
+    assert 12 not in managed
+    assert p["diagnostics"]["legacy_unverifiable_dropped"] == 1
+
+
+def test_process_ownership_stop_tree_closed_set_pin() -> None:
+    ps = sup.PS_TEMPLATE
+    block = ps[ps.index("function Stop-Tree"):ps.index("function Seed-CodexHome")]
+    assert "Get-CimInstance" not in block
+    assert "ParentProcessId" not in block
+    assert "foreach ($t in $arr)" in block
 
 
 def test_report_parity_wrapped_codex_uses_per_cli_threshold(tmp_path: Path) -> None:

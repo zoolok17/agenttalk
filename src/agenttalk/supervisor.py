@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import copy
 import json
+import shlex
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from agenttalk import ephemeral as eph
 from agenttalk import health as health_model
@@ -122,6 +124,25 @@ _WINDOW_STYLES = {
     "minimized": "Minimized",
     "normal": "Normal",
 }
+
+_ATTRIBUTION_MODEL = "process_ownership_v1"
+_PROVENANCE_TTL_SECONDS = 3600.0
+_DIAGNOSTIC_COUNTERS = (
+    "equal_start_edge",
+    "unparseable_start_edge",
+    "inverted_start_edge",
+    "foreign_root_branch",
+    "same_root_other_agent_branch",
+    "shell_boundary",
+    "unknown_root_cli",
+    "pid_reuse_suppressed",
+    "legacy_unverifiable_dropped",
+    "prior_ttl_expired",
+    "prior_field_missing",
+    "prior_request_mismatch",
+    "snapshot_unavailable_no_descendants",
+    "torn_provenance_read",
+)
 
 
 def resolve_window_style(config: dict, cfg_agent: dict) -> tuple[str, str | None]:
@@ -388,12 +409,31 @@ def _start_of(row: dict | None):
 
 
 def _iso_epoch(value) -> float | None:
-    """Parse an ISO-8601 start-time to epoch seconds (best-effort). Returns None
-    for non-ISO test sentinels (e.g. "t2") so guards using it degrade to off."""
+    """Parse an ISO-8601 start-time to epoch seconds.
+
+    PowerShell's ``[datetimeoffset].ToString('o')`` writes seven fractional
+    digits. Python 3.10 accepts at most six, so trim only the fractional portion
+    before ``datetime.fromisoformat`` and preserve the timezone suffix.
+    """
     if not isinstance(value, str):
         return None
+    s = value.strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    if "." in s:
+        dot = s.find(".")
+        tz_pos = len(s)
+        for marker in ("+", "-"):
+            pos = s.find(marker, dot + 1)
+            if pos != -1:
+                tz_pos = pos
+                break
+        frac = s[dot + 1:tz_pos]
+        if len(frac) > 6:
+            s = s[:dot + 1] + frac[:6] + s[tz_pos:]
     try:
-        s = value.replace("Z", "+00:00")
         return datetime.fromisoformat(s).timestamp()
     except ValueError:
         return None
@@ -404,9 +444,327 @@ def _pid_alive_guarded(idx: dict[int, dict], pid, expected_start) -> bool:
     recorded (a recycled pid with a different start-time is NOT our process)."""
     if not isinstance(pid, int) or pid not in idx:
         return False
-    if expected_start is None:
-        return True  # nothing to compare against (first sighting) - trust presence
+    if not isinstance(expected_start, str) or not expected_start:
+        return False
     return _start_of(idx[pid]) == expected_start
+
+
+def _diag() -> dict[str, int]:
+    return dict.fromkeys(_DIAGNOSTIC_COUNTERS, 0)
+
+
+def _bump(counters: dict[str, int], name: str) -> None:
+    if name in counters:
+        counters[name] = int(counters.get(name, 0)) + 1
+
+
+def _merge_diag(target: dict[str, int], source: dict[str, int]) -> None:
+    for key, value in source.items():
+        if isinstance(value, int) and value:
+            target[key] = int(target.get(key, 0)) + value
+
+
+def _root_key(value) -> str | None:
+    if not isinstance(value, str):
+        try:
+            value = str(value)
+        except Exception:  # noqa: BLE001 - root normalization is fail-closed
+            return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return str(Path(value).resolve(strict=False)).casefold()
+    except (OSError, ValueError):
+        return None
+
+
+def _same_root(candidate: str | None, root_key: str | None) -> bool:
+    return bool(candidate and root_key and _root_key(candidate) == root_key)
+
+
+def _image_stem(row_or_name) -> str:
+    name = row_or_name.get("name") if isinstance(row_or_name, dict) else row_or_name
+    if not isinstance(name, str):
+        return ""
+    leaf = name.replace("\\", "/").rsplit("/", 1)[-1]
+    if "." in leaf:
+        leaf = leaf.rsplit(".", 1)[0]
+    return leaf.casefold()
+
+
+_SHELL_HOSTS = {
+    "powershell",
+    "pwsh",
+    "cmd",
+    "windowsterminal",
+    "wt",
+    "conhost",
+    "openconsole",
+    "explorer",
+}
+
+
+def _is_shell_host(row: dict | None) -> bool:
+    return _image_stem(row or {}) in _SHELL_HOSTS
+
+
+def _split_command_line(command_line: object) -> list[str] | None:
+    if not isinstance(command_line, str) or not command_line.strip():
+        return None
+    try:
+        raw = shlex.split(command_line, posix=False)
+    except ValueError:
+        return None
+    out: list[str] = []
+    for token in raw:
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+            token = token[1:-1]
+        if token:
+            out.append(token)
+    return out or None
+
+
+def _token_stem(token: str) -> str:
+    return _image_stem(token)
+
+
+def _agenttalk_argv(command_line: object) -> list[str] | None:
+    tokens = _split_command_line(command_line)
+    if not tokens:
+        return None
+    first = _token_stem(tokens[0])
+    if first in _SHELL_HOSTS:
+        return None
+    if first in {"python", "python3", "py"}:
+        if len(tokens) >= 3 and tokens[1] == "-m" and tokens[2] == "agenttalk":
+            return tokens[3:]
+        return None
+    if first == "agenttalk":
+        return tokens[1:]
+    return None
+
+
+def _option_value(tokens: list[str], index: int) -> tuple[str | None, int]:
+    token = tokens[index]
+    if "=" in token:
+        return token.split("=", 1)[1], index + 1
+    if index + 1 >= len(tokens):
+        return None, len(tokens)
+    return tokens[index + 1], index + 2
+
+
+def _agenttalk_invocation(command_line: object, root_key: str | None) -> dict | None:
+    argv = _agenttalk_argv(command_line)
+    if argv is None:
+        return None
+    root = None
+    sub_i = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            return {"root": root, "root_match": _same_root(root, root_key),
+                    "subcommand": None, "args": [], "tail": argv[i + 1:]}
+        if arg in {"wrap", "wait", "send", "status", "supervise"}:
+            sub_i = i
+            break
+        if arg == "--root" or arg.startswith("--root="):
+            root, i = _option_value(argv, i)
+            continue
+        i += 1
+    if sub_i is None:
+        return {"root": root, "root_match": _same_root(root, root_key),
+                "subcommand": None, "args": [], "tail": []}
+    return {
+        "root": root,
+        "root_match": _same_root(root, root_key),
+        "subcommand": argv[sub_i],
+        "args": argv[sub_i + 1:],
+        "tail": [],
+    }
+
+
+def _agent_option(args: list[str], option: str) -> str | None:
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            return None
+        if arg == option or arg.startswith(option + "="):
+            value, _next = _option_value(args, i)
+            return value
+        i += 1
+    return None
+
+
+def parse_agenttalk_wait_invocation(command_line: object, root_key: str | None,
+                                    agent: str) -> bool:
+    inv = _agenttalk_invocation(command_line, root_key)
+    if not inv or inv.get("subcommand") != "wait" or not inv.get("root_match"):
+        return False
+    return _agent_option(inv.get("args") or [], "--for") == agent
+
+
+def parse_agenttalk_wrap_invocation(command_line: object, root_key: str | None,
+                                    agent: str) -> bool:
+    inv = _agenttalk_invocation(command_line, root_key)
+    if not inv or inv.get("subcommand") != "wrap" or not inv.get("root_match"):
+        return False
+    args = inv.get("args") or []
+    agent_value = _agent_option(args, "--for")
+    if agent_value != agent:
+        return False
+    before_tail = args[:args.index("--")] if "--" in args else args
+    return "--loop" in before_tail
+
+
+def _row_branch_reason(row: dict, root_key: str | None, agent: str) -> str | None:
+    if _is_shell_host(row):
+        return "shell_boundary"
+    inv = _agenttalk_invocation(row.get("command_line"), root_key)
+    if not inv:
+        return None
+    if inv.get("root") and not inv.get("root_match"):
+        return "foreign_root_branch"
+    if not inv.get("root_match"):
+        return None
+    sub = inv.get("subcommand")
+    args = inv.get("args") or []
+    if sub in {"wait", "wrap"}:
+        row_agent = _agent_option(args, "--for")
+        if row_agent is not None and row_agent != agent:
+            return "same_root_other_agent_branch"
+        if sub == "wait" and row_agent == agent:
+            return None
+        if sub == "wrap" and row_agent == agent and "--loop" in (
+                args[:args.index("--")] if "--" in args else args):
+            return None
+    return "unknown_root_cli"
+
+
+def _record_target(targets: dict[int, dict], row: dict, reason: str,
+                   *, seed_descendants: bool = False) -> None:
+    pid = row.get("pid")
+    start = _start_of(row)
+    if not isinstance(pid, int) or not isinstance(start, str) or not start:
+        return
+    targets[pid] = {
+        "pid": pid,
+        "start": start,
+        "reason": reason,
+        "source": reason,
+        "seed_descendants": bool(seed_descendants),
+    }
+
+
+def _is_expected_seed_row(row: dict, cfg_agent: dict, agent: str,
+                          root_key: str | None) -> bool:
+    if parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
+        return True
+    if parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
+        return True
+    name = _image_stem(row)
+    cli = cfg_agent.get("cli")
+    if isinstance(cli, str) and cli and cli.casefold() in name:
+        return True
+    pattern = cfg_agent.get("brain_pattern") or _liveness_cfg(cfg_agent).get("brain_pattern")
+    return isinstance(pattern, str) and pattern and pattern.casefold() in name
+
+
+def _new_provenance_entry(row: dict, *, root_key: str | None, agent: str,
+                          request_id: str | None, source: str,
+                          now_epoch: float, seed_descendants: bool,
+                          anchor: dict | None = None) -> dict | None:
+    pid = row.get("pid")
+    start = _start_of(row)
+    if not isinstance(pid, int) or not isinstance(start, str) or not start:
+        return None
+    entry = {
+        "attribution_model": _ATTRIBUTION_MODEL,
+        "root_key": root_key,
+        "agent": agent,
+        "request_id": request_id,
+        "pid": pid,
+        "start": start,
+        "source": source,
+        "captured_at_epoch": now_epoch,
+        "last_fresh_attribution_epoch": now_epoch,
+        "seed_descendants": bool(seed_descendants),
+    }
+    if isinstance(anchor, dict):
+        entry.update({
+            "anchor_pid": anchor.get("pid"),
+            "anchor_start": anchor.get("start"),
+            "anchor_source": anchor.get("source"),
+        })
+    return entry
+
+
+def _prior_valid(entry: dict, *, root_key: str | None, agent: str,
+                 request_id: str | None, now_epoch: float,
+                 diagnostics: dict[str, int]) -> bool:
+    required = (
+        "attribution_model",
+        "root_key",
+        "agent",
+        "request_id",
+        "pid",
+        "start",
+        "source",
+        "captured_at_epoch",
+        "last_fresh_attribution_epoch",
+    )
+    if any(key not in entry for key in required):
+        _bump(diagnostics, "prior_field_missing")
+        return False
+    if entry.get("attribution_model") != _ATTRIBUTION_MODEL:
+        _bump(diagnostics, "prior_field_missing")
+        return False
+    if entry.get("root_key") != root_key or entry.get("agent") != agent:
+        _bump(diagnostics, "prior_field_missing")
+        return False
+    if entry.get("request_id") != request_id:
+        _bump(diagnostics, "prior_request_mismatch")
+        return False
+    if not isinstance(entry.get("pid"), int):
+        _bump(diagnostics, "prior_field_missing")
+        return False
+    if not isinstance(entry.get("start"), str) or not entry.get("start"):
+        _bump(diagnostics, "prior_field_missing")
+        return False
+    last = entry.get("last_fresh_attribution_epoch")
+    if not isinstance(last, (int, float)) or isinstance(last, bool):
+        _bump(diagnostics, "prior_field_missing")
+        return False
+    if now_epoch - float(last) > _PROVENANCE_TTL_SECONDS:
+        _bump(diagnostics, "prior_ttl_expired")
+        return False
+    return True
+
+
+def _usable_priors(raw: object, *, root_key: str | None, agent: str,
+                   request_id: str | None, now_epoch: float,
+                   diagnostics: dict[str, int]) -> tuple[list[dict], list[dict]]:
+    if raw is None:
+        return [], []
+    if not isinstance(raw, list):
+        _bump(diagnostics, "torn_provenance_read")
+        return [], []
+    valid: list[dict] = []
+    legacy: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            _bump(diagnostics, "torn_provenance_read")
+            continue
+        if item.get("attribution_model") == _ATTRIBUTION_MODEL:
+            if _prior_valid(item, root_key=root_key, agent=agent,
+                            request_id=request_id, now_epoch=now_epoch,
+                            diagnostics=diagnostics):
+                valid.append(item)
+        else:
+            legacy.append(item)
+    return valid, legacy
 
 
 def _children_map(idx: dict[int, dict]) -> dict[int, list[int]]:
@@ -416,6 +774,362 @@ def _children_map(idx: dict[int, dict]) -> dict[int, list[int]]:
         if isinstance(ppid, int):
             kids.setdefault(ppid, []).append(pid)
     return kids
+
+
+def _strict_child_edge(parent: dict, child: dict, *,
+                       root_key: str | None, agent: str,
+                       diagnostics: dict[str, int]) -> bool:
+    if child.get("parent_pid") != parent.get("pid"):
+        return False
+    branch = _row_branch_reason(child, root_key, agent)
+    if branch is not None:
+        _bump(diagnostics, branch)
+        return False
+    parent_epoch = _iso_epoch(_start_of(parent))
+    child_epoch = _iso_epoch(_start_of(child))
+    if parent_epoch is None or child_epoch is None:
+        _bump(diagnostics, "unparseable_start_edge")
+        return False
+    if child_epoch == parent_epoch:
+        _bump(diagnostics, "equal_start_edge")
+        return False
+    if child_epoch < parent_epoch:
+        _bump(diagnostics, "inverted_start_edge")
+        return False
+    return True
+
+
+def _root_wait_brain(idx: dict[int, dict], wait_row: dict, cfg_agent: dict,
+                     root_key: str | None, agent: str,
+                     diagnostics: dict[str, int]) -> dict | None:
+    child = wait_row
+    best = None
+    seen: set[int] = set()
+    while True:
+        ppid = child.get("parent_pid")
+        parent = idx.get(ppid) if isinstance(ppid, int) else None
+        if not isinstance(parent, dict):
+            return best
+        pid = parent.get("pid")
+        if not isinstance(pid, int) or pid in seen:
+            return best
+        seen.add(pid)
+        branch = _row_branch_reason(parent, root_key, agent)
+        if branch is not None:
+            _bump(diagnostics, branch)
+            return best
+        parent_epoch = _iso_epoch(_start_of(parent))
+        child_epoch = _iso_epoch(_start_of(child))
+        if parent_epoch is None or child_epoch is None:
+            _bump(diagnostics, "unparseable_start_edge")
+            return best
+        if parent_epoch == child_epoch:
+            _bump(diagnostics, "equal_start_edge")
+            return best
+        if parent_epoch > child_epoch:
+            _bump(diagnostics, "inverted_start_edge")
+            return best
+        if _is_expected_seed_row(parent, cfg_agent, agent, root_key):
+            best = parent
+        child = parent
+
+
+def _attribution(
+    snapshot: list[dict] | None,
+    st: dict,
+    cfg_agent: dict,
+    agent: str,
+    *,
+    root_key: str | None,
+    request_id: str | None,
+    now_epoch: float,
+) -> dict:
+    diagnostics = _diag()
+    prior_raw = st.get("managed_pids") if isinstance(st, dict) else None
+    valid_priors, legacy_priors = _usable_priors(
+        prior_raw,
+        root_key=root_key,
+        agent=agent,
+        request_id=request_id,
+        now_epoch=now_epoch,
+        diagnostics=diagnostics,
+    )
+    if snapshot is None:
+        _bump(diagnostics, "snapshot_unavailable_no_descendants")
+        for _legacy in legacy_priors:
+            _bump(diagnostics, "legacy_unverifiable_dropped")
+        targets = []
+        for entry in valid_priors:
+            targets.append({
+                "pid": entry["pid"],
+                "start": entry["start"],
+                "reason": "provenanced_prior",
+                "source": "provenanced_prior",
+                "seed_descendants": False,
+            })
+        return {
+            "snapshot_available": False,
+            "targets": targets,
+            "managed_pids": valid_priors,
+            "diagnostics": diagnostics,
+            "brain_pid": st.get("brain_pid"),
+            "brain_start": st.get("brain_start"),
+            "wait_alive": False,
+            "discovered_brain": False,
+        }
+
+    idx = _snap_index(snapshot)
+    kids = _children_map(idx)
+    targets_by_pid: dict[int, dict] = {}
+    seed_pids: set[int] = set()
+    launcher_pid = st.get("launcher_pid")
+    launcher_start = st.get("launcher_start")
+    launcher_row = idx.get(launcher_pid) if isinstance(launcher_pid, int) else None
+    launcher_mismatch = (
+        isinstance(launcher_pid, int)
+        and isinstance(launcher_row, dict)
+        and isinstance(launcher_start, str)
+        and launcher_start
+        and _start_of(launcher_row) != launcher_start
+    )
+    confirmed_launcher = False
+    if launcher_mismatch:
+        _bump(diagnostics, "pid_reuse_suppressed")
+    if isinstance(launcher_row, dict) and _pid_alive_guarded(idx, launcher_pid, launcher_start):
+        confirmed_launcher = True
+        _record_target(targets_by_pid, launcher_row, "confirmed_launcher",
+                       seed_descendants=True)
+        seed_pids.add(launcher_pid)
+
+    own_wait_rows: list[dict] = []
+    for row in idx.values():
+        pid = row.get("pid")
+        if not isinstance(pid, int):
+            continue
+        if (launcher_mismatch or confirmed_launcher) and pid == launcher_pid:
+            continue
+        branch = _row_branch_reason(row, root_key, agent)
+        if branch is not None:
+            _bump(diagnostics, branch)
+            continue
+        if parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
+            _record_target(targets_by_pid, row, "own_wrapper", seed_descendants=True)
+            seed_pids.add(pid)
+        elif parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
+            _record_target(targets_by_pid, row, "own_wait", seed_descendants=False)
+            own_wait_rows.append(row)
+
+    brain_row = None
+    for wait_row in own_wait_rows:
+        cand = _root_wait_brain(idx, wait_row, cfg_agent, root_key, agent, diagnostics)
+        if cand is None:
+            continue
+        if brain_row is None:
+            brain_row = cand
+        else:
+            cand_epoch = _iso_epoch(_start_of(cand)) or float("-inf")
+            brain_epoch = _iso_epoch(_start_of(brain_row)) or float("-inf")
+            if cand_epoch < brain_epoch:
+                brain_row = cand
+    if brain_row is not None:
+        _record_target(targets_by_pid, brain_row, "root_wait_brain",
+                       seed_descendants=True)
+        if isinstance(brain_row.get("pid"), int):
+            seed_pids.add(brain_row["pid"])
+
+    for entry in valid_priors:
+        row = idx.get(entry.get("pid"))
+        if not isinstance(row, dict) or _start_of(row) != entry.get("start"):
+            continue
+        if entry["pid"] in targets_by_pid:
+            continue
+        reason = str(entry.get("source") or "provenanced_prior")
+        _record_target(
+            targets_by_pid,
+            row,
+            reason,
+            seed_descendants=bool(entry.get("seed_descendants")),
+        )
+        if entry["pid"] in targets_by_pid:
+            targets_by_pid[entry["pid"]]["prior_only"] = True
+        if entry.get("seed_descendants") and isinstance(entry.get("pid"), int):
+            seed_pids.add(entry["pid"])
+
+    queue = list(seed_pids)
+    visited_seed: set[int] = set()
+    while queue:
+        parent_pid = queue.pop(0)
+        if parent_pid in visited_seed:
+            continue
+        visited_seed.add(parent_pid)
+        parent = idx.get(parent_pid)
+        if not isinstance(parent, dict):
+            continue
+        for child_pid in kids.get(parent_pid, []):
+            if child_pid in targets_by_pid:
+                continue
+            child = idx.get(child_pid)
+            if not isinstance(child, dict):
+                continue
+            if not _strict_child_edge(parent, child, root_key=root_key,
+                                      agent=agent, diagnostics=diagnostics):
+                continue
+            _record_target(targets_by_pid, child, "live_chain_descendant",
+                           seed_descendants=True)
+            queue.append(child_pid)
+
+    fresh_pids = set(targets_by_pid)
+    managed_by_pid: dict[int, dict] = {}
+    for target in targets_by_pid.values():
+        if target.get("prior_only"):
+            continue
+        row = idx.get(target["pid"])
+        if not isinstance(row, dict):
+            continue
+        if target["reason"] == "confirmed_launcher":
+            continue
+        source = (
+            "first_confirmed_child_provenance"
+            if target["reason"] in {"own_wrapper", "own_wait", "root_wait_brain", "live_chain_descendant"}
+            else target["reason"]
+        )
+        entry = _new_provenance_entry(
+            row,
+            root_key=root_key,
+            agent=agent,
+            request_id=request_id,
+            source=source,
+            now_epoch=now_epoch,
+            seed_descendants=bool(target.get("seed_descendants")),
+            anchor={
+                "pid": launcher_pid,
+                "start": launcher_start,
+                "source": "confirmed_launcher",
+            },
+        )
+        if entry is not None:
+            entry["fresh_reason"] = target["reason"]
+            managed_by_pid[entry["pid"]] = entry
+
+    for entry in valid_priors:
+        if entry["pid"] in managed_by_pid:
+            continue
+        row = idx.get(entry["pid"])
+        if isinstance(row, dict) and _start_of(row) == entry["start"]:
+            managed_by_pid[entry["pid"]] = entry
+
+    for legacy in legacy_priors:
+        pid = legacy.get("pid")
+        start = legacy.get("start")
+        row = idx.get(pid) if isinstance(pid, int) else None
+        if (
+            isinstance(row, dict)
+            and isinstance(start, str)
+            and start
+            and _start_of(row) == start
+            and pid in fresh_pids
+        ):
+            entry = _new_provenance_entry(
+                row,
+                root_key=root_key,
+                agent=agent,
+                request_id=request_id,
+                source="legacy_rederived",
+                now_epoch=now_epoch,
+                seed_descendants=bool(targets_by_pid.get(pid, {}).get("seed_descendants")),
+                anchor={
+                    "pid": launcher_pid,
+                    "start": launcher_start,
+                    "source": "legacy",
+                },
+            )
+            if entry is not None:
+                managed_by_pid[pid] = entry
+                if pid in targets_by_pid:
+                    targets_by_pid[pid]["reason"] = "legacy_rederived"
+                    targets_by_pid[pid]["source"] = "legacy_rederived"
+            continue
+        _bump(diagnostics, "legacy_unverifiable_dropped")
+
+    wait_alive = any(t["reason"] == "own_wait" for t in targets_by_pid.values())
+    return {
+        "snapshot_available": True,
+        "targets": list(targets_by_pid.values()),
+        "managed_pids": list(managed_by_pid.values()),
+        "diagnostics": diagnostics,
+        "brain_pid": brain_row.get("pid") if isinstance(brain_row, dict) else st.get("brain_pid"),
+        "brain_start": _start_of(brain_row) if isinstance(brain_row, dict) else st.get("brain_start"),
+        "wait_alive": wait_alive,
+        "discovered_brain": brain_row is not None,
+    }
+
+
+def capture_launch_child_provenance(
+    pre_snapshot: list[dict] | None,
+    post_snapshot: list[dict] | None,
+    *,
+    launcher_pid: int | None,
+    launcher_start: str | None,
+    cfg_agent: dict,
+    agent: str,
+    root_key: str | None,
+    request_id: str | None,
+    now_epoch: float,
+) -> tuple[list[dict], dict[str, int]]:
+    diagnostics = _diag()
+    if not isinstance(launcher_pid, int):
+        return [], diagnostics
+    launcher_epoch = _iso_epoch(launcher_start)
+    if launcher_epoch is None or not isinstance(post_snapshot, list):
+        return [], diagnostics
+    baseline: set[tuple[int, str]] = set()
+    for row in pre_snapshot or []:
+        if not isinstance(row, dict):
+            continue
+        pid = row.get("pid")
+        start = _start_of(row)
+        if isinstance(pid, int) and isinstance(start, str):
+            baseline.add((pid, start))
+    out: list[dict] = []
+    for row in post_snapshot:
+        if not isinstance(row, dict) or row.get("parent_pid") != launcher_pid:
+            continue
+        pid = row.get("pid")
+        start = _start_of(row)
+        if not isinstance(pid, int) or not isinstance(start, str) or not start:
+            _bump(diagnostics, "unparseable_start_edge")
+            continue
+        if (pid, start) in baseline:
+            continue
+        child_epoch = _iso_epoch(start)
+        if child_epoch is None:
+            _bump(diagnostics, "unparseable_start_edge")
+            continue
+        if child_epoch < launcher_epoch:
+            _bump(diagnostics, "inverted_start_edge")
+            continue
+        branch = _row_branch_reason(row, root_key, agent)
+        if branch is not None:
+            _bump(diagnostics, branch)
+            continue
+        seed = _is_expected_seed_row(row, cfg_agent, agent, root_key)
+        entry = _new_provenance_entry(
+            row,
+            root_key=root_key,
+            agent=agent,
+            request_id=request_id,
+            source="launch_child_provenance",
+            now_epoch=now_epoch,
+            seed_descendants=seed,
+            anchor={
+                "pid": launcher_pid,
+                "start": launcher_start,
+                "source": "confirmed_launcher",
+            },
+        )
+        if entry is not None:
+            out.append(entry)
+    return out, diagnostics
 
 
 def _wait_row_for(idx: dict[int, dict], agent: str) -> dict | None:
@@ -604,7 +1318,9 @@ def _launcher_managed_set(idx: dict[int, dict], launcher_pid, agent: str,
 
 
 def _liveness(snapshot: list[dict] | None, st: dict, cfg_agent: dict,
-              agent: str, now_epoch: float) -> dict:
+              agent: str, now_epoch: float, *,
+              root_key: str | None = None,
+              request_id: str | None = None) -> dict:
     """Derive process-discovery facts for one agent (PURE).
 
     Returns ``snapshot_available`` (False when capture failed), ``brain_pid`` /
@@ -612,31 +1328,36 @@ def _liveness(snapshot: list[dict] | None, st: dict, cfg_agent: dict,
     ``wait_alive``, ``managed_pids`` (refreshed), and ``discovered_brain``.
     These fields seed next-state and scoped kill targets; heartbeat freshness,
     not process discovery, decides liveness."""
+    attr = _attribution(
+        snapshot,
+        st,
+        cfg_agent,
+        agent,
+        root_key=root_key,
+        request_id=request_id,
+        now_epoch=now_epoch,
+    )
     if snapshot is None:
-        return {"snapshot_available": False, "brain_pid": st.get("brain_pid"),
-                "brain_start": st.get("brain_start"), "brain_alive": False,
-                "wait_alive": False, "managed_pids": st.get("managed_pids") or [],
+        return {"snapshot_available": False, "brain_pid": attr.get("brain_pid"),
+                "brain_start": attr.get("brain_start"), "brain_alive": False,
+                "wait_alive": False, "managed_pids": attr.get("managed_pids") or [],
+                "kill_targets": attr.get("targets") or [],
+                "diagnostics": attr.get("diagnostics") or _diag(),
                 "discovered_brain": False}
     idx = _snap_index(snapshot)
     lcfg = _liveness_cfg(cfg_agent)
     allow_launcher_self = bool(lcfg.get("allow_launcher_self", False))
     launcher_pid = st.get("launcher_pid")
-    prior = st.get("managed_pids") or []
     if bool(lcfg.get("wrapped", False)):
-        # WRAPPED agent (launched THROUGH `agenttalk wrap --loop`): the wrapper
-        # (python) IS the long-lived root = launcher_pid, so there is no forking
-        # TUI to find and brain discovery is RETIRED (brain_pid stays None).
-        # Heartbeat freshness is the liveness authority; managed_pids still tracks
-        # the per-turn child (a launcher-tree descendant) so the start-guarded
-        # tree-kill can reap it. allow_launcher_self / brain_pattern are moot here.
-        managed = _launcher_managed_set(idx, launcher_pid, agent, now_epoch,
-                                        launch_epoch=st.get("last_launch_epoch"),
-                                        prior=prior)
-        wait_alive = (_wait_row_for(idx, agent) is not None
-                      or any(m.get("kind") == "wait" for m in managed))
+        # WRAPPED agent (launched THROUGH `agenttalk --root ... wrap --loop`):
+        # the wrapper (python) is the long-lived root, and the typed ownership
+        # pass decides which same-agent children are safe cleanup targets.
         return {"snapshot_available": True, "brain_pid": None,
                 "brain_start": None, "brain_alive": False,
-                "wait_alive": wait_alive, "managed_pids": managed,
+                "wait_alive": bool(attr.get("wait_alive")),
+                "managed_pids": attr.get("managed_pids") or [],
+                "kill_targets": attr.get("targets") or [],
+                "diagnostics": attr.get("diagnostics") or _diag(),
                 "discovered_brain": False}
     brain_pid = st.get("brain_pid")
     brain_start = st.get("brain_start")
@@ -662,16 +1383,13 @@ def _liveness(snapshot: list[dict] | None, st: dict, cfg_agent: dict,
             # repaired-away the bad pin but found no real brain -> not alive,
             # and clear the stale launcher pin from the reported brain_pid.
             brain_pid, brain_start = None, None
-    managed = _launcher_managed_set(idx, launcher_pid, agent, now_epoch,
-                                    launch_epoch=st.get("last_launch_epoch"),
-                                    prior=prior)
-    # Diagnostic only: a fresh command-line match OR a carried-forward live
-    # managed wait pid (cmdline may be unavailable now).
-    wait_alive = (_wait_row_for(idx, agent) is not None
-                  or any(m.get("kind") == "wait" for m in managed))
+    managed = attr.get("managed_pids") or []
+    wait_alive = bool(attr.get("wait_alive")) or _wait_row_for(idx, agent) is not None
     return {"snapshot_available": True, "brain_pid": brain_pid,
             "brain_start": brain_start, "brain_alive": brain_alive,
             "wait_alive": wait_alive, "managed_pids": managed,
+            "kill_targets": attr.get("targets") or [],
+            "diagnostics": attr.get("diagnostics") or _diag(),
             "discovered_brain": discovered}
 
 
@@ -825,6 +1543,7 @@ def build_report(store: Store, *, now_epoch: float,
     ]
     return {
         "schema_version": 1,
+        "root_key": _root_key(str(store.root.resolve())),
         "now_epoch": now_epoch,
         "now": datetime.fromtimestamp(now_epoch, timezone.utc).isoformat().replace(
             "+00:00", "Z"),
@@ -949,6 +1668,8 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     brain_pid = liveness.get("brain_pid")
     brain_start = liveness.get("brain_start")
     managed = liveness.get("managed_pids") or []
+    attributed_targets = liveness.get("kill_targets") or []
+    diagnostics = liveness.get("diagnostics") or _diag()
 
     launching = bool(st.get("launching", False))
     grace_until = float(st.get("launch_grace_until", 0.0) or 0.0)
@@ -997,17 +1718,18 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         # EVERY kill target carries its start-time so the executor can refuse to
         # kill a recycled pid (codex discipline note 2).
         out: list[dict] = []
-        if (
-            include_launcher
-            and isinstance(st.get("launcher_pid"), int)
-            and isinstance(st.get("launcher_start"), str)
-            and st.get("launcher_start")
-        ):
-            out.append({"pid": st.get("launcher_pid"),
-                        "start": st.get("launcher_start")})
-        for m in managed:
-            if isinstance(m.get("pid"), int) and isinstance(m.get("start"), str) and m.get("start"):
-                out.append({"pid": m["pid"], "start": m.get("start")})
+        for target in attributed_targets:
+            if not isinstance(target, dict):
+                continue
+            if not include_launcher and target.get("reason") == "confirmed_launcher":
+                continue
+            if isinstance(target.get("pid"), int) and isinstance(target.get("start"), str) and target.get("start"):
+                out.append({
+                    "pid": target["pid"],
+                    "start": target["start"],
+                    "reason": target.get("reason") or target.get("source") or "live_chain",
+                    "source": target.get("source") or target.get("reason") or "live_chain",
+                })
         return out
 
     def _result(action, *, state, kill_first=False, kill_orphans=False,
@@ -1025,6 +1747,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                "reason": reason, "cli": None, "launch_mode": None,
                "resume_mode": None, "session_id": None, "session_args": None,
                "health": _health_brief(health),
+               "diagnostics": {k: v for k, v in diagnostics.items() if v},
                "next_state": nxt}
         if action in (RELAUNCH, STUCK_RECOVER):
             res.update(_launch_detail({**st, "resume_available": resume_available},
@@ -1195,23 +1918,34 @@ def _store_cfg_from_report(report: dict) -> dict:
     return cfg
 
 
-def _ephemeral_kill_targets(snapshot: list[dict] | None, entry: dict, now_epoch: float) -> list[dict]:
-    if snapshot is None:
-        return []
-    idx = _snap_index(snapshot)
-    pid = entry.get("launcher_pid")
-    start = entry.get("launcher_start")
-    out: list[dict] = []
-    if _pid_alive_guarded(idx, pid, start):
-        out.append({"pid": pid, "start": start})
-    managed = _launcher_managed_set(
-        idx, pid, str(entry.get("agent") or ""), now_epoch,
-        launch_epoch=entry.get("launched_epoch"),
-        prior=entry.get("managed_pids") if isinstance(entry.get("managed_pids"), list) else [],
+def _ephemeral_kill_targets(snapshot: list[dict] | None, entry: dict,
+                            now_epoch: float, *,
+                            root_key: str | None = None) -> list[dict]:
+    agent = str(entry.get("agent") or "")
+    attr = _attribution(
+        snapshot,
+        entry,
+        {"cli": entry.get("cli") or "codex", "wrapped": True},
+        agent,
+        root_key=root_key or entry.get("root_key"),
+        request_id=str(entry.get("request_id") or ""),
+        now_epoch=now_epoch,
     )
-    for m in managed:
-        if isinstance(m.get("pid"), int) and all(t.get("pid") != m["pid"] for t in out):
-            out.append({"pid": m["pid"], "start": m.get("start")})
+    out: list[dict] = []
+    for target in attr.get("targets") or []:
+        if isinstance(target.get("pid"), int) and isinstance(target.get("start"), str) and target.get("start"):
+            out.append({
+                "pid": target["pid"],
+                "start": target["start"],
+                "reason": target.get("reason") or target.get("source") or "provenanced_prior",
+                "source": target.get("source") or target.get("reason") or "provenanced_prior",
+            })
+    if attr.get("managed_pids") is not None:
+        entry["managed_pids"] = attr.get("managed_pids")
+    if attr.get("diagnostics"):
+        entry["provenance_diagnostics"] = {
+            k: v for k, v in attr["diagnostics"].items() if v
+        }
     return out
 
 
@@ -1276,7 +2010,8 @@ def _plan_launch_requests(report: dict, state: dict, config: dict,
 
 def _plan_ephemeral_active(report: dict, state: dict, config: dict,
                            *, now_epoch: float,
-                           snapshot: list[dict] | None = None) -> dict[str, dict]:
+                           snapshot: list[dict] | None = None,
+                           root_key: str | None = None) -> dict[str, dict]:
     del config  # reserved for future per-profile completion policy
     state_root = (state or {}).get("ephemeral_reviewers")
     state_active = state_root.get("active") if isinstance(state_root, dict) else {}
@@ -1290,7 +2025,7 @@ def _plan_ephemeral_active(report: dict, state: dict, config: dict,
         rpt_entry = rpt_active.get(rid) if isinstance(rpt_active.get(rid), dict) else {}
         completion = rpt_entry.get("completion") if isinstance(rpt_entry.get("completion"), dict) else {}
         if completion.get("terminal") is True:
-            kt = _ephemeral_kill_targets(snapshot, entry, now_epoch)
+            kt = _ephemeral_kill_targets(snapshot, entry, now_epoch, root_key=root_key)
             out[rid] = {
                 "request_id": rid,
                 "agent": entry.get("agent"),
@@ -1308,7 +2043,7 @@ def _plan_ephemeral_active(report: dict, state: dict, config: dict,
             continue
         deadline = entry.get("deadline_epoch")
         if isinstance(deadline, (int, float)) and now_epoch >= float(deadline):
-            kt = _ephemeral_kill_targets(snapshot, entry, now_epoch)
+            kt = _ephemeral_kill_targets(snapshot, entry, now_epoch, root_key=root_key)
             out[rid] = {
                 "request_id": rid,
                 "agent": entry.get("agent"),
@@ -1379,6 +2114,9 @@ def plan_actions(report: dict, state: dict, config: dict,
     cfg_agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
     rpt_agents = report.get("agents") or {}
     state_agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
+    root_key = report.get("root_key")
+    if not isinstance(root_key, str):
+        root_key = _root_key(config.get("root") or config.get("root_key") or "")
     out: dict[str, dict] = {}
     for name, cfg_agent in cfg_agents.items():
         if not isinstance(cfg_agent, dict) or not cfg_agent.get("auto_restart", False):
@@ -1387,7 +2125,8 @@ def plan_actions(report: dict, state: dict, config: dict,
         if not isinstance(rpt, dict):
             continue
         st = state_agents.get(name) if isinstance(state_agents.get(name), dict) else {}
-        liveness = _liveness(snapshot, st, cfg_agent, name, now_epoch)
+        liveness = _liveness(snapshot, st, cfg_agent, name, now_epoch,
+                             root_key=root_key, request_id=None)
         out[name] = _plan_one(name, rpt, st, config, cfg_agent, liveness,
                               now_epoch=now_epoch)
     return {
@@ -1396,14 +2135,19 @@ def plan_actions(report: dict, state: dict, config: dict,
         "launch_requests": _plan_launch_requests(report, state, config,
                                                  now_epoch=now_epoch),
         "ephemeral_reviewers": _plan_ephemeral_active(
-            report, state, config, now_epoch=now_epoch, snapshot=snapshot),
+            report, state, config, now_epoch=now_epoch, snapshot=snapshot,
+            root_key=root_key),
     }
 
 
 def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
                   pid_start: str | None = None, now_epoch: float | None = None,
                   grace_seconds: float | None = None,
-                  session_id: str | None = None) -> dict:
+                  session_id: str | None = None,
+                  pre_snapshot: list[dict] | None = None,
+                  post_snapshot: list[dict] | None = None,
+                  cfg_agent: dict | None = None,
+                  root_key: str | None = None) -> dict:
     """Apply a launch-SUCCESS to ``state`` IN PLACE - the rule the generated
     script defers to Python (testable, not PS-internal). ``pid`` is the
     LAUNCHER pid from Start-Process (the short-lived bootstrap for a forking CLI;
@@ -1424,7 +2168,23 @@ def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
     entry["readiness_seen"] = False
     entry["brain_pid"] = None
     entry["brain_start"] = None
-    entry["managed_pids"] = []
+    now = now_epoch if now_epoch is not None else datetime.now(timezone.utc).timestamp()
+    lcfg = {"cli": cli}
+    if isinstance(cfg_agent, dict):
+        lcfg.update(cfg_agent)
+    launch_children, diagnostics = capture_launch_child_provenance(
+        pre_snapshot,
+        post_snapshot,
+        launcher_pid=pid,
+        launcher_start=pid_start,
+        cfg_agent=lcfg,
+        agent=agent,
+        root_key=root_key,
+        request_id=None,
+        now_epoch=now,
+    )
+    entry["managed_pids"] = launch_children
+    entry["provenance_diagnostics"] = {k: v for k, v in diagnostics.items() if v}
     if now_epoch is not None:
         entry["last_launch_epoch"] = now_epoch
         if grace_seconds is not None:
@@ -1542,16 +2302,43 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
 def record_ephemeral_launch(state: dict, request_id: str, *, pid: int | None,
                             pid_start: str | None = None,
                             now_epoch: float | None = None,
-                            timeout_seconds: int | None = None) -> dict:
+                            timeout_seconds: int | None = None,
+                            pre_snapshot: list[dict] | None = None,
+                            post_snapshot: list[dict] | None = None,
+                            cfg_agent: dict | None = None,
+                            root_key: str | None = None) -> dict:
     """Apply an ephemeral wrapper launch success to supervisor state."""
-    return eph.record_launched(
+    now = now_epoch if now_epoch is not None else datetime.now(timezone.utc).timestamp()
+    result = eph.record_launched(
         state,
         request_id=request_id,
         pid=pid,
         pid_start=pid_start,
-        now_epoch=now_epoch if now_epoch is not None else datetime.now(timezone.utc).timestamp(),
+        now_epoch=now,
         timeout_seconds=timeout_seconds,
     )
+    root = eph.ensure_state(result)
+    entry = root["active"].get(request_id)
+    if isinstance(entry, dict):
+        agent = entry.get("agent")
+        lcfg = {"cli": "codex", "wrapped": True}
+        if isinstance(cfg_agent, dict):
+            lcfg.update(cfg_agent)
+        if isinstance(agent, str):
+            launch_children, diagnostics = capture_launch_child_provenance(
+                pre_snapshot,
+                post_snapshot,
+                launcher_pid=pid,
+                launcher_start=pid_start,
+                cfg_agent=lcfg,
+                agent=agent,
+                root_key=root_key,
+                request_id=request_id,
+                now_epoch=now,
+            )
+            entry["managed_pids"] = launch_children
+            entry["provenance_diagnostics"] = {k: v for k, v in diagnostics.items() if v}
+    return result
 
 
 def archive_ephemeral_request(store: Store, state: dict, request_id: str, *,
@@ -1643,7 +2430,7 @@ CONFIG_TEMPLATE = """\
         "windows_sandbox": "unelevated",
         "launch": {
           "windows_file": "REPLACE: python.exe that can run `python -m agenttalk`",
-          "windows_args": ["-m", "agenttalk", "wrap", "--for", "{AGENT}", "--cli", "codex", "--loop", "--one-shot", "--to-request", "{REQUEST_ID}", "--", "REPLACE: the REAL codex.exe path", "--disable", "hooks"]
+          "windows_args": ["-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for", "{AGENT}", "--cli", "codex", "--loop", "--one-shot", "--to-request", "{REQUEST_ID}", "--", "REPLACE: the REAL codex.exe path", "--disable", "hooks"]
         }
       }
     },
@@ -1684,7 +2471,7 @@ CONFIG_TEMPLATE = """\
       "env": { "AGENTTALK_SELF": "AGENT_NAME_WRAPPED" },
       "launch": {
         "windows_file": "REPLACE: the PYTHON exe that runs agenttalk, e.g. C:\\\\Users\\\\you\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python314\\\\python.exe",
-        "windows_args": ["-m", "agenttalk", "wrap", "--for", "AGENT_NAME_WRAPPED", "--cli", "codex", "--loop", "--", "REPLACE: the REAL codex.exe path - the wrapper drives it ONE turn per inbound message", "--disable", "hooks"]
+        "windows_args": ["-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for", "AGENT_NAME_WRAPPED", "--cli", "codex", "--loop", "--", "REPLACE: the REAL codex.exe path - the wrapper drives it ONE turn per inbound message", "--disable", "hooks"]
       },
       "_comment_wrapped": "WRAPPED is the RECOMMENDED / default supervised archetype for hands-off agents (the manual /agenttalk.listen agent above is supported but BEST-EFFORT/LEGACY: a resumed manual session may not re-enter the listen loop, never heartbeat, and hit the readiness give-up cap). The wrapped codex child is launched with `--disable hooks` by default (codex's safe default - the wrapper owns the heartbeat, so the codex activity hook is neither needed nor wanted, and disabling it sidesteps hook-trust prompts; remove it from windows_args if you intentionally want the child's project hooks). Set wrapped=true to supervise the agent THROUGH `agenttalk wrap --loop`: windows_file is the PYTHON exe (NOT the CLI exe), windows_args is the FIXED wrap command, and the REAL codex.exe/claude.exe goes at the tail after '--' (it is what windows_file would be for a manual agent). NO {SESSION_ARGS} token - the wrapper owns session continuity end-to-end (it persists + reloads the codex thread_id / claude session-id across its own turns AND across a supervisor relaunch, so a restart re-runs the identical wrap argv and reload-resumes). The wrapper injects AGENTTALK_PY for model-side bus writes; for Codex workspace-write, add `--add-dir <python-dir>` to the codex tail only after auditing that explicit operator opt-in. The wrapper python IS the long-lived supervised root, so brain discovery is RETIRED for wrapped agents (brain_pid stays null); the per-turn child (codex exec / claude -p) is reaped via the start-guarded managed_pids tree-kill. activity_hook is NOT needed: a wrapped agent is instrumented by construction (heartbeat on every idle bus-wait cycle + on streaming progress), so a stale heartbeat past grace RECOVERS (restart) instead of warn-only.",
       "_comment_wrapped_stuck_after": "PER-CLI stuck_after_seconds (a per-agent stuck_after_seconds override ALWAYS wins; the global stuck_after_seconds is only the legacy/unclassified fallback). Defaults when unset: wrapped CLAUDE=180s, wrapped CODEX=2400s. WHY they differ: wrapped CLAUDE streams thinking+text+tool deltas and stays fresh through reasoning, so a tight threshold is fine; wrapped CODEX is ITEM-LEVEL (no exec --json event closes the pure-reasoning gap) so a long pure-reasoning stretch is SILENT between turn.started and the final agent_message. These are an OPERATIONAL false-positive tradeoff, NOT a provably-safe bound. TIMING-INVARIANT (v0.46.0): the per-turn watchdog (see turn_watchdog below) kills a HUNG TOOL DESCENDANT at turn_elapsed_seconds (default 1800); the supervisor stale-recovery MUST sit ABOVE that deadline + a 300s margin, else it would relaunch the wrapper into the same wedge before the watchdog fires. So the wrapped-codex default rose to 2400s and the planner now WARNS+REFUSES restart-on-stale (degrades to warn-only) when stuck_after_seconds <= turn_elapsed_seconds + 300, UNLESS allow_low_stuck_after=true. The older 600s floor guard also still applies. The value is never silently coerced. DO NOT try to tighten codex with a synthetic active-turn timer heartbeat: no intermediate exec --json event exists to confirm progress, so a timer would mark a silently-wedged turn healthy forever and defeat restart authority - the only levers are the per-CLI threshold + per-agent overrides + the per-turn watchdog.",
@@ -2058,8 +2845,9 @@ function Launch($name, $plan, $codexHome) {
     $tokens = $tokens | ForEach-Object { if ($_ -eq '{SESSION_ID}') { $sid } else { $_ } }
   }
   $argv = @()
+  $cwdToken = if ($a.cwd) { [string]$a.cwd } else { '' }
   foreach ($x in @($a.launch.windows_args)) {
-    if ($x -eq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ($x -replace '<cwd>', $a.cwd) }
+    if ($x -eq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ([string]$x).Replace('{ROOT}', $Root).Replace('<cwd>', $cwdToken) }
   }
   # Apply the agent's env, launch the REAL executable directly with -PassThru,
   # then RESTORE the supervisor's own env. The in-sandbox agent reaches the bus
@@ -2101,7 +2889,9 @@ function Launch-Spec($name, $spec, $codexHome) {
   }
   $windowStyle = if ($spec.window_style) { [string]$spec.window_style } else { 'Hidden' }
   if ($spec.window_style_warning) { Write-Warning ("supervisor: ephemeral {0}: {1}" -f $name, $spec.window_style_warning) }
+  $specCwdToken = if ($spec.cwd) { [string]$spec.cwd } else { '' }
   $argv = @($spec.launch.windows_args)
+  $argv = $argv | ForEach-Object { ([string]$_).Replace('{ROOT}', $Root).Replace('<cwd>', $specCwdToken) }
   $saved = @{}
   $applied = @{ AGENTTALK_ROOT = $Root; AGENTTALK_PY = $AgenttalkPython }
   if ($SrcOnPyPath) { $applied['PYTHONPATH'] = (Join-Path $Root 'src') + ';' + $env:PYTHONPATH }
@@ -2232,7 +3022,11 @@ do {
           Write-Warning ("supervisor: {0}: seed/preflight failed - skipping relaunch this tick (fail closed)" -f $name)
           $state.agents.$name = $p.next_state
         } else {
+          $preLaunchPath = Join-Path $PSScriptRoot ("supervisor-prelaunch-{0}.json" -f $name)
+          $postLaunchPath = Join-Path $PSScriptRoot ("supervisor-postlaunch-{0}.json" -f $name)
+          Get-ProcSnapshot $preLaunchPath | Out-Null
           $res = Launch $name $p $homeEnv
+          if ($res) { Get-ProcSnapshot $postLaunchPath | Out-Null }
           $state.agents.$name = $p.next_state    # planner fields pass brain/managed/launching/etc through
           if ($res) {
             Save-State $state
@@ -2241,7 +3035,7 @@ do {
             $extra = @(); if ($res.session_id) { $extra += @('--session-id', $res.session_id) }
             if ($res.start) { $extra += @('--pid-start', $res.start) }
             if (-not (Assert-ActionsEnabled ("record-launch {0}" -f $name))) { continue }
-            & $AgenttalkCmd --root $Root supervise --record-launch --for $name --cli $p.cli --pid $res.pid @extra --now $now --state-file $StatePath | Out-Null
+            & $AgenttalkCmd --root $Root supervise --record-launch --for $name --cli $p.cli --pid $res.pid @extra --pre-snapshot-file $preLaunchPath --post-snapshot-file $postLaunchPath --now $now --state-file $StatePath | Out-Null
             $state = Load-State
             # Clear the manual marker ONLY after a CONFIRMED relaunch.
             if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }
@@ -2291,11 +3085,15 @@ do {
             continue
           }
         }
+        $preLaunchPath = Join-Path $PSScriptRoot ("supervisor-prelaunch-{0}.json" -f $rid)
+        $postLaunchPath = Join-Path $PSScriptRoot ("supervisor-postlaunch-{0}.json" -f $rid)
+        Get-ProcSnapshot $preLaunchPath | Out-Null
         $res = Launch-Spec $prep.agent $prep $homeEnv
+        if ($res) { Get-ProcSnapshot $postLaunchPath | Out-Null }
         if ($res) {
           $extra = @(); if ($res.start) { $extra += @('--pid-start', $res.start) }
           if (-not (Assert-ActionsEnabled ("record-ephemeral-launch {0}" -f $rid))) { continue }
-          & $AgenttalkCmd --root $Root supervise --record-ephemeral-launch --request-id $rid --pid $res.pid @extra --timeout-seconds $prep.timeout_seconds --state-file $StatePath --now $now | Out-Null
+          & $AgenttalkCmd --root $Root supervise --record-ephemeral-launch --request-id $rid --pid $res.pid @extra --pre-snapshot-file $preLaunchPath --post-snapshot-file $postLaunchPath --timeout-seconds $prep.timeout_seconds --state-file $StatePath --now $now | Out-Null
           $state = Load-State
         } else {
           if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }

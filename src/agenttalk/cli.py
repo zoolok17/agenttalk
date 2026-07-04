@@ -6968,6 +6968,15 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             raise ValueError("need --state-file <path>")
         Path(args.state_file).write_text(json.dumps(state, indent=2), encoding="utf-8")
 
+    def _read_snapshot_file(path_value: str | None) -> list[dict] | None:
+        if path_value and Path(path_value).exists():
+            try:
+                raw = json.loads(Path(path_value).read_text(encoding="utf-8-sig"))
+                return raw if isinstance(raw, list) else None
+            except (ValueError, OSError):
+                return None
+        return None
+
     if args.prepare_launch_request:
         if not args.request_id or not args.state_file:
             sys.stderr.write("agenttalk supervise --prepare-launch-request: need "
@@ -6992,10 +7001,14 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                              "--request-id <rid> and --state-file <path>\n")
             return 2
         state = _read_state()
+        root_key = sup._root_key(str(store.root.resolve()))
         sup.record_ephemeral_launch(
             state, args.request_id, pid=args.pid, pid_start=args.pid_start,
             now_epoch=(args.now if args.now is not None else time.time()),
             timeout_seconds=args.timeout_seconds,
+            pre_snapshot=_read_snapshot_file(args.pre_snapshot_file),
+            post_snapshot=_read_snapshot_file(args.post_snapshot_file),
+            root_key=root_key,
         )
         _write_state(state)
         return 0
@@ -7055,10 +7068,18 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         rl_cfg = _load_supervisor_config(store)
         grace = rl_cfg.get("launch_grace_seconds")
         grace = float(grace) if isinstance(grace, (int, float)) else None
+        cfg_agent = {}
+        if isinstance(rl_cfg.get("agents"), dict):
+            raw_cfg_agent = rl_cfg["agents"].get(args.agent)
+            cfg_agent = raw_cfg_agent if isinstance(raw_cfg_agent, dict) else {}
         sup.record_launch(state, args.agent, cli=args.cli or "claude",
                           pid=args.pid, pid_start=args.pid_start,
                           now_epoch=(args.now if args.now is not None else time.time()),
-                          grace_seconds=grace, session_id=args.session_id)
+                          grace_seconds=grace, session_id=args.session_id,
+                          pre_snapshot=_read_snapshot_file(args.pre_snapshot_file),
+                          post_snapshot=_read_snapshot_file(args.post_snapshot_file),
+                          cfg_agent=cfg_agent,
+                          root_key=sup._root_key(str(store.root.resolve())))
         p.write_text(json.dumps(state, indent=2), encoding="utf-8")
         return 0
     if args.clear_restart:
@@ -7102,11 +7123,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         # tolerates the PowerShell 5.1 Set-Content BOM.
         snapshot = None
         if args.snapshot_file and Path(args.snapshot_file).exists():
-            try:
-                raw = json.loads(Path(args.snapshot_file).read_text(encoding="utf-8-sig"))
-                snapshot = raw if isinstance(raw, list) else None
-            except (ValueError, OSError):
-                snapshot = None
+            snapshot = _read_snapshot_file(args.snapshot_file)
         print(json.dumps(sup.plan_actions(report, _read_state(), config,
                                           now_epoch=now, snapshot=snapshot), indent=2))
         return 0
@@ -8415,6 +8432,12 @@ def build_parser() -> argparse.ArgumentParser:
                       help="(--plan) the executor's process snapshot JSON (list of "
                            "{pid,parent_pid,name,command_line,start_time}). Missing "
                            "or unreadable => UNAVAILABLE (brain-required CLI fails closed).")
+    psup.add_argument("--pre-snapshot-file", dest="pre_snapshot_file", default=None,
+                      help="(--record-launch/--record-ephemeral-launch) process snapshot "
+                           "captured immediately before Start-Process.")
+    psup.add_argument("--post-snapshot-file", dest="post_snapshot_file", default=None,
+                      help="(--record-launch/--record-ephemeral-launch) process snapshot "
+                           "captured immediately after Start-Process.")
     gsup.add_argument("--install-activity-hook", dest="install_activity_hook",
                       action="store_true",
                       help="MERGE the activity heartbeat hook into the project "
