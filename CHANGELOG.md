@@ -5,6 +5,35 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.61.0] - 2026-07-05
+
+### Added
+
+- **Team Console: colored "who's talking to whom" lines.** The Conversations flow
+  graph colors each edge by its sender (deterministic, stable per-agent color),
+  adds directional arrowheads, an edge tooltip, and a participant legend.
+  Active-review edges keep their animated dash on top of the sender color.
+- **Per-agent avatars.** Ten role-themed avatars render on agent cards, the
+  agent-detail header, relationship-graph nodes, and the lead card, each with a
+  live status-dot badge. Mapping is role-normalized + provider-scoped; an unmapped
+  agent or a missing/broken image falls back to the plain status dot. Served from a
+  fixed startup allowlist (no path traversal).
+- **Full conversation history + an Archived section on the Sessions page.** Sessions
+  now splits into Active (open threads) and Archived (this session's
+  closed/superseded conversations). Archived is lazy — it fetches only when opened —
+  via a new read-only, paginated `GET /api/threads?state=closed` endpoint
+  (newest-first, cursor pagination, hard-capped, envelope-only stubs with no message
+  bodies). Clicking any thread loads its full transcript via the existing per-thread
+  endpoint; the 2-second `/api/state` poll stays light (closed count only).
+
+### Changed
+
+- Thread derivation is refactored into one shared classifier producing both the
+  active `/api/state` rows and the terminal history rows, so the two cannot drift.
+  `/api/state`'s output is unchanged (parity-tested) and the new endpoint is
+  fail-safe — an endpoint error can never affect `/api/state`. All additive and
+  read-only; the actions-off console and `/api/state` stay byte-identical.
+
 ## [0.60.2] - 2026-07-04
 
 ### Fixed

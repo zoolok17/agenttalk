@@ -14,6 +14,16 @@ major · `P2` minor · `P3` nit. Each item: what, why, where, disposition.
 
 ## Recently shipped
 
+- **SHIPPED · v0.61.0 / `9dd0342` — Team Console UX batch (colored flow + history + archived + avatars).**
+  Colored per-sender flow lines + arrowheads + legend; new read-only paginated
+  `GET /api/threads?state=closed` (envelope-only, cursor, capped, fail-safe) feeding a
+  full conversation history + an Active/Archived Sessions split; 10 role-mapped avatars
+  (allowlist-served, StatusDot fallback). Thread derivation refactored into one shared
+  classifier — `/api/state` output unchanged (parity-tested), closed rows never bloat the
+  poll. Read-only; 2 reviewers GO on the final SHA + lead-gated.
+- **SHIPPED · v0.60.2 / `effbc58` — console UX fixes.** Composer/inbox forms survive the
+  2s poll (skip-render-while-editing + persisted composer state); flow-line thickness capped
+  (gentle log scale) so a busy bus no longer renders a white blob. Frontend-only.
 - **SHIPPED · v0.60.1 / `d6bab84` — cross-path operator-answer dedup.** Closed the
   v0.60.0 known-limitation: both the browser drain and the CLI relay now route the
   final operator-answer send through one `Store.send_operator_answer_atomic` that
