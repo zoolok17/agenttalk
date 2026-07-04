@@ -5,6 +5,22 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.60.1] - 2026-07-04
+
+### Fixed
+
+- **Cross-path operator-answer double-send (the v0.60.0 known-limitation).** Both
+  the browser intent drain and the CLI `relay operator-answer` now route their
+  final send through a single `Store.send_operator_answer_atomic`, which — under
+  the non-reentrant `_config_lock` — re-runs the ownership/pending resolver and
+  then sends while still holding the lock. The loser of a browser-vs-CLI race
+  re-reads fresh state, sees the escalation already answered, and is denied
+  (`not_pending`) with zero sends. Fail-closed on lock timeout, unreadable state,
+  recipient mismatch, or a rejected send. The browser drain keeps its two-phase
+  crash-recovery reconcile ahead of the atomic send. Reviewed by both bus
+  reviewers plus a fresh adversarial concurrency pass (8-way race + mixed
+  drain/relay race + 30 stress iterations, all single-send).
+
 ## [0.60.0] - 2026-07-04
 
 ### Added

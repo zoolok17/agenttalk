@@ -14,6 +14,14 @@ major · `P2` minor · `P3` nit. Each item: what, why, where, disposition.
 
 ## Recently shipped
 
+- **SHIPPED · v0.60.1 / `d6bab84` — cross-path operator-answer dedup.** Closed the
+  v0.60.0 known-limitation: both the browser drain and the CLI relay now route the
+  final operator-answer send through one `Store.send_operator_answer_atomic` that
+  re-checks pending + sends under the non-reentrant `_config_lock`, so a cross-path
+  race loser sees `answered` and is denied with zero sends (fail-closed on
+  lock/read/mismatch/reject; two-phase crash-recovery preserved). Reviewed: both bus
+  reviewers approve + a fresh adversarial concurrency pass (8-way + mixed race + 30
+  stress iterations, all single-send).
 - **SHIPPED · v0.60.0 / `6827801` — operator inbox: answer escalations from the
   browser.** New `answer_escalation` intent kind through the write spine; shared
   `resolve_operator_answer_target` enforces pending + needs_operator + owed-to-actor
@@ -633,17 +641,18 @@ Status: **SHIPPED as v0.41.0**. 2/2 reviewer-approved on the frozen SHA + lead-g
 
 ## BACKLOG
 
-- **Cross-path operator-answer double-send (P2, fast-follow → v0.60.1).** After
-  v0.60.0 there are two operator-answer sender paths: the browser intent **drain**
-  (attempt_floor + fingerprint dedup, fully idempotent) and the CLI **`relay
-  operator-answer`** (`_relay_operator_answer`, direct `store.send`, no floor).
-  Answering the *same* escalation via both surfaces at the same instant is a
-  cross-path TOCTOU on the pending check that can duplicate the answer message.
-  **Not** an authority/recipient/stale-content bypass; concurrent *intra-path*
-  drains are already serialized by the singleton `supervise --drain-instance` lock.
-  Both reviewers + a fresh adversarial pass confirmed track-not-block for v0.60.0
-  (2026-07-04). *Fix:* route the CLI relay through the same dedup, or add a
-  per-escalation serialization guard so both paths cannot both send.
+- **`send_operator_answer_atomic` extra_meta defense-in-depth (P3).** The shared
+  operator-answer helper merges caller `extra_meta` then overwrites only the three
+  canonical keys. Both current callers are safe (CLI scrubs control meta via
+  `_RELAY_RESERVED_META`; the drain passes only shape-validated stable/executor
+  meta), so a smuggled `needs_operator` cannot reach it today — and even if it did,
+  terminal classification ignores the reply's meta. Banked from the v0.60.1
+  adversarial/reviewer-2 notes: if this helper ever becomes a broader public API,
+  scrub control/reserved keys inside `Store` as defense-in-depth.
+- **`relay operator-answer` `not_found` message nuance (P3, trivial).** The CLI maps
+  a resolver `not_found` to a "no thread / not your thread" message, but `not_found`
+  also covers "thread has no validated opener" — a rare-case wording nuance, no
+  correctness/authority impact (v0.60.1 adversarial note).
 - **Dead-letter defense-in-depth (P3, fast-follow).** Banked from the dead-letter
   review/verify: (1) `ack` / `advance_cursor` accept an arbitrary id on write (no
   `_ID_RE` guard) — an operator cursor-skip vector; (2) the disposal path is not
