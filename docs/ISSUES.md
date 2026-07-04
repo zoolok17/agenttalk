@@ -12,6 +12,249 @@ major · `P2` minor · `P3` nit. Each item: what, why, where, disposition.
 
 ---
 
+## P0 · IN PROGRESS — supervisor cross-project process kill (2026-07-03)
+
+**P0 · a supervisor in project B can KILL an identically-named agent's processes in an
+unrelated project A on the same machine.** Operator hit this live: a standalone `claude` in
+project A was killed when the orbit-launcher project started *its* lead + supervisor.
+
+ROOT CAUSE: the supervisor takes a MACHINE-WIDE process snapshot (`supervisor.py:1837`,
+`Get-CimInstance Win32_Process`) and identifies "its" agent processes by AGENT NAME in the
+command line, with NO project-root scoping. `_wait_row_for` (`supervisor.py:389-397`) matches
+any `agenttalk … wait --for <agent>` process ANYWHERE on the machine; that row is added to the
+managed set (`_launcher_managed_set`, `supervisor.py:560-562`) → `_targets()`
+(`supervisor.py:975-977`) → `Stop-Tree`/`Stop-Process -Id` (`supervisor.py:2143`, `2247`). The
+one root-scoped signal (parent-process ancestry to the recorded `launcher_pid`) is correct; the
+name-based command-line match is the leak. The DEFAULT names `claude`/`codex` collide across
+projects by construction, so any two default-named projects on one host can cross-kill. TRIGGER:
+project B's `kill_first` cleanup on launch/restart of its same-named agent.
+
+MITIGATION (no code, effective now): use UNIQUE agent names per project — the `--for <name>`
+match then cannot collide across projects.
+
+FIX (P0, design→review — NOT a panic patch): root-scope EVERY process match — a process counts
+as this project's agent only if its command line carries this project's `--root <path>` (and
+supervised agents must launch with an explicit `--root`), not merely a matching `--for <name>`.
+A careless fix could stop the supervisor reaping its OWN agents (false negatives → no
+auto-recovery), so it needs the design pass. Also audit `_discover_brain` strategy-1 (climbs
+from the cross-matched wait row) and the brain name-pattern match (every `claude.exe` matches)
+for the same leak.
+
+STATUS: investigated + reported to operator 2026-07-03; fix approach pending operator go
+(fast-track on lead budget vs normal team cadence once the global token cap lifts).
+
+**P0 UPDATE — investigation complete (workflow `wrnuxcwka`, 2026-07-03).**
+
+VERDICT: **CONFIRMED — code mechanism (laptop-independent).** [CORRECTION 2026-07-03: the
+agenttalk team and the orbit-launcher team run on SEPARATE laptops; the orbit checkout on THIS
+(agenttalk) laptop is a STALE COPY, so the live incident state — orbit's supervisor + a
+same-named `claude-dev` on ONE machine — is on the orbit laptop and NOT inspectable from here.
+The operator's account STANDS; the "refuted on-disk" note below was a wrong-laptop visibility
+artifact. The bug is in `supervisor.py` (identical on both laptops), so the fix applies
+unchanged.] Original workflow verdict: The CODE MECHANISM (name-collision, no project-root scoping)
+is FULLY CONFIRMED and mechanically demonstrable in current master. The **specific** "orbit
+killed a claude-dev" pairing is **REFUTED** against current on-disk state: orbit-launcher has NO
+`supervisor.json` and NO `claude-dev` (its agents are codex-lead/nova/vega/…); a host-wide grep
+found NO project with a literal `claude-dev` agent; the only `supervisor.json` present is
+agenttalk's own. So the exact actors named in the report are not on disk now (rosters shifted
+since the incident, which was on **v0.56.0**), and the literal event can't be re-created — but
+the bug CLASS is live: `FEEDBACK-perf-slowdown-2026-06-15.md` captured real orbit agents running
+bare `agenttalk wait --for <name>` loops with **no `--root`** (claude-developer-2, claude-vega,
+codex-orbit-dev), the exact command-line shape the matcher keys on. Honest limit: we confirmed
+the class, not the literal incident.
+
+CONFIRMED CHAIN (file:line): machine-wide snapshot (`Get-CimInstance Win32_Process`,
+supervisor.py:1837) → `_wait_row_for` (389-397) matches `agenttalk … wait --for <agent>`
+ANYWHERE on the host (name-only, no root/cwd/ancestry) → `_launcher_managed_set` adds it
+UNCONDITIONALLY (560-562, OUTSIDE the launcher_pid ancestry gate at 552-558) → `_targets`
+copies it verbatim (975-977) → STUCK_RECOVER (1130-1136, `kill_first`) or MANUAL_RESTART
+(1009-1014) → `Stop-Tree` → `Stop-Process -Id -Force` (1868). The start-time guard (1867) is
+PID-reuse-only and MATCHES a genuinely-live foreign process, so it does NOT block the cross-kill.
+Max-likelihood trigger: a never-launched agent (first poll → `launcher_pid=None` → ancestry
+block skipped → the foreign wait row is the SOLE managed member) whose per-project heartbeat is
+stale. ENABLER: supervised launch argv carries no `--root` (wrapped args supervisor.py:1647) and
+the planner never threads `store.root` into the matcher — nothing distinguishes project A's
+`--for X` from project B's.
+
+FIX SPEC (design basis for the normal-cadence build): (1) emit `--root <abs>` onto every
+supervised launch argv (supervisor.py:1647) so the command line is self-identifying (env
+AGENTTALK_ROOT is not visible to the Win32_Process query — the cmdline token is the carrier);
+(2) thread `store.root` through plan_actions → `_liveness` → `_launcher_managed_set` / `_wait_row_for`
+(the planner is already invoked with `--root $Root`, supervisor.py:2112); (3) a name-matched wait
+row is eligible as a KILL target ONLY if its command line also carries this supervisor's
+normalized root token — else DROP it (fail-closed; may stay a diagnostic-only `wait_alive`
+signal); (4) keep the `launcher_pid`-ancestry match (552-558, already root-unique) as the PRIMARY
+reaper so NO false negative is introduced, and so the empty/access-limited-cmdline degrade case
+still reaps via ancestry; (5) update `agenttalk.listen.md` to ALWAYS pass `--root <abs>` (else a
+manual agent that omits it stops being reaped — a regression); (6) close the same leak in
+`_ephemeral_kill_targets` (1163-1180, also calls `_launcher_managed_set`).
+
+REGRESSION TEST: two-root snapshot — project A `wait --for claude-dev --root C:/projA` (pid P_A,
+ancestry to launcher_A) + project B same name `--root C:/projB` (P_B, ancestry to launcher_B);
+run plan_actions with root=C:/projB, launcher_pid=launcher_B, heartbeat stale. ASSERT (a) P_A NOT
+in kill_targets (cross-kill closed); (b) B's own tree IS reaped on stuck_recover (own-reaping
+preserved); (c) an EMPTY-cmdline row with ancestry to launcher_B is STILL reaped (degrade-to-
+ancestry). Mirror it through `supervise --plan --root` for the CLI wiring.
+
+KEY RESIDUALS to fold: `_discover_brain` strategy-1 (484-496) is seeded by the same cross-matched
+wait row and can pin a FOREIGN brain (mis-pin/false-liveness) — root-scope or demote it too;
+a stale/foreign recorded `launcher_pid` is a separate cross-kill vector the wait-gate doesn't
+cover (state hygiene); normalized-path comparison must handle PS quoting / mixed slashes /
+drive-case / trailing slash (too-loose re-opens the bypass, too-strict re-breaks own-reaping).
+
+STATUS: fix spec READY. NORMAL CADENCE — hand to codex (design-refine over this spec) → dev-2
+build (isolated worktree) → 2-reviewer → gate → ship, when the token cap lifts. Mitigation until
+then: project-DISTINCT agent names across concurrent projects.
+
+## P2 · PLANNED — supervisor: don't give up on a rate-limited agent (2026-07-04)
+
+Observed live: dev-2 (wrapped Claude, mid v0.59.0 build) hit a Claude rate-limit and STOPPED
+COMPLETELY (Claude agents halt on a rate-limit and do not auto-resume when it clears). Its
+wrapper stayed alive but never completed a turn → never heartbeated → the supervisor relaunched
+3× without reaching readiness → `READINESS_GAVE_UP` (sticky; manual intervention). The operator
+normally has to hand-wake such agents. GAP: the supervisor treats a rate-limited/outage agent
+(`health=rate_limited_or_outage`) like a dead one and eventually gives up, instead of HOLDING
+while health says rate-limited (infra, not poison) and/or auto-relaunching once it clears. FIX:
+the readiness-give-up path (supervisor.py ~1116-1136) should NOT fire while
+`health=rate_limited_or_outage` (extend the existing health-working delay at ~1074 to cover the
+rate-limited state); optionally an auto-wake that re-arms a recovered agent. RECOVERY used now:
+`agenttalk request-restart --for <agent>` clears the give-up + relaunches (the programmatic
+"wake up"). RELATED: relaunch the running team on **v0.58.4** so work-heartbeat stops the
+long-silent-turn false-STUCK churn that compounds this (a relaunch also refreshes the wrappers to
+current code).
+
+## PLANNED (v0.59.1 fast-follow) — dashboard write-spine P3s (from the v0.59.0 3-way review, 2026-07-04)
+
+Non-blocking nits from the v0.59.0 review (reviewer-2 + reviewer-3 + independent adversarial pass, all GO). Bundle into v0.59.1. None is an auth bypass; the write boundary is sound.
+
+- **P3 · non-ASCII CSRF header → TypeError** (sharpest). `web.py _handle_intent_post` runs
+  `hmac.compare_digest(supplied, csrf_token)` on STRINGS; a non-ASCII header (latin-1 decoded,
+  0x80-0xFF attacker-reachable) raises `TypeError` → unhandled `http.server` traceback + aborted
+  connection. FAIL-CLOSED (no mutation, before any write) but an unhandled exception on attacker
+  input on the security path. FIX: compare `.encode()` bytes, or `except TypeError` → 403 bad_csrf.
+- **P3 · rate-bucket unsynchronized RMW.** `web.py _rate_allowed` mutates the shared token-bucket
+  dict with no lock (ThreadingHTTPServer); two concurrent CSRF-valid requests can both admit past
+  the burst ceiling. NOT an auth bypass (valid CSRF required; hard `INTENT_MAX_ACTIVE` caps hold
+  under `_config_lock`). Flagged by BOTH the adversarial pass and reviewer-3. FIX: `threading.Lock`.
+- **P3 · audit-eviction filename order.** `store.rotate_intents` byte-cap eviction iterates
+  `sorted(iterdir())` = filename (`wi-<hex>`) order, not mtime → can drop NEWER audit records first,
+  contradicting the oldest-first docstring. Audit-retention only. FIX: sort by mtime.
+- **P3 · executor drain kill-switch (defense-in-depth).** the pure `intents.drain_intents` relies on
+  the CLI gate + PS `Assert-ActionsEnabled` for the kill-switch; a direct programmatic caller would
+  send despite an active `supervisor.kill`. Not web-reachable. FIX: short-circuit `drain_intents`
+  when `supervisor_kill_switch()` is active.
+- **CHANGELOG/doc note:** `supervisor.ps1` now exits 3 at startup if the kill-switch is already
+  active (claim-instance gate), replacing the old passive-observer mode — deliberate fail-closed;
+  make it visible to operators.
+
+## P2 · PLANNED (fast-follow) — wrapper stream teardown + work-heartbeat P3s
+
+Small, low-risk, bundle into one dev-2 task once capacity returns (normal cadence).
+
+- **P2 · Windows Errno-22 teardown spam.** A wrapped Claude window spammed `OSError: [Errno 22]
+  Invalid argument` / `Exception ignored while finalizing file <_io.TextIOWrapper name=3>`
+  pointing at `run.py:1359` (`for line in stream`). DIAGNOSIS: the loop's `try/except OSError`
+  (`run.py:1357`/`:1394`) already catches ITERATION-time OSErrors; this spam is FINALIZER-time —
+  `_ProcStream.__iter__`'s `finally` closes the child stdout pipe (`run.py:1211-1213`,
+  `self._proc.stdout.close()`), and on Windows closing an already-torn-down overlapped pipe
+  raises EINVAL (Errno 22) during generator GC, so it cannot propagate and prints as "Exception
+  ignored." FIX: wrap the pipe teardown in that `finally` (the `stdout.close()` at `:1212`, and
+  best-effort the `yield from` at `:1199`) in `try/except OSError` / `contextlib.suppress(OSError)`.
+  Benign (nothing at risk; recycling the window clears it) but noisy. Credit: the operator's lead
+  localized it to `:1359` / the stream teardown. WHERE: `src/agenttalk/wrapper/run.py:1199,1211-1213`.
+- **P3 · non-bool `enabled` silently ignored** (banked from the v0.58.4 work-heartbeat review):
+  `resolve_work_heartbeat._flag` requires an actual bool, so a JSON string `"false"` neither
+  disables nor errors — it falls through to the default (ticker stays ON for wrapped Claude),
+  inconsistent with the never-coerce posture the numeric keys get. FIX: record a `config_error`
+  for a non-bool `enabled`. WHERE: `src/agenttalk/wrapper/work_heartbeat.py` (`_flag`).
+- **P3 · generator-finalization dependency doc** (banked): the abnormal-exit stop-before-cleanup
+  ordering relies on CPython synchronous generator finalization — SUPERSEDED by the Errno-22 fix
+  above (same teardown path); fold together, add the documenting comment there.
+
+## P3 · PLANNED (post-v0.59.0) — dashboard UI polish
+
+Small console.css/js polish; run as a focused pass AFTER v0.59.0 ships — keeps the write-spine
+security review clean and avoids editing console.css/js while dev-2 is mid-build in those files.
+
+- **Compact density is a near-no-op.** The comfy/compact toggle IS wired (console.js:517-522 →
+  `applyPrefs` sets `#app[data-density]`, same path as the working theme toggle), but
+  `[data-density="compact"]` changes only ONE variable — `--card-pad` `15px 16px` → `13px 14px`
+  (console.css:141-142), a ~2px delta — so it reads as a dead button. FIX: have `compact` drive
+  MORE dimensions (row/list padding, inter-card gaps, header/nav height, maybe font-size) via
+  additional density-scoped custom properties so it visibly tightens. WHERE:
+  `src/agenttalk/web_static/console.css` (density vars) + `console.js` if new vars need wiring.
+- (Running bucket for further console UX nits the operator surfaces while using the dashboard.)
+
+## PLANNED (feature) — per-provider usage/limits in the dashboard (operator ask 2026-07-03)
+
+GOOD NEWS: mostly already built. `capacity.py` extracts 5-hour + weekly rate-limit windows +
+context for BOTH providers — Claude from `~/.claude/statusline-last-input.json`
+(`rate_limits.{five_hour,seven_day}`), Codex from the newest `~/.codex/sessions/**/rollout-*.jsonl`
+`payload.rate_limits.{primary,secondary}` (capacity.py:18-22,113-249) — i.e. agenttalk already
+reads the Codex rate limits the operator's own statusline tool could not. `/api/state` carries
+per-agent `capacity`; console.js already renders a 5-hour rate meter + context meter
+(console.js:402-404,1321-1324).
+
+GAP (why Codex looks empty): capacity is SELF-published by each agent's skill
+(`agenttalk capacity refresh`), NOT auto-refreshed by the wrapper — `wrapper/loop.py` has NO
+capacity wiring — so snapshots go stale/absent, especially for codex. OPEN QUESTION to verify
+first: does a WRAPPED HEADLESS agent produce its provider source? codex writes rollouts (yes);
+a wrapped `claude -p` may NOT run the statusline that writes `statusline-last-input.json` (verify).
+
+FIX: (1) auto-refresh capacity in `wrap --loop` each turn (loop.py, both providers, fail-safe) so
+every supervised agent always has fresh usage without depending on its skill; (2) enrich the
+console to show BOTH 5h + weekly windows + `resets_at` + `plan_type`, per agent + a per-provider
+summary (console.js/css — FOLD with the dashboard work to avoid conflict; the loop.py auto-refresh
+is independent and can ship on its own). Design-first dispatched to dev-4 (assignment=dashboard-capacity).
+
+## SHIPPED v0.57.0 — supervisor hardening · v0.57.1 — attention fast-follow (2026-07-02)
+
+- **v0.57.0** — kill-switch (`.agenttalk/supervisor.kill`), an independent fail-closed
+  `agenttalk deadman` mail-age alarm, a durable Scheduled-Task host (`supervisor-task.ps1`,
+  `docs/supervisor-hosting.md`), start-time-guarded kills + heartbeat-based restart
+  reconciliation. 3/3 reviewed, lead-gated, CI-green.
+- **v0.57.1** — attention-queue fast-follow: `attention --stats` (+ `--json`) north-star
+  counts, `show --include-*`, wrapped-form typed validation, naive-as-UTC, requeue/resolve
+  guidance. Review fold: **F8** (reviewer-1) a shared `_attention_input_warnings` so `--stats`
+  carries the same degraded-input warnings as the queue view; **F9** (codex) honest
+  no-body-reads docs.
+
+## Findings from the first real supervised run (2026-07-02)
+
+Origin: dogfooding the hardened supervisor on the live team (claude lead + 5 codex + 3 claude
+workers, all `wrap --loop`, real auto-recovery). The supervisor revived a dead Claude dev
+(dev-2) by itself — the revival premise works — but the first real dev turn surfaced these.
+
+- **P1 · PLANNED · wrapped-Claude has no write grants.** A supervised `wrap --loop --cli
+  claude` child ran in DEFAULT permission mode, so every Edit/Write/git write was auto-denied
+  headless (main repo AND worktree); the agent could read and use the bus but could not
+  edit/commit. Root cause: the wrapper never applies `claude_permission_mode` to the child
+  argv — it relied on a seeded `.claude/settings.json defaultMode`, which does not grant
+  writes for a `-p` headless child. WHERE: `src/agenttalk/wrapper/run.py` (no
+  `--permission-mode` in the claude argv); `supervise --seed-claude-settings`. INTERIM FIX
+  (config, applied): add `--permission-mode bypassPermissions` to each Claude worker's `wrap`
+  tail (+ `--add-dir <worktree>` when the work is outside cwd). PROPER FIX (planned): the
+  wrapper applies the resolved `claude_permission_mode` to the child argv so the seed and the
+  flag cannot diverge. (Codex agents were unaffected — they already run `-a never -s
+  workspace-write`.)
+- **P2 · KNOWN LIMITATION · isolated worktree vs sandboxed agents.** A separate-worktree task
+  (worktree files, plus git metadata under the main repo's `.git/worktrees/…`) falls outside
+  a sandboxed agent's writable root — Codex `workspace-write` + `writable_roots` (the Orbit
+  team hit this on `git worktree`) and Claude cwd/permission-mode are two faces of one thing.
+  Options, safest last: drop the sandbox (Codex `danger-full-access` / Claude
+  `bypassPermissions`); widen the writable root (`writable_roots += worktree` / Claude
+  `--add-dir`); or keep worktrees INSIDE the repo (or work on branches in-cwd) so nothing
+  leaves the writable root. RECOMMENDATION: prefer in-cwd branches / in-repo worktrees for
+  supervised agents; consider having the supervisor auto-add the active worktree to
+  `writable_roots` / `--add-dir` when it seeds.
+- **P3 · BACKLOG · supervisor `.ps1` hot-config-add crash.** The generated `supervisor.ps1`
+  caches `$cfg` at startup but `supervise --plan` reads the live config each poll, so ADDING
+  an agent to a running supervisor's config makes the state write-back
+  (`$state.agents.$name = …`) throw on a `PSCustomObject` that lacks the new property (seen
+  live when the alert-only loop met a 10-agent config). WORKAROUND: restart the supervisor
+  after any config change (standard). FIX: seed `$state.agents` from the plan's agents via
+  `Add-Member`, or reload `$cfg` each poll.
+
 ## SHIPPED v0.42.0 — split-identity lead-loop enforcement (Slice 1 + WP1–4)
 
 Origin: the **operator-raised "the lead stops leading"** failure (every lead, every
