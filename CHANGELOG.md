@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Team Console write-spine hardening.** The executor now treats frozen active
+  intent plans as untrusted input: before any reconciliation or send it
+  re-resolves the current actor, recipient semantics, bus kind, content, and
+  exact stable-meta shape. Forged or drifted plans deny with
+  `plan_revalidation_failed` and zero sends; `GET /api/intents` surfaces the
+  terminal code. Broadcast audiences and reply anchors are re-derived at drain
+  time, so roster/group/role/anchor drift requires a fresh operator requeue
+  rather than signing an unverifiable frozen recipient.
+- **Intent drain liveness and corruption hardening.** Intent and supervisor
+  reclaim now use a pid-start-aware owner identity check: live/unknown owners
+  remain non-stealable unless a start token is confidently different, and
+  unreadable start tokens degrade to conservative `None`. Torn/corrupt active
+  intent JSON is quarantined under reset-preserved
+  `.agenttalk/control-audit/intents-invalid/` before drain, and terminal active
+  intents with unparseable timestamps no longer linger forever against the cap.
+
 ## [0.59.0] - 2026-07-04
 
 ### Added

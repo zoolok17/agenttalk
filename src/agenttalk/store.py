@@ -3646,6 +3646,92 @@ class Store:
             return None
         return data
 
+    def _quarantine_active_intent_locked(self, path: Path, *, reason: str,
+                                         quarantined_at: str,
+                                         parse_error: str | None = None) -> dict | None:
+        if path.suffix != ".json" or not path.exists():
+            return None
+        sink = self.control_audit_dir / "intents-invalid"
+        sink.mkdir(parents=True, exist_ok=True)
+        stamp = quarantined_at.replace(":", "-")
+        dst: Path | None = None
+        sidecar: Path | None = None
+        for _ in range(100):
+            candidate = sink / f"invalid-{stamp}-{secrets.token_hex(4)}.json"
+            candidate_sidecar = sink / f"{candidate.name}.meta.json"
+            if not candidate.exists() and not candidate_sidecar.exists():
+                dst = candidate
+                sidecar = candidate_sidecar
+                break
+        if dst is None or sidecar is None:
+            return None
+        try:
+            shutil.move(str(path), str(dst))
+        except OSError:
+            return None
+        meta = {
+            "original_name": path.name,
+            "quarantined_name": dst.name,
+            "reason": reason,
+            "quarantined_at": quarantined_at,
+        }
+        if parse_error:
+            meta["parse_error"] = parse_error[:500]
+        _atomic_write_text(sidecar, json.dumps(meta, indent=2, ensure_ascii=False))
+        return {"from": str(path), "to": str(dst), **meta}
+
+    def quarantine_invalid_intents(self, *, now_epoch: float | None = None,
+                                   reason: str = "invalid_active_intent") -> dict:
+        """Move unreadable/corrupt active intent JSON into reset-preserved audit.
+
+        The scan is intentionally limited to ``state/intents/active/*.json`` and
+        runs only under the executor path, never from dashboard GET/POST routes.
+        """
+        if now_epoch is not None:
+            quarantined_at = datetime.fromtimestamp(
+                now_epoch, timezone.utc).isoformat(
+                    timespec="microseconds").replace("+00:00", "Z")
+        else:
+            quarantined_at = _now_iso()
+        moved = 0
+        with self._config_lock():
+            d = self.intents_active_dir
+            if not d.is_dir():
+                return {"quarantined": 0}
+            for p in sorted(d.iterdir()):
+                if p.suffix != ".json":
+                    continue
+                parse_error: str | None = None
+                invalid = False
+                try:
+                    self._intent_path(p.stem)
+                except ValueError as e:
+                    invalid = True
+                    parse_error = f"{type(e).__name__}: {e}"
+                try:
+                    raw = p.read_bytes()
+                    try:
+                        data = json.loads(raw.decode("utf-8"))
+                    except (UnicodeDecodeError, ValueError) as e:
+                        invalid = True
+                        parse_error = f"{type(e).__name__}: {e}"
+                    else:
+                        if not isinstance(data, dict):
+                            invalid = True
+                            parse_error = "intent file root is not an object"
+                        elif not invalid and data.get("intent_id") != p.stem:
+                            invalid = True
+                            parse_error = "intent_id does not match active filename"
+                except OSError as e:
+                    invalid = True
+                    parse_error = f"{type(e).__name__}: {e}"
+                if invalid and self._quarantine_active_intent_locked(
+                    p, reason=reason, quarantined_at=quarantined_at,
+                    parse_error=parse_error,
+                ):
+                    moved += 1
+        return {"quarantined": moved}
+
     def list_intents(self, *, limit: int = 100,
                      include_terminal: bool = True) -> list[dict]:
         """Recent intents from the ACTIVE dir, newest first. Corrupt files are
@@ -3696,10 +3782,13 @@ class Store:
                 owner = claim.get("pid")
                 age = now - float(claim.get("at_epoch") or 0.0)
                 if owner == pid:
-                    pass                       # our own claim: refresh below
+                    if not _same_pid_claim_allowed(
+                        owner, claim.get("pid_start"), pid_start,
+                    ):
+                        return None
                 elif age < claim_stale_after:
                     return None                # fresh claim: never contested
-                elif _process_liveness(owner) != PROC_DEAD:
+                elif not _owner_identity_gone(owner, claim.get("pid_start")):
                     return None                # live/unknown owner: NEVER stolen
             rec["state"] = self.INTENT_CLAIMED
             rec["attempts"] = int(rec.get("attempts") or 0) + 1
@@ -3743,7 +3832,10 @@ class Store:
         caps (age + bytes, oldest first). Best-effort; returns counts."""
         from agenttalk.health import parse_iso as _parse_iso_dt
         now = now_epoch if now_epoch is not None else time.time()
-        moved = dropped = 0
+        moved = dropped = quarantined_invalid = 0
+        quarantined_at = datetime.fromtimestamp(
+            now, timezone.utc).isoformat(
+                timespec="microseconds").replace("+00:00", "Z")
         with self._config_lock():
             d = self.intents_active_dir
             if d.is_dir():
@@ -3757,6 +3849,12 @@ class Store:
                     ts = _parse_iso_dt(rec.get("terminal_at") or rec.get("created_at"))
                     age = (now - ts.timestamp()) if ts is not None else None
                     if age is None or age < terminal_linger_seconds:
+                        if age is None and self._quarantine_active_intent_locked(
+                            p, reason="invalid_intent_timestamp",
+                            quarantined_at=quarantined_at,
+                            parse_error="terminal_at/created_at is unparseable",
+                        ):
+                            quarantined_invalid += 1
                         continue
                     audit.mkdir(parents=True, exist_ok=True)
                     _atomic_write_text(audit / p.name,
@@ -3789,7 +3887,8 @@ class Store:
                         total -= size
                     except OSError:
                         pass
-        return {"rotated": moved, "audit_dropped": dropped}
+        return {"rotated": moved, "audit_dropped": dropped,
+                "quarantined_invalid": quarantined_invalid}
 
     # ---------------------------------- supervisor kill-switch + instance lock
 
@@ -3828,8 +3927,17 @@ class Store:
         caller's own claim (documented in SECURITY.md)."""
         with self._config_lock():
             existing = self.read_supervisor_instance()
-            if existing is not None and _process_liveness(existing.get("pid")) != PROC_DEAD:
-                return None
+            if existing is not None:
+                existing_pid = existing.get("pid")
+                if existing_pid == pid:
+                    if not _same_pid_claim_allowed(
+                        existing_pid, existing.get("pid_start"), pid_start,
+                    ):
+                        return None
+                elif not _owner_identity_gone(
+                    existing_pid, existing.get("pid_start"),
+                ):
+                    return None
             record = {
                 "root": str(self.root),
                 "pid": int(pid),
@@ -4185,6 +4293,9 @@ def _process_alive(pid: int) -> bool:
 PROC_ALIVE = "alive"
 PROC_DEAD = "dead"
 PROC_UNKNOWN = "unknown"
+# Anti-reuse compares should be tight: widening this risks false-matching a
+# recycled pid. Ambiguous tokens already degrade to None and are not stealable.
+_START_TOKEN_COMPARE_TOLERANCE_SECONDS = 0.001
 
 
 def _process_liveness(pid: object) -> str:
@@ -4258,6 +4369,161 @@ def _process_liveness(pid: object) -> str:
         return PROC_ALIVE  # exists, owned by another user
     except OSError:
         return PROC_UNKNOWN  # uncertain -> never steal
+
+
+def _process_start_token(pid: object) -> str | None:
+    """Best-effort process start token, or None on any ambiguity.
+
+    A non-None token is only returned when the OS source is specific enough to
+    compare against a previously recorded start. Callers must treat None as
+    conservative/possibly-same-process.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    if os.name == "nt":
+        try:
+            import ctypes  # stdlib; lazy so POSIX never pays for it
+            from ctypes import wintypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            FILETIME_EPOCH_DELTA_SECONDS = 11644473600
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                             wintypes.DWORD]
+            kernel32.GetProcessTimes.restype = wintypes.BOOL
+            kernel32.GetProcessTimes.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+            ]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return None
+            try:
+                creation = wintypes.FILETIME()
+                exit_time = wintypes.FILETIME()
+                kernel_time = wintypes.FILETIME()
+                user_time = wintypes.FILETIME()
+                ok = kernel32.GetProcessTimes(
+                    handle, ctypes.byref(creation), ctypes.byref(exit_time),
+                    ctypes.byref(kernel_time), ctypes.byref(user_time))
+                if not ok:
+                    return None
+                ticks = (int(creation.dwHighDateTime) << 32) | int(creation.dwLowDateTime)
+                if ticks <= 0:
+                    return None
+                seconds = (ticks / 10_000_000.0) - FILETIME_EPOCH_DELTA_SECONDS
+                return datetime.fromtimestamp(seconds, timezone.utc).isoformat(
+                    timespec="microseconds").replace("+00:00", "Z")
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001 - ambiguity -> unknown token
+            return None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        rparen = stat.rfind(")")
+        if rparen < 0:
+            return None
+        fields = stat[rparen + 2:].split()
+        if len(fields) < 20:
+            return None
+        start_ticks = fields[19]
+        if not start_ticks.isdigit():
+            return None
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="utf-8").strip()
+        if not re.fullmatch(r"[0-9a-fA-F-]{32,64}", boot_id):
+            return None
+        return f"linux:{boot_id}:{start_ticks}"
+    except Exception:  # noqa: BLE001 - missing /proc, access denied, races -> None
+        return None
+
+
+def _parse_start_token(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    text = value
+    match = re.fullmatch(
+        r"(.+T\d{2}:\d{2}:\d{2})(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})",
+        text,
+    )
+    if match:
+        prefix, frac, zone = match.groups()
+        if frac:
+            frac = "." + frac[1:7].ljust(6, "0")
+        else:
+            frac = ""
+        text = prefix + frac + ("+00:00" if zone == "Z" else zone)
+    else:
+        text = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt
+
+
+def _start_tokens_differ(observed: object, recorded: object) -> bool:
+    if not isinstance(observed, str) or not observed:
+        return False
+    if not isinstance(recorded, str) or not recorded:
+        return False
+    if observed.startswith("linux:") or recorded.startswith("linux:"):
+        return observed.startswith("linux:") and recorded.startswith("linux:") and observed != recorded
+    obs_dt = _parse_start_token(observed)
+    rec_dt = _parse_start_token(recorded)
+    if obs_dt is None or rec_dt is None:
+        return False
+    return (
+        abs(obs_dt.timestamp() - rec_dt.timestamp())
+        > _START_TOKEN_COMPARE_TOLERANCE_SECONDS
+    )
+
+
+def _start_tokens_same(left: object, right: object) -> bool:
+    if not isinstance(left, str) or not left:
+        return False
+    if not isinstance(right, str) or not right:
+        return False
+    if left.startswith("linux:") or right.startswith("linux:"):
+        return left.startswith("linux:") and right.startswith("linux:") and left == right
+    left_dt = _parse_start_token(left)
+    right_dt = _parse_start_token(right)
+    if left_dt is None or right_dt is None:
+        return False
+    return (
+        abs(left_dt.timestamp() - right_dt.timestamp())
+        <= _START_TOKEN_COMPARE_TOLERANCE_SECONDS
+    )
+
+
+def _owner_identity_gone(pid: object, recorded_pid_start: object) -> bool:
+    """True only when the recorded owner is confidently not the same process."""
+    liveness = _process_liveness(pid)
+    if liveness == PROC_DEAD:
+        return True
+    if liveness != PROC_ALIVE:
+        return False
+    return _start_tokens_differ(_process_start_token(pid), recorded_pid_start)
+
+
+def _same_pid_claim_allowed(pid: object, recorded_pid_start: object,
+                            caller_pid_start: object) -> bool:
+    """Whether a caller using the same numeric pid may refresh/reclaim a claim."""
+    if _start_tokens_same(caller_pid_start, recorded_pid_start):
+        return True
+    observed = _process_start_token(pid)
+    return (
+        _start_tokens_differ(observed, recorded_pid_start)
+        and _start_tokens_same(observed, caller_pid_start)
+    )
 
 
 def _new_id() -> str:

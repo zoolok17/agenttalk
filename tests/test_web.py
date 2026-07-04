@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import signing, web
+from agenttalk import intents, signing, web
 from agenttalk.store import Store
 
 
@@ -1118,10 +1118,157 @@ def test_rejected_action_post_mutates_nothing(tmp_path: Path) -> None:
         with pytest.raises(urllib.error.HTTPError) as exc:
             _urlopen(req, timeout=5)
         assert exc.value.code == 403
+        problem = json.loads(exc.value.read())
+        assert problem["error"] == "bad_csrf"
     finally:
         srv.shutdown()
         srv.server_close()
     assert _tree_hashes(s.root) == before
+
+
+def test_wrong_present_csrf_token_returns_403_without_file(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    before = _tree_hashes(s.root)
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post_intent(base, token + "-wrong", {
+                "kind": "send",
+                "payload": {"target": "beta", "body": "hello"},
+            })
+        assert exc.value.code == 403
+        problem = json.loads(exc.value.read())
+        assert problem["error"] == "bad_csrf"
+        assert not s.intents_active_dir.exists()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert _tree_hashes(s.root) == before
+
+
+def test_origin_mismatch_returns_403_without_file(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    before = _tree_hashes(s.root)
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post_intent(base, token, {
+                "kind": "send",
+                "payload": {"target": "beta", "body": "hello"},
+            }, origin="http://127.0.0.1:1")
+        assert exc.value.code == 403
+        problem = json.loads(exc.value.read())
+        assert problem["error"] == "bad_origin"
+        assert not s.intents_active_dir.exists()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert _tree_hashes(s.root) == before
+
+
+def test_action_post_rate_limited_without_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web, "_ACTION_RATE_BURST", 0)
+    monkeypatch.setattr(web, "_ACTION_RATE_PER_MINUTE", 0)
+    s = _make_store(tmp_path)
+    before = _tree_hashes(s.root)
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post_intent(base, token, {
+                "kind": "send",
+                "payload": {"target": "beta", "body": "hello"},
+            })
+        assert exc.value.code == 429
+        problem = json.loads(exc.value.read())
+        assert problem["error"] == "rate_limited"
+        assert not s.intents_active_dir.exists()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert _tree_hashes(s.root) == before
+
+
+def test_action_post_body_too_large_without_file(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    before = _tree_hashes(s.root)
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        req = urllib.request.Request(  # noqa: S310  # nosemgrep
+            f"{base}/api/intent", method="POST",
+            data=b"x" * (web._ACTION_BODY_LIMIT + 1),  # noqa: SLF001
+            headers={
+                "Content-Type": "application/json",
+                "Origin": base,
+                "X-CSRF-Token": token,
+            })
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _urlopen(req, timeout=5)
+        assert exc.value.code == 413
+        problem = json.loads(exc.value.read())
+        assert problem["error"] == "body_too_large"
+        assert not s.intents_active_dir.exists()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert _tree_hashes(s.root) == before
+
+
+def test_action_post_intent_cap_without_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Store, "INTENT_MAX_ACTIVE", 0)
+    s = _make_store(tmp_path)
+    before = _tree_hashes(s.root)
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post_intent(base, token, {
+                "kind": "send",
+                "payload": {"target": "beta", "body": "hello"},
+            })
+        assert exc.value.code == 429
+        problem = json.loads(exc.value.read())
+        assert problem["error"] == "intent_cap"
+        assert not s.intents_active_dir.exists()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert _tree_hashes(s.root) == before
+
+
+def test_action_post_ignores_top_level_from_and_drain_uses_web_actor(
+    tmp_path: Path,
+) -> None:
+    s = _make_store(tmp_path)
+    s.set_role("alpha", "lead")
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        with _post_intent(base, token, {
+            "from": "beta",
+            "kind": "send",
+            "payload": {"target": "beta", "body": "hello"},
+        }) as resp:
+            assert resp.status == 202
+            accepted = json.loads(resp.read())
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    summary = intents.drain_intents(s, pid=123, max_per_tick=1)
+
+    assert summary["applied"] == 1
+    assert s.read_intent(accepted["intent_id"])["state"] == Store.INTENT_APPLIED
+    messages = s.messages_for("beta")
+    assert len(messages) == 1
+    assert messages[0].sender == "alpha"
 
 
 def test_reserved_action_payload_returns_400_without_file(tmp_path: Path) -> None:
@@ -1238,7 +1385,11 @@ def test_action_post_absolute_form_rejects_wrong_port_without_file(tmp_path: Pat
 
 def test_api_intents_and_preflight_are_read_only_body_free(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
-    s.write_intent("send", {"target": "beta", "body": "SECRET", "subject": "S"})
+    rec = s.write_intent("send", {"target": "beta", "body": "SECRET", "subject": "S"})
+    s.mark_intent_terminal(
+        rec["intent_id"], state=Store.INTENT_DENIED,
+        code="plan_revalidation_failed",
+        error="broadcast/reply semantics drifted; requeue")
     before = _tree_hashes(s.root)
     srv, _t, base = _serve(s, enable_actions=True)
     try:
@@ -1246,6 +1397,7 @@ def test_api_intents_and_preflight_are_read_only_body_free(tmp_path: Path) -> No
             payload = json.loads(resp.read())
         assert payload["target_root_index"] == 0
         assert payload["items"][0]["kind"] == "send"
+        assert payload["items"][0]["code"] == "plan_revalidation_failed"
         assert "SECRET" not in json.dumps(payload)
         with _get(f"{base}/api/preflight") as resp:
             preflight = json.loads(resp.read())

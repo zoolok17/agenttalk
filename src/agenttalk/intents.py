@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import time
 from typing import Callable
@@ -50,6 +51,7 @@ _SEND_MESSAGE_KINDS = frozenset({"message", "note", "question"})
 _REPLY_KINDS = frozenset({"message", "proposal-response"})
 _PROPOSAL_STATUSES = frozenset({"accepted", "rejected", "countered"})
 _AUDIENCE_KINDS = frozenset({"all", "group", "role"})
+_SAFE_BUS_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z")
 
 # Reserved/control keys REJECTED anywhere in a payload (exact names).
 RESERVED_KEYS = frozenset({
@@ -73,6 +75,11 @@ class IntentDenied(Exception):
         super().__init__(detail)
         self.code = code
         self.detail = detail
+
+
+def _plan_revalidation_failed(detail_code: str, detail: str) -> IntentDenied:
+    return IntentDenied("plan_revalidation_failed",
+                        f"{detail_code}: {detail}")
 
 
 # ------------------------------------------------------------------ schema
@@ -260,11 +267,26 @@ def resolve_reply_anchor(store: Store, actor: str, request_id: str):
     return matches[-1] if matches else None
 
 
-def build_plan(store: Store, actor: str, record: dict) -> dict:
-    """Freeze the delivery plan (recipients + bus kinds + minted thread ids)
-    for an intent. Raises :class:`IntentDenied` on any resolution failure.
-    Called ONCE per intent - the frozen plan makes retries deterministic (same
-    minted request_id/broadcast_id, same audience, same fingerprints)."""
+def _safe_prefixed_id(value: object, prefix: str) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith(prefix)
+        and _SAFE_BUS_ID_RE.fullmatch(value) is not None
+    )
+
+
+def _epoch_shape(value: object) -> bool:
+    return value is None or (
+        isinstance(value, str) and _SAFE_BUS_ID_RE.fullmatch(value) is not None
+    )
+
+
+def _resolve_plan_semantics(store: Store, actor: str, record: dict) -> dict:
+    """Side-effect-free authority + delivery semantic resolver.
+
+    ``build_plan`` mints stable ids from this shape; ``validate_frozen_plan``
+    checks an untrusted frozen plan against the same shape before any send.
+    """
     kind = record.get("kind")
     payload = record.get("payload") or {}
     roster, roles, groups = _roster(store)
@@ -276,33 +298,18 @@ def build_plan(store: Store, actor: str, record: dict) -> dict:
             raise IntentDenied("target_not_in_roster",
                                f"recipient {target!r} is not in the roster")
 
-    deliveries: list[dict] = []
-
-    def _opener_meta(meta: dict, bus_kind: str) -> dict:
-        if bus_kind in {"question", "proposal"} and "epoch_at_send" not in meta:
-            meta = dict(meta)
-            meta["epoch_at_send"] = store.current_epoch()
-        return meta
-
     if kind == "send":
         target = payload.get("target") or ""
         _check_target(target)
         bus_kind = payload.get("message_kind") or "message"
-        stable_meta: dict = {}
-        if bus_kind == "question":
-            stable_meta["request_id"] = "q-" + secrets.token_hex(6)
-        stable_meta = _opener_meta(stable_meta, bus_kind)
-        deliveries.append({"recipient": target, "bus_kind": bus_kind,
-                           "subject": subject, "body": body,
-                           "stable_meta": stable_meta})
+        meta_shape = "send_question" if bus_kind == "question" else "empty"
+        recipients = [target]
     elif kind == "propose":
         target = payload.get("target") or ""
         _check_target(target)
-        stable_meta = _opener_meta({"request_id": "pp-" + secrets.token_hex(6)},
-                                   "proposal")
-        deliveries.append({"recipient": target, "bus_kind": "proposal",
-                           "subject": subject, "body": body,
-                           "stable_meta": stable_meta})
+        bus_kind = "proposal"
+        meta_shape = "propose"
+        recipients = [target]
     elif kind == "reply":
         rid = payload.get("to_request") or ""
         anchor = resolve_reply_anchor(store, actor, rid)
@@ -312,12 +319,9 @@ def build_plan(store: Store, actor: str, record: dict) -> dict:
                 f"no validated message addressed to {actor!r} carries "
                 f"request_id {rid!r}")
         bus_kind = payload.get("reply_kind") or "message"
-        stable_meta = {"request_id": rid}
-        if bus_kind == "proposal-response":
-            stable_meta["status"] = payload.get("status") or ""
-        deliveries.append({"recipient": anchor.sender, "bus_kind": bus_kind,
-                           "subject": subject, "body": body,
-                           "stable_meta": stable_meta})
+        meta_shape = ("reply_proposal_response"
+                      if bus_kind == "proposal-response" else "reply_message")
+        recipients = [anchor.sender]
     elif kind == "broadcast":
         aud = payload.get("audience") or {}
         akind = aud.get("kind")
@@ -336,19 +340,218 @@ def build_plan(store: Store, actor: str, record: dict) -> dict:
                                f"audience {akind!r}={aval!r} resolves to no "
                                f"recipients (excluding the actor)")
         bus_kind = payload.get("message_kind") or "message"
-        bid = "b-" + secrets.token_hex(6)
-        shared = {"broadcast_id": bid, "request_id": bid,
-                  "audience_kind": str(akind),
-                  "audience_resolved": ",".join(recipients),
-                  "batch_total": str(len(recipients))}
-        shared = _opener_meta(shared, bus_kind)
-        for r in recipients:
-            deliveries.append({"recipient": r, "bus_kind": bus_kind,
-                               "subject": subject, "body": body,
-                               "stable_meta": dict(shared)})
+        meta_shape = "broadcast_question" if bus_kind == "question" else "broadcast"
     else:
         raise IntentDenied("invalid_payload", f"unknown intent kind {kind!r}")
+
+    return {
+        "kind": kind,
+        "payload": payload,
+        "recipients": recipients,
+        "bus_kind": bus_kind,
+        "subject": subject,
+        "body": body,
+        "meta_shape": meta_shape,
+    }
+
+
+def _opener_meta(store: Store, meta: dict, bus_kind: str) -> dict:
+    if bus_kind in {"question", "proposal"} and "epoch_at_send" not in meta:
+        meta = dict(meta)
+        meta["epoch_at_send"] = store.current_epoch()
+    return meta
+
+
+def _mint_stable_meta(store: Store, semantic: dict) -> dict:
+    shape = semantic["meta_shape"]
+    bus_kind = semantic["bus_kind"]
+    payload = semantic["payload"]
+    if shape == "empty":
+        return {}
+    if shape == "send_question":
+        return _opener_meta(
+            store, {"request_id": "q-" + secrets.token_hex(6)}, bus_kind)
+    if shape == "propose":
+        return _opener_meta(
+            store, {"request_id": "pp-" + secrets.token_hex(6)}, bus_kind)
+    if shape == "reply_message":
+        return {"request_id": payload.get("to_request") or ""}
+    if shape == "reply_proposal_response":
+        return {
+            "request_id": payload.get("to_request") or "",
+            "status": payload.get("status") or "",
+        }
+    if shape in {"broadcast", "broadcast_question"}:
+        bid = "b-" + secrets.token_hex(6)
+        shared = {
+            "broadcast_id": bid,
+            "request_id": bid,
+            "audience_kind": str((payload.get("audience") or {}).get("kind")),
+            "audience_resolved": ",".join(semantic["recipients"]),
+            "batch_total": str(len(semantic["recipients"])),
+        }
+        return _opener_meta(store, shared, bus_kind)
+    raise IntentDenied("invalid_payload", f"unknown stable meta shape {shape!r}")
+
+
+def _semantic_deliveries(semantic: dict, stable_meta: dict) -> list[dict]:
+    return [
+        {
+            "recipient": recipient,
+            "bus_kind": semantic["bus_kind"],
+            "subject": semantic["subject"],
+            "body": semantic["body"],
+            "stable_meta": dict(stable_meta),
+        }
+        for recipient in semantic["recipients"]
+    ]
+
+
+def build_plan(store: Store, actor: str, record: dict) -> dict:
+    """Freeze the delivery plan (recipients + bus kinds + minted thread ids)
+    for an intent. Raises :class:`IntentDenied` on any resolution failure.
+    Called ONCE per intent - the frozen plan makes retries deterministic (same
+    minted request_id/broadcast_id, same audience, same fingerprints)."""
+    semantic = _resolve_plan_semantics(store, actor, record)
+    stable_meta = _mint_stable_meta(store, semantic)
+    deliveries = _semantic_deliveries(semantic, stable_meta)
     return {"actor": actor, "deliveries": deliveries, "planned_at_epoch": time.time()}
+
+
+def _stable_meta_error(semantic: dict, meta: object) -> str | None:
+    if not isinstance(meta, dict):
+        return "stable_meta must be an object"
+    shape = semantic["meta_shape"]
+    payload = semantic["payload"]
+    recipients = semantic["recipients"]
+    if shape == "empty":
+        allowed: set[str] = set()
+    elif shape in {"send_question", "propose"}:
+        allowed = {"request_id", "epoch_at_send"}
+    elif shape == "reply_message":
+        allowed = {"request_id"}
+    elif shape == "reply_proposal_response":
+        allowed = {"request_id", "status"}
+    elif shape == "broadcast":
+        allowed = {
+            "broadcast_id", "request_id", "audience_kind",
+            "audience_resolved", "batch_total",
+        }
+    else:  # broadcast_question
+        allowed = {
+            "broadcast_id", "request_id", "audience_kind",
+            "audience_resolved", "batch_total", "epoch_at_send",
+        }
+    keys = set(meta)
+    if keys != allowed:
+        extra = sorted(keys - allowed)
+        missing = sorted(allowed - keys)
+        parts = []
+        if extra:
+            parts.append(f"unexpected stable_meta keys {extra}")
+        if missing:
+            parts.append(f"missing stable_meta keys {missing}")
+        return "; ".join(parts)
+    if shape == "empty":
+        return None
+    if shape == "send_question":
+        if not _safe_prefixed_id(meta.get("request_id"), "q-"):
+            return "send question request_id must be a safe q-* id"
+        if not _epoch_shape(meta.get("epoch_at_send")):
+            return "send question epoch_at_send has invalid shape"
+        return None
+    if shape == "propose":
+        if not _safe_prefixed_id(meta.get("request_id"), "pp-"):
+            return "proposal request_id must be a safe pp-* id"
+        if not _epoch_shape(meta.get("epoch_at_send")):
+            return "proposal epoch_at_send has invalid shape"
+        return None
+    if shape == "reply_message":
+        if meta.get("request_id") != payload.get("to_request"):
+            return "reply request_id does not match payload.to_request"
+        return None
+    if shape == "reply_proposal_response":
+        if meta.get("request_id") != payload.get("to_request"):
+            return "proposal-response request_id does not match payload.to_request"
+        if meta.get("status") != payload.get("status"):
+            return "proposal-response status does not match payload.status"
+        return None
+    if not _safe_prefixed_id(meta.get("broadcast_id"), "b-"):
+        return "broadcast_id must be a safe b-* id"
+    if meta.get("request_id") != meta.get("broadcast_id"):
+        return "broadcast request_id must equal broadcast_id"
+    if meta.get("audience_kind") != str((payload.get("audience") or {}).get("kind")):
+        return "broadcast audience_kind does not match payload"
+    if meta.get("audience_resolved") != ",".join(recipients):
+        return "broadcast audience_resolved does not match current audience"
+    if meta.get("batch_total") != str(len(recipients)):
+        return "broadcast batch_total does not match delivery count"
+    if shape == "broadcast_question" and not _epoch_shape(meta.get("epoch_at_send")):
+        return "broadcast question epoch_at_send has invalid shape"
+    return None
+
+
+def validate_frozen_plan(store: Store, actor: str, record: dict, plan: object) -> None:
+    """Validate an untrusted frozen plan against current store semantics.
+
+    The plan is never authority: this re-resolves the allowed recipients,
+    content, bus kind, and stable-meta shape before reconciliation or send.
+    """
+    if not isinstance(plan, dict):
+        raise _plan_revalidation_failed("plan_shape", "plan must be an object")
+    if plan.get("actor") != actor:
+        raise _plan_revalidation_failed("actor_changed", "plan actor changed")
+    try:
+        semantic = _resolve_plan_semantics(store, actor, record)
+    except IntentDenied as e:
+        raise _plan_revalidation_failed(e.code, e.detail) from e
+    deliveries = plan.get("deliveries")
+    if not isinstance(deliveries, list):
+        raise _plan_revalidation_failed("plan_shape",
+                                        "plan.deliveries must be a list")
+    expected_recipients = semantic["recipients"]
+    if len(deliveries) != len(expected_recipients):
+        raise _plan_revalidation_failed(
+            "recipient_drift",
+            "delivery count does not match current semantics")
+    actual_recipients: list[str] = []
+    for i, delivery in enumerate(deliveries):
+        if not isinstance(delivery, dict):
+            raise _plan_revalidation_failed(
+                "plan_shape", f"delivery {i} must be an object")
+        recipient = delivery.get("recipient")
+        if not isinstance(recipient, str):
+            raise _plan_revalidation_failed(
+                "recipient_drift", f"delivery {i} recipient must be a string")
+        actual_recipients.append(recipient)
+    if len(set(actual_recipients)) != len(actual_recipients):
+        raise _plan_revalidation_failed(
+            "recipient_drift", "duplicate recipient in delivery fan-out")
+    if actual_recipients != expected_recipients:
+        raise _plan_revalidation_failed(
+            "recipient_drift",
+            "delivery recipients do not match current semantics")
+    for i, delivery in enumerate(deliveries):
+        if delivery.get("bus_kind") != semantic["bus_kind"]:
+            raise _plan_revalidation_failed(
+                "bus_kind_drift",
+                f"delivery {i} bus_kind does not match current semantics")
+        subject = delivery.get("subject")
+        body = delivery.get("body")
+        if not isinstance(subject, str) or len(subject) > _MAX_SUBJECT_CHARS:
+            raise _plan_revalidation_failed(
+                "body_subject_drift", f"delivery {i} subject has invalid shape")
+        if not isinstance(body, str) or len(body) > _MAX_BODY_CHARS:
+            raise _plan_revalidation_failed(
+                "body_subject_drift", f"delivery {i} body has invalid shape")
+        if subject != semantic["subject"] or body != semantic["body"]:
+            raise _plan_revalidation_failed(
+                "body_subject_drift",
+                f"delivery {i} content does not match payload")
+        meta_error = _stable_meta_error(semantic, delivery.get("stable_meta"))
+        if meta_error is not None:
+            raise _plan_revalidation_failed(
+                "stable_meta_shape", f"delivery {i}: {meta_error}")
 
 
 # ------------------------------------------------------------------ drain
@@ -419,6 +622,12 @@ def _drain_one(store: Store, rec: dict) -> str:
             error=f"resolved actor {actor!r} differs from the frozen plan's "
                   f"{plan.get('actor')!r}; requeue a fresh intent")
         return Store.INTENT_FAILED
+    try:
+        validate_frozen_plan(store, actor, rec, plan)
+    except IntentDenied as e:
+        store.mark_intent_terminal(iid, state=Store.INTENT_DENIED,
+                                   code=e.code, error=e.detail[:500])
+        return Store.INTENT_DENIED
     deliveries = plan.get("deliveries") or []
     states = list(rec.get("deliveries") or [])
     while len(states) < len(deliveries):
@@ -492,7 +701,9 @@ def drain_intents(store: Store, *, pid: int, pid_start: object = None,
     pass. Returns a summary dict."""
     now = now_epoch if now_epoch is not None else time.time()
     summary = {"examined": 0, "claimed": 0, "applied": 0, "denied": 0,
-               "failed": 0, "skipped": 0}
+               "failed": 0, "skipped": 0, "quarantined_invalid": 0}
+    quarantine = store.quarantine_invalid_intents(now_epoch=now)
+    summary["quarantined_invalid"] = int(quarantine.get("quarantined") or 0)
     candidates = [r for r in store.list_intents(limit=100000)
                   if r.get("state") not in Store.INTENT_TERMINAL_STATES]
     candidates.sort(key=lambda r: str(r.get("created_at") or ""))

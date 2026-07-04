@@ -42,6 +42,16 @@ Three architectures were scored (security / non-dev UX / impl-simplicity / fit /
 
 ## 3. Phased roadmap
 
+v0.59.1 hardening note: active intent JSON is a co-resident-writable trust
+boundary, so the executor revalidates every frozen plan at drain time before
+reconciliation or send. The plan must still match current payload/store
+semantics exactly: `reply` re-resolves its request anchor now, and `broadcast`
+re-resolves the audience now, including recipient order. If a reply anchor
+disappears or a roster/group/role broadcast audience drifts, the intent is
+denied with `code=plan_revalidation_failed` (visible on `GET /api/intents`) and
+the operator requeues a fresh intent; v0.59.1 does not add a sealed-plan
+mechanism.
+
 > Phase order below is the workflow's synthesis (power-user-first). **The critique flags this ordering as a defect against the non-dev goal** — see §4. Final phasing is a pending operator decision.
 
 - **v0.59.0 — Intent-queue write spine + first bus-write verbs.** `store.write_intent` + `list_intents`/`read_intent`; `--enable-actions` flag; per-run secret; `POST /api/intent` (the full defense trio); `GET /api/session`; `GET /api/intents` (honest queued/claimed/applied/denied state); the **executor drain** (see §4 #1 — this is real new work); Tier-1 kinds **send/reply/propose/broadcast** only (fail-closed on unknown); flip the already-rendered composer live. Read-transcript already works.
