@@ -48,10 +48,11 @@ Routes
 - ``GET  /api/messages/<id>``   — single message JSON
 - ``GET  /favicon.ico``         — 204 (no icon shipped; suppress browser noise)
 - ``GET  /dashboard``           — the Team Console HTML shell (all roots; 0.58.0)
-- ``GET  /static/<name>``       — allowlisted console assets (console.css/js; 0.58.0)
+- ``GET  /static/<name>``       — allowlisted console assets (css/js/png; 0.58.0/0.61.0)
 - ``GET  /api/state``           — multi-root obligation aggregate, schema v1 (0.17.0)
 - ``GET  /api/attention``       — ranked "needs a human" queue for root[0] (0.58.0)
 - ``GET  /api/thread/<rid>``    — one thread's full transcript, CARRIES bodies (0.58.0)
+- ``GET  /api/threads``         — paged closed-thread stubs, envelope-only (0.61.0)
 
 Multi-root (0.17.0)
 ===================
@@ -148,7 +149,7 @@ _DEFAULT_CSP = ("default-src 'none'; style-src 'unsafe-inline'; "
 # favor of 'self' — the console carries zero inline <style> and zero style= attrs.
 _DASHBOARD_CSP = ("default-src 'none'; script-src 'self'; "
                   "connect-src 'self'; style-src 'self'; "
-                  "img-src 'none'; frame-ancestors 'none'")
+                  "img-src 'self'; frame-ancestors 'none'")
 _ACTION_BODY_LIMIT = 64 * 1024
 _ACTION_RATE_PER_MINUTE = 60
 _ACTION_RATE_BURST = 20
@@ -166,6 +167,21 @@ _EDGE_LIMIT = 50
 # /api/state per-root recent-activity feed cap (0.58.0). Envelope-only rows
 # (never body) for the live "what's happening" feed on the dashboard.
 _RECENT_LIMIT = 25
+_THREADS_DEFAULT_LIMIT = 50
+_THREADS_MAX_LIMIT = 100
+
+_AVATAR_ASSETS = (
+    "avatars/claude-arch.png",
+    "avatars/claude-dev.png",
+    "avatars/claude-docs.png",
+    "avatars/claude-lead.png",
+    "avatars/claude-rev.png",
+    "avatars/codex-dev.png",
+    "avatars/codex-infra.png",
+    "avatars/codex-rev.png",
+    "avatars/codex-scout.png",
+    "avatars/codex-test.png",
+)
 
 # Health-timeline ring (0.58.0, §5): a per-(root,agent) window of recent
 # health-state samples, kept IN-MEMORY on the server instance only (never a
@@ -188,6 +204,14 @@ class RootDescriptor:
     """One store the server watches, plus its display label."""
     store: Store
     label: str
+
+
+@dataclass
+class _RootThreadRows:
+    """Shared thread derivation for active /api/state rows and closed history."""
+    active: list[dict]
+    broadcasts: list[dict]
+    terminal: list[dict]
 
 
 def _dedup_labels(paths: list[Path]) -> list[str]:
@@ -598,6 +622,7 @@ def _load_static_assets() -> dict[str, tuple[str, bytes]]:
     for name, ctype in (
         ("console.css", "text/css; charset=utf-8"),
         ("console.js", "application/javascript; charset=utf-8"),
+        *((name, "image/png") for name in _AVATAR_ASSETS),
     ):
         try:
             assets[name] = (ctype, (_WEB_STATIC_DIR / name).read_bytes())
@@ -834,11 +859,53 @@ def _thread_verdict(m: Message) -> str | None:
     return None
 
 
-def _derive_root_threads(
+def _choose_terminal_thread(
+    pairs: list[tuple[str, Thread]], opener: Message | None,
+) -> tuple[str, Thread]:
+    """Pick one deterministic terminal perspective for an envelope-only stub."""
+    if opener is not None:
+        for a, t in pairs:
+            if a == opener.sender:
+                return a, t
+    return pairs[0]
+
+
+def _terminal_thread_row(t: Thread, opener: Message | None,
+                         last: Message | None) -> dict:
+    peer = None
+    opener_name = t.opener_sender
+    if opener is not None:
+        opener_name = opener.sender
+        if isinstance(opener.recipient, str) and opener.recipient and opener.recipient != opener.sender:
+            peer = opener.recipient
+    elif t.opener_recipient and t.opener_recipient != t.opener_sender:
+        peer = t.opener_recipient
+    out: dict[str, Any] = {
+        "request_id": t.request_id,
+        "subject": t.subject,
+        "opener_kind": t.opener_kind,
+        "opener": opener_name,
+        "state": t.state,
+        "age_seconds": (round(t.age_seconds, 3)
+                        if t.age_seconds is not None else None),
+        "last_msg_id": t.last_msg_id,
+    }
+    if peer:
+        out["opener_peer"] = peer
+    if last is not None and last.ts:
+        out["last_ts"] = last.ts
+    if t.needs_operator:
+        out["needs_operator"] = True
+    if t.operator_state:
+        out["operator_state"] = t.operator_state
+    return out
+
+
+def _derive_root_thread_sets(
     store: Store, msgs: list[Message], roster: list[str],
     current: str | None,
-) -> tuple[list[dict], list[dict], int]:
-    """(open thread rows, broadcast summaries, closed-thread count).
+) -> _RootThreadRows:
+    """Active thread rows, broadcast summaries, and terminal stubs.
 
     Derives per roster agent with the existing pure derivation, then
     collapses to ONE row per request_id using the ball-holder rule
@@ -857,6 +924,7 @@ def _derive_root_threads(
     """
     msgs_sorted = sorted(msgs, key=lambda m: m.id)
     openers: dict[str, Message] = {}
+    last_msgs: dict[str, Message] = {}
     verdicts: dict[str, str] = {}  # rid -> latest decision (0.58.0, §3b)
     for m in msgs_sorted:
         rid = (m.meta or {}).get("request_id")
@@ -864,6 +932,7 @@ def _derive_root_threads(
             continue
         if rid not in openers:
             openers[rid] = m
+        last_msgs[rid] = m
         v = _thread_verdict(m)
         if v is not None:
             verdicts[rid] = v  # msgs_sorted is ascending → last write is newest
@@ -879,13 +948,15 @@ def _derive_root_threads(
             views.setdefault(t.request_id, []).append((a, t))
 
     rows: list[dict] = []
+    terminal_rows: list[dict] = []
     broadcasts: list[dict] = []
-    closed = 0
     for rid, pairs in views.items():
         open_pairs = [(a, t) for a, t in pairs
                       if t.state not in _TERMINAL_STATES]
         if not open_pairs:
-            closed += 1
+            _, terminal = _choose_terminal_thread(pairs, openers.get(rid))
+            terminal_rows.append(_terminal_thread_row(
+                terminal, openers.get(rid), last_msgs.get(rid)))
             continue
         chosen: tuple[str, Thread] | None = None
         for a, t in open_pairs:  # rule 1: the ball-holder's own view
@@ -952,7 +1023,17 @@ def _derive_root_threads(
             })
     rows.sort(key=lambda r: r.get("last_msg_id") or "", reverse=True)
     broadcasts.sort(key=lambda b: b.get("request_id") or "")
-    return rows, broadcasts, closed
+    terminal_rows.sort(key=lambda r: r.get("last_msg_id") or "", reverse=True)
+    return _RootThreadRows(active=rows, broadcasts=broadcasts,
+                           terminal=terminal_rows)
+
+
+def _derive_root_threads(
+    store: Store, msgs: list[Message], roster: list[str],
+    current: str | None,
+) -> tuple[list[dict], list[dict], int]:
+    rows = _derive_root_thread_sets(store, msgs, roster, current)
+    return rows.active, rows.broadcasts, len(rows.terminal)
 
 
 # ------------------------------------------------- 0.58.0 per-agent enrichers
@@ -1453,6 +1534,42 @@ def build_state(roots: list[RootDescriptor],
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "roots": [_root_state(d, history) for d in roots],
     }
+
+
+def build_threads_index(desc: RootDescriptor, *, state: str = "closed",
+                        limit: int = _THREADS_DEFAULT_LIMIT,
+                        cursor: str | None = None) -> dict:
+    limit = max(1, min(_THREADS_MAX_LIMIT, limit))
+    payload: dict[str, Any] = {
+        "root": desc.label,
+        "state": state,
+        "limit": limit,
+        "total_count": 0,
+        "next_cursor": None,
+        "items": [],
+    }
+    if state != "closed":
+        payload["error"] = "unsupported_state"
+        return payload
+    try:
+        store = desc.store
+        cfg = store.load_config()
+        roster = cfg.get("agents", []) or []
+        msgs, _invalid_count = _validated_for_state(store, cfg)
+        rows = _derive_root_thread_sets(store, msgs, roster,
+                                        _epoch_from(msgs)).terminal
+        payload["total_count"] = len(rows)
+        if cursor:
+            rows = [r for r in rows if (r.get("last_msg_id") or "") < cursor]
+        page = rows[:limit]
+        payload["items"] = page
+        if len(rows) > limit and page:
+            payload["next_cursor"] = page[-1].get("last_msg_id")
+        return payload
+    except Exception as e:  # noqa: BLE001
+        payload["error"] = "threads_unavailable"
+        payload["detail"] = _envelope_str(e)
+        return payload
 
 
 # --------------------------------------------------- /api/attention (§4a)
@@ -2142,6 +2259,59 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                         return d.store
             return roots[0].store
 
+        def _request_params(self) -> dict[str, list[str]]:
+            parsed = urllib.parse.urlsplit(self.path)
+            return urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+
+        def _root_descriptor_for_threads(
+            self, params: dict[str, list[str]],
+        ) -> RootDescriptor | None:
+            wanted = (params.get("root") or [None])[0]
+            if not wanted:
+                return roots[0]
+            for d in roots:
+                if d.label == wanted:
+                    return d
+            return None
+
+        def _threads_bad_request(self, code: str, detail: str) -> None:
+            self._send_json(HTTPStatus.BAD_REQUEST, {
+                "error": code,
+                "detail": detail,
+                "state": "closed",
+                "limit": _THREADS_DEFAULT_LIMIT,
+                "total_count": 0,
+                "next_cursor": None,
+                "items": [],
+            })
+
+        def _handle_threads_get(self) -> None:
+            params = self._request_params()
+            state = (params.get("state") or ["closed"])[0] or "closed"
+            if state != "closed":
+                self._threads_bad_request("bad_state", "state must be closed")
+                return
+            root = self._root_descriptor_for_threads(params)
+            if root is None:
+                self._threads_bad_request("bad_root", "unknown root")
+                return
+            raw_limit = (params.get("limit") or [str(_THREADS_DEFAULT_LIMIT)])[0]
+            try:
+                limit = int(raw_limit)
+            except ValueError:
+                self._threads_bad_request("bad_limit", "limit must be an integer")
+                return
+            if limit <= 0:
+                self._threads_bad_request("bad_limit", "limit must be positive")
+                return
+            limit = min(_THREADS_MAX_LIMIT, limit)
+            cursor = (params.get("cursor") or [None])[0]
+            if cursor and not _MESSAGE_ID_RE.match(cursor):
+                self._threads_bad_request("bad_cursor", "invalid cursor")
+                return
+            self._send_json(HTTPStatus.OK, build_threads_index(
+                root, state=state, limit=limit, cursor=cursor))
+
         # ---- routing
         def _route(self) -> None:
             path = self._request_path()
@@ -2179,6 +2349,9 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 self._send_json(HTTPStatus.OK,
                                 build_attention(roots[0],
                                                 actions_enabled=enable_actions))
+                return
+            if path == "/api/threads":
+                self._handle_threads_get()
                 return
             if path == "/dashboard":
                 self._send_html(HTTPStatus.OK, render_dashboard(roots),

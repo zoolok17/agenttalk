@@ -528,7 +528,7 @@ _LEGACY_CSP = ("default-src 'none'; style-src 'unsafe-inline'; "
                "img-src 'none'; frame-ancestors 'none'")
 _DASH_CSP = ("default-src 'none'; script-src 'self'; "
              "connect-src 'self'; style-src 'self'; "
-             "img-src 'none'; frame-ancestors 'none'")
+             "img-src 'self'; frame-ancestors 'none'")
 
 
 def _make_two_stores(tmp_path: Path) -> tuple[Store, Store]:
@@ -982,6 +982,9 @@ def test_dashboard_shell_links_console_assets(tmp_path: Path) -> None:
             assert resp.headers["Content-Type"].startswith("application/javascript")
         with _get(f"{base}/static/console.css") as resp:
             assert resp.headers["Content-Type"].startswith("text/css")
+        with _get(f"{base}/static/avatars/claude-dev.png") as resp:
+            assert resp.headers["Content-Type"].startswith("image/png")
+            assert resp.read(8) == b"\x89PNG\r\n\x1a\n"
         # the server gives a cross-root client nothing to link to: root[1]'s
         # message ids are NOT resolvable via root[0]'s routes (FR-003).
         mid_b = b._scan_messages()[0][0].id
@@ -1003,7 +1006,15 @@ def test_static_unknown_name_404_and_no_traversal(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
     srv, _t, base = _serve(s)
     try:
-        for bad in ("nope.js", "..%2F..%2Fweb.py", "console.css.bak", ""):
+        for bad in (
+            "nope.js",
+            "..%2F..%2Fweb.py",
+            "console.css.bak",
+            "avatars/nope.png",
+            "avatars/..%2Fconsole.js",
+            "..%2Favatars%2Fclaude-dev.png",
+            "",
+        ):
             with pytest.raises(urllib.error.HTTPError) as exc:
                 _urlopen(f"{base}/static/{bad}", timeout=5)
             assert exc.value.code == 404, bad
@@ -1036,7 +1047,8 @@ def test_csp_split_per_route(tmp_path: Path) -> None:
             with _get(f"{base}{path}") as resp:
                 assert resp.headers["Content-Security-Policy"] == _DASH_CSP
         # the served assets are not documents; they carry the default policy too
-        for path in ("/static/console.js", "/static/console.css"):
+        for path in ("/static/console.js", "/static/console.css",
+                     "/static/avatars/claude-dev.png"):
             with _get(f"{base}{path}") as resp:
                 assert resp.headers["Content-Security-Policy"] == _LEGACY_CSP, path
     finally:
@@ -1050,9 +1062,9 @@ def test_new_routes_reject_write_methods(tmp_path: Path) -> None:
            meta={"request_id": "rid-w"})
     srv, _t, base = _serve(s)
     try:
-        for path in ("/api/state", "/dashboard", "/api/attention",
+        for path in ("/api/state", "/api/threads", "/dashboard", "/api/attention",
                      "/api/thread/rid-w", "/static/console.js",
-                     "/static/console.css"):
+                     "/static/console.css", "/static/avatars/claude-dev.png"):
             req = urllib.request.Request(  # noqa: S310  # nosemgrep
                 f"{base}{path}", method="POST", data=b"x")
             with pytest.raises(urllib.error.HTTPError) as exc:
@@ -2382,6 +2394,217 @@ def test_api_attention_degrades_on_corrupt_root(tmp_path: Path) -> None:
         # source_error items — never a partial/garbage item, never a 500.
         assert payload["items"] == [] or all(
             it["id"].startswith("source_error:") for it in payload["items"])
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+# -------------------------------------------------------- /api/threads closed
+
+def test_api_threads_closed_terminal_only_paginated_envelope(
+    tmp_path: Path,
+) -> None:
+    """v0.61.0: closed history is on-demand, terminal-only, newest-first,
+    cursor-paginated, and envelope-only. Active rows remain in /api/state, not
+    /api/threads?state=closed."""
+    s = _make_store(tmp_path)
+    closed_q = _hand_write_message(s, {
+        "id": "20990101-000000-000001-CLSO",
+        "ts": "2099-01-01T00:00:01Z",
+        "from": "alpha",
+        "to": "beta",
+        "kind": "question",
+        "subject": "closed question",
+        "body": "CLOSED_OPENER_BODY_TOKEN",
+        "meta": {"request_id": "rid-closed"},
+    })
+    _hand_write_message(s, {
+        "id": "20990101-000000-000002-CLSA",
+        "ts": "2099-01-01T00:00:02Z",
+        "from": "beta",
+        "to": "alpha",
+        "kind": "message",
+        "subject": "closed answer",
+        "body": "CLOSED_ANSWER_BODY_TOKEN",
+        "meta": {"request_id": "rid-closed"},
+    })
+    _hand_write_message(s, {
+        "id": "20990101-000000-000003-SUPO",
+        "ts": "2099-01-01T00:00:03Z",
+        "from": "alpha",
+        "to": "beta",
+        "kind": "question",
+        "subject": "superseded question",
+        "body": "SUPERSEDED_OPENER_BODY_TOKEN",
+        "meta": {"request_id": "rid-sup"},
+    })
+    superseded_last = _hand_write_message(s, {
+        "id": "20990101-000000-000004-SUPR",
+        "ts": "2099-01-01T00:00:04Z",
+        "from": "alpha",
+        "to": "beta",
+        "kind": "rescind",
+        "subject": "rescinded",
+        "body": "SUPERSEDED_RESCIND_BODY_TOKEN",
+        "meta": {
+            "request_id": "rid-sup",
+            "target_msg_id": "20990101-000000-000003-SUPO",
+        },
+    })
+    # Mark the terminal examples consumed; append a newer active opener after
+    # the cursor floor so it remains active and must not enter the history page.
+    s.set_cursor("alpha", superseded_last)
+    s.set_cursor("beta", superseded_last)
+    _hand_write_message(s, {
+        "id": "20990101-000000-000005-ACTV",
+        "ts": "2099-01-01T00:00:05Z",
+        "from": "alpha",
+        "to": "beta",
+        "kind": "question",
+        "subject": "still active",
+        "body": "ACTIVE_BODY_TOKEN",
+        "meta": {"request_id": "rid-active"},
+    })
+
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/api/threads?state=closed&limit=1") as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Security-Policy"] == _LEGACY_CSP
+            first = json.loads(resp.read())
+        assert first["root"] == s.root.name
+        assert first["state"] == "closed"
+        assert first["limit"] == 1
+        assert first["total_count"] == 2
+        assert first["next_cursor"] == "20990101-000000-000004-SUPR"
+        assert [item["request_id"] for item in first["items"]] == ["rid-sup"]
+        sup = first["items"][0]
+        assert sup["state"] == "closed-superseded"
+        assert sup["opener"] == "alpha"
+        assert sup["opener_peer"] == "beta"
+        assert sup["last_msg_id"] == "20990101-000000-000004-SUPR"
+        assert sup["last_ts"] == "2099-01-01T00:00:04Z"
+
+        dumped_first = json.dumps(first)
+        assert "body" not in dumped_first
+        assert "rescind" not in dumped_first
+        assert "SUPERSEDED_RESCIND_BODY_TOKEN" not in dumped_first
+        assert "ACTIVE_BODY_TOKEN" not in dumped_first
+
+        with _get(
+            f"{base}/api/threads?state=closed&limit=1"
+            f"&cursor={first['next_cursor']}"
+        ) as resp:
+            second = json.loads(resp.read())
+        assert second["next_cursor"] is None
+        assert [item["request_id"] for item in second["items"]] == ["rid-closed"]
+        assert second["items"][0]["state"] == "closed"
+        assert second["items"][0]["last_msg_id"] == "20990101-000000-000002-CLSA"
+        assert closed_q not in {item["last_msg_id"] for item in second["items"]}
+
+        (root,) = _state(base)["roots"]
+        assert root["counts"]["closed_threads"] == 2
+        assert [row["request_id"] for row in root["threads"]] == ["rid-active"]
+        _assert_no_body_keys(root)
+
+        with _get(f"{base}/api/thread/rid-closed") as resp:
+            transcript = json.loads(resp.read())
+        assert "CLOSED_ANSWER_BODY_TOKEN" in json.dumps(transcript)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_threads_query_validation_limit_cap_and_root_scope(
+    tmp_path: Path,
+) -> None:
+    a, b = _make_two_stores(tmp_path)
+    label0, label1 = a.root.name, b.root.name
+    _hand_write_message(b, {
+        "id": "20990101-000000-000001-BOPN",
+        "ts": "2099-01-01T00:00:01Z",
+        "from": "lead",
+        "to": "dev",
+        "kind": "question",
+        "subject": "root one closed",
+        "body": "ROOT1_CLOSED_OPENER_BODY",
+        "meta": {"request_id": "rid-root1"},
+    })
+    last = _hand_write_message(b, {
+        "id": "20990101-000000-000002-BANS",
+        "ts": "2099-01-01T00:00:02Z",
+        "from": "dev",
+        "to": "lead",
+        "kind": "message",
+        "subject": "root one answer",
+        "body": "ROOT1_CLOSED_ANSWER_BODY",
+        "meta": {"request_id": "rid-root1"},
+    })
+    b.set_cursor("lead", last)
+    b.set_cursor("dev", last)
+    srv, _t, base = _serve_multi(a, b)
+    try:
+        with _get(f"{base}/api/threads?root={label1}&state=closed&limit=1000") as resp:
+            payload = json.loads(resp.read())
+        assert payload["root"] == label1
+        assert payload["limit"] == 100
+        assert payload["total_count"] == 1
+        assert payload["items"][0]["request_id"] == "rid-root1"
+        assert "ROOT1_CLOSED" not in json.dumps(payload)
+
+        with _get(f"{base}/api/threads?root={label0}&state=closed") as resp:
+            root0 = json.loads(resp.read())
+        assert root0["root"] == label0
+        assert root0["items"] == []
+
+        bad_queries = (
+            ("bad_state", f"{base}/api/threads?state=open"),
+            ("bad_limit", f"{base}/api/threads?state=closed&limit=zero"),
+            ("bad_limit", f"{base}/api/threads?state=closed&limit=0"),
+            ("bad_cursor", f"{base}/api/threads?state=closed&cursor=..%2Fbad"),
+            ("bad_root", f"{base}/api/threads?state=closed&root=missing-root"),
+        )
+        for code, url in bad_queries:
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                _urlopen(url, timeout=5)
+            assert exc.value.code == 400
+            body = json.loads(exc.value.read())
+            assert body["error"] == code
+            assert body["items"] == []
+            assert body["state"] == "closed"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_threads_failure_is_bounded_and_state_survives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _make_store(tmp_path)
+    s.send(sender="alpha", recipient="beta", kind="question",
+           subject="active", body="ACTIVE_BODY_TOKEN",
+           meta={"request_id": "rid-active"})
+    srv, _t, base = _serve(s)
+    original = web._validated_for_state
+
+    def fail_validation(*_args, **_kwargs):
+        raise RuntimeError("boom " + ("x" * 200))
+
+    try:
+        monkeypatch.setattr(web, "_validated_for_state", fail_validation)
+        with _get(f"{base}/api/threads?state=closed") as resp:
+            assert resp.status == 200
+            payload = json.loads(resp.read())
+        assert payload["error"] == "threads_unavailable"
+        assert payload["items"] == []
+        assert payload["total_count"] == 0
+        assert len(payload["detail"]) < 260
+        assert "ACTIVE_BODY_TOKEN" not in json.dumps(payload)
+
+        monkeypatch.setattr(web, "_validated_for_state", original)
+        (root,) = _state(base)["roots"]
+        assert [row["request_id"] for row in root["threads"]] == ["rid-active"]
+        _assert_no_body_keys(root)
     finally:
         srv.shutdown()
         srv.server_close()

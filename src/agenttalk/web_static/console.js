@@ -50,6 +50,28 @@
   // inherited Object property and produce a garbage className.
   var SEV_COLOR = nullMap({ high: 'danger', med: 'warn', low: 'gray' });
   var SEV_LABEL = nullMap({ high: 'HIGH', med: 'MED', low: 'LOW' });
+  var ROLE_ALIAS = nullMap({
+    developer: 'dev', dev: 'dev',
+    reviewer: 'rev', rev: 'rev',
+    tester: 'test', test: 'test',
+    documentation: 'docs', docs: 'docs',
+    architect: 'arch', arch: 'arch',
+    infrastructure: 'infra', infra: 'infra',
+    lead: 'lead',
+    scout: 'scout',
+  });
+  var AVATAR_MANIFEST = nullMap({
+    'claude:arch': 'claude-arch.png',
+    'claude:dev': 'claude-dev.png',
+    'claude:docs': 'claude-docs.png',
+    'claude:lead': 'claude-lead.png',
+    'claude:rev': 'claude-rev.png',
+    'codex:dev': 'codex-dev.png',
+    'codex:infra': 'codex-infra.png',
+    'codex:rev': 'codex-rev.png',
+    'codex:scout': 'codex-scout.png',
+    'codex:test': 'codex-test.png',
+  });
 
   // ------------------------------------------------------------ client state
   var state = {
@@ -89,6 +111,16 @@
     body: '',
   };
   var answerComposerState = {};       // to_request -> body text
+  var archivedState = {
+    root: '',
+    open: false,
+    loading: false,
+    stale: false,
+    error: '',
+    count: null,
+    nextCursor: null,
+    items: [],
+  };
 
   // ------------------------------------------------------------ tiny helpers
   function el(tag, cls, text) {
@@ -111,6 +143,15 @@
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
   function isArray(x) { return Object.prototype.toString.call(x) === '[object Array]'; }
   function on(node, ev, fn) { node.addEventListener(ev, fn); return node; }
+  function stableHash(value) {
+    var s = String(value || '');
+    var h = 2166136261;
+    for (var i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  }
   function option(value, text) {
     var o = el('option', null, text);
     o.value = value;
@@ -410,6 +451,29 @@
   // Thread cache key: root-label + rid (P2-5). Keying by rid ALONE would let a
   // same-request_id thread in another root leak / cross-bleed once cached.
   function threadKey(rid) { return currentRootLabel() + '|' + rid; }
+  function rootClosedCount(root) {
+    var c = root && root.counts;
+    return c && typeof c.closed_threads === 'number' ? c.closed_threads : 0;
+  }
+  function syncArchivedRoot(root) {
+    var label = (root && root.label) || '';
+    var count = rootClosedCount(root);
+    if (archivedState.root !== label) {
+      archivedState.root = label;
+      archivedState.open = false;
+      archivedState.loading = false;
+      archivedState.stale = false;
+      archivedState.error = '';
+      archivedState.count = count;
+      archivedState.nextCursor = null;
+      archivedState.items = [];
+      return;
+    }
+    if (archivedState.open && archivedState.count !== null && archivedState.count !== count) {
+      archivedState.stale = true;
+    }
+    archivedState.count = count;
+  }
 
   // Agent bucket counts by health group (work/idle/attn/unknown).
   function agentCounts(root) {
@@ -451,6 +515,43 @@
     var info = cliInfo(cli, name);
     if (!info) return null;
     return el('span', 'tc-chip ' + info.cls, info.label);
+  }
+  function normalizedRole(role) {
+    if (!role) return '';
+    var key = String(role).toLowerCase().trim();
+    return ROLE_ALIAS[key] || '';
+  }
+  function cliFamily(agent) {
+    if (agent && (agent.cli === 'claude' || agent.cli === 'codex')) return agent.cli;
+    var name = agent && agent.name ? String(agent.name) : '';
+    var prefix = name.split('-', 1)[0];
+    return (prefix === 'claude' || prefix === 'codex') ? prefix : '';
+  }
+  function avatarFile(agent) {
+    var role = normalizedRole(agent && agent.role);
+    var family = cliFamily(agent);
+    if (!role || !family) return '';
+    return AVATAR_MANIFEST[family + ':' + role] || '';
+  }
+  function agentAvatar(agent, avatarCls, fallbackDotCls) {
+    var file = avatarFile(agent);
+    if (!file) return null;
+    var st = ((agent && agent.health) || {}).state;
+    var wrap = el('span', 'tc-avatar ' + (avatarCls || ''));
+    var img = document.createElement('img');
+    img.src = '/static/avatars/' + file;
+    img.alt = '';
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    on(img, 'error', function () {
+      if (wrap.parentNode) wrap.parentNode.replaceChild(statusDot(st, fallbackDotCls), wrap);
+    });
+    wrap.appendChild(img);
+    wrap.appendChild(statusDot(st, 'tc-avatar-badge'));
+    return wrap;
+  }
+  function avatarOrDot(agent, avatarCls, dotCls) {
+    return agentAvatar(agent, avatarCls, dotCls) || statusDot(((agent && agent.health) || {}).state, dotCls);
   }
   // A rate/ctx mini-meter (label + value + track/fill). .tc-meter-head lays out
   // its two spans as a space-between row; the fill state comes from meterClass.
@@ -633,7 +734,13 @@
 
     // Operator chip.
     var op = el('div', 'tc-operator');
-    op.appendChild(el('span', 'tc-operator-avatar', 'yo'));
+    var leadAvatar = agentAvatar({
+      name: 'claude-lead',
+      cli: 'claude',
+      role: 'lead',
+      health: { state: 'working_turn' },
+    }, 'tc-operator-avatar', null);
+    op.appendChild(leadAvatar || el('span', 'tc-operator-avatar', 'yo'));
     var opText = el('div', 'tc-operator-text');
     opText.appendChild(el('span', 'tc-operator-name', 'you'));
     opText.appendChild(el('span', 'tc-operator-role', 'operator · lead-liaison'));
@@ -855,7 +962,7 @@
 
     // Row 1: dot + name + CLI badge + spacer + wrapped icon.
     var r1 = el('div', 'tc-agent-row');
-    r1.appendChild(statusDot(st));
+    r1.appendChild(avatarOrDot(a, 'tc-agent-avatar', null));
     r1.appendChild(el('span', 'tc-agent-name', a.name));
     var badge = cliBadge(a.cli, a.name);
     if (badge) r1.appendChild(badge);
@@ -942,6 +1049,7 @@
     // Left: relationship graph card (fixed 640x480 canvas, scrolls in card).
     var graphCard = el('div', 'tc-card tc-graph-card');
     graphCard.appendChild(buildGraph(root));
+    graphCard.appendChild(flowLegend(root));
     body.appendChild(graphCard);
 
     // Right: Active-threads list.
@@ -1002,6 +1110,62 @@
     // Log-scale busy pairs so volume still reads, but never turns into a blob.
     return Math.max(1, Math.min(6, 1 + Math.log(w + 1) * 1.2));
   }
+  function graphEdgePoints(p1, p2) {
+    var dx = p2.x - p1.x;
+    var dy = p2.y - p1.y;
+    var len = Math.sqrt(dx * dx + dy * dy);
+    if (!len) return { x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y };
+    var ux = dx / len;
+    var uy = dy / len;
+    var start = Math.min(14, len / 3);
+    var end = Math.min(26, len / 3);
+    return {
+      x1: Math.round(p1.x + ux * start),
+      y1: Math.round(p1.y + uy * start),
+      x2: Math.round(p2.x - ux * end),
+      y2: Math.round(p2.y - uy * end),
+    };
+  }
+  function agentColor(name) {
+    var h = stableHash(name);
+    var hue = h % 360;
+    var sat = 66 + ((h >>> 9) % 3) * 6;
+    var baseLight = prefs.theme === 'dark' ? 63 : 39;
+    var light = baseLight + ((h >>> 17) % 3) * 4;
+    return 'hsl(' + hue + ', ' + sat + '%, ' + light + '%)';
+  }
+  function agentMarkerId(name) {
+    return 'tc-arrow-' + stableHash(name).toString(36);
+  }
+  function graphAgentNames(root) {
+    var names = {};
+    var edges = root.edges || [];
+    for (var e = 0; e < edges.length; e++) {
+      if (edges[e].from) names[edges[e].from] = true;
+      if (edges[e].to) names[edges[e].to] = true;
+    }
+    return Object.keys(names).sort();
+  }
+  function flowLegend(root) {
+    var legend = el('div', 'tc-legend tc-flow-legend');
+    legend.appendChild(el('div', 'tc-legend-label', 'Participant colors'));
+    var rows = el('div', 'tc-flow-legend-rows');
+    var names = graphAgentNames(root);
+    if (!names.length) {
+      rows.appendChild(el('div', 'tc-recent-empty', 'No participants yet.'));
+    } else {
+      for (var i = 0; i < names.length; i++) {
+        var row = el('div', 'tc-legend-row tc-flow-legend-row');
+        var sw = el('span', 'tc-flow-swatch');
+        sw.style.background = agentColor(names[i]);
+        row.appendChild(sw);
+        row.appendChild(el('span', 'tc-legend-text', names[i]));
+        rows.appendChild(row);
+      }
+    }
+    legend.appendChild(rows);
+    return legend;
+  }
 
   function buildGraph(root) {
     var agents = agentsOf(root);
@@ -1015,17 +1179,45 @@
     // SVG edges layer.
     var svg = svgEl('svg', { width: GRAPH_W, height: GRAPH_H, viewBox: '0 0 ' + GRAPH_W + ' ' + GRAPH_H });
     var edges = root.edges || [];
+    var senders = {};
+    for (var se = 0; se < edges.length; se++) if (edges[se].from) senders[edges[se].from] = true;
+    var defs = svgEl('defs');
+    var senderNames = Object.keys(senders).sort();
+    for (var si = 0; si < senderNames.length; si++) {
+      var sender = senderNames[si];
+      var marker = svgEl('marker', {
+        id: agentMarkerId(sender),
+        viewBox: '0 0 10 10',
+        refX: 8.5,
+        refY: 5,
+        markerWidth: 5.5,
+        markerHeight: 5.5,
+        orient: 'auto',
+      });
+      marker.appendChild(svgEl('path', {
+        d: 'M 0 0 L 10 5 L 0 10 z',
+        fill: agentColor(sender),
+      }));
+      defs.appendChild(marker);
+    }
+    svg.appendChild(defs);
     for (var e = 0; e < edges.length; e++) {
       var edge = edges[e];
       var p1 = pos[edge.from], p2 = pos[edge.to];
       if (!p1 || !p2) continue;   // an edge endpoint not in the roster — skip
       var w = (typeof edge.count === 'number' ? edge.count : (edge.weight || 1));
       var hot = pairs[edge.from + '|' + edge.to] === true;
+      var ep = graphEdgePoints(p1, p2);
       var line = svgEl('line', {
-        x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y,
+        x1: ep.x1, y1: ep.y1, x2: ep.x2, y2: ep.y2,
         'stroke-width': graphEdgeWidth(w),
       });
       line.setAttribute('class', 'tc-edge' + (hot ? ' is-active' : ''));
+      line.style.stroke = agentColor(edge.from);
+      line.setAttribute('marker-end', 'url(#' + agentMarkerId(edge.from) + ')');
+      var title = svgEl('title');
+      title.textContent = (edge.from || '?') + ' -> ' + (edge.to || '?') + ', count ' + w;
+      line.appendChild(title);
       svg.appendChild(line);
     }
     canvas.appendChild(svg);
@@ -1039,7 +1231,7 @@
         var node = el('div', 'tc-node');
         node.style.left = p.x + 'px';
         node.style.top = p.y + 'px';
-        node.appendChild(statusDot(st, 'tc-node-dot'));
+        node.appendChild(avatarOrDot(a, 'tc-node-avatar', 'tc-node-dot'));
         node.appendChild(el('span', 'tc-node-pill', a.name));
         on(node, 'click', function () { openAgent(a.name); });
         nodes.appendChild(node);
@@ -1352,17 +1544,30 @@
   // ------------------------------------------------------------ VIEW 4: sessions
   function renderSessions(main, root) {
     main.appendChild(viewHead('Sessions', 'Full transcripts of message threads on the bus'));
+    syncArchivedRoot(root);
 
     var body = el('div', 'tc-sessions-body');
 
     var left = el('div', 'tc-session-left');
     left.appendChild(actionComposer(root));
     left.appendChild(intentSummaryStrip());
+    left.appendChild(activeThreadsCard(root));
+    left.appendChild(archivedThreadsCard(root));
+    body.appendChild(left);
 
-    // Left: thread list (from root.threads).
+    // Right: transcript.
+    body.appendChild(transcriptCard());
+    main.appendChild(body);
+  }
+
+  function activeThreadsCard(root) {
     var listCard = el('div', 'tc-card tc-card-clip');
-    listCard.appendChild(el('div', 'tc-session-list-title', 'Threads'));
+    var head = el('div', 'tc-session-list-title tc-session-section-head');
+    head.appendChild(el('span', null, 'Active'));
+    head.appendChild(el('span', 'tc-spacer'));
     var threads = root.threads || [];
+    head.appendChild(el('span', 'tc-chip', threads.length + ' open'));
+    listCard.appendChild(head);
     if (!threads.length) {
       listCard.appendChild(el('p', 'tc-recent-empty', 'No threads.'));
     } else {
@@ -1370,12 +1575,66 @@
         listCard.appendChild(sessionListRow(threads[i]));
       }
     }
-    left.appendChild(listCard);
-    body.appendChild(left);
+    return listCard;
+  }
 
-    // Right: transcript.
-    body.appendChild(transcriptCard());
-    main.appendChild(body);
+  function archivedThreadsCard(root) {
+    var card = el('div', 'tc-card tc-card-clip tc-archive-card');
+    var count = rootClosedCount(root);
+    var head = el('button', 'tc-session-list-title tc-session-section-head tc-archive-toggle');
+    head.appendChild(el('span', null, archivedState.open ? 'Archived' : 'Archived'));
+    head.appendChild(el('span', 'tc-session-subtle', 'Current session'));
+    head.appendChild(el('span', 'tc-spacer'));
+    head.appendChild(el('span', 'tc-chip', count + ' closed'));
+    on(head, 'click', function () {
+      archivedState.open = !archivedState.open;
+      if (archivedState.open && !archivedState.items.length && !archivedState.loading) {
+        fetchArchivedThreads(true);
+      } else {
+        renderActiveView();
+      }
+    });
+    card.appendChild(head);
+    if (!archivedState.open) return card;
+    if (archivedState.stale) {
+      var stale = el('div', 'tc-archive-stale');
+      stale.appendChild(el('span', null, 'Archived list changed.'));
+      var refresh = el('button', 'tc-btn', 'Refresh');
+      on(refresh, 'click', function (ev) {
+        ev.stopPropagation();
+        fetchArchivedThreads(true);
+      });
+      stale.appendChild(refresh);
+      card.appendChild(stale);
+    }
+    if (archivedState.error) {
+      card.appendChild(el('p', 'tc-recent-empty', archivedState.error));
+    }
+    if (archivedState.loading && !archivedState.items.length) {
+      card.appendChild(el('p', 'tc-recent-empty', 'Loading archived threads...'));
+    } else if (!archivedState.items.length && !archivedState.error) {
+      card.appendChild(el('p', 'tc-recent-empty', 'No archived threads in this session.'));
+    } else {
+      for (var i = 0; i < archivedState.items.length; i++) {
+        card.appendChild(sessionListRow(archivedState.items[i]));
+      }
+    }
+    if (archivedState.nextCursor) {
+      var more = el('button', 'tc-archive-more', archivedState.loading ? 'Loading...' : 'Load more');
+      more.disabled = archivedState.loading;
+      on(more, 'click', function (ev) {
+        ev.stopPropagation();
+        fetchArchivedThreads(false);
+      });
+      card.appendChild(more);
+    }
+    return card;
+  }
+
+  function terminalChip(t) {
+    if (!t || (t.state !== 'closed' && t.state !== 'closed-superseded')) return null;
+    if (t.state === 'closed-superseded') return { label: 'superseded', cls: 'tstatus-hold' };
+    return { label: 'closed', cls: 'tstatus-neutral' };
   }
 
   function sessionListRow(t) {
@@ -1384,7 +1643,7 @@
     var top = el('div', 'tc-session-row-head');
     top.appendChild(kindChip(t.opener_kind || t.kind));
     top.appendChild(el('span', 'tc-spacer'));
-    var vi = threadChip(t);
+    var vi = threadChip(t) || terminalChip(t);
     if (vi) top.appendChild(el('span', 'tc-chip ' + vi.cls, vi.label));
     row.appendChild(top);
     row.appendChild(el('div', 'tc-session-subject', t.subject || t.request_id || ''));
@@ -1448,6 +1707,10 @@
     var root = currentRoot();
     var threads = (root && root.threads) || [];
     for (var i = 0; i < threads.length; i++) if (threads[i].request_id === rid) return threads[i];
+    if (archivedState.root === currentRootLabel()) {
+      var archived = archivedState.items || [];
+      for (var j = 0; j < archived.length; j++) if (archived[j].request_id === rid) return archived[j];
+    }
     return null;
   }
 
@@ -1514,9 +1777,12 @@
 
     // Header card.
     var headerCard = el('div', 'tc-detail-header');
-    var bigDot = statusDot(st, 'tc-detail-bigdot');
-    // Soft ring color: CSS reads --status-soft on the bigdot.
-    bigDot.style.setProperty('--status-soft', 'var(--' + info.color + '-soft)');
+    var bigDot = agentAvatar(a, 'tc-detail-avatar', 'tc-detail-bigdot');
+    if (!bigDot) {
+      bigDot = statusDot(st, 'tc-detail-bigdot');
+      // Soft ring color: CSS reads --status-soft on the bigdot.
+      bigDot.style.setProperty('--status-soft', 'var(--' + info.color + '-soft)');
+    }
     headerCard.appendChild(bigDot);
     var hInfo = el('div', 'tc-detail-head-text');
     var nameRow = el('div', 'tc-detail-name-row');
@@ -2012,6 +2278,48 @@
       renderSidebar();  // count badge
       if (state.view === 'attention') renderActiveViewFromPoll();
     }).catch(function () { attentionPending = false; });
+  }
+
+  function fetchArchivedThreads(reset) {
+    if (archivedState.loading) return;
+    var label = currentRootLabel();
+    if (!label) return;
+    archivedState.loading = true;
+    archivedState.error = '';
+    if (reset) {
+      archivedState.items = [];
+      archivedState.nextCursor = null;
+      archivedState.stale = false;
+    }
+    if (state.view === 'sessions') renderActiveView();
+    var url = '/api/threads?state=closed&limit=50&root=' + encodeURIComponent(label);
+    if (!reset && archivedState.nextCursor) {
+      url += '&cursor=' + encodeURIComponent(archivedState.nextCursor);
+    }
+    fetch(url, { cache: 'no-store' }).then(function (r) {
+      return r.json().then(function (data) { return { ok: r.ok, data: data }; });
+    }).then(function (res) {
+      if (archivedState.root !== label) return;
+      archivedState.loading = false;
+      var data = res.data || {};
+      if (!res.ok || data.error) {
+        archivedState.error = data.detail || data.error || 'archived threads unavailable';
+        archivedState.items = reset ? [] : archivedState.items;
+        archivedState.nextCursor = null;
+      } else {
+        var items = data.items || [];
+        archivedState.items = reset ? items : archivedState.items.concat(items);
+        archivedState.nextCursor = data.next_cursor || null;
+        archivedState.count = typeof data.total_count === 'number' ? data.total_count : archivedState.count;
+        archivedState.stale = false;
+      }
+      if (state.view === 'sessions') renderActiveView();
+    }).catch(function () {
+      if (archivedState.root !== label) return;
+      archivedState.loading = false;
+      archivedState.error = 'archived threads unavailable';
+      if (state.view === 'sessions') renderActiveView();
+    });
   }
 
   // Fetch the SELECTED root's transcript (P2-5): pass ?root=<label> and key the
