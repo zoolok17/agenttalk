@@ -5,6 +5,45 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.59.3] - 2026-07-04
+
+### Added
+
+- **Team Console shows per-provider capacity.** The supervised `wrap --loop` now
+  refreshes each agent's own capacity snapshot inline (failure-isolated, run after
+  the idle heartbeat stamp / cursor commit, interval-gated, exceptions swallowed).
+  A supervised Codex agent reads only its isolated `CODEX_HOME/sessions` rollouts
+  (no operator-home fallback; degrades to `unknown` with `reason=codex_home_missing`
+  when unset). `/api/state` gains additive per-provider capacity fields
+  (`primary` 5h window, `secondary` weekly window, and context fill), rendered as a
+  rich capacity card in the console. All fields are additive — the read-only console
+  stays byte-identical when actions are disabled.
+- **Real compact-density mode for the console**, driven by CSS variables so spacing,
+  font sizes, and card padding collapse consistently rather than per-element.
+
+### Changed
+
+- **Bounded, fail-closed Codex rollout discovery.** `read_codex_rollout` now scans
+  newest-first under real budgets (`CODEX_ROLLOUT_SCAN_LIMIT`,
+  `CODEX_ROLLOUT_MAX_FILES`) and orders candidate rollout files by each file's own
+  `st_mtime` — directory mtimes only prioritize traversal and never order selection.
+  If the budget cannot prove the true-newest rollout for the intended thread, the
+  read degrades to `unknown` rather than returning a possibly-stale value presented
+  as observed; a requested thread id that cannot be proven inside the bounded
+  candidate set fails closed instead of falling back to another thread's rollout.
+- The console's secondary capacity window drops the redundant weekly-label suffix.
+
+### Fixed
+
+- Four fail-closed hardening fixes on the web control plane and store: the CSRF
+  gate rejects a non-ASCII token with `403 bad_csrf` instead of raising; the action
+  rate bucket is guarded by a lock; the intents audit ring evicts oldest-first by
+  `(mtime, name)` under its byte cap; and `drain_intents` short-circuits when the
+  kill switch is engaged.
+- Documented the bounded-discovery known-limitation for shared `~/.codex` operator
+  homes (a manual `agenttalk capacity` against a shared home may read `unknown`
+  rather than best-effort; supervised wrapped Codex stays isolated per-agent).
+
 ## [0.59.2] - 2026-07-04
 
 ### Fixed
