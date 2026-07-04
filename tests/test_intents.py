@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
 
-from agenttalk import intents, threads
+from agenttalk import cli, intents, threads
 from agenttalk.store import PROC_ALIVE, PROC_DEAD, Store, _new_id
 
 
@@ -38,6 +39,21 @@ def _operator_question(store: Store, *, sender: str = "dev",
         meta=meta,
     )
     return msg.id
+
+
+def _operator_answers(store: Store, rid: str = "esc-help") -> list:
+    return [
+        m for m in store.valid_messages()
+        if (m.meta or {}).get("request_id") == rid
+        and (m.meta or {}).get("operator_answer") == "true"
+    ]
+
+
+def _relay_operator_answer(root: Path, rid: str, body: str) -> int:
+    return cli.main([
+        "--root", str(root), "relay", "operator-answer",
+        "--from", "lead", "--to-request", rid, "-m", body, "--quiet",
+    ])
 
 
 def _answer_plan(store: Store, rec: dict, actor: str = "lead") -> tuple[dict, dict, str]:
@@ -225,6 +241,207 @@ def test_answer_escalation_does_not_over_deny_visible_escalations(
     normal = threads.resolve_operator_answer_target(s2, "lead", "esc-normal")
     assert normal.ok is True
     assert normal.recipient == "dev"
+
+
+def test_send_operator_answer_atomic_fail_closed_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _store(tmp_path)
+    _operator_question(s, rid="esc-lock")
+    lockf = s.dir / "config.lock"
+    lockf.write_text(
+        json.dumps({"pid": os.getpid(), "at": "x", "root": str(s.root)}),
+        encoding="utf-8",
+    )
+    try:
+        locked = s.send_operator_answer_atomic(
+            actor="lead", request_id="esc-lock", body="blocked",
+            lock_timeout=0.01,
+        )
+    finally:
+        lockf.unlink()
+    assert locked.ok is False
+    assert locked.denial_code == "operator_answer_lock_unavailable"
+    assert _operator_answers(s, "esc-lock") == []
+
+    s2 = _store(tmp_path / "state-unreadable")
+    _operator_question(s2, rid="esc-state")
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("thread log unreadable")
+
+    monkeypatch.setattr(threads, "resolve_operator_answer_target", _boom)
+    unreadable = s2.send_operator_answer_atomic(
+        actor="lead", request_id="esc-state", body="blocked",
+    )
+    assert unreadable.ok is False
+    assert unreadable.denial_code == "operator_answer_state_unreadable"
+    assert _operator_answers(s2, "esc-state") == []
+    monkeypatch.undo()
+
+    s3 = _store(tmp_path / "recipient-mismatch")
+    _operator_question(s3, rid="esc-recipient")
+    mismatch = s3.send_operator_answer_atomic(
+        actor="lead", request_id="esc-recipient", body="blocked",
+        expected_recipient="reviewer",
+    )
+    assert mismatch.ok is False
+    assert mismatch.denial_code == "operator_answer_recipient_mismatch"
+    assert _operator_answers(s3, "esc-recipient") == []
+
+    s4 = _store(tmp_path / "send-rejected")
+    _operator_question(s4, rid="esc-send")
+
+    def _reject_send(**_kwargs):
+        raise ValueError("roster changed")
+
+    monkeypatch.setattr(s4, "send", _reject_send)
+    rejected = s4.send_operator_answer_atomic(
+        actor="lead", request_id="esc-send", body="blocked",
+    )
+    assert rejected.ok is False
+    assert rejected.failed is True
+    assert rejected.denial_code == "operator_answer_send_rejected"
+    assert _operator_answers(s4, "esc-send") == []
+
+
+def test_operator_answer_atomic_two_cli_relays_race_to_one_send(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    s.set_operator_facing("lead")
+    _operator_question(s, rid="esc-race")
+    barrier = threading.Barrier(2)
+    results: list[int] = []
+    errors: list[BaseException] = []
+
+    def _worker(body: str) -> None:
+        try:
+            barrier.wait(timeout=5)
+            results.append(_relay_operator_answer(tmp_path, "esc-race", body))
+        except BaseException as e:  # surfaced below
+            errors.append(e)
+
+    threads_ = [
+        threading.Thread(target=_worker, args=("first",)),
+        threading.Thread(target=_worker, args=("second",)),
+    ]
+    for t in threads_:
+        t.start()
+    for t in threads_:
+        t.join(timeout=10)
+
+    assert not errors
+    assert not any(t.is_alive() for t in threads_)
+    assert sorted(results) == [0, 2]
+    answers = _operator_answers(s, "esc-race")
+    assert len(answers) == 1
+    assert answers[0].body in {"first", "second"}
+
+
+def test_operator_answer_atomic_browser_wins_cli_loses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _store(tmp_path)
+    s.set_operator_facing("lead")
+    _operator_question(s, rid="esc-browser")
+    rec = s.write_intent(
+        "answer_escalation", {"to_request": "esc-browser", "body": "browser answer"}
+    )
+    original = Store.send_operator_answer_atomic
+    cli_waiting = threading.Event()
+    allow_cli = threading.Event()
+    errors: list[object] = []
+
+    def _wrapped(self, *args, **kwargs):
+        extra = kwargs.get("extra_meta") or {}
+        if extra.get("web_intent_id") != rec["intent_id"]:
+            cli_waiting.set()
+            if not allow_cli.wait(timeout=5):
+                errors.append("CLI relay did not resume")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Store, "send_operator_answer_atomic", _wrapped)
+    cli_results: list[int] = []
+
+    def _cli_worker() -> None:
+        try:
+            cli_results.append(
+                _relay_operator_answer(tmp_path, "esc-browser", "cli answer")
+            )
+        except BaseException as e:
+            errors.append(e)
+
+    t = threading.Thread(target=_cli_worker)
+    t.start()
+    assert cli_waiting.wait(timeout=5)
+
+    summary = intents.drain_intents(s, pid=123, max_per_tick=1)
+    allow_cli.set()
+    t.join(timeout=10)
+
+    assert not errors
+    assert not t.is_alive()
+    assert summary["applied"] == 1
+    assert cli_results == [2]
+    answers = _operator_answers(s, "esc-browser")
+    assert len(answers) == 1
+    assert answers[0].body == "browser answer"
+    assert (answers[0].meta or {}).get("web_intent_id") == rec["intent_id"]
+
+
+def test_operator_answer_atomic_cli_wins_before_browser_helper_enters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _store(tmp_path)
+    s.set_operator_facing("lead")
+    _operator_question(s, rid="esc-cli")
+    rec = s.write_intent(
+        "answer_escalation", {"to_request": "esc-cli", "body": "browser answer"}
+    )
+    original = Store.send_operator_answer_atomic
+    browser_waiting = threading.Event()
+    allow_browser = threading.Event()
+    errors: list[object] = []
+
+    def _wrapped(self, *args, **kwargs):
+        extra = kwargs.get("extra_meta") or {}
+        if extra.get("web_intent_id") == rec["intent_id"]:
+            browser_waiting.set()
+            if not allow_browser.wait(timeout=5):
+                errors.append("browser drain did not resume")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Store, "send_operator_answer_atomic", _wrapped)
+    summaries: list[dict] = []
+
+    def _browser_worker() -> None:
+        try:
+            summaries.append(intents.drain_intents(s, pid=123, max_per_tick=1))
+        except BaseException as e:
+            errors.append(e)
+
+    t = threading.Thread(target=_browser_worker)
+    t.start()
+    assert browser_waiting.wait(timeout=5)
+    stored_attempting = s.read_intent(rec["intent_id"])
+    assert stored_attempting["deliveries"][0]["state"] == "attempting"
+
+    assert _relay_operator_answer(tmp_path, "esc-cli", "cli answer") == 0
+    allow_browser.set()
+    t.join(timeout=10)
+
+    assert not errors
+    assert not t.is_alive()
+    assert len(summaries) == 1
+    assert summaries[0]["denied"] == 1
+    stored = s.read_intent(rec["intent_id"])
+    assert stored["state"] == Store.INTENT_DENIED
+    assert stored["code"] == "not_pending"
+    answers = _operator_answers(s, "esc-cli")
+    assert len(answers) == 1
+    assert answers[0].body == "cli answer"
+    assert "web_intent_id" not in (answers[0].meta or {})
 
 
 def test_answer_escalation_denies_not_owed_and_self_answer(tmp_path: Path) -> None:

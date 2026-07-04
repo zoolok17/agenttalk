@@ -818,15 +818,30 @@ def _drain_answer_escalation(store: Store, rec: dict) -> str:
         "web_intent_attempt_floor": floor,
         "executor_marker": EXECUTOR_MARKER,
     })
-    try:
-        msg = store.send(
-            sender=actor, recipient=delivery["recipient"],
-            body=delivery.get("body") or "", kind=delivery["bus_kind"],
-            subject=delivery.get("subject") or "", meta=meta,
+    result = store.send_operator_answer_atomic(
+        actor=actor,
+        request_id=(rec.get("payload") or {}).get("to_request") or "",
+        body=delivery.get("body") or "",
+        subject=delivery.get("subject") or "",
+        extra_meta=meta,
+        expected_recipient=delivery["recipient"],
+    )
+    if not result.ok:
+        code = result.denial_code or "operator_answer_denied"
+        if result.failed:
+            store.mark_intent_terminal(iid, state=Store.INTENT_FAILED,
+                                       code=code, error=result.detail[:500])
+            return Store.INTENT_FAILED
+        store.mark_intent_terminal(iid, state=Store.INTENT_DENIED,
+                                   code=code, error=result.detail[:500])
+        return Store.INTENT_DENIED
+    msg = result.message
+    if msg is None:
+        store.mark_intent_terminal(
+            iid, state=Store.INTENT_FAILED,
+            code="operator_answer_send_inconclusive",
+            error="atomic operator-answer helper succeeded without a message",
         )
-    except ValueError as e:
-        store.mark_intent_terminal(iid, state=Store.INTENT_FAILED,
-                                   code="send_rejected", error=str(e)[:500])
         return Store.INTENT_FAILED
     _record_delivery(store, iid, 0, state="delivered", message_id=msg.id,
                      fingerprint=fp, attempt_floor=floor)

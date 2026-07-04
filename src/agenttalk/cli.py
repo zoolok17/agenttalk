@@ -3338,9 +3338,14 @@ def _relay_operator_answer(store, sender: str, roster: list, args) -> int:
         sys.stderr.write("agenttalk relay operator-answer: empty body (use -m TEXT, "
                          "--file PATH, or pipe stdin) - relay the operator's answer.\n")
         return 2
-    resolved = th.resolve_operator_answer_target(store, sender, rid)
-    if not resolved.ok:
-        code = resolved.denial_code or "denied"
+    meta = _parse_meta(args.meta)
+    for k in _RELAY_RESERVED_META:
+        meta.pop(k, None)                            # SCRUB: handler-authoritative audit meta
+    result = store.send_operator_answer_atomic(
+        actor=sender, request_id=rid, body=body,
+        subject=args.subject, extra_meta=meta)
+    if not result.ok:
+        code = result.denial_code or "denied"
         if code == "not_found":
             sys.stderr.write(f"agenttalk relay operator-answer: no thread {rid!r} involving "
                              f"{sender!r} (unknown id or not your thread).\n")
@@ -3349,23 +3354,29 @@ def _relay_operator_answer(store, sender: str, roster: list, args) -> int:
                              f"escalation (needs_operator). Use `agenttalk reply` for an ordinary "
                              f"thread.\n")
         elif code == "not_owed":
-            sys.stderr.write(f"agenttalk relay operator-answer: {resolved.detail} - only the "
+            sys.stderr.write(f"agenttalk relay operator-answer: {result.detail} - only the "
                              "addressed liaison relays its answer.\n")
         elif code == "self_answer":
-            sys.stderr.write(f"agenttalk relay operator-answer: {resolved.detail}.\n")
+            sys.stderr.write(f"agenttalk relay operator-answer: {result.detail}.\n")
+        elif code == "operator_answer_lock_unavailable":
+            sys.stderr.write("agenttalk relay operator-answer: could not acquire the operator "
+                             "answer lock; no answer was sent.\n")
+        elif code == "operator_answer_state_unreadable":
+            sys.stderr.write("agenttalk relay operator-answer: could not read current "
+                             "operator-answer state; no answer was sent.\n")
+        elif code == "operator_answer_send_rejected":
+            sys.stderr.write(f"agenttalk relay operator-answer: send rejected ({result.detail}); "
+                             "no answer was sent.\n")
         else:
             sys.stderr.write(f"agenttalk relay operator-answer: escalation {rid!r} is not pending "
-                             f"({resolved.detail}) - nothing pending to answer.\n")
+                             f"({result.detail}) - nothing pending to answer.\n")
         return 2
-    target = resolved.recipient or ""                # back to the asking lead-loop / agent
-    meta = _parse_meta(args.meta)
-    for k in _RELAY_RESERVED_META:
-        meta.pop(k, None)                            # SCRUB: handler-authoritative audit meta
-    meta["request_id"] = rid                         # echo -> routes back on the SAME thread
-    meta["operator_answer"] = "true"
-    meta["operator_origin"] = sender
-    msg = store.send(sender=sender, recipient=target, kind="message",
-                     subject=args.subject or f"operator answer ({rid})", body=body, meta=meta)
+    msg = result.message
+    if msg is None:
+        sys.stderr.write("agenttalk relay operator-answer: answer state was inconclusive; "
+                         "no answer was sent.\n")
+        return 2
+    target = msg.recipient                           # back to the asking lead-loop / agent
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: RELAY operator-answer  {sender} -> {target}"))
     print(f"request_id={rid}")

@@ -494,6 +494,15 @@ class Message:
                 )
 
 
+@dataclass(frozen=True)
+class OperatorAnswerSendResult:
+    ok: bool
+    message: Message | None = None
+    denial_code: str | None = None
+    detail: str = ""
+    failed: bool = False
+
+
 class Store:
     def __init__(self, root: Path):
         self.root = Path(root).resolve()
@@ -1639,6 +1648,82 @@ class Store:
         path = self.messages_dir / f"{msg.id}.json"
         _atomic_write_text(path, json.dumps(msg.to_dict(), indent=2, ensure_ascii=False))
         return msg
+
+    def send_operator_answer_atomic(
+        self,
+        *,
+        actor: str,
+        request_id: str,
+        body: str,
+        subject: str | None = None,
+        extra_meta: dict | None = None,
+        expected_recipient: str | None = None,
+        lock_timeout: float = 10.0,
+    ) -> OperatorAnswerSendResult:
+        """Atomically re-check and emit a final operator answer.
+
+        This is the shared final-send path for CLI relay and dashboard-drained
+        ``answer_escalation`` intents. Callers must not already hold
+        ``_config_lock``: the lock is intentionally non-reentrant.
+        """
+        try:
+            with self._config_lock(timeout=lock_timeout):
+                from agenttalk import threads as _threads
+
+                try:
+                    resolved = _threads.resolve_operator_answer_target(
+                        self, actor, request_id)
+                except Exception as e:
+                    return OperatorAnswerSendResult(
+                        False,
+                        denial_code="operator_answer_state_unreadable",
+                        detail=str(e),
+                    )
+                if not resolved.ok:
+                    return OperatorAnswerSendResult(
+                        False,
+                        denial_code=resolved.denial_code or "operator_answer_denied",
+                        detail=resolved.detail,
+                    )
+                recipient = resolved.recipient or ""
+                if expected_recipient is not None and recipient != expected_recipient:
+                    return OperatorAnswerSendResult(
+                        False,
+                        denial_code="operator_answer_recipient_mismatch",
+                        detail=(f"resolved recipient {recipient!r} does not match "
+                                f"expected recipient {expected_recipient!r}"),
+                    )
+                meta = dict(extra_meta or {})
+                meta["request_id"] = request_id
+                meta["operator_answer"] = "true"
+                meta["operator_origin"] = actor
+                try:
+                    msg = self.send(
+                        sender=actor,
+                        recipient=recipient,
+                        kind="message",
+                        subject=subject or f"operator answer ({request_id})",
+                        body=body,
+                        meta=meta,
+                    )
+                except (OSError, ValueError) as e:
+                    return OperatorAnswerSendResult(
+                        False,
+                        denial_code="operator_answer_send_rejected",
+                        detail=str(e),
+                        failed=True,
+                    )
+                return OperatorAnswerSendResult(True, message=msg)
+        except TimeoutError as e:
+            return OperatorAnswerSendResult(
+                False, denial_code="operator_answer_lock_unavailable",
+                detail=str(e),
+            )
+        except Exception as e:
+            return OperatorAnswerSendResult(
+                False, denial_code="operator_answer_state_unreadable",
+                detail=str(e),
+            )
 
     # --------------------------------------------------------------- reading
 
