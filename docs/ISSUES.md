@@ -14,6 +14,22 @@ major · `P2` minor · `P3` nit. Each item: what, why, where, disposition.
 
 ## Recently shipped
 
+- **SHIPPED · v0.60.0 / `6827801` — operator inbox: answer escalations from the
+  browser.** New `answer_escalation` intent kind through the write spine; shared
+  `resolve_operator_answer_target` enforces pending + needs_operator + owed-to-actor
+  + anti-self + not-coalesced as distinct fail-closed predicates; two-phase drain
+  (reconcile-before-live-check) so a crash-retry never double-answers; server-injected
+  operator meta; `/api/attention` answerable annotations gated on `--enable-actions`
+  (actions-off byte-identical); plain-language inbox + answer composer. `relay
+  operator-answer` now also refuses a coalesced wrapper twin (`superseded_by_canonical`).
+  Reviewed: adversarial design gate (PASS_WITH_CONDITIONS, 8 folded) + 4-way final-SHA
+  review (2 bus reviewers approve, 2 fresh adversarial passes could-not-break) + a
+  coalescing-fold re-review (both approve).
+- **SHIPPED · v0.59.3 / `75c818f` — Team Console per-provider capacity + compact
+  density.** Failure-isolated synchronous capacity refresh in the supervised loop;
+  supervised Codex reads only its isolated `CODEX_HOME/sessions` (bounded, fail-closed
+  to unknown, never a stale value as observed); additive `/api/state` capacity fields;
+  real CSS-variable compact density; four fail-closed web/store P3s.
 - **SHIPPED · v0.59.2 / `1dd10ba` — supervisor process-ownership attribution.**
   Closed the cross-project-kill P0 with typed process ownership, strict live-chain
   descendant proof, and launch-nonce confirmation so a supervisor reaps only this
@@ -617,6 +633,17 @@ Status: **SHIPPED as v0.41.0**. 2/2 reviewer-approved on the frozen SHA + lead-g
 
 ## BACKLOG
 
+- **Cross-path operator-answer double-send (P2, fast-follow → v0.60.1).** After
+  v0.60.0 there are two operator-answer sender paths: the browser intent **drain**
+  (attempt_floor + fingerprint dedup, fully idempotent) and the CLI **`relay
+  operator-answer`** (`_relay_operator_answer`, direct `store.send`, no floor).
+  Answering the *same* escalation via both surfaces at the same instant is a
+  cross-path TOCTOU on the pending check that can duplicate the answer message.
+  **Not** an authority/recipient/stale-content bypass; concurrent *intra-path*
+  drains are already serialized by the singleton `supervise --drain-instance` lock.
+  Both reviewers + a fresh adversarial pass confirmed track-not-block for v0.60.0
+  (2026-07-04). *Fix:* route the CLI relay through the same dedup, or add a
+  per-escalation serialization guard so both paths cannot both send.
 - **Dead-letter defense-in-depth (P3, fast-follow).** Banked from the dead-letter
   review/verify: (1) `ack` / `advance_cursor` accept an arbitrary id on write (no
   `_ID_RE` guard) — an operator cursor-skip vector; (2) the disposal path is not

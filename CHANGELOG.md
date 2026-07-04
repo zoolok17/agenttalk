@@ -5,6 +5,43 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.60.0] - 2026-07-04
+
+### Added
+
+- **Operator inbox: answer escalations from the browser.** The Team Console
+  (with `--enable-actions`) lets the operator-facing agent answer a pending
+  escalation another agent raised, without a terminal. A new `answer_escalation`
+  intent kind (`{to_request, body}`) flows through the intent-queue write spine;
+  the supervised executor remains the sole authority boundary. A shared resolver
+  `resolve_operator_answer_target` enforces — as distinct fail-closed predicates —
+  that the target is a *pending* `needs_operator` escalation *owed to the resolved
+  actor* (never self-answerable, never unowed, never a coalesced duplicate), and
+  the answer is relayed with server-injected `operator_answer`/`operator_origin`
+  meta (the browser cannot supply identity or control meta). A dedicated two-phase
+  drain reconciles any prior delivery before the live check, so a crash-after-send
+  retry is marked applied and never double-answers. `/api/attention` gains
+  `answerable`/`answer_escalation` annotations only when actions are enabled
+  (the actions-off response and `/api/state` stay byte-identical); the console
+  renders a plain-language inbox + answer composer behind the actions gate.
+
+### Changed
+
+- **`relay operator-answer` now refuses a coalesced wrapper twin**
+  (`superseded_by_canonical`). The CLI relay and the browser answer path share one
+  resolver, so answering a redundant wrapper `needs_operator` notice that already
+  has a canonical config-blocked / dead-letter attention item is denied — answer
+  the canonical item instead. This keeps the browser answerable set equal to the
+  displayed attention queue.
+
+### Known limitations
+
+- Answering the *same* escalation via the browser and the CLI relay at the same
+  instant can produce a duplicate answer message (a cross-path race on the pending
+  check; not an authority/recipient/content bypass). Concurrent browser drains are
+  already serialized by the singleton drain-instance lock. Tracked as a v0.60.1
+  fast-follow. See docs/ISSUES.md.
+
 ## [0.59.3] - 2026-07-04
 
 ### Added
