@@ -1,0 +1,174 @@
+# agenttalk — Release Assurance & Security Posture
+
+**Purpose.** Every agenttalk release is attested here as **GOOD** (correct + tested),
+**ROBUST** (fail-safe + adversarially probed), and **SECURE** (authority-bounded +
+scanned), with the *evidence* that earns each label. This is a living document: the
+release ritual appends a ledger entry per release (see **Standing commitment**).
+
+Pairs with: `CHANGELOG.md` (what shipped) · `docs/DESIGN.md` (why / architecture) ·
+`docs/ISSUES.md` (open items + accepted known-limitations) ·
+`docs/audit-2026-06-28.md` (a full historical audit).
+
+---
+
+## 1. How a release earns GOOD / ROBUST / SECURE
+
+Every release passes the same pipeline before it ships:
+
+1. **Design-first.** Non-trivial or authority-sensitive work is designed before it is
+   built. **Authority-/security-critical designs get an adversarial design gate** — a
+   panel of independent agents that try to break the design and produce a
+   PASS / PASS-WITH-CONDITIONS / REVISE verdict with concrete build conditions.
+2. **Build in isolation.** Implemented in a dedicated git worktree off `master`, never
+   directly on the mainline.
+3. **Independent review on the final SHA.** At least **two independent reviewers**
+   review the *exact* SHA that will ship (the "both-reviewers-on-the-final-SHA"
+   discipline). Authority-sensitive changes additionally get **fresh adversarial
+   passes** that attempt concrete exploits (double-answer, identity spoof, race,
+   bypass). Reproduced evidence beats belief; any real blocker is folded and
+   re-reviewed on the new SHA.
+4. **Lead gate (hard, pre-merge).** `ruff` + `bandit` + `node --check` (frontend) +
+   `git diff --check` + the **full pytest suite on Python 3.10 AND 3.14** — all green
+   before fast-forward merge. The dev host lacks 3.14, so the lead runs it explicitly.
+5. **CI matrix.** GitHub Actions runs the suite across **Python 3.10–3.13 on Windows,
+   macOS, and Ubuntu**, a separate **security** workflow, and a **wheel-build /
+   packaging** gate. A release ships only on green; a flake is re-run and confirmed
+   (never merged red).
+
+**Invariants enforced across releases**
+- **Fail-closed authority.** The supervised executor (`supervise --drain-intents`) is
+  the *sole* write boundary; browser-supplied identity is never trusted — the actor is
+  derived server-side. Every write path re-validates at drain and denies on drift with
+  zero sends.
+- **Byte-identical read-only.** With `--enable-actions` off, the console and `/api/state`
+  are byte-identical to the pure read-only dashboard (fixture-tested).
+- **Idempotent + crash-safe writes.** Two-phase reconcile (attempt-floor + delivery
+  fingerprint) so a crash-after-send never double-acts.
+- **Signable bus + untrusted bodies.** Messages are HMAC-signable; message bodies are
+  treated as untrusted data (escaped on render, never executed).
+- **Documented threat-model non-goals** (see §2) — we state what we do *not* defend
+  against, rather than implying we do.
+
+---
+
+## 2. Codebase security posture
+
+**Last full scan: 2026-07-05** (free / open-source scanners; raw output archived by the
+lead). Re-run on demand and refreshed as the codebase changes.
+
+| Scanner | Scope | Result |
+|---|---|---|
+| **bandit** 1.9.4 | Python SAST | **0 issues** (28,553 LOC) |
+| **semgrep** (317 rules: `p/python`, `p/security-audit`, `p/secrets`, `p/javascript`) | multi-language SAST | **0 findings** (79 files) |
+| **detect-secrets** | committed credentials | **0 real** (2 hits, both intentional test-probe strings) |
+| **pip-audit** | dependency CVEs | **no runtime dependencies** — agenttalk is stdlib-only |
+| **vulture** | dead code | **0** (confidence ≥ 80) |
+| **ruff** | lint / bug-prone patterns | clean on the enforced ruleset; expanded rulesets surface only style/robustness (e.g. message-in-`raise`), no security findings — the 3 partial-path-subprocess sites are already `# nosec`-reviewed |
+
+**Structural security properties**
+- **No third-party runtime dependency attack surface** — the package imports only the
+  Python standard library; builds with `hatchling`; `dependencies = []`.
+- **Authority model** — the supervised executor is the only write boundary; identities
+  are resolved server-side; the bus is HMAC-signable; `.agenttalk/` state is gitignored
+  and HMAC keys are generated at runtime (never committed).
+- **Documented non-goals (accepted limitations, in `docs/ISSUES.md`):** the supervisor
+  process-ownership model is a correctness boundary against *accidental* cross-project
+  kills and PID reuse — **not** a security boundary against a deliberately malicious
+  same-user process that forges command lines / parent links (plus a backward
+  wall-clock step straddling PID reuse). These are explicit non-goals, not gaps.
+
+> Coverage notes (honesty): scans are static (no DAST of the running server), use
+> semgrep's community rulesets, and cover the working tree (not full git history — low
+> risk given secrets are runtime-generated and never committed).
+
+---
+
+## 3. Per-release assurance ledger
+
+All entries below shipped through the §1 pipeline. **CI (tests + security) is green for
+every release listed.** Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
+merged); Tag = the release commit (adds version/CHANGELOG only).
+
+### v0.61.0 — Team Console: colored flow + full history + archived + avatars (2026-07-05)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `9dd0342` · tag `v0.61.0` (`60f808b`)
+- **Review:** reviewer-1 + reviewer-2 GO on the final SHA (focus: `/api/state` derivation
+  parity + the new read-only `/api/threads` endpoint fail-safe + frontend contract).
+- **Gate:** ruff/bandit/node/diff clean; pytest **1835 passed / 3 skipped on 3.10 AND 3.14**.
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green. One
+  3.10-Windows timing flake in an *unrelated* work-heartbeat test; re-run green (hardening tracked).
+- **Robust/Secure:** read-only, additive; one shared thread classifier keeps `/api/state`
+  byte-identical (parity-tested); the endpoint is fail-safe (an error can never affect
+  `/api/state`); avatars served from a fixed allowlist (no path traversal).
+
+### v0.60.2 — console UX fixes: composer poll-clobber + flow-line thickness (2026-07-04)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `effbc58` · tag `v0.60.2` (`045a114`)
+- **Review:** reviewer-1 GO (frontend-only, right-sized).
+- **Gate:** ruff/bandit/node/diff clean; pytest **1832 / 3 skipped on 3.10 AND 3.14**. CI green.
+- **Robust/Secure:** frontend-only (`console.js`); actions-off behavior unchanged.
+
+### v0.60.1 — cross-path operator-answer dedup (2026-07-04)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `d6bab84` · tag `v0.60.1` (`62f1c4c`)
+- **Review:** reviewer-1 + reviewer-2 GO **+ a fresh adversarial concurrency pass that
+  could-not-break** (8-way race + mixed drain/relay race + 30 stress iterations, all single-send).
+- **Gate:** clean; pytest **1832 / 3 skipped on 3.10 AND 3.14**. CI green.
+- **Robust/Secure:** both operator-answer paths serialize on one atomic check-and-send
+  under the non-reentrant config lock (verified deadlock-safe); fail-closed on
+  lock/read/mismatch/reject.
+
+### v0.60.0 — operator inbox: answer escalations from the browser (2026-07-04)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `6827801` · tag `v0.60.0` (`f65c2fe`)
+- **Review:** **adversarial design gate = PASS-WITH-CONDITIONS (8 conditions folded)**;
+  then a **4-way review on the final SHA** — 2 reviewers GO + 2 fresh adversarial passes
+  (authority and idempotency/byte-identity) **could-not-break** — plus a re-review of the
+  coalescing fold (both GO).
+- **Gate:** ruff/bandit/node/diff clean; full suite green on 3.10 AND 3.14. CI green.
+- **Robust/Secure:** browser→lead-answer is authority-sensitive; the executor re-verifies
+  the escalation is pending + owed to the resolved actor, never self-answerable, never a
+  coalesced duplicate; server-injected operator meta; two-phase reconcile prevents
+  double-answer; actions-off byte-identical.
+
+### v0.59.3 — Team Console per-provider capacity + compact density (2026-07-04)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `2695266` · tag `v0.59.3` (`75c818f`)
+- **Review:** both reviewers GO on the rollout-fix fold (one reproduced-P1 held and folded
+  first — reproduced-evidence-trumps-belief).
+- **Gate:** clean; pytest **1813 / 3 skipped on 3.10 AND 3.14**. CI green.
+- **Robust/Secure:** capacity read is bounded + fail-closed (degrades to *unknown* rather
+  than reporting a stale value as observed); supervised Codex reads only its isolated home.
+
+### v0.59.2 — supervisor process-ownership attribution (cross-project-kill P0) (2026-07-04)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `5add1d0`/`1dd10ba` · tag `v0.59.2`
+- **Review:** **end-the-class design via an adversarial 4-lens design gate
+  (PASS-WITH-CONDITIONS)** after 3 patch rounds each caught a deeper residual; then
+  reviewer-2 GO + multiple fresh adversarial passes could-not-break.
+- **Gate:** ruff/bandit clean; **1790 passed on 3.10 AND 3.14**. CI green.
+- **Robust/Secure:** typed process-ownership + strict-live-chain + launch-nonce
+  confirmation; fail-safe (never cross-kills); monotonic-clock / cmdline-spoof documented
+  as non-goals.
+
+### v0.59.1 — Team Console write-spine hardening (2026-07-04)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `9d88dc1` · tag `v0.59.1`
+- **Review:** claude-reviewer-3 GO (per-test pass-for-right-reason analysis) + codex
+  security review; a reproduced release-blocker P1 was folded before ship.
+- **Gate:** full suite green on 3.10 AND 3.14. CI green.
+- **Robust/Secure:** drain-time frozen-plan revalidation (deny-on-drift, zero sends),
+  pid-start-aware anti-reuse reclaim, torn-intent quarantine, negative/e2e regression suite.
+
+### Releases ≤ v0.59.0
+Shipped through the same review + gate + CI discipline. Their evidence lives in
+`CHANGELOG.md`, `docs/ISSUES.md` (audit-findings disposition), `docs/audit-2026-06-28.md`
+(a full independent audit), and the git tag/CI history. Not re-attested per-release here.
+
+---
+
+## 4. Standing commitment
+
+**Every release appends its own ledger entry to §3 as part of the release ritual**, and
+refreshes §2 if the scan surface changed. Ship sequence:
+
+> bump `__init__`+`pyproject` → `CHANGELOG.md` → **`docs/ASSURANCE.md` ledger entry** →
+> `README` pins → tag → push → **CI green** → GitHub release.
+
+An entry is only valid if it records: the reviewer verdicts (on the final SHA), the
+lead-gate result (pytest on 3.10 **and** 3.14, ruff/bandit/node/diff), the CI matrix
+status, any adversarial-pass outcome, and any new known-limitation. If a release cannot
+truthfully claim GOOD/ROBUST/SECURE with that evidence, it does not ship.

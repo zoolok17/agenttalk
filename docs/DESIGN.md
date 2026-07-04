@@ -7,6 +7,7 @@ behaves*; this doc is the source of truth for *why it is shaped this way*.
 
 Companion docs:
 - `docs/ISSUES.md` — the living tracker (work in flight, known limitations, audit findings).
+- `docs/ASSURANCE.md` — per-release GOOD/ROBUST/SECURE attestation + the codebase security posture.
 - `CHANGELOG.md` — what changed, per release.
 - `README.md` — user-facing usage.
 - `docs/supervisor-tutorial.md` — step-by-step unattended-operation guide.
@@ -447,9 +448,13 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   SHA — `ruff`, `bandit -r src -x src/agenttalk/skills`, `git diff --check`, and
   full `pytest` on **Python 3.10 and 3.14**.
 - **Release ritual:** bump `src/agenttalk/__init__.py` + `pyproject.toml`; add a
-  `CHANGELOG.md` section; update README install pins; commit via `git commit -F`
+  `CHANGELOG.md` section; **append a `docs/ASSURANCE.md` ledger entry attesting the
+  release is GOOD/ROBUST/SECURE with its evidence (reviewer verdicts on the final
+  SHA, lead-gate result on 3.10+3.14, CI status, adversarial-pass outcome, any new
+  known-limitation)**; update README install pins; commit via `git commit -F`
   (never `-m` for multi-line — PowerShell native-arg trap); tag; push; `gh release
-  create`; watch CI.
+  create`; watch CI. A release that cannot truthfully carry that assurance entry
+  does not ship.
 - **We dogfood the assurance arc on ourselves:** our own work is reviewed and
   gated by the same gate/close/evidence machinery this tool provides.
 
