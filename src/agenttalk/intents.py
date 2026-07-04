@@ -277,6 +277,13 @@ def build_plan(store: Store, actor: str, record: dict) -> dict:
                                f"recipient {target!r} is not in the roster")
 
     deliveries: list[dict] = []
+
+    def _opener_meta(meta: dict, bus_kind: str) -> dict:
+        if bus_kind in {"question", "proposal"} and "epoch_at_send" not in meta:
+            meta = dict(meta)
+            meta["epoch_at_send"] = store.current_epoch()
+        return meta
+
     if kind == "send":
         target = payload.get("target") or ""
         _check_target(target)
@@ -284,15 +291,18 @@ def build_plan(store: Store, actor: str, record: dict) -> dict:
         stable_meta: dict = {}
         if bus_kind == "question":
             stable_meta["request_id"] = "q-" + secrets.token_hex(6)
+        stable_meta = _opener_meta(stable_meta, bus_kind)
         deliveries.append({"recipient": target, "bus_kind": bus_kind,
                            "subject": subject, "body": body,
                            "stable_meta": stable_meta})
     elif kind == "propose":
         target = payload.get("target") or ""
         _check_target(target)
+        stable_meta = _opener_meta({"request_id": "pp-" + secrets.token_hex(6)},
+                                   "proposal")
         deliveries.append({"recipient": target, "bus_kind": "proposal",
                            "subject": subject, "body": body,
-                           "stable_meta": {"request_id": "pp-" + secrets.token_hex(6)}})
+                           "stable_meta": stable_meta})
     elif kind == "reply":
         rid = payload.get("to_request") or ""
         anchor = resolve_reply_anchor(store, actor, rid)
@@ -331,6 +341,7 @@ def build_plan(store: Store, actor: str, record: dict) -> dict:
                   "audience_kind": str(akind),
                   "audience_resolved": ",".join(recipients),
                   "batch_total": str(len(recipients))}
+        shared = _opener_meta(shared, bus_kind)
         for r in recipients:
             deliveries.append({"recipient": r, "bus_kind": bus_kind,
                                "subject": subject, "body": body,
@@ -343,7 +354,7 @@ def build_plan(store: Store, actor: str, record: dict) -> dict:
 # ------------------------------------------------------------------ drain
 
 def _find_completed_send(store: Store, *, intent_id: str, delivery_index: int,
-                         attempt_floor: str, fingerprint: str) -> str | None:
+                         attempt_floor: str, actor: str, delivery: dict) -> str | None:
     """Crash recovery: the bounded idempotency scan. ``attempt_floor`` was
     minted by the sending process's own monotonic id generator BEFORE the send,
     so a completed send's id is strictly greater - the scan can never miss it,
@@ -351,10 +362,21 @@ def _find_completed_send(store: Store, *, intent_id: str, delivery_index: int,
     for m in store.valid_messages():
         if m.id <= attempt_floor:
             continue
+        if (m.sender != actor or m.recipient != delivery["recipient"]
+                or m.kind != delivery["bus_kind"]):
+            continue
         meta = m.meta or {}
+        stable_meta = delivery.get("stable_meta") or {}
+        if any(meta.get(k) != v for k, v in stable_meta.items()):
+            continue
+        fp = delivery_fingerprint(
+            intent_id=intent_id, delivery_index=delivery_index, actor=actor,
+            recipient=delivery["recipient"], bus_kind=delivery["bus_kind"],
+            subject=m.subject or "", body=m.body or "",
+            stable_meta=stable_meta)
         if (meta.get("web_intent_id") == intent_id
                 and str(meta.get("web_intent_delivery_index")) == str(delivery_index)
-                and meta.get("web_intent_fingerprint") == fingerprint):
+                and meta.get("web_intent_fingerprint") == fp):
             return m.id
     return None
 
@@ -413,7 +435,8 @@ def _drain_one(store: Store, rec: dict) -> str:
         prior_floor = st.get("attempt_floor")
         if isinstance(prior_floor, str) and prior_floor:
             done = _find_completed_send(store, intent_id=iid, delivery_index=i,
-                                        attempt_floor=prior_floor, fingerprint=fp)
+                                        attempt_floor=prior_floor, actor=actor,
+                                        delivery=d)
             if done is not None:
                 _record_delivery(store, iid, i, state="delivered",
                                  message_id=done, fingerprint=fp,

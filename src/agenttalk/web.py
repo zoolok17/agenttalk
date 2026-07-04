@@ -76,11 +76,14 @@ keep the stricter no-script policy byte-identical.
 from __future__ import annotations
 
 import html
+import hmac
 import ipaddress
 import json
 import re
+import secrets
 import socket
 import threading
+import time
 import urllib.parse
 from collections import Counter, deque
 from dataclasses import dataclass
@@ -145,6 +148,11 @@ _DEFAULT_CSP = ("default-src 'none'; style-src 'unsafe-inline'; "
 _DASHBOARD_CSP = ("default-src 'none'; script-src 'self'; "
                   "connect-src 'self'; style-src 'self'; "
                   "img-src 'none'; frame-ancestors 'none'")
+_ACTION_BODY_LIMIT = 64 * 1024
+_ACTION_RATE_PER_MINUTE = 60
+_ACTION_RATE_BURST = 20
+_INTENT_STALE_SECONDS = 120.0
+_CLAIM_STALE_SECONDS = 900.0
 
 # Thread states that owe nothing (mirror threads._derive_next's gate).
 _TERMINAL_STATES = ("closed", "closed-superseded")
@@ -221,6 +229,132 @@ def _format_url(host: str, port: int) -> str:
     if ":" in host and not host.startswith("["):
         return f"http://[{host}]:{port}/"
     return f"http://{host}:{port}/"
+
+
+def _server_host_port(handler: BaseHTTPRequestHandler) -> tuple[str, int]:
+    addr = handler.server.server_address
+    return str(addr[0]), int(addr[1])
+
+
+def _normalized_host_port(value: str) -> tuple[str, int | None] | None:
+    if not value or value.endswith("."):
+        return None
+    parsed = urllib.parse.urlsplit("//" + value)
+    try:
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if not host or not _is_loopback_addr(host):
+        return None
+    if ":" in host and not value.startswith("["):
+        return None
+    return host, port
+
+
+def _same_host_port(a: tuple[str, int | None] | None,
+                    b: tuple[str, int | None] | None,
+                    *, default_port: int = 80) -> bool:
+    if a is None or b is None:
+        return False
+    ah, ap = a
+    bh, bp = b
+    if (ap if ap is not None else default_port) != (bp if bp is not None else default_port):
+        return False
+    return ah.casefold() == bh.casefold()
+
+
+def _intent_public_record(rec: dict, *, now: datetime) -> dict:
+    created = _parse_iso(rec.get("created_at"))
+    claim = rec.get("claim") if isinstance(rec.get("claim"), dict) else {}
+    claimed = _parse_iso(claim.get("at"))
+    state = str(rec.get("state") or "unknown")
+    out = {
+        "intent_id": rec.get("intent_id"),
+        "kind": rec.get("kind"),
+        "state": state,
+        "created_at": rec.get("created_at"),
+        "claimed_at": claim.get("at"),
+        "terminal_at": rec.get("terminal_at"),
+        "code": rec.get("code"),
+        "error": rec.get("error"),
+        "deliveries": [
+            {
+                "delivery_index": d.get("delivery_index"),
+                "state": d.get("state"),
+                "recipient": d.get("recipient"),
+                "bus_kind": d.get("bus_kind"),
+                "message_id": d.get("message_id"),
+            }
+            for d in rec.get("deliveries", [])
+            if isinstance(d, dict)
+        ],
+    }
+    if created is not None and state == Store.INTENT_QUEUED:
+        out["queued_age_seconds"] = round((now - created).total_seconds(), 3)
+        out["queued_stale"] = out["queued_age_seconds"] > _INTENT_STALE_SECONDS
+    if claimed is not None and state == Store.INTENT_CLAIMED:
+        out["claimed_age_seconds"] = round((now - claimed).total_seconds(), 3)
+        out["claimed_stale"] = out["claimed_age_seconds"] > _CLAIM_STALE_SECONDS
+    return out
+
+
+def build_intents(roots: list[RootDescriptor], *, limit: int = 100) -> dict:
+    """Read-only intent status feed. Message bodies are deliberately omitted."""
+    now = datetime.now(timezone.utc)
+    root = roots[0]
+    return {
+        "target_root_index": 0,
+        "target_root_label": root.label,
+        "target_root_path": str(root.store.root),
+        "items": [
+            _intent_public_record(rec, now=now)
+            for rec in root.store.list_intents(limit=limit)
+        ],
+    }
+
+
+def build_preflight(root: RootDescriptor, *, actions_enabled: bool) -> dict:
+    """Read-only dashboard bootstrap/preflight checks. No store writes."""
+    store = root.store
+    initialized = store.initialized()
+    checks = []
+
+    def add(key: str, ok: bool, detail: str) -> None:
+        checks.append({"key": key, "ok": bool(ok), "detail": detail})
+
+    add("store_initialized", initialized,
+        "store exists" if initialized else "run agenttalk start --init-if-absent with --agents")
+    if initialized:
+        try:
+            actor = None
+            from agenttalk import intents as intent_mod
+            actor = intent_mod.resolve_web_actor(store)
+        except Exception:  # noqa: BLE001 - preflight reports degraded data, never 500s
+            actor = None
+        add("operator_actor", actor is not None,
+            f"browser actions will run as {actor}" if actor else
+            "set an operator-facing liaison or exactly one role=lead")
+    else:
+        add("operator_actor", False, "store not initialized")
+    sup_ps1 = store.dir / "supervisor.ps1"
+    sup_cfg = store.dir / "supervisor.json"
+    add("supervisor_scaffolded", sup_ps1.exists() and sup_cfg.exists(),
+        "supervisor scaffold found" if sup_ps1.exists() and sup_cfg.exists()
+        else "run agenttalk supervise --init, then fill supervisor.json")
+    inst = store.read_supervisor_instance()
+    add("supervisor_running", inst is not None,
+        f"instance pid={inst.get('pid')}" if inst else "no live supervisor instance lock")
+    add("actions_enabled", actions_enabled,
+        "browser intent enqueueing is enabled" if actions_enabled
+        else "restart dashboard with --enable-actions to enqueue intents")
+    return {
+        "target_root_index": 0,
+        "target_root_label": root.label,
+        "target_root_path": str(store.root),
+        "checks": checks,
+        "ok": all(c["ok"] for c in checks),
+    }
 
 
 # ----------------------------------------------------------- HTML rendering
@@ -1543,7 +1677,7 @@ def _age_seconds_of(ts: Any, *, now: datetime) -> float | None:
 
 # ------------------------------------------------------------ HTTP handler
 
-def _make_handler(roots: list[RootDescriptor]) -> type[BaseHTTPRequestHandler]:
+def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) -> type[BaseHTTPRequestHandler]:
     """Build a request handler class closed over the watched roots.
 
     Returns a class (not an instance) because ``ThreadingHTTPServer``
@@ -1557,6 +1691,9 @@ def _make_handler(roots: list[RootDescriptor]) -> type[BaseHTTPRequestHandler]:
     # created per connection, so the ring lives on this closure, shared across
     # them for the lifetime of the server.
     health_history = HealthTimelineRing()
+    session_id = secrets.token_hex(8)
+    csrf_token = secrets.token_urlsafe(32) if enable_actions else ""
+    rate = {"tokens": float(_ACTION_RATE_BURST), "updated": time.monotonic()}
 
     class Handler(BaseHTTPRequestHandler):
         server_version = f"agenttalk/{__version__}"
@@ -1574,7 +1711,8 @@ def _make_handler(roots: list[RootDescriptor]) -> type[BaseHTTPRequestHandler]:
 
         # ---- response helpers
         def _send(self, status: int, body: bytes, content_type: str,
-                  csp: str | None = None) -> None:
+                  csp: str | None = None,
+                  extra_headers: dict[str, str] | None = None) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
@@ -1586,6 +1724,8 @@ def _make_handler(roots: list[RootDescriptor]) -> type[BaseHTTPRequestHandler]:
             # byte-identical. Only /dashboard opts into a different one.
             self.send_header("Content-Security-Policy",
                              csp if csp is not None else _DEFAULT_CSP)
+            for k, v in (extra_headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(body)
@@ -1597,6 +1737,12 @@ def _make_handler(roots: list[RootDescriptor]) -> type[BaseHTTPRequestHandler]:
         def _send_json(self, status: int, payload: Any) -> None:
             data = json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
             self._send(status, data, "application/json; charset=utf-8")
+
+        def _json_problem(self, status: int, code: str, detail: str,
+                          *, close: bool = False) -> None:
+            if close:
+                self.close_connection = True
+            self._send_json(status, {"error": code, "detail": detail})
 
         def _error_html(self, status: int, message: str) -> None:
             body = _html_page(
@@ -1636,7 +1782,19 @@ def _make_handler(roots: list[RootDescriptor]) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802
             if not self._check_peer_or_403():
                 return
-            self._method_not_allowed()
+            if not enable_actions:
+                self._method_not_allowed()
+                return
+            path = self._request_path(validate_absolute=True)
+            if not path:
+                self._json_problem(HTTPStatus.FORBIDDEN, "bad_host",
+                                   "absolute-form request target must match this loopback server",
+                                   close=True)
+                return
+            if path != "/api/intent":
+                self._method_not_allowed()
+                return
+            self._handle_intent_post()
 
         def do_PUT(self) -> None:  # noqa: N802
             if not self._check_peer_or_403():
@@ -1654,10 +1812,194 @@ def _make_handler(roots: list[RootDescriptor]) -> type[BaseHTTPRequestHandler]:
             self._method_not_allowed()
 
         def _method_not_allowed(self) -> None:
-            self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
-            self.send_header("Allow", "GET, HEAD")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            allow = "POST" if enable_actions and self._request_path() == "/api/intent" else "GET, HEAD"
+            self._send(HTTPStatus.METHOD_NOT_ALLOWED, b"", "text/plain; charset=utf-8",
+                       extra_headers={"Allow": allow})
+
+        def _request_path(self, *, validate_absolute: bool = False) -> str:
+            parsed = urllib.parse.urlsplit(self.path)
+            if parsed.scheme or parsed.netloc:
+                if validate_absolute and not self._absolute_target_allowed(parsed):
+                    return ""
+                return parsed.path or "/"
+            return self.path.split("?", 1)[0].split("#", 1)[0] or "/"
+
+        def _absolute_target_allowed(self, parsed: urllib.parse.SplitResult) -> bool:
+            _bound_host, bound_port = _server_host_port(self)
+            target = _normalized_host_port(parsed.netloc)
+            if target is None:
+                return False
+            _target_host, target_port = target
+            return (target_port if target_port is not None else 80) == bound_port
+
+        def _host_allowed(self) -> bool:
+            _host, port = _server_host_port(self)
+            hp = _normalized_host_port(self.headers.get("Host", ""))
+            return hp is not None and (hp[1] if hp[1] is not None else 80) == port
+
+        def _origin_allowed(self, value: str | None) -> bool:
+            if not value:
+                return False
+            parsed = urllib.parse.urlsplit(value)
+            if parsed.scheme != "http" or not parsed.netloc:
+                return False
+            host = _normalized_host_port(self.headers.get("Host", ""))
+            origin = _normalized_host_port(parsed.netloc)
+            return _same_host_port(origin, host)
+
+        def _session_origin_headers_ok(self) -> bool:
+            if not self._host_allowed():
+                return False
+            origin = self.headers.get("Origin")
+            if origin and not self._origin_allowed(origin):
+                return False
+            ref = self.headers.get("Referer")
+            if ref:
+                parsed = urllib.parse.urlsplit(ref)
+                if parsed.scheme != "http" or not self._origin_allowed(f"{parsed.scheme}://{parsed.netloc}"):
+                    return False
+            fetch_site = self.headers.get("Sec-Fetch-Site")
+            return fetch_site in (None, "", "same-origin", "same-site", "none")
+
+        def _content_type_ok(self) -> bool:
+            ctype = self.headers.get("Content-Type", "")
+            return ctype.split(";", 1)[0].strip().casefold() == "application/json"
+
+        def _rate_allowed(self) -> bool:
+            now = time.monotonic()
+            elapsed = max(0.0, now - float(rate["updated"]))
+            rate["tokens"] = min(
+                float(_ACTION_RATE_BURST),
+                float(rate["tokens"]) + elapsed * (_ACTION_RATE_PER_MINUTE / 60.0))
+            rate["updated"] = now
+            if float(rate["tokens"]) < 1.0:
+                return False
+            rate["tokens"] = float(rate["tokens"]) - 1.0
+            return True
+
+        def _active_intent_capacity_ok(self) -> tuple[bool, str, str]:
+            count, size = store._intent_active_usage()  # noqa: SLF001 - web maps the store cap to HTTP before parse
+            if count >= Store.INTENT_MAX_ACTIVE:
+                return False, "intent_cap", "too many active intents"
+            if size >= Store.INTENT_MAX_ACTIVE_BYTES:
+                return False, "intent_bytes", "active intent byte cap reached"
+            return True, "", ""
+
+        def _read_limited_body(self) -> bytes | None:
+            raw_len = self.headers.get("Content-Length")
+            if raw_len is not None:
+                try:
+                    n = int(raw_len)
+                except ValueError:
+                    self._json_problem(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                                       "body_too_large", "invalid Content-Length",
+                                       close=True)
+                    return None
+                if n > _ACTION_BODY_LIMIT:
+                    self._json_problem(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                                       "body_too_large", "request body exceeds 64 KiB",
+                                       close=True)
+                    return None
+                return self.rfile.read(max(0, n))
+            data = self.rfile.read(_ACTION_BODY_LIMIT + 1)
+            if len(data) > _ACTION_BODY_LIMIT:
+                self._json_problem(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                                   "body_too_large", "request body exceeds 64 KiB",
+                                   close=True)
+                return None
+            return data
+
+        def _handle_session_get(self) -> None:
+            if not enable_actions:
+                self._error_html(HTTPStatus.NOT_FOUND, "not found")
+                return
+            if not self._session_origin_headers_ok():
+                self._json_problem(HTTPStatus.FORBIDDEN, "bad_origin",
+                                   "session endpoint requires same-origin loopback headers")
+                return
+            self._send_json(HTTPStatus.OK, {
+                "session_id": session_id,
+                "csrf_token": csrf_token,
+                "target_root_index": 0,
+                "target_root_label": roots[0].label,
+                "target_root_path": str(store.root),
+            })
+
+        def _handle_intent_post(self) -> None:
+            if not self._host_allowed():
+                self._json_problem(HTTPStatus.FORBIDDEN, "bad_host",
+                                   "Host must be loopback for this server",
+                                   close=True)
+                return
+            if not self._origin_allowed(self.headers.get("Origin")):
+                self._json_problem(HTTPStatus.FORBIDDEN, "bad_origin",
+                                   "Origin must match this dashboard",
+                                   close=True)
+                return
+            if not self._content_type_ok():
+                self._json_problem(HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                                   "bad_content_type",
+                                   "Content-Type must be application/json",
+                                   close=True)
+                return
+            supplied = self.headers.get("X-CSRF-Token", "")
+            if not hmac.compare_digest(supplied, csrf_token):
+                self._json_problem(HTTPStatus.FORBIDDEN, "bad_csrf",
+                                   "CSRF token is missing or expired",
+                                   close=True)
+                return
+            kill = store.supervisor_kill_switch()
+            if kill is not False:
+                code = "executor_disabled" if kill else "executor_state_unreadable"
+                self._json_problem(HTTPStatus.LOCKED, code,
+                                   "supervisor kill-switch blocks dashboard writes",
+                                   close=True)
+                return
+            body = self._read_limited_body()
+            if body is None:
+                return
+            if not self._rate_allowed():
+                self._json_problem(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited",
+                                   "too many dashboard write attempts")
+                return
+            ok, cap_code, cap_detail = self._active_intent_capacity_ok()
+            if not ok:
+                self._json_problem(HTTPStatus.TOO_MANY_REQUESTS, cap_code, cap_detail)
+                return
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                self._json_problem(HTTPStatus.BAD_REQUEST, "invalid_json",
+                                   "request body must be a JSON object")
+                return
+            if not isinstance(payload, dict):
+                self._json_problem(HTTPStatus.BAD_REQUEST, "invalid_json",
+                                   "request body must be a JSON object")
+                return
+            kind = payload.get("kind")
+            intent_payload = payload.get("payload")
+            from agenttalk import intents as intent_mod
+            errors = intent_mod.validate_intent(kind, intent_payload)
+            if errors:
+                self._send_json(HTTPStatus.BAD_REQUEST,
+                                {"error": "invalid_intent", "details": errors})
+                return
+            try:
+                rec = store.write_intent(
+                    kind, intent_payload,
+                    origin={"source": "web-console", "session_id": session_id,
+                            "host": self.headers.get("Host", ""),
+                            "origin": self.headers.get("Origin", "")})
+            except Store.IntentCapacityError as e:
+                status = HTTPStatus.INSUFFICIENT_STORAGE if e.code == "max_bytes" else HTTPStatus.TOO_MANY_REQUESTS
+                self._json_problem(status, e.code, str(e))
+                return
+            except ValueError as e:
+                self._json_problem(HTTPStatus.BAD_REQUEST, "invalid_intent", str(e))
+                return
+            self._send_json(HTTPStatus.ACCEPTED,
+                            {"intent_id": rec["intent_id"], "state": rec["state"],
+                             "target_root_index": 0, "target_root_label": roots[0].label})
 
         # ---- root resolution for the root-scoped thread route (P2-5)
         def _thread_store(self) -> Store:
@@ -1680,9 +2022,10 @@ def _make_handler(roots: list[RootDescriptor]) -> type[BaseHTTPRequestHandler]:
 
         # ---- routing
         def _route(self) -> None:
-            path = self.path.split("?", 1)[0].split("#", 1)[0]
+            path = self._request_path()
             if path == "/":
-                self._serve_index()
+                self._send_html(HTTPStatus.OK, render_dashboard(roots),
+                                csp=_DASHBOARD_CSP)
                 return
             if path == "/favicon.ico":
                 self._send(HTTPStatus.NO_CONTENT, b"", "image/x-icon")
@@ -1696,6 +2039,17 @@ def _make_handler(roots: list[RootDescriptor]) -> type[BaseHTTPRequestHandler]:
                 # feed keeps the strict _DEFAULT_CSP.
                 self._send_json(HTTPStatus.OK,
                                 build_state(roots, history=health_history))
+                return
+            if path == "/api/session":
+                self._handle_session_get()
+                return
+            if path == "/api/intents":
+                self._send_json(HTTPStatus.OK, build_intents(roots))
+                return
+            if path == "/api/preflight":
+                self._send_json(HTTPStatus.OK,
+                                build_preflight(roots[0],
+                                                actions_enabled=enable_actions))
                 return
             if path == "/api/attention":
                 # Ranked "needs a human" queue for root[0] (§4a). Envelope-only,
@@ -1790,6 +2144,7 @@ def _find_message(store: Store, mid: str) -> Message | None:
 def make_server(store: Store, host: str, port: int,
                 *, quiet: bool = True,
                 extra: list[RootDescriptor] | None = None,
+                enable_actions: bool = False,
                 ) -> ThreadingHTTPServer:
     """Build (but do not start) a dashboard HTTP server.
 
@@ -1817,7 +2172,7 @@ def make_server(store: Store, host: str, port: int,
         )
     roots = [RootDescriptor(store=store, label=store.root.name or str(store.root))]
     roots.extend(extra or [])
-    handler_cls = _make_handler(roots)
+    handler_cls = _make_handler(roots, enable_actions=enable_actions)
     if not quiet:
         handler_cls._quiet = False  # noqa: SLF001 — class attr by design
     # Bind a loopback LITERAL — never delegate 'localhost' to the OS resolver.
@@ -1839,6 +2194,7 @@ def make_server(store: Store, host: str, port: int,
 def serve(store: Store, *, host: str = "127.0.0.1", port: int = 8765,
           quiet: bool = True,
           extra: list[RootDescriptor] | None = None,
+          enable_actions: bool = False,
           on_ready: Callable[[str], None] | None = None) -> None:
     """Start the dashboard and block until interrupted.
 
@@ -1846,7 +2202,8 @@ def serve(store: Store, *, host: str = "127.0.0.1", port: int = 8765,
     port is announced via ``on_ready(url)`` and is also available as
     ``server.server_address[1]`` if the caller wraps this manually.
     """
-    srv = make_server(store, host, port, quiet=quiet, extra=extra)
+    srv = make_server(store, host, port, quiet=quiet, extra=extra,
+                      enable_actions=enable_actions)
     actual_port = srv.server_address[1]
     url = _format_url(host, actual_port)
     if on_ready is not None:
@@ -1861,6 +2218,7 @@ def serve(store: Store, *, host: str = "127.0.0.1", port: int = 8765,
 
 def serve_in_thread(store: Store, *, host: str = "127.0.0.1", port: int = 0,
                     extra: list[RootDescriptor] | None = None,
+                    enable_actions: bool = False,
                     ) -> tuple[ThreadingHTTPServer, threading.Thread, str]:
     """Start the dashboard on a daemon thread (used by tests).
 
@@ -1869,7 +2227,8 @@ def serve_in_thread(store: Store, *, host: str = "127.0.0.1", port: int = 0,
     has no trailing slash so callers can append ``/messages/<id>``
     etc. directly.
     """
-    srv = make_server(store, host, port, extra=extra)
+    srv = make_server(store, host, port, extra=extra,
+                      enable_actions=enable_actions)
     t = threading.Thread(target=srv.serve_forever, daemon=True,
                          name="agenttalk-web")
     t.start()
@@ -1883,6 +2242,8 @@ __all__ = [
     "HealthTimelineRing",
     "RootDescriptor",
     "build_attention",
+    "build_intents",
+    "build_preflight",
     "build_state",
     "build_thread",
     "make_descriptors",

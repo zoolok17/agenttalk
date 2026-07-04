@@ -8,9 +8,11 @@ import dataclasses
 import io
 import json
 import os
+import subprocess  # nosec B404
 import sys
 import time
 import uuid
+import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -5603,7 +5605,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         store = _get_store(args)
     try:
         srv = _web.make_server(store, host, args.port, quiet=args.quiet,
-                               extra=extra)
+                               extra=extra,
+                               enable_actions=getattr(args, "enable_actions", False))
     except ValueError as e:  # non-loopback host refusal — keep FIRST
         sys.stderr.write(f"agenttalk {spelling}: {e}\n")
         return 2
@@ -5623,6 +5626,85 @@ def cmd_serve(args: argparse.Namespace) -> int:
         sys.stderr.write(f"agenttalk: serving read-only dashboard at {url}\n")
     sys.stderr.write("           (Ctrl-C to stop)\n")
     sys.stderr.flush()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        sys.stderr.write("\nagenttalk: dashboard stopped\n")
+    finally:
+        srv.server_close()
+    return 0
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    """Step-0 bootstrap: optionally initialize an explicit root, then start the console."""
+    from agenttalk import web as _web
+
+    explicit_location = bool(args.here or args.path or getattr(args, "root", None))
+    if args.path:
+        root = Path(args.path).resolve()
+    elif args.here:
+        root = Path.cwd().resolve()
+    elif getattr(args, "root", None):
+        root = Path(args.root).resolve()
+    else:
+        root = find_root()
+    store = Store(root)
+    if not store.initialized():
+        if not args.init_if_absent:
+            sys.stderr.write(
+                f"agenttalk start: not initialized at {root}; pass --init-if-absent "
+                "with an explicit --here/--path/--root and --agents\n")
+            return 2
+        if not explicit_location or not args.agents:
+            sys.stderr.write(
+                "agenttalk start: --init-if-absent requires an explicit location "
+                "(--here, --path, or global --root) and --agents a,b\n")
+            return 2
+        init_args = argparse.Namespace(path=str(root), root=str(root),
+                                       agents=args.agents, force=False)
+        rc = cmd_init(init_args)
+        if rc != 0:
+            return rc
+    supervisor_present = (store.dir / "supervisor.ps1").exists()
+    if args.dry_run:
+        print(json.dumps({
+            "root": str(root), "initialized": store.initialized(),
+            "actions_enabled": bool(args.enable_actions),
+            "supervisor_present": supervisor_present,
+            "would_start_supervisor": bool(supervisor_present and not args.no_supervisor),
+        }, indent=2))
+        return 0
+    try:
+        srv = _web.make_server(
+            store, args.host, args.port, quiet=args.quiet,
+            enable_actions=args.enable_actions)
+    except ValueError as e:
+        sys.stderr.write(f"agenttalk start: {e}\n")
+        return 2
+    except OSError as e:
+        sys.stderr.write(
+            f"agenttalk start: could not bind {args.host}:{args.port} - {e}\n")
+        return 2
+    actual_port = srv.server_address[1]
+    url = _web._format_url(args.host, actual_port)
+    proc = None
+    if supervisor_present and not args.no_supervisor:
+        try:
+            proc = subprocess.Popen(  # noqa: S603  # nosec B603 B607
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(store.dir / "supervisor.ps1")],
+                cwd=str(store.dir),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as e:
+            sys.stderr.write(f"agenttalk start: supervisor.ps1 launch skipped ({e})\n")
+    if not args.no_browser:
+        webbrowser.open(url)
+    sys.stderr.write(f"agenttalk: serving team console at {url}\n")
+    if proc is not None:
+        sys.stderr.write(f"           supervisor started pid={proc.pid}\n")
+    sys.stderr.write("           (Ctrl-C to stop)\n")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -6745,7 +6827,9 @@ def cmd_supervise(args: argparse.Namespace) -> int:
     store = _get_store(args)
     supervisor_mutations = (
         "archive_launch_request",
+        "claim_instance",
         "clear_restart",
+        "drain_intents",
         "janitor_ephemeral",
         "prepare_launch_request",
         "record_ephemeral_launch",
@@ -6819,6 +6903,56 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         sp.write_text(sup.seed_claude_settings(existing, mode=mode), encoding="utf-8")
         print(f"seeded .claude/settings.json (defaultMode={mode}): {sp}")
         return 0
+    if args.claim_instance:
+        pid = args.pid if args.pid is not None else os.getpid()
+        rec = store.claim_supervisor_instance(pid=pid, pid_start=args.pid_start)
+        if rec is None:
+            sys.stderr.write("agenttalk supervise --claim-instance: another live supervisor instance owns this root\n")
+            return 3
+        print(json.dumps(rec, indent=2))
+        return 0
+    if args.release_instance:
+        ok = store.release_supervisor_instance(
+            token=args.instance_token or "", pid=args.pid, pid_start=args.pid_start)
+        if not ok:
+            sys.stderr.write("agenttalk supervise --release-instance: token/pid did not match the live instance\n")
+            return 3
+        print("released supervisor instance")
+        return 0
+    if args.drain_intents:
+        from agenttalk import intents as intent_mod
+        pid = args.pid if args.pid is not None else os.getpid()
+        owned = False
+        if args.instance_token:
+            rec = store.read_supervisor_instance()
+            if not rec or rec.get("token") != args.instance_token:
+                sys.stderr.write("agenttalk supervise --drain-intents: invalid or missing supervisor instance token\n")
+                return 3
+            if args.pid is not None and rec.get("pid") != args.pid:
+                sys.stderr.write("agenttalk supervise --drain-intents: instance pid mismatch\n")
+                return 3
+            if args.pid_start is not None and rec.get("pid_start") != args.pid_start:
+                sys.stderr.write("agenttalk supervise --drain-intents: instance pid-start mismatch\n")
+                return 3
+        else:
+            rec = store.claim_supervisor_instance(pid=pid, pid_start=args.pid_start)
+            if rec is None:
+                sys.stderr.write(
+                    "agenttalk supervise --drain-intents: another live "
+                    "supervisor instance owns this root\n")
+                return 3
+            args.instance_token = rec.get("token")
+            owned = True
+        try:
+            summary = intent_mod.drain_intents(
+                store, pid=pid, pid_start=args.pid_start,
+                max_per_tick=args.max_per_tick)
+            print(json.dumps(summary, indent=2))
+            return 0
+        finally:
+            if owned:
+                store.release_supervisor_instance(
+                    token=args.instance_token or "", pid=pid, pid_start=args.pid_start)
 
     def _read_state() -> dict:
         if args.state_file and Path(args.state_file).exists():
@@ -8241,6 +8375,12 @@ def build_parser() -> argparse.ArgumentParser:
                       action="store_true",
                       help="(script use) Merge {\"defaultMode\": --mode} into "
                            "<--dir>/.claude/settings.json (the Claude unattended seed).")
+    gsup.add_argument("--claim-instance", dest="claim_instance", action="store_true",
+                      help="(script use) Claim the singleton supervisor instance lock.")
+    gsup.add_argument("--release-instance", dest="release_instance", action="store_true",
+                      help="(script use) Release the singleton supervisor instance lock.")
+    gsup.add_argument("--drain-intents", dest="drain_intents", action="store_true",
+                      help="(script use) Drain queued dashboard intents once.")
     psup.add_argument("--home", help="(--seed-codex-config) the isolated CODEX_HOME dir.")
     psup.add_argument("--repo", help="(--seed-codex-config) repo abs path for "
                                      "writable_roots (default: the --root store dir).")
@@ -8255,6 +8395,10 @@ def build_parser() -> argparse.ArgumentParser:
     psup.add_argument("--pid-start", dest="pid_start", default=None,
                       help="(--record-launch) the launcher process start-time "
                            "(anti-pid-reuse guard).")
+    psup.add_argument("--instance-token", dest="instance_token",
+                      help="(--release-instance/--drain-intents) supervisor instance token.")
+    psup.add_argument("--max-per-tick", dest="max_per_tick", type=int, default=25,
+                      help="(--drain-intents) maximum queued intents to claim in one tick.")
     psup.add_argument("--session-id", dest="session_id",
                       help="(--record-launch) the minted session id (Claude).")
     psup.add_argument("--timeout-seconds", dest="timeout_seconds", type=int,
@@ -8363,6 +8507,35 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Exit after N seconds (default: 0 = run until Ctrl-C)")
     pt2.set_defaults(func=cmd_tail)
 
+    pst = sub.add_parser(
+        "start",
+        help="Step-0 bootstrap: optionally init an explicit root, then start the Team Console.",
+    )
+    loc = pst.add_mutually_exclusive_group()
+    loc.add_argument("--here", action="store_true",
+                     help="With --init-if-absent, initialize/use the current directory.")
+    loc.add_argument("--path", help="With --init-if-absent, initialize/use this project root.")
+    pst.add_argument("--init-if-absent", dest="init_if_absent", action="store_true",
+                     help="Initialize the store only when it is absent; requires an explicit location and --agents.")
+    pst.add_argument("--agents", help="Comma-separated roster for --init-if-absent.")
+    pst.add_argument("--host", default="127.0.0.1",
+                     help="Bind address. Only loopback values are accepted.")
+    pst.add_argument("--port", type=int, default=8765,
+                     help="TCP port (default: 8765; pass 0 for an OS-chosen ephemeral port).")
+    pst.add_argument("--enable-actions", action="store_true",
+                     help="Enable browser intent enqueueing. Off by default.")
+    pst.add_argument("--no-browser", action="store_true",
+                     help="Do not open the browser after the server starts.")
+    pst.add_argument("--no-supervisor", action="store_true",
+                     help="Do not start an existing supervisor.ps1 scaffold.")
+    pst.add_argument("--dry-run", action="store_true",
+                     help="Validate the bootstrap decision and print JSON without starting processes.")
+    pst.add_argument("--quiet", action="store_true", default=True,
+                     help="Suppress per-request access logs (default: true)")
+    pst.add_argument("--access-log", dest="quiet", action="store_false",
+                     help="Print per-request access logs to stderr")
+    pst.set_defaults(func=cmd_start)
+
     psv = sub.add_parser(
         "serve",
         help="Start a read-only local web dashboard on http://127.0.0.1:8765/ "
@@ -8379,6 +8552,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Suppress per-request access logs (default: true)")
     psv.add_argument("--access-log", dest="quiet", action="store_false",
                      help="Print per-request access logs to stderr")
+    psv.add_argument("--enable-actions", action="store_true",
+                     help="Enable browser intent enqueueing. Off by default.")
     psv.set_defaults(func=cmd_serve, landing="/")
 
     pdb = sub.add_parser(
@@ -8400,6 +8575,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Suppress per-request access logs (default: true)")
     pdb.add_argument("--access-log", dest="quiet", action="store_false",
                      help="Print per-request access logs to stderr")
+    pdb.add_argument("--enable-actions", action="store_true",
+                     help="Enable browser intent enqueueing. Off by default.")
     # Deliberately NO --host: the alias binds 127.0.0.1, period (NFR-002a).
     pdb.set_defaults(func=cmd_serve, landing="/dashboard")
 

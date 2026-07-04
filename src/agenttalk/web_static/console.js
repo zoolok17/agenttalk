@@ -66,7 +66,9 @@
   // Latest fetched payloads.
   var lastState = null;               // /api/state
   var attentionData = null;           // /api/attention (per open)
+  var intentsData = null;             // /api/intents (body-free queue state)
   var attentionPending = false;
+  var intentsPending = false;
   var statePending = false;           // /api/state in-flight guard (P2-4)
   var stateSeq = 0;                   // request sequence id (issued)
   var stateCommitted = 0;             // newest committed sequence id (stale-drop)
@@ -75,6 +77,7 @@
   var threadPending = {};             // rootKey -> bool (fetch in flight)
   var freshFeedIds = {};              // msg id -> true (animate-in one cycle)
   var seenFeedIds = {};               // msg id -> true (to detect fresh)
+  var actionSession = { enabled: false, token: null, pending: false, error: '' };
 
   // ------------------------------------------------------------ tiny helpers
   function el(tag, cls, text) {
@@ -97,6 +100,17 @@
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
   function isArray(x) { return Object.prototype.toString.call(x) === '[object Array]'; }
   function on(node, ev, fn) { node.addEventListener(ev, fn); return node; }
+  function option(value, text) {
+    var o = el('option', null, text);
+    o.value = value;
+    return o;
+  }
+  function formField(label, control) {
+    var wrap = el('label', 'tc-action-field');
+    wrap.appendChild(el('span', 'tc-action-label', label));
+    wrap.appendChild(control);
+    return wrap;
+  }
 
   // Relative-age formatter (matches the prototype _fmt: s / m / h with a
   // second component under an hour). Recomputed each clock tick from ts so
@@ -1025,11 +1039,120 @@
     return card;
   }
 
+  function intentSummaryStrip() {
+    var card = el('div', 'tc-card tc-intents-card');
+    var head = el('div', 'tc-intents-head');
+    head.appendChild(el('div', 'tc-card-title', 'Queued writes'));
+    head.appendChild(el('span', 'tc-chip', (intentsData && intentsData.target_root_label) || currentRootLabel() || 'root 0'));
+    card.appendChild(head);
+    var items = (intentsData && intentsData.items) || [];
+    if (!items.length) {
+      card.appendChild(el('div', 'tc-recent-empty', 'No queued intents.'));
+      return card;
+    }
+    var list = el('div', 'tc-intents-list');
+    for (var i = 0; i < Math.min(items.length, 8); i++) {
+      var it = items[i];
+      var row = el('div', 'tc-intent-row');
+      row.appendChild(kindChip(it.kind || 'message'));
+      row.appendChild(el('span', 'tc-intent-state state-' + (it.state || 'unknown'), it.state || 'unknown'));
+      row.appendChild(el('span', 'tc-intent-id', it.intent_id || ''));
+      if (it.queued_stale) row.appendChild(el('span', 'tc-chip status-stuck_suspected', 'stale'));
+      if (it.code) row.appendChild(el('span', 'tc-intent-code', it.code));
+      list.appendChild(row);
+    }
+    card.appendChild(list);
+    return card;
+  }
+
+  function actionComposer(root) {
+    var card = el('div', 'tc-card tc-action-card');
+    var head = el('div', 'tc-action-head');
+    head.appendChild(el('div', 'tc-card-title', 'Compose'));
+    head.appendChild(el('span', 'tc-chip ' + (actionSession.enabled ? 'status-working_turn' : 'status-unknown'),
+      actionSession.enabled ? 'actions on' : 'actions off'));
+    card.appendChild(head);
+
+    var form = el('div', 'tc-action-form');
+    var mode = document.createElement('select');
+    mode.appendChild(option('send', 'Send'));
+    mode.appendChild(option('reply', 'Reply'));
+    mode.appendChild(option('propose', 'Propose'));
+    mode.appendChild(option('broadcast', 'Broadcast'));
+    form.appendChild(formField('Mode', mode));
+
+    var target = document.createElement('select');
+    var as = agentsOf(root);
+    for (var i = 0; i < as.length; i++) target.appendChild(option(as[i].name, as[i].name));
+    form.appendChild(formField('Target', target));
+
+    var audienceKind = document.createElement('select');
+    audienceKind.appendChild(option('all', 'All'));
+    audienceKind.appendChild(option('group', 'Group'));
+    audienceKind.appendChild(option('role', 'Role'));
+    form.appendChild(formField('Audience', audienceKind));
+
+    var audienceValue = document.createElement('input');
+    audienceValue.type = 'text';
+    form.appendChild(formField('Audience value', audienceValue));
+
+    var kind = document.createElement('select');
+    kind.appendChild(option('message', 'Message'));
+    kind.appendChild(option('note', 'Note'));
+    kind.appendChild(option('question', 'Question'));
+    form.appendChild(formField('Kind', kind));
+
+    var subject = document.createElement('input');
+    subject.type = 'text';
+    form.appendChild(formField('Subject', subject));
+
+    var body = document.createElement('textarea');
+    body.rows = 4;
+    form.appendChild(formField('Body', body));
+
+    var footer = el('div', 'tc-action-footer');
+    var status = el('span', 'tc-action-status', actionSession.error || '');
+    var send = el('button', 'tc-btn tc-btn-primary', 'Queue');
+    send.disabled = !actionSession.enabled || actionSession.pending;
+    on(send, 'click', function () {
+      var payload;
+      var m = mode.value;
+      if (m === 'reply') {
+        if (!state.sessionRid) {
+          actionSession.error = 'Select a thread first.';
+          renderActiveView();
+          return;
+        }
+        payload = { to_request: state.sessionRid, body: body.value, reply_kind: 'message' };
+      } else if (m === 'broadcast') {
+        payload = { audience: { kind: audienceKind.value }, subject: subject.value,
+          body: body.value, message_kind: kind.value };
+        if (audienceKind.value !== 'all') payload.audience.value = audienceValue.value;
+      } else if (m === 'propose') {
+        payload = { target: target.value, subject: subject.value, body: body.value };
+      } else {
+        payload = { target: target.value, subject: subject.value, body: body.value,
+          message_kind: kind.value };
+      }
+      postIntent({ kind: m, payload: payload }, false);
+    });
+    footer.appendChild(status);
+    footer.appendChild(el('span', 'tc-spacer'));
+    footer.appendChild(send);
+    form.appendChild(footer);
+    card.appendChild(form);
+    return card;
+  }
+
   // ------------------------------------------------------------ VIEW 4: sessions
   function renderSessions(main, root) {
     main.appendChild(viewHead('Sessions', 'Full transcripts of message threads on the bus'));
 
     var body = el('div', 'tc-sessions-body');
+
+    var left = el('div', 'tc-session-left');
+    left.appendChild(actionComposer(root));
+    left.appendChild(intentSummaryStrip());
 
     // Left: thread list (from root.threads).
     var listCard = el('div', 'tc-card tc-card-clip');
@@ -1042,7 +1165,8 @@
         listCard.appendChild(sessionListRow(threads[i]));
       }
     }
-    body.appendChild(listCard);
+    left.appendChild(listCard);
+    body.appendChild(left);
 
     // Right: transcript.
     body.appendChild(transcriptCard());
@@ -1514,6 +1638,77 @@
   }
 
   // ------------------------------------------------------------ data fetching
+  function fetchSession(cb) {
+    fetch('/api/session', { cache: 'no-store' }).then(function (r) {
+      if (!r.ok) {
+        actionSession.enabled = false;
+        actionSession.token = null;
+        return null;
+      }
+      return r.json();
+    }).then(function (data) {
+      if (data && data.csrf_token) {
+        actionSession.enabled = true;
+        actionSession.token = data.csrf_token;
+      }
+      if (cb) cb();
+      if (state.view === 'sessions') renderActiveView();
+    }).catch(function () {
+      actionSession.enabled = false;
+      actionSession.token = null;
+      if (cb) cb();
+    });
+  }
+
+  function fetchIntents() {
+    if (intentsPending) return;
+    intentsPending = true;
+    fetch('/api/intents').then(function (r) {
+      if (!r.ok) return null;
+      return r.json();
+    }).then(function (data) {
+      intentsPending = false;
+      if (!data) return;
+      intentsData = data;
+      if (state.view === 'sessions') renderActiveView();
+    }).catch(function () { intentsPending = false; });
+  }
+
+  function postIntent(envelope, retried) {
+    if (!actionSession.enabled || !actionSession.token || actionSession.pending) return;
+    actionSession.pending = true;
+    actionSession.error = '';
+    fetch('/api/intent', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': actionSession.token,
+      },
+      body: JSON.stringify(envelope),
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (data) {
+        return { status: r.status, ok: r.ok, data: data };
+      });
+    }).then(function (res) {
+      actionSession.pending = false;
+      if (res.status === 403 && res.data && res.data.error === 'bad_csrf' && !retried) {
+        fetchSession(function () { postIntent(envelope, true); });
+        return;
+      }
+      if (!res.ok) {
+        actionSession.error = (res.data && (res.data.detail || res.data.error)) || 'intent rejected';
+      } else {
+        actionSession.error = 'Queued ' + (res.data.intent_id || 'intent');
+        fetchIntents();
+      }
+      if (state.view === 'sessions') renderActiveView();
+    }).catch(function () {
+      actionSession.pending = false;
+      actionSession.error = 'network error';
+      if (state.view === 'sessions') renderActiveView();
+    });
+  }
+
   function fetchState() {
     // In-flight guard (P2-4): only one /api/state at a time. If a scan takes
     // >2s, stacked requests could commit out of arrival order and move the
@@ -1633,8 +1828,11 @@
     // view: the sidebar count badge is the open-attention count and must be
     // current from the start, not blank until the Attention view is opened.
     fetchAttention();
+    fetchSession();
+    fetchIntents();
     setInterval(fetchState, POLL_MS);
     setInterval(fetchAttention, POLL_MS);
+    setInterval(fetchIntents, POLL_MS);
     setInterval(clockTick, CLOCK_MS);
   }
 

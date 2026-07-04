@@ -47,6 +47,43 @@ _HOOK_CODEX_CONFIG = {
                           "activity_hook": True}},
 }
 
+
+def test_ps_template_claims_instance_drains_and_releases_under_brake() -> None:
+    ps = sup.PS_TEMPLATE
+    assert "supervise --claim-instance" in ps
+    assert "supervise --drain-intents --instance-token $InstanceToken" in ps
+    assert "supervise --release-instance --instance-token $InstanceToken" in ps
+    assert "Assert-ActionsEnabled 'drain-intents'" in ps
+    assert "finally" in ps
+
+
+def test_supervise_drain_intents_manual_claims_and_releases_instance(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    s.set_role("lead", "lead")
+    s.write_intent("send", {"target": "worker", "body": "hello"})
+
+    rc = _run(["supervise", "--drain-intents", "--pid", "123", "--pid-start", "start"], tmp_path)
+
+    assert rc == 0
+    assert s.read_supervisor_instance() is None
+    assert s.messages_for("worker")[0].body == "hello"
+
+
+def test_supervise_claim_instance_refuses_kill_switch_and_release_allows_cleanup(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    assert _run(["supervise", "--claim-instance", "--pid", "123"], tmp_path) == 3
+
+    (s.dir / "supervisor.kill").unlink()
+    rec = s.claim_supervisor_instance(pid=123, pid_start="start")
+    assert rec is not None
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    assert _run([
+        "supervise", "--release-instance", "--pid", "123",
+        "--pid-start", "start", "--instance-token", rec["token"],
+    ], tmp_path) == 0
+    assert s.read_supervisor_instance() is None
+
 # ---- snapshot-model fixtures (the 8-state classifier reads a process snapshot) ----
 BRAIN_PID, BRAIN_START, LAUNCHER_PID, WAIT_PID = 200, "t-brain", 199, 400
 

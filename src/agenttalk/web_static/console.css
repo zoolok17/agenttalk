@@ -991,6 +991,77 @@ body {
   gap: 20px;
   align-items: start;
 }
+.tc-session-left {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.tc-action-card,
+.tc-intents-card { padding: 13px; }
+.tc-action-head,
+.tc-intents-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.tc-action-form { display: grid; gap: 9px; }
+.tc-action-field { display: grid; gap: 4px; }
+.tc-action-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--ink4);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.tc-action-field input,
+.tc-action-field select,
+.tc-action-field textarea {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface2);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  padding: 7px 8px;
+}
+.tc-action-field textarea {
+  resize: vertical;
+  min-height: 84px;
+  line-height: 1.4;
+}
+.tc-action-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tc-action-status {
+  min-width: 0;
+  font-size: 11px;
+  color: var(--ink3);
+  overflow-wrap: anywhere;
+}
+.tc-intents-list { display: grid; gap: 7px; }
+.tc-intent-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+}
+.tc-intent-state,
+.tc-intent-code,
+.tc-intent-id {
+  min-width: 0;
+  color: var(--ink3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tc-intent-state { font-family: var(--font-mono); color: var(--ink2); }
 .tc-session-list-title {
   padding: 12px 15px;
   border-bottom: 1px solid var(--hairline);

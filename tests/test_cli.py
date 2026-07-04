@@ -53,6 +53,31 @@ def _approval_meta_args() -> list[str]:
     ]
 
 
+def test_start_init_if_absent_requires_explicit_location(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    rc = cli.main(["start", "--init-if-absent", "--agents", "alpha,beta", "--dry-run"])
+
+    assert rc == 2
+    assert not (tmp_path / ".agenttalk").exists()
+    assert "requires an explicit location" in capsys.readouterr().err
+
+
+def test_start_init_if_absent_here_dry_run_bootstraps_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    rc = cli.main(["start", "--init-if-absent", "--here", "--agents", "alpha,beta", "--dry-run"])
+
+    assert rc == 0
+    assert (tmp_path / ".agenttalk" / "config.json").exists()
+    out = capsys.readouterr().out
+    assert '"initialized": true' in out
+
+
 # ----------------------------------------------------- init: hint emission
 
 def test_init_prints_concrete_env_hint_for_two_agents(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
@@ -2850,9 +2875,11 @@ def test_dashboard_store_plumbing(
     Store(b).init(["lead", "dev"])
     captured: dict = {}
 
-    def fake_make_server(store, host, port, *, quiet=True, extra=None):
+    def fake_make_server(store, host, port, *, quiet=True, extra=None,
+                         enable_actions=False):
         captured.update(store=store, host=host, port=port,
-                        extra=list(extra or []))
+                        extra=list(extra or []),
+                        enable_actions=enable_actions)
         return _FakeServer()
 
     monkeypatch.setattr(_web, "make_server", fake_make_server)
@@ -2860,6 +2887,7 @@ def test_dashboard_store_plumbing(
                    "--port", "0"])
     assert rc == 0
     assert captured["host"] == "127.0.0.1"
+    assert captured["enable_actions"] is False
     assert captured["store"].root == a.resolve()  # first --store is root[0]
     assert [d.store.root for d in captured["extra"]] == [b.resolve()]
     assert [d.label for d in captured["extra"]] == ["proj-b"]
@@ -2882,8 +2910,9 @@ def test_dashboard_missing_store_warns_not_fatal(
     empty.mkdir()
     captured: dict = {}
 
-    def fake_make_server(store, host, port, *, quiet=True, extra=None):
-        captured.update(extra=list(extra or []))
+    def fake_make_server(store, host, port, *, quiet=True, extra=None,
+                         enable_actions=False):
+        captured.update(extra=list(extra or []), enable_actions=enable_actions)
         return _FakeServer()
 
     monkeypatch.setattr(_web, "make_server", fake_make_server)

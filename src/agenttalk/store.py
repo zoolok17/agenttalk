@@ -3841,12 +3841,17 @@ class Store:
                                json.dumps(record, indent=2, ensure_ascii=False))
             return record
 
-    def release_supervisor_instance(self, *, token: str) -> bool:
-        """Token-checked release. A mismatched/absent token releases nothing
+    def release_supervisor_instance(self, *, token: str, pid: int | None = None,
+                                    pid_start: object = None) -> bool:
+        """Token/pid-checked release. A mismatched/absent token releases nothing
         (a stale releaser can never evict a newer live instance)."""
         with self._config_lock():
             existing = self.read_supervisor_instance()
             if not existing or not token or existing.get("token") != token:
+                return False
+            if pid is not None and existing.get("pid") != int(pid):
+                return False
+            if pid_start is not None and existing.get("pid_start") != pid_start:
                 return False
             try:
                 self.supervisor_instance_path().unlink()

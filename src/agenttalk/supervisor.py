@@ -2129,7 +2129,17 @@ function Launch-Spec($name, $spec, $codexHome) {
 # $Quiet suppresses the log; -DryRun prints every agent every run (one-shot).
 $lastLogged = @{}
 $pollNum = 0
+$SupervisorPid = $PID
+$SupervisorStart = Proc-Start $SupervisorPid
+$InstanceToken = $null
+if (-not $DryRun) {
+  if (-not (Assert-ActionsEnabled 'claim-instance')) { exit 3 }
+  $claimText = & $AgenttalkCmd --root $Root supervise --claim-instance --pid $SupervisorPid --pid-start $SupervisorStart
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  $InstanceToken = ($claimText | ConvertFrom-Json).token
+}
 
+try {
 do {
   $state = Load-State
   if (-not $state.agents) { $state | Add-Member agents ([pscustomobject]@{}) -Force }
@@ -2302,6 +2312,9 @@ do {
       }
     }
   }
+  if (-not $DryRun -and (Assert-ActionsEnabled 'drain-intents')) {
+    & $AgenttalkCmd --root $Root supervise --drain-intents --instance-token $InstanceToken --pid $SupervisorPid --pid-start $SupervisorStart | Out-Null
+  }
   # Periodic liveness summary so a long quiet stretch still shows the supervisor
   # is polling (every 10th poll, normal non-quiet runs only).
   if (-not $Quiet -and -not $DryRun -and $total -gt 0 -and ($pollNum % 10 -eq 0)) {
@@ -2310,6 +2323,11 @@ do {
   if (-not $DryRun) { Save-State $state }
   if (-not $Once) { Start-Sleep -Seconds ([int]$cfg.poll_seconds) }
 } while (-not $Once)
+} finally {
+  if ($InstanceToken) {
+    & $AgenttalkCmd --root $Root supervise --release-instance --instance-token $InstanceToken --pid $SupervisorPid --pid-start $SupervisorStart | Out-Null
+  }
+}
 """
 
 def agenttalk_shim(python_exe: str) -> str:

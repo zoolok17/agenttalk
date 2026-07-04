@@ -7,9 +7,11 @@ tests cover both happy-path rendering AND the refusal semantics.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -27,13 +29,13 @@ def _make_store(tmp_path: Path) -> Store:
     return s
 
 
-def _serve(store: Store, *, host: str = "127.0.0.1"):
+def _serve(store: Store, *, host: str = "127.0.0.1", enable_actions: bool = False):
     """Start the server on an ephemeral port in a daemon thread.
 
     Returns (server, thread, base_url). Caller is responsible for
     ``server.shutdown(); server.server_close()`` in a finally block.
     """
-    return web.serve_in_thread(store, host=host, port=0)
+    return web.serve_in_thread(store, host=host, port=0, enable_actions=enable_actions)
 
 
 def _urlopen(target, *, timeout: float = 5.0, _attempts: int = 4, _backoff: float = 0.05):
@@ -74,10 +76,54 @@ def _get(url: str, *, method: str = "GET", timeout: float = 5.0):
     return _urlopen(req, timeout=timeout)
 
 
+def _session(base: str) -> dict:
+    with _get(f"{base}/api/session") as resp:
+        assert resp.status == 200
+        return json.loads(resp.read())
+
+
+def _post_intent(base: str, token: str, payload: dict,
+                 *, origin: str | None = None, method: str = "POST"):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(  # noqa: S310  # nosemgrep
+        f"{base}/api/intent", method=method, data=data,
+        headers={
+            "Content-Type": "application/json",
+            "X-CSRF-Token": token,
+            "Origin": origin or base,
+        })
+    return _urlopen(req, timeout=5)
+
+
+def _raw_post(base: str, target: str, *, host: str, origin: str,
+              token: str, payload: dict) -> tuple[int, dict[str, str], bytes]:
+    parsed = urllib.parse.urlsplit(base)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+    body = json.dumps(payload).encode("utf-8")
+    try:
+        conn.request(
+            "POST",
+            target,
+            body=body,
+            headers={
+                "Host": host,
+                "Origin": origin,
+                "Content-Type": "application/json",
+                "X-CSRF-Token": token,
+                "Content-Length": str(len(body)),
+            },
+        )
+        resp = conn.getresponse()
+        data = resp.read()
+        return resp.status, dict(resp.getheaders()), data
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------- routing
 
 
-def test_index_renders_status_and_messages(tmp_path: Path) -> None:
+def test_root_serves_team_console_shell(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
     s.send(sender="alpha", recipient="beta", body="hello world")
     srv, _t, base = _serve(s)
@@ -85,13 +131,11 @@ def test_index_renders_status_and_messages(tmp_path: Path) -> None:
         with _get(f"{base}/") as resp:
             assert resp.status == 200
             assert resp.headers["Content-Type"].startswith("text/html")
+            assert resp.headers["Content-Security-Policy"] == _DASH_CSP
             body = resp.read().decode("utf-8")
-        assert "<!doctype html>" in body
-        assert "Project root" in body
-        assert "alpha" in body and "beta" in body
-        assert "Signing" in body
-        # The message row should be linkable
-        assert "/messages/" in body
+        assert 'id="topbar"' in body
+        assert "/static/console.css" in body
+        assert "/static/console.js" in body
     finally:
         srv.shutdown()
         srv.server_close()
@@ -941,9 +985,9 @@ def test_dashboard_shell_links_console_assets(tmp_path: Path) -> None:
             _urlopen(
                 f"{base}/api/messages/{mid_b}", timeout=5)
         assert exc.value.code == 404
-        # index keeps working and still links to the dashboard (additive)
+        # scope-add v0.59.0: index now serves the console too.
         with _get(f"{base}/") as resp:
-            assert "/dashboard" in resp.read().decode("utf-8")
+            assert "/static/console.js" in resp.read().decode("utf-8")
     finally:
         srv.shutdown()
         srv.server_close()
@@ -980,12 +1024,13 @@ def test_csp_split_per_route(tmp_path: Path) -> None:
     mid = s._scan_messages()[0][0].id
     srv, _t, base = _serve(s)
     try:
-        for path in ("/", f"/messages/{mid}", "/api/status", "/api/state",
+        for path in (f"/messages/{mid}", "/api/status", "/api/state",
                      "/api/attention", "/api/thread/rid-c"):
             with _get(f"{base}{path}") as resp:
                 assert resp.headers["Content-Security-Policy"] == _LEGACY_CSP, path
-        with _get(f"{base}/dashboard") as resp:
-            assert resp.headers["Content-Security-Policy"] == _DASH_CSP
+        for path in ("/", "/dashboard"):
+            with _get(f"{base}{path}") as resp:
+                assert resp.headers["Content-Security-Policy"] == _DASH_CSP
         # the served assets are not documents; they carry the default policy too
         for path in ("/static/console.js", "/static/console.css"):
             with _get(f"{base}{path}") as resp:
@@ -1015,11 +1060,226 @@ def test_new_routes_reject_write_methods(tmp_path: Path) -> None:
         srv.server_close()
 
 
+def test_actions_off_has_no_session_and_post_stays_405(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _get(f"{base}/api/session")
+        assert exc.value.code == 404
+        req = urllib.request.Request(  # noqa: S310  # nosemgrep
+            f"{base}/api/intent", method="POST", data=b'{"kind":"send"}',
+            headers={"Content-Type": "application/json", "Origin": base,
+                     "X-CSRF-Token": "looks-valid"})
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _urlopen(req, timeout=5)
+        assert exc.value.code == 405
+        assert exc.value.headers.get("Allow") == "GET, HEAD"
+        assert not s.intents_active_dir.exists()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_valid_action_post_appends_exactly_one_intent_file(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    before = _tree_hashes(s.root)
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        with _post_intent(base, token, {
+            "kind": "send",
+            "payload": {"target": "beta", "body": "hello", "message_kind": "message"},
+        }) as resp:
+            assert resp.status == 202
+            accepted = json.loads(resp.read())
+        after = _tree_hashes(s.root)
+        added = sorted(set(after) - set(before))
+        assert len(added) == 1
+        added_path = added[0].replace("\\", "/")
+        assert added_path.startswith("state/intents/active/")
+        assert added_path.endswith(".json")
+        rec = s.read_intent(accepted["intent_id"])
+        assert rec is not None and rec["state"] == Store.INTENT_QUEUED
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_rejected_action_post_mutates_nothing(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    before = _tree_hashes(s.root)
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        req = urllib.request.Request(  # noqa: S310  # nosemgrep
+            f"{base}/api/intent", method="POST",
+            data=json.dumps({"kind": "send"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Origin": base})
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _urlopen(req, timeout=5)
+        assert exc.value.code == 403
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert _tree_hashes(s.root) == before
+
+
+def test_reserved_action_payload_returns_400_without_file(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    before = _tree_hashes(s.root)
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post_intent(base, token, {
+                "kind": "send",
+                "payload": {"target": "beta", "body": "hello", "meta": {"request_id": "q-x"}},
+            })
+        assert exc.value.code == 400
+        problem = json.loads(exc.value.read())
+        assert problem["error"] == "invalid_intent"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert _tree_hashes(s.root) == before
+
+
+def test_kill_switch_blocks_valid_action_post_423(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post_intent(base, token, {
+                "kind": "send",
+                "payload": {"target": "beta", "body": "hello"},
+            })
+        assert exc.value.code == 423
+        assert not s.intents_active_dir.exists()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_kill_switch_unreadable_fails_closed_423(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _make_store(tmp_path)
+    monkeypatch.setattr(s, "supervisor_kill_switch", lambda: None)
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post_intent(base, token, {
+                "kind": "send",
+                "payload": {"target": "beta", "body": "hello"},
+            })
+        assert exc.value.code == 423
+        problem = json.loads(exc.value.read())
+        assert problem["error"] == "executor_state_unreadable"
+        assert not s.intents_active_dir.exists()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_action_post_absolute_form_accepts_loopback_alias_same_port(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        port = srv.server_address[1]
+        host = f"localhost:{port}"
+        status, _headers, _body = _raw_post(
+            base,
+            f"http://localhost:{port}/api/intent",
+            host=host,
+            origin=f"http://{host}",
+            token=token,
+            payload={
+                "kind": "send",
+                "payload": {"target": "beta", "body": "hello"},
+            },
+        )
+        assert status == 202
+        assert len(s.list_intents()) == 1
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_action_post_absolute_form_rejects_wrong_port_without_file(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        port = srv.server_address[1]
+        wrong_port = port + 1 if port < 65000 else port - 1
+        host = f"localhost:{port}"
+        status, _headers, body = _raw_post(
+            base,
+            f"http://localhost:{wrong_port}/api/intent",
+            host=host,
+            origin=f"http://{host}",
+            token=token,
+            payload={
+                "kind": "send",
+                "payload": {"target": "beta", "body": "hello"},
+            },
+        )
+        assert status == 403
+        assert json.loads(body)["error"] == "bad_host"
+        assert not s.intents_active_dir.exists()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_intents_and_preflight_are_read_only_body_free(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    s.write_intent("send", {"target": "beta", "body": "SECRET", "subject": "S"})
+    before = _tree_hashes(s.root)
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        with _get(f"{base}/api/intents") as resp:
+            payload = json.loads(resp.read())
+        assert payload["target_root_index"] == 0
+        assert payload["items"][0]["kind"] == "send"
+        assert "SECRET" not in json.dumps(payload)
+        with _get(f"{base}/api/preflight") as resp:
+            preflight = json.loads(resp.read())
+        assert preflight["target_root_index"] == 0
+        assert {c["key"] for c in preflight["checks"]} >= {
+            "store_initialized", "operator_actor", "supervisor_scaffolded",
+            "supervisor_running", "actions_enabled",
+        }
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert _tree_hashes(s.root) == before
+
+
+def test_actions_on_intent_route_allows_only_post(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        req = urllib.request.Request(  # noqa: S310  # nosemgrep
+            f"{base}/api/intent", method="PUT", data=b"{}")
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _urlopen(req, timeout=5)
+        assert exc.value.code == 405
+        assert exc.value.headers.get("Allow") == "POST"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def _tree_hashes(root: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     base = root / ".agenttalk"
     for p in sorted(base.rglob("*")):
-        if p.is_file():
+        if p.is_file() and p.name != "config.lock":
             out[str(p.relative_to(base))] = hashlib.sha256(
                 p.read_bytes()).hexdigest()
     return out
@@ -1279,9 +1539,14 @@ def test_console_renderer_safety(tmp_path: Path) -> None:
         srv.server_close()
     assert "textContent" in js
     assert "addEventListener" in js
+    assert "/api/session" in js
+    assert "/api/intent" in js
+    assert "X-CSRF-Token" in js
     assert "innerHTML" not in js
     assert "location.reload" not in js
     assert "eval(" not in js
+    assert "csrf_token" not in js.split("localStorage", 1)[0]
+    assert "sessionStorage" not in js
 
 
 def test_console_js_thread_cache_key_single_source(tmp_path: Path) -> None:
