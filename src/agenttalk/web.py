@@ -2124,11 +2124,6 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 return
             self._error_html(HTTPStatus.NOT_FOUND, f"no route for {path}")
 
-        def _serve_index(self) -> None:
-            msgs = _all_messages(store)
-            invalid = store.list_invalid_messages()
-            self._send_html(HTTPStatus.OK, render_index(store, msgs, invalid))
-
     return Handler
 
 

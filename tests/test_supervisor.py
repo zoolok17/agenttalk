@@ -50,9 +50,10 @@ _HOOK_CODEX_CONFIG = {
 
 def test_ps_template_claims_instance_drains_and_releases_under_brake() -> None:
     ps = sup.PS_TEMPLATE
-    assert "supervise --claim-instance" in ps
-    assert "supervise --drain-intents --instance-token $InstanceToken" in ps
-    assert "supervise --release-instance --instance-token $InstanceToken" in ps
+    assert "'supervise', '--claim-instance'" in ps
+    assert "'supervise', '--drain-intents'" in ps
+    assert "'supervise', '--release-instance'" in ps
+    assert "'--pid-start', $SupervisorStart" in ps
     assert "Assert-ActionsEnabled 'drain-intents'" in ps
     assert "finally" in ps
 
@@ -1395,6 +1396,16 @@ def _pick_powershell() -> str | None:
     return None
 
 
+def _replace_proc_start(ps1: Path, body: str) -> None:
+    text = ps1.read_text(encoding="utf-8-sig")
+    start = text.index("function Proc-Start($procId) {")
+    end = text.index("function Get-ProcSnapshot", start)
+    ps1.write_text(
+        text[:start] + "function Proc-Start($procId) {\n" + body + "\n}\n" + text[end:],
+        encoding="utf-8-sig",
+    )
+
+
 def test_generated_ps1_runs_bus_calls_without_console_script_on_path(tmp_path: Path) -> None:
     """0.28.1 BLOCKER 1 (RUNTIME): the generated supervisor.ps1 must make ITS OWN
     bus calls via the project-local shim (`& $AgenttalkCmd`), so they work even
@@ -1428,6 +1439,45 @@ def test_generated_ps1_runs_bus_calls_without_console_script_on_path(tmp_path: P
     assert "is not recognized" not in combined and "CommandNotFound" not in combined, combined
     # the DryRun plan line for the dead worker actually printed (the bus call ran)
     assert "worker:" in res.stdout, f"no plan emitted; stdout={res.stdout!r} stderr={res.stderr!r}"
+
+
+def test_proc_start_falls_back_to_get_process_when_cim_denied(tmp_path: Path) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)
+    out = tmp_path / "proc_start.json"
+    harness = "\n".join([
+        helpers,
+        "function Get-CimInstance { throw 'cim denied' }",
+        "$start = Proc-Start $PID",
+        f"@{{ has_start = [bool]$start }} | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(out))} -Encoding utf8",
+    ])
+    hp = tmp_path / "proc_start_fallback.ps1"
+    hp.write_text(harness, encoding="utf-8-sig")
+    res = subprocess.run([shell, "-NoProfile", "-File", str(hp)],
+                         capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, f"{res.stdout}{res.stderr}"
+    assert json.loads(out.read_text(encoding="utf-8-sig"))["has_start"] is True
+
+
+def test_generated_ps1_null_supervisor_start_does_not_argparse_abort(tmp_path: Path) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    s = _team(tmp_path)
+    (s.dir / "supervisor.json").write_text(json.dumps(_CONFIG), encoding="utf-8")
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    ps1 = s.dir / "supervisor.ps1"
+    _replace_proc_start(ps1, "  return $null")
+
+    res = subprocess.run([shell, "-NoProfile", "-File", str(ps1), "-Once", "-Quiet"],
+                         capture_output=True, text=True, timeout=120, cwd=str(tmp_path))
+    combined = res.stdout + res.stderr
+    assert "expected one argument" not in combined
+    assert res.returncode == 0, combined
+    assert s.read_supervisor_instance() is None
 
 
 def test_generated_ps1_quiet_suppresses_warning_path(tmp_path: Path) -> None:

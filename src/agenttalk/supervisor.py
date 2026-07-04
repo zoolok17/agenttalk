@@ -1867,6 +1867,10 @@ function Proc-Start($procId) {
     $p = Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction Stop
     if ($p -and $p.CreationDate) { return ([datetimeoffset]$p.CreationDate).ToString('o') }
   } catch {}
+  try {
+    $p = Get-Process -Id $procId -ErrorAction Stop
+    if ($p -and $p.StartTime) { return ([datetimeoffset]$p.StartTime).ToString('o') }
+  } catch {}
   return $null
 }
 function Get-ProcSnapshot($path) {
@@ -2131,10 +2135,17 @@ $lastLogged = @{}
 $pollNum = 0
 $SupervisorPid = $PID
 $SupervisorStart = Proc-Start $SupervisorPid
+function Supervisor-IdentityArgs {
+  $argv = @()
+  if ($SupervisorPid) { $argv += @('--pid', $SupervisorPid) }
+  if ($SupervisorStart) { $argv += @('--pid-start', $SupervisorStart) }
+  return $argv
+}
 $InstanceToken = $null
 if (-not $DryRun) {
   if (-not (Assert-ActionsEnabled 'claim-instance')) { exit 3 }
-  $claimText = & $AgenttalkCmd --root $Root supervise --claim-instance --pid $SupervisorPid --pid-start $SupervisorStart
+  $claimArgs = @('--root', $Root, 'supervise', '--claim-instance') + (Supervisor-IdentityArgs)
+  $claimText = & $AgenttalkCmd @claimArgs
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   $InstanceToken = ($claimText | ConvertFrom-Json).token
 }
@@ -2313,7 +2324,9 @@ do {
     }
   }
   if (-not $DryRun -and (Assert-ActionsEnabled 'drain-intents')) {
-    & $AgenttalkCmd --root $Root supervise --drain-intents --instance-token $InstanceToken --pid $SupervisorPid --pid-start $SupervisorStart | Out-Null
+    $drainArgs = @('--root', $Root, 'supervise', '--drain-intents',
+                   '--instance-token', $InstanceToken) + (Supervisor-IdentityArgs)
+    & $AgenttalkCmd @drainArgs | Out-Null
   }
   # Periodic liveness summary so a long quiet stretch still shows the supervisor
   # is polling (every 10th poll, normal non-quiet runs only).
@@ -2325,7 +2338,9 @@ do {
 } while (-not $Once)
 } finally {
   if ($InstanceToken) {
-    & $AgenttalkCmd --root $Root supervise --release-instance --instance-token $InstanceToken --pid $SupervisorPid --pid-start $SupervisorStart | Out-Null
+    $releaseArgs = @('--root', $Root, 'supervise', '--release-instance',
+                     '--instance-token', $InstanceToken) + (Supervisor-IdentityArgs)
+    & $AgenttalkCmd @releaseArgs | Out-Null
   }
 }
 """
