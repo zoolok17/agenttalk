@@ -79,6 +79,16 @@
   var seenFeedIds = {};               // msg id -> true (to detect fresh)
   var actionSession = { enabled: false, token: null, pending: false, error: '' };
   var queuedAnswers = {};             // to_request -> true (optimistic queued marker)
+  var composerState = {
+    mode: 'send',
+    target: '',
+    audienceKind: 'all',
+    audienceValue: '',
+    kind: 'message',
+    subject: '',
+    body: '',
+  };
+  var answerComposerState = {};       // to_request -> body text
 
   // ------------------------------------------------------------ tiny helpers
   function el(tag, cls, text) {
@@ -111,6 +121,50 @@
     wrap.appendChild(el('span', 'tc-action-label', label));
     wrap.appendChild(control);
     return wrap;
+  }
+  function selectPersistedValue(control, value) {
+    var found = false;
+    for (var i = 0; i < control.options.length; i++) {
+      if (control.options[i].value === value) {
+        found = true;
+        break;
+      }
+    }
+    if (found) {
+      control.value = value;
+    } else if (control.options.length) {
+      control.selectedIndex = 0;
+    } else {
+      control.value = '';
+    }
+    return control.value;
+  }
+  function isEditableControl(node) {
+    if (!node || node === document.body) return false;
+    var tag = String(node.tagName || '').toUpperCase();
+    return tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || node.isContentEditable;
+  }
+  function closestActionComposer(node) {
+    if (!node) return null;
+    if (node.closest) return node.closest('.tc-action-card, .tc-action-form, .tc-attn-answer, .tc-attn-answer-form');
+    while (node) {
+      if (node.classList && (
+        node.classList.contains('tc-action-card')
+        || node.classList.contains('tc-action-form')
+        || node.classList.contains('tc-attn-answer')
+        || node.classList.contains('tc-attn-answer-form')
+      )) return node;
+      node = node.parentNode;
+    }
+    return null;
+  }
+  function isEditingAction() {
+    if (!actionSession.enabled) return false;
+    var active = document.activeElement;
+    return isEditableControl(active) && !!closestActionComposer(active);
+  }
+  function renderActiveViewFromPoll() {
+    if (!isEditingAction()) renderActiveView();
   }
 
   // Relative-age formatter (matches the prototype _fmt: s / m / h with a
@@ -943,6 +997,12 @@
     return pairs;
   }
 
+  function graphEdgeWidth(count) {
+    var w = (typeof count === 'number' && count > 0) ? count : 1;
+    // Log-scale busy pairs so volume still reads, but never turns into a blob.
+    return Math.max(1, Math.min(6, 1 + Math.log(w + 1) * 1.2));
+  }
+
   function buildGraph(root) {
     var agents = agentsOf(root);
     var pos = nodePositions(agents);
@@ -963,7 +1023,7 @@
       var hot = pairs[edge.from + '|' + edge.to] === true;
       var line = svgEl('line', {
         x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y,
-        'stroke-width': (w * 1.4 + 0.6),
+        'stroke-width': graphEdgeWidth(w),
       });
       line.setAttribute('class', 'tc-edge' + (hot ? ' is-active' : ''));
       svg.appendChild(line);
@@ -1111,9 +1171,15 @@
     textarea.rows = 3;
     textarea.placeholder = 'Write the operator answer';
     var send = el('button', 'tc-btn tc-btn-primary', queuedAnswers[toRequest] ? 'Queued' : 'Queue answer');
-    send.disabled = !toRequest || queuedAnswers[toRequest] || actionSession.pending;
-    on(textarea, 'input', function () {
+    if (toRequest && Object.prototype.hasOwnProperty.call(answerComposerState, toRequest)) {
+      textarea.value = answerComposerState[toRequest];
+    }
+    function updateAnswerButton() {
       send.disabled = !toRequest || queuedAnswers[toRequest] || actionSession.pending || !textarea.value.trim();
+    }
+    on(textarea, 'input', function () {
+      if (toRequest) answerComposerState[toRequest] = textarea.value;
+      updateAnswerButton();
     });
     on(send, 'click', function () {
       var body = textarea.value.trim();
@@ -1121,11 +1187,12 @@
       postIntent({ kind: 'answer_escalation', payload: { to_request: toRequest, body: body } },
         false, function () {
           queuedAnswers[toRequest] = true;
+          delete answerComposerState[toRequest];
           fetchAttention();
         });
       send.disabled = true;
     });
-    send.disabled = true;
+    updateAnswerButton();
     form.appendChild(textarea);
     form.appendChild(send);
     box.appendChild(form);
@@ -1230,6 +1297,23 @@
     var body = document.createElement('textarea');
     body.rows = 4;
     form.appendChild(formField('Body', body));
+
+    if (actionSession.enabled) {
+      composerState.mode = selectPersistedValue(mode, composerState.mode);
+      composerState.target = selectPersistedValue(target, composerState.target);
+      composerState.audienceKind = selectPersistedValue(audienceKind, composerState.audienceKind);
+      audienceValue.value = composerState.audienceValue;
+      composerState.kind = selectPersistedValue(kind, composerState.kind);
+      subject.value = composerState.subject;
+      body.value = composerState.body;
+      on(mode, 'change', function () { composerState.mode = mode.value; });
+      on(target, 'change', function () { composerState.target = target.value; });
+      on(audienceKind, 'change', function () { composerState.audienceKind = audienceKind.value; });
+      on(audienceValue, 'input', function () { composerState.audienceValue = audienceValue.value; });
+      on(kind, 'change', function () { composerState.kind = kind.value; });
+      on(subject, 'input', function () { composerState.subject = subject.value; });
+      on(body, 'input', function () { composerState.body = body.value; });
+    }
 
     var footer = el('div', 'tc-action-footer');
     var status = el('span', 'tc-action-status', actionSession.error || '');
@@ -1809,7 +1893,7 @@
         actionSession.token = data.csrf_token;
       }
       if (cb) cb();
-      if (state.view === 'sessions') renderActiveView();
+      if (state.view === 'sessions') renderActiveViewFromPoll();
     }).catch(function () {
       actionSession.enabled = false;
       actionSession.token = null;
@@ -1827,7 +1911,7 @@
       intentsPending = false;
       if (!data) return;
       intentsData = data;
-      if (state.view === 'sessions') renderActiveView();
+      if (state.view === 'sessions') renderActiveViewFromPoll();
     }).catch(function () { intentsPending = false; });
   }
 
@@ -1897,7 +1981,7 @@
         fetchThread(state.sessionRid, true);
       }
       renderChrome();
-      renderActiveView();
+      renderActiveViewFromPoll();
     }).catch(function () { statePending = false; /* transient — retry next tick */ });
   }
 
@@ -1926,7 +2010,7 @@
       attentionData = data;
       attentionPending = false;
       renderSidebar();  // count badge
-      if (state.view === 'attention') renderActiveView();
+      if (state.view === 'attention') renderActiveViewFromPoll();
     }).catch(function () { attentionPending = false; });
   }
 
@@ -1959,7 +2043,7 @@
         threadCache[key] = data;
         delete threadNotFound[key];
       }
-      if (state.view === 'sessions' && state.sessionRid === rid) renderActiveView();
+      if (state.view === 'sessions' && state.sessionRid === rid) renderActiveViewFromPoll();
     }).catch(function () {
       threadPending[key] = false;
     });
