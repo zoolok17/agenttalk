@@ -374,6 +374,12 @@ def resolve_operator_answer_target(store, actor: str,
             False, denial_code="not_pending",
             detail=f"escalation {request_id!r} is {row.operator_state!r}",
         )
+    if wrapper_notice_has_canonical_row(store, opener.meta or {}, row.opener_sender):
+        return OperatorAnswerResolution(
+            False, denial_code="superseded_by_canonical",
+            detail=(f"escalation {request_id!r} is a redundant wrapper notice; "
+                    "answer the canonical attention item instead"),
+        )
     return OperatorAnswerResolution(True, recipient=row.opener_sender)
 
 

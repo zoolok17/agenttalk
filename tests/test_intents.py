@@ -24,14 +24,18 @@ def _write_raw_intent(store: Store, record: dict) -> None:
 
 
 def _operator_question(store: Store, *, sender: str = "dev",
-                       recipient: str = "lead", rid: str = "esc-help") -> str:
+                       recipient: str = "lead", rid: str = "esc-help",
+                       meta_extra: dict | None = None) -> str:
+    meta = {"request_id": rid, "needs_operator": "true"}
+    if meta_extra:
+        meta.update(meta_extra)
     msg = store.send(
         sender=sender,
         recipient=recipient,
         kind="question",
         subject="operator input needed",
         body="body stays out of attention",
-        meta={"request_id": rid, "needs_operator": "true"},
+        meta=meta,
     )
     return msg.id
 
@@ -152,6 +156,75 @@ def test_answer_escalation_applies_with_terminal_correlation_direction(
     row = next(t for t in rows if t.request_id == "esc-help")
     assert row.operator_state == "answered"
     assert s.read_intent(rec["intent_id"])["state"] == Store.INTENT_APPLIED
+
+
+def test_operator_answer_resolver_denies_coalesced_wrapper_config_notice(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    s.write_config_blocked_hold("dev", summary="exec denied")
+    _operator_question(
+        s,
+        rid="esc-cfg",
+        meta_extra={"dead_letter": "true", "config_blocked": "true"},
+    )
+
+    resolved = threads.resolve_operator_answer_target(s, "lead", "esc-cfg")
+
+    assert threads.wrapper_notice_has_canonical_row(
+        s, {"dead_letter": "true", "config_blocked": "true"}, "dev"
+    )
+    assert resolved.ok is False
+    assert resolved.denial_code == "superseded_by_canonical"
+
+
+def test_answer_escalation_drain_denies_coalesced_wrapper_config_notice(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    s.write_config_blocked_hold("dev", summary="exec denied")
+    _operator_question(
+        s,
+        rid="esc-cfg",
+        meta_extra={"dead_letter": "true", "config_blocked": "true"},
+    )
+    rec = s.write_intent(
+        "answer_escalation", {"to_request": "esc-cfg", "body": "hidden twin"}
+    )
+
+    summary = intents.drain_intents(s, pid=123, max_per_tick=1)
+
+    assert summary["applied"] == 0
+    assert summary["denied"] == 1
+    stored = s.read_intent(rec["intent_id"])
+    assert stored["state"] == Store.INTENT_DENIED
+    assert stored["code"] == "superseded_by_canonical"
+    assert not [
+        m for m in s.valid_messages()
+        if m.sender == "lead" and m.recipient == "dev"
+        and (m.meta or {}).get("operator_answer") == "true"
+    ]
+
+
+def test_answer_escalation_does_not_over_deny_visible_escalations(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    _operator_question(
+        s,
+        rid="esc-wrapper-kept",
+        meta_extra={"dead_letter": "true", "config_blocked": "true"},
+    )
+    kept = threads.resolve_operator_answer_target(s, "lead", "esc-wrapper-kept")
+    assert kept.ok is True
+    assert kept.recipient == "dev"
+
+    s2 = _store(tmp_path / "normal")
+    s2.write_config_blocked_hold("dev", summary="canonical hold exists")
+    _operator_question(s2, rid="esc-normal")
+    normal = threads.resolve_operator_answer_target(s2, "lead", "esc-normal")
+    assert normal.ok is True
+    assert normal.recipient == "dev"
 
 
 def test_answer_escalation_denies_not_owed_and_self_answer(tmp_path: Path) -> None:
