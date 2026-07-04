@@ -14,6 +14,7 @@ import sys
 
 import pytest
 
+from agenttalk import capacity as capmod
 from agenttalk import cli
 from agenttalk.store import Store
 from agenttalk.wrapper import loop, prompt, run, session
@@ -2199,6 +2200,86 @@ def test_continuous_loop_clears_waiting_on_stop(tmp_path) -> None:
     assert s.read_waiting("beta") is None
 
 
+def test_capacity_refresh_runs_after_idle_stamp_when_due(tmp_path) -> None:
+    s = _store(tmp_path)
+    seen_heartbeat: list[bool] = []
+    times = iter([0.0, 61.0])
+
+    def refresh() -> None:
+        seen_heartbeat.append(s.read_heartbeat("beta") is not None)
+        raise RuntimeError("capacity source unavailable")
+
+    turns = loop.run_loop(
+        s, "beta", lambda rec: True, clock=lambda: next(times),
+        sleep=lambda d: None, max_polls=1, heartbeat_interval=10.0,
+        capacity_refresh=refresh, capacity_interval_seconds=60.0)
+
+    assert turns == 0
+    assert seen_heartbeat == [True]
+    assert s.read_heartbeat("beta") is not None
+
+
+def test_capacity_refresh_not_called_before_interval_or_in_one_shot(tmp_path) -> None:
+    s = _store(tmp_path)
+    calls: list[str] = []
+    times = iter([0.0, 10.0, 20.0])
+
+    loop.run_loop(
+        s, "beta", lambda rec: True, clock=lambda: next(times),
+        sleep=lambda d: None, max_polls=2, heartbeat_interval=1.0,
+        capacity_refresh=lambda: calls.append("continuous"),
+        capacity_interval_seconds=60.0)
+
+    loop.run_loop(
+        s, "beta", lambda rec: True, clock=lambda: 1000.0,
+        sleep=lambda d: None, max_polls=2, only_request_id="q-missing",
+        heartbeat_interval=1.0, capacity_refresh=lambda: calls.append("one-shot"),
+        capacity_interval_seconds=0.0)
+
+    assert calls == []
+
+
+def test_capacity_refresh_runs_after_successful_turn_commit_cleanup_when_due(tmp_path) -> None:
+    s = _store(tmp_path)
+    msg = s.send(sender="alpha", recipient="beta", body="work")
+    seen: list[dict] = []
+    times = iter([0.0, 1.0, 61.0])
+
+    def drive(_record: dict) -> bool:
+        assert seen == []
+        return True
+
+    def refresh() -> None:
+        seen.append({
+            "cursor": s.cursor("beta"),
+            "attempt": s.attempt_record("beta", msg.id),
+        })
+
+    turns = loop.run_loop(
+        s, "beta", drive, clock=lambda: next(times),
+        sleep=lambda d: None, max_turns=1, capacity_refresh=refresh,
+        capacity_interval_seconds=60.0)
+
+    assert turns == 1
+    assert s.cursor("beta") == msg.id
+    assert seen == [{"cursor": msg.id, "attempt": None}]
+
+
+def test_capacity_refresh_not_called_after_failed_turn(tmp_path) -> None:
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="work")
+    calls: list[str] = []
+
+    turns = loop.run_loop(
+        s, "beta", lambda rec: False, clock=lambda: 100.0,
+        sleep=lambda d: None, max_polls=1, capacity_refresh=lambda: calls.append("refresh"),
+        capacity_interval_seconds=0.0)
+
+    assert turns == 0
+    assert calls == []
+    assert s.cursor("beta") == ""
+
+
 def test_loop_with_make_drive_end_to_end(tmp_path) -> None:
     # the full Phase-B pipeline, no real CLI: loop -> make_drive -> fake codex stream.
     s = _store(tmp_path)
@@ -2234,6 +2315,69 @@ def test_session_persist_round_trip(tmp_path) -> None:
     cst.codex_thread_id = "t-xyz"
     session.save_session(s, "alpha", cst)
     assert session.load_session(s, "alpha", "codex").codex_thread_id == "t-xyz"
+
+
+def test_wrap_loop_mode_capacity_refresh_uses_codex_home_and_thread_id(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _store(tmp_path)
+    codex_home = tmp_path / "codex-home"
+    session.save_session(
+        s, "beta", session.SessionState(cli="codex", codex_thread_id="THREAD123"))
+    seen: dict[str, object] = {}
+
+    def fake_read_local(source_agent, **kwargs):
+        seen["source_agent"] = source_agent
+        seen.update(kwargs)
+        return capmod.CapacitySnapshot.unknown(source_agent)
+
+    def fake_run_loop(store, agent, drive, **kw):
+        kw["capacity_refresh"]()
+        return 0
+
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(capmod, "read_local", fake_read_local)
+    monkeypatch.setattr(loop, "run_loop", fake_run_loop)
+    monkeypatch.setattr(run, "make_drive", lambda *a, **kw: (lambda rec: True))
+
+    rc = cli._wrap_loop_mode(
+        s, "beta", cli="codex", base_argv=["codex"], sender="beta",
+        min_interval=0.0, render=False)
+
+    assert rc == 0
+    assert seen["source_agent"] == "beta"
+    assert seen["source"] == "codex"
+    assert seen["sessions_dir"] == codex_home / "sessions"
+    assert seen["thread_id"] == "THREAD123"
+    assert s.read_capacity("beta")["source"] == "unknown"
+
+
+def test_wrap_loop_mode_codex_missing_home_publishes_unknown_without_fallback(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _store(tmp_path)
+
+    def forbidden_read_local(*args, **kwargs):
+        raise AssertionError("supervised codex must not fall back to operator sessions")
+
+    def fake_run_loop(store, agent, drive, **kw):
+        kw["capacity_refresh"]()
+        return 0
+
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(capmod, "read_local", forbidden_read_local)
+    monkeypatch.setattr(loop, "run_loop", fake_run_loop)
+    monkeypatch.setattr(run, "make_drive", lambda *a, **kw: (lambda rec: True))
+
+    rc = cli._wrap_loop_mode(
+        s, "beta", cli="codex", base_argv=["codex"], sender="beta",
+        min_interval=0.0, render=False)
+
+    snap = s.read_capacity("beta")
+    assert rc == 0
+    assert snap["source"] == "unknown"
+    assert snap["confidence"] == "unknown"
+    assert snap["reason"] == "codex_home_missing"
 
 
 def test_wrap_loop_mode_unknown_cli_returns_2(tmp_path) -> None:

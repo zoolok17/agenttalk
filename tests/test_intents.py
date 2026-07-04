@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -642,6 +643,53 @@ def test_drain_quarantines_invalid_active_intent_before_claim(tmp_path: Path) ->
     assert (sink / f"{payloads[0].name}.meta.json").exists()
 
 
+def test_drain_kill_switch_active_short_circuits_without_mutation(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    rec = s.write_intent("send", {"target": "dev", "body": "hello"})
+    s.intents_active_dir.mkdir(parents=True, exist_ok=True)
+    bad = s.intents_active_dir / "wi-bad.json"
+    bad.write_text("{not-json", encoding="utf-8")
+    (s.dir / "supervisor.kill").write_text("stop", encoding="utf-8")
+
+    summary = intents.drain_intents(s, pid=123, max_per_tick=10)
+
+    assert summary["disabled"] is True
+    assert summary["disabled_reason"] == "kill_switch"
+    assert summary["examined"] == 0
+    assert summary["claimed"] == 0
+    assert summary["applied"] == 0
+    assert summary["quarantined_invalid"] == 0
+    assert summary["rotation"] == {"rotated": 0, "audit_dropped": 0, "quarantined_invalid": 0}
+    assert s.read_intent(rec["intent_id"])["state"] == Store.INTENT_QUEUED
+    assert bad.exists()
+    assert s.messages_for("dev") == []
+    assert not (s.control_audit_dir / "intents-invalid").exists()
+
+
+def test_drain_kill_switch_unreadable_fails_closed_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _store(tmp_path)
+    rec = s.write_intent("send", {"target": "dev", "body": "hello"})
+    s.intents_active_dir.mkdir(parents=True, exist_ok=True)
+    bad = s.intents_active_dir / "wi-bad.json"
+    bad.write_text("{not-json", encoding="utf-8")
+    monkeypatch.setattr(s, "supervisor_kill_switch", lambda: None)
+
+    summary = intents.drain_intents(s, pid=123, max_per_tick=10)
+
+    assert summary["disabled"] is True
+    assert summary["disabled_reason"] == "kill_switch_unreadable"
+    assert summary["examined"] == 0
+    assert summary["claimed"] == 0
+    assert summary["applied"] == 0
+    assert summary["quarantined_invalid"] == 0
+    assert s.read_intent(rec["intent_id"])["state"] == Store.INTENT_QUEUED
+    assert bad.exists()
+    assert s.messages_for("dev") == []
+    assert not (s.control_audit_dir / "intents-invalid").exists()
+
+
 def test_rotate_quarantines_terminal_intent_with_unparseable_timestamp(
     tmp_path: Path,
 ) -> None:
@@ -662,3 +710,30 @@ def test_rotate_quarantines_terminal_intent_with_unparseable_timestamp(
     assert len(payloads) == 1
     meta = json.loads((sink / f"{payloads[0].name}.meta.json").read_text(encoding="utf-8"))
     assert meta["reason"] == "invalid_intent_timestamp"
+
+
+def test_rotate_intents_byte_eviction_sorts_by_mtime_then_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _store(tmp_path)
+    audit = s.control_audit_dir / "intents"
+    audit.mkdir(parents=True, exist_ok=True)
+    # Names sort opposite to mtimes: filename order would drop wi-a-new first.
+    files = {
+        "wi-a-new.json": (300.0, "n" * 20),
+        "wi-b-old.json": (100.0, "o" * 20),
+        "wi-c-mid.json": (200.0, "m" * 20),
+    }
+    for name, (mtime, body) in files.items():
+        p = audit / name
+        p.write_text(body, encoding="utf-8")
+        os.utime(p, (mtime, mtime))
+    monkeypatch.setattr(Store, "INTENT_AUDIT_MAX_BYTES", 45)
+    monkeypatch.setattr(Store, "INTENT_AUDIT_MAX_AGE_SECONDS", 10_000.0)
+
+    result = s.rotate_intents(now_epoch=350.0, terminal_linger_seconds=0.0)
+
+    assert result["audit_dropped"] == 1
+    assert not (audit / "wi-b-old.json").exists()
+    assert (audit / "wi-a-new.json").exists()
+    assert (audit / "wi-c-mid.json").exists()

@@ -413,12 +413,85 @@
     return wrap;
   }
 
-  // Read a { rate_used_pct, context_used_pct } pair from an agent's capacity.
+  function capNum(obj, key) {
+    if (!obj || typeof obj !== 'object') return null;
+    var v = obj[key];
+    return (typeof v === 'number') ? v : null;
+  }
+
+  // Read legacy flat percents, preferring the richer additive objects when present.
   function capPct(agent, key) {
     var cap = agent.capacity;
     if (!cap) return null;
+    if (key === 'rate_used_pct') {
+      var rate = capNum(cap.primary, 'used_pct');
+      if (rate !== null) return rate;
+    }
+    if (key === 'context_used_pct') {
+      var ctx = capNum(cap.context, 'used_pct');
+      if (ctx !== null) return ctx;
+    }
     var v = cap[key];
     return (typeof v === 'number') ? v : null;
+  }
+
+  function capProvider(cap, agent) {
+    var src = cap && typeof cap.source === 'string' ? cap.source : '';
+    if (src.indexOf('claude') === 0) return 'claude';
+    if (src.indexOf('codex') === 0) return 'codex';
+    return (agent && (agent.cli === 'claude' || agent.cli === 'codex')) ? agent.cli : 'unknown';
+  }
+
+  function capProviderBadge(cap, agent) {
+    var provider = capProvider(cap, agent);
+    var cls = provider === 'claude' ? 'cli-claude' : (provider === 'codex' ? 'cli-codex' : '');
+    return el('span', 'tc-chip ' + cls, provider.toUpperCase());
+  }
+
+  function capConfidenceChip(conf) {
+    var c = (conf === 'fresh' || conf === 'stale' || conf === 'unknown') ? conf : 'unknown';
+    return el('span', 'tc-chip tc-cap-confidence is-' + c, c);
+  }
+
+  function capWindow(cap, key, legacyPct) {
+    if (cap && cap[key] && typeof cap[key] === 'object') return cap[key];
+    if (legacyPct !== null && legacyPct !== undefined) {
+      return { label: key === 'primary' ? '5h' : 'weekly', used_pct: legacyPct };
+    }
+    return null;
+  }
+
+  function resetText(win) {
+    if (!win || typeof win !== 'object') return '—';
+    var secs = capNum(win, 'reset_in_seconds');
+    if (secs !== null) {
+      if (secs <= 0) return 'resets now';
+      var mins = Math.ceil(secs / 60);
+      if (mins < 60) return 'resets in ' + mins + 'm';
+      var h = Math.floor(mins / 60);
+      var m = mins % 60;
+      return 'resets in ' + h + 'h' + (m ? ' ' + m + 'm' : '');
+    }
+    var at = capNum(win, 'resets_at');
+    if (at !== null) {
+      return 'resets at ' + new Date(at * 1000).toLocaleTimeString('en-US', {
+        hour: '2-digit', minute: '2-digit'
+      });
+    }
+    return '—';
+  }
+
+  function contextNote(ctx, fallbackPct) {
+    var pct = capNum(ctx, 'used_pct');
+    if (pct === null) pct = fallbackPct;
+    var parts = [];
+    var tokens = capNum(ctx, 'tokens');
+    var size = capNum(ctx, 'window_size');
+    if (tokens !== null && size !== null) parts.push(Math.round(tokens) + ' / ' + Math.round(size) + ' tokens');
+    else if (tokens !== null) parts.push(Math.round(tokens) + ' tokens');
+    if (pct !== null && pct >= 85) parts.push('compaction risk');
+    if (!parts.length) return pct !== null && pct >= 85 ? 'Compaction risk - avoid heavy context' : 'Context budget';
+    return parts.join(' · ');
   }
 
   // ------------------------------------------------------------ navigation
@@ -1438,14 +1511,25 @@
   function detailRightCol(root, a) {
     var col = el('div', 'tc-detail-col');
 
-    // Capacity card: two labeled meters + notes.
+    // Capacity card: provider budgets + context headroom.
     var cap = detailCard('Capacity');
+    cap.appendChild(capacitySummary(a));
+    var capData = a.capacity || {};
     var rate = capPct(a, 'rate_used_pct');
+    var primary = capWindow(capData, 'primary', rate);
+    var secondary = capWindow(capData, 'secondary', null);
+    if (primary) {
+      cap.appendChild(capacityWindowRow('5-hour rate limit', primary,
+        rate !== null && rate >= 85 ? 'Near cap - steer long work elsewhere' : resetText(primary)));
+    }
+    if (secondary) {
+      cap.appendChild(capacityWindowRow('Weekly rate limit', secondary, resetText(secondary)));
+    }
+    if (!primary && !secondary) {
+      cap.appendChild(el('div', 'tc-cap-empty', capData.reason || 'budget unknown'));
+    }
     var ctx = capPct(a, 'context_used_pct');
-    cap.appendChild(bigMeter('5-hour rate limit', rate,
-      rate !== null && rate >= 85 ? 'Near cap — steer long work elsewhere' : 'Headroom for new work'));
-    cap.appendChild(bigMeter('Context window', ctx,
-      ctx !== null && ctx >= 85 ? 'Compaction risk — avoid heavy context' : 'Comfortable context budget'));
+    cap.appendChild(bigMeter('Context window', ctx, contextNote(capData.context, ctx)));
     col.appendChild(cap);
 
     // Supervisor card.
@@ -1497,6 +1581,31 @@
     row.appendChild(el('span', chipCls, v));
     return row;
   }
+
+  function capacitySummary(agent) {
+    var cap = agent.capacity || {};
+    var wrap = el('div', 'tc-cap-summary');
+    var badges = el('div', 'tc-cap-badges');
+    badges.appendChild(capProviderBadge(cap, agent));
+    badges.appendChild(capConfidenceChip(cap.confidence));
+    if (cap.plan_type) badges.appendChild(el('span', 'tc-chip', cap.plan_type));
+    wrap.appendChild(badges);
+    var meta = [];
+    if (cap.limit_id) meta.push(cap.limit_id);
+    if (cap.rate_limit_reached_type) meta.push(cap.rate_limit_reached_type);
+    if (cap.confidence === 'stale') meta.push('stale budget');
+    else if (cap.confidence === 'unknown') meta.push(cap.reason || 'budget unknown');
+    wrap.appendChild(el('div', 'tc-cap-meta', meta.join(' · ') || 'provider budget'));
+    return wrap;
+  }
+
+  function capacityWindowRow(label, win, note) {
+    var shownLabel = label;
+    if (win && win.label && win.label !== '5h' && label !== 'Weekly rate limit') shownLabel += ' · ' + win.label;
+    var pct = capNum(win, 'used_pct');
+    return bigMeter(shownLabel, pct, note);
+  }
+
   // Capacity meter block (7px track). Reuses .tc-meter-fill for the fill+state.
   function bigMeter(label, pct, note) {
     var wrap = el('div', 'tc-cap-block');

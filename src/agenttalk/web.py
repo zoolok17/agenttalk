@@ -983,19 +983,79 @@ def _infer_cli(agent: str, health: dict, capacity_snap: dict | None) -> str | No
     return None
 
 
+def _capacity_number(value: object) -> int | float | None:
+    if isinstance(value, bool):
+        return None
+    return value if isinstance(value, (int, float)) else None
+
+
+def _capacity_int(value: object) -> int | None:
+    num = _capacity_number(value)
+    return int(num) if num is not None else None
+
+
+def _capacity_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _capacity_window(snap: dict, prefix: str, *, label: str,
+                     now: datetime) -> dict | None:
+    used = _capacity_number(snap.get(f"{prefix}_used_percent"))
+    resets_at = _capacity_int(snap.get(f"{prefix}_resets_at"))
+    window_minutes = _capacity_int(snap.get(f"{prefix}_window_minutes"))
+    if used is None and resets_at is None and window_minutes is None:
+        return None
+    reset_in = None
+    if resets_at is not None:
+        reset_in = max(0, int(resets_at - now.timestamp()))
+    return {
+        "label": label,
+        "used_pct": used,
+        "resets_at": resets_at,
+        "reset_in_seconds": reset_in,
+        "window_minutes": window_minutes,
+    }
+
+
+def _capacity_context(snap: dict) -> dict | None:
+    used = _capacity_number(snap.get("context_used_percent"))
+    tokens = _capacity_int(snap.get("context_tokens"))
+    window_size = _capacity_int(snap.get("context_window_size"))
+    if used is None and tokens is None and window_size is None:
+        return None
+    return {"used_pct": used, "tokens": tokens, "window_size": window_size}
+
+
 def _capacity_entry(snap: dict | None, *, now: datetime) -> dict | None:
     """The `capacity` object (§3a) or None when no snapshot exists. `null`
     percents are allowed INSIDE this object (a snapshot may carry only one
     signal); the absent-not-null rule is about the `capacity` KEY itself."""
     if not isinstance(snap, dict):
         return None
-    rate = snap.get("primary_used_percent")
-    ctx = snap.get("context_used_percent")
-    return {
-        "rate_used_pct": rate if isinstance(rate, (int, float)) else None,
-        "context_used_pct": ctx if isinstance(ctx, (int, float)) else None,
+    rate = _capacity_number(snap.get("primary_used_percent"))
+    ctx = _capacity_number(snap.get("context_used_percent"))
+    out = {
+        "rate_used_pct": rate,
+        "context_used_pct": ctx,
         "confidence": _map_confidence(_capacity.effective_confidence(snap, now=now)),
     }
+    for key in (
+        "source", "observed_at", "plan_type", "limit_id",
+        "rate_limit_reached_type", "reason",
+    ):
+        val = _capacity_string(snap.get(key))
+        if val is not None:
+            out[key] = val
+    primary = _capacity_window(snap, "primary", label="5h", now=now)
+    if primary is not None:
+        out["primary"] = primary
+    secondary = _capacity_window(snap, "secondary", label="weekly", now=now)
+    if secondary is not None:
+        out["secondary"] = secondary
+    context = _capacity_context(snap)
+    if context is not None:
+        out["context"] = context
+    return out
 
 
 def _map_confidence(eff: str) -> str:
@@ -1694,6 +1754,7 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
     session_id = secrets.token_hex(8)
     csrf_token = secrets.token_urlsafe(32) if enable_actions else ""
     rate = {"tokens": float(_ACTION_RATE_BURST), "updated": time.monotonic()}
+    rate_lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
         server_version = f"agenttalk/{__version__}"
@@ -1866,16 +1927,17 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
             return ctype.split(";", 1)[0].strip().casefold() == "application/json"
 
         def _rate_allowed(self) -> bool:
-            now = time.monotonic()
-            elapsed = max(0.0, now - float(rate["updated"]))
-            rate["tokens"] = min(
-                float(_ACTION_RATE_BURST),
-                float(rate["tokens"]) + elapsed * (_ACTION_RATE_PER_MINUTE / 60.0))
-            rate["updated"] = now
-            if float(rate["tokens"]) < 1.0:
-                return False
-            rate["tokens"] = float(rate["tokens"]) - 1.0
-            return True
+            with rate_lock:
+                now = time.monotonic()
+                elapsed = max(0.0, now - float(rate["updated"]))
+                rate["tokens"] = min(
+                    float(_ACTION_RATE_BURST),
+                    float(rate["tokens"]) + elapsed * (_ACTION_RATE_PER_MINUTE / 60.0))
+                rate["updated"] = now
+                if float(rate["tokens"]) < 1.0:
+                    return False
+                rate["tokens"] = float(rate["tokens"]) - 1.0
+                return True
 
         def _active_intent_capacity_ok(self) -> tuple[bool, str, str]:
             count, size = store._intent_active_usage()  # noqa: SLF001 - web maps the store cap to HTTP before parse
@@ -1943,7 +2005,15 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                                    close=True)
                 return
             supplied = self.headers.get("X-CSRF-Token", "")
-            if not hmac.compare_digest(supplied, csrf_token):
+            try:
+                supplied_b = supplied.encode("ascii")
+                token_b = csrf_token.encode("ascii")
+            except UnicodeEncodeError:
+                self._json_problem(HTTPStatus.FORBIDDEN, "bad_csrf",
+                                   "CSRF token is missing or expired",
+                                   close=True)
+                return
+            if not hmac.compare_digest(supplied_b, token_b):
                 self._json_problem(HTTPStatus.FORBIDDEN, "bad_csrf",
                                    "CSRF token is missing or expired",
                                    close=True)

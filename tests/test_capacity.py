@@ -41,8 +41,11 @@ def _write_claude(tmp: Path, payload: dict) -> Path:
 
 def _write_codex_rollout(sessions: Path, name: str, *records: dict) -> Path:
     d = sessions / "2026" / "06" / "09"
-    d.mkdir(parents=True, exist_ok=True)
-    p = d / name
+    return _write_codex_rollout_file(d / name, *records)
+
+
+def _write_codex_rollout_file(p: Path, *records: dict) -> Path:
+    p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
     return p
 
@@ -58,6 +61,11 @@ _CLAUDE_CONTEXT = {
     "current_usage": {"input_tokens": 2, "cache_read_input_tokens": 205000,
                       "cache_creation_input_tokens": 1186, "output_tokens": 500},
 }
+
+
+@pytest.fixture(autouse=True)
+def _clear_codex_thread_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
 
 
 def _token_count(rl: dict, info: dict | None = None) -> dict:
@@ -97,6 +105,17 @@ def test_read_claude_statusline_parses_both_windows(tmp_path: Path) -> None:
     assert snap.primary_window_minutes == cap.FIVE_HOUR_MINUTES
     assert snap.secondary_used_percent == 41.2
     assert snap.secondary_window_minutes == cap.WEEKLY_MINUTES
+
+
+def test_read_claude_statusline_observed_at_uses_file_mtime(tmp_path: Path) -> None:
+    p = _write_claude(tmp_path, _CLAUDE_JSON)
+    mtime = datetime(2026, 6, 9, 7, 30, 0, tzinfo=timezone.utc).timestamp()
+    os.utime(p, (mtime, mtime))
+
+    snap = cap.read_claude_statusline("claude", path=p)
+
+    assert snap is not None
+    assert snap.observed_at == "2026-06-09T07:30:00Z"
 
 
 def test_read_claude_statusline_none_on_absent_or_garbage(tmp_path: Path) -> None:
@@ -168,6 +187,51 @@ def test_read_codex_rollout_prefers_newest_file(tmp_path: Path) -> None:
     assert snap is not None and snap.primary_used_percent == 77.0
 
 
+def test_read_codex_rollout_orders_by_file_mtime_not_parent_dir_mtime(tmp_path: Path) -> None:
+    stale = dict(_CODEX_RL, primary={"used_percent": 12.0, "window_minutes": 300, "resets_at": 1})
+    fresh = dict(_CODEX_RL, primary={"used_percent": 88.0, "window_minutes": 300, "resets_at": 2})
+    stale_dir = tmp_path / "newer-parent"
+    fresh_dir = tmp_path / "older-parent"
+    f_stale = _write_codex_rollout_file(stale_dir / "rollout-stale.jsonl", _token_count(stale))
+    f_fresh = _write_codex_rollout_file(fresh_dir / "rollout-fresh.jsonl", _token_count(fresh))
+    os.utime(f_fresh, (3_000, 3_000))
+    os.utime(f_stale, (1_000, 1_000))
+    os.utime(fresh_dir, (100, 100))
+    os.utime(stale_dir, (200, 200))
+
+    snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path)
+    assert snap is not None and snap.primary_used_percent == 88.0
+
+
+def test_read_codex_rollout_uses_bounded_walk_not_rglob(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_codex_rollout(tmp_path, "rollout-a.jsonl", _token_count(_CODEX_RL))
+
+    def fail_rglob(self: Path, pattern: str):  # noqa: ANN202 - monkeypatched test guard
+        raise AssertionError(f"unbounded rglob called for {pattern}")
+
+    monkeypatch.setattr(Path, "rglob", fail_rglob)
+    snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path)
+    assert snap is not None and snap.primary_used_percent == 12.0
+
+
+def test_read_codex_rollout_scan_limit_bounds_candidate_walk(tmp_path: Path) -> None:
+    _write_codex_rollout(tmp_path, "rollout-a.jsonl", _token_count(_CODEX_RL))
+    assert cap.read_codex_rollout("codex", sessions_dir=tmp_path, max_scan_entries=1) is None
+
+    snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path, max_scan_entries=4)
+    assert snap is not None and snap.primary_used_percent == 12.0
+
+
+def test_read_codex_rollout_incomplete_scan_fails_closed_after_candidate(tmp_path: Path) -> None:
+    _write_codex_rollout_file(tmp_path / "rollout-seen.jsonl", _token_count(_CODEX_RL))
+    hidden = tmp_path / "more" / "rollout-hidden.jsonl"
+    _write_codex_rollout_file(hidden, _token_count(_CODEX_RL))
+
+    assert cap.read_codex_rollout("codex", sessions_dir=tmp_path, max_scan_entries=2) is None
+
+
 def test_read_codex_rollout_none_on_absent_or_no_ratelimits(tmp_path: Path) -> None:
     assert cap.read_codex_rollout("codex", sessions_dir=tmp_path / "missing") is None
     _write_codex_rollout(tmp_path, "rollout-x.jsonl", {"type": "other", "payload": {}})
@@ -197,6 +261,11 @@ def test_read_codex_rollout_uses_thread_id_from_env(tmp_path: Path, monkeypatch:
     monkeypatch.setenv("CODEX_THREAD_ID", "TID123")
     snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path)  # thread_id resolved from env
     assert snap is not None and snap.primary_used_percent == 22.0
+
+
+def test_read_codex_rollout_thread_id_miss_fails_closed(tmp_path: Path) -> None:
+    _write_codex_rollout(tmp_path, "rollout-other.jsonl", _token_count(_CODEX_RL))
+    assert cap.read_codex_rollout("codex", sessions_dir=tmp_path, thread_id="MISSING") is None
 
 
 def test_read_codex_rollout_falls_back_to_newest_without_thread_id(tmp_path: Path) -> None:
@@ -306,6 +375,28 @@ def test_read_local_auto_detects_codex(tmp_path: Path, monkeypatch: pytest.Monke
     monkeypatch.delenv("CLAUDECODE", raising=False)
     snap = cap.read_local("codex", source="auto", sessions_dir=tmp_path)
     assert snap.source == "codex_rollout"
+
+
+def test_read_local_auto_detects_codex_home_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_codex_rollout(codex_home / "sessions", "rollout-home.jsonl", _token_count(_CODEX_RL))
+    monkeypatch.delenv("CLAUDECODE", raising=False)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    snap = cap.read_local("codex", source="auto")
+
+    assert snap.source == "codex_rollout"
+    assert snap.primary_used_percent == 12.0
+
+
+def test_unknown_snapshot_can_carry_reason() -> None:
+    snap = cap.CapacitySnapshot.unknown("codex", reason="codex_home_missing")
+
+    assert snap.source == "unknown"
+    assert snap.confidence == "unknown"
+    assert snap.reason == "codex_home_missing"
 
 
 def test_read_local_returns_unknown_when_undetectable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

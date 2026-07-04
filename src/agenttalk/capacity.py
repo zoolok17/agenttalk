@@ -17,7 +17,9 @@ paths, token bodies, file paths, prompts, or session contents.
 Sources (verified 2026-06-09):
 - Claude Code: ``~/.claude/statusline-last-input.json`` →
   ``rate_limits.{five_hour,seven_day}.{used_percentage,resets_at}``.
-- Codex: newest ``~/.codex/sessions/**/rollout-*.jsonl`` record whose
+- Codex: newest ``$CODEX_HOME/sessions/**/rollout-*.jsonl`` record (falling
+  back to ``~/.codex/sessions`` when the caller has not supplied an isolated
+  home) whose
   ``payload.rate_limits`` has ``{primary,secondary}.{used_percent,window_minutes,
   resets_at}`` plus ``plan_type``/``limit_id``/``rate_limit_reached_type``.
 """
@@ -29,6 +31,7 @@ import os
 import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from heapq import heappop, heappush
 from pathlib import Path
 
 # Provider window lengths in minutes. Codex reports them; Claude omits them, so
@@ -36,10 +39,17 @@ from pathlib import Path
 FIVE_HOUR_MINUTES = 300
 WEEKLY_MINUTES = 10080
 DEFAULT_STALE_AFTER_SECONDS = 600.0
+CODEX_ROLLOUT_MAX_FILES = 8
+CODEX_ROLLOUT_SCAN_LIMIT = 256
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _epoch_iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat(
+        timespec="seconds").replace("+00:00", "Z")
 
 
 def _as_float(v: object) -> float | None:
@@ -67,7 +77,7 @@ class CapacitySnapshot:
     """
 
     source_agent: str
-    observed_at: str                       # ISO-8601 Z — when WE read the source
+    observed_at: str                       # ISO-8601 Z — provider/source observation time
     source: str                            # claude_statusline | codex_rollout | unknown
     primary_used_percent: float | None
     primary_resets_at: int | None
@@ -87,6 +97,7 @@ class CapacitySnapshot:
     context_window_size: int | None = None
     context_tokens: int | None = None
     confidence: str = "observed"           # observed | stale | unknown
+    reason: str | None = None              # advisory reason for unknown snapshots
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -101,12 +112,12 @@ class CapacitySnapshot:
             return None  # missing a required field — treat as unparseable
 
     @classmethod
-    def unknown(cls, source_agent: str) -> "CapacitySnapshot":
+    def unknown(cls, source_agent: str, *, reason: str | None = None) -> "CapacitySnapshot":
         return cls(
             source_agent=source_agent, observed_at=_now_iso(), source="unknown",
             primary_used_percent=None, primary_resets_at=None, primary_window_minutes=None,
             secondary_used_percent=None, secondary_resets_at=None,
-            secondary_window_minutes=None, confidence="unknown",
+            secondary_window_minutes=None, confidence="unknown", reason=reason,
         )
 
 
@@ -116,7 +127,9 @@ def read_claude_statusline(
     """Parse the Claude Code status-line dump. None if absent/unreadable/empty."""
     p = Path(path) if path is not None else Path.home() / ".claude" / "statusline-last-input.json"
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        raw = p.read_text(encoding="utf-8")
+        observed = _epoch_iso(p.stat().st_mtime)
+        data = json.loads(raw)
     except (OSError, ValueError):
         return None
     if not isinstance(data, dict):
@@ -132,7 +145,7 @@ def read_claude_statusline(
     if not has_budget and ctx_pct is None:
         return None  # neither budget nor context data present yet
     return CapacitySnapshot(
-        source_agent=source_agent, observed_at=_now_iso(), source="claude_statusline",
+        source_agent=source_agent, observed_at=observed, source="claude_statusline",
         primary_used_percent=_as_float(five.get("used_percentage")),
         primary_resets_at=_as_int(five.get("resets_at")),
         primary_window_minutes=FIVE_HOUR_MINUTES,
@@ -287,25 +300,84 @@ def _codex_snapshot(source_agent: str, rec: dict) -> CapacitySnapshot | None:
     )
 
 
+def _newest_codex_rollouts(
+    root: Path, *, max_files: int, max_scan_entries: int,
+) -> tuple[list[Path], bool]:
+    """Return rollout files ordered by file mtime.
+
+    The bool is False when the scan budget was exhausted before traversal
+    completed; callers must then fail closed instead of publishing a possibly
+    stale observed value.
+    """
+    if max_files <= 0 or max_scan_entries <= 0:
+        return [], False
+    dirs: list[tuple[float, str, Path]] = []
+    files: list[tuple[float, str, Path]] = []
+
+    def push_dir(path: Path) -> None:
+        try:
+            heappush(dirs, (-path.stat().st_mtime, str(path), path))
+        except OSError:
+            return
+
+    def keep_file(path: Path) -> None:
+        try:
+            item = (path.stat().st_mtime, str(path), path)
+        except OSError:
+            return
+        if len(files) < max_files:
+            heappush(files, item)
+        elif item > files[0]:
+            heappop(files)
+            heappush(files, item)
+
+    push_dir(root)
+    scanned = 0
+    complete = True
+    while dirs:
+        _mtime, _name, path = heappop(dirs)
+        try:
+            for child in path.iterdir():
+                if scanned >= max_scan_entries:
+                    complete = False
+                    break
+                scanned += 1
+                try:
+                    if child.is_dir():
+                        push_dir(child)
+                    elif child.name.startswith("rollout-") and child.name.endswith(".jsonl"):
+                        keep_file(child)
+                except OSError:
+                    continue
+        except OSError:
+            continue
+        if not complete:
+            break
+    newest = [p for _mtime, _name, p in sorted(files, reverse=True)]
+    return newest, complete
+
+
 def read_codex_rollout(
     source_agent: str, *, sessions_dir: str | os.PathLike | None = None,
-    thread_id: str | None = None, max_files: int = 8,
+    thread_id: str | None = None, max_files: int = CODEX_ROLLOUT_MAX_FILES,
+    max_scan_entries: int = CODEX_ROLLOUT_SCAN_LIMIT,
 ) -> CapacitySnapshot | None:
     """Parse the CURRENT Codex session's rollout for its rate-limit budget.
 
     Selection (per Codex's contract): if ``CODEX_THREAD_ID`` is set, prefer
     rollout files matching that thread id (by filename, then by content), newest
-    mtime first — this avoids picking a resumed/forked sibling. Falls back to the
-    newest rollout overall when no thread id is set or matches. Within the chosen
-    file, takes the LAST record carrying budget and/or context data.
+    file mtime first — this avoids picking a resumed/forked sibling. Falls back
+    to the newest rollout overall only when no thread id is set. Within the
+    chosen file, takes the LAST record carrying budget and/or context data.
+    Candidate discovery is bounded because wrapper refresh calls this
+    synchronously; an incomplete scan fails closed to None/unknown.
     """
-    root = Path(sessions_dir) if sessions_dir is not None else Path.home() / ".codex" / "sessions"
+    root = _codex_sessions_root(sessions_dir)
     if not root.is_dir():
         return None
-    try:
-        rollouts = sorted(root.rglob("rollout-*.jsonl"),
-                          key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError:
+    rollouts, complete = _newest_codex_rollouts(
+        root, max_files=max_files, max_scan_entries=max_scan_entries)
+    if not complete:
         return None
     if not rollouts:
         return None
@@ -319,7 +391,8 @@ def read_codex_rollout(
             by_content = [f for f in rollouts[:max_files] if _file_contains(f, tid)]
             if by_content:
                 candidates = by_content
-            # else: no match anywhere — fall back to newest overall (candidates = rollouts)
+            else:
+                return None
     for f in candidates[:max_files]:
         rec = _last_capacity_record(f)
         if rec is not None:
@@ -327,6 +400,15 @@ def read_codex_rollout(
             if snap is not None:
                 return snap
     return None
+
+
+def _codex_sessions_root(sessions_dir: str | os.PathLike | None = None) -> Path:
+    if sessions_dir is not None:
+        return Path(sessions_dir)
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home) / "sessions"
+    return Path.home() / ".codex" / "sessions"
 
 
 def read_local(
@@ -345,7 +427,7 @@ def read_local(
         if os.environ.get("CLAUDECODE"):
             src = "claude"
         else:
-            codex_root = Path(sessions_dir) if sessions_dir is not None else Path.home() / ".codex" / "sessions"
+            codex_root = _codex_sessions_root(sessions_dir)
             src = "codex" if codex_root.is_dir() else "unknown"
     snap: CapacitySnapshot | None = None
     if src == "claude":

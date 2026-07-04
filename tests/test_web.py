@@ -6,9 +6,13 @@ tests cover both happy-path rendering AND the refusal semantics.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import http.client
+import inspect
 import json
+import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -1147,6 +1151,79 @@ def test_wrong_present_csrf_token_returns_403_without_file(tmp_path: Path) -> No
     assert _tree_hashes(s.root) == before
 
 
+def test_non_ascii_csrf_returns_403_without_rate_or_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web, "_ACTION_RATE_BURST", 1)
+    monkeypatch.setattr(web, "_ACTION_RATE_PER_MINUTE", 0)
+    s = _make_store(tmp_path)
+    before = _tree_hashes(s.root)
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post_intent(base, "é", {
+                "kind": "send",
+                "payload": {"target": "beta", "body": "bad token"},
+            })
+        assert exc.value.code == 403
+        problem = json.loads(exc.value.read())
+        assert problem["error"] == "bad_csrf"
+        assert not s.intents_active_dir.exists()
+        assert _tree_hashes(s.root) == before
+
+        with _post_intent(base, token, {
+            "kind": "send",
+            "payload": {"target": "beta", "body": "valid token"},
+        }) as resp:
+            assert resp.status == 202
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert len(s.list_intents()) == 1
+
+
+def test_action_rate_bucket_rmw_is_locked() -> None:
+    src = inspect.getsource(web._make_handler)
+    assert "rate_lock = threading.Lock()" in src
+    assert "with rate_lock:" in src
+    assert src.index("with rate_lock:") < src.index("rate[\"tokens\"] = float(rate[\"tokens\"]) - 1.0")
+
+
+def test_concurrent_valid_posts_respect_rate_burst(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web, "_ACTION_RATE_BURST", 2)
+    monkeypatch.setattr(web, "_ACTION_RATE_PER_MINUTE", 0)
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        barrier = threading.Barrier(8)
+
+        def attempt(i: int) -> int:
+            barrier.wait(timeout=5)
+            try:
+                with _post_intent(base, token, {
+                    "kind": "send",
+                    "payload": {"target": "beta", "body": f"hello {i}"},
+                }) as resp:
+                    return resp.status
+            except urllib.error.HTTPError as exc:
+                return exc.code
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            statuses = list(pool.map(attempt, range(8)))
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert statuses.count(202) == 2
+    assert statuses.count(429) == 6
+    assert len(s.list_intents()) == 2
+
+
 def test_origin_mismatch_returns_403_without_file(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
     before = _tree_hashes(s.root)
@@ -1701,6 +1778,73 @@ def test_console_renderer_safety(tmp_path: Path) -> None:
     assert "sessionStorage" not in js
 
 
+def _density_vars(css: str, density: str) -> dict[str, str]:
+    m = re.search(rf'#app\[data-density="{density}"\]\s*\{{(?P<body>.*?)\}}',
+                  css, flags=re.S)
+    assert m is not None
+    out: dict[str, str] = {}
+    for name, value in re.findall(r"(--[A-Za-z0-9_-]+)\s*:\s*([^;]+);", m.group("body")):
+        out[name] = value.strip()
+    return out
+
+
+def _px(value: str) -> float:
+    assert value.endswith("px")
+    return float(value[:-2])
+
+
+def _grid_columns_at_1280(vars_: dict[str, str]) -> int:
+    viewport = 1280.0
+    main_pad_x = 60.0
+    content_w = viewport - _px(vars_["--sidebar-w"]) - main_pad_x
+    card_min = _px(vars_["--agent-card-min"])
+    gap = _px(vars_["--card-gap"])
+    return int((content_w + gap) // (card_min + gap))
+
+
+def test_console_compact_density_has_material_size_delta_and_mobile_guards(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/static/console.css") as resp:
+            css = resp.read().decode("utf-8")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    comfortable = _density_vars(css, "comfortable")
+    compact = _density_vars(css, "compact")
+    comfortable_task = _px(comfortable["--task-min-h"])
+    compact_task = _px(compact["--task-min-h"])
+    assert (comfortable_task - compact_task) / comfortable_task >= 0.15
+    assert _grid_columns_at_1280(compact) >= _grid_columns_at_1280(comfortable) + 1
+    assert _px(compact["--topbar-h"]) < _px(comfortable["--topbar-h"])
+    assert _px(compact["--agent-card-min"]) < _px(comfortable["--agent-card-min"])
+    assert "grid-template-columns: minmax(0, 1fr);" in css
+    assert "overflow-wrap: anywhere;" in css
+
+
+def test_console_capacity_detail_renders_rich_provider_rows(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/static/console.js") as resp:
+            js = resp.read().decode("utf-8")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    for expected in (
+        "function capacitySummary",
+        "function capacityWindowRow",
+        "function resetText",
+        "Weekly rate limit",
+        "budget unknown",
+        "capProviderBadge",
+    ):
+        assert expected in js
+
+
 def test_console_js_thread_cache_key_single_source(tmp_path: Path) -> None:
     """Regression (reviewer-1, fold-3): the transcript cache READ (transcriptCard)
     and WRITE (fetchThread) must derive the key identically, or every Sessions
@@ -1769,10 +1913,16 @@ def test_api_state_capacity_cli_wrapped_present_when_data_exists(tmp_path: Path)
     s = _make_store(tmp_path)
     s.write_heartbeat("alpha")
     _write_health(s, "alpha", _hm.STATE_WORKING_TURN, cli="claude", mode="wrapper-loop")
+    observed = _now_iso()
     s.write_capacity("alpha", {
-        "schema_version": 1, "source_agent": "alpha", "observed_at": _now_iso(),
+        "schema_version": 1, "source_agent": "alpha", "observed_at": observed,
         "source": "claude_statusline", "primary_used_percent": 42.0,
-        "context_used_percent": 71.5, "confidence": "observed",
+        "primary_resets_at": 1781005233, "primary_window_minutes": 300,
+        "secondary_used_percent": 64.0, "secondary_resets_at": 1781137669,
+        "secondary_window_minutes": 10080,
+        "context_used_percent": 71.5, "context_tokens": 1234,
+        "context_window_size": 4096, "confidence": "observed",
+        "plan_type": "max", "limit_id": "claude",
     })
     srv, _t, base = _serve(s)
     try:
@@ -1780,10 +1930,25 @@ def test_api_state_capacity_cli_wrapped_present_when_data_exists(tmp_path: Path)
         alpha = next(a for a in root["agents"] if a["name"] == "alpha")
         assert alpha["cli"] == "claude"
         cap = alpha["capacity"]
-        assert set(cap) == {"rate_used_pct", "context_used_pct", "confidence"}
+        assert {"rate_used_pct", "context_used_pct", "confidence"} <= set(cap)
         assert cap["rate_used_pct"] == 42.0
         assert cap["context_used_pct"] == 71.5
         assert cap["confidence"] == "fresh"
+        assert cap["source"] == "claude_statusline"
+        assert cap["observed_at"] == observed
+        assert cap["plan_type"] == "max"
+        assert cap["limit_id"] == "claude"
+        assert cap["primary"] == {
+            "label": "5h",
+            "used_pct": 42.0,
+            "resets_at": 1781005233,
+            "reset_in_seconds": cap["primary"]["reset_in_seconds"],
+            "window_minutes": 300,
+        }
+        assert cap["secondary"]["label"] == "weekly"
+        assert cap["secondary"]["used_pct"] == 64.0
+        assert cap["secondary"]["window_minutes"] == 10080
+        assert cap["context"] == {"used_pct": 71.5, "tokens": 1234, "window_size": 4096}
         assert alpha["wrapped"] is True
         assert alpha["restartable"] is True
     finally:
@@ -1832,8 +1997,32 @@ def test_api_state_capacity_null_percent_allowed_inside_object(tmp_path: Path) -
         assert "capacity" in alpha
         assert alpha["capacity"]["rate_used_pct"] == 55.0
         assert alpha["capacity"]["context_used_pct"] is None
+        assert alpha["capacity"]["primary"]["used_pct"] == 55.0
+        assert "secondary" not in alpha["capacity"]
+        assert "context" not in alpha["capacity"]
         # cli inferred from the snapshot source when no fresh health.cli
         assert alpha["cli"] == "codex"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_capacity_unknown_reason_is_additive(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    s.write_capacity("alpha", {
+        "schema_version": 1, "source_agent": "alpha", "observed_at": _now_iso(),
+        "source": "unknown", "confidence": "unknown", "reason": "codex_home_missing",
+        "primary_used_percent": None, "context_used_percent": None,
+    })
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        cap = alpha["capacity"]
+        assert cap["confidence"] == "unknown"
+        assert cap["reason"] == "codex_home_missing"
+        assert cap["rate_used_pct"] is None
+        assert "primary" not in cap
     finally:
         srv.shutdown()
         srv.server_close()

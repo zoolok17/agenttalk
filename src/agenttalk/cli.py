@@ -6245,6 +6245,24 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         _release()
         sys.stderr.write(f"agenttalk wrap: {e}\n")
         return 2
+    capacity_refresh = None
+    if one_shot_request_id is None:
+
+        def capacity_refresh() -> None:
+            if cli == "codex":
+                codex_home = os.environ.get("CODEX_HOME")
+                if not codex_home:
+                    snap = capmod.CapacitySnapshot.unknown(
+                        agent, reason="codex_home_missing")
+                else:
+                    snap = capmod.read_local(
+                        agent, source="codex",
+                        sessions_dir=Path(codex_home) / "sessions",
+                        thread_id=state.codex_thread_id,
+                    )
+            else:
+                snap = capmod.read_local(agent, source="claude")
+            store.write_capacity(agent, snap.to_dict())
     if lead_loop:
         # OWNERSHIP GATE: re-verify the lease BEFORE consuming EACH record, so a lost
         # lease stops consumption IMMEDIATELY (not after the supervisor's stale
@@ -6364,6 +6382,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             manage_waiting=not lead_loop,  # the lead-loop LEASE owns the .waiting mirror
             cadence=cadence_hook,  # WP3 proactive sweep (lead-loop only)
             on_health_idle=health_writer.idle,
+            capacity_refresh=capacity_refresh,
         )
     except _LeadLoopLeaseLost:
         # LOST the lease mid-run (stolen / torn / force-released): the ownership gate /

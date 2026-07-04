@@ -3876,9 +3876,10 @@ class Store:
                     st = p.stat()
                 except OSError:
                     continue
-                entries.append((p, st.st_mtime, st.st_size))
+                entries.append((p, st.st_mtime, st.st_size, p.name))
                 total += st.st_size
-            for p, mtime, size in entries:
+            entries.sort(key=lambda item: (item[1], item[3]))
+            for p, mtime, size, _name in entries:
                 too_old = (now - mtime) > self.INTENT_AUDIT_MAX_AGE_SECONDS
                 if too_old or total > self.INTENT_AUDIT_MAX_BYTES:
                     try:

@@ -173,6 +173,8 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              manage_waiting: bool = True,
              cadence: Callable[[], CadenceResult] | None = None,
              on_health_idle: Callable[[], None] | None = None,
+             capacity_refresh: Callable[[], None] | None = None,
+             capacity_interval_seconds: float = 60.0,
              now_iso: Callable[[], str] = _iso_now) -> int:
     """Run the wrapper listen loop. ``drive(record)`` handles ONE turn (injected).
     Returns the number of turns driven. ``max_turns`` / ``max_polls`` / ``max_wall``
@@ -207,7 +209,12 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
     (the loop's commit / attempt / dead-letter machinery is untouched on the idle path).
     The hook gates due-ness itself (returns ``ran=False`` when not due, so calling it every
     poll is cheap-by-contract). A FAILED sweep (``ran and not ok``) makes the loop withhold
-    the idle heartbeat this poll (controller-health staleness)."""
+    the idle heartbeat this poll (controller-health staleness).
+
+    ``capacity_refresh`` (CONTINUOUS only): an advisory observability hook
+    called only after an idle heartbeat stamp or successful turn boundary. It is
+    interval-gated and failure-isolated; exceptions are swallowed so capacity
+    cannot undo the just-completed liveness/cursor boundary."""
     stamp = heartbeat if heartbeat is not None else (lambda: store.write_heartbeat(agent))
     if manage_waiting:
         store.write_waiting(agent, {"agent": agent, "mode": "wrapper-loop"})
@@ -228,6 +235,8 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
             max_wall=max_wall, k_poison=k_poison, k_escalate=k_escalate,
             on_dead_letter=on_dead_letter, on_escalate=on_escalate, stamp=stamp,
             pre_commit=pre_commit, cadence=cadence, on_health_idle=on_health_idle,
+            capacity_refresh=capacity_refresh,
+            capacity_interval_seconds=capacity_interval_seconds,
             now_iso=now_iso)
     finally:
         if manage_waiting:
@@ -246,6 +255,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     pre_commit: Callable[[], None] | None,
                     cadence: Callable[[], CadenceResult] | None,
                     on_health_idle: Callable[[], None] | None,
+                    capacity_refresh: Callable[[], None] | None,
+                    capacity_interval_seconds: float,
                     now_iso: Callable[[], str]) -> int:
     turns = 0
 
@@ -262,11 +273,26 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
     def _commit(rec: dict) -> None:
         _guard_advance()
         recv_api.commit(store, agent, rec)
+
     polls = 0
     last_hb: float | None = None
     cur_sleep = idle_interval
     fail_sleep = idle_interval
     start = clock()
+    last_capacity_refresh = start
+
+    def _maybe_refresh_capacity(now: float) -> None:
+        nonlocal last_capacity_refresh
+        if capacity_refresh is None:
+            return
+        interval = max(0.0, float(capacity_interval_seconds))
+        if (now - last_capacity_refresh) < interval:
+            return
+        last_capacity_refresh = now
+        try:
+            capacity_refresh()
+        except Exception:  # noqa: BLE001 - advisory capacity must never break loop progress
+            return
 
     def _info(record: dict, rec: dict, failure_class: str) -> dict:
         return {"agent": agent, "msg_id": record.get("id"), "from": record.get("from"),
@@ -358,6 +384,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 if on_health_idle is not None:
                     on_health_idle()
                 last_hb = now
+                _maybe_refresh_capacity(now)
             sleep(cur_sleep)
             cur_sleep = min(max_idle_interval, cur_sleep * 2.0)
             continue
@@ -420,6 +447,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             store.clear_attempt(agent, head_id)
             store.gc_attempts_below(agent, store.cursor(agent))
             last_hb = clock()                           # drive already stamped on success
+            _maybe_refresh_capacity(last_hb)
             fail_sleep = idle_interval                  # reset failure backoff
             turns += 1
             if max_turns is not None and turns >= max_turns:

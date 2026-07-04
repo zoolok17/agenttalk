@@ -699,9 +699,16 @@ def drain_intents(store: Store, *, pid: int, pid_start: object = None,
     terminal state, then rotate settled terminals into the control-audit sink.
     Per-intent failures are contained (terminal state=failed), never abort the
     pass. Returns a summary dict."""
-    now = now_epoch if now_epoch is not None else time.time()
     summary = {"examined": 0, "claimed": 0, "applied": 0, "denied": 0,
                "failed": 0, "skipped": 0, "quarantined_invalid": 0}
+    kill = store.supervisor_kill_switch()
+    if kill is not False:
+        summary["disabled"] = True
+        summary["disabled_reason"] = "kill_switch" if kill else "kill_switch_unreadable"
+        summary["rotation"] = {"rotated": 0, "audit_dropped": 0,
+                               "quarantined_invalid": 0}
+        return summary
+    now = now_epoch if now_epoch is not None else time.time()
     quarantine = store.quarantine_invalid_intents(now_epoch=now)
     summary["quarantined_invalid"] = int(quarantine.get("quarantined") or 0)
     candidates = [r for r in store.list_intents(limit=100000)

@@ -12,7 +12,18 @@ major · `P2` minor · `P3` nit. Each item: what, why, where, disposition.
 
 ---
 
-## P0 · IN PROGRESS — supervisor cross-project process kill (2026-07-03)
+## Recently shipped
+
+- **SHIPPED · v0.59.2 / `1dd10ba` — supervisor process-ownership attribution.**
+  Closed the cross-project-kill P0 with typed process ownership, strict live-chain
+  descendant proof, and launch-nonce confirmation so a supervisor reaps only this
+  project's own agent tree.
+- **SHIPPED · v0.59.1 / `9d88dc1` — Team Console write-spine hardening.**
+  Added drain-time frozen-plan revalidation, pid-start-aware anti-reuse reclaim,
+  torn-intent quarantine, deny-on-drift behavior, and the negative/e2e security
+  regression suite.
+
+## SHIPPED · v0.59.2 — supervisor cross-project process kill (2026-07-04)
 
 **P0 · a supervisor in project B can KILL an identically-named agent's processes in an
 unrelated project A on the same machine.** Operator hit this live: a standalone `claude` in
@@ -40,8 +51,7 @@ auto-recovery), so it needs the design pass. Also audit `_discover_brain` strate
 from the cross-matched wait row) and the brain name-pattern match (every `claude.exe` matches)
 for the same leak.
 
-STATUS: investigated + reported to operator 2026-07-03; fixed in the Unreleased
-supervisor process-ownership build pending review/gate/merge.
+STATUS: shipped in `v0.59.2` / `1dd10ba`.
 
 **P0 UPDATE — investigation complete (workflow `wrnuxcwka`, 2026-07-03).**
 
@@ -102,8 +112,8 @@ a stale/foreign recorded `launcher_pid` is a separate cross-kill vector the wait
 cover (state hygiene); normalized-path comparison must handle PS quoting / mixed slashes /
 drive-case / trailing slash (too-loose re-opens the bypass, too-strict re-breaks own-reaping).
 
-STATUS: fixed in the Unreleased supervisor process-ownership build pending review/gate/merge.
-Mitigation until then: project-DISTINCT agent names across concurrent projects.
+STATUS: shipped in `v0.59.2` / `1dd10ba`. Historical pre-fix mitigation was
+project-DISTINCT agent names across concurrent projects.
 
 **IMPLEMENTATION UPDATE - process ownership model (2026-07-04).**
 
@@ -171,9 +181,14 @@ rate-limited state); optionally an auto-wake that re-arms a recovered agent. REC
 long-silent-turn false-STUCK churn that compounds this (a relaunch also refreshes the wrappers to
 current code).
 
-## PLANNED (v0.59.1 fast-follow) — dashboard write-spine P3s (from the v0.59.0 3-way review, 2026-07-04)
+## P3 · IN PROGRESS (v0.59.3 dashboard increment) — capacity display, density, and write-spine P3 closeouts (2026-07-04)
 
-Non-blocking nits from the v0.59.0 review (reviewer-2 + reviewer-3 + independent adversarial pass, all GO). Bundle into v0.59.1. None is an auth bypass; the write boundary is sound.
+Dashboard increment 1 closes the four open v0.59.0 write-spine P3s, adds
+per-provider capacity display, and makes compact density materially smaller.
+None of the P3s is an auth bypass; the write boundary is sound. v0.60.0
+operator inbox work remains out of this increment.
+
+STATUS: in progress for `v0.59.3`.
 
 - **P3 · non-ASCII CSRF header → TypeError** (sharpest). `web.py _handle_intent_post` runs
   `hmac.compare_digest(supplied, csrf_token)` on STRINGS; a non-ASCII header (latin-1 decoded,
@@ -191,19 +206,24 @@ Non-blocking nits from the v0.59.0 review (reviewer-2 + reviewer-3 + independent
   the CLI gate + PS `Assert-ActionsEnabled` for the kill-switch; a direct programmatic caller would
   send despite an active `supervisor.kill`. Not web-reachable. FIX: short-circuit `drain_intents`
   when `supervisor_kill_switch()` is active.
-- **CHANGELOG/doc note:** `supervisor.ps1` now exits 3 at startup if the kill-switch is already
-  active (claim-instance gate), replacing the old passive-observer mode — deliberate fail-closed;
-  make it visible to operators.
+- **Capacity display + density polish.** Add isolated, advisory provider-budget refresh for wrapped
+  agents, richer `/api/state` capacity fields, a visible detail-card budget view, and compact-mode
+  sizing that shows materially more content at 1280px without desktop/mobile overflow.
+  Known limitation: manual Codex capacity reads against a shared operator `~/.codex/sessions`
+  use bounded rollout discovery (`CODEX_ROLLOUT_SCAN_LIMIT=256`, `CODEX_ROLLOUT_MAX_FILES=8`).
+  If a requested thread is outside the proven candidate set, capacity degrades to unknown rather
+  than publishing another thread's observed budget. Supervised wrapped Codex remains isolated to
+  that agent's `CODEX_HOME/sessions`.
 
-### v0.59.1 hardening batch — from the FRESH 4-reviewer pass (2026-07-04)
+### Historical review record — shipped in v0.59.1 / `9d88dc1`
 
 Second, independent fresh review of the v0.59.0 write spine (`5b8203a..72660b3`): 2 codex +
 2 claude, distinct adversarial lenses, every Claude P0/P1 adversarially refuted. **Core is
 VERIFIED sound in code** (OFF byte-identical, POST gate order with no pre-write side effect,
 Host/DNS-rebind, constant-time CSRF, server-side actor derivation with no browser identity
 trusted, no-double-send crash recovery, confirmed-dead-only reclaim, kill-switch 423, preflight
-read-only). One real code gap + a test-honesty cluster. **codex designing the batch** (assignment
-`v0591-hardening-design`). None is browser-reachable; v0.59.0 stays live.
+read-only). One real code gap + a test-honesty cluster. Shipped in `v0.59.1` /
+`9d88dc1`. None is browser-reachable; v0.59.0 stayed live during the fast-follow.
 
 - **P1 · drain-time plan-trust bypass (defense-in-depth / invariant-integrity)** — codex-reviewer-1,
   REPRODUCED at 72660b3. `intents._drain_one` validates only `rec.kind`/`rec.payload` (intents.py:388),
