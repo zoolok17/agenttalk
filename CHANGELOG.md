@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.59.0] - 2026-07-04
+
+### Added
+
+- **Team Console write actions — opt-in intent queue (`--enable-actions`, OFF by default).**
+  The read-only console becomes a control surface: the browser can **send / reply / propose /
+  broadcast** through a fail-closed intent queue. The web tier only APPENDS a typed intent
+  (`POST /api/intent`, gated in order by a per-run CSRF token + Host allowlist + `Origin==self`
+  + kill-switch + body/rate caps + schema); a supervised **executor** (`agenttalk supervise
+  --drain-intents`) is the SOLE actor — it derives the author server-side via `resolve_web_actor`
+  (operator-facing liaison, else sole lead, else fail-closed), never trusts a browser-supplied
+  identity, and applies through `store.send()`. Delivery is idempotent (pre-send attempt-floor
+  dedup + confirmed-dead-only reclaim + a `supervisor.instance.lock` singleton), so a stalled or
+  reclaimed executor cannot double-send. `GET /api/intents` shows honest queued/applied/denied
+  state; `GET /api/preflight` (read-only) surfaces setup status. **When actions are off the
+  console is byte-for-byte the shipped read-only surface** (`POST` → 405, no `/api/session`, no
+  `state/intents/`).
+- **`agenttalk start` bootstrap.** One command to launch the console + supervisor for an
+  already-configured team (guarded `--init-if-absent`: refuses without an explicit location and
+  `--agents`; never guesses a cwd/roster).
+- **`/` now serves the Team Console.** The old message-list dashboard is removed; `/` and
+  `/dashboard` both render the console.
+
 ## [0.58.5] - 2026-07-04
 
 ### Changed
