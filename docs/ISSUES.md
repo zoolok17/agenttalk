@@ -147,6 +147,60 @@ Non-blocking nits from the v0.59.0 review (reviewer-2 + reviewer-3 + independent
   active (claim-instance gate), replacing the old passive-observer mode — deliberate fail-closed;
   make it visible to operators.
 
+### v0.59.1 hardening batch — from the FRESH 4-reviewer pass (2026-07-04)
+
+Second, independent fresh review of the v0.59.0 write spine (`5b8203a..72660b3`): 2 codex +
+2 claude, distinct adversarial lenses, every Claude P0/P1 adversarially refuted. **Core is
+VERIFIED sound in code** (OFF byte-identical, POST gate order with no pre-write side effect,
+Host/DNS-rebind, constant-time CSRF, server-side actor derivation with no browser identity
+trusted, no-double-send crash recovery, confirmed-dead-only reclaim, kill-switch 423, preflight
+read-only). One real code gap + a test-honesty cluster. **codex designing the batch** (assignment
+`v0591-hardening-design`). None is browser-reachable; v0.59.0 stays live.
+
+- **P1 · drain-time plan-trust bypass (defense-in-depth / invariant-integrity)** — codex-reviewer-1,
+  REPRODUCED at 72660b3. `intents._drain_one` validates only `rec.kind`/`rec.payload` (intents.py:388),
+  then if a frozen `plan` already exists and `plan.actor == resolved actor` (intents.py:400/414) it
+  feeds the plan's `bus_kind` + `stable_meta` straight into `store.send` (intents.py:451-462) with NO
+  re-check against the closed bus-kind map / reserved-meta rules. A co-resident who writes a crafted
+  plan into `state/intents/active/<id>.json` (`bus_kind=release` + control meta) gets an
+  operator-authored `release` on the bus. NOT browser-reachable (`store.write_intent` never accepts a
+  browser plan) → not a pull; but it violates the "executor re-validation is the SOLE gate vs a
+  store-writing co-resident" invariant (design critique-must-fix #4). FIX: re-validate a trusted frozen
+  plan at drain time (bus_kind ∈ allowed map, stable_meta passes reserved-meta), fail-closed to
+  INTENT_DENIED with a structured code, WITHOUT discarding the freeze (resumable fan-out). The claude
+  test-coverage lens independently predicted this exact risk class.
+- **P1 · no negative CSRF test** — claude-reviewer-B, verify-confirmed P1. The `hmac.compare_digest`
+  gate is correct in code, but no test sends a WRONG-but-present token or asserts `bad_csrf`; a
+  regression to prefix/`startswith` matching would pass CI. FIX: wrong-token POST → 403 `bad_csrf` +
+  tree unchanged; pin `problem.error` on the existing missing-token test.
+- **P2 · executor defense-in-depth test** — a raw file dropped directly into `intents_active_dir` with
+  a control bus_kind / reserved meta / unknown kind must drain to INTENT_DENIED, zero sends. This test
+  ALSO pins the plan-trust P1 fix (drop a crafted PLAN → denied). (claude-reviewer-B, downgraded from P1.)
+- **P2 · no-forgery e2e test** — POST carrying a top-level browser `from=<x>`, drain, assert
+  `message.sender == resolve_web_actor` (derived), never the browser value. (claude-reviewer-B, downgraded.)
+- **P2 · pid_start-ignored-on-reclaim** — codex-reviewer-2, REPRODUCED. `claim_intent` (store.py:3702)
+  and `claim_supervisor_instance` (3831) reclaim on `_process_liveness(pid)` alone, ignoring the recorded
+  `pid_start`; PID reuse before the stale threshold strands the intent/singleton behind an unrelated live
+  process. FIX: pid_start-aware reclaim (same pid + different start == confirmed gone) + deterministic
+  PID-reuse regression for both the intent claim and the instance lock.
+- **P2 · torn-active-intent skipped forever** — codex-reviewer-2, REPRODUCED. On the Windows sandbox
+  direct-write fallback a partial `active/<id>.json` reads None, is skipped by `list_intents`/drain
+  forever, never terminalized, still counts against the active cap. FIX: bounded recovery/quarantine
+  (mirror `prune --invalid`) or at minimum doctor surfacing + a rotate path. Treat as ONE quarantine
+  story with the unparseable-timestamp P3 below.
+- **P2 · origin-mismatch / rate / body / intent-cap / no-double-drain / drain-denial-code tests** —
+  claude-reviewer-B. The gates are code-correct but have no negative web-layer tests: foreign Origin →
+  403 `bad_origin`; burst>limit → 429 `rate_limited`; body>64KiB → 413 `body_too_large`; active-cap →
+  429 `intent_cap`; a second live singleton claim refused + two overlapping drains → exactly one message;
+  drain-time codes (`target_not_in_roster`, `reply_anchor_not_found`, `empty_audience`,
+  `multiple_leads_configured`, `actor_changed`) each pinned.
+- **P3 (bank; fold only if trivially cheap):** terminal intents count against the active cap during the
+  600s linger; reset-mid-drain ghost-send (`update_intent` no-ops but `store.send` still fires);
+  actor-changed partial-fan-out duplicate on requeue (new intent_id defeats the crash-recovery
+  fingerprint); reply-anchor onto a non-proposal message (CLI parity); `rotate_intents` skips a record
+  whose `terminal_at`/`created_at` is unparseable forever (age None → never rotates — sibling of the
+  torn-file P2); OFF-mode POST not full-tree-hash-verified.
+
 ## P2 · PLANNED (fast-follow) — wrapper stream teardown + work-heartbeat P3s
 
 Small, low-risk, bundle into one dev-2 task once capacity returns (normal cadence).
