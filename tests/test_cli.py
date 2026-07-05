@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from agenttalk import cli
+from agenttalk import cli, health as hm
 from agenttalk.store import Store
 
 
@@ -373,6 +374,59 @@ def test_status_operator_lead_uses_last_seen_liveness_when_health_missing(
     assert "health=active" in out
 
 
+def test_status_operator_lead_liveness_uses_status_stale_threshold(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    s = Store(store_root)
+    s.set_role("alpha", "lead")
+    s.set_operator_facing("alpha")
+    old = datetime.now(timezone.utc) - timedelta(seconds=75)
+    (s.state_dir / "alpha.heartbeat").write_text(
+        old.isoformat().replace("+00:00", "Z"), encoding="utf-8")
+
+    rc = _run(["status", "--json"], store_root)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+    assert alpha["stale"] is True
+    assert alpha["lead_liveness"]["state"] == "unknown"
+    assert "health_display" not in alpha
+
+
+def test_status_wrapped_lead_stale_health_not_forced_active(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    s = Store(store_root)
+    s.set_role("alpha", "lead")
+    s.set_operator_facing("alpha")
+    s.write_heartbeat("alpha")
+    old = datetime.now(timezone.utc) - timedelta(seconds=999)
+    old_iso = old.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    s.write_health("alpha", hm.build_snapshot(
+        agent="alpha",
+        cli="codex",
+        mode="wrapped",
+        state=hm.STATE_IDLE_WAITING,
+        updated_at=old_iso,
+        since=old_iso,
+        reason_code="idle_waiting",
+    ))
+
+    rc = _run(["status", "--json"], store_root)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+    assert alpha["stale"] is False
+    assert alpha["health"]["state"] == hm.STATE_UNKNOWN
+    assert alpha["health"]["reason_code"] == "health_stale_ttl"
+    assert "lead_liveness" not in alpha
+    assert "health_display" not in alpha
+
+
 def test_status_supervisor_assessment_fail_safe(
     store_root: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -406,6 +460,10 @@ def test_supervisor_cli_read_fail_safe(
     payload = json.loads(capsys.readouterr().out)
     assert payload["agents"] == []
     assert "supervisor_read_unavailable:ValueError" in payload["event_ring"]["warnings"]
+
+
+def test_supervisor_cli_now_infinity_is_rejected(store_root: Path) -> None:
+    _run_expect_exit(["supervisor", "--json", "--now", "Infinity"], store_root, 2)
 
 
 def test_status_human_output_unchanged_for_no_heartbeat(

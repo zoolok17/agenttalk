@@ -86,6 +86,7 @@ _DEFAULTS = {
 SUPERVISOR_EVENT_RING_CAP = 512
 SUPERVISOR_EVENT_TAIL_BYTES = 262_144
 SUPERVISOR_EVENT_SUMMARY_INTERVAL_SECONDS = 300.0
+LEAD_LIVENESS_STALE_AFTER_SECONDS = 60.0
 _EVENT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
 
 # Per-CLI process-discovery defaults (config["agents"][n] overrides). These
@@ -648,53 +649,68 @@ def record_supervisor_plan_events(store: Store, plan: dict, *,
     reason codes. Free-form plan reasons, restart reasons, command lines, and
     config-blocked summaries are deliberately not representable.
     """
-    agents = plan.get("agents") if isinstance(plan.get("agents"), dict) else {}
-    prior, _ = read_supervisor_events(store)
-    last_fp: dict[str, str] = {}
-    last_summary_epoch: float | None = None
-    for event in prior:
-        if event.get("kind") == "agent_decision":
-            agent = event.get("agent")
-            fp = event.get("fingerprint")
-            if isinstance(agent, str) and isinstance(fp, str):
-                last_fp[agent] = fp
-        elif event.get("kind") == "poll_summary":
-            ts = event.get("at_epoch")
-            if isinstance(ts, (int, float)):
-                last_summary_epoch = float(ts)
-    new_events: list[dict] = []
-    for agent in sorted(agents):
-        p = agents.get(agent)
-        if not isinstance(p, dict):
-            continue
-        fp = _decision_fingerprint(agent, p)
-        if last_fp.get(agent) != fp:
-            new_events.append(_decision_event(agent, p, now_epoch=now_epoch))
-    if (last_summary_epoch is None
-            or now_epoch - last_summary_epoch >= float(summary_interval_seconds)):
-        new_events.append(_summary_event(plan, now_epoch=now_epoch))
-    append_supervisor_events(store, new_events, cap=cap)
+    try:
+        agents = plan.get("agents") if isinstance(plan.get("agents"), dict) else {}
+        prior, _ = read_supervisor_events(store)
+        last_fp: dict[str, str] = {}
+        last_summary_epoch: float | None = None
+        for event in prior:
+            if event.get("kind") == "agent_decision":
+                agent = event.get("agent")
+                fp = event.get("fingerprint")
+                if isinstance(agent, str) and isinstance(fp, str):
+                    last_fp[agent] = fp
+            elif event.get("kind") == "poll_summary":
+                ts = event.get("at_epoch")
+                if isinstance(ts, (int, float)):
+                    last_summary_epoch = float(ts)
+        new_events: list[dict] = []
+        for agent in sorted(agents):
+            p = agents.get(agent)
+            if not isinstance(p, dict):
+                continue
+            fp = _decision_fingerprint(agent, p)
+            if last_fp.get(agent) != fp:
+                new_events.append(_decision_event(agent, p, now_epoch=now_epoch))
+        if (last_summary_epoch is None
+                or now_epoch - last_summary_epoch >= float(summary_interval_seconds)):
+            new_events.append(_summary_event(plan, now_epoch=now_epoch))
+        append_supervisor_events(store, new_events, cap=cap)
+    except Exception:
+        return
 
 
 def lead_liveness_from_bus(*, agent: str, role: str | None, operator_facing: str | None,
                            heartbeat_age_seconds: object, heartbeat_stale: object,
-                           waiting: object) -> dict | None:
+                           waiting: object, health_reason_code: object = None,
+                           stale_after_seconds: float =
+                           LEAD_LIVENESS_STALE_AFTER_SECONDS) -> dict | None:
     """Display-only liveness for interactive leads without wrapper health."""
-    is_leadish = agent == operator_facing or (isinstance(role, str) and role.casefold() == "lead")
-    if not is_leadish:
+    _ = role, heartbeat_stale
+    if agent != operator_facing or health_reason_code != "health_missing":
         return None
     age = heartbeat_age_seconds
-    if isinstance(age, (int, float)) and heartbeat_stale is False:
+    stale_after = (
+        float(stale_after_seconds)
+        if isinstance(stale_after_seconds, (int, float)) and stale_after_seconds >= 0
+        else LEAD_LIVENESS_STALE_AFTER_SECONDS
+    )
+    if isinstance(age, (int, float)) and math.isfinite(float(age)) and float(age) <= stale_after:
         return {
             "state": "idle_waiting" if waiting else "active",
             "source": "bus_last_seen",
             "last_seen_seconds": round(float(age), 3),
+            "stale_after_seconds": stale_after,
             "advisory": True,
         }
     return {
         "state": "unknown",
         "source": "bus_last_seen",
-        "last_seen_seconds": round(float(age), 3) if isinstance(age, (int, float)) else None,
+        "last_seen_seconds": (
+            round(float(age), 3)
+            if isinstance(age, (int, float)) and math.isfinite(float(age)) else None
+        ),
+        "stale_after_seconds": stale_after,
         "advisory": True,
     }
 
@@ -704,7 +720,8 @@ def _assessment_health(rpt: dict, lead_liveness: dict | None) -> dict:
     state = health_model.label(health)
     reason = health.get("reason_code") if isinstance(health.get("reason_code"), str) else None
     effective = state
-    if state == health_model.STATE_UNKNOWN and isinstance(lead_liveness, dict):
+    if (state == health_model.STATE_UNKNOWN and reason == "health_missing"
+            and isinstance(lead_liveness, dict)):
         ll_state = lead_liveness.get("state")
         if isinstance(ll_state, str) and ll_state != "unknown":
             effective = ll_state
@@ -720,7 +737,10 @@ def _assessment_health(rpt: dict, lead_liveness: dict | None) -> dict:
 
 
 def supervisor_agent_assessment(name: str, rpt: dict, plan: dict | None, *,
-                                operator_facing: str | None = None) -> dict:
+                                operator_facing: str | None = None,
+                                lead_liveness_stale_after_seconds: float =
+                                LEAD_LIVENESS_STALE_AFTER_SECONDS) -> dict:
+    health = rpt.get("health") if isinstance(rpt.get("health"), dict) else {}
     lead_liveness = lead_liveness_from_bus(
         agent=name,
         role=rpt.get("role") if isinstance(rpt.get("role"), str) else None,
@@ -728,6 +748,8 @@ def supervisor_agent_assessment(name: str, rpt: dict, plan: dict | None, *,
         heartbeat_age_seconds=rpt.get("heartbeat_age_seconds"),
         heartbeat_stale=rpt.get("heartbeat_stale"),
         waiting=rpt.get("waiting"),
+        health_reason_code=health.get("reason_code"),
+        stale_after_seconds=lead_liveness_stale_after_seconds,
     )
     decision = None
     if isinstance(plan, dict):
@@ -774,11 +796,116 @@ def supervisor_agent_assessment(name: str, rpt: dict, plan: dict | None, *,
     }
 
 
+def _redacted_observation_value(value: object) -> object:
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return _event_token(value, "redacted")
+    if isinstance(value, list):
+        return [_redacted_observation_value(item) for item in value]
+    if isinstance(value, dict):
+        out: dict[str, object] = {}
+        for key, item in value.items():
+            safe_key = _event_token(key, "redacted")
+            out[safe_key] = _redacted_observation_value(item)
+        return out
+    return None
+
+
+def _redacted_restart_request(marker: object) -> dict | None:
+    if not isinstance(marker, dict):
+        return None
+    out: dict[str, object] = {}
+    for key in (
+        "request_id",
+        "requested_by",
+        "force_protected",
+        "live_ack",
+        "authority_live",
+        "authority_reason",
+        "authority_live_reason",
+    ):
+        if key in marker:
+            out[key] = _redacted_observation_value(marker.get(key))
+    return out
+
+
+def _redacted_report_agent(rpt: dict) -> dict:
+    hold = rpt.get("config_blocked_hold") if isinstance(
+        rpt.get("config_blocked_hold"), dict) else None
+    return {
+        "role": _redacted_observation_value(rpt.get("role")),
+        "protected": bool(rpt.get("protected")),
+        "heartbeat_age_seconds": _redacted_observation_value(rpt.get("heartbeat_age_seconds")),
+        "heartbeat_stale": bool(rpt.get("heartbeat_stale")),
+        "stuck_after_seconds": _redacted_observation_value(rpt.get("stuck_after_seconds")),
+        "health": _redacted_observation_value(rpt.get("health")),
+        "waiting": bool(rpt.get("waiting")),
+        "waiting_pid": _redacted_observation_value(rpt.get("waiting_pid")),
+        "waiting_pid_alive": bool(rpt.get("waiting_pid_alive")),
+        "waiting_deadline_epoch": _redacted_observation_value(
+            rpt.get("waiting_deadline_epoch")),
+        "restart_request": _redacted_restart_request(rpt.get("restart_request")),
+        "config_blocked_hold": {
+            "present": hold is not None,
+            "summary_code": "config_blocked" if hold is not None else None,
+        },
+        "session_id": _redacted_observation_value(rpt.get("session_id")),
+        "lead_loop": _redacted_observation_value(rpt.get("lead_loop")),
+        "lead_loop_exit": _redacted_observation_value(rpt.get("lead_loop_exit")),
+    }
+
+
+def _redacted_observation_report(report: dict) -> dict:
+    agents = report.get("agents") if isinstance(report.get("agents"), dict) else {}
+    return {
+        "roster": [
+            _event_token(name, "redacted")
+            for name in (report.get("roster") if isinstance(report.get("roster"), list) else [])
+        ],
+        "operator_facing": _redacted_observation_value(report.get("operator_facing")),
+        "agents": {
+            _event_token(name, "redacted"): _redacted_report_agent(rpt)
+            for name, rpt in agents.items()
+            if isinstance(rpt, dict)
+        },
+    }
+
+
+def _redacted_plan_agent(plan: dict) -> dict:
+    out = {
+        "action": plan.get("action"),
+        "state": plan.get("state"),
+        "reason": plan.get("reason"),
+    }
+    for key in ("notify", "clear_marker", "health"):
+        if key in plan:
+            out[key] = _redacted_observation_value(plan.get(key))
+    return out
+
+
+def _redacted_observation_plan(plan: dict) -> dict:
+    agents = plan.get("agents") if isinstance(plan.get("agents"), dict) else {}
+    return {
+        "agents": {
+            _event_token(name, "redacted"): _redacted_plan_agent(agent_plan)
+            for name, agent_plan in agents.items()
+            if isinstance(agent_plan, dict)
+        }
+    }
+
+
 def build_supervisor_observation(store: Store, *, now_epoch: float,
                                  state: dict | None = None,
                                  supervisor_config: dict | None = None,
                                  snapshot: list[dict] | None = None,
-                                 event_limit: int = 20) -> dict:
+                                 event_limit: int = 20,
+                                 lead_liveness_stale_after_seconds: float =
+                                 LEAD_LIVENESS_STALE_AFTER_SECONDS) -> dict:
     """Read-only operator view: report + exact planner output + bounded ring tail."""
     config = supervisor_config if isinstance(supervisor_config, dict) else {}
     stuck = config.get("stuck_after_seconds")
@@ -801,7 +928,8 @@ def build_supervisor_observation(store: Store, *, now_epoch: float,
         if not isinstance(rpt, dict):
             continue
         agents.append(supervisor_agent_assessment(
-            name, rpt, plan_agents.get(name), operator_facing=report.get("operator_facing")))
+            name, rpt, plan_agents.get(name), operator_facing=report.get("operator_facing"),
+            lead_liveness_stale_after_seconds=lead_liveness_stale_after_seconds))
     return {
         "schema_version": 1,
         "root": str(store.root),
@@ -814,8 +942,8 @@ def build_supervisor_observation(store: Store, *, now_epoch: float,
             "warnings": event_warnings,
         },
         "agents": agents,
-        "report": report,
-        "plan": plan,
+        "report": _redacted_observation_report(report),
+        "plan": _redacted_observation_plan(plan),
     }
 
 # Per-CLI session-argument templates, as LISTS of literal tokens (so the

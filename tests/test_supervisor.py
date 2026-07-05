@@ -768,6 +768,31 @@ def test_supervisor_cli_json_decision_matches_plan_actions(tmp_path: Path, capsy
     assert expected["action"] == sup.STUCK_RECOVER
 
 
+def test_supervisor_cli_json_redacts_embedded_report_config_blocked(
+        tmp_path: Path, capsys) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.json").write_text(json.dumps(_HOOK_CONFIG), encoding="utf-8")
+    secret = "child failed: /secret/path token=sk-ABC123SECRET"
+    s.write_config_blocked_hold("worker", summary=secret)
+
+    rc = _run(["supervisor", "--json", "--now", str(NOW)], tmp_path)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "/secret/path" not in out
+    assert "sk-ABC123SECRET" not in out
+    payload = json.loads(out)
+    worker = next(a for a in payload["agents"] if a["name"] == "worker")
+    assert worker["config_blocked_hold"] == {
+        "present": True,
+        "summary_code": "config_blocked",
+    }
+    assert payload["report"]["agents"]["worker"]["config_blocked_hold"] == {
+        "present": True,
+        "summary_code": "config_blocked",
+    }
+
+
 def test_supervisor_event_ring_bounded_redacted_and_transition_only(tmp_path: Path) -> None:
     s = _team(tmp_path)
     for i in range(8):
@@ -988,6 +1013,33 @@ def test_supervise_plan_record_events_uses_ring_not_bus(tmp_path: Path, capsys) 
     assert warnings == []
     assert events
     assert s.all_messages() == []
+
+
+def test_supervise_plan_prints_when_record_events_raises(
+        tmp_path: Path, monkeypatch, capsys) -> None:
+    _team(tmp_path)
+    (tmp_path / ".agenttalk" / "supervisor.json").write_text(
+        json.dumps(_CONFIG), encoding="utf-8")
+    report_file = tmp_path / "rpt.json"
+    report_file.write_text(json.dumps(_report()), encoding="utf-8")
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"agents": {"worker": {}}}), encoding="utf-8")
+    snap_file = tmp_path / "snap.json"
+    snap_file.write_text("[]", encoding="utf-8")
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("recording side channel failed")
+
+    monkeypatch.setattr(cli.sup, "record_supervisor_plan_events", boom)
+
+    rc = _run([
+        "supervise", "--plan", "--record-events", "--report-file", str(report_file),
+        "--state-file", str(state_file), "--snapshot-file", str(snap_file),
+        "--now", str(NOW),
+    ], tmp_path)
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["agents"]["worker"]["state"] == "HEALTHY_IDLE"
 
 
 _HOOK_CONFIG = {

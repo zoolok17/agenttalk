@@ -102,6 +102,16 @@ def _json_scrub_nonfinite(value):
     return value
 
 
+def _finite_float_arg(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a finite number") from exc
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be a finite number")
+    return parsed
+
+
 def _parse_meta(items: list[str] | None) -> dict:
     out: dict = {}
     for item in items or []:
@@ -630,6 +640,7 @@ def _status_supervisor_summaries(store: Store, now_epoch: float,
             supervisor_config=sup_cfg,
             snapshot=_read_supervisor_snapshot(store),
             event_limit=0,
+            lead_liveness_stale_after_seconds=STALE_THRESHOLD_SECONDS,
         )
     except Exception as exc:
         return {}, [f"supervisor_assessment_unavailable:{type(exc).__name__}"]
@@ -1172,6 +1183,7 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
             supervisor_config=config,
             snapshot=_read_supervisor_snapshot(store, args.snapshot_file),
             event_limit=max(0, int(args.events)),
+            lead_liveness_stale_after_seconds=STALE_THRESHOLD_SECONDS,
         )
     except Exception as exc:
         payload = {
@@ -7432,9 +7444,10 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             snapshot = _read_snapshot_file(args.snapshot_file)
         plan = sup.plan_actions(report, _read_state(), config,
                                 now_epoch=now, snapshot=snapshot)
-        if getattr(args, "record_events", False):
-            sup.record_supervisor_plan_events(store, plan, now_epoch=now)
         print(json.dumps(plan, indent=2))
+        if getattr(args, "record_events", False):
+            with contextlib.suppress(Exception):
+                sup.record_supervisor_plan_events(store, plan, now_epoch=now)
         return 0
     sys.stderr.write("agenttalk supervise: choose --init, --report, --plan, "
                      "--install-activity-hook, or --clear-restart\n")
@@ -7541,7 +7554,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Optional process snapshot JSON for exact plan parity.")
     psview.add_argument("--events", type=int, default=10,
                         help="Number of recent supervisor events to show (default 10).")
-    psview.add_argument("--now", type=float, default=None,
+    psview.add_argument("--now", type=_finite_float_arg, default=None,
                         help="Override 'now' (epoch seconds) for deterministic tests.")
     psview.set_defaults(func=cmd_supervisor)
 
