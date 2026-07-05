@@ -96,6 +96,7 @@ from typing import Any, Callable
 
 from agenttalk import __version__
 from agenttalk import attention as _attention
+from agenttalk import avatars as _avatars
 from agenttalk import capacity as _capacity
 from agenttalk import domains as _domains
 from agenttalk import signing as _signing
@@ -170,18 +171,7 @@ _RECENT_LIMIT = 25
 _THREADS_DEFAULT_LIMIT = 50
 _THREADS_MAX_LIMIT = 100
 
-_AVATAR_ASSETS = (
-    "avatars/claude-arch.png",
-    "avatars/claude-dev.png",
-    "avatars/claude-docs.png",
-    "avatars/claude-lead.png",
-    "avatars/claude-rev.png",
-    "avatars/codex-dev.png",
-    "avatars/codex-infra.png",
-    "avatars/codex-rev.png",
-    "avatars/codex-scout.png",
-    "avatars/codex-test.png",
-)
+_AVATAR_ASSETS = _avatars.avatar_static_paths()
 
 # Health-timeline ring (0.58.0, §5): a per-(root,agent) window of recent
 # health-state samples, kept IN-MEMORY on the server instance only (never a
@@ -1291,6 +1281,7 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
                    liaison: str | None, *,
                    threads_rows: list[dict] | None = None,
                    owned_domains: dict[str, list[dict]] | None = None,
+                   avatar_prefs: dict[str, str] | None = None,
                    history: "HealthTimelineRing | None" = None,
                    root_label: str | None = None,
                    managed_loop: set[str] | None = None) -> list[dict]:
@@ -1311,6 +1302,7 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
     groups = cfg.get("groups", {}) or {}
     threads_rows = threads_rows or []
     owned_domains = owned_domains or {}
+    avatar_prefs = avatar_prefs or {}
     managed_loop = managed_loop or set()
     now = datetime.now(timezone.utc)
     now_epoch = now.timestamp()
@@ -1371,6 +1363,9 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
         cli = _infer_cli(a, health, snap)
         if cli is not None:
             e["cli"] = cli
+        avatar = _avatars.resolve_avatar(avatar_prefs, a, roles.get(a), cli)
+        if avatar.get("source") != "none":
+            e["avatar"] = avatar
         cap = _capacity_entry(snap, now=now)
         if cap is not None:
             e["capacity"] = cap
@@ -1429,6 +1424,8 @@ def _root_state(desc: RootDescriptor,
         store = desc.store
         cfg = store.load_config()
         roster = cfg.get("agents", []) or []
+        avatar_prefs, _avatar_warnings = _avatars.sanitize_avatar_preferences(
+            cfg.get("avatars"), roster)
         # ONE disk walk per root per request (D8) — see _validated_for_state.
         msgs, invalid_count = _validated_for_state(store, cfg)
         current = _epoch_from(msgs)
@@ -1464,10 +1461,21 @@ def _root_state(desc: RootDescriptor,
         liaison = store.operator_facing()
         if liaison:
             out["operator_facing"] = liaison
+        operator: dict[str, Any] = {
+            "principal": _avatars.OPERATOR_PRINCIPAL,
+            "label": "you",
+            "role_label": "operator",
+        }
+        operator_avatar = _avatars.resolve_avatar(
+            avatar_prefs, _avatars.OPERATOR_PRINCIPAL)
+        if operator_avatar.get("source") != "none":
+            operator["avatar"] = operator_avatar
+        out["operator"] = operator
         out["agents"] = _agent_entries(
             store, cfg, msgs, liaison,
             threads_rows=threads_rows, owned_domains=owned_domains,
-            history=history, root_label=label, managed_loop=managed_loop)
+            avatar_prefs=avatar_prefs, history=history, root_label=label,
+            managed_loop=managed_loop)
         out["retired"] = store.retired_agents()
         out["threads"] = threads_rows
         out["broadcasts"] = broadcasts

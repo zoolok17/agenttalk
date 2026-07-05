@@ -81,6 +81,17 @@ def test_reset_bumps_session_id(store_root: Path) -> None:
     assert new_cfg["session_id"] != old_session
 
 
+def test_reset_preserves_avatar_preferences(store_root: Path) -> None:
+    s = Store(store_root)
+    s.set_avatar("alpha", "codex-dev")
+    s.set_operator_avatar("operator")
+
+    cfg, _ = s.reset()
+
+    assert cfg["avatars"] == {"alpha": "codex-dev", "operator": "operator"}
+    assert s.load_config()["avatars"] == cfg["avatars"]
+
+
 def test_reset_with_archive_preserves_old_state(store_root: Path) -> None:
     s = Store(store_root)
     s.send(sender="alpha", recipient="beta", body="archived me")

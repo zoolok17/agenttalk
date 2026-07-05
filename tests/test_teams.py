@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from agenttalk import avatars
 from agenttalk import cli
 from agenttalk.store import (
     ACTIVE_WITHIN_SECONDS,
@@ -164,6 +165,54 @@ def test_roster_add_remove_via_cli(tmp_path: Path, capsys: pytest.CaptureFixture
     assert "c" in Store(root).load_config()["agents"]
     assert _run(["roster", "remove", "c", "--force"], root) == 0
     assert "c" not in Store(root).load_config()["agents"]
+
+
+def test_avatar_cli_list_and_self_set_clear(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _team(tmp_path, ["alpha", "beta"])
+
+    assert _run(["avatar", "list", "--json"], root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    ids = {item["id"] for item in payload["avatars"]}
+    assert {"codex-dev", avatars.OPERATOR_DEFAULT_ID} <= ids
+
+    assert _run(["avatar", "set", "codex-dev", "--from", "beta"], root) == 0
+    cfg = Store(root).load_config()
+    assert cfg["avatars"] == {"beta": "codex-dev"}
+
+    assert _run(["avatar", "clear", "--from", "beta"], root) == 0
+    assert "avatars" not in Store(root).load_config()
+
+
+def test_avatar_cli_self_only_and_off_roster_rejected(tmp_path: Path) -> None:
+    root = _team(tmp_path, ["alpha", "beta"])
+
+    _run_expect_exit(["avatar", "set", "codex-dev", "--from", "ghost"], root, 2)
+    _run_expect_exit(["avatar", "set", "codex-dev", "--from", "beta", "--for", "alpha"], root, 2)
+    assert "avatars" not in Store(root).load_config()
+
+
+@pytest.mark.parametrize("bad_id", [
+    "../console.js",
+    "avatars/claude-dev.png",
+    "claude-dev.png",
+    "http://example.invalid/avatar.png",
+    "nope",
+])
+def test_avatar_cli_rejects_unallowlisted_or_pathlike_ids(tmp_path: Path, bad_id: str) -> None:
+    root = _team(tmp_path, ["alpha", "beta"])
+
+    _run_expect_exit(["avatar", "set", bad_id, "--from", "beta"], root, 2)
+    assert "avatars" not in Store(root).load_config()
+
+
+def test_avatar_cli_operator_set_and_clear(tmp_path: Path) -> None:
+    root = _team(tmp_path, ["alpha", "beta"])
+
+    assert _run(["avatar", "set-operator", "claude-lead"], root) == 0
+    assert Store(root).load_config()["avatars"][avatars.OPERATOR_PRINCIPAL] == "claude-lead"
+
+    assert _run(["avatar", "clear-operator"], root) == 0
+    assert "avatars" not in Store(root).load_config()
 
 
 # ------------------------------------------------ unique-name self-join guard
@@ -412,6 +461,45 @@ def test_load_config_accepts_null_groups_and_roles(tmp_path: Path) -> None:
     store = Store(root)
     store.load_config()  # must not raise on explicit null
     assert store.groups() == {} and store.roles() == {}
+
+
+def test_avatar_preferences_roundtrip_and_invalid_entries_are_ignored(tmp_path: Path) -> None:
+    store = Store(_team(tmp_path, ["alpha", "beta"]))
+    store.set_avatar("alpha", "codex-dev")
+    store.set_operator_avatar("operator")
+
+    cfg = store.load_config()
+    assert cfg["avatars"] == {"alpha": "codex-dev", avatars.OPERATOR_PRINCIPAL: "operator"}
+    assert store.avatar_preferences() == cfg["avatars"]
+
+    cfg_path = tmp_path / ".agenttalk" / "config.json"
+    cfg["avatars"] = {
+        "alpha": "../console.js",
+        "beta": "codex-rev",
+        "ghost": "claude-dev",
+        avatars.OPERATOR_PRINCIPAL: "http://example.invalid/avatar.png",
+    }
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    assert Store(tmp_path).load_config()["avatars"]["alpha"] == "../console.js"
+    assert Store(tmp_path).avatar_preferences() == {"beta": "codex-rev"}
+
+
+def test_roster_mutators_cleanup_avatar_preferences(tmp_path: Path) -> None:
+    store = Store(_team(tmp_path, ["alpha", "beta", "gamma", "delta"]))
+    store.set_avatar("alpha", "claude-dev")
+    store.set_avatar("beta", "claude-rev")
+    store.set_avatar("gamma", "codex-dev")
+
+    store.remove_agent("alpha")
+    store.retire_agent("beta")
+    store.rename_agent("gamma", "gamma-2")
+
+    prefs = store.load_config().get("avatars", {})
+    assert "alpha" not in prefs
+    assert "beta" not in prefs
+    assert prefs["gamma-2"] == "codex-dev"
+    assert "gamma" not in prefs
 
 
 def test_status_json_includes_role(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:

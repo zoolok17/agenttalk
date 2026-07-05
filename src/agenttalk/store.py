@@ -35,6 +35,7 @@ from pathlib import Path
 
 from agenttalk import health as _health
 from agenttalk._atomic import write_text as _atomic_write_text
+from agenttalk import avatars as _avatars
 from agenttalk import signing as _signing
 
 DIRNAME = ".agenttalk"
@@ -913,6 +914,17 @@ class Store:
         """Return the ``{agent: role}`` map ({} if none defined)."""
         return self.load_config().get("roles", {}) or {}
 
+    def avatar_preferences(self) -> dict[str, str]:
+        """Return sanitized display-avatar preferences.
+
+        Avatar preferences are deliberately fail-soft: bad hand-edited entries
+        never brick config loading or rendering.
+        """
+        cfg = self.load_config()
+        prefs, _warnings = _avatars.sanitize_avatar_preferences(
+            cfg.get("avatars"), cfg.get("agents", []) or [])
+        return prefs
+
     # ----------------------------------------------- identity registry (0.16.0)
     #
     # Two roster VIEWS that deliberately diverge (#19 Phase A, RFC §"Identity
@@ -1082,6 +1094,8 @@ class Store:
             # Drop any managed_lead_loop entry so a dangling key can't brick load_config.
             if isinstance(cfg.get("managed_lead_loop"), dict):
                 cfg["managed_lead_loop"].pop(name, None)
+            if isinstance(cfg.get("avatars"), dict):
+                cfg["avatars"].pop(name, None)
             self._write_config(cfg)
         return cfg
 
@@ -1269,9 +1283,10 @@ class Store:
 
     @staticmethod
     def _strip_identity(cfg: dict, name: str) -> None:
-        """Remove ``name`` from the active roster, roles, groups, and the
-        operator_facing slot — in place. Shared by retire/rename. Never touches
-        message files."""
+        """Remove ``name`` from roster-adjacent config maps in place.
+
+        Shared by retire/rename. Never touches message files.
+        """
         roster = list(cfg.get("agents", []) or [])
         if name in roster:
             roster.remove(name)
@@ -1289,6 +1304,71 @@ class Store:
         m = cfg.get("managed_lead_loop")
         if isinstance(m, dict):
             m.pop(name, None)
+        avatars = cfg.get("avatars")
+        if isinstance(avatars, dict):
+            avatars.pop(name, None)
+
+    def set_avatar(self, name: str, avatar_id: str) -> dict:
+        """Set an active roster member's display-avatar preference."""
+        validate_agent_name(name)
+        normalized = _avatars.normalize_avatar_id(avatar_id)
+        if normalized is None:
+            raise ValueError(
+                f"unknown avatar id {avatar_id!r} "
+                f"(known: {sorted(_avatars.AVATAR_ASSETS)})"
+            )
+        with self._config_lock():
+            cfg = self.load_config()
+            roster = cfg.get("agents", []) or []
+            if name not in roster:
+                raise ValueError(f"agent {name!r} is not in the roster {sorted(roster)}")
+            avatars = self._cfg_dict(cfg, "avatars")
+            avatars[name] = normalized
+            self._write_config(cfg)
+        return cfg
+
+    def clear_avatar(self, name: str) -> dict:
+        """Clear an active roster member's display-avatar preference."""
+        validate_agent_name(name)
+        with self._config_lock():
+            cfg = self.load_config()
+            roster = cfg.get("agents", []) or []
+            if name not in roster:
+                raise ValueError(f"agent {name!r} is not in the roster {sorted(roster)}")
+            avatars = cfg.get("avatars")
+            if isinstance(avatars, dict):
+                avatars.pop(name, None)
+                if not avatars:
+                    cfg.pop("avatars", None)
+            self._write_config(cfg)
+        return cfg
+
+    def set_operator_avatar(self, avatar_id: str) -> dict:
+        """Set the reserved operator principal's display-avatar preference."""
+        normalized = _avatars.normalize_avatar_id(avatar_id)
+        if normalized is None:
+            raise ValueError(
+                f"unknown avatar id {avatar_id!r} "
+                f"(known: {sorted(_avatars.AVATAR_ASSETS)})"
+            )
+        with self._config_lock():
+            cfg = self.load_config()
+            avatars = self._cfg_dict(cfg, "avatars")
+            avatars[_avatars.OPERATOR_PRINCIPAL] = normalized
+            self._write_config(cfg)
+        return cfg
+
+    def clear_operator_avatar(self) -> dict:
+        """Clear the reserved operator principal's display-avatar preference."""
+        with self._config_lock():
+            cfg = self.load_config()
+            avatars = cfg.get("avatars")
+            if isinstance(avatars, dict):
+                avatars.pop(_avatars.OPERATOR_PRINCIPAL, None)
+                if not avatars:
+                    cfg.pop("avatars", None)
+            self._write_config(cfg)
+        return cfg
 
     def retire_agent(self, name: str, *, reason: str | None = None,
                      renamed_to: str | None = None) -> dict:
@@ -1352,6 +1432,8 @@ class Store:
                           if old in members]
             was_liaison = cfg.get("operator_facing") == old
             old_managed = (cfg.get("managed_lead_loop") or {}).get(old)
+            avatars = cfg.get("avatars")
+            old_avatar = avatars.get(old) if isinstance(avatars, dict) else None
             # Retire old -> tombstone(renamed_to=new), then activate new + carryover.
             self._strip_identity(cfg, old)
             retired = cfg.get("retired")
@@ -1382,6 +1464,9 @@ class Store:
             # rename would SILENTLY DROP the managed flag.
             if old_managed is not None:
                 self._cfg_dict(cfg, "managed_lead_loop")[new] = old_managed
+            avatar_id = _avatars.normalize_avatar_id(old_avatar)
+            if avatar_id is not None:
+                self._cfg_dict(cfg, "avatars")[new] = avatar_id
             # Validate the WHOLE resulting config before writing (fail-closed).
             validate_agent_roster(roster)
             validate_retired(retired, roster)

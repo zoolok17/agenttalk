@@ -60,7 +60,9 @@
     lead: 'lead',
     scout: 'scout',
   });
-  var AVATAR_MANIFEST = nullMap({
+  // Legacy fallback for old /api/state payloads. Current servers resolve
+  // avatars backend-side and send agent.avatar.file / root.operator.avatar.file.
+  var LEGACY_AVATAR_FALLBACK = nullMap({
     'claude:arch': 'claude-arch.png',
     'claude:dev': 'claude-dev.png',
     'claude:docs': 'claude-docs.png',
@@ -528,12 +530,26 @@
     return (prefix === 'claude' || prefix === 'codex') ? prefix : '';
   }
   function avatarFile(agent) {
+    var backendFile = safeAvatarFile(agent && agent.avatar && agent.avatar.file);
+    if (backendFile) return backendFile;
     var role = normalizedRole(agent && agent.role);
     var family = cliFamily(agent);
     if (!role || !family) return '';
-    return AVATAR_MANIFEST[family + ':' + role] || '';
+    return LEGACY_AVATAR_FALLBACK[family + ':' + role] || '';
   }
-  function agentAvatar(agent, avatarCls, fallbackDotCls) {
+  function safeAvatarFile(file) {
+    if (typeof file !== 'string' || !file) return '';
+    if (file.indexOf('/') !== -1 || file.indexOf('\\') !== -1) return '';
+    if (file.indexOf('..') !== -1 || file.indexOf(':') !== -1) return '';
+    return file;
+  }
+  function operatorFallbackAvatar(avatarCls) {
+    var cls = avatarCls || 'tc-operator-avatar';
+    if (cls.indexOf('tc-operator-avatar') === -1) cls = 'tc-operator-avatar ' + cls;
+    return el('span', cls, 'yo');
+  }
+  function agentAvatar(agent, avatarCls, fallbackDotCls, opts) {
+    opts = opts || {};
     var file = avatarFile(agent);
     if (!file) return null;
     var st = ((agent && agent.health) || {}).state;
@@ -544,10 +560,11 @@
     img.loading = 'lazy';
     img.decoding = 'async';
     on(img, 'error', function () {
-      if (wrap.parentNode) wrap.parentNode.replaceChild(statusDot(st, fallbackDotCls), wrap);
+      var repl = opts.operator ? operatorFallbackAvatar(avatarCls) : statusDot(st, fallbackDotCls);
+      if (wrap.parentNode) wrap.parentNode.replaceChild(repl, wrap);
     });
     wrap.appendChild(img);
-    wrap.appendChild(statusDot(st, 'tc-avatar-badge'));
+    if (!opts.hideStatus) wrap.appendChild(statusDot(st, 'tc-avatar-badge'));
     return wrap;
   }
   function avatarOrDot(agent, avatarCls, dotCls) {
@@ -734,16 +751,16 @@
 
     // Operator chip.
     var op = el('div', 'tc-operator');
-    var leadAvatar = agentAvatar({
-      name: 'claude-lead',
-      cli: 'claude',
-      role: 'lead',
-      health: { state: 'working_turn' },
-    }, 'tc-operator-avatar', null);
-    op.appendChild(leadAvatar || el('span', 'tc-operator-avatar', 'yo'));
+    var operator = (root && root.operator) || {};
+    var operatorAvatar = agentAvatar({
+      principal: operator.principal || 'operator',
+      name: operator.principal || 'operator',
+      avatar: operator.avatar,
+    }, 'tc-operator-avatar', null, { operator: true, hideStatus: true });
+    op.appendChild(operatorAvatar || operatorFallbackAvatar('tc-operator-avatar'));
     var opText = el('div', 'tc-operator-text');
-    opText.appendChild(el('span', 'tc-operator-name', 'you'));
-    opText.appendChild(el('span', 'tc-operator-role', 'operator · lead-liaison'));
+    opText.appendChild(el('span', 'tc-operator-name', operator.label || 'you'));
+    opText.appendChild(el('span', 'tc-operator-role', operator.role_label || 'operator'));
     op.appendChild(opText);
     bar.appendChild(op);
   }

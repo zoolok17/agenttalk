@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import intents, signing, web
+from agenttalk import avatars, intents, signing, web
 from agenttalk.store import Store
 
 
@@ -985,6 +985,9 @@ def test_dashboard_shell_links_console_assets(tmp_path: Path) -> None:
         with _get(f"{base}/static/avatars/claude-dev.png") as resp:
             assert resp.headers["Content-Type"].startswith("image/png")
             assert resp.read(8) == b"\x89PNG\r\n\x1a\n"
+        with _get(f"{base}/static/avatars/operator.png") as resp:
+            assert resp.headers["Content-Type"].startswith("image/png")
+            assert resp.read(8) == b"\x89PNG\r\n\x1a\n"
         # the server gives a cross-root client nothing to link to: root[1]'s
         # message ids are NOT resolvable via root[0]'s routes (FR-003).
         mid_b = b._scan_messages()[0][0].id
@@ -1012,6 +1015,8 @@ def test_static_unknown_name_404_and_no_traversal(tmp_path: Path) -> None:
             "console.css.bak",
             "avatars/nope.png",
             "avatars/..%2Fconsole.js",
+            "avatars/operator.png%2F..%2Fconsole.js",
+            "avatars/http:%2F%2Fexample.invalid%2Fx.png",
             "..%2Favatars%2Fclaude-dev.png",
             "",
         ):
@@ -1025,6 +1030,90 @@ def test_static_unknown_name_404_and_no_traversal(tmp_path: Path) -> None:
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_api_state_avatar_records_and_operator_descriptor(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["claude-dev", "codex-dev", "plain"])
+    s.set_role("claude-dev", "developer")
+    s.set_role("codex-dev", "developer")
+    s.set_avatar("codex-dev", "claude-rev")
+    s.set_avatar("plain", "codex-rev")
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    by_name = {a["name"]: a for a in root["agents"]}
+    assert by_name["claude-dev"]["avatar"] == {
+        "id": "claude-dev",
+        "file": "claude-dev.png",
+        "source": "role_default",
+    }
+    assert by_name["plain"]["avatar"] == {
+        "id": "codex-rev",
+        "file": "codex-rev.png",
+        "source": "chosen",
+    }
+    assert by_name["codex-dev"]["avatar"] == {
+        "id": "claude-rev",
+        "file": "claude-rev.png",
+        "source": "chosen",
+    }
+    assert root["operator"] == {
+        "principal": avatars.OPERATOR_PRINCIPAL,
+        "label": "you",
+        "role_label": "operator",
+        "avatar": {"id": "operator", "file": "operator.png", "source": "operator_default"},
+    }
+    for agent in root["agents"]:
+        assert "name" in agent and "health" in agent and "unread" in agent
+
+
+@pytest.mark.parametrize("bad_value", [
+    "../console.js",
+    "avatars/claude-dev.png",
+    "claude-dev.png",
+    "http://example.invalid/avatar.png",
+    "unknown",
+])
+def test_api_state_bad_stored_avatar_choice_degrades_without_broken_path(
+    tmp_path: Path,
+    bad_value: str,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["claude-dev", "plain"])
+    s.set_role("claude-dev", "developer")
+    cfg = s.load_config()
+    cfg["avatars"] = {
+        "claude-dev": bad_value,
+        "plain": bad_value,
+        avatars.OPERATOR_PRINCIPAL: bad_value,
+    }
+    s._write_config(cfg)
+
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert root["errors"] == []
+    by_name = {a["name"]: a for a in root["agents"]}
+    assert by_name["claude-dev"]["avatar"] == {
+        "id": "claude-dev",
+        "file": "claude-dev.png",
+        "source": "role_default",
+    }
+    assert "avatar" not in by_name["plain"]
+    assert root["operator"]["avatar"] == {
+        "id": "operator",
+        "file": "operator.png",
+        "source": "operator_default",
+    }
 
 
 def test_csp_split_per_route(tmp_path: Path) -> None:

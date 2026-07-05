@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agenttalk import __version__
+from agenttalk import avatars as avatar_mod
 from agenttalk.display import render
 from agenttalk.store import (
     COMPOSING_INTENT_STALE_SECONDS,
@@ -4101,6 +4102,48 @@ def _roster_expertise(store, *, json_out: bool) -> int:
     return 0
 
 
+def cmd_avatar(args: argparse.Namespace) -> int:
+    """List and set display-avatar preferences."""
+    store = _get_store(args)
+    action = getattr(args, "avatar_cmd", None)
+    if action == "list":
+        items = avatar_mod.available_avatars()
+        if getattr(args, "json", False):
+            print(json.dumps({"avatars": items}, indent=2))
+            return 0
+        print(f"avatars ({len(items)}):")
+        for item in items:
+            print(f"  {item['id']:<14} {item['file']}")
+        return 0
+    if action == "set":
+        cfg = store.load_config()
+        agent = _resolve_self(getattr(args, "from_agent", None),
+                              roster=cfg.get("agents") or [])
+        store.set_avatar(agent, args.avatar_id)
+        print(f"avatar: {agent} -> {avatar_mod.normalize_avatar_id(args.avatar_id)}")
+        return 0
+    if action == "clear":
+        cfg = store.load_config()
+        agent = _resolve_self(getattr(args, "from_agent", None),
+                              roster=cfg.get("agents") or [])
+        store.clear_avatar(agent)
+        print(f"avatar: cleared {agent}")
+        return 0
+    if action == "set-operator":
+        store.set_operator_avatar(args.avatar_id)
+        print(
+            f"avatar: {avatar_mod.OPERATOR_PRINCIPAL} -> "
+            f"{avatar_mod.normalize_avatar_id(args.avatar_id)}"
+        )
+        return 0
+    if action == "clear-operator":
+        store.clear_operator_avatar()
+        print(f"avatar: cleared {avatar_mod.OPERATOR_PRINCIPAL}")
+        return 0
+    sys.stderr.write("agenttalk avatar: choose list, set, clear, set-operator, or clear-operator\n")
+    return 2
+
+
 def cmd_roster(args: argparse.Namespace) -> int:
     """View or manage the roster, roles, and groups.
 
@@ -7669,6 +7712,27 @@ def build_parser() -> argparse.ArgumentParser:
     r_of.add_argument("--clear", action="store_true",
                       help="Remove the operator-facing designation.")
     r_of.set_defaults(func=cmd_roster)
+
+    pav = sub.add_parser("avatar", help="List and set display-avatar preferences.")
+    pav.set_defaults(func=cmd_avatar, avatar_cmd=None)
+    avsub = pav.add_subparsers(dest="avatar_cmd", required=True)
+    av_list = avsub.add_parser("list", help="List allowlisted avatar ids.")
+    av_list.add_argument("--json", action="store_true")
+    av_list.set_defaults(func=cmd_avatar)
+    av_set = avsub.add_parser("set", help="Set your own avatar preference.")
+    av_set.add_argument("avatar_id", help="Allowlisted avatar id, e.g. claude-dev.")
+    av_set.add_argument("--from", dest="from_agent",
+                        help="Your active roster identity (or $AGENTTALK_SELF).")
+    av_set.set_defaults(func=cmd_avatar)
+    av_clear = avsub.add_parser("clear", help="Clear your own avatar preference.")
+    av_clear.add_argument("--from", dest="from_agent",
+                          help="Your active roster identity (or $AGENTTALK_SELF).")
+    av_clear.set_defaults(func=cmd_avatar)
+    av_op = avsub.add_parser("set-operator", help="Set the operator avatar preference.")
+    av_op.add_argument("avatar_id", help="Allowlisted avatar id.")
+    av_op.set_defaults(func=cmd_avatar)
+    av_op_clear = avsub.add_parser("clear-operator", help="Clear the operator avatar preference.")
+    av_op_clear.set_defaults(func=cmd_avatar)
 
     pdom = sub.add_parser(
         "domain",
