@@ -5,6 +5,31 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.63.0] - 2026-07-05
+
+### Fixed / Added
+
+- **Supervisor & wrapper reliability (Slice 1).** Ends the failure class where a struggling agent
+  spam-loops and floods the escalation channel:
+  - **B4 broken-session resume give-up** — after K=2 consecutive *session-attributable* failed
+    resumes of the same session, the wrapper starts a fresh session instead of respawning a broken
+    one forever (with one deduped continuity-loss notice). `known_global_infra`, supervisor/operator
+    kill, crash-mid-turn, and `config_blocked` failures don't count — on both the message-drive and
+    the lead-loop cadence paths (shared classifier).
+  - **B1 dead-letter escalation dedup** — one pending operator escalation per (agent, message-id)
+    via the existing attention/disposition layer; release is disposition-only (an ack/reply without
+    a resolve keeps the latch, so a stuck message can't flood ~150 near-duplicate escalations); a
+    worsening transition still resurfaces a fresh notice; a torn notice log fails open to exactly one.
+  - **B2 finite, duration-aware infra ceiling** — a persistently-failing infra-classed message
+    escalates once and quarantines (bytes preserved, requeue-able) after an elapsed floor + minimum
+    attempts, never a silent infinite loop; `0`/negative config falls back to the default.
+  - **B3 recovery-authority hardening** — heartbeat freshness is the liveness authority (a fresh
+    `working_silent` with a stale heartbeat no longer defeats auto-recovery); `request-restart`
+    carries an authorization envelope re-validated at plan time (a stale authorization refuses
+    loudly); a protected agent with a fresh heartbeat isn't force-killed without a second live-kill
+    ack; the restart marker clears only after the first fresh heartbeat; a per-agent relaunch
+    cooldown bounds restart-hammering.
+
 ## [0.62.1] - 2026-07-05
 
 ### Fixed

@@ -89,6 +89,21 @@ All entries below shipped through the §1 pipeline. **CI (tests + security) is g
 every release listed.** Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.63.0 — supervisor & wrapper reliability hotfix (Slice 1) (2026-07-05)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `fa9f92f` (rebased clean → `9a14d1a`) · tag `v0.63.0`
+- **Review:** design-first → adversarial design-gate → build → **2 independent reviewers + a 5-lens
+  adversarial reproduction pass** on the final SHA (B3 false-kill + B2 message-loss lenses confirmed
+  clean; the pass + reviewer-1 found the B4 cadence bug + 2 P2s) → one fold → **both reviewers GO**,
+  each confirming no over-correction (a legit current-liaison restart still relaunches). Authority-
+  critical surface (restart authority + session give-up) — gated accordingly.
+- **Gate:** ruff/bandit/diff clean; pytest **1902 passed / 3 skipped on 3.10 AND 3.14** (clean venvs).
+  Clean rebase onto v0.62.1 — range-diff = zero Slice-1 logic delta, only the hotfix integration.
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green.
+- **Robust:** every failure class now has a finite, operator-visible terminal path — no silent
+  infinite loop, no escalation flood; heartbeat is the liveness authority; restart authority is
+  re-validated at plan time; a broken session self-heals to a fresh one. Root-cause fix for the
+  spawn-loop/flood incident that struck three Claude agents this session.
+
 ### v0.62.1 — wrapper: stop the Windows pipe-teardown finalizer spam (2026-07-05)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `b1efdf2` · tag `v0.62.1`
 - **Review:** contained wrapper cleanup (right-sized) — reviewer-2 GO, verified the bounded
