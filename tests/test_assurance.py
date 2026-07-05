@@ -87,6 +87,18 @@ def test_status_vocabulary_is_exact() -> None:
     )
 
 
+def test_skill_warning_uses_utf8_em_dash_without_replacement_char() -> None:
+    skill = Path("src/agenttalk/skills/devkit/assurance-scan/SKILL.md").read_text(encoding="utf-8")
+    expected = (
+        "the scan is a cheap uniform FLOOR — the worst real bugs we shipped/nearly-shipped "
+        "($args binding, dir-vs-file mtime ordering, the lane-approval bypass chain) were caught by "
+        "EXECUTED tests + adversarial review, NOT by any scanner. ASSURANCE.md must NEVER read scanned == assured."
+    )
+    assert expected in skill
+    assert "FLOOR ?" not in skill
+    assert "\ufffd" not in skill
+
+
 def test_manifest_parser_accepts_valid_json_and_rejects_malformed_acceptance(tmp_path: Path) -> None:
     good = _manifest(
         tmp_path,

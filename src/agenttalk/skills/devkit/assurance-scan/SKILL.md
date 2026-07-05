@@ -43,7 +43,7 @@ manifest explicitly permits them for that tool.
 
 Warning:
 
-the scan is a cheap uniform FLOOR ? the worst real bugs we shipped/nearly-shipped ($args binding, dir-vs-file mtime ordering, the lane-approval bypass chain) were caught by EXECUTED tests + adversarial review, NOT by any scanner. ASSURANCE.md must NEVER read scanned == assured.
+the scan is a cheap uniform FLOOR — the worst real bugs we shipped/nearly-shipped ($args binding, dir-vs-file mtime ordering, the lane-approval bypass chain) were caught by EXECUTED tests + adversarial review, NOT by any scanner. ASSURANCE.md must NEVER read scanned == assured.
 
 References:
 
