@@ -166,6 +166,10 @@ def validate_agent_name(name: str) -> str:
         raise ValueError(f"agent name must be a string, got {type(name).__name__}")
     if not name:
         raise ValueError("agent name cannot be empty")
+    if name.casefold() in _avatars.RESERVED_PRINCIPALS:
+        raise ValueError(
+            f"agent name {name!r} is reserved for the {name.casefold()} principal"
+        )
     if not _AGENT_NAME_RE.match(name):
         raise ValueError(
             f"agent name {name!r} is not a safe identifier "

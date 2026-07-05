@@ -14,6 +14,7 @@ from agenttalk import cli
 from agenttalk.store import (
     ACTIVE_WITHIN_SECONDS,
     Store,
+    validate_agent_name,
     validate_group_name,
     validate_groups,
     validate_roles,
@@ -65,6 +66,14 @@ def test_validate_roles_bounds() -> None:
         validate_roles({"ghost": "x"}, roster)  # key not in roster
     with pytest.raises(ValueError):
         validate_roles({"a": "x" * 65}, roster)  # too long
+
+
+@pytest.mark.parametrize("name", sorted(avatars.RESERVED_PRINCIPALS))
+def test_validate_agent_name_rejects_reserved_principals(name: str) -> None:
+    with pytest.raises(ValueError, match="reserved"):
+        validate_agent_name(name)
+    with pytest.raises(ValueError, match="reserved"):
+        validate_agent_name(name.upper())
 
 
 # --------------------------------------------------- resolve_audience
@@ -165,6 +174,22 @@ def test_roster_add_remove_via_cli(tmp_path: Path, capsys: pytest.CaptureFixture
     assert "c" in Store(root).load_config()["agents"]
     assert _run(["roster", "remove", "c", "--force"], root) == 0
     assert "c" not in Store(root).load_config()["agents"]
+
+
+def test_roster_add_reserved_operator_rejected(tmp_path: Path) -> None:
+    root = _team(tmp_path, ["alpha", "beta"])
+
+    _run_expect_exit(["roster", "add", avatars.OPERATOR_PRINCIPAL], root, 2)
+    assert avatars.OPERATOR_PRINCIPAL not in Store(root).load_config()["agents"]
+
+
+def test_roster_rename_to_reserved_operator_rejected(tmp_path: Path) -> None:
+    root = _team(tmp_path, ["alpha", "beta"])
+
+    _run_expect_exit(["roster", "rename", "alpha", avatars.OPERATOR_PRINCIPAL], root, 2)
+    cfg = Store(root).load_config()
+    assert cfg["agents"] == ["alpha", "beta"]
+    assert "retired" not in cfg
 
 
 def test_avatar_cli_list_and_self_set_clear(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
