@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import cli
+from agenttalk import cli, lanes
 from agenttalk.store import Store
 from agenttalk.wrapper import loop
 
@@ -178,6 +178,103 @@ def test_e2e_lifecycle(tmp_path: Path, capsys) -> None:
     # the preserved gate state still reads back GO after reset
     assert _run(["gate", "check", "--release", "--json"], root) == 0
     assert _json_out(capsys)["verdict"] == "GO"
+
+
+def test_e2e_worktree_isolation_negative_paths(tmp_path: Path, capsys) -> None:
+    root = tmp_path
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "t@t")
+    _git(root, "config", "user.name", "t")
+    (root / ".gitignore").write_text(".agenttalk/\n.worktrees/\n", encoding="utf-8")
+    base = _commit(root, "src/core/a.py", "base\n")
+    br = _git(root, "branch", "--show-current").strip()
+
+    s = Store(root)
+    s.init(["lead", "dev"])
+    s.set_role("lead", "lead")
+    (s.dir / "domains.json").write_text(json.dumps({
+        "schema_version": 1,
+        "domains": {"core": {"title": "Core", "owners": {"agents": ["dev"]},
+                             "owned_globs": ["src/core/**"]}},
+        "shared_paths": []}), encoding="utf-8")
+
+    worktrees_root = root / ".worktrees"
+    assert _run(["lane", "assign", "--id", "e2eiso", "--from", "lead",
+                 "--assignee", "dev", "--domain", "core", "--base", base,
+                 "--target", br, "--path", "src/core",
+                 "--worktrees-root", str(worktrees_root)], root) == 0
+    capsys.readouterr()
+    lane = lanes.load_lanes(s)["lanes"]["e2eiso"]
+    assert Path(lane["worktree_path"]).exists()
+
+    main_head = _commit(root, "src/core/a.py", "base\nmain checkout work\n")
+    assert _run(["lane", "deliver", "--id", "e2eiso", "--from", "dev",
+                 "--head", main_head], root) == 3
+    capsys.readouterr()
+
+    assert _run(["lane", "assign", "--id", "e2eiso", "--from", "lead",
+                 "--assignee", "dev", "--domain", "core", "--base", base,
+                 "--target", br, "--path", "src/core",
+                 "--worktrees-root", str(worktrees_root)], root) == 2
+    capsys.readouterr()
+
+    data = lanes.load_lanes(s)
+    data["lanes"]["naked"] = lanes.new_lane(
+        "naked", assignee="dev", assigned_by="lead", assigned_at="t0",
+        domain_id="core", path_subset=["src/core"], base_sha=base, target_ref=br,
+        target_head_at_assign=main_head, epoch_at_assign=s.current_epoch(),
+        registry_hash_at_assign="manual", notes=None)
+    lanes.save_lanes(s, data)
+    assert _run(["lane", "deliver", "--id", "naked", "--from", "dev",
+                 "--head", main_head], root) == 3
+    capsys.readouterr()
+
+    fake_artifact = s.dir / "lane-deliveries" / "fake-artifact.json"
+    fake_artifact.parent.mkdir(parents=True, exist_ok=True)
+    fake_artifact.write_text(json.dumps({
+        "schema_version": lanes.SCHEMA_VERSION,
+        "delivery_id": "fake-e2eiso",
+        "lane_id": "e2eiso",
+        "worktree_branch": "lane/e2eiso",
+        "delivered_head": main_head,
+        "base_sha": base,
+        "verdict": lanes.VERDICT_GO,
+        "holds": [],
+        "isolation_status": "verified",
+        "worktree_waived": False,
+        "worktree_toplevel_canonical": lanes.canonical_host_path(root / ".worktrees" / "fake"),
+        "common_git_dir_canonical": lanes.canonical_host_path(root / ".git"),
+        "tracked_tree_clean": True,
+        "verifier_version": lanes.WORKTREE_VERIFIER_VERSION,
+        "delivered_at": "t1",
+        "detached_at_lane_tip": False,
+    }), encoding="utf-8")
+    assert _run(["close", "open", "--id", "fakeiso", "--from", "lead",
+                 "--scope", "release", "--revision", main_head,
+                 "--lane-artifact", str(fake_artifact)], root) == 0
+    assert _run(["close", "check", "--id", "fakeiso"], root) == 3
+    capsys.readouterr()
+
+    data = lanes.load_lanes(s)
+    data["lanes"]["e2eiso"]["status"] = lanes.STATUS_ABANDONED
+    data["lanes"]["naked"]["status"] = lanes.STATUS_ABANDONED
+    lanes.save_lanes(s, data)
+    assert _run(["lane", "assign", "--id", "squashlike", "--from", "lead",
+                 "--assignee", "dev", "--domain", "core", "--base", main_head,
+                 "--target", br, "--path", "src/core",
+                 "--worktrees-root", str(worktrees_root)], root) == 0
+    squash_lane = lanes.load_lanes(s)["lanes"]["squashlike"]
+    squash_wt = Path(squash_lane["worktree_path"])
+    _commit(squash_wt, "src/core/a.py", "base\nsquash-like branch only\n")
+    assert _run(["reset"], root) == 0
+    capsys.readouterr()
+    assert _run(["lane", "gc", "--delete", "--json", "--target", br], root) == 0
+    payload = _json_out(capsys)
+    item = next(i for i in payload["items"] if i["lane_id"] == "squashlike")
+    assert item["branch_delete_safe"] is False
+    assert "ancestor" in item["reason"]
+    assert _git(root, "rev-parse", "--verify",
+                "refs/heads/lane/squashlike^{commit}").strip()
 
 
 def lane_active_ids(store: Store) -> set[str]:

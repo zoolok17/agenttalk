@@ -2757,6 +2757,20 @@ def _lane_branch_delete_safe(root, lane_id: str, target: str) -> tuple[bool, str
     return True, "branch tip is ancestor of target"
 
 
+def _lane_branch_gc_allowed(lane: dict | None) -> tuple[bool, str]:
+    if lane is None:
+        return False, "no lane record; branch deletion needs manual review"
+    removable_states = {
+        lane_mod.STATUS_DELIVERED,
+        lane_mod.STATUS_ABANDONED,
+        lane_mod.STATUS_CLEANUP_FAILED,
+        lane_mod.STATUS_CLEANUP_PENDING,
+    }
+    if lane.get("status") in removable_states or lane.get("worktree_state") in removable_states:
+        return True, "lane is retired or cleanup-pending"
+    return False, "lane is still active or not in a cleanup state"
+
+
 def _lane_worktree_remove_safe(store, lane_id: str, lane: dict | None,
                                worktree_path: str | None,
                                branch_delete_safe: bool) -> tuple[bool, str]:
@@ -3286,6 +3300,11 @@ def cmd_lane(args: argparse.Namespace) -> int:
             wt_rec = wt_by_branch.get(branch)
             wt_path = (wt_rec.get("worktree") if wt_rec else None) or managed_wt_by_branch.get(branch)
             safe, reason = _lane_branch_delete_safe(store.root, lane_id, args.target)
+            branch_allowed, branch_allowed_reason = _lane_branch_gc_allowed(
+                lane if isinstance(lane, dict) else None)
+            if not branch_allowed:
+                safe = False
+                reason = branch_allowed_reason if reason.startswith("branch tip is") else reason
             wt_safe, wt_reason = _lane_worktree_remove_safe(
                 store, lane_id, lane if isinstance(lane, dict) else None, wt_path, safe)
             item = {

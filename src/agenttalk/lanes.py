@@ -512,6 +512,8 @@ _INTEGRITY_FIELDS = (
     "delivery_id", "lane_id", "worktree_branch", "delivered_head", "base_sha",
     "worktree_toplevel_canonical", "common_git_dir_canonical", "tracked_tree_clean",
     "verifier_version", "delivered_at", "detached_at_lane_tip", "worktree_waived",
+    "isolation_status", "worktree_waiver_reason", "worktree_waived_by",
+    "worktree_waived_at",
 )
 
 
@@ -690,10 +692,14 @@ def validate_delivery_artifact(path, *, lane_id: str, head_sha: str,
             raise LaneError("delivery artifact isolation validation needs a store secret")
         status = data.get("isolation_status")
         if status == "waived":
+            if data.get("worktree_waived") is not True:
+                raise LaneError("waived delivery artifact does not record worktree_waived=true")
             for k in ("worktree_waiver_reason", "worktree_waived_by", "worktree_waived_at"):
                 if not isinstance(data.get(k), str) or not data[k].strip():
                     raise LaneError(f"waived delivery artifact is missing {k}")
         elif status == "verified":
+            if data.get("worktree_waived") is not False:
+                raise LaneError("verified delivery artifact does not record worktree_waived=false")
             if data.get("worktree_branch") != lane_branch(lane_id):
                 raise LaneError("delivery artifact branch does not match lane id")
             if data.get("base_sha") and not _FULL_SHA_RE.match(str(data.get("base_sha"))):
