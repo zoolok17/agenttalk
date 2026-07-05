@@ -847,6 +847,12 @@ def _drain_answer_escalation(store: Store, rec: dict) -> str:
     else:
         actor = _resolve_answer_actor(store, request_id)
         current_lead = None
+    if actor is not None and _actor_is_operator(store, actor):
+        return _deny_intent(
+            store, iid, "operator_answer_not_queue_authorized",
+            "operator-principal answers are authorized only inside an "
+            "authenticated /api/lead-chat request",
+        )
     plan = rec.get("plan") if isinstance(rec.get("plan"), dict) else None
     if plan is None:
         if actor is None:

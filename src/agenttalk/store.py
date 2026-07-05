@@ -1933,9 +1933,10 @@ class Store:
     ) -> OperatorAnswerSendResult:
         """Atomically re-check and emit a final operator answer.
 
-        This is the shared final-send path for CLI relay and dashboard-drained
-        ``answer_escalation`` intents. Callers must not already hold
-        ``_config_lock``: the lock is intentionally non-reentrant.
+        This is the shared final-send path for CLI relay, roster-agent
+        ``answer_escalation`` intents, and authenticated dashboard lead-chat
+        answers. Callers must not already hold ``_config_lock``: the lock is
+        intentionally non-reentrant.
         """
         try:
             with self._config_lock(timeout=lock_timeout):

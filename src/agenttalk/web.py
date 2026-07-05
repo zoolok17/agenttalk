@@ -2050,6 +2050,49 @@ def _send_authenticated_lead_chat(
     }, None
 
 
+def _send_authenticated_lead_chat_answer(
+    store: Store, *, request_id: str, body: str
+) -> tuple[Message | None, dict | None, dict | None]:
+    try:
+        operator, lead = store.lead_chat_identities()
+        lead_chat_request_id = store.lead_chat_request_id(
+            operator=operator, lead=lead)
+    except ValueError as e:
+        return None, None, {
+            "status": HTTPStatus.CONFLICT,
+            "error": "lead_chat_identity_denied",
+            "detail": str(e),
+        }
+    liveness = store.lead_chat_liveness(lead=lead)
+    if not liveness.get("available"):
+        return None, None, {
+            "status": HTTPStatus.CONFLICT,
+            "error": "lead_unavailable",
+            "detail": liveness.get("reason") or liveness.get("detail") or "",
+            "liveness": liveness,
+        }
+    result = store.send_operator_answer_atomic(
+        actor=operator,
+        request_id=request_id,
+        body=body,
+        subject=f"operator answer ({request_id})",
+        expected_recipient=lead,
+    )
+    if not result.ok:
+        status = HTTPStatus.CONFLICT
+        if result.failed:
+            status = HTTPStatus.INTERNAL_SERVER_ERROR
+        return None, None, {
+            "status": status,
+            "error": result.denial_code or "operator_answer_denied",
+            "detail": result.detail,
+        }
+    return result.message, {
+        "request_id": request_id,
+        "lead_chat_request_id": lead_chat_request_id,
+    }, None
+
+
 def build_lead_chat(desc: RootDescriptor, *, limit: int = _LEAD_CHAT_LIMIT) -> dict:
     """Lead-chat read model: bounded transcript plus fail-closed availability."""
     store = desc.store
@@ -2563,12 +2606,39 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                                   "lead escalation addressed to the operator",
                     })
                     return
-                request_id = chat.get("request_id") or ""
                 kind = "answer_escalation"
                 intent_payload = {
                     "to_request": payload.get("to_request"),
                     "body": payload.get("body"),
                 }
+                from agenttalk import intents as intent_mod
+                errors = intent_mod.validate_intent(kind, intent_payload)
+                if errors:
+                    self._send_json(HTTPStatus.BAD_REQUEST,
+                                    {"error": "invalid_intent",
+                                     "details": errors})
+                    return
+                msg, answer_ids, problem = _send_authenticated_lead_chat_answer(
+                    store,
+                    request_id=intent_payload["to_request"],
+                    body=intent_payload["body"],
+                )
+                if problem is not None:
+                    status = problem.pop("status")
+                    self._send_json(status, problem)
+                    return
+                self._send_json(HTTPStatus.ACCEPTED, {
+                    "message_id": msg.id if msg else "",
+                    "state": "sent",
+                    "kind": kind,
+                    "request_id": (answer_ids or {}).get("request_id", ""),
+                    "lead_chat_request_id": (
+                        (answer_ids or {}).get("lead_chat_request_id", "")
+                    ),
+                    "target_root_index": 0,
+                    "target_root_label": roots[0].label,
+                })
+                return
             else:
                 self._send_json(HTTPStatus.BAD_REQUEST, {
                     "error": "invalid_lead_chat",
@@ -2578,34 +2648,6 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                     ],
                 })
                 return
-            from agenttalk import intents as intent_mod
-            errors = intent_mod.validate_intent(kind, intent_payload)
-            if errors:
-                self._send_json(HTTPStatus.BAD_REQUEST,
-                                {"error": "invalid_intent", "details": errors})
-                return
-            try:
-                rec = store.write_intent(
-                    kind, intent_payload,
-                    origin={"source": "web-lead-chat", "session_id": session_id,
-                            "lead_chat_request_id": request_id,
-                            "host": self.headers.get("Host", ""),
-                            "origin": self.headers.get("Origin", "")})
-            except Store.IntentCapacityError as e:
-                status = HTTPStatus.INSUFFICIENT_STORAGE if e.code == "max_bytes" else HTTPStatus.TOO_MANY_REQUESTS
-                self._json_problem(status, e.code, str(e))
-                return
-            except ValueError as e:
-                self._json_problem(HTTPStatus.BAD_REQUEST, "invalid_intent", str(e))
-                return
-            self._send_json(HTTPStatus.ACCEPTED, {
-                "intent_id": rec["intent_id"],
-                "state": rec["state"],
-                "kind": kind,
-                "request_id": request_id,
-                "target_root_index": 0,
-                "target_root_label": roots[0].label,
-            })
 
         # ---- root resolution for the root-scoped thread route (P2-5)
         def _thread_store(self) -> Store:

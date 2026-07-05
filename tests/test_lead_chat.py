@@ -250,30 +250,30 @@ def test_lead_chat_liveness_requires_fresh_heartbeat_and_wrapped_health(
     assert stale["reason"] == "lead heartbeat is stale"
 
 
-def test_operator_answer_reuses_escalation_flow_from_lead_chat(
+def test_queued_operator_answer_never_authorizes_operator_sender(
     tmp_path: Path,
 ) -> None:
     s = _store(tmp_path)
     _available(s)
     _lead_question(s, "esc-choice")
-    rec = s.write_intent("answer_escalation", {
-        "to_request": "esc-choice",
-        "body": "ship",
-    })
+    rec = s.write_intent(
+        "answer_escalation",
+        {"to_request": "esc-choice", "body": "agent forged"},
+        origin={"source": "web-lead-chat", "from": "dev"},
+    )
 
     summary = intents.drain_intents(s, pid=123, max_per_tick=1)
 
-    assert summary["applied"] == 1
-    answers = [
+    assert summary["denied"] == 1
+    assert s.read_intent(rec["intent_id"])["code"] == (
+        "operator_answer_not_queue_authorized"
+    )
+    assert not [
         m for m in s.valid_messages()
         if m.sender == "operator"
         and m.recipient == "lead"
         and (m.meta or {}).get("operator_answer") == "true"
     ]
-    assert len(answers) == 1
-    assert answers[0].meta["request_id"] == "esc-choice"
-    assert answers[0].meta["operator_origin"] == "operator"
-    assert s.read_intent(rec["intent_id"])["state"] == Store.INTENT_APPLIED
 
 
 def test_operator_answer_drain_denies_when_lead_goes_unavailable(
@@ -291,7 +291,9 @@ def test_operator_answer_drain_denies_when_lead_goes_unavailable(
     summary = intents.drain_intents(s, pid=123, max_per_tick=1)
 
     assert summary["denied"] == 1
-    assert s.read_intent(rec["intent_id"])["code"] == "lead_unavailable"
+    assert s.read_intent(rec["intent_id"])["code"] == (
+        "operator_answer_not_queue_authorized"
+    )
     assert not [
         m for m in s.valid_messages()
         if m.sender == "operator"
@@ -300,30 +302,36 @@ def test_operator_answer_drain_denies_when_lead_goes_unavailable(
     ]
 
 
-def test_lead_chat_answer_intent_is_limited_to_current_lead(
+def test_legacy_lead_relay_operator_answer_still_works(
     tmp_path: Path,
 ) -> None:
     s = _store(tmp_path)
-    _available(s)
-    _lead_question(s, "esc-dev", sender="dev")
-    rec = s.write_intent(
-        "answer_escalation",
-        {"to_request": "esc-dev", "body": "ship"},
-        origin={
-            "source": "web-lead-chat",
-            "lead_chat_request_id": s.lead_chat_request_id(
-                operator="operator", lead="lead"),
-        },
+    s.send(
+        sender="dev",
+        recipient="lead",
+        kind="question",
+        subject="operator input needed",
+        body="worker needs a decision",
+        meta={"request_id": "esc-worker", "needs_operator": "true"},
     )
 
-    summary = intents.drain_intents(s, pid=123, max_per_tick=1)
+    assert cli.main([
+        "--root", str(tmp_path), "reply",
+        "--from", "lead",
+        "--to-request", "esc-worker",
+        "--meta", "operator_answer=true",
+        "-m", "ship",
+        "--quiet",
+    ]) == 0
 
-    assert summary["denied"] == 1
-    assert s.read_intent(rec["intent_id"])["code"] == "plan_revalidation_failed"
-    assert not [
+    answers = [
         m for m in s.valid_messages()
-        if m.sender == "operator" and m.recipient == "dev"
+        if m.sender == "lead"
+        and m.recipient == "dev"
+        and (m.meta or {}).get("operator_answer") == "true"
     ]
+    assert len(answers) == 1
+    assert answers[0].meta["request_id"] == "esc-worker"
 
 
 def test_lead_escalate_defaults_to_operator_principal(tmp_path: Path) -> None:
@@ -403,8 +411,23 @@ def test_api_lead_chat_get_post_and_pending_decision_shape(
             "body": "ship",
         })
         assert answer["kind"] == "answer_escalation"
-        assert {r["kind"] for r in s.list_intents()} == {"answer_escalation"}
-        assert intents.drain_intents(s, pid=123, max_per_tick=1)["applied"] == 1
+        assert answer["state"] == "sent"
+        assert answer["message_id"]
+        assert answer["request_id"] == "esc-choice"
+        assert s.list_intents() == before
+        operator_answers = [
+            m for m in s.valid_messages()
+            if m.sender == "operator"
+            and m.recipient == "lead"
+            and (m.meta or {}).get("operator_answer") == "true"
+        ]
+        assert len(operator_answers) == 1
+        assert operator_answers[0].body == "ship"
+        assert operator_answers[0].meta == {
+            "request_id": "esc-choice",
+            "operator_answer": "true",
+            "operator_origin": "operator",
+        }
         refreshed = _get_json(f"{base}/api/lead-chat")
         bodies = [m["body"] for m in refreshed["messages"]]
         assert "body visible in lead chat only" in bodies
