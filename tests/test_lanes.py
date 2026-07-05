@@ -801,6 +801,35 @@ def test_abandon_active_launch_defers_worktree_removal(tmp_path: Path) -> None:
     assert wt.exists()
 
 
+def test_abandon_delete_branch_active_launch_keeps_branch_until_cleanup(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "busybranch")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({
+        "request_id": "lr-busy-branch", "state": "queued", "lane_id": "busybranch",
+    })
+    assert _run_raw(["lane", "abandon", "--id", "busybranch", "--delete-branch",
+                     "--target", _branch(root)], root) == 0
+    captured = capsys.readouterr()
+    saved = lanes.load_lanes(store)["lanes"]["busybranch"]
+    assert saved["status"] == lanes.STATUS_ABANDONED
+    assert saved["worktree_state"] == lanes.STATUS_CLEANUP_PENDING
+    assert wt.exists()
+    assert "not deleted - worktree has an active or pending launch" in captured.err
+    assert _git_rc(root, "rev-parse", "--verify",
+                   "refs/heads/lane/busybranch^{commit}").returncode == 0
+
+    assert store.archive_launch_request("lr-busy-branch", {
+        "request_id": "lr-busy-branch", "terminal_state": "archived"})
+    assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    item = next(i for i in payload["items"] if i["lane_id"] == "busybranch")
+    assert item["worktree_removed"] is True
+    assert not wt.exists()
+
+
 def test_m10_gc_discovers_lane_worktree_after_reset(tmp_path: Path, capsys) -> None:
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "orphan")

@@ -3253,12 +3253,14 @@ def cmd_lane(args: argparse.Namespace) -> int:
 
     if action == "abandon":
         lane_id = lane_mod.validate_lane_id(args.id)
+        branch_delete_block_reason = None
         with store._config_lock():
             data = lane_mod.load_lanes(store)
             lane = (data.get("lanes") or {}).get(lane_id)
             if isinstance(lane, dict):
                 lane["status"] = lane_mod.STATUS_ABANDONED
                 if lane.get("worktree_path"):
+                    branch_delete_block_reason = "worktree cleanup did not complete"
                     if _lane_worktree_idle(store, lane):
                         try:
                             _verify_lane_worktree(store, lane)
@@ -3269,19 +3271,32 @@ def cmd_lane(args: argparse.Namespace) -> int:
                                 else lane_mod.STATUS_CLEANUP_FAILED)
                             if rc != 0:
                                 lane["worktree_cleanup_error"] = err.strip()[:500]
+                                branch_delete_block_reason = (
+                                    lane["worktree_cleanup_error"] or "worktree removal failed")
+                            else:
+                                branch_delete_block_reason = None
                         except lane_mod.LaneError as e:
+                            msg = str(e)[:500] or "worktree cleanup pending"
                             lane["worktree_state"] = lane_mod.STATUS_CLEANUP_PENDING
-                            lane["worktree_cleanup_error"] = str(e)[:500]
+                            lane["worktree_cleanup_error"] = msg
+                            branch_delete_block_reason = msg
                         except GitWriteError as e:
+                            msg = str(e)[:500] or "worktree cleanup failed"
                             lane["worktree_state"] = lane_mod.STATUS_CLEANUP_FAILED
-                            lane["worktree_cleanup_error"] = str(e)[:500]
+                            lane["worktree_cleanup_error"] = msg
+                            branch_delete_block_reason = msg
                     else:
                         lane["worktree_state"] = lane_mod.STATUS_CLEANUP_PENDING
                         lane["worktree_cleanup_error"] = "worktree has an active or pending launch"
+                        branch_delete_block_reason = lane["worktree_cleanup_error"]
                 lane_mod.save_lanes(store, data)
         deleted = False
         if getattr(args, "delete_branch", False):
-            ok, reason = _lane_branch_delete_safe(store.root, lane_id, args.target)
+            ok, reason = (
+                (False, branch_delete_block_reason)
+                if branch_delete_block_reason else
+                _lane_branch_delete_safe(store.root, lane_id, args.target)
+            )
             if not ok:
                 sys.stderr.write(
                     f"agenttalk lane abandon: branch {lane_mod.lane_branch(lane_id)!r} "
