@@ -145,10 +145,7 @@ MANIFEST_TOP_LEVEL_KEYS = {
     "tools",
 }
 PROFILE_KEYS = {
-    "exclude_paths",
-    "include_paths",
     "network_allowed",
-    "optional_tools",
     "required_tools",
     "severity_floor",
 }
@@ -861,7 +858,10 @@ def _validate_accepted_findings(items: list[Any]) -> None:
         scope = _normalize_acceptance_scope(str(item["scope"]))
         if _blanket_acceptance_scope(scope):
             raise AssuranceUsageError(f"accepted_findings[{idx}] has a blanket scope")
-        _parse_expiry(str(item["expires"]))
+        try:
+            _parse_expiry(str(item["expires"]))
+        except ValueError as exc:
+            raise AssuranceUsageError(f"accepted_findings[{idx}] has an invalid expires: {item['expires']!r}") from exc
 
 
 def _validate_generated_artifacts(items: list[Any]) -> None:
@@ -881,7 +881,10 @@ def _validate_generated_artifacts(items: list[Any]) -> None:
 
 
 def _normalize_acceptance_scope(scope: str) -> str:
-    return _slash(scope.strip()).strip()
+    normalized = _slash(scope.strip()).strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
 
 
 def _blanket_acceptance_scope(scope: str) -> bool:

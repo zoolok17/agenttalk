@@ -27,9 +27,10 @@ Optional top-level fields:
 
 Unknown top-level manifest keys are validation errors. Unknown keys inside
 `profiles.<profile>` are also validation errors; the profile namespace is limited
-to `required_tools`, `optional_tools`, `network_allowed`, `severity_floor`,
-`include_paths`, and `exclude_paths`. Per-tool config under `tools.<tool>` is
-intentionally open so tool-specific options can evolve without a schema change.
+to `required_tools`, `network_allowed`, and `severity_floor`. Use top-level
+`paths.include` and `paths.exclude` for scan scope. Per-tool config under
+`tools.<tool>` is intentionally open so tool-specific options can evolve without
+a schema change.
 
 Accepted findings require:
 
@@ -45,11 +46,16 @@ Scopes are enforced against the matched finding path and optional dimension; a
 mismatch is reported as `accepted-scope-mismatch` and does not suppress the
 finding.
 
-Generated artifacts require `id` and `path`. `kind` is recommended and is
-normalized case-insensitively, with aliases such as `ps1` mapping to
-`powershell`. If `kind` is omitted, executable status is inferred from the file
-extension for release-profile declared-unexecuted checks. Unknown non-empty kinds
-are validation errors.
+Generated artifacts require `id` and `path`. `kind` is a closed enum: executable
+kinds are `binary`, `js`, `powershell`, `python`, and `shell`, normalized
+case-insensitively with aliases such as `ps1` mapping to `powershell`.
+Non-executable generated artifacts must use `kind: "other"` or omit `kind`.
+Unknown non-empty kinds, including descriptive values such as `json`, `yaml`,
+`data`, `config`, `html`, or `text`, are validation errors.
+
+If `kind` is omitted, executable status is inferred from the file extension for
+release-profile declared-unexecuted checks. Executable extensions such as `.py`,
+`.ps1`, `.sh`, and `.js` are treated as executable regardless of `kind`.
 
 Tool commands and custom commands are argv lists. Use `timeout_seconds` under
 `tools.<tool>` when a local required command, such as this repository's pytest

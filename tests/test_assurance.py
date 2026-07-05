@@ -130,6 +130,34 @@ def test_manifest_parser_accepts_valid_json_and_rejects_malformed_acceptance(tmp
         assurance.load_manifest(tmp_path, bad)
 
 
+def test_malformed_acceptance_expires_produces_validation_artifact(tmp_path: Path) -> None:
+    _baseline(tmp_path)
+    _manifest(
+        tmp_path,
+        {
+            "accepted_findings": [
+                {
+                    "fingerprint": "abc",
+                    "reason": "reviewed",
+                    "owner": "lead",
+                    "scope": "src",
+                    "expires": "not-a-date",
+                }
+            ]
+        },
+    )
+
+    artifact = _artifact_from_cli(tmp_path)
+
+    assert any(
+        f["tool_id"] == "manifest-validate"
+        and f["rule_id"] == "schema"
+        and "invalid expires" in f["message"]
+        and f["blocking"]
+        for f in artifact["findings"]
+    )
+
+
 def test_manifest_unknown_top_level_and_profile_keys_fail_closed(tmp_path: Path) -> None:
     _make_python_project(tmp_path)
     _baseline(tmp_path)
@@ -154,6 +182,22 @@ def test_manifest_unknown_top_level_and_profile_keys_fail_closed(tmp_path: Path)
         f["tool_id"] == "manifest-validate"
         and f["rule_id"] == "schema"
         and "profiles.change has unknown key" in f["message"]
+        and f["blocking"]
+        for f in artifact["findings"]
+    )
+
+
+def test_profile_scope_keys_fail_closed_instead_of_silent_ignore(tmp_path: Path) -> None:
+    _make_python_project(tmp_path)
+    _baseline(tmp_path)
+    _manifest(tmp_path, {"profiles": {"change": {"exclude_paths": ["src/generated"]}}})
+
+    artifact = _artifact_from_cli(tmp_path)
+
+    assert any(
+        f["tool_id"] == "manifest-validate"
+        and f["rule_id"] == "schema"
+        and "exclude_paths" in f["message"]
         and f["blocking"]
         for f in artifact["findings"]
     )
@@ -585,6 +629,55 @@ def test_accepted_scope_mismatch_does_not_suppress_finding(tmp_path: Path) -> No
     assert status_by_rule["B321"] == "new"
     assert status_by_rule["accepted-scope-mismatch"] == "new"
     assert any(f["rule_id"] == "accepted-scope-mismatch" and f["blocking"] for f in result.findings)
+
+
+def test_accepted_scope_allows_dot_slash_prefix(tmp_path: Path) -> None:
+    fp = assurance.finding_fingerprint("bandit", "B321", "src/app.py", "bad")
+    manifest = assurance._default_manifest()
+    manifest["accepted_findings"] = [
+        {
+            "fingerprint": fp,
+            "reason": "known",
+            "owner": "lead",
+            "scope": "./src/app.py",
+            "dimension": "security",
+            "expires": "2999-01-01",
+        }
+    ]
+    result = assurance.ScanResult(
+        root=tmp_path,
+        profile="change",
+        manifest=manifest,
+        baseline=assurance._default_baseline(),
+        detection={"stacks": [], "monorepo_children": []},
+        provenance={"manifest_changed_in_scan_range": False, "baseline_changed_in_scan_range": False},
+        tools_considered=["bandit"],
+        tools_run=[],
+        tools_skipped=[],
+        required_missing=[],
+        findings=[
+            {
+                "fingerprint": fp,
+                "dimension": "security",
+                "severity": "high",
+                "tool_id": "bandit",
+                "rule_id": "B321",
+                "path": "src/app.py",
+                "line": 1,
+                "message": "bad",
+                "raw_ref": None,
+            }
+        ],
+        residual_risk=[],
+        runner_errors=[],
+        run_id="test-scope-dot-slash",
+    )
+
+    result = assurance.apply_baseline(result, assurance._default_baseline(), manifest, [])
+
+    status_by_rule = {finding["rule_id"]: finding["status"] for finding in result.findings}
+    assert status_by_rule["B321"] == "accepted-applied"
+    assert "accepted-scope-mismatch" not in status_by_rule
 
 
 @pytest.mark.parametrize("scope", ["ALL", "Global/**/*", "./src/**"])

@@ -11,7 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - assurance-scan now fails closed on unknown top-level manifest keys and unknown
   profile keys. Annotation data must live under an allowed manifest block or an
-  explicit future schema field.
+  explicit future schema field, and scan scope must use top-level `paths`
+  instead of ignored profile-local include/exclude keys.
+- assurance-scan malformed accepted-finding expiry values now produce a blocking
+  manifest validation finding and artifact instead of a raw traceback.
 - assurance-scan attestation letters now require executed evidence for each
   relevant dimension, and baseline findings are marked fixed only after their
   originating tool actually ran.

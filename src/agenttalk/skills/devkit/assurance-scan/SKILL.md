@@ -41,6 +41,11 @@ risk. Missing required tools are recorded as gate-visible evidence in the
 artifact. Network-dependent tools are `skipped-network-disabled` unless the
 manifest explicitly permits them for that tool.
 
+Generated artifact `kind` values are a closed enum. Non-executable generated
+artifacts must use `kind: "other"` or omit `kind`; executable extensions such as
+`.py`, `.ps1`, `.sh`, and `.js` are treated as executable at release regardless
+of `kind`.
+
 Warning:
 
 the scan is a cheap uniform FLOOR — the worst real bugs we shipped/nearly-shipped ($args binding, dir-vs-file mtime ordering, the lane-approval bypass chain) were caught by EXECUTED tests + adversarial review, NOT by any scanner. ASSURANCE.md must NEVER read scanned == assured.
