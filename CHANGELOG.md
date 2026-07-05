@@ -5,6 +5,36 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.67.0] - 2026-07-05
+
+### Added
+
+- **Mechanically-guaranteed isolated worktree per lane (`lane assign` provisions by default).**
+  A lane assignment now provisions a dedicated git worktree on a fresh `lane/<id>` branch off the
+  frozen base SHA (default-on; opt out only with an explicit, audited `--no-worktree` + reason).
+  The worker is handed a ready path via the read-only `lane workspace --id <id>` and never creates
+  or picks a checkout itself — closing the class of bug where two agents shared one worktree. New:
+  `lane workspace`, `lane abandon`, `lane gc` (dry-run first; destructive deletes require an
+  explicit flag and never remove an unmerged/only-ref branch — deletion is gated on
+  `git merge-base --is-ancestor`, never `--merged`/content-equality).
+- **Release-time worktree-provenance backstop.** `lane deliver`/`close` verify the delivered commit
+  came from the registered lane worktree (canonical path + common-git-dir + branch/detached-at-tip
+  + clean tracked tree, all via live git) and **HOLD (`HOLD_WORKTREE_MISMATCH`)** otherwise; a
+  release-class lane with no worktree and no waiver also HOLDs. `close` validates the delivery
+  artifact's host-computed provenance (integrity token + branch-tip recompute) and never trusts a
+  hand-dropped artifact's self-reported fields.
+
+### Security / Internal
+
+- **First mutating git call, hardened.** A new `_git_write` helper (separate from the read-only
+  `_git`) runs an allowlisted set of worktree/branch operations with `GIT_TERMINAL_PROMPT=0`,
+  `GIT_OPTIONAL_LOCKS=0`, `-c core.editor=false`, argv-only (no shell), a `--` separator + full-SHA
+  base validation (no option injection), a bounded timeout, and loud fail-closed handling. See
+  DESIGN.md for the ADR. **Honest ceiling:** the delivery integrity token is a store-local HMAC —
+  it defeats a hand-authored artifact but is not a cryptographic authority boundary against a
+  fully-privileged local process; on a same-machine cooperative bus, identity remains an auditable
+  assertion (Git/OS is the real boundary).
+
 ## [0.66.0] - 2026-07-05
 
 ### Added

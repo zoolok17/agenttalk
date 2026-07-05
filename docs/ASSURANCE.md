@@ -91,6 +91,28 @@ gitleaks false-positive (a redaction-test's synthetic secret, not a real leak or
 corrected in v0.64.1. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.67.0 — mechanically-guaranteed isolated worktree per lane (2026-07-05)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `ab0cb5d` (rebased zero-delta → `27350c9`) · tag `v0.67.0`
+- **Review:** design-first → **adversarial design-gate** (PASS_WITH_CONDITIONS; 12 must-fix folded)
+  → build → **six review rounds** on the destructive-cleanup surface: reviewer-1 reproduced a real
+  data-loss/authority vector on *every* prior SHA (waived-artifact head-mismatch → abandon live-
+  worktree deletion → abandon branch-strand) and my executed-attack adversarial pass (PASS, core
+  guarantees held; contributed the S-P2 primary-checkout hardening) → **both reviewers GO on the
+  final SHA**. Authority-critical (first mutating git call + a new release-gate HOLD) — gated hardest
+  of the run.
+- **Gate:** ruff/bandit(`_git_write` `# nosec`-reviewed)/**gitleaks** (git-mode + range)/diff/
+  compileall clean; pytest **1971 passed / 3 skipped on 3.10 AND 3.14** (clean venvs); clean rebase
+  onto master `059a45e` (range-diff `=` on all 6 commits = zero logic delta).
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green.
+- **Robust/Secure:** the guarantee is **fail-closed** — provisioning is atomic under `_config_lock`
+  (git error → no lane), `deliver`/`close` HOLD on any worktree-provenance mismatch, gc/abandon
+  never delete an unmerged/only-ref branch (ancestor-gated) and never remove an in-use worktree.
+  `_git_write` is hardened (allowlist, no shell, `--` separator, full-SHA base, prompt-disabled env,
+  bounded timeout, loud fail-closed). **Honest ceiling (recorded, not over-claimed):** the delivery
+  integrity token is a *store-local* HMAC — it defeats a hand-dropped artifact but is **not** a
+  cryptographic authority boundary against a fully-privileged local process; on a same-machine
+  cooperative bus, identity stays an auditable assertion and Git/OS is the real boundary.
+
 ### v0.66.0 — 60 shaped avatars + shape-preserving render (2026-07-05)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `3e83048` · tag `v0.66.0`
 - **Review:** grounded design (a lead workflow mapped the render + allowlist + the scope decision) →
