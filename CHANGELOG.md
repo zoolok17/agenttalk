@@ -5,6 +5,21 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.65.1] - 2026-07-05
+
+### Fixed
+
+- **Dashboard: stop turning benign client disconnects into console tracebacks.** When a browser
+  aborted a connection mid-response (tab close, refresh, a cancelled poll), the server tried to
+  write a `500` page onto the already-dead socket and re-raised, so `socketserver` dumped a full
+  `ConnectionAbortedError`/`WinError 10053` traceback to the console. The handler now classifies
+  client-disconnect exceptions (`ConnectionAbortedError`/`ConnectionResetError`/`BrokenPipeError`/
+  `socket.timeout` + the matching POSIX errnos and Windows `10053`/`10054`) and abandons the
+  response quietly instead of attempting a doomed error write. A **genuine** server error on a live
+  socket still logs and returns `500` unchanged — the classifier is strictly type/errno-scoped and
+  never matches a generic exception, so no real error is masked. Covered by `handle_one_request`
+  as a lifecycle chokepoint (GET/HEAD/POST/body-read).
+
 ## [0.65.0] - 2026-07-05
 
 ### Added

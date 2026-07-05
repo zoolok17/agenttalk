@@ -91,6 +91,20 @@ gitleaks false-positive (a redaction-test's synthetic secret, not a real leak or
 corrected in v0.64.1. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.65.1 — dashboard client-disconnect noise fix (2026-07-05)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `ff1b06e` · tag `v0.65.1`
+- **Review:** grounded diagnosis (a lead 4-agent workflow mapped every `web.py` write/error path) →
+  build → **codex reviewer-1 GO** (focused on the anti-masking guarantee + disconnect-classification
+  completeness, no findings). Small, non-authority dashboard-robustness patch.
+- **Gate:** ruff/bandit/**gitleaks** (no-git + range)/diff/compileall clean; pytest **1944 passed /
+  3 skipped on 3.10 AND 3.14** (clean venvs — which also confirmed 2 supervisor-test failures in the
+  builder's environment were the known stale-PATH console-script artifact, not a regression).
+- **Robust/Secure:** the fix is **fail-safe without masking** — a strictly type/errno-scoped
+  `_is_client_disconnect` classifier (never matches a generic `Exception`/`RuntimeError`/`ValueError`/
+  `OSError(ENOENT)`) so a benign peer abort is abandoned quietly while a **real** `500` on a live
+  socket still logs + returns `500` (dedicated anti-masking regression test). `handle_one_request`
+  is the lifecycle chokepoint covering GET/HEAD/POST/body-read.
+
 ### v0.65.0 — agent self-selected avatars + operator avatar (2026-07-05)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `613bf1f` · tag `v0.65.0`
 - **Review:** design-first (lead-gated, display/preference — not authority-critical) → build → **both
