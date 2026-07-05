@@ -5,6 +5,17 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- assurance-scan now fails closed on unknown top-level manifest keys and unknown
+  profile keys. Annotation data must live under an allowed manifest block or an
+  explicit future schema field.
+- assurance-scan attestation letters now require executed evidence for each
+  relevant dimension, and baseline findings are marked fixed only after their
+  originating tool actually ran.
+
 ## [0.61.0] - 2026-07-05
 
 ### Added

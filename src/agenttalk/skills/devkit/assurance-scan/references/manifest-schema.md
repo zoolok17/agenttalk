@@ -25,6 +25,12 @@ Optional top-level fields:
 - `python.package` or `python.packages`: package imports to resolve for
   provenance.
 
+Unknown top-level manifest keys are validation errors. Unknown keys inside
+`profiles.<profile>` are also validation errors; the profile namespace is limited
+to `required_tools`, `optional_tools`, `network_allowed`, `severity_floor`,
+`include_paths`, and `exclude_paths`. Per-tool config under `tools.<tool>` is
+intentionally open so tool-specific options can evolve without a schema change.
+
 Accepted findings require:
 
 - `fingerprint`
@@ -35,5 +41,18 @@ Accepted findings require:
 
 Blanket scopes such as `*`, `**`, `all`, and `global` are invalid. Expired
 acceptances are reported as `accepted-expired` and remain gate-visible.
+Scopes are enforced against the matched finding path and optional dimension; a
+mismatch is reported as `accepted-scope-mismatch` and does not suppress the
+finding.
+
+Generated artifacts require `id` and `path`. `kind` is recommended and is
+normalized case-insensitively, with aliases such as `ps1` mapping to
+`powershell`. If `kind` is omitted, executable status is inferred from the file
+extension for release-profile declared-unexecuted checks. Unknown non-empty kinds
+are validation errors.
+
+Tool commands and custom commands are argv lists. Use `timeout_seconds` under
+`tools.<tool>` when a local required command, such as this repository's pytest
+suite, needs longer than the default timeout.
 
 The default manifest path and all run paths use lowercase `.json`.

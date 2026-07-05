@@ -27,6 +27,15 @@ Python v1:
   installed and applicable. Network-dependent dependency tools are skipped by
   default unless the manifest permits them.
 
+Semgrep configs must be local when network is disabled. Registry configs such as
+`p/ci` and URL configs are treated as network-required and therefore skipped
+unless the active profile explicitly allows network for semgrep.
+
+The inferred test command uses the default per-tool timeout. For repositories
+whose normal test suite exceeds that budget, configure
+`tools.tests.timeout_seconds` in `.agenttalk/assurance.json` so GOOD can be
+assessed from executed evidence instead of a visible timeout/unknown result.
+
 Release profile:
 
 - `python -m build` when available.

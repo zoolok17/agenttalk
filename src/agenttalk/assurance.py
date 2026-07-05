@@ -106,7 +106,9 @@ BINARY_EXTENSIONS = {
     ".7z",
     ".bmp",
     ".class",
+    ".db",
     ".dll",
+    ".eot",
     ".exe",
     ".gif",
     ".ico",
@@ -116,15 +118,51 @@ BINARY_EXTENSIONS = {
     ".pdf",
     ".png",
     ".pyc",
+    ".sqlite",
+    ".sqlite3",
     ".so",
+    ".ttf",
     ".wasm",
     ".webp",
+    ".woff",
+    ".woff2",
     ".whl",
     ".zip",
 }
 
 NETWORK_TOOLS = {"osv-scanner", "pip-audit"}
 SECURITY_TOOLS = {"bandit", "semgrep", "gitleaks", "osv-scanner", "pip-audit"}
+MANIFEST_TOP_LEVEL_KEYS = {
+    "accepted_findings",
+    "custom_commands",
+    "generated_artifacts",
+    "monorepo",
+    "paths",
+    "profiles",
+    "python",
+    "schema_version",
+    "thresholds",
+    "tools",
+}
+PROFILE_KEYS = {
+    "exclude_paths",
+    "include_paths",
+    "network_allowed",
+    "optional_tools",
+    "required_tools",
+    "severity_floor",
+}
+EXECUTABLE_ARTIFACT_KINDS = {"binary", "js", "powershell", "python", "shell"}
+EXECUTABLE_ARTIFACT_EXTENSIONS = {".bat", ".cmd", ".exe", ".js", ".ps1", ".py", ".sh"}
+GENERATED_KIND_ALIASES = {
+    "bash": "shell",
+    "exe": "binary",
+    "javascript": "js",
+    "ps1": "powershell",
+    "pwsh": "powershell",
+    "sh": "shell",
+}
+EXECUTED_STATUSES = {"pass", "fail-blocking", "fail-advisory"}
 
 
 class AssuranceUsageError(ValueError):
@@ -426,6 +464,7 @@ def build_plan(
                     "dimension": "security",
                     "executable": "semgrep",
                     "args": ["--config", _semgrep_config(root_path, manifest), "--json", "."],
+                    "network_required": _semgrep_requires_network(root_path, manifest),
                 }
             )
         add(
@@ -508,6 +547,8 @@ def run_plan(plan: ScanPlan) -> ScanResult:
             tools_run.append(run)
             findings.extend(built_findings)
             residual.extend(built_residual)
+            if spec.get("required") and run["status"].startswith(("skipped-", "error-", "timeout-")):
+                required_missing.append({"tool_id": tool_id, "reason": run["status"]})
             continue
         command = _resolve_command(spec)
         if command is None:
@@ -572,12 +613,29 @@ def apply_baseline(
     expired: list[dict[str, Any]] = []
     normalized: list[dict[str, Any]] = []
     floor_by_dim = _severity_floor(result.profile, manifest)
+    measured_tools = _executed_tools(result)
 
     for finding in result.findings:
         item = _normalize_finding(finding)
         fp = item["fingerprint"]
         seen.add(fp)
         acceptance = accepted.get(fp)
+        if acceptance and not _acceptance_applies(acceptance, item):
+            normalized.append(
+                _normalize_applied_finding(
+                    _finding(
+                        "manifest-validate",
+                        "accepted-scope-mismatch",
+                        "other",
+                        "high",
+                        item.get("path"),
+                        item.get("line"),
+                        f"accepted finding scope does not match {item['tool_id']}:{item['rule_id']}",
+                    ),
+                    floor_by_dim,
+                )
+            )
+            acceptance = None
         if acceptance:
             if _acceptance_expired(acceptance):
                 item["status"] = "accepted-expired"
@@ -596,22 +654,35 @@ def apply_baseline(
     for fp, base in sorted(baseline_by_fp.items()):
         if fp in seen:
             continue
+        tool_id = _baseline_tool_id(base)
+        status = "fixed" if tool_id in measured_tools else "unchanged"
+        message = "baseline finding no longer present"
+        if status != "fixed":
+            message = "baseline finding was not reassessed because its originating tool did not run"
+            result.residual_risk.append(
+                _risk(
+                    str(base.get("dimension") or "other"),
+                    f"baseline finding {fp} was not reassessed because {tool_id} did not run",
+                    _severity(str(base.get("severity") or "medium")),
+                    tool_id=tool_id,
+                )
+            )
         fixed = {
             "fingerprint": fp,
-            "status": "fixed",
+            "status": status,
             "dimension": str(base.get("dimension") or "other"),
             "severity": _severity(str(base.get("severity") or "info")),
-            "tool_id": str(base.get("tool") or base.get("tool_id") or "baseline"),
+            "tool_id": tool_id,
             "rule_id": str(base.get("rule_id") or "baseline"),
             "path": base.get("path"),
             "line": None,
-            "message": "baseline finding no longer present",
+            "message": message,
             "raw_ref": None,
             "blocking": False,
         }
         normalized.append(fixed)
 
-    result.findings = normalized
+    result.findings = sorted(normalized, key=_finding_sort_key)
     result.accepted_findings = {"applied": applied, "expired": expired}
     _recompute_tool_statuses(result)
     result.artifact = _artifact_from_result(result, changed_files or [])
@@ -663,7 +734,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default=str(DEFAULT_RUNS_DIR))
     parser.add_argument("--changed-from")
     parser.add_argument("--changed-to")
-    parser.add_argument("--no-network", action="store_true", default=True)
     parser.add_argument("--summary")
     parser.add_argument("--json-only", action="store_true")
     try:
@@ -726,12 +796,16 @@ def _normalize_manifest(data: Any, path: Path) -> dict[str, Any]:
         raise AssuranceUsageError("assurance manifest must be a JSON object")
     if data.get("schema_version") != SCHEMA_VERSION:
         raise AssuranceUsageError("assurance manifest schema_version must be 1")
+    unknown = sorted(set(data) - MANIFEST_TOP_LEVEL_KEYS)
+    if unknown:
+        raise AssuranceUsageError(f"assurance manifest has unknown top-level key(s): {', '.join(unknown)}")
     manifest = _default_manifest(path)
     for key in ("profiles", "tools", "thresholds", "custom_commands", "paths", "monorepo", "python"):
         if key in data:
             if not isinstance(data[key], dict):
                 raise AssuranceUsageError(f"manifest {key} must be an object")
             manifest[key] = data[key]
+    _validate_profiles(manifest["profiles"])
     for key in ("accepted_findings", "generated_artifacts"):
         if key in data:
             if not isinstance(data[key], list):
@@ -765,6 +839,17 @@ def _normalize_baseline(data: Any, path: Path) -> dict[str, Any]:
     return baseline
 
 
+def _validate_profiles(profiles: dict[str, Any]) -> None:
+    for name, cfg in profiles.items():
+        if name not in PROFILES:
+            raise AssuranceUsageError(f"manifest profiles has unknown profile {name!r}")
+        if not isinstance(cfg, dict):
+            raise AssuranceUsageError(f"manifest profiles.{name} must be an object")
+        unknown = sorted(set(cfg) - PROFILE_KEYS)
+        if unknown:
+            raise AssuranceUsageError(f"manifest profiles.{name} has unknown key(s): {', '.join(unknown)}")
+
+
 def _validate_accepted_findings(items: list[Any]) -> None:
     required = {"fingerprint", "reason", "owner", "scope", "expires"}
     for idx, item in enumerate(items):
@@ -773,8 +858,8 @@ def _validate_accepted_findings(items: list[Any]) -> None:
         missing = [key for key in sorted(required) if not str(item.get(key) or "").strip()]
         if missing:
             raise AssuranceUsageError(f"accepted_findings[{idx}] missing {', '.join(missing)}")
-        scope = str(item["scope"]).strip()
-        if scope in {"*", "**", "all", "global"}:
+        scope = _normalize_acceptance_scope(str(item["scope"]))
+        if _blanket_acceptance_scope(scope):
             raise AssuranceUsageError(f"accepted_findings[{idx}] has a blanket scope")
         _parse_expiry(str(item["expires"]))
 
@@ -786,9 +871,35 @@ def _validate_generated_artifacts(items: list[Any]) -> None:
         for key in ("id", "path"):
             if not str(item.get(key) or "").strip():
                 raise AssuranceUsageError(f"generated_artifacts[{idx}] missing {key}")
+        if str(item.get("kind") or "").strip():
+            kind = _generated_kind(item.get("kind"))
+            if kind not in EXECUTABLE_ARTIFACT_KINDS and kind != "other":
+                raise AssuranceUsageError(f"generated_artifacts[{idx}].kind is unknown: {item.get('kind')}")
         executed = item.get("executed_by_tests", [])
         if executed is not None and not isinstance(executed, list):
             raise AssuranceUsageError(f"generated_artifacts[{idx}].executed_by_tests must be a list")
+
+
+def _normalize_acceptance_scope(scope: str) -> str:
+    return _slash(scope.strip()).strip()
+
+
+def _blanket_acceptance_scope(scope: str) -> bool:
+    normalized = scope.strip().strip("./").casefold()
+    return not normalized or normalized in {"*", "**", "all", "global"} or "*" in normalized
+
+
+def _generated_kind(value: Any) -> str:
+    kind = str(value or "").strip().casefold()
+    return GENERATED_KIND_ALIASES.get(kind, kind)
+
+
+def _generated_artifact_is_executable(item: dict[str, Any]) -> bool:
+    kind = _generated_kind(item.get("kind"))
+    if kind in EXECUTABLE_ARTIFACT_KINDS:
+        return True
+    suffix = Path(str(item.get("path") or "")).suffix.casefold()
+    return suffix in EXECUTABLE_ARTIFACT_EXTENSIONS
 
 
 # --------------------------------------------------------------------------- detection
@@ -961,6 +1072,18 @@ def _semgrep_config(root: Path, manifest: dict[str, Any]) -> str:
     return ".semgrep"
 
 
+def _semgrep_requires_network(root: Path, manifest: dict[str, Any]) -> bool:
+    cfg = _semgrep_config(root, manifest)
+    if cfg.startswith(("http://", "https://")):
+        return True
+    path = Path(cfg)
+    if path.is_absolute():
+        return not path.exists()
+    if cfg.startswith((".", "/", "\\")):
+        return False
+    return not (root / cfg).exists()
+
+
 def _test_command(root: Path, manifest: dict[str, Any]) -> list[str] | None:
     custom = _custom_command(manifest, "test")
     if custom:
@@ -998,6 +1121,17 @@ def _run_builtin(
         elif built_in == "encoding":
             findings.extend(_encoding_findings(plan.root, plan.manifest))
         elif built_in == "git_diff":
+            if not _git_available(plan.root):
+                return (
+                    _run_record(
+                        spec,
+                        "skipped-not-applicable",
+                        start,
+                        command=["git", "diff", "--check"],
+                    ),
+                    findings,
+                    [_risk("encoding", "git diff --check not applicable outside a git checkout", "medium")],
+                )
             findings.extend(_git_diff_findings(plan.root))
         elif built_in == "generated":
             findings.extend(_generated_artifact_findings(plan.root, plan.manifest, plan.profile))
@@ -1264,15 +1398,21 @@ def _encoding_findings(root: Path, manifest: dict[str, Any]) -> list[dict[str, A
                 )
             )
             continue
+        if not _is_text_like(file_path, data):
+            continue
         rel = _slash(_rel(root, file_path))
         if b"\x00" in data:
             findings.append(
                 _finding(
-                    "encoding-hygiene", "nul-byte", "encoding", "high", rel, None, "NUL byte in source or text asset"
+                    "encoding-hygiene",
+                    "nul-byte",
+                    "encoding",
+                    "high",
+                    rel,
+                    None,
+                    "NUL byte in source or text asset",
                 )
             )
-            continue
-        if not _is_text_like(file_path, data):
             continue
         bad_control = [byte for byte in data if byte < 32 and byte not in (9, 10, 13)]
         if bad_control:
@@ -1300,7 +1440,7 @@ def _encoding_findings(root: Path, manifest: dict[str, Any]) -> list[dict[str, A
 
 def _git_diff_findings(root: Path) -> list[dict[str, Any]]:
     git = shutil.which("git")
-    if git is None or not (root / ".git").exists():
+    if git is None or not _git_available(root):
         return []
     try:
         completed = subprocess.run(  # nosec B603 - resolved executable, argv list
@@ -1349,8 +1489,7 @@ def _generated_artifact_findings(root: Path, manifest: dict[str, Any], profile: 
                 )
             )
         executed = item.get("executed_by_tests") or []
-        kind = str(item.get("kind") or "other")
-        if profile == "release" and kind in {"shell", "powershell", "python", "js", "binary"} and not executed:
+        if profile == "release" and _generated_artifact_is_executable(item) and not executed:
             findings.append(
                 _finding(
                     "generated-artifacts",
@@ -1781,12 +1920,44 @@ def _osv_findings(data: dict[str, Any]) -> list[dict[str, Any]]:
                     continue
                 advisory = str(vuln.get("id") or vuln.get("database_specific", {}).get("cwe_ids", ["vulnerability"])[0])
                 msg = str(vuln.get("summary") or f"{ecosystem} package {name} {version} has {advisory}")
-                out.append(
-                    _finding(
-                        "osv-scanner", advisory, "deps", _severity(str(vuln.get("severity") or "high")), None, None, msg
-                    )
-                )
+                out.append(_finding("osv-scanner", advisory, "deps", _osv_severity(vuln), None, None, msg))
     return out
+
+
+def _osv_severity(vuln: dict[str, Any]) -> str:
+    severity = vuln.get("severity")
+    if isinstance(severity, str):
+        return _severity(severity)
+    if isinstance(severity, list):
+        ranked = [
+            parsed
+            for item in severity
+            if isinstance(item, dict)
+            for parsed in (_cvss_score_to_severity(item.get("score")),)
+            if parsed
+        ]
+        if ranked:
+            return max(ranked, key=_severity_rank)
+    return "high"
+
+
+def _cvss_score_to_severity(score: Any) -> str | None:
+    text = str(score or "").strip()
+    if text.upper().startswith("CVSS:"):
+        return None
+    match = re.search(r"(?<!\d)(10(?:\.0)?|[0-9](?:\.[0-9])?)(?!\d)", text)
+    if not match:
+        return None
+    value = float(match.group(1))
+    if value >= 9.0:
+        return "critical"
+    if value >= 7.0:
+        return "high"
+    if value >= 4.0:
+        return "medium"
+    if value > 0:
+        return "low"
+    return "info"
 
 
 def _pip_audit_findings(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1898,6 +2069,44 @@ def _finding_blocks(item: dict[str, Any], floor_by_dim: dict[str, str]) -> bool:
 
 def _severity_rank(severity: str) -> int:
     return SEVERITY_RANK.get(_severity(severity), SEVERITY_RANK["medium"])
+
+
+def _normalize_applied_finding(finding: dict[str, Any], floor_by_dim: dict[str, str]) -> dict[str, Any]:
+    item = _normalize_finding(finding)
+    item["status"] = "new"
+    item["blocking"] = _finding_blocks(item, floor_by_dim)
+    return item
+
+
+def _executed_tools(result: ScanResult) -> set[str]:
+    return {str(run.get("tool_id")) for run in result.tools_run if str(run.get("status")) in EXECUTED_STATUSES}
+
+
+def _baseline_tool_id(item: dict[str, Any]) -> str:
+    return str(item.get("tool") or item.get("tool_id") or "baseline")
+
+
+def _acceptance_applies(acceptance: dict[str, Any], finding: dict[str, Any]) -> bool:
+    dimension = acceptance.get("dimension")
+    if dimension and str(dimension) != str(finding.get("dimension")):
+        return False
+    path = _slash(str(finding.get("path") or "")).strip()
+    if not path:
+        return True
+    scope = _normalize_acceptance_scope(str(acceptance.get("scope") or ""))
+    scope = scope.rstrip("/")
+    return path == scope or path.startswith(scope + "/")
+
+
+def _finding_sort_key(item: dict[str, Any]) -> tuple[str, str, str, str, int, str]:
+    return (
+        str(item.get("dimension") or ""),
+        str(item.get("tool_id") or ""),
+        str(item.get("rule_id") or ""),
+        str(item.get("path") or ""),
+        _int_or_none(item.get("line")) or 0,
+        str(item.get("fingerprint") or ""),
+    )
 
 
 def _is_worse(current: dict[str, Any], baseline: dict[str, Any]) -> bool:
@@ -2023,52 +2232,84 @@ def _derive_attestation(result: ScanResult) -> dict[str, Any]:
                 records.append(skipped)
         return records
 
-    def assess(name: str, tools: set[str], dimensions: set[str], required: bool = False) -> str:
-        records = tool_records(tools)
-        statuses = [str(record.get("status")) for record in records]
-        blocking = any(f.get("blocking") and f.get("dimension") in dimensions for f in result.findings)
-        if any(
+    def has_required_problem(records: list[dict[str, Any]]) -> bool:
+        return any(
             str(record.get("status")) in {"error-required-tool", "timeout-required"}
-            or (record.get("status") == "skipped-network-disabled" and bool(record.get("required")))
+            or (str(record.get("status")).startswith("skipped-") and bool(record.get("required")))
             for record in records
-        ):
+        )
+
+    def has_blocking(dimensions: set[str]) -> bool:
+        return any(
+            finding.get("blocking")
+            and (
+                finding.get("dimension") in dimensions
+                or finding.get("tool_id") in {"manifest-validate", "baseline-validate"}
+            )
+            for finding in result.findings
+        )
+
+    def evidence_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            record
+            for record in records
+            if str(record.get("status")) in EXECUTED_STATUSES and not _vacuous_attestation_record(result, record)
+        ]
+
+    def assess_any(name: str, tools: set[str], dimensions: set[str], required: bool = False) -> str:
+        records = tool_records(tools)
+        if has_required_problem(records):
             reasons.append(f"{name}: required scan skipped or errored")
             return "unknown"
-        if blocking:
+        if has_blocking(dimensions):
             reasons.append(f"{name}: blocking finding present")
             return "unknown"
-        if any(status == "pass" for status in statuses):
+        if evidence_records(records):
             return "good"
         if required:
             reasons.append(f"{name}: no executed evidence")
             return "unknown"
         return "not_assessed"
 
-    good = assess(
+    def assess_dimensions(
+        name: str, tools: set[str], dimensions: set[str], required_dimensions: tuple[str, ...]
+    ) -> str:
+        records = tool_records(tools)
+        if has_required_problem(records):
+            reasons.append(f"{name}: required scan skipped or errored")
+            return "unknown"
+        if has_blocking(dimensions):
+            reasons.append(f"{name}: blocking finding present")
+            return "unknown"
+        evidence = evidence_records(records)
+        missing = [
+            dimension
+            for dimension in required_dimensions
+            if not any(record.get("dimension") == dimension for record in evidence)
+        ]
+        if missing:
+            reasons.append(f"{name}: missing executed {', '.join(missing)} evidence")
+            return "unknown"
+        return "good"
+
+    good = assess_any(
         "GOOD",
         {"encoding-hygiene", "git-diff-check", "python-compileall", "ruff", "ruff-format", "tests", "complexity"},
         {"encoding", "quality", "complexity"},
         required=True,
     )
-    robust = assess(
+    robust = assess_any(
         "ROBUST",
         {"tests", "coverage", "generated-artifacts", "mypy", "pyright"},
         {"quality", "generated_artifact"},
         required=False,
     )
-    secure = assess(
-        "SECURE", SECURITY_TOOLS | {"provenance"}, {"security", "deps", "secrets", "supply_chain"}, required=True
+    secure = assess_dimensions(
+        "SECURE",
+        SECURITY_TOOLS,
+        {"security", "deps", "secrets", "supply_chain"},
+        ("security", "deps", "secrets"),
     )
-    security_passes = [run for run in result.tools_run if run["tool_id"] in SECURITY_TOOLS and run["status"] == "pass"]
-    security_findings = [
-        finding
-        for finding in result.findings
-        if finding.get("tool_id") in SECURITY_TOOLS
-        and finding.get("status") in {"new", "unchanged", "worsened", "accepted-applied", "accepted-expired"}
-    ]
-    if secure == "good" and not security_passes and not security_findings:
-        secure = "unknown"
-        reasons.append("SECURE: no executed security, dependency, or secrets scanner evidence")
     if "rust" in _stack_ids(result.detection) and secure == "good":
         secure = "unknown"
         reasons.append("SECURE: Rust detected; clippy/basic checks alone are not Rust SAST evidence")
@@ -2089,6 +2330,12 @@ def _summary_text(artifact: dict[str, Any]) -> str:
         f"- ROBUST: `{att.get('ROBUST')}`\n"
         f"- SECURE: `{att.get('SECURE')}`\n"
     )
+
+
+def _vacuous_attestation_record(result: ScanResult, record: dict[str, Any]) -> bool:
+    if record.get("tool_id") == "generated-artifacts":
+        return not bool(result.manifest.get("generated_artifacts"))
+    return False
 
 
 # --------------------------------------------------------------------------- filesystem/git helpers
@@ -2124,6 +2371,24 @@ def _sha256_file(path: Path) -> str | None:
     return hashlib.sha256(data).hexdigest()
 
 
+def _git_available(root: Path) -> bool:
+    git = shutil.which("git")
+    if git is None:
+        return False
+    try:
+        completed = subprocess.run(  # nosec B603 - resolved executable, argv list
+            [git, "rev-parse", "--is-inside-work-tree"],
+            cwd=root,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0 and completed.stdout.strip() == "true"
+
+
 def _git_output(root: Path, args: list[str]) -> str | None:
     git = shutil.which("git")
     if git is None:
@@ -2148,6 +2413,7 @@ def _changed_files(root: Path, *, changed_from: str | None, changed_to: str | No
     git = shutil.which("git")
     if git is None:
         return []
+    files: set[str] = set()
     args = [git, "diff", "--name-only"]
     if changed_from:
         args.append(changed_from)
@@ -2168,16 +2434,43 @@ def _changed_files(root: Path, *, changed_from: str | None, changed_to: str | No
         )
     except (OSError, subprocess.TimeoutExpired):
         return []
-    if completed.returncode != 0:
-        return []
-    files = {_slash(line.strip()) for line in completed.stdout.splitlines() if line.strip()}
-    status = _git_output(root, ["status", "--porcelain"])
-    if status:
-        for line in status.splitlines():
-            rel = line[3:].strip()
-            if rel:
-                files.add(_slash(rel))
+    if completed.returncode == 0:
+        files.update(_slash(line.strip()) for line in completed.stdout.splitlines() if line.strip())
+    files.update(_git_status_changed_files(root))
     return sorted(files)
+
+
+def _git_status_changed_files(root: Path) -> set[str]:
+    git = shutil.which("git")
+    if git is None:
+        return set()
+    try:
+        completed = subprocess.run(  # nosec B603 - resolved executable, argv list
+            [git, "status", "--porcelain=v1", "-z", "-uall"],
+            cwd=root,
+            text=False,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if completed.returncode != 0:
+        return set()
+    out: set[str] = set()
+    entries = [entry for entry in completed.stdout.split(b"\0") if entry]
+    idx = 0
+    while idx < len(entries):
+        entry = entries[idx].decode("utf-8", errors="replace")
+        if len(entry) >= 4:
+            path = entry[3:]
+            if path:
+                out.add(_slash(path))
+        if entry[:1] in {"R", "C"} or entry[1:2] in {"R", "C"}:
+            idx += 2
+        else:
+            idx += 1
+    return out
 
 
 def _packages_to_resolve(root: Path, manifest: dict[str, Any]) -> list[str]:
@@ -2240,11 +2533,11 @@ def _resolve_package(root: Path, package: str) -> dict[str, Any]:
 
 def _iter_files(root: Path, *, excludes: set[str], excluded_relative: set[str]) -> list[Path]:
     out: list[Path] = []
-    for path in root.rglob("*"):
+    for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
-        parts = set(path.relative_to(root).parts)
-        if parts & excludes:
+        rel_parts = path.relative_to(root).parts
+        if rel_parts and rel_parts[0] in excludes and not (root / rel_parts[0] / "__init__.py").exists():
             continue
         rel = _slash(_rel(root, path))
         if any(rel == item or rel.startswith(item.rstrip("/") + "/") for item in excluded_relative):
@@ -2257,6 +2550,8 @@ def _is_text_like(path: Path, data: bytes) -> bool:
     if path.suffix.lower() in TEXT_EXTENSIONS:
         return True
     if path.suffix.lower() in BINARY_EXTENSIONS:
+        return False
+    if b"\x00" in data[:4096]:
         return False
     try:
         data[:4096].decode("utf-8")

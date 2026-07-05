@@ -25,6 +25,13 @@ Required top-level fields:
 - `verdict_summary`
 - `residual_risk`
 
+Volatile fields for diffing two artifacts are `run_id`, `generated_at`,
+`root`, `scanner.runner_path`, and tool `duration_ms` values. Normalize those
+fields before byte-level artifact comparisons across machines or runs.
+
+`native_suppressions` is reserved for scanner-native suppressions. v1 emits the
+block with `count_by_tool` and `examples`, but does not yet populate it.
+
 Tool execution statuses are exactly:
 
 - `pass`

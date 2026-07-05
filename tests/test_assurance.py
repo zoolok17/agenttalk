@@ -52,6 +52,15 @@ def _run_scan(root: Path, profile: str = "change") -> assurance.ScanResult:
     return assurance.apply_baseline(result, baseline, manifest, provenance["changed_files"])
 
 
+def _artifact_from_cli(root: Path, profile: str = "change") -> dict:
+    out = root / ".agenttalk" / "assurance" / "runs"
+    rc = assurance.main(["--root", str(root), "--profile", profile, "--out", str(out), "--json-only"])
+    assert rc == 0
+    artifacts = sorted(out.glob("*/artifact.json"))
+    assert artifacts
+    return json.loads(artifacts[-1].read_text(encoding="utf-8"))
+
+
 def _fake_tool(path: Path, body: str) -> Path:
     path.write_text(body, encoding="utf-8")
     return path
@@ -119,6 +128,35 @@ def test_manifest_parser_accepts_valid_json_and_rejects_malformed_acceptance(tmp
     bad = _manifest(tmp_path, {"accepted_findings": [{"fingerprint": "abc", "scope": "*"}]})
     with pytest.raises(assurance.AssuranceUsageError):
         assurance.load_manifest(tmp_path, bad)
+
+
+def test_manifest_unknown_top_level_and_profile_keys_fail_closed(tmp_path: Path) -> None:
+    _make_python_project(tmp_path)
+    _baseline(tmp_path)
+
+    _manifest(tmp_path, {"required_tools": ["bandit"]})
+    artifact = _artifact_from_cli(tmp_path)
+    assert any(
+        f["tool_id"] == "manifest-validate"
+        and f["rule_id"] == "schema"
+        and "unknown top-level key" in f["message"]
+        and f["blocking"]
+        for f in artifact["findings"]
+    )
+
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    _make_python_project(inner)
+    _baseline(inner)
+    _manifest(inner, {"profiles": {"change": {"required_tool": ["bandit"]}}})
+    artifact = _artifact_from_cli(inner)
+    assert any(
+        f["tool_id"] == "manifest-validate"
+        and f["rule_id"] == "schema"
+        and "profiles.change has unknown key" in f["message"]
+        and f["blocking"]
+        for f in artifact["findings"]
+    )
 
 
 def test_runner_does_not_require_tomllib() -> None:
@@ -312,7 +350,20 @@ def test_baseline_delta_classifies_all_states(tmp_path: Path) -> None:
         detection={"stacks": [], "monorepo_children": []},
         provenance={"manifest_changed_in_scan_range": False, "baseline_changed_in_scan_range": False},
         tools_considered=["bandit"],
-        tools_run=[],
+        tools_run=[
+            {
+                "tool_id": "bandit",
+                "dimension": "security",
+                "command": ["bandit"],
+                "version": None,
+                "status": "pass",
+                "required": False,
+                "exit_code": 0,
+                "duration_ms": 0,
+                "network_allowed": False,
+                "raw_log": None,
+            }
+        ],
         tools_skipped=[],
         required_missing=[],
         findings=[
@@ -388,6 +439,174 @@ def test_baseline_delta_classifies_all_states(tmp_path: Path) -> None:
     assert any(f["blocking"] for f in result.findings if f["rule_id"] == "B104")
 
 
+def test_untracked_baseline_is_self_waiver_evidence(tmp_path: Path) -> None:
+    _make_python_project(tmp_path)
+    bandit = _fake_tool(
+        tmp_path / "fake_bandit.py",
+        "import json, sys\n"
+        "print(json.dumps({'findings':[{'rule_id':'B999','severity':'high','path':'src/samplepkg/__init__.py','line':1,'message':'bad'}]}))\n"
+        "sys.exit(1)\n",
+    )
+    _manifest(tmp_path, {"tools": {"bandit": {"command": [sys.executable, str(bandit)]}}})
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "test@example.invalid")
+    _git(tmp_path, "config", "user.name", "Test")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-m", "base")
+
+    fp = assurance.finding_fingerprint("bandit", "B999", "src/samplepkg/__init__.py", "bad")
+    _baseline(
+        tmp_path,
+        {
+            "findings": [
+                {
+                    "fingerprint": fp,
+                    "severity": "high",
+                    "dimension": "security",
+                    "tool": "bandit",
+                    "rule_id": "B999",
+                    "path": "src/samplepkg/__init__.py",
+                }
+            ]
+        },
+    )
+
+    result = _run_scan(tmp_path)
+    assert result.provenance["baseline_changed_in_scan_range"] is True
+    assert ".agenttalk/assurance/baseline.json" in result.provenance["changed_files"]
+    assert result.artifact["verdict_summary"]["manifest_self_waiver_risk"] is True
+    assert any(f["rule_id"] == "baseline-changed-in-range" and f["blocking"] for f in result.findings)
+
+
+def test_baseline_finding_is_not_fixed_when_tool_did_not_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _make_python_project(tmp_path)
+    empty_path = tmp_path / "empty-path"
+    empty_path.mkdir()
+    monkeypatch.setenv("PATH", str(empty_path))
+    fp = assurance.finding_fingerprint("gitleaks", "generic-api-key", "secret.txt", "secret")
+    _manifest(tmp_path)
+    _baseline(
+        tmp_path,
+        {
+            "findings": [
+                {
+                    "fingerprint": fp,
+                    "severity": "high",
+                    "dimension": "secrets",
+                    "tool": "gitleaks",
+                    "rule_id": "generic-api-key",
+                    "path": "secret.txt",
+                }
+            ]
+        },
+    )
+
+    result = _run_scan(tmp_path)
+
+    baseline_item = [f for f in result.findings if f["fingerprint"] == fp][0]
+    assert baseline_item["status"] == "unchanged"
+    assert "not reassessed" in baseline_item["message"]
+    assert any(
+        risk.get("tool_id") == "gitleaks" and "not reassessed" in risk["reason"] for risk in result.residual_risk
+    )
+
+
+def test_git_status_changed_files_preserves_porcelain_paths(tmp_path: Path) -> None:
+    _manifest(tmp_path)
+    _baseline(tmp_path)
+    (tmp_path / "src" / "pkg").mkdir(parents=True)
+    (tmp_path / "top.txt").write_text("one\n", encoding="utf-8")
+    (tmp_path / "src" / "pkg" / "foo.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "test@example.invalid")
+    _git(tmp_path, "config", "user.name", "Test")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-m", "base")
+
+    (tmp_path / "top.txt").write_text("two\n", encoding="utf-8")
+    (tmp_path / "src" / "pkg" / "foo.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    changed = assurance.collect_provenance(
+        tmp_path,
+        assurance.load_manifest(tmp_path),
+        "change",
+        assurance.load_baseline(tmp_path),
+    )["changed_files"]
+    assert "top.txt" in changed
+    assert "src/pkg/foo.py" in changed
+    assert "op.txt" not in changed
+    assert "rc/pkg/foo.py" not in changed
+
+
+def test_accepted_scope_mismatch_does_not_suppress_finding(tmp_path: Path) -> None:
+    fp = assurance.finding_fingerprint("bandit", "B321", "src/app.py", "bad")
+    manifest = assurance._default_manifest()
+    manifest["accepted_findings"] = [
+        {
+            "fingerprint": fp,
+            "reason": "known",
+            "owner": "lead",
+            "scope": "other",
+            "dimension": "security",
+            "expires": "2999-01-01",
+        }
+    ]
+    result = assurance.ScanResult(
+        root=tmp_path,
+        profile="change",
+        manifest=manifest,
+        baseline=assurance._default_baseline(),
+        detection={"stacks": [], "monorepo_children": []},
+        provenance={"manifest_changed_in_scan_range": False, "baseline_changed_in_scan_range": False},
+        tools_considered=["bandit"],
+        tools_run=[],
+        tools_skipped=[],
+        required_missing=[],
+        findings=[
+            {
+                "fingerprint": fp,
+                "dimension": "security",
+                "severity": "high",
+                "tool_id": "bandit",
+                "rule_id": "B321",
+                "path": "src/app.py",
+                "line": 1,
+                "message": "bad",
+                "raw_ref": None,
+            }
+        ],
+        residual_risk=[],
+        runner_errors=[],
+        run_id="test-scope",
+    )
+
+    result = assurance.apply_baseline(result, assurance._default_baseline(), manifest, [])
+    status_by_rule = {finding["rule_id"]: finding["status"] for finding in result.findings}
+    assert status_by_rule["B321"] == "new"
+    assert status_by_rule["accepted-scope-mismatch"] == "new"
+    assert any(f["rule_id"] == "accepted-scope-mismatch" and f["blocking"] for f in result.findings)
+
+
+@pytest.mark.parametrize("scope", ["ALL", "Global/**/*", "./src/**"])
+def test_accepted_finding_rejects_casefolded_blanket_scopes(tmp_path: Path, scope: str) -> None:
+    _manifest(
+        tmp_path,
+        {
+            "accepted_findings": [
+                {
+                    "fingerprint": "abc",
+                    "reason": "known",
+                    "owner": "lead",
+                    "scope": scope,
+                    "expires": "2999-01-01",
+                }
+            ]
+        },
+    )
+    with pytest.raises(assurance.AssuranceUsageError):
+        assurance.load_manifest(tmp_path)
+
+
 def test_encoding_hygiene_catches_nul_and_git_diff_check(tmp_path: Path) -> None:
     (tmp_path / "bad.py").write_bytes(b"print('x')\x00\n")
     findings = assurance._encoding_findings(tmp_path, assurance.load_manifest(tmp_path))
@@ -404,14 +623,30 @@ def test_encoding_hygiene_catches_nul_and_git_diff_check(tmp_path: Path) -> None
     assert any(f["rule_id"] == "diff-check" for f in diff_findings)
 
 
-def test_generated_artifact_without_execution_blocks_release(tmp_path: Path) -> None:
+def test_encoding_hygiene_skips_binary_nuls_and_scans_nested_build_package(tmp_path: Path) -> None:
+    (tmp_path / "font.woff").write_bytes(b"\x00\x01font")
+    nested = tmp_path / "src" / "pkg" / "build"
+    nested.mkdir(parents=True)
+    (nested / "bad.py").write_bytes(b"print('x')\x00\n")
+
+    findings = assurance._encoding_findings(tmp_path, assurance.load_manifest(tmp_path))
+
+    assert not any(f["path"] == "font.woff" and f["rule_id"] == "nul-byte" for f in findings)
+    assert any(f["path"] == "src/pkg/build/bad.py" and f["rule_id"] == "nul-byte" for f in findings)
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    [
+        {"id": "helper", "path": "scripts/helper.ps1", "kind": "powershell", "executed_by_tests": []},
+        {"id": "helper", "path": "scripts/helper.ps1", "kind": "ps1", "executed_by_tests": []},
+        {"id": "helper", "path": "scripts/helper.ps1", "executed_by_tests": []},
+    ],
+)
+def test_generated_artifact_without_execution_blocks_release(tmp_path: Path, artifact: dict) -> None:
     _manifest(
         tmp_path,
-        {
-            "generated_artifacts": [
-                {"id": "helper", "path": "scripts/helper.ps1", "kind": "powershell", "executed_by_tests": []}
-            ]
-        },
+        {"generated_artifacts": [artifact]},
     )
     _baseline(tmp_path)
     (tmp_path / "scripts").mkdir()
@@ -422,13 +657,63 @@ def test_generated_artifact_without_execution_blocks_release(tmp_path: Path) -> 
     assert generated[0]["blocking"] is True
 
 
+def test_generated_artifact_unknown_kind_is_manifest_validation_error(tmp_path: Path) -> None:
+    _manifest(
+        tmp_path,
+        {
+            "generated_artifacts": [
+                {"id": "helper", "path": "scripts/helper.txt", "kind": "ps", "executed_by_tests": []}
+            ]
+        },
+    )
+    _baseline(tmp_path)
+    artifact = _artifact_from_cli(tmp_path, "release")
+    assert any(
+        f["tool_id"] == "manifest-validate"
+        and f["rule_id"] == "schema"
+        and "kind is unknown" in f["message"]
+        and f["blocking"]
+        for f in artifact["findings"]
+    )
+
+
 def test_secure_is_unknown_without_executed_security_scanner(tmp_path: Path) -> None:
     (tmp_path / "package.json").write_text("{}", encoding="utf-8")
     _manifest(tmp_path)
     _baseline(tmp_path)
     result = _run_scan(tmp_path)
     assert result.artifact["attestation"]["SECURE"] == "unknown"
-    assert any("no executed security" in reason for reason in result.artifact["attestation"]["reasons"])
+    assert any("missing executed" in reason for reason in result.artifact["attestation"]["reasons"])
+
+
+def test_secure_requires_security_deps_and_secrets_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _make_python_project(tmp_path)
+    empty_path = tmp_path / "empty-path"
+    empty_path.mkdir()
+    monkeypatch.setenv("PATH", str(empty_path))
+    bandit = _fake_tool(tmp_path / "fake_bandit.py", "import sys\nsys.exit(0)\n")
+    _manifest(tmp_path, {"tools": {"bandit": {"command": [sys.executable, str(bandit)]}}})
+    _baseline(tmp_path)
+
+    result = _run_scan(tmp_path)
+
+    assert result.artifact["attestation"]["SECURE"] == "unknown"
+    assert any(
+        "missing executed deps, secrets evidence" in reason for reason in result.artifact["attestation"]["reasons"]
+    )
+
+
+def test_robust_is_not_good_from_vacuous_generated_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _make_python_project(tmp_path)
+    empty_path = tmp_path / "empty-path"
+    empty_path.mkdir()
+    monkeypatch.setenv("PATH", str(empty_path))
+    _manifest(tmp_path)
+    _baseline(tmp_path)
+
+    result = _run_scan(tmp_path)
+
+    assert result.artifact["attestation"]["ROBUST"] == "not_assessed"
 
 
 def test_optional_network_disabled_scanners_are_not_required_skips(
@@ -444,10 +729,66 @@ def test_optional_network_disabled_scanners_are_not_required_skips(
     result = _run_scan(tmp_path)
 
     summary = result.artifact["verdict_summary"]
-    assert summary["skipped_required_count"] == 0
+    required_tools = {item["tool_id"] for item in result.required_missing}
+    assert "osv-scanner" not in required_tools
+    assert "pip-audit" not in required_tools
     assert summary["skipped_optional_count"] >= 1
     assert result.artifact["attestation"]["SECURE"] == "unknown"
-    assert not any("required scan skipped" in reason for reason in result.artifact["attestation"]["reasons"])
+    assert not any(
+        reason.startswith("SECURE: required scan skipped") for reason in result.artifact["attestation"]["reasons"]
+    )
+
+
+def test_git_diff_check_without_git_checkout_is_not_a_required_pass(tmp_path: Path) -> None:
+    _make_python_project(tmp_path)
+    _manifest(tmp_path)
+    _baseline(tmp_path)
+
+    result = _run_scan(tmp_path)
+
+    git_diff = [run for run in result.tools_run if run["tool_id"] == "git-diff-check"][0]
+    assert git_diff["status"] == "skipped-not-applicable"
+    assert any(item["tool_id"] == "git-diff-check" for item in result.required_missing)
+    assert result.artifact["attestation"]["GOOD"] == "unknown"
+
+
+def test_semgrep_remote_config_is_network_required(tmp_path: Path) -> None:
+    _make_python_project(tmp_path)
+    _manifest(tmp_path, {"tools": {"semgrep": {"config": "p/ci"}}})
+    _baseline(tmp_path)
+
+    result = _run_scan(tmp_path)
+
+    semgrep = [item for item in result.tools_skipped if item["tool_id"] == "semgrep"][0]
+    assert semgrep["status"] == "skipped-network-disabled"
+
+
+def test_osv_severity_list_uses_max_cvss_score() -> None:
+    findings = assurance._osv_findings(
+        {
+            "results": [
+                {
+                    "packages": [
+                        {
+                            "package": {"name": "demo", "ecosystem": "PyPI"},
+                            "version": "1",
+                            "vulnerabilities": [
+                                {
+                                    "id": "OSV-1",
+                                    "summary": "vuln",
+                                    "severity": [
+                                        {"type": "CVSS_V3", "score": "9.8"},
+                                        {"type": "CVSS_V3", "score": "7.1"},
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ]
+        }
+    )
+    assert findings[0]["severity"] == "critical"
 
 
 def test_fake_tools_map_findings_raw_logs_and_errors(tmp_path: Path) -> None:
