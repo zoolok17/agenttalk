@@ -772,7 +772,7 @@ def test_supervisor_cli_json_redacts_embedded_report_config_blocked(
         tmp_path: Path, capsys) -> None:
     s = _team(tmp_path)
     (s.dir / "supervisor.json").write_text(json.dumps(_HOOK_CONFIG), encoding="utf-8")
-    secret = "child failed: /secret/path token=sk-ABC123SECRET"
+    secret = "child failed: /secret/path token=sk-FAKE-AGENTTALK-ABC123SECRET"
     s.write_config_blocked_hold("worker", summary=secret)
 
     rc = _run(["supervisor", "--json", "--now", str(NOW)], tmp_path)
@@ -780,7 +780,7 @@ def test_supervisor_cli_json_redacts_embedded_report_config_blocked(
 
     assert rc == 0
     assert "/secret/path" not in out
-    assert "sk-ABC123SECRET" not in out
+    assert "sk-FAKE-AGENTTALK-ABC123SECRET" not in out
     payload = json.loads(out)
     worker = next(a for a in payload["agents"] if a["name"] == "worker")
     assert worker["config_blocked_hold"] == {
@@ -803,7 +803,7 @@ def test_supervisor_event_ring_bounded_redacted_and_transition_only(tmp_path: Pa
                     "worker": {
                         "action": sup.NONE,
                         "state": f"STATE{i}",
-                        "reason": r"failed C:\Users\Milos\secret token=sk-test",
+                        "reason": r"failed C:\Users\Milos\secret token=sk-FAKE-AGENTTALK-TEST",
                         "notify": bool(i % 2),
                     }
                 }
@@ -818,7 +818,7 @@ def test_supervisor_event_ring_bounded_redacted_and_transition_only(tmp_path: Pa
     assert warnings == []
     assert len(events) == 5
     assert "STATE7" in raw
-    assert "sk-test" not in raw
+    assert "sk-FAKE-AGENTTALK-TEST" not in raw
     assert r"C:\Users\Milos" not in raw
     assert "failed" not in raw
 
@@ -841,7 +841,7 @@ def test_supervisor_event_ring_bounded_redacted_and_transition_only(tmp_path: Pa
 
 def test_supervisor_event_ring_redacts_config_blocked_summary(tmp_path: Path) -> None:
     s = _team(tmp_path)
-    secret = r"Command=C:\Users\Milos\secret-tool.exe error token=sk-config"
+    secret = r"Command=C:\Users\Milos\secret-tool.exe error token=sk-FAKE-AGENTTALK-CONFIG"
     sup.record_supervisor_plan_events(
         s,
         {"agents": {"worker": {"action": sup.NONE, "state": "CONFIG_BLOCKED", "reason": secret}}},
@@ -850,7 +850,7 @@ def test_supervisor_event_ring_redacts_config_blocked_summary(tmp_path: Path) ->
 
     raw = sup.supervisor_events_path(s).read_text(encoding="utf-8")
     assert "CONFIG_BLOCKED" in raw
-    assert "sk-config" not in raw
+    assert "sk-FAKE-AGENTTALK-CONFIG" not in raw
     assert r"C:\Users\Milos" not in raw
     assert "secret-tool" not in raw
 
@@ -859,7 +859,7 @@ def test_supervisor_event_ring_reader_sanitizes_polluted_rows(tmp_path: Path) ->
     s = _team(tmp_path)
     path = sup.supervisor_events_path(s)
     path.parent.mkdir(parents=True, exist_ok=True)
-    secret = r"C:\Users\Milos\secret-token-sk-live-path"
+    secret = r"C:\Users\Milos\secret-token-sk-FAKE-AGENTTALK-LIVE-PATH"
     polluted = {
         "schema_version": 1,
         "kind": "agent_decision",
@@ -881,7 +881,7 @@ def test_supervisor_event_ring_reader_sanitizes_polluted_rows(tmp_path: Path) ->
     rendered = json.dumps(events)
 
     assert warnings == ["supervisor_events_sanitized:1"]
-    assert "secret-token-sk-live-path" not in rendered
+    assert "sk-FAKE-AGENTTALK-LIVE-PATH" not in rendered
     assert "reason" not in events[0]
     assert "extra" not in events[0]
     assert events[0]["reason_code"] == "unknown"
@@ -896,7 +896,7 @@ def test_supervisor_event_ring_reader_sanitizes_polluted_rows(tmp_path: Path) ->
         snapshot=[],
         event_limit=10,
     )
-    assert "secret-token-sk-live-path" not in json.dumps(observation["event_ring"])
+    assert "sk-FAKE-AGENTTALK-LIVE-PATH" not in json.dumps(observation["event_ring"])
 
     sup.record_supervisor_plan_events(
         s,
@@ -909,7 +909,7 @@ def test_supervisor_event_ring_reader_sanitizes_polluted_rows(tmp_path: Path) ->
     after, _warnings = sup.read_supervisor_events(s)
     decisions = [e for e in after if e["kind"] == "agent_decision"]
     assert len(decisions) == 2
-    assert "secret-token-sk-live-path" not in rewritten
+    assert "sk-FAKE-AGENTTALK-LIVE-PATH" not in rewritten
 
 
 def test_supervisor_event_ring_reader_drops_non_finite_epoch(

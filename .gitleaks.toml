@@ -1,0 +1,10 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allow only the reserved fake-secret marker used by redaction tests."
+# Redaction/security tests must use this reserved marker for synthetic secrets.
+# Do not use this prefix for real credentials; real sk-<random> keys still trip.
+regexes = [
+  '''sk-FAKE-AGENTTALK-[A-Za-z0-9._:-]+''',
+]
