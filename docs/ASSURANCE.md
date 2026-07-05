@@ -91,6 +91,31 @@ gitleaks false-positive (a redaction-test's synthetic secret, not a real leak or
 corrected in v0.64.1. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.68.1 — lead-chat usable with an interactive lead (hotfix) (2026-07-06)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `aad1105` · tag `v0.68.1`
+- **Review:** v0.68.0 passed authority review + adversarial but shipped **unusable end-to-end** for
+  the common unwrapped/interactive single-operator lead (wrapped-only liveness gate + no
+  `operator_identity` on pre-0.68.0 stores). The lesson is now encoded as a **universal
+  end-to-end-user-path check** in the `qa-strategy` + `tester-qa` devkit skills (for an
+  operator/end-user-facing feature, run the real user journey against a realistic setup — unit /
+  contract / security coverage does not substitute). The fix was reviewed by reviewer-1 (executed
+  repros) + a **3-agent adversarial pass** (queue-into-void / spoofable-backfill /
+  regressions+universality, all **reproduced_any = false**); reviewer-1 caught + reproduced one P2
+  (the first backfill covered only the operator-facing shape, not the supported sole-lead shape) →
+  folded (mirror `lead_chat_lead` inline, no `load_config` recursion) → **reviewer-1 APPROVE on the
+  final SHA**.
+- **Gate:** ruff/bandit/**gitleaks** (git-mode + range)/node --check/diff/compileall clean; pytest
+  **1991 passed / 3 skipped on 3.10 AND 3.14** (clean venvs).
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green.
+- **Robust/Secure:** the liveness loosening reports available **only** for the resolved
+  operator-facing/sole lead with a *fresh* heartbeat (missing/stale → unavailable), and messages
+  queue durably — no queue-into-the-void. The `operator_identity` load-time inference resolves only
+  to the reserved `operator` principal, only when a lead resolves and `operator` is not a roster
+  agent, never overwrites an explicit value, and is in-memory only — the authenticated send path +
+  the zero-fallback resolver are unchanged. **Banked** (pre-existing to the heartbeat model,
+  unreachable from the real send path): future-dated heartbeat clamps to fresh; caller-overridable
+  `heartbeat_stale_after`.
+
 ### v0.68.0 — lead-chat (dashboard operator↔lead direct chat) (2026-07-06)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `95875cb` (rebased zero-delta → `c34019a`) · tag `v0.68.0`
 - **Review:** design-gated (PASS_WITH_CONDITIONS; 6 P1 identity conditions) → build → **three

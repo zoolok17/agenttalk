@@ -5,6 +5,30 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.68.1] - 2026-07-06
+
+### Fixed
+
+- **Lead-chat is now usable with a normal interactive lead.** As shipped in 0.68.0 the dashboard
+  chat treated a live-but-unwrapped operator-facing/sole lead as unavailable and could not resolve
+  the operator identity on stores created before 0.68.0 — so the feature was unusable for the common
+  single-operator setup. Now: an unwrapped operator-facing/sole lead with a **fresh heartbeat**
+  reports available (`unwrapped_live`), while a stale or missing heartbeat still correctly reports
+  *away*/*unavailable* (an interactive lead must be actively listening — which keeps its heartbeat
+  fresh — to be reachable); and `operator_identity` is inferred as the reserved `operator` principal
+  on load for upgraded single-operator stores (operator-facing **or** sole-lead shape), so no manual
+  `config.json` edit is needed. The lead-chat transcript no longer rebuilds on every 2s poll (a
+  payload fingerprint guards the rebuild and ignores volatile age fields), removing the perceived
+  "page keeps refreshing" flicker. The console banner now reports its real version.
+
+### Security
+
+- The `operator_identity` load-time inference does **not** weaken send authority: it resolves only
+  to the reserved `operator` principal, only when a lead-chat lead resolves and `operator` is not a
+  roster agent, never overwrites an explicit value, and is in-memory only. The authenticated
+  `/api/lead-chat` send path and the zero-fallback resolver are unchanged, the liveness change never
+  reports available for a lead with a missing/stale heartbeat, and messages queue durably.
+
 ## [0.68.0] - 2026-07-06
 
 ### Added
