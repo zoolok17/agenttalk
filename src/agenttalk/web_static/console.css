@@ -564,6 +564,32 @@ body {
   width: 10px;
   height: 10px;
 }
+.tc-avatar-shaped {
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.tc-avatar-shaped img {
+  border-radius: 0;
+  object-fit: contain;
+}
+.tc-avatar-shaped .tc-avatar-badge {
+  right: 0;
+  bottom: 0;
+}
+.tc-agent-avatar.tc-avatar-shaped {
+  width: 24px;
+  height: 32px;
+}
+.tc-node-avatar.tc-avatar-shaped {
+  width: 30px;
+  height: 40px;
+}
+.tc-detail-avatar.tc-avatar-shaped {
+  width: 52px;
+  height: 68px;
+  box-shadow: none;
+}
 
 /* --- Status color map (health states) --- */
 .status-working_turn.tc-chip,

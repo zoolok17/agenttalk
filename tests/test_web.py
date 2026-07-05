@@ -1163,6 +1163,33 @@ def test_static_unknown_name_404_and_no_traversal(tmp_path: Path) -> None:
         srv.server_close()
 
 
+def test_shaped_avatar_assets_are_flat_allowlisted_and_served(tmp_path: Path) -> None:
+    paths = avatars.avatar_static_paths()
+    assert len(paths) == 71
+    assert "avatars/hexagon-architect.png" in paths
+    assert "avatars/triangle-security.png" in paths
+    assert all(path.startswith("avatars/") for path in paths)
+    assert all("/" not in path.removeprefix("avatars/") for path in paths)
+
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/static/avatars/hexagon-architect.png") as resp:
+            assert resp.headers["Content-Type"].startswith("image/png")
+            assert resp.read(8) == b"\x89PNG\r\n\x1a\n"
+        for bad in (
+            "avatars/hexagon/architect.png",
+            "avatars/..%2Fhexagon-architect.png",
+            "avatars/hexagon-architect.png%2F..%2Fconsole.js",
+        ):
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                _urlopen(f"{base}/static/{bad}", timeout=5)
+            assert exc.value.code == 404, bad
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_state_avatar_records_and_operator_descriptor(tmp_path: Path) -> None:
     s = Store(tmp_path)
     s.init(["claude-dev", "codex-dev", "plain"])
@@ -1182,30 +1209,96 @@ def test_api_state_avatar_records_and_operator_descriptor(tmp_path: Path) -> Non
         "id": "claude-dev",
         "file": "claude-dev.png",
         "source": "role_default",
+        "shape": "",
     }
     assert by_name["plain"]["avatar"] == {
         "id": "codex-rev",
         "file": "codex-rev.png",
         "source": "chosen",
+        "shape": "",
     }
     assert by_name["codex-dev"]["avatar"] == {
         "id": "claude-rev",
         "file": "claude-rev.png",
         "source": "chosen",
+        "shape": "",
     }
     assert root["operator"] == {
         "principal": avatars.OPERATOR_PRINCIPAL,
         "label": "you",
         "role_label": "operator",
-        "avatar": {"id": "operator", "file": "operator.png", "source": "operator_default"},
+        "avatar": {
+            "id": "operator",
+            "file": "operator.png",
+            "source": "operator_default",
+            "shape": "",
+        },
     }
     for agent in root["agents"]:
         assert "name" in agent and "health" in agent and "unread" in agent
 
 
+def test_shaped_avatar_choice_flows_shape_and_originals_stay_circular(
+    tmp_path: Path,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "claude-dev"])
+    s.set_role("claude-dev", "developer")
+    s.set_avatar("alpha", "hexagon-architect")
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    by_name = {a["name"]: a for a in root["agents"]}
+    assert by_name["alpha"]["avatar"] == {
+        "id": "hexagon-architect",
+        "file": "hexagon-architect.png",
+        "source": "chosen",
+        "shape": "hexagon",
+    }
+    assert by_name["claude-dev"]["avatar"] == {
+        "id": "claude-dev",
+        "file": "claude-dev.png",
+        "source": "role_default",
+        "shape": "",
+    }
+    assert root["operator"]["avatar"]["id"] == "operator"
+    assert root["operator"]["avatar"]["shape"] == ""
+
+    original_ids = set(avatars.AVATAR_ASSETS) - set(avatars.AVATAR_SHAPES)
+    assert {
+        "claude-arch", "claude-dev", "claude-docs", "claude-lead",
+        "claude-rev", "codex-dev", "codex-infra", "codex-rev",
+        "codex-scout", "codex-test", "operator",
+    } <= original_ids
+    assert "operator" not in avatars.AVATAR_SHAPES
+    assert "claude-dev" not in avatars.AVATAR_SHAPES
+
+
+def test_shaped_avatar_cross_family_ids_are_distinct() -> None:
+    ids = {
+        "hexagon-architect",
+        "oval-muted-architect",
+        "rounded-square-architect",
+        "oval-muted-security",
+        "oval-vivid-security",
+        "triangle-security",
+    }
+    assert ids <= set(avatars.AVATAR_ASSETS)
+    files = {avatars.AVATAR_ASSETS[avatar_id] for avatar_id in ids}
+    assert len(files) == len(ids)
+    assert {avatars.AVATAR_SHAPES[avatar_id] for avatar_id in ids} == {
+        "hexagon", "oval-muted", "rounded-square", "oval-vivid", "triangle",
+    }
+
+
 @pytest.mark.parametrize("bad_value", [
     "../console.js",
     "avatars/claude-dev.png",
+    "hexagon/architect.png",
     "claude-dev.png",
     "http://example.invalid/avatar.png",
     "unknown",
@@ -1238,12 +1331,14 @@ def test_api_state_bad_stored_avatar_choice_degrades_without_broken_path(
         "id": "claude-dev",
         "file": "claude-dev.png",
         "source": "role_default",
+        "shape": "",
     }
     assert "avatar" not in by_name["plain"]
     assert root["operator"]["avatar"] == {
         "id": "operator",
         "file": "operator.png",
         "source": "operator_default",
+        "shape": "",
     }
 
 
@@ -2026,6 +2121,10 @@ def test_console_renderer_safety(tmp_path: Path) -> None:
     assert "/api/session" in js
     assert "/api/intent" in js
     assert "X-CSRF-Token" in js
+    assert "tc-avatar-shaped" in js
+    assert "avatarShape(agent)" in js
+    assert "file.indexOf('/') !== -1" in js
+    assert "file.indexOf('\\\\') !== -1" in js
     assert "innerHTML" not in js
     assert "location.reload" not in js
     assert "eval(" not in js
@@ -2077,6 +2176,31 @@ def test_console_compact_density_has_material_size_delta_and_mobile_guards(tmp_p
     assert _px(compact["--agent-card-min"]) < _px(comfortable["--agent-card-min"])
     assert "grid-template-columns: minmax(0, 1fr);" in css
     assert "overflow-wrap: anywhere;" in css
+
+
+def test_shaped_avatar_css_is_scoped_and_preserves_originals(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/static/console.css") as resp:
+            css = resp.read().decode("utf-8")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert ".tc-avatar img" in css
+    assert "object-fit: cover;" in css
+    assert ".tc-avatar-shaped" in css
+    assert ".tc-avatar-shaped img" in css
+    assert "object-fit: contain;" in css
+    assert ".tc-agent-avatar.tc-avatar-shaped" in css
+    assert "width: 24px;" in css and "height: 32px;" in css
+    assert ".tc-node-avatar.tc-avatar-shaped" in css
+    assert "width: 30px;" in css and "height: 40px;" in css
+    assert ".tc-detail-avatar.tc-avatar-shaped" in css
+    assert "width: 52px;" in css and "height: 68px;" in css
+    assert ".tc-operator-avatar" in css
+    assert "border-radius: 7px;" in css
 
 
 def test_console_capacity_detail_renders_rich_provider_rows(tmp_path: Path) -> None:

@@ -74,6 +74,14 @@
     'codex:scout': 'codex-scout.png',
     'codex:test': 'codex-test.png',
   });
+  var SHAPED_AVATAR_FAMILY = nullMap({
+    'hexagon': true,
+    'oval-muted': true,
+    'oval-vivid': true,
+    'rounded-square': true,
+    'star': true,
+    'triangle': true,
+  });
 
   // ------------------------------------------------------------ client state
   var state = {
@@ -543,6 +551,11 @@
     if (file.indexOf('..') !== -1 || file.indexOf(':') !== -1) return '';
     return file;
   }
+  function avatarShape(agent) {
+    var shape = agent && agent.avatar && agent.avatar.shape;
+    if (typeof shape !== 'string' || !shape) return '';
+    return SHAPED_AVATAR_FAMILY[shape] ? shape : '';
+  }
   function operatorFallbackAvatar(avatarCls) {
     var cls = avatarCls || 'tc-operator-avatar';
     if (cls.indexOf('tc-operator-avatar') === -1) cls = 'tc-operator-avatar ' + cls;
@@ -553,7 +566,9 @@
     var file = avatarFile(agent);
     if (!file) return null;
     var st = ((agent && agent.health) || {}).state;
-    var wrap = el('span', 'tc-avatar ' + (avatarCls || ''));
+    var cls = 'tc-avatar ' + (avatarCls || '');
+    if (avatarShape(agent)) cls += ' tc-avatar-shaped';
+    var wrap = el('span', cls);
     var img = document.createElement('img');
     img.src = '/static/avatars/' + file;
     img.alt = '';

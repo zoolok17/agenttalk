@@ -4112,8 +4112,23 @@ def cmd_avatar(args: argparse.Namespace) -> int:
             print(json.dumps({"avatars": items}, indent=2))
             return 0
         print(f"avatars ({len(items)}):")
-        for item in items:
-            print(f"  {item['id']:<14} {item['file']}")
+        width = max((len(item["id"]) for item in items), default=14)
+        groups = [
+            ("", "Originals"),
+            ("hexagon", "hexagon"),
+            ("oval-muted", "oval-muted"),
+            ("oval-vivid", "oval-vivid"),
+            ("rounded-square", "rounded-square"),
+            ("star", "star"),
+            ("triangle", "triangle"),
+        ]
+        for shape, label in groups:
+            grouped = [item for item in items if item.get("shape", "") == shape]
+            if not grouped:
+                continue
+            print(f"  {label}:")
+            for item in grouped:
+                print(f"    {item['id']:<{width}} {item['file']}")
         return 0
     if action == "set":
         cfg = store.load_config()

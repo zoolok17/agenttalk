@@ -197,12 +197,26 @@ def test_avatar_cli_list_and_self_set_clear(tmp_path: Path, capsys: pytest.Captu
 
     assert _run(["avatar", "list", "--json"], root) == 0
     payload = json.loads(capsys.readouterr().out)
-    ids = {item["id"] for item in payload["avatars"]}
-    assert {"codex-dev", avatars.OPERATOR_DEFAULT_ID} <= ids
+    by_id = {item["id"]: item for item in payload["avatars"]}
+    assert {"codex-dev", avatars.OPERATOR_DEFAULT_ID, "hexagon-architect"} <= set(by_id)
+    assert by_id["operator"]["shape"] == ""
+    assert by_id["codex-dev"]["shape"] == ""
+    assert by_id["hexagon-architect"]["shape"] == "hexagon"
+
+    assert _run(["avatar", "list"], root) == 0
+    human = capsys.readouterr().out
+    assert "Originals:" in human
+    assert "hexagon:" in human
+    assert "rounded-square:" in human
+    assert "rounded-square-accessibility" in human
 
     assert _run(["avatar", "set", "codex-dev", "--from", "beta"], root) == 0
     cfg = Store(root).load_config()
     assert cfg["avatars"] == {"beta": "codex-dev"}
+
+    assert _run(["avatar", "set", "hexagon-architect", "--from", "beta"], root) == 0
+    cfg = Store(root).load_config()
+    assert cfg["avatars"] == {"beta": "hexagon-architect"}
 
     assert _run(["avatar", "clear", "--from", "beta"], root) == 0
     assert "avatars" not in Store(root).load_config()
