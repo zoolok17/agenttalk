@@ -310,10 +310,16 @@ def _lead_chat_unavailable(liveness: dict) -> IntentDenied:
     return IntentDenied("lead_unavailable", str(detail))
 
 
+def lead_chat_stable_meta(store: Store, *, operator: str, lead: str) -> dict:
+    return {
+        "request_id": store.lead_chat_request_id(operator=operator, lead=lead),
+        "lead_chat": "true",
+        "operator_identity": operator,
+        "operator_facing_lead": lead,
+    }
+
+
 def _resolve_actor_for_record(store: Store, record: dict) -> str | None:
-    if record.get("kind") == "lead_chat_send":
-        operator, _lead = _resolve_lead_chat_identities(store)
-        return operator
     return resolve_web_actor(store)
 
 
@@ -450,12 +456,7 @@ def _mint_stable_meta(store: Store, semantic: dict) -> dict:
     if shape == "lead_chat":
         operator = semantic.get("operator_identity") or ""
         lead = semantic.get("operator_facing_lead") or ""
-        return {
-            "request_id": store.lead_chat_request_id(operator=operator, lead=lead),
-            "lead_chat": "true",
-            "operator_identity": operator,
-            "operator_facing_lead": lead,
-        }
+        return lead_chat_stable_meta(store, operator=operator, lead=lead)
     if shape in {"broadcast", "broadcast_question"}:
         bid = "b-" + secrets.token_hex(6)
         shared = {
@@ -935,10 +936,15 @@ def _drain_answer_escalation(store: Store, rec: dict) -> str:
             store, iid, "plan_revalidation_failed",
             "recipient_drift: live recipient does not match frozen plan")
     if _actor_is_operator(store, actor):
-        liveness = store.lead_chat_liveness(lead=delivery["recipient"])
-        if not liveness.get("available"):
-            denied = _lead_chat_unavailable(liveness)
-            return _deny_intent(store, iid, denied.code, denied.detail)
+        try:
+            _operator, resolved_lead = store.lead_chat_identities()
+        except ValueError:
+            resolved_lead = None
+        if resolved_lead and delivery["recipient"] == resolved_lead:
+            liveness = store.lead_chat_liveness(lead=resolved_lead)
+            if not liveness.get("available"):
+                denied = _lead_chat_unavailable(liveness)
+                return _deny_intent(store, iid, denied.code, denied.detail)
 
     floor = _new_id()
     _record_delivery(store, iid, 0, state="attempting", fingerprint=fp,
@@ -994,6 +1000,14 @@ def _drain_one(store: Store, rec: dict) -> str:
         store.mark_intent_terminal(iid, state=Store.INTENT_DENIED,
                                    code="invalid_payload",
                                    error="; ".join(errors)[:500])
+        return Store.INTENT_DENIED
+    if rec.get("kind") == "lead_chat_send":
+        store.mark_intent_terminal(
+            iid, state=Store.INTENT_DENIED,
+            code="lead_chat_send_not_queue_authorized",
+            error="lead_chat_send is authorized only inside an authenticated "
+                  "/api/lead-chat request",
+        )
         return Store.INTENT_DENIED
     try:
         actor = _resolve_actor_for_record(store, rec)
@@ -1074,8 +1088,7 @@ def _drain_one(store: Store, rec: dict) -> str:
         try:
             msg = store.send(sender=actor, recipient=d["recipient"],
                              body=d.get("body") or "", kind=d["bus_kind"],
-                             subject=d.get("subject") or "", meta=meta,
-                             _allow_reserved_sender=rec.get("kind") == "lead_chat_send")
+                             subject=d.get("subject") or "", meta=meta)
         except ValueError as e:
             store.mark_intent_terminal(iid, state=Store.INTENT_FAILED,
                                        code="send_rejected", error=str(e)[:500])

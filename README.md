@@ -1598,6 +1598,14 @@ The loopback story is unchanged and non-negotiable: no auth, no
 remote-bind flag on any spelling — SSH-tunnel the port if you need it
 from another machine.
 
+The Team Console lead-chat panel lets the local operator send a direct
+message to the configured lead from the authenticated dashboard request
+only. That path is gated by loopback, the dashboard session, and CSRF,
+then records the operator identity as an auditable bus assertion. It is
+not a cryptographic boundary against a fully privileged local process
+that can write raw message files or inspect process memory; the generic
+intent queue cannot authorize an operator-sender message.
+
 **0.19.0 polish.** The `/dashboard` view now renders a **hierarchical
 team layout** — the operator-facing liaison (or a lead-ish role) on top,
 developer-ish roles grouped left, reviewer-ish right (classified from the

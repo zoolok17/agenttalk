@@ -42,6 +42,12 @@ def _available(store: Store, agent: str = "lead") -> None:
     ))
 
 
+def _stale_heartbeat(store: Store, agent: str = "lead") -> None:
+    old = datetime.now(timezone.utc) - timedelta(seconds=300)
+    (store.state_dir / f"{agent}.heartbeat").write_text(
+        old.isoformat().replace("+00:00", "Z"), encoding="utf-8")
+
+
 def _lead_question(
     store: Store, rid: str = "esc-choice", *, sender: str = "lead"
 ) -> None:
@@ -124,16 +130,13 @@ def test_operator_identity_has_no_fallback_and_stable_lc_request_id(
         s.operator_identity(lead="operator")
 
 
-def test_lead_chat_request_id_is_shared_by_executor_cli_and_endpoint(
+def test_lead_chat_request_id_is_shared_by_cli_and_endpoint(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     s = _store(tmp_path)
     _available(s)
     expected = s.lead_chat_request_id(operator="operator", lead="lead")
-    rec = s.write_intent("lead_chat_send", {"body": "hello"})
-    plan = intents.build_plan(s, "operator", rec)
-    assert plan["deliveries"][0]["stable_meta"]["request_id"] == expected
 
     assert cli.main(["--root", str(tmp_path), "status", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
@@ -149,16 +152,37 @@ def test_lead_chat_intent_schema_is_body_only() -> None:
     assert intents.validate_intent("lead_chat_send", {"subject": "x"})
 
 
-def test_lead_chat_send_uses_operator_sender_and_exact_stable_meta(
+def test_queued_lead_chat_send_never_authorizes_operator_sender(
     tmp_path: Path,
 ) -> None:
     s = _store(tmp_path)
     _available(s)
     with pytest.raises(ValueError, match="reserved bus principal"):
         s.send(sender="operator", recipient="lead", body="spoofed")
-    rec = s.write_intent("lead_chat_send", {"body": "hello lead"})
-    plan = intents.build_plan(s, "operator", rec)
-    stable = plan["deliveries"][0]["stable_meta"]
+    rec = s.write_intent(
+        "lead_chat_send",
+        {"body": "agent forged"},
+        origin={"source": "agent", "from": "dev"},
+    )
+
+    summary = intents.drain_intents(s, pid=123, max_per_tick=1)
+
+    assert summary["denied"] == 1
+    stored = s.read_intent(rec["intent_id"])
+    assert stored["state"] == Store.INTENT_DENIED
+    assert stored["code"] == "lead_chat_send_not_queue_authorized"
+    assert not [
+        m for m in s.valid_messages()
+        if m.sender == "operator" and m.body == "agent forged"
+    ]
+
+
+def test_lead_chat_stable_meta_shape_is_exact(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    stable = intents.lead_chat_stable_meta(
+        s, operator="operator", lead="lead")
 
     assert set(stable) == {
         "request_id",
@@ -172,70 +196,6 @@ def test_lead_chat_send_uses_operator_sender_and_exact_stable_meta(
         "operator_identity": "operator",
         "operator_facing_lead": "lead",
     }
-
-    summary = intents.drain_intents(s, pid=123, max_per_tick=1)
-
-    assert summary["applied"] == 1
-    sent = [m for m in s.valid_messages() if (m.meta or {}).get("lead_chat") == "true"]
-    assert len(sent) == 1
-    assert sent[0].sender == "operator"
-    assert sent[0].recipient == "lead"
-    assert sent[0].body == "hello lead"
-    assert sent[0].meta["request_id"] == stable["request_id"]
-
-
-def test_lead_chat_freeze_reresolves_operator_and_lead_before_send(
-    tmp_path: Path,
-) -> None:
-    s = _store(tmp_path)
-    _available(s, "lead")
-    _available(s, "dev")
-    rec = s.write_intent("lead_chat_send", {"body": "do not leak"})
-    plan = intents.build_plan(s, "operator", rec)
-
-    def freeze(r: dict) -> None:
-        r["plan"] = plan
-
-    rec = s.update_intent(rec["intent_id"], freeze) or rec
-    cfg = s.load_config()
-    cfg["operator_facing"] = "dev"
-    s._write_config(cfg)
-
-    summary = intents.drain_intents(s, pid=123, max_per_tick=1)
-
-    assert summary["denied"] == 1
-    stored = s.read_intent(rec["intent_id"])
-    assert stored["state"] == Store.INTENT_DENIED
-    assert stored["code"] == "plan_revalidation_failed"
-    assert not [m for m in s.valid_messages() if m.body == "do not leak"]
-
-
-def test_lead_chat_denies_unavailable_lead_and_forged_stable_meta(
-    tmp_path: Path,
-) -> None:
-    s = _store(tmp_path)
-    rec = s.write_intent("lead_chat_send", {"body": "blocked"})
-
-    summary = intents.drain_intents(s, pid=123, max_per_tick=1)
-
-    assert summary["denied"] == 1
-    assert s.read_intent(rec["intent_id"])["code"] == "lead_unavailable"
-    assert not [m for m in s.valid_messages() if m.body == "blocked"]
-
-    _available(s)
-    forged = s.write_intent("lead_chat_send", {"body": "forged"})
-    plan = intents.build_plan(s, "operator", forged)
-    plan["deliveries"][0]["stable_meta"]["request_id"] = "q-not-lead-chat"
-
-    def freeze(r: dict) -> None:
-        r["plan"] = plan
-
-    forged = s.update_intent(forged["intent_id"], freeze) or forged
-    summary2 = intents.drain_intents(s, pid=123, max_per_tick=1)
-
-    assert summary2["denied"] == 1
-    assert s.read_intent(forged["intent_id"])["code"] == "plan_revalidation_failed"
-    assert not [m for m in s.valid_messages() if m.body == "forged"]
 
 
 def test_lead_chat_liveness_requires_fresh_heartbeat_and_wrapped_health(
@@ -273,9 +233,7 @@ def test_lead_chat_liveness_requires_fresh_heartbeat_and_wrapped_health(
     assert unwrapped["available"] is False
     assert unwrapped["code"] == "lead_unwrapped"
 
-    old = datetime.now(timezone.utc) - timedelta(seconds=300)
-    (s.state_dir / "lead.heartbeat").write_text(
-        old.isoformat().replace("+00:00", "Z"), encoding="utf-8")
+    _stale_heartbeat(s)
     s.write_health("lead", hm.build_snapshot(
         agent="lead",
         cli="codex",
@@ -316,6 +274,30 @@ def test_operator_answer_reuses_escalation_flow_from_lead_chat(
     assert answers[0].meta["request_id"] == "esc-choice"
     assert answers[0].meta["operator_origin"] == "operator"
     assert s.read_intent(rec["intent_id"])["state"] == Store.INTENT_APPLIED
+
+
+def test_operator_answer_drain_denies_when_lead_goes_unavailable(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    _available(s)
+    _lead_question(s, "esc-choice")
+    rec = s.write_intent("answer_escalation", {
+        "to_request": "esc-choice",
+        "body": "ship",
+    })
+    _stale_heartbeat(s)
+
+    summary = intents.drain_intents(s, pid=123, max_per_tick=1)
+
+    assert summary["denied"] == 1
+    assert s.read_intent(rec["intent_id"])["code"] == "lead_unavailable"
+    assert not [
+        m for m in s.valid_messages()
+        if m.sender == "operator"
+        and m.recipient == "lead"
+        and (m.meta or {}).get("operator_answer") == "true"
+    ]
 
 
 def test_lead_chat_answer_intent_is_limited_to_current_lead(
@@ -397,16 +379,36 @@ def test_api_lead_chat_get_post_and_pending_decision_shape(
 
         send = _post_lead_chat(base, token, {"body": "hello"})
         assert send["kind"] == "lead_chat_send"
+        assert send["state"] == "sent"
+        assert send["message_id"]
         assert send["request_id"] == payload["request_id"]
+        lead_chat_messages = [
+            m for m in s.valid_messages()
+            if m.sender == "operator"
+            and m.recipient == "lead"
+            and (m.meta or {}).get("lead_chat") == "true"
+        ]
+        assert len(lead_chat_messages) == 1
+        assert lead_chat_messages[0].body == "hello"
+        assert lead_chat_messages[0].meta == {
+            "request_id": payload["request_id"],
+            "lead_chat": "true",
+            "operator_identity": "operator",
+            "operator_facing_lead": "lead",
+        }
+        assert s.list_intents() == before
+
         answer = _post_lead_chat(base, token, {
             "to_request": "esc-choice",
             "body": "ship",
         })
         assert answer["kind"] == "answer_escalation"
-        assert {r["kind"] for r in s.list_intents()} == {
-            "lead_chat_send",
-            "answer_escalation",
-        }
+        assert {r["kind"] for r in s.list_intents()} == {"answer_escalation"}
+        assert intents.drain_intents(s, pid=123, max_per_tick=1)["applied"] == 1
+        refreshed = _get_json(f"{base}/api/lead-chat")
+        bodies = [m["body"] for m in refreshed["messages"]]
+        assert "body visible in lead chat only" in bodies
+        assert "ship" in bodies
     finally:
         srv.shutdown()
         srv.server_close()

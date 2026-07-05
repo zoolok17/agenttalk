@@ -2545,9 +2545,11 @@
         actionSession.error = (res.data && (res.data.detail || res.data.error))
           || 'lead chat rejected';
       } else {
-        actionSession.error = 'Queued ' + (res.data.intent_id || 'lead chat');
+        actionSession.error = res.data && res.data.message_id
+          ? 'Sent ' + res.data.message_id
+          : 'Queued ' + (res.data.intent_id || 'lead chat');
         if (onQueued) onQueued(res.data);
-        fetchIntents();
+        if (res.data && res.data.intent_id) fetchIntents();
         fetchLeadChat();
         fetchAttention();
       }

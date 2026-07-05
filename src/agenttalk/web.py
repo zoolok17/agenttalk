@@ -1942,8 +1942,18 @@ def _lead_chat_messages(
     allowed = {operator, lead}
     msgs = [
         m for m in _all_messages(store)
-        if (m.meta or {}).get("request_id") == request_id
-        and m.sender in allowed and m.recipient in allowed
+        if m.sender in allowed and m.recipient in allowed
+        and (
+            (m.meta or {}).get("request_id") == request_id
+            or (
+                isinstance((m.meta or {}).get("request_id"), str)
+                and str((m.meta or {}).get("request_id")).startswith("esc-")
+                and (
+                    (m.meta or {}).get("needs_operator") == "true"
+                    or (m.meta or {}).get("operator_answer") == "true"
+                )
+            )
+        )
     ]
     msgs.sort(key=lambda m: m.id)
     out: list[dict] = []
@@ -1984,6 +1994,60 @@ def _lead_chat_pending_decisions(store: Store, operator: str, lead: str) -> list
             "answerable": True,
         })
     return out
+
+
+def _send_authenticated_lead_chat(
+    store: Store, *, body: str
+) -> tuple[Message | None, dict | None, dict | None]:
+    """Send operator->lead from the authenticated web request boundary only.
+
+    Honest ceiling: this is an auditable same-machine bus assertion gated by
+    loopback, CSRF, and the in-memory dashboard session. It prevents public
+    intent-queue spoofing, but it is not a cryptographic boundary against a
+    fully privileged local process that can write raw message files or inspect
+    process memory.
+    """
+    try:
+        operator, lead = store.lead_chat_identities()
+        request_id = store.lead_chat_request_id(operator=operator, lead=lead)
+    except ValueError as e:
+        return None, None, {
+            "status": HTTPStatus.CONFLICT,
+            "error": "lead_chat_identity_denied",
+            "detail": str(e),
+        }
+    liveness = store.lead_chat_liveness(lead=lead)
+    if not liveness.get("available"):
+        return None, None, {
+            "status": HTTPStatus.CONFLICT,
+            "error": "lead_unavailable",
+            "detail": liveness.get("reason") or liveness.get("detail") or "",
+            "liveness": liveness,
+        }
+    from agenttalk import intents as intent_mod
+    meta = intent_mod.lead_chat_stable_meta(
+        store, operator=operator, lead=lead)
+    try:
+        msg = store.send(
+            sender=operator,
+            recipient=lead,
+            body=body,
+            kind="message",
+            subject="lead chat",
+            meta=meta,
+            _allow_reserved_sender=True,
+        )
+    except ValueError as e:
+        return None, None, {
+            "status": HTTPStatus.CONFLICT,
+            "error": "lead_chat_send_rejected",
+            "detail": str(e),
+        }
+    return msg, {
+        "operator": operator,
+        "lead": lead,
+        "request_id": request_id,
+    }, None
 
 
 def build_lead_chat(desc: RootDescriptor, *, limit: int = _LEAD_CHAT_LIMIT) -> dict:
@@ -2454,23 +2518,30 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 return
             keys = set(payload)
             if keys == {"body"}:
-                try:
-                    operator, lead = store.lead_chat_identities()
-                    request_id = store.lead_chat_request_id(operator=operator, lead=lead)
-                except ValueError as e:
-                    self._json_problem(HTTPStatus.CONFLICT, "lead_chat_identity_denied",
-                                       str(e))
-                    return
-                liveness = store.lead_chat_liveness(lead=lead)
-                if not liveness.get("available"):
-                    self._send_json(HTTPStatus.CONFLICT, {
-                        "error": "lead_unavailable",
-                        "detail": liveness.get("reason") or liveness.get("detail") or "",
-                        "liveness": liveness,
-                    })
-                    return
                 kind = "lead_chat_send"
                 intent_payload = {"body": payload.get("body")}
+                from agenttalk import intents as intent_mod
+                errors = intent_mod.validate_intent(kind, intent_payload)
+                if errors:
+                    self._send_json(HTTPStatus.BAD_REQUEST,
+                                    {"error": "invalid_intent",
+                                     "details": errors})
+                    return
+                msg, chat_ids, problem = _send_authenticated_lead_chat(
+                    store, body=intent_payload["body"])
+                if problem is not None:
+                    status = problem.pop("status")
+                    self._send_json(status, problem)
+                    return
+                self._send_json(HTTPStatus.ACCEPTED, {
+                    "message_id": msg.id if msg else "",
+                    "state": "sent",
+                    "kind": kind,
+                    "request_id": (chat_ids or {}).get("request_id", ""),
+                    "target_root_index": 0,
+                    "target_root_label": roots[0].label,
+                })
+                return
             elif keys == {"to_request", "body"}:
                 chat = build_lead_chat(roots[0])
                 if not chat.get("available"):
