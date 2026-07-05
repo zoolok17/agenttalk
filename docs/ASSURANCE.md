@@ -89,6 +89,21 @@ All entries below shipped through the §1 pipeline. **CI (tests + security) is g
 every release listed.** Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.64.0 — supervisor observability (Slice 2) (2026-07-05)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `8d0dbb7` · tag `v0.64.0`
+- **Review:** gate-approved design (Track A) → build → **three untrusted-read hardening rounds**
+  (secret-text leak → non-finite epochs → embedded-report leak + unguarded record — the last two
+  caught by a fresh 4-lens adversarial pass that the reviewers' ring-focus missed) → **both
+  reviewers GO on the final folded SHA** (each verified the redaction projections + lead-liveness
+  scope). Read-only + advisory + fail-safe (not authority-critical).
+- **Gate:** ruff/bandit/diff clean; pytest **1919 passed / 3 skipped on 3.10 AND 3.14** (clean venvs).
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green.
+- **Robust/Secure:** the read/ring surfaces treat persisted + child-authored data as UNTRUSTED —
+  sanitized to a token-only schema on read (non-finite rejected, secret-like free text never
+  echoed, unknown keys dropped), the ring is bounded (512 / 256KB — never the accumulation class),
+  and the whole surface is out-of-band (never blocks the supervisor loop or `/api/state`). Lead
+  liveness is display-only with no authority reach.
+
 ### v0.63.0 — supervisor & wrapper reliability hotfix (Slice 1) (2026-07-05)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `fa9f92f` (rebased clean → `9a14d1a`) · tag `v0.63.0`
 - **Review:** design-first → adversarial design-gate → build → **2 independent reviewers + a 5-lens

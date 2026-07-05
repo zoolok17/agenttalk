@@ -5,6 +5,27 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.64.0] - 2026-07-05
+
+### Added
+
+- **Supervisor observability (`agenttalk supervisor` read + decision-event ring).** See the
+  supervisor's per-agent assessment and its actual `plan_actions` decision **verbatim** (action +
+  state + reason, every branch distinct) via `agenttalk supervisor` (+ `--json`) and a compact
+  line in `agenttalk status` — built from the same planner call the supervisor runs, so the view
+  cannot drift. Read-only + fail-safe (missing/torn state degrades to a warning + exit 0).
+- **Bounded, redacted decision-event ring** at `.agenttalk/state/supervisor-events.jsonl`
+  (outside the message store): per-agent transitions + periodic poll summaries, **count-capped
+  (512) + tail-capped (256KB)** (never unbounded), **token-only** (no config-blocked/restart free
+  text). Treated as untrusted on read — persisted rows are sanitized to the known token-only
+  schema before display/dedupe (non-finite epochs rejected, unknown keys dropped, secret-like
+  text never echoed), and `supervisor --json` embeds only redacted report/plan projections. All
+  lock/read/write/torn failures are swallowed, so the ring can never block or alter the loop.
+- **Accurate lead liveness.** The human-facing (operator-facing, unwrapped) lead now reads
+  active/idle from recent bus activity (`last_seen`) instead of "unknown" when it has no wrapper
+  health snapshot — scoped to the genuinely health-missing lead (a wrapped TTL-stale lead is not
+  forced active), display-only.
+
 ## [0.63.0] - 2026-07-05
 
 ### Fixed / Added
