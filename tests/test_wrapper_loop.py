@@ -724,6 +724,65 @@ def _patch_procstream_popen(monkeypatch, lines, *, close_exc: OSError | None = N
     monkeypatch.setattr(run.subprocess, "Popen", _Popen)
 
 
+class _TrackedPipe:
+    def __init__(self, lines: list[str] | None = None, write_exc: OSError | None = None) -> None:
+        self._lines = lines or []
+        self._write_exc = write_exc
+        self.closed = False
+        self.close_count = 0
+
+    def write(self, text):
+        _ = text
+        if self._write_exc is not None:
+            raise self._write_exc
+
+    def close(self):
+        self.close_count += 1
+        self.closed = True
+
+    def __iter__(self):
+        return iter(self._lines)
+
+
+class _TrackedPopen:
+    def __init__(self, argv, **kwargs):
+        _ = argv, kwargs
+        self.stdin = _TrackedPipe(write_exc=OSError(errno.EINVAL, "Invalid argument"))
+        self.stdout = _TrackedPipe()
+        self.pid = 123
+        self.returncode = None
+        self.terminated = False
+        self.wait_calls: list[float | None] = []
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self):
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        self.wait_calls.append(timeout)
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+
+def _patch_procstream_popen_write_error(monkeypatch) -> list[_TrackedPopen]:
+    created: list[_TrackedPopen] = []
+
+    class _Popen(_TrackedPopen):
+        def __init__(self, argv, **kwargs):
+            super().__init__(argv, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(run.subprocess, "Popen", _Popen)
+    return created
+
+
 def test_procstream_stdout_close_einval_is_swallowed(monkeypatch) -> None:
     lines = _codex_turn_lines()
     _patch_procstream_popen(
@@ -748,6 +807,74 @@ def test_procstream_generator_finalizer_einval_is_quiet(monkeypatch, capsys) -> 
 
     assert stream.returncode == 0
     assert "Exception ignored" not in capsys.readouterr().err
+
+
+def test_procstream_constructor_write_error_closes_pipes_and_child(monkeypatch) -> None:
+    created = _patch_procstream_popen_write_error(monkeypatch)
+
+    with pytest.raises(OSError):
+        run._ProcStream(["codex"], "prompt")
+
+    proc = created[0]
+    assert proc.stdin.closed is True
+    assert proc.stdin.close_count == 1
+    assert proc.stdout.closed is True
+    assert proc.stdout.close_count == 1
+    assert proc.terminated is True
+    assert proc.wait_calls == [10.0]
+
+
+def test_procstream_success_closes_stdout_once(monkeypatch) -> None:
+    lines = _codex_turn_lines()
+    created: list[_TrackedPopen] = []
+
+    class _Popen(_TrackedPopen):
+        def __init__(self, argv, **kwargs):
+            super().__init__(argv, **kwargs)
+            self.stdin = _TrackedPipe()
+            self.stdout = _TrackedPipe(lines)
+            created.append(self)
+
+    monkeypatch.setattr(run.subprocess, "Popen", _Popen)
+
+    stream = run._ProcStream(["codex"], "prompt")
+
+    proc = created[0]
+    assert proc.stdin.closed is True
+    assert proc.stdin.close_count == 1
+    assert proc.stdout.close_count == 0
+    assert list(stream) == lines
+    assert proc.stdout.closed is True
+    assert proc.stdout.close_count == 1
+    assert proc.terminated is False
+    assert stream.returncode == 0
+    assert proc.wait_calls == [None]
+
+
+def test_make_drive_procstream_write_error_stays_infra(tmp_path, monkeypatch) -> None:
+    created = _patch_procstream_popen_write_error(monkeypatch)
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    drive = run.make_drive(
+        _store(tmp_path),
+        "beta",
+        "codex",
+        session.SessionState(cli="codex"),
+        ["codex"],
+        agenttalk_preflight=lambda: None,
+        clock=lambda: 0.0,
+        render=False,
+    )
+
+    out = drive(rec)
+
+    assert out.ok is False
+    assert out.failure_class == loop.CLASS_INFRA
+    assert "spawn/exec error" in out.summary
+    proc = created[0]
+    assert proc.stdin.closed is True
+    assert proc.stdout.closed is True
+    assert proc.terminated is True
 
 
 def test_launch_preflight_resolves_known_npm_codex_shim_and_blocks_unknown(

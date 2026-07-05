@@ -467,6 +467,18 @@ def _iter_suppressing_benign_pipe_teardown(lines: Iterable[str]) -> Iterator[str
             raise
 
 
+def _close_pipe_suppressing_benign_pipe_teardown(pipe) -> None:
+    if pipe is None:
+        return
+    if getattr(pipe, "closed", False):
+        return
+    try:
+        pipe.close()
+    except OSError as exc:
+        if not _is_benign_pipe_teardown_error(exc):
+            raise
+
+
 def _workspace_root() -> Path:
     root = os.environ.get("AGENTTALK_ROOT")
     return Path(root).resolve() if root else Path.cwd().resolve()
@@ -1203,42 +1215,46 @@ class _ProcStream:
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
             bufsize=1, env=child_env, **_child_window_kwargs(child_env),
         )
-        # Record the per-turn root start-time right after spawn (~ the OS-reported create
-        # time, within spawn jitter) so the watchdog can start-time-guard the kill against
-        # pid reuse. Wall clock, to match the snapshot adapter's create_epoch.
-        self._root_start = watchdog_wall_clock()
-        if self._proc.stdin is not None:
-            if stdin_text is not None:
-                self._proc.stdin.write(stdin_text)
-            self._proc.stdin.close()
         self.returncode: int | None = None
-        # Per-turn watchdog (off unless an ENABLED config is passed). A structured result
-        # lands on .watchdog_result iff it fires (the kill closes stdout -> __iter__ ends).
         self.watchdog_result: dict | None = None
         self._watchdog = None
-        if watchdog is not None and watchdog.enabled:
-            from .turn_watchdog import TurnWatchdog
-            self._watchdog = TurnWatchdog(
-                root_pid=self._proc.pid, root_start=self._root_start, cfg=watchdog,
-                snapshot_fn=watchdog_snapshot_fn, kill_fn=watchdog_kill_fn,
-                clock=watchdog_clock, wall_clock=watchdog_wall_clock)
-            self._watchdog.start()
-        # Bounded in-turn work heartbeat (wrapped-Claude false-STUCK fix): stamps the
-        # supervisor heartbeat while THIS child is alive, capped at max_turn_seconds.
-        # Started LAST (after stdin close, before stdout iteration) so a constructor
-        # failure never leaks a live ticker. A structured result lands on
-        # .work_heartbeat_result once the stream is exhausted.
         self.work_heartbeat_result: dict | None = None
         self._work_hb = None
-        if (work_heartbeat is not None and work_heartbeat_stamp is not None):
-            from .work_heartbeat import WorkHeartbeatTicker, work_heartbeat_effectively_live
-            if work_heartbeat_effectively_live(work_heartbeat):
-                self._work_hb = WorkHeartbeatTicker(
-                    cfg=work_heartbeat, stamp=work_heartbeat_stamp,
-                    child_alive=lambda: self._proc.poll() is None,
-                    lease_lost_exceptions=lease_lost_exceptions,
-                    on_status=work_heartbeat_status)
-                self._work_hb.start()
+        try:
+            # Record the per-turn root start-time right after spawn (~ the OS-reported create
+            # time, within spawn jitter) so the watchdog can start-time-guard the kill against
+            # pid reuse. Wall clock, to match the snapshot adapter's create_epoch.
+            self._root_start = watchdog_wall_clock()
+            if self._proc.stdin is not None:
+                if stdin_text is not None:
+                    self._proc.stdin.write(stdin_text)
+                self._proc.stdin.close()
+            # Per-turn watchdog (off unless an ENABLED config is passed). A structured result
+            # lands on .watchdog_result iff it fires (the kill closes stdout -> __iter__ ends).
+            if watchdog is not None and watchdog.enabled:
+                from .turn_watchdog import TurnWatchdog
+                self._watchdog = TurnWatchdog(
+                    root_pid=self._proc.pid, root_start=self._root_start, cfg=watchdog,
+                    snapshot_fn=watchdog_snapshot_fn, kill_fn=watchdog_kill_fn,
+                    clock=watchdog_clock, wall_clock=watchdog_wall_clock)
+                self._watchdog.start()
+            # Bounded in-turn work heartbeat (wrapped-Claude false-STUCK fix): stamps the
+            # supervisor heartbeat while THIS child is alive, capped at max_turn_seconds.
+            # Started LAST (after stdin close, before stdout iteration) so a constructor
+            # failure never leaks a live ticker. A structured result lands on
+            # .work_heartbeat_result once the stream is exhausted.
+            if (work_heartbeat is not None and work_heartbeat_stamp is not None):
+                from .work_heartbeat import WorkHeartbeatTicker, work_heartbeat_effectively_live
+                if work_heartbeat_effectively_live(work_heartbeat):
+                    self._work_hb = WorkHeartbeatTicker(
+                        cfg=work_heartbeat, stamp=work_heartbeat_stamp,
+                        child_alive=lambda: self._proc.poll() is None,
+                        lease_lost_exceptions=lease_lost_exceptions,
+                        on_status=work_heartbeat_status)
+                    self._work_hb.start()
+        except Exception:
+            self._cleanup_after_constructor_error()
+            raise
 
     def __iter__(self) -> Iterator[str]:
         try:
@@ -1255,11 +1271,7 @@ class _ProcStream:
                 self._work_hb.join(timeout=10.0)
                 self.work_heartbeat_result = dict(self._work_hb.result)
             if self._proc.stdout:
-                try:
-                    self._proc.stdout.close()
-                except OSError as exc:
-                    if not _is_benign_pipe_teardown_error(exc):
-                        raise
+                _close_pipe_suppressing_benign_pipe_teardown(self._proc.stdout)
             self.returncode = self._proc.wait()
             # Stop + join the watchdog AFTER the child has exited: a normal turn completion
             # makes the thread exit its wait immediately (no kill race), and a watchdog that
@@ -1268,6 +1280,35 @@ class _ProcStream:
                 self._watchdog.stop()
                 self._watchdog.join(timeout=10.0)
                 self.watchdog_result = self._watchdog.result
+
+    def _cleanup_after_constructor_error(self) -> None:
+        # Best-effort only: preserve the original constructor failure so make_drive
+        # keeps its existing spawn/exec classification.
+        for worker in (self._work_hb, self._watchdog):
+            if worker is None:
+                continue
+            try:
+                worker.stop()
+                worker.join(timeout=10.0)
+            except Exception as exc:
+                _ = exc
+        for pipe in (self._proc.stdin, self._proc.stdout):
+            try:
+                _close_pipe_suppressing_benign_pipe_teardown(pipe)
+            except OSError as exc:
+                _ = exc
+        try:
+            if self._proc.poll() is None:
+                self._proc.terminate()
+            self._proc.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            try:
+                self._proc.kill()
+                self._proc.wait(timeout=5.0)
+            except Exception as exc:
+                _ = exc
+        except OSError as exc:
+            _ = exc
 
 
 def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str], *,
