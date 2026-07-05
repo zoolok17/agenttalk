@@ -36,7 +36,7 @@
   var DENSITIES = ['comfortable', 'compact'];
   var PREF_KEYS = { theme: 'tc.theme', accent: 'tc.accent', density: 'tc.density' };
 
-  var VIEWS = ['overview', 'flow', 'attention', 'sessions', 'agent'];
+  var VIEWS = ['overview', 'flow', 'attention', 'lead-chat', 'sessions', 'agent'];
 
   // Graph geometry (frozen: §7 / prototype). 640x480 canvas, nodes on a
   // circle radius 178 around center (320,240), node i at angle -90 + i*36 deg.
@@ -98,8 +98,10 @@
   // Latest fetched payloads.
   var lastState = null;               // /api/state
   var attentionData = null;           // /api/attention (per open)
+  var leadChatData = null;            // /api/lead-chat (operator<->lead bodies)
   var intentsData = null;             // /api/intents (body-free queue state)
   var attentionPending = false;
+  var leadChatPending = false;
   var intentsPending = false;
   var statePending = false;           // /api/state in-flight guard (P2-4)
   var stateSeq = 0;                   // request sequence id (issued)
@@ -121,6 +123,7 @@
     body: '',
   };
   var answerComposerState = {};       // to_request -> body text
+  var leadChatComposerState = { body: '' };
   var archivedState = {
     root: '',
     open: false,
@@ -197,13 +200,18 @@
   }
   function closestActionComposer(node) {
     if (!node) return null;
-    if (node.closest) return node.closest('.tc-action-card, .tc-action-form, .tc-attn-answer, .tc-attn-answer-form');
+    if (node.closest) return node.closest(
+      '.tc-action-card, .tc-action-form, .tc-attn-answer, .tc-attn-answer-form, '
+      + '.tc-lead-composer, .tc-lead-decision-form'
+    );
     while (node) {
       if (node.classList && (
         node.classList.contains('tc-action-card')
         || node.classList.contains('tc-action-form')
         || node.classList.contains('tc-attn-answer')
         || node.classList.contains('tc-attn-answer-form')
+        || node.classList.contains('tc-lead-composer')
+        || node.classList.contains('tc-lead-decision-form')
       )) return node;
       node = node.parentNode;
     }
@@ -689,6 +697,7 @@
     if (opts && 'sessionRid' in opts) state.sessionRid = opts.sessionRid;
     // Attention/thread data is view-scoped; refetch on entry.
     if (view === 'attention') fetchAttention();
+    if (view === 'lead-chat') fetchLeadChat();
     if (view === 'sessions' && state.sessionRid) fetchThread(state.sessionRid);
     renderActiveView();
     renderChrome();
@@ -832,6 +841,9 @@
     var attnCount = attentionData && typeof attentionData.count === 'number'
       ? attentionData.count
       : (attentionData && attentionData.items ? attentionData.items.length : 0);
+    var leadPendingCount = leadChatData && isArray(leadChatData.pending_decisions)
+      ? leadChatData.pending_decisions.length
+      : 0;
 
     var nav = el('nav', 'tc-nav');
     // "overview" nav stays active while an agent-detail is open.
@@ -839,6 +851,7 @@
       { key: 'overview', label: 'Team overview', icon: navIconGrid, activeWith: 'agent' },
       { key: 'flow', label: 'Conversations', icon: navIconChat },
       { key: 'attention', label: 'Attention', icon: navIconAlert, badge: attnCount },
+      { key: 'lead-chat', label: 'Lead chat', icon: navIconChat, badge: leadPendingCount },
       { key: 'sessions', label: 'Sessions', icon: navIconFile },
     ];
     for (var i = 0; i < items.length; i++) {
@@ -905,6 +918,7 @@
       case 'overview': renderOverview(main, root); break;
       case 'flow': renderFlow(main, root); break;
       case 'attention': renderAttention(main, root); break;
+      case 'lead-chat': renderLeadChat(main, root); break;
       case 'sessions': renderSessions(main, root); break;
       case 'agent': renderAgentDetail(main, root); break;
       default: renderOverview(main, root);
@@ -1449,6 +1463,260 @@
     card.appendChild(el('div', 'tc-empty-title', 'All clear'));
     card.appendChild(el('div', 'tc-empty-text', 'Nothing is waiting on you right now.'));
     return card;
+  }
+
+  // ------------------------------------------------------------ VIEW 4: lead chat
+  function renderLeadChat(main, root) {
+    var data = leadChatData;
+    var wrap = el('div', 'tc-lead-chat');
+    var head = el('div', 'tc-view-head');
+    var title = el('div');
+    title.appendChild(el('h1', 'tc-h1', 'Lead chat'));
+    title.appendChild(el('p', 'tc-subtitle', leadChatSubtitle(data, root)));
+    head.appendChild(title);
+    head.appendChild(el('div', 'tc-spacer'));
+    head.appendChild(leadChatStatusChip(data));
+    wrap.appendChild(head);
+
+    var layout = el('div', 'tc-lead-layout');
+    layout.appendChild(leadChatTranscript(data));
+    layout.appendChild(leadChatSide(data));
+    wrap.appendChild(layout);
+    main.appendChild(wrap);
+  }
+
+  function leadChatSubtitle(data, root) {
+    if (!data) return 'Loading operator to lead channel';
+    if (data.operator && data.lead && data.request_id) {
+      return data.operator + ' -> ' + data.lead + ' · ' + data.request_id;
+    }
+    var label = (root && root.label) || data.root || currentRootLabel() || 'root';
+    return label + ' · ' + (data.detail || data.error || 'lead chat unavailable');
+  }
+
+  function leadChatStatusChip(data) {
+    if (!data) return el('span', 'tc-chip status-unknown', 'loading');
+    var status = data.status || 'unavailable';
+    var cls = 'status-unknown';
+    var label = 'unavailable';
+    if (status === 'idle') {
+      cls = 'status-idle_waiting';
+      label = 'lead idle';
+    } else if (status === 'live') {
+      cls = 'status-working_turn';
+      label = 'lead live';
+    } else if (data.available) {
+      cls = 'status-working_silent';
+      label = 'lead available';
+    }
+    return el('span', 'tc-chip ' + cls, label);
+  }
+
+  function leadChatTranscript(data) {
+    var card = el('div', 'tc-card tc-lead-panel tc-lead-transcript-card');
+    var head = el('div', 'tc-lead-panel-head');
+    head.appendChild(el('div', 'tc-card-title', 'Direct channel'));
+    head.appendChild(el('span', 'tc-spacer'));
+    var count = data && isArray(data.messages) ? data.messages.length : 0;
+    head.appendChild(el('span', 'tc-chip', count + ' messages'));
+    card.appendChild(head);
+
+    var body = el('div', 'tc-lead-transcript-body');
+    if (!data) {
+      body.appendChild(transcriptEmpty('Loading chat', ''));
+    } else if (!isArray(data.messages) || !data.messages.length) {
+      body.appendChild(transcriptEmpty('No messages yet', 'Send the first note to the lead.'));
+    } else {
+      for (var i = 0; i < data.messages.length; i++) {
+        body.appendChild(leadChatMessage(data.messages[i], data.operator));
+      }
+    }
+    card.appendChild(body);
+    card.appendChild(leadChatComposer(data));
+    return card;
+  }
+
+  function leadChatMessage(m, operator) {
+    var mine = m.from === operator;
+    var row = el('div', 'tc-msg-row tc-lead-msg-row');
+    var bubble = el('div', 'tc-bubble ' + (mine ? 'is-right' : 'is-left'));
+    var bh = el('div', 'tc-bubble-head');
+    bh.appendChild(el('span', 'tc-bubble-from', mine ? 'operator' : (m.from || 'lead')));
+    bh.appendChild(kindChip(m.kind || 'message'));
+    bh.appendChild(el('span', 'tc-spacer'));
+    bh.appendChild(ageEl('tc-bubble-age', m));
+    bubble.appendChild(bh);
+    bubble.appendChild(el('div', 'tc-bubble-body', m.body || ''));
+    row.appendChild(bubble);
+    return row;
+  }
+
+  function leadChatComposer(data) {
+    var form = el('div', 'tc-lead-composer');
+    var textarea = document.createElement('textarea');
+    textarea.rows = 4;
+    textarea.placeholder = data && data.available ? 'Message the lead' : 'Lead is unavailable';
+    textarea.value = leadChatComposerState.body;
+    var send = el('button', 'tc-btn tc-btn-primary', actionSession.pending ? 'Queueing' : 'Send');
+    var hint = el('span', 'tc-action-status',
+      actionSession.error || leadChatUnavailableText(data));
+    function updateButton() {
+      send.disabled = !actionSession.enabled || actionSession.pending
+        || !(data && data.available) || !textarea.value.trim();
+    }
+    on(textarea, 'input', function () {
+      leadChatComposerState.body = textarea.value;
+      updateButton();
+    });
+    on(send, 'click', function () {
+      var body = textarea.value.trim();
+      if (!body) return;
+      postLeadChat({ body: body }, false, function () {
+        leadChatComposerState.body = '';
+        fetchLeadChat();
+      });
+      send.disabled = true;
+    });
+    updateButton();
+    form.appendChild(textarea);
+    var footer = el('div', 'tc-action-footer');
+    footer.appendChild(hint);
+    footer.appendChild(el('span', 'tc-spacer'));
+    footer.appendChild(send);
+    form.appendChild(footer);
+    return form;
+  }
+
+  function leadChatUnavailableText(data) {
+    if (!actionSession.enabled) return 'actions off';
+    if (!data) return 'loading';
+    if (data.available) return '';
+    return data.detail || data.error || 'lead unavailable';
+  }
+
+  function leadChatSide(data) {
+    var side = el('div', 'tc-lead-side');
+    side.appendChild(leadChatLivenessCard(data));
+    side.appendChild(leadChatDecisionsCard(data));
+    side.appendChild(intentSummaryStrip());
+    return side;
+  }
+
+  function leadChatLivenessCard(data) {
+    var card = el('div', 'tc-card tc-lead-status-card');
+    var head = el('div', 'tc-lead-panel-head');
+    head.appendChild(el('div', 'tc-card-title', 'Lead status'));
+    head.appendChild(el('span', 'tc-spacer'));
+    head.appendChild(leadChatStatusChip(data));
+    card.appendChild(head);
+    var rows = el('div', 'tc-lead-status-rows');
+    var lead = data && data.lead ? data.lead : 'unresolved';
+    rows.appendChild(leadChatStatusRow('Lead', lead));
+    var stateValue = data && data.liveness && data.liveness.state
+      ? data.liveness.state
+      : (data && data.status) || 'unknown';
+    rows.appendChild(leadChatStatusRow('State', stateValue));
+    if (data && data.liveness && data.liveness.reason) {
+      rows.appendChild(leadChatStatusRow('Reason', data.liveness.reason));
+    } else if (data && data.detail) {
+      rows.appendChild(leadChatStatusRow('Reason', data.detail));
+    }
+    card.appendChild(rows);
+    return card;
+  }
+
+  function leadChatStatusRow(k, v) {
+    var row = el('div', 'tc-lead-status-row');
+    row.appendChild(el('span', 'tc-lead-status-key', k));
+    row.appendChild(el('span', 'tc-lead-status-value', v || ''));
+    return row;
+  }
+
+  function leadChatDecisionsCard(data) {
+    var card = el('div', 'tc-card tc-lead-decisions-card');
+    var head = el('div', 'tc-lead-panel-head');
+    head.appendChild(el('div', 'tc-card-title', 'Pending decisions'));
+    head.appendChild(el('span', 'tc-spacer'));
+    var items = data && isArray(data.pending_decisions) ? data.pending_decisions : [];
+    head.appendChild(el('span', 'tc-chip', items.length + ' open'));
+    card.appendChild(head);
+    if (!data) {
+      card.appendChild(el('p', 'tc-recent-empty', 'Loading decisions...'));
+    } else if (!items.length) {
+      card.appendChild(el('p', 'tc-recent-empty', 'No lead escalations are waiting.'));
+    } else {
+      var list = el('div', 'tc-lead-decision-list');
+      for (var i = 0; i < items.length; i++) list.appendChild(leadChatDecision(items[i]));
+      card.appendChild(list);
+    }
+    return card;
+  }
+
+  function leadChatDecision(item) {
+    var box = el('div', 'tc-lead-decision');
+    var top = el('div', 'tc-lead-decision-top');
+    top.appendChild(el('span', 'tc-attn-agent', item.sender || 'lead'));
+    if (item.priority) top.appendChild(el('span', 'tc-chip', 'priority ' + item.priority));
+    top.appendChild(el('span', 'tc-spacer'));
+    top.appendChild(ageEl('tc-attn-age', item, { suffix: ' ago' }));
+    box.appendChild(top);
+    box.appendChild(el('div', 'tc-attn-title', item.decision || item.subject || 'Decision needed'));
+    if (item.recommendation) {
+      box.appendChild(el('div', 'tc-attn-detail', item.recommendation));
+    }
+    box.appendChild(leadChatDecisionForm(item));
+    return box;
+  }
+
+  function leadChatDecisionForm(item) {
+    var toRequest = item.request_id || '';
+    var form = el('div', 'tc-lead-decision-form');
+    var opts = isArray(item.options) ? item.options : [];
+    if (opts.length) {
+      var optWrap = el('div', 'tc-attn-options');
+      for (var i = 0; i < opts.length; i++) {
+        (function (label) {
+          var b = el('button', 'tc-btn', label);
+          on(b, 'click', function () {
+            answerComposerState[toRequest] = label;
+            renderActiveView();
+          });
+          optWrap.appendChild(b);
+        })(opts[i]);
+      }
+      form.appendChild(optWrap);
+    }
+    var textarea = document.createElement('textarea');
+    textarea.rows = 3;
+    textarea.placeholder = 'Answer the lead';
+    if (toRequest && Object.prototype.hasOwnProperty.call(answerComposerState, toRequest)) {
+      textarea.value = answerComposerState[toRequest];
+    }
+    var send = el('button', 'tc-btn tc-btn-primary',
+      queuedAnswers[toRequest] ? 'Queued' : 'Queue answer');
+    function updateAnswerButton() {
+      send.disabled = !actionSession.enabled || actionSession.pending
+        || queuedAnswers[toRequest] || !toRequest || !textarea.value.trim();
+    }
+    on(textarea, 'input', function () {
+      if (toRequest) answerComposerState[toRequest] = textarea.value;
+      updateAnswerButton();
+    });
+    on(send, 'click', function () {
+      var body = textarea.value.trim();
+      if (!body || !toRequest) return;
+      postLeadChat({ to_request: toRequest, body: body }, false, function () {
+        queuedAnswers[toRequest] = true;
+        delete answerComposerState[toRequest];
+        fetchLeadChat();
+        fetchAttention();
+      });
+      send.disabled = true;
+    });
+    updateAnswerButton();
+    form.appendChild(textarea);
+    form.appendChild(send);
+    return form;
   }
 
   function intentSummaryStrip() {
@@ -2191,7 +2459,7 @@
         actionSession.token = data.csrf_token;
       }
       if (cb) cb();
-      if (state.view === 'sessions') renderActiveViewFromPoll();
+      if (state.view === 'sessions' || state.view === 'lead-chat') renderActiveViewFromPoll();
     }).catch(function () {
       actionSession.enabled = false;
       actionSession.token = null;
@@ -2242,11 +2510,52 @@
         fetchIntents();
         fetchAttention();
       }
-      if (state.view === 'sessions' || state.view === 'attention') renderActiveView();
+      if (state.view === 'sessions' || state.view === 'attention'
+        || state.view === 'lead-chat') renderActiveView();
     }).catch(function () {
       actionSession.pending = false;
       actionSession.error = 'network error';
-      if (state.view === 'sessions' || state.view === 'attention') renderActiveView();
+      if (state.view === 'sessions' || state.view === 'attention'
+        || state.view === 'lead-chat') renderActiveView();
+    });
+  }
+
+  function postLeadChat(payload, retried, onQueued) {
+    if (!actionSession.enabled || !actionSession.token || actionSession.pending) return;
+    actionSession.pending = true;
+    actionSession.error = '';
+    fetch('/api/lead-chat', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': actionSession.token,
+      },
+      body: JSON.stringify(payload),
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (data) {
+        return { status: r.status, ok: r.ok, data: data };
+      });
+    }).then(function (res) {
+      actionSession.pending = false;
+      if (res.status === 403 && res.data && res.data.error === 'bad_csrf' && !retried) {
+        fetchSession(function () { postLeadChat(payload, true, onQueued); });
+        return;
+      }
+      if (!res.ok) {
+        actionSession.error = (res.data && (res.data.detail || res.data.error))
+          || 'lead chat rejected';
+      } else {
+        actionSession.error = 'Queued ' + (res.data.intent_id || 'lead chat');
+        if (onQueued) onQueued(res.data);
+        fetchIntents();
+        fetchLeadChat();
+        fetchAttention();
+      }
+      if (state.view === 'lead-chat' || state.view === 'attention') renderActiveView();
+    }).catch(function () {
+      actionSession.pending = false;
+      actionSession.error = 'network error';
+      if (state.view === 'lead-chat') renderActiveView();
     });
   }
 
@@ -2310,6 +2619,21 @@
       renderSidebar();  // count badge
       if (state.view === 'attention') renderActiveViewFromPoll();
     }).catch(function () { attentionPending = false; });
+  }
+
+  function fetchLeadChat() {
+    if (leadChatPending) return;
+    leadChatPending = true;
+    fetch('/api/lead-chat').then(function (r) {
+      if (!r.ok) return null;
+      return r.json();
+    }).then(function (data) {
+      leadChatPending = false;
+      if (!data) return;
+      leadChatData = data;
+      renderSidebar();
+      if (state.view === 'lead-chat') renderActiveViewFromPoll();
+    }).catch(function () { leadChatPending = false; });
   }
 
   function fetchArchivedThreads(reset) {
@@ -2411,10 +2735,12 @@
     // view: the sidebar count badge is the open-attention count and must be
     // current from the start, not blank until the Attention view is opened.
     fetchAttention();
+    fetchLeadChat();
     fetchSession();
     fetchIntents();
     setInterval(fetchState, POLL_MS);
     setInterval(fetchAttention, POLL_MS);
+    setInterval(fetchLeadChat, POLL_MS);
     setInterval(fetchIntents, POLL_MS);
     setInterval(clockTick, CLOCK_MS);
   }

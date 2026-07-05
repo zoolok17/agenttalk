@@ -198,6 +198,7 @@ _EDGE_LIMIT = 50
 _RECENT_LIMIT = 25
 _THREADS_DEFAULT_LIMIT = 50
 _THREADS_MAX_LIMIT = 100
+_LEAD_CHAT_LIMIT = 100
 
 _AVATAR_ASSETS = _avatars.avatar_static_paths()
 
@@ -1932,6 +1933,97 @@ def build_thread(store: Store, rid: str) -> dict | None:
     }
 
 
+# ------------------------------------------------------------ /api/lead-chat
+
+def _lead_chat_messages(
+    store: Store, *, request_id: str, operator: str, lead: str, limit: int
+) -> list[dict]:
+    now = datetime.now(timezone.utc)
+    allowed = {operator, lead}
+    msgs = [
+        m for m in _all_messages(store)
+        if (m.meta or {}).get("request_id") == request_id
+        and m.sender in allowed and m.recipient in allowed
+    ]
+    msgs.sort(key=lambda m: m.id)
+    out: list[dict] = []
+    for m in msgs[-max(1, limit):]:
+        out.append({
+            "id": m.id,
+            "from": m.sender,
+            "to": m.recipient,
+            "kind": m.kind,
+            "subject": m.subject or "",
+            "body": m.body or "",
+            "ts": m.ts,
+            "age_seconds": _age_seconds_of(m.ts, now=now),
+        })
+    return out
+
+
+def _lead_chat_pending_decisions(store: Store, operator: str, lead: str) -> list[dict]:
+    pending = _web_needs_operator(store, operator)
+    out: list[dict] = []
+    for item in pending:
+        if _envelope_str(item.get("sender")) != lead:
+            continue
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        att = meta.get("attention") if isinstance(meta.get("attention"), dict) else {}
+        options = att.get("options") if isinstance(att.get("options"), list) else []
+        out.append({
+            "request_id": _envelope_str(item.get("request_id")),
+            "sender": _envelope_str(item.get("sender")),
+            "subject": _envelope_str(item.get("subject") or "operator input needed"),
+            "decision": _envelope_str(att.get("decision") or item.get("subject")
+                                      or "operator input needed"),
+            "recommendation": _envelope_str(att.get("recommendation") or ""),
+            "priority": _envelope_str(att.get("priority") or ""),
+            "risk_severity": _envelope_str(att.get("risk_severity") or ""),
+            "options": [_envelope_str(o) for o in options if isinstance(o, str)],
+            "age_seconds": item.get("age_seconds"),
+            "answerable": True,
+        })
+    return out
+
+
+def build_lead_chat(desc: RootDescriptor, *, limit: int = _LEAD_CHAT_LIMIT) -> dict:
+    """Lead-chat read model: bounded transcript plus fail-closed availability."""
+    store = desc.store
+    payload: dict[str, Any] = {
+        "root": desc.label,
+        "root_path": str(store.root),
+        "available": False,
+        "status": "unavailable",
+        "messages": [],
+        "pending_decisions": [],
+        "limit": max(1, min(_LEAD_CHAT_LIMIT, int(limit))),
+    }
+    try:
+        operator, lead = store.lead_chat_identities()
+        request_id = store.lead_chat_request_id(operator=operator, lead=lead)
+        liveness = store.lead_chat_liveness(lead=lead)
+        payload.update({
+            "operator": operator,
+            "lead": lead,
+            "request_id": request_id,
+            "available": bool(liveness.get("available")),
+            "status": liveness.get("status") or "unavailable",
+            "liveness": liveness,
+            "messages": _lead_chat_messages(
+                store, request_id=request_id, operator=operator,
+                lead=lead, limit=payload["limit"]),
+            "pending_decisions": _lead_chat_pending_decisions(store, operator, lead),
+        })
+        if not payload["available"]:
+            payload["error"] = "lead_unavailable"
+            payload["detail"] = liveness.get("reason") or liveness.get("detail") or ""
+        return payload
+    except Exception as e:  # noqa: BLE001 - fail-safe JSON, never a broken endpoint
+        payload["error"] = "lead_chat_unavailable"
+        payload["detail"] = _envelope_str(e)
+        return payload
+
+
 def _age_seconds_of(ts: Any, *, now: datetime) -> float | None:
     """Seconds since a message ``ts`` (ISO-8601), or None if unparseable."""
     dt = _parse_iso(ts)
@@ -2075,10 +2167,13 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                                    "absolute-form request target must match this loopback server",
                                    close=True)
                 return
-            if path != "/api/intent":
+            if path not in ("/api/intent", "/api/lead-chat"):
                 self._method_not_allowed()
                 return
-            self._handle_intent_post()
+            if path == "/api/lead-chat":
+                self._handle_lead_chat_post()
+            else:
+                self._handle_intent_post()
 
         def do_PUT(self) -> None:  # noqa: N802
             if not self._check_peer_or_403():
@@ -2096,7 +2191,11 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
             self._method_not_allowed()
 
         def _method_not_allowed(self) -> None:
-            allow = "POST" if enable_actions and self._request_path() == "/api/intent" else "GET, HEAD"
+            allow = (
+                "POST"
+                if enable_actions and self._request_path() in ("/api/intent", "/api/lead-chat")
+                else "GET, HEAD"
+            )
             self._send(HTTPStatus.METHOD_NOT_ALLOWED, b"", "text/plain; charset=utf-8",
                        extra_headers={"Allow": allow})
 
@@ -2294,6 +2393,149 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                             {"intent_id": rec["intent_id"], "state": rec["state"],
                              "target_root_index": 0, "target_root_label": roots[0].label})
 
+        def _handle_lead_chat_post(self) -> None:
+            if not self._host_allowed():
+                self._json_problem(HTTPStatus.FORBIDDEN, "bad_host",
+                                   "Host must be loopback for this server",
+                                   close=True)
+                return
+            if not self._origin_allowed(self.headers.get("Origin")):
+                self._json_problem(HTTPStatus.FORBIDDEN, "bad_origin",
+                                   "Origin must match this dashboard",
+                                   close=True)
+                return
+            if not self._content_type_ok():
+                self._json_problem(HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                                   "bad_content_type",
+                                   "Content-Type must be application/json",
+                                   close=True)
+                return
+            supplied = self.headers.get("X-CSRF-Token", "")
+            try:
+                supplied_b = supplied.encode("ascii")
+                token_b = csrf_token.encode("ascii")
+            except UnicodeEncodeError:
+                self._json_problem(HTTPStatus.FORBIDDEN, "bad_csrf",
+                                   "CSRF token is missing or expired",
+                                   close=True)
+                return
+            if not hmac.compare_digest(supplied_b, token_b):
+                self._json_problem(HTTPStatus.FORBIDDEN, "bad_csrf",
+                                   "CSRF token is missing or expired",
+                                   close=True)
+                return
+            kill = store.supervisor_kill_switch()
+            if kill is not False:
+                code = "executor_disabled" if kill else "executor_state_unreadable"
+                self._json_problem(HTTPStatus.LOCKED, code,
+                                   "supervisor kill-switch blocks dashboard writes",
+                                   close=True)
+                return
+            body = self._read_limited_body()
+            if body is None:
+                return
+            if not self._rate_allowed():
+                self._json_problem(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited",
+                                   "too many dashboard write attempts")
+                return
+            ok, cap_code, cap_detail = self._active_intent_capacity_ok()
+            if not ok:
+                self._json_problem(HTTPStatus.TOO_MANY_REQUESTS, cap_code, cap_detail)
+                return
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                self._json_problem(HTTPStatus.BAD_REQUEST, "invalid_json",
+                                   "request body must be a JSON object")
+                return
+            if not isinstance(payload, dict):
+                self._json_problem(HTTPStatus.BAD_REQUEST, "invalid_json",
+                                   "request body must be a JSON object")
+                return
+            keys = set(payload)
+            if keys == {"body"}:
+                try:
+                    operator, lead = store.lead_chat_identities()
+                    request_id = store.lead_chat_request_id(operator=operator, lead=lead)
+                except ValueError as e:
+                    self._json_problem(HTTPStatus.CONFLICT, "lead_chat_identity_denied",
+                                       str(e))
+                    return
+                liveness = store.lead_chat_liveness(lead=lead)
+                if not liveness.get("available"):
+                    self._send_json(HTTPStatus.CONFLICT, {
+                        "error": "lead_unavailable",
+                        "detail": liveness.get("reason") or liveness.get("detail") or "",
+                        "liveness": liveness,
+                    })
+                    return
+                kind = "lead_chat_send"
+                intent_payload = {"body": payload.get("body")}
+            elif keys == {"to_request", "body"}:
+                chat = build_lead_chat(roots[0])
+                if not chat.get("available"):
+                    self._send_json(HTTPStatus.CONFLICT, {
+                        "error": "lead_unavailable",
+                        "detail": chat.get("detail") or "",
+                        "liveness": chat.get("liveness") or {},
+                    })
+                    return
+                pending_ids = {
+                    item.get("request_id")
+                    for item in chat.get("pending_decisions") or []
+                    if isinstance(item, dict)
+                }
+                if payload.get("to_request") not in pending_ids:
+                    self._send_json(HTTPStatus.CONFLICT, {
+                        "error": "decision_not_pending",
+                        "detail": "lead-chat answers must target a pending "
+                                  "lead escalation addressed to the operator",
+                    })
+                    return
+                request_id = chat.get("request_id") or ""
+                kind = "answer_escalation"
+                intent_payload = {
+                    "to_request": payload.get("to_request"),
+                    "body": payload.get("body"),
+                }
+            else:
+                self._send_json(HTTPStatus.BAD_REQUEST, {
+                    "error": "invalid_lead_chat",
+                    "details": [
+                        "lead chat send requires exactly {body}; "
+                        "decision answer requires exactly {to_request, body}"
+                    ],
+                })
+                return
+            from agenttalk import intents as intent_mod
+            errors = intent_mod.validate_intent(kind, intent_payload)
+            if errors:
+                self._send_json(HTTPStatus.BAD_REQUEST,
+                                {"error": "invalid_intent", "details": errors})
+                return
+            try:
+                rec = store.write_intent(
+                    kind, intent_payload,
+                    origin={"source": "web-lead-chat", "session_id": session_id,
+                            "lead_chat_request_id": request_id,
+                            "host": self.headers.get("Host", ""),
+                            "origin": self.headers.get("Origin", "")})
+            except Store.IntentCapacityError as e:
+                status = HTTPStatus.INSUFFICIENT_STORAGE if e.code == "max_bytes" else HTTPStatus.TOO_MANY_REQUESTS
+                self._json_problem(status, e.code, str(e))
+                return
+            except ValueError as e:
+                self._json_problem(HTTPStatus.BAD_REQUEST, "invalid_intent", str(e))
+                return
+            self._send_json(HTTPStatus.ACCEPTED, {
+                "intent_id": rec["intent_id"],
+                "state": rec["state"],
+                "kind": kind,
+                "request_id": request_id,
+                "target_root_index": 0,
+                "target_root_label": roots[0].label,
+            })
+
         # ---- root resolution for the root-scoped thread route (P2-5)
         def _thread_store(self) -> Store:
             """The Store for the ``?root=<label>`` query arg, else ``roots[0]``.
@@ -2403,6 +2645,11 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 self._send_json(HTTPStatus.OK,
                                 build_attention(roots[0],
                                                 actions_enabled=enable_actions))
+                return
+            if path == "/api/lead-chat":
+                # Dedicated operator<->lead transcript. Carries bodies, but only
+                # from the stable lc-* thread between the configured principals.
+                self._send_json(HTTPStatus.OK, build_lead_chat(roots[0]))
                 return
             if path == "/api/threads":
                 self._handle_threads_get()
@@ -2589,6 +2836,7 @@ __all__ = [
     "RootDescriptor",
     "build_attention",
     "build_intents",
+    "build_lead_chat",
     "build_preflight",
     "build_state",
     "build_thread",

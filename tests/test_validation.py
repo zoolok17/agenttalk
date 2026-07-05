@@ -59,14 +59,14 @@ def test_message_validate_rejects_unknown_kind() -> None:
 def test_message_validate_rejects_non_roster_sender() -> None:
     m = Message(id="x", ts="x", sender="evil", recipient="alpha",
                 kind="message", body="ok", meta={})
-    with pytest.raises(ValueError, match="sender 'evil' not in roster"):
+    with pytest.raises(ValueError, match="sender 'evil' not in bus principals"):
         m.validate(["alpha", "beta"])
 
 
 def test_message_validate_rejects_non_roster_recipient() -> None:
     m = Message(id="x", ts="x", sender="alpha", recipient="ghost",
                 kind="message", body="ok", meta={})
-    with pytest.raises(ValueError, match="recipient 'ghost' not in roster"):
+    with pytest.raises(ValueError, match="recipient 'ghost' not in bus principals"):
         m.validate(["alpha", "beta"])
 
 

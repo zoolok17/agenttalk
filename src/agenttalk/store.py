@@ -146,6 +146,12 @@ _SESSION_ID_RE = re.compile(r"\A[0-9]{8}T[0-9]{6}(-[A-Za-z0-9]{4})?Z\Z")
 # them or a sidecar leaks in as a phantom dead-letter with a bogus stem message_id. The
 # .resolved.json sidecar was added in 0.56.0 (dead-letter resolve).
 _DEAD_LETTER_SIDECAR_SUFFIXES = (".deadletter.json", ".resolved.json")
+_LEAD_CHAT_AVAILABLE_STATES = frozenset({
+    _health.STATE_IDLE_WAITING,
+    _health.STATE_WORKING_TURN,
+    _health.STATE_WORKING_SILENT,
+})
+_LEAD_CHAT_HEARTBEAT_STALE_AFTER_SECONDS = 120.0
 
 
 def _is_dead_letter_payload(name: str) -> bool:
@@ -224,6 +230,11 @@ def validate_agent_roster(names: list[str]) -> list[str]:
             )
         seen[key] = n
     return names
+
+
+def _bus_principals(roster: list[str]) -> set[str]:
+    """Active agents plus code-owned reserved principals that may appear on the bus."""
+    return set(roster) | set(_avatars.RESERVED_PRINCIPALS)
 
 
 # Group names share the agent-name safety rule (interpolated nowhere
@@ -489,13 +500,14 @@ class Message:
         if not isinstance(self.meta, dict):
             raise ValueError(f"meta must be a dict, got {type(self.meta).__name__}")
         if roster:
-            if self.sender not in roster:
+            principals = _bus_principals(roster)
+            if self.sender not in principals:
                 raise ValueError(
-                    f"sender {self.sender!r} not in roster {sorted(roster)}"
+                    f"sender {self.sender!r} not in bus principals {sorted(principals)}"
                 )
-            if self.recipient not in roster:
+            if self.recipient not in principals:
                 raise ValueError(
-                    f"recipient {self.recipient!r} not in roster {sorted(roster)}"
+                    f"recipient {self.recipient!r} not in bus principals {sorted(principals)}"
                 )
 
 
@@ -595,6 +607,7 @@ class Store:
             "agents": agents,
             "created_at": _now_iso(),
             "session_id": _new_session_id(),
+            "operator_identity": _avatars.OPERATOR_PRINCIPAL,
             "deadman": {"mail_age_slo_seconds": 900, "alarm_unread_response": False},
             # NOTE: no project_id in config.json. The HMAC key file
             # is addressed by `signing.project_id_for_root(self.root)`,
@@ -1228,6 +1241,165 @@ class Store:
         roster = cfg.get("agents", []) or []
         return v if v in roster else None
 
+    def operator_identity_raw(self) -> str | None:
+        """The configured operator bus principal without validation."""
+        v = self.load_config().get("operator_identity")
+        return v if isinstance(v, str) and v else None
+
+    def operator_identity(self, *, lead: str | None = None) -> str:
+        """The human operator's bus sender.
+
+        This resolver intentionally has zero fallback. A dashboard-originated
+        operator message must come from a dedicated reserved principal, never
+        from the lead, liaison, environment, or browser payload.
+        """
+        value = self.operator_identity_raw()
+        if value is None:
+            raise ValueError(
+                "operator_identity is not configured; set config.json "
+                f"operator_identity to {_avatars.OPERATOR_PRINCIPAL!r}"
+            )
+        if value not in _avatars.RESERVED_PRINCIPALS:
+            raise ValueError(
+                f"operator_identity {value!r} is not a reserved bus principal "
+                f"{sorted(_avatars.RESERVED_PRINCIPALS)}"
+            )
+        if value != _avatars.OPERATOR_PRINCIPAL:
+            raise ValueError(
+                f"operator_identity {value!r} is not the supported operator "
+                f"principal {_avatars.OPERATOR_PRINCIPAL!r}"
+            )
+        if lead is not None and value == lead:
+            raise ValueError("operator_identity must not equal the lead identity")
+        return value
+
+    def lead_chat_lead(self) -> str:
+        """Resolve the lead recipient for the dashboard lead-chat surface."""
+        lead = self.operator_facing() or self.sole_lead()
+        if lead is None:
+            raise ValueError(
+                "lead chat needs an operator-facing lead or exactly one role=lead agent"
+            )
+        return lead
+
+    def lead_chat_identities(self) -> tuple[str, str]:
+        """Return ``(operator, lead)`` for lead-chat with no identity fallback."""
+        lead = self.lead_chat_lead()
+        operator = self.operator_identity(lead=lead)
+        return operator, lead
+
+    def lead_chat_request_id(
+        self, *, operator: str | None = None, lead: str | None = None
+    ) -> str:
+        """Stable chat thread id: ``lc-<sha256(session_id, operator, lead)>``."""
+        if operator is None or lead is None:
+            operator, lead = self.lead_chat_identities()
+        session_id = self.load_config().get("session_id")
+        validate_session_id(session_id)
+        h = hashlib.sha256()
+        for part in (session_id, operator, lead):
+            data = str(part).encode("utf-8")
+            h.update(len(data).to_bytes(4, "big"))
+            h.update(data)
+        return "lc-" + h.hexdigest()
+
+    @staticmethod
+    def _lead_chat_wrapped(health: dict) -> bool:
+        mode = health.get("mode") if isinstance(health, dict) else None
+        if not isinstance(mode, str):
+            return False
+        normalized = mode.casefold()
+        return normalized.startswith("wrapper") or normalized == "lead-loop"
+
+    def lead_chat_liveness(
+        self, *, lead: str | None = None, now_epoch: float | None = None,
+        heartbeat_stale_after: float = _LEAD_CHAT_HEARTBEAT_STALE_AFTER_SECONDS,
+    ) -> dict:
+        """Fail-closed availability for the dashboard lead-chat send path."""
+        try:
+            resolved_lead = lead or self.lead_chat_lead()
+        except ValueError as e:
+            return {
+                "available": False,
+                "status": "unavailable",
+                "code": "lead_unavailable",
+                "detail": str(e),
+            }
+        hb = self.read_heartbeat(resolved_lead)
+        now = time.time() if now_epoch is None else float(now_epoch)
+        stale_after = (
+            float(heartbeat_stale_after)
+            if isinstance(heartbeat_stale_after, (int, float))
+            and heartbeat_stale_after >= 0
+            else _LEAD_CHAT_HEARTBEAT_STALE_AFTER_SECONDS
+        )
+        if hb is None:
+            return {
+                "available": False,
+                "status": "unavailable",
+                "code": "lead_unavailable",
+                "lead": resolved_lead,
+                "reason": "lead heartbeat is missing",
+                "heartbeat_age_seconds": None,
+                "heartbeat_stale_after_seconds": stale_after,
+            }
+        heartbeat_age = max(0.0, now - hb.timestamp())
+        if heartbeat_age > stale_after:
+            return {
+                "available": False,
+                "status": "unavailable",
+                "code": "lead_unavailable",
+                "lead": resolved_lead,
+                "reason": "lead heartbeat is stale",
+                "heartbeat_age_seconds": round(heartbeat_age, 3),
+                "heartbeat_stale_after_seconds": stale_after,
+            }
+        health = self.read_health(resolved_lead, now_epoch=now, heartbeat=hb)
+        state = health.get("state") if isinstance(health, dict) else _health.STATE_UNKNOWN
+        reason = health.get("reason_code") if isinstance(health, dict) else None
+        wrapped = self._lead_chat_wrapped(health)
+        age = health.get("age_seconds") if isinstance(health, dict) else None
+        if not wrapped:
+            return {
+                "available": False,
+                "status": "unavailable",
+                "code": "lead_unwrapped",
+                "lead": resolved_lead,
+                "state": state,
+                "reason": reason or "lead is not a wrapped/managed process",
+                "heartbeat_age_seconds": round(heartbeat_age, 3),
+                "heartbeat_stale_after_seconds": stale_after,
+                "health": health,
+            }
+        if state not in _LEAD_CHAT_AVAILABLE_STATES:
+            return {
+                "available": False,
+                "status": "unavailable",
+                "code": "lead_unavailable",
+                "lead": resolved_lead,
+                "state": state,
+                "reason": reason or "lead is not currently available",
+                "heartbeat_age_seconds": round(heartbeat_age, 3),
+                "heartbeat_stale_after_seconds": stale_after,
+                "health": health,
+            }
+        status = {
+            _health.STATE_IDLE_WAITING: "idle",
+            _health.STATE_WORKING_TURN: "live",
+            _health.STATE_WORKING_SILENT: "away",
+        }.get(state, "unavailable")
+        return {
+            "available": True,
+            "status": status,
+            "code": status,
+            "lead": resolved_lead,
+            "state": state,
+            "age_seconds": age,
+            "heartbeat_age_seconds": round(heartbeat_age, 3),
+            "heartbeat_stale_after_seconds": stale_after,
+            "health": health,
+        }
+
     def is_release_authorized(self, sender: str) -> bool:
         """DEPRECATED legacy alias - delegates to the SINGLE loop-exit resolver
         :meth:`loop_exit_relay_authorized` (0.40.0 unification). It used to carry a
@@ -1668,29 +1840,39 @@ class Store:
         subject: str = "",
         meta: dict | None = None,
         sign: bool | None = None,
+        _allow_reserved_sender: bool = False,
     ) -> Message:
         if not self.initialized():
             raise FileNotFoundError("agenttalk not initialized; run `agenttalk init`.")
         cfg = self.load_config()
         agents = set(cfg.get("agents", []))
+        principals = _bus_principals(list(agents))
         # A retired identity (#19) is removed from the ACTIVE roster, so it
         # already fails this membership check — but give it a tombstone-specific
         # message rather than a confusing "not in registered agents" (FR-004).
         retired = set(self._retired_names(cfg))
-        if agents and sender not in agents:
+        if sender in _avatars.RESERVED_PRINCIPALS and not _allow_reserved_sender:
+            raise ValueError(
+                f"sender '{sender}' is a reserved bus principal and can only be "
+                "used by the lead-chat/operator-answer authority path"
+            )
+        sender_allowed = sender in agents or (
+            _allow_reserved_sender and sender in _avatars.RESERVED_PRINCIPALS
+        )
+        if agents and not sender_allowed:
             if sender in retired:
                 raise ValueError(
                     f"sender '{sender}' is retired (a tombstone) and cannot "
                     f"send; tombstones are permanent (#19). See `agenttalk roster`."
                 )
-            raise ValueError(f"sender '{sender}' not in registered agents {sorted(agents)}")
-        if agents and recipient not in agents:
+            raise ValueError(f"sender '{sender}' not in registered bus principals {sorted(principals)}")
+        if agents and recipient not in principals:
             if recipient in retired:
                 raise ValueError(
                     f"recipient '{recipient}' is retired (a tombstone) and cannot "
                     f"receive new messages (#19). See `agenttalk roster`."
                 )
-            raise ValueError(f"recipient '{recipient}' not in registered agents {sorted(agents)}")
+            raise ValueError(f"recipient '{recipient}' not in registered bus principals {sorted(principals)}")
         # Reject unknown kinds at WRITE time so the sender sees an
         # immediate error rather than a silent receive-side skip.
         # Without this, `agenttalk send --kind typo` would exit 0 +
@@ -1794,6 +1976,7 @@ class Store:
                         subject=subject or f"operator answer ({request_id})",
                         body=body,
                         meta=meta,
+                        _allow_reserved_sender=actor in _avatars.RESERVED_PRINCIPALS,
                     )
                 except (OSError, ValueError) as e:
                     return OperatorAnswerSendResult(

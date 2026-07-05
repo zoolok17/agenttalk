@@ -1832,11 +1832,16 @@ def test_escalate_refusal_matrix(tmp_path: Path, capsys) -> None:
     # --to override works without a liaison
     assert _run(["escalate", "--from", "w1", "--to", "lead", "-m", "ping",
                  "--quiet"], root) == 0
-    # liaison self-escalation refused
+    # The operator-facing lead now escalates to the reserved operator principal
+    # for the dashboard lead-chat decision flow.
     assert _run(["roster", "set-operator-facing", "lead"], root) == 0
     capsys.readouterr()
-    _run_expect_exit(["escalate", "--from", "lead", "-m", "self"], root, 2)
-    assert "operator channel" in capsys.readouterr().err
+    assert _run(["escalate", "--from", "lead", "-m", "self", "--quiet"], root) == 0
+    lead_escalation = [
+        m for m in Store(root).valid_messages()
+        if m.sender == "lead" and m.recipient == "operator"
+    ]
+    assert len(lead_escalation) == 1
     # configured liaison gone from roster
     assert _run(["roster", "set-operator-facing", "w2"], root) == 0
     assert _run(["roster", "remove", "w2", "--force"], root) == 0  # #19: --force

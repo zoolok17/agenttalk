@@ -43,7 +43,10 @@ from agenttalk.store import CONTROL_KINDS, Store, _new_id
 
 EXECUTOR_MARKER = "dashboard_intent_v2"
 
-INTENT_KINDS = ("send", "reply", "propose", "broadcast", "answer_escalation")
+INTENT_KINDS = (
+    "send", "reply", "propose", "broadcast", "answer_escalation",
+    "lead_chat_send",
+)
 
 # Message kinds a browser intent may produce, per intent kind. Everything else
 # (release, end, rescind, wake, composing, review-result, gate, ...) is
@@ -135,8 +138,10 @@ def validate_intent(kind: object, payload: object) -> list[str]:
         allowed = {"target", "subject", "body"}
     elif kind == "broadcast":
         allowed = {"audience", "subject", "body", "message_kind"}
-    else:  # answer_escalation
+    elif kind == "answer_escalation":
         allowed = {"to_request", "body"}
+    else:  # lead_chat_send
+        allowed = {"body"}
     for k in payload:
         if k not in allowed:
             errors.append(f"unknown field {k!r} for intent kind {kind!r}")
@@ -289,6 +294,29 @@ def _epoch_shape(value: object) -> bool:
     )
 
 
+def _resolve_lead_chat_identities(store: Store) -> tuple[str, str]:
+    try:
+        return store.lead_chat_identities()
+    except ValueError as e:
+        raise IntentDenied("lead_chat_identity_denied", str(e)) from e
+
+
+def _lead_chat_unavailable(liveness: dict) -> IntentDenied:
+    detail = (
+        liveness.get("reason")
+        or liveness.get("detail")
+        or "lead is unavailable for lead chat"
+    )
+    return IntentDenied("lead_unavailable", str(detail))
+
+
+def _resolve_actor_for_record(store: Store, record: dict) -> str | None:
+    if record.get("kind") == "lead_chat_send":
+        operator, _lead = _resolve_lead_chat_identities(store)
+        return operator
+    return resolve_web_actor(store)
+
+
 def _resolve_plan_semantics(store: Store, actor: str, record: dict) -> dict:
     """Side-effect-free authority + delivery semantic resolver.
 
@@ -312,6 +340,15 @@ def _resolve_plan_semantics(store: Store, actor: str, record: dict) -> dict:
         bus_kind = payload.get("message_kind") or "message"
         meta_shape = "send_question" if bus_kind == "question" else "empty"
         recipients = [target]
+    elif kind == "lead_chat_send":
+        operator, lead = _resolve_lead_chat_identities(store)
+        liveness = store.lead_chat_liveness(lead=lead)
+        if not liveness.get("available"):
+            raise _lead_chat_unavailable(liveness)
+        bus_kind = "message"
+        subject = "lead chat"
+        meta_shape = "lead_chat"
+        recipients = [lead]
     elif kind == "propose":
         target = payload.get("target") or ""
         _check_target(target)
@@ -372,7 +409,9 @@ def _resolve_plan_semantics(store: Store, actor: str, record: dict) -> dict:
         "subject": subject,
         "body": body,
         "meta_shape": meta_shape,
-        "actor": actor,
+        "actor": operator if kind == "lead_chat_send" else actor,
+        "operator_identity": operator if kind == "lead_chat_send" else None,
+        "operator_facing_lead": lead if kind == "lead_chat_send" else None,
     }
 
 
@@ -407,6 +446,15 @@ def _mint_stable_meta(store: Store, semantic: dict) -> dict:
             "request_id": payload.get("to_request") or "",
             "operator_answer": "true",
             "operator_origin": semantic.get("actor") or "",
+        }
+    if shape == "lead_chat":
+        operator = semantic.get("operator_identity") or ""
+        lead = semantic.get("operator_facing_lead") or ""
+        return {
+            "request_id": store.lead_chat_request_id(operator=operator, lead=lead),
+            "lead_chat": "true",
+            "operator_identity": operator,
+            "operator_facing_lead": lead,
         }
     if shape in {"broadcast", "broadcast_question"}:
         bid = "b-" + secrets.token_hex(6)
@@ -445,7 +493,7 @@ def build_plan(store: Store, actor: str, record: dict) -> dict:
     return {"actor": actor, "deliveries": deliveries, "planned_at_epoch": time.time()}
 
 
-def _stable_meta_error(semantic: dict, meta: object) -> str | None:
+def _stable_meta_error(store: Store | None, semantic: dict, meta: object) -> str | None:
     if not isinstance(meta, dict):
         return "stable_meta must be an object"
     shape = semantic["meta_shape"]
@@ -461,6 +509,11 @@ def _stable_meta_error(semantic: dict, meta: object) -> str | None:
         allowed = {"request_id", "status"}
     elif shape == "operator_answer":
         allowed = {"request_id", "operator_answer", "operator_origin"}
+    elif shape == "lead_chat":
+        allowed = {
+            "request_id", "lead_chat", "operator_identity",
+            "operator_facing_lead",
+        }
     elif shape == "broadcast":
         allowed = {
             "broadcast_id", "request_id", "audience_kind",
@@ -512,6 +565,23 @@ def _stable_meta_error(semantic: dict, meta: object) -> str | None:
             return "operator_answer must be the string 'true'"
         if meta.get("operator_origin") != semantic.get("actor"):
             return "operator_origin does not match the frozen actor"
+        return None
+    if shape == "lead_chat":
+        if not _safe_prefixed_id(meta.get("request_id"), "lc-"):
+            return "lead-chat request_id must be a safe lc-* id"
+        if store is None:
+            return "lead-chat stable meta requires store context"
+        if meta.get("request_id") != store.lead_chat_request_id(
+            operator=semantic.get("operator_identity") or "",
+            lead=semantic.get("operator_facing_lead") or "",
+        ):
+            return "lead-chat request_id does not match current identities"
+        if meta.get("lead_chat") != "true":
+            return "lead_chat must be the string 'true'"
+        if meta.get("operator_identity") != semantic.get("operator_identity"):
+            return "operator_identity does not match current operator identity"
+        if meta.get("operator_facing_lead") != semantic.get("operator_facing_lead"):
+            return "operator_facing_lead does not match current lead"
         return None
     if not _safe_prefixed_id(meta.get("broadcast_id"), "b-"):
         return "broadcast_id must be a safe b-* id"
@@ -585,7 +655,7 @@ def validate_frozen_plan(store: Store, actor: str, record: dict, plan: object) -
             raise _plan_revalidation_failed(
                 "body_subject_drift",
                 f"delivery {i} content does not match payload")
-        meta_error = _stable_meta_error(semantic, delivery.get("stable_meta"))
+        meta_error = _stable_meta_error(store, semantic, delivery.get("stable_meta"))
         if meta_error is not None:
             raise _plan_revalidation_failed(
                 "stable_meta_shape", f"delivery {i}: {meta_error}")
@@ -675,7 +745,7 @@ def _validate_answer_escalation_static_plan(record: dict, plan: object) -> tuple
     if subject != semantic["subject"] or body != semantic["body"]:
         raise _plan_revalidation_failed(
             "body_subject_drift", "delivery 0 content does not match payload")
-    meta_error = _stable_meta_error(semantic, delivery.get("stable_meta"))
+    meta_error = _stable_meta_error(None, semantic, delivery.get("stable_meta"))
     if meta_error is not None:
         raise _plan_revalidation_failed(
             "stable_meta_shape", f"delivery 0: {meta_error}")
@@ -731,13 +801,51 @@ def _deny_intent(store: Store, intent_id: str, code: str, error: str) -> str:
     return Store.INTENT_DENIED
 
 
+def _resolve_answer_actor(store: Store, request_id: str) -> str | None:
+    """Use the operator principal for operator-addressed escalations.
+
+    Existing dashboard attention answers still resolve through the historical
+    web actor when the escalation is addressed to an agent liaison.
+    """
+    try:
+        operator = store.operator_identity()
+    except ValueError:
+        operator = None
+    if operator:
+        resolved = th.resolve_operator_answer_target(store, operator, request_id)
+        if resolved.ok or resolved.denial_code != "not_found":
+            return operator
+    return resolve_web_actor(store)
+
+
+def _actor_is_operator(store: Store, actor: str) -> bool:
+    try:
+        return actor == store.operator_identity()
+    except ValueError:
+        return False
+
+
+def _is_lead_chat_origin(record: dict) -> bool:
+    origin = record.get("origin") if isinstance(record.get("origin"), dict) else {}
+    return origin.get("source") == "web-lead-chat"
+
+
 def _drain_answer_escalation(store: Store, rec: dict) -> str:
     iid = rec["intent_id"]
     errors = validate_intent(rec.get("kind"), rec.get("payload"))
     if errors:
         return _deny_intent(store, iid, "invalid_payload", "; ".join(errors))
 
-    actor = resolve_web_actor(store)
+    request_id = (rec.get("payload") or {}).get("to_request") or ""
+    lead_chat_origin = _is_lead_chat_origin(rec)
+    if lead_chat_origin:
+        try:
+            actor, current_lead = _resolve_lead_chat_identities(store)
+        except IntentDenied as e:
+            return _deny_intent(store, iid, e.code, e.detail)
+    else:
+        actor = _resolve_answer_actor(store, request_id)
+        current_lead = None
     plan = rec.get("plan") if isinstance(rec.get("plan"), dict) else None
     if plan is None:
         if actor is None:
@@ -797,6 +905,27 @@ def _drain_answer_escalation(store: Store, rec: dict) -> str:
             f"resolved actor {actor!r} differs from the frozen plan's "
             f"{frozen_actor!r}; requeue a fresh intent",
         )
+    if lead_chat_origin:
+        if current_lead is None:
+            return _deny_intent(
+                store, iid, "lead_chat_identity_denied",
+                "lead-chat answer has no current lead identity")
+        if frozen_actor != actor:
+            return _deny_intent(
+                store, iid, "actor_changed",
+                f"resolved operator {actor!r} differs from the frozen plan's "
+                f"{frozen_actor!r}; requeue a fresh intent",
+            )
+        if delivery["recipient"] != current_lead:
+            return _deny_intent(
+                store, iid, "plan_revalidation_failed",
+                "recipient_drift: lead-chat answer recipient does not match "
+                "the current lead",
+            )
+        liveness = store.lead_chat_liveness(lead=current_lead)
+        if not liveness.get("available"):
+            denied = _lead_chat_unavailable(liveness)
+            return _deny_intent(store, iid, denied.code, denied.detail)
     try:
         semantic = _resolve_plan_semantics(store, actor, rec)
     except IntentDenied as e:
@@ -805,6 +934,11 @@ def _drain_answer_escalation(store: Store, rec: dict) -> str:
         return _deny_intent(
             store, iid, "plan_revalidation_failed",
             "recipient_drift: live recipient does not match frozen plan")
+    if _actor_is_operator(store, actor):
+        liveness = store.lead_chat_liveness(lead=delivery["recipient"])
+        if not liveness.get("available"):
+            denied = _lead_chat_unavailable(liveness)
+            return _deny_intent(store, iid, denied.code, denied.detail)
 
     floor = _new_id()
     _record_delivery(store, iid, 0, state="attempting", fingerprint=fp,
@@ -861,7 +995,12 @@ def _drain_one(store: Store, rec: dict) -> str:
                                    code="invalid_payload",
                                    error="; ".join(errors)[:500])
         return Store.INTENT_DENIED
-    actor = resolve_web_actor(store)
+    try:
+        actor = _resolve_actor_for_record(store, rec)
+    except IntentDenied as e:
+        store.mark_intent_terminal(iid, state=Store.INTENT_DENIED,
+                                   code=e.code, error=e.detail)
+        return Store.INTENT_DENIED
     if actor is None:
         code, detail = web_actor_denial(store)
         store.mark_intent_terminal(iid, state=Store.INTENT_DENIED,
@@ -935,7 +1074,8 @@ def _drain_one(store: Store, rec: dict) -> str:
         try:
             msg = store.send(sender=actor, recipient=d["recipient"],
                              body=d.get("body") or "", kind=d["bus_kind"],
-                             subject=d.get("subject") or "", meta=meta)
+                             subject=d.get("subject") or "", meta=meta,
+                             _allow_reserved_sender=rec.get("kind") == "lead_chat_send")
         except ValueError as e:
             store.mark_intent_terminal(iid, state=Store.INTENT_FAILED,
                                        code="send_rejected", error=str(e)[:500])

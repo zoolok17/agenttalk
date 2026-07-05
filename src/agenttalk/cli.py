@@ -544,6 +544,7 @@ def _gather_status(store: Store) -> dict:
     signing_enforced = store.signing_enforced()
     # project_id is path-derived; surfaces here for diagnostics
     project_id = store.project_id()
+    lead_chat = _lead_chat_status(store)
     payload = {
         "root": str(store.root),
         "session_id": cfg.get("session_id"),
@@ -561,10 +562,34 @@ def _gather_status(store: Store) -> dict:
         payload["quarantined"] = quarantined  # additive: absent when zero
     if dead_lettered:
         payload["dead_lettered_count"] = dead_lettered  # additive: absent when zero
+    if lead_chat.get("request_id"):
+        payload["lead_chat"] = lead_chat
     if signing_enforced:
         health = _signing.inspect_key(project_id, store.root)
         payload["hmac_key"] = health.to_dict()
     return payload
+
+
+def _lead_chat_status(store: Store) -> dict:
+    """CLI-visible lead-chat identity/rid view using the single store deriver."""
+    try:
+        operator, lead = store.lead_chat_identities()
+        request_id = store.lead_chat_request_id(operator=operator, lead=lead)
+        liveness = store.lead_chat_liveness(lead=lead)
+    except ValueError as e:
+        return {
+            "available": False,
+            "status": "unavailable",
+            "error": "lead_chat_identity_denied",
+            "detail": str(e),
+        }
+    return {
+        "available": bool(liveness.get("available")),
+        "status": liveness.get("status") or "unavailable",
+        "operator_identity": operator,
+        "lead": lead,
+        "request_id": request_id,
+    }
 
 
 def _status_warnings(agents: list[dict]) -> list[str]:
@@ -3771,7 +3796,11 @@ def cmd_escalate(args: argparse.Namespace) -> int:
         _ensure_in_roster(args.to, roster, label="escalation target")
         target = args.to
     else:
-        target = store.operator_facing()
+        try:
+            operator_identity, lead_chat_lead = store.lead_chat_identities()
+        except ValueError:
+            operator_identity, lead_chat_lead = None, None
+        target = operator_identity if sender == lead_chat_lead else store.operator_facing()
         if target is None:
             # No usable liaison. Fall back to the team's single lead rather than
             # stranding the escalation (0.24.0, feedback 3.1). The at-most-one

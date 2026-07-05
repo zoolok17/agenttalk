@@ -698,11 +698,17 @@ def test_liaison_flow_refusals_e2e(tmp_path: Path, capsys) -> None:
     # explicit --to override still works
     assert _run(["escalate", "--from", "w1", "--to", "lead", "-m", "ping",
                  "--quiet"], root) == 0
-    # liaison self-escalation refused with its reason
+    # lead self-escalation routes to the reserved operator principal so
+    # lead-chat pending decisions use the same escalation channel.
     assert _run(["roster", "set-operator-facing", "lead"], root) == 0
     capsys.readouterr()
-    _run_expect_exit(["escalate", "--from", "lead", "-m", "self"], root, 2)
-    assert "operator channel" in capsys.readouterr().err
+    assert _run(["escalate", "--from", "lead", "-m", "self",
+                 "--quiet"], root) == 0
+    lead_escalations = [
+        msg for msg in Store(root).valid_messages()
+        if msg.sender == "lead" and msg.recipient == "operator"
+    ]
+    assert len(lead_escalations) == 1
     # liaison cleared mid-flight: the pending escalation survives and the
     # (former) liaison's answer still closes it
     capsys.readouterr()
