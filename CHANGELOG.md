@@ -5,6 +5,32 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.65.0] - 2026-07-05
+
+### Added
+
+- **Agent self-selected avatars + an operator avatar.** Avatars are now a durable per-principal
+  preference (`avatars: {<principal>: <avatar_id>}` in `config.json`) resolved through a new
+  code-owned allowlist module (`agenttalk.avatars`) instead of being derived only from role.
+  New CLI: `agenttalk avatar list [--json]`, `avatar set <id> --from <self>` (self-only — cannot
+  target another agent), `avatar clear --from <self>`, `avatar set-operator <id>`,
+  `avatar clear-operator`. The human-facing **operator** principal now gets a real avatar
+  (ships `operator.png`) instead of always rendering a bare status dot, and this generalizes to
+  any roster principal without a role.
+- **Dashboard operator descriptor.** `/api/state` gains an additive per-agent `avatar`
+  record (`{id, file, source}`) and a top-level `operator` descriptor; unset agents keep their
+  exact previous role-based avatar behavior (strictly additive — no field removed or renamed).
+  Static avatar serving stays allowlist-only (no config value is ever joined into a served path),
+  and any bad/missing/invalid preference degrades gracefully (chosen → operator-default →
+  role-default → status dot) — it never bricks `load_config`, `/api/state`, or the render.
+
+### Fixed / Hardened
+
+- **Reserved the `operator` principal name.** `operator` (and every reserved principal) is now
+  rejected as an assignable agent name at `init` / roster add / roster rename, so an agent can no
+  longer collide with the reserved human-operator avatar key. (Caught by the adversarial review of
+  this release.)
+
 ## [0.64.1] - 2026-07-05
 
 ### Fixed

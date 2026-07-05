@@ -1,3 +1,3 @@
 """agenttalk: file-backed message bus for coding-agent CLIs (pairs or named teams)."""
 
-__version__ = "0.64.1"
+__version__ = "0.65.0"

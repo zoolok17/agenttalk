@@ -91,6 +91,24 @@ gitleaks false-positive (a redaction-test's synthetic secret, not a real leak or
 corrected in v0.64.1. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.65.0 — agent self-selected avatars + operator avatar (2026-07-05)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `613bf1f` · tag `v0.65.0`
+- **Review:** design-first (lead-gated, display/preference — not authority-critical) → build → **both
+  reviewers GO** (reviewer-1 security/fail-safe + reviewer-2 correctness/contract, no findings) + a
+  fresh **4-lens adversarial pass** (no-traversal / fail-safe / impersonation / additive-parity)
+  that caught one real **P2 neither reviewer did** — the reserved `operator` principal key could
+  collide with a roster agent named `operator` — folded (reserve the name in `validate_agent_name`)
+  and re-checked GO by reviewer-2. Three P3 nits accepted/banked with rationale.
+- **Gate:** ruff/bandit/**gitleaks** (no-git + range)/node --check/diff/compileall clean; pytest
+  **1939 passed / 3 skipped on 3.10 AND 3.14** (clean venvs).
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green.
+- **Robust/Secure:** avatar serving stays **allowlist-only** — a chosen id resolves ONLY to a
+  code-owned `AVATAR_ASSETS` file; no config value is ever joined into a served path (traversal,
+  encoded, absolute/UNC, embedded-slash, unicode inputs all normalize to *no chosen avatar*,
+  verified adversarially). A malformed/hostile `avatars` map is fail-soft (dropped with a warning,
+  never bricks `load_config`/`/api/state`, never a broken image). `avatar set --from` is self-only
+  (cannot relabel another principal); the avatar is display-only and never an identity/routing key.
+
 ### v0.64.1 — gitleaks security-CI false-positive fix (2026-07-05)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `b086a12` · tag `v0.64.1`
 - **Review:** contained scanner-config + test-fixture hotfix (right-sized) — **codex reviewer-1 GO**
