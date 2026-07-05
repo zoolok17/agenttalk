@@ -369,6 +369,10 @@ def _codex_completed_lines() -> list[str]:
     ]]
 
 
+def _codex_failed_lines(message: str) -> list[str]:
+    return [json.dumps({"type": "turn.failed", "error": {"message": message}})]
+
+
 def _codex_cadence_bus_output_lines(output: str, exit_code: int | None = None) -> list[str]:
     item = {"type": "command_execution",
             "command": "python -m agenttalk reply --to-request rq-1 --file out.md",
@@ -491,6 +495,104 @@ def test_make_cadence_drive_required_bus_unknown_without_signal_success(
     )
     assert cd({"agent": "beta"}, [{"type": "dead_letter"}]) is True
     assert s.read_heartbeat("beta") is not None
+
+
+def test_make_cadence_drive_resume_infra_does_not_consume_broken_session_gate(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex", codex_thread_id="t-old")
+    cd = run.make_cadence_drive(
+        s,
+        "beta",
+        "codex",
+        st,
+        ["codex"],
+        spawn=lambda _a, _i: _codex_failed_lines("HTTP 529 overloaded"),
+        clock=lambda: 0.0,
+        render=False,
+    )
+
+    assert cd({"agent": "beta"}, [{"type": "dead_letter"}]) is False
+    assert cd({"agent": "beta"}, [{"type": "dead_letter"}]) is False
+    assert st.resume_available is True
+    assert st.codex_thread_id == "t-old"
+    assert st.resume_failure_count == 0
+
+
+def test_make_cadence_drive_resume_supervisor_kill_does_not_consume_gate(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex", codex_thread_id="t-old")
+    cd = run.make_cadence_drive(
+        s,
+        "beta",
+        "codex",
+        st,
+        ["codex"],
+        spawn=lambda _a, _i: _codex_failed_lines("child killed by supervisor"),
+        clock=lambda: 0.0,
+        render=False,
+    )
+
+    assert cd({"agent": "beta"}, [{"type": "dead_letter"}]) is False
+    assert cd({"agent": "beta"}, [{"type": "dead_letter"}]) is False
+    assert st.resume_available is True
+    assert st.codex_thread_id == "t-old"
+    assert st.resume_failure_count == 0
+
+
+def test_make_cadence_drive_resume_config_blocked_does_not_consume_gate(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex", codex_thread_id="t-old")
+    cd = run.make_cadence_drive(
+        s,
+        "beta",
+        "codex",
+        st,
+        ["codex"],
+        spawn=lambda _a, _i: _codex_completed_lines(),
+        agenttalk_preflight=lambda: "Access is denied",
+        clock=lambda: 0.0,
+        render=False,
+    )
+
+    assert cd({"agent": "beta"}, [{"type": "dead_letter"}]) is False
+    assert cd({"agent": "beta"}, [{"type": "dead_letter"}]) is False
+    assert st.resume_available is True
+    assert st.codex_thread_id == "t-old"
+    assert st.resume_failure_count == 0
+
+
+def test_make_cadence_drive_resume_broken_session_gives_up_once(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    s.set_operator_facing("alpha")
+    st = session.SessionState(cli="codex", codex_thread_id="t-old")
+    cd = run.make_cadence_drive(
+        s,
+        "beta",
+        "codex",
+        st,
+        ["codex"],
+        spawn=lambda _a, _i: _codex_failed_lines("no session"),
+        clock=lambda: 0.0,
+        render=False,
+    )
+
+    assert cd({"agent": "beta"}, [{"type": "dead_letter"}]) is False
+    assert st.resume_available is True
+    assert cd({"agent": "beta"}, [{"type": "dead_letter"}]) is False
+    assert st.resume_available is False
+    assert st.codex_thread_id is None
+    notices = [m for m in s.valid_messages()
+               if m.subject == "wrapper resume continuity loss"]
+    assert len(notices) == 1
+    assert notices[0].recipient == "alpha"
 
 
 # ----------------------------------------------------------- cli wiring (the real hook)

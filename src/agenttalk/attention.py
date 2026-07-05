@@ -387,8 +387,7 @@ def should_emit_dead_letter_notice(store, *, agent: str, message_id: str,
         return False, {"reason": "resolved"}
     events, warnings = read_notice_events(store)
     prior = latest_dead_letter_notices(events).get(key)
-    if (prior and prior.get("state_hash") == state_hash
-            and (prior.get("warnings") or []) == warnings):
+    if prior and prior.get("state_hash") == state_hash:
         return False, {"reason": "duplicate", "request_id": prior.get("request_id")}
     return True, {"notice_key": key, "state_hash": state_hash, "warnings": warnings}
 

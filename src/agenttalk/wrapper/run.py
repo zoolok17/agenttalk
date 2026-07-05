@@ -1312,6 +1312,51 @@ class _ProcStream:
             _ = exc
 
 
+def _classify_drive_failure(sig: dict) -> tuple[str, str]:
+    """Map failed-turn signals to the wrapper dead-letter/resume taxonomy."""
+    from .loop import (
+        CLASS_AMBIGUOUS,
+        CLASS_CONFIG_BLOCKED,
+        CLASS_INFRA,
+        CLASS_POISON,
+    )
+
+    wd = sig.get("watchdog")
+    if wd:
+        summary = wd.get("summary") if isinstance(wd, dict) else None
+        return CLASS_AMBIGUOUS, summary or "turn watchdog killed hung tool descendant"
+    if sig.get("config_blocked"):
+        summary = sig.get("config_blocked_text")
+        return CLASS_CONFIG_BLOCKED, summary or "deterministic exec permission denied"
+    bus_failure = sig.get("bus_failure")
+    if isinstance(bus_failure, dict):
+        return CLASS_AMBIGUOUS, bus_failure.get("summary") or "bus write failed"
+    if sig.get("error"):
+        return CLASS_INFRA, sig["error"]
+    if sig.get("terminal"):
+        text = sig.get("terminal_text") or ""
+        blocked = _terminal_config_blocked_summary(text)
+        if blocked is None:
+            blocked = _runtime_config_blocked_summary(text)
+        if blocked:
+            return CLASS_CONFIG_BLOCKED, blocked
+        if _looks_like_infra(text):
+            return CLASS_INFRA, f"terminal infra error: {text[:160]}"
+        if _looks_like_content_poison(text):
+            return CLASS_POISON, f"terminal content-poison: {text[:160]}"
+        return CLASS_AMBIGUOUS, (f"terminal failure, unrecognized cause: {text[:160]}"
+                                 if text else "terminal failure, no error text")
+    if sig.get("retryable"):
+        return CLASS_INFRA, ("retryable transport error"
+                             + (" after handshake" if sig.get("started") else ", no start"))
+    if sig.get("started"):
+        if not sig.get("completed"):
+            return CLASS_AMBIGUOUS, ("partial stream: started, never completed "
+                                     "(poison or an unrecognized drop after the handshake)")
+        return CLASS_AMBIGUOUS, f"nonzero child exit (rc={sig.get('rc')}) after start"
+    return CLASS_AMBIGUOUS, f"turn never started (rc={sig.get('rc')}, no clear signal)"
+
+
 def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str], *,
                sender: str | None = None, min_interval: float = 5.0,
                render: bool = True, rules: str | None = None,
@@ -1356,8 +1401,6 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
     from .loop import (
         CLASS_AMBIGUOUS,
         CLASS_CONFIG_BLOCKED,
-        CLASS_INFRA,
-        CLASS_POISON,
         DriveOutcome,
     )
 
@@ -1546,73 +1589,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         return sig
 
     def _classify(sig: dict) -> tuple[str, str]:
-        """Map failed-turn signals to (failure_class, summary) for the dead-letter
-        taxonomy. A terminal turn-failure is low-cap POISON ONLY when its error text
-        POSITIVELY matches a message-content signature (size / content-policy); an
-        infra-looking terminal error, and any unrecognized/ambiguous partial/nonzero
-        outcome, gets the high K_escalate ceiling so a sustained INFRA outage (or an
-        unobserved cause) can never false-dead-letter a healthy message (lead verify P1)."""
-        wd = sig.get("watchdog")
-        if wd:
-            # the per-turn watchdog killed a hung tool descendant: AMBIGUOUS (never poison),
-            # checked BEFORE rc/terminal noise it caused. The message stays pending and rides
-            # the K_escalate ceiling - a persistently-wedging head escalates, never auto-DLs.
-            summary = wd.get("summary") if isinstance(wd, dict) else None
-            return CLASS_AMBIGUOUS, summary or "turn watchdog killed hung tool descendant"
-        if sig.get("config_blocked"):
-            summary = sig.get("config_blocked_text")
-            return CLASS_CONFIG_BLOCKED, summary or "deterministic exec permission denied"
-        bus_failure = sig.get("bus_failure")
-        if isinstance(bus_failure, dict):
-            return CLASS_AMBIGUOUS, bus_failure.get("summary") or "bus write failed"
-        if sig.get("error"):                       # spawn/exec OS error (missing binary, ...)
-            return CLASS_INFRA, sig["error"]
-        if sig.get("terminal"):
-            text = sig.get("terminal_text") or ""
-            blocked = _terminal_config_blocked_summary(text)
-            if blocked is None:
-                blocked = _runtime_config_blocked_summary(text)
-            if blocked:
-                return CLASS_CONFIG_BLOCKED, blocked
-            if _looks_like_infra(text):
-                # a terminal carrying an infra message (overloaded/rate-limit/5xx/auth/edge
-                # block) is a GLOBAL outage, not poison -> never auto-DL. INFRA is checked
-                # BEFORE poison ON PURPOSE: if a terminal somehow matched BOTH families, the
-                # safe direction is INFRA (retry + escalate, decided by a human) over a low-cap
-                # auto-dispose - a misclassified poison just disposes later at the ceiling, a
-                # misclassified outage would false-DL a healthy message (fail-closed).
-                return CLASS_INFRA, f"terminal infra error: {text[:160]}"
-            if _looks_like_content_poison(text):
-                # EXPLICIT message-content-attributable failure - the size family (this message
-                # is too large) or the content-policy family (this message's content is
-                # disallowed) -> deterministic poison fast-path @K_poison.
-                return CLASS_POISON, f"terminal content-poison: {text[:160]}"
-            # DEFAULT (codex ruling): an unrecognized terminal cause is AMBIGUOUS, not
-            # poison - an UNKNOWN-infra terminal must not false-DL at the low cap. It still
-            # disposes (bounded) at the high K_escalate ceiling, with escalation.
-            return CLASS_AMBIGUOUS, (f"terminal failure, unrecognized cause: {text[:160]}"
-                                     if text else "terminal failure, no error text")
-        # An EXPLICIT recognized retryable transport error -> INFRA, checked BEFORE the
-        # started/partial-stream ambiguity so a transport drop AFTER the handshake (turn
-        # STARTED, recognized retryable error, then dropped with no terminal) is NOT shadowed
-        # as ambiguous (lead 6th-verify P2). It is dominantly an infra drop after the
-        # handshake -> keep retrying/escalating, NEVER auto-dead-letter. Covers both no-start
-        # and started-then-dropped; a TERMINAL failure was already classified above by its text.
-        if sig.get("retryable"):
-            return CLASS_INFRA, ("retryable transport error"
-                                 + (" after handshake" if sig.get("started") else ", no start"))
-        if sig.get("started"):
-            # started, NO terminal, NO recognized retryable signal: a partial stream / nonzero
-            # exit is AMBIGUOUS - the start event may be only an API handshake (e.g. claude
-            # message_start), so an UNRECOGNIZED drop MID-stream looks identical to
-            # message-poison. Treat as ambiguous so a sustained OUTAGE escalates + only
-            # dead-letters at the high K_escalate ceiling (never at the low poison cap).
-            if not sig.get("completed"):
-                return CLASS_AMBIGUOUS, ("partial stream: started, never completed "
-                                         "(poison or an unrecognized drop after the handshake)")
-            return CLASS_AMBIGUOUS, f"nonzero child exit (rc={sig.get('rc')}) after start"
-        # the turn never started and no recognized signal: not attributable to the record.
-        return CLASS_AMBIGUOUS, f"turn never started (rc={sig.get('rc')}, no clear signal)"
+        return _classify_drive_failure(sig)
 
     def drive(record: dict) -> DriveOutcome:
         prompt = _prompt.assemble_turn_prompt(record, rules=rules)
@@ -1764,10 +1741,11 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
 
     ``cadence_drive(snapshot, items) -> bool`` drives ONE CLI turn whose prompt is the
     bounded read-only SNAPSHOT + the actionable items (NOT a bus record), returning True
-    iff the turn reached a clean COMPLETED boundary. UNLIKE :func:`make_drive` there is NO
-    failure CLASSIFICATION, NO :class:`~.loop.DriveOutcome`, and NO dead-letter path - a
-    cadence failure is just ``False`` (the controller treats it as controller-HEALTH
-    trouble: back off + escalate, never poison).
+    iff the turn reached a clean COMPLETED boundary. The cadence path still has NO
+    :class:`~.loop.DriveOutcome` and NO dead-letter path - a cadence failure is just
+    ``False`` (the controller treats it as controller-HEALTH trouble: back off + escalate,
+    never poison). Resume failures are classified only to decide whether the session
+    resume give-up ledger may count them.
 
     It builds its OWN engine/detector (a separate degraded window from the message drive is
     fine - cadence turns are rare) but SHARES ``session_state`` by reference, so codex
@@ -1777,6 +1755,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
     propagates out so a lost-lease controller stops sweeping at once."""
     from . import prompt as _prompt
     from . import session as _session
+    from .loop import CLASS_CONFIG_BLOCKED
 
     mapper = _ADAPTERS.get(cli)
     if mapper is None:
@@ -1814,19 +1793,25 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
         preflight = preflight_agenttalk_runtime
     preflight_ok = False
 
-    def _run_one(spec) -> bool:
+    def _run_one(spec) -> dict:
         """Spawn ONE CLI invocation for ``spec`` and stream its JSONL through the engine.
-        True only if it reached a COMPLETED boundary, hit no terminal (non-retryable)
+        ok only if it reached a COMPLETED boundary, hit no terminal (non-retryable)
         adapter_error, produced no config-blocked bus tool output, and the child exited
-        cleanly. A spawn/exec OSError is a False turn (never raised). Cadence still returns
-        only ok / not-ok; classification is used only to avoid false success."""
+        cleanly. A spawn/exec OSError is captured for the same classification path as
+        message turns, so resume cadence never counts infra/config/kill failures toward
+        the broken-session K gate."""
         argv = list(base_argv) + spec.args
-        started = completed = terminal = False
-        bus_failed = False
+        sig = {"ok": False, "started": False, "completed": False, "terminal": False,
+               "retryable": False, "rc": None, "error": None, "terminal_text": "",
+               "config_blocked": False, "config_blocked_text": "", "bus_failure": None}
         nonlocal preflight_ok
         if preflight is not None and not preflight_ok:
-            if preflight():
-                return False
+            blocked = preflight()
+            if blocked:
+                sig["config_blocked"] = True
+                sig["config_blocked_text"] = blocked
+                sig["error"] = blocked
+                return sig
             preflight_ok = True
         try:
             stream = spawner(argv, spec.stdin)
@@ -1841,26 +1826,44 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                 _session.observe_event(session_state, raw)
                 for ev in mapper(raw):
                     if ev.type == EventType.TURN_STARTED:
-                        started = True
+                        sig["started"] = True
                     elif ev.type == EventType.TURN_FINISHED:
-                        completed = True
-                    elif ev.type == EventType.ADAPTER_ERROR and not ev.retryable:
-                        terminal = True
+                        sig["completed"] = True
+                    elif ev.type == EventType.ADAPTER_ERROR:
+                        if ev.retryable:
+                            sig["retryable"] = True
+                        else:
+                            sig["terminal"] = True
+                            sig["terminal_text"] = ev.text or sig["terminal_text"]
                     elif ev.type == EventType.TOOL_FINISHED:
                         bus = classify_bus_execution(ev.tool, ev.text, ev.exit_code, ev.raw)
-                        if bus["kind"] in (
-                            BUS_KIND_CONFIG_BLOCKED,
-                            BUS_KIND_SEMANTIC_FAILURE,
-                            BUS_KIND_UNKNOWN_FAILURE,
-                        ):
-                            bus_failed = True
+                        if bus["kind"] == BUS_KIND_CONFIG_BLOCKED:
+                            sig["config_blocked"] = True
+                            sig["config_blocked_text"] = bus["summary"]
+                        elif bus["kind"] in (
+                                BUS_KIND_SEMANTIC_FAILURE,
+                                BUS_KIND_UNKNOWN_FAILURE):
+                            sig["bus_failure"] = bus
                     engine.process(ev, clock())
         except OSError as exc:
-            _ = _spawn_config_blocked_summary(argv, exc)
-            return False
+            blocked = _spawn_config_blocked_summary(argv, exc)
+            if blocked:
+                sig["config_blocked"] = True
+                sig["config_blocked_text"] = blocked
+                sig["error"] = blocked
+            else:
+                sig["error"] = f"spawn/exec error running {_compact_text(_format_argv(argv))}: {exc}"
+            return sig
         rc = getattr(stream, "returncode", None)
-        _ = started  # observed for parity with make_drive; cadence gates on completed
-        return completed and not terminal and not bus_failed and rc in (0, None)
+        sig["rc"] = rc
+        sig["ok"] = (
+            sig["completed"]
+            and not sig["terminal"]
+            and not sig["config_blocked"]
+            and sig["bus_failure"] is None
+            and rc in (0, None)
+        )
+        return sig
 
     def cadence_drive(snapshot: dict, items: list) -> bool:
         prompt = _prompt.assemble_cadence_prompt(snapshot, items, rules=rules)
@@ -1872,15 +1875,25 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
             _session.resume_attempt_start(session_state, agent=agent, msg_id="cadence")
             if persist is not None:
                 persist(session_state)
-        ok = _run_one(spec)
+        sig = _run_one(spec)
+        ok = bool(sig["ok"])
         if not ok and attempted_resume:
-            count = _session.record_resume_attempt_result(
-                session_state,
-                failure_class="poison_eligible",
-                summary="cadence resume turn failed",
-                attributable=True,
-            )
-            if count >= 2:
+            resume_failure_class, resume_summary = _classify_drive_failure(sig)
+            attributable = _session.resume_failure_is_session_attributable(
+                resume_failure_class, resume_summary)
+            if resume_failure_class == CLASS_CONFIG_BLOCKED:
+                _session.clear_resume_attempt(session_state)
+                if persist is not None:
+                    persist(session_state)
+                count = 0
+            else:
+                count = _session.record_resume_attempt_result(
+                    session_state,
+                    failure_class=resume_failure_class,
+                    summary=resume_summary,
+                    attributable=attributable,
+                )
+            if attributable and count >= 2:
                 if cli_name == "claude":
                     _session.reset_claude_session(
                         session_state, "resume_unavailable after 2 session failures")

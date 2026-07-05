@@ -208,6 +208,7 @@ def test_working_health_with_stale_heartbeat_does_not_delay_recovery_or_restart(
     assert plan["state"] == "STUCK_OR_DEAD"
     assert plan["health"]["state"] == hm.STATE_WORKING_SILENT
 
+    s.set_operator_facing("alpha")
     s.write_restart_request("beta", {
         "request_id": "rr-1",
         "requested_by": "alpha",

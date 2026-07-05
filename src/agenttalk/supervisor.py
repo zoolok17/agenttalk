@@ -363,6 +363,29 @@ def resolve_health_timing(config: dict, cfg_agent: dict) -> dict:
             "heartbeat_skew_seconds", "health_heartbeat_skew_seconds"),
     }
 
+
+def _restart_request_with_live_authority(store: Store, marker: dict | None) -> dict | None:
+    if not isinstance(marker, dict):
+        return marker
+    out = dict(marker)
+    authority = resolve_restart_request_authority(
+        store,
+        out.get("requested_by"),
+        force_protected=bool(out.get("force_protected")),
+        acknowledge_live_protected_kill=bool(
+            out.get("acknowledge_live_protected_kill")),
+    )
+    out["authority_still_valid"] = (
+        authority.get("authority_result") == "authorized"
+        and authority.get("authorized_by") == out.get("requested_by")
+    )
+    out["force_protected_still_authorized"] = bool(
+        authority.get("force_protected_authorized"))
+    out["acknowledge_live_protected_kill_still_authorized"] = bool(
+        authority.get("acknowledge_live_protected_kill_authorized"))
+    out["authority_live_reason"] = authority.get("authority_reason")
+    return out
+
 # Per-CLI session-argument templates, as LISTS of literal tokens (so the
 # generated PowerShell uses an array-of-literals ArgumentList - single-quoted
 # PS literals do NOT expand `$`, so the Codex `$agenttalk-listen` prompt and
@@ -1803,7 +1826,8 @@ def build_report(store: Store, *, now_epoch: float,
             "waiting_pid_alive": bool(w_pid is not None and _process_alive(w_pid)),
             "waiting_deadline_epoch": (marker.get("deadline_epoch")
                                        if isinstance(marker, dict) else None),
-            "restart_request": store.read_restart_request(a),
+            "restart_request": _restart_request_with_live_authority(
+                store, store.read_restart_request(a)),
             "config_blocked_hold": store.read_config_blocked_hold(a),
             "session_id": st.get("session_id"),  # supervisor-local; None unless state passed
         }
@@ -2108,22 +2132,29 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             and isinstance(marker.get("requested_by"), str)
             and isinstance(marker.get("authorized_by"), str)
             and marker.get("authorized_by") == marker.get("requested_by")
+            and marker.get("authority_still_valid", True) is True
         )
         if not auth_ok:
             nxt["last_warn_epoch"] = now_epoch
             return _result(REFUSE_PROTECTED, state="RESTART_UNAUTHORIZED",
                            notify=True,
                            reason="restart-request has no valid authorization marker")
-        if protected and not (
-                marker.get("force_protected_authorized") is True
-                and isinstance(marker.get("force_protected_authorized_by"), str)):
+        force_authorized = (
+            marker.get("force_protected_authorized") is True
+            and isinstance(marker.get("force_protected_authorized_by"), str)
+            and marker.get("force_protected_still_authorized", True) is True
+        )
+        if protected and not force_authorized:
             nxt["last_warn_epoch"] = now_epoch
             return _result(REFUSE_PROTECTED, state="REFUSE_PROTECTED",
                            notify=True, reason="restart of a protected agent requires "
                                                "authorized --force-protected")
         if rid not in consumed:
-            if protected and not hb_stale and not bool(
-                    marker.get("acknowledge_live_protected_kill_authorized")):
+            live_kill_ack = (
+                marker.get("acknowledge_live_protected_kill_authorized") is True
+                and marker.get("acknowledge_live_protected_kill_still_authorized", True) is True
+            )
+            if protected and not hb_stale and not live_kill_ack:
                 nxt["last_warn_epoch"] = now_epoch
                 return _result(REFUSE_PROTECTED, state="LIVE_PROTECTED_REFUSED",
                                notify=True,

@@ -696,6 +696,64 @@ def test_b1_corrupt_notice_log_fails_open_once(tmp_path: Path) -> None:
     assert len(notices) == 1
 
 
+def test_b1_clean_notice_then_corrupt_log_stays_latched(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    s.set_operator_facing("lead")
+    m = _send(s, "poison")
+    notifier = cli._dead_letter_notifier(s, "beta")
+    info = {
+        "agent": "beta", "msg_id": m.id, "from": "lead", "kind": "message",
+        "attempts": 3, "attempts_bucket": "quarantined",
+        "first_started_at": "2026-07-05T00:00:00Z",
+        "failure_class": CLASS_POISON,
+        "quarantined": True,
+    }
+
+    assert notifier(info, disposed=True) is True
+    p = att.attention_dir(s) / "notices.jsonl"
+    p.write_text(p.read_text(encoding="utf-8") + "{torn\n", encoding="utf-8")
+    for _ in range(20):
+        assert notifier(info, disposed=True) is True
+
+    notices = [msg for msg in s.messages_for("lead")
+               if msg.subject == "dead-letter notice"]
+    assert len(notices) == 1
+
+
+def test_b1_resolve_requeue_refail_fresh_id_emits_new_notice(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    s.set_operator_facing("lead")
+    original = _send(s, "poison", meta={"request_id": "rq-retry"})
+    rec = _rec(s)
+    s.dead_letter("beta", rec, reason="poison", failure_class=CLASS_POISON, at="t")
+    notifier = cli._dead_letter_notifier(s, "beta")
+    first_info = {
+        "agent": "beta", "msg_id": original.id, "from": "lead", "kind": "message",
+        "attempts": 3, "attempts_bucket": "quarantined",
+        "first_started_at": "2026-07-05T00:00:00Z",
+        "failure_class": CLASS_POISON,
+        "quarantined": True,
+    }
+
+    assert notifier(first_info, disposed=True) is True
+    assert _run(["dead-letter", "resolve", "--agent", "beta", "--id", original.id,
+                 "--reason", "handled", "--from", "lead"], tmp_path) == 0
+    assert _run(["dead-letter", "requeue", "--agent", "beta", "--id", original.id,
+                 "--force-resolved", "--reason", "retry", "--from", "lead"],
+                tmp_path) == 0
+    requeued = _rec(s)
+    assert requeued is not None and requeued["id"] != original.id
+    s.dead_letter("beta", requeued, reason="poison", failure_class=CLASS_POISON, at="t")
+    second_info = dict(first_info, msg_id=requeued["id"])
+
+    assert notifier(second_info, disposed=True) is True
+
+    notices = [msg for msg in s.messages_for("lead")
+               if msg.subject == "dead-letter notice"]
+    assert len(notices) == 2
+    assert {msg.meta.get("dl_msg_id") for msg in notices} == {original.id, requeued["id"]}
+
+
 def test_b2_infra_raw_attempt_churn_before_elapsed_floor_does_not_quarantine(tmp_path: Path) -> None:
     s = _store(tmp_path)
     m = _send(s, "infra")

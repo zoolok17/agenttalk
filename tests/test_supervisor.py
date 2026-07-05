@@ -446,6 +446,40 @@ def test_restart_authority_operator_facing_controls_live_kill_ack(tmp_path: Path
     assert ops_auth["acknowledge_live_protected_kill_authorized"] is True
 
 
+def test_restart_marker_revalidates_authority_at_plan_time(tmp_path: Path) -> None:
+    s = _team(tmp_path, "lead,ops,worker")
+    s.set_role("lead", "lead")
+    s.set_operator_facing("ops")
+    assert _run(["request-restart", "--for", "lead", "--from", "ops",
+                 "--force-protected", "--acknowledge-live-protected-kill"],
+                tmp_path) == 0
+    marker = s.read_restart_request("lead")
+    assert marker is not None and marker["authority_result"] == "authorized"
+    assert marker["force_protected_authorized"] is True
+    assert marker["acknowledge_live_protected_kill_authorized"] is True
+
+    s.set_operator_facing(None)
+    (s.state_dir / "lead.heartbeat").write_text(_iso(NOW), encoding="utf-8")
+    cfg = {**_CONFIG, "agents": {"lead": {"auto_restart": True, "cli": "codex"}}}
+    report = sup.build_report(s, now_epoch=NOW + 1, supervisor_config=cfg)
+    live_marker = report["agents"]["lead"]["restart_request"]
+    assert live_marker["authority_still_valid"] is False
+    assert live_marker["force_protected_still_authorized"] is False
+    assert live_marker["acknowledge_live_protected_kill_still_authorized"] is False
+
+    plan = sup.plan_actions(
+        report,
+        {"agents": {"lead": _ready(backoff_next_epoch=0)}},
+        cfg,
+        now_epoch=NOW + 1,
+        snapshot=_snap(agent="lead"),
+    )["agents"]["lead"]
+    assert plan["action"] == sup.REFUSE_PROTECTED
+    assert plan["state"] == "RESTART_UNAUTHORIZED"
+    assert plan["clear_marker"] is None
+    assert s.read_restart_request("lead")["request_id"] == marker["request_id"]
+
+
 def test_request_restart_unknown_agent_exit_2(tmp_path: Path) -> None:
     _team(tmp_path)
     assert _run(["request-restart", "--for", "ghost"], tmp_path) == 2
@@ -1756,6 +1790,7 @@ def test_manual_restart_marker_clears_only_after_readiness(tmp_path: Path) -> No
     """Slice 1: applying a manual restart leaves the marker latched until a
     later fresh heartbeat/readiness tick. Launch success alone is not release."""
     s = _team(tmp_path)
+    s.set_role("lead", "lead")
     s.write_restart_request("worker", {"agent": "worker", **_auth_marker("rr-1")})
     rpt = sup.build_report(s, now_epoch=NOW)
     plan = sup.plan_actions(rpt, {"agents": {"worker": {"pid_alive": False}}},
@@ -2199,6 +2234,7 @@ def test_config_blocked_hold_request_restart_overrides_and_clear_preserves_hold(
     tmp_path: Path,
 ) -> None:
     s = _team(tmp_path)
+    s.set_role("lead", "lead")
     (s.state_dir / "worker.heartbeat").write_text(_iso(NOW), encoding="utf-8")
     _write_config_blocked_health(s, "worker", NOW)
     s.write_config_blocked_hold("worker", summary="command=codex; error=shim")
