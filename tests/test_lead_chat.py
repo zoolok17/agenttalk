@@ -437,6 +437,39 @@ def test_api_lead_chat_get_post_and_pending_decision_shape(
         srv.server_close()
 
 
+@pytest.mark.parametrize("bad_to_request", [[], 123, {"request_id": "esc-choice"}])
+def test_api_lead_chat_answer_rejects_non_string_to_request_without_disconnect(
+    tmp_path: Path,
+    bad_to_request: object,
+) -> None:
+    s = _store(tmp_path)
+    _available(s)
+    _lead_question(s)
+    srv, _t, base = web.serve_in_thread(s, port=0, enable_actions=True)
+    try:
+        token = _session(base)
+
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post_lead_chat(base, token, {
+                "to_request": bad_to_request,
+                "body": "x",
+            })
+
+        assert exc.value.code == 400
+        payload = json.loads(exc.value.read())
+        assert payload["error"] == "invalid_intent"
+        assert any("to_request" in detail for detail in payload["details"])
+        assert s.list_intents() == []
+        assert not [
+            m for m in s.valid_messages()
+            if m.sender == "operator"
+            and (m.meta or {}).get("operator_answer") == "true"
+        ]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_lead_chat_unavailable_never_queues(tmp_path: Path) -> None:
     s = _store(tmp_path)
     srv, _t, base = web.serve_in_thread(s, port=0, enable_actions=True)

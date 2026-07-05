@@ -2586,6 +2586,18 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 })
                 return
             elif keys == {"to_request", "body"}:
+                kind = "answer_escalation"
+                intent_payload = {
+                    "to_request": payload.get("to_request"),
+                    "body": payload.get("body"),
+                }
+                from agenttalk import intents as intent_mod
+                errors = intent_mod.validate_intent(kind, intent_payload)
+                if errors:
+                    self._send_json(HTTPStatus.BAD_REQUEST,
+                                    {"error": "invalid_intent",
+                                     "details": errors})
+                    return
                 chat = build_lead_chat(roots[0])
                 if not chat.get("available"):
                     self._send_json(HTTPStatus.CONFLICT, {
@@ -2605,18 +2617,6 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                         "detail": "lead-chat answers must target a pending "
                                   "lead escalation addressed to the operator",
                     })
-                    return
-                kind = "answer_escalation"
-                intent_payload = {
-                    "to_request": payload.get("to_request"),
-                    "body": payload.get("body"),
-                }
-                from agenttalk import intents as intent_mod
-                errors = intent_mod.validate_intent(kind, intent_payload)
-                if errors:
-                    self._send_json(HTTPStatus.BAD_REQUEST,
-                                    {"error": "invalid_intent",
-                                     "details": errors})
                     return
                 msg, answer_ids, problem = _send_authenticated_lead_chat_answer(
                     store,
