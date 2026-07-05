@@ -192,12 +192,10 @@ def compute_verdict(record: dict, gate_check: dict,
                  "release-class close lacks verified lane worktree isolation evidence")
         else:
             status = worktree_eval.get("status")
-            if status == "verified":
+            if status in {"verified", "waived"}:
                 if worktree_eval.get("delivered_head") != record.get("revision"):
                     hold(HOLD_WORKTREE_ISOLATION,
                          "lane delivery artifact head does not match close revision")
-            elif status == "waived":
-                pass
             else:
                 detail = worktree_eval.get("reason") or "lane worktree isolation is unverified"
                 hold(HOLD_WORKTREE_ISOLATION, str(detail))

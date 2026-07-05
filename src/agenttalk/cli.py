@@ -3246,17 +3246,25 @@ def cmd_lane(args: argparse.Namespace) -> int:
             if isinstance(lane, dict):
                 lane["status"] = lane_mod.STATUS_ABANDONED
                 if lane.get("worktree_path"):
-                    try:
-                        rc, _out, err = _git_write(
-                            store.root, ["worktree", "remove", "--", str(lane["worktree_path"])])
-                        lane["worktree_state"] = (
-                            lane_mod.STATUS_ABANDONED if rc == 0
-                            else lane_mod.STATUS_CLEANUP_FAILED)
-                        if rc != 0:
-                            lane["worktree_cleanup_error"] = err.strip()[:500]
-                    except GitWriteError as e:
-                        lane["worktree_state"] = lane_mod.STATUS_CLEANUP_FAILED
-                        lane["worktree_cleanup_error"] = str(e)[:500]
+                    if _lane_worktree_idle(store, lane):
+                        try:
+                            _verify_lane_worktree(store, lane)
+                            rc, _out, err = _git_write(
+                                store.root, ["worktree", "remove", "--", str(lane["worktree_path"])])
+                            lane["worktree_state"] = (
+                                lane_mod.STATUS_ABANDONED if rc == 0
+                                else lane_mod.STATUS_CLEANUP_FAILED)
+                            if rc != 0:
+                                lane["worktree_cleanup_error"] = err.strip()[:500]
+                        except lane_mod.LaneError as e:
+                            lane["worktree_state"] = lane_mod.STATUS_CLEANUP_PENDING
+                            lane["worktree_cleanup_error"] = str(e)[:500]
+                        except GitWriteError as e:
+                            lane["worktree_state"] = lane_mod.STATUS_CLEANUP_FAILED
+                            lane["worktree_cleanup_error"] = str(e)[:500]
+                    else:
+                        lane["worktree_state"] = lane_mod.STATUS_CLEANUP_PENDING
+                        lane["worktree_cleanup_error"] = "worktree has an active or pending launch"
                 lane_mod.save_lanes(store, data)
         deleted = False
         if getattr(args, "delete_branch", False):

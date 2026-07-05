@@ -773,6 +773,20 @@ def test_m9_active_launch_prevents_deliver_teardown(tmp_path: Path) -> None:
     assert wt.exists()
 
 
+def test_abandon_active_launch_defers_worktree_removal(tmp_path: Path) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "busyabandon")
+    wt = Path(lane["worktree_path"])
+    Store(root).write_launch_request({
+        "request_id": "lr-busy-abandon", "state": "queued", "lane_id": "busyabandon",
+    })
+    assert _run_raw(["lane", "abandon", "--id", "busyabandon"], root) == 0
+    saved = lanes.load_lanes(Store(root))["lanes"]["busyabandon"]
+    assert saved["status"] == lanes.STATUS_ABANDONED
+    assert saved["worktree_state"] == lanes.STATUS_CLEANUP_PENDING
+    assert wt.exists()
+
+
 def test_m10_gc_discovers_lane_worktree_after_reset(tmp_path: Path, capsys) -> None:
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "orphan")

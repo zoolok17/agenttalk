@@ -307,6 +307,17 @@ def test_m6_release_close_without_lane_artifact_holds(tmp_path: Path) -> None:
     assert close.HOLD_WORKTREE_ISOLATION in _codes(result)
 
 
+def test_release_close_waived_artifact_head_mismatch_holds() -> None:
+    rec = close.empty_close(
+        "rel", scope="release", revision=OTHER_SHA, revision_kind="sha",
+        gate_scope="release", opened_by="lead", opened_at="t0",
+        epoch_at_open=None, required_lenses=[], revision_clean=True,
+        dirty_artifact=None)
+    result = close.compute_verdict(
+        rec, _gate_go(), worktree_eval={"status": "waived", "delivered_head": SHA})
+    assert close.HOLD_WORKTREE_ISOLATION in _codes(result)
+
+
 def test_cli_gate_hold_drives_close_hold(tmp_path: Path) -> None:
     root = _init(tmp_path)
     _open(root)
