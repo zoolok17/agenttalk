@@ -887,6 +887,44 @@ def test_supervisor_event_ring_reader_sanitizes_polluted_rows(tmp_path: Path) ->
     assert "secret-token-sk-live-path" not in rewritten
 
 
+def test_supervisor_event_ring_reader_drops_non_finite_epoch(
+        tmp_path: Path, capsys) -> None:
+    s = _team(tmp_path)
+    path = sup.supervisor_events_path(s)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '{"schema_version":1,"kind":"poll_summary",'
+        '"at":"2026-07-05T00:00:00Z","at_epoch":NaN,'
+        '"planned_agents":1,"healthy_idle":0,"states":{"HEALTHY_IDLE":1}}\n',
+        encoding="utf-8",
+    )
+
+    events, warnings = sup.read_supervisor_events(s)
+
+    assert warnings == ["supervisor_events_sanitized:1"]
+    assert "at_epoch" not in events[0]
+    assert json.dumps(events, allow_nan=False)
+
+    rc = _run(["supervisor", "--json", "--now", str(NOW)], s.root)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "NaN" not in out
+    json.loads(out)
+
+    sup.record_supervisor_plan_events(
+        s,
+        {"agents": {"worker": {"action": sup.NONE, "state": "HEALTHY_IDLE"}}},
+        now_epoch=NOW + 999,
+        cap=5,
+        summary_interval_seconds=300,
+    )
+    raw = path.read_text(encoding="utf-8")
+    after, _warnings = sup.read_supervisor_events(s)
+    summaries = [e for e in after if e["kind"] == "poll_summary"]
+    assert any(e.get("at_epoch") == NOW + 999 for e in summaries)
+    assert "NaN" not in raw
+
+
 def test_supervisor_event_ring_torn_read_degrades(tmp_path: Path) -> None:
     s = _team(tmp_path)
     path = sup.supervisor_events_path(s)

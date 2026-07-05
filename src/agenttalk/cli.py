@@ -7,6 +7,7 @@ import contextlib
 import dataclasses
 import io
 import json
+import math
 import os
 import subprocess  # nosec B404
 import sys
@@ -89,6 +90,16 @@ def _read_body(args: argparse.Namespace) -> str:
         if data:
             return data
     return ""
+
+
+def _json_scrub_nonfinite(value):
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, list):
+        return [_json_scrub_nonfinite(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_scrub_nonfinite(item) for key, item in value.items()}
+    return value
 
 
 def _parse_meta(items: list[str] | None) -> dict:
@@ -1179,7 +1190,16 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
             },
         }
     if args.json:
-        print(json.dumps(payload, indent=2))
+        try:
+            rendered = json.dumps(payload, indent=2, allow_nan=False)
+        except ValueError:
+            payload = _json_scrub_nonfinite(payload)
+            if isinstance(payload.get("event_ring"), dict):
+                warnings = payload["event_ring"].setdefault("warnings", [])
+                if isinstance(warnings, list):
+                    warnings.append("supervisor_json_nonfinite_sanitized")
+            rendered = json.dumps(payload, indent=2, allow_nan=False)
+        print(rendered)
         return 0
     print(f"root:       {payload['root']}")
     print(f"supervisor: events cap={payload.get('event_ring', {}).get('cap')}")

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 import shlex
 import sys
@@ -421,7 +422,9 @@ def _event_nonnegative_int(value: object) -> int:
 
 def _event_epoch(value: object) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
+        epoch = float(value)
+        if math.isfinite(epoch):
+            return epoch
     return None
 
 
@@ -570,15 +573,24 @@ def append_supervisor_events(store: Store, events: list[dict], *,
     """Best-effort bounded JSONL append implemented as read/cap/rewrite."""
     if not events:
         return
+    clean_events: list[dict] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        clean = _sanitize_supervisor_event(event)
+        if clean is not None:
+            clean_events.append(clean)
+    if not clean_events:
+        return
     cap = cap if isinstance(cap, int) and cap > 0 else SUPERVISOR_EVENT_RING_CAP
     try:
         with store._config_lock(timeout=0.05, poll=0.01):
             prior, _ = read_supervisor_events(store)
-            kept = [*prior, *events][-cap:]
+            kept = [*prior, *clean_events][-cap:]
             path = supervisor_events_path(store)
             path.parent.mkdir(parents=True, exist_ok=True)
             text = "".join(
-                json.dumps(e, ensure_ascii=False, sort_keys=True) + "\n"
+                json.dumps(e, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
                 for e in kept
             )
             _atomic_write_text(path, text)
