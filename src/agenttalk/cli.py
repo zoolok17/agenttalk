@@ -7468,7 +7468,11 @@ def cmd_wrap(args: argparse.Namespace) -> int:
             lane_id = lane_mod.validate_lane_id(args.lane_id)
             data = lane_mod.load_lanes(store)
             lane = (data.get("lanes") or {}).get(lane_id)
-            if not isinstance(lane, dict) or not lane.get("worktree_path"):
+            if not isinstance(lane, dict):
+                raise lane_mod.LaneError(f"lane {lane_id!r} has no active provisioned worktree")
+            if lane.get("status") != lane_mod.STATUS_ACTIVE:
+                raise lane_mod.LaneError(f"lane {lane_id!r} is not active for launch")
+            if not lane.get("worktree_path"):
                 raise lane_mod.LaneError(f"lane {lane_id!r} has no provisioned worktree")
             launch_cwd = Path(lane["worktree_path"])
             if args.cli == "codex" and not any(

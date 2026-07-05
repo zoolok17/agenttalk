@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from agenttalk import ephemeral as eph
 from agenttalk import cli
+from agenttalk import lanes
 from agenttalk import supervisor as sup
 from agenttalk.store import Store
 from agenttalk.wrapper import loop
@@ -179,6 +182,53 @@ def test_prepare_launch_request_resolves_ephemeral_window_style(tmp_path: Path) 
 
     assert spec["window_style"] == "Minimized"
     assert spec["window_style_warning"] is None
+
+
+def test_prepare_lane_without_worktree_archives_denied_after_claim(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    lane = lanes.new_lane(
+        "nowt", assignee="dev", assigned_by="lead", assigned_at="t0",
+        domain_id="core", path_subset=[], base_sha=SHA, target_ref="main",
+        target_head_at_assign=SHA, epoch_at_assign=None,
+        registry_hash_at_assign="hash")
+    lanes.save_lanes(s, {"schema_version": lanes.SCHEMA_VERSION, "lanes": {"nowt": lane}})
+    marker = _marker("lr-nowt", lane_id="nowt")
+    marker["scope"]["lane_id"] = "nowt"
+    s.write_launch_request(marker)
+
+    with pytest.raises(eph.EphemeralError, match="no provisioned worktree"):
+        sup.prepare_launch_request(s, {}, _cfg(), "lr-nowt", now_epoch=NOW)
+
+    assert s.read_launch_request("lr-nowt") is None
+    archived = json.loads(
+        (s.launch_requests_archive_dir / "lr-nowt.json").read_text(encoding="utf-8"))
+    assert archived["terminal_state"] == eph.STATE_DENIED
+    assert "no provisioned worktree" in archived["reason"]
+
+
+def test_prepare_inactive_lane_worktree_archives_denied_after_claim(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    lane = lanes.new_lane(
+        "done", assignee="dev", assigned_by="lead", assigned_at="t0",
+        domain_id="core", path_subset=[], base_sha=SHA, target_ref="main",
+        target_head_at_assign=SHA, epoch_at_assign=None,
+        registry_hash_at_assign="hash",
+        worktree={"path": str(tmp_path / ".worktrees" / "done"), "branch": "lane/done",
+                  "base_sha": SHA, "created_at": "t0", "root": str(tmp_path / ".worktrees")})
+    lane["status"] = lanes.STATUS_DELIVERED
+    lanes.save_lanes(s, {"schema_version": lanes.SCHEMA_VERSION, "lanes": {"done": lane}})
+    marker = _marker("lr-done", lane_id="done")
+    marker["scope"]["lane_id"] = "done"
+    s.write_launch_request(marker)
+
+    with pytest.raises(eph.EphemeralError, match="not active"):
+        sup.prepare_launch_request(s, {}, _cfg(), "lr-done", now_epoch=NOW)
+
+    assert s.read_launch_request("lr-done") is None
+    archived = json.loads(
+        (s.launch_requests_archive_dir / "lr-done.json").read_text(encoding="utf-8"))
+    assert archived["terminal_state"] == eph.STATE_DENIED
+    assert "not active" in archived["reason"]
 
 
 def test_cli_archive_launch_request_preserves_completion_evidence(tmp_path: Path) -> None:

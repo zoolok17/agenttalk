@@ -3225,9 +3225,12 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
             lane_id = lane_mod.validate_lane_id(str(lane_id))
             lanes_data = lane_mod.load_lanes(store)
             lane = (lanes_data.get("lanes") or {}).get(lane_id)
-            if not isinstance(lane, dict) or not lane.get("worktree_path"):
-                raise eph.EphemeralError(
-                    f"lane {lane_id!r} has no provisioned worktree for launch")
+            if not isinstance(lane, dict):
+                raise lane_mod.LaneError(f"lane {lane_id!r} has no active provisioned worktree")
+            if lane.get("status") != lane_mod.STATUS_ACTIVE:
+                raise lane_mod.LaneError(f"lane {lane_id!r} is not active for launch")
+            if not lane.get("worktree_path"):
+                raise lane_mod.LaneError(f"lane {lane_id!r} has no provisioned worktree for launch")
             workspace_path = str(Path(lane["worktree_path"]))
             marker["lane_id"] = lane_id
             marker["workspace_path"] = workspace_path
