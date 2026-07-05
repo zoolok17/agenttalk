@@ -346,6 +346,68 @@ def test_status_json_includes_heartbeat_when_set(
     assert alpha["stale"] is False
 
 
+def test_status_operator_lead_uses_last_seen_liveness_when_health_missing(
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    s = Store(store_root)
+    s.set_role("alpha", "lead")
+    s.set_operator_facing("alpha")
+    s.write_heartbeat("alpha")
+
+    rc = _run(["status", "--json"], store_root)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    alpha = next(a for a in payload["agents"] if a["name"] == "alpha")
+    assert alpha["health"]["state"] == "unknown"
+    assert alpha["health"]["reason_code"] == "health_missing"
+    assert alpha["lead_liveness"]["state"] == "active"
+    assert alpha["health_display"] == {"state": "active", "source": "bus_last_seen"}
+
+    rc = _run(["status"], store_root)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "alpha" in out
+    assert "health=active" in out
+
+
+def test_status_supervisor_assessment_fail_safe(
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    def boom(*_args, **_kwargs):
+        raise ValueError("bad supervisor report")
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", boom)
+
+    rc = _run(["status", "--json"], store_root)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "supervisor_assessment_unavailable:ValueError" in payload["warnings"]
+
+
+def test_supervisor_cli_read_fail_safe(
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    def boom(*_args, **_kwargs):
+        raise ValueError("bad supervisor report")
+
+    monkeypatch.setattr(cli.sup, "build_supervisor_observation", boom)
+
+    rc = _run(["supervisor", "--json"], store_root)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["agents"] == []
+    assert "supervisor_read_unavailable:ValueError" in payload["event_ring"]["warnings"]
+
+
 def test_status_human_output_unchanged_for_no_heartbeat(
     store_root: Path,
     capsys: pytest.CaptureFixture,

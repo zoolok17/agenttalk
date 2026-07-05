@@ -535,6 +535,7 @@ def test_supervise_init_generates_and_is_idempotent(tmp_path: Path, capsys) -> N
     # + restores env, the dry-run hook, and preserves state on a failed launch.
     ps = (s.dir / "supervisor.ps1").read_text(encoding="utf-8")
     assert "supervise --plan --state-file" in ps
+    assert "--record-events" in ps
     assert "--json" not in ps                       # blocker regression guard
     assert "Start-Process -FilePath" in ps and "-ArgumentList" in ps and "-PassThru" in ps
     assert "Invoke-Expression" not in ps            # file/args executor, no expr
@@ -658,6 +659,229 @@ def test_supervise_plan_cli_with_fixtures(tmp_path: Path, capsys) -> None:
     plan = json.loads(capsys.readouterr().out)
     assert plan["agents"]["worker"]["action"] == sup.NONE
     assert plan["agents"]["worker"]["state"] == "HEALTHY_IDLE"
+
+
+def test_supervisor_assessment_copies_real_plan_decisions_verbatim() -> None:
+    conflict_health = {
+        "state": hm.STATE_WORKING_SILENT,
+        "age_seconds": 1.0,
+        "warnings": [],
+        "advisory": True,
+    }
+    cases = [
+        _plan(_report(protected=True, heartbeat_stale=True),
+              {"agents": {"worker": _ready()}}, snapshot=[],
+              config=_HOOK_CODEX_CONFIG),
+        _plan(_report(heartbeat_stale=True),
+              {"agents": {"worker": _ready(last_warn_epoch=0)}}, snapshot=_snap()),
+        _plan(_report(protected=True, restart_request=_auth_marker("rr-protected")),
+              {"agents": {"worker": _ready()}}, snapshot=_snap()),
+        _plan(_report(heartbeat_stale=True),
+              {"agents": {"worker": _ready(
+                  launching=True, readiness_seen=False, launch_grace_until=NOW - 1,
+                  readiness_fails=3, backoff_next_epoch=0, last_warn_epoch=0,
+              )}}, snapshot=[], config=_HOOK_CODEX_CONFIG),
+        _plan(_report(heartbeat_stale=True,
+                      config_blocked_hold={"summary": r"secret C:\Users\Milos\token"}),
+              {"agents": {"worker": _ready()}}, snapshot=[],
+              config=_HOOK_CODEX_CONFIG),
+        _plan(_report(heartbeat_stale=True,
+                      lead_loop_exit={"state": "stood_down"}),
+              {"agents": {"worker": _ready()}}, snapshot=[],
+              config=_HOOK_CODEX_CONFIG),
+        _plan(_report(heartbeat_stale=True,
+                      lead_loop_exit={"state": "blocked"},
+                      lead_loop={"armed": True}),
+              {"agents": {"worker": _ready()}}, snapshot=[],
+              config=_HOOK_CODEX_CONFIG),
+        _plan(_report(restart_request={"request_id": "rr-forged",
+                                       "requested_by": "peer",
+                                       "force_protected": True}),
+              {"agents": {"worker": _ready(backoff_next_epoch=0)}}),
+        _plan(_report(restart_request=_auth_marker("rr-cool")),
+              {"agents": {"worker": _ready(last_launch_epoch=NOW - 10)}},
+              config={**_CONFIG, "restart_cooldown_seconds": 45},
+              snapshot=_snap()),
+        _plan(_report(heartbeat_stale=True, health=conflict_health),
+              {"agents": {"worker": _ready(last_warn_epoch=0)}}, snapshot=_snap()),
+        _plan(_report(), {"agents": {"worker": _ready()}}, snapshot=_snap()),
+        _plan(_report(heartbeat_stale=True),
+              {"agents": {"worker": _ready(backoff_next_epoch=0)}}, snapshot=[],
+              config=_HOOK_CODEX_CONFIG),
+        _plan(_report(restart_request=_auth_marker("rr-manual")),
+              {"agents": {"worker": _ready(backoff_next_epoch=NOW + 9999)}},
+              snapshot=_snap()),
+    ]
+
+    seen = {(p["action"], p["state"]) for p in cases}
+    assert (sup.WARN_ONLY, "STUCK_OR_DEAD") in seen
+    assert (sup.SUSPECT_WARN, "ACTIVE_OR_BUSY") in seen
+    assert (sup.REFUSE_PROTECTED, "REFUSE_PROTECTED") in seen
+    assert (sup.READINESS_GAVE_UP, "READINESS_GAVE_UP") in seen
+    assert (sup.NONE, "CONFIG_BLOCKED") in seen
+    assert (sup.NONE, "LEAD_LOOP_STOOD_DOWN") in seen
+    assert (sup.NONE, "LEAD_LOOP_BLOCKED") in seen
+    assert (sup.REFUSE_PROTECTED, "RESTART_UNAUTHORIZED") in seen
+    assert (sup.BACKOFF_WAIT, "RESTART_COOLDOWN") in seen
+    assert (sup.NONE, "HEALTHY_IDLE") in seen
+    assert (sup.STUCK_RECOVER, "STUCK_OR_DEAD") in seen
+    assert (sup.RELAUNCH, "MANUAL_RESTART") in seen
+
+    for plan in cases:
+        assessment = sup.supervisor_agent_assessment(
+            "worker",
+            _report()["agents"]["worker"],
+            plan,
+        )
+        assert assessment["decision"]["action"] == plan["action"]
+        assert assessment["decision"]["state"] == plan["state"]
+        assert assessment["decision"]["reason"] == plan["reason"]
+
+    conflict = next(p for p in cases if "advisory-health-conflict" in p["health"]["warnings"])
+    conflict_assessment = sup.supervisor_agent_assessment(
+        "worker", _report()["agents"]["worker"], conflict)
+    assert "advisory-health-conflict" in conflict_assessment["decision"]["health"]["warnings"]
+
+
+def test_supervisor_cli_json_decision_matches_plan_actions(tmp_path: Path, capsys) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.json").write_text(json.dumps(_HOOK_CONFIG), encoding="utf-8")
+    (s.state_dir / "worker.heartbeat").write_text(_iso(NOW - 5000), encoding="utf-8")
+    state_file = tmp_path / "state.json"
+    state = {"agents": {"worker": _ready(session_id="SID")}}
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+    snap_file = s.dir / "supervisor-snapshot.json"
+    snap_file.write_text(json.dumps(_snap(cli="claude")), encoding="utf-8")
+
+    rc = _run([
+        "supervisor", "--json", "--state-file", str(state_file),
+        "--now", str(NOW),
+    ], tmp_path)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    expected = payload["plan"]["agents"]["worker"]
+    worker = next(a for a in payload["agents"] if a["name"] == "worker")
+    assert worker["decision"]["action"] == expected["action"]
+    assert worker["decision"]["state"] == expected["state"]
+    assert worker["decision"]["reason"] == expected["reason"]
+    assert expected["action"] == sup.STUCK_RECOVER
+
+
+def test_supervisor_event_ring_bounded_redacted_and_transition_only(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    for i in range(8):
+        sup.record_supervisor_plan_events(
+            s,
+            {
+                "agents": {
+                    "worker": {
+                        "action": sup.NONE,
+                        "state": f"STATE{i}",
+                        "reason": r"failed C:\Users\Milos\secret token=sk-test",
+                        "notify": bool(i % 2),
+                    }
+                }
+            },
+            now_epoch=NOW + i,
+            cap=5,
+            summary_interval_seconds=999999,
+        )
+
+    events, warnings = sup.read_supervisor_events(s)
+    raw = sup.supervisor_events_path(s).read_text(encoding="utf-8")
+    assert warnings == []
+    assert len(events) == 5
+    assert "STATE7" in raw
+    assert "sk-test" not in raw
+    assert r"C:\Users\Milos" not in raw
+    assert "failed" not in raw
+
+    before = list(events)
+    same = {
+        "agents": {
+            "worker": {
+                "action": sup.NONE,
+                "state": "STATE7",
+                "reason": "changed secret",
+                "notify": True,
+            }
+        }
+    }
+    sup.record_supervisor_plan_events(
+        s, same, now_epoch=NOW + 100, cap=5, summary_interval_seconds=999999)
+    after, _ = sup.read_supervisor_events(s)
+    assert after == before
+
+
+def test_supervisor_event_ring_redacts_config_blocked_summary(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    secret = r"Command=C:\Users\Milos\secret-tool.exe error token=sk-config"
+    sup.record_supervisor_plan_events(
+        s,
+        {"agents": {"worker": {"action": sup.NONE, "state": "CONFIG_BLOCKED", "reason": secret}}},
+        now_epoch=NOW,
+    )
+
+    raw = sup.supervisor_events_path(s).read_text(encoding="utf-8")
+    assert "CONFIG_BLOCKED" in raw
+    assert "sk-config" not in raw
+    assert r"C:\Users\Milos" not in raw
+    assert "secret-tool" not in raw
+
+
+def test_supervisor_event_ring_torn_read_degrades(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    path = sup.supervisor_events_path(s)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"kind":"agent_decision","agent":"worker"}\n{torn\n',
+                    encoding="utf-8")
+
+    events, warnings = sup.read_supervisor_events(s)
+
+    assert events == [{"kind": "agent_decision", "agent": "worker"}]
+    assert warnings == ["supervisor_events_torn:2"]
+
+
+def test_supervisor_event_write_lock_timeout_is_fail_safe(tmp_path: Path, monkeypatch) -> None:
+    s = _team(tmp_path)
+
+    class BusyLock:
+        def __enter__(self):
+            raise TimeoutError("busy")
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(s, "_config_lock", lambda **_kwargs: BusyLock())
+
+    sup.append_supervisor_events(s, [{"kind": "agent_decision"}])
+
+    assert not sup.supervisor_events_path(s).exists()
+
+
+def test_supervise_plan_record_events_uses_ring_not_bus(tmp_path: Path, capsys) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.json").write_text(json.dumps(_CONFIG), encoding="utf-8")
+    report_file = tmp_path / "rpt.json"
+    report_file.write_text(json.dumps(_report()), encoding="utf-8")
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"agents": {"worker": {}}}), encoding="utf-8")
+    snap_file = tmp_path / "snap.json"
+    snap_file.write_text("[]", encoding="utf-8")
+
+    rc = _run([
+        "supervise", "--plan", "--record-events", "--report-file", str(report_file),
+        "--state-file", str(state_file), "--snapshot-file", str(snap_file),
+        "--now", str(NOW),
+    ], tmp_path)
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["agents"]["worker"]["state"] == "HEALTHY_IDLE"
+    events, warnings = sup.read_supervisor_events(s)
+    assert warnings == []
+    assert events
+    assert s.all_messages() == []
 
 
 _HOOK_CONFIG = {

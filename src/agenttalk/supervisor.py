@@ -34,6 +34,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agenttalk._atomic import write_text as _atomic_write_text
 from agenttalk import ephemeral as eph
 from agenttalk import health as health_model
 from agenttalk.store import Store, _process_alive
@@ -78,6 +79,13 @@ _DEFAULTS = {
         "infra_exhaust_after_seconds": 14400,
     },
 }
+
+# File-backed supervisor observability ring. Hard count cap: at most 512 JSONL
+# records are retained, independent of poll cadence.
+SUPERVISOR_EVENT_RING_CAP = 512
+SUPERVISOR_EVENT_TAIL_BYTES = 262_144
+SUPERVISOR_EVENT_SUMMARY_INTERVAL_SECONDS = 300.0
+_EVENT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
 
 # Per-CLI process-discovery defaults (config["agents"][n] overrides). These
 # values identify session metadata and best-effort cleanup targets only; they do
@@ -385,6 +393,329 @@ def _restart_request_with_live_authority(store: Store, marker: dict | None) -> d
         authority.get("acknowledge_live_protected_kill_authorized"))
     out["authority_live_reason"] = authority.get("authority_reason")
     return out
+
+
+def supervisor_events_path(store: Store) -> Path:
+    return store.state_dir / "supervisor-events.jsonl"
+
+
+def _event_now(now_epoch: float) -> str:
+    return datetime.fromtimestamp(now_epoch, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _event_token(value: object, default: str = "unknown") -> str:
+    if isinstance(value, str) and _EVENT_TOKEN_RE.fullmatch(value):
+        return value
+    return default
+
+
+def _decision_reason_code(plan: dict) -> str:
+    health = plan.get("health") if isinstance(plan.get("health"), dict) else {}
+    warnings = health.get("warnings") if isinstance(health.get("warnings"), list) else []
+    if "advisory-health-conflict" in warnings:
+        return "advisory-health-conflict"
+    state = _event_token(plan.get("state"), "")
+    if state:
+        return state.lower()
+    return _event_token(plan.get("action"), "unknown").lower()
+
+
+def _decision_fingerprint(agent: str, plan: dict) -> str:
+    parts = [
+        _event_token(agent),
+        _event_token(plan.get("action")),
+        _event_token(plan.get("state")),
+        _decision_reason_code(plan),
+        "notify" if plan.get("notify") is True else "silent",
+        "clear" if isinstance(plan.get("clear_marker"), str) else "keep",
+    ]
+    return "|".join(parts)
+
+
+def read_supervisor_events(store: Store, *, limit: int | None = None) -> tuple[list[dict], list[str]]:
+    """Read the supervisor decision-event ring fail-safe.
+
+    The reader tails a fixed byte budget before JSON parsing, so even an externally
+    bloated file cannot make status/supervisor reads scan unbounded history.
+    """
+    path = supervisor_events_path(store)
+    if not path.exists():
+        return [], []
+    warnings: list[str] = []
+    try:
+        with path.open("rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            if size > SUPERVISOR_EVENT_TAIL_BYTES:
+                f.seek(-SUPERVISOR_EVENT_TAIL_BYTES, 2)
+                warnings.append("supervisor_events_tail_truncated")
+            else:
+                f.seek(0)
+            raw = f.read()
+    except OSError as exc:
+        return [], [f"supervisor_events_unreadable:{type(exc).__name__}"]
+    text = raw.decode("utf-8", "replace")
+    lines = text.splitlines()
+    if warnings and lines:
+        lines = lines[1:]  # likely a partial first line after a tail seek
+    events: list[dict] = []
+    for idx, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            warnings.append(f"supervisor_events_torn:{idx}")
+            continue
+        if not isinstance(obj, dict):
+            warnings.append(f"supervisor_events_malformed:{idx}")
+            continue
+        events.append(obj)
+    if isinstance(limit, int) and limit >= 0:
+        events = events[-limit:] if limit else []
+    return events, warnings
+
+
+def append_supervisor_events(store: Store, events: list[dict], *,
+                             cap: int = SUPERVISOR_EVENT_RING_CAP) -> None:
+    """Best-effort bounded JSONL append implemented as read/cap/rewrite."""
+    if not events:
+        return
+    cap = cap if isinstance(cap, int) and cap > 0 else SUPERVISOR_EVENT_RING_CAP
+    try:
+        with store._config_lock(timeout=0.05, poll=0.01):
+            prior, _ = read_supervisor_events(store)
+            kept = [*prior, *events][-cap:]
+            path = supervisor_events_path(store)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            text = "".join(
+                json.dumps(e, ensure_ascii=False, sort_keys=True) + "\n"
+                for e in kept
+            )
+            _atomic_write_text(path, text)
+    except Exception:
+        return
+
+
+def _decision_event(agent: str, plan: dict, *, now_epoch: float) -> dict:
+    fingerprint = _decision_fingerprint(agent, plan)
+    return {
+        "schema_version": 1,
+        "kind": "agent_decision",
+        "at": _event_now(now_epoch),
+        "at_epoch": float(now_epoch),
+        "agent": _event_token(agent),
+        "action": _event_token(plan.get("action")),
+        "state": _event_token(plan.get("state")),
+        "reason_code": _decision_reason_code(plan),
+        "notify": plan.get("notify") is True,
+        "clear_marker": isinstance(plan.get("clear_marker"), str),
+        "fingerprint": fingerprint,
+    }
+
+
+def _summary_event(plan: dict, *, now_epoch: float) -> dict:
+    agents = plan.get("agents") if isinstance(plan.get("agents"), dict) else {}
+    states: dict[str, int] = {}
+    healthy = 0
+    for p in agents.values():
+        if not isinstance(p, dict):
+            continue
+        state = _event_token(p.get("state"))
+        states[state] = states.get(state, 0) + 1
+        if state == "HEALTHY_IDLE":
+            healthy += 1
+    return {
+        "schema_version": 1,
+        "kind": "poll_summary",
+        "at": _event_now(now_epoch),
+        "at_epoch": float(now_epoch),
+        "planned_agents": len(agents),
+        "healthy_idle": healthy,
+        "states": states,
+    }
+
+
+def record_supervisor_plan_events(store: Store, plan: dict, *,
+                                  now_epoch: float,
+                                  cap: int = SUPERVISOR_EVENT_RING_CAP,
+                                  summary_interval_seconds: float =
+                                  SUPERVISOR_EVENT_SUMMARY_INTERVAL_SECONDS) -> None:
+    """Append redacted supervisor decision events once per transition.
+
+    Events contain planner tokens only: action, state, booleans, and bounded
+    reason codes. Free-form plan reasons, restart reasons, command lines, and
+    config-blocked summaries are deliberately not representable.
+    """
+    agents = plan.get("agents") if isinstance(plan.get("agents"), dict) else {}
+    prior, _ = read_supervisor_events(store)
+    last_fp: dict[str, str] = {}
+    last_summary_epoch: float | None = None
+    for event in prior:
+        if event.get("kind") == "agent_decision":
+            agent = event.get("agent")
+            fp = event.get("fingerprint")
+            if isinstance(agent, str) and isinstance(fp, str):
+                last_fp[agent] = fp
+        elif event.get("kind") == "poll_summary":
+            ts = event.get("at_epoch")
+            if isinstance(ts, (int, float)):
+                last_summary_epoch = float(ts)
+    new_events: list[dict] = []
+    for agent in sorted(agents):
+        p = agents.get(agent)
+        if not isinstance(p, dict):
+            continue
+        fp = _decision_fingerprint(agent, p)
+        if last_fp.get(agent) != fp:
+            new_events.append(_decision_event(agent, p, now_epoch=now_epoch))
+    if (last_summary_epoch is None
+            or now_epoch - last_summary_epoch >= float(summary_interval_seconds)):
+        new_events.append(_summary_event(plan, now_epoch=now_epoch))
+    append_supervisor_events(store, new_events, cap=cap)
+
+
+def lead_liveness_from_bus(*, agent: str, role: str | None, operator_facing: str | None,
+                           heartbeat_age_seconds: object, heartbeat_stale: object,
+                           waiting: object) -> dict | None:
+    """Display-only liveness for interactive leads without wrapper health."""
+    is_leadish = agent == operator_facing or (isinstance(role, str) and role.casefold() == "lead")
+    if not is_leadish:
+        return None
+    age = heartbeat_age_seconds
+    if isinstance(age, (int, float)) and heartbeat_stale is False:
+        return {
+            "state": "idle_waiting" if waiting else "active",
+            "source": "bus_last_seen",
+            "last_seen_seconds": round(float(age), 3),
+            "advisory": True,
+        }
+    return {
+        "state": "unknown",
+        "source": "bus_last_seen",
+        "last_seen_seconds": round(float(age), 3) if isinstance(age, (int, float)) else None,
+        "advisory": True,
+    }
+
+
+def _assessment_health(rpt: dict, lead_liveness: dict | None) -> dict:
+    health = rpt.get("health") if isinstance(rpt.get("health"), dict) else {}
+    state = health_model.label(health)
+    reason = health.get("reason_code") if isinstance(health.get("reason_code"), str) else None
+    effective = state
+    if state == health_model.STATE_UNKNOWN and isinstance(lead_liveness, dict):
+        ll_state = lead_liveness.get("state")
+        if isinstance(ll_state, str) and ll_state != "unknown":
+            effective = ll_state
+    return {
+        "state": state,
+        "effective_state": effective,
+        "reason_code": reason,
+        "age_seconds": health.get("age_seconds") if isinstance(
+            health.get("age_seconds"), (int, float)) else None,
+        "warnings": health.get("warnings") if isinstance(health.get("warnings"), list) else [],
+        "advisory": True,
+    }
+
+
+def supervisor_agent_assessment(name: str, rpt: dict, plan: dict | None, *,
+                                operator_facing: str | None = None) -> dict:
+    lead_liveness = lead_liveness_from_bus(
+        agent=name,
+        role=rpt.get("role") if isinstance(rpt.get("role"), str) else None,
+        operator_facing=operator_facing,
+        heartbeat_age_seconds=rpt.get("heartbeat_age_seconds"),
+        heartbeat_stale=rpt.get("heartbeat_stale"),
+        waiting=rpt.get("waiting"),
+    )
+    decision = None
+    if isinstance(plan, dict):
+        decision = {
+            "action": plan.get("action"),
+            "state": plan.get("state"),
+            "reason": plan.get("reason"),
+        }
+        if isinstance(plan.get("health"), dict):
+            decision["health"] = plan["health"]
+    rr = rpt.get("restart_request") if isinstance(rpt.get("restart_request"), dict) else None
+    hold = rpt.get("config_blocked_hold") if isinstance(
+        rpt.get("config_blocked_hold"), dict) else None
+    return {
+        "name": name,
+        "role": rpt.get("role"),
+        "protected": bool(rpt.get("protected")),
+        "heartbeat_stale": bool(rpt.get("heartbeat_stale")),
+        "heartbeat_age_seconds": rpt.get("heartbeat_age_seconds"),
+        "stuck_after_seconds": rpt.get("stuck_after_seconds"),
+        "health": _assessment_health(rpt, lead_liveness),
+        "lead_liveness": lead_liveness,
+        "waiting": {
+            "present": bool(rpt.get("waiting")),
+            "pid": rpt.get("waiting_pid"),
+            "pid_alive": bool(rpt.get("waiting_pid_alive")),
+            "deadline_epoch": rpt.get("waiting_deadline_epoch"),
+        },
+        "restart_request": {
+            "pending": rr is not None,
+            "request_id": rr.get("request_id") if rr else None,
+            "requested_by": rr.get("requested_by") if rr else None,
+        },
+        "config_blocked_hold": {
+            "present": hold is not None,
+            "summary_code": "config_blocked" if hold is not None else None,
+        },
+        "session_id": rpt.get("session_id"),
+        "lead_loop": rpt.get("lead_loop") if isinstance(rpt.get("lead_loop"), dict) else None,
+        "lead_loop_exit": (
+            rpt.get("lead_loop_exit") if isinstance(rpt.get("lead_loop_exit"), dict) else None
+        ),
+        "decision": decision,
+    }
+
+
+def build_supervisor_observation(store: Store, *, now_epoch: float,
+                                 state: dict | None = None,
+                                 supervisor_config: dict | None = None,
+                                 snapshot: list[dict] | None = None,
+                                 event_limit: int = 20) -> dict:
+    """Read-only operator view: report + exact planner output + bounded ring tail."""
+    config = supervisor_config if isinstance(supervisor_config, dict) else {}
+    stuck = config.get("stuck_after_seconds")
+    stuck = float(stuck) if isinstance(stuck, (int, float)) else None
+    state = state if isinstance(state, dict) else {}
+    report = build_report(
+        store,
+        now_epoch=now_epoch,
+        stuck_after_seconds=stuck,
+        state=state,
+        supervisor_config=config,
+    )
+    plan = plan_actions(report, state, config, now_epoch=now_epoch, snapshot=snapshot)
+    events, event_warnings = read_supervisor_events(store, limit=event_limit)
+    agents = []
+    rpt_agents = report.get("agents") if isinstance(report.get("agents"), dict) else {}
+    plan_agents = plan.get("agents") if isinstance(plan.get("agents"), dict) else {}
+    for name in report.get("roster", []):
+        rpt = rpt_agents.get(name)
+        if not isinstance(rpt, dict):
+            continue
+        agents.append(supervisor_agent_assessment(
+            name, rpt, plan_agents.get(name), operator_facing=report.get("operator_facing")))
+    return {
+        "schema_version": 1,
+        "root": str(store.root),
+        "now_epoch": float(now_epoch),
+        "now": _event_now(now_epoch),
+        "event_ring": {
+            "path": str(supervisor_events_path(store)),
+            "cap": SUPERVISOR_EVENT_RING_CAP,
+            "events": events,
+            "warnings": event_warnings,
+        },
+        "agents": agents,
+        "report": report,
+        "plan": plan,
+    }
 
 # Per-CLI session-argument templates, as LISTS of literal tokens (so the
 # generated PowerShell uses an array-of-literals ArgumentList - single-quoted
@@ -3484,7 +3815,8 @@ do {
   # skew -> constant stuck_recover). DateTimeOffset.UtcNow.ToUnixTimeSeconds() is
   # unambiguous UTC and locale-independent.
   $now = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-  $plan = (& $AgenttalkCmd --root $Root supervise --plan --state-file $StatePath @snapshotArgs --now $now) | ConvertFrom-Json
+  $eventArgs = @(); if (-not $DryRun) { $eventArgs += @('--record-events') }
+  $plan = (& $AgenttalkCmd --root $Root supervise --plan --state-file $StatePath @snapshotArgs @eventArgs --now $now) | ConvertFrom-Json
   $pollNum++; $healthy = 0; $total = 0
   foreach ($name in $plan.agents.PSObject.Properties.Name) {
     $p = $plan.agents.$name

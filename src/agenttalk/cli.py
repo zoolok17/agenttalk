@@ -439,6 +439,8 @@ def _gather_status(store: Store) -> dict:
     sup_agents = (
         sup_cfg.get("agents") if isinstance(sup_cfg.get("agents"), dict) else {}
     )
+    supervisor_rows, supervisor_warnings = _status_supervisor_summaries(
+        store, now.timestamp(), sup_cfg)
     agents = []
     for a in cfg.get("agents", []):
         hb = store.read_heartbeat(a)
@@ -490,6 +492,19 @@ def _gather_status(store: Store) -> dict:
             "waiting": waiting,
             "waiting_stale": waiting_stale,
         }
+        sup_row = supervisor_rows.get(a)
+        if isinstance(sup_row, dict):
+            decision = sup_row.get("decision")
+            if isinstance(decision, dict):
+                row["supervisor"] = {"decision": decision}
+            if isinstance(sup_row.get("lead_liveness"), dict):
+                row["lead_liveness"] = sup_row["lead_liveness"]
+            effective = sup_row.get("health_effective_state")
+            if isinstance(effective, str):
+                row["health_display"] = {
+                    "state": effective,
+                    "source": "bus_last_seen" if effective != health.get("state") else "health",
+                }
         if a == liaison:
             row["operator_facing"] = True  # additive: absent unless set
         # Managed lead-loop visibility (additive: present only when the agent is
@@ -515,7 +530,9 @@ def _gather_status(store: Store) -> dict:
         "invalid_messages": [{"id": mid, "reason": reason} for mid, reason in invalid],
         "agents": agents,
         "stale_threshold_seconds": STALE_THRESHOLD_SECONDS,
-        "warnings": _status_warnings(agents) + _thread_warnings(store, cfg),
+        "warnings": (
+            _status_warnings(agents) + _thread_warnings(store, cfg) + supervisor_warnings
+        ),
     }
     if quarantined:
         payload["quarantined"] = quarantined  # additive: absent when zero
@@ -568,6 +585,68 @@ def _status_warnings(agents: list[dict]) -> list[str]:
             msg += " Whoever owes the next reply should send it."
         warnings.append(msg)
     return warnings
+
+
+def _read_supervisor_state(store: Store, path_value: str | None = None) -> dict:
+    path = Path(path_value) if path_value else store.dir / "supervisor-state.json"
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (ValueError, OSError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _read_supervisor_snapshot(store: Store, path_value: str | None = None) -> list[dict] | None:
+    path = Path(path_value) if path_value else store.dir / "supervisor-snapshot.json"
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (ValueError, OSError):
+        return None
+    return raw if isinstance(raw, list) else None
+
+
+def _status_supervisor_summaries(store: Store, now_epoch: float,
+                                 sup_cfg: dict) -> tuple[dict[str, dict], list[str]]:
+    try:
+        obs = sup.build_supervisor_observation(
+            store,
+            now_epoch=now_epoch,
+            state=_read_supervisor_state(store),
+            supervisor_config=sup_cfg,
+            snapshot=_read_supervisor_snapshot(store),
+            event_limit=0,
+        )
+    except Exception as exc:
+        return {}, [f"supervisor_assessment_unavailable:{type(exc).__name__}"]
+    rows: dict[str, dict] = {}
+    for item in obs.get("agents") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            continue
+        decision = item.get("decision") if isinstance(item.get("decision"), dict) else None
+        health = item.get("health") if isinstance(item.get("health"), dict) else {}
+        lead_liveness = item.get("lead_liveness") if isinstance(item.get("lead_liveness"), dict) else None
+        effective = health.get("effective_state")
+        raw_state = health.get("state")
+        if decision is None and lead_liveness is None and effective == raw_state:
+            continue
+        row: dict[str, object] = {}
+        if decision is not None:
+            row["decision"] = decision
+        if isinstance(effective, str) and effective != raw_state:
+            row["health_effective_state"] = effective
+        if lead_liveness is not None:
+            row["lead_liveness"] = lead_liveness
+        rows[item["name"]] = row
+    warnings = []
+    ring = obs.get("event_ring") if isinstance(obs.get("event_ring"), dict) else {}
+    for warning in ring.get("warnings") or []:
+        if isinstance(warning, str):
+            warnings.append(warning)
+    return rows, warnings
 
 
 def _closed_rids(store: Store, agent: str) -> set[str]:
@@ -1049,16 +1128,118 @@ def cmd_status(args: argparse.Namespace) -> int:
         if a.get("waiting"):
             seen += " waiting(stale)" if a.get("waiting_stale") else " waiting"
         h = a.get("health") if isinstance(a.get("health"), dict) else {}
-        h_state = h.get("state") if isinstance(h.get("state"), str) else "unknown"
+        h_display = a.get("health_display") if isinstance(a.get("health_display"), dict) else {}
+        h_state = h_display.get("state") if isinstance(h_display.get("state"), str) else (
+            h.get("state") if isinstance(h.get("state"), str) else "unknown"
+        )
         h_age = h.get("age_seconds")
         seen += f" health={h_state}"
         if isinstance(h_age, (int, float)):
             seen += f"/{_format_age(h_age)}"
+        sv = a.get("supervisor") if isinstance(a.get("supervisor"), dict) else {}
+        dec = sv.get("decision") if isinstance(sv.get("decision"), dict) else None
+        if dec:
+            seen += f" supervisor={dec.get('state', '?')}/{dec.get('action', '?')}"
         role = f" role={a['role']}" if a.get("role") else ""
         of = " [operator-facing]" if a.get("operator_facing") else ""
         print(f"  {a['name']:<10}{role}{of} cursor={cursor:<32} unread={a['unread']:<3} {seen}")
     for w in payload.get("warnings", []):
         print(f"WARN:       {w}")
+    return 0
+
+
+def cmd_supervisor(args: argparse.Namespace) -> int:
+    """Lead-readable supervisor assessment. Read-only and advisory."""
+    store = _get_store(args)
+    now = args.now if args.now is not None else time.time()
+    config = _load_supervisor_config(store)
+    try:
+        payload = sup.build_supervisor_observation(
+            store,
+            now_epoch=now,
+            state=_read_supervisor_state(store, args.state_file),
+            supervisor_config=config,
+            snapshot=_read_supervisor_snapshot(store, args.snapshot_file),
+            event_limit=max(0, int(args.events)),
+        )
+    except Exception as exc:
+        payload = {
+            "schema_version": 1,
+            "root": str(store.root),
+            "now_epoch": float(now),
+            "now": datetime.fromtimestamp(now, timezone.utc).isoformat().replace("+00:00", "Z"),
+            "agents": [],
+            "report": None,
+            "plan": None,
+            "event_ring": {
+                "path": str(sup.supervisor_events_path(store)),
+                "cap": sup.SUPERVISOR_EVENT_RING_CAP,
+                "events": [],
+                "warnings": [f"supervisor_read_unavailable:{type(exc).__name__}"],
+            },
+        }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    print(f"root:       {payload['root']}")
+    print(f"supervisor: events cap={payload.get('event_ring', {}).get('cap')}")
+    for item in payload.get("agents") or []:
+        if not isinstance(item, dict):
+            continue
+        decision = item.get("decision") if isinstance(item.get("decision"), dict) else None
+        if decision:
+            plan = f"{decision.get('state', '?')}/{decision.get('action', '?')}"
+            reason = decision.get("reason") or ""
+        else:
+            plan = "UNMANAGED"
+            reason = "not auto_restart in supervisor.json"
+        health = item.get("health") if isinstance(item.get("health"), dict) else {}
+        hb = "stale" if item.get("heartbeat_stale") else "fresh"
+        age = item.get("heartbeat_age_seconds")
+        hb_age = f"/{_format_age(age)}" if isinstance(age, (int, float)) else ""
+        rr = item.get("restart_request") if isinstance(item.get("restart_request"), dict) else {}
+        flags = []
+        if rr.get("pending"):
+            flags.append(f"restart_by={rr.get('requested_by') or '?'}")
+        hold = item.get("config_blocked_hold")
+        if isinstance(hold, dict) and hold.get("present"):
+            flags.append("config_blocked")
+        plan_health = decision.get("health") if isinstance(decision, dict) else None
+        plan_warnings = (
+            plan_health.get("warnings")
+            if isinstance(plan_health, dict) and isinstance(plan_health.get("warnings"), list)
+            else []
+        )
+        for warning in plan_warnings:
+            if isinstance(warning, str):
+                flags.append(f"plan_health={warning}")
+        print(
+            f"  {item.get('name', '?'):<10} {plan:<32} "
+            f"health={health.get('effective_state', health.get('state', 'unknown'))} "
+            f"heartbeat={hb}{hb_age} {reason}"
+        )
+        if flags:
+            print(f"    {' '.join(flags)}")
+    ring = payload.get("event_ring") if isinstance(payload.get("event_ring"), dict) else {}
+    for warning in ring.get("warnings") or []:
+        print(f"WARN:       {warning}")
+    events = ring.get("events") if isinstance(ring.get("events"), list) else []
+    if events:
+        print("recent supervisor events:")
+        for event in events[-int(args.events):]:
+            if not isinstance(event, dict):
+                continue
+            if event.get("kind") == "agent_decision":
+                print(
+                    f"  {event.get('at', '?')} {event.get('agent', '?')}: "
+                    f"{event.get('state', '?')}/{event.get('action', '?')} "
+                    f"{event.get('reason_code', '')}"
+                )
+            elif event.get("kind") == "poll_summary":
+                print(
+                    f"  {event.get('at', '?')} summary: "
+                    f"{event.get('healthy_idle', 0)}/{event.get('planned_agents', 0)} healthy"
+                )
     return 0
 
 
@@ -7229,8 +7410,11 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         snapshot = None
         if args.snapshot_file and Path(args.snapshot_file).exists():
             snapshot = _read_snapshot_file(args.snapshot_file)
-        print(json.dumps(sup.plan_actions(report, _read_state(), config,
-                                          now_epoch=now, snapshot=snapshot), indent=2))
+        plan = sup.plan_actions(report, _read_state(), config,
+                                now_epoch=now, snapshot=snapshot)
+        if getattr(args, "record_events", False):
+            sup.record_supervisor_plan_events(store, plan, now_epoch=now)
+        print(json.dumps(plan, indent=2))
         return 0
     sys.stderr.write("agenttalk supervise: choose --init, --report, --plan, "
                      "--install-activity-hook, or --clear-restart\n")
@@ -7324,6 +7508,22 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--json", action="store_true",
                     help="Emit structured JSON instead of human-readable text.")
     ps.set_defaults(func=cmd_status)
+
+    psview = sub.add_parser(
+        "supervisor",
+        help="Read-only supervisor assessment: report, exact plan decision, and event ring.",
+    )
+    psview.add_argument("--json", action="store_true",
+                        help="Emit structured JSON instead of human-readable text.")
+    psview.add_argument("--state-file", dest="state_file",
+                        help="Supervisor state JSON (default .agenttalk/supervisor-state.json).")
+    psview.add_argument("--snapshot-file", dest="snapshot_file",
+                        help="Optional process snapshot JSON for exact plan parity.")
+    psview.add_argument("--events", type=int, default=10,
+                        help="Number of recent supervisor events to show (default 10).")
+    psview.add_argument("--now", type=float, default=None,
+                        help="Override 'now' (epoch seconds) for deterministic tests.")
+    psview.set_defaults(func=cmd_supervisor)
 
     pth = sub.add_parser(
         "threads",
@@ -8574,6 +8774,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="(--plan) read the report from this JSON file instead of live.")
     psup.add_argument("--state-file", dest="state_file",
                       help="(--plan) the supervisor's local state JSON (pids/backoff).")
+    psup.add_argument("--record-events", dest="record_events", action="store_true",
+                      help="(--plan, script use) append bounded redacted decision events.")
     psup.add_argument("--for", dest="agent", help="(--clear-restart) agent name.")
     psup.add_argument("--request-id", dest="request_id", help="(--clear-restart) rid to clear.")
     psup.set_defaults(func=cmd_supervise)
