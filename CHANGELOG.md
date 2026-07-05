@@ -5,6 +5,26 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.64.1] - 2026-07-05
+
+### Fixed
+
+- **Security CI (gitleaks) false-positive on redaction-test fixtures.** v0.64.0's
+  supervisor-observability tests plant synthetic secrets to prove the redaction path strips
+  them; one high-entropy fixture (`sk-ABC123SECRET`) tripped the `gitleaks` secret-scan job,
+  reddening the `security` workflow (the code and redaction behavior were correct — the scanner
+  flagged the *bait*). Fixed without weakening detection:
+  - Added a scoped `.gitleaks.toml` (`[extend] useDefault = true`, so **all** default rules stay
+    active) with a single **marker-only** allowlist regex `sk-FAKE-AGENTTALK-[A-Za-z0-9._:-]+` — a
+    reserved prefix no real key uses. Redaction/security tests must use this marker for synthetic
+    secrets; a real `sk-<random>` key anywhere still trips (verified: a non-marker high-entropy
+    `sk-` is detected, the marker form is allowlisted).
+  - Renamed the existing redaction fixtures to the reserved marker form (redaction assertions
+    unchanged — they still verify the path/token is stripped).
+  - Added `.gitleaksignore` with **only three exact** `commit:path:rule:line` fingerprints for the
+    historical high-entropy findings the marker regex can't retroactively match, so full
+    git-history scans pass without any path-broad allowlist. No default rule is disabled.
+
 ## [0.64.0] - 2026-07-05
 
 ### Added

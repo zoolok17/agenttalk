@@ -86,8 +86,26 @@ lead). Re-run on demand and refreshed as the codebase changes.
 ## 3. Per-release assurance ledger
 
 All entries below shipped through the §1 pipeline. **CI (tests + security) is green for
-every release listed.** Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
+every release listed** — with one honest exception: v0.64.0's `security` leg went red on a
+gitleaks false-positive (a redaction-test's synthetic secret, not a real leak or code defect),
+corrected in v0.64.1. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
+
+### v0.64.1 — gitleaks security-CI false-positive fix (2026-07-05)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `b086a12` · tag `v0.64.1`
+- **Review:** contained scanner-config + test-fixture hotfix (right-sized) — **codex reviewer-1 GO**
+  on the final SHA (verified `[extend] useDefault = true` keeps all default rules, exactly one
+  marker-only allowlist regex `sk-FAKE-AGENTTALK-…`, no `tests/` path carveout, `.gitleaksignore`
+  = 3 exact `commit:path:rule:line` fingerprints only, and redaction assertions preserved).
+- **Gate:** gitleaks clean in **every mode** — working-tree (`--no-git`), full 598-commit history,
+  and pushed range — plus a **tightness probe** (a non-marker high-entropy `sk-` still trips; the
+  marker form is allowlisted), so detection is **not** weakened. ruff/bandit/diff-check/compileall
+  clean; pytest **1919 passed / 3 skipped on 3.10 AND 3.14** (clean venvs).
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + **security** + wheel — green (restores the
+  v0.64.0 red `security` leg to green).
+- **Process fix:** exposed a lead-gate gap — the gate had run ruff+bandit+pytest+diff but **not**
+  the full CI `security` suite. The lead gate now runs **gitleaks** (and pip-audit when deps
+  change) so this class is caught locally, never again only in CI.
 
 ### v0.64.0 — supervisor observability (Slice 2) (2026-07-05)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `8d0dbb7` · tag `v0.64.0`
@@ -97,7 +115,9 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
   reviewers GO on the final folded SHA** (each verified the redaction projections + lead-liveness
   scope). Read-only + advisory + fail-safe (not authority-critical).
 - **Gate:** ruff/bandit/diff clean; pytest **1919 passed / 3 skipped on 3.10 AND 3.14** (clean venvs).
-- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green.
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + wheel — green. **The `security` leg went RED**
+  on a gitleaks false-positive — a redaction-test's synthetic `sk-` fixture, **not** a real secret
+  or code defect (the redaction behavior it tests is correct). Corrected in **v0.64.1** (above).
 - **Robust/Secure:** the read/ring surfaces treat persisted + child-authored data as UNTRUSTED —
   sanitized to a token-only schema on read (non-finite rejected, secret-like free text never
   echoed, unknown keys dropped), the ring is bounded (512 / 256KB — never the accumulation class),
