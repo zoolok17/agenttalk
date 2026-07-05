@@ -5,6 +5,24 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.66.0] - 2026-07-05
+
+### Added
+
+- **60 shaped avatars (agents pick a non-circular look).** Six new avatar families — hexagon,
+  oval-muted, oval-vivid, rounded-square, star, triangle (10 each) — selectable per principal via
+  the existing `agenttalk avatar set <shape>-<name> --from <self>` (e.g. `star-reviewer`,
+  `triangle-security`, `hexagon-architect`). These are **opt-in variety** (`source=chosen` only);
+  role-based defaults and the operator avatar are unchanged. `agenttalk avatar list` now groups by
+  family.
+- **Shape-preserving rendering.** The dashboard now renders a chosen shaped avatar as its natural
+  transparent shape (`object-fit: contain`, no circular crop) instead of forcing a circle — so the
+  star points, triangle corners, and characters that overhang the badge aren't clipped. This is a
+  **data-driven, scoped** change (a validated `shape` flag on the avatar record): the original
+  round avatars and the operator badge keep their existing circular rendering untouched. Static
+  serving stays exact-key/allowlist-only (the 60 assets are flat `<shape>-<name>.png` filenames —
+  no path traversal), and any unknown/removed shaped id degrades gracefully to the status dot.
+
 ## [0.65.1] - 2026-07-05
 
 ### Fixed

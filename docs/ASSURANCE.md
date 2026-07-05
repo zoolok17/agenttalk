@@ -91,6 +91,21 @@ gitleaks false-positive (a redaction-test's synthetic secret, not a real leak or
 corrected in v0.64.1. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.66.0 — 60 shaped avatars + shape-preserving render (2026-07-05)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `3e83048` · tag `v0.66.0`
+- **Review:** grounded design (a lead workflow mapped the render + allowlist + the scope decision) →
+  build → **codex reviewer-1 GO** (focused: no-traversal preserved for the 60 flat names, originals/
+  operator not regressed, fail-safe degrade; exact-diff review + 22 targeted tests). Display/
+  preference increment — not authority-critical.
+- **Gate:** ruff/bandit/**gitleaks** (git-mode + range)/node --check/diff/compileall clean; pytest
+  **1949 passed / 3 skipped on 3.10 AND 3.14** (clean venvs).
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green.
+- **Robust/Secure:** the 60 assets are **flat `<shape>-<name>.png` exact-key allowlist entries** —
+  no subdirectories, no config value joined into a served path, so the v0.65.0 no-traversal
+  guarantee holds (nested/traversal probes 404). The render change is **data-driven + scoped** (a
+  validated `shape` flag): originals + the operator badge keep circular rendering, so no regression.
+  A bad/removed shaped id degrades to the status dot; the map is fail-soft on read.
+
 ### v0.65.1 — dashboard client-disconnect noise fix (2026-07-05)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `ff1b06e` · tag `v0.65.1`
 - **Review:** grounded diagnosis (a lead 4-agent workflow mapped every `web.py` write/error path) →
