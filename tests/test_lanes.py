@@ -689,6 +689,20 @@ def test_m1_m3_canonical_paths_and_common_git_dir_match(tmp_path: Path) -> None:
     assert prov["common_git_dir_canonical"] == cli._common_git_dir(root)
 
 
+def test_s_p2_verify_lane_worktree_rejects_primary_checkout_tamper(tmp_path: Path) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "mainroot")
+    wt = Path(lane["worktree_path"])
+    assert _git_rc(root, "worktree", "remove", str(wt)).returncode == 0
+    assert _git_rc(root, "checkout", "-q", lanes.lane_branch("mainroot")).returncode == 0
+    lane["worktree_path"] = str(root)
+    lane["worktree_toplevel_canonical"] = lanes.canonical_host_path(root)
+    lane["worktree_common_git_dir_canonical"] = cli._common_git_dir(root)
+
+    with pytest.raises(lanes.LaneError, match="primary checkout"):
+        cli._verify_lane_worktree(Store(root), lane, expected_base=base)
+
+
 def test_m5_git_write_worktree_add_uses_separator_and_rejects_evil_id(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root, base = _repo(tmp_path)
@@ -872,6 +886,10 @@ def test_m12_git_write_env_timeout_and_allowlist(monkeypatch: pytest.MonkeyPatch
     assert "GIT_ASKPASS" not in seen["env"]
     with pytest.raises(cli.GitWriteError):
         cli._git_write(tmp_path, ["branch", "-D", "lane/safe"])
+    with pytest.raises(cli.GitWriteError):
+        cli._git_write(
+            tmp_path, ["worktree", "add", "-b", "lane/bad/slash", "--",
+                       str(tmp_path / "bad"), full_sha])
 
     class StuckProc:
         def communicate(self, timeout=None):  # noqa: ANN001

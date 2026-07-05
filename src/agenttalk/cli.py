@@ -1762,8 +1762,11 @@ def _allowed_git_write(argv: list[str]) -> bool:
     if len(argv) == 7 and argv[0:3] == ["worktree", "add", "-b"] and argv[4] == "--":
         branch = argv[3]
         base = argv[6]
-        return branch == lane_mod.lane_branch(branch.removeprefix("lane/")) and \
-            bool(lane_mod._FULL_SHA_RE.match(base))
+        try:
+            return branch == lane_mod.lane_branch(branch.removeprefix("lane/")) and \
+                bool(lane_mod._FULL_SHA_RE.match(base))
+        except lane_mod.LaneError:
+            return False
     if len(argv) == 4 and argv[:3] == ["worktree", "remove", "--"]:
         return True
     if len(argv) == 3 and argv[:2] == ["update-ref", "-d"]:
@@ -2510,6 +2513,14 @@ def _common_git_dir(root) -> str:
     return lane_mod.canonical_host_path(Path(root) / raw)
 
 
+def _git_dir(root) -> str:
+    rc, out = _git(root, ["rev-parse", "--path-format=absolute", "--git-dir"])
+    if rc == 0 and out.strip():
+        return lane_mod.canonical_host_path(out.strip())
+    raw = _git_read_one(root, ["rev-parse", "--git-dir"], "git dir")
+    return lane_mod.canonical_host_path(Path(root) / raw)
+
+
 def _prepare_worktrees_root(store, configured: str | None) -> Path:
     root = lane_mod.worktrees_root(store, configured)
     root_c = lane_mod.canonical_host_path(root)
@@ -2614,6 +2625,8 @@ def _verify_lane_worktree(store, lane: dict, *, expected_base: str | None = None
     wt_common = _common_git_dir(wt)
     if repo_common != wt_common:
         raise lane_mod.LaneError("worktree common git dir does not match the store repository")
+    if _git_dir(wt) == wt_common:
+        raise lane_mod.LaneError("registered worktree is the primary checkout")
     head = _git_read_one(wt, ["rev-parse", "--verify", "HEAD^{commit}"], "worktree HEAD")
     if expected_base is not None and head != expected_base:
         raise lane_mod.LaneError(
