@@ -409,6 +409,22 @@ def _event_token(value: object, default: str = "unknown") -> str:
     return default
 
 
+def _event_bool(value: object) -> bool:
+    return value is True
+
+
+def _event_nonnegative_int(value: object) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return 0
+
+
+def _event_epoch(value: object) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
 def _decision_reason_code(plan: dict) -> str:
     health = plan.get("health") if isinstance(plan.get("health"), dict) else {}
     warnings = health.get("warnings") if isinstance(health.get("warnings"), list) else []
@@ -432,11 +448,78 @@ def _decision_fingerprint(agent: str, plan: dict) -> str:
     return "|".join(parts)
 
 
+def _stored_decision_fingerprint(event: dict) -> str:
+    parts = [
+        _event_token(event.get("agent")),
+        _event_token(event.get("action")),
+        _event_token(event.get("state")),
+        _event_token(event.get("reason_code")),
+        "notify" if event.get("notify") is True else "silent",
+        "clear" if event.get("clear_marker") is True else "keep",
+    ]
+    return "|".join(parts)
+
+
+def _sanitize_agent_decision_event(obj: dict) -> dict:
+    event: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "agent_decision",
+        "at": _event_token(obj.get("at")),
+        "agent": _event_token(obj.get("agent")),
+        "action": _event_token(obj.get("action")),
+        "state": _event_token(obj.get("state")),
+        "reason_code": _event_token(obj.get("reason_code")),
+        "notify": _event_bool(obj.get("notify")),
+        "clear_marker": _event_bool(obj.get("clear_marker")),
+    }
+    at_epoch = _event_epoch(obj.get("at_epoch"))
+    if at_epoch is not None:
+        event["at_epoch"] = at_epoch
+    event["fingerprint"] = _stored_decision_fingerprint(event)
+    return event
+
+
+def _sanitize_summary_states(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    states: dict[str, int] = {}
+    for raw_state, raw_count in value.items():
+        state = _event_token(raw_state)
+        states[state] = states.get(state, 0) + _event_nonnegative_int(raw_count)
+    return states
+
+
+def _sanitize_poll_summary_event(obj: dict) -> dict:
+    event: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "poll_summary",
+        "at": _event_token(obj.get("at")),
+        "planned_agents": _event_nonnegative_int(obj.get("planned_agents")),
+        "healthy_idle": _event_nonnegative_int(obj.get("healthy_idle")),
+        "states": _sanitize_summary_states(obj.get("states")),
+    }
+    at_epoch = _event_epoch(obj.get("at_epoch"))
+    if at_epoch is not None:
+        event["at_epoch"] = at_epoch
+    return event
+
+
+def _sanitize_supervisor_event(obj: dict) -> dict | None:
+    kind = _event_token(obj.get("kind"), "")
+    if kind == "agent_decision":
+        return _sanitize_agent_decision_event(obj)
+    if kind == "poll_summary":
+        return _sanitize_poll_summary_event(obj)
+    return None
+
+
 def read_supervisor_events(store: Store, *, limit: int | None = None) -> tuple[list[dict], list[str]]:
     """Read the supervisor decision-event ring fail-safe.
 
     The reader tails a fixed byte budget before JSON parsing, so even an externally
-    bloated file cannot make status/supervisor reads scan unbounded history.
+    bloated file cannot make status/supervisor reads scan unbounded history. Rows
+    are normalized to the known token-only event schemas before any caller sees or
+    uses them, so a pre-existing polluted ring cannot leak free text through reads.
     """
     path = supervisor_events_path(store)
     if not path.exists():
@@ -470,7 +553,13 @@ def read_supervisor_events(store: Store, *, limit: int | None = None) -> tuple[l
         if not isinstance(obj, dict):
             warnings.append(f"supervisor_events_malformed:{idx}")
             continue
-        events.append(obj)
+        event = _sanitize_supervisor_event(obj)
+        if event is None:
+            warnings.append(f"supervisor_events_malformed:{idx}")
+            continue
+        if event != obj:
+            warnings.append(f"supervisor_events_sanitized:{idx}")
+        events.append(event)
     if isinstance(limit, int) and limit >= 0:
         events = events[-limit:] if limit else []
     return events, warnings

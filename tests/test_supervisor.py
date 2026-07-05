@@ -830,6 +830,63 @@ def test_supervisor_event_ring_redacts_config_blocked_summary(tmp_path: Path) ->
     assert "secret-tool" not in raw
 
 
+def test_supervisor_event_ring_reader_sanitizes_polluted_rows(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    path = sup.supervisor_events_path(s)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    secret = r"C:\Users\Milos\secret-token-sk-live-path"
+    polluted = {
+        "schema_version": 1,
+        "kind": "agent_decision",
+        "at": secret,
+        "at_epoch": secret,
+        "agent": "worker",
+        "action": sup.NONE,
+        "state": "STATE1",
+        "reason": secret,
+        "reason_code": secret,
+        "notify": False,
+        "clear_marker": False,
+        "fingerprint": "worker|NONE|STATE1|state1|silent|keep",
+        "extra": secret,
+    }
+    path.write_text(json.dumps(polluted) + "\n", encoding="utf-8")
+
+    events, warnings = sup.read_supervisor_events(s)
+    rendered = json.dumps(events)
+
+    assert warnings == ["supervisor_events_sanitized:1"]
+    assert "secret-token-sk-live-path" not in rendered
+    assert "reason" not in events[0]
+    assert "extra" not in events[0]
+    assert events[0]["reason_code"] == "unknown"
+    assert events[0]["at"] == "unknown"
+    assert events[0]["fingerprint"] == "worker|none|STATE1|unknown|silent|keep"
+
+    observation = sup.build_supervisor_observation(
+        s,
+        now_epoch=NOW,
+        state={},
+        supervisor_config=_CONFIG,
+        snapshot=[],
+        event_limit=10,
+    )
+    assert "secret-token-sk-live-path" not in json.dumps(observation["event_ring"])
+
+    sup.record_supervisor_plan_events(
+        s,
+        {"agents": {"worker": {"action": sup.NONE, "state": "STATE1", "notify": False}}},
+        now_epoch=NOW + 1,
+        cap=5,
+        summary_interval_seconds=999999,
+    )
+    rewritten = path.read_text(encoding="utf-8")
+    after, _warnings = sup.read_supervisor_events(s)
+    decisions = [e for e in after if e["kind"] == "agent_decision"]
+    assert len(decisions) == 2
+    assert "secret-token-sk-live-path" not in rewritten
+
+
 def test_supervisor_event_ring_torn_read_degrades(tmp_path: Path) -> None:
     s = _team(tmp_path)
     path = sup.supervisor_events_path(s)
@@ -839,8 +896,19 @@ def test_supervisor_event_ring_torn_read_degrades(tmp_path: Path) -> None:
 
     events, warnings = sup.read_supervisor_events(s)
 
-    assert events == [{"kind": "agent_decision", "agent": "worker"}]
-    assert warnings == ["supervisor_events_torn:2"]
+    assert events == [{
+        "schema_version": 1,
+        "kind": "agent_decision",
+        "at": "unknown",
+        "agent": "worker",
+        "action": "unknown",
+        "state": "unknown",
+        "reason_code": "unknown",
+        "notify": False,
+        "clear_marker": False,
+        "fingerprint": "worker|unknown|unknown|unknown|silent|keep",
+    }]
+    assert warnings == ["supervisor_events_sanitized:1", "supervisor_events_torn:2"]
 
 
 def test_supervisor_event_write_lock_timeout_is_fail_safe(tmp_path: Path, monkeypatch) -> None:
