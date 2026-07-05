@@ -7,16 +7,19 @@ tests cover both happy-path rendering AND the refusal semantics.
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import hashlib
 import http.client
 import inspect
 import json
 import re
+import socket
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import pytest
@@ -78,6 +81,134 @@ def _urlopen(target, *, timeout: float = 5.0, _attempts: int = 4, _backoff: floa
 def _get(url: str, *, method: str = "GET", timeout: float = 5.0):
     req = urllib.request.Request(url, method=method)  # noqa: S310  # nosemgrep
     return _urlopen(req, timeout=timeout)
+
+
+def _raw_abort(base: str, request: bytes) -> None:
+    parsed = urllib.parse.urlsplit(base)
+    assert parsed.hostname is not None and parsed.port is not None
+    sock = socket.create_connection((parsed.hostname, parsed.port), timeout=5)
+    try:
+        sock.sendall(request)
+    finally:
+        sock.close()
+
+
+def test_client_disconnect_mid_response_no_traceback_and_server_survives(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str],
+) -> None:
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        _raw_abort(
+            base,
+            b"GET /static/console.js HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Connection: close\r\n\r\n",
+        )
+        with _get(f"{base}/api/status") as resp:
+            assert resp.status == 200
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    err = capfd.readouterr().err
+    assert "Traceback" not in err
+    assert "ConnectionAbortedError" not in err
+    assert "ConnectionResetError" not in err
+    assert "BrokenPipeError" not in err
+
+
+def test_thread_route_real_error_returns_500_and_logs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    def boom(_store: Store, _rid: str) -> dict | None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(web, "build_thread", boom)
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _get(f"{base}/api/thread/thread-1")
+        assert exc.value.code == 500
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    err = capfd.readouterr().err
+    assert "Traceback" in err
+    assert "RuntimeError: boom" in err
+
+
+def test_error_html_swallows_only_disconnect(tmp_path: Path) -> None:
+    handler_cls = web._make_handler([web.RootDescriptor(_make_store(tmp_path), "root")])
+
+    handler = object.__new__(handler_cls)
+    handler.close_connection = False
+
+    def disconnect(_status: int, _body: bytes, _csp: str | None = None) -> None:
+        raise ConnectionAbortedError()
+
+    handler._send_html = disconnect  # type: ignore[method-assign]
+    handler._error_html(500, "internal server error")
+    assert handler.close_connection is True
+
+    handler = object.__new__(handler_cls)
+    handler.close_connection = False
+
+    def explode(_status: int, _body: bytes, _csp: str | None = None) -> None:
+        raise ValueError("render failed")
+
+    handler._send_html = explode  # type: ignore[method-assign]
+    with pytest.raises(ValueError, match="render failed"):
+        handler._error_html(500, "internal server error")
+    assert handler.close_connection is False
+
+
+def test_client_disconnect_classifier_is_type_and_errno_scoped() -> None:
+    class WinDisconnect(OSError):
+        pass
+
+    win_abort = WinDisconnect("abort")
+    win_abort.winerror = 10053  # type: ignore[attr-defined]
+
+    assert web._is_client_disconnect(ConnectionAbortedError())
+    assert web._is_client_disconnect(ConnectionResetError())
+    assert web._is_client_disconnect(BrokenPipeError())
+    assert web._is_client_disconnect(socket.timeout())
+    assert web._is_client_disconnect(OSError(errno.EPIPE, "pipe"))
+    assert web._is_client_disconnect(win_abort)
+
+    assert not web._is_client_disconnect(Exception("boom"))
+    assert not web._is_client_disconnect(RuntimeError("boom"))
+    assert not web._is_client_disconnect(ValueError())
+    assert not web._is_client_disconnect(OSError(errno.ENOENT, "missing"))
+
+
+def test_handle_one_request_swallows_only_disconnects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler_cls = web._make_handler([web.RootDescriptor(_make_store(tmp_path), "root")])
+
+    def disconnect(_self: BaseHTTPRequestHandler) -> None:
+        raise ConnectionResetError()
+
+    monkeypatch.setattr(BaseHTTPRequestHandler, "handle_one_request", disconnect)
+    handler = object.__new__(handler_cls)
+    handler.close_connection = False
+    handler.handle_one_request()
+    assert handler.close_connection is True
+
+    def explode(_self: BaseHTTPRequestHandler) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(BaseHTTPRequestHandler, "handle_one_request", explode)
+    handler = object.__new__(handler_cls)
+    handler.close_connection = False
+    with pytest.raises(RuntimeError, match="boom"):
+        handler.handle_one_request()
+    assert handler.close_connection is False
 
 
 def _session(base: str) -> dict:

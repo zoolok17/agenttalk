@@ -76,6 +76,7 @@ keep the stricter no-script policy byte-identical.
 
 from __future__ import annotations
 
+import errno
 import html
 import hmac
 import ipaddress
@@ -108,6 +109,33 @@ from agenttalk.threads import Thread, derive_threads
 # The only host strings accepted by ``make_server``. No opt-in to
 # extend this list — if you need remote access, SSH-tunnel.
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+_CLIENT_DISCONNECT_ERRNOS = frozenset(
+    code for code in (
+        getattr(errno, "EPIPE", None),
+        getattr(errno, "ECONNRESET", None),
+        getattr(errno, "ECONNABORTED", None),
+        getattr(errno, "ESHUTDOWN", None),
+    )
+    if code is not None
+)
+_CLIENT_DISCONNECT_WINERRORS = frozenset({10053, 10054})
+
+
+def _is_client_disconnect(exc: BaseException) -> bool:
+    if isinstance(exc, (
+        BrokenPipeError,
+        ConnectionAbortedError,
+        ConnectionResetError,
+        socket.timeout,
+    )):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    return (
+        getattr(exc, "errno", None) in _CLIENT_DISCONNECT_ERRNOS
+        or getattr(exc, "winerror", None) in _CLIENT_DISCONNECT_WINERRORS
+    )
 
 
 def _is_loopback_addr(peer: str) -> bool:
@@ -1939,6 +1967,15 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
         # through ``log_message`` so the caller can opt in / out.
         _quiet = True
 
+        def handle_one_request(self) -> None:
+            try:
+                super().handle_one_request()
+            except Exception as exc:
+                if _is_client_disconnect(exc):
+                    self.close_connection = True
+                    return
+                raise
+
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             if not self._quiet:
                 super().log_message(format, *args)
@@ -1988,7 +2025,13 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 f"<h1>{status}</h1><p>{html.escape(message)}</p>"
                 "<p><a href=\"/\">&larr; back to dashboard</a></p>",
             )
-            self._send_html(status, body)
+            try:
+                self._send_html(status, body)
+            except Exception as exc:
+                if _is_client_disconnect(exc):
+                    self.close_connection = True
+                    return
+                raise
 
         # ---- method dispatch
         # Every do_* method MUST first call ``_check_peer_or_403``.
@@ -2012,7 +2055,10 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 return
             try:
                 self._route()
-            except Exception:  # noqa: BLE001 — never leak a traceback to the browser
+            except Exception as exc:  # noqa: BLE001 — never leak a traceback to the browser
+                if _is_client_disconnect(exc):
+                    self.close_connection = True
+                    return
                 self._error_html(HTTPStatus.INTERNAL_SERVER_ERROR,
                                  "internal server error")
                 raise  # surface in stderr for the operator
