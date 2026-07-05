@@ -48,6 +48,8 @@ def _commit(root: Path, rel: str, text: str) -> str:
 
 
 def _run(argv: list[str], root: Path) -> int:
+    if argv[:2] == ["lane", "assign"] and "--no-worktree" not in argv and "--worktrees-root" not in argv:
+        argv = [*argv, "--no-worktree", "--worktree-waiver-reason", "legacy e2e test"]
     return cli.main(["--root", str(root), *argv])
 
 

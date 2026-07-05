@@ -120,6 +120,10 @@ truth. That poll is exactly why reconciliation stays LIGHT.
   re-send ONLY that missing wake/note keyed by its `transition_key`; do NOT
   blindly duplicate a review-result. Reply on an existing `request_id` only if
   that thread is still open AND owed; otherwise send a non-closing `wake`/`note`.
+- If the active assignment carries `lane_id`, run
+  `& "$env:AGENTTALK_PY" -m agenttalk lane workspace --id <lane_id>` and `cd`
+  into that path before implementation. If no workspace resolves, STOP and tell
+  the lead; never create or reuse your own worktree.
 - **Limitation:** poll-self-heal only covers participants ACTIVELY running
   sk-loop polling. If a participant sits in listen-mode (a long wait) instead of
   the sk-loop, a missed wake is NOT auto-covered - the LEAD should reconcile

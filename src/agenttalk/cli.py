@@ -9,6 +9,7 @@ import io
 import json
 import math
 import os
+import re
 import subprocess  # nosec B404
 import sys
 import time
@@ -1753,6 +1754,67 @@ def _git(root, argv: list[str]) -> tuple[int, str]:
         return -1, ""
 
 
+class GitWriteError(RuntimeError):
+    """Mutating git command refused or failed in the authority-critical path."""
+
+
+def _allowed_git_write(argv: list[str]) -> bool:
+    if len(argv) == 7 and argv[0:3] == ["worktree", "add", "-b"] and argv[4] == "--":
+        branch = argv[3]
+        base = argv[6]
+        return branch == lane_mod.lane_branch(branch.removeprefix("lane/")) and \
+            bool(lane_mod._FULL_SHA_RE.match(base))
+    if len(argv) == 4 and argv[:3] == ["worktree", "remove", "--"]:
+        return True
+    if len(argv) == 3 and argv[:2] == ["update-ref", "-d"]:
+        ref = argv[2]
+        if not ref.startswith("refs/heads/lane/"):
+            return False
+        try:
+            lane_mod.validate_lane_id(ref.removeprefix("refs/heads/lane/"))
+            return True
+        except lane_mod.LaneError:
+            return False
+    return False
+
+
+def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, str, str]:
+    """Run a narrowly allowlisted mutating git command.
+
+    This is intentionally separate from `_git`: callers must opt into mutating git,
+    every positional path/ref remains an argv element, and timeouts kill+reap before
+    returning so a lane is never persisted after an unknown write state.
+    """
+    if not _allowed_git_write(argv):
+        raise GitWriteError(f"mutating git command shape is not allowlisted: {argv!r}")
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    for key in ("GIT_ASKPASS", "SSH_ASKPASS", "GIT_EDITOR"):
+        env.pop(key, None)
+    cmd = ["git", "-c", "core.editor=false", "-C", str(root), *argv]
+    try:
+        proc = subprocess.Popen(  # noqa: S603,S607  # nosec B603 B607
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace", env=env)
+    except OSError as e:
+        raise GitWriteError(f"mutating git failed to start: {e}") from e
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        proc.kill()
+        try:
+            out, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired as reap:
+            raise GitWriteError(
+                "mutating git timed out and could not be reaped; git/config lock may be stranded"
+            ) from reap
+        raise GitWriteError(
+            f"mutating git timed out after {timeout:g}s and was killed: {err or out or e}"
+        ) from e
+    return proc.returncode, out or "", err or ""
+
+
 def _resolve_revision(root, ref: str) -> tuple[str, str]:
     """Freeze ``ref`` to a full 40-char SHA via git. Returns (sha, kind) where kind
     is 'sha' (caller passed a full SHA we verified or could not check) or 'ref'
@@ -2097,6 +2159,48 @@ def _print_verdict(close_id: str, result: dict) -> None:
         print(f"  HOLD[{h['code']}]: {h['detail']}")
 
 
+def _close_worktree_eval(store, record: dict) -> dict | None:
+    if not isinstance(record, dict):
+        return {"status": "unverified", "reason": "close record is malformed"}
+    if record.get("non_lane_isolation_not_asserted"):
+        return {"status": "not_applicable", "reason": "non-lane close; isolation not asserted"}
+    artifact_raw = record.get("lane_delivery_artifact")
+    if not artifact_raw:
+        return {"status": "unverified", "reason": "no lane delivery artifact recorded"}
+    path = Path(artifact_raw)
+    if not path.is_absolute():
+        path = store.root / path
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return {"status": "unverified", "reason": f"delivery artifact unreadable: {e}"}
+    if not isinstance(data, dict):
+        return {"status": "unverified", "reason": "delivery artifact is not an object"}
+    lane_id = data.get("lane_id")
+    head = data.get("delivered_head")
+    if not isinstance(lane_id, str) or not isinstance(head, str):
+        return {"status": "unverified", "reason": "delivery artifact lacks lane/head"}
+    try:
+        data = lane_mod.validate_delivery_artifact(
+            path, lane_id=lane_id, head_sha=head, store=store, require_isolation=True)
+    except lane_mod.LaneError as e:
+        return {"status": "unverified", "reason": str(e)}
+    status = data.get("isolation_status")
+    if status == "verified":
+        rc, out = _git(store.root, ["rev-parse", "--verify", f"{lane_mod.lane_ref(lane_id)}^{{commit}}"])
+        branch_tip = out.strip()
+        if rc != 0 or branch_tip != head:
+            return {"status": "unverified",
+                    "reason": "lane branch tip is missing or differs from delivered head",
+                    "lane_id": lane_id, "delivered_head": head}
+    return {
+        "status": "waived" if status == "waived" else "verified",
+        "lane_id": lane_id,
+        "delivered_head": head,
+        "artifact": str(path),
+    }
+
+
 def cmd_close(args: argparse.Namespace) -> int:
     """Assurance P2 milestone/release close (advisory; see close.py)."""
     from agenttalk import close as close_mod
@@ -2120,7 +2224,11 @@ def cmd_close(args: argparse.Namespace) -> int:
             gate_scope=args.gate_scope or args.scope, opened_by=opener,
             opened_at=_iso_now(), epoch_at_open=store.current_epoch(),
             required_lenses=_close_lens_specs(args),
-            revision_clean=bool(clean), dirty_artifact=args.dirty_artifact)
+            revision_clean=bool(clean), dirty_artifact=args.dirty_artifact,
+            lane_delivery_artifact=getattr(args, "lane_artifact", None),
+            non_lane_isolation_not_asserted=bool(
+                getattr(args, "non_lane_isolation_not_asserted", False)))
+        record["worktree_isolation"] = _close_worktree_eval(store, record)
         if close_mod.close_path(store, close_id).exists() and not args.force:
             sys.stderr.write(
                 f"agenttalk close open: {close_id!r} already exists "
@@ -2274,12 +2382,14 @@ def cmd_close(args: argparse.Namespace) -> int:
             store.root, scope=record.get("gate_scope") if isinstance(record, dict) else None)
         rec = record if isinstance(record, dict) else {}
         signoff_eval = _build_signoff_eval(store, rec) if isinstance(record, dict) else None
-        result = close_mod.compute_verdict(rec, gate_check, signoff_eval)
+        worktree_eval = _close_worktree_eval(store, rec) if isinstance(record, dict) else None
+        result = close_mod.compute_verdict(rec, gate_check, signoff_eval, worktree_eval)
         if getattr(args, "json", False):
             print(json.dumps({**result, "gate_verdict": gate_check["verdict"],
                               "signoff_policy": (None if signoff_eval is None
                                                  else "present" if signoff_eval.get("policy_present")
-                                                 else "none")}, indent=2))
+                                                 else "none"),
+                              "worktree_isolation": worktree_eval}, indent=2))
         else:
             _print_verdict(args.id, result)
         return 0 if result["verdict"] == close_mod.VERDICT_GO else 3
@@ -2295,7 +2405,9 @@ def cmd_close(args: argparse.Namespace) -> int:
             return 2
         gate_check = gate_mod.check_gates(store.root, scope=record.get("gate_scope"))
         signoff_eval = _build_signoff_eval(store, record)
-        result = close_mod.compute_verdict(record, gate_check, signoff_eval)
+        worktree_eval = _close_worktree_eval(store, record)
+        record["worktree_isolation"] = worktree_eval
+        result = close_mod.compute_verdict(record, gate_check, signoff_eval, worktree_eval)
         if args.verdict == "go" and result["verdict"] != close_mod.VERDICT_GO:
             sys.stderr.write(
                 "agenttalk close publish: refusing GO - close check is HOLD:\n")
@@ -2382,6 +2494,297 @@ def cmd_close(args: argparse.Namespace) -> int:
 # Lane deliver-gate: the CLI/git adapter resolves all I/O (git diff, merge-tree,
 # domain classification, gate check, epoch, registry hash, active-lane snapshot)
 # and hands lane_mod.compute_verdict already-resolved data — the verdict stays pure.
+
+def _git_read_one(root, argv: list[str], what: str) -> str:
+    rc, out = _git(root, argv)
+    if rc != 0 or not out.strip():
+        raise lane_mod.LaneError(f"could not read {what} (git rc={rc})")
+    return out.strip()
+
+
+def _common_git_dir(root) -> str:
+    rc, out = _git(root, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+    if rc == 0 and out.strip():
+        return lane_mod.canonical_host_path(out.strip())
+    raw = _git_read_one(root, ["rev-parse", "--git-common-dir"], "common git dir")
+    return lane_mod.canonical_host_path(Path(root) / raw)
+
+
+def _prepare_worktrees_root(store, configured: str | None) -> Path:
+    root = lane_mod.worktrees_root(store, configured)
+    root_c = lane_mod.canonical_host_path(root)
+    repo_c = lane_mod.canonical_host_path(store.root)
+    git_c = lane_mod.canonical_host_path(store.root / ".git")
+    if root_c == repo_c or root_c == git_c or root_c.startswith(git_c + "/"):
+        raise lane_mod.LaneError("worktrees root cannot be the repo root or inside .git")
+    if not root_c.startswith(repo_c + "/"):
+        raise lane_mod.LaneError("worktrees root must be inside the locked store root")
+    marker = root / lane_mod.WORKTREE_MARKER_FILENAME
+    if root.exists():
+        if not marker.exists() and any(root.iterdir()):
+            raise lane_mod.LaneError(
+                "worktrees root exists and is non-empty but lacks the agenttalk marker")
+    else:
+        root.mkdir(parents=True, exist_ok=True)
+    marker.write_text("agenttalk managed worktrees\n", encoding="utf-8")
+    return root
+
+
+def _branch_exists(root, branch: str) -> bool:
+    rc, _out = _git(root, ["rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}"])
+    return rc == 0
+
+
+def _mint_worktree_path(root: Path, lane_id: str, base_sha: str) -> Path:
+    return root / f"{lane_id}-{base_sha[:12]}-{uuid.uuid4().hex[:8]}"
+
+
+def _path_stat_token(path: Path) -> tuple[bool, int | None, int | None]:
+    try:
+        st = path.stat()
+    except OSError:
+        return (False, None, None)
+    return (True, st.st_mtime_ns, st.st_size)
+
+
+def _lane_assignment_fingerprint(store) -> tuple:
+    """Cheap stale-work detector for assign's lock window.
+
+    The expensive authority read is ``current_epoch()`` outside the lock. Inside
+    the lock we only compare filesystem shape that would change if messages,
+    config, or the domain registry changed while provisioning was being prepared.
+    """
+    try:
+        names = sorted(p.name for p in store.messages_dir.glob("*.json") if p.is_file())
+    except OSError:
+        names = []
+    return (
+        _path_stat_token(store.dir / "config.json"),
+        _path_stat_token(store.dir / dom.FILENAME),
+        _path_stat_token(store.messages_dir),
+        len(names),
+        names[-1] if names else None,
+    )
+
+
+def _cleanup_failed_provision(store, *, lane_id: str, base_sha: str,
+                              created_path: Path | None,
+                              cleanup_branch: bool) -> str | None:
+    notes: list[str] = []
+    if created_path is not None:
+        try:
+            rc, _out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
+            if rc != 0:
+                notes.append(f"worktree cleanup failed: {err.strip() or rc}")
+        except GitWriteError as e:
+            notes.append(f"worktree cleanup failed: {e}")
+    if cleanup_branch:
+        ref = lane_mod.lane_ref(lane_id)
+        rc, out = _git(store.root, ["rev-parse", "--verify", f"{ref}^{{commit}}"])
+        tip = out.strip()
+        if rc == 0:
+            if tip == base_sha:
+                try:
+                    rc2, _out, err = _git_write(store.root, ["update-ref", "-d", ref])
+                    if rc2 != 0:
+                        notes.append(f"branch cleanup failed: {err.strip() or rc2}")
+                except GitWriteError as e:
+                    notes.append(f"branch cleanup failed: {e}")
+            else:
+                notes.append("branch cleanup skipped: lane branch tip changed after failed provision")
+    return "; ".join(notes) if notes else None
+
+
+def _verify_lane_worktree(store, lane: dict, *, expected_base: str | None = None) -> dict:
+    wt = lane.get("worktree_path")
+    if not isinstance(wt, str) or not wt:
+        raise lane_mod.LaneError("lane has no registered worktree")
+    lane_id = lane_mod.validate_lane_id(str(lane.get("lane_id")))
+    branch = lane_mod.lane_branch(lane_id)
+    toplevel = _git_read_one(wt, ["rev-parse", "--show-toplevel"], "worktree toplevel")
+    toplevel_c = lane_mod.canonical_host_path(toplevel)
+    expected_c = lane_mod.canonical_host_path(wt)
+    if toplevel_c != expected_c:
+        raise lane_mod.LaneError(
+            f"registered worktree path {expected_c!r} does not match git toplevel {toplevel_c!r}")
+    stored_c = lane.get("worktree_toplevel_canonical")
+    if stored_c and lane_mod.canonical_host_path(stored_c) != toplevel_c:
+        raise lane_mod.LaneError("stored worktree canonical path no longer matches git")
+    repo_common = _common_git_dir(store.root)
+    wt_common = _common_git_dir(wt)
+    if repo_common != wt_common:
+        raise lane_mod.LaneError("worktree common git dir does not match the store repository")
+    head = _git_read_one(wt, ["rev-parse", "--verify", "HEAD^{commit}"], "worktree HEAD")
+    if expected_base is not None and head != expected_base:
+        raise lane_mod.LaneError(
+            f"new worktree HEAD {head[:12]} does not match base {expected_base[:12]}")
+    rc, short_branch = _git(wt, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+    detached_at_lane_tip = False
+    if rc == 0:
+        if short_branch.strip() != branch:
+            raise lane_mod.LaneError(
+                f"worktree branch {short_branch.strip()!r} does not match {branch!r}")
+    else:
+        branch_tip = _git_read_one(store.root, [
+            "rev-parse", "--verify", f"{lane_mod.lane_ref(lane_id)}^{{commit}}"],
+            "lane branch tip")
+        if head != branch_tip:
+            raise lane_mod.LaneError("detached worktree HEAD is not at the lane branch tip")
+        detached_at_lane_tip = True
+    rc, status = _git(wt, ["status", "--porcelain", "--untracked-files=no"])
+    if rc != 0:
+        raise lane_mod.LaneError(f"could not verify worktree tracked status (git rc={rc})")
+    if status.strip():
+        raise lane_mod.LaneError("worktree has staged/unstaged tracked changes")
+    return {
+        "head": head,
+        "worktree_toplevel_canonical": toplevel_c,
+        "common_git_dir_canonical": wt_common,
+        "tracked_tree_clean": True,
+        "detached_at_lane_tip": detached_at_lane_tip,
+    }
+
+
+def _lane_has_valid_waiver(lane: dict) -> bool:
+    return bool(lane.get("worktree_waived")
+                and isinstance(lane.get("worktree_waiver_reason"), str)
+                and lane["worktree_waiver_reason"].strip()
+                and isinstance(lane.get("worktree_waived_by"), str)
+                and isinstance(lane.get("worktree_waived_at"), str))
+
+
+def _release_class_lane(lane: dict) -> bool:
+    return lane.get("release_class", True) is not False
+
+
+def _lane_worktree_idle(store, lane: dict) -> bool:
+    wt = lane.get("worktree_path")
+    if not wt:
+        return True
+    wt_c = lane_mod.canonical_host_path(wt)
+    lane_id = lane.get("lane_id")
+    try:
+        for marker in store.list_launch_requests():
+            scope = marker.get("scope") if isinstance(marker, dict) else None
+            if marker.get("lane_id") == lane_id or (isinstance(scope, dict) and scope.get("lane_id") == lane_id):
+                state = marker.get("state")
+                if state not in {"archived", "failed", "launched"}:
+                    return False
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        state_path = store.dir / "state" / "supervisor-state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    except (OSError, ValueError):
+        return False
+    for section in ("agents", "ephemeral_reviewers"):
+        obj = state.get(section) if isinstance(state, dict) else None
+        if not isinstance(obj, dict):
+            continue
+        active = obj.get("active") if section == "ephemeral_reviewers" else obj
+        if not isinstance(active, dict):
+            continue
+        for rec in active.values():
+            if not isinstance(rec, dict):
+                continue
+            cwd = rec.get("cwd") or rec.get("launch_cwd") or rec.get("workspace_path")
+            if isinstance(cwd, str) and lane_mod.canonical_host_path(cwd) == wt_c:
+                return False
+    return True
+
+
+def _worktree_list(root) -> list[dict]:
+    rc, out = _git(root, ["worktree", "list", "--porcelain"])
+    if rc != 0:
+        return []
+    records: list[dict] = []
+    current: dict[str, str] = {}
+    for line in out.splitlines():
+        if not line.strip():
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        if " " in line:
+            key, value = line.split(" ", 1)
+        else:
+            key, value = line, ""
+        current[key] = value
+    if current:
+        records.append(current)
+    return records
+
+
+def _lane_id_from_worktree_dir(name: str) -> str | None:
+    parts = name.rsplit("-", 2)
+    if len(parts) != 3:
+        return None
+    lane_id, base12, nonce = parts
+    if not re.fullmatch(r"[0-9a-f]{12}", base12) or not re.fullmatch(r"[0-9a-f]{8}", nonce):
+        return None
+    try:
+        return lane_mod.validate_lane_id(lane_id)
+    except lane_mod.LaneError:
+        return None
+
+
+def _managed_worktree_paths(store) -> dict[str, str]:
+    found: dict[str, str] = {}
+    try:
+        markers = list(store.root.rglob(lane_mod.WORKTREE_MARKER_FILENAME))
+    except OSError:
+        return found
+    for marker in markers:
+        root = marker.parent
+        try:
+            children = list(root.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if not child.is_dir():
+                continue
+            lane_id = _lane_id_from_worktree_dir(child.name)
+            if lane_id:
+                found.setdefault(lane_mod.lane_branch(lane_id), str(child))
+    return found
+
+
+def _lane_branch_delete_safe(root, lane_id: str, target: str) -> tuple[bool, str]:
+    ref = lane_mod.lane_ref(lane_id)
+    rc, _out = _git(root, ["merge-base", "--is-ancestor", ref, target])
+    if rc != 0:
+        return False, "branch is not proven ancestor of target"
+    return True, "branch tip is ancestor of target"
+
+
+def _lane_worktree_remove_safe(store, lane_id: str, lane: dict | None,
+                               worktree_path: str | None,
+                               branch_delete_safe: bool) -> tuple[bool, str]:
+    if not worktree_path:
+        return False, "no worktree path discovered"
+    if lane is None and not branch_delete_safe:
+        return False, "no lane record and branch is not proven safe"
+    probe = dict(lane or {"lane_id": lane_id})
+    probe["lane_id"] = lane_id
+    probe["worktree_path"] = worktree_path
+    status = probe.get("status")
+    wt_state = probe.get("worktree_state")
+    removable_states = {
+        lane_mod.STATUS_DELIVERED,
+        lane_mod.STATUS_ABANDONED,
+        lane_mod.STATUS_CLEANUP_FAILED,
+        lane_mod.STATUS_CLEANUP_PENDING,
+    }
+    if lane is not None and status not in removable_states and wt_state not in removable_states:
+        return False, "lane is not delivered, abandoned, or cleanup-pending"
+    if not _lane_worktree_idle(store, probe):
+        return False, "worktree has an active or pending launch"
+    try:
+        _verify_lane_worktree(store, probe)
+    except lane_mod.LaneError as e:
+        return False, f"worktree is not clean/verifiable: {e}"
+    return True, "worktree is clean and idle"
+
 
 def _lane_diff(root, base: str, head: str) -> dict:
     """`git diff --name-status -z -M -C base..head` parsed structurally. touched =
@@ -2506,6 +2909,12 @@ def cmd_lane(args: argparse.Namespace) -> int:
         lane_id = lane_mod.validate_lane_id(args.id)
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         _ensure_in_roster(args.assignee, roster, label="assignee")
+        provision_worktree = not bool(getattr(args, "no_worktree", False))
+        waiver_reason = getattr(args, "worktree_waiver_reason", None)
+        if not provision_worktree and not (isinstance(waiver_reason, str) and waiver_reason.strip()):
+            sys.stderr.write(
+                "agenttalk lane assign: --no-worktree requires --worktree-waiver-reason.\n")
+            return 2
         reg = _load_domain_registry(store)
         if args.domain not in (reg.data.get("domains") or {}):
             sys.stderr.write(
@@ -2516,47 +2925,105 @@ def cmd_lane(args: argparse.Namespace) -> int:
             base = _lane_resolve(store, args.base)
             target_head = _lane_resolve(store, args.target)
             prefixes = lane_mod.normalize_prefixes(args.path, casefold=False)
+            planned_epoch = store.current_epoch()
+            assignment_fp = _lane_assignment_fingerprint(store)
+            assigned_at = _iso_now()
+            branch = lane_mod.lane_branch(lane_id)
+            wt_root = _prepare_worktrees_root(store, getattr(args, "worktrees_root", None)) \
+                if provision_worktree else None
+            wt_path = _mint_worktree_path(wt_root, lane_id, base) if wt_root else None
         except lane_mod.LaneError as e:
             sys.stderr.write(f"agenttalk lane assign: {e}\n")
             return 2
         casefold = dom.default_casefold_paths()
-        with store._config_lock():
-            data = lane_mod.load_lanes(store)
-            if lane_id in (data.get("lanes") or {}) and not args.force:
-                sys.stderr.write(
-                    f"agenttalk lane assign: lane {lane_id!r} already exists "
-                    "(use --force).\n")
-                return 2
-            for other in lane_mod.active_lanes(data):
-                if other.get("lane_id") == lane_id:
-                    continue
-                # Disjointness is checked WITHIN a domain (an empty subset = the whole
-                # domain, so it conflicts with any same-domain lane). Different-domain
-                # lanes are allowed at assign; the per-path domain classification +
-                # active_lane_overlap recompute at deliver enforce any real overlap
-                # (which also covers the case of overlapping domain globs). Fail closed
-                # on same-domain overlap.
-                if other.get("domain_id") != args.domain:
-                    continue
-                if not lane_mod.prefixes_disjoint(prefixes, other.get("path_subset") or [],
-                                                  casefold=casefold):
+        created_path: Path | None = None
+        cleanup_branch = False
+        provision_error: str | None = None
+        try:
+            with store._config_lock():
+                if _lane_assignment_fingerprint(store) != assignment_fp:
+                    raise lane_mod.LaneError(
+                        "assignment inputs changed while preparing lane assignment; retry assign")
+                data = lane_mod.load_lanes(store)
+                if lane_id in (data.get("lanes") or {}) and not args.force:
                     sys.stderr.write(
-                        f"agenttalk lane assign: path subset {prefixes or '[whole domain]'} "
-                        f"overlaps active lane {other.get('lane_id')!r} "
-                        f"{other.get('path_subset') or '[whole domain]'} in domain "
-                        f"{args.domain!r} - refusing (fail closed on overlap).\n")
+                        f"agenttalk lane assign: lane {lane_id!r} already exists "
+                        "(use --force).\n")
                     return 2
-            lane = lane_mod.new_lane(
-                lane_id, assignee=args.assignee, assigned_by=actor, assigned_at=_iso_now(),
-                domain_id=args.domain, path_subset=prefixes, base_sha=base,
-                target_ref=args.target, target_head_at_assign=target_head,
-                epoch_at_assign=store.current_epoch(),
-                registry_hash_at_assign=reg.registry_hash, notes=args.notes)
-            data.setdefault("lanes", {})[lane_id] = lane
-            lane_mod.save_lanes(store, data)
+                for other in lane_mod.active_lanes(data):
+                    if other.get("lane_id") == lane_id:
+                        continue
+                    # Disjointness is checked WITHIN a domain (an empty subset = the whole
+                    # domain, so it conflicts with any same-domain lane). Different-domain
+                    # lanes are allowed at assign; the per-path domain classification +
+                    # active_lane_overlap recompute at deliver enforce any real overlap
+                    # (which also covers the case of overlapping domain globs). Fail closed
+                    # on same-domain overlap.
+                    if other.get("domain_id") != args.domain:
+                        continue
+                    if not lane_mod.prefixes_disjoint(prefixes, other.get("path_subset") or [],
+                                                      casefold=casefold):
+                        sys.stderr.write(
+                            f"agenttalk lane assign: path subset {prefixes or '[whole domain]'} "
+                            f"overlaps active lane {other.get('lane_id')!r} "
+                            f"{other.get('path_subset') or '[whole domain]'} in domain "
+                            f"{args.domain!r} - refusing (fail closed on overlap).\n")
+                        return 2
+                worktree = None
+                waiver = None
+                if provision_worktree:
+                    if wt_root is None or wt_path is None:
+                        raise lane_mod.LaneError("worktree provisioning was not prepared")
+                    if _branch_exists(store.root, branch):
+                        raise lane_mod.LaneError(f"lane branch {branch!r} already exists")
+                    if wt_path.exists():
+                        raise lane_mod.LaneError(f"planned worktree path already exists: {wt_path}")
+                    if not lane_mod._FULL_SHA_RE.match(base):
+                        raise lane_mod.LaneError("resolved worktree base is not a full 40-char SHA")
+                    cleanup_branch = True
+                    rc, _out, err = _git_write(
+                        store.root, ["worktree", "add", "-b", branch, "--", str(wt_path), base])
+                    created_path = wt_path
+                    if rc != 0:
+                        raise lane_mod.LaneError(f"git worktree add failed rc={rc}: {err.strip()}")
+                    worktree = {
+                        "path": str(wt_path),
+                        "branch": branch,
+                        "base_sha": base,
+                        "created_at": assigned_at,
+                        "root": str(wt_root),
+                        "state": lane_mod.STATUS_ACTIVE,
+                    }
+                else:
+                    waiver = {"reason": waiver_reason, "by": actor, "at": assigned_at}
+                lane = lane_mod.new_lane(
+                    lane_id, assignee=args.assignee, assigned_by=actor, assigned_at=assigned_at,
+                    domain_id=args.domain, path_subset=prefixes, base_sha=base,
+                    target_ref=args.target, target_head_at_assign=target_head,
+                    epoch_at_assign=planned_epoch,
+                    registry_hash_at_assign=reg.registry_hash, notes=args.notes,
+                    worktree=worktree, waiver=waiver)
+                if provision_worktree:
+                    prov = _verify_lane_worktree(store, lane, expected_base=base)
+                    lane["worktree_toplevel_canonical"] = prov["worktree_toplevel_canonical"]
+                    lane["worktree_common_git_dir_canonical"] = prov["common_git_dir_canonical"]
+                data.setdefault("lanes", {})[lane_id] = lane
+                lane_mod.save_lanes(store, data)
+        except (lane_mod.LaneError, GitWriteError) as e:
+            provision_error = str(e)
+        if provision_error:
+            cleanup_note = _cleanup_failed_provision(
+                store, lane_id=lane_id, base_sha=base,
+                created_path=created_path, cleanup_branch=cleanup_branch)
+            if cleanup_note:
+                sys.stderr.write(f"agenttalk lane assign: cleanup note: {cleanup_note}\n")
+            sys.stderr.write(f"agenttalk lane assign: {provision_error}\n")
+            return 2
         print(f"assigned lane {lane_id} to {args.assignee} @ domain {args.domain}; "
               f"base {base[:12]} -> {args.target} ({target_head[:12]}); "
-              f"subset {prefixes or '[whole domain]'}")
+              f"subset {prefixes or '[whole domain]'}"
+              + (f"; worktree {wt_path} [{branch}]" if provision_worktree
+                 else "; WORKTREE WAIVED (not isolated)"))
         return 0
 
     if action == "approve-shared":
@@ -2627,12 +3094,34 @@ def cmd_lane(args: argparse.Namespace) -> int:
         if not isinstance(lane, dict):
             sys.stderr.write(f"agenttalk lane {action}: no lane {args.id!r}.\n")
             return 2
+        provenance = None
         try:
-            head = _lane_resolve(store, args.head) if getattr(args, "head", None) else \
-                _lane_resolve(store, "HEAD")
+            if lane.get("worktree_path") and (action == "deliver" or not getattr(args, "head", None)):
+                provenance = _verify_lane_worktree(store, lane)
+                head = provenance["head"]
+                if getattr(args, "head", None):
+                    requested = _lane_resolve(store, args.head)
+                    if requested != head:
+                        raise lane_mod.LaneError(
+                            "--head does not match the registered lane worktree HEAD; "
+                            "deliver from the provisioned worktree or omit --head")
+            else:
+                head = _lane_resolve(store, args.head) if getattr(args, "head", None) else \
+                    _lane_resolve(store, "HEAD")
         except lane_mod.LaneError as e:
             sys.stderr.write(f"agenttalk lane {action}: {e}\n")
+            msg = str(e)
+            if action == "deliver" and (
+                    lane.get("worktree_path") or "tracked changes" in msg
+                    or "--head does not match" in msg):
+                return 3
             return 2
+        if (action == "deliver" and _release_class_lane(lane)
+                and not lane.get("worktree_path") and not _lane_has_valid_waiver(lane)):
+            sys.stderr.write(
+                "agenttalk lane deliver: HOLD - release-class lane has no worktree "
+                "and no audited --no-worktree waiver.\n")
+            return 3
         others = [ln for ln in lane_mod.active_lanes(data) if ln.get("lane_id") != args.id]
         verdict, ctx = _lane_eval(store, lane, others, head, getattr(args, "gate_scope", None))
         if action == "check":
@@ -2667,7 +3156,7 @@ def cmd_lane(args: argparse.Namespace) -> int:
                 artifact = lane_mod.write_delivery_artifact(
                     store, lane=lane, head_sha=head, verdict=verdict, changed=ctx["changed"],
                     merge=ctx["merge"], gate_check=ctx["gate_check"], delivered_by=actor,
-                    at=_iso_now())
+                    at=_iso_now(), worktree_provenance=provenance)
             except OSError as e:
                 sys.stderr.write(
                     f"agenttalk lane deliver: artifact write failed ({e}); lane stays "
@@ -2679,14 +3168,159 @@ def cmd_lane(args: argparse.Namespace) -> int:
             # printed evidence path can never get a false success on unreadable evidence.
             try:
                 lane_mod.validate_delivery_artifact(
-                    artifact, lane_id=args.id, head_sha=head)
+                    artifact, lane_id=args.id, head_sha=head, store=store,
+                    require_isolation=_release_class_lane(current))
             except lane_mod.LaneError as e:
                 sys.stderr.write(
                     f"agenttalk lane deliver: {e}; lane stays active (NOT cleared).\n")
                 return 2
-            (data.get("lanes") or {}).pop(args.id, None)
+            current["status"] = lane_mod.STATUS_DELIVERED
+            if current.get("worktree_path"):
+                if _lane_worktree_idle(store, current):
+                    try:
+                        teardown = _verify_lane_worktree(store, current)
+                        if teardown["head"] != head:
+                            raise lane_mod.LaneError(
+                                "worktree HEAD changed after delivery artifact was written")
+                        rc, _out, err = _git_write(
+                            store.root, ["worktree", "remove", "--", str(current["worktree_path"])])
+                        current["worktree_state"] = (
+                            lane_mod.STATUS_DELIVERED if rc == 0
+                            else lane_mod.STATUS_CLEANUP_FAILED)
+                        if rc != 0:
+                            current["worktree_cleanup_error"] = err.strip()[:500]
+                    except lane_mod.LaneError as e:
+                        current["worktree_state"] = lane_mod.STATUS_CLEANUP_PENDING
+                        current["worktree_cleanup_error"] = str(e)[:500]
+                    except GitWriteError as e:
+                        current["worktree_state"] = lane_mod.STATUS_CLEANUP_FAILED
+                        current["worktree_cleanup_error"] = str(e)[:500]
+                else:
+                    current["worktree_state"] = lane_mod.STATUS_CLEANUP_PENDING
             lane_mod.save_lanes(store, data)
         print(f"delivered lane {args.id} @ {head[:12]} (GO); evidence: {artifact}")
+        return 0
+
+    if action == "workspace":
+        data = lane_mod.load_lanes(store)
+        lane = (data.get("lanes") or {}).get(args.id)
+        if not isinstance(lane, dict):
+            sys.stderr.write(f"agenttalk lane workspace: no lane {args.id!r}.\n")
+            return 2
+        path = lane.get("worktree_path")
+        payload = {
+            "lane_id": args.id,
+            "worktree_path": path,
+            "worktree_branch": lane_mod.lane_branch(args.id),
+            "worktree_state": lane.get("worktree_state"),
+            "worktree_waived": bool(lane.get("worktree_waived")),
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2))
+        elif path:
+            print(path)
+        else:
+            print(f"lane {args.id} has no worktree (waived={payload['worktree_waived']})")
+            return 3
+        return 0
+
+    if action == "abandon":
+        lane_id = lane_mod.validate_lane_id(args.id)
+        with store._config_lock():
+            data = lane_mod.load_lanes(store)
+            lane = (data.get("lanes") or {}).get(lane_id)
+            if isinstance(lane, dict):
+                lane["status"] = lane_mod.STATUS_ABANDONED
+                if lane.get("worktree_path"):
+                    try:
+                        rc, _out, err = _git_write(
+                            store.root, ["worktree", "remove", "--", str(lane["worktree_path"])])
+                        lane["worktree_state"] = (
+                            lane_mod.STATUS_ABANDONED if rc == 0
+                            else lane_mod.STATUS_CLEANUP_FAILED)
+                        if rc != 0:
+                            lane["worktree_cleanup_error"] = err.strip()[:500]
+                    except GitWriteError as e:
+                        lane["worktree_state"] = lane_mod.STATUS_CLEANUP_FAILED
+                        lane["worktree_cleanup_error"] = str(e)[:500]
+                lane_mod.save_lanes(store, data)
+        deleted = False
+        if getattr(args, "delete_branch", False):
+            ok, reason = _lane_branch_delete_safe(store.root, lane_id, args.target)
+            if not ok:
+                sys.stderr.write(
+                    f"agenttalk lane abandon: branch {lane_mod.lane_branch(lane_id)!r} "
+                    f"not deleted - {reason}.\n")
+            else:
+                rc, _out, err = _git_write(store.root, ["update-ref", "-d", lane_mod.lane_ref(lane_id)])
+                if rc == 0:
+                    deleted = True
+                else:
+                    sys.stderr.write(f"agenttalk lane abandon: branch delete failed: {err.strip()}\n")
+        print(f"abandoned lane {lane_id}" + ("; branch deleted" if deleted else ""))
+        return 0
+
+    if action == "gc":
+        try:
+            data = lane_mod.load_lanes(store)
+        except lane_mod.LaneError:
+            data = {"lanes": {}}
+        lane_records = {k: v for k, v in (data.get("lanes") or {}).items() if isinstance(v, dict)}
+        wt_by_branch = {
+            rec.get("branch", "").removeprefix("refs/heads/"): rec
+            for rec in _worktree_list(store.root)
+            if isinstance(rec.get("branch"), str) and rec.get("branch", "").startswith("refs/heads/lane/")
+        }
+        managed_wt_by_branch = _managed_worktree_paths(store)
+        rc, refs_out = _git(store.root, ["for-each-ref", "--format=%(refname:short)", "refs/heads/lane/"])
+        branches = [b.strip() for b in refs_out.splitlines() if rc == 0 and b.strip()]
+        items = []
+        for branch in sorted(set(branches) | set(wt_by_branch) | set(managed_wt_by_branch)):
+            lane_id = branch.removeprefix("lane/")
+            try:
+                lane_mod.validate_lane_id(lane_id)
+            except lane_mod.LaneError:
+                continue
+            lane = lane_records.get(lane_id)
+            status = lane.get("status") if isinstance(lane, dict) else "orphaned"
+            wt_rec = wt_by_branch.get(branch)
+            wt_path = (wt_rec.get("worktree") if wt_rec else None) or managed_wt_by_branch.get(branch)
+            safe, reason = _lane_branch_delete_safe(store.root, lane_id, args.target)
+            wt_safe, wt_reason = _lane_worktree_remove_safe(
+                store, lane_id, lane if isinstance(lane, dict) else None, wt_path, safe)
+            item = {
+                "lane_id": lane_id,
+                "branch": branch,
+                "status": status,
+                "worktree": wt_path,
+                "worktree_remove_safe": wt_safe,
+                "worktree_reason": wt_reason,
+                "branch_delete_safe": safe,
+                "reason": reason,
+            }
+            if getattr(args, "delete", False):
+                if wt_path and wt_safe:
+                    try:
+                        _git_write(store.root, ["worktree", "remove", "--", wt_path])
+                        item["worktree_removed"] = True
+                    except GitWriteError as e:
+                        item["worktree_removed"] = False
+                        item["remove_error"] = str(e)
+                if safe:
+                    rc2, _out, err = _git_write(
+                        store.root, ["update-ref", "-d", lane_mod.lane_ref(lane_id)])
+                    item["branch_deleted"] = rc2 == 0
+                    if rc2 != 0:
+                        item["delete_error"] = err.strip()
+            items.append(item)
+        if getattr(args, "json", False):
+            print(json.dumps({"dry_run": not bool(getattr(args, "delete", False)),
+                              "items": items}, indent=2))
+        else:
+            print("lane gc " + ("delete" if getattr(args, "delete", False) else "dry-run"))
+            for item in items:
+                print(f"  {item['lane_id']}: {item['status']} {item.get('worktree') or '[no worktree]'} "
+                      f"branch-delete={'yes' if item['branch_delete_safe'] else 'manual'}")
         return 0
 
     if action == "status":
@@ -2708,12 +3342,19 @@ def cmd_lane(args: argparse.Namespace) -> int:
             if ln.get("registry_hash_at_assign") != reg.registry_hash:
                 stale.append("registry")
             tag = f" STALE[{','.join(stale)}]" if stale else ""
+            if ln.get("worktree_path"):
+                wt = f" worktree={ln.get('worktree_state') or lane_mod.STATUS_ACTIVE}"
+            elif ln.get("worktree_waived"):
+                wt = " worktree=waived"
+            else:
+                wt = " worktree=missing"
             print(f"  {ln['lane_id']}: {ln.get('assignee')} @ {ln.get('domain_id')} "
-                  f"{ln.get('path_subset') or '[whole domain]'} -> {ln.get('target_ref')}{tag}")
+                  f"{ln.get('path_subset') or '[whole domain]'} -> {ln.get('target_ref')}{tag}{wt}")
         return 0
 
     sys.stderr.write(
-        "agenttalk lane: expected assign, check, deliver, status, or approve-shared.\n")
+        "agenttalk lane: expected assign, check, deliver, workspace, abandon, gc, "
+        "status, or approve-shared.\n")
     return 2
 
 
@@ -6234,6 +6875,14 @@ def cmd_request_launch(args: argparse.Namespace) -> int:
             "summary": args.summary or "",
         },
     }
+    if getattr(args, "lane_id", None):
+        try:
+            lane_id = lane_mod.validate_lane_id(args.lane_id)
+        except lane_mod.LaneError as e:
+            sys.stderr.write(f"agenttalk request-launch: {e}\n")
+            return 2
+        marker["lane_id"] = lane_id
+        marker["scope"]["lane_id"] = lane_id
     if args.timeout_seconds is not None:
         marker["timeout_seconds"] = args.timeout_seconds
     if args.role:
@@ -6786,9 +7435,25 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         return 2
     sender = (_resolve_self(args.sender, roster=roster)
               if getattr(args, "sender", None) else agent)
+    launch_cwd = store.root
+    if getattr(args, "lane_id", None):
+        try:
+            lane_id = lane_mod.validate_lane_id(args.lane_id)
+            data = lane_mod.load_lanes(store)
+            lane = (data.get("lanes") or {}).get(lane_id)
+            if not isinstance(lane, dict) or not lane.get("worktree_path"):
+                raise lane_mod.LaneError(f"lane {lane_id!r} has no provisioned worktree")
+            launch_cwd = Path(lane["worktree_path"])
+            if args.cli == "codex" and not any(
+                    argv[i] == "--add-dir" and i + 1 < len(argv)
+                    and str(argv[i + 1]) == str(launch_cwd) for i in range(len(argv))):
+                argv = ["--add-dir", str(launch_cwd), *argv]
+        except lane_mod.LaneError as e:
+            sys.stderr.write(f"agenttalk wrap: {e}\n")
+            return 2
     child_env = wrapper_run._child_env(store.root)
     launch = wrapper_run.preflight_launch_runtime(
-        argv, args.cli, store.root, child_env)
+        argv, args.cli, launch_cwd, child_env)
     if launch.blocked:
         mode = (
             "lead-loop" if lead_loop else
@@ -6801,6 +7466,8 @@ def cmd_wrap(args: argparse.Namespace) -> int:
             summary=launch.blocked)
     store.clear_config_blocked_hold(agent)
     argv = launch.argv
+    if launch_cwd != store.root:
+        os.chdir(launch_cwd)
     if getattr(args, "loop", False):
         # Dead-letter caps: an explicit --dead-letter-* flag wins; otherwise resolve from
         # supervisor.json (per-agent -> global -> default) so a supervised wrapped agent's
@@ -7951,6 +8618,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Authorize a lens ack: LENS:AGENT or LENS:@ROLE (repeatable).")
     copen.add_argument("--dirty-artifact", help="Pointer to a recorded diff when the worktree is dirty.")
     copen.add_argument("--allow-dirty", action="store_true", help="Proceed on a dirty worktree (records dirty).")
+    copen.add_argument("--lane-artifact",
+                       help="Path to a lane delivery artifact proving worktree isolation.")
+    copen.add_argument("--non-lane-isolation-not-asserted", action="store_true",
+                       help="Declare this release-class close does not assert lane isolation.")
     copen.add_argument("--force", action="store_true", help="Overwrite an existing close with this id.")
     copen.add_argument("--derive-signoffs", action="store_true",
                        help="P3: derive required signoffs from the risk inventory + signoffs.json.")
@@ -8066,7 +8737,7 @@ def build_parser() -> argparse.ArgumentParser:
     cshow.add_argument("--id", required=True)
     cshow.set_defaults(func=cmd_close)
 
-    # ----- lane (deliver-gate; advisory point-in-time coordination, opt-in) -----
+    # ----- lane (deliver-gate + default-on isolated worktree provisioning) -----
     plane = sub.add_parser(
         "lane",
         help="Scoped work lanes with a deliver-gate: segment-aware path bounds vs the "
@@ -8075,7 +8746,8 @@ def build_parser() -> argparse.ArgumentParser:
     plane.set_defaults(func=cmd_lane, lane_cmd=None)
     lsub = plane.add_subparsers(dest="lane_cmd")
 
-    lassign = lsub.add_parser("assign", help="Assign a lane (validates + stamps under lock).")
+    lassign = lsub.add_parser(
+        "assign", help="Assign a lane and provision an isolated worktree by default.")
     lassign.add_argument("--id", required=True, help="Lane id (safe identifier).")
     lassign.add_argument("--from", dest="actor", help="Agent assigning the lane.")
     lassign.add_argument("--assignee", required=True, help="Agent who works the lane.")
@@ -8086,6 +8758,12 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Repo-relative path PREFIX in scope (repeatable; omit = whole domain).")
     lassign.add_argument("--notes", help="Free-text notes.")
     lassign.add_argument("--force", action="store_true", help="Overwrite an existing lane id.")
+    lassign.add_argument("--worktrees-root",
+                         help="Managed worktree root (default: <repo>/.worktrees).")
+    lassign.add_argument("--no-worktree", action="store_true",
+                         help="Audited waiver: assign without isolation (requires reason).")
+    lassign.add_argument("--worktree-waiver-reason",
+                         help="Required human-readable reason when --no-worktree is used.")
     lassign.set_defaults(func=cmd_lane)
 
     lcheck = lsub.add_parser("check", help="READ-ONLY deliver-gate verdict (exit 0=GO/3=HOLD).")
@@ -8101,6 +8779,27 @@ def build_parser() -> argparse.ArgumentParser:
     ldeliver.add_argument("--head", help="Head ref/SHA to deliver (default: HEAD).")
     ldeliver.add_argument("--gate-scope", help="Gate scope (default: lane:<id>).")
     ldeliver.set_defaults(func=cmd_lane)
+
+    lworkspace = lsub.add_parser("workspace", help="Show the provisioned workspace for a lane.")
+    lworkspace.add_argument("--id", required=True)
+    lworkspace.add_argument("--json", action="store_true")
+    lworkspace.set_defaults(func=cmd_lane)
+
+    labandon = lsub.add_parser("abandon", help="Mark a lane abandoned and clean up its worktree.")
+    labandon.add_argument("--id", required=True)
+    labandon.add_argument("--target", default="HEAD",
+                          help="Target ref used to prove branch ancestry before deletion.")
+    labandon.add_argument("--delete-branch", action="store_true",
+                          help="Delete lane branch only when merge-base --is-ancestor proves it safe.")
+    labandon.set_defaults(func=cmd_lane)
+
+    lgc = lsub.add_parser("gc", help="Discover/clean managed lane worktree leftovers.")
+    lgc.add_argument("--target", default="HEAD",
+                     help="Target ref used to prove branch ancestry before deletion.")
+    lgc.add_argument("--delete", action="store_true",
+                     help="Perform proven cleanups; default is dry-run only.")
+    lgc.add_argument("--json", action="store_true")
+    lgc.set_defaults(func=cmd_lane)
 
     lstatus = lsub.add_parser("status", help="List active lanes with staleness indicators.")
     lstatus.add_argument("--json", action="store_true")
@@ -8651,6 +9350,8 @@ def build_parser() -> argparse.ArgumentParser:
     prl.add_argument("--summary", help="Short scope summary.")
     prl.add_argument("--request-id", dest="request_id",
                      help="Explicit launch request id (default: generated lr-*).")
+    prl.add_argument("--lane-id",
+                     help="Provisioned lane whose worktree should be used for the launch.")
     prl.add_argument("--timeout-seconds", dest="timeout_seconds", type=int,
                      help="Requested timeout; must not exceed supervisor default.")
     prl.add_argument("--role", help="Requested temporary role (must be allowed).")
@@ -8674,6 +9375,8 @@ def build_parser() -> argparse.ArgumentParser:
     pwrap.add_argument("--from", dest="sender",
                        help="Identity recorded as the degraded-restart requester "
                             "(default: the wrapped agent).")
+    pwrap.add_argument("--lane-id",
+                       help="Run the wrapped child from the provisioned lane worktree.")
     pwrap.add_argument("--min-interval", dest="min_interval", type=float, default=5.0,
                        help="Throttle: stamp heartbeat at most once per this many "
                             "seconds (default 5).")

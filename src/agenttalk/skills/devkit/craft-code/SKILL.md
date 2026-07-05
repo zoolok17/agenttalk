@@ -19,6 +19,10 @@ and **readable**, by making the smallest correct change that fits the codebase.
 Work the checklist top to bottom; don't skip the AFTER gate.
 
 ## BEFORE — understand and scope
+- [ ] If the assignment carries `lane_id`, run
+      `python -m agenttalk lane workspace --id <lane_id>` and work only in that
+      path. If no workspace resolves, STOP and ask the lead; never create or
+      reuse your own git worktree.
 - [ ] Restate the task as the **smallest concrete outcome**. List what is explicitly
       OUT of scope: no speculative features, flags, config knobs, or abstractions
       (YAGNI — every guess has build/delay/carry/repair cost).

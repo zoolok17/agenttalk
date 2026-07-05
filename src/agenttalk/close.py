@@ -78,6 +78,9 @@ HOLD_UNROUTABLE_SIGNOFF = "unroutable_required_signoff"
 HOLD_INVALID_POLICY = "invalid_signoff_policy"
 HOLD_UNMAPPED_RISK = "unmapped_required_risk"
 HOLD_STALE_ROUTE = "stale_signoff_route"
+HOLD_WORKTREE_ISOLATION = "worktree_isolation_unverified"
+
+RELEASE_CLASS_SCOPES = {"release", "milestone", "feature", "hotfix"}
 
 # Core-neutral risk envelope (project: extensions allowed, like gates). Core
 # VALIDATES the string; it never DECIDES a change's risk - the project supplies
@@ -100,7 +103,9 @@ class CloseError(ValueError):
 def empty_close(close_id: str, *, scope: str, revision: str, revision_kind: str,
                 gate_scope: str, opened_by: str, opened_at: str,
                 epoch_at_open: str | None, required_lenses: list[dict],
-                revision_clean: bool, dirty_artifact: str | None) -> dict[str, Any]:
+                revision_clean: bool, dirty_artifact: str | None,
+                lane_delivery_artifact: str | None = None,
+                non_lane_isolation_not_asserted: bool = False) -> dict[str, Any]:
     """A freshly OPENED close record (pure; the CLI persists it)."""
     return {
         "schema_version": SCHEMA_VERSION,
@@ -116,6 +121,9 @@ def empty_close(close_id: str, *, scope: str, revision: str, revision_kind: str,
         "epoch_at_open": epoch_at_open,         # AUDIT ONLY - never the freeze
         "status": OPEN,
         "required_lenses": required_lenses,     # [{id, allowed_agents, allowed_roles, allowed_groups, required}]
+        "lane_delivery_artifact": lane_delivery_artifact,
+        "non_lane_isolation_not_asserted": bool(non_lane_isolation_not_asserted),
+        "worktree_isolation": None,
         "lens_acks": {},                        # lens_id -> ack record
         "counters": {},                         # counter_id -> counter record
         "remediation_items": {},                # item_id -> remediation record
@@ -133,7 +141,8 @@ def empty_close(close_id: str, *, scope: str, revision: str, revision_kind: str,
 # --------------------------------------------------------------- pure verdict
 
 def compute_verdict(record: dict, gate_check: dict,
-                    signoff_eval: dict | None = None) -> dict[str, Any]:
+                    signoff_eval: dict | None = None,
+                    worktree_eval: dict | None = None) -> dict[str, Any]:
     """PURE: derive HOLD|GO + the stable hold codes from a close ``record`` and a
     ``gate_check`` result (:func:`gates.check_gates` output for the close's
     gate_scope). No I/O. GO requires, in order of the codes below: a well-formed
@@ -174,6 +183,24 @@ def compute_verdict(record: dict, gate_check: dict,
     if gate_check.get("verdict") != VERDICT_GO:
         names = ", ".join(b.get("name", "?") for b in gate_check.get("blockers", [])) or "?"
         hold(HOLD_GATE, f"gate check for scope is HOLD (blockers: {names})")
+
+    if str(record.get("scope") or "").lower() in RELEASE_CLASS_SCOPES:
+        if record.get("non_lane_isolation_not_asserted"):
+            pass
+        elif not isinstance(worktree_eval, dict):
+            hold(HOLD_WORKTREE_ISOLATION,
+                 "release-class close lacks verified lane worktree isolation evidence")
+        else:
+            status = worktree_eval.get("status")
+            if status == "verified":
+                if worktree_eval.get("delivered_head") != record.get("revision"):
+                    hold(HOLD_WORKTREE_ISOLATION,
+                         "lane delivery artifact head does not match close revision")
+            elif status == "waived":
+                pass
+            else:
+                detail = worktree_eval.get("reason") or "lane worktree isolation is unverified"
+                hold(HOLD_WORKTREE_ISOLATION, str(detail))
 
     revision = record.get("revision")
     acks = record.get("lens_acks", {})

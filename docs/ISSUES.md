@@ -14,6 +14,13 @@ major · `P2` minor · `P3` nit. Each item: what, why, where, disposition.
 
 ## Recently shipped
 
+- **SHIPPED - v0.66.0 / pending - lane worktree isolation.**
+  `lane assign` now provisions managed in-repo worktrees by default, launch paths can
+  carry `lane_id` so supervised children run in the registered workspace, and
+  release-class `close` checks HOLD without a signed lane delivery artifact or an
+  explicit non-lane isolation declaration. This closes the old sandboxed-worktree
+  limitation for the lane path while preserving audited `--no-worktree` waivers.
+
 - **SHIPPED · v0.61.0 / `9dd0342` — Team Console UX batch (colored flow + history + archived + avatars).**
   Colored per-sender flow lines + arrowheads + legend; new read-only paginated
   `GET /api/threads?state=closed` (envelope-only, cursor, capped, fail-safe) feeding a

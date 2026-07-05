@@ -13,6 +13,7 @@ Two layers, mirroring gates/close:
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -370,12 +371,17 @@ def _git(root: Path, *args: str) -> str:
                           text=True, encoding="utf-8").stdout
 
 
+def _git_rc(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True,
+                          text=True, encoding="utf-8")
+
+
 def _repo(tmp_path: Path) -> tuple[Path, str]:
     """A git repo with .agenttalk gitignored + an initialized store + a core domain."""
     subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
     _git(tmp_path, "config", "user.email", "t@t")
     _git(tmp_path, "config", "user.name", "t")
-    (tmp_path / ".gitignore").write_text(".agenttalk/\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(".agenttalk/\n.worktrees/\n", encoding="utf-8")
     (tmp_path / "src" / "core").mkdir(parents=True)
     (tmp_path / "src" / "other").mkdir(parents=True)
     (tmp_path / "src" / "core" / "a.py").write_text("base\n", encoding="utf-8")
@@ -394,6 +400,12 @@ def _repo(tmp_path: Path) -> tuple[Path, str]:
 
 
 def _run(argv: list[str], root: Path) -> int:
+    if argv[:2] == ["lane", "assign"] and "--no-worktree" not in argv and "--worktrees-root" not in argv:
+        argv = [*argv, "--no-worktree", "--worktree-waiver-reason", "legacy deliver-gate test"]
+    return cli.main(["--root", str(root), *argv])
+
+
+def _run_raw(argv: list[str], root: Path) -> int:
     return cli.main(["--root", str(root), *argv])
 
 
@@ -635,6 +647,291 @@ def test_cli_malformed_lanes_does_not_brick_status(tmp_path: Path) -> None:
     # lane status fails closed (exit 2), but an unrelated command still works
     assert _run(["lane", "status"], root) == 2
     assert _run(["status"], root) == 0
+
+
+def _assign_worktree(root: Path, base: str, lane_id: str = "lwt") -> dict:
+    assert _run_raw([
+        "lane", "assign", "--id", lane_id, "--from", "lead", "--assignee", "dev",
+        "--domain", "core", "--base", base, "--target", _branch(root),
+        "--path", "src/core", "--worktrees-root", str(root / ".worktrees"),
+    ], root) == 0
+    return lanes.load_lanes(Store(root))["lanes"][lane_id]
+
+
+def test_m8_lane_id_strict_and_branch_derived() -> None:
+    assert lanes.lane_branch("abc-_.1") == "lane/abc-_.1"
+    for bad in ("..", "a..b", "bad.", "x.lock", "x/ y", "-x", "x:y", "x\\y", "x~y", "x[y"):
+        with pytest.raises(lanes.LaneError):
+            lanes.validate_lane_id(bad)
+
+
+def test_m6_assign_provisions_worktree_by_default_and_workspace(tmp_path: Path, capsys) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base)
+    wt = Path(lane["worktree_path"])
+    assert wt.exists()
+    assert lane["worktree_branch"] == "lane/lwt"
+    assert lane["worktree_base_sha"] == base
+    assert lane["worktree_toplevel_canonical"] == lanes.canonical_host_path(wt)
+    assert (root / ".worktrees" / lanes.WORKTREE_MARKER_FILENAME).exists()
+    capsys.readouterr()
+    assert _run_raw(["lane", "workspace", "--id", "lwt", "--json"], root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["worktree_path"] == str(wt)
+
+
+def test_m1_m3_canonical_paths_and_common_git_dir_match(tmp_path: Path) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "canon")
+    prov = cli._verify_lane_worktree(Store(root), lane, expected_base=base)
+    wt = Path(lane["worktree_path"])
+    assert prov["worktree_toplevel_canonical"] == lanes.canonical_host_path(wt)
+    assert prov["common_git_dir_canonical"] == cli._common_git_dir(root)
+
+
+def test_m5_git_write_worktree_add_uses_separator_and_rejects_evil_id(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    assert _run_raw(["lane", "assign", "--id=--detach", "--from", "lead",
+                     "--assignee", "dev", "--domain", "core", "--base", base,
+                     "--target", _branch(root)], root) == 2
+    calls = []
+    real = cli._git_write
+
+    def spy(git_root, argv, **kw):
+        calls.append(list(argv))
+        return real(git_root, argv, **kw)
+
+    monkeypatch.setattr(cli, "_git_write", spy)
+    _assign_worktree(root, base, "sep")
+    add = next(c for c in calls if c[:3] == ["worktree", "add", "-b"])
+    assert add[3] == "lane/sep"
+    assert add[4] == "--"
+    assert re.fullmatch(r"[0-9a-f]{40}", add[6])
+
+
+def test_m2_worktree_dirty_rules_and_main_head_mismatch(tmp_path: Path) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "clean")
+    wt = Path(lane["worktree_path"])
+    _commit(wt, "src/core/a.py", "base\nwork\n")
+    (wt / "scratch.txt").write_text("untracked\n", encoding="utf-8")
+    assert _run_raw(["lane", "deliver", "--id", "clean", "--from", "dev"], root) == 0
+    art = next((Store(root).dir / "lane-deliveries").glob("clean-*.json"))
+    assert json.loads(art.read_text(encoding="utf-8"))["isolation_status"] == "verified"
+
+    dirty = _assign_worktree(root, base, "dirty")
+    dirty_wt = Path(dirty["worktree_path"])
+    (dirty_wt / "src" / "core" / "a.py").write_text("dirty but uncommitted\n", encoding="utf-8")
+    assert _run_raw(["lane", "deliver", "--id", "dirty", "--from", "dev"], root) == 3
+
+    mismatch_root = tmp_path / "mismatch-repo"
+    mismatch_root.mkdir()
+    root2, base2 = _repo(mismatch_root)
+    mismatch = _assign_worktree(root2, base2, "mismatch")
+    assert Path(mismatch["worktree_path"]).exists()
+    main_head = _commit(root2, "src/core/a.py", "main checkout change\n")
+    assert _run_raw(["lane", "deliver", "--id", "mismatch", "--from", "dev",
+                     "--head", main_head], root2) == 3
+
+
+def test_m4_m7_close_validates_artifact_after_worktree_removed(tmp_path: Path) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "rel")
+    wt = Path(lane["worktree_path"])
+    head = _commit(wt, "src/core/a.py", "base\nrelease\n")
+    assert _run_raw(["lane", "deliver", "--id", "rel", "--from", "dev"], root) == 0
+    artifact = next((Store(root).dir / "lane-deliveries").glob("rel-*.json"))
+    assert not wt.exists()
+    assert _run_raw(["close", "open", "--id", "ship", "--from", "lead",
+                     "--scope", "release", "--revision", head,
+                     "--lane-artifact", str(artifact)], root) == 0
+    assert _run_raw(["close", "check", "--id", "ship"], root) == 0
+
+    bad = Store(root).dir / "lane-deliveries" / "bad-token.json"
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    payload["integrity_token"] = "0" * 64
+    bad.write_text(json.dumps(payload), encoding="utf-8")
+    assert _run_raw(["close", "open", "--id", "bad", "--from", "lead",
+                     "--scope", "release", "--revision", head,
+                     "--lane-artifact", str(bad)], root) == 0
+    assert _run_raw(["close", "check", "--id", "bad"], root) == 3
+
+
+def test_m9_active_launch_prevents_deliver_teardown(tmp_path: Path) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "busy")
+    wt = Path(lane["worktree_path"])
+    _commit(wt, "src/core/a.py", "base\nbusy\n")
+    Store(root).write_launch_request({
+        "request_id": "lr-busy", "state": "queued", "lane_id": "busy",
+    })
+    assert _run_raw(["lane", "deliver", "--id", "busy", "--from", "dev"], root) == 0
+    saved = lanes.load_lanes(Store(root))["lanes"]["busy"]
+    assert saved["status"] == lanes.STATUS_DELIVERED
+    assert saved["worktree_state"] == lanes.STATUS_CLEANUP_PENDING
+    assert wt.exists()
+
+
+def test_m10_gc_discovers_lane_worktree_after_reset(tmp_path: Path, capsys) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "orphan")
+    wt = Path(lane["worktree_path"])
+    assert _run_raw(["reset"], root) == 0
+    capsys.readouterr()
+    assert _run_raw(["lane", "gc", "--json"], root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    item = next(i for i in payload["items"] if i["lane_id"] == "orphan")
+    assert lanes.canonical_host_path(item["worktree"]) == lanes.canonical_host_path(wt)
+    assert item["status"] == "orphaned"
+
+
+def test_s1_gc_dry_run_reports_managed_leftover_without_lane_record(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    managed = root / ".worktrees"
+    managed.mkdir()
+    (managed / lanes.WORKTREE_MARKER_FILENAME).write_text(
+        "agenttalk managed worktrees\n", encoding="utf-8")
+    leftover = managed / f"leftover-{base[:12]}-abcdef12"
+    leftover.mkdir()
+    capsys.readouterr()
+    assert _run_raw(["lane", "gc", "--json"], root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    item = next(i for i in payload["items"] if i["lane_id"] == "leftover")
+    assert item["status"] == "orphaned"
+    assert item["worktree"] == str(leftover)
+    assert item["worktree_remove_safe"] is False
+
+
+def test_m11_stale_epoch_denies_without_git_write(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    epoch_calls = {"n": 0}
+    fp_calls = {"n": 0}
+
+    def moving_epoch(self):  # noqa: ANN001 - monkeypatch signature follows Store
+        epoch_calls["n"] += 1
+        if epoch_calls["n"] > 1:
+            raise AssertionError("current_epoch must stay outside the assign lock")
+        return "epoch-before"
+
+    def moving_fingerprint(_store):  # noqa: ANN001 - monkeypatch signature follows CLI helper
+        fp_calls["n"] += 1
+        return ("fp-before",) if fp_calls["n"] == 1 else ("fp-after",)
+
+    def no_write(*_a, **_kw):
+        raise AssertionError("_git_write must not run after a stale assignment fingerprint")
+
+    monkeypatch.setattr(Store, "current_epoch", moving_epoch)
+    monkeypatch.setattr(cli, "_lane_assignment_fingerprint", moving_fingerprint)
+    monkeypatch.setattr(cli, "_git_write", no_write)
+    assert _run_raw(["lane", "assign", "--id", "stale", "--from", "lead",
+                     "--assignee", "dev", "--domain", "core", "--base", base,
+                     "--target", _branch(root), "--worktrees-root",
+                     str(root / ".worktrees")], root) == 2
+    assert epoch_calls["n"] == 1
+
+
+def test_m12_git_write_env_timeout_and_allowlist(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen = {}
+
+    class OkProc:
+        returncode = 0
+
+        def communicate(self, timeout=None):  # noqa: ANN001
+            return "", ""
+
+    def ok_popen(cmd, **kw):  # noqa: ANN001
+        seen["cmd"] = cmd
+        seen["env"] = kw["env"]
+        return OkProc()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", ok_popen)
+    full_sha = "a" * 40
+    rc, _out, _err = cli._git_write(
+        tmp_path, ["worktree", "add", "-b", "lane/safe", "--", str(tmp_path / "wt"), full_sha])
+    assert rc == 0
+    assert seen["cmd"][:4] == ["git", "-c", "core.editor=false", "-C"]
+    assert seen["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert seen["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+    assert "GIT_ASKPASS" not in seen["env"]
+    with pytest.raises(cli.GitWriteError):
+        cli._git_write(tmp_path, ["branch", "-D", "lane/safe"])
+
+    class StuckProc:
+        def communicate(self, timeout=None):  # noqa: ANN001
+            raise subprocess.TimeoutExpired("git", timeout)
+
+        def kill(self):
+            seen["killed"] = True
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *_a, **_kw: StuckProc())
+    with pytest.raises(cli.GitWriteError, match="could not be reaped"):
+        cli._git_write(
+            tmp_path, ["worktree", "add", "-b", "lane/safe", "--",
+                       str(tmp_path / "wt2"), full_sha], timeout=0.01)
+    assert seen["killed"] is True
+
+
+def test_s2_failed_add_cleanup_removes_branch_after_lock_release(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+
+    def fail_verify(*_a, **_kw):
+        raise lanes.LaneError("forced verifier failure")
+
+    monkeypatch.setattr(cli, "_verify_lane_worktree", fail_verify)
+    assert _run_raw(["lane", "assign", "--id", "failclean", "--from", "lead",
+                     "--assignee", "dev", "--domain", "core", "--base", base,
+                     "--target", _branch(root), "--worktrees-root",
+                     str(root / ".worktrees")], root) == 2
+    assert _git_rc(root, "rev-parse", "--verify",
+                   "refs/heads/lane/failclean^{commit}").returncode != 0
+    assert not list((root / ".worktrees").glob("failclean-*"))
+
+
+def test_s3_gc_removes_cleanup_pending_worktree_and_keeps_unmerged_branch(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "later")
+    wt = Path(lane["worktree_path"])
+    _commit(wt, "src/core/a.py", "base\nlater\n")
+    store = Store(root)
+    store.write_launch_request({
+        "request_id": "lr-later", "state": "queued", "lane_id": "later",
+    })
+    assert _run_raw(["lane", "deliver", "--id", "later", "--from", "dev"], root) == 0
+    assert wt.exists()
+    assert lanes.load_lanes(store)["lanes"]["later"]["worktree_state"] == lanes.STATUS_CLEANUP_PENDING
+    assert store.archive_launch_request("lr-later", {"request_id": "lr-later",
+                                                     "terminal_state": "archived"})
+    capsys.readouterr()
+    assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    item = next(i for i in payload["items"] if i["lane_id"] == "later")
+    assert item["worktree_removed"] is True
+    assert item["branch_delete_safe"] is False
+    assert _git_rc(root, "rev-parse", "--verify",
+                   "refs/heads/lane/later^{commit}").returncode == 0
+    assert not wt.exists()
+
+
+def test_s4_detached_at_tip_passes_and_detached_other_holds(tmp_path: Path) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "det")
+    wt = Path(lane["worktree_path"])
+    _commit(wt, "src/core/a.py", "base\ndetached\n")
+    assert _git_rc(wt, "checkout", "--detach", "HEAD").returncode == 0
+    assert _run_raw(["lane", "deliver", "--id", "det", "--from", "dev"], root) == 0
+    art = next((Store(root).dir / "lane-deliveries").glob("det-*.json"))
+    assert json.loads(art.read_text(encoding="utf-8"))["detached_at_lane_tip"] is True
+
+    other = _assign_worktree(root, base, "detbad")
+    other_wt = Path(other["worktree_path"])
+    _commit(other_wt, "src/core/a.py", "base\ndetached bad\n")
+    assert _git_rc(other_wt, "checkout", "--detach", base).returncode == 0
+    assert _run_raw(["lane", "deliver", "--id", "detbad", "--from", "dev"], root) == 3
 
 
 # --- C5a (0.40.1): lane delivery artifact readback before clearing the lane ----------

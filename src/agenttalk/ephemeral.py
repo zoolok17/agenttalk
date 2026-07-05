@@ -161,6 +161,20 @@ def validate_marker(marker: object) -> list[str]:
         paths = scope.get("paths", [])
         if paths is not None and not isinstance(paths, list):
             errors.append("scope.paths must be a list when present")
+        lane_id = scope.get("lane_id")
+        if lane_id is not None:
+            try:
+                from agenttalk import lanes as _lanes
+                _lanes.validate_lane_id(lane_id)
+            except Exception:
+                errors.append("scope.lane_id must be a valid lane id when present")
+    lane_id = marker.get("lane_id")
+    if lane_id is not None:
+        try:
+            from agenttalk import lanes as _lanes
+            _lanes.validate_lane_id(lane_id)
+        except Exception:
+            errors.append("lane_id must be a valid lane id when present")
     timeout = marker.get("timeout_seconds")
     if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0):
         errors.append("timeout_seconds must be positive when present")
@@ -336,6 +350,8 @@ def launch_spec(marker: dict, profile: dict, agent: str) -> dict:
         "env": env,
         "windows_sandbox": profile.get("windows_sandbox", "unelevated"),
         "codex_home_isolation": bool(profile.get("codex_home_isolation", True)),
+        "lane_id": marker.get("lane_id"),
+        "workspace_path": marker.get("workspace_path"),
     }
 
 

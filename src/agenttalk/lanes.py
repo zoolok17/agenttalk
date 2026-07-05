@@ -28,7 +28,12 @@ Design (codex lane design, lead-gated; dev-2 review folded in):
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import os
 import re
+import secrets
 from typing import Any
 
 from agenttalk import domains as dom
@@ -38,6 +43,15 @@ STATE_FILENAME = "lanes.json"          # under .agenttalk/state/
 DELIVERIES_DIRNAME = "lane-deliveries"  # under .agenttalk/
 
 STATUS_ACTIVE = "active"
+STATUS_DELIVERED = "delivered"
+STATUS_ABANDONED = "abandoned"
+STATUS_CLEANUP_FAILED = "cleanup_failed"
+STATUS_CLEANUP_PENDING = "cleanup_pending"
+
+WORKTREE_MARKER_FILENAME = ".agenttalk-worktrees-root"
+WORKTREE_DEFAULT_DIRNAME = ".worktrees"
+WORKTREE_VERIFIER_VERSION = 1
+INTEGRITY_KEY_FILENAME = ".worktree-integrity-secret"
 
 VERDICT_GO = "GO"
 VERDICT_HOLD = "HOLD"
@@ -59,8 +73,9 @@ HOLD_MERGE_UNKNOWN = "merge_unknown_degraded"
 HOLD_GATE = "gate_hold"
 HOLD_MALFORMED = "malformed_lane"
 
-_LANE_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+_LANE_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,62}[A-Za-z0-9_-]\Z|\A[A-Za-z0-9]\Z")
 _FULL_SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class LaneError(ValueError):
@@ -120,11 +135,43 @@ def prefixes_disjoint(a: list[str], b: list[str], *, casefold: bool) -> bool:
 # --------------------------------------------------------------- lane record
 
 def validate_lane_id(value: str) -> str:
-    if not isinstance(value, str) or not _LANE_ID_RE.match(value):
+    bad = (
+        not isinstance(value, str)
+        or not _LANE_ID_RE.match(value)
+        or value in {".", ".."}
+        or ".." in value
+        or value.endswith(".")
+        or value.lower().endswith(".lock")
+        or any(ch in value for ch in "/\\: \t\r\n~^?*[")
+        or bool(_CONTROL_RE.search(value))
+        or value.startswith("-")
+    )
+    if bad:
         raise LaneError(
-            f"lane id {value!r} is not a safe identifier (alphanumeric plus . _ -, "
-            "starts alphanumeric, max 64 chars)")
+            f"lane id {value!r} is not a safe identifier (ASCII alphanumeric plus . _ -, "
+            "starts alphanumeric, ends alphanumeric/_/-, max 64 chars, no path/ref metacharacters)")
     return value
+
+
+def lane_branch(lane_id: str) -> str:
+    return f"lane/{validate_lane_id(lane_id)}"
+
+
+def lane_ref(lane_id: str) -> str:
+    return f"refs/heads/{lane_branch(lane_id)}"
+
+
+def canonical_host_path(value: str | os.PathLike[str]) -> str:
+    """Canonical host path token for persisted worktree provenance.
+
+    The compare key is deliberately host-local: absolute + realpath + Windows
+    normcase + normalized separators. It is not a URL or a repo-relative path.
+    """
+    raw = os.fspath(value)
+    path = os.path.abspath(os.path.realpath(raw))
+    if os.name == "nt":
+        path = os.path.normcase(path)
+    return path.replace("\\", "/")
 
 
 def normalize_prefixes(raw: object, *, casefold: bool = False) -> list[str]:
@@ -145,12 +192,15 @@ def normalize_prefixes(raw: object, *, casefold: bool = False) -> list[str]:
 def new_lane(lane_id: str, *, assignee: str, assigned_by: str, assigned_at: str,
              domain_id: str, path_subset: list[str], base_sha: str, target_ref: str,
              target_head_at_assign: str, epoch_at_assign: str | None,
-             registry_hash_at_assign: str, notes: str | None = None) -> dict[str, Any]:
+             registry_hash_at_assign: str, notes: str | None = None,
+             worktree: dict | None = None, waiver: dict | None = None,
+             release_class: bool = True) -> dict[str, Any]:
     """A freshly assigned, ACTIVE lane record (pure; the CLI persists it under lock)."""
-    return {
+    lane = {
         "schema_version": SCHEMA_VERSION,
         "lane_id": lane_id,
         "status": STATUS_ACTIVE,
+        "release_class": bool(release_class),
         "assignee": assignee,
         "assigned_by": assigned_by,
         "assigned_at": assigned_at,
@@ -164,6 +214,27 @@ def new_lane(lane_id: str, *, assignee: str, assigned_by: str, assigned_at: str,
         "shared_approvals": [],                         # [{path/glob, approved_by, reason, at, epoch, registry_hash}]
         "notes": notes,
     }
+    if worktree:
+        lane.update({
+            "worktree_path": worktree.get("path"),
+            "worktree_branch": worktree.get("branch"),
+            "worktree_base_sha": worktree.get("base_sha"),
+            "worktree_created_at": worktree.get("created_at"),
+            "worktree_root": worktree.get("root"),
+            "worktree_state": worktree.get("state") or STATUS_ACTIVE,
+            "worktree_toplevel_canonical": worktree.get("toplevel_canonical"),
+            "worktree_common_git_dir_canonical": worktree.get("common_git_dir_canonical"),
+        })
+    if waiver:
+        lane.update({
+            "worktree_waived": True,
+            "worktree_waiver_reason": waiver.get("reason"),
+            "worktree_waived_by": waiver.get("by"),
+            "worktree_waived_at": waiver.get("at"),
+        })
+    else:
+        lane["worktree_waived"] = False
+    return lane
 
 
 def add_shared_approval(lane: dict, *, path_or_glob: str, approved_by: str, reason: str,
@@ -412,6 +483,61 @@ def deliveries_dir(store):
     return store.dir / DELIVERIES_DIRNAME
 
 
+def worktrees_root(store, configured: str | None = None):
+    from pathlib import Path
+    return Path(configured) if configured else store.root / WORKTREE_DEFAULT_DIRNAME
+
+
+def _integrity_secret_path(store):
+    return deliveries_dir(store) / INTEGRITY_KEY_FILENAME
+
+
+def _integrity_secret(store) -> bytes:
+    from agenttalk import _atomic
+
+    path = _integrity_secret_path(store)
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        if len(raw) >= 32:
+            return raw.encode("ascii", errors="ignore")
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = secrets.token_hex(32)
+    _atomic.write_text(path, raw)
+    return raw.encode("ascii")
+
+
+_INTEGRITY_FIELDS = (
+    "delivery_id", "lane_id", "worktree_branch", "delivered_head", "base_sha",
+    "worktree_toplevel_canonical", "common_git_dir_canonical", "tracked_tree_clean",
+    "verifier_version", "delivered_at", "detached_at_lane_tip", "worktree_waived",
+)
+
+
+def _integrity_payload(artifact: dict) -> dict[str, Any]:
+    return {k: artifact.get(k) for k in _INTEGRITY_FIELDS if k in artifact}
+
+
+def compute_integrity_token(store, artifact: dict) -> str:
+    payload = json.dumps(
+        _integrity_payload(artifact), ensure_ascii=True, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hmac.new(_integrity_secret(store), payload, hashlib.sha256).hexdigest()
+
+
+def verify_integrity_token(store, artifact: dict) -> bool:
+    token = artifact.get("integrity_token")
+    if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token):
+        return False
+    try:
+        expected = compute_integrity_token(store, artifact)
+    except OSError:
+        return False
+    return hmac.compare_digest(token, expected)
+
+
 def load_lanes(store) -> dict:
     """Load lanes.json. Missing = empty. A malformed file FAILS CLOSED for lane
     commands (LaneError) but the caller must ensure this never bricks unrelated bus
@@ -452,6 +578,8 @@ def fingerprint(lane: dict) -> tuple:
         lane.get("target_ref"), lane.get("target_head_at_assign"),
         lane.get("registry_hash_at_assign"),
         tuple(lane.get("path_subset") or []),
+        lane.get("worktree_path"), lane.get("worktree_branch"),
+        lane.get("worktree_base_sha"), lane.get("worktree_waived"),
     )
 
 
@@ -462,7 +590,8 @@ def delivery_artifact_path(store, lane_id: str, head_sha: str):
 
 def write_delivery_artifact(store, *, lane: dict, head_sha: str, verdict: dict,
                             changed: dict, merge: dict, gate_check: dict,
-                            delivered_by: str, at: str):
+                            delivered_by: str, at: str,
+                            worktree_provenance: dict | None = None):
     """Durable delivery evidence OUTSIDE lanes.json (reset clears lanes.json). This is
     the stable pointer close/gate evidence can reference. Written BEFORE the lane is
     cleared; if this write fails the CLI must NOT clear the lane."""
@@ -473,11 +602,13 @@ def write_delivery_artifact(store, *, lane: dict, head_sha: str, verdict: dict,
     d.mkdir(parents=True, exist_ok=True)
     artifact = {
         "schema_version": SCHEMA_VERSION,
+        "delivery_id": f"{lane['lane_id']}-{head_sha[:12]}-{at}",
         "lane_id": lane["lane_id"],
         "domain_id": lane.get("domain_id"),
         "assignee": lane.get("assignee"),
         "base_sha": lane.get("base_sha"),
         "target_ref": lane.get("target_ref"),
+        "worktree_branch": lane_branch(lane["lane_id"]),
         "delivered_head": head_sha,
         "delivered_by": delivered_by,
         "delivered_at": at,
@@ -490,12 +621,35 @@ def write_delivery_artifact(store, *, lane: dict, head_sha: str, verdict: dict,
         "epoch_at_assign": lane.get("epoch_at_assign"),
         "registry_hash_at_assign": lane.get("registry_hash_at_assign"),
     }
+    if lane.get("worktree_waived"):
+        artifact.update({
+            "worktree_waived": True,
+            "worktree_waiver_reason": lane.get("worktree_waiver_reason"),
+            "worktree_waived_by": lane.get("worktree_waived_by"),
+            "worktree_waived_at": lane.get("worktree_waived_at"),
+            "isolation_status": "waived",
+        })
+        artifact["integrity_token"] = compute_integrity_token(store, artifact)
+    elif worktree_provenance:
+        artifact.update({
+            "worktree_waived": False,
+            "isolation_status": "verified",
+            "worktree_toplevel_canonical": worktree_provenance.get("worktree_toplevel_canonical"),
+            "common_git_dir_canonical": worktree_provenance.get("common_git_dir_canonical"),
+            "tracked_tree_clean": bool(worktree_provenance.get("tracked_tree_clean")),
+            "detached_at_lane_tip": bool(worktree_provenance.get("detached_at_lane_tip")),
+            "verifier_version": WORKTREE_VERIFIER_VERSION,
+        })
+        artifact["integrity_token"] = compute_integrity_token(store, artifact)
+    else:
+        artifact.update({"worktree_waived": False, "isolation_status": "unverified"})
     path = delivery_artifact_path(store, lane["lane_id"], head_sha)
     _atomic.write_text(path, json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True))
     return path
 
 
-def validate_delivery_artifact(path, *, lane_id: str, head_sha: str) -> dict:
+def validate_delivery_artifact(path, *, lane_id: str, head_sha: str,
+                               store=None, require_isolation: bool = False) -> dict:
     """Read back + SEMANTICALLY validate the just-written delivery artifact (C5a) before
     the lane is cleared. Raises :class:`LaneError` on ANY read/parse/shape/semantic
     mismatch so the caller leaves the lane ACTIVE - a truncated/corrupt/tampered OR
@@ -531,4 +685,28 @@ def validate_delivery_artifact(path, *, lane_id: str, head_sha: str) -> dict:
         raise LaneError(
             "delivery artifact lane_id/delivered_head does not match the delivered lane "
             f"(got {data.get('lane_id')!r}@{str(data.get('delivered_head'))[:12]})")
+    if require_isolation:
+        if store is None:
+            raise LaneError("delivery artifact isolation validation needs a store secret")
+        status = data.get("isolation_status")
+        if status == "waived":
+            for k in ("worktree_waiver_reason", "worktree_waived_by", "worktree_waived_at"):
+                if not isinstance(data.get(k), str) or not data[k].strip():
+                    raise LaneError(f"waived delivery artifact is missing {k}")
+        elif status == "verified":
+            if data.get("worktree_branch") != lane_branch(lane_id):
+                raise LaneError("delivery artifact branch does not match lane id")
+            if data.get("base_sha") and not _FULL_SHA_RE.match(str(data.get("base_sha"))):
+                raise LaneError("delivery artifact base_sha is not a full SHA")
+            if data.get("tracked_tree_clean") is not True:
+                raise LaneError("delivery artifact did not record a clean tracked tree")
+            for k in ("worktree_toplevel_canonical", "common_git_dir_canonical"):
+                if not isinstance(data.get(k), str) or not data[k].strip():
+                    raise LaneError(f"delivery artifact is missing {k}")
+            if data.get("verifier_version") != WORKTREE_VERIFIER_VERSION:
+                raise LaneError("delivery artifact verifier_version is unsupported")
+        else:
+            raise LaneError("delivery artifact has no verified or waived worktree isolation")
+        if not verify_integrity_token(store, data):
+            raise LaneError("delivery artifact integrity token is missing or invalid")
     return data

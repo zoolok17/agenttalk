@@ -34,6 +34,10 @@ feature work, drive-by cleanup, or self-approval.
 - [ ] Emit a production-handoff evidence record (hand to reviewers/lead; never self-approve).
 
 ## Procedure
+0. If the failing assignment carries `lane_id`, run
+   `python -m agenttalk lane workspace --id <lane_id>` and diagnose/fix only in
+   that path. If no workspace resolves, STOP and ask the lead; never create or
+   reuse your own git worktree.
 1. Capture the failing command/check, ref, environment, and FULL log/output first.
    Do not infer from a summary when the log is available.
 2. Reproduce locally when it is deterministic and cheap. If it is CI-only, inspect

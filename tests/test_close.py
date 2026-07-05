@@ -46,7 +46,8 @@ def _satisfied() -> dict:
         gate_scope="release", opened_by="lead", opened_at="t0", epoch_at_open=None,
         required_lenses=[close.validate_lens_spec(
             {"id": "sec", "allowed_agents": ["codex"]})],
-        revision_clean=True, dirty_artifact=None)
+        revision_clean=True, dirty_artifact=None,
+        non_lane_isolation_not_asserted=True)
     close.apply_ack(rec, lens_id="sec", status="accept", agent="codex",
                     from_role=None, at="t1", evidence={"risk_class": "none"})
     return rec
@@ -129,7 +130,8 @@ def test_role_authorizes_lens_ack() -> None:
         gate_scope="release", opened_by="lead", opened_at="t", epoch_at_open=None,
         required_lenses=[close.validate_lens_spec(
             {"id": "sec", "allowed_roles": ["reviewer"]})],
-        revision_clean=True, dirty_artifact=None)
+        revision_clean=True, dirty_artifact=None,
+        non_lane_isolation_not_asserted=True)
     close.apply_ack(rec, lens_id="sec", status="accept", agent="anyone",
                     from_role="reviewer", at="t")
     assert close.compute_verdict(rec, _gate_go())["verdict"] == close.VERDICT_GO
@@ -269,7 +271,8 @@ def _run(argv: list[str], root: Path) -> int:
 def _open(root: Path, *extra: str) -> int:
     return _run(["close", "open", "--id", "rel", "--from", "lead",
                  "--scope", "release", "--revision", SHA,
-                 "--lens", "sec", "--allow", "sec:codex", *extra], root)
+                 "--lens", "sec", "--allow", "sec:codex",
+                 "--non-lane-isolation-not-asserted", *extra], root)
 
 
 def _accept(root: Path) -> int:
@@ -291,6 +294,17 @@ def test_cli_full_go_lifecycle(tmp_path: Path) -> None:
     rec = close.load_close(Store(root), "rel")
     assert rec["status"] == close.PUBLISHED
     assert rec["final"]["verdict"] == close.VERDICT_GO
+
+
+def test_m6_release_close_without_lane_artifact_holds(tmp_path: Path) -> None:
+    root = _init(tmp_path)
+    assert _run(["close", "open", "--id", "rel", "--from", "lead",
+                 "--scope", "release", "--revision", SHA], root) == 0
+    assert _run(["close", "check", "--id", "rel"], root) == 3
+    rec = close.load_close(Store(root), "rel")
+    result = close.compute_verdict(
+        rec, {"verdict": "GO", "required_gates": [], "blockers": [], "gates": []})
+    assert close.HOLD_WORKTREE_ISOLATION in _codes(result)
 
 
 def test_cli_gate_hold_drives_close_hold(tmp_path: Path) -> None:

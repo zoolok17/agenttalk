@@ -131,6 +131,7 @@ Ad-hoc cross-review mode (if available):
 - `base_sha=$(git merge-base ...)`
 - `head_sha=$(git rev-parse HEAD)`
 - `branch=<name>` (optional)
+- `lane_id=<lane id>` (if the work was done in a lane-provisioned workspace)
 - `scope=ad-hoc`
 
 ### 4. Build the body
@@ -165,6 +166,7 @@ python -m agenttalk send --from "$SELF" --to "$TARGET" --kind review-request \
   --subject "<one-line>" \
   --meta request_id="$REQ_ID" \
   --meta base_sha=<sha> --meta head_sha=<sha> \
+  --meta lane_id=<lane-id> \
   -m "$BODY"
 python -m agenttalk wait --for "$SELF" --to-request "$REQ_ID" --kind review-result --timeout 600
 ```

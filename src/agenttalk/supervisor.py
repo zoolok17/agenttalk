@@ -38,6 +38,7 @@ from pathlib import Path
 from agenttalk._atomic import write_text as _atomic_write_text
 from agenttalk import ephemeral as eph
 from agenttalk import health as health_model
+from agenttalk import lanes as lane_mod
 from agenttalk.store import Store, _process_alive
 
 # ---- action vocabulary (the dry-run ACTION PLAN tokens) --------------------
@@ -3216,6 +3217,29 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
                                  at_epoch=now_epoch),
         )
         raise eph.EphemeralError("; ".join(errors or ["profile is not allowed"]))
+    lane_id = marker.get("lane_id") or ((marker.get("scope") or {}).get("lane_id")
+                                        if isinstance(marker.get("scope"), dict) else None)
+    workspace_path = None
+    if lane_id:
+        try:
+            lane_id = lane_mod.validate_lane_id(str(lane_id))
+            lanes_data = lane_mod.load_lanes(store)
+            lane = (lanes_data.get("lanes") or {}).get(lane_id)
+            if not isinstance(lane, dict) or not lane.get("worktree_path"):
+                raise eph.EphemeralError(
+                    f"lane {lane_id!r} has no provisioned worktree for launch")
+            workspace_path = str(Path(lane["worktree_path"]))
+            marker["lane_id"] = lane_id
+            marker["workspace_path"] = workspace_path
+            marker.setdefault("scope", {})["lane_id"] = lane_id
+        except lane_mod.LaneError as e:
+            store.archive_launch_request(
+                request_id,
+                eph.terminal_archive(marker, terminal_state=eph.STATE_DENIED,
+                                     reason=f"invalid lane launch: {e}",
+                                     at_epoch=now_epoch),
+            )
+            raise eph.EphemeralError(f"invalid lane launch: {e}") from e
     cfg = store.load_config()
     agent = eph.choose_agent_name(request_id, cfg.get("agents", []) or [],
                                   store.retired_agents())
@@ -3266,6 +3290,8 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
         "review_request_msg_id": msg.id,
         "requested_at": eph.utc_now(),
         "requested_at_epoch": now_epoch,
+        "lane_id": lane_id,
+        "workspace_path": workspace_path,
     })
     eph.record_prepared(
         state,
@@ -3278,6 +3304,17 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
         review_request_id=msg.id,
     )
     spec = eph.launch_spec(marker, profile, agent)
+    if workspace_path:
+        spec["lane_id"] = lane_id
+        spec["workspace_path"] = workspace_path
+        spec["cwd"] = workspace_path
+        if spec.get("cli") == "codex":
+            launch = spec.setdefault("launch", {})
+            args = list(launch.get("windows_args") or [])
+            if not any(args[i] == "--add-dir" and i + 1 < len(args)
+                       and str(args[i + 1]) == workspace_path for i in range(len(args))):
+                args = ["--add-dir", workspace_path, *args]
+            launch["windows_args"] = args
     window_style, warning = resolve_window_style(config, profile)
     spec["window_style"] = window_style
     spec["window_style_warning"] = warning

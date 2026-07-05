@@ -130,26 +130,26 @@ Publish your own headroom with `capacity refresh --for $SELF` (5h/weekly rate-li
 
 ### (c) Developer / implementer
 
-**Mission.** Build an assigned slice in an **isolated git worktree** off the candidate base SHA (so concurrent builders don't collide on `git checkout`), self-gate, then hand off for cross-review.
+**Mission.** Build an assigned slice in the **lane-provisioned isolated git worktree** off the candidate base SHA (so concurrent builders don't collide on `git checkout`), self-gate, then hand off for cross-review.
 
 **Skill(s).** `craft-code` (devkit coding discipline) / `/agenttalk.handoff` (Claude) / `agenttalk-handoff` (Codex) for the review round-trip / `/agenttalk.sk-loop` inside a spec-kitty mission.
 
 **Your commands.**
 - Hand off for review: generate `$reqId = rq-<guid>`, then `send --from $SELF --to <reviewer> --kind review-request --meta request_id=$reqId --meta base_sha=.. --meta head_sha=.. --meta branch/scope=.. -m "<body>"`, then `wait --for $SELF --to-request $reqId --kind review-result --timeout 600` (or 1800/0).
-- Lane work: `lane assign` (lead) -> developer `lane check --id --head --json` (exit 0=GO/3=HOLD) -> `lane deliver --id --from --head --gate-scope`.
+- Lane work: `lane assign` (lead, provisions `lane/<id>` worktree by default) -> developer `lane workspace --id <id>` and `cd` there -> `lane check --id --json` (exit 0=GO/3=HOLD) -> `lane deliver --id <id> --from $SELF --gate-scope <scope>`. Do **not** create or reuse your own checkout; use `--no-worktree --worktree-waiver-reason ...` only when the lead/operator explicitly accepts the isolation waiver.
 - spec-kitty: `/agenttalk.sk-loop <mission>` driven by `spec-kitty next` (spec-kitty is the source of truth; agenttalk is only the wake). Lanes are `planned`/`doing`/`for_review`/`done` (1.0.2; `in_progress` is only an alias for `doing`). **Move the spec-kitty lane FIRST, then wake** - never wake on a failed move. Implementer: `doing -> for_review`; reviewer approve: `for_review -> done`; reject: `for_review -> planned` with the full feedback on the bus first + a `--review-feedback-file` written to the OS temp dir OUTSIDE the mission tree and deleted after the move (NO `--force`; that is an operator escape hatch only). Carry `--meta transition_key=sk:<mission>:<wp>:<from>:<to>:<verdict>` on the wake; on start/rejoin reconcile move/wake drift by that key (the ~30s poll is the correctness backstop).
 - Pre-action gate: `check --for $SELF --to-request <id>` (exit 3 = rescinded HOLD).
 - Operator input: `escalate --from $SELF`.
 
 **Your cadence.**
-1. Create an isolated worktree off the candidate base SHA; build only your owned files.
+1. Resolve your assigned workspace with `lane workspace --id <lane_id>` and build only inside that path.
 2. Self-gate (formatter/linter/type-checker/tests) per `craft-code`'s mandatory AFTER gate - don't declare done on "probably works".
 3. Hand off with a `kind=review-request` carrying `base_sha`/`head_sha`/`branch`/`scope`; block on the `review-result`.
 4. Fold review findings yourself (reviews never silently patch your code); push the final SHA; reviewers re-approve on it.
 
 **Hard boundaries.** Changes only your owned files. Outside spec-kitty, **no splitting implementation work with a peer without operator approval** (no proposal/broadcast backdoor); approved splits state ownership up front and every piece still gets a cross-review. Don't loop forever - 3 consecutive rejected reviews on the same scope -> surface to the operator. Reviews are read-only.
 
-**Common pitfalls.** Building on master instead of an isolated worktree off the candidate SHA. Declaring done before the self-gate. Claiming always-on availability from a manual chat window; say best-effort unless the identity is wrapped. Folding unrelated refactors into a fix (`craft-code`: don't).
+**Common pitfalls.** Building on master, self-creating a checkout, or delivering a `--head` from the main checkout instead of the registered lane worktree. Declaring done before the self-gate. Claiming always-on availability from a manual chat window; say best-effort unless the identity is wrapped. Folding unrelated refactors into a fix (`craft-code`: don't).
 
 ---
 
@@ -213,7 +213,7 @@ The ritual every change runs through, with the verbs used at each step:
 6. **FF-MERGE** - fast-forward merge the approved, lead-gated SHA onto master.
 7. **RELEASE RITUAL** - bump `src/agenttalk/__init__.py` + `pyproject.toml`, add a `CHANGELOG.md` section, update README install pins, `git commit -F <file>` (never `-m` for multi-line - PowerShell native-arg trap), tag, push, `gh release create`, and watch CI green. The deliberate release act may bump the release barrier via `close publish --bump-barrier` after a GO.
 
-Assurance closes (`agenttalk close`) aggregate gates + review lenses + remediation into one auditable HOLD/GO verdict for a frozen revision; never publish GO while `close check` reports HOLD.
+Assurance closes (`agenttalk close`) aggregate gates + review lenses + remediation into one auditable HOLD/GO verdict for a frozen revision; never publish GO while `close check` reports HOLD. Release-class closes require a lane delivery artifact (`--lane-artifact <path>`) proving the registered worktree/branch/tip, or an explicit `--non-lane-isolation-not-asserted` declaration that the close is not claiming worktree isolation.
 
 ---
 
@@ -243,8 +243,8 @@ Assurance closes (`agenttalk close`) aggregate gates + review lenses + remediati
 | `relay operator-answer --to-request <rid> -m ...` | Relay the operator's answer (audit-owned) |
 | `relay operator-command [--to] [--override --reason] -m ...` | Relay a spontaneous operator instruction |
 | `release --relay-human --reason ...` / `release --emergency --reason ...` | Relay / narrow-override stand-down |
-| `lane assign` / `lane approve-shared --path --reason` | Open & govern work lanes |
-| `close open / ack / check / publish` | Drive an assurance close to HOLD/GO |
+| `lane assign` / `lane workspace --id` / `lane approve-shared --path --reason` | Open, locate & govern isolated work lanes |
+| `close open --lane-artifact <path> / ack / check / publish` | Drive an assurance close to HOLD/GO |
 | `request-restart --for <agent>` / `request-launch` | Bounce / launch under supervisor |
 
 ### Lead-loop controller (v0.42.0)
@@ -260,7 +260,7 @@ Assurance closes (`agenttalk close`) aggregate gates + review lenses + remediati
 |---|---|
 | `send --kind review-request --meta base_sha=.. --meta head_sha=..` | Hand off a diff |
 | `wait --for $SELF --to-request <rq-id> --kind review-result` | Block on the review |
-| `lane check --id --head` / `lane deliver --id --head` | Deliver-gate a lane slice |
+| `lane check --id` / `lane deliver --id` | Deliver-gate a lane slice from its registered worktree |
 | `/agenttalk.sk-loop <mission>` + `send --kind wake` | spec-kitty loop & wakes |
 
 ### Reviewer

@@ -208,11 +208,16 @@ authoritative.
 3. Clarify the mission only if necessary. For an implementation split
    outside spec-kitty, get explicit user approval before dispatching.
 4. Decompose into small assignments with clear owners and reviewers.
+   For implementation lanes, run `& "$env:AGENTTALK_PY" -m agenttalk lane assign ...`
+   first; it provisions the isolated worktree by default. Include
+   `--meta lane_id=<id>` in the work request so the worker can resolve
+   `& "$env:AGENTTALK_PY" -m agenttalk lane workspace --id <id>`.
    Prefer point-to-point work requests for owned implementation:
    ```bash
    python -m agenttalk send --from "$SELF" --to <agent> --kind question \
      --subject "<assignment>" \
      --meta assignment=<short-id> \
+     --meta lane_id=<lane-id> \
      -m "<goal, scope, verification, expected reply>"
    ```
 5. Use broadcast for shared awareness or parallel input:

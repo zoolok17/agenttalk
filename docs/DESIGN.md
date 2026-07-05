@@ -182,6 +182,13 @@ two parallel ownership concepts.
   between overlapping entries — that ordering heuristic was twice unsound — so a
   path governed by two entries must satisfy both; duplicate normalized shared
   globs are rejected at validation.
+  Worktree isolation extends this lane layer: `lane assign` provisions a managed
+  `git worktree` and `lane/<id>` branch by default, with only an audited
+  `--no-worktree --worktree-waiver-reason ...` waiver. Mutating git goes through
+  `_git_write` (argv-list, prompt-disabled env, bounded timeout, `--` before
+  positionals, full-SHA base). `lane deliver` derives HEAD from the registered
+  worktree, signs canonical worktree/branch provenance into the delivery artifact,
+  and keeps the branch so `close` can re-verify after the worktree is removed.
 - **Knowledge (`knowledge.py`, v0.38.0):** an append-only **pointer** layer
   (`notes.jsonl`), latest valid event by `(domain_id, key)`. Capture-open +
   curate-gated (anyone publishes `uncurated`; owners/curators/lead verify/

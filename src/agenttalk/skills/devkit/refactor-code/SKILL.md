@@ -23,6 +23,10 @@ always the behavior-preservation scope: what observable behavior must remain the
 same, what files/modules are in scope, and what is explicitly out of scope.
 
 ## When To Use
+- [ ] If the assignment carries `lane_id`, run
+      `python -m agenttalk lane workspace --id <lane_id>` and work only in that
+      path. If no workspace resolves, STOP and ask the lead; never create or
+      reuse your own git worktree.
 - [ ] Behavior must stay unchanged and the goal is structure, duplication,
       boundaries, naming, module shape, or simplification.
 - [ ] The requested change is easier reviewability or maintainability, not new

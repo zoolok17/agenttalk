@@ -47,7 +47,8 @@ def _signoff_record(policy: dict, inventory=None) -> dict:
     rec = close.empty_close(
         "s1", scope="release", revision=SHA, revision_kind="sha",
         gate_scope="release", opened_by="lead", opened_at="t", epoch_at_open=None,
-        required_lenses=[], revision_clean=True, dirty_artifact=None)
+        required_lenses=[], revision_clean=True, dirty_artifact=None,
+        non_lane_isolation_not_asserted=True)
     inv = inventory if inventory is not None else [
         {"risk_class": "security", "affected_paths": ["a.py"]}]
     close.apply_signoffs(rec, policy=policy, risk_inventory=inv, derived_by="lead", at="t")
@@ -274,7 +275,8 @@ def test_p2_only_close_ignores_signoffs() -> None:
     rec = close.empty_close(
         "p2", scope="release", revision=SHA, revision_kind="sha", gate_scope="release",
         opened_by="lead", opened_at="t", epoch_at_open=None,
-        required_lenses=[], revision_clean=True, dirty_artifact=None)
+        required_lenses=[], revision_clean=True, dirty_artifact=None,
+        non_lane_isolation_not_asserted=True)
     assert close.compute_verdict(rec, _gate_go(), None)["verdict"] == close.VERDICT_GO
 
 
@@ -315,7 +317,7 @@ def _init_signoff(tmp_path: Path, policy: dict | None = None) -> Path:
 def _open_signoff(root: Path, *risks: str) -> int:
     argv = ["close", "open", "--id", "rel", "--from", "lead", "--scope", "release",
             "--revision", SHA, "--derive-signoffs", "--changed-path", "src/a.py",
-            "--dirty-artifact", "d:1"]
+            "--dirty-artifact", "d:1", "--non-lane-isolation-not-asserted"]
     for r in risks:
         argv += ["--risk-class", r]
     return _run(argv, root)
