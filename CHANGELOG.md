@@ -5,7 +5,28 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.62.0] - 2026-07-05
+
+### Added
+
+- **`assurance-scan` devkit skill + `python -m agenttalk.assurance` runner (stdlib-only).**
+  A codebase-adaptive *evidence producer*: it detects the stack(s) by marker files, runs
+  only applicable + installed tools, and emits one normalized typed JSON artifact plus a
+  human summary. It never decides GO/HOLD (the gate/close consumes the artifact) and never
+  mutates the repo.
+- **Fail-safe gate, fail-honest per-dimension attestation.** Missing optional tools are
+  skipped (never bricks a local run); a skipped/errored *required* security/deps/secrets
+  scan forces SECURE to UNKNOWN (never silently "good"); GOOD/ROBUST/SECURE each require
+  executed evidence for their dimensions.
+- **Delta-vs-baseline** blocking (new/worsened block; unchanged/accepted don't;
+  accepted-expired is gate-visible), **accepted-findings** requiring
+  fingerprint+reason+owner+scope+expiry (blanket scopes rejected, expiry fail-closed), and
+  a **self-waiver guard** that surfaces a manifest/baseline change in the scanned range
+  (including a new untracked baseline) as a distinct blocking evidence line.
+- **Provenance in every artifact** (scanned SHA, dirty flag, changed files, manifest+baseline
+  hashes, resolved package path, tool versions) with a package-outside-repo HIGH finding, and
+  **universal hygiene checks** (NUL/control bytes, BOM, mixed-EOL, `git diff --check`, and a
+  declared-but-unexecuted generated-artifact check).
 
 ### Changed
 

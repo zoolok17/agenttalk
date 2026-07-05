@@ -89,6 +89,24 @@ All entries below shipped through the §1 pipeline. **CI (tests + security) is g
 every release listed.** Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.62.0 — assurance-scan: codebase-adaptive evidence producer (Slice A) (2026-07-05)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `73c4a85` · tag `v0.62.0`
+- **Review:** design-first → two adversarial design-gates → build → **three independent
+  tracks on the final SHA** — reviewer-1 GO (zero findings) + fable GO + a fresh 6-lens
+  adversarial reproduction pass (GO_WITH_NITS; all 8 original fail-opens confirmed closed,
+  no over-correction, no regression). One consolidated fold + a micro-fold closed every
+  finding; both design-gates each caught an incident-validated bug before ship.
+- **Gate:** ruff/bandit/diff/compileall clean; pytest **1872 passed / 3 skipped on 3.10 AND
+  3.14**, run in clean isolated venvs (the gate host had a stale editable shadow; a clean
+  env was stood up so the gate ran against the reviewed code, not a shadow).
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green.
+- **Robust/Secure:** pure evidence producer (never mutates the repo, never decides GO/HOLD);
+  fail-safe gate + fail-honest per-dimension attestation (a skipped required
+  security/deps/secrets scan → SECURE=UNKNOWN, never silently good); fail-closed manifest;
+  self-waiver guard; provenance guards against green-about-wrong-code. NOTE: once this is
+  wired into the gate/close (Slice B), SECURE for *this* repo will honestly read UNKNOWN
+  until gitleaks + a dependency scanner are configured in the release profile.
+
 ### v0.61.0 — Team Console: colored flow + full history + archived + avatars (2026-07-05)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `9dd0342` · tag `v0.61.0` (`60f808b`)
 - **Review:** reviewer-1 + reviewer-2 GO on the final SHA (focus: `/api/state` derivation
