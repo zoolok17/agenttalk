@@ -5,6 +5,19 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.62.1] - 2026-07-05
+
+### Fixed
+
+- **Wrapper: stop the Windows pipe-teardown finalizer spam.** `_ProcStream.__init__` is now
+  exception-safe after `Popen`: if a post-spawn step raises (e.g. `stdin.write` to a child that
+  exited immediately), it stops the watchdog/work-heartbeat workers, closes stdin/stdout through
+  the benign-pipe-teardown suppressor, terminates and bounded-waits the child, and re-raises the
+  original error. This prevents the child's stdout `TextIOWrapper` from being left to GC
+  finalization, which on Windows raised a repeated `OSError: [Errno 22] Invalid argument`
+  ("Exception ignored while finalizing file …") in the agent's window on every failing turn.
+  `make_drive` keeps its existing spawn/exec infra classification (retryable, not poison).
+
 ## [0.62.0] - 2026-07-05
 
 ### Added

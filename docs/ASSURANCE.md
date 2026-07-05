@@ -89,6 +89,19 @@ All entries below shipped through the §1 pipeline. **CI (tests + security) is g
 every release listed.** Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.62.1 — wrapper: stop the Windows pipe-teardown finalizer spam (2026-07-05)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `b1efdf2` · tag `v0.62.1`
+- **Review:** contained wrapper cleanup (right-sized) — reviewer-2 GO, verified the bounded
+  cleanup path (worker-stop+join, benign-teardown-suppressed close, terminate+wait, kill+5s on
+  timeout — no hang) and that `make_drive` still classifies the constructor EINVAL as
+  infra/retryable (not poison).
+- **Gate:** ruff/bandit/diff clean; pytest **1875 passed / 3 skipped on 3.10 AND 3.14** (clean venvs).
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green.
+- **Robust:** `_ProcStream.__init__` is exception-safe after `Popen` — no child stdout/stdin
+  pipe is left to GC finalization on any post-spawn failure, so a failing/mis-launched turn
+  degrades quietly instead of spamming `EINVAL`. Silences the *symptom*; the root-cause
+  broken-session spiral is fixed by the supervisor reliability work (in review).
+
 ### v0.62.0 — assurance-scan: codebase-adaptive evidence producer (Slice A) (2026-07-05)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `73c4a85` · tag `v0.62.0`
 - **Review:** design-first → two adversarial design-gates → build → **three independent
