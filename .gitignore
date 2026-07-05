@@ -47,6 +47,14 @@ dist/
 htmlcov/
 .pytest_cache/
 
+# Ephemeral scratch that lives under the repo root: reviewer sandboxes, pytest
+# root-scope temp dirs, and dev git worktrees. These can hold secrets (e.g. a
+# codex auth.json) or binaries and must never be committed — explicitly ignored
+# after a `git add -A` nearly swept them into the v0.64.1 release commit.
+/.codex-review-tmp/
+/.tmp-*/
+/.worktrees/
+
 
 # Per-release scratch release-note files (kept out of the repo per
 # the v0.4.0 review feedback — they're for GitHub release pages only)
