@@ -39,10 +39,14 @@ code, write or run tests, or approve a change — hand those to the skills it na
    pinned, say the scope is **provisional** and plan against the stated intent.
 2. Identify risk areas: behavior; persistence/state; CLI/process/filesystem;
    config/install/package; docs contract; security (input/path/env); performance;
-   compatibility; release/close authority.
+   compatibility; release/close authority; end-user / operator-facing workflow
+   (a human uses this directly via a UI, chat, or CLI).
 3. Map each risk to the checks that catch it: lint/static, unit/regression,
    integration/boundary, failure-injection, contract-drift, docs-QA,
-   release-readiness, and fresh-context evidence.
+   release-readiness, end-to-end user-path exercise, and fresh-context evidence.
+   For an end-user-facing feature, the plan MUST include running the REAL user
+   journey against a realistic setup; unit / contract / security coverage does
+   NOT substitute for it.
 4. Assign each recommended check a cost — cheap, moderate, or expensive — and
    justify every expensive one (its token/time cost against the risk it retires).
 5. State explicitly what is NOT needed and why (for example: no security review

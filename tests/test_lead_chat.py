@@ -114,6 +114,7 @@ def test_operator_identity_has_no_fallback_and_stable_lc_request_id(
     s._write_config(cfg)
     assert s.lead_chat_request_id(operator="operator", lead="lead") != rid
 
+    cfg["roles"] = {"lead": "developer", "dev": "developer", "reviewer": "reviewer"}
     cfg.pop("operator_identity", None)
     s._write_config(cfg)
     with pytest.raises(ValueError, match="operator_identity is not configured"):
@@ -128,6 +129,48 @@ def test_operator_identity_has_no_fallback_and_stable_lc_request_id(
     s._write_config(cfg)
     with pytest.raises(ValueError, match="must not equal the lead"):
         s.operator_identity(lead="operator")
+
+
+def test_operator_identity_backfills_upgraded_operator_facing_store(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    s.set_operator_facing("lead")
+    cfg = s.load_config()
+    cfg.pop("operator_identity", None)
+    s._write_config(cfg)
+
+    assert s.operator_identity(lead="lead") == "operator"
+    assert s.lead_chat_identities() == ("operator", "lead")
+
+
+def test_operator_identity_backfills_upgraded_sole_lead_store(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    cfg = s.load_config()
+    cfg.pop("operator_facing", None)
+    cfg.pop("operator_identity", None)
+    s._write_config(cfg)
+
+    assert s.operator_identity(lead="lead") == "operator"
+    assert s.lead_chat_identities() == ("operator", "lead")
+
+
+def test_operator_identity_does_not_backfill_ambiguous_sole_lead_store(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    cfg = s.load_config()
+    cfg.pop("operator_facing", None)
+    cfg.pop("operator_identity", None)
+    cfg["roles"]["dev"] = "LeAd"
+    s._write_config(cfg)
+
+    with pytest.raises(ValueError, match="operator_identity is not configured"):
+        s.operator_identity()
+    with pytest.raises(ValueError, match="lead chat needs"):
+        s.lead_chat_identities()
 
 
 def test_lead_chat_request_id_is_shared_by_cli_and_endpoint(
@@ -198,7 +241,7 @@ def test_lead_chat_stable_meta_shape_is_exact(
     }
 
 
-def test_lead_chat_liveness_requires_fresh_heartbeat_and_wrapped_health(
+def test_lead_chat_liveness_requires_fresh_heartbeat_and_allows_current_lead(
     tmp_path: Path,
 ) -> None:
     s = _store(tmp_path)
@@ -230,8 +273,24 @@ def test_lead_chat_liveness_requires_fresh_heartbeat_and_wrapped_health(
         reason_code=hm.STATE_IDLE_WAITING,
     ))
     unwrapped = s.lead_chat_liveness(lead="lead")
-    assert unwrapped["available"] is False
-    assert unwrapped["code"] == "lead_unwrapped"
+    assert unwrapped["available"] is True
+    assert unwrapped["status"] == "idle"
+    assert unwrapped["code"] == "unwrapped_live"
+
+    s.write_heartbeat("dev")
+    s.write_health("dev", hm.build_snapshot(
+        agent="dev",
+        cli="codex",
+        mode="manual",
+        state=hm.STATE_IDLE_WAITING,
+        updated_at=now,
+        since=now,
+        last_progress_at=now,
+        reason_code=hm.STATE_IDLE_WAITING,
+    ))
+    non_lead_unwrapped = s.lead_chat_liveness(lead="dev")
+    assert non_lead_unwrapped["available"] is False
+    assert non_lead_unwrapped["code"] == "lead_unwrapped"
 
     _stale_heartbeat(s)
     s.write_health("lead", hm.build_snapshot(
@@ -248,6 +307,21 @@ def test_lead_chat_liveness_requires_fresh_heartbeat_and_wrapped_health(
     assert stale["available"] is False
     assert stale["code"] == "lead_unavailable"
     assert stale["reason"] == "lead heartbeat is stale"
+
+
+def test_lead_chat_liveness_allows_fresh_heartbeat_without_health_for_current_lead(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    s.set_operator_facing("lead")
+    s.write_heartbeat("lead")
+
+    live = s.lead_chat_liveness(lead="lead")
+
+    assert live["available"] is True
+    assert live["status"] == "idle"
+    assert live["code"] == "unwrapped_live"
+    assert live["reason"] == "lead heartbeat is fresh"
 
 
 def test_queued_operator_answer_never_authorizes_operator_sender(

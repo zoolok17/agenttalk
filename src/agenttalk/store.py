@@ -788,6 +788,26 @@ class Store:
                 validate_managed_lead_loop(cfg["managed_lead_loop"], agents)
             except ValueError as e:
                 raise ValueError(f"corrupt config at {self.config_path}: {e}.") from e
+        # Upgrade pre-0.68.0 single-operator stores without weakening the send
+        # resolver: infer the dedicated reserved operator principal only when
+        # lead-chat can resolve a lead and the roster has no collision. This
+        # runs inside load_config, so mirror lead_chat_lead inline from cfg.
+        if "operator_identity" not in cfg:
+            effective_lead = None
+            operator_facing = cfg.get("operator_facing")
+            if isinstance(operator_facing, str) and operator_facing in agents:
+                effective_lead = operator_facing
+            else:
+                roles = cfg.get("roles") or {}
+                leads = [
+                    a for a in agents
+                    if isinstance(roles.get(a), str)
+                    and roles[a].casefold() == "lead"
+                ]
+                if len(leads) == 1:
+                    effective_lead = leads[0]
+            if effective_lead is not None and _avatars.OPERATOR_PRINCIPAL not in agents:
+                cfg["operator_identity"] = _avatars.OPERATOR_PRINCIPAL
         return cfg
 
     # ------------------------------------------------------- team / roster
@@ -1360,6 +1380,33 @@ class Store:
         wrapped = self._lead_chat_wrapped(health)
         age = health.get("age_seconds") if isinstance(health, dict) else None
         if not wrapped:
+            try:
+                lead_chat_lead = self.lead_chat_lead()
+            except ValueError:
+                lead_chat_lead = None
+            if resolved_lead == lead_chat_lead:
+                status = {
+                    _health.STATE_IDLE_WAITING: "idle",
+                    _health.STATE_WORKING_TURN: "live",
+                    _health.STATE_WORKING_SILENT: "away",
+                }.get(state, "idle")
+                live_reason = (
+                    "lead heartbeat is fresh"
+                    if reason in {None, "health_missing"}
+                    else reason
+                )
+                return {
+                    "available": True,
+                    "status": status,
+                    "code": "unwrapped_live",
+                    "lead": resolved_lead,
+                    "state": state,
+                    "reason": live_reason,
+                    "age_seconds": age,
+                    "heartbeat_age_seconds": round(heartbeat_age, 3),
+                    "heartbeat_stale_after_seconds": stale_after,
+                    "health": health,
+                }
             return {
                 "available": False,
                 "status": "unavailable",

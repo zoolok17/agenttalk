@@ -36,6 +36,11 @@ but stay read-only against production when reviewing someone else's.
        fail-closed direction. Pair with review-failure-injection for hostile cases.
 3. [ ] **Determinism** — no time/random/network flakiness; seed and isolate. Flag any
        flaky test you observe.
+4. [ ] **End-to-end user path** - for an end-user / operator-facing feature, RUN
+       the real user journey against a realistic setup (launch the actual app/UI/CLI
+       and do what a user does: open it, find the feature, use it end to end), not
+       only unit / contract / security tests. A feature can pass every unit,
+       contract, and security check and still be unusable end to end.
 
 ## RUN — and capture what actually happened
 - [ ] Execute the tests. Record the EXACT command and its observed result: pass/fail

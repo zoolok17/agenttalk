@@ -1606,6 +1606,12 @@ not a cryptographic boundary against a fully privileged local process
 that can write raw message files or inspect process memory; the generic
 intent queue cannot authorize an operator-sender message.
 
+For lead-chat reachability, the operator-facing lead must be actively
+listening in an `agenttalk wait` or listen loop so its heartbeat stays
+fresh. When that lead is busy in a long turn or not running, chat
+correctly reports it as away instead of queueing into an unreachable
+listener.
+
 **0.19.0 polish.** The `/dashboard` view now renders a **hierarchical
 team layout** — the operator-facing liaison (or a lead-ish role) on top,
 developer-ish roles grouped left, reviewer-ish right (classified from the

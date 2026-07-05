@@ -1,6 +1,6 @@
 'use strict';
 /*
- * agenttalk Team Console — vanilla-JS single-page app (v0.58.0, READ-ONLY).
+ * agenttalk Team Console — vanilla-JS single-page app (v0.68.1, READ-ONLY).
  *
  * Zero dependencies. CSP-safe under `script-src 'self'`: every node is built
  * via document.createElement / createElementNS + textContent. No raw-HTML
@@ -99,6 +99,7 @@
   var lastState = null;               // /api/state
   var attentionData = null;           // /api/attention (per open)
   var leadChatData = null;            // /api/lead-chat (operator<->lead bodies)
+  var leadChatPayloadHash = null;      // unchanged-payload guard for lead-chat
   var intentsData = null;             // /api/intents (body-free queue state)
   var attentionPending = false;
   var leadChatPending = false;
@@ -156,6 +157,10 @@
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
   function isArray(x) { return Object.prototype.toString.call(x) === '[object Array]'; }
   function on(node, ev, fn) { node.addEventListener(ev, fn); return node; }
+  var LEAD_CHAT_VOLATILE_KEYS = nullMap({
+    age_seconds: true,
+    heartbeat_age_seconds: true,
+  });
   function stableHash(value) {
     var s = String(value || '');
     var h = 2166136261;
@@ -164,6 +169,27 @@
       h = Math.imul(h, 16777619);
     }
     return h >>> 0;
+  }
+  function leadChatPayloadIdentity(value) {
+    if (isArray(value)) {
+      var arr = [];
+      for (var i = 0; i < value.length; i++) arr.push(leadChatPayloadIdentity(value[i]));
+      return arr;
+    }
+    if (value && typeof value === 'object') {
+      var out = {};
+      var keys = Object.keys(value).sort();
+      for (var j = 0; j < keys.length; j++) {
+        var key = keys[j];
+        if (LEAD_CHAT_VOLATILE_KEYS[key]) continue;
+        out[key] = leadChatPayloadIdentity(value[key]);
+      }
+      return out;
+    }
+    return value;
+  }
+  function leadChatPayloadFingerprint(data) {
+    return stableHash(JSON.stringify(leadChatPayloadIdentity(data)));
   }
   function option(value, text) {
     var o = el('option', null, text);
@@ -1362,7 +1388,7 @@
     }
     card.appendChild(body);
 
-    // Right block: action buttons. In v0.58.0 all disposition actions render
+    // Right block: action buttons. Disposition actions render
     // DISABLED with a CLI hint; only Inspect works (client navigation).
     var right = el('div', 'tc-attn-actions');
     var actions = attentionActions(item);
@@ -2590,7 +2616,7 @@
         fetchThread(state.sessionRid, true);
       }
       renderChrome();
-      renderActiveViewFromPoll();
+      if (state.view !== 'lead-chat') renderActiveViewFromPoll();
     }).catch(function () { statePending = false; /* transient — retry next tick */ });
   }
 
@@ -2632,9 +2658,12 @@
     }).then(function (data) {
       leadChatPending = false;
       if (!data) return;
+      var nextHash = leadChatPayloadFingerprint(data);
+      var changed = leadChatPayloadHash !== nextHash;
+      leadChatPayloadHash = nextHash;
       leadChatData = data;
       renderSidebar();
-      if (state.view === 'lead-chat') renderActiveViewFromPoll();
+      if (changed && state.view === 'lead-chat') renderActiveViewFromPoll();
     }).catch(function () { leadChatPending = false; });
   }
 
