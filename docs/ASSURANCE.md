@@ -91,6 +91,28 @@ gitleaks false-positive (a redaction-test's synthetic secret, not a real leak or
 corrected in v0.64.1. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.68.0 — lead-chat (dashboard operator↔lead direct chat) (2026-07-06)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `95875cb` (rebased zero-delta → `c34019a`) · tag `v0.68.0`
+- **Review:** design-gated (PASS_WITH_CONDITIONS; 6 P1 identity conditions) → build → **three
+  authority folds driven by reviewer-1's executed repros**: reviewer-1 reproduced a real
+  operator-impersonation vector on the first two SHAs (queued `lead_chat_send`, then queued
+  operator-*answer*, both minting an operator-sent message from the agent-writable queue) and my
+  adversarial pass false-passed the first one — **the executed reviewer repro is what caught it**;
+  fold #3 closed reviewer-2's P3 (malformed-input traceback). **Both reviewers GO on the final SHA**
+  (reviewer-1 re-ran both repros → zero operator sends; reviewer-2 confirmed the direct-send path +
+  the P3 fix). Authority-adjacent (operator as bus sender) — gated with both-reviewers-on-final-SHA.
+- **Gate:** ruff/bandit/**gitleaks** (git-mode + range)/node --check/diff/compileall clean; pytest
+  **1987 passed / 3 skipped on 3.10 AND 3.14** (clean venvs); clean rebase onto master `63ccf3f`
+  (range-diff `=` on all 4 commits = zero logic delta).
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green.
+- **Robust/Secure:** operator-send authority lives ONLY in the authenticated `/api/lead-chat` request
+  (loopback + CSRF + session); it is **refused from the agent-writable intent queue** (both
+  `lead_chat_send` and the operator-answer path fail closed in the drain), `operator_identity()` has
+  zero fallback (no self-send), the operator principal is excluded from all agents-only walks, and a
+  malformed decision-answer returns a bounded 400. **Honest ceiling:** authenticated-request boundary,
+  NOT a cryptographic boundary vs a fully-privileged local process — identity is an auditable
+  same-machine assertion.
+
 ### v0.67.0 — mechanically-guaranteed isolated worktree per lane (2026-07-05)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `ab0cb5d` (rebased zero-delta → `27350c9`) · tag `v0.67.0`
 - **Review:** design-first → **adversarial design-gate** (PASS_WITH_CONDITIONS; 12 must-fix folded)

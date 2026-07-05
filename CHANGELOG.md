@@ -5,6 +5,31 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.68.0] - 2026-07-06
+
+### Added
+
+- **Lead-chat: talk to the lead directly from the dashboard.** A dedicated 1:1 operator↔lead chat
+  in the browser — you type to the lead and its replies render back in the window — built on a
+  purpose-built `lead_chat_send` path rather than the multi-recipient send. The lead's pending
+  decisions/escalations surface inline as answerable prompts (reusing the existing escalate flow),
+  and the chat header shows lead liveness (live / idle / away / unavailable) so you know whether a
+  message is seen now or the lead is unreachable. Opt-in and additive; nothing changes for existing
+  flows.
+
+### Security
+
+- **Operator becomes a bus sender only through the authenticated web request.** This is the first
+  time the human operator sends on the bus, so the authority is scoped tightly: `Store.operator_identity()`
+  resolves with **zero fallback** (never derives from the lead — no self-send), the operator send
+  happens **directly in the authenticated `/api/lead-chat` request** (loopback + CSRF + session)
+  and is **refused from the agent-writable intent queue** (both `lead_chat_send` and the
+  operator-answer path fail closed there), and the operator principal is excluded from every
+  agents-only walk. A malformed decision-answer returns a bounded `400` instead of erroring.
+  **Honest ceiling:** this makes operator-impersonation unreachable via the public API, but on a
+  same-machine cooperative bus it is not a cryptographic boundary against a fully-privileged local
+  process — identity remains an auditable assertion.
+
 ## [0.67.0] - 2026-07-05
 
 ### Added
