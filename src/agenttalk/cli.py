@@ -3006,9 +3006,7 @@ def _collect_attention_items(store: Store, *, for_agent: str | None, roster: lis
         items.append(A.source_error_item("config_blocked", str(e)))
     # dead-letter (ALL; build_queue hides resolved via the resolve_dead_letter disposition)
     try:
-        items += A.dead_letter_items(
-            [{"agent": d.get("agent"), "message_id": d.get("message_id")}
-             for d in store.list_dead_letters()])
+        items += A.dead_letter_items(store.list_dead_letters())
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("dead_letter", str(e)))
     # gate HOLDs (cheap state read, no git/lane recompute)
@@ -5884,19 +5882,42 @@ def cmd_request_restart(args: argparse.Namespace) -> int:
         sys.stderr.write(f"agenttalk request-restart: {agent!r} is not in the "
                          f"roster {sorted(roster)}\n")
         return 2
-    requested_by = (_resolve_self(args.sender, roster=roster)
-                    if getattr(args, "sender", None) else "operator")
+    from agenttalk import supervisor as _sup
+    requested_by = _resolve_self(args.sender, roster=roster)
+    authority = _sup.resolve_restart_request_authority(
+        store,
+        requested_by,
+        force_protected=bool(args.force_protected),
+        acknowledge_live_protected_kill=bool(
+            getattr(args, "acknowledge_live_protected_kill", False)),
+    )
+    if authority.get("authority_result") != "authorized":
+        sys.stderr.write("agenttalk request-restart: requester is not authorized "
+                         f"({authority.get('authority_reason')}).\n")
+        return 2
     rid = "rr-" + uuid.uuid4().hex[:12]
-    store.write_restart_request(agent, {
+    marker = {
         "agent": agent,
         "request_id": rid,
         "source": "manual",
         "requested_by": requested_by,
+        "authorized_by": authority.get("authorized_by"),
+        "authority_result": authority.get("authority_result"),
+        "authority_reason": authority.get("authority_reason"),
         "at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "at_epoch": time.time(),
         "force_protected": bool(args.force_protected),
+        "force_protected_authorized": bool(authority.get("force_protected_authorized")),
+        "force_protected_authorized_by": authority.get("force_protected_authorized_by"),
+        "acknowledge_live_protected_kill": bool(
+            getattr(args, "acknowledge_live_protected_kill", False)),
+        "acknowledge_live_protected_kill_authorized": bool(
+            authority.get("acknowledge_live_protected_kill_authorized")),
+        "acknowledge_live_protected_kill_by": authority.get(
+            "acknowledge_live_protected_kill_by"),
         "reason": args.reason or "",
-    })
+    }
+    store.write_restart_request(agent, marker)
     extra = " (force-protected)" if args.force_protected else ""
     print(f"request-restart: queued restart of {agent!r} [{rid}]{extra} — the "
           f"supervisor will relaunch it.")
@@ -5973,6 +5994,7 @@ def _dead_letter_notifier(store, agent: str):
     an unread FYI (reviewer-1 blocker). NEVER crashes the loop."""
     def emit(info: dict, *, disposed: bool) -> bool:
         try:
+            from agenttalk import attention as A
             target = store.operator_facing() or store.sole_lead()
             if not target or target == agent:
                 return False
@@ -5996,6 +6018,19 @@ def _dead_letter_notifier(store, agent: str):
                                  "dl_disposed": "false",
                                  "request_id": "esc-" + uuid.uuid4().hex[:12]})
                 return True
+            state = A.dead_letter_notice_state(info, disposed=disposed)
+            generation = str(
+                info.get("requeue_generation")
+                or info.get("first_started_at")
+                or info.get("first_at")
+                or "unknown"
+            )
+            should_emit, notice = A.should_emit_dead_letter_notice(
+                store, agent=str(ag), message_id=str(mid),
+                generation=generation, state=state)
+            if not should_emit:
+                return True
+            request_id = "esc-" + uuid.uuid4().hex[:12]
             verb = "DEAD-LETTERED" if disposed else "repeatedly FAILING (not yet dead-lettered)"
             body = (f"[dead-letter] agent {ag} {verb} message {mid} from "
                     f"{info.get('from')} (kind={info.get('kind')}, "
@@ -6008,7 +6043,21 @@ def _dead_letter_notifier(store, agent: str):
                        meta={"needs_operator": "true", "dead_letter": "true",
                              "dl_msg_id": str(mid),
                              "dl_disposed": "true" if disposed else "false",
-                             "request_id": "esc-" + uuid.uuid4().hex[:12]})
+                             "request_id": request_id})
+            with contextlib.suppress(Exception):
+                A.append_notice_event(store, {
+                    "schema_version": A.SCHEMA_VERSION,
+                    "kind": A.NOTICE_DEAD_LETTER,
+                    "notice_key": notice["notice_key"],
+                    "request_id": request_id,
+                    "agent": str(ag),
+                    "message_id": str(mid),
+                    "generation": generation,
+                    "state": state,
+                    "state_hash": notice["state_hash"],
+                    "at": _attn_now_iso(),
+                    "warnings": notice.get("warnings") or [],
+                })
             return True
         except Exception:  # noqa: BLE001 - a notification must never crash the loop
             return False   # not routed; dead-letter + doctor visibility remain
@@ -6130,6 +6179,9 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     sender: str, min_interval: float, render: bool,
                     one_shot_request_id: str | None = None,
                     k_poison: int = 3, k_escalate: int = 20,
+                    infra_exhaust_after_seconds: float = 14400.0,
+                    infra_exhaust_min_attempts: int = 100,
+                    noninfra_sub_ceiling: int | None = None,
                     lead_loop: bool = False,
                     supervisor_config: dict | None = None,
                     turn_watchdog: object | None = None,
@@ -6369,6 +6421,9 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             only_request_id=one_shot_request_id,
             max_wall=max_wall,
             k_poison=k_poison, k_escalate=k_escalate,
+            infra_exhaust_after_seconds=infra_exhaust_after_seconds,
+            infra_exhaust_min_attempts=infra_exhaust_min_attempts,
+            noninfra_sub_ceiling=noninfra_sub_ceiling,
             on_dead_letter=lambda info: notifier(info, disposed=True),
             on_escalate=lambda info: notifier(info, disposed=False),
             heartbeat=heartbeat,
@@ -6500,6 +6555,8 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         flag_escalate = getattr(args, "dead_letter_escalate_after", None)
         k_poison = flag_poison if flag_poison is not None else res_poison
         k_escalate = flag_escalate if flag_escalate is not None else res_escalate
+        infra_ceiling = _sup.resolve_infra_retry_exhaustion(
+            sup_cfg, cfg_agent, k_escalate)
         # Per-turn watchdog (wrapped-codex hung-tool-descendant hang). DEFAULT-ON for a
         # CONTINUOUS wrapped-codex loop only (not one-shot, not claude); config can flip it.
         from agenttalk.wrapper import turn_watchdog as _twd
@@ -6549,6 +6606,11 @@ def cmd_wrap(args: argparse.Namespace) -> int:
                                render=not args.no_render,
                                one_shot_request_id=args.to_request if args.one_shot else None,
                                k_poison=k_poison, k_escalate=k_escalate,
+                               infra_exhaust_after_seconds=infra_ceiling[
+                                   "infra_exhaust_after_seconds"],
+                               infra_exhaust_min_attempts=infra_ceiling[
+                                   "infra_exhaust_min_attempts"],
+                               noninfra_sub_ceiling=infra_ceiling["noninfra_sub_ceiling"],
                                lead_loop=lead_loop, supervisor_config=sup_cfg,
                                turn_watchdog=watchdog_cfg,
                                work_heartbeat=whb_cfg)
@@ -6624,6 +6686,13 @@ def _dead_letter_resolution_state(store: Store) -> dict[tuple[str, str], str]:
     (latest dead_letter_resolution event per item wins). A resolve_dead_letter marks it
     resolved; a later requeued_after_resolve reopens it. Central log is authoritative."""
     from agenttalk import attention as A
+    live_hashes: dict[tuple[str, str], str] = {}
+    try:
+        for entry in store.list_dead_letters():
+            key = (str(entry.get("agent") or ""), str(entry.get("message_id") or ""))
+            live_hashes[key] = A.dead_letter_entry_source_hash(entry)
+    except Exception:
+        live_hashes = {}
     events, _ = A.read_dispositions(store)
     folded = A.fold_dispositions(events)
     out: dict[tuple[str, str], str] = {}
@@ -6635,6 +6704,9 @@ def _dead_letter_resolution_state(store: Store) -> dict[tuple[str, str], str]:
         if len(parts) != 3:
             continue
         key = (parts[1], parts[2])
+        snap_hash = dl.get("source_snapshot", {}).get("source_hash")
+        if snap_hash != live_hashes.get(key):
+            continue
         out[key] = "resolved" if dl["action"] == A.ACTION_RESOLVE_DEAD_LETTER else "requeued"
     return out
 
@@ -6674,7 +6746,13 @@ def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
         sys.stderr.write(f"agenttalk dead-letter resolve: no dead-letter "
                          f"{args.agent}/{args.id}.\n")
         return 2
-    src_hash = A.source_hash({"agent": args.agent, "message_id": args.id})
+    entry = next((m for m in store.list_dead_letters(args.agent)
+                  if m.get("message_id") == args.id), None)
+    if entry is None:
+        sys.stderr.write(f"agenttalk dead-letter resolve: no dead-letter "
+                         f"{args.agent}/{args.id}.\n")
+        return 2
+    src_hash = A.dead_letter_entry_source_hash(entry)
     event_id = "att-" + uuid.uuid4().hex[:12]
     A.append_disposition(store, {
         "schema_version": A.SCHEMA_VERSION, "event_id": event_id,
@@ -6799,14 +6877,20 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                                  "dead-letter; set --from/$AGENTTALK_SELF to that identity.\n")
                 return 2
             from agenttalk import attention as A
+            entry = next((m for m in store.list_dead_letters(args.agent)
+                          if m.get("message_id") == args.id), None)
+            if entry is None:
+                sys.stderr.write(
+                    f"agenttalk dead-letter requeue: no dead-letter {args.agent}/{args.id}.\n")
+                return 2
             reopen_event = {
                 "schema_version": A.SCHEMA_VERSION, "event_id": "att-" + uuid.uuid4().hex[:12],
                 "item_id": A.item_id(A.SOURCE_DEAD_LETTER, args.agent, args.id),
                 "source": A.SOURCE_DEAD_LETTER, "action": A.ACTION_REQUEUED_AFTER_RESOLVE,
                 "actor": reopen_actor,
                 "reason": reason, "at": _attn_now_iso(),
-                "source_snapshot": {"source_hash": A.source_hash(
-                    {"agent": args.agent, "message_id": args.id}), "refs": []}}
+                "source_snapshot": {"source_hash": A.dead_letter_entry_source_hash(entry),
+                                    "refs": []}}
         try:
             orig = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as e:
@@ -8226,10 +8310,15 @@ def build_parser() -> argparse.ArgumentParser:
              "(operator_facing/lead) agent requires --force-protected.",
     )
     prr.add_argument("--for", dest="agent", required=True, help="Agent to restart.")
-    prr.add_argument("--from", dest="sender", help="Requester (default: 'operator').")
+    prr.add_argument("--from", dest="sender",
+                     help="Requester (default: $AGENTTALK_SELF; must be authorized).")
     prr.add_argument("--reason", help="Free-text reason.")
     prr.add_argument("--force-protected", dest="force_protected", action="store_true",
                      help="Allow restarting a protected (operator_facing/lead) agent.")
+    prr.add_argument("--acknowledge-live-protected-kill",
+                     dest="acknowledge_live_protected_kill", action="store_true",
+                     help="Second operator-facing acknowledgement required before a "
+                          "freshly heartbeating protected agent is killed.")
     prr.set_defaults(func=cmd_request_restart)
 
     prl = sub.add_parser(

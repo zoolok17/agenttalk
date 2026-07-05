@@ -66,6 +66,23 @@ _HOOK_CODEX_CONFIG = {
 }
 
 
+def _auth_marker(rid: str = "rr-1", *, force_protected: bool = False,
+                 live_ack: bool = False) -> dict:
+    return {
+        "request_id": rid,
+        "requested_by": "lead",
+        "authorized_by": "lead",
+        "authority_result": "authorized",
+        "authority_reason": "sole_lead",
+        "force_protected": force_protected,
+        "force_protected_authorized": force_protected,
+        "force_protected_authorized_by": "lead" if force_protected else None,
+        "acknowledge_live_protected_kill": live_ack,
+        "acknowledge_live_protected_kill_authorized": live_ack,
+        "acknowledge_live_protected_kill_by": "lead" if live_ack else None,
+    }
+
+
 def test_ps_template_claims_instance_drains_and_releases_under_brake() -> None:
     ps = sup.PS_TEMPLATE
     assert "'supervise', '--claim-instance'" in ps
@@ -178,17 +195,18 @@ def test_scenario_ii_alive_stale_without_hook_is_suspect_warn_not_kill() -> None
                  {"agents": {"worker": _ready()}}, snapshot=_snap())["action"] == sup.NONE
 
 
-def test_scenario_iii_manual_marker_relaunches_and_clears() -> None:
-    marker = {"request_id": "rr-1", "force_protected": False}
+def test_scenario_iii_manual_marker_relaunches_and_waits_for_readiness() -> None:
+    marker = _auth_marker("rr-1")
     p = _plan(_report(restart_request=marker),
               {"agents": {"worker": _ready(backoff_next_epoch=NOW + 9999)}},
               snapshot=_snap())
     assert p["action"] == sup.RELAUNCH and p["state"] == "MANUAL_RESTART"
-    assert p["clear_marker"] == "rr-1"
+    assert p["clear_marker"] is None
     assert p["kill_first"] is True          # best-effort cleanup before relaunch
     assert p["kill_targets"]                # non-empty (launcher + managed)
     assert p["bypass_backoff"] is True      # bypasses the future backoff_next
     assert "rr-1" in p["next_state"]["consumed_rids"]
+    assert p["next_state"]["restart_request_state"] == "applied_pending_readiness"
 
 
 def test_scenario_iv_protected_stale_heartbeat_is_warn_only() -> None:
@@ -228,26 +246,69 @@ def test_scenario_v_backoff_escalates_then_resets() -> None:
 
 # ----------------------------------------- marker / protected edge cases
 
-def test_protected_marker_without_force_is_refused_and_cleared() -> None:
-    p = _plan(_report(protected=True, restart_request={"request_id": "rr-9"}),
+def test_protected_marker_without_force_is_refused_and_stays_visible() -> None:
+    p = _plan(_report(protected=True, heartbeat_stale=True,
+                      restart_request=_auth_marker("rr-9")),
               {"agents": {"worker": {"pid_alive": False}}})
     assert p["action"] == sup.REFUSE_PROTECTED
-    assert p["clear_marker"] == "rr-9"
+    assert p["clear_marker"] is None
     assert p["notify"] is True
 
 
 def test_protected_marker_with_force_relaunches() -> None:
-    p = _plan(_report(protected=True,
-                      restart_request={"request_id": "rr-9", "force_protected": True}),
+    p = _plan(_report(protected=True, heartbeat_stale=True,
+                      restart_request=_auth_marker("rr-9", force_protected=True)),
               {"agents": {"worker": {"pid_alive": False}}})
     assert p["action"] == sup.RELAUNCH
-    assert p["clear_marker"] == "rr-9"
+    assert p["clear_marker"] is None
+
+
+def test_unauthorized_restart_marker_refuses_and_stays_visible() -> None:
+    p = _plan(_report(restart_request={"request_id": "rr-forged",
+                                       "requested_by": "peer",
+                                       "force_protected": True}),
+              {"agents": {"worker": _ready(backoff_next_epoch=0)}})
+    assert p["action"] == sup.REFUSE_PROTECTED
+    assert p["state"] == "RESTART_UNAUTHORIZED"
+    assert p["clear_marker"] is None
+
+
+def test_fresh_protected_force_requires_second_live_kill_ack() -> None:
+    marker = _auth_marker("rr-live", force_protected=True)
+    p = _plan(_report(protected=True, heartbeat_stale=False, restart_request=marker),
+              {"agents": {"worker": _ready(backoff_next_epoch=0)}},
+              snapshot=_snap())
+    assert p["action"] == sup.REFUSE_PROTECTED
+    assert p["state"] == "LIVE_PROTECTED_REFUSED"
+    assert p["clear_marker"] is None
+
+
+def test_fresh_protected_second_live_kill_ack_relaunches() -> None:
+    marker = _auth_marker("rr-live", force_protected=True, live_ack=True)
+    p = _plan(_report(protected=True, heartbeat_stale=False, restart_request=marker),
+              {"agents": {"worker": _ready(backoff_next_epoch=0)}},
+              snapshot=_snap())
+    assert p["action"] == sup.RELAUNCH
+    assert p["clear_marker"] is None
+    assert p["next_state"]["restart_requested_by"] == "lead"
+
+
+def test_restart_cooldown_defers_without_consuming_marker() -> None:
+    marker = _auth_marker("rr-cool")
+    p = _plan(_report(restart_request=marker),
+              {"agents": {"worker": _ready(last_launch_epoch=NOW - 10)}},
+              config={**_CONFIG, "restart_cooldown_seconds": 45},
+              snapshot=_snap())
+    assert p["action"] == sup.BACKOFF_WAIT
+    assert p["state"] == "RESTART_COOLDOWN"
+    assert p["clear_marker"] is None
+    assert "requested_by=lead" in p["reason"]
 
 
 def test_consumed_marker_still_dead_does_not_bypass_backoff() -> None:
     # the manual relaunch already fired (rid consumed) but the heartbeat is STILL
     # stale -> do NOT bypass backoff again every poll; honor the backoff window.
-    p = _plan(_report(heartbeat_stale=True, restart_request={"request_id": "rr-1"}),
+    p = _plan(_report(heartbeat_stale=True, restart_request=_auth_marker("rr-1")),
               {"agents": {"worker": _ready(consumed_rids=["rr-1"],
                                            backoff_next_epoch=NOW + 9999)}},
               snapshot=[], config=_HOOK_CODEX_CONFIG)
@@ -256,14 +317,14 @@ def test_consumed_marker_still_dead_does_not_bypass_backoff() -> None:
 
 
 def test_consumed_marker_now_alive_clears() -> None:
-    p = _plan(_report(restart_request={"request_id": "rr-1"}),
+    p = _plan(_report(restart_request=_auth_marker("rr-1")),
               {"agents": {"worker": _ready(consumed_rids=["rr-1"])}}, snapshot=_snap())
     assert p["action"] == sup.CLEAR_MARKER
     assert p["clear_marker"] == "rr-1"
 
 
 def test_snapshot_unavailable_uses_only_versioned_provenanced_priors() -> None:
-    report = _report(restart_request={"request_id": "rr-1"})
+    report = _report(restart_request=_auth_marker("rr-1"))
     prior = {
         "attribution_model": "process_ownership_v1",
         "root_key": sup._root_key(TEST_ROOT),
@@ -335,7 +396,8 @@ def test_report_heartbeat_stale_and_waiting(tmp_path: Path, monkeypatch) -> None
 
 def test_report_reflects_restart_request(tmp_path: Path) -> None:
     s = _team(tmp_path)
-    _run(["request-restart", "--for", "worker", "--reason", "x"], tmp_path)
+    s.set_role("lead", "lead")
+    _run(["request-restart", "--for", "worker", "--from", "lead", "--reason", "x"], tmp_path)
     rpt = sup.build_report(s, now_epoch=NOW)
     rr = rpt["agents"]["worker"]["restart_request"]
     assert rr is not None and rr["agent"] == "worker" and rr["request_id"].startswith("rr-")
@@ -345,12 +407,43 @@ def test_report_reflects_restart_request(tmp_path: Path) -> None:
 
 def test_request_restart_writes_marker(tmp_path: Path) -> None:
     s = _team(tmp_path)
+    s.set_role("lead", "lead")
     assert _run(["request-restart", "--for", "worker", "--from", "lead",
                  "--reason", "outage", "--force-protected"], tmp_path) == 0
     m = s.read_restart_request("worker")
     assert m["agent"] == "worker" and m["source"] == "manual"
     assert m["requested_by"] == "lead" and m["force_protected"] is True
+    assert m["authority_result"] == "authorized"
+    assert m["force_protected_authorized_by"] == "lead"
     assert m["reason"] == "outage" and m["request_id"].startswith("rr-")
+
+
+def test_request_restart_missing_requested_by_is_denied(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    auth = sup.resolve_restart_request_authority(s, None, force_protected=True)
+    assert auth["authority_result"] == "denied"
+    assert auth["force_protected_authorized"] is False
+
+
+def test_request_restart_unauthorized_peer_cannot_force_protected(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    s.set_role("lead", "lead")
+    assert _run(["request-restart", "--for", "lead", "--from", "worker",
+                 "--force-protected"], tmp_path) == 2
+    assert s.read_restart_request("lead") is None
+
+
+def test_restart_authority_operator_facing_controls_live_kill_ack(tmp_path: Path) -> None:
+    s = _team(tmp_path, "lead,ops,worker")
+    s.set_role("lead", "lead")
+    s.set_operator_facing("ops")
+    lead_auth = sup.resolve_restart_request_authority(
+        s, "lead", force_protected=True, acknowledge_live_protected_kill=True)
+    assert lead_auth["authority_result"] == "denied"
+    ops_auth = sup.resolve_restart_request_authority(
+        s, "ops", force_protected=True, acknowledge_live_protected_kill=True)
+    assert ops_auth["authority_result"] == "authorized"
+    assert ops_auth["acknowledge_live_protected_kill_authorized"] is True
 
 
 def test_request_restart_unknown_agent_exit_2(tmp_path: Path) -> None:
@@ -1659,23 +1752,25 @@ def test_generated_ps1_quotes_args_with_spaces_as_single_arg(tmp_path: Path) -> 
     assert data["cwd"].replace("\\", "/").endswith("dir with spaces"), data["cwd"]
 
 
-def test_failed_launch_preserves_marker_success_clears(tmp_path: Path) -> None:
-    """Executor/plan boundary (codex MAJOR): the plan tells the executor to
-    relaunch a fresh manual request and clear its rid, but the clear is a
-    SEPARATE command the script runs ONLY after a confirmed relaunch. A failed
-    launch (no clear call) leaves the marker for retry; a successful one clears
-    it. (The PS executor gates the clear inside `if ($newPid)`.)"""
+def test_manual_restart_marker_clears_only_after_readiness(tmp_path: Path) -> None:
+    """Slice 1: applying a manual restart leaves the marker latched until a
+    later fresh heartbeat/readiness tick. Launch success alone is not release."""
     s = _team(tmp_path)
-    s.write_restart_request("worker", {"agent": "worker", "request_id": "rr-1",
-                                       "force_protected": False})
+    s.write_restart_request("worker", {"agent": "worker", **_auth_marker("rr-1")})
     rpt = sup.build_report(s, now_epoch=NOW)
     plan = sup.plan_actions(rpt, {"agents": {"worker": {"pid_alive": False}}},
                             {"agents": {"worker": {"auto_restart": True}}},
                             now_epoch=NOW)["agents"]["worker"]
-    assert plan["action"] == sup.RELAUNCH and plan["clear_marker"] == "rr-1"
-    # FAILED launch -> executor does NOT call clear -> marker survives
+    assert plan["action"] == sup.RELAUNCH and plan["clear_marker"] is None
     assert s.read_restart_request("worker") is not None
-    # SUCCESSFUL launch -> executor clears via the dedicated command
+    s.write_heartbeat("worker")
+    clear = sup.plan_actions(
+        sup.build_report(s, now_epoch=NOW),
+        {"agents": {"worker": _ready(consumed_rids=["rr-1"], readiness_seen=True)}},
+        {"agents": {"worker": {"auto_restart": True}}},
+        now_epoch=NOW,
+    )["agents"]["worker"]
+    assert clear["action"] == sup.CLEAR_MARKER and clear["clear_marker"] == "rr-1"
     _run(["supervise", "--clear-restart", "--for", "worker",
           "--request-id", "rr-1"], tmp_path)
     assert s.read_restart_request("worker") is None
@@ -2020,13 +2115,13 @@ def test_wrapped_config_blocked_hold_marker_holds_when_stale_until_restart() -> 
     assert p["kill_targets"] == []
     assert "config_blocked" in p["reason"]
 
-    marker = {"request_id": "rr-config-fix"}
+    marker = _auth_marker("rr-config-fix")
     p2 = _plan_wrap(_report(heartbeat_stale=True, config_blocked_hold=hold,
                             restart_request=marker),
                     {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
                     snapshot=_wrap_snap())
     assert p2["action"] == sup.RELAUNCH and p2["state"] == "MANUAL_RESTART"
-    assert p2["clear_marker"] == "rr-config-fix"
+    assert p2["clear_marker"] is None
     assert p2["kill_first"] is True
 
 
@@ -2107,7 +2202,7 @@ def test_config_blocked_hold_request_restart_overrides_and_clear_preserves_hold(
     (s.state_dir / "worker.heartbeat").write_text(_iso(NOW), encoding="utf-8")
     _write_config_blocked_health(s, "worker", NOW)
     s.write_config_blocked_hold("worker", summary="command=codex; error=shim")
-    s.write_restart_request("worker", {"agent": "worker", "request_id": "rr-fix"})
+    s.write_restart_request("worker", {"agent": "worker", **_auth_marker("rr-fix")})
 
     report = sup.build_report(s, now_epoch=NOW + 2500, supervisor_config=_WRAP_CONFIG)
     plan = sup.plan_actions(report,
@@ -2115,7 +2210,7 @@ def test_config_blocked_hold_request_restart_overrides_and_clear_preserves_hold(
                             _WRAP_CONFIG, now_epoch=NOW + 2500,
                             snapshot=_wrap_snap(root=str(tmp_path)))["agents"]["worker"]
     assert plan["action"] == sup.RELAUNCH and plan["state"] == "MANUAL_RESTART"
-    assert plan["clear_marker"] == "rr-fix"
+    assert plan["clear_marker"] is None
 
     assert _run(["supervise", "--clear-restart", "--for", "worker",
                  "--request-id", "rr-fix"], tmp_path) == 0
@@ -3097,7 +3192,7 @@ def test_readiness_cap_resets_on_fresh_heartbeat() -> None:
 
 def test_manual_restart_clears_readiness_give_up() -> None:
     # operator restart-request resets the give-up counter (a way out of GAVE_UP).
-    p = _plan_hook(_report(heartbeat_stale=True, restart_request={"request_id": "rr-x"}),
+    p = _plan_hook(_report(heartbeat_stale=True, restart_request=_auth_marker("rr-x")),
                    {"agents": {"worker": _never_ready(readiness_fails=9,
                                                       backoff_next_epoch=NOW + 9999)}},
                    snapshot=[])
@@ -3224,7 +3319,7 @@ def test_lead_loop_crash_no_marker_still_relaunches() -> None:
 def test_lead_loop_manual_restart_overrides_stood_down_marker() -> None:
     # An operator request-RESTART (section 0, highest priority) overrides the stand-down
     # HOLD: the operator deliberately wants the controller back -> RELAUNCH.
-    marker = {"request_id": "rr-ll", "force_protected": False}
+    marker = _auth_marker("rr-ll")
     p = _plan(_report(heartbeat_stale=True, restart_request=marker,
                       lead_loop_exit={"state": "stood_down"}),
               {"agents": {"worker": _ready(backoff_next_epoch=NOW + 9999)}},

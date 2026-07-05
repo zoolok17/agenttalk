@@ -13,6 +13,7 @@ a restart-request marker.
 from __future__ import annotations
 
 import errno
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -1370,6 +1371,40 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             store, agent, cli, mode="wrapper-loop", min_interval=min_interval)
     restart = _default_escalate(store, agent, sender or agent)
 
+    def _notify_resume_continuity_loss(record: dict | None) -> None:
+        if not _session.should_notify_continuity_loss(session_state):
+            return
+        try:
+            target = store.operator_facing() or store.sole_lead()
+            if not target or target == agent:
+                return
+            rid = "esc-" + uuid.uuid4().hex[:12]
+            msg_id = (record or {}).get("id")
+            session_key = session_state.resume_failure_key or session_state.resume_attempt_key
+            body = (
+                f"[wrapper-resume-unavailable] agent {agent} gave up resuming session "
+                f"{session_key} after repeated session-attributable failures. The next "
+                "attempt will start a fresh session; the bus message is still pending and "
+                "was not marked poison."
+            )
+            store.send(
+                sender=agent,
+                recipient=target,
+                kind="question",
+                subject="wrapper resume continuity loss",
+                body=body,
+                meta={
+                    "needs_operator": "true",
+                    "resume_unavailable": "true",
+                    "continuity_lost": "true",
+                    "msg_id": str(msg_id or ""),
+                    "request_id": rid,
+                },
+            )
+            _session.mark_continuity_loss_notified(session_state)
+        except Exception:
+            return
+
     def _health_escalate(signal) -> None:
         health_writer.degraded(signal)
         restart(signal)
@@ -1591,6 +1626,11 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         attempted_resume = ((cli == "codex" and "resume" in spec.args)
                             or (cli == "claude" and "--resume" in spec.args))
         health_writer.turn_start(record)
+        if attempted_resume:
+            _session.resume_attempt_start(
+                session_state, agent=agent, msg_id=record.get("id"))
+            if persist is not None:
+                persist(session_state)
         sig = _run_one(spec)
         if not sig["ok"] and attempted_resume:
             try:
@@ -1598,7 +1638,10 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             except Exception:  # noqa: BLE001 - publish unknown before preserving failure
                 health_writer.unknown()
                 raise
+            attributable = _session.resume_failure_is_session_attributable(
+                resume_failure_class, resume_summary)
             if resume_failure_class == CLASS_CONFIG_BLOCKED:
+                _session.clear_resume_attempt(session_state)
                 store.clear_heartbeat(agent)
                 engine.reset_heartbeat_throttle()
                 if persist is not None:
@@ -1609,26 +1652,57 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     failure_class=resume_failure_class,
                     summary=resume_summary,
                 )
-            # the resume turn failed -> force a FRESH session for the SAME record and retry
-            # inline (codex: a new thread_id will be observed + persisted; claude: a new
-            # session id is minted). The whole drive() (resume -> fresh) is EXACTLY ONE attempt.
-            if cli == "claude":
-                _session.reset_claude_session(session_state, "resume turn failed")
-            else:
-                _session.mark_resume_unavailable(session_state, "resume turn failed")
+            count = _session.record_resume_attempt_result(
+                session_state,
+                failure_class=resume_failure_class,
+                summary=resume_summary,
+                attributable=attributable,
+            )
             if persist is not None:
                 persist(session_state)
-            health_writer.turn_start(record)
-            sig = _run_one(_session.build_turn(session_state, prompt))
+            store.clear_heartbeat(agent)
+            engine.reset_heartbeat_throttle()
+            if attributable and count >= 2:
+                if cli == "claude":
+                    _session.reset_claude_session(
+                        session_state, "resume_unavailable after 2 session failures")
+                else:
+                    _session.mark_resume_unavailable(
+                        session_state, "resume_unavailable after 2 session failures")
+                session_state.resume_failure_count = 0
+                _notify_resume_continuity_loss(record)
+                _session.clear_resume_attempt(session_state)
+                if persist is not None:
+                    persist(session_state)
+                health_writer.failure(sig, CLASS_AMBIGUOUS)
+                return DriveOutcome(
+                    ok=False,
+                    failure_class=CLASS_AMBIGUOUS,
+                    summary="resume_unavailable; next attempt will start a fresh session",
+                )
+            health_writer.failure(sig, CLASS_AMBIGUOUS if attributable else resume_failure_class)
+            return DriveOutcome(
+                ok=False,
+                failure_class=CLASS_AMBIGUOUS if attributable else resume_failure_class,
+                summary=("resume attempt failed; retrying resume once before fresh session"
+                         if attributable else resume_summary),
+            )
         if sig["ok"]:
+            _session.clear_resume_attempt(session_state)
+            session_state.resume_failure_count = 0
             session_state.turns += 1
             if cli == "claude" and not session_state.resume_available:
                 # a FRESH claude session just succeeded -> it is now resumable next turn
                 # (codex re-arms via the observed thread.started; claude is minted, so set here).
-                # Clear the stale reason too, mirroring observe_event's re-arm (diagnostic
-                # hygiene, both reviewers - the field is only surfaced while resume is unavailable).
+                # Preserve continuity-loss audit fields before clearing the operator-facing
+                # unavailable reason.
+                if session_state.resume_unavailable_reason:
+                    session_state.continuity_lost_reason = (
+                        session_state.resume_unavailable_reason)
+                    session_state.fresh_session_success_reason = "fresh_session_success"
                 session_state.resume_available = True
                 session_state.resume_unavailable_reason = ""
+                session_state.resume_failure_key = ""
             # Unconditional: a clean completed turn ALWAYS ends with a fresh
             # heartbeat, even if the engine's min_interval throttled the in-turn
             # stamps (e.g. a quick retry right after a failure). Route through the
@@ -1794,22 +1868,64 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
         cli_name = session_state.cli
         attempted_resume = ((cli_name == "codex" and "resume" in spec.args)
                             or (cli_name == "claude" and "--resume" in spec.args))
-        ok = _run_one(spec)
-        if not ok and attempted_resume:
-            # mirror make_drive's resume self-heal: a failed RESUME turn forces a FRESH
-            # session for the SAME prompt and retries inline (still ONE cadence attempt).
-            if cli_name == "claude":
-                _session.reset_claude_session(session_state, "resume turn failed")
-            else:
-                _session.mark_resume_unavailable(session_state, "resume turn failed")
+        if attempted_resume:
+            _session.resume_attempt_start(session_state, agent=agent, msg_id="cadence")
             if persist is not None:
                 persist(session_state)
-            ok = _run_one(_session.build_turn(session_state, prompt))
+        ok = _run_one(spec)
+        if not ok and attempted_resume:
+            count = _session.record_resume_attempt_result(
+                session_state,
+                failure_class="poison_eligible",
+                summary="cadence resume turn failed",
+                attributable=True,
+            )
+            if count >= 2:
+                if cli_name == "claude":
+                    _session.reset_claude_session(
+                        session_state, "resume_unavailable after 2 session failures")
+                else:
+                    _session.mark_resume_unavailable(
+                        session_state, "resume_unavailable after 2 session failures")
+                session_state.resume_failure_count = 0
+                with contextlib.suppress(Exception):
+                    target = store.operator_facing() or store.sole_lead()
+                    if target and target != agent and _session.should_notify_continuity_loss(session_state):
+                        rid = "esc-" + uuid.uuid4().hex[:12]
+                        store.send(
+                            sender=agent,
+                            recipient=target,
+                            kind="question",
+                            subject="wrapper resume continuity loss",
+                            body=(
+                                f"[wrapper-resume-unavailable] agent {agent} gave up resuming "
+                                "its cadence session after repeated session-attributable failures. "
+                                "The next attempt will start a fresh session."
+                            ),
+                            meta={
+                                "needs_operator": "true",
+                                "resume_unavailable": "true",
+                                "continuity_lost": "true",
+                                "msg_id": "cadence",
+                                "request_id": rid,
+                            },
+                        )
+                        _session.mark_continuity_loss_notified(session_state)
+                _session.clear_resume_attempt(session_state)
+            if persist is not None:
+                persist(session_state)
         if ok:
+            _session.clear_resume_attempt(session_state)
+            session_state.resume_failure_count = 0
             session_state.turns += 1
             if cli_name == "claude" and not session_state.resume_available:
+                if session_state.resume_unavailable_reason:
+                    session_state.continuity_lost_reason = (
+                        session_state.resume_unavailable_reason)
+                    session_state.fresh_session_success_reason = "fresh_session_success"
                 session_state.resume_available = True
                 session_state.resume_unavailable_reason = ""
+                session_state.resume_failure_key = ""
             # a clean cadence turn ends with a fresh heartbeat; route through the injected
             # lead-loop hook (renew+stamp), which RAISES on a lost lease.
             if heartbeat is not None:

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from agenttalk import attention as att
 from agenttalk import cli, supervisor as sup
 from agenttalk.store import Store
 from agenttalk.wrapper import loop, recv_api, run, session
@@ -42,10 +43,11 @@ def _run(argv: list[str], root: Path) -> int:
 
 def _runloop(s, agent="beta", *, drive, max_polls=12, k_poison=3, k_escalate=20,
              on_dead_letter=None, on_escalate=None, **kw):
+    now_iso = kw.pop("now_iso", lambda: "t")
     return loop.run_loop(s, agent, drive, clock=lambda: 0.0, sleep=lambda d: None,
                          max_polls=max_polls, k_poison=k_poison, k_escalate=k_escalate,
                          on_dead_letter=on_dead_letter, on_escalate=on_escalate,
-                         now_iso=lambda: "t", **kw)
+                         now_iso=now_iso, **kw)
 
 
 def _always_false():
@@ -342,7 +344,7 @@ def test_16_control_never_counts(tmp_path: Path) -> None:
     assert s.dead_letter_attempts("beta")["messages"] == {}   # no attempt recorded
 
 
-def test_17_codex_resume_retry_is_one_attempt(tmp_path: Path, monkeypatch) -> None:
+def test_17_codex_resume_give_up_then_fresh_is_bounded_attempts(tmp_path: Path, monkeypatch) -> None:
     s = _store(tmp_path)
     _send(s, "hi")
     st = session.SessionState(cli="codex", codex_thread_id="t-old", resume_available=True)
@@ -363,8 +365,13 @@ def test_17_codex_resume_retry_is_one_attempt(tmp_path: Path, monkeypatch) -> No
 
     monkeypatch.setattr(s, "record_attempt_start", counting)
     loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None, max_turns=1)
-    assert len(spawns) == 2                          # resume then fresh (internal retry)
-    assert counts["n"] == 1                          # the loop counts EXACTLY ONE attempt
+    assert len(spawns) == 3                          # two resumes, then fresh
+    assert spawns[:2] == [
+        ["codex", "exec", "resume", "--json", "t-old"],
+        ["codex", "exec", "resume", "--json", "t-old"],
+    ]
+    assert spawns[2] == ["codex", "exec", "--json"]
+    assert counts["n"] == 3                          # bounded retries, no spawn-loop burst
 
 
 def test_18_one_shot_unchanged_no_dead_letter(tmp_path: Path) -> None:
@@ -612,6 +619,176 @@ def test_31_unrouted_escalation_retries_after_target_configured(tmp_path: Path) 
     assert any(msg.meta.get("dead_letter") == "true" for msg in s.messages_for("lead"))
 
 
+def test_b1_dead_letter_notice_replies_do_not_release_latch(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    s.set_operator_facing("lead")
+    m = _send(s, "infra")
+    notifier = cli._dead_letter_notifier(s, "beta")
+    info = {
+        "agent": "beta",
+        "msg_id": m.id,
+        "from": "lead",
+        "kind": "message",
+        "attempts": 20,
+        "attempts_bucket": "escalate_backstop",
+        "first_started_at": "2026-07-05T00:00:00Z",
+        "failure_class": CLASS_INFRA,
+    }
+
+    assert notifier(info, disposed=False) is True
+    first = s.messages_for("lead")[-1]
+    for n in range(3):
+        s.send(sender="lead", recipient="beta", body=f"ack {n}", kind="message",
+               meta={"request_id": first.meta["request_id"]})
+        assert notifier(info, disposed=False) is True
+
+    notices = [msg for msg in s.messages_for("lead")
+               if msg.subject == "dead-letter notice"]
+    assert len(notices) == 1
+
+
+def test_b1_dead_letter_worsening_state_emits_new_notice(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    s.set_operator_facing("lead")
+    m = _send(s, "mixed")
+    notifier = cli._dead_letter_notifier(s, "beta")
+
+    assert notifier({
+        "agent": "beta", "msg_id": m.id, "from": "lead", "kind": "message",
+        "attempts": 20, "attempts_bucket": "escalate_backstop",
+        "first_started_at": "2026-07-05T00:00:00Z",
+        "failure_class": CLASS_INFRA,
+    }, disposed=False) is True
+    assert notifier({
+        "agent": "beta", "msg_id": m.id, "from": "lead", "kind": "message",
+        "attempts": 21, "attempts_bucket": "quarantined",
+        "first_started_at": "2026-07-05T00:00:00Z",
+        "failure_class": CLASS_AMBIGUOUS,
+        "quarantined": True,
+    }, disposed=True) is True
+
+    notices = [msg for msg in s.messages_for("lead")
+               if msg.subject == "dead-letter notice"]
+    assert len(notices) == 2
+
+
+def test_b1_corrupt_notice_log_fails_open_once(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    s.set_operator_facing("lead")
+    m = _send(s, "poison")
+    p = att.attention_dir(s) / "notices.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{torn\n", encoding="utf-8")
+    notifier = cli._dead_letter_notifier(s, "beta")
+    info = {
+        "agent": "beta", "msg_id": m.id, "from": "lead", "kind": "message",
+        "attempts": 3, "attempts_bucket": "quarantined",
+        "first_started_at": "2026-07-05T00:00:00Z",
+        "failure_class": CLASS_POISON,
+        "quarantined": True,
+    }
+
+    assert notifier(info, disposed=True) is True
+    assert notifier(info, disposed=True) is True
+
+    notices = [msg for msg in s.messages_for("lead")
+               if msg.subject == "dead-letter notice"]
+    assert len(notices) == 1
+
+
+def test_b2_infra_raw_attempt_churn_before_elapsed_floor_does_not_quarantine(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    m = _send(s, "infra")
+    drive = _always(DriveOutcome(ok=False, failure_class=CLASS_INFRA, summary="529"))
+    _runloop(
+        s,
+        drive=drive,
+        k_poison=99,
+        k_escalate=2,
+        infra_exhaust_after_seconds=3600,
+        infra_exhaust_min_attempts=3,
+        on_escalate=lambda i: True,
+        now_iso=lambda: "2026-07-05T00:01:00Z",
+        max_polls=6,
+    )
+    assert s.dead_lettered_count("beta") == 0
+    assert s.cursor("beta") != m.id
+    assert len(drive.calls) >= 3
+
+
+def test_b2_infra_elapsed_and_min_attempts_quarantines_once_with_notice(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    s.set_operator_facing("lead")
+    m = _send(s, "infra")
+    rec = _rec(s)
+    s.record_attempt_start("beta", rec, attempt_id="a", at="2026-07-05T00:00:00Z")
+    data = s.dead_letter_attempts("beta")
+    data["messages"][m.id].update({
+        "attempts_started": 3,
+        "infra_failures": 3,
+        "last_failure_class": CLASS_INFRA,
+        "last_failure_summary": "529",
+        "in_progress": False,
+    })
+    s._write_attempts("beta", data)
+    notifier = cli._dead_letter_notifier(s, "beta")
+    drive = _always(DriveOutcome(ok=False, failure_class=CLASS_INFRA, summary="529"))
+
+    _runloop(
+        s,
+        drive=drive,
+        k_poison=99,
+        k_escalate=2,
+        infra_exhaust_after_seconds=60,
+        infra_exhaust_min_attempts=3,
+        on_dead_letter=lambda i: notifier(i, disposed=True),
+        now_iso=lambda: "2026-07-05T00:02:00Z",
+        max_polls=2,
+    )
+
+    assert drive.calls == []
+    assert s.dead_lettered_count("beta") == 1
+    item = s.list_dead_letters("beta")[0]
+    assert item["class"] == loop.CLASS_INFRA_RETRY_EXHAUSTED
+    notices = [msg for msg in s.messages_for("lead")
+               if msg.subject == "dead-letter notice"]
+    assert len(notices) == 1
+    assert "Requeue:" in notices[0].body
+
+
+def test_b2_infra_exhaustion_zero_negative_config_falls_back() -> None:
+    caps = sup.resolve_infra_retry_exhaustion(
+        {"dead_letter": {
+            "infra_exhaust_after_seconds": 0,
+            "infra_exhaust_min_attempts": -1,
+            "noninfra_sub_ceiling": 0,
+        }},
+        {},
+        k_escalate=2,
+    )
+    assert caps == {
+        "infra_exhaust_after_seconds": 14400.0,
+        "infra_exhaust_min_attempts": 100,
+        "noninfra_sub_ceiling": 4,
+    }
+
+
+def test_b2_mixed_poison_infra_hits_noninfra_sub_ceiling(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    _send(s, "mixed")
+    drive = _cycle_outcomes([CLASS_INFRA, CLASS_POISON, CLASS_INFRA, CLASS_AMBIGUOUS])
+    _runloop(
+        s,
+        drive=drive,
+        k_poison=99,
+        k_escalate=99,
+        noninfra_sub_ceiling=2,
+        max_polls=5,
+    )
+    assert s.dead_lettered_count("beta") == 1
+    assert s.list_dead_letters("beta")[0]["class"] == CLASS_AMBIGUOUS
+
+
 def test_32_corrupt_ledger_value_at_cap_disposes_without_crash(tmp_path: Path) -> None:
     # reviewer-1 major: a corrupt counter VALUE at the cap must dispose + NOTIFY without
     # crashing - _info (the notice builder) must degrade-LOW too, not just the cap checks.
@@ -767,10 +944,9 @@ def _claude_fail_lines(msg="session is full"):
     return [json.dumps({"type": "result", "is_error": True, "result": msg})]
 
 
-def test_40_claude_self_heal_two_healthy_messages_zero_dead_letters(tmp_path: Path) -> None:
-    # codex ruling #2 (d), loop level: claude --resume keeps failing (session full) but the
-    # FRESH session succeeds each time -> two healthy queued messages BOTH commit, with 0
-    # dead-letters. Proves session-pressure self-heals and never false-DLs a healthy message.
+def test_40_claude_resume_give_up_two_healthy_messages_zero_dead_letters(tmp_path: Path) -> None:
+    # B4 loop level: claude --resume fails twice, then the fresh session succeeds. Healthy
+    # queued messages commit with 0 dead-letters, but there is no same-poll spawn burst.
     s = _store(tmp_path)
     _send(s, "healthy-1")
     _send(s, "healthy-2")
@@ -789,8 +965,8 @@ def test_40_claude_self_heal_two_healthy_messages_zero_dead_letters(tmp_path: Pa
     _runloop(s, drive=drive, k_poison=3, max_polls=6)
     assert s.dead_lettered_count("beta") == 0            # both healthy -> NEVER dead-lettered
     assert recv_api.next_record(s, "beta") is None       # both committed (cursor past both)
-    # each message: a failed --resume then a successful fresh --session-id (2 spawns x 2 msgs)
-    assert sum(1 for c in calls if "--resume" in c) == 2
+    # each message: two failed --resume attempts, then a successful fresh --session-id.
+    assert sum(1 for c in calls if "--resume" in c) == 4
     assert sum(1 for c in calls if "--session-id" in c) == 2
 
 

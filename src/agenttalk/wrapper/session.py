@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import asdict, dataclass, fields
+from datetime import datetime, timezone
 
 _CLAUDE_STREAM = ["--output-format", "stream-json", "--verbose", "--include-partial-messages"]
 
@@ -34,6 +35,16 @@ class SessionState:
     resume_available: bool = True
     resume_unavailable_reason: str = ""
     turns: int = 0
+    resume_failure_count: int = 0
+    resume_failure_key: str = ""
+    resume_attempt_state: str = ""
+    resume_attempt_key: str = ""
+    resume_attempt_id: str = ""
+    resume_attempt_started_at: str = ""
+    resume_attempt_msg_id: str = ""
+    continuity_lost_reason: str = ""
+    continuity_loss_notified_key: str = ""
+    fresh_session_success_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -81,7 +92,12 @@ def observe_event(state: SessionState, raw: object) -> None:
         if isinstance(tid, str) and tid:
             state.codex_thread_id = tid
             state.resume_available = True
-            state.resume_unavailable_reason = ""
+            if state.resume_unavailable_reason:
+                state.continuity_lost_reason = state.resume_unavailable_reason
+                state.fresh_session_success_reason = "fresh_session_success"
+                state.resume_unavailable_reason = ""
+            state.resume_failure_count = 0
+            state.resume_failure_key = ""
 
 
 def mark_resume_unavailable(state: SessionState, reason: str) -> None:
@@ -90,6 +106,7 @@ def mark_resume_unavailable(state: SessionState, reason: str) -> None:
     state.resume_available = False
     state.resume_unavailable_reason = reason
     state.codex_thread_id = None
+    state.continuity_lost_reason = reason
 
 
 def reset_claude_session(state: SessionState, reason: str) -> None:
@@ -103,6 +120,92 @@ def reset_claude_session(state: SessionState, reason: str) -> None:
     state.claude_session_id = str(uuid.uuid4())
     state.resume_available = False
     state.resume_unavailable_reason = reason
+    state.continuity_lost_reason = reason
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def resume_session_key(state: SessionState, agent: str) -> str:
+    ident = state.codex_thread_id if state.cli == "codex" else state.claude_session_id
+    return f"{agent}:{state.cli}:{ident or 'none'}"
+
+
+def reconcile_resume_attempt(state: SessionState) -> None:
+    if state.resume_attempt_state == "in_progress":
+        state.resume_attempt_state = "ambiguous"
+        state.resume_attempt_msg_id = ""
+
+
+def resume_attempt_start(state: SessionState, *, agent: str, msg_id: object) -> None:
+    state.resume_attempt_key = resume_session_key(state, agent)
+    state.resume_attempt_id = uuid.uuid4().hex[:12]
+    state.resume_attempt_started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    state.resume_attempt_msg_id = str(msg_id or "")
+    state.resume_attempt_state = "in_progress"
+
+
+def resume_failure_is_session_attributable(failure_class: str | None,
+                                           summary: str | None) -> bool:
+    if failure_class in {"known_global_infra", "config_blocked"}:
+        return False
+    text = (summary or "").casefold()
+    broken_terms = (
+        "no session",
+        "session not found",
+        "invalid session",
+        "expired session",
+        "broken session",
+        "resume turn failed",
+        "session is full",
+        "prompt is too long",
+    )
+    return (
+        failure_class == "poison_eligible"
+        or (
+            failure_class in {"ambiguous_or_unknown", "broken_session"}
+            and any(t in text for t in broken_terms)
+        )
+    )
+
+
+def record_resume_attempt_result(state: SessionState, *, failure_class: str | None,
+                                 summary: str | None,
+                                 attributable: bool) -> int:
+    state.resume_attempt_state = "failed"
+    state.resume_attempt_msg_id = ""
+    if attributable:
+        key = state.resume_attempt_key
+        if key != state.resume_failure_key:
+            state.resume_failure_count = 0
+            state.resume_failure_key = key
+        state.resume_failure_count = _safe_int(state.resume_failure_count) + 1
+    else:
+        state.resume_failure_count = 0
+        state.resume_failure_key = ""
+    return state.resume_failure_count
+
+
+def clear_resume_attempt(state: SessionState) -> None:
+    state.resume_attempt_state = ""
+    state.resume_attempt_id = ""
+    state.resume_attempt_started_at = ""
+    state.resume_attempt_msg_id = ""
+
+
+def should_notify_continuity_loss(state: SessionState) -> bool:
+    key = state.resume_failure_key or state.resume_attempt_key
+    return bool(key and state.continuity_loss_notified_key != key)
+
+
+def mark_continuity_loss_notified(state: SessionState) -> None:
+    key = state.resume_failure_key or state.resume_attempt_key
+    if key:
+        state.continuity_loss_notified_key = key
 
 
 # --- persistence: the session layer owns its state, written atomically (Codex) ---
@@ -119,7 +222,10 @@ def load_session(store, agent: str, cli: str) -> SessionState:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             known = {f.name for f in fields(SessionState)}
-            return SessionState(**{k: v for k, v in data.items() if k in known})
+            state = SessionState(**{k: v for k, v in data.items() if k in known})
+            state.resume_failure_count = _safe_int(state.resume_failure_count)
+            reconcile_resume_attempt(state)
+            return state
         except (ValueError, OSError, TypeError):
             pass  # corrupt / unreadable -> start fresh
     state = SessionState(cli=cli)

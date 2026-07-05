@@ -152,6 +152,37 @@ def test_session_observe_event_is_codex_only() -> None:
     assert st.codex_thread_id is None         # claude has no codex thread_id
 
 
+def test_session_resume_ledger_torn_reads_degrade_low(tmp_path) -> None:
+    s = _store(tmp_path)
+    path = s.state_dir / "beta.wrapper-session.json"
+    path.write_text(json.dumps({
+        "cli": "codex",
+        "codex_thread_id": "t-old",
+        "resume_failure_count": "not-a-number",
+        "resume_attempt_state": "in_progress",
+        "resume_attempt_key": "beta:codex:t-old",
+        "resume_attempt_msg_id": "m-1",
+    }), encoding="utf-8")
+
+    st = session.load_session(s, "beta", "codex")
+
+    assert st.resume_failure_count == 0
+    assert st.resume_attempt_state == "ambiguous"
+    assert st.resume_attempt_msg_id == ""
+
+
+def test_session_resume_attempt_start_records_auditable_metadata() -> None:
+    st = session.SessionState(cli="codex", codex_thread_id="t-old")
+
+    session.resume_attempt_start(st, agent="beta", msg_id="msg-1")
+
+    assert st.resume_attempt_state == "in_progress"
+    assert st.resume_attempt_key == "beta:codex:t-old"
+    assert st.resume_attempt_msg_id == "msg-1"
+    assert st.resume_attempt_id
+    assert st.resume_attempt_started_at.endswith("Z")
+
+
 # --------------------------------------------------------------- loop
 
 def test_is_terminal_control() -> None:
@@ -348,10 +379,9 @@ def _failed_turn_lines(msg: str = "no session") -> list[str]:
     return [json.dumps({"type": "turn.failed", "error": {"message": msg}})]
 
 
-def test_make_drive_resume_failure_retries_fresh(tmp_path) -> None:
-    # reviewer-1/codex: a persisted thread_id whose RESUME turn fails must clear the
-    # stale id, retry FRESH (exec --json) for the same record, observe the new id,
-    # and report success. The next invocation uses exec --json, not exec resume.
+def test_make_drive_resume_failure_gives_up_after_two_then_fresh_succeeds(tmp_path) -> None:
+    # Slice 1 B4: a failed resume does not inline-spawn fresh. After two consecutive
+    # session-attributable failures, resume is marked unavailable; the next attempt is fresh.
     s = _store(tmp_path)
     st = session.SessionState(cli="codex", codex_thread_id="t-old", resume_available=True)
     spawned: list[list[str]] = []
@@ -364,29 +394,116 @@ def test_make_drive_resume_failure_retries_fresh(tmp_path) -> None:
 
     drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=fake_spawn,
                            clock=lambda: 0.0, render=False)
-    ok = drive({"from": "a", "kind": "message", "body": "hi",
-                "correlation_id": None, "request_id": None, "broadcast_id": None})
-    assert ok.ok is True                               # fresh retry succeeded
-    assert spawned[0] == ["codex", "exec", "resume", "--json", "t-old"]  # resume first
-    assert spawned[1] == ["codex", "exec", "--json"]                      # then fresh
-    assert st.codex_thread_id == "t-new"               # new id observed + persisted
-    assert st.turns == 1
+    rec = {"from": "a", "kind": "message", "body": "hi",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    one = drive(rec)
+    assert one.ok is False and one.failure_class == loop.CLASS_AMBIGUOUS
+    assert spawned == [["codex", "exec", "resume", "--json", "t-old"]]
+    assert st.resume_available is True and st.resume_failure_count == 1
+    two = drive(rec)
+    assert two.ok is False and "resume_unavailable" in two.summary
+    assert st.resume_available is False and st.codex_thread_id is None
+    three = drive(rec)
+    assert three.ok is True
+    assert spawned[-1] == ["codex", "exec", "--json"]
+    assert st.codex_thread_id == "t-new" and st.turns == 1
 
 
-def test_make_drive_resume_and_fresh_both_fail_returns_false(tmp_path) -> None:
+def test_make_drive_resume_first_failure_does_not_mark_unavailable(tmp_path) -> None:
     s = _store(tmp_path)
     st = session.SessionState(cli="codex", codex_thread_id="t-old")
 
     def fake_spawn(argv, stdin):
-        return _failed_turn_lines("broken")            # every attempt fails
+        return _failed_turn_lines("no session")        # session-attributable resume failure
 
     drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=fake_spawn,
                            clock=lambda: 0.0, render=False)
     ok = drive({"from": "a", "kind": "message", "body": "hi",
                 "correlation_id": None, "request_id": None, "broadcast_id": None})
     assert ok.ok is False                              # genuine failure -> no commit
-    assert st.resume_available is False                # marked unavailable
+    assert st.resume_available is True                 # first failure only records the ledger
+    assert st.resume_failure_count == 1
     assert st.turns == 0                               # a failed turn does not advance
+
+
+def test_make_drive_resume_infra_failures_do_not_consume_b4_ceiling(tmp_path) -> None:
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex", codex_thread_id="t-old")
+    spawned: list[list[str]] = []
+
+    def fake_spawn(argv, stdin):
+        spawned.append(argv)
+        return _failed_turn_lines("HTTP 529 overloaded")
+
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=fake_spawn,
+                           clock=lambda: 0.0, render=False)
+    rec = {"id": "msg-1", "from": "a", "kind": "message", "body": "hi",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    one = drive(rec)
+    two = drive(rec)
+
+    assert one.ok is False and one.failure_class == loop.CLASS_INFRA
+    assert two.ok is False and two.failure_class == loop.CLASS_INFRA
+    assert st.resume_available is True
+    assert st.resume_failure_count == 0
+    assert st.codex_thread_id == "t-old"
+    assert spawned == [
+        ["codex", "exec", "resume", "--json", "t-old"],
+        ["codex", "exec", "resume", "--json", "t-old"],
+    ]
+
+
+def test_make_drive_resume_ambiguous_non_session_failure_does_not_consume_b4_ceiling(
+    tmp_path,
+) -> None:
+    s = _store(tmp_path)
+    st = session.SessionState(cli="codex", codex_thread_id="t-old")
+
+    def fake_spawn(argv, stdin):
+        return _failed_turn_lines("child killed by supervisor")
+
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=fake_spawn,
+                           clock=lambda: 0.0, render=False)
+    rec = {"id": "msg-1", "from": "a", "kind": "message", "body": "hi",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    out = drive(rec)
+
+    assert out.ok is False and out.failure_class == loop.CLASS_AMBIGUOUS
+    assert st.resume_available is True
+    assert st.resume_failure_count == 0
+    assert st.codex_thread_id == "t-old"
+
+
+def test_make_drive_resume_give_up_sends_one_continuity_loss_signal(tmp_path) -> None:
+    s = _store(tmp_path)
+    s.set_operator_facing("alpha")
+    st = session.SessionState(cli="codex", codex_thread_id="t-old", resume_available=True)
+
+    def fake_spawn(argv, stdin):
+        if "resume" in argv:
+            return _failed_turn_lines("no session")
+        return _codex_turn_lines(thread_id="t-new")
+
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=fake_spawn,
+                           clock=lambda: 0.0, render=False)
+    rec = {"id": "msg-1", "from": "a", "kind": "message", "body": "hi",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+
+    assert drive(rec).ok is False
+    assert not [m for m in s.valid_messages() if m.subject == "wrapper resume continuity loss"]
+    assert drive(rec).ok is False
+    notices = [m for m in s.valid_messages() if m.subject == "wrapper resume continuity loss"]
+    assert len(notices) == 1
+    assert notices[0].recipient == "alpha"
+    assert notices[0].meta["resume_unavailable"] == "true"
+    assert notices[0].meta["continuity_lost"] == "true"
+    assert notices[0].meta["msg_id"] == "msg-1"
+
+    assert drive(rec).ok is True
+    assert len([m for m in s.valid_messages()
+                if m.subject == "wrapper resume continuity loss"]) == 1
+    assert st.codex_thread_id == "t-new"
+    assert st.fresh_session_success_reason == "fresh_session_success"
 
 
 class _Stream:
@@ -1800,10 +1917,9 @@ def _claude_rec():
             "correlation_id": None, "request_id": None, "broadcast_id": None}
 
 
-def test_make_drive_claude_resume_failure_self_heals_to_fresh_session(tmp_path) -> None:
-    # codex ruling #2 (d): a failed claude --resume turn (full session) mints a FRESH session
-    # id and retries the SAME record inline ONCE; a healthy message then SUCCEEDS, so the turn
-    # is ok (the loop commits it, 0 dead-letters) - NOT poison. The whole drive() = resume+fresh.
+def test_make_drive_claude_resume_gives_up_after_two_then_fresh_session(tmp_path) -> None:
+    # Slice 1 B4: failed claude --resume is bounded by the session-attributable K=2
+    # ledger, then the following attempt uses a fresh --session-id.
     calls = []
 
     def spawn(argv, stdin):
@@ -1817,18 +1933,22 @@ def test_make_drive_claude_resume_failure_self_heals_to_fresh_session(tmp_path) 
     drive = run.make_drive(_store(tmp_path), "beta", "claude", state, ["claude"],
                            spawn=spawn, clock=lambda: 0.0, render=False)
     out = drive(_claude_rec())
-    assert out.ok is True                                        # healthy -> success, NOT poison
-    assert len(calls) == 2 and "--resume" in calls[0] and "--session-id" in calls[1]
-    assert state.claude_session_id != "sess-1"                  # a FRESH session was minted
-    assert state.resume_available is True                       # fresh session is resumable next
-    assert state.resume_unavailable_reason == ""                # stale reason cleared on re-arm
+    assert out.ok is False and out.failure_class == loop.CLASS_AMBIGUOUS
+    assert len(calls) == 1 and "--resume" in calls[0]
+    out2 = drive(_claude_rec())
+    assert out2.ok is False and "resume_unavailable" in out2.summary
+    assert state.claude_session_id != "sess-1"                  # fresh id minted only at K
+    out3 = drive(_claude_rec())
+    assert out3.ok is True
+    assert "--session-id" in calls[-1]
+    assert state.resume_available is True
+    assert state.continuity_lost_reason
+    assert state.fresh_session_success_reason == "fresh_session_success"
 
 
-def test_make_drive_claude_prompt_too_long_poison_only_after_fresh_retry(tmp_path) -> None:
-    # codex ruling #2 (e) + #1: 'prompt too long' on the --resume turn is NOT poison (a full
-    # session is global session-pressure); only when the FRESH session ALSO fails with a size
-    # marker for the SAME message is it POISON. Proves poison-after-self-heal, not on the first
-    # (stale-session) failure.
+def test_make_drive_claude_prompt_too_long_on_resume_is_not_message_poison(tmp_path) -> None:
+    # Resume-scoped session pressure never classifies the message as poison on the
+    # first failed resume; it must go through the B4 resume ledger.
     calls = []
 
     def spawn(argv, stdin):
@@ -1840,8 +1960,9 @@ def test_make_drive_claude_prompt_too_long_poison_only_after_fresh_retry(tmp_pat
     drive = run.make_drive(_store(tmp_path), "beta", "claude", state, ["claude"],
                            spawn=spawn, clock=lambda: 0.0, render=False)
     out = drive(_claude_rec())
-    assert out.ok is False and out.failure_class == loop.CLASS_POISON
-    assert len(calls) == 2 and "--resume" in calls[0] and "--session-id" in calls[1]
+    assert out.ok is False and out.failure_class == loop.CLASS_AMBIGUOUS
+    assert len(calls) == 1 and "--resume" in calls[0]
+    assert state.resume_failure_count == 1
 
 
 def test_make_drive_success_stamps_heartbeat(tmp_path) -> None:

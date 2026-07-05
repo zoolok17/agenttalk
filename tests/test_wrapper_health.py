@@ -184,7 +184,9 @@ def test_small_future_health_within_skew_is_accepted(tmp_path: Path) -> None:
     assert h["stale"] is False
 
 
-def test_working_health_delays_auto_recovery_but_not_manual_restart(tmp_path: Path) -> None:
+def test_working_health_with_stale_heartbeat_does_not_delay_recovery_or_restart(
+    tmp_path: Path,
+) -> None:
     s = _store(tmp_path)
     _set_hb(s, "beta", NOW - 1000)
     s.write_health("beta", hm.build_snapshot(
@@ -202,17 +204,55 @@ def test_working_health_delays_auto_recovery_but_not_manual_restart(tmp_path: Pa
     report = sup.build_report(s, now_epoch=NOW, supervisor_config=cfg)
     plan = sup.plan_actions(report, _ready_state(), cfg, now_epoch=NOW,
                             snapshot=[])["agents"]["beta"]
-    assert plan["action"] == sup.SUSPECT_WARN
-    assert plan["state"] == "ACTIVE_OR_BUSY"
-    assert plan["kill_first"] is False
+    assert plan["action"] == sup.STUCK_RECOVER
+    assert plan["state"] == "STUCK_OR_DEAD"
     assert plan["health"]["state"] == hm.STATE_WORKING_SILENT
 
-    s.write_restart_request("beta", {"request_id": "rr-1"})
+    s.write_restart_request("beta", {
+        "request_id": "rr-1",
+        "requested_by": "alpha",
+        "authorized_by": "alpha",
+        "authority_result": "authorized",
+        "authority_reason": "test",
+        "force_protected": False,
+        "force_protected_authorized": False,
+    })
     report2 = sup.build_report(s, now_epoch=NOW, supervisor_config=cfg)
     plan2 = sup.plan_actions(report2, _ready_state(), cfg, now_epoch=NOW,
                              snapshot=[])["agents"]["beta"]
     assert plan2["action"] == sup.RELAUNCH
-    assert plan2["clear_marker"] == "rr-1"
+    assert plan2["clear_marker"] is None
+    assert plan2["next_state"]["restart_request_state"] == "applied_pending_readiness"
+
+
+def test_non_wrapped_working_health_with_stale_heartbeat_still_needs_stuck_signal(
+    tmp_path: Path,
+) -> None:
+    s = _store(tmp_path)
+    _set_hb(s, "beta", NOW - 1000)
+    s.write_health("beta", hm.build_snapshot(
+        agent="beta",
+        cli="claude",
+        mode="wrapper-loop",
+        state=hm.STATE_WORKING_SILENT,
+        updated_at=_iso(NOW - 10),
+        since=_iso(NOW - 10),
+        last_progress_at=None,
+        reason_code="turn_spawned",
+    ))
+
+    cfg = _wrapped_cfg(wrapped=False, activity_hook=False)
+    plan = sup.plan_actions(
+        sup.build_report(s, now_epoch=NOW, supervisor_config=cfg),
+        _ready_state(),
+        cfg,
+        now_epoch=NOW,
+        snapshot=[],
+    )["agents"]["beta"]
+
+    assert plan["action"] == sup.SUSPECT_WARN
+    assert plan["state"] == "ACTIVE_OR_BUSY"
+    assert "advisory-health-conflict" in plan["health"]["warnings"]
 
 
 class _Stream:

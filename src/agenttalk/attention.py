@@ -99,6 +99,8 @@ _ACTION_FAMILY = {
     ACTION_REQUEUED_AFTER_RESOLVE: "dead_letter_resolution",
 }
 
+NOTICE_DEAD_LETTER = "dead_letter"
+
 
 # ----------------------------------------------------------- typed meta validation
 
@@ -262,6 +264,133 @@ def source_hash(payload: Any) -> str:
     a prior disposition is stale and the item resurfaces (gate condition 1)."""
     norm = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+
+def _notice_log_path(store) -> Path:
+    # Attention-owned notification memory, not a dead-letter sink sidecar.
+    return attention_dir(store) / "notices.jsonl"
+
+
+def dead_letter_notice_key(agent: str, message_id: str,
+                           generation: str | None = None) -> str:
+    base = item_id(SOURCE_DEAD_LETTER, agent, message_id)
+    return f"{base}:gen:{generation or 'unknown'}"
+
+
+def dead_letter_notice_state(info: dict, *, disposed: bool) -> dict:
+    """Stable tuple used to dedupe wrapper dead-letter/backstop notices."""
+    failure_class = info.get("failure_class") or info.get("class") or ""
+    infra_exhausted = bool(info.get("infra_exhausted") or failure_class == "infra_retry_exhausted")
+    return {
+        "failure_class": str(failure_class),
+        "attempts_bucket": str(info.get("attempts_bucket") or info.get("attempts") or ""),
+        "disposed": bool(disposed),
+        "infra_exhausted": infra_exhausted,
+        "quarantined": bool(info.get("quarantined")),
+    }
+
+
+def dead_letter_entry_notice_state(entry: dict) -> dict:
+    """State tuple for a dead-letter sink row, matching wrapper notice state."""
+    info = dict(entry or {})
+    info.setdefault("failure_class", info.get("class"))
+    info.setdefault("attempts_bucket", "quarantined")
+    info["quarantined"] = True
+    return dead_letter_notice_state(info, disposed=True)
+
+
+def dead_letter_entry_source_hash(entry: dict) -> str:
+    return source_hash(dead_letter_entry_notice_state(entry))
+
+
+def read_notice_events(store) -> tuple[list[dict], list[str]]:
+    """Read attention notice events fail-safe.
+
+    Torn/corrupt lines produce warnings but never hide a notice path. Valid prior lines
+    are still returned so a corrupt append fails open to one replacement notice rather
+    than crashing or suppressing all future notices.
+    """
+    p = _notice_log_path(store)
+    if not p.exists():
+        return [], []
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()
+    except OSError as e:
+        return [], [f"notice_log_unreadable:{e}"]
+    events: list[dict] = []
+    warnings: list[str] = []
+    for idx, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            warnings.append(f"notice_log_torn:{idx}")
+            continue
+        if not isinstance(obj, dict):
+            warnings.append(f"notice_log_malformed:{idx}")
+            continue
+        events.append(obj)
+    return events, warnings
+
+
+def latest_dead_letter_notices(events: list[dict]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for e in events:
+        if e.get("kind") != NOTICE_DEAD_LETTER:
+            continue
+        key = e.get("notice_key")
+        if isinstance(key, str) and key:
+            out[key] = e
+    return out
+
+
+def append_notice_event(store, event: dict) -> None:
+    line = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str)
+    with store._config_lock():
+        p = _notice_log_path(store)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, (line + "\n").encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def dead_letter_resolved_for_state(store, *, agent: str, message_id: str,
+                                   source_hash_value: str) -> bool:
+    events, _ = read_dispositions(store)
+    folded = fold_dispositions(events)
+    iid = item_id(SOURCE_DEAD_LETTER, agent, message_id)
+    dl = folded.get(iid, {}).get("dead_letter_resolution")
+    return bool(
+        dl
+        and dl.get("action") == ACTION_RESOLVE_DEAD_LETTER
+        and dl.get("source_snapshot", {}).get("source_hash") == source_hash_value
+    )
+
+
+def should_emit_dead_letter_notice(store, *, agent: str, message_id: str,
+                                   generation: str | None,
+                                   state: dict) -> tuple[bool, dict]:
+    """Decide if the wrapper should send a needs-operator dead-letter notice.
+
+    Only ``dead-letter resolve`` releases the latch. Closing or replying on the escalation
+    thread is intentionally ignored.
+    """
+    key = dead_letter_notice_key(agent, message_id, generation)
+    state_hash = source_hash(state)
+    if dead_letter_resolved_for_state(
+            store, agent=agent, message_id=message_id,
+            source_hash_value=state_hash):
+        return False, {"reason": "resolved"}
+    events, warnings = read_notice_events(store)
+    prior = latest_dead_letter_notices(events).get(key)
+    if (prior and prior.get("state_hash") == state_hash
+            and (prior.get("warnings") or []) == warnings):
+        return False, {"reason": "duplicate", "request_id": prior.get("request_id")}
+    return True, {"notice_key": key, "state_hash": state_hash, "warnings": warnings}
 
 
 def dedupe_key(source: str, *, identity: str, decision_hash: str | None = None) -> str:
@@ -561,9 +690,10 @@ def dead_letter_items(entries: list[dict]) -> list[dict]:
     out = []
     for e in entries:
         ag, mid = e.get("agent", ""), e.get("message_id", "")
+        ident = dead_letter_entry_notice_state(e)
         it = _mk_item(SOURCE_DEAD_LETTER, item_id(SOURCE_DEAD_LETTER, ag, mid),
                       title=f"dead-letter: {ag}/{mid}",
-                      ident_content={"agent": ag, "message_id": mid},
+                      ident_content=ident,
                       human_can_unblock_now=True,
                       fields={"why_it_matters": "a required message could not be delivered",
                               "priority": "high"},

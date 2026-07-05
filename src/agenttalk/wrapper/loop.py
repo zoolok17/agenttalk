@@ -32,6 +32,7 @@ CLASS_POISON = "poison_eligible"
 CLASS_INFRA = "known_global_infra"
 CLASS_AMBIGUOUS = "ambiguous_or_unknown"
 CLASS_CONFIG_BLOCKED = "config_blocked"
+CLASS_INFRA_RETRY_EXHAUSTED = "infra_retry_exhausted"
 
 
 @dataclass(frozen=True)
@@ -96,6 +97,39 @@ def _infra_dominant(rec: dict) -> bool:
     return (_safe_int(rec.get("infra_failures"))
             > _safe_int(rec.get("poison_eligible_failures"))
             + _safe_int(rec.get("ambiguous_failures")))
+
+
+def _iso_epoch(value: object) -> float | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
+def _infra_retry_exhausted(rec: dict, *, now_text: str,
+                           after_seconds: float, min_attempts: int) -> bool:
+    if _safe_int((rec or {}).get("attempts_started")) < max(1, int(min_attempts)):
+        return False
+    first = _iso_epoch((rec or {}).get("first_started_at"))
+    now = _iso_epoch(now_text)
+    if first is None or now is None:
+        return False
+    return (now - first) >= max(0.0, float(after_seconds))
+
+
+def _noninfra_failure_count(rec: dict) -> int:
+    return (_safe_int((rec or {}).get("poison_eligible_failures"))
+            + _safe_int((rec or {}).get("ambiguous_failures")))
+
+
+def _noninfra_failure_class(rec: dict) -> str:
+    if _safe_int((rec or {}).get("ambiguous_failures")) >= _safe_int(
+            (rec or {}).get("poison_eligible_failures")):
+        return CLASS_AMBIGUOUS
+    return CLASS_POISON
 
 
 def is_terminal_control(record: dict) -> bool:
@@ -166,6 +200,9 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              only_request_id: str | None = None,
              max_wall: float | None = None,
              k_poison: int = 3, k_escalate: int = 20,
+             infra_exhaust_after_seconds: float = 14400.0,
+             infra_exhaust_min_attempts: int = 100,
+             noninfra_sub_ceiling: int | None = None,
              on_dead_letter: Callable[[dict], None] | None = None,
              on_escalate: Callable[[dict], None] | None = None,
              heartbeat: Callable[[], None] | None = None,
@@ -233,6 +270,9 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
             max_idle_interval=max_idle_interval, heartbeat_interval=heartbeat_interval,
             clock=clock, sleep=sleep, max_turns=max_turns, max_polls=max_polls,
             max_wall=max_wall, k_poison=k_poison, k_escalate=k_escalate,
+            infra_exhaust_after_seconds=infra_exhaust_after_seconds,
+            infra_exhaust_min_attempts=infra_exhaust_min_attempts,
+            noninfra_sub_ceiling=noninfra_sub_ceiling,
             on_dead_letter=on_dead_letter, on_escalate=on_escalate, stamp=stamp,
             pre_commit=pre_commit, cadence=cadence, on_health_idle=on_health_idle,
             capacity_refresh=capacity_refresh,
@@ -249,6 +289,9 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     sleep: Callable[[float], None], max_turns: int | None,
                     max_polls: int | None, max_wall: float | None,
                     k_poison: int, k_escalate: int,
+                    infra_exhaust_after_seconds: float,
+                    infra_exhaust_min_attempts: int,
+                    noninfra_sub_ceiling: int | None,
                     on_dead_letter: Callable[[dict], None] | None,
                     on_escalate: Callable[[dict], None] | None,
                     stamp: Callable[[], None],
@@ -294,15 +337,30 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         except Exception:  # noqa: BLE001 - advisory capacity must never break loop progress
             return
 
-    def _info(record: dict, rec: dict, failure_class: str) -> dict:
+    def _info(record: dict, rec: dict, failure_class: str, *,
+              infra_exhausted: bool = False, quarantined: bool = False) -> dict:
+        attempts = _safe_int((rec or {}).get("attempts_started"))
+        bucket = "below_backstop"
+        if quarantined:
+            bucket = "quarantined"
+        elif infra_exhausted:
+            bucket = "infra_exhausted"
+        elif k_escalate > 0 and attempts >= k_escalate:
+            bucket = "escalate_backstop"
         return {"agent": agent, "msg_id": record.get("id"), "from": record.get("from"),
                 "subject": record.get("subject"), "kind": record.get("kind"),
                 "request_id": record.get("request_id"),
-                "attempts": _safe_int((rec or {}).get("attempts_started")),  # degrade-low
+                "attempts": attempts,  # degrade-low
+                "attempts_bucket": bucket,
+                "first_started_at": (rec or {}).get("first_started_at"),
+                "requeue_generation": (rec or {}).get("requeue_generation"),
+                "infra_exhausted": infra_exhausted,
+                "quarantined": quarantined,
                 "failure_class": failure_class,
                 "summary": (rec or {}).get("last_failure_summary") or ""}
 
-    def _dispose(record: dict, *, failure_class: str, reason: str | None) -> None:
+    def _dispose(record: dict, *, failure_class: str, reason: str | None,
+                 infra_exhausted: bool = False) -> None:
         """Dead-letter the head record (store advances the cursor past it), then stamp
         progress: DL is PROGRESS, not a failed turn, so the heartbeat goes FRESH and
         the failure backoff resets - the supervisor sees progress + never restarts."""
@@ -323,7 +381,9 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             # is stamped above; a raising notice callback must not crash the loop and leave it
             # stuck - doctor surfaces the sink regardless (no-silent-disposal). Swallow + return.
             try:
-                on_dead_letter(_info(record, rec, failure_class))
+                on_dead_letter(_info(
+                    record, rec, failure_class,
+                    infra_exhausted=infra_exhausted, quarantined=True))
             except Exception:  # noqa: BLE001 - a notification must never crash the loop
                 return
 
@@ -413,16 +473,33 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         # attempts_started already counted the crashed attempt toward the K_escalate ceiling.
         store.reconcile_crash_in_progress(agent, head_id, at=now_iso())
         rec = store.attempt_record(agent, head_id) or {}
-        if (rec.get("last_failure_class") == CLASS_CONFIG_BLOCKED
-                and head_id in config_blocked_ids):
+        if rec.get("last_failure_class") == CLASS_CONFIG_BLOCKED:
+            if isinstance(head_id, str):
+                config_blocked_ids.add(head_id)
             _park_config_blocked(record)
             continue
         # AUTO-DISPOSE WITHOUT DRIVE if a cap is already reached on entry (covers the
         # relaunch/crash-accumulation path - test #3).
         if rec.get("last_failure_class") != CLASS_CONFIG_BLOCKED:
+            cap_now = now_iso()
             if k_poison > 0 and _safe_int(rec.get("poison_eligible_failures")) >= k_poison:
                 _dispose(record, failure_class=CLASS_POISON,
                          reason=rec.get("last_failure_summary"))
+                continue
+            if (noninfra_sub_ceiling is not None and noninfra_sub_ceiling > 0
+                    and _noninfra_failure_count(rec) >= int(noninfra_sub_ceiling)):
+                cls = _noninfra_failure_class(rec)
+                _dispose(record, failure_class=cls,
+                         reason=rec.get("last_failure_summary"))
+                continue
+            if (rec.get("last_failure_class") == CLASS_INFRA
+                    and _infra_retry_exhausted(
+                        rec, now_text=cap_now,
+                        after_seconds=infra_exhaust_after_seconds,
+                        min_attempts=infra_exhaust_min_attempts)):
+                _dispose(record, failure_class=CLASS_INFRA_RETRY_EXHAUSTED,
+                         reason=rec.get("last_failure_summary"),
+                         infra_exhausted=True)
                 continue
             if k_escalate > 0 and _safe_int(rec.get("attempts_started")) >= k_escalate:
                 last_class = rec.get("last_failure_class") or CLASS_AMBIGUOUS
@@ -465,6 +542,19 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         if (k_poison > 0 and outcome.failure_class == CLASS_POISON
                 and _safe_int(rec.get("poison_eligible_failures")) >= k_poison):
             _dispose(record, failure_class=CLASS_POISON, reason=outcome.summary)
+            continue
+        if (noninfra_sub_ceiling is not None and noninfra_sub_ceiling > 0
+                and _noninfra_failure_count(rec) >= int(noninfra_sub_ceiling)):
+            _dispose(record, failure_class=_noninfra_failure_class(rec),
+                     reason=outcome.summary)
+            continue
+        if (outcome.failure_class == CLASS_INFRA
+                and _infra_retry_exhausted(
+                    rec, now_text=now_iso(),
+                    after_seconds=infra_exhaust_after_seconds,
+                    min_attempts=infra_exhaust_min_attempts)):
+            _dispose(record, failure_class=CLASS_INFRA_RETRY_EXHAUSTED,
+                     reason=outcome.summary, infra_exhausted=True)
             continue
         if k_escalate > 0 and _safe_int(rec.get("attempts_started")) >= k_escalate:
             _escalate_once(record, outcome.failure_class)

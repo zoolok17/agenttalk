@@ -63,6 +63,7 @@ _DEFAULTS = {
     "stuck_after_seconds": 120,            # heartbeat older than this = stale
     "suspect_warn_interval_seconds": 300,  # rate-limit for the no-hook warn fallback
     "launch_grace_seconds": 120,           # forking-CLI startup grace (brain discovery + first hb)
+    "restart_cooldown_seconds": 45,        # manual restarts bypass backoff, not every-poll churn
     "max_readiness_retries": 3,            # never-ready relaunches before READINESS_GAVE_UP (no infinite churn)
     "backoff": {"base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180},
     "health": {"ttl_seconds": health_model.DEFAULT_TTL_SECONDS,
@@ -71,7 +72,11 @@ _DEFAULTS = {
     # planner is unchanged). K_poison = deterministic poison-eligible failures before
     # auto-dead-letter; K_escalate = class-agnostic high-attempt backstop (escalate +,
     # for ambiguous/unknown, last-resort dead-letter) so no failure loops forever.
-    "dead_letter": {"max_attempts": 3, "escalate_after_attempts": 20},
+    "dead_letter": {
+        "max_attempts": 3,
+        "escalate_after_attempts": 20,
+        "infra_exhaust_after_seconds": 14400,
+    },
 }
 
 # Per-CLI process-discovery defaults (config["agents"][n] overrides). These
@@ -234,6 +239,99 @@ def resolve_dead_letter_caps(config: dict, cfg_agent: dict) -> tuple[int, int]:
         return int(defaults[key])
 
     return _pick("max_attempts"), _pick("escalate_after_attempts")
+
+
+def resolve_infra_retry_exhaustion(config: dict, cfg_agent: dict,
+                                   k_escalate: int) -> dict:
+    """Resolve the finite infra-exhaustion ceiling.
+
+    This is intentionally separate from ``resolve_dead_letter_caps``: normal operator
+    config cannot set 0/negative to mean "infinite" for prolonged infra retry.
+    """
+    default_after = int(_DEFAULTS["dead_letter"]["infra_exhaust_after_seconds"])
+    safe_k = max(1, int(k_escalate) if isinstance(k_escalate, int) else 20)
+    default_min = max(100, 5 * safe_k)
+    default_noninfra = 2 * safe_k
+    config = config if isinstance(config, dict) else {}
+    cfg_agent = cfg_agent if isinstance(cfg_agent, dict) else {}
+    gcfg = config.get("dead_letter")
+    gcfg = gcfg if isinstance(gcfg, dict) else {}
+    acfg = cfg_agent.get("dead_letter")
+    acfg = acfg if isinstance(acfg, dict) else {}
+
+    def _positive_number(key: str, default: float) -> float:
+        for src in (acfg, gcfg):
+            v = src.get(key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+                return float(v)
+        return float(default)
+
+    def _positive_int(key: str, default: int) -> int:
+        for src in (acfg, gcfg):
+            v = src.get(key)
+            if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+                return v
+        return int(default)
+
+    return {
+        "infra_exhaust_after_seconds": _positive_number(
+            "infra_exhaust_after_seconds", default_after),
+        "infra_exhaust_min_attempts": _positive_int(
+            "infra_exhaust_min_attempts", default_min),
+        "noninfra_sub_ceiling": _positive_int(
+            "noninfra_sub_ceiling", default_noninfra),
+    }
+
+
+def resolve_restart_request_authority(
+    store: Store,
+    requested_by: str | None,
+    *,
+    force_protected: bool = False,
+    acknowledge_live_protected_kill: bool = False,
+) -> dict:
+    """Resolve audited authority for ``request-restart``.
+
+    Mirrors the stand-down envelope: a request is authorized only when the explicit
+    requester is the configured operator-facing liaison, or the sole lead when no
+    liaison is configured. There is no silent default requester.
+    """
+    if not isinstance(requested_by, str) or not requested_by.strip():
+        return {
+            "requested_by": requested_by,
+            "authorized_by": None,
+            "authority_result": "denied",
+            "authority_reason": "missing explicit requested_by",
+            "force_protected_authorized": False,
+            "acknowledge_live_protected_kill_authorized": False,
+        }
+    liaison = store.operator_facing()
+    sole = store.sole_lead()
+    if store.loop_exit_relay_authorized(requested_by):
+        reason = "operator_facing" if liaison and requested_by == liaison else "sole_lead"
+        ack_live = bool(acknowledge_live_protected_kill and liaison and requested_by == liaison)
+        return {
+            "requested_by": requested_by,
+            "authorized_by": requested_by,
+            "authority_result": "authorized",
+            "authority_reason": reason,
+            "force_protected_authorized": bool(force_protected),
+            "force_protected_authorized_by": requested_by if force_protected else None,
+            "acknowledge_live_protected_kill_authorized": ack_live,
+            "acknowledge_live_protected_kill_by": requested_by if ack_live else None,
+        }
+    return {
+        "requested_by": requested_by,
+        "authorized_by": None,
+        "authority_result": "denied",
+        "authority_reason": (
+            "operator_facing required" if liaison else
+            "sole_lead required" if sole else
+            "no operator_facing or sole lead configured"
+        ),
+        "force_protected_authorized": False,
+        "acknowledge_live_protected_kill_authorized": False,
+    }
 
 
 def resolve_health_timing(config: dict, cfg_agent: dict) -> dict:
@@ -1813,6 +1911,14 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     grace_seconds = float(config.get("launch_grace_seconds", _DEFAULTS["launch_grace_seconds"]))
     max_readiness_retries = int(config.get(
         "max_readiness_retries", _DEFAULTS["max_readiness_retries"]))
+    raw_restart_cooldown = config.get(
+        "restart_cooldown_seconds", _DEFAULTS["restart_cooldown_seconds"])
+    restart_cooldown = (
+        float(raw_restart_cooldown)
+        if isinstance(raw_restart_cooldown, (int, float)) and not isinstance(raw_restart_cooldown, bool)
+        else float(_DEFAULTS["restart_cooldown_seconds"])
+    )
+    restart_cooldown = min(60.0, max(30.0, restart_cooldown))
     activity_hook = bool(cfg_agent.get("activity_hook", False))
     _lcfg = _liveness_cfg(cfg_agent)
     # A WRAPPED agent is instrumented BY CONSTRUCTION: the wrap --loop loop writes
@@ -1851,8 +1957,23 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     watchdog_preempted = (wrapped and cli_name == "codex" and watchdog_live
                           and stuck_after <= watchdog_turn_elapsed + _WATCHDOG_STUCK_AFTER_MARGIN
                           and not allow_low_stuck_after)
+    from agenttalk.wrapper import work_heartbeat as _whb
+    _work_hb_problem = None
+    if wrapped and cli_name == "claude":
+        _whb_cfg = _whb.resolve_work_heartbeat(
+            config, cfg_agent, cli=cli_name, mode=_whb.MODE_LOOP)
+        _work_hb_problems = list(_whb_cfg.config_errors)
+        _work_hb_violation = _whb.interval_violation(
+            _whb_cfg, stuck_after_seconds=stuck_after)
+        if _work_hb_violation:
+            _work_hb_problems.append(_work_hb_violation)
+        if not _whb_cfg.enabled:
+            _work_hb_problem = "work heartbeat ticker disabled"
+        elif _work_hb_problems:
+            _work_hb_problem = "; ".join(_work_hb_problems)
     can_confirm_stuck = ((activity_hook or wrapped)
-                         and not unsafe_low_codex and not watchdog_preempted)
+                         and not unsafe_low_codex and not watchdog_preempted
+                         and _work_hb_problem is None)
     # the EFFECTIVE isolation flag (per-CLI default merged) - emitted in the plan
     # so the executor seeds CODEX_HOME exactly when the planner assumed it, even
     # if the raw config omits the field (codex impl-review MAJOR).
@@ -1877,12 +1998,11 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         if isinstance(hb_age, (int, float)):
             hb_stale = float(hb_age) > stuck_after
     health = rpt.get("health") if isinstance(rpt.get("health"), dict) else {}
-    health_state = health_model.label(health)
-    health_working = (
-        health_state in (health_model.STATE_WORKING_TURN,
-                         health_model.STATE_WORKING_SILENT)
-        and not bool(health.get("stale", True))
-    )
+    if hb_stale and health_model.label(health) == health_model.STATE_WORKING_SILENT:
+        health = dict(health)
+        warnings = health.get("warnings") if isinstance(health.get("warnings"), list) else []
+        if "advisory-health-conflict" not in warnings:
+            health["warnings"] = [*warnings, "advisory-health-conflict"]
     marker = rpt.get("restart_request") or None
     consumed = list(st.get("consumed_rids", []))
     fails = int(st.get("consecutive_fails", 0))
@@ -1983,22 +2103,56 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     # 0) Manual restart-request marker (highest priority).
     if isinstance(marker, dict) and isinstance(marker.get("request_id"), str):
         rid = marker["request_id"]
-        if protected and not bool(marker.get("force_protected")):
+        auth_ok = (
+            marker.get("authority_result") == "authorized"
+            and isinstance(marker.get("requested_by"), str)
+            and isinstance(marker.get("authorized_by"), str)
+            and marker.get("authorized_by") == marker.get("requested_by")
+        )
+        if not auth_ok:
             nxt["last_warn_epoch"] = now_epoch
-            return _result(REFUSE_PROTECTED, state="REFUSE_PROTECTED", clear_marker=rid,
+            return _result(REFUSE_PROTECTED, state="RESTART_UNAUTHORIZED",
+                           notify=True,
+                           reason="restart-request has no valid authorization marker")
+        if protected and not (
+                marker.get("force_protected_authorized") is True
+                and isinstance(marker.get("force_protected_authorized_by"), str)):
+            nxt["last_warn_epoch"] = now_epoch
+            return _result(REFUSE_PROTECTED, state="REFUSE_PROTECTED",
                            notify=True, reason="restart of a protected agent requires "
-                                               "--force-protected")
+                                               "authorized --force-protected")
         if rid not in consumed:
+            if protected and not hb_stale and not bool(
+                    marker.get("acknowledge_live_protected_kill_authorized")):
+                nxt["last_warn_epoch"] = now_epoch
+                return _result(REFUSE_PROTECTED, state="LIVE_PROTECTED_REFUSED",
+                               notify=True,
+                               reason="protected agent has a fresh heartbeat; repeat the "
+                                      "operator-facing request with "
+                                      "--acknowledge-live-protected-kill")
+            last_launch = st.get("last_launch_epoch")
+            if isinstance(last_launch, (int, float)) and now_epoch - float(last_launch) < restart_cooldown:
+                return _result(BACKOFF_WAIT, state="RESTART_COOLDOWN",
+                               reason=f"manual restart-request {rid} cooling down "
+                                      f"until {float(last_launch) + restart_cooldown:.0f} "
+                                      f"(requested_by={marker.get('requested_by')})")
             nxt["consumed_rids"] = [*consumed, rid]
             kt = _targets(include_launcher=True)
             _relaunch_state()
             nxt["readiness_fails"] = 0   # operator restart CLEARS a readiness give-up
-            return _result(RELAUNCH, state="MANUAL_RESTART", clear_marker=rid,
+            nxt["restart_request_state"] = "applied_pending_readiness"
+            nxt["pending_restart_request_id"] = rid
+            nxt["restart_requested_by"] = marker.get("requested_by")
+            nxt["restart_authorized_by"] = marker.get("authorized_by")
+            nxt["restart_authority_result"] = marker.get("authority_result")
+            nxt["restart_authority_reason"] = marker.get("authority_reason")
+            return _result(RELAUNCH, state="MANUAL_RESTART",
                            kill_first=bool(kt), kill_targets=kt, bypass_backoff=True,
                            reason=f"manual restart-request {rid}")
-        if not hb_stale:
+        if not hb_stale and readiness_seen:
+            nxt["restart_request_state"] = "readiness_seen"
             return _result(CLEAR_MARKER, state="HEALTHY_IDLE", clear_marker=rid,
-                           reason=f"restart {rid} already applied; clearing marker")
+                           reason=f"restart {rid} reached readiness; clearing marker")
         # consumed but still stale -> relaunch failed; fall through (no re-bypass).
 
     # 1) LAUNCHING: still in grace with readiness unresolved. Launcher death and
@@ -2055,15 +2209,6 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             nxt["last_warn_epoch"] = now_epoch
             return _result(WARN_ONLY, state="STUCK_OR_DEAD", notify=True,
                            reason="protected agent heartbeat stale - recover manually")
-        if health_working:
-            reason = (
-                f"heartbeat stale but advisory health={health_state}; delaying "
-                "automatic recovery until health goes unknown/stale or the heartbeat recovers")
-            if now_epoch - last_warn >= suspect_interval:
-                nxt["last_warn_epoch"] = now_epoch
-                return _result(SUSPECT_WARN, state="ACTIVE_OR_BUSY", reason=reason)
-            return _result(NONE, state="ACTIVE_OR_BUSY",
-                           reason="advisory working health delay (warn rate-limited)")
         if not can_confirm_stuck:
             if unsafe_low_codex:
                 warn_reason = (
@@ -2079,6 +2224,11 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                     "margin - REFUSING restart-on-stale (it would relaunch into the same "
                     "wedge before the per-turn watchdog fires); raise stuck_after_seconds "
                     "above the deadline+margin or set allow_low_stuck_after=true to opt in")
+            elif _work_hb_problem is not None:
+                warn_reason = (
+                    "heartbeat stale but wrapped Claude work-heartbeat ticker is not "
+                    f"authoritative ({_work_hb_problem}); refusing stale recovery until "
+                    "doctor/config repair")
             else:
                 warn_reason = ("heartbeat stale but NO activity hook - cannot "
                                "confirm stuck; not killed")
@@ -3379,7 +3529,7 @@ do {
             if (-not (Assert-ActionsEnabled ("record-launch {0}" -f $name))) { continue }
             & $AgenttalkCmd --root $Root supervise --record-launch --for $name --cli $p.cli --pid $res.pid @extra --pre-snapshot-file $preLaunchPath --post-snapshot-file $postLaunchPath --now $now --state-file $StatePath | Out-Null
             $state = Load-State
-            # Clear the manual marker ONLY after a CONFIRMED relaunch.
+            # Manual restart markers clear on a later readiness-seen plan tick, not on PID return.
             if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }
           } else {
             Write-Warning ("supervisor: {0}: {1} FAILED (no PID) - keeping marker/state for retry" -f $name, $p.action)
