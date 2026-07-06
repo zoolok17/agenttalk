@@ -12,6 +12,40 @@ major · `P2` minor · `P3` nit. Each item: what, why, where, disposition.
 
 ---
 
+## P2 · PLANNED — CI test-suite timing flakiness (systematic hardening pass) (2026-07-06)
+
+**What.** The CI matrix (3.10–3.13 × win/mac/ubuntu) intermittently reddens on
+**timing-sensitive tests** that assume thread scheduling / async-write ordering. On a
+single loaded runner cell an assertion can observe fewer events (or an un-flushed
+buffer) than expected, while every other cell + the local 3.10/3.14 gate pass. Two
+distinct instances were confirmed on 2026-07-06 (both single-cell, re-run green =
+timing only, no product defect):
+- **FIXED (`29e7d7e`, test-only)** — `tests/test_web.py::test_thread_route_real_error_returns_500_and_logs`
+  asserted `"Traceback" in err` immediately after the client got its 500, but the
+  ThreadingHTTPServer logs the traceback from the **handler thread** after the response;
+  `capfd` capture raced the write (macOS-3.11). Hardened with `_read_stderr_until` — a
+  bounded poll that accumulates drained `capfd` output until the needles appear or a
+  timeout, assertions unchanged (a real missing-traceback regression still fails).
+- **OPEN** — `tests/test_work_heartbeat.py::test_make_drive_long_silent_claude_turn_stays_live_and_ends_fresh`
+  (~line 358) asserts `status["stamps"] >= 2` — the work-heartbeat ticker (0.05s interval)
+  is expected to fire ≥2× during a 0.5s silent child turn, but a starved ticker thread on
+  a loaded runner got only 1 tick (`assert 1 >= 2`, 3.12-windows). Pre-existing; unrelated
+  to the `29e7d7e` change.
+
+**Why not chased one-by-one.** Two distinct flakes in consecutive runs is a *suite-level*
+signal. Reactive one-offs are inefficient and the fixes involve test-design judgment
+(lengthen the silent window vs. wait-for-condition vs. count-tolerance) best made
+deliberately, ideally by the test owner — not reactively/unsupervised.
+
+**Disposition.** `P2 PLANNED`. Recommend a **single focused hardening pass**: audit tests
+that assert a *minimum count* of async/scheduled events or read captured output
+immediately after an async producer, and make them deterministic (wait-for-condition with
+a bounded timeout; generous interval margins; or count-tolerant with a wait). Master stays
+green via targeted job re-runs in the interim (the flakes are timing-only). Relates to the
+`work-heartbeat P3s` planned item below.
+
+---
+
 ## Recently shipped
 
 - **SHIPPED - v0.66.0 / pending - lane worktree isolation.**
