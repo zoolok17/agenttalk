@@ -331,6 +331,18 @@ two parallel ownership concepts.
   message with a fresh id and fresh attempt count; it does not rewind the cursor
   or delete the original evidence. `dead-letter resolve` is an operator
   disposition; the payload remains for audit.
+- **Failure classification is structured-first (0.69.2).** A global-infra
+  label (which retries rather than dead-letters) requires a *structured* signal
+  — a retryable rate-limit event, or an API status of 429/529/5xx/auth-outage —
+  with legacy free-text markers (`timeout`/`unavailable`/`temporarily`/…)
+  demoted to an ambiguous fallback used only when no structured fact exists, so
+  a local error is not misread as a provider outage (`config_blocked` keeps
+  first precedence). For diagnosis, a bounded **redacted** tail of the child's
+  `stdout`/`stderr` is persisted with the dead-letter sidecar and shown by
+  `dead-letter show`; it is never classification authority. Redaction strips
+  `Authorization` bearer + assignment-style credentials before persistence, and
+  the tail is byte-bounded by per-character UTF-8 cost (a multi-byte/non-BMP
+  line cannot overflow the cap or split a character). Module: `redaction.py`.
 
 ## 5. Design decisions & rationale (ADR-lite)
 

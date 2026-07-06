@@ -88,8 +88,32 @@ lead). Re-run on demand and refreshed as the codebase changes.
 All entries below shipped through the §1 pipeline. **CI (tests + security) is green for
 every release listed** — with one honest exception: v0.64.0's `security` leg went red on a
 gitleaks false-positive (a redaction-test's synthetic secret, not a real leak or code defect),
-corrected in v0.64.1. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
+corrected in v0.64.1; and v0.69.1's `tests` leg went red on an environment-fragile `doctor` test
+(it asserted the *global* `doctor` exit code / overall severity, which depend on which CLIs are
+installed on the runner — a test-only fragility, not a code defect; the dev host has the CLIs so it
+passed the lead gate but a clean CI runner did not), fixed test-only in the follow-up commit
+`748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
+
+### v0.69.2 — wrapper failure taxonomy + redacted dead-letter output tail (2026-07-06)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `7d6e0c3` · tag `v0.69.2`
+- **Review:** design-first (codex) → lead-gated → build in an isolated worktree → **both reviewers GO
+  on the final SHA** (reviewer-1 + reviewer-2, verdicts verified directly from the store). This
+  security-sensitive surface (secret redaction + byte-bounding of a persisted child-output tail) took
+  **four folds**, each closing a real reviewer-reproduced bug: (1) the tail leaked `Authorization`
+  bearer + quoted assignment secrets; (2) *short* `Authorization` credential values still leaked; (3) a
+  non-BMP Unicode line sliced on raw UTF-8 bytes could store 4100 bytes over the 4096 cap. Each fold
+  added a regression and the findings narrowed to convergence — no single-reviewer path would have
+  caught all three.
+- **Gate:** ruff/bandit/**gitleaks** (git-mode + range)/diff/compileall clean; pytest **2017 passed /
+  3 skipped on 3.10 AND 3.14** (clean venvs).
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green (watched post-push).
+- **Robust/Secure:** the child-output tail is **not** classification authority; secrets are redacted
+  before persistence (`Authorization` bearer + assignment-style credentials); the tail is byte-bounded
+  by per-character UTF-8 cost (multi-byte-safe). Infra classification is **structured-first** — a
+  global-outage label requires a structured rate-limit / API-status signal, with legacy free-text
+  markers demoted to an ambiguous fallback, so a local error is no longer misread as a provider outage.
+  Fixes Bug 4 + Bug 5 from the 2026-07-06 wrapped-fleet incident report. New module: `redaction.py`.
 
 ### v0.69.1 — supervisor duplicate-wrapper containment (2026-07-06)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `9456cfa` · tag `v0.69.1`

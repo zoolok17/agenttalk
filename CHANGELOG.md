@@ -5,6 +5,31 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.69.2] - 2026-07-06
+
+### Fixed
+
+- **Wrapper infra-vs-local failure classification is now structured, not substring-guessed.** A failed
+  drive is labelled a global-infra outage — which retries under backoff instead of dead-lettering —
+  only when a *structured* signal says so: a retryable rate-limit event, or a structured API status of
+  429 / 529 / 5xx / auth outage. Legacy free-text markers (`timeout`, `unavailable`, `temporarily`, …)
+  are now an ambiguous fallback used only when no structured fact exists, so a local error whose
+  message merely contains an infra-like word is no longer misattributed to a provider outage.
+  `config_blocked` (preflight / local runtime blocks) keeps first precedence.
+
+### Added
+
+- **Dead-letter records now preserve a bounded, redacted tail of the child process's output.** When a
+  turn fails, a size-capped tail of the child `stdout`/`stderr` is persisted with the dead-letter
+  sidecar and surfaced by `agenttalk dead-letter show`, so an operator can see *why* a message was
+  quarantined instead of only its failure label. The tail is **not** used for classification authority.
+  Secrets are redacted before persistence — `Authorization` bearer values and quoted/unquoted
+  assignment-style credentials (tokens, passwords) are stripped — and the tail is byte-bounded by
+  per-character UTF-8 cost, so a multi-byte (non-BMP) line cannot overflow the cap or split a
+  character.
+
+_Context: fixes Bug 4 and Bug 5 from the 2026-07-06 wrapped-fleet incident report._
+
 ## [0.69.1] - 2026-07-06
 
 ### Fixed
