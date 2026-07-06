@@ -4697,8 +4697,9 @@ def _merge_post_tool_use_hook(
     heartbeat``: the FIRST match is UPGRADED in place to the current command, and
     any ADDITIONAL heartbeat hooks are removed (dedupe) - so an upgrade from a
     pre-0.31.1 install never leaves a bare (blocking) hook or a duplicate."""
-    if preserve_existing_fallback and _has_fallback_activity_hook(settings):
-        return False
+    prefer_existing_fallback = (
+        preserve_existing_fallback and _has_fallback_activity_hook(settings)
+    )
     hooks = settings.setdefault("hooks", {})
     groups = hooks.setdefault("PostToolUse", [])
     if not isinstance(groups, list):
@@ -4710,14 +4711,25 @@ def _merge_post_tool_use_hook(
             continue
         kept: list = []
         for h in g.get("hooks", []):
-            if isinstance(h, dict) and _parse_activity_hook_command(h.get("command")) is not None:
-                if seen:
-                    changed = True          # drop the duplicate (dedupe)
-                    continue
-                seen = True
-                if h.get("command") != target_command:
-                    h["command"] = target_command
-                    changed = True
+            if isinstance(h, dict):
+                parsed = _parse_activity_hook_command(h.get("command"))
+            else:
+                parsed = None
+            if parsed is not None:
+                if prefer_existing_fallback:
+                    if parsed[0] == "fallback" and not seen:
+                        seen = True
+                    else:
+                        changed = True      # drop neutral/legacy/duplicate hooks
+                        continue
+                else:
+                    if seen:
+                        changed = True      # drop the duplicate (dedupe)
+                        continue
+                    seen = True
+                    if h.get("command") != target_command:
+                        h["command"] = target_command
+                        changed = True
             kept.append(h)
         if isinstance(g.get("hooks"), list) and len(kept) != len(g["hooks"]):
             g["hooks"] = kept

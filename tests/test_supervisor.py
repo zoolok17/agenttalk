@@ -1890,6 +1890,19 @@ def _post_tool_commands(path: Path) -> list[str]:
         if isinstance(h, dict) and "command" in h
     ]
 
+
+def _recognized_heartbeat_commands(commands: list[str]) -> list[str]:
+    return [
+        command
+        for command in commands
+        if (
+            command == "agenttalk heartbeat"
+            or command == "agenttalk heartbeat --hook"
+            or command.startswith("agenttalk heartbeat --hook --fallback-for ")
+        )
+    ]
+
+
 def test_install_activity_hook_merges_and_is_idempotent(tmp_path: Path) -> None:
     s = _team(tmp_path)
     settings = s.root / ".claude" / "settings.json"
@@ -2030,6 +2043,7 @@ def test_install_activity_hook_interactive_rebinds_wrong_fallback_without_dup(
 
 def test_install_activity_hook_neutral_does_not_downgrade_existing_fallback(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture,
 ) -> None:
     s = _team(tmp_path)
     settings = s.root / ".claude" / "settings.json"
@@ -2041,7 +2055,33 @@ def test_install_activity_hook_neutral_does_not_downgrade_existing_fallback(
 
     assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
 
-    assert _post_tool_commands(settings) == [fallback]
+    assert "already:" in capsys.readouterr().out
+    cmds = _post_tool_commands(settings)
+    assert cmds == [fallback]
+    assert _recognized_heartbeat_commands(cmds) == [fallback]
+
+
+def test_install_activity_hook_neutral_dedupes_mixed_fallback_and_neutral(
+    tmp_path: Path,
+) -> None:
+    s = _team(tmp_path)
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    fallback = "agenttalk heartbeat --hook --fallback-for lead"
+    neutral = "agenttalk heartbeat --hook"
+    settings.write_text(json.dumps({"hooks": {"PostToolUse": [
+        {"matcher": "*", "hooks": [
+            {"type": "command", "command": fallback},
+            {"type": "command", "command": "echo other"}]},
+        {"matcher": "Edit", "hooks": [
+            {"type": "command", "command": neutral}]},
+    ]}}), encoding="utf-8")
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+
+    cmds = _post_tool_commands(settings)
+    assert _recognized_heartbeat_commands(cmds) == [fallback]
+    assert "echo other" in cmds
 
 
 def test_install_activity_hook_interactive_refuses_non_liaison(
