@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import doctor, install_skills as iskl, signing
+from agenttalk import cli, doctor, install_skills as iskl, signing
 from agenttalk.store import Store
 
 
@@ -687,6 +687,39 @@ def test_doctor_supervised_codex_ignores_non_dict_supervisor_json(tmp_path: Path
     assert doctor._check_supervised_codex(s) is None
     report = doctor.run(tmp_path)
     assert not any(c.name == "supervised_codex" for c in report.checks)
+
+
+def test_doctor_supervisor_script_guard_absent_for_new_generated_script(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["worker"])
+    assert cli.main(["--root", str(tmp_path), "supervise", "--init"]) == 0
+
+    assert doctor._check_supervisor_script_guard(s) is None
+
+
+def test_doctor_supervisor_script_missing_singleton_guard_warns_advisory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = Store(tmp_path)
+    s.init(["worker"])
+    (s.dir / "supervisor.ps1").write_text(
+        "# agenttalk supervisor\n"
+        "& $AgenttalkCmd --root $Root supervise --plan\n",
+        encoding="utf-8",
+    )
+
+    chk = doctor._check_supervisor_script_guard(s)
+    assert chk is not None
+    assert chk.status == "warn"
+    assert chk.name == "supervisor_script"
+    assert "--claim-instance" in chk.details
+    assert "supervise --init --force" in chk.fix
+
+    rc = cli.main(["--root", str(tmp_path), "doctor"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "supervisor_script" in out
+    assert "overall: WARN" in out
 
 
 def test_doctor_supervised_codex_ok_requires_full_env_mirror(tmp_path: Path) -> None:

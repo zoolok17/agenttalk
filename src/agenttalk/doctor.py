@@ -117,6 +117,9 @@ def run(project_root: Path | None = None) -> Report:
         codex_vis = _check_supervised_codex(store, runtime_checker=_check_agenttalk_runtime)
         if codex_vis is not None:  # additive: absent unless a supervised codex agent
             report.checks.append(codex_vis)
+        supervisor_script = _check_supervisor_script_guard(store)
+        if supervisor_script is not None:  # additive: absent unless stale/unreadable
+            report.checks.append(supervisor_script)
         holds = _check_config_blocked_holds(store)
         if holds is not None:  # additive: absent unless a valid config-blocked hold exists
             report.checks.append(holds)
@@ -1052,6 +1055,40 @@ def _read_supervisor_ps1_pin(store: Store) -> str | None:
         return None
     m = _SUPERVISOR_PS1_PIN_RE.search(text)
     return m.group(1).replace("''", "'").strip() if m else None
+
+
+def _check_supervisor_script_guard(store: Store) -> Check | None:
+    p = store.dir / "supervisor.ps1"
+    if not p.exists():
+        return None
+    try:
+        text = p.read_text(encoding="utf-8-sig")
+    except OSError as e:
+        return Check(
+            name="supervisor_script",
+            status="warn",
+            details=f"could not read supervisor.ps1 to verify singleton guard: {e}",
+            fix="regenerate the supervisor script with `agenttalk supervise --init --force`",
+        )
+    has_claim = "--claim-instance" in text
+    has_release = "--release-instance" in text
+    if has_claim and has_release:
+        return None
+    missing = []
+    if not has_claim:
+        missing.append("--claim-instance")
+    if not has_release:
+        missing.append("--release-instance")
+    return Check(
+        name="supervisor_script",
+        status="warn",
+        details=(
+            "supervisor.ps1 is missing the singleton guard "
+            f"({', '.join(missing)}); multiple old supervisors can run concurrently"
+        ),
+        fix="regenerate it with `agenttalk supervise --init --force`",
+        data={"path": str(p), "missing": missing},
+    )
 
 
 def _resolve_agenttalk_pin(store: Store | None, *, wrapped: bool,

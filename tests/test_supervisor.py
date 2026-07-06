@@ -88,6 +88,7 @@ def test_ps_template_claims_instance_drains_and_releases_under_brake() -> None:
     assert "'supervise', '--claim-instance'" in ps
     assert "'supervise', '--drain-intents'" in ps
     assert "'supervise', '--release-instance'" in ps
+    assert "supervise --launch-barrier" in ps
     assert "'--pid-start', $SupervisorStart" in ps
     assert "Assert-ActionsEnabled 'drain-intents'" in ps
     assert "finally" in ps
@@ -3492,6 +3493,259 @@ def test_process_ownership_legacy_managed_pids_rederive_only_when_freshly_attrib
     assert managed[11]["source"] == "legacy_rederived"
     assert 12 not in managed
     assert p["diagnostics"]["legacy_unverifiable_dropped"] == 1
+
+
+def test_process_ownership_drifted_launcher_targets_cmdline_matched_wrapper() -> None:
+    snap = [
+        _proc(22, 1, "python.exe", _wrap_cmd(), _ps_iso(220000)),
+    ]
+    p = sup.plan_actions(
+        _ownership_report(),
+        _ownership_state(launcher_pid=10, launcher_start=_ps_iso(100000)),
+        _WRAP_CONFIG,
+        now_epoch=NOW,
+        snapshot=snap,
+    )["agents"]["worker"]
+    assert p["kill_targets"] == [{
+        "pid": 22,
+        "start": _ps_iso(220000),
+        "reason": "own_wrapper",
+        "source": "own_wrapper",
+    }]
+
+
+def test_launch_barrier_duplicate_orphan_wrapper_blocks_replacement() -> None:
+    snap = [
+        _proc(22, 1, "python.exe", _wrap_cmd(), _ps_iso(220000)),
+    ]
+    result = sup.evaluate_launch_barrier(
+        snap,
+        _ownership_state(launcher_pid=10, launcher_start=_ps_iso(100000)),
+        _WRAP_CONFIG,
+        "worker",
+        root_key=sup._root_key(TEST_ROOT),
+    )
+    assert result["blocked"] is True
+    assert result["allow_launch"] is False
+    assert result["reason"] == "same_agent_wrapper_survived"
+    assert result["survivor_count"] == 1
+    assert result["survivors"] == [{"kind": "own_wrapper", "pid": 22, "name": "python.exe"}]
+
+
+def test_launch_barrier_same_agent_wait_survivor_blocks_replacement() -> None:
+    snap = [
+        _proc(31, 1, "python.exe",
+              f"python -m agenttalk --root {TEST_ROOT} wait --for worker",
+              _ps_iso(310000)),
+    ]
+    result = sup.evaluate_launch_barrier(
+        snap,
+        _ownership_state(launcher_pid=10, launcher_start=_ps_iso(100000)),
+        _WRAP_CONFIG,
+        "worker",
+        root_key=sup._root_key(TEST_ROOT),
+    )
+    assert result["blocked"] is True
+    assert result["reason"] == "same_agent_wait_survived"
+
+
+def test_launch_barrier_clear_snapshot_allows_replacement() -> None:
+    snap = [
+        _proc(44, 1, "python.exe",
+              f"python -m agenttalk --root {TEST_ROOT} wrap --for other --loop",
+              _ps_iso(440000)),
+    ]
+    result = sup.evaluate_launch_barrier(
+        snap,
+        _ownership_state(launcher_pid=10, launcher_start=_ps_iso(100000)),
+        _WRAP_CONFIG,
+        "worker",
+        root_key=sup._root_key(TEST_ROOT),
+    )
+    assert result["allow_launch"] is True
+    assert result["blocked"] is False
+    assert result["reason"] == "clear"
+
+
+def test_launch_barrier_snapshot_unavailable_does_not_stack_prior_wrapper() -> None:
+    blocked = sup.evaluate_launch_barrier(
+        None,
+        _ownership_state(launcher_pid=10, launcher_start=_ps_iso(100000)),
+        _WRAP_CONFIG,
+        "worker",
+        root_key=sup._root_key(TEST_ROOT),
+    )
+    assert blocked["blocked"] is True
+    assert blocked["reason"] == "snapshot_unavailable_prior_maybe_alive"
+
+    first_launch = sup.evaluate_launch_barrier(
+        None,
+        {"agents": {"worker": {}}},
+        _WRAP_CONFIG,
+        "worker",
+        root_key=sup._root_key(TEST_ROOT),
+    )
+    assert first_launch["allow_launch"] is True
+
+
+def test_launch_barrier_state_enters_backoff_without_fake_launch_grace() -> None:
+    state = {"agents": {"worker": _wrap_ready(
+        consecutive_fails=0,
+        backoff_next_epoch=0,
+        launch_grace_until=0,
+    )}}
+    p = _plan_wrap(
+        _report(heartbeat_stale=True),
+        state,
+        snapshot=_wrap_snap(),
+    )
+
+    assert p["action"] == sup.STUCK_RECOVER
+    assert p["next_state"]["launching"] is True
+    barrier = p["barrier_state"]
+    assert barrier["launching"] is False
+    assert barrier["readiness_seen"] is True
+    assert barrier["launch_grace_until"] == 0.0
+    assert barrier["consecutive_fails"] == 1
+    assert barrier["backoff_next_epoch"] == NOW + 30
+
+    p2 = _plan_wrap(
+        _report(heartbeat_stale=True),
+        {"agents": {"worker": barrier}},
+        now=NOW + 1,
+        snapshot=_wrap_snap(),
+    )
+    assert p2["action"] == sup.BACKOFF_WAIT
+    assert p2["state"] == "STUCK_OR_DEAD"
+
+
+def test_launch_barrier_state_preserves_manual_restart_until_spawn() -> None:
+    marker = _auth_marker("rr-barrier")
+    p = _plan_wrap(
+        _report(heartbeat_stale=True, restart_request=marker),
+        {"agents": {"worker": _wrap_ready(backoff_next_epoch=0)}},
+        snapshot=_wrap_snap(),
+    )
+
+    assert p["action"] == sup.RELAUNCH
+    assert "rr-barrier" in p["next_state"]["consumed_rids"]
+    barrier = p["barrier_state"]
+    assert "rr-barrier" not in barrier["consumed_rids"]
+    assert barrier["launching"] is False
+    assert barrier.get("restart_request_state") != "applied_pending_readiness"
+
+    p2 = _plan_wrap(
+        _report(heartbeat_stale=True, restart_request=marker),
+        {"agents": {"worker": barrier}},
+        now=NOW + 1,
+        snapshot=_wrap_snap(),
+    )
+    assert p2["action"] == sup.RELAUNCH
+    assert p2["state"] == "MANUAL_RESTART"
+    assert p2["clear_marker"] is None
+
+
+def test_launch_barrier_event_is_deduped(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    sup.record_supervisor_launch_barrier_event(
+        s, "worker",
+        reason_code="same_agent_wrapper_survived",
+        now_epoch=NOW,
+    )
+    sup.record_supervisor_launch_barrier_event(
+        s, "worker",
+        reason_code="same_agent_wrapper_survived",
+        now_epoch=NOW + 1,
+    )
+    events, warnings = sup.read_supervisor_events(s)
+    assert warnings == []
+    decisions = [e for e in events if e.get("kind") == "agent_decision"]
+    assert len(decisions) == 1
+    assert decisions[0]["action"] == "launch_barrier"
+    assert decisions[0]["reason_code"] == "same_agent_wrapper_survived"
+
+
+def test_launch_barrier_event_dedupes_across_generated_plan_sequence(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    plan = {
+        "agents": {
+            "worker": {
+                "action": sup.STUCK_RECOVER,
+                "state": "STUCK_OR_DEAD",
+                "reason": "stale heartbeat",
+                "notify": True,
+            },
+        },
+    }
+
+    for i in range(2):
+        sup.record_supervisor_plan_events(
+            s, plan,
+            now_epoch=NOW + (i * 2),
+            summary_interval_seconds=999999,
+        )
+        sup.record_supervisor_launch_barrier_event(
+            s, "worker",
+            reason_code="same_agent_wrapper_survived",
+            now_epoch=NOW + (i * 2) + 1,
+        )
+
+    events, warnings = sup.read_supervisor_events(s)
+    assert warnings == []
+    decisions = [e for e in events if e.get("kind") == "agent_decision"]
+    assert [e["action"] for e in decisions] == [
+        sup.STUCK_RECOVER,
+        "launch_barrier",
+    ]
+
+
+def test_supervise_launch_barrier_cli_reports_block_and_records_event(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _team(tmp_path)
+    state_file = s.dir / "supervisor-state.json"
+    snapshot_file = s.dir / "supervisor-barrier-worker.json"
+    state_file.write_text(
+        json.dumps(_ownership_state(launcher_pid=10, launcher_start=_ps_iso(100000))),
+        encoding="utf-8",
+    )
+    snapshot_file.write_text(
+        json.dumps([_proc(22, 1, "python.exe", _wrap_cmd(root=str(tmp_path)), _ps_iso(220000))]),
+        encoding="utf-8",
+    )
+
+    rc = _run([
+        "supervise", "--launch-barrier",
+        "--for", "worker",
+        "--state-file", str(state_file),
+        "--snapshot-file", str(snapshot_file),
+        "--record-events",
+        "--now", str(NOW),
+    ], tmp_path)
+
+    assert rc == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["blocked"] is True
+    assert result["reason"] == "same_agent_wrapper_survived"
+    events, warnings = sup.read_supervisor_events(s)
+    assert warnings == []
+    assert [e["action"] for e in events if e.get("kind") == "agent_decision"] == [
+        "launch_barrier",
+    ]
+
+
+def test_ps_template_rechecks_launch_barrier_after_stop_tree_before_launch() -> None:
+    ps = sup.PS_TEMPLATE
+    block_start = ps.index("if (($p.kill_first -or $p.kill_orphans)")
+    block_end = ps.index("# SEED the agent", block_start)
+    block = ps[block_start:block_end]
+    assert block.index("Stop-Tree $p.kill_targets") < block.index("--launch-barrier")
+    assert "Get-ProcSnapshot $barrierPath" in block
+    assert "Write-Warning" in block
+    assert "$state.agents.$name = $p.barrier_state" in block
+    assert "continue" in block
+    launch_idx = ps.index("$res = Launch $name", block_end)
+    assert block_end < launch_idx
 
 
 def test_process_ownership_stop_tree_closed_set_pin() -> None:

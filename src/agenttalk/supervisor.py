@@ -87,6 +87,7 @@ _DEFAULTS = {
 SUPERVISOR_EVENT_RING_CAP = 512
 SUPERVISOR_EVENT_TAIL_BYTES = 262_144
 SUPERVISOR_EVENT_SUMMARY_INTERVAL_SECONDS = 300.0
+_LAUNCH_BARRIER_ACTION = "launch_barrier"
 LEAD_LIVENESS_STALE_AFTER_SECONDS = 60.0
 _EVENT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
 
@@ -431,6 +432,9 @@ def _event_epoch(value: object) -> float | None:
 
 
 def _decision_reason_code(plan: dict) -> str:
+    explicit = _event_token(plan.get("reason_code"), "")
+    if explicit:
+        return explicit.lower()
     health = plan.get("health") if isinstance(plan.get("health"), dict) else {}
     warnings = health.get("warnings") if isinstance(health.get("warnings"), list) else []
     if "advisory-health-conflict" in warnings:
@@ -657,6 +661,8 @@ def record_supervisor_plan_events(store: Store, plan: dict, *,
         last_summary_epoch: float | None = None
         for event in prior:
             if event.get("kind") == "agent_decision":
+                if event.get("action") == _LAUNCH_BARRIER_ACTION:
+                    continue
                 agent = event.get("agent")
                 fp = event.get("fingerprint")
                 if isinstance(agent, str) and isinstance(fp, str):
@@ -677,6 +683,36 @@ def record_supervisor_plan_events(store: Store, plan: dict, *,
                 or now_epoch - last_summary_epoch >= float(summary_interval_seconds)):
             new_events.append(_summary_event(plan, now_epoch=now_epoch))
         append_supervisor_events(store, new_events, cap=cap)
+    except Exception:
+        return
+
+
+def record_supervisor_launch_barrier_event(store: Store, agent: str, *,
+                                           reason_code: str, now_epoch: float,
+                                           cap: int = SUPERVISOR_EVENT_RING_CAP) -> None:
+    """Append a deduped post-kill launch-barrier decision event.
+
+    The generated executor records the normal plan first, then this only when a
+    fresh post-kill snapshot refuses launch. Dedupe is against the last agent
+    decision fingerprint, so a steady barrier does not flood the ring.
+    """
+    try:
+        plan = {
+            "action": _LAUNCH_BARRIER_ACTION,
+            "state": "LAUNCH_BLOCKED",
+            "reason_code": reason_code,
+            "notify": True,
+        }
+        fp = _decision_fingerprint(agent, plan)
+        prior, _ = read_supervisor_events(store)
+        for event in reversed(prior):
+            if event.get("kind") == "agent_decision" and event.get("agent") == _event_token(agent):
+                if event.get("action") != _LAUNCH_BARRIER_ACTION:
+                    continue
+                if event.get("fingerprint") == fp:
+                    return
+                break
+        append_supervisor_events(store, [_decision_event(agent, plan, now_epoch=now_epoch)], cap=cap)
     except Exception:
         return
 
@@ -1962,6 +1998,86 @@ def _attribution(
     }
 
 
+def _agent_state_entry(state: dict, agent: str) -> dict:
+    agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
+    entry = agents.get(agent) if isinstance(agents, dict) else None
+    return entry if isinstance(entry, dict) else {}
+
+
+def _prior_wrapper_may_be_alive(st: dict) -> bool:
+    if isinstance(st.get("launcher_pid"), int):
+        return True
+    if isinstance(st.get("pid"), int):
+        return True
+    managed = st.get("managed_pids")
+    if isinstance(managed, list) and any(isinstance(item, dict) for item in managed):
+        return True
+    return bool(st.get("launching"))
+
+
+def evaluate_launch_barrier(
+    snapshot: list[dict] | None,
+    state: dict,
+    config: dict,
+    agent: str,
+    *,
+    root_key: str | None = None,
+) -> dict:
+    """Post-kill one-live-wrapper barrier for the generated executor.
+
+    This is intentionally stricter than planner liveness: after a relaunch
+    decision has killed its targets, a fresh snapshot must prove no same-root
+    same-agent wrapper or wait process survived before Start-Process runs.
+    """
+    root_key = root_key or _root_key(config.get("root") or config.get("root_key") or "")
+    st = _agent_state_entry(state, agent)
+    if snapshot is None:
+        blocked = _prior_wrapper_may_be_alive(st)
+        return {
+            "allow_launch": not blocked,
+            "blocked": blocked,
+            "reason": "snapshot_unavailable_prior_maybe_alive" if blocked else "no_prior_process",
+            "snapshot_available": False,
+            "survivor_count": 0,
+            "survivors": [],
+        }
+
+    survivors: list[dict] = []
+    for row in snapshot:
+        if not isinstance(row, dict):
+            continue
+        kind = None
+        if parse_agenttalk_wrap_invocation(row.get("command_line"), root_key, agent):
+            kind = "own_wrapper"
+        elif parse_agenttalk_wait_invocation(row.get("command_line"), root_key, agent):
+            kind = "own_wait"
+        if kind is None:
+            continue
+        item = {
+            "kind": kind,
+            "pid": row.get("pid") if isinstance(row.get("pid"), int) else None,
+            "name": _event_token(row.get("name"), "unknown"),
+        }
+        survivors.append(item)
+
+    blocked = bool(survivors)
+    reason = "clear"
+    if blocked:
+        reason = (
+            "same_agent_wrapper_survived"
+            if any(s.get("kind") == "own_wrapper" for s in survivors)
+            else "same_agent_wait_survived"
+        )
+    return {
+        "allow_launch": not blocked,
+        "blocked": blocked,
+        "reason": reason,
+        "snapshot_available": True,
+        "survivor_count": len(survivors),
+        "survivors": survivors[:8],
+    }
+
+
 def capture_launch_child_provenance(
     pre_snapshot: list[dict] | None,
     post_snapshot: list[dict] | None,
@@ -2645,6 +2761,14 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         nxt["brain_start"] = None
         nxt["managed_pids"] = []
 
+    def _barrier_backoff_state() -> dict:
+        hold = copy.deepcopy(nxt)
+        nf = fails + 1
+        hold["consecutive_fails"] = nf
+        hold["backoff_next_epoch"] = now_epoch + min(cap, base * (2 ** (nf - 1)))
+        hold["healthy_since"] = None
+        return hold
+
     def _targets(include_launcher: bool) -> list[dict]:
         # EVERY kill target carries its start-time so the executor can refuse to
         # kill a recycled pid (codex discipline note 2).
@@ -2665,7 +2789,8 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
 
     def _result(action, *, state, kill_first=False, kill_orphans=False,
                 kill_targets=None, clear_marker=None, bypass_backoff=False,
-                notify=False, discover_brain=False, reason=""):
+                notify=False, discover_brain=False, reason="",
+                barrier_state=None):
         res = {"agent": name, "action": action, "state": state,
                "clear_marker": clear_marker, "kill_first": bool(kill_first),
                "kill_orphans": bool(kill_orphans), "kill_targets": kill_targets or [],
@@ -2683,6 +2808,8 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         if action in (RELAUNCH, STUCK_RECOVER):
             res.update(_launch_detail({**st, "resume_available": resume_available},
                                       cfg_agent, perm_mode=perm_mode))
+            if isinstance(barrier_state, dict):
+                res["barrier_state"] = barrier_state
         return res
 
     # 0) Manual restart-request marker (highest priority).
@@ -2728,6 +2855,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                                reason=f"manual restart-request {rid} cooling down "
                                       f"until {float(last_launch) + restart_cooldown:.0f} "
                                       f"(requested_by={marker.get('requested_by')})")
+            barrier_state = copy.deepcopy(nxt)
             nxt["consumed_rids"] = [*consumed, rid]
             kt = _targets(include_launcher=True)
             _relaunch_state()
@@ -2740,7 +2868,8 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             nxt["restart_authority_reason"] = marker.get("authority_reason")
             return _result(RELAUNCH, state="MANUAL_RESTART",
                            kill_first=bool(kt), kill_targets=kt, bypass_backoff=True,
-                           reason=f"manual restart-request {rid}")
+                           reason=f"manual restart-request {rid}",
+                           barrier_state=barrier_state)
         if not hb_stale and readiness_seen:
             nxt["restart_request_state"] = "readiness_seen"
             return _result(CLEAR_MARKER, state="HEALTHY_IDLE", clear_marker=rid,
@@ -2854,12 +2983,14 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                 return _result(NONE, state="READINESS_GAVE_UP",
                                reason="readiness gave up (warn rate-limited)")
             kt = _targets(include_launcher=True)
+            barrier_state = _barrier_backoff_state()
             _relaunch_state()
             nxt["readiness_fails"] = (readiness_fails + 1) if never_ready else 1
             return _result(STUCK_RECOVER, state="STUCK_OR_DEAD",
                            kill_first=bool(kt), kill_orphans=True,
                            kill_targets=kt,
-                           reason="heartbeat stale; best-effort kill + resume")
+                           reason="heartbeat stale; best-effort kill + resume",
+                           barrier_state=barrier_state)
         return _result(BACKOFF_WAIT, state="STUCK_OR_DEAD",
                        reason=f"heartbeat stale; backing off until {backoff_next:.0f}")
 
@@ -4117,6 +4248,23 @@ do {
         # process-TREE kill of the recorded targets (brain + managed descendants
         # + any orphan wait). The launcher pid is long dead - we never rely on it.
         if (($p.kill_first -or $p.kill_orphans) -and $p.kill_targets) { Stop-Tree $p.kill_targets }
+        # One-live-wrapper barrier: after the best-effort kill, re-snapshot and
+        # refuse to launch if a same-root same-agent wrapper/wait survived, or if
+        # the snapshot is unavailable while prior launcher state may still be live.
+        # The Python helper owns command-line parsing so this script never tries
+        # to classify process command lines itself.
+        $barrierPath = Join-Path $PSScriptRoot ("supervisor-barrier-{0}.json" -f $name)
+        Get-ProcSnapshot $barrierPath | Out-Null
+        $barrierText = & $AgenttalkCmd --root $Root supervise --launch-barrier --for $name --state-file $StatePath --snapshot-file $barrierPath @eventArgs --now $now
+        $barrier = $null
+        try { $barrier = $barrierText | ConvertFrom-Json } catch {}
+        if (($null -eq $barrier) -or $barrier.blocked) {
+          $why = if ($barrier -and $barrier.reason) { $barrier.reason } else { 'launch_barrier_unavailable' }
+          $n = if ($barrier -and $barrier.survivor_count) { [int]$barrier.survivor_count } else { 0 }
+          Write-Warning ("supervisor: {0}: launch barrier held ({1}; survivors={2}) - skipping relaunch this tick" -f $name, $why, $n)
+          if ($p.barrier_state) { $state.agents.$name = $p.barrier_state } else { $state.agents.$name = $p.next_state }
+          continue
+        }
         # SEED the agent for UNATTENDED launch (blocker #2). Codex: a per-agent
         # isolated CODEX_HOME with the overlaid auto-mode config.toml (the
         # planner emits the EFFECTIVE isolation flag + windows_sandbox). Claude:

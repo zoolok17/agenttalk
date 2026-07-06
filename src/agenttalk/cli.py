@@ -8169,6 +8169,31 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         _write_state(state)
         return 0
 
+    if args.launch_barrier:
+        if not args.agent or not args.state_file:
+            sys.stderr.write("agenttalk supervise --launch-barrier: need --for "
+                             "<agent> and --state-file <path>\n")
+            return 2
+        state = _read_state()
+        config = _load_supervisor_config(store)
+        now = args.now if args.now is not None else time.time()
+        result = sup.evaluate_launch_barrier(
+            _read_snapshot_file(args.snapshot_file),
+            state,
+            config,
+            args.agent,
+            root_key=sup._root_key(str(store.root.resolve())),
+        )
+        if result.get("blocked") and getattr(args, "record_events", False):
+            with contextlib.suppress(Exception):
+                sup.record_supervisor_launch_barrier_event(
+                    store, args.agent,
+                    reason_code=str(result.get("reason") or "launch_barrier"),
+                    now_epoch=now,
+                )
+        print(json.dumps(result, indent=2))
+        return 0
+
     if args.janitor_ephemeral:
         if not args.agent:
             sys.stderr.write("agenttalk supervise --janitor-ephemeral: need --for <agent>\n")
@@ -8263,7 +8288,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                 sup.record_supervisor_plan_events(store, plan, now_epoch=now)
         return 0
     sys.stderr.write("agenttalk supervise: choose --init, --report, --plan, "
-                     "--install-activity-hook, or --clear-restart\n")
+                     "--install-activity-hook, --launch-barrier, or --clear-restart\n")
     return 2
 
 
@@ -9612,6 +9637,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="(script use) Release the singleton supervisor instance lock.")
     gsup.add_argument("--drain-intents", dest="drain_intents", action="store_true",
                       help="(script use) Drain queued dashboard intents once.")
+    gsup.add_argument("--launch-barrier", dest="launch_barrier", action="store_true",
+                      help="(script use) Verify no same-agent wrapper survived before launch.")
     psup.add_argument("--home", help="(--seed-codex-config) the isolated CODEX_HOME dir.")
     psup.add_argument("--repo", help="(--seed-codex-config) repo abs path for "
                                      "writable_roots (default: the --root store dir).")
