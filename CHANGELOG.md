@@ -5,6 +5,29 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.69.6] - 2026-07-07
+
+### Fixed
+
+- **An interactive operator-facing lead no longer shows "heartbeat stale / unavailable" while it's
+  actively working.** A human-launched Claude window (the liaison) usually doesn't export
+  `AGENTTALK_SELF`, so the tool-boundary heartbeat hook couldn't tell which agent to stamp and the
+  lead only stayed live while explicitly sitting in a wait loop. Now `agenttalk heartbeat --hook`
+  accepts a hook-only `--fallback-for <agent>` (resolution order: `--for` → `AGENTTALK_SELF` →
+  `--fallback-for` → silent no-op), and `agenttalk supervise --install-activity-hook --interactive-for
+  <lead>` installs it for the operator-facing liaison. A supervised worker (which sets `AGENTTALK_SELF`)
+  still stamps *itself*, so the shared project hook is safe. Liveness stays honest and fail-closed — a
+  missing or stale heartbeat still reads *unavailable*; this only gives a live lead a real heartbeat.
+
+### Added
+
+- **`doctor` now advises on the interactive-lead heartbeat hook** — it classifies the project
+  `.claude/settings.json` PostToolUse heartbeat state (none / neutral / fallback / wrong-identity /
+  unreadable) and, only when the liaison is actually stale, suggests the fix. Advisory only, never a
+  gating error; suppressed when the lead is fresh, wrapped, or a managed lead-loop.
+
+_Fixes Bug 6 — the last item from the 2026-07-06 wrapped-fleet incident report._
+
 ## [0.69.5] - 2026-07-06
 
 ### Added

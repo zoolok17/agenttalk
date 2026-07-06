@@ -314,6 +314,14 @@ two parallel ownership concepts.
   `src` comes only from allowlisted records (never a bus string); CSS is scoped
   to the lead-chat transcript (`.tc-lead-msg-row`), leaving the shared row style
   untouched.
+- **Interactive-lead heartbeat:** v0.69.6 lets a human-launched operator-facing
+  Claude window (which usually lacks `AGENTTALK_SELF`) stay honestly Active while
+  working. `heartbeat --hook --fallback-for <lead>` resolves identity as `--for`
+  → `AGENTTALK_SELF` → `--fallback-for` → silent no-op, so a shared project hook
+  stamps each supervised worker as *itself* and only the env-less liaison falls
+  through to the fallback; installed via `supervise --install-activity-hook
+  --interactive-for <lead>`. No exemption — a stale/missing heartbeat still reads
+  unavailable (fail-closed); it only supplies a better heartbeat path.
 - **Honest ceiling:** these controls defend the local dashboard against
   drive-by localhost/CSRF/rebinding, keep ordinary dashboard authorization in
   the executor, and keep operator lead-chat sends inside one guarded route. They

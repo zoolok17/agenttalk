@@ -95,6 +95,25 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.69.6 — interactive-lead heartbeat (2026-07-07)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `901b554` (feature `707b1d3` + dedupe fold) · tag `v0.69.6`
+- **Review:** design-first (codex, gated PASS — the `--fallback-for` resolution order that keeps a
+  shared project hook safe) → build in an isolated worktree → **dual verification on the final SHA**:
+  the dedicated tester (`codex-test`) ran the real operator journey (proved no-env → stamps the lead,
+  `AGENTTALK_SELF=worker` → stamps the worker, and a stale/missing heartbeat still reads *unavailable*)
+  = GO; reviewer-1 (code) caught a real blocker — the non-interactive installer left a *mixed*
+  fallback+neutral config with two hooks — folded to dedupe-to-one, reviewer-1 re-verified
+  (`recognized_count 1`). The two lenses split cleanly: the tester confirmed it *works*, the reviewer
+  found the code-path edge the tester's clean-start didn't hit.
+- **Gate:** ruff/bandit/**gitleaks** (git-mode + range)/diff/compileall clean; pytest **2042 passed /
+  3 skipped on 3.10 AND 3.14** (clean venvs).
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green (watched post-push).
+- **Robust/Secure:** advisory liveness, not authz. No change to `lead_chat_liveness`, dashboard render,
+  supervisor recovery, or wrapper heartbeat ownership — the fix only supplies a better heartbeat *path*
+  (identity-bound hook fallback), fail-closed preserved. Honest limit: an env-less non-liaison window
+  in the same checkout can also stamp the fallback (documented; set `AGENTTALK_SELF` for non-liaison
+  windows). Closes Bug 6, the last item from the 2026-07-06 incident report.
+
 ### v0.69.5 — all-views dashboard render smoke + QA-skill tightening (2026-07-06)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `16d8ab5` · tag `v0.69.5`
 - **Review:** first task for the newly-onboarded dedicated tester (`codex-test`, role `test-agent`) —
