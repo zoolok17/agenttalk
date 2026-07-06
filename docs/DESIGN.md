@@ -243,6 +243,15 @@ two parallel ownership concepts.
 - **Why:** real hangs and resume-wake churn happened in the field. Heartbeat
   liveness + wrapper-owned loop is the robust unattended answer; wrapped is the
   recommended supervised archetype.
+- **Launch containment (v0.69.1):** a crashed wrapper that is not fully reaped must
+  never be *replaced alongside* a survivor. Before spawning a replacement the
+  supervisor re-snapshots and refuses to launch if a same-root, same-`--for`-agent
+  wrapper (or its wait) still lives — or if the process snapshot is unavailable and a
+  prior launcher may still be alive: it backs off and emits a deduped decision event
+  rather than stacking wrappers (the self-DDoS failure mode). A barrier-held poll
+  carries an explicit `barrier_state`, so it never fakes a launch or consumes a pending
+  manual-restart request. `doctor` also warns about a stale generated `supervisor.ps1`
+  that predates the per-project singleton lock.
 
 ### 4.7 Supporting modules
 - `signing.py` — optional HMAC message signing (constant-time, length-floored);

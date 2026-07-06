@@ -91,6 +91,26 @@ gitleaks false-positive (a redaction-test's synthetic secret, not a real leak or
 corrected in v0.64.1. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.69.1 — supervisor duplicate-wrapper containment (2026-07-06)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `9456cfa` · tag `v0.69.1`
+- **Review:** design-first triage (codex, verified against master) → lead-gated → build in an
+  isolated worktree → **both reviewers GO on the final SHA** (reviewer-1 + reviewer-2, verdicts
+  verified from the store). The review caught **two real bugs** across two folds: reviewer-2 found a
+  decision-event dedup gap (a steady blocked state spammed alternating `stuck_recover` /
+  `launch_barrier` events), and reviewer-1 found a P1 — a barrier-held poll wrote `next_state` before
+  `continue`, so it faked a launch *and* consumed the pending manual-restart request; folded via an
+  explicit `barrier_state` (auto-recovery backs off without opening launch grace; manual restart
+  stays unconsumed until a spawn actually passes the barrier).
+- **Gate:** ruff/bandit/**gitleaks** (git-mode + range)/diff/compileall clean; pytest **2007 passed
+  / 3 skipped on 3.10 AND 3.14** (clean venvs).
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green.
+- **Robust/Secure:** the launch barrier is **fail-closed** — an unavailable process snapshot with a
+  possibly-live prior launcher blocks the replacement rather than stacking, and the barrier never
+  fakes a launch or drops a manual-restart request. The `supervisor.ps1` per-project singleton lock
+  (0.69.0) is unchanged; 0.69.1 only adds an advisory `doctor` warning for stale pre-lock scripts.
+  Fixes Bug 2 + the Bug 3 residual from the 2026-07-06 wrapped-fleet incident report (the report's
+  Bug 1 P0 and the Bug 3 new-script lock were already fixed in 0.69.0).
+
 ### v0.69.0 — dashboard liveness render for unwrapped-active agents (2026-07-06)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `aa5c85c` · tag `v0.69.0`
 - **Review:** design-first (codex) → lead-gated design → build in an isolated worktree → **both

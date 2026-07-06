@@ -5,6 +5,25 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.69.1] - 2026-07-06
+
+### Fixed
+
+- **Supervisor no longer stacks duplicate wrappers when a crashed one is not fully reaped.** Before
+  spawning a replacement, the supervisor re-snapshots and applies a one-live-wrapper-per-agent
+  launch barrier: if a same-project, same-`--for`-agent wrapper (or its wait loop) still survives —
+  or if the process snapshot is unavailable and a prior launcher may still be alive — it skips the
+  relaunch for that poll, enters backoff, and emits a (deduped) decision event instead of piling on
+  more wrappers (the duplicate-pileup / self-inflicted rate-limit failure mode). A barrier-held poll
+  no longer fakes a launch or consumes a pending manual-restart request.
+- **`doctor` warns about a stale generated `supervisor.ps1`** that predates the per-project
+  singleton lock (missing `--claim-instance` / `--release-instance`); regenerate with
+  `supervise --init --force`. Advisory only.
+
+_Context: fixes Bug 2 and the Bug 3 residual from the 2026-07-06 wrapped-fleet incident report. That
+report's P0 (a wrapped Claude agent looping forever on a dead `--resume` session) and the Bug 3
+singleton lock for newly-generated scripts were already fixed in 0.69.0 — upgrading resolves those._
+
 ## [0.69.0] - 2026-07-06
 
 ### Fixed
