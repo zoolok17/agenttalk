@@ -355,6 +355,7 @@
   // The CSS owns semantic→color; the CLASS carries the RAW state (status-<state>),
   // and `color` feeds the card left-bar CSS custom properties (--status-color etc).
   // States without a dedicated CSS rule (errored_*) map to the nearest defined key.
+  var UNWRAPPED_LIVE_STALE_AFTER_SECONDS = 120;
   function stateInfo(st) {
     switch (st) {
       case 'working_turn': return { label: 'Working', key: 'working_turn', color: 'ok', grp: 'work', pulse: true };
@@ -371,8 +372,23 @@
       default: return { label: 'Unknown', key: 'unknown', color: 'gray', grp: 'unknown', noHb: true };
     }
   }
+  function freshHeartbeat(agent) {
+    var age = Number(agent && agent.last_seen_age_seconds);
+    return Number.isFinite(age) && age >= 0 && age <= UNWRAPPED_LIVE_STALE_AFTER_SECONDS;
+  }
+  function agentStateInfo(agent) {
+    var raw = ((agent && agent.health) || {}).state;
+    var info = stateInfo(raw);
+    if (info.key === 'unknown' && freshHeartbeat(agent) && agent && agent.wrapped !== true) {
+      return { label: 'Active', key: 'unwrapped_live', color: 'teal', grp: 'work', heartbeatOnly: true };
+    }
+    return info;
+  }
+  function stateInfoFrom(value) {
+    return value && typeof value === 'object' && value.key ? value : stateInfo(value);
+  }
   // status-<state> class carrying the raw health state (CSS owns the color).
-  function statusClass(st) { return 'status-' + stateInfo(st).key; }
+  function statusClass(st) { return 'status-' + stateInfoFrom(st).key; }
   // Representative raw health-state for a health group (work/idle/attn/unknown),
   // used to color legend/stat/filter dots via the .status-<state> CSS rules.
   function groupState(grp) {
@@ -524,7 +540,7 @@
     var c = { work: 0, idle: 0, attn: 0, unknown: 0 };
     var as = agentsOf(root);
     for (var i = 0; i < as.length; i++) {
-      c[stateInfo((as[i].health || {}).state).grp]++;
+      c[agentStateInfo(as[i]).grp]++;
     }
     return c;
   }
@@ -533,7 +549,7 @@
     if (state.filter === 'all') return as.slice();
     var out = [];
     for (var i = 0; i < as.length; i++) {
-      var grp = stateInfo((as[i].health || {}).state).grp;
+      var grp = agentStateInfo(as[i]).grp;
       if (state.filter === 'working' && grp === 'work') out.push(as[i]);
       else if (state.filter === 'idle' && grp === 'idle') out.push(as[i]);
       else if (state.filter === 'attention' && (grp === 'attn' || grp === 'unknown')) out.push(as[i]);
@@ -543,13 +559,14 @@
 
   // ------------------------------------------------------------ shared bits
   function statusDot(st, extraCls) {
-    var info = stateInfo(st);
-    var cls = 'tc-dot ' + statusClass(st) + (info.pulse ? ' is-pulsing' : '');
+    var info = stateInfoFrom(st);
+    var cls = 'tc-dot ' + statusClass(info) + (info.pulse ? ' is-pulsing' : '');
     if (extraCls) cls += ' ' + extraCls;
     return el('span', cls);
   }
   function statusChip(st) {
-    return el('span', 'tc-chip ' + statusClass(st), stateInfo(st).label);
+    var info = stateInfoFrom(st);
+    return el('span', 'tc-chip ' + statusClass(info), info.label);
   }
   function kindChip(kind) {
     var info = kindInfo(kind);
@@ -599,7 +616,7 @@
     opts = opts || {};
     var file = avatarFile(agent);
     if (!file) return null;
-    var st = ((agent && agent.health) || {}).state;
+    var info = agentStateInfo(agent);
     var cls = 'tc-avatar ' + (avatarCls || '');
     if (avatarShape(agent)) cls += ' tc-avatar-shaped';
     var wrap = el('span', cls);
@@ -609,15 +626,15 @@
     img.loading = 'lazy';
     img.decoding = 'async';
     on(img, 'error', function () {
-      var repl = opts.operator ? operatorFallbackAvatar(avatarCls) : statusDot(st, fallbackDotCls);
+      var repl = opts.operator ? operatorFallbackAvatar(avatarCls) : statusDot(info, fallbackDotCls);
       if (wrap.parentNode) wrap.parentNode.replaceChild(repl, wrap);
     });
     wrap.appendChild(img);
-    if (!opts.hideStatus) wrap.appendChild(statusDot(st, 'tc-avatar-badge'));
+    if (!opts.hideStatus) wrap.appendChild(statusDot(info, 'tc-avatar-badge'));
     return wrap;
   }
   function avatarOrDot(agent, avatarCls, dotCls) {
-    return agentAvatar(agent, avatarCls, dotCls) || statusDot(((agent && agent.health) || {}).state, dotCls);
+    return agentAvatar(agent, avatarCls, dotCls) || statusDot(agentStateInfo(agent), dotCls);
   }
   // A rate/ctx mini-meter (label + value + track/fill). .tc-meter-head lays out
   // its two spans as a space-between row; the fill state comes from meterClass.
@@ -1026,8 +1043,7 @@
 
   // Agent Card (clickable -> Agent Detail).
   function agentCard(root, a) {
-    var st = (a.health || {}).state;
-    var info = stateInfo(st);
+    var info = agentStateInfo(a);
     var card = el('div', 'tc-agent-card');
     // Left status bar: CSS reads --status-color for the inset shadow.
     card.style.setProperty('--status-color', 'var(--' + info.color + ')');
@@ -1054,7 +1070,7 @@
 
     // Row 4: status chip + spacer + heartbeat age ("no hb" if unknown).
     var r4 = el('div', 'tc-agent-status-row');
-    r4.appendChild(statusChip(st));
+    r4.appendChild(statusChip(info));
     r4.appendChild(el('span', 'tc-spacer'));
     r4.appendChild(ageEl('tc-agent-hb',
       { ts: a.last_seen, age_seconds: a.last_seen_age_seconds },
@@ -2098,14 +2114,13 @@
       return;
     }
 
-    var st = (a.health || {}).state;
-    var info = stateInfo(st);
+    var info = agentStateInfo(a);
 
     // Header card.
     var headerCard = el('div', 'tc-detail-header');
     var bigDot = agentAvatar(a, 'tc-detail-avatar', 'tc-detail-bigdot');
     if (!bigDot) {
-      bigDot = statusDot(st, 'tc-detail-bigdot');
+      bigDot = statusDot(info, 'tc-detail-bigdot');
       // Soft ring color: CSS reads --status-soft on the bigdot.
       bigDot.style.setProperty('--status-soft', 'var(--' + info.color + '-soft)');
     }
@@ -2117,7 +2132,7 @@
     if (badge) nameRow.appendChild(badge);
     hInfo.appendChild(nameRow);
     var metaRow = el('div', 'tc-detail-sub');
-    metaRow.appendChild(statusChip(st));
+    metaRow.appendChild(statusChip(info));
     var roleParts = [];
     if (a.role) roleParts.push(a.role);
     if (a.groups && a.groups.length) roleParts.push(a.groups.join(', '));
@@ -2263,13 +2278,12 @@
     supRows.appendChild(supRow('CLI', cliI ? cliI.label : '—', cliI ? ('tc-chip ' + cliI.cls) : 'tc-chip'));
     var mode = a.wrapped ? 'wrapped · loop' : 'manual listen';
     supRows.appendChild(supRow('Mode', mode, 'tc-chip'));
-    var st = (a.health || {}).state;
-    var info = stateInfo(st);
+    var info = agentStateInfo(a);
     // Heartbeat age is a live-ticked chip (B2a): build the row with an ageEl
     // chip so the 1 Hz ticker advances it without a DOM rebuild.
     var hbRow = el('div', 'tc-sup-row');
     hbRow.appendChild(el('span', 'tc-sup-key', 'Heartbeat'));
-    hbRow.appendChild(ageEl('tc-chip ' + statusClass(st),
+    hbRow.appendChild(ageEl('tc-chip ' + statusClass(info),
       { ts: a.last_seen, age_seconds: a.last_seen_age_seconds },
       { suffix: ' ago', nullText: 'missing', noHb: info.noHb }));
     supRows.appendChild(hbRow);

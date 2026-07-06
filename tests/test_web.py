@@ -14,6 +14,7 @@ import inspect
 import json
 import re
 import socket
+import subprocess
 import threading
 import time
 import urllib.error
@@ -739,6 +740,49 @@ def test_api_state_absent_not_null(tmp_path: Path) -> None:
         assert "operator_facing" not in root
         assert "spec_kitty" not in root
         _assert_no_body_keys(state)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_unwrapped_fresh_heartbeat_stays_raw_unknown(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    s.write_heartbeat("alpha")
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        assert set(alpha) == {
+            "name", "last_seen", "last_seen_age_seconds", "health",
+            "unread", "sent", "received",
+        }
+        assert alpha["health"]["state"] == "unknown"
+        assert 0 <= alpha["last_seen_age_seconds"] <= 120
+        assert "wrapped" not in alpha
+        assert "unwrapped_live" not in json.dumps(alpha)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_state_unwrapped_stale_heartbeat_stays_raw_unknown(tmp_path: Path) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    s = _make_store(tmp_path)
+    old = datetime.now(timezone.utc) - timedelta(seconds=130)
+    (s.state_dir / "alpha.heartbeat").write_text(old.isoformat(), encoding="utf-8")
+    srv, _t, base = _serve(s)
+    try:
+        (root,) = _state(base)["roots"]
+        alpha = next(a for a in root["agents"] if a["name"] == "alpha")
+        assert set(alpha) == {
+            "name", "last_seen", "last_seen_age_seconds", "health",
+            "unread", "sent", "received",
+        }
+        assert alpha["health"]["state"] == "unknown"
+        assert alpha["last_seen_age_seconds"] > 120
+        assert "wrapped" not in alpha
+        assert "unwrapped_live" not in json.dumps(alpha)
     finally:
         srv.shutdown()
         srv.server_close()
@@ -2130,6 +2174,76 @@ def test_console_renderer_safety(tmp_path: Path) -> None:
     assert "eval(" not in js
     assert "csrf_token" not in js.split("localStorage", 1)[0]
     assert "sessionStorage" not in js
+
+
+def test_console_agent_state_info_uses_fresh_unwrapped_heartbeat(tmp_path: Path) -> None:
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    stateInfo: stateInfo,\n"
+        "    agentStateInfo: agentStateInfo,\n"
+        "    freshHeartbeat: freshHeartbeat\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-agent-state.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+const source = fs.readFileSync(process.argv[2], 'utf8');
+const ctx = {
+  console,
+  document: { readyState: 'loading', addEventListener() {} },
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  setInterval() {},
+  clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+ctx.__agenttalkConsoleTestHooks = {};
+vm.createContext(ctx);
+vm.runInContext(source, ctx, { filename: 'console.instrumented.js' });
+const hooks = ctx.__agenttalkConsoleTestHooks;
+
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg);
+}
+function check(agent, expected) {
+  const got = hooks.agentStateInfo(agent);
+  for (const [key, value] of Object.entries(expected)) {
+    assert(got[key] === value, `${JSON.stringify(agent)} ${key}: ${got[key]} !== ${value}`);
+  }
+}
+
+check({ health: { state: 'unknown' }, last_seen_age_seconds: 5 },
+  { key: 'unwrapped_live', label: 'Active', color: 'teal', grp: 'work', heartbeatOnly: true });
+check({ last_seen_age_seconds: 5 },
+  { key: 'unwrapped_live', label: 'Active', color: 'teal', grp: 'work', heartbeatOnly: true });
+check({ health: { state: 'unknown' }, last_seen_age_seconds: 5, wrapped: false },
+  { key: 'unwrapped_live', label: 'Active', color: 'teal', grp: 'work', heartbeatOnly: true });
+check({ health: { state: 'unknown' }, last_seen_age_seconds: 121 },
+  { key: 'unknown', label: 'Unknown', color: 'gray', grp: 'unknown' });
+check({ health: { state: 'unknown' } },
+  { key: 'unknown', label: 'Unknown', color: 'gray', grp: 'unknown' });
+check({ health: { state: 'unknown' }, last_seen_age_seconds: 5, wrapped: true },
+  { key: 'unknown', label: 'Unknown', color: 'gray', grp: 'unknown' });
+check({ health: { state: 'working_turn' }, last_seen_age_seconds: 5, wrapped: true },
+  { key: 'working_turn', label: 'Working', color: 'ok', grp: 'work', pulse: true });
+check({ health: { state: 'idle_waiting' }, last_seen_age_seconds: 5, wrapped: true },
+  { key: 'idle_waiting', label: 'Idle \u00b7 waiting', color: 'warn', grp: 'idle' });
+assert(hooks.freshHeartbeat({ last_seen_age_seconds: -1 }) === false, 'negative heartbeat fails');
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
 
 
 def _density_vars(css: str, density: str) -> dict[str, str]:

@@ -602,6 +602,10 @@ body {
 .status-working_silent.tc-dot,
 .status-working_silent.tc-legend-dot { background: var(--info); }
 
+.status-unwrapped_live.tc-chip { color: var(--teal); background: var(--teal-soft); }
+.status-unwrapped_live.tc-dot,
+.status-unwrapped_live.tc-legend-dot { background: var(--teal); }
+
 .status-idle_waiting.tc-chip { color: var(--warn); background: var(--warn-soft); }
 .status-idle_waiting.tc-dot,
 .status-idle_waiting.tc-legend-dot { background: var(--warn); }
