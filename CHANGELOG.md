@@ -5,6 +5,24 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.69.0] - 2026-07-06
+
+### Fixed
+
+- **The dashboard roster no longer shows an actively-running interactive agent as "Unknown."** An
+  unwrapped agent (one running interactively rather than under the supervisor wrapper — most often
+  the human-facing lead) has no wrapper health file, so it previously rendered as *Unknown* even
+  while it was clearly alive. The roster, agent cards, agent detail, supervisor rows, avatars,
+  counts, and filters now show such an agent as **Active** when it has a fresh heartbeat
+  (`last_seen` within 120s — the same freshness window as chat liveness). A missing, stale, or
+  invalid heartbeat still renders *Unknown* (fail-closed — an agent that stopped listening is
+  honestly not shown as live), and wrapped/managed agents keep their exact health-state rendering
+  (Working / Idle · waiting / etc.). Timeline segments and health legends are unchanged (they carry
+  historical states with no heartbeat context).
+
+This is a pure client-side presentation correction: `/api/state` is byte-identical (no new server
+field), and the read-only dashboard remains byte-identical with actions off.
+
 ## [0.68.1] - 2026-07-06
 
 ### Fixed

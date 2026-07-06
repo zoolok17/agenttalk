@@ -91,6 +91,26 @@ gitleaks false-positive (a redaction-test's synthetic secret, not a real leak or
 corrected in v0.64.1. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.69.0 — dashboard liveness render for unwrapped-active agents (2026-07-06)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `aa5c85c` · tag `v0.69.0`
+- **Review:** design-first (codex) → lead-gated design → build in an isolated worktree → **both
+  reviewers GO on the final SHA** (reviewer-1 APPROVE, reviewer-2 GO — verdicts verified directly
+  from the store, not a relayed summary) + my independent review clean. Display-only, not
+  authority-critical. The review crux was **call-site classification** — verified complete: every
+  agent-scoped render site (roster/counts/filter/card/detail/supervisor/avatar) uses the new
+  `agentStateInfo`, while raw-state sites (timeline segments + legend) correctly retain the raw
+  `stateInfo` vocabulary via a polymorphic adapter.
+- **Gate:** ruff/bandit/**gitleaks** (git-mode + range)/node --check/diff/compileall clean; pytest
+  **1994 passed / 3 skipped on 3.10 AND 3.14** (clean venvs).
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green.
+- **Robust/Secure:** a pure **client-side** presentation correction — `/api/state` is byte-identical
+  (no new server field; locked by additive-boundary fixtures) and the read-only dashboard remains
+  byte-identical with actions off. **Fail-closed:** an unwrapped agent shows *Active* only with a
+  *fresh* heartbeat (≤120s, the shared `ACTIVE_WITHIN_SECONDS`); missing/stale/negative/invalid
+  heartbeat stays *Unknown*; a known-wrapped agent (`wrapped===true`) always uses its raw health
+  rendering and is never relabeled. The `agentStateInfo` matrix (fresh/stale/missing/wrapped/negative)
+  is covered by an executed node-vm JS test.
+
 ### v0.68.1 — lead-chat usable with an interactive lead (hotfix) (2026-07-06)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `aad1105` · tag `v0.68.1`
 - **Review:** v0.68.0 passed authority review + adversarial but shipped **unusable end-to-end** for
