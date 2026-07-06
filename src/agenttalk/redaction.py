@@ -49,8 +49,22 @@ def _trim_left_to_bytes(text: str, budget: int) -> str:
         return text
     if budget <= len(marker_bytes):
         return marker[:budget]
-    kept = raw[-(budget - len(marker_bytes)):].decode("utf-8", "replace")
+    kept = _suffix_within_bytes(text, budget - len(marker_bytes))
     return marker + kept
+
+
+def _suffix_within_bytes(text: str, budget: int) -> str:
+    if budget <= 0:
+        return ""
+    kept: list[str] = []
+    used = 0
+    for char in reversed(text):
+        size = len(char.encode("utf-8", "replace"))
+        if used + size > budget:
+            break
+        kept.append(char)
+        used += size
+    return "".join(reversed(kept))
 
 
 def _normalize_tail_line(item: object) -> dict[str, str] | None:

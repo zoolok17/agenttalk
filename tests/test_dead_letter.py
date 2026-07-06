@@ -384,6 +384,27 @@ def test_11c_dead_letter_child_output_tail_cap_holds(tmp_path: Path) -> None:
     assert stored["bytes"] <= stored["max_bytes"] == 4096
     assert "line-0" not in json.dumps(stored)
 
+    msg = _send(s, "unicode-poison")
+    rec = _rec(s)
+    s.dead_letter(
+        "beta",
+        rec,
+        reason="x",
+        failure_class=CLASS_POISON,
+        at="t",
+        child_output_tail={
+            "lines": [{"stream": "stderr", "text": chr(0x1f600) * 10_000}]
+        },
+    )
+
+    stored_unicode = next(
+        item["child_output_tail"]
+        for item in s.list_dead_letters("beta")
+        if item["message_id"] == msg.id
+    )
+    assert stored_unicode["truncated"] is True
+    assert stored_unicode["bytes"] <= stored_unicode["max_bytes"] == 4096
+
 
 def test_12_atomic_ordering_idempotent_replay(tmp_path: Path, monkeypatch) -> None:
     s = _store(tmp_path)
