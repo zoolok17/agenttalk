@@ -13,6 +13,7 @@ import http.client
 import inspect
 import json
 import re
+import shutil
 import socket
 import subprocess
 import threading
@@ -2259,6 +2260,154 @@ check({ health: { state: 'working_turn' }, last_seen_age_seconds: 5, wrapped: tr
 check({ health: { state: 'idle_waiting' }, last_seen_age_seconds: 5, wrapped: true },
   { key: 'idle_waiting', label: 'Idle \u00b7 waiting', color: 'warn', grp: 'idle' });
 assert(hooks.freshHeartbeat({ last_seen_age_seconds: -1 }) === false, 'negative heartbeat fails');
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_agent_detail_render_smoke_uses_selected_agent(tmp_path: Path) -> None:
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console agent-detail render smoke test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    state: state,\n"
+        "    renderAgentDetail: renderAgentDetail\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-agent-detail.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function makeNode(tag) {
+  const node = {
+    tagName: String(tag).toUpperCase(),
+    children: [],
+    parentNode: null,
+    firstChild: null,
+    attributes: {},
+    className: '',
+    textContent: '',
+    disabled: false,
+    scrollTop: 0,
+    style: {
+      setProperty(name, value) { this[name] = String(value); },
+    },
+    appendChild(child) {
+      this.children.push(child);
+      child.parentNode = this;
+      this.firstChild = this.children[0] || null;
+      return child;
+    },
+    removeChild(child) {
+      const idx = this.children.indexOf(child);
+      if (idx !== -1) this.children.splice(idx, 1);
+      child.parentNode = null;
+      this.firstChild = this.children[0] || null;
+      return child;
+    },
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+      if (name === 'class') this.className = String(value);
+    },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name)
+        ? this.attributes[name]
+        : null;
+    },
+    addEventListener() {},
+    querySelector() { return null; },
+  };
+  return node;
+}
+
+function hasClass(node, cls) {
+  return String(node.className || '').split(/\s+/).includes(cls);
+}
+
+function findByClass(node, cls) {
+  if (hasClass(node, cls)) return node;
+  for (const child of node.children || []) {
+    const got = findByClass(child, cls);
+    if (got) return got;
+  }
+  return null;
+}
+
+function collectText(node) {
+  let out = node.textContent || '';
+  for (const child of node.children || []) out += collectText(child);
+  return out;
+}
+
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg);
+}
+
+const source = fs.readFileSync(process.argv[2], 'utf8');
+const document = {
+  body: makeNode('body'),
+  readyState: 'loading',
+  createElement: makeNode,
+  createElementNS(_ns, tag) { return makeNode(tag); },
+  addEventListener() {},
+  querySelector() { return null; },
+  querySelectorAll() { return []; },
+};
+const ctx = {
+  console,
+  document,
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  setInterval() {},
+  clearInterval() {},
+  fetch() { throw new Error('fetch should not run'); },
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+ctx.__agenttalkConsoleTestHooks = {};
+vm.createContext(ctx);
+vm.runInContext(source, ctx, { filename: 'console.instrumented.js' });
+const hooks = ctx.__agenttalkConsoleTestHooks;
+
+function render(agent) {
+  hooks.state.selectedAgent = agent.name;
+  const main = makeNode('main');
+  hooks.renderAgentDetail(main, { agents: [agent], threads: [], recent: [] });
+  assert(findByClass(main, 'tc-detail-body'), `${agent.name} detail body missing`);
+  assert(collectText(main).includes(agent.name), `${agent.name} text missing`);
+  return main;
+}
+
+render({
+  name: 'wrapped',
+  cli: 'codex',
+  wrapped: true,
+  health: { state: 'working_silent' },
+  last_seen_age_seconds: 8,
+});
+render({
+  name: 'fresh-unwrapped',
+  health: { state: 'unknown' },
+  last_seen_age_seconds: 5,
+});
+const stuck = render({
+  name: 'stuck',
+  cli: 'claude',
+  wrapped: true,
+  health: { state: 'stuck_suspected' },
+  last_seen_age_seconds: 900,
+});
+assert(collectText(stuck).includes('Restart with context'), 'stuck restart action missing');
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)

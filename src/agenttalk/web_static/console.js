@@ -2179,7 +2179,7 @@
 
     // Header actions: Restart (only when stuck; disabled read-only) + Open transcript.
     var actions = el('div', 'tc-detail-actions');
-    if (st === 'stuck_suspected') {
+    if (info.key === 'stuck_suspected') {
       var rb = el('button', 'tc-btn tc-btn-primary tc-btn-lg', 'Restart with context');
       rb.disabled = true;
       rb.setAttribute('title', 'run via the agenttalk CLI');
