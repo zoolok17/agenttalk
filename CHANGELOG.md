@@ -5,6 +5,24 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.69.4] - 2026-07-06
+
+### Fixed
+
+- **The dashboard agent-detail view no longer renders blank when you click an agent.**
+  `renderAgentDetail` referenced an undefined variable when deciding whether to show the "Restart with
+  context" action, which threw at runtime and aborted the render (leaving a blank pane) for *every*
+  agent. It now reads the already-resolved state (`info.key`), so the profile renders correctly and the
+  Restart action still appears only for a stuck-suspected agent. (The bug was invisible to `node
+  --check` and the Python suite because neither executes the browser render.)
+
+### Added
+
+- **A Node-VM render smoke test for the dashboard** (`tests/test_web.py`) that executes the real
+  `renderAgentDetail` and asserts a non-empty profile for normal, unwrapped, and stuck agents — a
+  committed regression guard for the class of runtime render bug above. It skips cleanly when Node is
+  unavailable, so it never reds a Node-less CI runner.
+
 ## [0.69.3] - 2026-07-06
 
 ### Added

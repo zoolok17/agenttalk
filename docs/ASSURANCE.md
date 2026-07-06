@@ -95,6 +95,24 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.69.4 — dashboard agent-detail blank-page fix + render smoke test (2026-07-06)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `774bf9b` · tag `v0.69.4`
+- **Review:** operator-reported blank agent-detail page → lead-diagnosed (undefined `st` in
+  `renderAgentDetail` → runtime ReferenceError → blank render for every agent) → fix + committed
+  Node-VM render smoke test built in an isolated worktree → **reviewer GO on the final SHA** (verdict
+  verified from the store). The reviewer **proved the test is a genuine regression guard** — reverting
+  the one-line fix turned the smoke test red (`ReferenceError: st is not defined`), restoring it turned
+  it green — and flagged a real CI-safety blocker (the test errored instead of skipping when Node was
+  absent), folded before GO.
+- **Gate:** node --check + ruff/bandit/**gitleaks** (git-mode + range)/diff/compileall clean; pytest
+  **2018 passed / 3 skipped on 3.10 AND 3.14** (clean venvs); plus a **node-absent leg** confirming the
+  new smoke test skips cleanly (1 skipped, exit 0) with Node off PATH.
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green (watched post-push).
+- **Robust/Secure:** display-only, not authority-critical. Closes a real assurance gap — the dashboard
+  JS was never *executed* by the gate (only `node --check`'d), which let a plain undefined-variable bug
+  survive since v0.58.0. The committed render smoke test now runs in every gate + CI. (A dedicated
+  tester and an all-views render harness are the tracked follow-up.)
+
 ### v0.69.3 — lead-chat message avatars (2026-07-06)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `c097f05` (= `e97846f` rebased zero-delta) · tag `v0.69.3`
 - **Review:** operator-requested UI polish → build in an isolated worktree (frontend-only) → **both
