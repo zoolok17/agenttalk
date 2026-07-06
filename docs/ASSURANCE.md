@@ -95,6 +95,22 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.69.5 — all-views dashboard render smoke + QA-skill tightening (2026-07-06)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `16d8ab5` · tag `v0.69.5`
+- **Review:** first task for the newly-onboarded dedicated tester (`codex-test`, role `test-agent`) —
+  it built the harness (its charter owns it) in an isolated worktree → **reviewer GO on the final SHA**
+  (verified from the store). The reviewer **proved the guard across multiple views** (broke overview
+  and agent-detail independently → each went red → restored green) and **confirmed no coverage
+  regression** — the generalized test still catches the original v0.69.4 `st`→`info.key` agent-detail
+  bug (revert → red), with the stuck-agent Restart-button assertion preserved.
+- **Gate:** node --check + ruff/bandit/**gitleaks** (git-mode + range)/diff/compileall clean; pytest
+  **2018 passed / 3 skipped on 3.10 AND 3.14** (clean venvs); node-absent leg confirms the smoke skips
+  cleanly (1 skipped, exit 0).
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green (watched post-push).
+- **Robust/Secure:** display/test-only. Completes the assurance step opened in 0.69.4 — the dashboard
+  JS is now *executed* across every view in the gate + CI, and the QA skills mandate smoking all views
+  on shared-frontend changes. Owned and maintained by the dedicated tester going forward.
+
 ### v0.69.4 — dashboard agent-detail blank-page fix + render smoke test (2026-07-06)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `774bf9b` · tag `v0.69.4`
 - **Review:** operator-reported blank agent-detail page → lead-diagnosed (undefined `st` in

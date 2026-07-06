@@ -5,6 +5,22 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.69.5] - 2026-07-06
+
+### Added
+
+- **The dashboard render smoke test now covers every view.** The Node-VM render check introduced in
+  0.69.4 (which executed one view) is generalized to drive all six dashboard views through
+  `renderActiveView` — overview, flow, attention, lead chat, sessions, and agent detail — asserting
+  each renders a non-empty pane against representative payloads. Because `console.js`/`console.css` is
+  one shared file that drives every view, a change to it is now smoke-tested across all views in every
+  gate and CI run, not just the view that was edited. Skips cleanly when Node is unavailable.
+
+### Changed
+
+- **QA guidance (`qa-strategy`, `tester-qa` skills):** a shared-frontend / dashboard change now
+  explicitly requires smoking ALL dashboard views, not only the one changed.
+
 ## [0.69.4] - 2026-07-06
 
 ### Fixed
