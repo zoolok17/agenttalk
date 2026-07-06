@@ -47,6 +47,8 @@ code, write or run tests, or approve a change — hand those to the skills it na
    For an end-user-facing feature, the plan MUST include running the REAL user
    journey against a realistic setup; unit / contract / security coverage does
    NOT substitute for it.
+   For a SHARED-FRONTEND / dashboard change (`console.js` / `console.css`),
+   require smoking ALL dashboard views, not only the one changed.
 4. Assign each recommended check a cost — cheap, moderate, or expensive — and
    justify every expensive one (its token/time cost against the risk it retires).
 5. State explicitly what is NOT needed and why (for example: no security review

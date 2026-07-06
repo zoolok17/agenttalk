@@ -2265,9 +2265,9 @@ assert(hooks.freshHeartbeat({ last_seen_age_seconds: -1 }) === false, 'negative 
                    capture_output=True, text=True)
 
 
-def test_console_agent_detail_render_smoke_uses_selected_agent(tmp_path: Path) -> None:
+def test_console_all_dashboard_views_render_smoke_non_empty_main(tmp_path: Path) -> None:
     if shutil.which("node") is None:
-        pytest.skip("node is required for console agent-detail render smoke test")
+        pytest.skip("node is required for console all-views render smoke test")
 
     console_js = Path(web.__file__).with_name("web_static") / "console.js"
     src = console_js.read_text(encoding="utf-8")
@@ -2277,13 +2277,24 @@ def test_console_agent_detail_render_smoke_uses_selected_agent(tmp_path: Path) -
         marker,
         "  globalThis.__agenttalkConsoleTestHooks = {\n"
         "    state: state,\n"
-        "    renderAgentDetail: renderAgentDetail\n"
+        "    renderActiveView: renderActiveView,\n"
+        "    setPayloads: function (payloads) {\n"
+        "      lastState = payloads.lastState;\n"
+        "      attentionData = payloads.attentionData;\n"
+        "      leadChatData = payloads.leadChatData;\n"
+        "      intentsData = payloads.intentsData;\n"
+        "      threadCache = payloads.threadCache;\n"
+        "      actionSession.enabled = false;\n"
+        "      actionSession.token = null;\n"
+        "      actionSession.pending = false;\n"
+        "      actionSession.error = '';\n"
+        "    }\n"
         "  };\n\n" + marker,
         1,
     )
     instrumented = tmp_path / "console.instrumented.js"
     instrumented.write_text(src, encoding="utf-8")
-    runner = tmp_path / "console-agent-detail.js"
+    runner = tmp_path / "console-all-views.js"
     runner.write_text(r"""
 const fs = require('node:fs');
 const vm = require('node:vm');
@@ -2298,14 +2309,26 @@ function makeNode(tag) {
     className: '',
     textContent: '',
     disabled: false,
+    id: '',
+    value: '',
+    rows: 0,
+    placeholder: '',
+    selectedIndex: -1,
+    options: [],
     scrollTop: 0,
     style: {
       setProperty(name, value) { this[name] = String(value); },
+    },
+    classList: {
+      contains(cls) {
+        return String(node.className || '').split(/\s+/).includes(cls);
+      },
     },
     appendChild(child) {
       this.children.push(child);
       child.parentNode = this;
       this.firstChild = this.children[0] || null;
+      if (this.tagName === 'SELECT' && child.tagName === 'OPTION') this.options = this.children;
       return child;
     },
     removeChild(child) {
@@ -2313,11 +2336,23 @@ function makeNode(tag) {
       if (idx !== -1) this.children.splice(idx, 1);
       child.parentNode = null;
       this.firstChild = this.children[0] || null;
+      if (this.tagName === 'SELECT') this.options = this.children;
       return child;
+    },
+    replaceChild(next, prev) {
+      const idx = this.children.indexOf(prev);
+      if (idx === -1) return this.appendChild(next);
+      this.children[idx] = next;
+      next.parentNode = this;
+      prev.parentNode = null;
+      this.firstChild = this.children[0] || null;
+      if (this.tagName === 'SELECT') this.options = this.children;
+      return prev;
     },
     setAttribute(name, value) {
       this.attributes[name] = String(value);
       if (name === 'class') this.className = String(value);
+      if (name === 'id') this.id = String(value);
     },
     getAttribute(name) {
       return Object.prototype.hasOwnProperty.call(this.attributes, name)
@@ -2325,13 +2360,41 @@ function makeNode(tag) {
         : null;
     },
     addEventListener() {},
-    querySelector() { return null; },
+    querySelector(selector) {
+      if (selector[0] === '.') return findByClass(this, selector.slice(1));
+      if (selector[0] === '#') return findById(this, selector.slice(1));
+      return null;
+    },
+    querySelectorAll(selector) {
+      const found = [];
+      collectMatches(this, selector, found);
+      return found;
+    },
+    closest(selector) {
+      let cur = this;
+      const classes = selector.split(',').map((s) => s.trim()).filter((s) => s[0] === '.')
+        .map((s) => s.slice(1));
+      while (cur) {
+        if (classes.some((cls) => hasClass(cur, cls))) return cur;
+        cur = cur.parentNode;
+      }
+      return null;
+    },
   };
   return node;
 }
 
 function hasClass(node, cls) {
   return String(node.className || '').split(/\s+/).includes(cls);
+}
+
+function findById(node, id) {
+  if (node.id === id || node.attributes.id === id) return node;
+  for (const child of node.children || []) {
+    const got = findById(child, id);
+    if (got) return got;
+  }
+  return null;
 }
 
 function findByClass(node, cls) {
@@ -2341,6 +2404,14 @@ function findByClass(node, cls) {
     if (got) return got;
   }
   return null;
+}
+
+function collectMatches(node, selector, found) {
+  if (selector[0] === '.' && hasClass(node, selector.slice(1))) found.push(node);
+  if (selector[0] === '#' && (node.id === selector.slice(1) || node.attributes.id === selector.slice(1))) {
+    found.push(node);
+  }
+  for (const child of node.children || []) collectMatches(child, selector, found);
 }
 
 function collectText(node) {
@@ -2354,15 +2425,35 @@ function assert(cond, msg) {
 }
 
 const source = fs.readFileSync(process.argv[2], 'utf8');
+const app = makeNode('div');
+app.setAttribute('id', 'app');
+const topbar = makeNode('header');
+topbar.setAttribute('id', 'topbar');
+const sidebar = makeNode('aside');
+sidebar.setAttribute('id', 'sidebar');
+const main = makeNode('main');
+main.setAttribute('id', 'main');
 const document = {
   body: makeNode('body'),
+  activeElement: null,
   readyState: 'loading',
   createElement: makeNode,
   createElementNS(_ns, tag) { return makeNode(tag); },
   addEventListener() {},
-  querySelector() { return null; },
-  querySelectorAll() { return []; },
+  getElementById(id) { return findById(this.body, id); },
+  querySelector(selector) {
+    if (selector === '#topbar .tc-clock') {
+      const bar = this.getElementById('topbar');
+      return bar ? findByClass(bar, 'tc-clock') : null;
+    }
+    return this.body.querySelector(selector);
+  },
+  querySelectorAll(selector) { return this.body.querySelectorAll(selector); },
 };
+document.body.appendChild(app);
+app.appendChild(topbar);
+app.appendChild(sidebar);
+app.appendChild(main);
 const ctx = {
   console,
   document,
@@ -2379,35 +2470,196 @@ vm.createContext(ctx);
 vm.runInContext(source, ctx, { filename: 'console.instrumented.js' });
 const hooks = ctx.__agenttalkConsoleTestHooks;
 
-function render(agent) {
-  hooks.state.selectedAgent = agent.name;
-  const main = makeNode('main');
-  hooks.renderAgentDetail(main, { agents: [agent], threads: [], recent: [] });
-  assert(findByClass(main, 'tc-detail-body'), `${agent.name} detail body missing`);
-  assert(collectText(main).includes(agent.name), `${agent.name} text missing`);
-  return main;
-}
+const now = Date.now();
+const iso = new Date(now - 30_000).toISOString();
+const root = {
+  label: 'demo-root',
+  operator: { principal: 'operator', label: 'Operator', role_label: 'operator' },
+  spec_kitty: { missions: ['smoke-mission'] },
+  counts: { closed_threads: 1 },
+  agents: [
+    {
+      name: 'codex-test',
+      cli: 'codex',
+      role: 'tester',
+      groups: ['qa'],
+      task: 'Smoke every dashboard view',
+      wrapped: true,
+      restartable: true,
+      health: { state: 'working_turn' },
+      last_seen: iso,
+      last_seen_age_seconds: 5,
+      sent: 4,
+      received: 6,
+      rate_used_pct: 22,
+      context_used_pct: 41,
+      capacity: {
+        confidence: 'fresh',
+        primary: { label: '5h', used_pct: 22, reset_in_seconds: 1800 },
+        secondary: { label: 'weekly', used_pct: 33, reset_in_seconds: 7200 },
+        context: { used_pct: 41, tokens: 41000, window_size: 100000 },
+      },
+      health_timeline: [
+        { state: 'working_turn', seconds: 900 },
+        { state: 'idle_waiting', seconds: 300 },
+      ],
+      owned_domains: [{ name: 'dashboard', globs: ['src/agenttalk/web_static/*'] }],
+    },
+    {
+      name: 'claude-lead',
+      cli: 'claude',
+      role: 'lead',
+      task: 'Route QA work',
+      wrapped: true,
+      health: { state: 'idle_waiting' },
+      last_seen: iso,
+      last_seen_age_seconds: 12,
+      sent: 7,
+      received: 5,
+      capacity: { confidence: 'unknown', reason: 'not reported' },
+    },
+    {
+      name: 'stuck-agent',
+      cli: 'claude',
+      role: 'developer',
+      task: 'Needs restart',
+      wrapped: true,
+      restartable: true,
+      health: { state: 'stuck_suspected' },
+      last_seen: iso,
+      last_seen_age_seconds: 900,
+      sent: 1,
+      received: 2,
+      capacity: { confidence: 'stale' },
+    },
+  ],
+  edges: [
+    { from: 'claude-lead', to: 'codex-test', count: 4 },
+    { from: 'codex-test', to: 'stuck-agent', count: 2 },
+  ],
+  threads: [{
+    request_id: 'rid-qa',
+    opener: 'claude-lead',
+    opener_peer: 'codex-test',
+    opener_kind: 'question',
+    subject: 'All views QA task',
+    next_owner: 'codex-test',
+    active_review: true,
+    mission: 'smoke-mission',
+    wp_id: 'WP-QA',
+    ts: iso,
+    age_seconds: 30,
+    verdict: 'accepted',
+  }],
+  recent: [
+    {
+      id: 'm2', ts: iso, age_seconds: 20,
+      from: 'codex-test', to: 'claude-lead', kind: 'message',
+      subject: 'PASS evidence',
+    },
+    {
+      id: 'm1', ts: iso, age_seconds: 40,
+      from: 'claude-lead', to: 'codex-test', kind: 'question',
+      subject: 'All views QA task',
+    },
+  ],
+};
 
-render({
-  name: 'wrapped',
-  cli: 'codex',
-  wrapped: true,
-  health: { state: 'working_silent' },
-  last_seen_age_seconds: 8,
-});
-render({
-  name: 'fresh-unwrapped',
-  health: { state: 'unknown' },
-  last_seen_age_seconds: 5,
-});
-const stuck = render({
-  name: 'stuck',
-  cli: 'claude',
-  wrapped: true,
-  health: { state: 'stuck_suspected' },
-  last_seen_age_seconds: 900,
-});
-assert(collectText(stuck).includes('Restart with context'), 'stuck restart action missing');
+const payloads = {
+  lastState: { roots: [root], _fetchedAt: now },
+  attentionData: {
+    count: 2,
+    items: [
+      {
+        source: 'escalation',
+        source_label: 'ESCALATION',
+        severity: 'high',
+        title: 'Operator decision needed',
+        detail: 'Choose release path',
+        agent: 'claude-lead',
+        request_id: 'esc-1',
+        answerable: true,
+        ts: iso,
+        age_seconds: 90,
+      },
+      {
+        source: 'stuck',
+        source_label: 'STUCK',
+        severity: 'med',
+        title: 'stuck-agent may need restart',
+        detail: 'No progress heartbeat',
+        agent: 'stuck-agent',
+        ts: iso,
+        age_seconds: 900,
+      },
+    ],
+  },
+  leadChatData: {
+    status: 'live',
+    available: true,
+    operator: 'operator',
+    lead: 'claude-lead',
+    request_id: 'lead-chat-rid',
+    messages: [
+      { from: 'operator', kind: 'message', body: 'please gate after QA', ts: iso, age_seconds: 55 },
+      { from: 'claude-lead', kind: 'message', body: 'route received', ts: iso, age_seconds: 45 },
+    ],
+    pending_decisions: [{
+      request_id: 'esc-1',
+      sender: 'codex-test',
+      decision: 'Need operator choice',
+      recommendation: 'hold until QA evidence lands',
+      options: ['hold', 'go'],
+      priority: 'high',
+      ts: iso,
+      age_seconds: 75,
+    }],
+    liveness: { state: 'idle_waiting', reason: 'listening' },
+  },
+  intentsData: {
+    target_root_label: 'demo-root',
+    items: [{ intent_id: 'intent-1', kind: 'send', state: 'queued', code: 'queued' }],
+  },
+  threadCache: {
+    'demo-root|rid-qa': {
+      request_id: 'rid-qa',
+      subject: 'All views QA task',
+      participants: ['claude-lead', 'codex-test'],
+      messages: [
+        { id: 't1', from: 'claude-lead', kind: 'question', body: 'smoke every view', ts: iso, age_seconds: 30 },
+        { id: 't2', from: 'codex-test', kind: 'message', body: 'PASS evidence', ts: iso, age_seconds: 10 },
+      ],
+    },
+  },
+};
+
+const cases = [
+  { view: 'overview', expected: ['Who', 'Working', 'codex-test'] },
+  { view: 'flow', expected: ['talking to whom', 'Active threads', 'All views QA task'] },
+  { view: 'attention', expected: ['Needs a human', 'Operator decision needed', 'stuck-agent'] },
+  { view: 'lead-chat', expected: ['Lead chat', 'Direct channel', 'route received'] },
+  { view: 'sessions', sessionRid: 'rid-qa', expected: ['Sessions', 'All views QA task', 'smoke every view'] },
+  { view: 'agent', selectedAgent: 'stuck-agent', expected: ['stuck-agent', 'Restart with context', 'Supervisor'] },
+];
+
+for (const tc of cases) {
+  hooks.setPayloads(payloads);
+  hooks.state.view = tc.view;
+  hooks.state.selectedRoot = 0;
+  hooks.state.selectedAgent = tc.selectedAgent || null;
+  hooks.state.sessionRid = tc.sessionRid || null;
+  hooks.state.filter = 'all';
+  main.children = [];
+  main.firstChild = null;
+  main.textContent = '';
+  hooks.renderActiveView();
+  const text = collectText(main).replace(/\s+/g, ' ').trim();
+  assert(main.children.length > 0, `${tc.view} did not append content`);
+  assert(text.length > 0, `${tc.view} rendered an empty main pane`);
+  for (const expected of tc.expected) {
+    assert(text.includes(expected), `${tc.view} missing expected text: ${expected}\nrendered: ${text}`);
+  }
+}
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)
