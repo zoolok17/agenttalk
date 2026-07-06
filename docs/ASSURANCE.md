@@ -6,7 +6,7 @@ scanned), with the *evidence* that earns each label. This is a living document: 
 release ritual appends a ledger entry per release (see **Standing commitment**).
 
 Pairs with: `CHANGELOG.md` (what shipped) · `docs/DESIGN.md` (why / architecture) ·
-`docs/ISSUES.md` (open items + accepted known-limitations) ·
+`docs/ROADMAP.md` (where it's going) · `docs/ISSUES.md` (open items + accepted known-limitations) ·
 `docs/audit-2026-06-28.md` (a full historical audit).
 
 ---

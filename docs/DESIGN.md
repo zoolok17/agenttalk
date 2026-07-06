@@ -6,6 +6,7 @@ working in this codebase: the code and tests are the source of truth for *how it
 behaves*; this doc is the source of truth for *why it is shaped this way*.
 
 Companion docs:
+- `docs/ROADMAP.md` — the official product roadmap + feasibility verdict (where this is going).
 - `docs/ISSUES.md` — the living tracker (work in flight, known limitations, audit findings).
 - `docs/ASSURANCE.md` — per-release GOOD/ROBUST/SECURE attestation + the codebase security posture.
 - `CHANGELOG.md` — what changed, per release.
