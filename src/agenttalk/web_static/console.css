@@ -1185,7 +1185,6 @@ body {
   max-height: calc(100vh - 360px);
   overflow: auto;
 }
-.tc-lead-msg-row .tc-bubble { max-width: min(680px, 86%); }
 .tc-lead-composer {
   display: grid;
   gap: 9px;
@@ -1437,6 +1436,28 @@ body {
 }
 .tc-bubble.is-left  { align-self: flex-start; background: var(--surface); }
 .tc-bubble.is-right { align-self: flex-end; background: var(--accent-soft); }
+.tc-lead-msg-row {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 8px;
+}
+.tc-lead-msg-row.is-left { justify-content: flex-start; }
+.tc-lead-msg-row.is-right { justify-content: flex-end; }
+.tc-lead-msg-row > .tc-bubble {
+  align-self: flex-start;
+  max-width: min(680px, 86%, calc(100% - 36px));
+}
+.tc-lead-msg-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  flex: none;
+}
+.tc-lead-msg-avatar.tc-avatar-shaped {
+  width: 24px;
+  height: 32px;
+}
 .tc-bubble-head { display: flex; align-items: center; gap: 7px; margin-bottom: 8px; }
 .tc-bubble-from { font-family: var(--font-mono); font-size: 12px; font-weight: 500; color: var(--ink2); }
 .tc-bubble-age { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink5); }

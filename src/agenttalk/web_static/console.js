@@ -1521,7 +1521,7 @@
     wrap.appendChild(head);
 
     var layout = el('div', 'tc-lead-layout');
-    layout.appendChild(leadChatTranscript(data));
+    layout.appendChild(leadChatTranscript(data, root));
     layout.appendChild(leadChatSide(data));
     wrap.appendChild(layout);
     main.appendChild(wrap);
@@ -1554,7 +1554,7 @@
     return el('span', 'tc-chip ' + cls, label);
   }
 
-  function leadChatTranscript(data) {
+  function leadChatTranscript(data, root) {
     var card = el('div', 'tc-card tc-lead-panel tc-lead-transcript-card');
     var head = el('div', 'tc-lead-panel-head');
     head.appendChild(el('div', 'tc-card-title', 'Direct channel'));
@@ -1570,7 +1570,7 @@
       body.appendChild(transcriptEmpty('No messages yet', 'Send the first note to the lead.'));
     } else {
       for (var i = 0; i < data.messages.length; i++) {
-        body.appendChild(leadChatMessage(data.messages[i], data.operator));
+        body.appendChild(leadChatMessage(data.messages[i], data.operator, root));
       }
     }
     card.appendChild(body);
@@ -1578,9 +1578,28 @@
     return card;
   }
 
-  function leadChatMessage(m, operator) {
+  function leadChatMessage(m, operator, root) {
     var mine = m.from === operator;
-    var row = el('div', 'tc-msg-row tc-lead-msg-row');
+    var row = el('div', 'tc-msg-row tc-lead-msg-row ' + (mine ? 'is-right' : 'is-left'));
+    var av;
+    if (mine) {
+      av = agentAvatar({
+        principal: operator || 'operator',
+        name: operator || 'operator',
+        avatar: root && root.operator && root.operator.avatar,
+      }, 'tc-lead-msg-avatar tc-operator-avatar', null, { operator: true, hideStatus: true }) ||
+        operatorFallbackAvatar('tc-lead-msg-avatar tc-operator-avatar');
+    } else {
+      var agents = root && isArray(root.agents) ? root.agents : [];
+      var agentObj = null;
+      for (var i = 0; i < agents.length; i++) {
+        if (agents[i] && agents[i].name === m.from) {
+          agentObj = agents[i];
+          break;
+        }
+      }
+      av = avatarOrDot(agentObj || { name: m.from }, 'tc-lead-msg-avatar', 'tc-lead-msg-dot');
+    }
     var bubble = el('div', 'tc-bubble ' + (mine ? 'is-right' : 'is-left'));
     var bh = el('div', 'tc-bubble-head');
     bh.appendChild(el('span', 'tc-bubble-from', mine ? 'operator' : (m.from || 'lead')));
@@ -1589,7 +1608,13 @@
     bh.appendChild(ageEl('tc-bubble-age', m));
     bubble.appendChild(bh);
     bubble.appendChild(el('div', 'tc-bubble-body', m.body || ''));
-    row.appendChild(bubble);
+    if (mine) {
+      row.appendChild(bubble);
+      row.appendChild(av);
+    } else {
+      row.appendChild(av);
+      row.appendChild(bubble);
+    }
     return row;
   }
 
