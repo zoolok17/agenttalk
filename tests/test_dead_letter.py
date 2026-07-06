@@ -17,6 +17,7 @@ import pytest
 
 from agenttalk import attention as att
 from agenttalk import cli, supervisor as sup
+from agenttalk.redaction import normalize_child_output_tail, redact_diagnostic_text
 from agenttalk.store import Store
 from agenttalk.wrapper import loop, recv_api, run, session
 from agenttalk.wrapper.loop import CLASS_AMBIGUOUS, CLASS_INFRA, CLASS_POISON, DriveOutcome
@@ -273,6 +274,32 @@ def test_11_no_loss_on_move_and_collision_safe(tmp_path: Path) -> None:
     assert s.read_dead_letter_payload("beta", stem) == orig2                       # recoverable bytes
 
 
+@pytest.mark.parametrize(("raw", "expected", "raw_tokens"), [
+    ("Authorization: Bearer short", "Authorization: [REDACTED]", ["short"]),
+    ("Authorization: Basic abc123", "Authorization: [REDACTED]", ["abc123"]),
+    ("Authorization: Token tok123", "Authorization: [REDACTED]", ["tok123"]),
+    ("authorization=Bearer short", "authorization=[REDACTED]", ["short"]),
+    ("Bearer short", "Bearer [REDACTED]", ["short"]),
+    ("token=\"abcdefghijklmnop\"", "token=[REDACTED]", ["abcdefghijklmnop"]),
+    ("password='hunter2'", "password=[REDACTED]", ["hunter2"]),
+    ("credential=\"abc def\"", "credential=[REDACTED]", ["abc def"]),
+])
+def test_child_output_redaction_covers_auth_and_quoted_assignments(
+    raw: str,
+    expected: str,
+    raw_tokens: list[str],
+) -> None:
+    assert redact_diagnostic_text(raw) == expected
+
+    tail = normalize_child_output_tail({"lines": [{"stream": "stderr", "text": raw}]})
+
+    assert tail is not None
+    rendered = json.dumps(tail, ensure_ascii=False)
+    assert tail["lines"][0]["text"] == expected
+    for token in raw_tokens:
+        assert token not in rendered
+
+
 def test_11b_dead_letter_stores_and_shows_redacted_child_output_tail(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -281,6 +308,9 @@ def test_11b_dead_letter_stores_and_shows_redacted_child_output_tail(
     msg = _send(s, "poison")
     secret = "sk-FAKE-AGENTTALK-ABC123SECRET"  # gitleaks:allow
     bearer = "abcdefghijklmnop"
+    short_bearer = "short"
+    short_basic = "abc123"
+    short_token = "tok123"
     token = "secret12345"
     password = "hunter2"
     tail = {
@@ -288,6 +318,9 @@ def test_11b_dead_letter_stores_and_shows_redacted_child_output_tail(
             {"stream": "stdout", "text": "child booted"},
             {"stream": "stderr", "text": f"crashed token={secret}"},
             {"stream": "stderr", "text": f"Authorization: Bearer {bearer}"},
+            {"stream": "stderr", "text": f"Authorization: Bearer {short_bearer}"},
+            {"stream": "stderr", "text": f"Authorization: Basic {short_basic}"},
+            {"stream": "stderr", "text": f"Authorization: Token {short_token}"},
             {"stream": "stdout", "text": f"token={token}"},
             {"stream": "stderr", "text": f"password='{password}'"},
         ]
@@ -306,6 +339,9 @@ def test_11b_dead_letter_stores_and_shows_redacted_child_output_tail(
     assert "child_output_tail" in entry
     assert secret not in rendered
     assert bearer not in rendered
+    assert short_bearer not in rendered
+    assert short_basic not in rendered
+    assert short_token not in rendered
     assert token not in rendered
     assert password not in rendered
     assert "[REDACTED]" in rendered
@@ -321,6 +357,9 @@ def test_11b_dead_letter_stores_and_shows_redacted_child_output_tail(
     assert "[stderr] password=[REDACTED]" in out
     assert secret not in out
     assert bearer not in out
+    assert short_bearer not in out
+    assert short_basic not in out
+    assert short_token not in out
     assert token not in out
     assert password not in out
 
