@@ -10,7 +10,9 @@ CHILD_OUTPUT_TAIL_MAX_LINES = 64
 
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(api[-_ ]?key|token|secret|password|credential|authorization)"
-    r"(\s*[:=]\s*)([^\s'\",;]+)"
+    r"(\s*[:=]\s*)"
+    r"(?:[A-Za-z]+\s+(?:[A-Za-z0-9._~+/=-]{8,}|\[REDACTED\])|"
+    r"\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s'\",;]+)"
 )
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}")
 _OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9._-]{8,}\b")
@@ -19,8 +21,8 @@ _OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9._-]{8,}\b")
 def redact_diagnostic_text(value: object) -> str:
     """Redact common secret-bearing tokens while preserving diagnostic context."""
     text = str(value or "")
-    text = _SECRET_ASSIGNMENT_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", text)
     text = _BEARER_RE.sub("Bearer [REDACTED]", text)
+    text = _SECRET_ASSIGNMENT_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", text)
     return _OPENAI_KEY_RE.sub("sk-[REDACTED]", text)
 
 

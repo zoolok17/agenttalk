@@ -280,10 +280,16 @@ def test_11b_dead_letter_stores_and_shows_redacted_child_output_tail(
     s = _store(tmp_path)
     msg = _send(s, "poison")
     secret = "sk-FAKE-AGENTTALK-ABC123SECRET"  # gitleaks:allow
+    bearer = "abcdefghijklmnop"
+    token = "secret12345"
+    password = "hunter2"
     tail = {
         "lines": [
             {"stream": "stdout", "text": "child booted"},
             {"stream": "stderr", "text": f"crashed token={secret}"},
+            {"stream": "stderr", "text": f"Authorization: Bearer {bearer}"},
+            {"stream": "stdout", "text": f"token={token}"},
+            {"stream": "stderr", "text": f"password='{password}'"},
         ]
     }
     drive = _always(DriveOutcome(
@@ -299,6 +305,9 @@ def test_11b_dead_letter_stores_and_shows_redacted_child_output_tail(
     rendered = json.dumps(entry, ensure_ascii=False)
     assert "child_output_tail" in entry
     assert secret not in rendered
+    assert bearer not in rendered
+    assert token not in rendered
+    assert password not in rendered
     assert "[REDACTED]" in rendered
 
     rc = _run(["dead-letter", "show", "--agent", "beta", "--id", msg.id], tmp_path)
@@ -307,7 +316,13 @@ def test_11b_dead_letter_stores_and_shows_redacted_child_output_tail(
     assert "---- child output tail (redacted) ----" in out
     assert "[stdout] child booted" in out
     assert "[stderr] crashed token=[REDACTED]" in out
+    assert "[stderr] Authorization: [REDACTED]" in out
+    assert "[stdout] token=[REDACTED]" in out
+    assert "[stderr] password=[REDACTED]" in out
     assert secret not in out
+    assert bearer not in out
+    assert token not in out
+    assert password not in out
 
 
 def test_11c_dead_letter_child_output_tail_cap_holds(tmp_path: Path) -> None:
