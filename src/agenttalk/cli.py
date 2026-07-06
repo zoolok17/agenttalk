@@ -6830,6 +6830,9 @@ def cmd_heartbeat(args: argparse.Namespace) -> int:
     than once per interval (the stuck threshold is ~120s; ~5s granularity is
     plenty).
     """
+    if getattr(args, "fallback_for", None) and not getattr(args, "hook", False):
+        sys.stderr.write("agenttalk heartbeat: --fallback-for requires --hook\n")
+        return 2
     if getattr(args, "hook", False):
         # HOOK MODE (wired as PostToolUse / Codex hook): must NEVER block a tool
         # call AND must stay SILENT (it fires on every tool call, so any output
@@ -6854,7 +6857,7 @@ def _do_heartbeat(args: argparse.Namespace) -> int:
     """Strict heartbeat stamp (throttled). Raises on a bad identity / store."""
     store = _get_store(args)
     roster = store.load_config().get("agents") or []
-    agent = _resolve_self(args.agent, roster=roster)
+    agent = _resolve_heartbeat_agent(args, roster=roster)
     min_interval = max(0.0, args.min_interval)
     if min_interval > 0:
         hb = store.read_heartbeat(agent)
@@ -6862,6 +6865,21 @@ def _do_heartbeat(args: argparse.Namespace) -> int:
             return 0  # still fresh — throttled no-op
     store.write_heartbeat(agent)
     return 0
+
+
+def _resolve_heartbeat_agent(args: argparse.Namespace, *, roster: list[str]) -> str:
+    if getattr(args, "agent", None) or os.environ.get("AGENTTALK_SELF"):
+        return _resolve_self(args.agent, roster=roster)
+    if getattr(args, "hook", False) and getattr(args, "fallback_for", None):
+        fallback = args.fallback_for
+        try:
+            validate_agent_name(fallback)
+        except ValueError as e:
+            sys.stderr.write(f"agenttalk: {e}\n")
+            sys.exit(2)
+        _ensure_in_roster(fallback, roster, label="fallback")
+        return fallback
+    return _resolve_self(args.agent, roster=roster)
 
 
 def cmd_request_restart(args: argparse.Namespace) -> int:
@@ -8013,8 +8031,27 @@ def cmd_supervise(args: argparse.Namespace) -> int:
               f"{sup.claude_hook_snippet()}")
         return 0
     if args.install_activity_hook:
-        res = sup.install_activity_hook(store, claude=not args.codex_only,
-                                        codex=args.codex or args.codex_only)
+        interactive_for = getattr(args, "interactive_for", None)
+        if interactive_for and (args.codex or args.codex_only):
+            sys.stderr.write(
+                "agenttalk supervise --install-activity-hook: --interactive-for "
+                "cannot be combined with --codex or --codex-only\n"
+            )
+            return 2
+        if interactive_for:
+            try:
+                interactive_for = sup.resolve_interactive_activity_hook_target(
+                    store, interactive_for)
+            except ValueError as e:
+                sys.stderr.write(
+                    f"agenttalk supervise --install-activity-hook: {e}\n")
+                return 2
+        res = sup.install_activity_hook(
+            store,
+            claude=True if interactive_for else not args.codex_only,
+            codex=False if interactive_for else args.codex or args.codex_only,
+            interactive_for=interactive_for,
+        )
         for path, status in res.items():
             print(f"  {status}: {path}")
         print("install-activity-hook: merged into PROJECT config only (never "
@@ -9440,6 +9477,8 @@ def build_parser() -> argparse.ArgumentParser:
              "hook so it stays fresh while the model works.",
     )
     phb.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
+    phb.add_argument("--fallback-for", dest="fallback_for",
+                     help="Hook-only fallback identity when --for and AGENTTALK_SELF are absent.")
     phb.add_argument("--min-interval", dest="min_interval", type=float, default=5.0,
                      help="No-op if the heartbeat is younger than this many "
                           "seconds (default 5).")
@@ -9720,6 +9759,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="(--install-activity-hook) ALSO install the Codex hook.")
     psup.add_argument("--codex-only", dest="codex_only", action="store_true",
                       help="(--install-activity-hook) install ONLY the Codex hook.")
+    psup.add_argument("--interactive-for", dest="interactive_for",
+                      help="(--install-activity-hook) install a Claude hook "
+                           "bound to the operator-facing liaison identity.")
     psup.add_argument("--force", action="store_true", help="(--init) overwrite existing files.")
     psup.add_argument("--now", type=float, default=None,
                       help="Override 'now' (epoch seconds) for report/plan — test hook.")

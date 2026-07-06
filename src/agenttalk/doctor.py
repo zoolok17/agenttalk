@@ -24,6 +24,7 @@ from agenttalk import __version__
 from agenttalk import codex_config as cxc
 from agenttalk import install_skills as iskl
 from agenttalk import signing as _signing
+from agenttalk import supervisor as sup
 from agenttalk.store import Store, find_root, find_stores_upward
 
 
@@ -456,12 +457,88 @@ def _check_multi_store(resolved_root: Path, *, cwd: Path | None = None) -> Check
     )
 
 
+def _is_wrapped_or_managed_lead(store: Store, agent: str) -> bool:
+    if store.is_managed_lead_loop(agent):
+        return True
+    p = store.dir / "supervisor.json"
+    try:
+        cfg = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(cfg, dict):
+        return False
+    agents = cfg.get("agents")
+    if not isinstance(agents, dict):
+        return False
+    entry = agents.get(agent)
+    return isinstance(entry, dict) and bool(entry.get("wrapped"))
+
+
+def _interactive_hook_warning(
+    *,
+    target: str,
+    descriptor: str,
+    heartbeat_state: str,
+    hook_state: str,
+) -> Check:
+    base = f"{descriptor} {heartbeat_state}; pending escalations may sit unread"
+    interactive_fix = (
+        f"run `agenttalk supervise --install-activity-hook --interactive-for {target}` "
+        f"in the interactive Claude project, or have {target} start listening "
+        f"(`agenttalk wait --for {target}`)"
+    )
+    if hook_state == "neutral":
+        return Check(
+            name="operator_facing",
+            status="warn",
+            details=(f"{base}; neutral Claude activity heartbeat hook needs "
+                     "AGENTTALK_SELF in this window"),
+            fix=(f"set AGENTTALK_SELF={target} before launching this window, "
+                 f"or run `agenttalk supervise --install-activity-hook "
+                 f"--interactive-for {target}`"),
+        )
+    if hook_state == "fallback-other":
+        return Check(
+            name="operator_facing",
+            status="warn",
+            details=(f"{base}; Claude activity heartbeat hook is bound to the "
+                     "wrong identity"),
+            fix=(f"run `agenttalk supervise --install-activity-hook "
+                 f"--interactive-for {target}` to bind the hook to {target}"),
+        )
+    if hook_state == "fallback-matching":
+        return Check(
+            name="operator_facing",
+            status="warn",
+            details=(f"{base}; fallback hook is installed but no fresh "
+                     "heartbeat arrived"),
+            fix=("reload or restart the interactive Claude window, then run a "
+                 f"tool call; otherwise have {target} start listening "
+                 f"(`agenttalk wait --for {target}`)"),
+        )
+    if hook_state == "unreadable":
+        return Check(
+            name="operator_facing",
+            status="warn",
+            details=(f"{base}; .claude/settings.json is unreadable, so doctor "
+                     "could not inspect the heartbeat hook"),
+            fix=interactive_fix,
+        )
+    return Check(
+        name="operator_facing",
+        status="warn",
+        details=(f"{base}; no Claude activity heartbeat hook is installed"),
+        fix=interactive_fix,
+    )
+
+
 def _check_operator_facing(store: Store) -> Check:
     """Liaison designation health (#18). Advisory routing metadata only —
     diagnostics phrase routing/visibility facts, never enforcement."""
     raw = store.operator_facing_raw()
     resolved = store.operator_facing()
-    if raw is None:
+    sole = store.sole_lead()
+    if raw is None and sole is None:
         # Legitimate for pairs/single-window teams — INFO. But once
         # escalation traffic exists, workers are asking for an operator
         # channel that has no contracted owner: WARN. One pass over the
@@ -486,36 +563,53 @@ def _check_operator_facing(store: Store) -> Check:
                     "human operator should designate a liaison)",
         )
     if resolved is None:
+        if raw is None and sole is not None:
+            resolved = sole
+            descriptor = f"sole lead {resolved}"
+        else:
+            return Check(
+                name="operator_facing",
+                status="error",
+                details=f"configured liaison {raw!r} is NOT in the roster — "
+                        f"escalations will refuse",
+                fix=("run `agenttalk roster set-operator-facing <agent>` with a "
+                     "rostered name, or `... set-operator-facing --clear`"),
+            )
+    else:
+        descriptor = f"liaison {resolved}"
+    if _is_wrapped_or_managed_lead(store, resolved):
         return Check(
             name="operator_facing",
-            status="error",
-            details=f"configured liaison {raw!r} is NOT in the roster — "
-                    f"escalations will refuse",
-            fix=("run `agenttalk roster set-operator-facing <agent>` with a "
-                 "rostered name, or `... set-operator-facing --clear`"),
+            status="ok",
+            details=f"{descriptor}: wrapped/managed lead loop handles liveness",
         )
+    if store.agent_active(resolved):
+        return Check(
+            name="operator_facing",
+            status="ok",
+            details=f"{descriptor}: active",
+        )
+    hook_state = sup.classify_claude_activity_hook_state(store.root, resolved)
     hb = store.read_heartbeat(resolved)
     if hb is None:
         # Never listened (or an unreadable/corrupt heartbeat — read_heartbeat
         # collapses both to None). This is the exact scenario this check exists
         # to catch — escalations routed to a liaison nobody is reading — so it
         # must WARN, not fall through to OK (review).
-        return Check(
-            name="operator_facing",
-            status="warn",
-            details=(f"liaison {resolved} is configured but has never listened "
-                     f"(no readable heartbeat) — pending escalations may sit "
-                     f"unread"),
-            fix=f"have {resolved} start listening (`agenttalk wait --for {resolved}`)",
+        return _interactive_hook_warning(
+            target=resolved,
+            descriptor=descriptor,
+            heartbeat_state=("is configured but has never listened "
+                             "(no readable heartbeat)"),
+            hook_state=hook_state,
         )
     age = (datetime.now(timezone.utc) - hb).total_seconds()
     if age > 300:  # same 5-min rule as the heartbeat checks
-        return Check(
-            name="operator_facing",
-            status="warn",
-            details=(f"liaison {resolved} last seen {int(age)}s ago — "
-                     f"pending escalations may sit unread"),
-            fix=f"have {resolved} rejoin (`agenttalk sync --for {resolved}`)",
+        return _interactive_hook_warning(
+            target=resolved,
+            descriptor=descriptor,
+            heartbeat_state=f"last seen {int(age)}s ago",
+            hook_state=hook_state,
         )
     return Check(
         name="operator_facing",

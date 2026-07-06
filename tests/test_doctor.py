@@ -336,6 +336,145 @@ def test_operator_facing_warns_when_liaison_never_listened(tmp_path: Path) -> No
     assert "never listened" in c.details
 
 
+def _write_stale_heartbeat(store: Store, agent: str = "lead") -> None:
+    (store.state_dir / f"{agent}.heartbeat").write_text(
+        "2026-01-01T00:00:00Z", encoding="utf-8")
+
+
+def _write_claude_post_tool_hook(root: Path, command: str) -> None:
+    settings = root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"hooks": {"PostToolUse": [
+        {"matcher": "*", "hooks": [{"type": "command", "command": command}]},
+    ]}}), encoding="utf-8")
+
+
+def test_operator_facing_missing_heartbeat_no_hook_suggests_interactive_install(
+    tmp_path: Path,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["lead", "w1"])
+    s.set_operator_facing("lead")
+
+    c = doctor._check_operator_facing(s)
+
+    assert c.status == "warn"
+    assert "never listened" in c.details
+    assert "interactive-for lead" in c.fix
+    assert "wait --for lead" in c.fix
+
+
+def test_operator_facing_stale_neutral_hook_mentions_agenttalk_self(
+    tmp_path: Path,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["lead", "w1"])
+    s.set_operator_facing("lead")
+    _write_stale_heartbeat(s)
+    _write_claude_post_tool_hook(tmp_path, "agenttalk heartbeat --hook")
+
+    c = doctor._check_operator_facing(s)
+
+    assert c.status == "warn"
+    assert "neutral" in c.details
+    assert "AGENTTALK_SELF" in c.fix
+    assert "interactive-for lead" in c.fix
+
+
+def test_operator_facing_stale_wrong_fallback_warns_wrong_identity(
+    tmp_path: Path,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["lead", "w1"])
+    s.set_operator_facing("lead")
+    _write_stale_heartbeat(s)
+    _write_claude_post_tool_hook(tmp_path, "agenttalk heartbeat --hook --fallback-for w1")
+
+    c = doctor._check_operator_facing(s)
+
+    assert c.status == "warn"
+    assert "wrong identity" in c.details
+    assert "interactive-for lead" in c.fix
+
+
+def test_operator_facing_stale_matching_fallback_is_soft_reload_hint(
+    tmp_path: Path,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["lead", "w1"])
+    s.set_operator_facing("lead")
+    _write_stale_heartbeat(s)
+    _write_claude_post_tool_hook(tmp_path, "agenttalk heartbeat --hook --fallback-for lead")
+
+    c = doctor._check_operator_facing(s)
+
+    assert c.status == "warn"
+    assert "fallback hook is installed" in c.details
+    assert "reload" in c.fix
+
+
+def test_operator_facing_fresh_suppresses_interactive_hook_warning(
+    tmp_path: Path,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["lead", "w1"])
+    s.set_operator_facing("lead")
+    s.write_heartbeat("lead")
+    _write_claude_post_tool_hook(tmp_path, "agenttalk heartbeat --hook")
+
+    c = doctor._check_operator_facing(s)
+
+    assert c.status == "ok"
+
+
+def test_operator_facing_managed_or_wrapped_suppresses_interactive_hook_warning(
+    tmp_path: Path,
+) -> None:
+    managed = Store(tmp_path / "managed")
+    managed.init(["lead", "w1"])
+    managed.set_operator_facing("lead")
+    managed.set_managed_lead_loop("lead")
+    assert doctor._check_operator_facing(managed).status == "ok"
+
+    wrapped = Store(tmp_path / "wrapped")
+    wrapped.init(["lead", "w1"])
+    wrapped.set_operator_facing("lead")
+    (wrapped.dir / "supervisor.json").write_text(
+        json.dumps({"agents": {"lead": {"wrapped": True}}}), encoding="utf-8")
+    assert doctor._check_operator_facing(wrapped).status == "ok"
+
+
+def test_operator_facing_unreadable_hook_settings_warns_without_traceback(
+    tmp_path: Path,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["lead", "w1"])
+    s.set_operator_facing("lead")
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text("{not json", encoding="utf-8")
+
+    c = doctor._check_operator_facing(s)
+
+    assert c.status == "warn"
+    assert "settings.json" in c.details
+    assert "Traceback" not in c.details
+
+
+def test_operator_facing_sole_lead_missing_heartbeat_uses_interactive_hint(
+    tmp_path: Path,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["lead", "w1"])
+    s.set_role("lead", "lead")
+
+    c = doctor._check_operator_facing(s)
+
+    assert c.status == "warn"
+    assert "sole lead" in c.details
+    assert "interactive-for lead" in c.fix
+
+
 # ----- devkit (dev-discipline pack) doctor check -----------------------
 
 def _point_devkit_at(monkeypatch: pytest.MonkeyPatch, cl: Path, cx: Path) -> None:

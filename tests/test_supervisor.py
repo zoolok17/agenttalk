@@ -1797,7 +1797,98 @@ def test_heartbeat_hook_mode_uninitialized_store_returns_0_and_is_silent(
     assert captured.out == "" and captured.err == ""
 
 
+def test_heartbeat_hook_fallback_writes_without_env(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _team(tmp_path)
+    monkeypatch.delenv("AGENTTALK_SELF", raising=False)
+
+    assert _run(["heartbeat", "--hook", "--fallback-for", "lead"], tmp_path) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err == ""
+    assert s.read_heartbeat("lead") is not None
+    assert s.read_heartbeat("worker") is None
+
+
+def test_heartbeat_hook_env_overrides_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _team(tmp_path)
+    monkeypatch.setenv("AGENTTALK_SELF", "worker")
+
+    assert _run(["heartbeat", "--hook", "--fallback-for", "lead"], tmp_path) == 0
+
+    assert s.read_heartbeat("worker") is not None
+    assert s.read_heartbeat("lead") is None
+
+
+@pytest.mark.parametrize("fallback", ["ghost", "../lead"])
+def test_heartbeat_hook_invalid_or_off_roster_fallback_is_silent_noop(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    fallback: str,
+) -> None:
+    s = _team(tmp_path)
+    monkeypatch.delenv("AGENTTALK_SELF", raising=False)
+
+    assert _run(["heartbeat", "--hook", "--fallback-for", fallback], tmp_path) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err == ""
+    assert s.read_heartbeat("lead") is None
+    assert s.read_heartbeat("worker") is None
+
+
+def test_heartbeat_fallback_requires_hook_and_is_not_strict_authority(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _team(tmp_path)
+    monkeypatch.delenv("AGENTTALK_SELF", raising=False)
+
+    assert _run(["heartbeat", "--fallback-for", "lead"], tmp_path) == 2
+
+    captured = capsys.readouterr()
+    assert "--fallback-for requires --hook" in captured.err
+    assert s.read_heartbeat("lead") is None
+
+
+def test_heartbeat_hook_fallback_obeys_throttle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _team(tmp_path)
+    monkeypatch.delenv("AGENTTALK_SELF", raising=False)
+
+    assert _run(["heartbeat", "--hook", "--fallback-for", "lead"], tmp_path) == 0
+    first = s.read_heartbeat("lead")
+    assert first is not None
+
+    assert _run(
+        ["heartbeat", "--hook", "--fallback-for", "lead", "--min-interval", "9999"],
+        tmp_path,
+    ) == 0
+
+    assert s.read_heartbeat("lead") == first
+
+
 # ---------------------------------------- WP-3: install-activity-hook (merge-safe)
+
+
+def _post_tool_commands(path: Path) -> list[str]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return [
+        h["command"]
+        for group in data["hooks"]["PostToolUse"]
+        for h in group.get("hooks", [])
+        if isinstance(h, dict) and "command" in h
+    ]
 
 def test_install_activity_hook_merges_and_is_idempotent(tmp_path: Path) -> None:
     s = _team(tmp_path)
@@ -1862,6 +1953,134 @@ def test_install_activity_hook_upgrades_and_dedupes_legacy_bare(tmp_path: Path) 
     assert cmds.count("agenttalk heartbeat --hook") == 1     # upgraded + deduped
     assert "agenttalk heartbeat" not in cmds                 # no bare (blocking) hook left
     assert "echo other" in cmds                              # unrelated hook preserved
+
+
+def test_install_activity_hook_interactive_writes_fallback_and_preserves(
+    tmp_path: Path,
+) -> None:
+    s = _team(tmp_path)
+    s.set_operator_facing("lead")
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({
+        "model": "opus",
+        "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+            {"type": "command", "command": "echo pre"}]}]},
+    }), encoding="utf-8")
+
+    assert _run(["supervise", "--install-activity-hook", "--interactive-for", "lead"], tmp_path) == 0
+
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    assert data["model"] == "opus"
+    assert data["hooks"]["PreToolUse"]
+    cmds = _post_tool_commands(settings)
+    assert cmds == ["agenttalk heartbeat --hook --fallback-for lead"]
+    assert not (s.root / ".codex" / "hooks.json").exists()
+
+    assert _run(["supervise", "--install-activity-hook", "--interactive-for", "lead"], tmp_path) == 0
+    assert _post_tool_commands(settings).count("agenttalk heartbeat --hook --fallback-for lead") == 1
+
+
+@pytest.mark.parametrize("existing", [
+    "agenttalk heartbeat --hook",
+    "agenttalk heartbeat",
+])
+def test_install_activity_hook_interactive_upgrades_existing_heartbeat_without_dup(
+    tmp_path: Path,
+    existing: str,
+) -> None:
+    s = _team(tmp_path)
+    s.set_operator_facing("lead")
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"hooks": {"PostToolUse": [
+        {"matcher": "*", "hooks": [
+            {"type": "command", "command": existing},
+            {"type": "command", "command": "echo other"}]},
+        {"matcher": "Edit", "hooks": [
+            {"type": "command", "command": existing}]},
+    ]}}), encoding="utf-8")
+
+    assert _run(["supervise", "--install-activity-hook", "--interactive-for", "lead"], tmp_path) == 0
+
+    cmds = _post_tool_commands(settings)
+    assert cmds.count("agenttalk heartbeat --hook --fallback-for lead") == 1
+    assert existing not in cmds
+    assert "echo other" in cmds
+
+
+def test_install_activity_hook_interactive_rebinds_wrong_fallback_without_dup(
+    tmp_path: Path,
+) -> None:
+    s = _team(tmp_path)
+    s.set_operator_facing("lead")
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"hooks": {"PostToolUse": [
+        {"matcher": "*", "hooks": [
+            {"type": "command", "command": "agenttalk heartbeat --hook --fallback-for worker"}]},
+        {"matcher": "Edit", "hooks": [
+            {"type": "command", "command": "agenttalk heartbeat --hook"}]},
+    ]}}), encoding="utf-8")
+
+    assert _run(["supervise", "--install-activity-hook", "--interactive-for", "lead"], tmp_path) == 0
+
+    assert _post_tool_commands(settings) == ["agenttalk heartbeat --hook --fallback-for lead"]
+
+
+def test_install_activity_hook_neutral_does_not_downgrade_existing_fallback(
+    tmp_path: Path,
+) -> None:
+    s = _team(tmp_path)
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    fallback = "agenttalk heartbeat --hook --fallback-for lead"
+    settings.write_text(json.dumps({"hooks": {"PostToolUse": [
+        {"matcher": "*", "hooks": [{"type": "command", "command": fallback}]},
+    ]}}), encoding="utf-8")
+
+    assert _run(["supervise", "--install-activity-hook"], tmp_path) == 0
+
+    assert _post_tool_commands(settings) == [fallback]
+
+
+def test_install_activity_hook_interactive_refuses_non_liaison(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    s = _team(tmp_path)
+    s.set_operator_facing("lead")
+
+    assert _run(["supervise", "--install-activity-hook", "--interactive-for", "worker"], tmp_path) == 2
+
+    assert "operator-facing liaison" in capsys.readouterr().err
+
+
+def test_install_activity_hook_interactive_allows_sole_lead_without_liaison(
+    tmp_path: Path,
+) -> None:
+    s = _team(tmp_path)
+    s.set_role("lead", "lead")
+
+    assert _run(["supervise", "--install-activity-hook", "--interactive-for", "lead"], tmp_path) == 0
+
+    settings = s.root / ".claude" / "settings.json"
+    assert _post_tool_commands(settings) == ["agenttalk heartbeat --hook --fallback-for lead"]
+
+
+@pytest.mark.parametrize("flag", ["--codex", "--codex-only"])
+def test_install_activity_hook_interactive_refuses_codex_modes(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    flag: str,
+) -> None:
+    s = _team(tmp_path)
+    s.set_operator_facing("lead")
+
+    assert _run(["supervise", "--install-activity-hook", "--interactive-for", "lead", flag], tmp_path) == 2
+
+    assert "cannot be combined" in capsys.readouterr().err
+    assert not (s.root / ".codex" / "hooks.json").exists()
 
 
 def test_generated_ps1_is_bom_ascii_and_parses(tmp_path: Path) -> None:
