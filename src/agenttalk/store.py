@@ -36,6 +36,7 @@ from pathlib import Path
 from agenttalk import health as _health
 from agenttalk._atomic import write_text as _atomic_write_text
 from agenttalk import avatars as _avatars
+from agenttalk.redaction import normalize_child_output_tail
 from agenttalk import signing as _signing
 
 DIRNAME = ".agenttalk"
@@ -2449,7 +2450,8 @@ class Store:
             self._write_attempts(agent, data)
 
     def dead_letter(self, agent: str, record: dict, *, reason: str | None,
-                    failure_class: str, at: str) -> Path:
+                    failure_class: str, at: str,
+                    child_output_tail: object | None = None) -> Path:
         """Dispose the poison HEAD ``record``: move its bytes to the scan-invisible
         sink + advance the cursor past it, as ONE ordered, fail-closed sequence
         (single-writer = serialized): identity-check -> size/SHA256 -> MOVE
@@ -2510,6 +2512,9 @@ class Store:
                 "deadlettered_at": at, "cursor_at_deadletter": self.cursor(agent),
                 "payload_path": str(dst),
             }
+            tail = normalize_child_output_tail(child_output_tail)
+            if tail is not None:
+                meta["child_output_tail"] = tail
             _atomic_write_text(sidecar_dst, json.dumps(meta, indent=2, ensure_ascii=False))
         elif not payload.exists():
             # bytes neither in messages/ nor in the sink -> NOT recoverable -> NEVER

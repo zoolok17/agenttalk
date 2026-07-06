@@ -273,6 +273,64 @@ def test_11_no_loss_on_move_and_collision_safe(tmp_path: Path) -> None:
     assert s.read_dead_letter_payload("beta", stem) == orig2                       # recoverable bytes
 
 
+def test_11b_dead_letter_stores_and_shows_redacted_child_output_tail(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _store(tmp_path)
+    msg = _send(s, "poison")
+    secret = "sk-FAKE-AGENTTALK-ABC123SECRET"  # gitleaks:allow
+    tail = {
+        "lines": [
+            {"stream": "stdout", "text": "child booted"},
+            {"stream": "stderr", "text": f"crashed token={secret}"},
+        ]
+    }
+    drive = _always(DriveOutcome(
+        ok=False,
+        failure_class=CLASS_POISON,
+        summary="terminal poison",
+        child_output_tail=tail,
+    ))
+
+    _runloop(s, drive=drive, k_poison=1)
+
+    entry = s.list_dead_letters("beta")[0]
+    rendered = json.dumps(entry, ensure_ascii=False)
+    assert "child_output_tail" in entry
+    assert secret not in rendered
+    assert "[REDACTED]" in rendered
+
+    rc = _run(["dead-letter", "show", "--agent", "beta", "--id", msg.id], tmp_path)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "---- child output tail (redacted) ----" in out
+    assert "[stdout] child booted" in out
+    assert "[stderr] crashed token=[REDACTED]" in out
+    assert secret not in out
+
+
+def test_11c_dead_letter_child_output_tail_cap_holds(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    _send(s, "poison")
+    rec = _rec(s)
+    tail = {
+        "lines": [
+            {"stream": "stdout", "text": f"line-{idx} " + ("x" * 120)}
+            for idx in range(100)
+        ]
+    }
+
+    s.dead_letter("beta", rec, reason="x", failure_class=CLASS_POISON, at="t",
+                  child_output_tail=tail)
+
+    stored = s.list_dead_letters("beta")[0]["child_output_tail"]
+    assert stored["truncated"] is True
+    assert len(stored["lines"]) <= stored["max_lines"] == 64
+    assert stored["bytes"] <= stored["max_bytes"] == 4096
+    assert "line-0" not in json.dumps(stored)
+
+
 def test_12_atomic_ordering_idempotent_replay(tmp_path: Path, monkeypatch) -> None:
     s = _store(tmp_path)
     p = _send(s, "poison")

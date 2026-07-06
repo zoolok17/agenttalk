@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 from datetime import datetime, timezone
 
 from agenttalk import health as health_model
+from agenttalk.redaction import normalize_child_output_tail
 from agenttalk.store import LEAD_LOOP_LEASE_ENV
 
 from . import claude_adapter, codex_adapter
@@ -53,14 +54,10 @@ _TELEMETRY_ONLY = {"codex": True, "claude": False}
 _NO_CHILD_WINDOW_ENV = "AGENTTALK_NO_CHILD_WINDOW"
 _BENIGN_PIPE_TEARDOWN_ERRNOS = {errno.EINVAL, errno.EPIPE}
 
-# Known GLOBAL/INFRA signatures in a terminal turn-failure error message. A terminal
-# turn.failed / is_error carrying one of these is an OUTAGE (overload, rate-limit, 5xx,
-# auth, network, edge/WAF/proxy block), NOT message-poison - so it must NOT auto-dead-letter
-# at the low poison cap (lead verify P1/C4). Erring toward INFRA is the SAFE direction: a
-# misclassified poison just keeps retrying (with escalation at the ceiling), never false-DLs
-# a healthy one during an outage. NOTE: bare "blocked" is DELIBERATELY excluded - it would
-# shadow the content-policy poison markers ("blocked by safety" / "blocked by content
-# policy"), which must stay POISON; the edge tokens below catch gateway/WAF blocks without it.
+# Legacy infra-like text markers. These are low-confidence hints only; they deliberately
+# no longer classify known_global_infra without a structured CLI status/rate-limit fact.
+# NOTE: bare "blocked" is DELIBERATELY excluded - it would shadow the content-policy
+# poison markers ("blocked by safety" / "blocked by content policy").
 _INFRA_ERROR_MARKERS = (
     "rate limit", "rate_limit", "ratelimit", "too many requests", "429", "529",
     "overloaded", "quota", "usage limit", "capacity",
@@ -79,6 +76,11 @@ _INFRA_ERROR_MARKERS = (
     # this message being too big - infra-first so it never false-DLs a healthy message during a
     # rate window. ("quota" + "usage limit" are already infra markers above.)
     "per minute", "per day", "per hour", "tokens per", "tpm", "daily token",
+)
+_STRUCTURED_API_INFRA_STATUSES = frozenset({429, 529})
+_STRUCTURED_AUTH_STATUSES = frozenset({401, 403})
+_STRUCTURED_AUTH_MARKERS = (
+    "auth", "authentication", "unauthorized", "credential", "api_key", "api key",
 )
 
 
@@ -964,9 +966,112 @@ def _tool_config_blocked_summary(tool: object, output: object) -> str | None:
 
 
 def _looks_like_infra(text: str | None) -> bool:
-    """True if a terminal error message reads as a GLOBAL/INFRA outage (vs message-poison)."""
+    """Low-confidence legacy text marker; never authoritative for known infra."""
     t = (text or "").lower()
     return any(m in t for m in _INFRA_ERROR_MARKERS)
+
+
+def _int_status(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            return int(stripped)
+    return None
+
+
+def _first_status(*values: object) -> int | None:
+    for value in values:
+        status = _int_status(value)
+        if status is not None:
+            return status
+    return None
+
+
+def _dict_or_empty(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _claude_error_fact(ev: Event) -> dict | None:
+    """Extract structured Claude API facts that can classify known infra."""
+    raw = ev.raw if isinstance(ev.raw, dict) else {}
+    typ = raw.get("type")
+    if typ == "rate_limit_event":
+        info = _dict_or_empty(raw.get("rate_limit_info"))
+        return {
+            "source": "claude",
+            "kind": "rate_limit_event",
+            "retryable": bool(ev.retryable),
+            "status": info.get("status"),
+            "rateLimitType": info.get("rateLimitType") or info.get("rate_limit_type"),
+            "utilization": info.get("utilization"),
+            "retry_after": (
+                info.get("retry_after")
+                or info.get("retryAfter")
+                or raw.get("retry_after")
+                or raw.get("retryAfter")
+            ),
+        }
+    if typ != "result" or not raw.get("is_error"):
+        return None
+    err = _dict_or_empty(raw.get("error"))
+    api_error = _dict_or_empty(raw.get("api_error"))
+    response = _dict_or_empty(raw.get("response"))
+    status = _first_status(
+        raw.get("api_error_status"),
+        raw.get("status"),
+        raw.get("status_code"),
+        err.get("api_error_status"),
+        err.get("status"),
+        err.get("status_code"),
+        api_error.get("status"),
+        api_error.get("status_code"),
+        response.get("status"),
+        response.get("status_code"),
+    )
+    return {
+        "source": "claude",
+        "kind": "result",
+        "api_error_status": status,
+        "subtype": raw.get("subtype") or err.get("subtype") or api_error.get("subtype"),
+        "retryable": bool(ev.retryable),
+    }
+
+
+def _structured_auth_outage(fact: dict) -> bool:
+    status = fact.get("api_error_status")
+    subtype = str(fact.get("subtype") or "").casefold()
+    return status in _STRUCTURED_AUTH_STATUSES and any(
+        marker in subtype for marker in _STRUCTURED_AUTH_MARKERS
+    )
+
+
+def _structured_infra_summary(sig: dict) -> str | None:
+    for fact in sig.get("structured_errors") or []:
+        if not isinstance(fact, dict):
+            continue
+        if fact.get("kind") == "rate_limit_event" and fact.get("retryable") is True:
+            parts = ["structured retryable rate_limit_event"]
+            for key in ("status", "rateLimitType", "utilization", "retry_after"):
+                value = fact.get(key)
+                if value not in (None, ""):
+                    parts.append(f"{key}={_compact_text(value, 80)}")
+            return "; ".join(parts)
+        if fact.get("kind") != "result":
+            continue
+        status = fact.get("api_error_status")
+        if (
+            status in _STRUCTURED_API_INFRA_STATUSES
+            or (isinstance(status, int) and 500 <= status <= 599)
+            or _structured_auth_outage(fact)
+        ):
+            subtype = _compact_text(fact.get("subtype"), 80)
+            suffix = f" subtype={subtype}" if subtype else ""
+            return f"structured api error status={status}{suffix}"
+    return None
 
 
 # POSITIVE, message-CONTENT-attributable poison signatures (codex marker-conservatism
@@ -1331,8 +1436,11 @@ def _classify_drive_failure(sig: dict) -> tuple[str, str]:
     bus_failure = sig.get("bus_failure")
     if isinstance(bus_failure, dict):
         return CLASS_AMBIGUOUS, bus_failure.get("summary") or "bus write failed"
+    structured = _structured_infra_summary(sig)
     if sig.get("error"):
-        return CLASS_INFRA, sig["error"]
+        if structured:
+            return CLASS_INFRA, structured
+        return CLASS_AMBIGUOUS, f"turn error without structured infra status: {sig['error']}"
     if sig.get("terminal"):
         text = sig.get("terminal_text") or ""
         blocked = _terminal_config_blocked_summary(text)
@@ -1340,15 +1448,21 @@ def _classify_drive_failure(sig: dict) -> tuple[str, str]:
             blocked = _runtime_config_blocked_summary(text)
         if blocked:
             return CLASS_CONFIG_BLOCKED, blocked
-        if _looks_like_infra(text):
-            return CLASS_INFRA, f"terminal infra error: {text[:160]}"
+        if structured:
+            return CLASS_INFRA, structured
         if _looks_like_content_poison(text):
             return CLASS_POISON, f"terminal content-poison: {text[:160]}"
+        if not sig.get("structured_errors") and _looks_like_infra(text):
+            return CLASS_AMBIGUOUS, f"terminal ambiguous infra-like text: {text[:160]}"
         return CLASS_AMBIGUOUS, (f"terminal failure, unrecognized cause: {text[:160]}"
                                  if text else "terminal failure, no error text")
     if sig.get("retryable"):
-        return CLASS_INFRA, ("retryable transport error"
-                             + (" after handshake" if sig.get("started") else ", no start"))
+        if structured:
+            return CLASS_INFRA, structured
+        return CLASS_AMBIGUOUS, (
+            "retryable transport error without structured infra status"
+            + (" after handshake" if sig.get("started") else ", no start")
+        )
     if sig.get("started"):
         if not sig.get("completed"):
             return CLASS_AMBIGUOUS, ("partial stream: started, never completed "
@@ -1384,9 +1498,9 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         error text POSITIVELY matches a message-CONTENT signature (the size family or the
         content-policy family) - explicit evidence THIS message's content is the cause. A
         terminal that is merely "not infra" is NOT poison; it is ambiguous (see below).
-      * ``known_global_infra`` (never auto-DL): a spawn/exec OS error; a terminal failure
-        whose text matches a global-outage signature (overloaded/rate-limit/5xx/auth/edge
-        block/...); or a retryable transport error with no turn start.
+      * ``known_global_infra`` (never auto-DL): a structured retryable Claude
+        rate-limit event or structured API status (429/529/5xx/auth outage). Legacy
+        text markers are low-confidence only and stay ambiguous.
       * ``ambiguous_or_unknown`` (high ceiling): an UNRECOGNIZED terminal cause (neither
         content nor infra), a partial stream / nonzero exit after the turn STARTED (could be
         poison OR an infra drop after the handshake), crash-mid-turn, or no start with no
@@ -1513,7 +1627,30 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         argv = list(base_argv) + spec.args
         sig = {"ok": False, "started": False, "completed": False, "terminal": False,
                "retryable": False, "rc": None, "error": None, "terminal_text": "",
-               "config_blocked": False, "config_blocked_text": "", "bus_failure": None}
+               "config_blocked": False, "config_blocked_text": "", "bus_failure": None,
+               "structured_errors": [], "child_output_tail": None}
+        child_output_lines: list[dict[str, str]] = []
+        child_output_truncated = False
+
+        def _capture_child_output(stream_name: str, text: object) -> None:
+            nonlocal child_output_truncated
+            tail = normalize_child_output_tail({
+                "truncated": child_output_truncated,
+                "lines": [*child_output_lines, {"stream": stream_name, "text": text}],
+            })
+            if tail is None:
+                return
+            child_output_lines[:] = tail["lines"]
+            child_output_truncated = tail.get("truncated") is True
+
+        def _finalize_child_output() -> None:
+            tail = normalize_child_output_tail({
+                "truncated": child_output_truncated,
+                "lines": child_output_lines,
+            })
+            if tail is not None:
+                sig["child_output_tail"] = tail
+
         nonlocal preflight_ok
         if preflight is not None and not preflight_ok:
             blocked = preflight()
@@ -1526,6 +1663,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         try:
             stream = spawner(argv, spec.stdin)
             for line in _iter_suppressing_benign_pipe_teardown(stream):
+                _capture_child_output("stdout", line)
                 s = line.strip()
                 if not s:
                     continue
@@ -1540,6 +1678,9 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     elif ev.type == EventType.TURN_FINISHED:
                         sig["completed"] = True
                     elif ev.type == EventType.ADAPTER_ERROR:
+                        fact = _claude_error_fact(ev) if cli == "claude" else None
+                        if fact is not None:
+                            sig["structured_errors"].append(fact)
                         if ev.retryable:
                             sig["retryable"] = True
                         else:
@@ -1561,6 +1702,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     health_writer.event(ev)
                     engine.process(ev, clock())
         except OSError as e:
+            _capture_child_output("stderr", f"{type(e).__name__}: {e}")
+            _finalize_child_output()
             # spawn/exec/transport OS error (missing binary, broken pipe, ...): a
             # GLOBAL/infra failure unless it is a deterministic local permission/config
             # denial. Never crash the wrapper.
@@ -1579,6 +1722,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         # cause of this turn's death - it closed the stream, so rc/partial-stream signals
         # are downstream noise. Carry it for _classify to check FIRST.
         sig["watchdog"] = getattr(stream, "watchdog_result", None)
+        _finalize_child_output()
         sig["ok"] = (
             sig["completed"]
             and not sig["terminal"]
@@ -1628,6 +1772,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     ok=False,
                     failure_class=resume_failure_class,
                     summary=resume_summary,
+                    child_output_tail=sig.get("child_output_tail"),
                 )
             count = _session.record_resume_attempt_result(
                 session_state,
@@ -1656,6 +1801,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     ok=False,
                     failure_class=CLASS_AMBIGUOUS,
                     summary="resume_unavailable; next attempt will start a fresh session",
+                    child_output_tail=sig.get("child_output_tail"),
                 )
             health_writer.failure(sig, CLASS_AMBIGUOUS if attributable else resume_failure_class)
             return DriveOutcome(
@@ -1663,6 +1809,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 failure_class=CLASS_AMBIGUOUS if attributable else resume_failure_class,
                 summary=("resume attempt failed; retrying resume once before fresh session"
                          if attributable else resume_summary),
+                child_output_tail=sig.get("child_output_tail"),
             )
         if sig["ok"]:
             _session.clear_resume_attempt(session_state)
@@ -1721,7 +1868,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 heartbeat()
             else:
                 store.write_heartbeat(agent)
-        return DriveOutcome(ok=False, failure_class=failure_class, summary=summary)
+        return DriveOutcome(ok=False, failure_class=failure_class, summary=summary,
+                            child_output_tail=sig.get("child_output_tail"))
 
     return drive
 

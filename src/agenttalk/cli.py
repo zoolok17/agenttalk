@@ -7857,13 +7857,36 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 body = (json.loads(raw.decode("utf-8")) or {}).get("body", "")
             except (ValueError, UnicodeDecodeError):
                 body = "<unreadable payload>"
-        out = {"metadata": meta, "body": body}
+        child_output_tail = (
+            meta.get("child_output_tail")
+            if isinstance(meta, dict) and isinstance(meta.get("child_output_tail"), dict)
+            else None
+        )
+        out = {"metadata": meta, "body": body, "child_output_tail": child_output_tail}
         if getattr(args, "json", False):
             print(json.dumps(out, indent=2))
         else:
             print(json.dumps(meta, indent=2))
             print("---- original body (untrusted data) ----")
             print(body)
+            if child_output_tail is not None:
+                lines = child_output_tail.get("lines")
+                if isinstance(lines, list) and lines:
+                    print("---- child output tail (redacted) ----")
+                    for line in lines:
+                        if not isinstance(line, dict):
+                            continue
+                        stream = line.get("stream")
+                        text = line.get("text")
+                        if stream not in {"stdout", "stderr"} or not isinstance(text, str):
+                            continue
+                        print(f"[{stream}] {text}")
+                    if child_output_tail.get("truncated") is True:
+                        print(
+                            "---- child output tail truncated "
+                            f"(last {child_output_tail.get('max_lines')} lines / "
+                            f"{child_output_tail.get('max_bytes')} bytes) ----"
+                        )
         return 0
     if action == "requeue":
         if not (getattr(args, "agent", None) and getattr(args, "id", None)):

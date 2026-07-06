@@ -379,6 +379,14 @@ def _failed_turn_lines(msg: str = "no session") -> list[str]:
     return [json.dumps({"type": "turn.failed", "error": {"message": msg}})]
 
 
+def _claude_api_error_lines(msg: str, status: int | None = None,
+                            subtype: str = "api_error") -> list[str]:
+    obj = {"type": "result", "is_error": True, "result": msg, "subtype": subtype}
+    if status is not None:
+        obj["api_error_status"] = status
+    return [json.dumps(obj)]
+
+
 def test_make_drive_resume_failure_gives_up_after_two_then_fresh_succeeds(tmp_path) -> None:
     # Slice 1 B4: a failed resume does not inline-spawn fresh. After two consecutive
     # session-attributable failures, resume is marked unavailable; the next attempt is fresh.
@@ -426,16 +434,18 @@ def test_make_drive_resume_first_failure_does_not_mark_unavailable(tmp_path) -> 
     assert st.turns == 0                               # a failed turn does not advance
 
 
-def test_make_drive_resume_infra_failures_do_not_consume_b4_ceiling(tmp_path) -> None:
+def test_make_drive_resume_structured_infra_failures_do_not_consume_b4_ceiling(
+    tmp_path,
+) -> None:
     s = _store(tmp_path)
-    st = session.SessionState(cli="codex", codex_thread_id="t-old")
+    st = session.SessionState(cli="claude", claude_session_id="sess-1", turns=1)
     spawned: list[list[str]] = []
 
     def fake_spawn(argv, stdin):
         spawned.append(argv)
-        return _failed_turn_lines("HTTP 529 overloaded")
+        return _claude_api_error_lines("service unavailable", 529)
 
-    drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=fake_spawn,
+    drive = run.make_drive(s, "beta", "claude", st, ["claude"], spawn=fake_spawn,
                            clock=lambda: 0.0, render=False)
     rec = {"id": "msg-1", "from": "a", "kind": "message", "body": "hi",
            "correlation_id": None, "request_id": None, "broadcast_id": None}
@@ -446,11 +456,7 @@ def test_make_drive_resume_infra_failures_do_not_consume_b4_ceiling(tmp_path) ->
     assert two.ok is False and two.failure_class == loop.CLASS_INFRA
     assert st.resume_available is True
     assert st.resume_failure_count == 0
-    assert st.codex_thread_id == "t-old"
-    assert spawned == [
-        ["codex", "exec", "resume", "--json", "t-old"],
-        ["codex", "exec", "resume", "--json", "t-old"],
-    ]
+    assert all("--resume" in argv and "sess-1" in argv for argv in spawned)
 
 
 def test_make_drive_resume_ambiguous_non_session_failure_does_not_consume_b4_ceiling(
@@ -605,11 +611,11 @@ def test_make_drive_benign_broken_pipe_is_not_classified_infra(tmp_path) -> None
 
 def test_make_drive_classifies_failures_for_dead_letter(tmp_path) -> None:
     # dead-letter taxonomy. A terminal turn.failed is low-cap POISON ONLY when its error text
-    # POSITIVELY matches a message-content signature (size / content-policy); a 529/rate-limit
-    # or edge-block terminal is an OUTAGE -> INFRA (never false-DL at cap 3), and an
-    # unrecognized terminal cause is AMBIGUOUS (lead-verify P1 + codex ruling). A partial
-    # stream (started, no completion) is AMBIGUOUS; launch-spawn lookup errors and
-    # deterministic spawn permission denials are CONFIG_BLOCKED.
+    # POSITIVELY matches a message-content signature (size / content-policy); known infra now
+    # requires structured CLI facts (e.g. Claude 429/529/5xx or retryable rate-limit), and
+    # legacy text markers are AMBIGUOUS. A partial stream (started, no completion) is
+    # AMBIGUOUS; launch-spawn lookup errors and deterministic spawn permission denials are
+    # CONFIG_BLOCKED.
     rec = {"from": "a", "kind": "message", "body": "x",
            "correlation_id": None, "request_id": None, "broadcast_id": None}
 
@@ -618,14 +624,56 @@ def test_make_drive_classifies_failures_for_dead_letter(tmp_path) -> None:
                               session.SessionState(cli="codex"), ["codex"],
                               spawn=spawn, clock=lambda: 0.0, render=False)
 
-    # codex unified taxonomy - terminal failure split 3 ways by its error TEXT:
-    # (a) infra signature -> INFRA (never auto-DL). Includes edge/WAF/reverse-proxy blocks
-    #     (lead C4): a gateway/proxy/firewall block is an OUTAGE signature, not message-poison.
+    # codex unified taxonomy - terminal failure split by structured facts first, then text:
+    # (a) legacy infra-like text is AMBIGUOUS, not known_global_infra.
     for msg in ("HTTP 529 overloaded", "rate limit exceeded", "503 service unavailable",
                 "401 unauthorized: invalid api key", "Request blocked by upstream proxy",
-                "blocked by waf", "403 forbidden", "request rejected by firewall"):
+                "blocked by waf", "403 forbidden", "request rejected by firewall",
+                "local tool unavailable while parsing config"):
         o = _drive(lambda a, i, m=msg: _failed_turn_lines(m))(rec)
-        assert o.ok is False and o.failure_class == loop.CLASS_INFRA, msg
+        assert o.ok is False and o.failure_class == loop.CLASS_AMBIGUOUS, msg
+    d_claude = run.make_drive(_store(tmp_path), "beta", "claude",
+                              session.SessionState(cli="claude", claude_session_id="sess-1"),
+                              ["claude"], spawn=lambda a, i: _claude_api_error_lines(
+                                  "service unavailable", 529),
+                              clock=lambda: 0.0, render=False)
+    o_structured = d_claude(rec)
+    assert o_structured.ok is False and o_structured.failure_class == loop.CLASS_INFRA
+    d_claude_local = run.make_drive(
+        _store(tmp_path), "beta", "claude",
+        session.SessionState(cli="claude", claude_session_id="sess-1"),
+        ["claude"],
+        spawn=lambda a, i: _claude_api_error_lines("local cache unavailable", None,
+                                                   "local_config_error"),
+        clock=lambda: 0.0,
+        render=False,
+    )
+    o_local = d_claude_local(rec)
+    assert o_local.ok is False and o_local.failure_class == loop.CLASS_AMBIGUOUS
+    d_claude_rate = run.make_drive(
+        _store(tmp_path), "beta", "claude",
+        session.SessionState(cli="claude", claude_session_id="sess-1"),
+        ["claude"],
+        spawn=lambda a, i: [json.dumps({
+            "type": "rate_limit_event",
+            "rate_limit_info": {"status": "throttled", "rateLimitType": "requests"},
+        })],
+        clock=lambda: 0.0,
+        render=False,
+    )
+    o_rate = d_claude_rate(rec)
+    assert o_rate.ok is False and o_rate.failure_class == loop.CLASS_INFRA
+    d_config = run.make_drive(
+        _store(tmp_path), "beta", "claude",
+        session.SessionState(cli="claude", claude_session_id="sess-1"),
+        ["claude"],
+        spawn=lambda a, i: _claude_api_error_lines("service unavailable", 529),
+        agenttalk_preflight=lambda: "agenttalk runtime temporarily unavailable",
+        clock=lambda: 0.0,
+        render=False,
+    )
+    o_config = d_config(rec)
+    assert o_config.ok is False and o_config.failure_class == loop.CLASS_CONFIG_BLOCKED
     # (b) EXPLICIT message-content-attributable failure -> POISON (the @K_poison fast-path):
     #     ONLY the size + content-policy families (this message is the deterministic cause).
     #     "blocked by content policy"/"by safety" stay POISON - the C4 edge tokens above do NOT
@@ -968,7 +1016,10 @@ def test_procstream_success_closes_stdout_once(monkeypatch) -> None:
     assert proc.wait_calls == [None]
 
 
-def test_make_drive_procstream_write_error_stays_infra(tmp_path, monkeypatch) -> None:
+def test_make_drive_procstream_write_error_is_ambiguous_without_structured_signal(
+    tmp_path,
+    monkeypatch,
+) -> None:
     created = _patch_procstream_popen_write_error(monkeypatch)
     rec = {"from": "a", "kind": "message", "body": "x",
            "correlation_id": None, "request_id": None, "broadcast_id": None}
@@ -986,8 +1037,8 @@ def test_make_drive_procstream_write_error_stays_infra(tmp_path, monkeypatch) ->
     out = drive(rec)
 
     assert out.ok is False
-    assert out.failure_class == loop.CLASS_INFRA
-    assert "spawn/exec error" in out.summary
+    assert out.failure_class == loop.CLASS_AMBIGUOUS
+    assert "without structured infra status" in out.summary
     proc = created[0]
     assert proc.stdin.closed is True
     assert proc.stdout.closed is True
@@ -1330,28 +1381,27 @@ def test_classify_bus_execution_contract_matrix() -> None:
 # "too long" / "violates" / "maximum number of tokens") were each an overbroad entry this
 # matrix would have caught in ONE pass. Add a row when a new provider string is observed.
 _CLASSIFICATION_MATRIX = [
-    # --- INFRA: global outage / rate-limit / auth / edge - NEVER auto-DL ---
-    ("rate limit exceeded", loop.CLASS_INFRA),
-    ("429 too many requests", loop.CLASS_INFRA),
-    ("HTTP 529 overloaded", loop.CLASS_INFRA),
-    ("the model is overloaded", loop.CLASS_INFRA),
-    ("request timed out", loop.CLASS_INFRA),
-    ("502 bad gateway", loop.CLASS_INFRA),
-    ("503 service unavailable", loop.CLASS_INFRA),
-    ("504 gateway timeout", loop.CLASS_INFRA),
-    ("connection reset by peer", loop.CLASS_INFRA),
-    ("401 unauthorized", loop.CLASS_INFRA),
-    ("403 forbidden", loop.CLASS_INFRA),
-    ("invalid api key", loop.CLASS_INFRA),
-    ("request blocked by upstream proxy", loop.CLASS_INFRA),
-    ("blocked by waf", loop.CLASS_INFRA),
-    # token/quota RATE windows (P1 #2 + codex expansion) - a TPM/daily/quota limit, NOT this
-    # message being too big.
-    ("maximum number of tokens per minute exceeded for this organization", loop.CLASS_INFRA),
-    ("reached your maximum number of tokens per day", loop.CLASS_INFRA),
-    ("maximum tokens per minute reached (TPM)", loop.CLASS_INFRA),
-    ("daily token limit reached", loop.CLASS_INFRA),
-    ("daily token limit exceeded", loop.CLASS_INFRA),       # codex probe: rate-window synonym
+    # --- LEGACY INFRA-LIKE TEXT: low-confidence only; never known_global_infra alone ---
+    ("rate limit exceeded", loop.CLASS_AMBIGUOUS),
+    ("429 too many requests", loop.CLASS_AMBIGUOUS),
+    ("HTTP 529 overloaded", loop.CLASS_AMBIGUOUS),
+    ("the model is overloaded", loop.CLASS_AMBIGUOUS),
+    ("request timed out", loop.CLASS_AMBIGUOUS),
+    ("502 bad gateway", loop.CLASS_AMBIGUOUS),
+    ("503 service unavailable", loop.CLASS_AMBIGUOUS),
+    ("504 gateway timeout", loop.CLASS_AMBIGUOUS),
+    ("connection reset by peer", loop.CLASS_AMBIGUOUS),
+    ("401 unauthorized", loop.CLASS_AMBIGUOUS),
+    ("403 forbidden", loop.CLASS_AMBIGUOUS),
+    ("invalid api key", loop.CLASS_AMBIGUOUS),
+    ("request blocked by upstream proxy", loop.CLASS_AMBIGUOUS),
+    ("blocked by waf", loop.CLASS_AMBIGUOUS),
+    # token/quota text alone is not enough to claim global infra.
+    ("maximum number of tokens per minute exceeded for this organization", loop.CLASS_AMBIGUOUS),
+    ("reached your maximum number of tokens per day", loop.CLASS_AMBIGUOUS),
+    ("maximum tokens per minute reached (TPM)", loop.CLASS_AMBIGUOUS),
+    ("daily token limit reached", loop.CLASS_AMBIGUOUS),
+    ("daily token limit exceeded", loop.CLASS_AMBIGUOUS),       # codex probe: rate-window synonym
     # --- POISON: positive message-content attribution - DL at the low cap ---
     ("context length exceeded", loop.CLASS_POISON),
     ("context window exceeded", loop.CLASS_POISON),
@@ -1368,9 +1418,9 @@ _CLASSIFICATION_MATRIX = [
     ("HTTP 413", loop.CLASS_POISON),
     ("status 413", loop.CLASS_POISON),
     ("payload too large", loop.CLASS_POISON),
-    # --- PRECEDENCE: a terminal matching BOTH families is INFRA (fail-closed, human decides) ---
-    ("context length exceeded (429 rate limit)", loop.CLASS_INFRA),
-    ("payload too large behind upstream proxy", loop.CLASS_INFRA),
+    # --- PRECEDENCE: poison-like local failures do not become known infra via text markers. ---
+    ("context length exceeded (429 rate limit)", loop.CLASS_POISON),
+    ("payload too large behind upstream proxy", loop.CLASS_POISON),
     # --- CONFIG-BLOCKED: deterministic bus exec/permission denial, not transient infra ---
     ("Bash(agenttalk reply --from beta --to-request rq-1 -m ok) failed: "
      "Access is denied (os error 5)", loop.CLASS_CONFIG_BLOCKED),
@@ -1383,7 +1433,7 @@ _CLASSIFICATION_MATRIX = [
     ("import agenttalk failed: Access is denied: D:\\Projects\\claude\\agenttalk\\src\\"
      "agenttalk\\__init__.py", loop.CLASS_CONFIG_BLOCKED),
     ("ModuleNotFoundError: No module named 'agenttalk'", loop.CLASS_CONFIG_BLOCKED),
-    ("python -m agenttalk reply failed: error 503 service unavailable", loop.CLASS_INFRA),
+    ("python -m agenttalk reply failed: error 503 service unavailable", loop.CLASS_AMBIGUOUS),
     # --- AMBIGUOUS: not-known-infra, not positive-content - high ceiling, never DL@3 ---
     ("invalid request: model not found", loop.CLASS_AMBIGUOUS),
     ("invalid request: unsupported parameter 'temperature'", loop.CLASS_AMBIGUOUS),
@@ -1414,7 +1464,7 @@ _CLASSIFICATION_MATRIX = [
 def test_classification_contract_matrix(tmp_path) -> None:
     # the authoritative classification contract: each provider string maps to its REQUIRED
     # dead-letter class via the real make_drive _classify (terminal turn.failed). The gate
-    # against future marker drift - INFRA-first precedence + the narrow positive-poison allowlist.
+    # against future marker drift - structured-infra authority + the narrow positive-poison allowlist.
     rec = {"from": "a", "kind": "message", "body": "x",
            "correlation_id": None, "request_id": None, "broadcast_id": None}
 
@@ -1875,11 +1925,9 @@ def test_cmd_wrap_preflight_success_clears_config_blocked_hold(
     assert s.read_config_blocked_hold("beta") is None
 
 
-def test_make_drive_retryable_after_start_is_infra(tmp_path) -> None:
-    # lead 6th-verify P2: a RECOGNIZED retryable transport error that arrives AFTER turn-start
-    # (then drops with no terminal) must classify INFRA, NOT be shadowed as the started/partial-
-    # stream AMBIGUOUS - else a homogeneous transport OUTAGE on one head accumulates ambiguous
-    # and false-dead-letters a HEALTHY message at the K_escalate ceiling.
+def test_make_drive_retryable_after_start_needs_structured_infra_signal(tmp_path) -> None:
+    # Structured retryable rate-limit facts are known infra. A generic retryable text event
+    # with no structured status is only ambiguous evidence, even if it arrives after start.
     rec = {"from": "a", "kind": "message", "body": "x",
            "correlation_id": None, "request_id": None, "broadcast_id": None}
     # codex: thread.started + turn.started + a top-level {type:error} (retryable), no completion
@@ -1890,7 +1938,7 @@ def test_make_drive_retryable_after_start_is_infra(tmp_path) -> None:
                              session.SessionState(cli="codex"), ["codex"],
                              spawn=lambda a, i: codex_stream, clock=lambda: 0.0, render=False)
     o = d_codex(rec)
-    assert o.ok is False and o.failure_class == loop.CLASS_INFRA, o
+    assert o.ok is False and o.failure_class == loop.CLASS_AMBIGUOUS, o
     # claude: message_start + a throttled rate_limit_event (retryable), no message_stop
     claude_stream = [json.dumps({"type": "stream_event", "event": {"type": "message_start"}}),
                      json.dumps({"type": "rate_limit_event",

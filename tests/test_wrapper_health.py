@@ -271,9 +271,10 @@ def test_health_failure_and_degraded_mappings(tmp_path: Path) -> None:
                                   "error": {"message": "prompt is too long"}}),
          hm.STATE_ERRORED_POISON),
         ("ambiguous", _codex_lines({"type": "turn.started"}), hm.STATE_ERRORED_AMBIGUOUS),
-        ("outage", _codex_lines({"type": "turn.started"},
-                                  {"type": "error", "message": "rate limit exceeded"}),
-         hm.STATE_RATE_LIMITED_OR_OUTAGE),
+        ("generic_retryable", _codex_lines({"type": "turn.started"},
+                                            {"type": "error",
+                                             "message": "rate limit exceeded"}),
+         hm.STATE_ERRORED_AMBIGUOUS),
         ("crashed", _Stream(_codex_lines({"type": "turn.started"},
                                           {"type": "turn.completed"}), returncode=7),
          hm.STATE_CRASHED_OR_EXITED),
@@ -287,6 +288,22 @@ def test_health_failure_and_degraded_mappings(tmp_path: Path) -> None:
         out = drive(_rec())
         assert out.ok is False
         assert _health_state(s) == expected
+
+    s = _store(tmp_path / "structured_outage")
+    st = session.SessionState(cli="claude", claude_session_id="sess-1")
+    drive = run.make_drive(
+        s, "beta", "claude", st, ["claude"],
+        spawn=lambda _a, _i: [
+            json.dumps({"type": "stream_event", "event": {"type": "message_start"}}),
+            json.dumps({"type": "rate_limit_event",
+                        "rate_limit_info": {"status": "throttled"}}),
+        ],
+        clock=lambda: 0.0,
+        render=False,
+    )
+    out = drive(_rec())
+    assert out.ok is False
+    assert _health_state(s) == hm.STATE_RATE_LIMITED_OR_OUTAGE
 
     s = _store(tmp_path / "config_blocked_spawn")
     st = session.SessionState(cli="codex")

@@ -45,6 +45,7 @@ class DriveOutcome:
     ok: bool
     failure_class: str | None = None
     summary: str = ""
+    child_output_tail: dict | None = None
 
 
 def _as_outcome(ret: object) -> DriveOutcome:
@@ -360,7 +361,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 "summary": (rec or {}).get("last_failure_summary") or ""}
 
     def _dispose(record: dict, *, failure_class: str, reason: str | None,
-                 infra_exhausted: bool = False) -> None:
+                 infra_exhausted: bool = False,
+                 child_output_tail: dict | None = None) -> None:
         """Dead-letter the head record (store advances the cursor past it), then stamp
         progress: DL is PROGRESS, not a failed turn, so the heartbeat goes FRESH and
         the failure backoff resets - the supervisor sees progress + never restarts."""
@@ -370,7 +372,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         #                                       lease ownership first (lead-loop), else a
         #                                       lost-lease controller could dispose unguarded
         store.dead_letter(agent, record, reason=reason, failure_class=failure_class,
-                          at=now_iso())
+                          at=now_iso(), child_output_tail=child_output_tail)
         stamp()                               # DL is progress (bypasses drive's stamp)
         if on_health_idle is not None:
             on_health_idle()
@@ -541,12 +543,14 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             continue
         if (k_poison > 0 and outcome.failure_class == CLASS_POISON
                 and _safe_int(rec.get("poison_eligible_failures")) >= k_poison):
-            _dispose(record, failure_class=CLASS_POISON, reason=outcome.summary)
+            _dispose(record, failure_class=CLASS_POISON, reason=outcome.summary,
+                     child_output_tail=outcome.child_output_tail)
             continue
         if (noninfra_sub_ceiling is not None and noninfra_sub_ceiling > 0
                 and _noninfra_failure_count(rec) >= int(noninfra_sub_ceiling)):
             _dispose(record, failure_class=_noninfra_failure_class(rec),
-                     reason=outcome.summary)
+                     reason=outcome.summary,
+                     child_output_tail=outcome.child_output_tail)
             continue
         if (outcome.failure_class == CLASS_INFRA
                 and _infra_retry_exhausted(
@@ -554,7 +558,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     after_seconds=infra_exhaust_after_seconds,
                     min_attempts=infra_exhaust_min_attempts)):
             _dispose(record, failure_class=CLASS_INFRA_RETRY_EXHAUSTED,
-                     reason=outcome.summary, infra_exhausted=True)
+                     reason=outcome.summary, infra_exhausted=True,
+                     child_output_tail=outcome.child_output_tail)
             continue
         if k_escalate > 0 and _safe_int(rec.get("attempts_started")) >= k_escalate:
             _escalate_once(record, outcome.failure_class)
@@ -563,7 +568,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             # re-read AFTER record_attempt_result above, so the predicate counts the current result.
             if outcome.failure_class != CLASS_INFRA and not _infra_dominant(rec):
                 _dispose(record, failure_class=outcome.failure_class,
-                         reason=outcome.summary)
+                         reason=outcome.summary,
+                         child_output_tail=outcome.child_output_tail)
                 continue
         # Below the caps (or known-infra at the backstop): do NOT commit (re-delivers,
         # at-least-once) and do NOT stamp the heartbeat - so a persistent no-progress
