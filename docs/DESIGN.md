@@ -306,6 +306,13 @@ two parallel ownership concepts.
   dashboard display: an unwrapped agent with unknown health and a fresh heartbeat
   (within 120s) renders as `Active`; missing or stale heartbeat remains
   `Unknown`, and wrapped states keep their raw health labels.
+- **Message avatars:** v0.69.3 renders a sender avatar beside each lead-chat
+  message (operator on the right, lead on the left), reusing the allowlisted
+  `avatars.py` records already carried in `/api/state`. Presentational only — no
+  new server field or network path; message bodies stay `textContent`; avatar
+  `src` comes only from allowlisted records (never a bus string); CSS is scoped
+  to the lead-chat transcript (`.tc-lead-msg-row`), leaving the shared row style
+  untouched.
 - **Honest ceiling:** these controls defend the local dashboard against
   drive-by localhost/CSRF/rebinding, keep ordinary dashboard authorization in
   the executor, and keep operator lead-chat sends inside one guarded route. They

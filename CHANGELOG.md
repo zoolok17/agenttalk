@@ -5,6 +5,18 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.69.3] - 2026-07-06
+
+### Added
+
+- **The dashboard Lead chat now shows an avatar beside each message** — the operator's avatar on the
+  right of their own messages and the lead's avatar on the left of the lead's — reusing the existing
+  allowlisted, path-safe avatar rendering used by the roster. Purely presentational and frontend-only:
+  message bodies stay text-only (no HTML), avatar images stay allowlisted (never built from a bus
+  string), no new network calls, and the styling is scoped to the lead-chat transcript so the shared
+  message-row rendering used elsewhere is untouched. Falls back to the operator glyph or a status dot
+  when no avatar image is set.
+
 ## [0.69.2] - 2026-07-06
 
 ### Fixed

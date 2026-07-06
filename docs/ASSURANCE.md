@@ -95,6 +95,21 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.69.3 — lead-chat message avatars (2026-07-06)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `c097f05` (= `e97846f` rebased zero-delta) · tag `v0.69.3`
+- **Review:** operator-requested UI polish → build in an isolated worktree (frontend-only) → **both
+  reviewers GO on the final SHA** (reviewer-1 security + render correctness; reviewer-2 quality/e2e —
+  ran a Node DOM probe of the production renderer: operator-right/lead-left ordering, shaped avatars,
+  and loading/empty/unavailable/no-avatar-fallback states all render clean). Verdicts verified directly
+  from the store; rebased zero-delta onto the v0.69.2 master (range-diff `=`) before shipping.
+- **Gate:** node --check + ruff/bandit/**gitleaks** (git-mode + range)/diff/compileall clean; pytest
+  **2017 passed / 3 skipped on 3.10 AND 3.14** (clean venvs).
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green (watched post-push).
+- **Robust/Secure:** display-only, not authority-critical. Message bodies stay `textContent` (no
+  `innerHTML`); avatar `src` flows only through the allowlisted avatar helpers (never built from a bus
+  string); no new network surface; CSS overrides are scoped to `.tc-lead-msg-row`, so the shared
+  `.tc-msg-row` (sessions transcript) render is unchanged.
+
 ### v0.69.2 — wrapper failure taxonomy + redacted dead-letter output tail (2026-07-06)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `7d6e0c3` · tag `v0.69.2`
 - **Review:** design-first (codex) → lead-gated → build in an isolated worktree → **both reviewers GO
