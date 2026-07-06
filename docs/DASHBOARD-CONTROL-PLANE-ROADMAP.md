@@ -1,8 +1,18 @@
 # Dashboard Control Plane — Roadmap & Design
 
-**Status:** proposed (design pass complete; phasing pending operator decision)
+**Status:** shipped/current through v0.69.0. This document is retained as the
+design history for the dashboard control plane.
+
 **Goal (operator, 2026-07-03):** let a *non-developer* drive everything the CLI does from the browser — send/answer messages, manage the roster, start/stop/restart agents, run gates, onboard a team — without touching a terminal.
-**Baseline:** v0.58.3 (read-only Team Console: loopback-only, GET/HEAD-only, `/api/state` carries no body, split CSP, `/api/thread` the only body-bearing route).
+
+**Shipped baseline:** v0.59.0 added the action-gated intent-queue write spine
+behind `--enable-actions`; v0.68.0 added dashboard lead-chat; v0.69.0 aligned
+dashboard liveness render for fresh-heartbeat unwrapped agents.
+
+**Historical baseline:** v0.58.3 was the read-only Team Console: loopback-only,
+GET/HEAD-only, `/api/state` carries no body, split CSP, `/api/thread` the only
+body-bearing route.
+
 **Source:** design workflow `w5dr2t76t` (11 agents: full CLI inventory + 3 judged architectures + deep security model + non-dev UX + phased synthesis + adversarial critique). Full output archived at the task output file.
 
 ---
@@ -52,7 +62,10 @@ denied with `code=plan_revalidation_failed` (visible on `GET /api/intents`) and
 the operator requeues a fresh intent; v0.59.1 does not add a sealed-plan
 mechanism.
 
-> Phase order below is the workflow's synthesis (power-user-first). **The critique flags this ordering as a defect against the non-dev goal** — see §4. Final phasing is a pending operator decision.
+> Phase order below is the original workflow synthesis. It is now historical:
+> the write spine shipped in v0.59.0, lead-chat shipped in v0.68.0, and the
+> dashboard liveness render shipped in v0.69.0. Current architecture lives in
+> `docs/DESIGN.md` §4.8 and ADR D-18.
 
 - **v0.59.0 — Intent-queue write spine + first bus-write verbs.** `store.write_intent` + `list_intents`/`read_intent`; `--enable-actions` flag; per-run secret; `POST /api/intent` (the full defense trio); `GET /api/session`; `GET /api/intents` (honest queued/claimed/applied/denied state); the **executor drain** (see §4 #1 — this is real new work); Tier-1 kinds **send/reply/propose/broadcast** only (fail-closed on unknown); flip the already-rendered composer live. Read-transcript already works.
 - **v0.60.0 — Answer-escalation + the operator inbox goes actionable** (highest daily non-dev value). escalate / relay-operator-answer / attention dispositions; `--from` forced through the server-side liaison/sole-lead resolver; plain-language layer over the queue.
@@ -82,7 +95,12 @@ Additional real items to fold:
 
 ---
 
-## 5. Open decisions for the operator
+## 5. Historical open decisions
+
+These were open in the design pass. The shipped implementation chose the
+intent-queue executor path, kept actions off by default, and added the later
+lead-chat and liveness increments without turning the dashboard into a remote
+API.
 
 1. **Phasing / audience** (the strategic fork): power-user-first (as ordered) vs non-dev-first (wizard early) vs **hybrid — write spine + minimal Step-0 bootstrap + read-only doctor preflight together in v0.59.0** (critique's recommendation).
 2. **Executor host:** fold the drain into the supervisor .ps1 loop as a new `--drain-intents` subcommand (recommended) vs `wrap --loop` resident host vs a dedicated control-daemon (Arch B — second lifecycle a non-dev must manage).

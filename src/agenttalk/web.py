@@ -1,4 +1,4 @@
-"""Read-only local web dashboard for an agenttalk project.
+"""Loopback Team Console and action-gated dashboard control surface.
 
 Threat model
 ============
@@ -21,8 +21,12 @@ Defenses in this module:
    A non-loopback peer is rejected with 403 *before* any other
    policy runs, so probes can't measure us via methods that skip
    later checks.
-3. **No write methods.** Only ``GET``/``HEAD`` are dispatched;
-   everything else returns 405 without touching disk.
+3. **Actions off by default.** With ``enable_actions=False`` only
+   ``GET``/``HEAD`` are dispatched and POST returns 405 without touching
+   disk. When actions are enabled, ordinary dashboard writes append typed
+   intents for the drain executor; those intent requests never call
+   ``store.send`` directly. ``/api/lead-chat`` is the single authenticated
+   in-process direct operator-send path, guarded by reserved-principal checks.
 4. **Strict path allowlist.** Only the routes documented below are
    served; anything else 404s before path interpolation.
 5. **Roster/kind validation parity with ``recv``/``tail``.** The
@@ -53,6 +57,12 @@ Routes
 - ``GET  /api/attention``       — ranked "needs a human" queue for root[0] (0.58.0)
 - ``GET  /api/thread/<rid>``    — one thread's full transcript, CARRIES bodies (0.58.0)
 - ``GET  /api/threads``         — paged closed-thread stubs, envelope-only (0.61.0)
+- ``GET  /api/session``         — dashboard session metadata (token only when
+  actions are enabled)
+- ``GET  /api/intents``         — recent dashboard intent state (no bodies)
+- ``GET  /api/lead-chat``       — operator<->lead chat view
+- ``POST /api/intent``          — append a typed intent when actions are enabled
+- ``POST /api/lead-chat``       — authenticated operator lead-chat send/answer
 
 Multi-root (0.17.0)
 ===================

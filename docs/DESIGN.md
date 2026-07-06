@@ -91,13 +91,22 @@ these win.
 - `gates.json` — assurance gate state.
 - `closes/` — milestone-close records and sign-offs.
 - `knowledge/notes.jsonl` — append-only durable team memory (survives `reset`).
+- `attention/dispositions.jsonl` — append-only operator decisions over the
+  derived attention queue (survives `reset`).
 - `lane-deliveries/` — durable lane delivery artifacts.
+- `dead-letter/<agent>/` — quarantined poison-message payloads and sidecars
+  (survives `reset`; requeue copies, it does not rewind).
+- `state/intents/active/` — current-session dashboard intents (cleared by
+  `reset`; queued control from an old session must not fire in a new one).
+- `control-audit/` — terminal dashboard-control audit records (survives
+  `reset`).
 - `sessions/` — transcripts.
 
 **Durability boundary (load-bearing):** `reset` clears `messages/` and
 `state/` (active runtime), but **preserves** `domains.json`, `knowledge/`,
-`closes/`, `gates.json`, and `lane-deliveries/`. Getting this set wrong is
-catastrophic, so it is asserted by the end-to-end regression test.
+`attention/`, `closes/`, `gates.json`, `lane-deliveries/`, `dead-letter/`,
+`control-audit/`, and `sessions/`. Getting this set wrong is catastrophic, so
+it is asserted by the end-to-end regression test.
 
 ## 4. Subsystems — the why and how
 
@@ -219,6 +228,18 @@ two parallel ownership concepts.
   `thread_id` / claude session-id). The wrapped **model is a pure per-turn
   handler** — the wrapper owns the loop and loop-exit, so a resumed session
   re-enters listening regardless of the model (principle #7).
+- **Managed lead-loop controller (`lead_loop_runtime.py`,
+  `lead_loop_cadence.py`):** the split-identity lead can own a durable lease,
+  resolve one heartbeat-stale threshold for both stealability and visibility,
+  and run bounded synthetic cadence ticks when the bus is quiet. Synthetic ticks
+  never advance the cursor or enter the dead-letter path; they are controller
+  health, not message poison.
+- **Three liveness surfaces:** the supervisor heartbeat is the authority for
+  process liveness and recovery decisions; top-level `health.py` is an
+  advisory view of wrapper state (`idle_waiting`, `working_turn`, degraded,
+  errored, unknown) that degrades safely and never authorizes a kill by itself;
+  `deadman.py` is an independent mail-age SLO alarm over owed work, derived
+  from the thread projector and not from supervisor state.
 - **Why:** real hangs and resume-wake churn happened in the field. Heartbeat
   liveness + wrapper-owned loop is the robust unattended answer; wrapped is the
   recommended supervised archetype.
@@ -231,8 +252,76 @@ two parallel ownership concepts.
 - `doctor.py` — diagnostics: invalid/torn message and knowledge lines, resolved
   supervised CLI path/version, etc.
 - `_atomic.py` — the atomic-write primitive (see principle #3).
-- `web.py` / `dashboard` / `serve` — read-only views.
+- `assurance.py` — standalone stdlib evidence producer run as
+  `python -m agenttalk.assurance`; it emits scan artifacts and baselines, but
+  does not decide GO/HOLD and is distinct from the `gate`/`close` verdict layer.
+- `avatars.py` — allowlisted cosmetic avatar resolution, including the reserved
+  `operator` principal; chosen ids resolve to known package assets only.
+- `skill_currency.py` — mechanical source lint for bundled skills: CLI-token
+  drift, frontmatter, and reviewed-against currency.
+- `web.py` / `dashboard` / `serve` — loopback Team Console and JSON read views,
+  plus an action-gated dashboard control surface behind `--enable-actions`.
 - `codex_config.py`, `install_skills.py` — environment/skill setup.
+
+### 4.8 Dashboard control plane (Architecture C)
+- **Modules:** `web.py` (loopback server, CSRF/session, `/api/intent`,
+  `/api/lead-chat`), `intents.py` (typed schema + executor), `store.py`
+  (`write_intent`, `list_intents`, lead-chat identity), `web_static/console.js`.
+- **Intent write spine:** for ordinary dashboard controls on `/api/intent`, the
+  browser never calls `store.send()` directly. With `--enable-actions` off,
+  `POST` stays disabled and no session token exists. With actions enabled, the
+  browser may append a bounded, typed intent under `state/intents/active/` after
+  loopback, Host, same-origin header, content-type, CSRF-token, session,
+  body-size, and kind/payload checks. The supervised executor (`agenttalk
+  supervise --drain-intents`) is the sole actor that claims intents, re-resolves
+  authority server-side through `resolve_web_actor`, and performs those bus
+  writes through normal store validation/HMAC paths.
+- **Intent authority is re-derived at drain:** browser-provided origin, `from`,
+  or `human_authorized` claims are diagnostics at most. Recipients, broadcast
+  audiences, reply anchors, and escalation answers are resolved again from the
+  current store when the executor drains. Any `lead_chat_send` record in the
+  agent-writable queue is unconditionally denied; there is no authorized queued
+  creation path for operator lead-chat sends.
+- **Lead-chat direct-send exception:** v0.68.0 made the human operator a bus
+  sender, but only as the reserved `operator` principal derived by
+  `Store.operator_identity()` with no fallback. The operator principal is not a
+  roster agent, is excluded from agents-only walks, and cannot be chosen by an
+  agent. `/api/lead-chat` is not an intent path: after loopback, Host/Origin,
+  content-type, CSRF, session, kill-switch, rate/cap, schema, lead-liveness, and
+  reserved-principal checks, the handler itself sends on the single durable
+  operator<->lead thread via `store.send(..., _allow_reserved_sender=True)` or
+  answers a pending decision via `store.send_operator_answer_atomic`. Correct
+  invariant: an operator bus-send happens only through this authenticated
+  in-process route; queued `lead_chat_send` is denied as defense in depth.
+- **Liveness render:** v0.69.0 keeps health semantics unchanged but fixes the
+  dashboard display: an unwrapped agent with unknown health and a fresh heartbeat
+  (within 120s) renders as `Active`; missing or stale heartbeat remains
+  `Unknown`, and wrapped states keep their raw health labels.
+- **Honest ceiling:** these controls defend the local dashboard against
+  drive-by localhost/CSRF/rebinding, keep ordinary dashboard authorization in
+  the executor, and keep operator lead-chat sends inside one guarded route. They
+  are not a cryptographic boundary against a fully privileged same-user local
+  process that can write `.agenttalk/` or the repo.
+
+### 4.9 Dead-letter poison quarantine
+- **Modules:** `wrapper/loop.py` (drive outcome taxonomy and ceilings),
+  `store.py` (attempt ledger and sink), `cli.py` (`dead-letter` verbs),
+  `attention.py` (operator-visible notices and resolve disposition).
+- A failed drive is classified as poison, infra, ambiguous, or config-blocked.
+  The wrapper records a per-agent, per-message attempt ledger in
+  `state/dead-letter-attempts/<agent>.json` before each drive, so a crash
+  mid-turn still counts once on the next run. Torn or corrupt ledgers degrade
+  low to zero attempts; they never false-quarantine a healthy message.
+- `K_poison` bounds deterministic poison retries; `K_escalate` is the loud
+  backstop for repeated ambiguous/unknown failure. Infra-dominant failures do
+  not auto-dead-letter under the poison ceiling; they retry under backoff and
+  escalate through the high-attempt path. Config-blocked is parked as operator
+  work, not treated as message poison.
+- Dead-lettering advances the cursor only after a payload is preserved under
+  `.agenttalk/dead-letter/<agent>/`. `dead-letter requeue` injects a fresh
+  message with a fresh id and fresh attempt count; it does not rewind the cursor
+  or delete the original evidence. `dead-letter resolve` is an operator
+  disposition; the payload remains for audit.
 
 ## 5. Design decisions & rationale (ADR-lite)
 
@@ -446,6 +535,54 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   writes would be dead liveness). *Honest limit:* enabled-config vs running-ticker drift is
   surfaced only via the diagnostics status record, not enforced, in v1.
 
+- **D-18 Dashboard writes use Architecture C for general controls; lead-chat is
+  the scoped direct-send exception.** *Why:* once the Team Console stopped being
+  read-only, a direct browser->store write path for ordinary agent/dashboard
+  actions would have made the web handler an authority boundary and would have
+  repeated the drift classes the lane and operator-answer work already exposed.
+  *Decision:* `/api/intent` is action-gated and can only append a typed intent
+  envelope after loopback, session, CSRF, Host/Origin, content-type, size, kind,
+  and schema checks. `agenttalk supervise --drain-intents` is the sole actor
+  that claims, plans, revalidates, and performs those bus writes. The executor
+  re-resolves the actor with `resolve_web_actor`, re-derives
+  recipients/audiences/anchors from the current store, and treats all browser
+  identity/human-authorized fields as audit data, not authority.
+  *Operator-as-sender:* `/api/lead-chat` is the deliberate narrow exception: the
+  authenticated handler sends directly as the reserved `operator` principal via
+  `store.send(..., _allow_reserved_sender=True)` or answers via
+  `store.send_operator_answer_atomic` after the full loopback/session/CSRF,
+  kill-switch, rate/cap, schema, lead-liveness, and reserved-principal guard
+  set. `Store.operator_identity()` has no fallback, the operator is kept out of
+  agents-only walks, and a `lead_chat_send` intent found in the ordinary
+  agent-writable queue is always denied. *Rejected:* direct POST endpoints
+  calling `store.send` for general dashboard actions (too much authority in the
+  web handler), routing lead-chat through an agent-writable queue kind (an agent
+  could try to mint operator sends), a second control daemon (more lifecycle for
+  the operator), and trusting a browser-supplied `from` or operator flag
+  (body/meta are untrusted data, D-2). *Honest ceiling:* this is an
+  authenticated local request boundary, not a cryptographic boundary against a
+  same-user local process that can write `.agenttalk/` directly.
+
+- **D-19 Dead-letter quarantine bounds poison retries without rewinding the bus.**
+  *Why:* at-least-once delivery is correct for transient failure but unsafe for
+  a valid message that deterministically crashes or wedges the wrapped model.
+  Infinite retry starves the mailbox; blind cursor advance loses work.
+  *Decision:* the wrapper classifies each failed drive with a `DriveOutcome`
+  failure class. A write-ahead attempt ledger records one started attempt per
+  message before the turn, then records poison/infra/ambiguous/config-blocked
+  outcomes. Consecutive poison hits at `K_poison` move the payload into
+  `.agenttalk/dead-letter/<agent>/` and then advance the cursor; repeated
+  ambiguous/unknown hits at `K_escalate` take the same loud terminal path.
+  Infra-dominant failures retry under backoff and escalate at the high-attempt
+  path rather than being silently quarantined as poison. Requeue is recovery by
+  copy: it sends a fresh message with a fresh id and attempt count, preserves
+  the original sink payload, and never rewinds the cursor. *Rejected:* treating
+  any failed drive as poison (outages would destroy valid work), never
+  quarantining (one poison head can block the agent forever), and deleting the
+  sink on requeue (destroys forensic evidence). *Honest ceiling:* classification
+  is conservative but not omniscient; config-blocked and infra-heavy histories
+  surface to the operator rather than pretending the tool can prove intent.
+
 ## 6. How we work (process)
 
 - **Per-phase cadence:** architect designs → lead gates the design → builder
@@ -455,9 +592,11 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   SHA — `ruff`, `bandit -r src -x src/agenttalk/skills`, `git diff --check`, and
   full `pytest` on **Python 3.10 and 3.14**.
 - **Release ritual:** bump `src/agenttalk/__init__.py` + `pyproject.toml`; add a
-  `CHANGELOG.md` section; **append a `docs/ASSURANCE.md` ledger entry attesting the
-  release is GOOD/ROBUST/SECURE with its evidence (reviewer verdicts on the final
-  SHA, lead-gate result on 3.10+3.14, CI status, adversarial-pass outcome, any new
+  `CHANGELOG.md` section; update `docs/DESIGN.md` with the subsystem/ADR change
+  (or record an explicit no-architecture-change note in the release evidence);
+  **append a `docs/ASSURANCE.md` ledger entry attesting the release is
+  GOOD/ROBUST/SECURE with its evidence (reviewer verdicts on the final SHA,
+  lead-gate result on 3.10+3.14, CI status, adversarial-pass outcome, any new
   known-limitation)**; update README install pins; commit via `git commit -F`
   (never `-m` for multi-line — PowerShell native-arg trap); tag; push; `gh release
   create`; watch CI. A release that cannot truthfully carry that assurance entry
@@ -471,19 +610,32 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
 |---|---|
 | Bus, mailbox, cursors, config, locking, validation, authority | `store.py` |
 | Threads / who-owes-whom | `threads.py` |
+| Terminal display / transcripts | `display.py`, `transcript.py` |
 | Atomic writes | `_atomic.py` |
 | Assurance gate / typed evidence | `gates.py` |
+| Assurance scan evidence producer (standalone, no GO/HOLD verdict) | `assurance.py` |
 | Milestone close / sign-offs | `close.py` |
 | Ephemeral reviewers | `ephemeral.py` |
 | Domain registry | `domains.py` |
 | Lanes (deliver-gate) | `lanes.py` |
 | Knowledge (durable memory) | `knowledge.py` |
 | Operator attention queue + dispositions | `attention.py` |
+| Dashboard control-plane intent schema + executor | `intents.py` |
+| Local Team Console / dashboard server | `web.py`, `web_static/console.js`, `web_static/console.css` |
 | Unattended supervisor | `supervisor.py` |
-| Wrapper (loop, run, session, degraded, adapters, recv) | `wrapper/` |
+| Wrapper loop and CLI process adapter | `wrapper/loop.py`, `wrapper/run.py`, `wrapper/recv_api.py` |
+| Wrapper engine, events, prompts, health, liveness watchdogs | `wrapper/framework.py`, `wrapper/events.py`, `wrapper/prompt.py`, `wrapper/health.py`, `wrapper/work_heartbeat.py`, `wrapper/turn_watchdog.py` |
+| Wrapper CLI adapters and sessions | `wrapper/claude_adapter.py`, `wrapper/codex_adapter.py`, `wrapper/session.py`, `wrapper/degraded.py` |
+| Managed lead-loop timing and cadence | `lead_loop_runtime.py`, `lead_loop_cadence.py` |
+| Dead-letter poison quarantine | `store.py`, `wrapper/loop.py`, `cli.py` |
+| Advisory health snapshots | `health.py` |
+| Mail-age SLO alarm | `deadman.py` |
 | Signing | `signing.py` |
 | Capacity hints | `capacity.py` |
+| Display avatars / reserved operator principal | `avatars.py` |
 | Diagnostics | `doctor.py` |
+| Skill installation and bundled-skill currency | `install_skills.py`, `skill_currency.py` |
+| Codex sandbox callback setup | `codex_config.py` |
 | CLI verbs | `cli.py` |
 
 For the current state of work and known gaps, see **`docs/ISSUES.md`**.
