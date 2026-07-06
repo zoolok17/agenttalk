@@ -94,6 +94,24 @@ def _raw_abort(base: str, request: bytes) -> None:
         sock.close()
 
 
+def _read_stderr_until(
+    capfd: pytest.CaptureFixture[str],
+    needles: tuple[str, ...],
+    *,
+    timeout: float = 5.0,
+    interval: float = 0.05,
+) -> str:
+    deadline = time.monotonic() + timeout
+    buf = ""
+    while True:
+        buf += capfd.readouterr().err
+        if all(needle in buf for needle in needles):
+            return buf
+        if time.monotonic() >= deadline:
+            return buf
+        time.sleep(interval)
+
+
 def test_client_disconnect_mid_response_no_traceback_and_server_survives(
     tmp_path: Path, capfd: pytest.CaptureFixture[str],
 ) -> None:
@@ -137,7 +155,7 @@ def test_thread_route_real_error_returns_500_and_logs(
         srv.shutdown()
         srv.server_close()
 
-    err = capfd.readouterr().err
+    err = _read_stderr_until(capfd, ("Traceback", "RuntimeError: boom"))
     assert "Traceback" in err
     assert "RuntimeError: boom" in err
 
