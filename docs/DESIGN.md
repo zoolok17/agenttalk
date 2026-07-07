@@ -206,7 +206,9 @@ two parallel ownership concepts.
   *anchor* changed `verified_against_sha..HEAD`; HEAD merely moving = caution).
   Pointer-not-mirror: bodies are byte-capped, untrusted, and carry only the
   insight not already in the artifact. `roster --expertise` derives from domain
-  roles + lane-delivery history.
+  roles + lane-delivery history. Lessons are a `type=lesson` record in the same
+  ledger: accepted lessons can be surfaced in `sync`/`onboard` as advisory
+  process memory, but they do not authorize, block, or replace tests/skills/gates.
 - **Why:** a project needs ownership (who may change/approve what) and memory
   (the durable *why* behind seams/gotchas) that survive resets and don't rot.
   The domain registry is the authority spine for both: lanes answer "may this

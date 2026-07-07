@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import datetime, timezone
 from typing import Any
 
 from agenttalk import domains as dom
@@ -42,7 +43,19 @@ TYPE_SEAM = "seam"
 TYPE_GOTCHA = "gotcha"
 TYPE_DECISION = "decision"
 TYPE_POINTER = "pointer"
-NOTE_TYPES = frozenset({TYPE_SEAM, TYPE_GOTCHA, TYPE_DECISION, TYPE_POINTER})
+TYPE_LESSON = "lesson"
+NOTE_TYPES = frozenset({TYPE_SEAM, TYPE_GOTCHA, TYPE_DECISION, TYPE_POINTER, TYPE_LESSON})
+
+PROCESS_DOMAIN = "process"
+LESSON_SCOPES = frozenset({
+    "process", "craft", "review", "test", "release", "ops", "docs", "security",
+})
+LESSON_STATUS_PROPOSED = "proposed"
+LESSON_STATUS_ACCEPTED = "accepted"
+LESSON_STATUS_RETIRED = "retired"
+LESSON_STATUSES = frozenset({
+    LESSON_STATUS_PROPOSED, LESSON_STATUS_ACCEPTED, LESSON_STATUS_RETIRED,
+})
 
 ANCHOR_KINDS = frozenset({"path", "symbol", "request", "wp", "sha"})
 
@@ -65,14 +78,21 @@ STALE_SYMBOL_MISMATCH = "symbol_evidence_mismatch"
 STALE_TARGET_UNRESOLVABLE = "anchor_target_unresolvable"
 STALE_MISSING_BASELINE = "missing_verified_baseline"   # path/symbol anchor, null vsha (C4b)
 STALE_UNSUPPORTED_WP = "unsupported_wp_anchor"          # pathless wp, no resolver in 0.40.1 (C4b)
+STALE_EXPIRED = "expired"
 # caution flags (shown, NOT excluded by default)
 CAUTION_SHA_NOT_HEAD = "verified_sha_not_head"
 CAUTION_UNCURATED = "uncurated"
 CAUTION_WEAK_SYMBOL = "weak_symbol_evidence"
+CAUTION_REVIEW_DUE = "review_due"
 
 _KEY_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _NOTE_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _FULL_SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
+_SAFE_TAG_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+_AGENT_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+LESSON_TEXT_MAX_BYTES = 500
+LESSON_TAG_LIMIT = 16
+LESSON_SUPERSEDES_LIMIT = 16
 
 
 class KnowledgeError(ValueError):
@@ -115,6 +135,104 @@ def validate_body(value: object) -> str:
             f"body is {n} bytes, above the {BODY_MAX_BYTES}-byte cap - notes are "
             "pointers to insight, not copies of code/docs (point with the anchor)")
     return value
+
+
+def validate_lesson_tag(value: object) -> str:
+    if not isinstance(value, str) or not _SAFE_TAG_RE.match(value):
+        raise KnowledgeError(
+            f"lesson tag {value!r} is not a safe slug (alphanumeric plus . _ -, "
+            "starts alphanumeric, max 64 chars)")
+    return value
+
+
+def _validate_agent(value: object, field: str) -> str:
+    if not isinstance(value, str) or not _AGENT_RE.match(value):
+        raise KnowledgeError(f"lesson.{field} must be a valid agent name")
+    return value
+
+
+def _validate_bounded_text(value: object, field: str,
+                           *, max_bytes: int = LESSON_TEXT_MAX_BYTES) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise KnowledgeError(f"lesson.{field} is required")
+    n = len(value.encode("utf-8"))
+    if n > max_bytes:
+        raise KnowledgeError(f"lesson.{field} is {n} bytes, above the {max_bytes}-byte cap")
+    return value
+
+
+def _parse_iso_datetime(value: object, field: str) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise KnowledgeError(f"lesson.{field} must be an ISO date or datetime")
+    raw = value.strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as e:
+        raise KnowledgeError(f"lesson.{field} must be an ISO date or datetime") from e
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _coerce_now(now: datetime | str | None = None) -> datetime:
+    if now is None:
+        return datetime.now(timezone.utc)
+    if isinstance(now, datetime):
+        return now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    return _parse_iso_datetime(now, "now")
+
+
+def validate_lesson(raw: object, *, default_owner: str | None = None,
+                    default_status: str | None = None) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise KnowledgeError("lesson must be an object")
+    scope = raw.get("scope")
+    if scope not in LESSON_SCOPES:
+        raise KnowledgeError(
+            f"lesson.scope must be one of {sorted(LESSON_SCOPES)}, got {scope!r}")
+    status = raw.get("status", default_status)
+    if status not in LESSON_STATUSES:
+        raise KnowledgeError(
+            f"lesson.status must be one of {sorted(LESSON_STATUSES)}, got {status!r}")
+    owner = raw.get("owner", default_owner)
+    out: dict[str, Any] = {
+        "scope": scope,
+        "trigger": _validate_bounded_text(raw.get("trigger"), "trigger"),
+        "evidence_ref": _validate_bounded_text(raw.get("evidence_ref"), "evidence_ref"),
+        "owner": _validate_agent(owner, "owner"),
+        "status": status,
+        "review_after": raw.get("review_after"),
+        "expires_at": raw.get("expires_at"),
+    }
+    review_after = _parse_iso_datetime(out["review_after"], "review_after")
+    expires_at = _parse_iso_datetime(out["expires_at"], "expires_at")
+    if expires_at <= review_after:
+        raise KnowledgeError("lesson.expires_at must be after lesson.review_after")
+
+    tags = raw.get("applies_to", [])
+    if tags is None:
+        tags = []
+    if not isinstance(tags, list):
+        raise KnowledgeError("lesson.applies_to must be a list of safe slug tags")
+    if len(tags) > LESSON_TAG_LIMIT:
+        raise KnowledgeError(f"lesson.applies_to may contain at most {LESSON_TAG_LIMIT} tags")
+    out["applies_to"] = [validate_lesson_tag(t) for t in tags]
+
+    supersedes = raw.get("supersedes", [])
+    if supersedes is None:
+        supersedes = []
+    if not isinstance(supersedes, list):
+        raise KnowledgeError("lesson.supersedes must be a list of lesson keys")
+    if len(supersedes) > LESSON_SUPERSEDES_LIMIT:
+        raise KnowledgeError(
+            f"lesson.supersedes may contain at most {LESSON_SUPERSEDES_LIMIT} keys")
+    out["supersedes"] = [validate_key(k) for k in supersedes]
+
+    if raw.get("curator") is not None:
+        out["curator"] = _validate_agent(raw.get("curator"), "curator")
+    if raw.get("anchor") is not None:
+        out["anchor"] = validate_anchor(raw.get("anchor"))
+    return out
 
 
 def validate_anchor(raw: object) -> dict:
@@ -184,23 +302,24 @@ def anchor_path(anchor: dict) -> str | None:
 # --------------------------------------------------------------- event builders
 
 def new_publish_event(*, note_id: str, key: str, type: str, domain_id: str, body: str,
-                      anchor: dict, verified_against_sha: str | None,
+                      anchor: dict | None, verified_against_sha: str | None,
                       domain_registry_hash: str, author: str, resolved_from: str,
                       at: str, supersedes_id: str | None = None,
-                      supersedes_key: str | None = None) -> dict[str, Any]:
+                      supersedes_key: str | None = None,
+                      lesson: dict | None = None) -> dict[str, Any]:
     """A PUBLISH event (capture). Always ``uncurated`` - curation is a separate
     event. Pure; the CLI persists it under the lock."""
     if verified_against_sha is not None and not _FULL_SHA_RE.match(str(verified_against_sha)):
         raise KnowledgeError("verified_against_sha must be a full 40-char SHA when present")
-    return {
+    note_type = validate_type(type)
+    evt = {
         "schema_version": SCHEMA_VERSION,
         "event": EVENT_PUBLISH,
         "id": validate_note_id(note_id),
         "key": validate_key(key),
-        "type": validate_type(type),
+        "type": note_type,
         "domain_id": domain_id,
         "body": validate_body(body),
-        "anchor": validate_anchor(anchor),
         "verified_against_sha": verified_against_sha,
         "domain_registry_hash": domain_registry_hash,
         "author": author,
@@ -210,6 +329,15 @@ def new_publish_event(*, note_id: str, key: str, type: str, domain_id: str, body
         "supersedes_id": supersedes_id,
         "supersedes_key": supersedes_key,
     }
+    if note_type == TYPE_LESSON:
+        lesson_obj = dict(lesson or {})
+        if anchor is not None and lesson_obj.get("anchor") is None:
+            lesson_obj["anchor"] = anchor
+        evt["lesson"] = validate_lesson(
+            lesson_obj, default_owner=author, default_status=LESSON_STATUS_PROPOSED)
+    else:
+        evt["anchor"] = validate_anchor(anchor)
+    return evt
 
 
 def new_curate_event(*, base: dict, action: str, curated_by: str, resolved_from: str,
@@ -230,6 +358,11 @@ def new_curate_event(*, base: dict, action: str, curated_by: str, resolved_from:
     evt["curated_by"] = curated_by
     evt["curated_at"] = at
     evt["updated_at"] = at
+    if evt.get("type") == TYPE_LESSON:
+        lesson = validate_lesson(evt.get("lesson"))
+        lesson["status"] = LESSON_STATUS_RETIRED if action == "retract" else LESSON_STATUS_ACCEPTED
+        lesson["curator"] = curated_by
+        evt["lesson"] = validate_lesson(lesson)
     if action == "retract":
         evt["retract_reason"] = reason
     return evt
@@ -288,9 +421,21 @@ def event_problem(evt: object) -> str | None:
     try:
         validate_key(evt["key"])
         validate_note_id(evt["id"])
-        validate_type(evt.get("type"))
+        note_type = validate_type(evt.get("type"))
         validate_body(evt.get("body"))
-        validate_anchor(evt.get("anchor"))
+        if note_type == TYPE_LESSON:
+            lesson = validate_lesson(evt.get("lesson"))
+            expected = {
+                EVENT_PUBLISH: LESSON_STATUS_PROPOSED,
+                EVENT_CURATE: LESSON_STATUS_ACCEPTED,
+                EVENT_RETRACT: LESSON_STATUS_RETIRED,
+            }[event]
+            if lesson["status"] != expected:
+                return f"lesson.status must be {expected} for {event}"
+            if event == EVENT_CURATE and not lesson.get("curator"):
+                return "accepted lessons require lesson.curator"
+        else:
+            validate_anchor(evt.get("anchor"))
     except KnowledgeError as e:
         return str(e)
     return None
@@ -423,6 +568,71 @@ def compute_staleness(note: dict, *, domain_exists: bool, current_registry_hash:
     return {"stale_reasons": sorted(set(reasons)),
             "caution_flags": sorted(set(cautions)),
             "hard_stale": bool(reasons)}
+
+
+def lesson_superseded_keys(notes: list[dict]) -> set[str]:
+    """Keys retired from active lesson digests by accepted superseding lessons."""
+    out: set[str] = set()
+    for note in notes:
+        if note.get("type") != TYPE_LESSON or not is_curated(note) or is_retracted(note):
+            continue
+        lesson = note.get("lesson") or {}
+        if lesson.get("status") != LESSON_STATUS_ACCEPTED:
+            continue
+        out.update(k for k in lesson.get("supersedes", []) if isinstance(k, str))
+    return out
+
+
+def lesson_updated_at(note: dict) -> datetime:
+    for field in ("curated_at", "updated_at", "created_at"):
+        try:
+            return _parse_iso_datetime(note.get(field), field)
+        except KnowledgeError:
+            continue
+    return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def compute_lesson_state(note: dict, *, now: datetime | str | None = None,
+                         superseded_keys: set[str] | None = None) -> dict[str, Any]:
+    """PURE lesson freshness. Lesson staleness is date/status/key based only.
+
+    The optional lesson anchor is provenance and filtering context, never freshness
+    authority, so callers do not pass anchor/git status here.
+    """
+    tnow = _coerce_now(now)
+    lesson = validate_lesson(note.get("lesson"))
+    reasons: list[str] = []
+    cautions: list[str] = []
+    review_at = _parse_iso_datetime(lesson.get("review_after"), "review_after")
+    expires_at = _parse_iso_datetime(lesson.get("expires_at"), "expires_at")
+    status = lesson.get("status")
+
+    if is_retracted(note) or status == LESSON_STATUS_RETIRED:
+        reasons.append(STALE_RETRACTED)
+    if note.get("key") in (superseded_keys or set()):
+        reasons.append(STALE_SUPERSEDED)
+    if expires_at <= tnow:
+        reasons.append(STALE_EXPIRED)
+    if status != LESSON_STATUS_ACCEPTED or not is_curated(note):
+        cautions.append(CAUTION_UNCURATED)
+    if review_at <= tnow and status == LESSON_STATUS_ACCEPTED:
+        cautions.append(CAUTION_REVIEW_DUE)
+
+    active = (
+        status == LESSON_STATUS_ACCEPTED
+        and is_curated(note)
+        and not reasons
+    )
+    return {
+        "stale_reasons": sorted(set(reasons)),
+        "caution_flags": sorted(set(cautions)),
+        "hard_stale": bool(reasons),
+        "review_due": CAUTION_REVIEW_DUE in cautions,
+        "expired": STALE_EXPIRED in reasons,
+        "active": active,
+        "review_after": lesson.get("review_after"),
+        "expires_at": lesson.get("expires_at"),
+    }
 
 
 # --------------------------------------------------------------- authority

@@ -3508,6 +3508,8 @@ def _knowledge_anchor_status(store, note: dict) -> dict:
 
 def _knowledge_eval(store, note: dict, registry):
     from agenttalk import knowledge as kn
+    if note.get("type") == kn.TYPE_LESSON:
+        return kn.compute_lesson_state(note)
     domains = registry.data.get("domains") or {}
     domain_exists = note.get("domain_id") in domains
     return kn.compute_staleness(
@@ -3516,8 +3518,64 @@ def _knowledge_eval(store, note: dict, registry):
         anchor_status=_knowledge_anchor_status(store, note))
 
 
+def _knowledge_process_is_lead(store, actor: str) -> bool:
+    cfg = store.load_config()
+    roster = cfg.get("agents") or []
+    roles = cfg.get("roles") or {}
+    return actor in roster and isinstance(roles.get(actor), str) \
+        and roles[actor].casefold() == "lead"
+
+
+def _knowledge_process_curators(store) -> list[str]:
+    cfg = store.load_config()
+    roster = cfg.get("agents") or []
+    curators: list[str] = []
+    liaison = store.operator_facing()
+    if liaison:
+        curators.append(liaison)
+    for agent in roster:
+        role = (cfg.get("roles") or {}).get(agent)
+        if isinstance(role, str) and role.casefold() == "lead" and agent not in curators:
+            curators.append(agent)
+    return curators
+
+
+def _knowledge_resolve_domain_for_publish(store, args, reg):
+    from agenttalk import knowledge as kn
+    note_type = args.type
+    domain_id = args.domain or (kn.PROCESS_DOMAIN if note_type == kn.TYPE_LESSON else None)
+    if not domain_id:
+        raise kn.KnowledgeError("domain is required")
+    if domain_id == kn.PROCESS_DOMAIN and note_type == kn.TYPE_LESSON:
+        return domain_id, None
+    if domain_id not in (reg.data.get("domains") or {}):
+        known = sorted((reg.data.get("domains") or {}))
+        raise kn.KnowledgeError(f"unknown domain {domain_id!r} (known: {known})")
+    return domain_id, reg.data["domains"][domain_id]
+
+
+def _knowledge_resolve_curators(store, domain_id: str, reg):
+    from agenttalk import knowledge as kn
+    if domain_id == kn.PROCESS_DOMAIN:
+        return [], list(_knowledge_process_curators(store))
+    dom_entry = (reg.data.get("domains") or {}).get(domain_id)
+    if not dom_entry:
+        raise kn.KnowledgeError(f"unknown domain {domain_id!r}")
+    cfg = store.load_config()
+    return (dom.resolve_refset(dom_entry.get("owners") or {}, cfg),
+            dom.resolve_refset(dom_entry.get("curators") or {}, cfg))
+
+
+def _kn_split_csv(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [p.strip() for p in value.split(",") if p.strip()]
+
+
 def _kn_anchor_from_args(args):
     from agenttalk import knowledge as kn
+    if not getattr(args, "anchor_kind", None):
+        return None
     spec = {"kind": args.anchor_kind}
     for f in ("path", "symbol", "request_id", "msg_id", "mission", "wp_id", "sha"):
         v = getattr(args, f, None)
@@ -3526,7 +3584,194 @@ def _kn_anchor_from_args(args):
     return kn.validate_anchor(spec)
 
 
+def _kn_lesson_from_args(args, actor: str, anchor: dict | None):
+    from agenttalk import knowledge as kn
+    lesson = {
+        "scope": getattr(args, "scope", None),
+        "trigger": getattr(args, "trigger", None),
+        "evidence_ref": getattr(args, "evidence_ref", None),
+        "applies_to": _kn_split_csv(getattr(args, "applies_to", None)),
+        "owner": getattr(args, "owner", None) or actor,
+        "review_after": getattr(args, "review_after", None),
+        "expires_at": getattr(args, "expires_at", None),
+        "supersedes": _kn_split_csv(getattr(args, "supersedes", None)),
+    }
+    if anchor is not None:
+        lesson["anchor"] = anchor
+    return kn.validate_lesson(
+        lesson, default_owner=actor, default_status=kn.LESSON_STATUS_PROPOSED)
+
+
+def _kn_lesson_rows(events: list[dict], *, include_uncurated: bool = False,
+                    include_stale: bool = False, scope: str | None = None,
+                    tags: list[str] | None = None, now: str | None = None,
+                    active_only: bool = False) -> list[tuple[dict, dict]]:
+    from agenttalk import knowledge as kn
+    accepted = []
+    views = kn.resolve_views(events)
+    for rec in views.values():
+        note = rec.get("curated")
+        if note and note.get("type") == kn.TYPE_LESSON and kn.is_curated(note):
+            accepted.append(note)
+    superseded = kn.lesson_superseded_keys(accepted)
+    wanted_tags = {t.casefold() for t in (tags or [])}
+    rows: list[tuple[dict, dict]] = []
+    for (_domain_id, _key), rec in sorted(views.items()):
+        latest, curated = rec.get("latest"), rec.get("curated")
+        note = None
+        if include_uncurated and latest is not None and latest.get("type") == kn.TYPE_LESSON \
+                and not kn.is_curated(latest) and not kn.is_retracted(latest):
+            note = latest
+        else:
+            note = curated
+        if note is None or note.get("type") != kn.TYPE_LESSON:
+            continue
+        lesson = note.get("lesson") or {}
+        if scope and lesson.get("scope") != scope:
+            continue
+        applies_to = {str(t).casefold() for t in lesson.get("applies_to", [])}
+        if wanted_tags and not (applies_to & wanted_tags):
+            continue
+        verdict = kn.compute_lesson_state(note, now=now, superseded_keys=superseded)
+        if active_only:
+            if not verdict.get("active"):
+                continue
+        elif verdict.get("hard_stale") and not include_stale:
+            continue
+        elif not kn.is_curated(note) and not include_uncurated \
+                and not (include_stale and kn.is_retracted(note)):
+            continue
+        rows.append((note, verdict))
+    return rows
+
+
+def _kn_lesson_marker(verdict: dict) -> str:
+    if verdict.get("hard_stale"):
+        return "stale:" + ",".join(verdict.get("stale_reasons") or [])
+    if verdict.get("review_due"):
+        return "review_due"
+    return "expires:" + str(verdict.get("expires_at") or "?")
+
+
+def _kn_trim(value: object, limit: int = 160) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def _kn_lesson_dict(note: dict, verdict: dict) -> dict:
+    lesson = note.get("lesson") or {}
+    return {
+        "domain_id": note.get("domain_id"),
+        "key": note.get("key"),
+        "scope": lesson.get("scope"),
+        "trigger": lesson.get("trigger"),
+        "body": note.get("body"),
+        "evidence_ref": lesson.get("evidence_ref"),
+        "applies_to": lesson.get("applies_to") or [],
+        "status": lesson.get("status"),
+        "marker": _kn_lesson_marker(verdict),
+        "_verdict": verdict,
+    }
+
+
+def _kn_print_lesson(note: dict, verdict: dict) -> None:
+    lesson = note.get("lesson") or {}
+    tag = note.get("authority", {}).get("state", "?")
+    status = lesson.get("status") or "?"
+    flags = "  " + _kn_lesson_marker(verdict)
+    print(f"  [lesson] {note.get('domain_id')}/{note.get('key')} "
+          f"({tag}, {lesson.get('scope')}, {status}){flags}")
+    print(f"      trigger: {_kn_trim(lesson.get('trigger'), 180)}")
+    print(f"      lesson: {_kn_trim(note.get('body'), 200)}")
+    print(f"      evidence: {_kn_trim(lesson.get('evidence_ref'), 160)}")
+
+
+def _kn_format_lesson_line(note: dict, verdict: dict) -> str:
+    lesson = note.get("lesson") or {}
+    return (
+        f"  {note.get('key')} [{lesson.get('scope')}] "
+        f"{_kn_trim(lesson.get('trigger'), 80)} - {_kn_trim(note.get('body'), 140)} "
+        f"(evidence: {_kn_trim(lesson.get('evidence_ref'), 80)}; "
+        f"{_kn_lesson_marker(verdict)})"
+    )
+
+
+def _kn_lesson_scope_for_text(text: str) -> str:
+    lowered = text.casefold()
+    if "review-request" in lowered or "review" in lowered:
+        return "review"
+    if "test" in lowered or "qa" in lowered:
+        return "test"
+    if "release" in lowered or "close" in lowered:
+        return "release"
+    if "docs" in lowered or "doc" in lowered or "design" in lowered:
+        return "docs"
+    if "build" in lowered or "fix" in lowered:
+        return "craft"
+    if "security" in lowered:
+        return "security"
+    return "process"
+
+
+def _kn_tokenize_tags(text: str) -> set[str]:
+    from agenttalk import knowledge as kn
+    out: set[str] = set()
+    for m in re.finditer(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", text or ""):
+        token = m.group(0)
+        try:
+            out.add(kn.validate_lesson_tag(token).casefold())
+        except kn.KnowledgeError:
+            continue
+    return out
+
+
+def _kn_sync_lesson_context(msgs: list, rows: list[dict],
+                            explicit_tags: list[str] | None) -> tuple[str, set[str]]:
+    from agenttalk import knowledge as kn
+    by_rid: dict[str, list] = {}
+    for m in msgs:
+        rid = (m.meta or {}).get("request_id")
+        if isinstance(rid, str) and rid:
+            by_rid.setdefault(rid, []).append(m)
+    parts: list[str] = []
+    for d in rows:
+        parts.extend([str(d.get("opener_kind") or ""), str(d.get("subject") or "")])
+        for m in by_rid.get(str(d.get("request_id") or ""), [])[:3]:
+            parts.extend([m.kind, m.subject or "", json.dumps(m.meta or {}, sort_keys=True)])
+    text = " ".join(parts)
+    tags = _kn_tokenize_tags(text)
+    for tag in explicit_tags or []:
+        try:
+            tags.add(kn.validate_lesson_tag(tag).casefold())
+        except kn.KnowledgeError:
+            continue
+    return _kn_lesson_scope_for_text(text), tags
+
+
+def _kn_rank_lessons(rows: list[tuple[dict, dict]], *, context_scope: str) -> list[tuple[dict, dict]]:
+    def key(nv: tuple[dict, dict]):
+        note, verdict = nv
+        lesson = note.get("lesson") or {}
+        return (
+            0 if lesson.get("scope") == "process" else 1,
+            0 if lesson.get("scope") == context_scope else 1,
+            0 if verdict.get("review_due") else 1,
+            -kn_time(note),
+            note.get("key") or "",
+        )
+
+    def kn_time(note: dict) -> float:
+        from agenttalk import knowledge as kn
+        return kn.lesson_updated_at(note).timestamp()
+
+    return sorted(rows, key=key)
+
+
 def _kn_print_note(note: dict, verdict: dict) -> None:
+    from agenttalk import knowledge as kn
+    if note.get("type") == kn.TYPE_LESSON:
+        _kn_print_lesson(note, verdict)
+        return
     a = note.get("anchor") or {}
     tag = note.get("authority", {}).get("state", "?")
     flags = ""
@@ -3550,9 +3795,10 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
     if action == "publish":
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         reg = _load_domain_registry(store)
-        if args.domain not in (reg.data.get("domains") or {}):
-            sys.stderr.write(f"agenttalk knowledge publish: unknown domain {args.domain!r} "
-                             f"(known: {sorted((reg.data.get('domains') or {}))}).\n")
+        try:
+            domain_id, dentry = _knowledge_resolve_domain_for_publish(store, args, reg)
+        except kn.KnowledgeError as e:
+            sys.stderr.write(f"agenttalk knowledge publish: {e}\n")
             return 2
         # verified-against defaults to HEAD; capture is OPEN (any active agent).
         if args.verified_against:
@@ -3563,22 +3809,30 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
                 return 2
         else:
             vsha = _kn_full_head(store)
-        dentry = reg.data["domains"][args.domain]
-        owners = dom.resolve_refset(dentry.get("owners") or {}, store.load_config())
-        curators = dom.resolve_refset(dentry.get("curators") or {}, store.load_config())
+        if dentry is not None:
+            owners = dom.resolve_refset(dentry.get("owners") or {}, store.load_config())
+            curators = dom.resolve_refset(dentry.get("curators") or {}, store.load_config())
+        else:
+            owners, curators = [], _knowledge_process_curators(store)
         resolved_from = "curator" if actor in curators else "owner" if actor in owners else \
-            "lead" if actor in _close_lead_set(store) else "active_agent"
+            "lead" if (actor in _close_lead_set(store) or
+                        _knowledge_process_is_lead(store, actor)) else "active_agent"
         try:
+            anchor = _kn_anchor_from_args(args)
+            if args.type != kn.TYPE_LESSON and anchor is None:
+                raise kn.KnowledgeError("anchor-kind is required for non-lesson notes")
+            lesson = _kn_lesson_from_args(args, actor, anchor) if args.type == kn.TYPE_LESSON else None
             evt = kn.new_publish_event(
                 note_id=kn.new_note_id(), key=args.key, type=args.type,
-                domain_id=args.domain, body=args.message, anchor=_kn_anchor_from_args(args),
+                domain_id=domain_id, body=args.message, anchor=anchor,
                 verified_against_sha=vsha, domain_registry_hash=reg.registry_hash,
-                author=actor, resolved_from=resolved_from, at=_iso_now())
+                author=actor, resolved_from=resolved_from, at=_iso_now(),
+                lesson=lesson)
         except kn.KnowledgeError as e:
             sys.stderr.write(f"agenttalk knowledge publish: {e}\n")
             return 2
         kn.append_event(store, evt)
-        print(f"published note {evt['id']} {args.domain}/{args.key} ({args.type}, uncurated)")
+        print(f"published note {evt['id']} {domain_id}/{args.key} ({args.type}, uncurated)")
         return 0
 
     if action == "curate":
@@ -3588,17 +3842,18 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
             return 2
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         reg = _load_domain_registry(store)
-        dom_entry = (reg.data.get("domains") or {}).get(args.domain)
-        if not dom_entry:
-            sys.stderr.write(f"agenttalk knowledge curate: unknown domain {args.domain!r}.\n")
+        try:
+            owners, curators = _knowledge_resolve_curators(store, args.domain, reg)
+        except kn.KnowledgeError as e:
+            sys.stderr.write(f"agenttalk knowledge curate: {e}\n")
             return 2
-        owners = dom.resolve_refset(dom_entry.get("owners") or {}, store.load_config())
-        curators = dom.resolve_refset(dom_entry.get("curators") or {}, store.load_config())
         # CURATION is ENFORCED (it gates the verified/authoritative set): owner/
         # curator of the domain, or a lead override. Refuse others (fail closed).
         resolved_from = kn.resolve_curation_authority(
             actor, owner_agents=owners, curator_agents=curators,
-            is_lead=actor in _close_lead_set(store))
+            is_lead=(actor in _close_lead_set(store) or
+                     (args.domain == kn.PROCESS_DOMAIN and
+                      _knowledge_process_is_lead(store, actor))))
         if resolved_from is None:
             sys.stderr.write(
                 f"agenttalk knowledge curate: {actor!r} is not an owner/curator of "
@@ -3630,6 +3885,31 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
         reg = _load_domain_registry(store)
         include_stale = getattr(args, "include_stale", False)
         include_uncurated = getattr(args, "include_uncurated", False)
+        type_filter = getattr(args, "type", None)
+        lesson_tags = _kn_split_csv(getattr(args, "tags", None))
+        if type_filter == kn.TYPE_LESSON and action in ("pull", "search"):
+            rows = _kn_lesson_rows(
+                events, include_uncurated=include_uncurated,
+                include_stale=include_stale, scope=getattr(args, "scope", None),
+                tags=lesson_tags)
+            if action == "search":
+                q = (args.query or "").casefold()
+                rows = [(n, v) for (n, v) in rows if q in json.dumps(
+                    {"k": n.get("key"), "b": n.get("body"), "t": n.get("type"),
+                     "lesson": n.get("lesson")}, ensure_ascii=False).casefold()]
+            rows = _kn_rank_lessons(rows, context_scope=getattr(args, "scope", None) or "process")
+            limit = getattr(args, "limit", None)
+            if isinstance(limit, int) and limit >= 0:
+                rows = rows[:limit]
+            if getattr(args, "json", False):
+                print(json.dumps([_kn_lesson_dict(n, v) for (n, v) in rows], indent=2))
+                return 0
+            label = "matching" if action == "search" else "active"
+            print(f"knowledge {action}: {len(rows)} {label} lesson(s)"
+                  + (f"; {len(problems)} corrupt line(s) (see doctor)" if problems else ""))
+            for n, v in rows:
+                _kn_print_lesson(n, v)
+            return 0
         # Curated/capture split (codex blocker): default shows the latest CURATED
         # note per key; a later uncurated publish only appears with --include-uncurated
         # and NEVER shadows the verified note in the default view.
@@ -3644,6 +3924,10 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
             else:
                 note = curated         # the authoritative verified note
             if note is None or kn.is_retracted(note):
+                continue
+            if note.get("type") == kn.TYPE_LESSON and type_filter != kn.TYPE_LESSON:
+                continue
+            if type_filter and note.get("type") != type_filter:
                 continue
             rows.append((note, _knowledge_eval(store, note, reg)))
 
@@ -3672,7 +3956,21 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
             if isinstance(limit, int) and limit >= 0 and onboard_total > limit:
                 shown = shown[:limit]
                 onboard_truncated = True
+        lesson_rows = []
+        if action == "onboard" and getattr(args, "include_lessons", False):
+            lesson_rows = _kn_rank_lessons(
+                _kn_lesson_rows(events, active_only=True),
+                context_scope="process")
+            lesson_limit = getattr(args, "lesson_limit", 5)
+            if isinstance(lesson_limit, int) and lesson_limit >= 0:
+                lesson_rows = lesson_rows[:lesson_limit]
         if getattr(args, "json", False):
+            if action == "onboard" and getattr(args, "include_lessons", False):
+                print(json.dumps({
+                    "notes": [{**n, "_verdict": v} for (n, v) in shown],
+                    "lessons": [_kn_lesson_dict(n, v) for (n, v) in lesson_rows],
+                }, indent=2))
+                return 0
             print(json.dumps([{**n, "_verdict": v} for (n, v) in shown], indent=2))
             return 0
         if action == "onboard":
@@ -3687,6 +3985,10 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
                 print(f"domain {d}:")
                 for n, v in by_domain[d]:
                     _kn_print_note(n, v)
+            if getattr(args, "include_lessons", False) and lesson_rows:
+                print(f"Lessons to check ({len(lesson_rows)}):")
+                for n, v in lesson_rows:
+                    print(_kn_format_lesson_line(n, v))
             return 0
         label = "matching" if action == "search" else "active"
         print(f"knowledge {action}: {len(shown)} {label} note(s)"
@@ -4796,6 +5098,8 @@ def _roster_expertise(store, *, json_out: bool) -> int:
         note = rec.get("curated")
         if note is None or rec.get("tombstoned") or kn.is_retracted(note):
             continue
+        if note.get("type") == kn.TYPE_LESSON:
+            continue
         d = note.get("domain_id")
         a = note.get("author")
         if isinstance(d, str) and isinstance(a, str):
@@ -5880,6 +6184,34 @@ def cmd_sync(args: argparse.Namespace) -> int:
             and t.role == "responder"
         ]
 
+    lesson_rows: list[tuple[dict, dict]] = []
+    lesson_warnings: list[str] = []
+    lesson_context_scope = "process"
+    try:
+        lesson_context_scope, lesson_tags = _kn_sync_lesson_context(
+            msgs, thread_payload, getattr(args, "lesson_tag", None))
+        from agenttalk import knowledge as kn
+        events, problems = kn.read_events(store)
+        raw_lesson_rows = _kn_lesson_rows(events, active_only=True)
+
+        def lesson_matches(note: dict) -> bool:
+            lesson = note.get("lesson") or {}
+            scope = lesson.get("scope")
+            if scope not in ("process", lesson_context_scope):
+                return False
+            applies_to = {str(t).casefold() for t in lesson.get("applies_to", [])}
+            return not applies_to or bool(applies_to & lesson_tags)
+
+        lesson_rows = _kn_rank_lessons(
+            [(n, v) for (n, v) in raw_lesson_rows if lesson_matches(n)],
+            context_scope=lesson_context_scope)[:5]
+        if problems:
+            lesson_warnings.append(
+                f"knowledge skipped {min(len(problems), 99)} corrupt line(s); "
+                "malformed lessons were ignored")
+    except Exception as e:  # noqa: BLE001 - sync must continue if lesson read/render fails
+        lesson_warnings.append(f"lessons unavailable: {_kn_trim(e, 160)}")
+
     payload = {
         "agent": agent,
         "roster": roster,
@@ -5893,6 +6225,11 @@ def cmd_sync(args: argparse.Namespace) -> int:
         payload["rescinded"] = rescinded       # additive: absent when none
     if agent == liaison:
         payload["escalations"] = escalations   # additive: liaison only
+    if lesson_rows:
+        payload["lessons"] = [_kn_lesson_dict(n, v) for (n, v) in lesson_rows]
+        payload["lesson_context_scope"] = lesson_context_scope
+    if lesson_warnings:
+        payload["lesson_warnings"] = lesson_warnings
     if args.json:
         print(json.dumps(payload, indent=2))
         return 0
@@ -5923,6 +6260,13 @@ def cmd_sync(args: argparse.Namespace) -> int:
             subj = f' "{d["subject"]}"' if d["subject"] else ""
             print(f"  {d['request_id']}  from {d['peer']}  age={age}{subj}")
             print(f"      -> {d['hint']}")
+    if lesson_warnings:
+        for warning in lesson_warnings:
+            print(f"WARN: {warning}")
+    if lesson_rows:
+        print(f"Lessons to check ({len(lesson_rows)}):")
+        for n, v in lesson_rows:
+            print(_kn_format_lesson_line(n, v))
     if thread_payload:
         print("actionable threads (owe / hint):")
         for d in thread_payload:
@@ -9038,9 +9382,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pkn.set_defaults(func=cmd_knowledge, knowledge_cmd=None)
     knsub = pkn.add_subparsers(dest="knowledge_cmd")
+    lesson_scope_choices = sorted([
+        "process", "craft", "review", "test", "release", "ops", "docs", "security",
+    ])
 
     def _add_anchor_args(p):
-        p.add_argument("--anchor-kind", required=True, choices=sorted(["path", "symbol", "request", "wp", "sha"]))
+        p.add_argument("--anchor-kind", choices=sorted(["path", "symbol", "request", "wp", "sha"]))
         p.add_argument("--path", help="anchor path (path/symbol/wp).")
         p.add_argument("--symbol", help="anchor symbol (symbol).")
         p.add_argument("--request-id", dest="request_id", help="anchor request id (request).")
@@ -9051,12 +9398,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     knpub = knsub.add_parser("publish", help="Capture a note (any active agent; uncurated).")
     knpub.add_argument("--from", dest="actor", help="Publishing agent.")
-    knpub.add_argument("--domain", required=True, help="Domain id (must exist in domains.json).")
-    knpub.add_argument("--type", required=True, choices=sorted(["seam", "gotcha", "decision", "pointer"]))
+    knpub.add_argument("--domain", help="Domain id (lessons default to process).")
+    knpub.add_argument("--type", required=True,
+                       choices=sorted(["seam", "gotcha", "decision", "pointer", "lesson"]))
     knpub.add_argument("--key", required=True, help="Stable note key (latest-by-key).")
     knpub.add_argument("-m", "--message", required=True, help="The insight (not a copy of the anchor).")
     knpub.add_argument("--verified-against", dest="verified_against",
                        help="Ref/SHA the insight was verified against (default: HEAD).")
+    knpub.add_argument("--scope", choices=lesson_scope_choices,
+                       help="Lesson scope (required for --type lesson).")
+    knpub.add_argument("--trigger", help="Lesson trigger text (required for --type lesson).")
+    knpub.add_argument("--evidence-ref", dest="evidence_ref",
+                       help="Lesson evidence reference (required for --type lesson).")
+    knpub.add_argument("--applies-to", dest="applies_to",
+                       help="Comma-separated safe-slug lesson tags.")
+    knpub.add_argument("--owner", help="Lesson owner agent (default: publisher).")
+    knpub.add_argument("--review-after", dest="review_after",
+                       help="Lesson review-after ISO date/datetime.")
+    knpub.add_argument("--expires-at", dest="expires_at",
+                       help="Lesson expiry ISO date/datetime.")
+    knpub.add_argument("--supersedes", help="Comma-separated lesson keys superseded by this lesson.")
     _add_anchor_args(knpub)
     knpub.set_defaults(func=cmd_knowledge)
 
@@ -9074,6 +9435,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     knpull = knsub.add_parser("pull", help="List active notes (default: curated, non-stale).")
     knpull.add_argument("--domain", help="Limit to a domain.")
+    knpull.add_argument("--type", choices=sorted(["seam", "gotcha", "decision", "pointer", "lesson"]))
+    knpull.add_argument("--scope", choices=lesson_scope_choices,
+                        help="Limit lesson pull to a scope.")
+    knpull.add_argument("--tags", help="Comma-separated lesson applies_to tags.")
+    knpull.add_argument("--limit", type=int, default=5, help="Limit lesson pull rows (default 5).")
     knpull.add_argument("--include-stale", dest="include_stale", action="store_true")
     knpull.add_argument("--include-uncurated", dest="include_uncurated", action="store_true")
     knpull.add_argument("--json", action="store_true")
@@ -9082,6 +9448,11 @@ def build_parser() -> argparse.ArgumentParser:
     knsearch = knsub.add_parser("search", help="Substring search over key/body/type/anchor.")
     knsearch.add_argument("query", help="Search string.")
     knsearch.add_argument("--domain")
+    knsearch.add_argument("--type", choices=sorted(["seam", "gotcha", "decision", "pointer", "lesson"]))
+    knsearch.add_argument("--scope", choices=lesson_scope_choices,
+                          help="Limit lesson search to a scope.")
+    knsearch.add_argument("--tags", help="Comma-separated lesson applies_to tags.")
+    knsearch.add_argument("--limit", type=int, help="Limit lesson search rows.")
     knsearch.add_argument("--include-stale", dest="include_stale", action="store_true")
     knsearch.add_argument("--include-uncurated", dest="include_uncurated", action="store_true")
     knsearch.add_argument("--json", action="store_true")
@@ -9095,6 +9466,10 @@ def build_parser() -> argparse.ArgumentParser:
     knonb.add_argument("--limit", type=int, default=20,
                        help="Max notes in the digest (default 20; deterministic order, "
                             "grouped by domain then type). Truncated beyond this.")
+    knonb.add_argument("--include-lessons", dest="include_lessons", action="store_true",
+                       help="Append a capped active lesson digest.")
+    knonb.add_argument("--lesson-limit", dest="lesson_limit", type=int, default=5,
+                       help="Max active lessons in the digest (default 5).")
     knonb.add_argument("--json", action="store_true")
     knonb.set_defaults(func=cmd_knowledge)
 
@@ -9419,6 +9794,8 @@ def build_parser() -> argparse.ArgumentParser:
              "work. Run it on restart/rejoin before acting.",
     )
     psync.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
+    psync.add_argument("--lesson-tag", dest="lesson_tag", action="append",
+                       help="Extra safe-slug tag for matching active lessons (repeatable).")
     psync.add_argument("--json", action="store_true",
                        help="Emit the structured digest for skills to parse.")
     psync.set_defaults(func=cmd_sync)

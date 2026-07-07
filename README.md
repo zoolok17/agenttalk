@@ -907,7 +907,7 @@ pure verdict, and the artifact shape; the project supplies `domains.json`,
 shared-path policy, lane ids/assignees/targets/subsets, and required
 gates.
 
-### Knowledge: durable pointer notes (0.38.0)
+### Knowledge: durable pointer notes and lessons (0.38.0, lessons 0.70.0)
 
 `agenttalk knowledge {publish,curate,pull,search,onboard}` is durable,
 pointer-shaped project memory hung off the domain registry. A **note**
@@ -927,6 +927,27 @@ domain owner/curator (or a lead override) then `knowledge curate
 verify|retract`s it. `knowledge pull` defaults to curated, non-stale notes
 (`--include-uncurated`, `--include-stale` widen it); `search` is a
 substring scan; `onboard` is a bounded digest grouped by domain.
+
+**Lessons are a note type, not a second store.** `knowledge publish --type
+lesson --domain process --key K --scope review --trigger TEXT
+--evidence-ref REF --review-after YYYY-MM-DD --expires-at YYYY-MM-DD -m TEXT`
+captures a proposed process lesson in the same `notes.jsonl`. The reserved
+virtual domain `process` is curated by the operator-facing liaison or active
+lead; a lesson can also use a real code domain when domain owners/curators
+should own the acceptance decision. Verification moves a lesson from
+`proposed` to `accepted`; `curate retract --reason ...` retires it. Default
+`knowledge pull --type lesson` and `sync` consume only accepted, not-expired,
+not-retired, not-superseded lessons. Lesson pulls default to five rows
+(`--limit` adjusts this). `--include-uncurated` shows proposals;
+`--include-stale` shows expired, retired, or superseded lessons with reasons.
+
+`agenttalk sync --for A` includes a capped **Lessons to check** section when
+active lessons match the current work context. Process-scope lessons rank
+first, then the inferred scope (review/test/release/docs/craft/security),
+review-due lessons, and newest accepted lessons. This is advisory memory, not
+authorization: it informs the agent before acting, never blocks a command.
+Repeatedly useful lessons should be promoted into skills, tests, gates, or
+docs; the ledger is the capture-and-review path, not the final home.
 
 **Staleness is anchor-relative**, not HEAD-relative — the make-or-break
 rule, so an unrelated commit doesn't empty the layer. A note is
@@ -1160,7 +1181,7 @@ Protected agents — the operator-facing liaison and every active
 | `agenttalk whoami [--for A] [--json]` | Show effective root, resolved self and peer, roster membership, role/groups, unread count, and owed-thread count. Warns when identity is unresolved or not in the roster, which is often a wrong `--root` or env issue. |
 | `agenttalk status` | Show roster, per-agent cursor, unread count, and **actionable warnings**: never-acked unread, soft-deadlocks, unconsumed correlated replies, and stale outbound threads. |
 | `agenttalk threads [--for A] [--all] [--json]` | Derive request/reply thread state from validated messages. Default view shows actionable rows only (`reply-waiting`, `owed-inbound`, `open-outbound`); `--all` includes `closed`. 0.16.0: open rows in `--json` carry read-only `next_owner` / `next_action` (`reply`/`read-reply`/`await-reply`/`answer-operator`) — who owes the next move, a pure projection of state. |
-| `agenttalk sync --for A [--json]` | Rejoin digest: show identity, roster, actionable threads grouped by request id, terminal decisions, recent unread non-action messages, and deterministic next-action hints. Pure derivation; no cursor or threadstate writes. |
+| `agenttalk sync --for A [--lesson-tag TAG] [--json]` | Rejoin digest: show identity, roster, actionable threads grouped by request id, terminal decisions, recent unread non-action messages, deterministic next-action hints, and a capped advisory `Lessons to check` section when accepted lessons match the work context. Pure derivation; no cursor or threadstate writes. |
 | `agenttalk capacity [show\|refresh] [--for A] [--source auto\|claude\|codex] [--threshold N] [--context-threshold N] [--reset-soon-min N] [--statusline-path PATH] [--sessions-dir PATH]` | Advisory headroom snapshots. `refresh` reads the caller's local Claude/Codex signal and publishes a normalized snapshot for `A`; `show` (the default) prints the team's published 5-hour/weekly usage, context-window fill, stale/unknown confidence, and near-cap/reset-soon/near-compaction flags. Never gates progress. |
 | `agenttalk avatar list\|set\|clear\|set-operator\|clear-operator` | Display-avatar preferences. Choices are allowlisted ids, never filenames or URLs. The shaped avatar families (`hexagon-*`, `oval-muted-*`, `oval-vivid-*`, `rounded-square-*`, `star-*`, `triangle-*`) are opt-in self-select variety via `agenttalk avatar set <shape>-<name> --from <self>`; role defaults stay on the original circular robot/operator avatars. |
 | `agenttalk send --from A --to B [--kind K] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -)` | Drop a message into the bus. `--file -` reads the body from stdin. `review-request`, `question`, and `proposal` without `--meta request_id=...` get one minted + printed; `wake` gets a `wk-` correlation id minted the same way but does **not** open a thread (0.24.0); `review-result` and `proposal-response` without one warn (soft, exit 0). |

@@ -511,3 +511,274 @@ def test_cli_onboard_limit_and_grouping(tmp_path: Path,
     # text shows the truncation note
     assert _run(["knowledge", "onboard", "--limit", "2"], root) == 0
     assert "showing 2 of 5" in capsys.readouterr().out
+
+
+# ---- lessons: capture-learning ledger (v0.70.0)
+
+PAST = "2000-01-01T00:00:00Z"
+FUTURE_REVIEW = "2099-01-01T00:00:00Z"
+FUTURE_EXPIRES = "2100-01-01T00:00:00Z"
+
+
+def _lesson_obj(**over) -> dict:
+    lesson = {
+        "scope": "process",
+        "trigger": "When a flaky test depends on host timing",
+        "evidence_ref": "rr-lesson",
+        "applies_to": [],
+        "owner": "dev",
+        "review_after": FUTURE_REVIEW,
+        "expires_at": FUTURE_EXPIRES,
+        "supersedes": [],
+    }
+    lesson.update(over)
+    return lesson
+
+
+def _lesson_event(*, note_id="kn-lesson", key="process.flake", author="dev",
+                  lesson: dict | None = None, body="Capture the lesson before moving on",
+                  domain_id: str = kn.PROCESS_DOMAIN) -> dict:
+    return kn.new_publish_event(
+        note_id=note_id, key=key, type=kn.TYPE_LESSON, domain_id=domain_id,
+        body=body, anchor=None, verified_against_sha=None,
+        domain_registry_hash="rh1", author=author, resolved_from="active_agent",
+        at="2026-07-07T00:00:00Z", lesson=lesson or _lesson_obj(owner=author))
+
+
+def _lesson_pub(root: Path, *, who="dev", key="process.flake", scope="process",
+                body="Capture the lesson before moving on", trigger="Use bounded polling",
+                evidence="rr-lesson", applies_to: str | None = None,
+                review_after=FUTURE_REVIEW, expires_at=FUTURE_EXPIRES,
+                supersedes: str | None = None, domain="process",
+                anchor: bool = False) -> int:
+    argv = ["knowledge", "publish", "--from", who, "--domain", domain, "--type", "lesson",
+            "--key", key, "--scope", scope, "--trigger", trigger, "--evidence-ref",
+            evidence, "--review-after", review_after, "--expires-at", expires_at,
+            "-m", body]
+    if applies_to:
+        argv.extend(["--applies-to", applies_to])
+    if supersedes:
+        argv.extend(["--supersedes", supersedes])
+    if anchor:
+        argv.extend(["--anchor-kind", "path", "--path", "src/cli.py"])
+    return _run(argv, root)
+
+
+def _lesson_verify(root: Path, key: str, *, who="lead", domain="process") -> int:
+    return _run(["knowledge", "curate", "verify", "--from", who, "--domain", domain,
+                 "--key", key], root)
+
+
+def test_lesson_schema_validation_and_existing_notes_unchanged() -> None:
+    pub = _lesson_event()
+    assert pub["type"] == kn.TYPE_LESSON
+    assert pub["lesson"]["status"] == kn.LESSON_STATUS_PROPOSED
+    verify = kn.new_curate_event(base=pub, action="verify", curated_by="lead",
+                                 resolved_from="lead", at="2026-07-07T01:00:00Z",
+                                 reason=None)
+    assert verify["lesson"]["status"] == kn.LESSON_STATUS_ACCEPTED
+    assert verify["lesson"]["curator"] == "lead"
+
+    for field in ("scope", "trigger", "evidence_ref", "review_after", "expires_at"):
+        bad = _lesson_obj()
+        bad.pop(field)
+        with pytest.raises(kn.KnowledgeError):
+            _lesson_event(lesson=bad)
+    missing_owner = _lesson_event()
+    missing_owner["lesson"].pop("owner")
+    assert kn.event_problem(missing_owner) is not None
+    for bad in [
+        _lesson_obj(scope="bogus"),
+        _lesson_obj(applies_to=["../bad"]),
+        _lesson_obj(expires_at=PAST),
+        _lesson_obj(anchor={"kind": "path", "path": "../outside.py"}),
+    ]:
+        with pytest.raises(kn.KnowledgeError):
+            _lesson_event(lesson=bad)
+    with pytest.raises(kn.KnowledgeError):
+        _lesson_event(key="bad key")
+
+    assert _publish()["type"] == kn.TYPE_SEAM
+    assert _publish()["anchor"]["path"] == "src/cli.py"
+
+
+def test_lesson_invalid_line_skips_without_hiding_valid() -> None:
+    valid = _lesson_event(note_id="kn-good")
+    bad = dict(valid)
+    bad["id"] = "kn-bad"
+    bad["lesson"] = {"scope": "process"}
+    assert kn.event_problem(bad) is not None
+    view = kn.current_view([valid, bad])
+    assert view[(kn.PROCESS_DOMAIN, "process.flake")]["id"] == "kn-good"
+
+
+def test_cli_lesson_curation_and_retract_are_process_authorized(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    assert _lesson_pub(root) == 0
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--type", "lesson"], root) == 0
+    assert "0 active lesson" in capsys.readouterr().out
+    assert _run(["knowledge", "pull", "--type", "lesson", "--include-uncurated"], root) == 0
+    assert "proposed" in capsys.readouterr().out
+    assert _run(["knowledge", "curate", "verify", "--from", "dev", "--domain", "process",
+                 "--key", "process.flake"], root) == 2
+    assert _lesson_verify(root, "process.flake") == 0
+    assert _lesson_pub(root, key="cli.lesson", domain="cli") == 0
+    assert _lesson_verify(root, "cli.lesson", who="curator", domain="cli") == 0
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--type", "lesson"], root) == 0
+    assert "2 active lesson" in capsys.readouterr().out
+    assert _run(["knowledge", "curate", "retract", "--from", "lead", "--domain", "process",
+                 "--key", "process.flake", "--reason", "promoted to test"], root) == 0
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--type", "lesson"], root) == 0
+    out = capsys.readouterr().out
+    assert "1 active lesson" in out and "cli.lesson" in out and "process.flake" not in out
+    assert _run(["knowledge", "pull", "--type", "lesson", "--include-stale"], root) == 0
+    assert "stale:retracted" in capsys.readouterr().out
+
+
+def test_lesson_same_key_and_supersedes_affect_active_digest(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    _lesson_pub(root, key="process.repeat", body="old lesson")
+    _lesson_verify(root, "process.repeat")
+    _lesson_pub(root, key="process.repeat", body="new proposal")
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--type", "lesson"], root) == 0
+    out = capsys.readouterr().out
+    assert "old lesson" in out and "new proposal" not in out
+    _lesson_verify(root, "process.repeat")
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--type", "lesson"], root) == 0
+    out = capsys.readouterr().out
+    assert "new proposal" in out and "old lesson" not in out
+
+    _lesson_pub(root, key="process.old", body="superseded lesson")
+    _lesson_verify(root, "process.old")
+    _lesson_pub(root, key="process.new", body="replacement lesson",
+                supersedes="process.old")
+    _lesson_verify(root, "process.new")
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--type", "lesson"], root) == 0
+    out = capsys.readouterr().out
+    assert "replacement lesson" in out and "superseded lesson" not in out
+    assert _run(["knowledge", "pull", "--type", "lesson", "--include-stale"], root) == 0
+    assert "stale:superseded" in capsys.readouterr().out
+
+
+def test_lesson_review_due_expires_and_anchor_hint_do_not_use_anchor_staleness(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    _lesson_pub(root, key="process.review", review_after=PAST, expires_at=FUTURE_EXPIRES,
+                anchor=True)
+    _lesson_verify(root, "process.review")
+    _lesson_pub(root, key="process.expired", review_after=PAST, expires_at="2001-01-01T00:00:00Z")
+    _lesson_verify(root, "process.expired")
+    (root / "src" / "cli.py").write_text("base\nchanged\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "change")
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--type", "lesson"], root) == 0
+    out = capsys.readouterr().out
+    assert "process.review" in out and "review_due" in out
+    assert "process.expired" not in out
+    assert "anchor_path_changed" not in out
+    assert _run(["knowledge", "pull", "--type", "lesson", "--include-stale"], root) == 0
+    assert "stale:expired" in capsys.readouterr().out
+
+
+def test_lesson_pull_defaults_to_five_row_cap(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    for i in range(6):
+        key = f"process.pull{i}"
+        _lesson_pub(root, key=key, body=f"pull lesson {i}")
+        _lesson_verify(root, key)
+    capsys.readouterr()
+
+    assert _run(["knowledge", "pull", "--type", "lesson"], root) == 0
+    out = capsys.readouterr().out
+    assert "5 active lesson" in out
+    assert out.count("process.pull") == 5
+
+    assert _run(["knowledge", "pull", "--type", "lesson", "--limit", "6"], root) == 0
+    assert capsys.readouterr().out.count("process.pull") == 6
+
+
+def test_sync_lessons_are_capped_ranked_contextual_and_failsafe(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    for key, scope, body, tag, review_after in [
+        ("process.global", "process", "process first", None, FUTURE_REVIEW),
+        ("review.parser", "review", "review due parser", "parser", PAST),
+        ("review.other", "review", "wrong tag", "other", PAST),
+        ("craft.build", "craft", "craft lesson", None, PAST),
+    ]:
+        _lesson_pub(root, key=key, scope=scope, body=body, applies_to=tag,
+                    review_after=review_after, expires_at=FUTURE_EXPIRES)
+        _lesson_verify(root, key)
+    with open(kn.notes_path(Store(root)), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"schema_version": 1, "event": "publish", "id": "kn-bad",
+                             "key": "review.parser", "domain_id": "process",
+                             "type": "lesson", "body": "bad",
+                             "domain_registry_hash": "rh1",
+                             "authority": {"state": "uncurated"}}) + "\n")
+    Store(root).send(sender="lead", recipient="dev", kind="review-request",
+                     subject="Review parser fix", body="please review",
+                     meta={"request_id": "rq-parser", "assignment": "parser"})
+    capsys.readouterr()
+    assert _run(["sync", "--for", "dev"], root) == 0
+    out = capsys.readouterr().out
+    assert "Lessons to check" in out
+    assert out.index("process.global") < out.index("review.parser")
+    assert "review_due" in out
+    assert "wrong tag" not in out
+    assert "craft lesson" not in out
+    assert "malformed lessons were ignored" in out
+
+    cap_path = tmp_path / "cap"
+    cap_path.mkdir()
+    cap_root = _repo(cap_path)
+    for i in range(6):
+        key = f"process.cap{i}"
+        _lesson_pub(cap_root, key=key, body=f"cap lesson {i}")
+        _lesson_verify(cap_root, key)
+    capsys.readouterr()
+    assert _run(["sync", "--for", "dev", "--json"], cap_root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload["lessons"]) == 5
+
+    empty_path = tmp_path / "empty"
+    empty_path.mkdir()
+    empty = _repo(empty_path)
+    capsys.readouterr()
+    assert _run(["sync", "--for", "dev"], empty) == 0
+    assert "Lessons to check" not in capsys.readouterr().out
+
+
+def test_knowledge_onboard_can_include_capped_lessons_without_changing_default(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    for i in range(3):
+        key = f"process.lesson{i}"
+        _lesson_pub(root, key=key, body=f"lesson {i}")
+        _lesson_verify(root, key)
+    capsys.readouterr()
+    assert _run(["knowledge", "onboard", "--json"], root) == 0
+    assert isinstance(json.loads(capsys.readouterr().out), list)
+    assert _run(["knowledge", "onboard", "--include-lessons", "--lesson-limit", "2"], root) == 0
+    out = capsys.readouterr().out
+    assert "Lessons to check (2)" in out
+    assert out.count("process.lesson") == 2
+
+
+def test_reset_preserves_lesson_events(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    _lesson_pub(root)
+    assert kn.notes_path(Store(root)).exists()
+    _run(["reset"], root)
+    events, _ = kn.read_events(Store(root))
+    assert len(events) == 1
+    assert events[0]["type"] == kn.TYPE_LESSON
