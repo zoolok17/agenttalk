@@ -288,6 +288,14 @@ def _repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _write_process_domain(root: Path) -> None:
+    (Store(root).dir / "domains.json").write_text(json.dumps({
+        "schema_version": 1, "domains": {"process": {
+            "title": "Process", "owners": {"agents": ["lead"]},
+            "curators": {"agents": ["curator"]}, "owned_globs": ["src/**"]}},
+        "shared_paths": []}), encoding="utf-8")
+
+
 def _run(argv: list[str], root: Path) -> int:
     return cli.main(["--root", str(root), *argv])
 
@@ -637,6 +645,37 @@ def test_cli_lesson_curation_and_retract_are_process_authorized(
     assert "1 active lesson" in out and "cli.lesson" in out and "process.flake" not in out
     assert _run(["knowledge", "pull", "--type", "lesson", "--include-stale"], root) == 0
     assert "stale:retracted" in capsys.readouterr().out
+
+
+def test_real_process_domain_non_lesson_uses_registry_curator(
+        tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    _write_process_domain(root)
+
+    assert _run(["knowledge", "publish", "--from", "dev", "--domain", "process",
+                 "--type", "seam", "--key", "process.seam", "-m",
+                 "real process domain seam", "--anchor-kind", "path",
+                 "--path", "src/cli.py"], root) == 0
+    assert _run(["knowledge", "curate", "verify", "--from", "curator",
+                 "--domain", "process", "--key", "process.seam"], root) == 0
+
+
+def test_process_lesson_uses_real_domain_curator_when_registered(
+        tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    _write_process_domain(root)
+
+    assert _lesson_pub(root, key="process.lesson", domain="process") == 0
+    assert _lesson_verify(root, "process.lesson", who="curator", domain="process") == 0
+
+
+def test_virtual_process_lesson_allows_operator_liaison(
+        tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    Store(root).set_operator_facing("curator")
+
+    assert _lesson_pub(root, key="process.liaison") == 0
+    assert _lesson_verify(root, "process.liaison", who="curator") == 0
 
 
 def test_lesson_same_key_and_supersedes_affect_active_digest(

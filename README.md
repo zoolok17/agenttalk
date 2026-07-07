@@ -934,7 +934,10 @@ lesson --domain process --key K --scope review --trigger TEXT
 captures a proposed process lesson in the same `notes.jsonl`. The reserved
 virtual domain `process` is curated by the operator-facing liaison or active
 lead; a lesson can also use a real code domain when domain owners/curators
-should own the acceptance decision. Verification moves a lesson from
+should own the acceptance decision. If the registry defines a real domain named
+`process`, that real domain wins: lessons published to `process` are curated by
+that domain's owners/curators, and the virtual liaison/lead authority applies
+only when no real `process` domain is registered. Verification moves a lesson from
 `proposed` to `accepted`; `curate retract --reason ...` retires it. Default
 `knowledge pull --type lesson` and `sync` consume only accepted, not-expired,
 not-retired, not-superseded lessons. Lesson pulls default to five rows

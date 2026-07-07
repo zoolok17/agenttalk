@@ -3546,24 +3546,33 @@ def _knowledge_resolve_domain_for_publish(store, args, reg):
     domain_id = args.domain or (kn.PROCESS_DOMAIN if note_type == kn.TYPE_LESSON else None)
     if not domain_id:
         raise kn.KnowledgeError("domain is required")
-    if domain_id == kn.PROCESS_DOMAIN and note_type == kn.TYPE_LESSON:
+    domains = reg.data.get("domains") or {}
+    if domain_id == kn.PROCESS_DOMAIN and note_type == kn.TYPE_LESSON and domain_id not in domains:
         return domain_id, None
-    if domain_id not in (reg.data.get("domains") or {}):
-        known = sorted((reg.data.get("domains") or {}))
+    if domain_id not in domains:
+        known = sorted(domains)
         raise kn.KnowledgeError(f"unknown domain {domain_id!r} (known: {known})")
-    return domain_id, reg.data["domains"][domain_id]
+    return domain_id, domains[domain_id]
 
 
-def _knowledge_resolve_curators(store, domain_id: str, reg):
+def _knowledge_resolve_registry_curators(store, domain_id: str, reg):
     from agenttalk import knowledge as kn
-    if domain_id == kn.PROCESS_DOMAIN:
-        return [], list(_knowledge_process_curators(store))
     dom_entry = (reg.data.get("domains") or {}).get(domain_id)
     if not dom_entry:
         raise kn.KnowledgeError(f"unknown domain {domain_id!r}")
     cfg = store.load_config()
     return (dom.resolve_refset(dom_entry.get("owners") or {}, cfg),
             dom.resolve_refset(dom_entry.get("curators") or {}, cfg))
+
+
+def _knowledge_resolve_curators_for_note(store, note: dict, reg):
+    from agenttalk import knowledge as kn
+    domain_id = note.get("domain_id")
+    domains = reg.data.get("domains") or {}
+    if note.get("type") == kn.TYPE_LESSON and domain_id == kn.PROCESS_DOMAIN \
+            and domain_id not in domains:
+        return [], list(_knowledge_process_curators(store))
+    return _knowledge_resolve_registry_curators(store, domain_id, reg)
 
 
 def _kn_split_csv(value: str | None) -> list[str]:
@@ -3842,29 +3851,35 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
             return 2
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         reg = _load_domain_registry(store)
-        try:
-            owners, curators = _knowledge_resolve_curators(store, args.domain, reg)
-        except kn.KnowledgeError as e:
-            sys.stderr.write(f"agenttalk knowledge curate: {e}\n")
-            return 2
-        # CURATION is ENFORCED (it gates the verified/authoritative set): owner/
-        # curator of the domain, or a lead override. Refuse others (fail closed).
-        resolved_from = kn.resolve_curation_authority(
-            actor, owner_agents=owners, curator_agents=curators,
-            is_lead=(actor in _close_lead_set(store) or
-                     (args.domain == kn.PROCESS_DOMAIN and
-                      _knowledge_process_is_lead(store, actor))))
-        if resolved_from is None:
-            sys.stderr.write(
-                f"agenttalk knowledge curate: {actor!r} is not an owner/curator of "
-                f"{args.domain!r} (or a lead) - refusing (curation gates the verified set).\n")
-            return 2
         with store._config_lock():
             events, _ = kn.read_events(store)
             view = kn.current_view(events)
             base = view.get((args.domain, args.key))
             if not base or kn.is_retracted(base):
                 sys.stderr.write(f"agenttalk knowledge curate: no live note {args.domain}/{args.key}.\n")
+                return 2
+            try:
+                owners, curators = _knowledge_resolve_curators_for_note(store, base, reg)
+            except kn.KnowledgeError as e:
+                sys.stderr.write(f"agenttalk knowledge curate: {e}\n")
+                return 2
+            # CURATION is ENFORCED (it gates the verified/authoritative set): owner/
+            # curator of the domain, or a lead override. For the reserved lesson
+            # process domain, the virtual liaison/lead curators apply only when no
+            # real registry domain named process exists.
+            is_virtual_process_lesson = (
+                base.get("type") == kn.TYPE_LESSON
+                and base.get("domain_id") == kn.PROCESS_DOMAIN
+                and kn.PROCESS_DOMAIN not in (reg.data.get("domains") or {})
+            )
+            resolved_from = kn.resolve_curation_authority(
+                actor, owner_agents=owners, curator_agents=curators,
+                is_lead=(actor in _close_lead_set(store) or
+                         (is_virtual_process_lesson and _knowledge_process_is_lead(store, actor))))
+            if resolved_from is None:
+                sys.stderr.write(
+                    f"agenttalk knowledge curate: {actor!r} is not an owner/curator of "
+                    f"{args.domain!r} (or a lead) - refusing (curation gates the verified set).\n")
                 return 2
             try:
                 evt = kn.new_curate_event(base=base, action=sub, curated_by=actor,
