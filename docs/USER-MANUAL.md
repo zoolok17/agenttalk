@@ -143,22 +143,32 @@ mailbox. Do not run two listen loops for the same roster name.
 4. Send a first message:
 
    ```powershell
-   agenttalk send --from claude --to codex --kind question --subject first-check -m "Can you see this?"
+   agenttalk send --from claude --to codex --kind question --subject first-check --meta request_id=q-first-check -m "Can you see this?"
    ```
 
-5. Read it from the other terminal:
+5. Read and consume it from the other terminal:
 
    ```powershell
-   agenttalk recv --for codex
+   agenttalk drain --for codex
    ```
+
+   `recv --for codex` is a peek: it prints unread messages but does not move
+   Codex's cursor. Use `drain --for codex` or `recv --for codex --ack` when
+   you want to consume the message.
 
 6. Reply on the same request thread:
 
    ```powershell
-   agenttalk reply --from codex --to-request <request-id> -m "Yes."
+   agenttalk reply --from codex --to-request q-first-check -m "Yes."
    ```
 
-7. Rejoin and inspect state whenever a terminal restarts:
+7. Read and consume the reply from the Claude terminal:
+
+   ```powershell
+   agenttalk drain --for claude
+   ```
+
+8. Rejoin and inspect state whenever a terminal restarts:
 
    ```powershell
    agenttalk sync --for claude
@@ -181,9 +191,13 @@ Roster commands are deliberate local admin operations:
 ```powershell
 agenttalk roster
 agenttalk roster add claude-dev --role implementer --group devs
+agenttalk roster add codex-dev --role implementer --group devs
+agenttalk roster add claude-rev --role reviewer --group reviewers
 agenttalk roster add codex-rev --role reviewer --group reviewers
+agenttalk roster add claude-lead
 agenttalk roster set-role claude-lead lead
 agenttalk roster set-group reviewers 'claude-rev,codex-rev'
+agenttalk roster set-operator-facing claude-lead
 agenttalk roster --json
 ```
 
@@ -450,6 +464,41 @@ A lane is a scoped assignment tied to a domain registry entry. It records the
 assignee, base SHA, target ref, and path prefixes. The default `lane assign`
 provisions an isolated worktree so concurrent builders do not collide.
 
+Before assigning a docs lane, author a minimal domain registry. In PowerShell,
+this writes `.agenttalk/domains.json` as UTF-8 without a BOM for the roster
+names from Section 4:
+
+```powershell
+$domainsJson = @'
+{
+  "schema_version": 1,
+  "domains": {
+    "docs": {
+      "title": "Documentation",
+      "owners": { "groups": ["devs"] },
+      "reviewers": { "groups": ["reviewers"] },
+      "curators": { "agents": ["claude-lead"] },
+      "owned_globs": ["docs/**", "README.md"]
+    }
+  },
+  "shared_paths": [
+    {
+      "glob": "pyproject.toml",
+      "category": "package-metadata",
+      "requires": "shared-lease-or-lead-approval",
+      "default_reviewers": { "groups": ["reviewers"] }
+    }
+  ]
+}
+'@
+$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+[System.IO.File]::WriteAllText((Join-Path (Resolve-Path .agenttalk) 'domains.json'), $domainsJson, $utf8NoBom)
+
+agenttalk domain validate
+agenttalk domain show docs
+agenttalk domain check-path docs/USER-MANUAL.md README.md pyproject.toml
+```
+
 Assign a lane:
 
 ```powershell
@@ -536,7 +585,8 @@ For release protocol and attestation, read [ASSURANCE.md](ASSURANCE.md) and
 
 ## 11. Knowledge, domains, and lessons
 
-Domains describe ownership and expertise for repo areas. Inspect them:
+Domains describe ownership and expertise for repo areas. The examples below
+assume the `docs` domain from Section 9 exists. Inspect it:
 
 ```powershell
 agenttalk domain list
