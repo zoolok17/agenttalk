@@ -5,6 +5,17 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.70.2] - 2026-07-07
+
+### Fixed
+
+- **Wrapped supervisor restarts now launch parser-visible same-root wrappers even for stale
+  `supervisor.json` files.** The generated PowerShell supervisor normalizes legacy wrapped launch
+  argv such as `python -m agenttalk wrap --for NAME ...` by inserting global `--root {ROOT}` before
+  `wrap` at launch time. Surviving old wrappers are then visible to the process parser and launch
+  barrier as same-root same-agent survivors, preventing manual restart from stacking duplicate
+  wrappers for one mailbox.
+
 ## [0.70.1] - 2026-07-07
 
 ### Added

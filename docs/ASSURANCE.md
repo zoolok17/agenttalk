@@ -95,6 +95,29 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.70.2 - wrapped supervisor explicit-root launch repair (2026-07-07)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `aa38654` · tag `v0.70.2`
+- **Review:** production bug report showed OrbitLauncher wrappers launched as
+  `python -m agenttalk wrap --for <agent> ...` and relied on `AGENTTALK_ROOT`, which process
+  snapshots cannot see. That made `parse_agenttalk_wrap_invocation` and the launch barrier miss
+  same-root survivors, so manual restart could stack duplicate wrappers for one mailbox. The fix was
+  built in isolated worktree `fix/wrap-explicit-root`: generated `supervisor.ps1` now normalizes
+  wrapped launch argv at executor time, inserting `--root $Root` before `wrap` when missing, before
+  supervisor nonce injection. Already-rooted and non-wrap argv remain unchanged.
+- **Verification:** `codex-test` approved `aa38654` after running the new regression, seven
+  parser/barrier tests, and full `tests/test_supervisor.py` (`204 passed`). `codex-agenttalk-reviewer-1`
+  approved `aa38654` for generated PowerShell correctness, nonce ordering, stale-config
+  compatibility, parser/barrier safety, and cross-root attribution. Local lead gate: `ruff check src
+  tests`, `compileall src tests`, `git diff --check`, and full pytest (`2055 passed / 3 skipped`) with
+  repo-external basetemp.
+- **CI:** pending at tag creation; release close requires watching GitHub Actions tests matrix,
+  security, and wheel/packaging after push and reporting actual results.
+- **Robust/Secure:** no new trust in environment variables. The parser remains fail-closed for
+  unrooted wrapper command lines; the durable repair is to make supervised launches carry the root on
+  the visible command line. Honest limit: no live OrbitLauncher wrappers were killed or relaunched by
+  this gate; evidence is generated PowerShell helper execution plus parser, planner, and launch
+  barrier tests.
+
 ### v0.70.1 - operator user manual (2026-07-07)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `58eef95` (manual `5ab342a` + executable-doc fold) · tag `v0.70.1`
 - **Review:** docs-only work in isolated worktree `user-manual`. `codex-agenttalk-reviewer-1`
