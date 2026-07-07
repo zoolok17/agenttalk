@@ -95,6 +95,29 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.70.1 - operator user manual (2026-07-07)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `58eef95` (manual `5ab342a` + executable-doc fold) · tag `v0.70.1`
+- **Review:** docs-only work in isolated worktree `user-manual`. `codex-agenttalk-reviewer-1`
+  approved the original manual + README doc-map at `5ab342a` (link map, section coverage, argparse
+  help/flag accuracy, and honest scope framing). `codex-test` then executed the operator path and
+  rejected three blocking examples (peek-only `recv`, roster references before `add`, and missing
+  `docs` domain for lanes/knowledge). `codex-agenttalk-developer-4` folded those fixes into
+  `58eef95`; `codex-test` reran Sections 3, 4, 9, and 11 on the folded SHA and approved with all
+  focused commands returning rc 0. The reviewer-1 accuracy approval carries for the unchanged
+  non-folded scope; the executable fold is covered by the final-SHA QA approval.
+- **Gate:** feature diff and release diff are documentation/version only; `git diff --check` and the
+  focused executable doc-QA passed. The acting Codex lead could not reproduce the previous Claude
+  lead's private 3.10+3.14 venv gate; per handoff, this docs-only release relies on developer self-QA
+  plus the post-push CI matrix as the authoritative full gate.
+- **CI:** pending at tag creation; release close requires watching GitHub Actions tests matrix,
+  security, and wheel/packaging after push and reporting actual results.
+- **Robust/Secure:** no runtime code or authority surface change. The release reduces operator risk by
+  replacing ad hoc procedure memory with an executable manual and by documenting that local workspace
+  trust, dashboard actions, gates, and lessons are advisory/coordination mechanisms rather than
+  authorization boundaries. Honest limit: only the focused examples from the rejected QA pass were
+  re-executed after the fold; global install/config, dashboard, supervise, and release-adjacent
+  sections remain covered by review/help checks rather than full end-to-end execution.
+
 ### v0.70.0 — capture-learning (curated lesson ledger) (2026-07-07)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `f584b1d` (feature `3e32c83` + curation-collision fold) · tag `v0.70.0`
 - **Review:** operator-raised → design-first (codex, gated PASS — reuse the knowledge ledger, one

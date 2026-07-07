@@ -5,6 +5,19 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.70.1] - 2026-07-07
+
+### Added
+
+- **Operator user manual:** Adds `docs/USER-MANUAL.md` as the operator-facing guide for install,
+  roster setup, first message flows, dashboard and supervisor operation, lanes, gates, knowledge,
+  troubleshooting, and glossary usage. The README now has a documentation map that points operators
+  to the manual first and keeps maintainer-oriented architecture and assurance docs linked, not
+  duplicated.
+- **Executable manual examples:** The manual's first bus workflow consumes reads with `drain`, roster
+  examples add agents before assigning roles/groups, and the lane/knowledge walkthrough creates the
+  `docs` domain before using it.
+
 ## [0.70.0] - 2026-07-07
 
 ### Added
