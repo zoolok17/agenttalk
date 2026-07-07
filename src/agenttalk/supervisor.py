@@ -3875,6 +3875,48 @@ function Stop-Tree($targets) {
     Stop-Process -Id $t.pid -Force -ErrorAction SilentlyContinue
   }
 }
+function Ensure-AgenttalkWrapRootArg($argv) {
+  # Older supervisor.json files launched wrappers as:
+  #   python.exe -m agenttalk wrap --for NAME --loop ...
+  # and relied on AGENTTALK_ROOT in the environment. Win32_Process exposes only
+  # the command line, so the planner/barrier could not attribute surviving
+  # wrapper processes to this project. Normalize the argv at the executor
+  # boundary so stale configs become parser-visible without editing config.
+  $args = @($argv)
+  if ($args.Count -eq 0) { return $args }
+  $scan = 0
+  if ($args.Count -ge 2 -and [string]$args[0] -eq '-m' -and [string]$args[1] -eq 'agenttalk') {
+    $scan = 2
+  }
+  $rootPresent = $false
+  $wrapIndex = -1
+  $i = $scan
+  while ($i -lt $args.Count) {
+    $arg = [string]$args[$i]
+    if ($arg -eq '--') { break }
+    if ($arg -eq '--root') {
+      $rootPresent = $true
+      $i += 2
+      continue
+    }
+    if ($arg -like '--root=*') {
+      $rootPresent = $true
+      $i += 1
+      continue
+    }
+    if ($arg -eq 'wrap') {
+      $wrapIndex = $i
+      break
+    }
+    $i += 1
+  }
+  if ($rootPresent -or $wrapIndex -lt 0) { return $args }
+  $out = @()
+  if ($wrapIndex -gt 0) { $out += $args[0..($wrapIndex - 1)] }
+  $out += @('--root', $Root)
+  $out += $args[$wrapIndex..($args.Count - 1)]
+  return $out
+}
 function Seed-CodexHome($name, $sandbox) {
   if (-not (Assert-ActionsEnabled ("seed-codex-home {0}" -f $name))) { return $null }
   # Provision a per-agent ISOLATED CODEX_HOME so `resume --last` is unambiguous
@@ -4078,6 +4120,7 @@ function Launch($name, $plan, $codexHome) {
   foreach ($x in @($a.launch.windows_args)) {
     if ($x -eq '{SESSION_ARGS}') { $argv += $tokens } else { $argv += ([string]$x).Replace('{ROOT}', $Root).Replace('<cwd>', $cwdToken) }
   }
+  $argv = @(Ensure-AgenttalkWrapRootArg $argv)
   $launchNonce = [guid]::NewGuid().ToString('N')
   $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce
   $argv = @($nonceResult.argv)
@@ -4131,6 +4174,7 @@ function Launch-Spec($name, $spec, $codexHome) {
   $specCwdToken = if ($spec.cwd) { [string]$spec.cwd } else { '' }
   $argv = @($spec.launch.windows_args)
   $argv = $argv | ForEach-Object { ([string]$_).Replace('{ROOT}', $Root).Replace('<cwd>', $specCwdToken) }
+  $argv = @(Ensure-AgenttalkWrapRootArg $argv)
   $launchNonce = [guid]::NewGuid().ToString('N')
   $nonceResult = Add-SupervisorLaunchNonce $file $argv $launchNonce
   $argv = @($nonceResult.argv)

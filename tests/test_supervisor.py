@@ -2505,6 +2505,38 @@ def test_supervisor_launch_nonce_injection_powershell_helper(tmp_path: Path) -> 
     assert data["native"]["missing_reason"] == "unsupported_launch_argv"
 
 
+def test_wrapped_launch_helper_inserts_root_before_wrap_for_legacy_configs(tmp_path: Path) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    helpers = _exec_helpers(tmp_path)
+    out = tmp_path / "wrap_root.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$Root = {_pslit(str(tmp_path))}",
+        helpers,
+        "$legacyPy = Ensure-AgenttalkWrapRootArg @('-m','agenttalk','wrap',"
+        "'--for','Cygnus','--cli','codex','--loop','--','codex.exe')",
+        "$legacyConsole = Ensure-AgenttalkWrapRootArg @('wrap','--for',"
+        "'Altair','--cli','codex','--loop','--','codex.exe')",
+        "$alreadyRooted = Ensure-AgenttalkWrapRootArg @('-m','agenttalk','--root','R','wrap','--for','Vega','--loop')",
+        "$nonWrap = Ensure-AgenttalkWrapRootArg @('-m','agenttalk','wait','--for','Cygnus')",
+        "@{ legacyPy = $legacyPy; legacyConsole = $legacyConsole; "
+        "alreadyRooted = $alreadyRooted; nonWrap = $nonWrap } | ConvertTo-Json -Depth 6 | "
+        f"Set-Content {_pslit(str(out))} -Encoding utf8",
+    ])
+    hp = tmp_path / "wrap_root.ps1"
+    hp.write_text(harness, encoding="utf-8-sig")
+    res = subprocess.run([shell, "-NoProfile", "-File", str(hp)],
+                         capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, f"{res.stdout}{res.stderr}"
+    data = json.loads(out.read_text(encoding="utf-8-sig"))
+    assert data["legacyPy"][:5] == ["-m", "agenttalk", "--root", str(tmp_path), "wrap"]
+    assert data["legacyConsole"][:3] == ["--root", str(tmp_path), "wrap"]
+    assert data["alreadyRooted"][:5] == ["-m", "agenttalk", "--root", "R", "wrap"]
+    assert data["nonWrap"] == ["-m", "agenttalk", "wait", "--for", "Cygnus"]
+
+
 def test_launch_rechecks_kill_switch_after_branch_guard(tmp_path: Path) -> None:
     shell = _pick_powershell()
     if not shell:
@@ -3374,6 +3406,7 @@ def test_process_ownership_parse_agenttalk_wrap_fail_closed_matrix() -> None:
     ) is True
     bad = [
         f"cmd.exe /c python -m agenttalk --root {TEST_ROOT} wrap --for worker --loop",
+        "python -m agenttalk wrap --for worker --loop",
         f"python -m agenttalk wrap --root {TEST_ROOT} --for worker --loop",
         f"python -m agenttalk --root {TEST_ROOT} wrap --supervisor-launch-nonce {SUPERVISOR_NONCE} --for worker --loop",
         f"python -m agenttalk --root {TEST_ROOT} wrap --for worker -- --loop",
