@@ -29,7 +29,7 @@ The healthy shape is **a thin substrate + pluggable products with hard seams**, 
 | **B. Method Engine Adapter** | spec-kitty (and other) workflow engines drive *what next*; agenttalk carries wake/handoff/evidence | Yes | Integration exists; not packaged |
 | **C. Craft Skill Pack** | coding/review/test/QA/security/release skills encoding standards + evidence | Mostly | Useful; needs templates |
 | **D. Assurance & Release Governance** | gates, closes, specialist sign-off, release ledger, scan evidence | Yes | Strong primitive; needs turnkey close-flow |
-| **E. Knowledge & Codebase Memory** | domains, durable pointer-notes, anchor-relative staleness, onboarding digests | Yes | Primitives exist; comprehension product not built |
+| **E. Knowledge & Codebase Memory** | domains, durable pointer-notes, anchor-relative staleness, onboarding digests, **+ a curated process/craft `lesson` ledger (capture → curate → surfaced in `sync`)** | Yes | Primitives exist; **lesson ledger (capture-learning) shipped v0.70.0**; codebase-comprehension product not built |
 | **F. Operator Control Plane** | local console, read views, action-gated intent queue, lead-chat, attention/capacity/liveness | Yes (local) | Useful local console; not remote admin |
 | **G. Execution Runtime** | supervisor, wrapper, session continuity, dead-letter, managed lead-loop, isolated lane worktrees | Yes | Powerful but **high-maintenance** |
 | **H. Legacy Adoption Suite** *(flagship)* | opinionated composition of E+D+G+F+A+skills: map → preserve → safety-net → gated change | Yes, if built as a flow | **Primitives + dogfooded practice, not yet a product** |

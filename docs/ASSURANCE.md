@@ -95,6 +95,26 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.70.0 — capture-learning (curated lesson ledger) (2026-07-07)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `f584b1d` (feature `3e32c83` + curation-collision fold) · tag `v0.70.0`
+- **Review:** operator-raised → design-first (codex, gated PASS — reuse the knowledge ledger, one
+  `lesson` type, time-based staleness, one forced-consumption path via `sync`) → build in an isolated
+  worktree → **dual verification on the final SHA**: `codex-test` (QA) proved the loop closes
+  end-to-end with real CLI (publish→proposed-inert, curate→shows-in-`sync`, cap-at-5, review-due /
+  expire / retract / supersede all correct, malformed-line fail-safe, no-regression) = GO; reviewer-1
+  (code) caught a real MAJOR — the virtual `process` curation resolver shadowed a *real* domain named
+  `process`, breaking its non-lesson curation — folded (registry-first: read the note, branch by type)
+  and re-verified (curator verify rc 0). The two lenses split cleanly again.
+- **Gate:** ruff/bandit/**gitleaks** (git-mode + range)/diff/compileall clean; pytest **2054 passed /
+  3 skipped on 3.10 AND 3.14** (clean venvs).
+- **CI:** tests matrix (3.10–3.13 × win/mac/ubuntu) + security + wheel — green (watched post-push).
+- **Robust/Secure:** additive + reset-preserved (shares `knowledge/notes.jsonl`); curate-gated (only
+  accepted lessons feed); required fields load-bearing (missing → invalid → skipped, never hides a
+  valid line); fail-safe reader; advisory, not authz (v1 informs via `sync`, does not block). Honest
+  limit: curation is load-bearing (a wrong accepted lesson is worse than none), and the ledger
+  complements skills rather than replacing them — a repeatedly-useful lesson should be promoted into
+  skill text / tests / gates.
+
 ### v0.69.6 — interactive-lead heartbeat (2026-07-07)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `901b554` (feature `707b1d3` + dedupe fold) · tag `v0.69.6`
 - **Review:** design-first (codex, gated PASS — the `--fallback-for` resolution order that keeps a

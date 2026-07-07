@@ -5,6 +5,23 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.70.0] - 2026-07-07
+
+### Added
+
+- **Capture-learning: a curated "lesson" ledger that surfaces process/craft lessons before agents
+  repeat known mistakes.** A new `lesson` note type in the knowledge layer captures reusable
+  process/craft learning (review gotchas, CI habits, command hygiene, …) with a required scope,
+  trigger, evidence, owner, and review/expiry dates. Capture is open (`agenttalk knowledge publish
+  --type lesson …`) but **inert until curated** — only an *accepted* lesson (verified by the
+  operator-facing liaison / lead, or a real domain's curators) feeds anything. Accepted, non-expired
+  lessons are injected — capped and context-matched — into `agenttalk sync` as a "Lessons to check"
+  section (and `knowledge onboard --include-lessons`), so a hard-won habit reaches the next agent
+  instead of living in one lead's memory. Lessons age by review/expiry (not code-anchor), can be
+  superseded/retracted, and the reader is fail-safe (a malformed lesson never breaks `sync` or hides a
+  valid one). Advisory, not blocking — the ledger is the capture+review layer; the best lessons should
+  still graduate into skills/tests/gates.
+
 ## [0.69.6] - 2026-07-07
 
 ### Fixed
