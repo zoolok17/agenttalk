@@ -33,6 +33,22 @@ exported on session end.
 
 The first row is the whole essence; everything else is opt-in.
 
+## Documentation
+
+Start with [docs/USER-MANUAL.md](docs/USER-MANUAL.md) for operator-facing
+procedures and examples. The other canonical docs are:
+
+- [docs/AGENT-MANUAL.md](docs/AGENT-MANUAL.md) - role-keyed operating guide
+  for agents.
+- [docs/DESIGN.md](docs/DESIGN.md) - architecture, rationale, and decision
+  history.
+- [docs/ROADMAP.md](docs/ROADMAP.md) - product roadmap.
+- [docs/ASSURANCE.md](docs/ASSURANCE.md) - release attestation and gate
+  evidence.
+- [docs/ISSUES.md](docs/ISSUES.md) - living tracker.
+- [CHANGELOG.md](CHANGELOG.md) - release history.
+- [SECURITY.md](SECURITY.md) - security posture and trust model.
+
 ---
 
 ## The minimal start (just tell the agent)
