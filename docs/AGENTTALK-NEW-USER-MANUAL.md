@@ -7,7 +7,7 @@ Goal: understand the system first, then operate it safely: messaging,
 thread states, dashboard views, skills, workflows, supervision, lanes,
 knowledge, gates, close records, and recovery.
 
-Last updated: 2026-07-09. Current release baseline: v0.72.0.
+Last updated: 2026-07-09. Current release baseline: v0.72.1.
 
 agenttalk is a local, file-backed coordination platform for coding-agent CLIs
 such as Claude Code and Codex. It lets separate agent windows talk directly,
@@ -90,7 +90,7 @@ Keep these rules in mind before learning commands.
 Install from a pinned release:
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.72.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.72.1"
 agenttalk --version
 agenttalk install-skills
 ```

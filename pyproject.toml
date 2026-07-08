@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agenttalk"
-version = "0.72.0"
+version = "0.72.1"
 description = "File-backed message bus and coordination layer for coding-agent CLIs (Claude Code and Codex) - a pair or a named team - working on the same repository."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -49,6 +49,41 @@ ignore = [
 
 [project.scripts]
 agenttalk = "agenttalk.cli:main"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/.gitattributes",
+    "/.gitignore",
+    "/.gitleaks.toml",
+    "/.gitleaksignore",
+    "/.semgrep",
+    "/CHANGELOG.md",
+    "/README.md",
+    "/ROADMAP.md",
+    "/SECURITY.md",
+    "/docs/AGENT-MANUAL.md",
+    "/docs/AGENTTALK-NEW-USER-MANUAL.md",
+    "/docs/AGENTTALK-NEW-USER-MANUAL.pdf",
+    "/docs/ASSURANCE.md",
+    "/docs/DASHBOARD-CONTROL-PLANE-ROADMAP.md",
+    "/docs/DESIGN.md",
+    "/docs/DashboardDesign",
+    "/docs/ISSUES.md",
+    "/docs/ROADMAP.md",
+    "/docs/USER-MANUAL.md",
+    "/docs/agenttalk-delivery-os-field-notes.md",
+    "/docs/audit-2026-06-28.md",
+    "/docs/reviews",
+    "/docs/rfc-identity-authz.md",
+    "/docs/skill-devkit-evolution-design.md",
+    "/docs/supervisor-hosting.md",
+    "/docs/supervisor-liveness-design.md",
+    "/docs/supervisor-tutorial.md",
+    "/kitty-specs",
+    "/pyproject.toml",
+    "/src",
+    "/tests",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agenttalk"]

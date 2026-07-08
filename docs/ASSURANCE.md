@@ -95,6 +95,25 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.72.1 - clean source package and release evidence correction (2026-07-09)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `TBD` · tag `v0.72.1`
+- **Review:** release-readiness follow-up after publishing `v0.72.0` found a package-artifact
+  defect: the source distribution had been built from the release workstation's unclean tree and
+  included local-only scratch/cache/operator files (`.tmp/`, `.pytest-cache-local/`, handoff notes,
+  local brief docs, and similar). The runtime/wheel code path was not changed; the fix scopes
+  Hatchling's sdist target to explicit project artifacts and adds a CI sentinel check that creates
+  local-only files before `python -m build` and fails if they appear in the generated `.tar.gz`.
+- **Verification:** local release gate rebuilt the sdist/wheel, opened the sdist, and verified the
+  known bad local artifacts are absent while `docs/AGENTTALK-NEW-USER-MANUAL.pdf` and dashboard
+  static assets are present. Wheel install smoke verifies `agenttalk.__version__ == "0.72.1"` and
+  bundled `console.css`/`console.js`.
+- **CI:** the release process requires GitHub Actions tests matrix, security workflow, and
+  wheel/packaging gate green for the `v0.72.1` commit before tag/release; the published GitHub
+  release notes record the actual run IDs.
+- **Robust/Secure:** no authority/runtime behavior changed. The packaging surface now fails closed
+  against a broad sdist manifest by testing with local sentinels, and `v0.72.1` supersedes the
+  `v0.72.0` package artifacts rather than rewriting the already-published tag.
+
 ### v0.72.0 - learning dashboard and new-user manual (2026-07-09)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `d659d0d` · tag `v0.72.0`
 - **Review:** built on the main worktree with the wrapped team. UX/API/QA reviewers approved the
@@ -111,8 +130,10 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
   `node --check src/agenttalk/web_static/console.js`, `git diff --check`, isolated
   `python -m build` (sdist + wheel), and a wheel install smoke asserting `agenttalk.__version__ ==
   "0.72.0"` plus bundled `console.css`/`console.js`.
-- **CI:** pending at tag creation; release close requires watching GitHub Actions tests matrix,
-  security, and wheel/packaging after push and reporting actual results.
+- **CI:** GitHub Actions tests matrix + wheel gate passed in run `28980774437`; security passed in
+  run `28980774464`. Packaging caveat: the uploaded `v0.72.0` sdist included local-only release
+  workstation files; `v0.72.1` supersedes the package artifacts with a clean sdist and a packaging
+  regression gate.
 - **Robust/Secure:** `/api/learning` is GET/HEAD-only, root-aware, defaults to accepted active
   lessons, keeps proposed/stale/retired rows behind explicit filters, never returns raw bus bodies or
   prompt blocks from exposure telemetry, and now allowlists lesson anchor evidence. Honest limit:

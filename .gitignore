@@ -52,8 +52,11 @@ htmlcov/
 # codex auth.json) or binaries and must never be committed — explicitly ignored
 # after a `git add -A` nearly swept them into the v0.64.1 release commit.
 /.codex-review-tmp/
+/.tmp/
 /.tmp-*/
 /.worktrees/
+/.pytest-cache-local/
+/py-write-probe/
 
 
 # Per-release scratch release-note files (kept out of the repo per
@@ -63,3 +66,11 @@ htmlcov/
 # Ad-hoc operator feedback / input docs dropped at the repo root — these
 # drive work but aren't shipped artifacts (kept locally, out of the repo).
 /FEEDBACK-*.md
+/HANDOFF-*.md
+/agenttalk-*.md
+/dogfood-test-plan.html
+/docs/*.zip
+/docs/agenttalk-*.md
+/docs/audit-wrapped-*.md
+/docs/full-codebase-review-*.md
+/docs/skill_proposals.md

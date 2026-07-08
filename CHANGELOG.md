@@ -5,6 +5,19 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.72.1] - 2026-07-09
+
+### Fixed
+
+- **Source distributions are now scoped to project artifacts.** The `v0.72.0` sdist was built from
+  a local working tree and included untracked scratch/cache/operator files such as `.tmp/`,
+  `.pytest-cache-local/`, and local handoff notes. Hatchling's sdist target now has an explicit
+  include list for source, tests, docs, specs, and project metadata so local-only files cannot ship
+  in the source package.
+- **Packaging CI now probes for local-file leaks.** The wheel/build workflow creates sdist sentinel
+  files before `python -m build` and then opens the generated `.tar.gz` to assert the sentinels are
+  absent while the new-user manual PDF and dashboard static assets are present.
+
 ## [0.72.0] - 2026-07-09
 
 ### Added
