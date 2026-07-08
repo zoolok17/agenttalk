@@ -36,7 +36,7 @@
   var DENSITIES = ['comfortable', 'compact'];
   var PREF_KEYS = { theme: 'tc.theme', accent: 'tc.accent', density: 'tc.density' };
 
-  var VIEWS = ['overview', 'flow', 'attention', 'lead-chat', 'sessions', 'agent'];
+  var VIEWS = ['overview', 'flow', 'attention', 'lead-chat', 'learning', 'sessions', 'agent'];
 
   // Graph geometry (frozen: §7 / prototype). 640x480 canvas, nodes on a
   // circle radius 178 around center (320,240), node i at angle -90 + i*36 deg.
@@ -99,10 +99,13 @@
   var lastState = null;               // /api/state
   var attentionData = null;           // /api/attention (per open)
   var leadChatData = null;            // /api/lead-chat (operator<->lead bodies)
+  var learningData = null;            // /api/learning (lessons + exposure telemetry)
+  var learningRootLabel = '';         // root label for learningData
   var leadChatPayloadHash = null;      // unchanged-payload guard for lead-chat
   var intentsData = null;             // /api/intents (body-free queue state)
   var attentionPending = false;
   var leadChatPending = false;
+  var learningPending = false;
   var intentsPending = false;
   var statePending = false;           // /api/state in-flight guard (P2-4)
   var stateSeq = 0;                   // request sequence id (issued)
@@ -741,6 +744,7 @@
     // Attention/thread data is view-scoped; refetch on entry.
     if (view === 'attention') fetchAttention();
     if (view === 'lead-chat') fetchLeadChat();
+    if (view === 'learning') fetchLearning();
     if (view === 'sessions' && state.sessionRid) fetchThread(state.sessionRid);
     renderActiveView();
     renderChrome();
@@ -785,8 +789,11 @@
             // Reset drill-in state that references the old root.
             state.selectedAgent = null;
             state.sessionRid = null;
+            learningData = null;
+            learningRootLabel = '';
             renderChrome();
             renderActiveView();
+            if (state.view === 'learning') fetchLearning();
           });
           sw.appendChild(b);
         })(i);
@@ -887,6 +894,9 @@
     var leadPendingCount = leadChatData && isArray(leadChatData.pending_decisions)
       ? leadChatData.pending_decisions.length
       : 0;
+    var learningCount = learningData && learningData.counts
+      ? (learningData.counts.active || 0)
+      : 0;
 
     var nav = el('nav', 'tc-nav');
     // "overview" nav stays active while an agent-detail is open.
@@ -895,6 +905,7 @@
       { key: 'flow', label: 'Conversations', icon: navIconChat },
       { key: 'attention', label: 'Attention', icon: navIconAlert, badge: attnCount },
       { key: 'lead-chat', label: 'Lead chat', icon: navIconChat, badge: leadPendingCount },
+      { key: 'learning', label: 'Learning', icon: navIconFile, badge: learningCount },
       { key: 'sessions', label: 'Sessions', icon: navIconFile },
     ];
     for (var i = 0; i < items.length; i++) {
@@ -962,6 +973,7 @@
       case 'flow': renderFlow(main, root); break;
       case 'attention': renderAttention(main, root); break;
       case 'lead-chat': renderLeadChat(main, root); break;
+      case 'learning': renderLearning(main, root); break;
       case 'sessions': renderSessions(main, root); break;
       case 'agent': renderAgentDetail(main, root); break;
       default: renderOverview(main, root);
@@ -1812,6 +1824,190 @@
     return card;
   }
 
+  // ------------------------------------------------------------ VIEW 5: learning
+  function renderLearning(main, root) {
+    var data = learningData;
+    var wrap = el('div', 'tc-learning');
+    var head = viewHead('Learning',
+      'Accepted lessons, curation provenance, and wrapper exposure telemetry');
+    head.appendChild(el('div', 'tc-spacer'));
+    if (data && data.counts) {
+      head.appendChild(el('span', 'tc-chip', (data.counts.active || 0) + ' active'));
+      head.appendChild(el('span', 'tc-chip', (data.counts.exposures || 0) + ' exposures'));
+    }
+    wrap.appendChild(head);
+
+    if (!data) {
+      wrap.appendChild(el('p', 'tc-recent-empty', 'Loading learning ledger...'));
+      main.appendChild(wrap);
+      return;
+    }
+    if (data.error) {
+      wrap.appendChild(emptyState('Learning unavailable', data.detail || data.error));
+      main.appendChild(wrap);
+      return;
+    }
+
+    wrap.appendChild(learningSummary(data));
+    var body = el('div', 'tc-learning-layout');
+    body.appendChild(learningLessons(data));
+    var side = el('div', 'tc-learning-side');
+    side.appendChild(learningExposurePanel(data));
+    side.appendChild(learningProblemsPanel(data));
+    body.appendChild(side);
+    wrap.appendChild(body);
+    main.appendChild(wrap);
+  }
+
+  function learningSummary(data) {
+    var counts = data.counts || {};
+    var grid = el('div', 'tc-learning-stats');
+    var defs = [
+      ['Active', counts.active || 0],
+      ['Proposed', counts.proposed || 0],
+      ['Accepted', counts.accepted || 0],
+      ['Review due', counts.review_due || 0],
+      ['Stale', counts.stale || 0],
+    ];
+    for (var i = 0; i < defs.length; i++) {
+      var tile = el('div', 'tc-card tc-learning-stat');
+      tile.appendChild(el('div', 'tc-stat-label', defs[i][0]));
+      tile.appendChild(el('div', 'tc-stat-value', defs[i][1]));
+      grid.appendChild(tile);
+    }
+    return grid;
+  }
+
+  function learningLessons(data) {
+    var card = el('div', 'tc-card tc-learning-lessons');
+    var head = el('div', 'tc-lead-panel-head');
+    head.appendChild(el('div', 'tc-card-title', 'Accepted lessons'));
+    head.appendChild(el('span', 'tc-spacer'));
+    var lessons = data.items || data.lessons || [];
+    head.appendChild(el('span', 'tc-chip', lessons.length + ' lessons'));
+    card.appendChild(head);
+    var list = el('div', 'tc-learning-list');
+    if (!lessons.length) {
+      list.appendChild(transcriptEmpty('No accepted lessons yet',
+        'Accepted active lessons will appear here. Proposed or stale lessons are not mixed into this default view.'));
+    } else {
+      for (var i = 0; i < lessons.length; i++) list.appendChild(learningLessonCard(lessons[i]));
+    }
+    card.appendChild(list);
+    return card;
+  }
+
+  function learningLessonCard(item) {
+    var card = el('div', 'tc-learning-card');
+    var top = el('div', 'tc-learning-card-head');
+    top.appendChild(el('span', 'tc-chip status-' + learningStatusClass(item), item.status || 'unknown'));
+    if (item.active) top.appendChild(el('span', 'tc-chip status-working_turn', 'active'));
+    if (item.review_due) top.appendChild(el('span', 'tc-chip sev-med', 'review due'));
+    if (item.hard_stale) top.appendChild(el('span', 'tc-chip sev-high', 'stale'));
+    top.appendChild(el('span', 'tc-spacer'));
+    top.appendChild(el('span', 'tc-learning-key', (item.domain_id || '-') + '/' + (item.key || '-')));
+    card.appendChild(top);
+    card.appendChild(el('div', 'tc-learning-trigger', item.trigger || 'Lesson'));
+    card.appendChild(el('div', 'tc-learning-body', item.body || ''));
+    var meta = el('div', 'tc-learning-meta');
+    meta.appendChild(el('span', null, 'captured by ' + (item.author || 'unknown')));
+    if (item.curator) meta.appendChild(el('span', null, 'curated by ' + item.curator));
+    if (item.owner) meta.appendChild(el('span', null, 'owner ' + item.owner));
+    if (item.scope) meta.appendChild(el('span', null, 'scope ' + item.scope));
+    card.appendChild(meta);
+    if (item.evidence_ref) {
+      card.appendChild(el('div', 'tc-learning-evidence', 'evidence: ' + item.evidence_ref));
+    }
+    if (item.applies_to && item.applies_to.length) {
+      var tags = el('div', 'tc-learning-tags');
+      for (var i = 0; i < item.applies_to.length; i++) tags.appendChild(el('span', 'tc-chip', item.applies_to[i]));
+      card.appendChild(tags);
+    }
+    card.appendChild(learningExposureSummary(item.exposure || {}));
+    return card;
+  }
+
+  function learningStatusClass(item) {
+    if (item.status === 'accepted') return 'idle_waiting';
+    if (item.status === 'proposed') return 'working_silent';
+    if (item.status === 'retired') return 'unknown';
+    return 'unknown';
+  }
+
+  function learningExposureSummary(exposure) {
+    var box = el('div', 'tc-learning-exposure');
+    var count = exposure.count || 0;
+    box.appendChild(el('span', 'tc-learning-exposure-count',
+      count ? ('surfaced ' + count + ' time' + (count === 1 ? '' : 's')) : 'not surfaced yet'));
+    if (count) {
+      var agents = exposure.agents || [];
+      var names = [];
+      for (var i = 0; i < agents.length; i++) names.push(agents[i].agent + ' x' + agents[i].count);
+      if (names.length) box.appendChild(el('span', 'tc-learning-exposure-agents', names.join(', ')));
+      if (exposure.last_request_id) {
+        var btn = el('button', 'tc-link-btn', 'Open last thread');
+        on(btn, 'click', function () { openThread(exposure.last_request_id); });
+        box.appendChild(btn);
+      }
+    }
+    return box;
+  }
+
+  function learningExposurePanel(data) {
+    var card = el('div', 'tc-card tc-learning-panel');
+    var head = el('div', 'tc-lead-panel-head');
+    head.appendChild(el('div', 'tc-card-title', 'Recent surfaced lessons'));
+    head.appendChild(el('span', 'tc-spacer'));
+    head.appendChild(el('span', 'tc-chip', 'surfaced, not proven applied'));
+    card.appendChild(head);
+    var rows = el('div', 'tc-learning-exposure-list');
+    var items = data.recent_exposures || [];
+    if (!items.length) {
+      rows.appendChild(el('div', 'tc-recent-empty', 'No wrapper lesson exposures recorded yet.'));
+    } else {
+      for (var i = 0; i < items.length; i++) rows.appendChild(learningExposureRow(items[i]));
+    }
+    card.appendChild(rows);
+    return card;
+  }
+
+  function learningExposureRow(item) {
+    var row = el('div', 'tc-learning-exposure-row');
+    var head = el('div', 'tc-learning-exposure-head');
+    head.appendChild(el('span', 'tc-learning-key', (item.domain_id || '-') + '/' + (item.key || '-')));
+    head.appendChild(el('span', 'tc-spacer'));
+    head.appendChild(ageEl('tc-bubble-age', { ts: item.exposed_at }, { suffix: ' ago' }));
+    row.appendChild(head);
+    var meta = el('div', 'tc-learning-meta');
+    meta.appendChild(el('span', null, 'to ' + (item.agent || 'unknown')));
+    if (item.context_scope) meta.appendChild(el('span', null, 'context ' + item.context_scope));
+    if (item.request_id) meta.appendChild(el('span', null, 'request ' + item.request_id));
+    row.appendChild(meta);
+    if (item.evidence_ref) row.appendChild(el('div', 'tc-learning-evidence', 'lesson evidence: ' + item.evidence_ref));
+    return row;
+  }
+
+  function learningProblemsPanel(data) {
+    var card = el('div', 'tc-card tc-learning-panel');
+    var head = el('div', 'tc-lead-panel-head');
+    head.appendChild(el('div', 'tc-card-title', 'Ledger health'));
+    card.appendChild(head);
+    var problems = [];
+    var p = data.problems || {};
+    var kp = p.knowledge || [];
+    var ep = p.exposures || [];
+    for (var i = 0; i < kp.length; i++) problems.push('knowledge line ' + kp[i].line + ': ' + kp[i].error);
+    for (var j = 0; j < ep.length; j++) problems.push('exposure line ' + ep[j].line + ': ' + ep[j].error);
+    if (!problems.length) {
+      card.appendChild(el('div', 'tc-recent-empty', data.note || 'Learning ledger is readable.'));
+    } else {
+      var list = el('div', 'tc-learning-problems');
+      for (var k = 0; k < problems.length; k++) list.appendChild(el('div', 'tc-learning-problem', problems[k]));
+      card.appendChild(list);
+    }
+    return card;
+  }
+
   function actionComposer(root) {
     var card = el('div', 'tc-card tc-action-card');
     var head = el('div', 'tc-action-head');
@@ -1908,7 +2104,7 @@
     return card;
   }
 
-  // ------------------------------------------------------------ VIEW 4: sessions
+  // ------------------------------------------------------------ VIEW 6: sessions
   function renderSessions(main, root) {
     main.appendChild(viewHead('Sessions', 'Full transcripts of message threads on the bus'));
     syncArchivedRoot(root);
@@ -2706,6 +2902,27 @@
     }).catch(function () { leadChatPending = false; });
   }
 
+  function fetchLearning() {
+    if (learningPending) return;
+    var label = currentRootLabel();
+    var url = '/api/learning?status=active&limit=100';
+    if (label) url += '&root=' + encodeURIComponent(label);
+    learningPending = true;
+    fetch(url).then(function (r) {
+      if (!r.ok) return null;
+      return r.json();
+    }).then(function (data) {
+      learningPending = false;
+      if (!data) return;
+      if (label && label !== currentRootLabel()) return;
+      if (label && data.root && data.root !== label) return;
+      learningRootLabel = data.root || label || '';
+      learningData = data;
+      renderSidebar();
+      if (state.view === 'learning') renderActiveViewFromPoll();
+    }).catch(function () { learningPending = false; });
+  }
+
   function fetchArchivedThreads(reset) {
     if (archivedState.loading) return;
     var label = currentRootLabel();
@@ -2806,6 +3023,7 @@
     // current from the start, not blank until the Attention view is opened.
     fetchAttention();
     fetchLeadChat();
+    fetchLearning();
     fetchSession();
     fetchIntents();
     setInterval(fetchState, POLL_MS);

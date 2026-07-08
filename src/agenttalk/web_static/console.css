@@ -1321,6 +1321,133 @@ body {
   white-space: nowrap;
 }
 .tc-intent-state { font-family: var(--font-mono); color: var(--ink2); }
+
+/* -----------------------------------------------------------------------------
+   9b. VIEW: LEARNING
+   --------------------------------------------------------------------------- */
+
+.tc-learning {
+  display: flex;
+  flex-direction: column;
+  gap: var(--section-gap);
+}
+.tc-learning-stats {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: var(--card-gap);
+}
+.tc-learning-stat { padding: 13px 15px; }
+.tc-learning-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 330px;
+  gap: var(--section-gap);
+  align-items: start;
+}
+.tc-learning-side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--section-gap);
+}
+.tc-learning-lessons,
+.tc-learning-panel {
+  overflow: hidden;
+}
+.tc-learning-list,
+.tc-learning-exposure-list,
+.tc-learning-problems {
+  display: flex;
+  flex-direction: column;
+}
+.tc-learning-card {
+  padding: 15px 18px;
+  border-top: 1px solid var(--hairline);
+}
+.tc-learning-card:first-child { border-top: none; }
+.tc-learning-card-head,
+.tc-learning-exposure-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 8px;
+}
+.tc-learning-key {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink3);
+  overflow-wrap: anywhere;
+}
+.tc-learning-trigger {
+  font-family: var(--font-head);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+  margin-bottom: 6px;
+}
+.tc-learning-body {
+  font-size: 13px;
+  line-height: 1.48;
+  color: var(--ink);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin-bottom: 10px;
+}
+.tc-learning-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink3);
+}
+.tc-learning-evidence {
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink4);
+  overflow-wrap: anywhere;
+}
+.tc-learning-tags,
+.tc-learning-exposure {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  margin-top: 10px;
+}
+.tc-learning-exposure {
+  padding-top: 9px;
+  border-top: 1px solid var(--hairline);
+  font-size: 11.5px;
+  color: var(--ink3);
+}
+.tc-learning-exposure-count { font-weight: 600; color: var(--ink2); }
+.tc-learning-exposure-agents {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+.tc-link-btn {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  padding: 0;
+}
+.tc-link-btn:hover { text-decoration: underline; }
+.tc-learning-exposure-row,
+.tc-learning-problem {
+  padding: 11px 13px;
+  border-top: 1px solid var(--hairline);
+}
+.tc-learning-exposure-row:first-child,
+.tc-learning-problem:first-child { border-top: none; }
+.tc-learning-problem {
+  color: var(--warn);
+  background: var(--warn-soft);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
 .tc-session-list-title {
   padding: 12px 15px;
   border-bottom: 1px solid var(--hairline);
@@ -1808,6 +1935,7 @@ body {
   .tc-overview-body,
   .tc-flow-body,
   .tc-lead-layout,
+  .tc-learning-layout,
   .tc-sessions-body,
   .tc-detail-body {
     grid-template-columns: minmax(0, 1fr);
@@ -1837,6 +1965,9 @@ body {
 @media (max-width: 560px) {
   .tc-stats {
     grid-template-columns: minmax(0, 1fr);
+  }
+  .tc-learning-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .tc-agent-meters,
   .tc-feed-row1,

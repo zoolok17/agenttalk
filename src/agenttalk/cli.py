@@ -9943,7 +9943,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gsup = psup.add_mutually_exclusive_group(required=True)
     gsup.add_argument("--init", action="store_true",
-                      help="Scaffold supervisor.json + supervisor.ps1 + supervisor.sh.")
+                      help="Scaffold supervisor.json + PowerShell supervisor helpers.")
     gsup.add_argument("--report", action="store_true",
                       help="Emit the read-only per-agent liveness snapshot (JSON).")
     gsup.add_argument("--plan", action="store_true",

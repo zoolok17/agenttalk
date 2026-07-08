@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import avatars, intents, signing, web
+from agenttalk import avatars, intents, knowledge as kn, lesson_context as lc, signing, web
 from agenttalk.store import Store
 
 
@@ -1418,7 +1418,7 @@ def test_csp_split_per_route(tmp_path: Path) -> None:
     srv, _t, base = _serve(s)
     try:
         for path in (f"/messages/{mid}", "/api/status", "/api/state",
-                     "/api/attention", "/api/thread/rid-c"):
+                     "/api/attention", "/api/learning", "/api/thread/rid-c"):
             with _get(f"{base}{path}") as resp:
                 assert resp.headers["Content-Security-Policy"] == _LEGACY_CSP, path
         for path in ("/", "/dashboard"):
@@ -1441,7 +1441,7 @@ def test_new_routes_reject_write_methods(tmp_path: Path) -> None:
     srv, _t, base = _serve(s)
     try:
         for path in ("/api/state", "/api/threads", "/dashboard", "/api/attention",
-                     "/api/thread/rid-w", "/static/console.js",
+                     "/api/learning", "/api/thread/rid-w", "/static/console.js",
                      "/static/console.css", "/static/avatars/claude-dev.png"):
             req = urllib.request.Request(  # noqa: S310  # nosemgrep
                 f"{base}{path}", method="POST", data=b"x")
@@ -1951,7 +1951,7 @@ def test_no_mutation_full_tree_hash(tmp_path: Path) -> None:
         for _ in range(3):
             _state(base)
         for path in ("/dashboard", "/static/console.js", "/static/console.css",
-                     "/", f"/messages/{mid}", "/api/attention",
+                     "/", f"/messages/{mid}", "/api/attention", "/api/learning",
                      "/api/thread/r1"):
             with _get(f"{base}{path}") as resp:
                 resp.read()
@@ -2282,6 +2282,7 @@ def test_console_all_dashboard_views_render_smoke_non_empty_main(tmp_path: Path)
         "      lastState = payloads.lastState;\n"
         "      attentionData = payloads.attentionData;\n"
         "      leadChatData = payloads.leadChatData;\n"
+        "      learningData = payloads.learningData;\n"
         "      intentsData = payloads.intentsData;\n"
         "      threadCache = payloads.threadCache;\n"
         "      actionSession.enabled = false;\n"
@@ -2616,6 +2617,42 @@ const payloads = {
     }],
     liveness: { state: 'idle_waiting', reason: 'listening' },
   },
+  learningData: {
+    root: 'demo-root',
+    counts: { total: 1, active: 1, proposed: 0, accepted: 1, retired: 0, review_due: 0, stale: 0, exposures: 2 },
+    lessons: [{
+      domain_id: 'process',
+      key: 'review.final-sha',
+      note_id: 'kn-lesson',
+      scope: 'review',
+      status: 'accepted',
+      active: true,
+      trigger: 'Review the final SHA',
+      body: 'Always review the final candidate, not an earlier draft.',
+      author: 'codex-test',
+      owner: 'codex-test',
+      curator: 'claude-lead',
+      evidence_ref: 'rq-final-review',
+      applies_to: ['review'],
+      exposure: {
+        count: 2,
+        agents: [{ agent: 'codex-test', count: 2 }],
+        last_request_id: 'rid-qa',
+        last_context_scope: 'review',
+      },
+    }],
+    recent_exposures: [{
+      domain_id: 'process',
+      key: 'review.final-sha',
+      agent: 'codex-test',
+      request_id: 'rid-qa',
+      context_scope: 'review',
+      evidence_ref: 'rq-final-review',
+      exposed_at: iso,
+    }],
+    problems: { knowledge: [], exposures: [] },
+    note: 'Exposure means surfaced to an agent turn, not proven application.',
+  },
   intentsData: {
     target_root_label: 'demo-root',
     items: [{ intent_id: 'intent-1', kind: 'send', state: 'queued', code: 'queued' }],
@@ -2638,6 +2675,15 @@ const cases = [
   { view: 'flow', expected: ['talking to whom', 'Active threads', 'All views QA task'] },
   { view: 'attention', expected: ['Needs a human', 'Operator decision needed', 'stuck-agent'] },
   { view: 'lead-chat', expected: ['Lead chat', 'Direct channel', 'route received'] },
+  {
+    view: 'learning',
+    expected: [
+      'Learning',
+      'Accepted lessons',
+      'Always review the final candidate',
+      'surfaced, not proven applied',
+    ],
+  },
   { view: 'sessions', sessionRid: 'rid-qa', expected: ['Sessions', 'All views QA task', 'smoke every view'] },
   { view: 'agent', selectedAgent: 'stuck-agent', expected: ['stuck-agent', 'Restart with context', 'Supervisor'] },
 ];
@@ -3093,6 +3139,340 @@ def test_health_timeline_ring_window_expiry() -> None:
     assert sum(seg["seconds"] for seg in segs) <= 1.0 + 1e-6
     # >1s later with no new sample: the stale sample falls outside the window.
     assert ring.segments("root", "alpha", now=1002.0) == []
+
+
+# ---------------------------------------------------------- /api/learning
+
+def _write_verified_lesson(
+        store: Store, *, note_id: str = "kn-review-final",
+        key: str = "review.final-sha", scope: str = "review",
+        trigger: str = "Review final candidate",
+        body: str = "Always review the final candidate, not an earlier draft.",
+        evidence_ref: str = "rq-final-review",
+        applies_to: list[str] | None = None,
+        anchor: dict | None = None) -> dict:
+    at = "2026-07-08T00:00:00Z"
+    lesson = {
+        "scope": scope,
+        "trigger": trigger,
+        "evidence_ref": evidence_ref,
+        "owner": "dev",
+        "status": kn.LESSON_STATUS_PROPOSED,
+        "review_after": "2026-07-01T00:00:00Z",
+        "expires_at": "2027-07-01T00:00:00Z",
+        "applies_to": applies_to or [scope],
+    }
+    pub = kn.new_publish_event(
+        note_id=note_id,
+        key=key,
+        type=kn.TYPE_LESSON,
+        domain_id=kn.PROCESS_DOMAIN,
+        body=body,
+        anchor=anchor,
+        verified_against_sha=None,
+        domain_registry_hash="registry-hash",
+        author="dev",
+        resolved_from="active",
+        at=at,
+        lesson=lesson,
+    )
+    cur = kn.new_curate_event(
+        base=pub,
+        action="verify",
+        curated_by="lead",
+        resolved_from="lead",
+        at="2026-07-08T00:01:00Z",
+        reason=None,
+    )
+    with store._config_lock():
+        kn.write_event_locked(store, pub)
+        kn.write_event_locked(store, cur)
+    return cur
+
+
+def _write_proposed_lesson(store: Store, *, key: str = "review.final-sha") -> dict:
+    lesson = {
+        "scope": "review",
+        "trigger": "Review proposed candidate update",
+        "evidence_ref": "rq-proposed-review",
+        "owner": "dev",
+        "status": kn.LESSON_STATUS_PROPOSED,
+        "review_after": "2027-07-01T00:00:00Z",
+        "expires_at": "2028-07-01T00:00:00Z",
+        "applies_to": ["review"],
+    }
+    pub = kn.new_publish_event(
+        note_id="kn-review-update",
+        key=key,
+        type=kn.TYPE_LESSON,
+        domain_id=kn.PROCESS_DOMAIN,
+        body="Proposed update must not show as learned by default.",
+        anchor=None,
+        verified_against_sha=None,
+        domain_registry_hash="registry-hash",
+        author="dev",
+        resolved_from="active",
+        at="2026-07-08T00:04:00Z",
+        lesson=lesson,
+    )
+    with store._config_lock():
+        kn.write_event_locked(store, pub)
+    return pub
+
+
+def test_api_learning_surfaces_lessons_and_exposure_without_message_body(
+        tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["lead", "dev", "codex"])
+    note = _write_verified_lesson(s)
+    verdict = kn.compute_lesson_state(note, now="2026-07-08T00:02:00Z")
+    selection = lc.LessonSelection(
+        rows=[(note, verdict)],
+        warnings=[],
+        context_scope="review",
+        tags={"review"},
+    )
+    exposure = lc.build_exposure_event(
+        agent="codex",
+        record={
+            "id": "20260708-000200-msg",
+            "request_id": "rq-final-review",
+            "kind": "review-request",
+            "subject": "contains-safe-envelope-only",
+            "body": "SECRET RAW BODY MUST NOT LEAK",
+        },
+        selection=selection,
+        turn_id="turn-final-review",
+        at="2026-07-08T00:02:00Z",
+    )
+    assert exposure is not None
+    lc.append_exposure_event(s, exposure)
+
+    payload = web.build_learning(web.RootDescriptor(s, "root"))
+    assert payload["counts"]["accepted"] == 1
+    assert payload["counts"]["active"] == 1
+    assert payload["counts"]["review_due"] == 1
+    assert payload["counts"]["exposures"] == 1
+    lesson = payload["lessons"][0]
+    assert lesson["key"] == "review.final-sha"
+    assert lesson["body"] == "Always review the final candidate, not an earlier draft."
+    assert lesson["author"] == "dev"
+    assert lesson["curator"] == "lead"
+    assert lesson["exposure"]["count"] == 1
+    assert lesson["exposure"]["agents"] == [{"agent": "codex", "count": 1}]
+    assert payload["recent_exposures"][0]["request_id"] == "rq-final-review"
+    assert payload["recent_exposures"][0]["prompt_block_sha256"]
+    assert payload["recent_exposures"][0]["lesson_fingerprint"] == lesson["lesson_fingerprint"]
+    assert "SECRET RAW BODY" not in json.dumps(payload)
+
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/api/learning") as resp:
+            wire = json.loads(resp.read().decode("utf-8"))
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert wire["lessons"][0]["key"] == "review.final-sha"
+
+
+def test_api_learning_anchor_evidence_is_pointer_allowlisted(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["lead", "dev"])
+    _write_verified_lesson(
+        s,
+        anchor={
+            "kind": "request",
+            "request_id": "rq-anchor",
+            "anchor_evidence": {
+                "body": "SECRET ANCHOR BODY MUST NOT LEAK",
+                "prompt": "SECRET ANCHOR PROMPT MUST NOT LEAK",
+                "prompt_block": "SECRET PROMPT BLOCK MUST NOT LEAK",
+                "output": "SECRET OUTPUT MUST NOT LEAK",
+                "trace_sha256": "a" * 64,
+                "artifact_ref": "quality-run-123",
+                "nested_hashes": {"body": "SECRET NESTED BODY MUST NOT LEAK"},
+            },
+        },
+    )
+
+    payload = web.build_learning(web.RootDescriptor(s, "root"))
+    dumped = json.dumps(payload)
+    assert "SECRET ANCHOR BODY" not in dumped
+    assert "SECRET ANCHOR PROMPT" not in dumped
+    assert "SECRET PROMPT BLOCK" not in dumped
+    assert "SECRET OUTPUT" not in dumped
+    assert "SECRET NESTED BODY" not in dumped
+    anchor = payload["lessons"][0]["anchor"]
+    assert anchor["kind"] == "request"
+    assert anchor["request_id"] == "rq-anchor"
+    assert anchor["anchor_evidence"] == {
+        "trace_sha256": "a" * 64,
+        "artifact_ref": "quality-run-123",
+    }
+
+
+def test_api_learning_default_keeps_proposed_updates_separate(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["lead", "dev"])
+    _write_verified_lesson(s)
+    _write_proposed_lesson(s)
+
+    active = web.build_learning(web.RootDescriptor(s, "root"))
+    assert active["filters"]["status"] == "active"
+    assert active["counts"]["active"] == 1
+    assert active["counts"]["accepted"] == 1
+    assert active["counts"]["proposed"] == 1
+    assert [it["body"] for it in active["lessons"]] == [
+        "Always review the final candidate, not an earlier draft."
+    ]
+
+    proposed = web.build_learning(web.RootDescriptor(s, "root"), status="proposed")
+    assert proposed["filters"]["status"] == "proposed"
+    assert [it["body"] for it in proposed["lessons"]] == [
+        "Proposed update must not show as learned by default."
+    ]
+
+
+def test_api_learning_route_rejects_bad_filters(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["lead", "dev"])
+    srv, _t, base = _serve(s)
+    try:
+        for suffix, code in (
+            ("?status=bogus", "bad_status"),
+            ("?limit=nope", "bad_limit"),
+            ("?limit=0", "bad_limit"),
+            ("?root=no-such-root", "bad_root"),
+        ):
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                _get(f"{base}/api/learning{suffix}")
+            assert exc.value.code == 400
+            payload = json.loads(exc.value.read().decode("utf-8"))
+            assert payload["error"] == code
+            assert payload["lessons"] == []
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_learning_empty_state_shape(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["lead", "dev"])
+    payload = web.build_learning(web.RootDescriptor(s, "root"))
+    assert payload["schema_version"] == 1
+    assert payload["filters"]["status"] == "active"
+    assert payload["counts"]["total"] == 0
+    assert payload["counts"]["showing"] == 0
+    assert payload["items"] == []
+    assert payload["lessons"] == []
+    assert payload["recent_exposures"] == []
+    assert payload["problems"] == {"knowledge": [], "exposures": []}
+
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/api/learning") as resp:
+            wire = json.loads(resp.read().decode("utf-8"))
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert wire["lessons"] == []
+
+
+def test_api_learning_retired_filter_is_explicit(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["lead", "dev"])
+    note = _write_verified_lesson(s)
+    retired = kn.new_curate_event(
+        base=note,
+        action="retract",
+        curated_by="lead",
+        resolved_from="lead",
+        at="2026-07-08T00:05:00Z",
+        reason="obsolete",
+    )
+    with s._config_lock():
+        kn.write_event_locked(s, retired)
+
+    active = web.build_learning(web.RootDescriptor(s, "root"))
+    assert active["lessons"] == []
+    assert active["counts"]["retired"] == 1
+
+    payload = web.build_learning(web.RootDescriptor(s, "root"), status="retired")
+    assert [it["key"] for it in payload["lessons"]] == ["review.final-sha"]
+    assert payload["lessons"][0]["status"] == kn.LESSON_STATUS_RETIRED
+    assert payload["lessons"][0]["stale_reasons"] == ["retracted"]
+
+
+def test_api_learning_route_filters_scope_tag_and_root(tmp_path: Path) -> None:
+    a, b = _make_two_stores(tmp_path)
+    _write_verified_lesson(
+        a,
+        note_id="kn-review-final",
+        key="review.final-sha",
+        scope="review",
+        applies_to=["review"],
+        body="Review lesson from project A.",
+    )
+    _write_verified_lesson(
+        b,
+        note_id="kn-docs-final",
+        key="docs.final-pass",
+        scope="docs",
+        applies_to=["docs", "manual"],
+        body="Docs lesson from project B.",
+    )
+    srv, _t, base = _serve_multi(a, b)
+    try:
+        with _get(f"{base}/api/learning?root={b.root.name}&scope=docs&tag=manual") as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        assert payload["root"] == b.root.name
+        assert payload["filters"]["scope"] == "docs"
+        assert payload["filters"]["tags"] == ["manual"]
+        assert [it["body"] for it in payload["lessons"]] == [
+            "Docs lesson from project B."
+        ]
+
+        with _get(f"{base}/api/learning?root={b.root.name}&scope=review") as resp:
+            empty = json.loads(resp.read().decode("utf-8"))
+        assert empty["lessons"] == []
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_learning_degrades_on_corrupt_ledger_lines(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["lead", "dev"])
+    note = _write_verified_lesson(s)
+    verdict = kn.compute_lesson_state(note, now="2026-07-08T00:03:00Z")
+    exposure = lc.build_exposure_event(
+        agent="dev",
+        record={"id": "20260708-000300-msg", "request_id": "rq-learning"},
+        selection=lc.LessonSelection(
+            rows=[(note, verdict)],
+            warnings=[],
+            context_scope="review",
+            tags=set(),
+        ),
+        turn_id="turn-ok",
+        at="2026-07-08T00:03:00Z",
+    )
+    assert exposure is not None
+    lc.append_exposure_event(s, exposure)
+    kn.notes_path(s).write_text(
+        kn.notes_path(s).read_text(encoding="utf-8") + "{not-json\n",
+        encoding="utf-8",
+    )
+    lc.exposures_path(s).write_text(
+        lc.exposures_path(s).read_text(encoding="utf-8") + "{bad\n",
+        encoding="utf-8",
+    )
+
+    payload = web.build_learning(web.RootDescriptor(s, "root"))
+    assert payload["counts"]["total"] == 1
+    assert payload["counts"]["exposures"] == 1
+    assert payload["problems"]["knowledge"]
+    assert payload["problems"]["exposures"]
 
 
 # ---------------------------------------------------------- /api/attention

@@ -454,12 +454,12 @@ without ever rebuilding state.
   (900s+) to avoid false-killing a thinking agent. A genuinely wedged
   Codex turn therefore takes that long to be caught. This is an
   operational false-positive tradeoff, not a provable bound.
-- **Poison-message slow restart loop.** If an inbound message reliably
-  crashes a wrapped agent's turn, the cycle is: fail → heartbeat goes
-  stale → restart → reload-resume → re-deliver the same message → fail
-  again. Backoff throttles it (base..cap), but it does not stop until a
-  dead-letter / skip-after-N fix lands or you intervene. (Dead-letter is
-  a banked future item.)
+- **Poison-message recovery.** If an inbound message reliably crashes a
+  wrapped agent's turn, the cycle is: fail -> heartbeat goes stale -> restart
+  -> reload-resume -> re-deliver the same message -> fail again. Backoff
+  throttles it (base..cap). Once the wrapper dead-letters the message, use
+  `agenttalk dead-letter list`, `show`, `requeue`, or `resolve` to inspect and
+  make an operator decision without rewinding cursors.
 - **Pinned executables.** `windows_file` must be the real CLI exe (or
   Python for wrapped), never a `.cmd`/npm/PowerShell shim — a shim hands
   off and exits, and the supervisor would track the wrong process.

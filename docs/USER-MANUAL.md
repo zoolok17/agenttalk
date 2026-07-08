@@ -59,7 +59,7 @@ decisions are what make a GO credible.
 Install once per machine. Pin the version in repeatable setups.
 
 ```powershell
-python -m pip install git+https://github.com/zoolok17/agenttalk.git@v0.70.0
+python -m pip install git+https://github.com/zoolok17/agenttalk.git@v0.71.0
 agenttalk --version
 agenttalk --help
 agenttalk install-skills
@@ -377,6 +377,15 @@ heartbeat. It can be active in `wait`, running under the wrapper, or refreshed
 by the interactive activity hook. A stale or missing heartbeat means lead-chat
 reports the lead as unavailable. That is intentional.
 
+The **Learning** view answers "what was learned, how, and by whom" for curated
+lessons. It is read-only and defaults to accepted active lessons: lesson text,
+trigger, publisher, curator, owner, evidence reference, anchor metadata,
+exposure count, and recent wrapper exposure pointers. Exposure means the
+wrapper surfaced a matched accepted lesson to an agent turn; it does not prove
+the model read, remembered, or applied it. Proposed, stale, retired, or
+superseded lessons stay out of the default view and should be inspected through
+explicit CLI/API filters when you are doing curation or diagnosis.
+
 ## 8. Supervisor and unattended operation
 
 The supervisor is optional. Use it when agents need to survive unattended
@@ -642,6 +651,12 @@ the child prompt, and appends a pointer-only exposure event to
 child process. The exposure event is audit telemetry: it records which accepted
 lesson was surfaced to which agent/message, not whether the model read or
 applied it.
+
+To inspect the same audit trail visually, open the dashboard and choose
+**Learning**. For scripting, `GET /api/learning` returns the selected root's
+accepted active lessons by default, with pointer-only exposure telemetry.
+Use `status=proposed`, `status=stale`, `status=retired`, or `status=all` only
+when you intentionally want diagnostic rows outside the accepted active set.
 
 ## 12. Troubleshooting
 

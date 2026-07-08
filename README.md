@@ -35,8 +35,11 @@ The first row is the whole essence; everything else is opt-in.
 
 ## Documentation
 
-Start with [docs/USER-MANUAL.md](docs/USER-MANUAL.md) for operator-facing
-procedures and examples. The other canonical docs are:
+Start with [docs/AGENTTALK-NEW-USER-MANUAL.md](docs/AGENTTALK-NEW-USER-MANUAL.md)
+for a concept-first onboarding manual. A generated PDF is available at
+[docs/AGENTTALK-NEW-USER-MANUAL.pdf](docs/AGENTTALK-NEW-USER-MANUAL.pdf).
+For operator-facing procedures and examples, use
+[docs/USER-MANUAL.md](docs/USER-MANUAL.md). The other canonical docs are:
 
 - [docs/AGENT-MANUAL.md](docs/AGENT-MANUAL.md) - role-keyed operating guide
   for agents.
@@ -980,6 +983,15 @@ hash. The event proves the operational chain (accepted -> matched ->
 surfaced), not cognition or compliance, and malformed exposure lines are
 skipped like malformed knowledge lines.
 
+The Team Console exposes the same audit trail in the **Learning** view and
+`GET /api/learning`. The default view shows accepted, active lessons only:
+what was captured, who published it, who curated it, the owner/evidence/anchor
+metadata, how often it was surfaced to wrapped agents, and recent exposure
+pointers. Proposed, stale, retired, or superseded lessons stay out of the
+default "accepted lessons" view and are available through explicit API status
+filters for diagnostics. Exposure rows remain pointer-only and never include
+raw bus message bodies, prompt blocks, or child CLI output.
+
 **Staleness is anchor-relative**, not HEAD-relative — the make-or-break
 rule, so an unrelated commit doesn't empty the layer. A note is
 *hard-stale* (excluded by default) when its anchor actually changed
@@ -1241,7 +1253,7 @@ Protected agents — the operator-facing liaison and every active
 | `agenttalk reply [--from A] [--to-id MSG_ID \| --to-request REQUEST_ID] [--kind K] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--dry-run]` | Reply to the most recent received message, or anchor to a specific received message/thread. Auto-derives recipient and echoes the anchor's `request_id`; explicit `--meta request_id=...` wins. `--dry-run` prints the resolved recipient, request id, and kind without sending. A reply that opens a new thread (`review-request` or `proposal`) mints a fresh id instead of echoing. 0.15.0: `--na` sends a not-applicable response — closes your obligation, displayed as (n/a); refused on review-request/proposal threads. |
 | `agenttalk tail [--from-start] [--interval S] [--timeout S]` | Passive monitor: stream all messages as they arrive. Does **not** advance cursors or write heartbeats — safe to run in a third terminal alongside two active agents. `--from-start` replays existing messages first. |
 | `agenttalk serve [--port P] [--host H] [--access-log]` | Start a **read-only** local web dashboard at `http://127.0.0.1:8765/` for browsing the message log in a real browser. **Loopback-only by design** — only `127.0.0.1`, `::1`, and `localhost` are accepted; there is no flag to expose it elsewhere (SSH-tunnel `localhost:<port>` from another machine if needed). HTML output is escaped, strict CSP, `GET`/`HEAD` only, peer-IP check on every method. JSON at `/api/status` and `/api/messages` for scripting. 0.17.0: the same server also serves `/dashboard` (the obligation view) and `/api/state`; a port that can't be bound now exits **2** with a `--port 0` hint instead of a raw traceback. See `SECURITY.md`. |
-| `agenttalk dashboard [--port P] [--store PATH]... [--access-log]` | The **obligation dashboard** (0.17.0): who owes what, whose turn it is, and the next action — per agent, per open thread, with mission/WP tags and epoch staleness. Same read-only loopback-only server as `serve`, landing on `http://127.0.0.1:8765/dashboard`; auto-refreshes every ~2 s. Repeat `--store <project-root>` to watch **several projects in one tab** (each path is the project root itself — no upward search; an uninitialized path shows as a degraded panel, not an error). No `--host` option exists on this spelling. `GET /api/state` (`schema_version: 1`) is the same data for scripting. |
+| `agenttalk dashboard [--port P] [--store PATH]... [--access-log]` | The **obligation dashboard** (0.17.0): who owes what, whose turn it is, and the next action — per agent, per open thread, with mission/WP tags and epoch staleness. Same read-only loopback-only server as `serve`, landing on `http://127.0.0.1:8765/dashboard`; auto-refreshes state every ~2 s. Repeat `--store <project-root>` to watch **several projects in one tab** (each path is the project root itself — no upward search; an uninitialized path shows as a degraded panel, not an error). No `--host` option exists on this spelling. `GET /api/state` (`schema_version: 1`) is the envelope data for scripting; `GET /api/learning` returns the selected root's accepted lesson ledger plus pointer-only exposure telemetry. |
 | `agenttalk install-skills [--claude-only\|--codex-only] [--no-devkit\|--devkit-only] [--force] [--dry-run]` | Copy bundled bus skills to `~/.claude/commands/` and `~/.codex/skills/`, and by default copy the shared dev-discipline devkit (`craft-code`, `test-coverage`, `review-code`, `write-docs`, `review-docs`) to both `~/.claude/skills/` and `~/.codex/skills/`. `--claude-only` and `--codex-only` scope only the bus skills; use `--no-devkit` to skip the shared devkit. Idempotent — preserves your local edits unless `--force`; use `--dry-run --force` to preview overwrites. |
 | `agenttalk codex-config [--enable\|--disable\|--status]` | Manage per-project sandbox/trust block in `~/.codex/config.toml` so Codex can call agenttalk from inside its sandbox. |
 | `agenttalk doctor [--json]` | Health check: store initialized, bus skills installed + in sync, devkit absent/in sync/stale state surfaced, Codex sandbox block configured, heartbeats fresh. Per the global exit-code contract, exit 2 on any error; warnings exit 0 with the warning state visible in output. |
@@ -1672,6 +1684,13 @@ the interactive activity hook so its heartbeat stays fresh. The
 interactive hook is a heartbeat path, not a staleness exemption: when the
 heartbeat is stale or missing, lead-chat still correctly reports the lead
 as away instead of queueing into an unreachable listener.
+
+The **Learning** panel is read-only. It shows accepted active lessons by
+default, with the lesson text, trigger, publisher, curator, owner, evidence,
+anchor metadata, exposure count, and recent wrapper exposure pointers. It
+labels exposure as "surfaced" rather than "applied": the wrapper can prove an
+accepted lesson was matched and handed to a child prompt, but only later review,
+tests, or explicit evidence can prove the outcome followed it.
 
 **0.19.0 polish.** The `/dashboard` view now renders a **hierarchical
 team layout** — the operator-facing liaison (or a lead-ish role) on top,

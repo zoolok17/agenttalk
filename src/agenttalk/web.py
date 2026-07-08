@@ -55,6 +55,7 @@ Routes
 - ``GET  /static/<name>``       — allowlisted console assets (css/js/png; 0.58.0/0.61.0)
 - ``GET  /api/state``           — multi-root obligation aggregate, schema v1 (0.17.0)
 - ``GET  /api/attention``       — ranked "needs a human" queue for root[0] (0.58.0)
+- ``GET  /api/learning``        — lesson ledger + pointer-only exposure telemetry
 - ``GET  /api/thread/<rid>``    — one thread's full transcript, CARRIES bodies (0.58.0)
 - ``GET  /api/threads``         — paged closed-thread stubs, envelope-only (0.61.0)
 - ``GET  /api/session``         — dashboard session metadata (token only when
@@ -80,8 +81,8 @@ message-derived HTML server-side and its client builds DOM via
 ``textContent`` only. The console CSS/JS ship as served files, so the console
 CSP drops ``'unsafe-inline'`` entirely (``script-src 'self'; style-src
 'self'``). Routes that render hostile message bodies (``/messages/<id>``) and
-every JSON feed (``/api/state``, ``/api/attention``, ``/api/thread/<rid>``)
-keep the stricter no-script policy byte-identical.
+every JSON feed (``/api/state``, ``/api/attention``, ``/api/learning``,
+``/api/thread/<rid>``) keep the stricter no-script policy byte-identical.
 """
 
 from __future__ import annotations
@@ -110,6 +111,8 @@ from agenttalk import attention as _attention
 from agenttalk import avatars as _avatars
 from agenttalk import capacity as _capacity
 from agenttalk import domains as _domains
+from agenttalk import knowledge as _knowledge
+from agenttalk import lesson_context as _lesson_context
 from agenttalk import signing as _signing
 from agenttalk import threads as th
 from agenttalk.store import COMPOSING_INTENT_STALE_SECONDS, Message, Store
@@ -209,6 +212,27 @@ _RECENT_LIMIT = 25
 _THREADS_DEFAULT_LIMIT = 50
 _THREADS_MAX_LIMIT = 100
 _LEAD_CHAT_LIMIT = 100
+_LEARNING_DEFAULT_LIMIT = 100
+_LEARNING_MAX_LIMIT = 200
+_LEARNING_RECENT_EXPOSURE_LIMIT = 25
+_LEARNING_STATUSES = frozenset({
+    "active", "proposed", "review_due", "stale", "retired", "all",
+})
+_LEARNING_ANCHOR_KEYS = frozenset({
+    "kind", "path", "symbol", "request_id", "msg_id", "mission", "wp_id", "sha",
+})
+_LEARNING_ANCHOR_EVIDENCE_KEYS = frozenset({
+    "id", "ids", "ref", "refs", "sha", "sha256", "hash", "hashes",
+    "digest", "digests", "line", "lines", "range", "ranges", "path", "symbol",
+})
+_LEARNING_ANCHOR_EVIDENCE_SUFFIXES = (
+    "_id", "_ids", "_ref", "_refs", "_sha", "_sha256", "_hash", "_hashes",
+    "_digest", "_digests", "_line", "_lines", "_range", "_ranges",
+)
+_LEARNING_ANCHOR_EVIDENCE_FORBIDDEN = (
+    "body", "prompt", "prompt_block", "output", "stdout", "stderr",
+    "transcript", "content", "text",
+)
 
 _AVATAR_ASSETS = _avatars.avatar_static_paths()
 
@@ -1619,6 +1643,369 @@ def build_threads_index(desc: RootDescriptor, *, state: str = "closed",
         return payload
 
 
+# --------------------------------------------------- /api/learning
+
+def _learning_text(value: Any, *, limit: int = 600) -> str:
+    """Bound knowledge text for dashboard display.
+
+    Knowledge note bodies are first-class project memory, not bus message
+    bodies, so the Learning view may show them. They remain untrusted text and
+    the client renders them via textContent.
+    """
+    s = "" if value is None else str(value).replace("\r", "\n").strip()
+    if len(s) > limit:
+        s = s[: limit - 3].rstrip() + "..."
+    return s
+
+
+def _learning_short(value: Any, *, limit: int = 160) -> str:
+    s = "" if value is None else str(value)
+    s = s.replace("\r", " ").replace("\n", " ").strip()
+    if len(s) > limit:
+        s = s[: limit - 3].rstrip() + "..."
+    return s
+
+
+def _learning_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _lesson_ref(domain_id: str, key: str) -> str:
+    return f"{domain_id}/{key}" if domain_id else key
+
+
+def _learning_anchor_evidence_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, list):
+        out = []
+        for item in value[:16]:
+            if item is None or isinstance(item, (bool, int, float, str)):
+                out.append(_learning_anchor_evidence_value(item))
+        return out
+    if isinstance(value, str):
+        return _learning_short(value, limit=160)
+    return ""
+
+
+def _learning_anchor_evidence(raw: Any) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for k, v in list(raw.items())[:12]:
+        key = _learning_short(k, limit=64)
+        folded = key.casefold()
+        if not key:
+            continue
+        if any(token in folded for token in _LEARNING_ANCHOR_EVIDENCE_FORBIDDEN):
+            continue
+        if (
+            folded not in _LEARNING_ANCHOR_EVIDENCE_KEYS
+            and not folded.endswith(_LEARNING_ANCHOR_EVIDENCE_SUFFIXES)
+        ):
+            continue
+        value = _learning_anchor_evidence_value(v)
+        if value != "":
+            out[key] = value
+    return out
+
+
+def _learning_anchor(raw: Any) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in _LEARNING_ANCHOR_KEYS:
+        if raw.get(key) is not None:
+            out[key] = _learning_short(raw.get(key), limit=160)
+    evidence = _learning_anchor_evidence(raw.get("anchor_evidence"))
+    if evidence:
+        out["anchor_evidence"] = evidence
+    return out
+
+
+def _exposure_index(events: list[dict]) -> tuple[dict[tuple[str, str, str], dict],
+                                                list[dict]]:
+    by_lesson: dict[tuple[str, str, str], dict] = {}
+    recent: list[dict] = []
+    for evt in events:
+        event_row = {
+            "id": _learning_short(evt.get("id"), limit=96),
+            "surface": _learning_short(evt.get("surface"), limit=64),
+            "agent": _learning_short(evt.get("agent"), limit=96),
+            "message_id": _learning_short(evt.get("message_id"), limit=128),
+            "request_id": _learning_short(evt.get("request_id"), limit=128),
+            "broadcast_id": _learning_short(evt.get("broadcast_id"), limit=128),
+            "correlation_id": _learning_short(evt.get("correlation_id"), limit=128),
+            "turn_id": _learning_short(evt.get("turn_id"), limit=96),
+            "context_scope": _learning_short(evt.get("context_scope"), limit=32),
+            "tags": [_learning_short(t, limit=64) for t in evt.get("tags") or []
+                     if isinstance(t, str)],
+            "prompt_block_sha256": _learning_short(
+                evt.get("prompt_block_sha256"), limit=64),
+            "exposed_at": _learning_short(evt.get("exposed_at"), limit=64),
+        }
+        for lesson in evt.get("lessons") or []:
+            domain_id = _learning_short(lesson.get("domain_id"), limit=128)
+            key = _learning_short(lesson.get("key"), limit=128)
+            fingerprint = _learning_short(
+                lesson.get("lesson_fingerprint"), limit=64)
+            if not key:
+                continue
+            agg = by_lesson.setdefault((domain_id, key, fingerprint), {
+                "count": 0,
+                "agents": {},
+                "last_exposed_at": "",
+                "last_agent": "",
+                "last_request_id": "",
+                "last_message_id": "",
+                "last_context_scope": "",
+            })
+            agg["count"] += 1
+            agent = event_row["agent"]
+            if agent:
+                agg["agents"][agent] = agg["agents"].get(agent, 0) + 1
+            if event_row["exposed_at"] >= str(agg.get("last_exposed_at") or ""):
+                agg["last_exposed_at"] = event_row["exposed_at"]
+                agg["last_agent"] = agent
+                agg["last_request_id"] = event_row["request_id"]
+                agg["last_message_id"] = event_row["message_id"]
+                agg["last_context_scope"] = event_row["context_scope"]
+            recent_row = dict(event_row)
+            recent_row.update({
+                "domain_id": domain_id,
+                "key": key,
+                "note_id": _learning_short(lesson.get("note_id"), limit=96),
+                "marker": _learning_short(lesson.get("marker"), limit=160),
+                "evidence_ref": _learning_short(lesson.get("evidence_ref"), limit=160),
+                "lesson_fingerprint": fingerprint,
+            })
+            recent.append(recent_row)
+    for agg in by_lesson.values():
+        agents = agg.pop("agents")
+        agg["agents"] = [
+            {"agent": name, "count": count}
+            for name, count in sorted(agents.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+    recent.sort(key=lambda r: r.get("exposed_at") or "", reverse=True)
+    return by_lesson, recent[:_LEARNING_RECENT_EXPOSURE_LIMIT]
+
+
+def _lesson_learning_item(note: dict, verdict: dict,
+                          exposure: dict | None) -> dict:
+    lesson = note.get("lesson") or {}
+    authority = note.get("authority") if isinstance(note.get("authority"), dict) else {}
+    exposure = exposure or {
+        "count": 0,
+        "agents": [],
+        "last_exposed_at": "",
+        "last_agent": "",
+        "last_request_id": "",
+        "last_message_id": "",
+        "last_context_scope": "",
+    }
+    domain_id = _learning_short(note.get("domain_id"), limit=128)
+    key = _learning_short(note.get("key"), limit=128)
+    return {
+        "ref": _lesson_ref(domain_id, key),
+        "domain_id": domain_id,
+        "key": key,
+        "note_id": _learning_short(note.get("id"), limit=96),
+        "scope": _learning_short(lesson.get("scope"), limit=32),
+        "status": _learning_short(lesson.get("status"), limit=32),
+        "lesson_status": _learning_short(lesson.get("status"), limit=32),
+        "active": bool(verdict.get("active")),
+        "marker": _lesson_context.lesson_marker(verdict),
+        "trigger": _learning_short(lesson.get("trigger"), limit=240),
+        "body": _learning_text(note.get("body")),
+        "lesson_fingerprint": _lesson_context.lesson_fingerprint(note),
+        "author": _learning_short(note.get("author"), limit=96),
+        "owner": _learning_short(lesson.get("owner"), limit=96),
+        "curated_by": _learning_short(note.get("curated_by"), limit=96),
+        "curator": _learning_short(lesson.get("curator") or note.get("curated_by"), limit=96),
+        "authority_state": _learning_short(authority.get("state"), limit=64),
+        "authority_from": _learning_short(authority.get("resolved_from"), limit=64),
+        "verified_against_sha": _learning_short(note.get("verified_against_sha"), limit=40),
+        "domain_registry_hash": _learning_short(note.get("domain_registry_hash"), limit=96),
+        "evidence_ref": _learning_short(lesson.get("evidence_ref"), limit=240),
+        "anchor": _learning_anchor(lesson.get("anchor") or note.get("anchor")),
+        "supersedes": [_learning_short(t, limit=128) for t in lesson.get("supersedes") or []
+                       if isinstance(t, str)],
+        "supersedes_key": _learning_short(note.get("supersedes_key"), limit=128),
+        "supersedes_id": _learning_short(note.get("supersedes_id"), limit=96),
+        "applies_to": [_learning_short(t, limit=64) for t in lesson.get("applies_to") or []
+                       if isinstance(t, str)],
+        "created_at": _learning_short(note.get("created_at"), limit=64),
+        "updated_at": _learning_short(note.get("updated_at"), limit=64),
+        "curated_at": _learning_short(note.get("curated_at"), limit=64),
+        "review_after": _learning_short(verdict.get("review_after"), limit=64),
+        "expires_at": _learning_short(verdict.get("expires_at"), limit=64),
+        "review_due": bool(verdict.get("review_due")),
+        "hard_stale": bool(verdict.get("hard_stale")),
+        "caution_flags": list(verdict.get("caution_flags") or []),
+        "stale_reasons": list(verdict.get("stale_reasons") or []),
+        "exposure": exposure,
+    }
+
+
+def _learning_rows(events: list[dict], *, scope: str | None,
+                   tags: list[str], now: str | None) -> list[tuple[dict, dict]]:
+    rows: dict[str, tuple[dict, dict]] = {}
+    for group in (
+        _lesson_context.lesson_rows(
+            events, scope=scope, tags=tags, now=now, active_only=True),
+        _lesson_context.lesson_rows(
+            events, scope=scope, tags=tags, now=now,
+            include_uncurated=True, include_stale=True),
+        _lesson_context.lesson_rows(
+            events, scope=scope, tags=tags, now=now,
+            include_stale=True),
+    ):
+        for note, verdict in group:
+            note_id = str(note.get("id") or f"{note.get('domain_id')}:{note.get('key')}")
+            rows[note_id] = (note, verdict)
+    return list(rows.values())
+
+
+def _learning_exposure_for_item(item: dict,
+                                exposure_by_lesson: dict[tuple[str, str, str], dict]) -> dict | None:
+    domain_id = str(item.get("domain_id") or "")
+    key = str(item.get("key") or "")
+    fingerprint = str(item.get("lesson_fingerprint") or "")
+    return (
+        exposure_by_lesson.get((domain_id, key, fingerprint))
+        or exposure_by_lesson.get((domain_id, key, ""))
+    )
+
+
+def _learning_item_matches_status(item: dict, status: str) -> bool:
+    if status == "all":
+        return True
+    if status == "active":
+        return bool(item.get("active")) and item.get("status") == _knowledge.LESSON_STATUS_ACCEPTED
+    if status == "review_due":
+        return bool(item.get("active")) and bool(item.get("review_due"))
+    if status == "proposed":
+        return item.get("status") == _knowledge.LESSON_STATUS_PROPOSED
+    if status == "retired":
+        return item.get("status") == _knowledge.LESSON_STATUS_RETIRED
+    if status == "stale":
+        return bool(item.get("hard_stale")) or (
+            item.get("status") == _knowledge.LESSON_STATUS_ACCEPTED
+            and not item.get("active")
+        )
+    return False
+
+
+def _learning_sort_key(item: dict) -> tuple:
+    status_order = {
+        _knowledge.LESSON_STATUS_ACCEPTED: 0,
+        _knowledge.LESSON_STATUS_PROPOSED: 1,
+        _knowledge.LESSON_STATUS_RETIRED: 2,
+    }.get(item.get("status"), 3)
+    return (
+        0 if item.get("active") else 1,
+        0 if item.get("review_due") else 1,
+        status_order,
+        item.get("scope") or "",
+        item.get("key") or "",
+    )
+
+
+def build_learning(desc: RootDescriptor, *, status: str = "active",
+                   scope: str | None = None, tags: list[str] | None = None,
+                   limit: int = _LEARNING_DEFAULT_LIMIT,
+                   now: str | None = None) -> dict:
+    """Dashboard learning ledger: lessons plus pointer-only exposure telemetry.
+
+    Exposure telemetry proves the wrapper surfaced a lesson in a turn. It does
+    not prove the model read, understood, or applied the lesson.
+    """
+    status = status if status in _LEARNING_STATUSES else "active"
+    tags = list(tags or [])
+    limit = max(1, min(_LEARNING_MAX_LIMIT, int(limit)))
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "generated_at": _learning_now(),
+        "root": desc.label,
+        "root_path": str(desc.store.root),
+        "root_info": {"label": desc.label, "path": str(desc.store.root)},
+        "filters": {
+            "status": status,
+            "scope": scope or "",
+            "tags": tags,
+            "limit": limit,
+        },
+        "items": [],
+        "lessons": [],
+        "recent_exposures": [],
+        "counts": {
+            "total": 0,
+            "showing": 0,
+            "active": 0,
+            "proposed": 0,
+            "accepted": 0,
+            "retired": 0,
+            "review_due": 0,
+            "stale": 0,
+            "expired": 0,
+            "superseded": 0,
+            "exposures": 0,
+            "invalid_notes": 0,
+            "invalid_exposures": 0,
+            "truncated": 0,
+        },
+        "problems": {
+            "knowledge": [],
+            "exposures": [],
+        },
+        "note": "Exposure means surfaced to an agent turn, not proven application.",
+    }
+    try:
+        events, knowledge_problems = _knowledge.read_events(desc.store)
+        exposures, exposure_problems = _lesson_context.read_exposure_events(desc.store)
+        exposure_by_lesson, recent = _exposure_index(exposures)
+        rows = _learning_rows(events, scope=scope, tags=tags, now=now)
+        items = []
+        for note, verdict in rows:
+            item = _lesson_learning_item(note, verdict, None)
+            item["exposure"] = _learning_exposure_for_item(item, exposure_by_lesson) \
+                or item["exposure"]
+            items.append(item)
+        items.sort(key=_learning_sort_key)
+        counts = payload["counts"]
+        counts["total"] = len(items)
+        counts["active"] = sum(1 for it in items if it.get("active"))
+        counts["review_due"] = sum(1 for it in items if it.get("review_due"))
+        counts["stale"] = sum(1 for it in items if it.get("hard_stale"))
+        counts["expired"] = sum(1 for it in items
+                                if "expired" in (it.get("stale_reasons") or []))
+        counts["superseded"] = sum(1 for it in items
+                                   if "superseded" in (it.get("stale_reasons") or []))
+        for it in items:
+            status = it.get("status")
+            if status in ("proposed", "accepted", "retired"):
+                counts[status] += 1
+        counts["exposures"] = len(exposures)
+        counts["invalid_notes"] = len(knowledge_problems)
+        counts["invalid_exposures"] = len(exposure_problems)
+        page = [it for it in items if _learning_item_matches_status(it, payload["filters"]["status"])]
+        counts["showing"] = min(len(page), limit)
+        counts["truncated"] = max(0, len(page) - limit)
+        page = page[:limit]
+        payload["items"] = page
+        payload["lessons"] = page
+        payload["recent_exposures"] = recent
+        payload["problems"] = {
+            "knowledge": knowledge_problems[:20],
+            "exposures": exposure_problems[:20],
+        }
+        return payload
+    except Exception as e:  # noqa: BLE001
+        payload["error"] = "learning_unavailable"
+        payload["detail"] = _envelope_str(e)
+        return payload
+
+
 # --------------------------------------------------- /api/attention (§4a)
 #
 # The ranked "needs a human" queue for root[0]. Composed from the PURE
@@ -2704,6 +3091,33 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 "items": [],
             })
 
+        def _learning_bad_request(self, code: str, detail: str) -> None:
+            self._send_json(HTTPStatus.BAD_REQUEST, {
+                "schema_version": 1,
+                "error": code,
+                "detail": detail,
+                "items": [],
+                "lessons": [],
+                "recent_exposures": [],
+                "counts": {
+                    "total": 0,
+                    "showing": 0,
+                    "active": 0,
+                    "proposed": 0,
+                    "accepted": 0,
+                    "retired": 0,
+                    "review_due": 0,
+                    "stale": 0,
+                    "expired": 0,
+                    "superseded": 0,
+                    "exposures": 0,
+                    "invalid_notes": 0,
+                    "invalid_exposures": 0,
+                    "truncated": 0,
+                },
+                "problems": {"knowledge": [], "exposures": []},
+            })
+
         def _handle_threads_get(self) -> None:
             params = self._request_params()
             state = (params.get("state") or ["closed"])[0] or "closed"
@@ -2730,6 +3144,36 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 return
             self._send_json(HTTPStatus.OK, build_threads_index(
                 root, state=state, limit=limit, cursor=cursor))
+
+        def _handle_learning_get(self) -> None:
+            params = self._request_params()
+            root = self._root_descriptor_for_threads(params)
+            if root is None:
+                self._learning_bad_request("bad_root", "unknown root")
+                return
+            status = (params.get("status") or ["active"])[0] or "active"
+            if status not in _LEARNING_STATUSES:
+                self._learning_bad_request(
+                    "bad_status",
+                    "status must be one of active, proposed, review_due, stale, retired, all")
+                return
+            raw_limit = (params.get("limit") or [str(_LEARNING_DEFAULT_LIMIT)])[0]
+            try:
+                limit = int(raw_limit)
+            except ValueError:
+                self._learning_bad_request("bad_limit", "limit must be an integer")
+                return
+            if limit <= 0:
+                self._learning_bad_request("bad_limit", "limit must be positive")
+                return
+            scope = (params.get("scope") or [""])[0].strip() or None
+            tags = [
+                str(tag).strip()
+                for tag in params.get("tag", [])
+                if str(tag).strip()
+            ]
+            self._send_json(HTTPStatus.OK, build_learning(
+                root, status=status, scope=scope, tags=tags, limit=limit))
 
         # ---- routing
         def _route(self) -> None:
@@ -2768,6 +3212,11 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 self._send_json(HTTPStatus.OK,
                                 build_attention(roots[0],
                                                 actions_enabled=enable_actions))
+                return
+            if path == "/api/learning":
+                # Lessons + wrapper exposure telemetry for the selected root.
+                # Carries knowledge-note text, never raw bus message bodies.
+                self._handle_learning_get()
                 return
             if path == "/api/lead-chat":
                 # Dedicated operator<->lead transcript. Carries bodies, but only
@@ -2959,6 +3408,7 @@ __all__ = [
     "RootDescriptor",
     "build_attention",
     "build_intents",
+    "build_learning",
     "build_lead_chat",
     "build_preflight",
     "build_state",
