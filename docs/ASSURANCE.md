@@ -95,6 +95,24 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.72.2 - dashboard human queue clarity and escalation context (2026-07-09)
+**GOOD / ROBUST / SECURE** · reviewed-SHA `47e4ab9` · tag `v0.72.2`
+- **Review:** patch release for the operator-facing dashboard. Attention navigation now distinguishes
+  the human action queue from agent health attention counts, and action-enabled escalation cards show
+  a bounded `prompt_excerpt` above the reply box so the operator can see what they are answering.
+  The API keeps the body-free `/api/attention` contract when actions are disabled.
+- **Verification:** targeted local gate ran `tests/test_attention.py tests/test_web.py`
+  (`167 passed, 1 skipped`), `python -m ruff check src/agenttalk/attention.py src/agenttalk/web.py
+  tests/test_attention.py tests/test_web.py`, `node --check src/agenttalk/web_static/console.js`,
+  and `git diff --check`. The new-user manual source and PDF were regenerated with the dashboard
+  behavior update.
+- **CI:** the release process requires GitHub Actions tests matrix, security workflow, and
+  wheel/packaging gate green for the `v0.72.2` commit before tag/release; the published GitHub
+  release notes record the actual run IDs.
+- **Robust/Secure:** the surfaced question excerpt is capped and rendered as text, not HTML. It is
+  exposed only for answerable action-enabled escalation items; non-action `/api/attention` responses
+  remain envelope-first and covered by regression tests.
+
 ### v0.72.1 - clean source package and release evidence correction (2026-07-09)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `3523036` · tag `v0.72.1`
 - **Review:** release-readiness follow-up after publishing `v0.72.0` found a package-artifact
