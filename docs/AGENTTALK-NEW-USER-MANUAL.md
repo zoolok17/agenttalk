@@ -388,7 +388,7 @@ Main views:
 | --- | --- | --- |
 | Overview | Team layout, health, tasks, recent envelope activity | No |
 | Conversations | Traffic graph and active thread list | No |
-| Attention | Human-needed queue: escalations, holds, stuck agents, dead letters | No raw message bodies |
+| Attention | Human-needed queue: escalations, holds, stuck agents, dead letters | Bounded escalation excerpt only when action replies are enabled |
 | Lead chat | Operator-to-lead direct channel and pending lead decisions | Yes for the direct transcript; pending decision cards may be summaries |
 | Learning | Accepted lessons, curation provenance, and wrapper exposure telemetry | Yes for curated lesson text; no raw bus bodies or prompt blocks |
 | Sessions | Full transcript for a selected thread | Yes |
@@ -396,8 +396,9 @@ Main views:
 
 The body-text split is deliberate:
 
-- `/api/state` and `/api/attention` are envelope-only and avoid raw message
-  bodies.
+- `/api/state` avoids raw message bodies. `/api/attention` is envelope-first;
+  with dashboard actions enabled, answerable escalation cards also show a
+  bounded question excerpt so the operator can see what the reply box answers.
 - `/api/learning` carries curated lesson text and pointer-only exposure
   telemetry. It labels exposure as surfaced, not applied.
 - `/api/thread/<request-id>` carries raw thread bodies for the Sessions view.
@@ -411,23 +412,15 @@ publisher, curator, owner, evidence reference, anchor metadata, exposure count,
 and recent "surfaced to prompt" events. Proposed, stale, retired, or
 superseded lessons are diagnostic rows, not default learned context.
 
-### If you can type an answer but cannot see the question
+### If you can type an answer
 
-This usually means an escalation exists, but the visible card only has envelope
-fields. Current safe workarounds:
+The **Attention** card shows the typed decision fields and, when dashboard
+actions are enabled, a bounded **Question** excerpt from the escalation body
+above the reply box. Use that card for the immediate answer. Open
+**Conversations** or **Sessions** when you need the complete thread history.
 
-1. Open **Conversations**, find the active thread, and click it. This opens
-   **Sessions**, where the full transcript body is visible.
-2. If you know the request id, use the CLI:
-
-   ```powershell
-   agenttalk sync --for <liaison>
-   agenttalk threads --for <liaison>
-   agenttalk drain --for <liaison>
-   ```
-
-3. Ask agents to send typed escalation fields so the Attention and Lead chat
-   cards are readable without opening the transcript:
+Ask agents to send typed escalation fields so Attention and Lead chat cards are
+readable even before the full transcript is opened:
 
    ```powershell
    agenttalk escalate --from <agent> `
@@ -440,13 +433,8 @@ fields. Current safe workarounds:
      -m "Full context for the operator..."
    ```
 
-Current UX limitation: the Attention answer composer or Lead chat
-pending-decision reply box can appear while the raw question body is not visible
-in that card. The product should add a first-class "Open transcript" affordance
-on escalation cards and should show the typed `decision`, `why`, options, and
-recommendation prominently.
-Until that exists, do not answer from a context-free textarea alone; open the
-thread transcript first.
+The question excerpt is intentionally bounded; it is context for the action, not
+a replacement for the full transcript.
 
 ## 10. Supervisor, wrapper, and liveness
 
@@ -633,7 +621,7 @@ agenttalk threads --for <agent> --all
 | Command sees the wrong team | Wrong root | Use `agenttalk --root <project> ...`; check `whoami` |
 | Agent has unread replies | Cursor not advanced | `drain --for <agent>` or scoped `wait --to-request` |
 | You are waiting on a stale request | Request was superseded or unknown | `check --for <agent> --to-request <id>` |
-| Dashboard reply box has no visible question | Envelope-only Attention card and untyped escalation | Open Sessions transcript; use typed escalation fields next time |
+| Dashboard reply box needs more context | Attention card shows a bounded excerpt, not the whole transcript | Open Conversations or Sessions for the full thread; use typed escalation fields |
 | Lead chat unavailable | Liaison heartbeat stale or missing | Start `wait`, run wrapped, or install activity hook |
 | Duplicate wrappers/windows | Same mailbox consumed twice | Stop duplicate; use `wait --refuse-stacked-wait`; inspect supervisor |
 | Poison message blocks wrapped agent | Repeated deterministic failure | `dead-letter list`, `show`, `requeue`, or `resolve` |

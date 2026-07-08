@@ -2285,8 +2285,8 @@ def test_console_all_dashboard_views_render_smoke_non_empty_main(tmp_path: Path)
         "      learningData = payloads.learningData;\n"
         "      intentsData = payloads.intentsData;\n"
         "      threadCache = payloads.threadCache;\n"
-        "      actionSession.enabled = false;\n"
-        "      actionSession.token = null;\n"
+        "      actionSession.enabled = true;\n"
+        "      actionSession.token = 'test-token';\n"
         "      actionSession.pending = false;\n"
         "      actionSession.error = '';\n"
         "    }\n"
@@ -2577,6 +2577,7 @@ const payloads = {
         severity: 'high',
         title: 'Operator decision needed',
         detail: 'Choose release path',
+        prompt_excerpt: 'Can I publish v0.72.1 now?',
         agent: 'claude-lead',
         request_id: 'esc-1',
         answerable: true,
@@ -2671,9 +2672,17 @@ const payloads = {
 };
 
 const cases = [
-  { view: 'overview', expected: ['Who', 'Working', 'codex-test'] },
+  { view: 'overview', expected: ['Who', 'Health attention', 'human queue', 'codex-test'] },
   { view: 'flow', expected: ['talking to whom', 'Active threads', 'All views QA task'] },
-  { view: 'attention', expected: ['Needs a human', 'Operator decision needed', 'stuck-agent'] },
+  {
+    view: 'attention',
+    expected: [
+      'Human attention queue',
+      'Operator decision needed',
+      'Can I publish v0.72.1 now?',
+      'stuck-agent',
+    ],
+  },
   { view: 'lead-chat', expected: ['Lead chat', 'Direct channel', 'route received'] },
   {
     view: 'learning',
@@ -3551,8 +3560,9 @@ def test_api_attention_actions_on_adds_answer_annotations_for_liaison_only(
 ) -> None:
     s = _make_store(tmp_path)
     s.set_operator_facing("beta")
+    body = "Can I publish v0.72.1 now?\nCI is green but the old sdist was polluted."
     s.send(sender="alpha", recipient="beta", kind="question",
-           subject="operator input needed", body="body",
+           subject="operator input needed", body=body,
            meta={"request_id": "esc-help", "needs_operator": "true",
                  "attention": {"priority": "urgent",
                                "decision": "Choose release path",
@@ -3572,9 +3582,40 @@ def test_api_attention_actions_on_adds_answer_annotations_for_liaison_only(
         assert item["priority"] == "urgent"
         assert item["recommendation"] == "ship the narrow fix"
         assert item["options"] == ["ship", "hold"]
+        assert item["prompt_excerpt"] == body
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_api_attention_prompt_excerpt_is_action_only_bounded_context(
+    tmp_path: Path,
+) -> None:
+    s = _make_store(tmp_path)
+    s.set_operator_facing("beta")
+    body = "Question text " + ("x" * 1300)
+    s.send(sender="alpha", recipient="beta", kind="question",
+           subject="operator input needed", body=body,
+           meta={"request_id": "esc-help", "needs_operator": "true"})
+
+    srv, _t, base = _serve(s)
+    try:
+        item = next(it for it in _attention(base)["items"] if it["source"] == "escalation")
+        assert "prompt_excerpt" not in item
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    srv2, _t2, base2 = _serve(s, enable_actions=True)
+    try:
+        item2 = next(it for it in _attention(base2)["items"] if it["source"] == "escalation")
+        assert item2["answerable"] is True
+        assert item2["prompt_excerpt"].startswith("Question text ")
+        assert len(item2["prompt_excerpt"]) == web._ATTENTION_PROMPT_MAX
+        assert item2["prompt_excerpt"] == web._attention_prompt_excerpt(body)
+    finally:
+        srv2.shutdown()
+        srv2.server_close()
 
     s2 = _make_store(tmp_path / "requester-view")
     s2.set_operator_facing("alpha")

@@ -312,9 +312,11 @@ def _now() -> str:
 def test_needs_operator_item_carries_typed_fields_and_surfaces_malformed() -> None:
     good = att.needs_operator_items([{"request_id": "esc-1", "subject": "ship?",
         "sender": "beta", "age_seconds": 10,
+        "prompt_excerpt": "Full question for the operator.",
         "meta": {"needs_operator": "true", "attention": {"decision": "ship or hold?",
                  "priority": "urgent", "risk_severity": "high"}}}])
     assert good[0]["priority"] == "urgent" and good[0]["decision"] == "ship or hold?"
+    assert good[0]["prompt_excerpt"] == "Full question for the operator."
     assert good[0]["human_can_unblock_now"] is True and good[0]["warnings"] == []
     bad = att.needs_operator_items([{"request_id": "esc-2", "subject": "x", "sender": "b",
         "age_seconds": 1, "meta": {"needs_operator": "true", "attention": {"priority": "BOGUS"}}}])

@@ -555,9 +555,15 @@
       var grp = agentStateInfo(as[i]).grp;
       if (state.filter === 'working' && grp === 'work') out.push(as[i]);
       else if (state.filter === 'idle' && grp === 'idle') out.push(as[i]);
-      else if (state.filter === 'attention' && (grp === 'attn' || grp === 'unknown')) out.push(as[i]);
+      else if (state.filter === 'attention' && grp === 'attn') out.push(as[i]);
+      else if (state.filter === 'unknown' && grp === 'unknown') out.push(as[i]);
     }
     return out;
+  }
+  function humanQueueCount() {
+    return attentionData && typeof attentionData.count === 'number'
+      ? attentionData.count
+      : (attentionData && attentionData.items ? attentionData.items.length : 0);
   }
 
   // ------------------------------------------------------------ shared bits
@@ -888,9 +894,7 @@
     side.appendChild(el('div', 'tc-nav-label', 'Views'));
 
     var root = currentRoot();
-    var attnCount = attentionData && typeof attentionData.count === 'number'
-      ? attentionData.count
-      : (attentionData && attentionData.items ? attentionData.items.length : 0);
+    var attnCount = humanQueueCount();
     var leadPendingCount = leadChatData && isArray(leadChatData.pending_decisions)
       ? leadChatData.pending_decisions.length
       : 0;
@@ -903,7 +907,7 @@
     var items = [
       { key: 'overview', label: 'Team overview', icon: navIconGrid, activeWith: 'agent' },
       { key: 'flow', label: 'Conversations', icon: navIconChat },
-      { key: 'attention', label: 'Attention', icon: navIconAlert, badge: attnCount },
+      { key: 'attention', label: 'Human queue', icon: navIconAlert, badge: attnCount },
       { key: 'lead-chat', label: 'Lead chat', icon: navIconChat, badge: leadPendingCount },
       { key: 'learning', label: 'Learning', icon: navIconFile, badge: learningCount },
       { key: 'sessions', label: 'Sessions', icon: navIconFile },
@@ -931,7 +935,7 @@
     var rows = [
       { label: 'Working', grp: 'work', count: c.work },
       { label: 'Idle · waiting', grp: 'idle', count: c.idle },
-      { label: 'Needs attention', grp: 'attn', count: c.attn },
+      { label: 'Health attention', grp: 'attn', count: c.attn },
       { label: 'Unknown / offline', grp: 'unknown', count: c.unknown },
     ];
     var legendRows = el('div', 'tc-legend-rows');
@@ -993,7 +997,7 @@
     titleBox.appendChild(el('h1', 'tc-h1', "Who's doing what"));
     var missionN = (root.spec_kitty && isArray(root.spec_kitty.missions)) ? root.spec_kitty.missions.length : 0;
     var sub = all.length + ' agents · ' + missionN + ' mission' + (missionN === 1 ? '' : 's')
-      + ' active · ' + counts.attn + ' need attention';
+      + ' active · ' + humanQueueCount() + ' human queue · ' + counts.attn + ' health attention';
     titleBox.appendChild(el('p', 'tc-subtitle', sub));
     header.appendChild(titleBox);
     header.appendChild(el('div', 'tc-spacer'));
@@ -1005,7 +1009,7 @@
     var tileDefs = [
       { label: 'Working', grp: 'work', value: counts.work },
       { label: 'Idle', grp: 'idle', value: counts.idle },
-      { label: 'Needs attention', grp: 'attn', value: counts.attn },
+      { label: 'Health attention', grp: 'attn', value: counts.attn },
       { label: 'Unknown', grp: 'unknown', value: counts.unknown },
     ];
     for (var i = 0; i < tileDefs.length; i++) {
@@ -1039,7 +1043,8 @@
       { key: 'all', label: 'All', count: agentsOf(root).length },
       { key: 'working', label: 'Working', count: counts.work },
       { key: 'idle', label: 'Idle', count: counts.idle },
-      { key: 'attention', label: 'Attention', count: counts.attn + counts.unknown },
+      { key: 'attention', label: 'Health attention', count: counts.attn },
+      { key: 'unknown', label: 'Unknown', count: counts.unknown },
     ];
     for (var i = 0; i < defs.length; i++) {
       (function (d) {
@@ -1371,8 +1376,8 @@
   function renderAttention(main, root) {
     var wrap = el('div', 'tc-attention');
 
-    var header = viewHead('Needs a human',
-      'Ranked queue — escalations, gate holds, stuck agents, dead letters');
+    var header = viewHead('Human attention queue',
+      'Ranked human-needed queue — escalations, gate holds, stuck agents, dead letters');
     header.appendChild(el('div', 'tc-spacer'));
 
     var items = (attentionData && attentionData.items) || [];
@@ -1452,6 +1457,12 @@
     var recommendation = item.recommendation || '';
     if (recommendation) meta.appendChild(el('span', 'tc-attn-detail', recommendation));
     box.appendChild(meta);
+    if (item.prompt_excerpt) {
+      var prompt = el('div', 'tc-attn-question');
+      prompt.appendChild(el('div', 'tc-attn-question-label', 'Question'));
+      prompt.appendChild(el('div', 'tc-attn-question-text', item.prompt_excerpt));
+      box.appendChild(prompt);
+    }
     var opts = item.options || [];
     if (opts.length) {
       var optWrap = el('div', 'tc-attn-options');

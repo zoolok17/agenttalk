@@ -5,6 +5,17 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Dashboard Attention cards now show the escalation question.** Action-enabled escalation cards
+  include a bounded `prompt_excerpt` above the answer box so the operator can see what they are
+  answering without opening Sessions first.
+- **Dashboard counts are labeled by what they count.** The menu/page badge is the human attention
+  queue count; overview/filter/status health buckets now say "Health attention" instead of implying
+  they are the same queue.
+
 ## [0.72.1] - 2026-07-09
 
 ### Fixed

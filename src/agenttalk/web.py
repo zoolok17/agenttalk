@@ -2081,22 +2081,25 @@ def _collect_web_attention_items(store: Store, roster: list[str],
 
 def _web_needs_operator(store: Store, for_agent: str) -> list[dict]:
     """Pending needs_operator escalations from ``for_agent``'s thread view, each
-    as {request_id, subject, sender, age_seconds, meta}. Parity with the CLI's
-    ``_needs_operator_items``: an escalation is an opener carrying
+    as {request_id, subject, sender, age_seconds, meta, prompt_excerpt}. Parity
+    with the CLI's ``_needs_operator_items``: an escalation is an opener carrying
     ``meta.needs_operator == "true"`` whose derived thread is still
-    ``operator_state == "pending"``. Envelope-only — the opener meta (incl.
-    meta.attention) feeds the fail-safe parser; the body is never read."""
+    ``operator_state == "pending"``. Envelope-first: opener meta feeds the
+    fail-safe parser, while ``prompt_excerpt`` is a bounded body excerpt used
+    only by action-enabled Attention cards."""
     now = datetime.now(timezone.utc)
     cfg = store.load_config()
     msgs, _ = _validated_for_state(store, cfg)
     msgs_sorted = sorted(msgs, key=lambda m: m.id)
     opener_meta: dict[str, dict] = {}
     opener_sender: dict[str, str] = {}
+    opener_prompt: dict[str, str] = {}
     for m in msgs_sorted:
         rid = (m.meta or {}).get("request_id")
         if rid and (m.meta or {}).get("needs_operator") == "true" and rid not in opener_meta:
             opener_meta[rid] = m.meta or {}
             opener_sender[rid] = m.sender
+            opener_prompt[rid] = _attention_prompt_excerpt(m.body or "")
     retired = set(store.retired_agents())
     rows = derive_threads(msgs_sorted, agent=for_agent,
                           cursor=store.cursor(for_agent) or "", now=now,
@@ -2104,7 +2107,8 @@ def _web_needs_operator(store: Store, for_agent: str) -> list[dict]:
                           retired=retired)
     pending = [{"request_id": t.request_id, "subject": t.subject,
                 "sender": opener_sender.get(t.request_id, ""),
-                "age_seconds": t.age_seconds, "meta": opener_meta.get(t.request_id, {})}
+                "age_seconds": t.age_seconds, "meta": opener_meta.get(t.request_id, {}),
+                "prompt_excerpt": opener_prompt.get(t.request_id, "")}
                for t in rows
                if t.needs_operator and t.operator_state == "pending"
                and t.opener_recipient == for_agent and t.opener_sender != for_agent]
@@ -2229,6 +2233,9 @@ def build_attention(desc: RootDescriptor,
                         entry["options"] = [
                             _envelope_str(o) for o in it["options"] if isinstance(o, str)
                         ]
+                    prompt = _attention_prompt_excerpt(it.get("prompt_excerpt"))
+                    if prompt:
+                        entry["prompt_excerpt"] = prompt
             wire.append(entry)
         if agents is None:
             try:
@@ -2248,6 +2255,7 @@ def build_attention(desc: RootDescriptor,
 # contract we bound every surfaced string to one line and a hard length so no
 # multi-paragraph prose can ride a field. Envelope summaries are short by design.
 _ENVELOPE_MAX = 300
+_ATTENTION_PROMPT_MAX = 1200
 
 
 def _envelope_str(value: Any) -> str:
@@ -2258,6 +2266,24 @@ def _envelope_str(value: Any) -> str:
     s = s.replace("\r", " ").replace("\n", " ").strip()
     if len(s) > _ENVELOPE_MAX:
         s = s[: _ENVELOPE_MAX - 1].rstrip() + "…"
+    return s
+
+
+def _attention_prompt_excerpt(value: Any) -> str:
+    """Bound an escalation body for the action-enabled Attention composer.
+
+    This is not the generic attention envelope. It exists only so a local
+    operator can see the question they are about to answer. The frontend renders
+    it with textContent; the server still strips control characters and caps it.
+    """
+    if not isinstance(value, str):
+        return ""
+    s = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not s:
+        return ""
+    s = "".join(ch if ch == "\n" or ord(ch) >= 32 else " " for ch in s)
+    if len(s) > _ATTENTION_PROMPT_MAX:
+        s = s[: _ATTENTION_PROMPT_MAX - 3].rstrip() + "..."
     return s
 
 

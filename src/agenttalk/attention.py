@@ -641,13 +641,20 @@ def _mk_item(source: str, iid: str, *, title: str, ident_content: Any,
 
 
 def needs_operator_items(pending: list[dict]) -> list[dict]:
-    """Each entry: {request_id, subject, sender, age_seconds, meta}. The typed fields come
-    from the opener's meta.attention via the FAIL-SAFE parse (a malformed block still
-    surfaces the escalation with a warning - gate 2). human_can_unblock_now=True (a worker
-    is literally blocked on the operator's answer)."""
+    """Each entry: {request_id, subject, sender, age_seconds, meta, prompt_excerpt?}.
+
+    The typed fields come from the opener's meta.attention via the FAIL-SAFE parse
+    (a malformed block still surfaces the escalation with a warning - gate 2).
+    ``prompt_excerpt`` is optional and caller-sanitized; the core projection only
+    carries it so UI surfaces with an answer box can show what is being answered.
+    human_can_unblock_now=True (a worker is literally blocked on the operator's answer).
+    """
     out = []
     for e in pending:
         fields, warns = parse_attention_meta(e.get("meta") or {})
+        extra_fields = {**fields, "requester": e.get("sender", "")}
+        if isinstance(e.get("prompt_excerpt"), str) and e.get("prompt_excerpt"):
+            extra_fields["prompt_excerpt"] = e["prompt_excerpt"]
         rid = e.get("request_id", "")
         dh = hashlib.sha256((fields.get("decision") or e.get("subject") or "").encode()).hexdigest()
         it = _mk_item(SOURCE_NEEDS_OPERATOR, item_id(SOURCE_NEEDS_OPERATOR, rid),
@@ -656,7 +663,7 @@ def needs_operator_items(pending: list[dict]) -> list[dict]:
                                      "subject": e.get("subject")},
                       human_can_unblock_now=True, age_seconds=float(e.get("age_seconds") or 0),
                       source_refs=[{"kind": "message", "request_id": rid}],
-                      fields={**fields, "requester": e.get("sender", "")},
+                      fields=extra_fields,
                       warnings=warns)
         it["dedupe_key"] = dedupe_key(SOURCE_NEEDS_OPERATOR,
                                       identity=f"{e.get('sender', '')}|{e.get('subject', '')}",
