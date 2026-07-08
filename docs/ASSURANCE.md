@@ -96,7 +96,7 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
 ### v0.72.1 - clean source package and release evidence correction (2026-07-09)
-**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `TBD` · tag `v0.72.1`
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `3523036` · tag `v0.72.1`
 - **Review:** release-readiness follow-up after publishing `v0.72.0` found a package-artifact
   defect: the source distribution had been built from the release workstation's unclean tree and
   included local-only scratch/cache/operator files (`.tmp/`, `.pytest-cache-local/`, handoff notes,
