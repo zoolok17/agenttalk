@@ -90,7 +90,7 @@ a prerequisite.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.70.2"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.71.0"
 agenttalk install-skills          # installs bus skills + the dev-discipline devkit
 
 # in your project root, once per project
@@ -195,10 +195,10 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.70.2"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.71.0"
 ```
 
-Pin to a specific tag so you control upgrades. Replace `v0.37.0` with
+Pin to a specific tag so you control upgrades. Replace the tag with
 whatever's listed on the [releases page](https://github.com/zoolok17/agenttalk/releases).
 Check what you have with `agenttalk --version`.
 

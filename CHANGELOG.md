@@ -5,6 +5,22 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.71.0] - 2026-07-08
+
+### Added
+
+- **Wrapped agents now receive accepted lessons automatically.** `wrap --loop` computes the same
+  active, accepted lesson context that `agenttalk sync` would show for a matching work context and
+  injects it into each inbound wrapped turn as a bounded **Lessons to check** prompt section. Wrapped
+  children are still forbidden from running inbox/cursor commands such as `sync`, `threads`, `drain`,
+  `recv`, `wait`, and `ack`; lessons are framed as advisory memory only, never instructions or
+  authorization.
+- **Lesson exposure telemetry.** When a wrapped turn receives at least one matched lesson, the wrapper
+  appends a pointer-only exposure event to `.agenttalk/knowledge/lesson-exposures.jsonl` after prompt
+  handoff. The event records agent/message ids, context scope/tags, lesson refs/fingerprints, and a
+  prompt-block hash without duplicating lesson bodies. The reader validates the exposure schema and
+  skips malformed or wrong-stream lines without affecting the knowledge ledger or wrapper turn.
+
 ## [0.70.2] - 2026-07-07
 
 ### Fixed

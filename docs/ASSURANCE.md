@@ -95,6 +95,33 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.71.0 - automatic wrapped lesson exposure (2026-07-08)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `07aac50` · tag `v0.71.0`
+- **Review:** implemented on the main worktree and reviewed by the healthy wrapped team before the
+  release bump. The change moves lesson selection/ranking/rendering into the shared
+  `agenttalk.lesson_context` module, keeps `sync` read-only by delegating to that shared selector, and
+  injects matched accepted lessons into wrapped inbound turns without letting the child run
+  inbox/cursor commands. Final review approvals covered architecture (`codex`), wrapper lifecycle
+  (`codex-agenttalk-developer-3`), failure/security (`codex-agenttalk-reviewer-2`), QA
+  (`codex-test`), prompt trust boundary (`codex-agenttalk-reviewer-1` after a malicious-lesson
+  regression), and exposure persistence/schema (`codex-agenttalk-developer-4` after schema validation
+  and intent-to-add packaging fixes).
+- **Verification:** local lead gate on Python 3.14 used a repo-local pytest basetemp because the
+  sandbox denied the user-profile temp dir. Gates: `ruff check` on touched Python files; `pytest
+  tests/test_wrapper_loop.py tests/test_knowledge.py -q -p no:cacheprovider --basetemp
+  .tmp-pytest/release-feature` (`150 passed`); `git diff --check`; and
+  `python -m py_compile src/agenttalk/lesson_context.py`. Reviewers independently reran targeted
+  wrapper/knowledge tests, including malicious lesson text, corrupt knowledge tails, exposure append
+  failure, no-match/no-exposure, schema rejection of wrong-stream rows, and no exposure on spawn
+  failure.
+- **CI:** pending at tag creation; release close requires watching GitHub Actions tests matrix,
+  security, and wheel/packaging after push and reporting actual results.
+- **Robust/Secure:** lesson bodies remain untrusted prompt data and are not written into exposure
+  events. The exposure stream is separate from `notes.jsonl`, append-only under the store lock,
+  flush/fsyncs writes, validates reads, and fails open: telemetry failure cannot dead-letter or fail a
+  wrapped turn. Honest limit: exposure proves accepted -> matched -> surfaced, not model cognition or
+  lesson application.
+
 ### v0.70.2 - wrapped supervisor explicit-root launch repair (2026-07-07)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `aa38654` · tag `v0.70.2`
 - **Review:** production bug report showed OrbitLauncher wrappers launched as
