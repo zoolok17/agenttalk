@@ -1,112 +1,244 @@
-# agenttalk — Product Roadmap & Feasibility
+# agenttalk - Product Roadmap & Feasibility
 
-**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-07-06
-**Horizon:** pragmatic next 2–3 quarters + a labeled "later" tier.
+**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-07-08
+**Audience:** maintainers, operators, and agents deciding what to build next.
+**Horizon:** pragmatic next 2-3 quarters + a labeled "later" tier.
+**Current shipped baseline:** v0.70.2 (2026-07-07). `CHANGELOG.md` remains the release-history source of truth.
 
-Companion docs: `docs/DESIGN.md` (why / architecture) · `docs/ASSURANCE.md` (per-release GOOD/ROBUST/SECURE attestation) · `docs/ISSUES.md` (living work tracker + known limitations) · `docs/DASHBOARD-CONTROL-PLANE-ROADMAP.md` (the detailed dashboard sub-roadmap — a component of Products F/H below) · `CHANGELOG.md`.
-
-**Provenance:** synthesized from two independently-run team tracks — a builder roadmap and an adversarial feasibility critique — reconciled with the lead's view. The tracks *converged*, which is the basis for the confidence in the scoping below. Keep this document current: when scope or sequencing changes, update it (same anti-drift discipline as `DESIGN.md`).
-
----
-
-## 1. The verdict, up front
-
-**Feasible — if scoped.** Feasible as a **local-first product *suite*** for trusted single-operator workspaces. **Not** feasible as stated if "comprehensive AI-orchestration platform" implies enterprise auth, remote multi-tenant security, or *autonomous* legacy comprehension.
-
-The builder track and the skeptic track were run independently and **converged** on this — an optimistic architect and a blunt critic landing in the same place is a high-confidence result, not a compromise.
-
-**North star:** *a local AI engineering operating system for trusted workspaces* — not a magic autonomous engineer. **The claim to sell is "faster safe comprehension and safer change," not "full automation" or "proof of correctness."** The human remains the oracle for business intent, public-API contracts, data migration, and release.
+Companion docs: `docs/DESIGN.md` (why / architecture) · `docs/ASSURANCE.md` (per-release GOOD/ROBUST/SECURE attestation) · `docs/ISSUES.md` (living work tracker + known limitations) · `docs/DASHBOARD-CONTROL-PLANE-ROADMAP.md` (dashboard control-plane design history) · `CHANGELOG.md`.
 
 ---
 
-## 2. Shape: separate products that work together
+## 1. Verdict
 
-The healthy shape is **a thin substrate + pluggable products with hard seams**, held together by the load-bearing principles (*bus-is-files, bodies-are-data, fail-closed, advisory-not-authz*). Monolith creep is the #1 structural risk — every capability that folds into one CLI with shared invariants makes every file-lock and provider-quirk release-critical.
+**Feasible if scoped as a local-first software delivery platform for trusted workspaces.**
 
-| Product | What it is | Independently adoptable? | Today |
-|---|---|---|---|
-| **A. Core Coordination Bus** | roster, threads, requests, review handoff, broadcast, transcripts | Yes — the minimal install | **Product-grade** |
-| **B. Method Engine Adapter** | spec-kitty (and other) workflow engines drive *what next*; agenttalk carries wake/handoff/evidence | Yes | Integration exists; not packaged |
-| **C. Craft Skill Pack** | coding/review/test/QA/security/release skills encoding standards + evidence | Mostly | Useful; needs templates |
-| **D. Assurance & Release Governance** | gates, closes, specialist sign-off, release ledger, scan evidence | Yes | Strong primitive; needs turnkey close-flow |
-| **E. Knowledge & Codebase Memory** | domains, durable pointer-notes, anchor-relative staleness, onboarding digests, **+ a curated process/craft `lesson` ledger (capture → curate → surfaced in `sync`)** | Yes | Primitives exist; **lesson ledger (capture-learning) shipped v0.70.0**; codebase-comprehension product not built |
-| **F. Operator Control Plane** | local console, read views, action-gated intent queue, lead-chat, attention/capacity/liveness | Yes (local) | Useful local console; not remote admin |
-| **G. Execution Runtime** | supervisor, wrapper, session continuity, dead-letter, managed lead-loop, isolated lane worktrees | Yes | Powerful but **high-maintenance** |
-| **H. Legacy Adoption Suite** *(flagship)* | opinionated composition of E+D+G+F+A+skills: map → preserve → safety-net → gated change | Yes, if built as a flow | **Primitives + dogfooded practice, not yet a product** |
+The product should not promise that vague requirements become correct software without human judgment. The feasible claim is:
 
-Key seam discipline: **assurance produces *evidence*, gates/close *decide* from typed evidence; runtime *executes*, never decides release truth; method owns *task state*, the bus owns *messaging*.** Don't merge those state machines.
+> agenttalk turns requirements into a disciplined, evidence-backed delivery workflow run by agent teams: plan, isolate, build, test, review, gate, and release with a human oracle for intent and waivers.
+
+The human remains responsible for business intent, public contracts, migration risk, legal/security tolerance, and final release judgment. agenttalk is the workflow contract, evidence spine, local runtime, and operator control plane.
 
 ---
 
-## 3. The flagship — Legacy Adoption Suite (honestly framed)
+## 2. North Star
 
-The reframe that makes this real: the product is **not** "AI understands your legacy code." It is **"the system makes your uncertainty visible, preserves what gets discovered, and blocks risky changes without evidence."** Less sexy, actually true, and differentiated — nobody does the *trust + preservation* part well.
+Build an **agentic software delivery platform** that a team can pick up for greenfield or existing projects, provide requirements, and have agents build the product by a professional software-development process.
 
-**The experience (phased):**
-- **Phase 0 — point at a repo.** Detect stacks/tests/CI/docs/ownership seams; propose a mapping plan; ask the operator to confirm goals + risk tolerance. No authority claims yet.
-- **Phase 1 — map by fan-out.** Scout agents across proposed domains produce *bounded artifacts* — subsystem map, build/test entry points, risky seams, missing docs, characterization-test targets — written back as normal `domains.json`, `knowledge/notes.jsonl`, and DESIGN docs (not private transcripts). Curators verify so staleness stays anchor-relative.
-- **Phase 2 — install the safety net.** Configure assurance, baseline scans, gates, risk classes; identify golden/characterization tests *before* changing behavior; work through lanes with worktree isolation.
-- **Phase 3 — small gated changes.** Each change starts from a mapped domain + knowledge digest; add characterization tests before invasive edits; `lane deliver` → `gate` → `close` → independent review + assurance evidence.
+The platform should make the correct path the normal path:
 
-**Honest gap (primitives vs product):** we *have* durable notes + anchor staleness (`knowledge.py`), domain ownership (`domains.py`), worktree isolation (`lanes.py`), review/close (`gates.py`/`close.py`), scan evidence (`assurance.py`), local ops (`supervisor.py`/`web.py`/`intents.py`). We *don't have*: a first-class repo-map command, a fan-out scout orchestrator with stable artifact contracts, a legacy-onboarding dashboard flow, a characterization-first workflow, or a coverage/drift dashboard telling the operator what's unmapped/stale/unverified. **The MVP must be humble: map, summarize, gate.**
+1. Requirements become explicit specs, acceptance criteria, risks, and non-goals.
+2. Work is split into bounded items with owners, paths, domains, and isolated workspaces.
+3. Agents produce code only inside recorded workspaces.
+4. Quality checks and third-party tools produce write-once, content-addressed evidence artifacts.
+5. Independent reviewers inspect the real diff at the exact revision.
+6. Gates and closes compute HOLD/GO from typed evidence, not prose.
+7. Operators can see what is blocked, why, and what evidence is missing.
 
----
-
-## 4. Roadmap
-
-### Quarter 1 — harden & package what exists *(trust is the prerequisite for everything bigger)*
-1. **Finish live reliability slices** — the wrapped-fleet follow-ups: launch containment (shipped), structured failure taxonomy + persisted dead-letter tails (shipped, v0.69.2), **identity-bound heartbeat hook (Bug 6, next)**. `supervisor.py`, `wrapper/*`, `redaction.py`.
-2. **Assurance Slice B** — make `assurance.py` artifacts consumable by `gate`/`close` (still evidence-not-authority); dashboard + release-summary views for required/skipped scans, new findings, provenance.
-3. **Productize first-run setup** — one command/dashboard path that checks install, skills, roster, operator-facing lead, supervisor script, activity hook, dashboard, codex config. Local, explicit, no daemon.
-4. **Supervisor & attention observability** — surface *why* the system is waiting/backing-off/refusing/escalating in the dashboard.
-
-### Quarter 2 — legacy-adoption **alpha**
-5. **Repo-map MVP** — `agenttalk map init`: detect stacks/docs/tests/CI/likely-domains/unmapped areas → propose `domains.json` + map report + knowledge-note drafts + assurance entries. Reviewable, opt-in.
-6. **Fan-out comprehension workflow** — assign scout questions per domain, collect structured summaries, curate into knowledge notes. Reuse typed metadata; avoid new bus kinds.
-7. **Characterization-first change workflow** — playbooks/templates to extract behavior specs from tests/logs/outputs; gate changes touching unmapped/fragile domains unless characterization evidence is supplied or explicitly waived.
-8. **Dashboard legacy-map view** — mapped domains, stale knowledge, missing tests, risky seams, active lanes, assurance status. Read-first.
-
-### Quarter 3 — make the alpha repeatable
-9. **Beta packaging** — a documented golden path (bootstrap → map → curate → configure safety → first safe change → release) with sample-repo walkthroughs + importable artifact schemas.
-10. **Knowledge quality & drift management** — coverage metrics (domains w/o notes, stale anchors, high-change areas lacking characterization), *review queues* not automatic truth claims.
-11. **Optional runtime polish** — digest-pinned Docker clean-install smoke + scanner image (off by default); runtime self-test.
-
-### Later — explicitly *not* scheduled
-Hosted multi-tenant SaaS · enterprise auth / cryptographic human identity · remote runners / cloud fleet · semantic/vector index over large codebases · automated architecture inference claiming completeness · multi-repo program management · skill/method marketplace.
+**Positioning:** safer AI-assisted software delivery, not autonomous correctness.
 
 ---
 
-## 5. Honest limits & top risks *(keep these load-bearing)*
+## 3. Product Shape
 
-**Ceilings (from the repo's own posture):** advisory-not-authz · identity = auditable assertion, not a crypto boundary · gates prove *evidence recorded*, not *behavior correct* · knowledge = curated pointers, not a codebase brain · capacity/context = advisory, can't eliminate context loss · execution = local process mgmt, not a cloud scheduler · **legacy intent needs a human oracle.**
+The healthy shape is still a thin substrate plus pluggable products with hard boundaries. The new center of gravity is the **Native Work & Evidence Spine**.
 
-**Risks → trigger:**
-- **False trust** → operators read "gate green / dashboard clean" as *correctness*. (Mitigate: language + UI that says "evidence recorded," never "verified correct.")
-- **Authority confusion** → multiple humans / untrusted agents / prompt-injected commands writing to the bus. (Mitigate: keep the identity model honest; don't over-promise authz.)
-- **Monolith creep** → everything moves into one CLI with shared invariants. (Mitigate: hard seams; the product table above.)
-- **Maintenance overload** → provider CLI JSON changes, Windows quirks, stale state. (This session's four-fold redaction hardening is the evidence.) (Mitigate: reliability stays ahead of features.)
-- **Knowledge rot** → uncurated notes pile up, anchors go stale. (Mitigate: pointer-shaped notes + review queues; resist over-ingest.)
-- **Adoption friction** → a legacy team must configure roster/env/skills/supervisor/domains/lanes/gates/CI before seeing *any* value.
-- **Safety regression** → dashboard drifts from read-only observability to broad write control.
+| Product | What it is | Today |
+|---|---|---|
+| **A. Core Coordination Bus** | roster, messages, threads, requests, review handoff, broadcast, transcripts | Product-grade |
+| **B. Native Work & Evidence Spine** | work items, bounded workspaces, evidence artifacts, review bindings, gate/check status, delivery lifecycle | Missing product layer; next major slice |
+| **C. Method Engine Adapter** | spec-kitty and future planners can create/link work items; method owns decomposition, agenttalk owns execution evidence | Integration exists; source-of-truth boundary must shift |
+| **D. Craft Skill Pack** | coding/review/test/QA/security/release skills that encode standards and evidence expectations | Useful; needs templates aligned to native work |
+| **E. Assurance & Release Governance** | gates, closes, specialist sign-off, release ledger, scan evidence | Strong primitives; needs work-item consumption |
+| **F. Knowledge & Codebase Memory** | domains, durable pointer-notes, lessons, onboarding digests, anchor-relative staleness | Primitives exist; codebase-comprehension product not built |
+| **G. Operator Control Plane** | local console, read views, action-gated intent queue, lead-chat, attention/capacity/liveness | Useful local console; needs Work view |
+| **H. Execution Runtime** | supervisor, wrapper, session continuity, dead-letter, managed lead-loop, isolated lane worktrees | Powerful but high-maintenance; runtime ergonomics remain active |
+| **I. Delivery Workflows** | greenfield product build, existing-project change, legacy adoption, release preparation | Mostly dogfooded practice, not yet productized |
+
+Key boundary:
+
+**method engines plan; work items execute; evidence records facts; gates decide from evidence; humans own intent and waivers.**
 
 ---
 
-## 6. Team-capacity reality
+## 4. Native Work & Evidence Spine
 
-Mostly AI agents + one operator → **narrow vertical slices, dogfooded, each shipped via the existing cadence.** Every feature is exercised by its own dev loop — that's the moat *and* the constraint. **Do not** attempt broad platform bets while runtime/assurance are still evolving. Explicit *not now*: remote SaaS/multi-user auth · IDE replacement · universal language understanding · automatic large refactors without human-curated characterization · per-ecosystem dependency policy · a new DB/server core · more authority surfaces before dashboard/supervisor/assurance are *boring*.
+This is the missing product layer. It should be agenttalk-native, domain-neutral, and optional for non-development uses.
+
+### Core contract
+
+`agenttalk work` should bind existing primitives into one durable delivery record:
+
+- **Domain:** who owns this area and which paths are in scope?
+- **Lane/workspace:** where is the isolated local copy and what may change?
+- **Work item:** what is being built, by whom, from which base, against which target?
+- **Quality evidence:** which checks ran, at which revision, with what result?
+- **Review evidence:** who reviewed the real diff and what did they find?
+- **Gate state:** what is missing, stale, failed, waived, or satisfied?
+- **Close state:** is this exact revision ready to merge/release under current policy?
+
+### Minimal native lifecycle
+
+Start narrow. Avoid a rich project-management state machine.
+
+```text
+draft -> open -> active -> review -> blocked -> ready -> delivered -> closed
+                                  \                         \
+                                   -> changes_requested      -> abandoned
+```
+
+Status should be a projection over typed records, not a place to hide contradictory truth. A work item may link to one lane/worktree, many evidence artifacts, review-request threads, gates, closes, and knowledge records.
+
+### Storage direction
+
+Use small per-item records, append-only events, and write-once artifacts:
+
+```text
+.agenttalk/work/items/<work_id>.json
+.agenttalk/work/events/<work_id>.jsonl
+.agenttalk/artifacts/<artifact_id>.json
+.agenttalk/artifacts/<artifact_id>.log
+```
+
+The exact layout can change in the RFC, but these invariants should not:
+
+- One corrupt item must not brick all work.
+- Artifacts are write-once; corrections create new artifacts.
+- Evidence binds to exact inputs: work id, base SHA, head SHA, diff hash, policy hash, command/tool, cwd, exit code, timestamps, producer, and trust tier.
+- Gates consume only evidence that matches the current work revision and policy.
+
+### Evidence tiers
+
+Do not collapse all green checks into one green dot.
+
+| Tier | Meaning | Default gate role |
+|---|---|---|
+| `referenced` | prose claim or linked output only | Never satisfies required gates |
+| `local_agent` | local command run by an agent | Useful pre-review evidence |
+| `local_operator` | local command run/confirmed by operator | Strong local evidence, still not CI |
+| `automation_ci` | configured automation on exact commit/policy | Default release-authoritative tier |
+| `external_attested` | signed/attested third-party evidence | Later, strongest tier |
+
+Release-blocking gates should require `automation_ci`, `external_attested`, or an explicit operator waiver unless project policy intentionally allows otherwise.
+
+### Policy boundary
+
+Core validates schemas, IDs, references, freshness, hashes, transitions, and HOLD codes. It should not hardcode Python, Rust, Android, web, or any specific scanner.
+
+Project policy owns:
+
+- required checks by risk/domain/path
+- required review lenses
+- accepted evidence tiers
+- waiver rules
+- named tool commands/adapters
+- timeouts, environment assumptions, and network policy
+
+Third-party tools are declared checks. agenttalk's job is to run or ingest them reproducibly, capture output safely, and require evidence at the right boundary.
 
 ---
 
-## 7. Lead's synthesis & recommendation
+## 5. Workflows On Top
 
-Three points on top of the two tracks:
+### Greenfield product build
 
-1. **The convergence is the headline.** An optimistic builder and a deliberately adversarial skeptic, run independently, agreed on scope, on the human-oracle requirement, and on the "reduced-chaos-not-autonomy" positioning. Treat that as a settled foundation, not a debate to keep having.
+1. Requirements intake: goals, users, non-goals, constraints, risk tolerance.
+2. Spec: acceptance criteria, architecture, test strategy, delivery plan.
+3. Bootstrap: repo, stack, CI, checks, docs, code policy, work lanes.
+4. Slice delivery: each feature becomes native work with artifacts and review.
+5. Release: close over exact revision and required evidence.
 
-2. **The real enemy is friction + trust, not feasibility.** Technically, the primitives are further along than most teams' — the risk that actually kills this is (a) *adoption friction* (config-before-value) and (b) *false trust* (green ≠ correct). So the highest-leverage Q1 investment isn't a flashy feature — it's **value-before-configuration** (deliver a read-only "here's what we found / here's what's unmapped and risky" map *before* asking anyone to wire up gates/lanes/CI) and **honest UI language** everywhere evidence is shown.
+### Existing-project change
 
-3. **Dogfood the flagship workflow *before* building the command.** We can run the Phase-1 fan-out map on a real legacy repo *today*, by hand, using existing primitives + a workflow. Do that first to pin down the *artifact contracts* (what a scout returns, what a map report looks like) — then Q2's `agenttalk map` command productizes a proven flow instead of a guessed one. Same "prove the vertical slice, then harden" discipline that's worked all along.
+1. Detect stack, tests, docs, CI, domains, risky seams.
+2. Map ownership and path scope before editing.
+3. Add characterization tests before risky behavior changes.
+4. Deliver small bounded work items through review/gate/close.
+5. Preserve discoveries in knowledge notes and lessons.
 
-**Concrete next increment:** finish **Bug 6** (identity-bound heartbeat hook — v0.69.4) to close the reliability arc, then **Assurance Slice B** (artifact→gate/close consumption + dashboard evidence). Those make the *runtime and the evidence* trustworthy — the precondition for the legacy-adoption alpha. Hold the legacy-map command until the fan-out map has been dogfooded once by hand.
+### Legacy adoption
 
-**Bottom line:** yes, this is achievable — as a suite of local-first products with a legacy-adoption flagship, built in narrow dogfooded slices over 2–3 quarters, sold as *safer, more understandable AI-assisted change on codebases you don't fully understand.* Not as an autonomous modernization engine. The scoping is what makes it real.
+Legacy adoption remains a flagship workflow, but it is no longer the whole roadmap. It becomes an opinionated composition of native work, knowledge, assurance, runtime, and dashboard:
+
+1. Map: repo-map MVP, domain proposals, build/test inventory.
+2. Preserve: curated knowledge notes, lessons, risky seams, characterization targets.
+3. Safety net: assurance baselines, gates, CI evidence, required reviews.
+4. Change: small gated work items with exact evidence and independent review.
+
+---
+
+## 6. Roadmap
+
+### Quarter 1 - prove the delivery spine
+
+1. **Wrapped-agent runtime ergonomics.** First-class per-agent model / reasoning-effort config, restart-safe session fingerprinting when runtime config changes, and the planned no-visible-CLI/headless supervised mode with full dashboard status.
+2. **Native Work RFC.** Specify work item schema, event model, artifact schema, lifecycle, source-of-truth boundaries with lanes/gates/close, evidence tiers, reset semantics, and safety invariants.
+3. **Work item MVP.** `work create|list|show|status|assign|start|deliver|abandon`, with one record per item and links to existing lanes, domains, request threads, gates, closes, and artifacts.
+4. **Evidence registry MVP.** Write-once artifacts, hash validation, bounded logs, redaction status, exact input binding, trust tiers, and stale-at-head detection.
+5. **Pure work check.** `work check` computes `GO`, `HOLD`, or `UNKNOWN` with stable HOLD codes over work state, lane/worktree state, artifact freshness, review state, and gate/close inputs.
+6. **Assurance Slice B integration.** Make `assurance.py` artifacts consumable by work checks, gates, and closes without turning assurance into authority.
+
+### Quarter 2 - make it useful for real projects
+
+7. **Project code-policy v1.** Optional `.agenttalk/code-policy.json` declaring required evidence by risk/domain/path, accepted tiers, review lenses, and named checks. No arbitrary shell runner by default.
+8. **Generic quality runner / ingestion.** Start with structured argv, no shell by default, explicit cwd/env/network policy, timeouts, output caps, redaction, and fake-adapter failure tests. Add convenience adapters only after the generic contract is proven.
+9. **Native review binding.** `review request --work` and review-result consumption tied to reviewed ref, artifact ids, tests executed, findings, residual risk, and release-blocker flags.
+10. **Dashboard Work view.** Show work item, owner, worktree, head SHA, dirty/stale state, evidence tiers, review obligations, HOLD reasons, and next owner/action. Keep `/api/state` body-free and log-free.
+11. **First-run delivery setup.** One command/dashboard path to check install, skills, roster, operator-facing lead, supervisor, dashboard, code policy, CI visibility, and tool availability.
+
+### Quarter 3 - productize greenfield and existing-project workflows
+
+12. **Greenfield workflow alpha.** Requirements intake -> spec -> stack/bootstrap -> work slices -> evidence/review/gate -> release close.
+13. **Existing-project workflow alpha.** Repo detection, domain proposal, test/CI inventory, characterization targets, safe first change.
+14. **Legacy adoption alpha.** Repo-map MVP, fan-out comprehension artifacts, knowledge curation, dashboard legacy-map view, unmapped/stale/risky coverage.
+15. **CI adapters.** GitHub Actions first: ingest run ids, workflow refs, commit SHA, conclusion, logs/artifacts as evidence. Other providers later.
+16. **Repeatable beta packaging.** Golden-path walkthroughs for one greenfield app and one existing-project change, with sample policies and artifact schemas.
+
+### Later - explicitly not scheduled
+
+Hosted multi-tenant SaaS · enterprise auth / cryptographic human identity · remote cloud runners · semantic/vector index over large codebases · automatic architecture inference claiming completeness · automatic large refactors without human-curated characterization · multi-repo program management · skill/method marketplace · broad merge/release automation before gate semantics are proven.
+
+---
+
+## 7. Hard HOLDs
+
+Do not ship broad workflow claims if any of these are true:
+
+- Work items, lanes, gates, closes, and review threads can disagree with no single projection explaining the conflict.
+- Artifact records are mutable in place.
+- A gate can pass from chat prose or referenced-but-unexecuted evidence.
+- Evidence is not bound to exact head SHA, base SHA, diff/policy hash, and producer.
+- Local agent evidence satisfies release-blocking gates by default.
+- Project policy changed inside the same worktree silently changes the gate.
+- A runner accepts shell strings by default or inherits uncontrolled environment/secrets.
+- Timeout, malformed output, parser failure, or adapter failure can normalize to pass.
+- Worktree cleanup can delete dirty, unmerged, unmanaged, or user-created files.
+- Dashboard collapses evidence tiers into one misleading green status.
+
+---
+
+## 8. Top Risks
+
+- **False trust:** operators read green as correctness. Mitigation: language and UI say "evidence current and policy satisfied," not "code correct."
+- **State-machine drift:** native work duplicates lane/gate/close truth. Mitigation: work links and projects existing primitives; pure checks derive state.
+- **Command-runner risk:** project policy becomes arbitrary code execution. Mitigation: structured argv, opt-in execution, explicit env/network, timeouts, caps, redaction, and failure-injection tests.
+- **Policy drift:** a branch changes the rules that judge itself. Mitigation: policy hash binding, base-policy evaluation, explicit waiver for policy changes.
+- **Evidence rot:** artifacts point at old SHAs or missing logs. Mitigation: stale-at-head detection and content-addressed artifact references.
+- **Maintenance overload:** provider CLI, CI, and scanner formats change. Mitigation: adapter boundaries and generic artifact schema first.
+
+---
+
+## 9. Recommendation
+
+The next major roadmap change is to build **Native Work & Evidence Spine** before expanding legacy-adoption features. That spine is what makes both greenfield and existing-project delivery credible.
+
+Immediate sequence:
+
+1. Close the small wrapped-agent runtime ergonomics slice.
+2. Write the Native Work RFC.
+3. Ship work item records + lane/worktree binding + write-once evidence registry.
+4. Add pure `work check` with stable HOLD codes.
+5. Integrate assurance artifacts and review-result evidence.
+6. Only then add runners, CI adapters, dashboard Work view, and greenfield/legacy workflow productization.
+
+Bottom line: agenttalk can become the platform for teams of agents to build software "by the book," but the product has to be honest about authority. It can enforce process, preserve evidence, and fail closed when evidence is missing. It cannot remove the human oracle or prove correctness by itself.

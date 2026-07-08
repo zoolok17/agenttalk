@@ -10,6 +10,67 @@ with its version; when a new finding lands, add it with a disposition.
 (shipped & accepted) · `BACKLOG` · `SHIPPED`. Severity: `P0` critical · `P1`
 major · `P2` minor · `P3` nit. Each item: what, why, where, disposition.
 
+**Roadmap source of truth.** `docs/ROADMAP.md` is the authoritative product
+roadmap. This file tracks concrete work items, shipped incident records, and
+accepted limitations; older incident sections may remain for rationale but should
+be labeled `SHIPPED` once the changelog closes them.
+
+---
+
+## P1 · PLANNED — Native Work & Evidence Spine (2026-07-08)
+
+**What.** agenttalk needs a native, domain-neutral work/evidence contract that
+binds requirements, domains, isolated workspaces, quality artifacts, reviews,
+gates, and closes into one delivery record. This is the product layer that lets
+agent teams build greenfield and existing-project changes by a disciplined
+software-development process.
+
+**Scope.**
+- Add native work records under `.agenttalk/work/` with stable IDs, lifecycle
+  events, owner, base/head refs, path/domain scope, linked lane/worktree,
+  linked requests, gates, closes, and artifact refs.
+- Reuse lanes for worktree isolation; do not create a second workspace truth.
+- Add write-once evidence artifacts with hashes, exact input binding, trust
+  tier, producer, command/tool metadata, timestamps, exit/result state, and
+  bounded/redacted output references.
+- Add a pure `work check` projection that returns `GO`, `HOLD`, or `UNKNOWN`
+  with stable HOLD codes over current revision, policy hash, lane/worktree
+  state, artifact freshness, review state, and gate/close inputs.
+- Keep project-specific requirements in optional `.agenttalk/code-policy.json`;
+  core validates policy shape and hashes but does not hardcode tools or stacks.
+- Defer arbitrary third-party command execution, CI adapters, merge automation,
+  and broad dashboard actions until the schema and check semantics are proven.
+
+**Disposition.** `P1 PLANNED`. Start with an RFC, then ship work records,
+lane/worktree binding, write-once evidence references, and pure status/check.
+This becomes the spine for greenfield, existing-project, and legacy-adoption
+workflows.
+
+---
+
+## P2 · PLANNED — wrapped-agent runtime config and headless status (2026-07-08)
+
+**What.** Wrapped supervised agents need first-class runtime settings and a
+clean headless operating mode. Today an operator can pass Codex model/effort
+through the raw child argv tail, but that is brittle, hard to inspect, and easy
+to combine accidentally with stale wrapper sessions.
+
+**Scope.**
+- Add per-agent `model` and `reasoning_effort` config for wrapped agents.
+- For Codex, inject `-m <model>` and `-c model_reasoning_effort="<effort>"`.
+- For Claude, inject `--model <model>` only; leave effort unsupported unless a
+  verified headless flag exists.
+- Store a runtime fingerprint with wrapper session state; when model/effort
+  changes, start a fresh session instead of resuming an old thread.
+- Surface configured runtime in status/dashboard, and warn when raw
+  `windows_args` already contains conflicting model/effort flags.
+- Design the adjacent no-visible-CLI/headless supervised-agent mode so the
+  dashboard exposes full liveness, runtime, mailbox, and failure state.
+
+**Disposition.** `P2 PLANNED`. Implement the model/effort config as the small
+first slice; keep headless/no-CLI execution as the next runtime-design slice if
+it grows beyond argument injection and dashboard display.
+
 ---
 
 ## P2 · PLANNED — CI test-suite timing flakiness (systematic hardening pass) (2026-07-06)
@@ -48,7 +109,22 @@ green via targeted job re-runs in the interim (the flakes are timing-only). Rela
 
 ## Recently shipped
 
-- **SHIPPED - v0.66.0 / pending - lane worktree isolation.**
+- **SHIPPED · v0.70.2 — wrapped supervisor launch containment for legacy configs.**
+  The generated PowerShell supervisor now normalizes legacy wrapped launch argv by
+  inserting global `--root {ROOT}` before `wrap`, so same-root survivor detection
+  works even when an older `supervisor.json` omitted parser-visible root flags.
+- **SHIPPED · v0.70.1 — operator user manual.**
+  Added `docs/USER-MANUAL.md` plus executable manual examples and README
+  navigation.
+- **SHIPPED · v0.70.0 — curated lesson ledger.**
+  Added a `lesson` knowledge-note type that is inert until curated, then surfaces
+  accepted, non-expired process/craft lessons in `sync` and onboarding.
+- **SHIPPED · v0.69.6 — interactive-lead heartbeat hook / Bug 6.**
+  `heartbeat --hook --fallback-for <lead>` and
+  `supervise --install-activity-hook --interactive-for <lead>` let a
+  human-launched operator-facing lead stamp the correct heartbeat while working.
+
+- **SHIPPED · v0.66.0 — lane worktree isolation.**
   `lane assign` now provisions managed in-repo worktrees by default, launch paths can
   carry `lane_id` so supervised children run in the registered workspace, and
   release-class `close` checks HOLD without a signed lane delivery artifact or an
@@ -256,14 +332,14 @@ rate-limited state); optionally an auto-wake that re-arms a recovered agent. REC
 long-silent-turn false-STUCK churn that compounds this (a relaunch also refreshes the wrappers to
 current code).
 
-## P3 · IN PROGRESS (v0.59.3 dashboard increment) — capacity display, density, and write-spine P3 closeouts (2026-07-04)
+## SHIPPED · v0.59.3 — capacity display, density, and write-spine P3 closeouts (2026-07-04)
 
 Dashboard increment 1 closes the four open v0.59.0 write-spine P3s, adds
 per-provider capacity display, and makes compact density materially smaller.
 None of the P3s is an auth bypass; the write boundary is sound. v0.60.0
 operator inbox work remains out of this increment.
 
-STATUS: in progress for `v0.59.3`.
+STATUS: shipped in `v0.59.3`; retained here as the design/review record.
 
 - **P3 · non-ASCII CSRF header → TypeError** (sharpest). `web.py _handle_intent_post` runs
   `hmac.compare_digest(supplied, csrf_token)` on STRINGS; a non-ASCII header (latin-1 decoded,
@@ -290,13 +366,13 @@ STATUS: in progress for `v0.59.3`.
   than publishing another thread's observed budget. Supervised wrapped Codex remains isolated to
   that agent's `CODEX_HOME/sessions`.
 
-## P2 · IN PROGRESS (v0.60.0 operator inbox) — answer escalation intent (2026-07-04)
+## SHIPPED · v0.60.0 — answer escalation intent (2026-07-04)
 
 Add the first operator-inbox write action: an `answer_escalation` intent that queues an
 operator answer for a pending `needs_operator` escalation, then the executor re-derives
 the recipient at drain time and emits a normal non-control message back to the requester.
-This increment does **not** add attention dispositions; defer/dismiss/resolve remain a
-fast-follow for v0.60.1.
+This increment did **not** add attention dispositions; defer/dismiss/resolve remained a
+fast-follow.
 
 Kill-switch invariant for this increment: the web tier rejects new queued writes while
 `supervisor.kill` is active, the executor pauses without mutating queued intents, and any
@@ -382,21 +458,19 @@ Small, low-risk, bundle into one dev-2 task once capacity returns (normal cadenc
   ordering relies on CPython synchronous generator finalization — SUPERSEDED by the Errno-22 fix
   above (same teardown path); fold together, add the documenting comment there.
 
-## P3 · PLANNED (post-v0.59.0) — dashboard UI polish
+## SHIPPED · v0.59.3 — dashboard compact-density polish
 
-Small console.css/js polish; run as a focused pass AFTER v0.59.0 ships — keeps the write-spine
-security review clean and avoids editing console.css/js while dev-2 is mid-build in those files.
+Historical design note for the compact-density work that shipped in v0.59.3.
+Keep this section only as rationale for the dashboard density decisions.
 
-- **Compact density is a near-no-op.** The comfy/compact toggle IS wired (console.js:517-522 →
+- **Original finding: compact density was a near-no-op.** The comfy/compact toggle was wired (console.js:517-522 →
   `applyPrefs` sets `#app[data-density]`, same path as the working theme toggle), but
-  `[data-density="compact"]` changes only ONE variable — `--card-pad` `15px 16px` → `13px 14px`
-  (console.css:141-142), a ~2px delta — so it reads as a dead button. FIX: have `compact` drive
-  MORE dimensions (row/list padding, inter-card gaps, header/nav height, maybe font-size) via
-  additional density-scoped custom properties so it visibly tightens. WHERE:
-  `src/agenttalk/web_static/console.css` (density vars) + `console.js` if new vars need wiring.
+  `[data-density="compact"]` changed only ONE variable — `--card-pad` `15px 16px` → `13px 14px`
+  (console.css:141-142), a ~2px delta — so it read as a dead button. The v0.59.3 fix made compact
+  density materially smaller through additional density-scoped sizing.
 - (Running bucket for further console UX nits the operator surfaces while using the dashboard.)
 
-## PLANNED (feature) — per-provider usage/limits in the dashboard (operator ask 2026-07-03)
+## SHIPPED · v0.59.3 — per-provider usage/limits in the dashboard (operator ask 2026-07-03)
 
 GOOD NEWS: mostly already built. `capacity.py` extracts 5-hour + weekly rate-limit windows +
 context for BOTH providers — Claude from `~/.claude/statusline-last-input.json`
@@ -406,17 +480,10 @@ reads the Codex rate limits the operator's own statusline tool could not. `/api/
 per-agent `capacity`; console.js already renders a 5-hour rate meter + context meter
 (console.js:402-404,1321-1324).
 
-GAP (why Codex looks empty): capacity is SELF-published by each agent's skill
-(`agenttalk capacity refresh`), NOT auto-refreshed by the wrapper — `wrapper/loop.py` has NO
-capacity wiring — so snapshots go stale/absent, especially for codex. OPEN QUESTION to verify
-first: does a WRAPPED HEADLESS agent produce its provider source? codex writes rollouts (yes);
-a wrapped `claude -p` may NOT run the statusline that writes `statusline-last-input.json` (verify).
-
-FIX: (1) auto-refresh capacity in `wrap --loop` each turn (loop.py, both providers, fail-safe) so
-every supervised agent always has fresh usage without depending on its skill; (2) enrich the
-console to show BOTH 5h + weekly windows + `resets_at` + `plan_type`, per agent + a per-provider
-summary (console.js/css — FOLD with the dashboard work to avoid conflict; the loop.py auto-refresh
-is independent and can ship on its own). Design-first dispatched to dev-4 (assignment=dashboard-capacity).
+Original gap (why Codex looked empty): capacity was SELF-published by each agent's skill
+(`agenttalk capacity refresh`) rather than refreshed by supervision, so snapshots went stale or
+absent, especially for Codex. The v0.59.3 fix added failure-isolated supervised capacity refresh,
+isolated wrapped-Codex reads, richer `/api/state` capacity fields, and visible dashboard meters.
 
 ## SHIPPED v0.57.0 — supervisor hardening · v0.57.1 — attention fast-follow (2026-07-02)
 
@@ -436,7 +503,7 @@ Origin: dogfooding the hardened supervisor on the live team (claude lead + 5 cod
 workers, all `wrap --loop`, real auto-recovery). The supervisor revived a dead Claude dev
 (dev-2) by itself — the revival premise works — but the first real dev turn surfaced these.
 
-- **P1 · PLANNED · wrapped-Claude has no write grants.** A supervised `wrap --loop --cli
+- **SHIPPED · v0.58.1 · wrapped-Claude has no write grants.** A supervised `wrap --loop --cli
   claude` child ran in DEFAULT permission mode, so every Edit/Write/git write was auto-denied
   headless (main repo AND worktree); the agent could read and use the bus but could not
   edit/commit. Root cause: the wrapper never applies `claude_permission_mode` to the child
@@ -444,10 +511,10 @@ workers, all `wrap --loop`, real auto-recovery). The supervisor revived a dead C
   writes for a `-p` headless child. WHERE: `src/agenttalk/wrapper/run.py` (no
   `--permission-mode` in the claude argv); `supervise --seed-claude-settings`. INTERIM FIX
   (config, applied): add `--permission-mode bypassPermissions` to each Claude worker's `wrap`
-  tail (+ `--add-dir <worktree>` when the work is outside cwd). PROPER FIX (planned): the
-  wrapper applies the resolved `claude_permission_mode` to the child argv so the seed and the
-  flag cannot diverge. (Codex agents were unaffected — they already run `-a never -s
-  workspace-write`.)
+  tail (+ `--add-dir <worktree>` when the work is outside cwd). The proper fix shipped in
+  v0.58.1: the wrapper applies the resolved `claude_permission_mode` to the child argv so
+  the seed and the flag cannot diverge. (Codex agents were unaffected — they already run
+  `-a never -s workspace-write`.)
 - **P2 · KNOWN LIMITATION · isolated worktree vs sandboxed agents.** A separate-worktree task
   (worktree files, plus git metadata under the main repo's `.git/worktrees/…`) falls outside
   a sandboxed agent's writable root — Codex `workspace-write` + `writable_roots` (the Orbit

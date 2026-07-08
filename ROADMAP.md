@@ -1,13 +1,18 @@
 # agenttalk — roadmap & working notes
 
+> Historical working notes through the early production retros. The
+> authoritative current product roadmap is `docs/ROADMAP.md`; the release
+> source of truth is `CHANGELOG.md`.
+
 Carry-forward notes for the next session / next machine: what production
 use validated, what hurt, and the ranked backlog to address it. Built from
 the Claude Code + Codex collaboration that shipped 0.10.0–0.13.0, the first
 four-agent production retro (2026-06-03), **and the band's consolidated
 second retro (2026-06-05), which reprioritized everything below.**
 
-> Current release: **v0.24.0** (`master`). See `CHANGELOG.md` for history
-> and `SECURITY.md` for the trust model.
+> Historical baseline in this note: **v0.24.0** (`master`). See
+> `CHANGELOG.md` for current release history and `SECURITY.md` for the trust
+> model.
 
 ---
 
