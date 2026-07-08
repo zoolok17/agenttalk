@@ -3615,51 +3615,21 @@ def _kn_lesson_rows(events: list[dict], *, include_uncurated: bool = False,
                     include_stale: bool = False, scope: str | None = None,
                     tags: list[str] | None = None, now: str | None = None,
                     active_only: bool = False) -> list[tuple[dict, dict]]:
-    from agenttalk import knowledge as kn
-    accepted = []
-    views = kn.resolve_views(events)
-    for rec in views.values():
-        note = rec.get("curated")
-        if note and note.get("type") == kn.TYPE_LESSON and kn.is_curated(note):
-            accepted.append(note)
-    superseded = kn.lesson_superseded_keys(accepted)
-    wanted_tags = {t.casefold() for t in (tags or [])}
-    rows: list[tuple[dict, dict]] = []
-    for (_domain_id, _key), rec in sorted(views.items()):
-        latest, curated = rec.get("latest"), rec.get("curated")
-        note = None
-        if include_uncurated and latest is not None and latest.get("type") == kn.TYPE_LESSON \
-                and not kn.is_curated(latest) and not kn.is_retracted(latest):
-            note = latest
-        else:
-            note = curated
-        if note is None or note.get("type") != kn.TYPE_LESSON:
-            continue
-        lesson = note.get("lesson") or {}
-        if scope and lesson.get("scope") != scope:
-            continue
-        applies_to = {str(t).casefold() for t in lesson.get("applies_to", [])}
-        if wanted_tags and not (applies_to & wanted_tags):
-            continue
-        verdict = kn.compute_lesson_state(note, now=now, superseded_keys=superseded)
-        if active_only:
-            if not verdict.get("active"):
-                continue
-        elif verdict.get("hard_stale") and not include_stale:
-            continue
-        elif not kn.is_curated(note) and not include_uncurated \
-                and not (include_stale and kn.is_retracted(note)):
-            continue
-        rows.append((note, verdict))
-    return rows
+    from agenttalk import lesson_context as lc
+    return lc.lesson_rows(
+        events,
+        include_uncurated=include_uncurated,
+        include_stale=include_stale,
+        scope=scope,
+        tags=tags,
+        now=now,
+        active_only=active_only,
+    )
 
 
 def _kn_lesson_marker(verdict: dict) -> str:
-    if verdict.get("hard_stale"):
-        return "stale:" + ",".join(verdict.get("stale_reasons") or [])
-    if verdict.get("review_due"):
-        return "review_due"
-    return "expires:" + str(verdict.get("expires_at") or "?")
+    from agenttalk import lesson_context as lc
+    return lc.lesson_marker(verdict)
 
 
 def _kn_trim(value: object, limit: int = 160) -> str:
@@ -3668,19 +3638,8 @@ def _kn_trim(value: object, limit: int = 160) -> str:
 
 
 def _kn_lesson_dict(note: dict, verdict: dict) -> dict:
-    lesson = note.get("lesson") or {}
-    return {
-        "domain_id": note.get("domain_id"),
-        "key": note.get("key"),
-        "scope": lesson.get("scope"),
-        "trigger": lesson.get("trigger"),
-        "body": note.get("body"),
-        "evidence_ref": lesson.get("evidence_ref"),
-        "applies_to": lesson.get("applies_to") or [],
-        "status": lesson.get("status"),
-        "marker": _kn_lesson_marker(verdict),
-        "_verdict": verdict,
-    }
+    from agenttalk import lesson_context as lc
+    return lc.lesson_dict(note, verdict)
 
 
 def _kn_print_lesson(note: dict, verdict: dict) -> None:
@@ -3696,84 +3655,29 @@ def _kn_print_lesson(note: dict, verdict: dict) -> None:
 
 
 def _kn_format_lesson_line(note: dict, verdict: dict) -> str:
-    lesson = note.get("lesson") or {}
-    return (
-        f"  {note.get('key')} [{lesson.get('scope')}] "
-        f"{_kn_trim(lesson.get('trigger'), 80)} - {_kn_trim(note.get('body'), 140)} "
-        f"(evidence: {_kn_trim(lesson.get('evidence_ref'), 80)}; "
-        f"{_kn_lesson_marker(verdict)})"
-    )
+    from agenttalk import lesson_context as lc
+    return lc.format_lesson_line(note, verdict)
 
 
 def _kn_lesson_scope_for_text(text: str) -> str:
-    lowered = text.casefold()
-    if "review-request" in lowered or "review" in lowered:
-        return "review"
-    if "test" in lowered or "qa" in lowered:
-        return "test"
-    if "release" in lowered or "close" in lowered:
-        return "release"
-    if "docs" in lowered or "doc" in lowered or "design" in lowered:
-        return "docs"
-    if "build" in lowered or "fix" in lowered:
-        return "craft"
-    if "security" in lowered:
-        return "security"
-    return "process"
+    from agenttalk import lesson_context as lc
+    return lc.lesson_scope_for_text(text)
 
 
 def _kn_tokenize_tags(text: str) -> set[str]:
-    from agenttalk import knowledge as kn
-    out: set[str] = set()
-    for m in re.finditer(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", text or ""):
-        token = m.group(0)
-        try:
-            out.add(kn.validate_lesson_tag(token).casefold())
-        except kn.KnowledgeError:
-            continue
-    return out
+    from agenttalk import lesson_context as lc
+    return lc.tokenize_tags(text)
 
 
 def _kn_sync_lesson_context(msgs: list, rows: list[dict],
                             explicit_tags: list[str] | None) -> tuple[str, set[str]]:
-    from agenttalk import knowledge as kn
-    by_rid: dict[str, list] = {}
-    for m in msgs:
-        rid = (m.meta or {}).get("request_id")
-        if isinstance(rid, str) and rid:
-            by_rid.setdefault(rid, []).append(m)
-    parts: list[str] = []
-    for d in rows:
-        parts.extend([str(d.get("opener_kind") or ""), str(d.get("subject") or "")])
-        for m in by_rid.get(str(d.get("request_id") or ""), [])[:3]:
-            parts.extend([m.kind, m.subject or "", json.dumps(m.meta or {}, sort_keys=True)])
-    text = " ".join(parts)
-    tags = _kn_tokenize_tags(text)
-    for tag in explicit_tags or []:
-        try:
-            tags.add(kn.validate_lesson_tag(tag).casefold())
-        except kn.KnowledgeError:
-            continue
-    return _kn_lesson_scope_for_text(text), tags
+    from agenttalk import lesson_context as lc
+    return lc.sync_lesson_context(msgs, rows, explicit_tags)
 
 
 def _kn_rank_lessons(rows: list[tuple[dict, dict]], *, context_scope: str) -> list[tuple[dict, dict]]:
-    def key(nv: tuple[dict, dict]):
-        note, verdict = nv
-        lesson = note.get("lesson") or {}
-        return (
-            0 if lesson.get("scope") == "process" else 1,
-            0 if lesson.get("scope") == context_scope else 1,
-            0 if verdict.get("review_due") else 1,
-            -kn_time(note),
-            note.get("key") or "",
-        )
-
-    def kn_time(note: dict) -> float:
-        from agenttalk import knowledge as kn
-        return kn.lesson_updated_at(note).timestamp()
-
-    return sorted(rows, key=key)
+    from agenttalk import lesson_context as lc
+    return lc.rank_lessons(rows, context_scope=context_scope)
 
 
 def _kn_print_note(note: dict, verdict: dict) -> None:
@@ -6202,30 +6106,17 @@ def cmd_sync(args: argparse.Namespace) -> int:
     lesson_rows: list[tuple[dict, dict]] = []
     lesson_warnings: list[str] = []
     lesson_context_scope = "process"
-    try:
-        lesson_context_scope, lesson_tags = _kn_sync_lesson_context(
-            msgs, thread_payload, getattr(args, "lesson_tag", None))
-        from agenttalk import knowledge as kn
-        events, problems = kn.read_events(store)
-        raw_lesson_rows = _kn_lesson_rows(events, active_only=True)
-
-        def lesson_matches(note: dict) -> bool:
-            lesson = note.get("lesson") or {}
-            scope = lesson.get("scope")
-            if scope not in ("process", lesson_context_scope):
-                return False
-            applies_to = {str(t).casefold() for t in lesson.get("applies_to", [])}
-            return not applies_to or bool(applies_to & lesson_tags)
-
-        lesson_rows = _kn_rank_lessons(
-            [(n, v) for (n, v) in raw_lesson_rows if lesson_matches(n)],
-            context_scope=lesson_context_scope)[:5]
-        if problems:
-            lesson_warnings.append(
-                f"knowledge skipped {min(len(problems), 99)} corrupt line(s); "
-                "malformed lessons were ignored")
-    except Exception as e:  # noqa: BLE001 - sync must continue if lesson read/render fails
-        lesson_warnings.append(f"lessons unavailable: {_kn_trim(e, 160)}")
+    from agenttalk import lesson_context as lc
+    lesson_selection = lc.select_for_sync(
+        store,
+        msgs,
+        thread_payload,
+        explicit_tags=getattr(args, "lesson_tag", None),
+        limit=5,
+    )
+    lesson_rows = lesson_selection.rows
+    lesson_warnings = lesson_selection.warnings
+    lesson_context_scope = lesson_selection.context_scope
 
     payload = {
         "agent": agent,

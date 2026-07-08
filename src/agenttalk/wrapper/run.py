@@ -1512,6 +1512,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
     subprocess); ``persist`` is called after each turn to save session state."""
     from . import prompt as _prompt
     from . import session as _session
+    from agenttalk import lesson_context as _lesson_context
     from .loop import (
         CLASS_AMBIGUOUS,
         CLASS_CONFIG_BLOCKED,
@@ -1617,7 +1618,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         preflight = preflight_agenttalk_runtime
     preflight_ok = False
 
-    def _run_one(spec) -> dict:
+    def _run_one(spec, *, after_spawn: Callable[[], None] | None = None) -> dict:
         """Spawn ONE CLI invocation for ``spec`` and process its JSONL via the engine.
         Returns the raw turn SIGNALS for classification: ``{ok, started, completed,
         terminal, retryable, rc, error}``. ok is True only if it reached a COMPLETED
@@ -1628,7 +1629,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         sig = {"ok": False, "started": False, "completed": False, "terminal": False,
                "retryable": False, "rc": None, "error": None, "terminal_text": "",
                "config_blocked": False, "config_blocked_text": "", "bus_failure": None,
-               "structured_errors": [], "child_output_tail": None}
+               "structured_errors": [], "child_output_tail": None,
+               "lesson_exposure_error": None}
         child_output_lines: list[dict[str, str]] = []
         child_output_truncated = False
 
@@ -1662,6 +1664,12 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             preflight_ok = True
         try:
             stream = spawner(argv, spec.stdin)
+            if after_spawn is not None:
+                try:
+                    after_spawn()
+                except Exception as e:  # noqa: BLE001 - lesson telemetry must not kill turns
+                    sig["lesson_exposure_error"] = (
+                        f"{type(e).__name__}: {_compact_text(e, 160)}")
             for line in _iter_suppressing_benign_pipe_teardown(stream):
                 _capture_child_output("stdout", line)
                 s = line.strip()
@@ -1736,7 +1744,23 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         return _classify_drive_failure(sig)
 
     def drive(record: dict) -> DriveOutcome:
-        prompt = _prompt.assemble_turn_prompt(record, rules=rules)
+        lesson_selection = _lesson_context.select_for_record(store, record)
+        lesson_prompt = _lesson_context.render_prompt_section(lesson_selection)
+        lesson_turn_id = f"turn-{uuid.uuid4().hex[:12]}"
+
+        def _record_lesson_exposure() -> None:
+            if not lesson_selection.rows:
+                return
+            _lesson_context.record_exposure(
+                store=store,
+                agent=agent,
+                record=record,
+                selection=lesson_selection,
+                turn_id=lesson_turn_id,
+            )
+
+        prompt = _prompt.assemble_turn_prompt(
+            record, rules=rules, lessons=lesson_prompt)
         spec = _session.build_turn(session_state, prompt)
         cli = session_state.cli
         # A failed RESUME turn self-heals to a fresh session before we classify (codex:
@@ -1752,7 +1776,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 session_state, agent=agent, msg_id=record.get("id"))
             if persist is not None:
                 persist(session_state)
-        sig = _run_one(spec)
+        sig = _run_one(spec, after_spawn=_record_lesson_exposure)
         if not sig["ok"] and attempted_resume:
             try:
                 resume_failure_class, resume_summary = _classify(sig)

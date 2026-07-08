@@ -266,7 +266,8 @@ agenttalk sync --for claude-dev --lesson-tag docs
 
 `sync` gives identity, roster, open threads, terminal decisions, unread FYI
 traffic, and a capped Lessons to check section when accepted lessons match the
-work.
+work. Wrapped agents get matching lessons injected by the wrapper instead of
+running `sync`; do not ask a wrapped child model to run inbox/cursor commands.
 
 Use `status` for a team-wide snapshot:
 
@@ -633,6 +634,14 @@ agenttalk knowledge pull --type lesson --scope docs --tags docs --include-uncura
 `agenttalk sync --for <agent>` includes a capped Lessons to check section when
 accepted, not-expired lessons match the current work context or supplied
 `--lesson-tag` values. Lessons are advisory memory, not authorization.
+
+For `agenttalk wrap --loop`, lesson surfacing is automatic. The wrapper matches
+accepted lessons against the inbound message, adds a Lessons to check section to
+the child prompt, and appends a pointer-only exposure event to
+`.agenttalk/knowledge/lesson-exposures.jsonl` after the prompt is handed to the
+child process. The exposure event is audit telemetry: it records which accepted
+lesson was surfaced to which agent/message, not whether the model read or
+applied it.
 
 ## 12. Troubleshooting
 
