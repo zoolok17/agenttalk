@@ -93,7 +93,7 @@ a prerequisite.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.71.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.72.0"
 agenttalk install-skills          # installs bus skills + the dev-discipline devkit
 
 # in your project root, once per project
@@ -198,7 +198,7 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.71.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.72.0"
 ```
 
 Pin to a specific tag so you control upgrades. Replace the tag with
@@ -926,7 +926,7 @@ pure verdict, and the artifact shape; the project supplies `domains.json`,
 shared-path policy, lane ids/assignees/targets/subsets, and required
 gates.
 
-### Knowledge: durable pointer notes and lessons (0.38.0, lessons 0.70.0, wrapped exposure 0.71.0)
+### Knowledge: durable pointer notes and lessons (0.38.0, lessons 0.70.0, wrapped exposure 0.71.0, dashboard learning 0.72.0)
 
 `agenttalk knowledge {publish,curate,pull,search,onboard}` is durable,
 pointer-shaped project memory hung off the domain registry. A **note**

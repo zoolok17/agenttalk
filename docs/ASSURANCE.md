@@ -95,6 +95,30 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.72.0 - learning dashboard and new-user manual (2026-07-09)
+**GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `d659d0d` · tag `v0.72.0`
+- **Review:** built on the main worktree with the wrapped team. UX/API/QA reviewers approved the
+  narrow read-only Learning dashboard slice. `codex-agenttalk-reviewer-2` found a release-blocking
+  anchor-evidence leak in `/api/learning`; the fix replaced generic recursive anchor rendering with
+  an explicit pointer allowlist, added `test_api_learning_anchor_evidence_is_pointer_allowlisted`,
+  and passed security re-review. The release also adds the concept-first new-user manual source/PDF
+  and a `.gitattributes` rule so PDF manuals are committed as binary artifacts.
+- **Verification:** feature gate covered targeted Learning/web security tests (`13 passed`),
+  lesson/exposure adjacency tests (`150 passed`), `python -m ruff check src/agenttalk/web.py
+  tests/test_web.py`, `python -m py_compile src/agenttalk/web.py`, `node --check
+  src/agenttalk/web_static/console.js`, and `git diff --check`. Release gate then ran full local
+  pytest with an external basetemp (`2071 passed, 3 skipped`), `python -m ruff check src tests`,
+  `node --check src/agenttalk/web_static/console.js`, `git diff --check`, isolated
+  `python -m build` (sdist + wheel), and a wheel install smoke asserting `agenttalk.__version__ ==
+  "0.72.0"` plus bundled `console.css`/`console.js`.
+- **CI:** pending at tag creation; release close requires watching GitHub Actions tests matrix,
+  security, and wheel/packaging after push and reporting actual results.
+- **Robust/Secure:** `/api/learning` is GET/HEAD-only, root-aware, defaults to accepted active
+  lessons, keeps proposed/stale/retired rows behind explicit filters, never returns raw bus bodies or
+  prompt blocks from exposure telemetry, and now allowlists lesson anchor evidence. Honest limit:
+  exposure still proves only accepted -> matched -> surfaced, not model cognition, compliance, or
+  outcome quality.
+
 ### v0.71.0 - automatic wrapped lesson exposure (2026-07-08)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `07aac50` · tag `v0.71.0`
 - **Review:** implemented on the main worktree and reviewed by the healthy wrapped team before the

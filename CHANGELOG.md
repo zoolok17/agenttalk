@@ -5,6 +5,36 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.72.0] - 2026-07-09
+
+### Added
+
+- **Dashboard Learning view.** The Team Console now has a read-only Learning panel that shows accepted
+  active lessons by default, including what was captured, who published/curated/owns it, evidence and
+  anchor pointers, exposure counts, recent "surfaced to prompt" events, and ledger health warnings.
+  The UI deliberately labels exposure as surfaced, not applied: it proves the operational chain
+  accepted -> matched -> prompt handoff, not model cognition or compliance.
+- **`GET /api/learning`.** Added a selected-root-aware, read-only JSON feed for the learning ledger.
+  It supports explicit `status`, `scope`, `tag`, and `limit` filters; defaults to accepted active
+  lessons; keeps proposed/stale/retired rows out of the default view; joins pointer-only exposure
+  telemetry by lesson fingerprint when available; and degrades corrupt knowledge/exposure lines into
+  bounded problem rows instead of 500s.
+- **New user manual source and PDF.** Added `docs/AGENTTALK-NEW-USER-MANUAL.md` and generated
+  `docs/AGENTTALK-NEW-USER-MANUAL.pdf`, and updated the README documentation map to point new
+  operators at the concept-first manual first.
+
+### Security
+
+- **Learning anchor metadata is allowlisted.** `/api/learning` no longer recursively returns arbitrary
+  `anchor_evidence` objects. It emits only known anchor pointer fields plus primitive ID/hash/ref-style
+  evidence keys, drops body/prompt/output/content-shaped keys, and has a regression covering
+  `body`, `prompt`, `prompt_block`, `output`, and nested secret-shaped evidence.
+
+### Changed
+
+- Added a `.gitattributes` rule so checked-in PDF manuals are stored as binary artifacts rather than
+  line-ending-converted text.
+
 ## [0.71.0] - 2026-07-08
 
 ### Added
