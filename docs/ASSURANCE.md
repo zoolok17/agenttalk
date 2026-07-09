@@ -95,6 +95,32 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.73.0 - project onboarding ledger and dashboard view (2026-07-09)
+**GOOD / ROBUST / SECURE** · reviewed-SHA `1f7afc7` · tag `v0.73.0`
+- **Review:** feature release for the first native project-onboarding surface. The release adds
+  `agenttalk onboarding create|list|show|state|record`, an append-only
+  `.agenttalk/onboarding/<run-id>/events.jsonl` ledger, the read-only `/api/onboarding` projection,
+  and a Team Console Onboarding view. The wrapped team reviewed the implementation before the release
+  bump: code review approved the ledger/API shape, QA approved the CLI/API/dashboard tests, and the
+  dashboard reviewer rejected then re-approved after `needs-human` claim blockers were surfaced in
+  the human-needed panel.
+- **Verification:** local release gate passed `python -m ruff check src tests`, `python -m bandit -q
+  -r src -x src/agenttalk/skills`, `node --check src\agenttalk\web_static\console.js`,
+  `git diff --check`, and `python -m compileall -q src tests`. Full pytest passed on Python 3.10
+  (`2099 passed, 3 skipped`) and Python 3.14 (`2099 passed, 3 skipped`) using external `D:\tmp`
+  basetemps so store-root discovery tests did not see the live repo store. Packaging passed isolated
+  `python -m build --outdir .tmp-dist-v0.73.0`, wheel install smoke (`agenttalk 0.73.0`), and a
+  package-content probe confirming onboarding source/tests and manuals are present while `.tmp`,
+  `.pytest-cache`, and `.agenttalk` state are absent from the sdist.
+- **CI:** pending at tag creation; release close requires watching GitHub Actions tests matrix,
+  security, and wheel/packaging after push and reporting actual results.
+- **Robust/Secure:** onboarding is evidence capture, not an analyzer or authority boundary. The
+  writer validates bounded run ids, keys, agent names, statuses, summaries, refs, and repo-relative
+  paths; the reader skips malformed lines while keeping valid records visible. `/api/onboarding` and
+  the dashboard are read-only, selected-root aware, pointer-first, and do not return raw bus bodies,
+  prompt blocks, copied source, or command output. Human-needed onboarding blockers are visible but
+  advisory until future native work/gate integration consumes them.
+
 ### v0.72.3 - liaison-session friction and waiter/stall visibility (2026-07-09)
 **GOOD / ROBUST / SECURE** · reviewed-SHA `3961470` · tag `v0.72.3`
 - **Review:** patch release for production liaison-session friction. Dead-letter notice twins are
