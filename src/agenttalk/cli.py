@@ -48,6 +48,7 @@ from agenttalk import gates as gate_mod
 from agenttalk import lanes as lane_mod
 from agenttalk import install_skills as iskl
 from agenttalk import lead_loop_runtime
+from agenttalk import onboarding as ob
 from agenttalk import signing as _signing
 from agenttalk import threads as th
 from agenttalk import supervisor as sup
@@ -3919,6 +3920,181 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
 
     sys.stderr.write(
         "agenttalk knowledge: expected publish, curate, pull, search, or onboard.\n")
+    return 2
+
+
+def _onboarding_print_run(run: dict, *, detail: bool = False) -> None:
+    counts = run.get("counts") or {}
+    state = run.get("state") or "unknown"
+    title = run.get("title") or run.get("id") or "onboarding"
+    print(f"{run.get('id')}: {title} [{state}]")
+    if run.get("objective"):
+        print(f"  objective: {run.get('objective')}")
+    if run.get("base_ref"):
+        print(f"  base: {run.get('base_ref')}")
+    if run.get("lead"):
+        print(f"  lead: {run.get('lead')}")
+    print(
+        "  "
+        f"segments {counts.get('accepted_segments', 0)}/{counts.get('segments', 0)} accepted; "
+        f"claims {counts.get('confirmed_claims', 0)}/{counts.get('claims', 0)} confirmed; "
+        f"open drift {counts.get('open_drift', 0)}; "
+        f"open unknowns {counts.get('open_unknowns', 0)}"
+        + (f"; blockers {counts.get('blocking_unknowns', 0)}"
+           if counts.get("blocking_unknowns") else "")
+    )
+    if not detail:
+        return
+    records = run.get("records") or {}
+    for kind in (ob.KIND_SEGMENT, ob.KIND_CLAIM, ob.KIND_DRIFT, ob.KIND_UNKNOWN):
+        rows = records.get(kind) or []
+        if not rows:
+            continue
+        print(f"  {kind}:")
+        for row in rows:
+            extras = []
+            if row.get("segment"):
+                extras.append(f"segment={row.get('segment')}")
+            if row.get("owner"):
+                extras.append(f"owner={row.get('owner')}")
+            if row.get("source"):
+                extras.append(f"source={row.get('source')}")
+            if row.get("confidence"):
+                extras.append(f"confidence={row.get('confidence')}")
+            if row.get("blocking"):
+                extras.append("blocking")
+            suffix = f" ({', '.join(extras)})" if extras else ""
+            print(f"    - {row.get('key')} [{row.get('status')}]{suffix}: {row.get('summary')}")
+
+
+def cmd_onboarding(args: argparse.Namespace) -> int:
+    """Native project-onboarding evidence ledger."""
+    store = _get_store(args)
+    action = getattr(args, "onboarding_cmd", None)
+    roster = store.load_config().get("agents") or []
+
+    if action == "create":
+        actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        run_id = getattr(args, "run_id", None) or ob.new_run_id()
+        try:
+            if ob.events_path(store, run_id).exists():
+                raise ob.OnboardingError(f"run {run_id!r} already exists")
+            evt = ob.new_create_event(
+                run_id=run_id,
+                title=args.title,
+                objective=getattr(args, "objective", None),
+                base_ref=getattr(args, "base_ref", None),
+                lead=actor,
+                state=getattr(args, "state", None) or "scanning",
+                at=_iso_now(),
+            )
+            ob.append_event(store, evt)
+        except ob.OnboardingError as e:
+            sys.stderr.write(f"agenttalk onboarding create: {e}\n")
+            return 2
+        run, _ = ob.get_run(store, evt["run_id"])
+        if args.json:
+            print(json.dumps(run or evt, indent=2))
+        else:
+            print(f"created onboarding run {evt['run_id']}")
+        return 0
+
+    if action == "list":
+        try:
+            payload = ob.list_runs(store, limit=getattr(args, "limit", None))
+        except ob.OnboardingError as e:
+            sys.stderr.write(f"agenttalk onboarding list: {e}\n")
+            return 2
+        if args.json:
+            print(json.dumps(payload, indent=2))
+            return 0
+        runs = payload.get("runs") or []
+        print(
+            f"onboarding runs: {len(runs)}"
+            + (f" shown of {payload.get('total', 0)}" if payload.get("truncated") else "")
+        )
+        for run in runs:
+            _onboarding_print_run(run)
+        if payload.get("problems"):
+            print(f"ledger problems: {len(payload['problems'])}")
+        return 0
+
+    if action == "show":
+        try:
+            run, problems = ob.get_run(store, args.run_id)
+        except ob.OnboardingError as e:
+            sys.stderr.write(f"agenttalk onboarding show: {e}\n")
+            return 2
+        if run is None:
+            sys.stderr.write(f"agenttalk onboarding show: no onboarding run {args.run_id!r}\n")
+            return 2
+        run["problems"] = problems
+        if args.json:
+            print(json.dumps(run, indent=2))
+        else:
+            _onboarding_print_run(run, detail=True)
+            if problems:
+                print(f"  ledger problems: {len(problems)}")
+        return 0
+
+    if action == "state":
+        actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        try:
+            run, _ = ob.get_run(store, args.run_id)
+            if run is None:
+                raise ob.OnboardingError(f"no onboarding run {args.run_id!r}")
+            evt = ob.new_state_event(
+                run_id=args.run_id,
+                state=args.state,
+                actor=actor,
+                summary=getattr(args, "summary", None),
+                at=_iso_now(),
+            )
+            ob.append_event(store, evt)
+        except ob.OnboardingError as e:
+            sys.stderr.write(f"agenttalk onboarding state: {e}\n")
+            return 2
+        if args.json:
+            run, _ = ob.get_run(store, args.run_id)
+            print(json.dumps(run, indent=2))
+        else:
+            print(f"onboarding {args.run_id}: state -> {args.state}")
+        return 0
+
+    if action == "record":
+        actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        try:
+            run, _ = ob.get_run(store, args.run_id)
+            if run is None:
+                raise ob.OnboardingError(f"no onboarding run {args.run_id!r}")
+            evt = ob.new_record_event(
+                run_id=args.run_id,
+                kind=args.kind,
+                key=args.key,
+                status=args.status,
+                summary=args.summary,
+                actor=actor,
+                segment=getattr(args, "segment", None),
+                owner=getattr(args, "owner", None),
+                checkers=getattr(args, "checker", None),
+                refs=getattr(args, "ref", None),
+                paths=getattr(args, "path", None),
+                source=getattr(args, "source", None),
+                confidence=getattr(args, "confidence", None),
+                blocking=bool(getattr(args, "blocking", False)),
+                at=_iso_now(),
+            )
+            ob.append_event(store, evt)
+        except ob.OnboardingError as e:
+            sys.stderr.write(f"agenttalk onboarding record: {e}\n")
+            return 2
+        if args.json:
+            print(json.dumps(evt, indent=2))
+        else:
+            print(f"recorded {args.kind} {args.key} [{args.status}] in {args.run_id}")
+        return 0
+
+    sys.stderr.write("agenttalk onboarding: expected create|list|show|state|record.\n")
     return 2
 
 
@@ -9660,6 +9836,67 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Max active lessons in the digest (default 5).")
     knonb.add_argument("--json", action="store_true")
     knonb.set_defaults(func=cmd_knowledge)
+
+    # ----- onboarding (project/codebase analysis ledger) -----
+    ponb = sub.add_parser(
+        "onboarding",
+        help="Track new-project or existing-codebase analysis: segments, claims, drift, and unknowns.",
+    )
+    ponb.set_defaults(func=cmd_onboarding, onboarding_cmd=None)
+    onbsub = ponb.add_subparsers(dest="onboarding_cmd")
+
+    onb_create = onbsub.add_parser("create", help="Start an onboarding run.")
+    onb_create.add_argument("--id", dest="run_id", help="Run id (default: generated ob-*).")
+    onb_create.add_argument("--from", dest="actor", help="Lead/agent creating the run.")
+    onb_create.add_argument("--title", required=True, help="Short run title.")
+    onb_create.add_argument("--objective", help="What this onboarding pass must answer.")
+    onb_create.add_argument("--base-ref", dest="base_ref", help="Repo ref/SHA this pass describes.")
+    onb_create.add_argument("--state", choices=sorted(ob.RUN_STATES), default="scanning")
+    onb_create.add_argument("--json", action="store_true")
+    onb_create.set_defaults(func=cmd_onboarding)
+
+    onb_list = onbsub.add_parser("list", help="List onboarding runs.")
+    onb_list.add_argument("--limit", type=int, default=20)
+    onb_list.add_argument("--json", action="store_true")
+    onb_list.set_defaults(func=cmd_onboarding)
+
+    onb_show = onbsub.add_parser("show", help="Show one onboarding run.")
+    onb_show.add_argument("--id", dest="run_id", required=True)
+    onb_show.add_argument("--json", action="store_true")
+    onb_show.set_defaults(func=cmd_onboarding)
+
+    onb_state = onbsub.add_parser("state", help="Update onboarding run lifecycle state.")
+    onb_state.add_argument("--id", dest="run_id", required=True)
+    onb_state.add_argument("--from", dest="actor", help="Agent recording the state.")
+    onb_state.add_argument("--state", required=True, choices=sorted(ob.RUN_STATES))
+    onb_state.add_argument("--summary", help="Short reason/evidence for the transition.")
+    onb_state.add_argument("--json", action="store_true")
+    onb_state.set_defaults(func=cmd_onboarding)
+
+    onb_record = onbsub.add_parser(
+        "record",
+        help="Record or replace a segment/claim/drift/unknown row in an onboarding run.",
+    )
+    onb_record.add_argument("--id", dest="run_id", required=True)
+    onb_record.add_argument("--from", dest="actor", help="Agent recording this row.")
+    onb_record.add_argument("--kind", required=True, choices=sorted(ob.ITEM_KINDS))
+    onb_record.add_argument("--key", required=True, help="Stable row key; latest event wins.")
+    onb_record.add_argument("--status", required=True,
+                            help="Status for the kind (validated by kind).")
+    onb_record.add_argument("--summary", required=True,
+                            help="Bounded finding summary; point to evidence with --ref/--path.")
+    onb_record.add_argument("--segment", help="Segment key this row belongs to.")
+    onb_record.add_argument("--owner", help="Agent owning the segment or finding.")
+    onb_record.add_argument("--checker", action="append", help="Agent who checked it (repeatable).")
+    onb_record.add_argument("--ref", action="append", help="Evidence pointer/id (repeatable).")
+    onb_record.add_argument("--path", action="append", help="Repo-relative evidence path (repeatable).")
+    onb_record.add_argument("--source", choices=sorted(ob.CLAIM_SOURCES),
+                            help="Where a claim/finding came from.")
+    onb_record.add_argument("--confidence", choices=sorted(ob.CONFIDENCE_LEVELS))
+    onb_record.add_argument("--blocking", action="store_true",
+                            help="Mark an open unknown as blocking further work.")
+    onb_record.add_argument("--json", action="store_true")
+    onb_record.set_defaults(func=cmd_onboarding)
 
     pbar = sub.add_parser(
         "barrier",

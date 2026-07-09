@@ -54,11 +54,12 @@ operator-facing lead or liaison
     +--> gates.json         scoped gate status
     +--> closes/            milestone/release close records
     +--> knowledge/         notes, lessons, lesson exposure telemetry
+    +--> onboarding/        codebase-analysis runs and evidence pointers
     +--> dead-letter/       poison-message quarantine
     +--> sessions/          transcripts
     |
     +--> CLI views: sync, threads, status, doctor
-    +--> dashboard views: Overview, Conversations, Attention, Lead chat, Learning, Sessions
+    +--> dashboard views: Overview, Conversations, Attention, Lead chat, Learning, Onboarding, Sessions
     +--> supervisor/wrapper: heartbeats, restart, session continuity
 ```
 
@@ -391,6 +392,7 @@ Main views:
 | Attention | Human-needed queue: escalations, holds, stuck agents, dead letters | Bounded escalation excerpt only when action replies are enabled |
 | Lead chat | Operator-to-lead direct channel and pending lead decisions | Yes for the direct transcript; pending decision cards may be summaries |
 | Learning | Accepted lessons, curation provenance, and wrapper exposure telemetry | Yes for curated lesson text; no raw bus bodies or prompt blocks |
+| Onboarding | Codebase-analysis runs, segments, claims, drift, and blocking unknowns | No raw bus bodies or prompt blocks; bounded summaries and refs only |
 | Sessions | Full transcript for a selected thread | Yes |
 | Agent detail | Health, supervisor, capacity, recent envelope activity | No |
 
@@ -401,6 +403,9 @@ The body-text split is deliberate:
   bounded question excerpt so the operator can see what the reply box answers.
 - `/api/learning` carries curated lesson text and pointer-only exposure
   telemetry. It labels exposure as surfaced, not applied.
+- `/api/onboarding` carries bounded onboarding summaries and evidence refs for
+  the selected root. It is evidence tracking, not proof of complete project
+  understanding.
 - `/api/thread/<request-id>` carries raw thread bodies for the Sessions view.
 - `/api/lead-chat` carries the bounded operator/lead transcript plus pending
   lead-decision summaries.
@@ -542,6 +547,24 @@ assigned/active -> checked -> delivered -> cleared from active lanes
 ```
 
 Lane verdicts are advisory HOLD/GO evidence, not file locks.
+
+## 12a. Onboarding an existing codebase
+
+Before a team edits a large existing project, record the analysis pass:
+
+```powershell
+agenttalk onboarding create --id ob-api --from codex-lead --title "API onboarding" --base-ref main
+agenttalk onboarding record --id ob-api --from codex-dev --kind segment --key cli --status accepted --summary "CLI parser and README command reference mapped." --path src/agenttalk/cli.py --path README.md
+agenttalk onboarding record --id ob-api --from codex-review --kind drift --key docs.cli.reference --status open --segment cli --source docs --confidence medium --summary "README command table may lag parser help."
+agenttalk onboarding record --id ob-api --from codex-test --kind unknown --key release.owner --status open --blocking --summary "Need operator confirmation of the release owner."
+agenttalk onboarding show --id ob-api
+```
+
+Use the dashboard **Onboarding** view to see the same selected-root ledger:
+segments inspected, confirmed/conflicted claims, open drift, blocking unknowns,
+and corrupt-ledger warnings. Treat the ledger as recorded evidence. It does not
+prove the codebase is fully understood and it does not replace review, tests,
+or gates.
 
 ## 13. Gates, close records, and assurance
 
@@ -728,6 +751,7 @@ and the generated plan as the operational source.
 | Operator routing | `escalate`, `relay`, `attention` |
 | Safety | `check`, `barrier`, `gate`, `close` |
 | Work scope | `domain`, `lane assign`, `lane workspace`, `lane check`, `lane deliver`, `lane approve-shared` |
+| Onboarding | `onboarding create`, `onboarding record`, `onboarding show`, `onboarding state`, `onboarding list` |
 | Memory | `knowledge publish`, `knowledge curate`, `knowledge pull`, `knowledge search`, `knowledge onboard` |
 | Runtime | `dashboard`, `serve`, `start`, `wrap`, `supervise`, `heartbeat`, `request-restart`, `request-launch`, `managed-lead-loop`, `deadman` |
 | Recovery | `dead-letter list/show/requeue/resolve`, `prune`, `compact`, `reset` |

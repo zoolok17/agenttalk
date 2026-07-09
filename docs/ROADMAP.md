@@ -50,8 +50,8 @@ The healthy shape is still a thin substrate plus pluggable products with hard bo
 | **C. Method Engine Adapter** | spec-kitty and future planners can create/link work items; method owns decomposition, agenttalk owns execution evidence | Integration exists; source-of-truth boundary must shift |
 | **D. Craft Skill Pack** | coding/review/test/QA/security/release skills that encode standards and evidence expectations | Useful; needs templates aligned to native work |
 | **E. Assurance & Release Governance** | gates, closes, specialist sign-off, release ledger, scan evidence | Strong primitives; needs work-item consumption |
-| **F. Knowledge & Codebase Memory** | domains, durable pointer-notes, lessons, onboarding digests, anchor-relative staleness | Primitives exist; codebase-comprehension product not built |
-| **G. Operator Control Plane** | local console, read views, action-gated intent queue, lead-chat, attention/capacity/liveness | Useful local console; needs Work view |
+| **F. Knowledge & Codebase Memory** | domains, durable pointer-notes, lessons, onboarding digests, onboarding evidence ledgers, anchor-relative staleness | Primitives exist; codebase-comprehension product just started |
+| **G. Operator Control Plane** | local console, read views, action-gated intent queue, lead-chat, attention/capacity/liveness, onboarding progress | Useful local console; needs Work view |
 | **H. Execution Runtime** | supervisor, wrapper, session continuity, dead-letter, managed lead-loop, isolated lane worktrees | Powerful but high-maintenance; runtime ergonomics remain active |
 | **I. Delivery Workflows** | greenfield product build, existing-project change, legacy adoption, release preparation | Mostly dogfooded practice, not yet productized |
 
@@ -140,6 +140,20 @@ Third-party tools are declared checks. agenttalk's job is to run or ingest them 
 
 ## 5. Workflows On Top
 
+### Project onboarding and codebase comprehension
+
+Before greenfield bootstrap or existing-project changes, the lead should open
+an onboarding run. The run records which code/docs segments the team inspected,
+what claims were proposed or confirmed, where docs/code/runtime drift exists,
+and which unknowns still block safe work. This is evidence tracking, not a
+claim that agenttalk understands the whole project.
+
+For large existing projects, fan out by segment so each agent has enough
+context, then require cross-check records before the lead turns the result into
+domains, work items, knowledge notes, or characterization-test targets. When
+code and documentation disagree, record drift rather than silently treating one
+side as truth.
+
 ### Greenfield product build
 
 1. Requirements intake: goals, users, non-goals, constraints, risk tolerance.
@@ -150,11 +164,12 @@ Third-party tools are declared checks. agenttalk's job is to run or ingest them 
 
 ### Existing-project change
 
-1. Detect stack, tests, docs, CI, domains, risky seams.
-2. Map ownership and path scope before editing.
-3. Add characterization tests before risky behavior changes.
-4. Deliver small bounded work items through review/gate/close.
-5. Preserve discoveries in knowledge notes and lessons.
+1. Open an onboarding run and map stack, tests, docs, CI, domains, risky seams.
+2. Record segments, claims, drift, and blocking unknowns before editing.
+3. Map ownership and path scope from the reviewed onboarding evidence.
+4. Add characterization tests before risky behavior changes.
+5. Deliver small bounded work items through review/gate/close.
+6. Preserve durable discoveries in knowledge notes and lessons.
 
 ### Legacy adoption
 
@@ -172,27 +187,28 @@ Legacy adoption remains a flagship workflow, but it is no longer the whole roadm
 ### Quarter 1 - prove the delivery spine
 
 1. **Wrapped-agent runtime ergonomics.** First-class per-agent model / reasoning-effort config, restart-safe session fingerprinting when runtime config changes, and the planned no-visible-CLI/headless supervised mode with full dashboard status.
-2. **Native Work RFC.** Specify work item schema, event model, artifact schema, lifecycle, source-of-truth boundaries with lanes/gates/close, evidence tiers, reset semantics, and safety invariants.
-3. **Work item MVP.** `work create|list|show|status|assign|start|deliver|abandon`, with one record per item and links to existing lanes, domains, request threads, gates, closes, and artifacts.
-4. **Evidence registry MVP.** Write-once artifacts, hash validation, bounded logs, redaction status, exact input binding, trust tiers, and stale-at-head detection.
-5. **Pure work check.** `work check` computes `GO`, `HOLD`, or `UNKNOWN` with stable HOLD codes over work state, lane/worktree state, artifact freshness, review state, and gate/close inputs.
-6. **Assurance Slice B integration.** Make `assurance.py` artifacts consumable by work checks, gates, and closes without turning assurance into authority.
+2. **Project onboarding MVP.** Native onboarding runs for segments, claims, drift, and blocking unknowns, plus a read-only dashboard projection. This is the first step for existing-codebase adoption and the input to later work routing.
+3. **Native Work RFC.** Specify work item schema, event model, artifact schema, lifecycle, source-of-truth boundaries with lanes/gates/close, evidence tiers, reset semantics, and safety invariants.
+4. **Work item MVP.** `work create|list|show|status|assign|start|deliver|abandon`, with one record per item and links to existing lanes, domains, request threads, gates, closes, onboarding runs, and artifacts.
+5. **Evidence registry MVP.** Write-once artifacts, hash validation, bounded logs, redaction status, exact input binding, trust tiers, and stale-at-head detection.
+6. **Pure work check.** `work check` computes `GO`, `HOLD`, or `UNKNOWN` with stable HOLD codes over work state, lane/worktree state, artifact freshness, review state, and gate/close inputs.
+7. **Assurance Slice B integration.** Make `assurance.py` artifacts consumable by work checks, gates, and closes without turning assurance into authority.
 
 ### Quarter 2 - make it useful for real projects
 
-7. **Project code-policy v1.** Optional `.agenttalk/code-policy.json` declaring required evidence by risk/domain/path, accepted tiers, review lenses, and named checks. No arbitrary shell runner by default.
-8. **Generic quality runner / ingestion.** Start with structured argv, no shell by default, explicit cwd/env/network policy, timeouts, output caps, redaction, and fake-adapter failure tests. Add convenience adapters only after the generic contract is proven.
-9. **Native review binding.** `review request --work` and review-result consumption tied to reviewed ref, artifact ids, tests executed, findings, residual risk, and release-blocker flags.
-10. **Dashboard Work view.** Show work item, owner, worktree, head SHA, dirty/stale state, evidence tiers, review obligations, HOLD reasons, and next owner/action. Keep `/api/state` body-free and log-free.
-11. **First-run delivery setup.** One command/dashboard path to check install, skills, roster, operator-facing lead, supervisor, dashboard, code policy, CI visibility, and tool availability.
+8. **Project code-policy v1.** Optional `.agenttalk/code-policy.json` declaring required evidence by risk/domain/path, accepted tiers, review lenses, and named checks. No arbitrary shell runner by default.
+9. **Generic quality runner / ingestion.** Start with structured argv, no shell by default, explicit cwd/env/network policy, timeouts, output caps, redaction, and fake-adapter failure tests. Add convenience adapters only after the generic contract is proven.
+10. **Native review binding.** `review request --work` and review-result consumption tied to reviewed ref, artifact ids, tests executed, findings, residual risk, and release-blocker flags.
+11. **Dashboard Work view.** Show work item, owner, worktree, head SHA, dirty/stale state, evidence tiers, review obligations, HOLD reasons, and next owner/action. Keep `/api/state` body-free and log-free.
+12. **First-run delivery setup.** One command/dashboard path to check install, skills, roster, operator-facing lead, supervisor, dashboard, code policy, CI visibility, and tool availability.
 
 ### Quarter 3 - productize greenfield and existing-project workflows
 
-12. **Greenfield workflow alpha.** Requirements intake -> spec -> stack/bootstrap -> work slices -> evidence/review/gate -> release close.
-13. **Existing-project workflow alpha.** Repo detection, domain proposal, test/CI inventory, characterization targets, safe first change.
-14. **Legacy adoption alpha.** Repo-map MVP, fan-out comprehension artifacts, knowledge curation, dashboard legacy-map view, unmapped/stale/risky coverage.
-15. **CI adapters.** GitHub Actions first: ingest run ids, workflow refs, commit SHA, conclusion, logs/artifacts as evidence. Other providers later.
-16. **Repeatable beta packaging.** Golden-path walkthroughs for one greenfield app and one existing-project change, with sample policies and artifact schemas.
+13. **Greenfield workflow alpha.** Requirements intake -> spec -> onboarding/bootstrap -> work slices -> evidence/review/gate -> release close.
+14. **Existing-project workflow alpha.** Onboarding run, repo detection, domain proposal, test/CI inventory, characterization targets, safe first change.
+15. **Legacy adoption alpha.** Repo-map MVP, fan-out comprehension artifacts, knowledge curation, dashboard legacy-map view, unmapped/stale/risky coverage.
+16. **CI adapters.** GitHub Actions first: ingest run ids, workflow refs, commit SHA, conclusion, logs/artifacts as evidence. Other providers later.
+17. **Repeatable beta packaging.** Golden-path walkthroughs for one greenfield app and one existing-project change, with sample policies and artifact schemas.
 
 ### Later - explicitly not scheduled
 

@@ -26,7 +26,9 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import avatars, intents, knowledge as kn, lesson_context as lc, signing, web
+from agenttalk import avatars, intents, knowledge as kn, lesson_context as lc
+from agenttalk import onboarding as ob
+from agenttalk import signing, web
 from agenttalk.store import Store
 
 
@@ -1418,7 +1420,8 @@ def test_csp_split_per_route(tmp_path: Path) -> None:
     srv, _t, base = _serve(s)
     try:
         for path in (f"/messages/{mid}", "/api/status", "/api/state",
-                     "/api/attention", "/api/learning", "/api/thread/rid-c"):
+                     "/api/attention", "/api/learning", "/api/onboarding",
+                     "/api/thread/rid-c"):
             with _get(f"{base}{path}") as resp:
                 assert resp.headers["Content-Security-Policy"] == _LEGACY_CSP, path
         for path in ("/", "/dashboard"):
@@ -1441,7 +1444,7 @@ def test_new_routes_reject_write_methods(tmp_path: Path) -> None:
     srv, _t, base = _serve(s)
     try:
         for path in ("/api/state", "/api/threads", "/dashboard", "/api/attention",
-                     "/api/learning", "/api/thread/rid-w", "/static/console.js",
+                     "/api/learning", "/api/onboarding", "/api/thread/rid-w", "/static/console.js",
                      "/static/console.css", "/static/avatars/claude-dev.png"):
             req = urllib.request.Request(  # noqa: S310  # nosemgrep
                 f"{base}{path}", method="POST", data=b"x")
@@ -1952,7 +1955,7 @@ def test_no_mutation_full_tree_hash(tmp_path: Path) -> None:
             _state(base)
         for path in ("/dashboard", "/static/console.js", "/static/console.css",
                      "/", f"/messages/{mid}", "/api/attention", "/api/learning",
-                     "/api/thread/r1"):
+                     "/api/onboarding", "/api/thread/r1"):
             with _get(f"{base}{path}") as resp:
                 resp.read()
         for bad in (f"{base}/messages/zzz-does-not-exist", f"{base}/nope",
@@ -2283,6 +2286,7 @@ def test_console_all_dashboard_views_render_smoke_non_empty_main(tmp_path: Path)
         "      attentionData = payloads.attentionData;\n"
         "      leadChatData = payloads.leadChatData;\n"
         "      learningData = payloads.learningData;\n"
+        "      onboardingData = payloads.onboardingData;\n"
         "      intentsData = payloads.intentsData;\n"
         "      threadCache = payloads.threadCache;\n"
         "      actionSession.enabled = true;\n"
@@ -2654,6 +2658,90 @@ const payloads = {
     problems: { knowledge: [], exposures: [] },
     note: 'Exposure means surfaced to an agent turn, not proven application.',
   },
+  onboardingData: {
+    root: 'demo-root',
+    counts: {
+      total: 1,
+      showing: 1,
+      active: 1,
+      blocked: 1,
+      segments: 1,
+      accepted_segments: 1,
+      claims: 1,
+      confirmed_claims: 1,
+      conflicted_claims: 0,
+      needs_human_claims: 0,
+      open_drift: 1,
+      open_unknowns: 1,
+      blocking_unknowns: 1,
+      blocking_records: 1,
+      human_needed: 1,
+      invalid_lines: 0,
+      truncated: 0,
+    },
+    runs: [{
+      id: 'ob-api',
+      title: 'API onboarding',
+      objective: 'Map the API before implementation starts.',
+      base_ref: 'main',
+      lead: 'claude-lead',
+      state: 'scanning',
+      active: true,
+      blocked: true,
+      updated_at: iso,
+      counts: {
+        segments: 1,
+        accepted_segments: 1,
+        claims: 1,
+        confirmed_claims: 1,
+        needs_human_claims: 0,
+        open_drift: 1,
+        open_unknowns: 1,
+        blocking_unknowns: 1,
+        blocking_records: 1,
+        human_needed: 1,
+      },
+      records: {
+        segment: [{
+          kind: 'segment',
+          key: 'cli',
+          status: 'accepted',
+          summary: 'CLI parser and README command reference mapped.',
+          actor: 'codex-test',
+          owner: 'codex-test',
+          paths: ['src/agenttalk/cli.py', 'README.md'],
+        }],
+        claim: [{
+          kind: 'claim',
+          key: 'cli.parser.source',
+          status: 'confirmed',
+          summary: 'Parser is the command surface authority.',
+          actor: 'codex-test',
+          source: 'code',
+          confidence: 'high',
+        }],
+        drift: [{
+          kind: 'drift',
+          key: 'docs.cli.reference',
+          status: 'open',
+          summary: 'README command table may lag parser help.',
+          segment: 'cli',
+          source: 'docs',
+          confidence: 'medium',
+        }],
+        unknown: [{
+          kind: 'unknown',
+          key: 'release.owner',
+          status: 'open',
+          summary: 'Need operator confirmation of the release owner.',
+          blocking: true,
+        }],
+      },
+      problems: [],
+    }],
+    problems: [],
+    note: 'Onboarding records pointer evidence.',
+  },
   intentsData: {
     target_root_label: 'demo-root',
     items: [{ intent_id: 'intent-1', kind: 'send', state: 'queued', code: 'queued' }],
@@ -2691,6 +2779,16 @@ const cases = [
       'Accepted lessons',
       'Always review the final candidate',
       'surfaced, not proven applied',
+    ],
+  },
+  {
+    view: 'onboarding',
+    expected: [
+      'Onboarding',
+      'Analysis runs',
+      'API onboarding',
+      'README command table may lag parser help',
+      'Human-needed blockers',
     ],
   },
   { view: 'sessions', sessionRid: 'rid-qa', expected: ['Sessions', 'All views QA task', 'smoke every view'] },
@@ -3526,6 +3624,171 @@ def test_api_learning_degrades_on_corrupt_ledger_lines(tmp_path: Path) -> None:
     assert payload["counts"]["exposures"] == 1
     assert payload["problems"]["knowledge"]
     assert payload["problems"]["exposures"]
+
+
+# ---------------------------------------------------------- /api/onboarding
+
+def _write_onboarding_run(store: Store, *, run_id: str = "ob-existing") -> None:
+    with store._config_lock():
+        ob.write_event_locked(store, ob.new_create_event(
+            run_id=run_id,
+            title="Existing codebase analysis",
+            objective="Map code/docs drift before implementation starts.",
+            base_ref="main",
+            lead="alpha",
+            state="scanning",
+            at="2026-07-09T11:00:00Z",
+        ))
+        ob.write_event_locked(store, ob.new_record_event(
+            run_id=run_id,
+            kind=ob.KIND_SEGMENT,
+            key="cli",
+            status="accepted",
+            summary="CLI command surface mapped from parser and README.",
+            actor="alpha",
+            owner="alpha",
+            checkers=["beta"],
+            refs=["analysis:cli"],
+            paths=["src/agenttalk/cli.py", "README.md"],
+            at="2026-07-09T11:01:00Z",
+        ))
+        ob.write_event_locked(store, ob.new_record_event(
+            run_id=run_id,
+            kind=ob.KIND_DRIFT,
+            key="docs.cli.reference",
+            status="open",
+            summary="README command reference may lag parser help.",
+            actor="beta",
+            segment="cli",
+            source="docs",
+            confidence="medium",
+            at="2026-07-09T11:02:00Z",
+        ))
+        ob.write_event_locked(store, ob.new_record_event(
+            run_id=run_id,
+            kind=ob.KIND_UNKNOWN,
+            key="release.owner",
+            status="open",
+            summary="Need operator confirmation for release owner.",
+            actor="beta",
+            blocking=True,
+            at="2026-07-09T11:03:00Z",
+        ))
+
+
+def test_api_onboarding_surfaces_runs_without_message_body(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    s.send(sender="alpha", recipient="beta", body="SECRET BUS BODY MUST NOT LEAK")
+    _write_onboarding_run(s)
+
+    payload = web.build_onboarding(web.RootDescriptor(s, "root"))
+
+    assert payload["counts"]["total"] == 1
+    assert payload["counts"]["active"] == 1
+    assert payload["counts"]["accepted_segments"] == 1
+    assert payload["counts"]["open_drift"] == 1
+    assert payload["counts"]["blocking_unknowns"] == 1
+    run = payload["runs"][0]
+    assert run["id"] == "ob-existing"
+    assert run["records"]["segment"][0]["paths"] == [
+        "src/agenttalk/cli.py", "README.md"
+    ]
+    assert "SECRET BUS BODY" not in json.dumps(payload)
+
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/api/onboarding") as resp:
+            wire = json.loads(resp.read().decode("utf-8"))
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert wire["runs"][0]["id"] == "ob-existing"
+
+
+def test_api_onboarding_empty_state_shape(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+
+    payload = web.build_onboarding(web.RootDescriptor(s, "root"))
+
+    assert payload["schema_version"] == 1
+    assert payload["counts"]["total"] == 0
+    assert payload["counts"]["showing"] == 0
+    assert payload["runs"] == []
+    assert payload["problems"] == []
+
+
+def test_api_onboarding_needs_human_claim_blocks_run(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    with s._config_lock():
+        ob.write_event_locked(s, ob.new_create_event(
+            run_id="ob-human",
+            title="Human-needed claim",
+            objective=None,
+            base_ref=None,
+            lead="alpha",
+            state="scanning",
+            at="2026-07-09T12:00:00Z",
+        ))
+        ob.write_event_locked(s, ob.new_record_event(
+            run_id="ob-human",
+            kind=ob.KIND_CLAIM,
+            key="release.owner",
+            status="needs-human",
+            summary="Need operator to confirm release owner.",
+            actor="beta",
+            source="human",
+            confidence="medium",
+            at="2026-07-09T12:01:00Z",
+        ))
+
+    payload = web.build_onboarding(web.RootDescriptor(s, "root"))
+
+    assert payload["counts"]["blocked"] == 1
+    assert payload["counts"]["needs_human_claims"] == 1
+    assert payload["counts"]["human_needed"] == 1
+    run = payload["runs"][0]
+    assert run["blocked"] is True
+    assert run["counts"]["needs_human_claims"] == 1
+    assert run["records"]["claim"][0]["status"] == "needs-human"
+    assert run["records"]["unknown"] == []
+
+
+def test_api_onboarding_route_rejects_bad_filters(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    srv, _t, base = _serve(s)
+    try:
+        for suffix, code in (
+            ("?limit=nope", "bad_limit"),
+            ("?limit=0", "bad_limit"),
+            ("?root=no-such-root", "bad_root"),
+        ):
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                _get(f"{base}/api/onboarding{suffix}")
+            assert exc.value.code == 400
+            payload = json.loads(exc.value.read().decode("utf-8"))
+            assert payload["error"] == code
+            assert payload["runs"] == []
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_onboarding_degrades_on_corrupt_ledger_lines(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    _write_onboarding_run(s)
+    path = ob.events_path(s, "ob-existing")
+    path.write_text(path.read_text(encoding="utf-8") + "{bad\n", encoding="utf-8")
+
+    payload = web.build_onboarding(web.RootDescriptor(s, "root"))
+
+    assert payload["counts"]["total"] == 1
+    assert payload["counts"]["invalid_lines"] == 1
+    assert payload["runs"][0]["problems"]
 
 
 # ---------------------------------------------------------- /api/attention

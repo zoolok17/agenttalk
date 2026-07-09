@@ -389,6 +389,13 @@ the model read, remembered, or applied it. Proposed, stale, retired, or
 superseded lessons stay out of the default view and should be inspected through
 explicit CLI/API filters when you are doing curation or diagnosis.
 
+The **Onboarding** view tracks codebase-analysis runs before implementation:
+segments inspected, claims recorded, open documentation/code drift, blocking
+unknowns, and ledger-health warnings. It is read-only and pointer-first. It
+shows bounded summaries, paths, refs, and counts from `GET /api/onboarding`;
+it does not show raw bus message bodies, prompt blocks, copied source, or full
+command output.
+
 ## 8. Supervisor and unattended operation
 
 The supervisor is optional. Use it when agents need to survive unattended
@@ -557,6 +564,38 @@ Common HOLD causes include stale epoch, stale domain registry, out-of-bounds
 paths, unowned paths, active lane overlap, shared path missing approval, merge
 conflict, degraded merge check, or gate hold.
 
+### Onboarding before implementation
+
+For a new project or a large existing project, start by recording what the team
+learned before assigning implementation. This is a ledger, not an analyzer: it
+captures evidence, drift, and open questions so the lead can see whether the
+team is ready to create work.
+
+Create a run:
+
+```powershell
+agenttalk onboarding create --id ob-api --from claude-lead --title "API onboarding" --base-ref main
+```
+
+Record evidence as the team reads code and docs:
+
+```powershell
+agenttalk onboarding record --id ob-api --from codex-dev --kind segment --key cli --status accepted --summary "CLI parser and README command reference mapped." --path src/agenttalk/cli.py --path README.md
+agenttalk onboarding record --id ob-api --from codex-review --kind drift --key docs.cli.reference --status open --segment cli --source docs --confidence medium --summary "README command table may lag parser help."
+agenttalk onboarding record --id ob-api --from codex-test --kind unknown --key release.owner --status open --blocking --summary "Need operator confirmation of the release owner."
+```
+
+Inspect or update the run:
+
+```powershell
+agenttalk onboarding show --id ob-api
+agenttalk onboarding state --id ob-api --from claude-lead --state ready-for-work --summary "Required segments accepted; no blocking unknowns remain."
+```
+
+Use **Onboarding** in the dashboard for the same selected-root view. Treat its
+claims as untrusted project evidence until the lead, reviewers, tests, and
+gates turn them into work items, knowledge notes, or release evidence.
+
 ## 10. Assurance, gates, reviews, and release use
 
 Assurance is an opt-in HOLD/GO layer. It records evidence and makes unsafe
@@ -723,6 +762,7 @@ This is a compact operator map, not a full argparse dump. Use
 | Operator routing | `escalate`, `attention`, `relay` | Route human decisions, inspect the attention queue, and carry operator answers or commands through the bus. |
 | Safety checks | `check`, `barrier`, `gate`, `close` | Check request currentness, mark epochs, manage gates, and aggregate HOLD/GO release evidence. |
 | Lanes | `domain`, `lane assign`, `lane workspace`, `lane check`, `lane deliver`, `lane approve-shared` | Bound work to domain paths and deliver from isolated worktrees. |
+| Onboarding | `onboarding create`, `onboarding record`, `onboarding show`, `onboarding state`, `onboarding list` | Track codebase-analysis segments, claims, drift, and blocking unknowns before implementation. |
 | Knowledge | `knowledge publish`, `knowledge curate`, `knowledge pull`, `knowledge search`, `knowledge onboard` | Capture, verify, retrieve, and search durable project notes and lessons. |
 | Supervision | `supervise`, `wrap`, `heartbeat`, `request-restart`, `request-launch`, `managed-lead-loop`, `deadman` | Run unattended agents, maintain liveness, request restarts, and monitor stale work. |
 | Recovery | `dead-letter list`, `dead-letter show`, `dead-letter requeue`, `dead-letter resolve`, `dead-letter purge --resolved`, `prune`, `compact`, `reset` | Inspect poison messages, archive resolved poison evidence, quarantine invalid files, archive old messages, or clear active state. |

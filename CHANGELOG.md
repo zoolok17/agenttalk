@@ -5,6 +5,20 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Project onboarding ledger.** Added `agenttalk onboarding create|list|show|state|record`
+  as a native, append-only evidence surface for new-project and existing-codebase analysis.
+  Runs capture bounded segment, claim, doc/code drift, and unknown records under
+  `.agenttalk/onboarding/<run-id>/events.jsonl`; corrupt lines are surfaced as problems
+  without hiding valid records.
+- **Dashboard Onboarding view and `/api/onboarding`.** The Team Console now exposes selected-root
+  onboarding runs, checklist counts, open drift, blocking unknowns, and ledger-health warnings.
+  The projection is read-only, pointer-first, bounded, and does not include raw bus message bodies
+  or prompt/output text.
+
 ## [0.72.3] - 2026-07-09
 
 ### Fixed

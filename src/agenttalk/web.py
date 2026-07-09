@@ -56,6 +56,7 @@ Routes
 - ``GET  /api/state``           — multi-root obligation aggregate, schema v1 (0.17.0)
 - ``GET  /api/attention``       — ranked "needs a human" queue for root[0] (0.58.0)
 - ``GET  /api/learning``        — lesson ledger + pointer-only exposure telemetry
+- ``GET  /api/onboarding``      — project/codebase onboarding runs + evidence pointers
 - ``GET  /api/thread/<rid>``    — one thread's full transcript, CARRIES bodies (0.58.0)
 - ``GET  /api/threads``         — paged closed-thread stubs, envelope-only (0.61.0)
 - ``GET  /api/session``         — dashboard session metadata (token only when
@@ -82,6 +83,7 @@ message-derived HTML server-side and its client builds DOM via
 CSP drops ``'unsafe-inline'`` entirely (``script-src 'self'; style-src
 'self'``). Routes that render hostile message bodies (``/messages/<id>``) and
 every JSON feed (``/api/state``, ``/api/attention``, ``/api/learning``,
+``/api/onboarding``,
 ``/api/thread/<rid>``) keep the stricter no-script policy byte-identical.
 """
 
@@ -113,6 +115,7 @@ from agenttalk import capacity as _capacity
 from agenttalk import domains as _domains
 from agenttalk import knowledge as _knowledge
 from agenttalk import lesson_context as _lesson_context
+from agenttalk import onboarding as _onboarding
 from agenttalk import signing as _signing
 from agenttalk import threads as th
 from agenttalk.store import COMPOSING_INTENT_STALE_SECONDS, Message, Store
@@ -215,6 +218,9 @@ _LEAD_CHAT_LIMIT = 100
 _LEARNING_DEFAULT_LIMIT = 100
 _LEARNING_MAX_LIMIT = 200
 _LEARNING_RECENT_EXPOSURE_LIMIT = 25
+_ONBOARDING_DEFAULT_LIMIT = 50
+_ONBOARDING_MAX_LIMIT = 100
+_ONBOARDING_RECORD_LIMIT = 50
 _LEARNING_STATUSES = frozenset({
     "active", "proposed", "review_due", "stale", "retired", "all",
 })
@@ -2010,6 +2016,166 @@ def build_learning(desc: RootDescriptor, *, status: str = "active",
         return payload
 
 
+# --------------------------------------------------- /api/onboarding
+
+def _onboarding_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _onboarding_short(value: Any, *, limit: int = 180) -> str:
+    s = "" if value is None else str(value)
+    s = s.replace("\r", " ").replace("\n", " ").strip()
+    if len(s) > limit:
+        s = s[: limit - 3].rstrip() + "..."
+    return s
+
+
+def _onboarding_record(row: dict) -> dict:
+    return {
+        "kind": _onboarding_short(row.get("kind"), limit=32),
+        "key": _onboarding_short(row.get("key"), limit=128),
+        "status": _onboarding_short(row.get("status"), limit=64),
+        "summary": _onboarding_short(row.get("summary"), limit=600),
+        "segment": _onboarding_short(row.get("segment"), limit=128),
+        "actor": _onboarding_short(row.get("actor"), limit=96),
+        "owner": _onboarding_short(row.get("owner"), limit=96),
+        "checkers": [
+            _onboarding_short(v, limit=96)
+            for v in (row.get("checkers") or [])[:16]
+            if isinstance(v, str)
+        ],
+        "refs": [
+            _onboarding_short(v, limit=200)
+            for v in (row.get("refs") or [])[:16]
+            if isinstance(v, str)
+        ],
+        "paths": [
+            _onboarding_short(v, limit=200)
+            for v in (row.get("paths") or [])[:32]
+            if isinstance(v, str)
+        ],
+        "source": _onboarding_short(row.get("source"), limit=32),
+        "confidence": _onboarding_short(row.get("confidence"), limit=32),
+        "blocking": bool(row.get("blocking")),
+        "updated_at": _onboarding_short(row.get("updated_at"), limit=64),
+    }
+
+
+def _onboarding_records(records: dict) -> tuple[dict, dict]:
+    out: dict[str, list[dict]] = {}
+    trunc: dict[str, int] = {}
+    for kind in sorted(_onboarding.ITEM_KINDS):
+        rows = list(records.get(kind) or [])
+        out[kind] = [_onboarding_record(r) for r in rows[:_ONBOARDING_RECORD_LIMIT]]
+        trunc[kind] = max(0, len(rows) - _ONBOARDING_RECORD_LIMIT)
+    return out, trunc
+
+
+def _onboarding_run_item(run: dict) -> dict:
+    records, truncated = _onboarding_records(run.get("records") or {})
+    return {
+        "id": _onboarding_short(run.get("id"), limit=96),
+        "run_id": _onboarding_short(run.get("run_id") or run.get("id"), limit=96),
+        "title": _onboarding_short(run.get("title"), limit=240),
+        "objective": _onboarding_short(run.get("objective"), limit=800),
+        "base_ref": _onboarding_short(run.get("base_ref"), limit=200),
+        "lead": _onboarding_short(run.get("lead"), limit=96),
+        "state": _onboarding_short(run.get("state"), limit=64),
+        "state_summary": _onboarding_short(run.get("state_summary"), limit=600),
+        "created_at": _onboarding_short(run.get("created_at"), limit=64),
+        "updated_at": _onboarding_short(run.get("updated_at"), limit=64),
+        "active": bool(run.get("active")),
+        "blocked": bool(run.get("blocked")),
+        "counts": dict(run.get("counts") or {}),
+        "records": records,
+        "record_truncated": truncated,
+        "problems": [
+            {
+                "line": p.get("line"),
+                "error": _onboarding_short(p.get("error"), limit=240),
+            }
+            for p in (run.get("problems") or [])[:20]
+            if isinstance(p, dict)
+        ],
+    }
+
+
+def build_onboarding(desc: RootDescriptor, *,
+                     limit: int = _ONBOARDING_DEFAULT_LIMIT) -> dict:
+    """Dashboard onboarding ledger: project-analysis runs and evidence pointers."""
+    limit = max(1, min(_ONBOARDING_MAX_LIMIT, int(limit)))
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "generated_at": _onboarding_now(),
+        "root": desc.label,
+        "root_path": str(desc.store.root),
+        "root_info": {"label": desc.label, "path": str(desc.store.root)},
+        "filters": {"limit": limit},
+        "runs": [],
+        "counts": {
+            "total": 0,
+            "showing": 0,
+            "active": 0,
+            "blocked": 0,
+            "segments": 0,
+            "accepted_segments": 0,
+            "claims": 0,
+            "confirmed_claims": 0,
+            "conflicted_claims": 0,
+            "needs_human_claims": 0,
+            "open_drift": 0,
+            "open_unknowns": 0,
+            "blocking_unknowns": 0,
+            "blocking_records": 0,
+            "human_needed": 0,
+            "invalid_lines": 0,
+            "truncated": 0,
+        },
+        "problems": [],
+        "note": "Onboarding records pointer evidence for codebase understanding; it is not an enforcement boundary.",
+    }
+    try:
+        listed = _onboarding.list_runs(desc.store, limit=limit)
+        runs = [_onboarding_run_item(r) for r in listed.get("runs") or []]
+        counts = payload["counts"]
+        counts["total"] = int(listed.get("total") or len(runs))
+        counts["showing"] = len(runs)
+        counts["active"] = sum(1 for r in runs if r.get("active"))
+        counts["blocked"] = sum(1 for r in runs if r.get("blocked"))
+        counts["truncated"] = int(listed.get("truncated") or 0)
+        for run in runs:
+            c = run.get("counts") or {}
+            for key in (
+                "segments", "accepted_segments", "claims", "confirmed_claims",
+                "conflicted_claims", "needs_human_claims", "open_drift",
+                "open_unknowns", "blocking_unknowns", "blocking_records",
+                "human_needed",
+            ):
+                counts[key] += int(c.get(key) or 0)
+            counts["invalid_lines"] += len(run.get("problems") or [])
+        payload["runs"] = runs
+        payload["problems"] = [
+            {
+                "run_id": _onboarding_short(p.get("run_id"), limit=96),
+                "problems": [
+                    {
+                        "line": row.get("line"),
+                        "error": _onboarding_short(row.get("error"), limit=240),
+                    }
+                    for row in (p.get("problems") or [])[:10]
+                    if isinstance(row, dict)
+                ],
+            }
+            for p in (listed.get("problems") or [])[:20]
+            if isinstance(p, dict)
+        ]
+        return payload
+    except Exception as e:  # noqa: BLE001
+        payload["error"] = "onboarding_unavailable"
+        payload["detail"] = _envelope_str(e)
+        return payload
+
+
 # --------------------------------------------------- /api/attention (§4a)
 #
 # The ranked "needs a human" queue for root[0]. Composed from the PURE
@@ -3166,6 +3332,34 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 "problems": {"knowledge": [], "exposures": []},
             })
 
+        def _onboarding_bad_request(self, code: str, detail: str) -> None:
+            self._send_json(HTTPStatus.BAD_REQUEST, {
+                "schema_version": 1,
+                "error": code,
+                "detail": detail,
+                "runs": [],
+                "counts": {
+                    "total": 0,
+                    "showing": 0,
+                    "active": 0,
+                    "blocked": 0,
+                    "segments": 0,
+                    "accepted_segments": 0,
+                    "claims": 0,
+                    "confirmed_claims": 0,
+                    "conflicted_claims": 0,
+                    "needs_human_claims": 0,
+                    "open_drift": 0,
+                    "open_unknowns": 0,
+                    "blocking_unknowns": 0,
+                    "blocking_records": 0,
+                    "human_needed": 0,
+                    "invalid_lines": 0,
+                    "truncated": 0,
+                },
+                "problems": [],
+            })
+
         def _handle_threads_get(self) -> None:
             params = self._request_params()
             state = (params.get("state") or ["closed"])[0] or "closed"
@@ -3223,6 +3417,23 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
             self._send_json(HTTPStatus.OK, build_learning(
                 root, status=status, scope=scope, tags=tags, limit=limit))
 
+        def _handle_onboarding_get(self) -> None:
+            params = self._request_params()
+            root = self._root_descriptor_for_threads(params)
+            if root is None:
+                self._onboarding_bad_request("bad_root", "unknown root")
+                return
+            raw_limit = (params.get("limit") or [str(_ONBOARDING_DEFAULT_LIMIT)])[0]
+            try:
+                limit = int(raw_limit)
+            except ValueError:
+                self._onboarding_bad_request("bad_limit", "limit must be an integer")
+                return
+            if limit <= 0:
+                self._onboarding_bad_request("bad_limit", "limit must be positive")
+                return
+            self._send_json(HTTPStatus.OK, build_onboarding(root, limit=limit))
+
         # ---- routing
         def _route(self) -> None:
             path = self._request_path()
@@ -3265,6 +3476,11 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 # Lessons + wrapper exposure telemetry for the selected root.
                 # Carries knowledge-note text, never raw bus message bodies.
                 self._handle_learning_get()
+                return
+            if path == "/api/onboarding":
+                # Project/codebase onboarding runs: bounded summaries plus
+                # evidence pointers, never raw bus message bodies.
+                self._handle_onboarding_get()
                 return
             if path == "/api/lead-chat":
                 # Dedicated operator<->lead transcript. Carries bodies, but only
@@ -3458,6 +3674,7 @@ __all__ = [
     "build_intents",
     "build_learning",
     "build_lead_chat",
+    "build_onboarding",
     "build_preflight",
     "build_state",
     "build_thread",

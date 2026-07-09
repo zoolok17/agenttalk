@@ -36,7 +36,7 @@
   var DENSITIES = ['comfortable', 'compact'];
   var PREF_KEYS = { theme: 'tc.theme', accent: 'tc.accent', density: 'tc.density' };
 
-  var VIEWS = ['overview', 'flow', 'attention', 'lead-chat', 'learning', 'sessions', 'agent'];
+  var VIEWS = ['overview', 'flow', 'attention', 'lead-chat', 'learning', 'onboarding', 'sessions', 'agent'];
 
   // Graph geometry (frozen: §7 / prototype). 640x480 canvas, nodes on a
   // circle radius 178 around center (320,240), node i at angle -90 + i*36 deg.
@@ -101,11 +101,14 @@
   var leadChatData = null;            // /api/lead-chat (operator<->lead bodies)
   var learningData = null;            // /api/learning (lessons + exposure telemetry)
   var learningRootLabel = '';         // root label for learningData
+  var onboardingData = null;          // /api/onboarding (project analysis runs)
+  var onboardingRootLabel = '';       // root label for onboardingData
   var leadChatPayloadHash = null;      // unchanged-payload guard for lead-chat
   var intentsData = null;             // /api/intents (body-free queue state)
   var attentionPending = false;
   var leadChatPending = false;
   var learningPending = false;
+  var onboardingPending = false;
   var intentsPending = false;
   var statePending = false;           // /api/state in-flight guard (P2-4)
   var stateSeq = 0;                   // request sequence id (issued)
@@ -751,6 +754,7 @@
     if (view === 'attention') fetchAttention();
     if (view === 'lead-chat') fetchLeadChat();
     if (view === 'learning') fetchLearning();
+    if (view === 'onboarding') fetchOnboarding();
     if (view === 'sessions' && state.sessionRid) fetchThread(state.sessionRid);
     renderActiveView();
     renderChrome();
@@ -797,9 +801,12 @@
             state.sessionRid = null;
             learningData = null;
             learningRootLabel = '';
+            onboardingData = null;
+            onboardingRootLabel = '';
             renderChrome();
             renderActiveView();
             if (state.view === 'learning') fetchLearning();
+            if (state.view === 'onboarding') fetchOnboarding();
           });
           sw.appendChild(b);
         })(i);
@@ -901,6 +908,9 @@
     var learningCount = learningData && learningData.counts
       ? (learningData.counts.active || 0)
       : 0;
+    var onboardingCount = onboardingData && onboardingData.counts
+      ? (onboardingData.counts.active || 0)
+      : 0;
 
     var nav = el('nav', 'tc-nav');
     // "overview" nav stays active while an agent-detail is open.
@@ -910,6 +920,7 @@
       { key: 'attention', label: 'Human queue', icon: navIconAlert, badge: attnCount },
       { key: 'lead-chat', label: 'Lead chat', icon: navIconChat, badge: leadPendingCount },
       { key: 'learning', label: 'Learning', icon: navIconFile, badge: learningCount },
+      { key: 'onboarding', label: 'Onboarding', icon: navIconFile, badge: onboardingCount },
       { key: 'sessions', label: 'Sessions', icon: navIconFile },
     ];
     for (var i = 0; i < items.length; i++) {
@@ -978,6 +989,7 @@
       case 'attention': renderAttention(main, root); break;
       case 'lead-chat': renderLeadChat(main, root); break;
       case 'learning': renderLearning(main, root); break;
+      case 'onboarding': renderOnboarding(main, root); break;
       case 'sessions': renderSessions(main, root); break;
       case 'agent': renderAgentDetail(main, root); break;
       default: renderOverview(main, root);
@@ -2019,6 +2031,239 @@
     return card;
   }
 
+  // ------------------------------------------------------------ VIEW 5b: onboarding
+  function renderOnboarding(main, root) {
+    var data = onboardingData;
+    var wrap = el('div', 'tc-onboarding');
+    var head = viewHead('Onboarding',
+      'Project analysis runs, codebase claims, doc drift, and open unknowns');
+    head.appendChild(el('div', 'tc-spacer'));
+    if (data && data.counts) {
+      head.appendChild(el('span', 'tc-chip', (data.counts.active || 0) + ' active'));
+      if (data.counts.human_needed) {
+        head.appendChild(el('span', 'tc-chip sev-high', data.counts.human_needed + ' human-needed'));
+      }
+    }
+    var refresh = el('button', 'tc-pref-btn', 'Refresh');
+    refresh.setAttribute('title', 'Refresh onboarding runs');
+    on(refresh, 'click', fetchOnboarding);
+    head.appendChild(refresh);
+    wrap.appendChild(head);
+
+    if (!data) {
+      wrap.appendChild(el('p', 'tc-recent-empty', 'Loading onboarding runs...'));
+      main.appendChild(wrap);
+      return;
+    }
+    if (data.error) {
+      wrap.appendChild(emptyState('Onboarding unavailable', data.detail || data.error));
+      main.appendChild(wrap);
+      return;
+    }
+
+    wrap.appendChild(onboardingSummary(data));
+    var body = el('div', 'tc-onboarding-layout');
+    body.appendChild(onboardingRuns(data));
+    var side = el('div', 'tc-onboarding-side');
+    side.appendChild(onboardingBlockersPanel(data));
+    side.appendChild(onboardingProblemsPanel(data));
+    body.appendChild(side);
+    wrap.appendChild(body);
+    main.appendChild(wrap);
+  }
+
+  function onboardingSummary(data) {
+    var counts = data.counts || {};
+    var grid = el('div', 'tc-onboarding-stats');
+    var defs = [
+      ['Runs', counts.total || 0],
+      ['Segments accepted', (counts.accepted_segments || 0) + ' / ' + (counts.segments || 0)],
+      ['Claims confirmed', (counts.confirmed_claims || 0) + ' / ' + (counts.claims || 0)],
+      ['Human needed', counts.human_needed || 0],
+      ['Open drift', counts.open_drift || 0],
+    ];
+    for (var i = 0; i < defs.length; i++) {
+      var tile = el('div', 'tc-card tc-onboarding-stat');
+      tile.appendChild(el('div', 'tc-stat-label', defs[i][0]));
+      tile.appendChild(el('div', 'tc-stat-value', defs[i][1]));
+      grid.appendChild(tile);
+    }
+    return grid;
+  }
+
+  function onboardingRuns(data) {
+    var card = el('div', 'tc-card tc-onboarding-runs');
+    var head = el('div', 'tc-lead-panel-head');
+    head.appendChild(el('div', 'tc-card-title', 'Analysis runs'));
+    head.appendChild(el('span', 'tc-spacer'));
+    head.appendChild(el('span', 'tc-chip', (data.runs || []).length + ' shown'));
+    card.appendChild(head);
+    var list = el('div', 'tc-onboarding-list');
+    var runs = data.runs || [];
+    if (!runs.length) {
+      list.appendChild(transcriptEmpty('No onboarding runs yet',
+        'Create one with agenttalk onboarding create before the team starts reading a codebase.'));
+    } else {
+      for (var i = 0; i < runs.length; i++) list.appendChild(onboardingRunCard(runs[i]));
+    }
+    card.appendChild(list);
+    return card;
+  }
+
+  function onboardingRunCard(run) {
+    var card = el('div', 'tc-onboarding-card');
+    var top = el('div', 'tc-onboarding-card-head');
+    top.appendChild(el('span', 'tc-chip ' + onboardingStateClass(run.state), run.state || 'unknown'));
+    if (run.blocked) top.appendChild(el('span', 'tc-chip sev-high', 'blocked'));
+    top.appendChild(el('span', 'tc-spacer'));
+    top.appendChild(el('span', 'tc-onboarding-key', run.id || ''));
+    card.appendChild(top);
+    card.appendChild(el('div', 'tc-onboarding-title', run.title || run.id || 'Onboarding run'));
+    if (run.objective) card.appendChild(el('div', 'tc-onboarding-body', run.objective));
+    var meta = el('div', 'tc-onboarding-meta');
+    if (run.lead) meta.appendChild(el('span', null, 'lead ' + run.lead));
+    if (run.base_ref) meta.appendChild(el('span', null, 'base ' + run.base_ref));
+    if (run.updated_at) meta.appendChild(ageEl('tc-bubble-age', { ts: run.updated_at }, { suffix: ' ago' }));
+    card.appendChild(meta);
+    card.appendChild(onboardingCountStrip(run.counts || {}));
+    var records = run.records || {};
+    card.appendChild(onboardingRecordSection('Segments', records.segment || []));
+    card.appendChild(onboardingRecordSection('Claims', records.claim || []));
+    card.appendChild(onboardingRecordSection('Drift', records.drift || []));
+    card.appendChild(onboardingRecordSection('Unknowns', records.unknown || []));
+    return card;
+  }
+
+  function onboardingCountStrip(counts) {
+    var strip = el('div', 'tc-onboarding-counts');
+    var defs = [
+      ['segments', (counts.accepted_segments || 0) + '/' + (counts.segments || 0)],
+      ['claims', (counts.confirmed_claims || 0) + '/' + (counts.claims || 0)],
+      ['drift', counts.open_drift || 0],
+      ['unknowns', counts.open_unknowns || 0],
+    ];
+    for (var i = 0; i < defs.length; i++) {
+      strip.appendChild(el('span', 'tc-chip', defs[i][0] + ' ' + defs[i][1]));
+    }
+    if (counts.human_needed) strip.appendChild(el('span', 'tc-chip sev-high', 'human ' + counts.human_needed));
+    return strip;
+  }
+
+  function onboardingRecordSection(title, rows) {
+    var box = el('div', 'tc-onboarding-section');
+    var head = el('div', 'tc-onboarding-section-head');
+    head.appendChild(el('span', null, title));
+    head.appendChild(el('span', 'tc-chip', rows.length));
+    box.appendChild(head);
+    if (!rows.length) return box;
+    var max = Math.min(rows.length, 6);
+    for (var i = 0; i < max; i++) box.appendChild(onboardingRecordRow(rows[i]));
+    if (rows.length > max) box.appendChild(el('div', 'tc-onboarding-more', '+' + (rows.length - max) + ' more'));
+    return box;
+  }
+
+  function onboardingRecordRow(row) {
+    var item = el('div', 'tc-onboarding-row');
+    var top = el('div', 'tc-onboarding-row-head');
+    top.appendChild(el('span', 'tc-chip ' + onboardingStatusClass(row.status, row.blocking), row.status || 'unknown'));
+    top.appendChild(el('span', 'tc-onboarding-key', row.key || ''));
+    top.appendChild(el('span', 'tc-spacer'));
+    if (row.confidence) top.appendChild(el('span', 'tc-chip', row.confidence));
+    item.appendChild(top);
+    item.appendChild(el('div', 'tc-onboarding-body', row.summary || ''));
+    var meta = el('div', 'tc-onboarding-meta');
+    if (row.segment) meta.appendChild(el('span', null, 'segment ' + row.segment));
+    if (row.owner) meta.appendChild(el('span', null, 'owner ' + row.owner));
+    if (row.actor) meta.appendChild(el('span', null, 'by ' + row.actor));
+    if (row.source) meta.appendChild(el('span', null, 'source ' + row.source));
+    item.appendChild(meta);
+    if (row.paths && row.paths.length) {
+      item.appendChild(el('div', 'tc-onboarding-evidence', 'paths: ' + row.paths.join(', ')));
+    }
+    if (row.refs && row.refs.length) {
+      item.appendChild(el('div', 'tc-onboarding-evidence', 'refs: ' + row.refs.join(', ')));
+    }
+    return item;
+  }
+
+  function onboardingBlockersPanel(data) {
+    var card = el('div', 'tc-card tc-onboarding-panel');
+    var head = el('div', 'tc-lead-panel-head');
+    head.appendChild(el('div', 'tc-card-title', 'Human-needed blockers'));
+    card.appendChild(head);
+    var rows = [];
+    var runs = data.runs || [];
+    var kinds = ['claim', 'drift', 'segment', 'unknown'];
+    for (var i = 0; i < runs.length; i++) {
+      var records = runs[i].records || {};
+      for (var k = 0; k < kinds.length; k++) {
+        var items = records[kinds[k]] || [];
+        for (var j = 0; j < items.length; j++) {
+          if (items[j].blocking || (kinds[k] === 'claim' && items[j].status === 'needs-human')) {
+            rows.push({ run: runs[i], row: items[j], kind: kinds[k] });
+          }
+        }
+      }
+    }
+    var list = el('div', 'tc-onboarding-problems');
+    if (!rows.length) {
+      list.appendChild(el('div', 'tc-recent-empty', 'No human-needed blockers recorded.'));
+    } else {
+      for (var k = 0; k < rows.length; k++) {
+        var line = el('div', 'tc-onboarding-problem');
+        line.appendChild(el('div', 'tc-onboarding-key', rows[k].run.id + ' / ' + rows[k].kind + ' / ' + rows[k].row.key));
+        line.appendChild(el('div', null, rows[k].row.summary || ''));
+        list.appendChild(line);
+      }
+    }
+    card.appendChild(list);
+    return card;
+  }
+
+  function onboardingProblemsPanel(data) {
+    var card = el('div', 'tc-card tc-onboarding-panel');
+    var head = el('div', 'tc-lead-panel-head');
+    head.appendChild(el('div', 'tc-card-title', 'Ledger health'));
+    card.appendChild(head);
+    var problems = [];
+    var runs = data.runs || [];
+    for (var i = 0; i < runs.length; i++) {
+      var ps = runs[i].problems || [];
+      for (var j = 0; j < ps.length; j++) {
+        problems.push((runs[i].id || 'run') + ' line ' + ps[j].line + ': ' + ps[j].error);
+      }
+    }
+    var top = data.problems || [];
+    for (var k = 0; k < top.length; k++) {
+      var rows = top[k].problems || [];
+      for (var m = 0; m < rows.length; m++) {
+        problems.push((top[k].run_id || 'run') + ' line ' + rows[m].line + ': ' + rows[m].error);
+      }
+    }
+    if (!problems.length) {
+      card.appendChild(el('div', 'tc-recent-empty', data.note || 'Onboarding ledger is readable.'));
+    } else {
+      var list = el('div', 'tc-onboarding-problems');
+      for (var n = 0; n < problems.length; n++) list.appendChild(el('div', 'tc-onboarding-problem', problems[n]));
+      card.appendChild(list);
+    }
+    return card;
+  }
+
+  function onboardingStateClass(stateName) {
+    if (stateName === 'ready-for-work' || stateName === 'closed') return 'status-working_turn';
+    if (stateName === 'blocked') return 'sev-high';
+    if (stateName === 'abandoned' || stateName === 'superseded') return 'status-unknown';
+    return 'status-idle_waiting';
+  }
+
+  function onboardingStatusClass(status, blocking) {
+    if (blocking || status === 'blocked' || status === 'conflicted' || status === 'needs-human') return 'sev-high';
+    if (status === 'accepted' || status === 'confirmed' || status === 'resolved' || status === 'answered') return 'status-working_turn';
+    if (status === 'open' || status === 'triaged' || status === 'rework') return 'status-idle_waiting';
+    return 'status-unknown';
+  }
+
   function actionComposer(root) {
     var card = el('div', 'tc-card tc-action-card');
     var head = el('div', 'tc-action-head');
@@ -2934,6 +3179,27 @@
     }).catch(function () { learningPending = false; });
   }
 
+  function fetchOnboarding() {
+    if (onboardingPending) return;
+    var label = currentRootLabel();
+    var url = '/api/onboarding?limit=50';
+    if (label) url += '&root=' + encodeURIComponent(label);
+    onboardingPending = true;
+    fetch(url).then(function (r) {
+      if (!r.ok) return null;
+      return r.json();
+    }).then(function (data) {
+      onboardingPending = false;
+      if (!data) return;
+      if (label && label !== currentRootLabel()) return;
+      if (label && data.root && data.root !== label) return;
+      onboardingRootLabel = data.root || label || '';
+      onboardingData = data;
+      renderSidebar();
+      if (state.view === 'onboarding') renderActiveViewFromPoll();
+    }).catch(function () { onboardingPending = false; });
+  }
+
   function fetchArchivedThreads(reset) {
     if (archivedState.loading) return;
     var label = currentRootLabel();
@@ -3035,6 +3301,7 @@
     fetchAttention();
     fetchLeadChat();
     fetchLearning();
+    fetchOnboarding();
     fetchSession();
     fetchIntents();
     setInterval(fetchState, POLL_MS);

@@ -926,6 +926,38 @@ pure verdict, and the artifact shape; the project supplies `domains.json`,
 shared-path policy, lane ids/assignees/targets/subsets, and required
 gates.
 
+### Onboarding: project analysis before implementation
+
+`agenttalk onboarding {create,list,show,state,record}` is a native ledger for
+the first pass over a new project or an existing codebase. It records what the
+team inspected before it starts changing code:
+
+- **segments**: codebase areas or documentation areas assigned for reading
+- **claims**: bounded statements the team believes, with source/evidence refs
+- **drift**: documentation/code/runtime mismatches and their disposition
+- **unknowns**: questions that are still open, optionally marked blocking
+
+The ledger is evidence capture, not an analyzer and not proof of consensus. It
+does not decide whether code or docs are "true"; agents record observed
+evidence, disagreements, and open questions. Runs live under
+`.agenttalk/onboarding/<run-id>/events.jsonl` as append-only JSONL. The reader
+skips malformed lines, reports problems, and keeps valid records visible.
+
+Example:
+
+```text
+$ agenttalk onboarding create --id ob-api --from claude-lead --title "API onboarding" --base-ref main
+$ agenttalk onboarding record --id ob-api --from codex-dev --kind segment --key cli --status accepted --summary "CLI parser and README command reference mapped." --path src/agenttalk/cli.py --path README.md
+$ agenttalk onboarding record --id ob-api --from codex-review --kind drift --key docs.cli.reference --status open --segment cli --source docs --confidence medium --summary "README command table may lag parser help."
+$ agenttalk onboarding record --id ob-api --from codex-test --kind unknown --key release.owner --status open --blocking --summary "Need operator confirmation of the release owner."
+$ agenttalk onboarding show --id ob-api
+```
+
+The Team Console exposes this through the **Onboarding** view and
+`GET /api/onboarding`. The dashboard projection is read-only and pointer-first:
+bounded summaries, paths, refs, counts, and problem rows, never raw bus message
+bodies, prompt blocks, full command output, or copied source.
+
 ### Knowledge: durable pointer notes and lessons (0.38.0, lessons 0.70.0, wrapped exposure 0.71.0, dashboard learning 0.72.0)
 
 `agenttalk knowledge {publish,curate,pull,search,onboard}` is durable,
@@ -1230,6 +1262,7 @@ still has a fresh heartbeat, the operator-facing requester must also pass
 | `agenttalk roster retire <name> [--reason R]` / `rename <old> <new> [--drain-check] [--reason R]` / `forward <retired> --to <live> --to-request RID [--from A]` | Identity lifecycle (0.16.0, #19). `retire` makes a **permanent tombstone** (can't send, name never re-bound, history stays valid). `rename` = retire `<old>`→tombstone + add `<new>`, carrying over role/group/operator-facing; `--drain-check` refuses while work is owed to/from `<old>`. `forward` redirects a single owed request to a live agent, transcript-visible. |
 | `agenttalk barrier bump --from A --scope global [-m REASON] [--json]` | Fire a **global epoch barrier** (0.16.0, #19): one meta-marked message whose id becomes the new epoch, marking everything before it as a previous epoch. Any active member may bump (trusted-team global-stall lever). Tracked openers after it record `epoch_at_send` automatically. |
 | `agenttalk domain [--json] {list,show <id>,check-path <paths...>,validate}` | Inspect the project's **domain registry** (`.agenttalk/domains.json`, 0.31.0). `list` = domains + registry hash; `show <id>` = one domain with resolved owner/reviewer/curator refs; `check-path <paths...>` = classify repo-relative paths as owned/unowned/shared (`--case-sensitive`/`--case-insensitive`); `validate` = structure + ref resolution. Read-only foundation for upcoming lane/knowledge features; author `domains.json` by hand for now. |
+| `agenttalk onboarding {create,list,show,state,record}` | Track a new-project or existing-codebase analysis pass before implementation. Runs live under `.agenttalk/onboarding/<run-id>/events.jsonl` and record bounded segments, claims, drift, and unknowns with pointer evidence. Evidence tracking only: not an analyzer or consensus proof. |
 | `agenttalk whoami [--for A] [--json]` | Show effective root, resolved self and peer, roster membership, role/groups, unread count, and owed-thread count. Warns when identity is unresolved or not in the roster, which is often a wrong `--root` or env issue. |
 | `agenttalk status` | Show roster, per-agent cursor, unread count, and **actionable warnings**: never-acked unread, soft-deadlocks, unconsumed correlated replies, and stale outbound threads. |
 | `agenttalk threads [--for A] [--all] [--json]` | Derive request/reply thread state from validated messages. Default view shows actionable rows only (`reply-waiting`, `owed-inbound`, `open-outbound`); `--all` includes `closed`. 0.16.0: open rows in `--json` carry read-only `next_owner` / `next_action` (`reply`/`read-reply`/`await-reply`/`answer-operator`) — who owes the next move, a pure projection of state. |
@@ -1262,7 +1295,7 @@ still has a fresh heartbeat, the operator-facing requester must also pass
 | `agenttalk reply [--from A] [--to-id MSG_ID \| --to-request REQUEST_ID] [--kind K] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--dry-run]` | Reply to the most recent received message, or anchor to a specific received message/thread. Auto-derives recipient and echoes the anchor's `request_id`; explicit `--meta request_id=...` wins. `--dry-run` prints the resolved recipient, request id, and kind without sending. A reply that opens a new thread (`review-request` or `proposal`) mints a fresh id instead of echoing. 0.15.0: `--na` sends a not-applicable response — closes your obligation, displayed as (n/a); refused on review-request/proposal threads. |
 | `agenttalk tail [--from-start] [--interval S] [--timeout S]` | Passive monitor: stream all messages as they arrive. Does **not** advance cursors or write heartbeats — safe to run in a third terminal alongside two active agents. `--from-start` replays existing messages first. |
 | `agenttalk serve [--port P] [--host H] [--access-log]` | Start a **read-only** local web dashboard at `http://127.0.0.1:8765/` for browsing the message log in a real browser. **Loopback-only by design** — only `127.0.0.1`, `::1`, and `localhost` are accepted; there is no flag to expose it elsewhere (SSH-tunnel `localhost:<port>` from another machine if needed). HTML output is escaped, strict CSP, `GET`/`HEAD` only, peer-IP check on every method. JSON at `/api/status` and `/api/messages` for scripting. 0.17.0: the same server also serves `/dashboard` (the obligation view) and `/api/state`; a port that can't be bound now exits **2** with a `--port 0` hint instead of a raw traceback. See `SECURITY.md`. |
-| `agenttalk dashboard [--port P] [--store PATH]... [--access-log]` | The **obligation dashboard** (0.17.0): who owes what, whose turn it is, and the next action — per agent, per open thread, with mission/WP tags and epoch staleness. Same read-only loopback-only server as `serve`, landing on `http://127.0.0.1:8765/dashboard`; auto-refreshes state every ~2 s. Repeat `--store <project-root>` to watch **several projects in one tab** (each path is the project root itself — no upward search; an uninitialized path shows as a degraded panel, not an error). No `--host` option exists on this spelling. `GET /api/state` (`schema_version: 1`) is the envelope data for scripting; `GET /api/learning` returns the selected root's accepted lesson ledger plus pointer-only exposure telemetry. |
+| `agenttalk dashboard [--port P] [--store PATH]... [--access-log]` | The **obligation dashboard** (0.17.0): who owes what, whose turn it is, and the next action — per agent, per open thread, with mission/WP tags and epoch staleness. Same read-only loopback-only server as `serve`, landing on `http://127.0.0.1:8765/dashboard`; auto-refreshes state every ~2 s. Repeat `--store <project-root>` to watch **several projects in one tab** (each path is the project root itself — no upward search; an uninitialized path shows as a degraded panel, not an error). No `--host` option exists on this spelling. `GET /api/state` (`schema_version: 1`) is the envelope data for scripting; `GET /api/learning` returns the selected root's accepted lesson ledger plus pointer-only exposure telemetry; `GET /api/onboarding` returns selected-root onboarding runs and bounded evidence pointers. |
 | `agenttalk install-skills [--claude-only\|--codex-only] [--no-devkit\|--devkit-only] [--force] [--dry-run]` | Copy bundled bus skills to `~/.claude/commands/` and `~/.codex/skills/`, and by default copy the shared dev-discipline devkit (`craft-code`, `test-coverage`, `review-code`, `write-docs`, `review-docs`) to both `~/.claude/skills/` and `~/.codex/skills/`. `--claude-only` and `--codex-only` scope only the bus skills; use `--no-devkit` to skip the shared devkit. Idempotent — preserves your local edits unless `--force`; use `--dry-run --force` to preview overwrites. |
 | `agenttalk codex-config [--enable\|--disable\|--status]` | Manage per-project sandbox/trust block in `~/.codex/config.toml` so Codex can call agenttalk from inside its sandbox. |
 | `agenttalk doctor [--json]` | Health check: store initialized, bus skills installed + in sync, devkit absent/in sync/stale state surfaced, Codex sandbox block configured, heartbeats fresh. Per the global exit-code contract, exit 2 on any error; warnings exit 0 with the warning state visible in output. |
