@@ -95,6 +95,22 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.72.3 - liaison-session friction and waiter/stall visibility (2026-07-09)
+**GOOD / ROBUST / SECURE** · reviewed-SHA `3961470` · tag `v0.72.3`
+- **Review:** patch release for production liaison-session friction. Dead-letter notice twins are
+  closed/suppressed when the canonical dead-letter is resolved, resolved sink rows can be archived,
+  manual restart requests apply to healthy idle wrapped agents, duplicate scoped waiters exit as
+  superseded instead of timing out misleadingly, and wrapped `git worktree` branch-collision stalls
+  surface as fixed-code dashboard Attention items.
+- **Verification:** targeted local gate covered dead-letter CLI/dashboard behavior, restart request
+  planning, action-enabled Attention context, duplicate scoped wait supersession including a real
+  subprocess replacement waiter receiving the later reply, wrapper setup-failure classification,
+  health reason mapping, and `/api/attention` stalled item derivation. Final release gate also runs
+  ruff, `git diff --check`, build, wheel install smoke, and GitHub Actions before publishing.
+- **Robust/Secure:** wait supersession remains observational and token-scoped; it does not move
+  cursors or acknowledge messages. Health continues to store only bounded safe reason codes, while
+  dashboard Attention renders fixed remediation text rather than raw command output.
+
 ### v0.72.2 - dashboard human queue clarity and escalation context (2026-07-09)
 **GOOD / ROBUST / SECURE** · reviewed-SHA `47e4ab9` · tag `v0.72.2`
 - **Review:** patch release for the operator-facing dashboard. Attention navigation now distinguishes
