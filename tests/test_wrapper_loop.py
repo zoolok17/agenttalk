@@ -1797,6 +1797,28 @@ def test_make_drive_tool_bus_missing_module_is_config_blocked_even_if_turn_compl
     assert "install agenttalk non-editable" in out.summary
 
 
+def test_make_drive_worktree_collision_is_config_blocked_setup_failure(tmp_path) -> None:
+    rec = {"from": "a", "kind": "message", "body": "x",
+           "correlation_id": None, "request_id": None, "broadcast_id": None}
+    stream = [json.dumps({"type": "thread.started", "thread_id": "t"}),
+              json.dumps({"type": "turn.started"}),
+              json.dumps({"type": "item.completed",
+                          "item": {"type": "command_execution",
+                                   "command": "git worktree add .worktrees/lane lane/existing",
+                                   "exit_code": 128,
+                                   "aggregated_output": (
+                                       "fatal: 'lane/existing' is already checked out at "
+                                       "'D:/repo/.worktrees/other'"
+                                   )}})]
+    drive = run.make_drive(_store(tmp_path), "beta", "codex",
+                           session.SessionState(cli="codex"), ["codex"],
+                           spawn=lambda a, i: stream, clock=lambda: 0.0, render=False)
+    out = drive(rec)
+    assert out.ok is False
+    assert out.failure_class == loop.CLASS_CONFIG_BLOCKED
+    assert "worktree_branch_already_checked_out" in out.summary
+
+
 def test_make_drive_tool_bus_usage_error_is_not_config_blocked(tmp_path) -> None:
     rec = {"from": "a", "kind": "message", "body": "x",
            "correlation_id": None, "request_id": None, "broadcast_id": None}

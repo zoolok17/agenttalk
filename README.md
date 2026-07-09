@@ -93,7 +93,7 @@ a prerequisite.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.72.2"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.72.3"
 agenttalk install-skills          # installs bus skills + the dev-discipline devkit
 
 # in your project root, once per project
@@ -198,7 +198,7 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.72.2"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.72.3"
 ```
 
 Pin to a specific tag so you control upgrades. Replace the tag with
@@ -1052,12 +1052,19 @@ repaired, answered, or deferred, never silenced. `--all` /
 the view.
 
 **Dead letters get a distinct `resolve`.** `agenttalk dead-letter resolve
---agent A --id ID --reason …` records that a poison message was handled
+--agent A --id ID --reason ...` records that a poison message was handled
 out-of-band, **preserving** the payload and dropping it from the default
 `dead-letter list`, the doctor warning, and the attention queue. The
 central disposition log is authoritative (a best-effort `.resolved.json`
-sidecar aids copied sinks); `dead-letter requeue --force-resolved --reason`
-reopens a resolved item, audited.
+sidecar aids copied sinks). If the wrapper also spawned a matching
+operator-facing "dead-letter notice" escalation, `resolve` answers that
+notice thread with an audit stamp so it no longer lingers as phantom current
+work. `dead-letter requeue --force-resolved --reason` reopens a resolved
+item, audited. `dead-letter purge --resolved --from <liaison>` archives
+resolved payloads and sidecars under `.agenttalk/dead-letter-archive/` when
+you want them out of the live sink. Archived rows are no longer requeueable by
+the live `dead-letter requeue` command unless you restore the archived files to
+the sink.
 
 `requeue` and `resolve` are complementary, not the same: **`requeue`
 re-injects a fresh copy** (new id, own fresh attempt count) so the work gets
@@ -1067,7 +1074,7 @@ requeued-but-not-resolved dead letter *keeps showing* in `dead-letter list`,
 poison message (it could hide a real unhandled failure). Once you have
 actually handled it, run `dead-letter resolve --reason …` to quiet it.
 Typical flow: `list` → `show` (inspect) → `requeue` (retry) → `resolve`
-(when done).
+(when done) -> optional `purge --resolved` (archive old resolved evidence).
 
 Dispositions live append-only in `.agenttalk/attention/dispositions.jsonl`
 (latest-valid per item + action-family, fsync under the store lock,
@@ -1207,7 +1214,9 @@ supervisor does not read it.
 
 Protected agents — the operator-facing liaison and every active
 `role=lead` — are **never auto-killed** (warn/note only), and a manual
-`request-restart` of one needs `--force-protected`.
+`request-restart` of one needs `--force-protected`; if that protected agent
+still has a fresh heartbeat, the operator-facing requester must also pass
+`--acknowledge-live-protected-kill`.
 
 ---
 
@@ -1232,7 +1241,7 @@ Protected agents — the operator-facing liaison and every active
 | `agenttalk propose [--from A] [--to B] [--subject S] [--meta k=v] (-m TEXT \| --file PATH \| --file -) [--in-reply-to ID] [--print-id] [--quiet]` | Send a first-class `proposal`. Auto-mints `meta.request_id=pp-...` if absent and prints `(proposal id: pp-...)` unless quiet. `--in-reply-to` sets `meta.in_reply_to` for counters. |
 | `agenttalk recv --for A [--ack] [--since ID] [--include-control]` | **Peek** at queued messages — does NOT move the cursor unless `--ack`. Plain `recv` that prints messages emits a hint pointing at `drain`. Hides `composing` pings by default; `--include-control` surfaces them. |
 | `agenttalk drain --for A [--include-control]` | **Consume**: print all unread AND advance the cursor to newest, in one shot. Same path as `recv --ack`. Use this instead of hand-rolled timestamp polling. |
-| `agenttalk wait --for A [--to-request RID] [--kind K] [--timeout 120] [--no-ack] [--grace 2] [--composing-extend 120] [--max-poll-interval 2.0] [--refuse-stacked-wait]` | Plain wait blocks until a new real message arrives, prints it, and advances the global cursor unless `--no-ack`. Scoped wait (`--to-request` and/or `--kind`) returns only matching addressed messages, advances only the per-thread `seen_msg_id`, and never advances the global cursor. A scoped wait on a rescinded request wakes immediately with **exit 3** (0.14.0). Idle polling backs off from `--interval` up to `--max-poll-interval` (reset on activity; set `<= --interval` to disable). `--refuse-stacked-wait` exits **6** instead of warning when a live duplicate waiter already holds the mailbox. |
+| `agenttalk wait --for A [--to-request RID] [--kind K] [--timeout 120] [--no-ack] [--grace 2] [--composing-extend 120] [--max-poll-interval 2.0] [--refuse-stacked-wait]` | Plain wait blocks until a new real message arrives, prints it, and advances the global cursor unless `--no-ack`. Scoped wait (`--to-request` and/or `--kind`) returns only matching addressed messages, advances only the per-thread `seen_msg_id`, and never advances the global cursor. A scoped wait on a rescinded request wakes immediately with **exit 3** (0.14.0). Idle polling backs off from `--interval` up to `--max-poll-interval` (reset on activity; set `<= --interval` to disable). `--refuse-stacked-wait` exits **6** instead of warning when a live duplicate waiter already holds the mailbox; an older scoped wait also exits **6** with a stderr superseded diagnostic when a newer same-thread waiter replaces it. |
 | `agenttalk composing --from A [--to-request RID] [-m "still drafting"]` | Send a `composing` ping so the peer's `wait` extends its deadline. Use periodically while you draft a long reply. The peer's `wait` consumes these as deadline-extension signals — they do NOT surface as a returned reply. With `--to-request` (0.14.0) the peer is derived from the thread, and a **reply-in-flight** marker shows up in their `threads`/`sync`. |
 | `agenttalk ack --for A [--id ID] [--to-request RID]` | Without `--to-request`, manually move an agent's global cursor forward. With `--to-request`, manually close that request thread for A and record the latest seen matching message without touching the global cursor. |
 | `agenttalk rescind --from A --to-request RID [--to-id MSG] [-m REASON]` | Mark a tracked request you opened as **no-longer-current** (0.14.0). Transcript-visible; the thread becomes `closed-superseded`, a peer blocked in `wait --to-request` wakes with exit 3, and `check` reports superseded. Requester-only. Prefer this over a prose "ignore my last message". |
@@ -1246,7 +1255,7 @@ Protected agents — the operator-facing liaison and every active
 | `agenttalk reset [--archive]` | Clear **active bus state** (messages + cursors + heartbeats); preserves historical transcripts under `.agenttalk/sessions/` so past exports aren't lost. Bumps `session_id`. With `--archive`, instead moves **everything** (messages + state + sessions) under `.agenttalk/archived/<old_session>/`. Preserves config (roster) either way. |
 | `agenttalk supervise (--init \| --report \| --plan \| --install-activity-hook \| --clear-restart)` | Thin support for the **external agent supervisor** (24/7 outage auto-restart + stuck-recovery). `--init` scaffolds `.agenttalk/supervisor.{json,ps1}` (a config you fill with per-agent launch commands + a generated PowerShell monitor script; POSIX is a follow-up). `--report`/`--plan` emit the read-only liveness JSON and the **action plan** (the shared decision table the script executes). Heartbeat freshness is the liveness authority: a fresh heartbeat is healthy even when process discovery is missing or misleading; a stale heartbeat becomes `stuck_recover` (best-effort kill + resume) only when the activity hook is installed (`activity_hook=true`), else it is warn-only (`suspect_warn`), never a kill. `--install-activity-hook` merges the identity-neutral `agenttalk heartbeat --hook` PostToolUse hook into the **project** `.claude/settings.json` (`--codex` for `.codex/hooks.json`; never global, never clobbers). Add `--interactive-for <lead>` only for the current operator-facing human Claude liaison; it writes a Claude-only fallback hook and refuses Codex hook modes. Every recovery **resumes the pinned session** so context survives a force-kill. Protected agents (`operator_facing` ∪ every active `role=lead`) are never auto-killed (warn/note). |
 | `agenttalk wrap --for A --cli claude\|codex [--loop] [--no-render] [--from S] [--min-interval N] -- <real-exe> <base-args>` | Run agent `A` through the **progress wrapper** (0.30.0): a per-CLI structured-stream adapter giving **visibility** (echoes the agent's stream — token/thinking deltas for Claude, item-level events for Codex; `--no-render` to silence), a **working-turn heartbeat** (stays fresh while the agent works, not just idles), and **degraded-output detection** (confirmed garble-then-silence can request a self-restart, recorded as `--from`). `--loop` makes it the long-running **supervised** wrapper: it owns the idle bus-wait + heartbeat and drives the CLI **one turn per inbound message**, persisting+reloading the Codex `thread_id`/Claude `session-id` so a relaunch reload-resumes. Each inbound wrapped turn also receives matching accepted lessons as advisory prompt context and records pointer-only exposure telemetry after prompt handoff. The real CLI exe + its base args go after `--`; the wrapper appends the per-turn session/stream args. For durable unattended listening, this is the documented default; manual `/agenttalk.listen` is best-effort for interactive use. |
-| `agenttalk request-restart --for A [--from L] [--reason ...] [--force-protected]` | Queue a **manual** restart of agent `A`: writes an atomic, request-id-scoped `state/<A>.restart-request` marker the supervisor relaunches (resuming the session) from and clears. Restarting a protected agent requires `--force-protected`. |
+| `agenttalk request-restart --for A [--from L] [--reason ...] [--force-protected] [--acknowledge-live-protected-kill]` | Queue a **manual** restart of agent `A`: writes an atomic, request-id-scoped `state/<A>.restart-request` marker the supervisor relaunches (resuming the session) from and clears. Healthy idle agents are eligible for manual restart at the next supervisor poll. Restarting a protected agent requires `--force-protected`; if that protected agent still has a fresh heartbeat, the operator-facing requester must also pass `--acknowledge-live-protected-kill`. |
 | `agenttalk heartbeat [--for A] [--min-interval 5]` | Stamp this agent's **activity heartbeat** (the supervisor's stuck signal). Wire as a Claude PostToolUse / Codex hook so it's stamped at **tool boundaries** (PostToolUse) **plus** the wait-loop heartbeat while idle — so it stays fresh whether the agent is waiting or running tools, and goes stale only when the model is genuinely stuck. Hook identity resolves from `--for`, then `AGENTTALK_SELF`; the installer uses the hook-only fallback form for the operator-facing interactive liaison. Choose `stuck_after_seconds` generously for the longest expected no-tool model/API turn or long-running tool call; production configs may need a larger value than the 120s default. **Throttled** — a no-op if the heartbeat is younger than `--min-interval`, so the per-tool-call hook costs almost nothing. |
 | `agenttalk compact [--dry-run] [--keep-count N] [--keep-age-days D] [--json]` | Bound live-store growth by archiving a **safe prefix** of old messages (`id < keep_floor`) into the cold `.agenttalk/archived/compacted/` dir. `keep_floor` is the MIN of: the lowest active cursor (never archive a message unread by an active recipient), the current epoch barrier, the earliest message of any **protected** thread (owed-inbound / reply-waiting / open-outbound / closed-superseded — kept whole), and a keep-tail (`keep_count` newest + everything younger than `keep_age_days`). Any undeterminable component fails safe to **archive nothing**. Never archives invalid files (they stay for `prune`/`doctor`). Diagnostics name which component capped the floor; `--dry-run` plans without moving. |
 | `agenttalk hmac-init [--force]` | Generate the HMAC signing key for this project. Stored outside `.agenttalk/` (per-user config dir). The key's existence at the path-derived per-user location automatically activates signature enforcement — there's no config flag to flip. Override the default key path with `AGENTTALK_HMAC_KEY_FILE`. See `SECURITY.md`. |
@@ -1724,7 +1733,9 @@ Two operating assumptions are worth stating plainly (0.18.0):
   guarantee. Pass `--refuse-stacked-wait` to turn that warning into a hard
   **exit 6** (refuse to arm a duplicate loop); a confirmed-dead waiter's
   ghost marker is reaped at arm, and `wait` also warns when more than 8
-  live waiters share one store (leftover loops from old sessions).
+  live waiters share one store (leftover loops from old sessions). If a newer
+  scoped wait for the same request arms, the older scoped wait exits **6** with
+  `superseded` on stderr rather than later reporting a misleading timeout.
 - **Idle waiters back off.** `agenttalk wait` adaptively grows its poll
   interval from `--interval` up to `--max-poll-interval` (default 2.0s)
   while the bus is quiet, resetting to `--interval` the instant a message,
@@ -1770,7 +1781,7 @@ rely on these:
 | `1` | Reserved for `agenttalk wait` timeout (no new messages within `--timeout`). Loop skills should treat this as "keep waiting", not as an error. |
 | `2` | Usage error: missing/invalid identity (`--from`/`--to`/`--for` or `AGENTTALK_SELF`/`AGENTTALK_PEER`), unsafe agent name, identity not in roster, self-mail attempt, malformed `--meta`, corrupt config, missing `.agenttalk/`. 0.17.0: also a `serve`/`dashboard` bind failure (port in use / OS-denied) — with a `--port 0` remediation hint. Always prints a remediation hint to stderr. |
 | `5` | Partial broadcast fan-out: some copies written, some failed (see the delivered/missed manifest; `--resume`). 0.18.0: a frozen recipient retired *after* a partial fan-out is reported under `dropped` and skipped — it no longer traps `--resume` at a permanent exit 5; an all-retired remainder resolves to exit 0. |
-| `6` | `agenttalk wait --refuse-stacked-wait` only: another LIVE process already holds this agent's mailbox, so this wait refused to stack a duplicate poll loop. Without the flag this is a non-fatal warning (exit unchanged). |
+| `6` | `agenttalk wait` duplicate-wait class: `--refuse-stacked-wait` refused to stack on a live mailbox owner, or an older scoped wait was superseded by a newer same-thread waiter. Superseded waits print a stderr diagnostic and do not consume messages, advance cursors, or mark the thread seen. |
 | `130` | `SIGINT` (Ctrl-C). |
 
 ---
@@ -1778,7 +1789,7 @@ rely on these:
 
 0.14.0 additions: **3** = the request was superseded/rescinded
 (`check`, and a scoped `wait --to-request` waking on a rescind);
-**4** = unknown request id (`check`); **5** = PARTIAL broadcast fan-out (0.15.0 — some copies written, some failed; see the delivered/missed manifest); **6** = `wait --refuse-stacked-wait` hit a live duplicate waiter. Exit 1 remains *exclusively* the
+**4** = unknown request id (`check`); **5** = PARTIAL broadcast fan-out (0.15.0 — some copies written, some failed; see the delivered/missed manifest); **6** = `wait` duplicate-wait class (`--refuse-stacked-wait` or superseded same-thread waiter). Exit 1 remains *exclusively* the
 `wait` timeout; 2 remains usage/refusal.
 
 ## How terminals see messages

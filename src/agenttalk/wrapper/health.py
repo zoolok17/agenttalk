@@ -150,12 +150,22 @@ def _looks_rate_limited(text: str | None) -> bool:
     return any(token in t for token in ("rate", "429", "too many requests", "quota"))
 
 
+def _setup_failure_reason(sig: dict[str, Any]) -> str | None:
+    setup_failure = sig.get("setup_failure")
+    if not isinstance(setup_failure, dict):
+        return None
+    subtype = setup_failure.get("subtype")
+    if subtype == "worktree_branch_already_checked_out":
+        return "worktree_branch_already_checked_out"
+    return None
+
+
 def classify_failure(sig: dict[str, Any], failure_class: str | None) -> tuple[str, str]:
     """Map turn signals to an advisory state plus safe reason code."""
     if sig.get("watchdog"):
         return health_model.STATE_STUCK_SUSPECTED, "turn_watchdog_fired"
     if failure_class == CLASS_CONFIG_BLOCKED:
-        return health_model.STATE_ERRORED_AMBIGUOUS, "config_blocked"
+        return health_model.STATE_ERRORED_AMBIGUOUS, _setup_failure_reason(sig) or "config_blocked"
     if sig.get("error"):
         return health_model.STATE_RATE_LIMITED_OR_OUTAGE, "spawn_exec_error"
     rc = sig.get("rc")

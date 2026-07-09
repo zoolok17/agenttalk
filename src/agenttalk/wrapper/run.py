@@ -107,6 +107,8 @@ BUS_KIND_CONFIG_BLOCKED = "config_blocked"
 BUS_KIND_SEMANTIC_FAILURE = "bus_write_semantic_failure"
 BUS_KIND_UNKNOWN_FAILURE = "bus_write_unknown_failure"
 BUS_KIND_AMBIGUOUS_TRANSIENT = "ambiguous_transient"
+SETUP_KIND_FAILURE = "setup_failure"
+SETUP_WORKTREE_BRANCH_ALREADY_CHECKED_OUT = "worktree_branch_already_checked_out"
 _FAILED_TOOL_STATUSES = frozenset({
     "failed", "failure", "error", "errored", "cancelled", "canceled",
     "timeout", "timed_out",
@@ -879,6 +881,37 @@ def _bus_result(kind: str, subtype: str, summary: str) -> dict[str, str]:
     return {"kind": kind, "subtype": subtype, "summary": summary}
 
 
+def _setup_result(subtype: str, summary: str) -> dict[str, str]:
+    return {"kind": SETUP_KIND_FAILURE, "subtype": subtype, "summary": summary}
+
+
+def classify_setup_execution(
+    command: object,
+    output: object,
+    exit_status: object = None,
+    raw_event: object = None,
+) -> dict[str, str] | None:
+    """Classify failed setup/tool commands into safe, bounded reason codes."""
+    if not _bus_execution_failed(exit_status, raw_event):
+        return None
+    command_text = _command_text(command)
+    text = str(output or "")
+    low = f"{command_text}\n{text}".casefold()
+    if (
+        "already checked out" in low
+        and ("worktree" in low or "git worktree" in low)
+    ):
+        return _setup_result(
+            SETUP_WORKTREE_BRANCH_ALREADY_CHECKED_OUT,
+            (
+                "subtype=worktree_branch_already_checked_out; "
+                "remediation=use the existing worktree for that branch, remove the "
+                "stale worktree, or create a unique branch for the reassigned work"
+            ),
+        )
+    return None
+
+
 def classify_bus_execution(
     command: object,
     output: object,
@@ -1436,6 +1469,9 @@ def _classify_drive_failure(sig: dict) -> tuple[str, str]:
     bus_failure = sig.get("bus_failure")
     if isinstance(bus_failure, dict):
         return CLASS_AMBIGUOUS, bus_failure.get("summary") or "bus write failed"
+    setup_failure = sig.get("setup_failure")
+    if isinstance(setup_failure, dict):
+        return CLASS_CONFIG_BLOCKED, setup_failure.get("summary") or "deterministic setup failure"
     structured = _structured_infra_summary(sig)
     if sig.get("error"):
         if structured:
@@ -1629,6 +1665,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         sig = {"ok": False, "started": False, "completed": False, "terminal": False,
                "retryable": False, "rc": None, "error": None, "terminal_text": "",
                "config_blocked": False, "config_blocked_text": "", "bus_failure": None,
+               "setup_failure": None,
                "structured_errors": [], "child_output_tail": None,
                "lesson_exposure_error": None}
         child_output_lines: list[dict[str, str]] = []
@@ -1707,6 +1744,10 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                             BUS_KIND_UNKNOWN_FAILURE,
                         ):
                             sig["bus_failure"] = bus
+                        setup_failure = classify_setup_execution(
+                            ev.tool, ev.text, ev.exit_code, ev.raw)
+                        if setup_failure is not None:
+                            sig["setup_failure"] = setup_failure
                     health_writer.event(ev)
                     engine.process(ev, clock())
         except OSError as e:
@@ -1975,7 +2016,8 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
         argv = list(base_argv) + spec.args
         sig = {"ok": False, "started": False, "completed": False, "terminal": False,
                "retryable": False, "rc": None, "error": None, "terminal_text": "",
-               "config_blocked": False, "config_blocked_text": "", "bus_failure": None}
+               "config_blocked": False, "config_blocked_text": "", "bus_failure": None,
+               "setup_failure": None}
         nonlocal preflight_ok
         if preflight is not None and not preflight_ok:
             blocked = preflight()
@@ -2016,6 +2058,10 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                                 BUS_KIND_SEMANTIC_FAILURE,
                                 BUS_KIND_UNKNOWN_FAILURE):
                             sig["bus_failure"] = bus
+                        setup_failure = classify_setup_execution(
+                            ev.tool, ev.text, ev.exit_code, ev.raw)
+                        if setup_failure is not None:
+                            sig["setup_failure"] = setup_failure
                     engine.process(ev, clock())
         except OSError as exc:
             blocked = _spawn_config_blocked_summary(argv, exc)

@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import threading
 import time as _time
 from pathlib import Path
@@ -385,6 +388,165 @@ def test_wait_warns_but_proceeds_without_refuse(
                "--quiet"], store_root)
     assert rc == 1
     assert "another live process" in capsys.readouterr().err
+
+
+def test_scoped_wait_superseded_by_newer_wait_exits_6(
+    store: Store,
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A newer scoped waiter should replace an older one explicitly, not make
+    the older waiter report a misleading long-timeout result."""
+    observed_old_token = ""
+
+    def fake_sleep(_duration: float) -> None:
+        nonlocal observed_old_token
+        marker = store.read_waiting("alpha") or {}
+        observed_old_token = str(marker.get("wait_token") or "")
+        assert observed_old_token.startswith("wait-")
+        store.write_waiting("alpha", {
+            "agent": "alpha",
+            "pid": 999999,
+            "since": "2099-01-01T00:00:00Z",
+            "cursor_at_start": "",
+            "timeout_seconds": 30,
+            "deadline_epoch": cli.time.time() + 30,
+            "wait_token": "wait-newer",
+            "to_request": "r1",
+        })
+
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+
+    rc = _run([
+        "wait", "--for", "alpha", "--to-request", "r1",
+        "--timeout", "3600", "--grace", "0", "--interval", "0.1",
+        "--max-poll-interval", "0.1", "--heartbeat-interval", "0", "--quiet",
+    ], store_root)
+
+    captured = capsys.readouterr()
+    assert rc == 6
+    assert captured.out == ""
+    assert "superseded" in captured.err
+    assert "timeout" not in captured.err
+    assert store.waiting_superseded("alpha", observed_old_token) is None
+    assert (store.read_waiting("alpha") or {}).get("wait_token") == "wait-newer"
+
+
+def test_plain_wait_marker_does_not_supersede_older_waiter(store: Store) -> None:
+    store.write_waiting("alpha", {
+        "agent": "alpha",
+        "pid": 111,
+        "since": "2099-01-01T00:00:00Z",
+        "cursor_at_start": "",
+        "timeout_seconds": 30,
+        "deadline_epoch": cli.time.time() + 30,
+        "wait_token": "wait-old",
+    })
+    store.write_waiting("alpha", {
+        "agent": "alpha",
+        "pid": 222,
+        "since": "2099-01-01T00:00:00Z",
+        "cursor_at_start": "",
+        "timeout_seconds": 30,
+        "deadline_epoch": cli.time.time() + 30,
+        "wait_token": "wait-new",
+    })
+
+    assert store.waiting_superseded("alpha", "wait-old") is None
+    assert (store.read_waiting("alpha") or {}).get("wait_token") == "wait-new"
+
+
+def test_scoped_wait_not_superseded_by_different_request(
+    store: Store,
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    injected = False
+
+    def fake_sleep(_duration: float) -> None:
+        nonlocal injected
+        if injected:
+            raise AssertionError("wait slept again after the deterministic reply")
+        injected = True
+        store.write_waiting("alpha", {
+            "agent": "alpha",
+            "pid": 999999,
+            "since": "2099-01-01T00:00:00Z",
+            "cursor_at_start": "",
+            "timeout_seconds": 30,
+            "deadline_epoch": cli.time.time() + 30,
+            "wait_token": "wait-r2",
+            "to_request": "r2",
+        })
+        store.send(sender="beta", recipient="alpha", kind="message",
+                   body="reply", meta={"request_id": "r1"})
+
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+
+    rc = _run([
+        "wait", "--for", "alpha", "--to-request", "r1",
+        "--timeout", "3600", "--grace", "0", "--interval", "0.1",
+        "--max-poll-interval", "0.1", "--heartbeat-interval", "0",
+    ], store_root)
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "superseded" not in captured.err
+    assert "RECEIVED" in captured.out
+    assert store.thread_seen("alpha", "r1")
+    assert (store.read_waiting("alpha") or {}).get("wait_token") == "wait-r2"
+
+
+def test_scoped_wait_replacement_receives_later_reply(
+    store: Store,
+    store_root: Path,
+) -> None:
+    env = os.environ.copy()
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    base = [
+        sys.executable, "-m", "agenttalk", "--root", str(store_root),
+        "wait", "--for", "alpha", "--to-request", "r1",
+        "--timeout", "10", "--grace", "0", "--interval", "0.05",
+        "--max-poll-interval", "0.05", "--heartbeat-interval", "0",
+    ]
+
+    def wait_marker(pid: int, *, timeout: float = 5.0) -> None:
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            marker = store.read_waiting("alpha") or {}
+            if marker.get("pid") == pid and marker.get("to_request") == "r1":
+                return
+            _time.sleep(0.05)
+        raise AssertionError(f"wait marker for pid {pid} was not written")
+
+    p1 = subprocess.Popen(base, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, env=env)
+    p2 = None
+    try:
+        wait_marker(p1.pid)
+        p2 = subprocess.Popen(base, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, env=env)
+        wait_marker(p2.pid)
+        out1, err1 = p1.communicate(timeout=5)
+        assert p1.returncode == 6
+        assert out1 == ""
+        assert "superseded" in err1
+
+        store.send(sender="beta", recipient="alpha", kind="message",
+                   body="reply", meta={"request_id": "r1"})
+        out2, err2 = p2.communicate(timeout=5)
+        assert p2.returncode == 0
+        assert "RECEIVED" in out2
+        assert "reply" in out2
+        assert "superseded" not in err2
+    finally:
+        for proc in (p1, p2):
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
 
 
 def test_wait_dead_marker_does_not_block(

@@ -5,6 +5,27 @@ All notable changes to agenttalk are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.72.3] - 2026-07-09
+
+### Fixed
+
+- **Dead-letter notice escalations no longer linger as phantom current work.** Resolving a
+  dead-letter now closes matching pending wrapper notice threads, dashboard thread/current-work
+  projections suppress canonical notice twins, and resolved sink rows are excluded from default
+  operator counts.
+- **Resolved dead-letters can be archived safely.** Added `dead-letter purge --resolved` with
+  dry-run/JSON support, and kept purge guarded by the same operator-facing disposition authority.
+- **Manual restart requests now cover healthy idle wrapped agents.** Supervisor restart handling
+  treats authorized restart markers as actionable for fresh idle agents instead of waiting for a
+  stale signal; protected live restarts require an explicit acknowledgement.
+- **Duplicate scoped waiters now exit explicitly as superseded.** A newer same-thread
+  `wait --to-request` records a tokened supersession event; the older waiter exits 6 with a stderr
+  diagnostic, does not consume messages, and does not clear the replacement waiter's marker.
+- **Wrapped setup/worktree stalls are visible in health and Attention.** Failed wrapped turns caused
+  by a `git worktree` branch collision are classified as deterministic setup blocks, recorded with
+  a safe `worktree_branch_already_checked_out` health reason, and shown in dashboard Attention as a
+  `STALLED` item with fixed remediation text.
+
 ## [0.72.2] - 2026-07-09
 
 ### Fixed

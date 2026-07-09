@@ -397,6 +397,156 @@ def test_wrapper_dead_letter_notice_coalesced_into_sink_row(tmp_path: Path) -> N
                 if i["source"] in (A.SOURCE_NEEDS_OPERATOR, A.SOURCE_DEAD_LETTER)]
 
 
+def test_dead_letter_resolve_closes_related_wrapper_notice_thread(tmp_path: Path) -> None:
+    from agenttalk import threads
+    s = _team(tmp_path)
+    mid = _dl_message(s)
+    emit = cli._dead_letter_notifier(s, "beta")
+    assert emit({"msg_id": mid, "agent": "beta", "from": "claude", "kind": "message",
+                 "attempts": 3, "failure_class": "poison_eligible"}, disposed=True) is True
+    notice = next(
+        m for m in s.valid_messages()
+        if (m.meta or {}).get("dead_letter") == "true"
+        and (m.meta or {}).get("dl_msg_id") == mid
+    )
+    rid = notice.meta["request_id"]
+    before = next(t for t in threads.derive_threads(
+        s.valid_messages(), agent="claude", cursor="", closed_rids=set())
+        if t.request_id == rid)
+    assert before.operator_state == "pending"
+
+    assert cli.main([*_root(tmp_path), "dead-letter", "resolve", "--from", "claude",
+                     "--agent", "beta", "--id", mid, "--reason", "handled"]) == 0
+
+    after = next(t for t in threads.derive_threads(
+        s.valid_messages(), agent="claude", cursor="", closed_rids=set())
+        if t.request_id == rid)
+    assert after.operator_state == "answered"
+    answer = next(
+        m for m in s.valid_messages()
+        if m.sender == "claude" and m.recipient == "beta"
+        and (m.meta or {}).get("request_id") == rid
+    )
+    assert answer.meta["operator_answer"] == "true"
+    assert answer.meta["dead_letter_resolved"] == "true"
+
+
+def test_status_dead_letter_count_is_unresolved_only(tmp_path: Path) -> None:
+    import io
+    import json as _json
+    from contextlib import redirect_stdout
+
+    s = _team(tmp_path)
+    mid = _dl_message(s)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        assert cli.main([*_root(tmp_path), "status", "--json"]) == 0
+    assert _json.loads(buf.getvalue())["dead_lettered_count"] == 1
+
+    assert cli.main([*_root(tmp_path), "dead-letter", "resolve", "--from", "claude",
+                     "--agent", "beta", "--id", mid, "--reason", "handled"]) == 0
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        assert cli.main([*_root(tmp_path), "status", "--json"]) == 0
+    assert "dead_lettered_count" not in _json.loads(buf.getvalue())
+
+
+def test_dead_letter_purge_resolved_archives_payload_and_sidecars(tmp_path: Path) -> None:
+    import io
+    import json as _json
+    from contextlib import redirect_stdout
+
+    s = _team(tmp_path)
+    mid = _dl_message(s)
+    assert cli.main([*_root(tmp_path), "dead-letter", "resolve", "--from", "claude",
+                     "--agent", "beta", "--id", mid, "--reason", "handled"]) == 0
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        assert cli.main([*_root(tmp_path), "dead-letter", "purge", "--resolved",
+                         "--from", "claude", "--json"]) == 0
+    out = _json.loads(buf.getvalue())
+    assert out["count"] == 1
+    assert not (s.dead_letter_dir / "beta" / f"{mid}.json").exists()
+    archived = list((s.dir / "dead-letter-archive").glob(f"*/beta/{mid}.json"))
+    assert len(archived) == 1
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        assert cli.main([*_root(tmp_path), "dead-letter", "list", "--all", "--json"]) == 0
+    assert _json.loads(buf.getvalue()) == []
+
+
+def test_dead_letter_purge_refuses_if_wrapper_notice_still_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _team(tmp_path)
+    mid = _dl_message(s)
+    emit = cli._dead_letter_notifier(s, "beta")
+    assert emit({"msg_id": mid, "agent": "beta", "from": "claude", "kind": "message",
+                 "attempts": 3, "failure_class": "poison_eligible"}, disposed=True) is True
+
+    original_send = Store.send
+
+    def fail_notice_close(self, *args, **kwargs):
+        meta = kwargs.get("meta") or {}
+        if meta.get("dead_letter_resolved") == "true":
+            raise OSError("simulated notice close failure")
+        return original_send(self, *args, **kwargs)
+
+    monkeypatch.setattr(Store, "send", fail_notice_close)
+
+    assert cli.main([*_root(tmp_path), "dead-letter", "resolve", "--from", "claude",
+                     "--agent", "beta", "--id", mid, "--reason", "handled"]) == 0
+    assert cli.main([*_root(tmp_path), "dead-letter", "purge", "--resolved",
+                     "--from", "claude"]) == 2
+    assert (s.dead_letter_dir / "beta" / f"{mid}.json").exists()
+
+
+def test_dead_letter_purge_dry_run_does_not_move_resolved_payload(tmp_path: Path) -> None:
+    import io
+    import json as _json
+    from contextlib import redirect_stdout
+
+    s = _team(tmp_path)
+    mid = _dl_message(s)
+    assert cli.main([*_root(tmp_path), "dead-letter", "resolve", "--from", "claude",
+                     "--agent", "beta", "--id", mid, "--reason", "handled"]) == 0
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        assert cli.main([*_root(tmp_path), "dead-letter", "purge", "--resolved",
+                         "--from", "claude", "--dry-run", "--json"]) == 0
+    out = _json.loads(buf.getvalue())
+    assert out["dry_run"] is True
+    assert out["count"] == 1
+    assert (s.dead_letter_dir / "beta" / f"{mid}.json").exists()
+
+
+def test_dead_letter_purge_resolved_leaves_unresolved_items_live(tmp_path: Path) -> None:
+    import io
+    import json as _json
+    from contextlib import redirect_stdout
+
+    s = _team(tmp_path)
+    resolved_mid = _dl_message(s, body="resolved poison")
+    unresolved_mid = _dl_message(s, body="still live poison")
+    assert cli.main([*_root(tmp_path), "dead-letter", "resolve", "--from", "claude",
+                     "--agent", "beta", "--id", resolved_mid,
+                     "--reason", "handled"]) == 0
+
+    assert cli.main([*_root(tmp_path), "dead-letter", "purge", "--resolved",
+                     "--from", "claude"]) == 0
+
+    assert not (s.dead_letter_dir / "beta" / f"{resolved_mid}.json").exists()
+    assert (s.dead_letter_dir / "beta" / f"{unresolved_mid}.json").exists()
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        assert cli.main([*_root(tmp_path), "dead-letter", "list", "--json"]) == 0
+    live = _json.loads(buf.getvalue())
+    assert [m["message_id"] for m in live] == [unresolved_mid]
+
+
 def test_wrapper_notice_kept_when_no_canonical_row(tmp_path: Path) -> None:
     # a not-yet-disposed dead-letter notice (dl_disposed=false, NO sink row) is the SOLE
     # signal and must be KEPT (fail-safe: coalesce only a proven-redundant twin).

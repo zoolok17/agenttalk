@@ -7,7 +7,7 @@ Goal: understand the system first, then operate it safely: messaging,
 thread states, dashboard views, skills, workflows, supervision, lanes,
 knowledge, gates, close records, and recovery.
 
-Last updated: 2026-07-09. Current release baseline: v0.72.2.
+Last updated: 2026-07-09. Current release baseline: v0.72.3.
 
 agenttalk is a local, file-backed coordination platform for coding-agent CLIs
 such as Claude Code and Codex. It lets separate agent windows talk directly,
@@ -90,7 +90,7 @@ Keep these rules in mind before learning commands.
 Install from a pinned release:
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.72.2"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.72.3"
 agenttalk --version
 agenttalk install-skills
 ```
@@ -623,8 +623,8 @@ agenttalk threads --for <agent> --all
 | You are waiting on a stale request | Request was superseded or unknown | `check --for <agent> --to-request <id>` |
 | Dashboard reply box needs more context | Attention card shows a bounded excerpt, not the whole transcript | Open Conversations or Sessions for the full thread; use typed escalation fields |
 | Lead chat unavailable | Liaison heartbeat stale or missing | Start `wait`, run wrapped, or install activity hook |
-| Duplicate wrappers/windows | Same mailbox consumed twice | Stop duplicate; use `wait --refuse-stacked-wait`; inspect supervisor |
-| Poison message blocks wrapped agent | Repeated deterministic failure | `dead-letter list`, `show`, `requeue`, or `resolve` |
+| Duplicate wrappers/windows | Same mailbox consumed twice | Stop duplicate; use `wait --refuse-stacked-wait`; inspect supervisor. Exit 6 can also mean an older scoped wait was superseded by a newer same-thread waiter; it did not consume the reply. |
+| Poison message blocks wrapped agent | Repeated deterministic failure | `dead-letter list`, `show`, `requeue`, `resolve`, or `purge --resolved` |
 | Invalid message files | Corrupt or forged files | `prune --invalid --dry-run`, then `prune --invalid` |
 | Store too large | Old closed history accumulated | `compact`; remember old closed checks can become unknown |
 | Need to clear active bus state | Fresh session needed | `reset`; know what survives before running it |
@@ -636,7 +636,13 @@ agenttalk dead-letter list
 agenttalk dead-letter show --agent <agent> --id <message-id>
 agenttalk dead-letter requeue --agent <agent> --id <message-id>
 agenttalk dead-letter resolve --agent <agent> --id <message-id> --reason handled --from <liaison>
+agenttalk dead-letter purge --resolved --from <liaison>
 ```
+
+`resolve` closes matching wrapper dead-letter notice escalations so they do not
+linger as active work. `purge --resolved` archives resolved payloads and sidecars
+under `.agenttalk/dead-letter-archive/`; archived rows are no longer requeueable
+by the live `dead-letter requeue` command unless restored.
 
 ## 16. State reference
 

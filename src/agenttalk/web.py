@@ -1037,6 +1037,10 @@ def _derive_root_thread_sets(
         _inject_next(d, t)
         opener = openers.get(rid)
         ometa = (opener.meta or {}) if opener is not None else {}
+        if opener is not None and th.wrapper_notice_has_canonical_row(
+            store, ometa, opener.sender
+        ):
+            continue
         if isinstance(ometa.get("mission"), str):
             d["mission"] = ometa["mission"]
         if isinstance(ometa.get("wp_id"), str):
@@ -2116,6 +2120,16 @@ def _web_needs_operator(store: Store, for_agent: str) -> list[dict]:
             if not th.wrapper_notice_has_canonical_row(store, p["meta"], p["sender"])]
 
 
+_HEALTH_REASON_DETAILS = {
+    "worktree_branch_already_checked_out": (
+        "STALLED",
+        "looks stalled",
+        "branch already checked out in another worktree; use the existing worktree, "
+        "remove the stale one, or assign a unique branch",
+    ),
+}
+
+
 def _derive_stuck_items(agents: list[dict], *, now: datetime) -> list[dict]:
     """One STUCK attention item per agent whose advisory health.state ==
     ``stuck_suspected`` (§4a — NOT a build_queue source). Envelope-derived; the
@@ -2123,18 +2137,26 @@ def _derive_stuck_items(agents: list[dict], *, now: datetime) -> list[dict]:
     stuck: list[dict] = []
     for a in agents:
         health = a.get("health") or {}
-        if health.get("state") != "stuck_suspected":
+        reason = str(health.get("reason_code") or "")
+        descriptor = _HEALTH_REASON_DETAILS.get(reason)
+        if health.get("state") == "stuck_suspected":
+            source_label = "STUCK"
+            title_suffix = "looks stuck"
+            detail = "no forward progress on this agent's turn (advisory health)"
+        elif descriptor is not None:
+            source_label, title_suffix, detail = descriptor
+        else:
             continue
         name = a.get("name")
         age = a.get("last_seen_age_seconds")
         stuck.append({
             "id": f"stuck:{name}",
             "source": "stuck",
-            "source_label": "STUCK",
+            "source_label": source_label,
             "severity": "med",
-            "title": f"{name} looks stuck",
+            "title": f"{name} {title_suffix}",
             "agent": name,
-            "detail": "no forward progress on this agent's turn (advisory health)",
+            "detail": detail,
             "age_seconds": float(age) if isinstance(age, (int, float)) else 0.0,
             "human_can_unblock_now": True,
         })

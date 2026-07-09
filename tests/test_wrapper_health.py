@@ -318,6 +318,26 @@ def test_health_failure_and_degraded_mappings(tmp_path: Path) -> None:
     assert _health_state(s) == hm.STATE_ERRORED_AMBIGUOUS
     assert _health_reason(s) == "config_blocked"
 
+    s = _store(tmp_path / "worktree_collision")
+    st = session.SessionState(cli="codex")
+    stream = _codex_lines(
+        {"type": "turn.started"},
+        {"type": "item.completed",
+         "item": {"type": "command_execution",
+                  "command": "git worktree add .worktrees/lane lane/existing",
+                  "exit_code": 128,
+                  "aggregated_output": (
+                      "fatal: 'lane/existing' is already checked out at "
+                      "'D:/repo/.worktrees/other'"
+                  )}},
+    )
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"],
+                           spawn=lambda _a, _i: stream, clock=lambda: 0.0, render=False)
+    out = drive(_rec())
+    assert out.ok is False
+    assert _health_state(s) == hm.STATE_ERRORED_AMBIGUOUS
+    assert _health_reason(s) == "worktree_branch_already_checked_out"
+
     s = _store(tmp_path / "degraded")
     st = session.SessionState(cli="codex")
     leak = '<invoke name="Read"><parameter name="file_path">x</parameter></invoke>'

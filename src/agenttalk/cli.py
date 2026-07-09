@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess  # nosec B404
 import sys
 import time
@@ -540,7 +541,7 @@ def _gather_status(store: Store) -> dict:
         agents.append(row)
     invalid = store.list_invalid_messages()
     quarantined = store.quarantined_count()
-    dead_lettered = store.dead_lettered_count()
+    dead_lettered = _unresolved_dead_letter_count(store)
     signing_enforced = store.signing_enforced()
     # project_id is path-derived; surfaces here for diagnostics
     project_id = store.project_id()
@@ -5538,7 +5539,8 @@ def cmd_drain(args: argparse.Namespace) -> int:
 
 def _write_waiting_marker(
     store: Store, agent: str, *, cursor_at_start: str, timeout: float,
-    deadline: float | None,
+    deadline: float | None, wait_token: str | None = None,
+    to_request: str | None = None, kind: str | None = None,
 ) -> None:
     """Best-effort write of the observational `.waiting` marker.
 
@@ -5548,7 +5550,7 @@ def _write_waiting_marker(
     failure is swallowed — this is diagnostics, never correctness.
     """
     try:
-        store.write_waiting(agent, {
+        marker = {
             "agent": agent,
             "pid": os.getpid(),
             "since": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -5557,9 +5559,40 @@ def _write_waiting_marker(
             # epoch seconds; None when --timeout 0 (waits forever). Updated
             # in place when composing pings push the deadline out.
             "deadline_epoch": deadline,
-        })
+        }
+        if wait_token:
+            marker["wait_token"] = wait_token
+        if to_request:
+            marker["to_request"] = to_request
+        if kind:
+            marker["kind"] = kind
+        store.write_waiting(agent, marker)
     except OSError:
         pass
+
+
+def _wait_was_superseded(store: Store, agent: str, wait_token: str) -> bool:
+    try:
+        return store.waiting_superseded(agent, wait_token) is not None
+    except Exception:  # noqa: BLE001 - observability only
+        return False
+
+
+def _print_wait_superseded(agent: str, *, rid: str | None) -> None:
+    if rid:
+        sys.stderr.write(
+            f"(superseded: wait on thread {rid} for {agent} "
+            "was replaced by a newer waiter)\n"
+        )
+    else:
+        sys.stderr.write(
+            f"(superseded: wait for {agent} was replaced by a newer waiter)\n"
+        )
+
+
+def _clear_waiting_marker(store: Store, agent: str, wait_token: str) -> None:
+    store.clear_waiting_if_token(agent, wait_token)
+    store.clear_waiting_superseded(agent, wait_token)
 
 
 def _next_backoff(cur: float, base: float, cap: float, activity: bool) -> float:
@@ -5611,7 +5644,7 @@ def _print_rescinded(store: Store, rid: str, row) -> None:
             print(f"  reason: {row.rescind_reason}")
 
 
-def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
+def _scoped_wait(store: Store, agent: str, args: argparse.Namespace, wait_token: str) -> int:
     """Block until a message on ONE thread (request_id) arrives — ignoring
     unrelated traffic — and return only that match.
 
@@ -5660,10 +5693,14 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
         last_heartbeat = time.time()
     _write_waiting_marker(
         store, agent, cursor_at_start=store.thread_seen(agent, rid),
-        timeout=args.timeout, deadline=deadline,
+        timeout=args.timeout, deadline=deadline, wait_token=wait_token,
+        to_request=rid, kind=kind_filter,
     )
     try:
         while True:
+            if _wait_was_superseded(store, agent, wait_token):
+                _print_wait_superseded(agent, rid=rid)
+                return 6
             # Floor delivery at BOTH the per-thread seen pointer AND the
             # global cursor: a message already consumed globally (a `drain`
             # or plain `wait` advanced the cursor past it) must NOT be
@@ -5707,6 +5744,8 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
                             _write_waiting_marker(
                                 store, agent, cursor_at_start=floor,
                                 timeout=args.timeout, deadline=deadline,
+                                wait_token=wait_token,
+                                to_request=rid, kind=kind_filter,
                             )
                             if not args.quiet:
                                 print(f"(composing from {m.sender}: deadline "
@@ -5771,7 +5810,7 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace) -> int:
             else:
                 time.sleep(interval)
     finally:
-        store.clear_waiting(agent)
+        _clear_waiting_marker(store, agent, wait_token)
 
 
 def cmd_wait(args: argparse.Namespace) -> int:
@@ -5837,8 +5876,12 @@ def cmd_wait(args: argparse.Namespace) -> int:
     _early_cursor = (store.thread_seen(agent, args.to_request)
                      if getattr(args, "to_request", None) else store.cursor(agent))
     _early_deadline = _now + args.timeout if args.timeout > 0 else None
+    wait_token = f"wait-{uuid.uuid4().hex[:12]}"
     _write_waiting_marker(store, agent, cursor_at_start=_early_cursor,
-                          timeout=args.timeout, deadline=_early_deadline)
+                          timeout=args.timeout, deadline=_early_deadline,
+                          wait_token=wait_token,
+                          to_request=getattr(args, "to_request", None),
+                          kind=getattr(args, "kind", None))
     # Everything after the early marker write is wrapped in one try/finally so
     # a failure before the poll loop (the scoped entry-return, a cursor read
     # that raises, any pre-loop setup error) can't leak the .waiting marker —
@@ -5850,7 +5893,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
         # the store grows past the threshold. Throttled + fail-safe.
         _maybe_auto_compact(store, now_epoch=_now)
         if getattr(args, "to_request", None):
-            return _scoped_wait(store, agent, args)
+            return _scoped_wait(store, agent, args, wait_token)
         deadline = time.time() + args.timeout if args.timeout > 0 else None
         interval = max(0.1, args.interval)
         heartbeat_interval = max(0.0, args.heartbeat_interval)
@@ -5878,9 +5921,12 @@ def cmd_wait(args: argparse.Namespace) -> int:
         # freshly-read cursor; the early stamp above only covered arm latency.
         _write_waiting_marker(
             store, agent, cursor_at_start=cursor_at_start,
-            timeout=args.timeout, deadline=deadline,
+            timeout=args.timeout, deadline=deadline, wait_token=wait_token,
         )
         while True:
+            if _wait_was_superseded(store, agent, wait_token):
+                _print_wait_superseded(agent, rid=None)
+                return 6
             msgs = store.messages_for(agent, since_id=cursor_at_start or None)
             cur_max = max((m.id for m in msgs), default=last_seen_max_id)
             for m in msgs:
@@ -5919,6 +5965,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
                         _write_waiting_marker(
                             store, agent, cursor_at_start=cursor_at_start,
                             timeout=args.timeout, deadline=deadline,
+                            wait_token=wait_token,
                         )
                         if not args.quiet:
                             print(
@@ -5971,7 +6018,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
     finally:
         # Always retract the marker — message received, timeout, or the
         # KeyboardInterrupt that main() catches one frame up. Best-effort.
-        store.clear_waiting(agent)
+        _clear_waiting_marker(store, agent, wait_token)
 
 
 def cmd_ack(args: argparse.Namespace) -> int:
@@ -7137,6 +7184,7 @@ def cmd_request_restart(args: argparse.Namespace) -> int:
 
     Writes an atomic, request_id-scoped state/<agent>.restart-request marker.
     A protected agent (operator_facing / role=lead) needs --force-protected,
+    and a fresh protected heartbeat also needs --acknowledge-live-protected-kill,
     enforced by the supervisor.
     """
     store = _get_store(args)
@@ -8005,6 +8053,31 @@ def _dead_letter_resolution_state(store: Store) -> dict[tuple[str, str], str]:
     return out
 
 
+def _unresolved_dead_letter_entries(store: Store, agent: str | None = None) -> list[dict]:
+    """User-facing unresolved dead-letter projection.
+
+    ``Store.dead_lettered_count`` deliberately counts payload files in the sink. Status and
+    dashboard-style surfaces need the attention count instead: resolved items no longer need
+    an operator. Fail safe by returning the raw entries if disposition state is unreadable.
+    """
+    items = store.list_dead_letters(agent)
+    try:
+        res = _dead_letter_resolution_state(store)
+    except Exception:  # noqa: BLE001 - a broken disposition log must not hide poison messages
+        return items
+    return [
+        m for m in items
+        if res.get((str(m.get("agent") or ""), str(m.get("message_id") or ""))) != "resolved"
+    ]
+
+
+def _unresolved_dead_letter_count(store: Store, agent: str | None = None) -> int:
+    try:
+        return len(_unresolved_dead_letter_entries(store, agent))
+    except Exception:  # noqa: BLE001 - preserve the older raw-count warning on read failures
+        return store.dead_lettered_count(agent)
+
+
 def _is_listed_dead_letter(store: Store, agent: str, msg_id: str) -> bool:
     """SECURITY guard (reviewer-2 F5): the --id must be an EXACT message_id currently in the
     agent's sink. Blocks a path-traversal id (e.g. ..\\..\\config) from reaching ANY payload
@@ -8016,6 +8089,93 @@ def _is_listed_dead_letter(store: Store, agent: str, msg_id: str) -> bool:
         return any(m.get("message_id") == msg_id for m in store.list_dead_letters(agent))
     except (OSError, ValueError):
         return False
+
+
+def _pending_dead_letter_notice_request_ids(
+    store: Store,
+    *,
+    actor: str,
+    agent: str,
+    msg_id: str,
+) -> list[str]:
+    msgs = sorted(store.valid_messages(), key=lambda m: m.id)
+    rows = {
+        t.request_id: t
+        for t in th.derive_threads(
+            msgs,
+            agent=actor,
+            cursor=store.cursor(actor) or "",
+            closed_rids=_closed_rids(store, actor),
+            retired=set(store.retired_agents()),
+        )
+    }
+    request_ids: list[str] = []
+    for m in msgs:
+        meta = m.meta or {}
+        rid = meta.get("request_id")
+        if not (isinstance(rid, str) and rid):
+            continue
+        if m.sender != agent or m.recipient != actor or m.kind != "question":
+            continue
+        if str(meta.get("needs_operator", "")).lower() != "true":
+            continue
+        if str(meta.get("dead_letter", "")).lower() != "true":
+            continue
+        if str(meta.get("dl_disposed", "")).lower() != "true":
+            continue
+        if str(meta.get("dl_msg_id") or "") != msg_id:
+            continue
+        row = rows.get(rid)
+        if row is None or row.operator_state != "pending":
+            continue
+        request_ids.append(rid)
+    return sorted(set(request_ids))
+
+
+def _close_dead_letter_notice_threads(
+    store: Store,
+    *,
+    actor: str,
+    agent: str,
+    msg_id: str,
+    reason: str,
+    evidence: str | None = None,
+) -> int:
+    """Best-effort close of wrapper escalation twins for a resolved sink row.
+
+    The normal operator-answer resolver intentionally rejects these twins as
+    ``superseded_by_canonical`` and tells the operator to resolve the canonical
+    dead-letter. This helper is that canonical path: after the sink row is resolved, answer
+    only the matching pending wrapper notices so their thread projections stop looking like
+    current work.
+    """
+    closed = 0
+    for rid in _pending_dead_letter_notice_request_ids(
+        store, actor=actor, agent=agent, msg_id=msg_id,
+    ):
+        meta = {
+            "request_id": rid,
+            "operator_answer": "true",
+            "operator_origin": actor,
+            "dead_letter_resolved": "true",
+            "dead_letter_agent": agent,
+            "dead_letter_msg_id": msg_id,
+        }
+        if evidence:
+            meta["dead_letter_evidence"] = evidence
+        try:
+            store.send(
+                sender=actor,
+                recipient=agent,
+                kind="message",
+                subject=f"dead-letter resolved ({msg_id})",
+                body=f"Dead-letter {agent}/{msg_id} was resolved by {actor}: {reason}",
+                meta=meta,
+            )
+            closed += 1
+        except (OSError, ValueError):
+            continue
+    return closed
 
 
 def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
@@ -8066,8 +8226,128 @@ def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
                                    ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         pass
+    closed = _close_dead_letter_notice_threads(
+        store,
+        actor=actor,
+        agent=args.agent,
+        msg_id=args.id,
+        reason=reason.strip(),
+        evidence=getattr(args, "evidence", None),
+    )
+    extra = f"; closed {closed} related escalation thread(s)" if closed else ""
     print(f"resolved dead-letter {args.agent}/{args.id} by {actor} "
-          "(payload preserved; requeue with --force-resolved --reason to reopen)")
+          f"(payload preserved; requeue with --force-resolved --reason to reopen{extra})")
+    return 0
+
+
+def _cmd_dead_letter_purge(store: Store, args: argparse.Namespace) -> int:
+    if not getattr(args, "resolved", False):
+        sys.stderr.write("agenttalk dead-letter purge: pass --resolved (only resolved "
+                         "dead-letters can be purged).\n")
+        return 2
+    actor = _resolve_disposition_actor(store, args)
+    if actor is None:
+        sys.stderr.write("agenttalk dead-letter purge: only the operator-facing liaison "
+                         "(or the sole lead) may purge; set --from/$AGENTTALK_SELF.\n")
+        return 2
+    agent_filter = getattr(args, "agent", None)
+    items = store.list_dead_letters(agent_filter)
+    res = _dead_letter_resolution_state(store)
+    candidates = [
+        m for m in items
+        if res.get((str(m.get("agent") or ""), str(m.get("message_id") or ""))) == "resolved"
+    ]
+    if getattr(args, "json", False) and getattr(args, "dry_run", False):
+        preview = []
+        for entry in candidates:
+            ag = str(entry.get("agent") or "")
+            mid = str(entry.get("message_id") or "")
+            preview.append({
+                **entry,
+                "pending_notice_request_ids": _pending_dead_letter_notice_request_ids(
+                    store, actor=actor, agent=ag, msg_id=mid,
+                ),
+            })
+        print(json.dumps({"dry_run": True, "count": len(preview), "items": preview},
+                         indent=2))
+        return 0
+    if not candidates:
+        if getattr(args, "json", False):
+            print(json.dumps({"dry_run": bool(getattr(args, "dry_run", False)),
+                              "count": 0, "archive_dir": None, "items": []}, indent=2))
+        else:
+            print("dead-letter purge: no resolved dead-letters")
+        return 0
+
+    if not getattr(args, "dry_run", False):
+        blocked: list[str] = []
+        for entry in candidates:
+            ag = str(entry.get("agent") or "")
+            mid = str(entry.get("message_id") or "")
+            if _pending_dead_letter_notice_request_ids(store, actor=actor, agent=ag, msg_id=mid):
+                _close_dead_letter_notice_threads(
+                    store, actor=actor, agent=ag, msg_id=mid,
+                    reason="dead-letter purge preflight",
+                )
+            pending = _pending_dead_letter_notice_request_ids(
+                store, actor=actor, agent=ag, msg_id=mid,
+            )
+            if pending:
+                blocked.append(f"{ag}/{mid} ({', '.join(pending)})")
+        if blocked:
+            sys.stderr.write(
+                "agenttalk dead-letter purge: refusing to archive resolved item(s) "
+                "with pending wrapper notice thread(s): "
+                + "; ".join(blocked)
+                + "\n"
+            )
+            return 2
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_root = store.dir / "dead-letter-archive" / stamp
+    moved: list[dict] = []
+    for entry in candidates:
+        agent = str(entry.get("agent") or "")
+        msg_id = str(entry.get("message_id") or "")
+        try:
+            safe_agent = validate_agent_name(agent)
+        except ValueError:
+            continue
+        src_dir = store.dead_letter_dir / safe_agent
+        dst_dir = archive_root / safe_agent
+        names = [
+            f"{msg_id}.json",
+            f"{msg_id}.deadletter.json",
+            f"{msg_id}.resolved.json",
+        ]
+        selected = [src_dir / name for name in names if (src_dir / name).is_file()]
+        if not selected:
+            continue
+        if getattr(args, "dry_run", False):
+            moved.append({"agent": agent, "message_id": msg_id,
+                          "files": [p.name for p in selected]})
+            continue
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst_files = []
+        for src in selected:
+            dst = dst_dir / src.name
+            if dst.exists():
+                dst = dst_dir / f"{src.stem}.{uuid.uuid4().hex[:8]}{src.suffix}"
+            shutil.move(str(src), str(dst))
+            dst_files.append(str(dst))
+        moved.append({"agent": agent, "message_id": msg_id, "files": dst_files})
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "dry_run": bool(getattr(args, "dry_run", False)),
+            "count": len(moved),
+            "archive_dir": str(archive_root),
+            "items": moved,
+        }, indent=2))
+        return 0
+    verb = "would archive" if getattr(args, "dry_run", False) else "archived"
+    print(f"dead-letter purge: {verb} {len(moved)} resolved item(s) "
+          f"to {archive_root}")
     return 0
 
 
@@ -8081,6 +8361,8 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
     action = getattr(args, "dead_letter_cmd", None)
     if action == "resolve":
         return _cmd_dead_letter_resolve(store, args)
+    if action == "purge":
+        return _cmd_dead_letter_purge(store, args)
     if action == "list":
         items = store.list_dead_letters(getattr(args, "agent", None))
         # resolved-aware (0.56.0): default shows UNRESOLVED only; --resolved / --all audit.
@@ -8230,7 +8512,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         print(f"requeued dead-letter {args.id} as fresh message {new.id} "
               "(new id, own fresh attempt count; original evidence preserved in the sink)")
         return 0
-    sys.stderr.write("agenttalk dead-letter: expected list, show, or requeue.\n")
+    sys.stderr.write("agenttalk dead-letter: expected list, show, requeue, resolve, or purge.\n")
     return 2
 
 
@@ -9670,7 +9952,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "pointer, never the global cursor. Close the thread "
                          "with `ack --to-request`. Exit codes: 0 reply, "
                          "1 timeout, 3 the request was RESCINDED (wakes "
-                         "immediately; do not act on it).")
+                         "immediately; do not act on it), 6 superseded by "
+                         "a newer same-thread waiter.")
     pw.add_argument("--kind",
                     help="With --to-request: further restrict the scoped wait "
                          "to this message kind. Note: the per-thread pointer "
@@ -9776,7 +10059,8 @@ def build_parser() -> argparse.ArgumentParser:
         "request-restart",
         help="Queue a MANUAL restart of an agent (the external supervisor "
              "relaunches it and clears the request). A protected "
-             "(operator_facing/lead) agent requires --force-protected.",
+             "(operator_facing/lead) agent requires --force-protected; a fresh "
+             "protected heartbeat also requires --acknowledge-live-protected-kill.",
     )
     prr.add_argument("--for", dest="agent", required=True, help="Agent to restart.")
     prr.add_argument("--from", dest="sender",
@@ -9914,6 +10198,18 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Actor (default $AGENTTALK_SELF); must resolve to the "
                             "liaison or sole lead. No --by.")
     dlres.set_defaults(func=cmd_dead_letter, dead_letter_cmd="resolve")
+    dlp = dlsub.add_parser(
+        "purge",
+        help="Archive resolved dead-letter payloads out of the live sink.")
+    dlp.add_argument("--resolved", action="store_true",
+                     help="Required selector; only resolved entries can be purged.")
+    dlp.add_argument("--agent", help="Limit to one agent (default: all).")
+    dlp.add_argument("--from", dest="sender",
+                     help="Actor (default $AGENTTALK_SELF); must resolve to the liaison "
+                          "or sole lead.")
+    dlp.add_argument("--dry-run", action="store_true")
+    dlp.add_argument("--json", action="store_true")
+    dlp.set_defaults(func=cmd_dead_letter, dead_letter_cmd="purge")
 
     pmll = sub.add_parser(
         "managed-lead-loop",

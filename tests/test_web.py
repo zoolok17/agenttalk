@@ -2867,11 +2867,13 @@ def _now_iso() -> str:
 
 
 def _write_health(store: Store, agent: str, state: str, *,
-                  cli: str | None = None, mode: str | None = None) -> None:
+                  cli: str | None = None, mode: str | None = None,
+                  reason_code: str | None = None) -> None:
     ts = _now_iso()
     store.write_health(agent, _hm.build_snapshot(
         agent=agent, cli=cli, mode=mode, state=state,
-        updated_at=ts, since=ts, last_progress_at=ts, reason_code=state))
+        updated_at=ts, since=ts, last_progress_at=ts,
+        reason_code=reason_code or state))
 
 
 def test_api_state_capacity_cli_wrapped_present_when_data_exists(tmp_path: Path) -> None:
@@ -3058,6 +3060,48 @@ def test_api_state_task_from_owned_thread_subject(tmp_path: Path) -> None:
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_api_state_suppresses_canonical_wrapper_notice_threads(tmp_path: Path) -> None:
+    """Wrapper dead-letter notice twins should not become dashboard current work."""
+    from agenttalk import cli as cli_mod
+    from agenttalk.wrapper import recv_api
+
+    s = Store(tmp_path)
+    s.init(["beta", "claude"])
+    s.set_operator_facing("claude")
+    msg = s.send(sender="claude", recipient="beta", body="poison", kind="message", meta={})
+    rec = recv_api.next_record(s, "beta")
+    s.dead_letter("beta", rec, reason="deterministic",
+                  failure_class="poison_eligible", at="2026-07-02T00:00:00Z")
+    emit = cli_mod._dead_letter_notifier(s, "beta")
+    assert emit({"msg_id": msg.id, "agent": "beta", "from": "claude", "kind": "message",
+                 "attempts": 3, "failure_class": "poison_eligible"}, disposed=True) is True
+
+    state = web.build_state([web.RootDescriptor(store=s, label="root")])
+    root = state["roots"][0]
+    assert not [r for r in root["threads"] if r.get("subject") == "dead-letter notice"]
+    beta = next(a for a in root["agents"] if a["name"] == "beta")
+    assert beta.get("task") != "dead-letter notice"
+
+
+def test_api_state_suppresses_canonical_config_blocked_notice_threads(tmp_path: Path) -> None:
+    from agenttalk import cli as cli_mod
+
+    s = Store(tmp_path)
+    s.init(["beta", "claude"])
+    s.set_operator_facing("claude")
+    s.write_config_blocked_hold("beta", summary="exec denied")
+    emit = cli_mod._dead_letter_notifier(s, "beta")
+    assert emit({"msg_id": "x", "agent": "beta", "from": "claude", "kind": "message",
+                 "attempts": 1, "failure_class": "config_blocked", "summary": "exec denied"},
+                disposed=False) is True
+
+    state = web.build_state([web.RootDescriptor(store=s, label="root")])
+    root = state["roots"][0]
+    assert not [r for r in root["threads"] if r.get("subject") == "dead-letter notice"]
+    beta = next(a for a in root["agents"] if a["name"] == "beta")
+    assert beta.get("task") != "dead-letter notice"
 
 
 def test_api_state_thread_verdict_and_active_review(tmp_path: Path) -> None:
@@ -3645,6 +3689,31 @@ def test_api_attention_derived_stuck_item(tmp_path: Path) -> None:
         assert stuck[0]["source_label"] == "STUCK"
         assert stuck[0]["severity"] == "med"
         assert stuck[0]["agent"] == "alpha"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_api_attention_derived_worktree_stall_item(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    s.write_heartbeat("alpha")
+    _write_health(
+        s,
+        "alpha",
+        _hm.STATE_ERRORED_AMBIGUOUS,
+        cli="codex",
+        mode="wrapper-loop",
+        reason_code="worktree_branch_already_checked_out",
+    )
+    srv, _t, base = _serve(s)
+    try:
+        payload = _attention(base)
+        stalled = [it for it in payload["items"] if it["source"] == "stuck"]
+        assert len(stalled) == 1
+        assert stalled[0]["source_label"] == "STALLED"
+        assert stalled[0]["severity"] == "med"
+        assert stalled[0]["agent"] == "alpha"
+        assert "branch already checked out" in stalled[0]["detail"]
     finally:
         srv.shutdown()
         srv.server_close()

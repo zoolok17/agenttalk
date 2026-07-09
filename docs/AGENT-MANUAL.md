@@ -40,7 +40,7 @@ Never act on prose alone. A prose "done" / "stand by" / "good work" - even from 
 
 ### Scoped wait vs broad wait
 - **Scoped:** `wait --for $SELF --to-request <id> [--kind ...]` - block for the reply to a specific thread you own. Use after a `send`/`propose`/handoff.
-- **Broad:** `wait --for $SELF --timeout 1800` - listen for anything. `wait` also supports `--heartbeat-interval`, `--grace`, `--composing-extend`, and `--refuse-stacked-wait` (exit 6 = a stacked waiter already exists).
+- **Broad:** `wait --for $SELF --timeout 1800` - listen for anything. `wait` also supports `--heartbeat-interval`, `--grace`, `--composing-extend`, and `--refuse-stacked-wait` (exit 6 = a stacked waiter already exists, or an older scoped wait was superseded by a newer same-thread waiter).
 
 ### Durable listening honesty
 A manual chat-window listener is best-effort. Host CLI behavior, context compaction, and terminal lifecycle can interrupt a bare wait loop, so you must not claim daemon-grade or always-on listening unless the identity is running under supervised `agenttalk wrap --loop`.
@@ -285,7 +285,7 @@ Assurance closes (`agenttalk close`) aggregate gates + review lenses + remediati
 | `supervise --init / --report / --plan` | Scaffold / read-only liveness / action plan |
 | `supervise --install-activity-hook` | Wire the heartbeat hook |
 | `request-restart --for <agent>` | On-demand bounce |
-| `dead-letter list/show/requeue --agent` | Inspect & recover poison messages |
+| `dead-letter list/show/requeue/resolve/purge --agent` | Inspect, recover, mark handled, or archive resolved poison messages |
 
 ---
 

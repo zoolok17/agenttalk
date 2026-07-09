@@ -2846,6 +2846,47 @@ class Store:
     # left behind by a crashed shell is expected and handled at read
     # time (status cross-checks heartbeat age + the recorded deadline).
 
+    def _waiting_superseded_path(self, agent: str, wait_token: str) -> Path | None:
+        try:
+            validate_agent_name(agent)
+        except ValueError:
+            return None
+        if not isinstance(wait_token, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", wait_token):
+            return None
+        return self.state_dir / "waiting-superseded" / f"{agent}.{wait_token}.json"
+
+    def _mark_waiting_superseded(self, agent: str, previous: dict, replacement: dict) -> None:
+        old_token = previous.get("wait_token")
+        new_token = replacement.get("wait_token")
+        if not isinstance(old_token, str) or not isinstance(new_token, str):
+            return
+        if old_token == new_token:
+            return
+        previous_request = previous.get("to_request")
+        replacement_request = replacement.get("to_request")
+        if not isinstance(previous_request, str) or not previous_request:
+            return
+        if previous_request != replacement_request:
+            return
+        if previous.get("kind") != replacement.get("kind"):
+            return
+        path = self._waiting_superseded_path(agent, old_token)
+        if path is None:
+            return
+        event = {
+            "agent": agent,
+            "wait_token": old_token,
+            "pid": previous.get("pid"),
+            "superseded_by_token": new_token,
+            "superseded_by_pid": replacement.get("pid"),
+            "superseded_at": _now_iso(),
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(path, json.dumps(event, ensure_ascii=False))
+        except OSError:
+            pass
+
     def write_waiting(self, agent: str, info: dict) -> None:
         """Stamp .agenttalk/state/<agent>.waiting with a JSON liveness record.
 
@@ -2855,6 +2896,9 @@ class Store:
         in-sandbox direct-write fallback - see _atomic.write_text.)
         """
         p = self.state_dir / f"{agent}.waiting"
+        previous = self.read_waiting(agent)
+        if isinstance(previous, dict):
+            self._mark_waiting_superseded(agent, previous, info)
         _atomic_write_text(p, json.dumps(info, ensure_ascii=False))
 
     def read_waiting(self, agent: str) -> dict | None:
@@ -2926,6 +2970,47 @@ class Store:
         p = self.state_dir / f"{agent}.waiting"
         try:
             p.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+    def clear_waiting_if_token(self, agent: str, wait_token: str) -> bool:
+        """Remove the waiting marker only if it still belongs to ``wait_token``.
+
+        This keeps an older waiter from erasing the marker for a newer waiter
+        that superseded it. Observational only; returns whether it unlinked.
+        """
+        try:
+            marker = self.read_waiting(agent)
+            if not marker or marker.get("wait_token") != wait_token:
+                return False
+            (self.state_dir / f"{agent}.waiting").unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+
+    def waiting_superseded(self, agent: str, wait_token: str) -> dict | None:
+        """Return the supersession event for ``wait_token`` if a newer wait replaced it."""
+        path = self._waiting_superseded_path(agent, wait_token)
+        if path is None or not path.exists():
+            return None
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def clear_waiting_superseded(self, agent: str, wait_token: str) -> None:
+        """Remove a supersession event after the superseded waiter observes it."""
+        path = self._waiting_superseded_path(agent, wait_token)
+        if path is None:
+            return
+        try:
+            path.unlink()
         except FileNotFoundError:
             pass
         except OSError:

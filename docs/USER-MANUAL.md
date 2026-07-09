@@ -59,7 +59,7 @@ decisions are what make a GO credible.
 Install once per machine. Pin the version in repeatable setups.
 
 ```powershell
-python -m pip install git+https://github.com/zoolok17/agenttalk.git@v0.72.2
+python -m pip install git+https://github.com/zoolok17/agenttalk.git@v0.72.3
 agenttalk --version
 agenttalk --help
 agenttalk install-skills
@@ -292,6 +292,9 @@ agenttalk wait --for codex-rev --to-request <request-id> --kind review-result
 
 If `wait --refuse-stacked-wait` exits 6, another live waiter already owns that
 mailbox. Stop the duplicate; one live consumer per agent is the supported rule.
+If an older scoped wait exits 6 with `superseded` on stderr, a newer wait for
+the same request replaced it; the older wait did not consume a message or move
+the thread cursor.
 
 ## 6. Running a lead and a team
 
@@ -457,7 +460,9 @@ agenttalk request-restart --for codex-dev --from claude-lead --reason reload-aft
 
 Protected agents are the operator-facing liaison and active lead-role agents.
 The supervisor will not auto-kill them. A manual restart of a protected agent
-requires `--force-protected`.
+requires `--force-protected`; if the protected agent still has a fresh
+heartbeat, the operator-facing requester must also pass
+`--acknowledge-live-protected-kill`.
 
 Kill switch:
 
@@ -685,7 +690,11 @@ Common cases:
 - Dead letter. A wrapped agent hit its retry ceiling for a valid message.
   Inspect with `agenttalk dead-letter list` and
   `agenttalk dead-letter show --agent <agent> --id <id>`. Requeue only when the cause is fixed, or
-  mark handled with `dead-letter resolve`.
+  mark handled with `dead-letter resolve`. Resolve also closes matching wrapper
+  dead-letter notice escalations so they do not remain as phantom current work.
+  Use `agenttalk dead-letter purge --resolved --from <liaison>` to archive old
+  resolved payloads out of the live sink; archived rows are no longer requeueable
+  by the live `dead-letter requeue` command unless restored.
 - Wrapper crash. Check `supervise --report`, `supervise --plan`, wrapper
   health files, and the dead-letter sink. The wrapper owns the heartbeat for
   wrapped agents.
@@ -716,7 +725,7 @@ This is a compact operator map, not a full argparse dump. Use
 | Lanes | `domain`, `lane assign`, `lane workspace`, `lane check`, `lane deliver`, `lane approve-shared` | Bound work to domain paths and deliver from isolated worktrees. |
 | Knowledge | `knowledge publish`, `knowledge curate`, `knowledge pull`, `knowledge search`, `knowledge onboard` | Capture, verify, retrieve, and search durable project notes and lessons. |
 | Supervision | `supervise`, `wrap`, `heartbeat`, `request-restart`, `request-launch`, `managed-lead-loop`, `deadman` | Run unattended agents, maintain liveness, request restarts, and monitor stale work. |
-| Recovery | `dead-letter list`, `dead-letter show`, `dead-letter requeue`, `dead-letter resolve`, `prune`, `compact`, `reset` | Inspect poison messages, quarantine invalid files, archive old messages, or clear active state. |
+| Recovery | `dead-letter list`, `dead-letter show`, `dead-letter requeue`, `dead-letter resolve`, `dead-letter purge --resolved`, `prune`, `compact`, `reset` | Inspect poison messages, archive resolved poison evidence, quarantine invalid files, archive old messages, or clear active state. |
 | Web | `dashboard`, `serve`, `start` | Open local loopback UI surfaces and optional browser intent enqueueing. |
 
 ## 14. Glossary
