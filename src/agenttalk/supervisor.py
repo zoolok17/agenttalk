@@ -2583,6 +2583,357 @@ def build_report(store: Store, *, now_epoch: float,
     }
 
 
+_BOOTSTRAP_SUPPORTED_CLIS = {"claude", "codex"}
+_BOOTSTRAP_PLACEHOLDER_TOKENS = (
+    "REPLACE",
+    "REPLACE_WITH_PROJECT_DIR",
+    "AGENT_NAME",
+    "{AGENT}",
+    "<CWD>",
+)
+
+
+def _bootstrap_add(checks: list[dict], check_id: str, status: str, detail: str,
+                   *, agent: str | None = None, suggestion: str | None = None,
+                   facts: dict | None = None) -> None:
+    row = {"id": check_id, "status": status, "detail": detail}
+    if agent is not None:
+        row["agent"] = agent
+    if suggestion:
+        row["suggestion"] = suggestion
+    if facts:
+        row["facts"] = facts
+    checks.append(row)
+
+
+def _bootstrap_has_placeholder(value: object) -> bool:
+    if isinstance(value, str):
+        upper = value.upper()
+        return any(token in upper for token in _BOOTSTRAP_PLACEHOLDER_TOKENS)
+    if isinstance(value, list):
+        return any(_bootstrap_has_placeholder(item) for item in value)
+    if isinstance(value, dict):
+        return any(_bootstrap_has_placeholder(item) for item in value.values())
+    return False
+
+
+def _bootstrap_arg_value(args: list, flag: str) -> str | None:
+    for i, item in enumerate(args):
+        if item == flag and i + 1 < len(args) and isinstance(args[i + 1], str):
+            return args[i + 1]
+        if isinstance(item, str) and item.startswith(flag + "="):
+            return item[len(flag) + 1:]
+    return None
+
+
+def _bootstrap_flag_before(args: list, flag: str, before: str) -> bool:
+    try:
+        cut = args.index(before)
+    except ValueError:
+        cut = len(args)
+    head = args[:cut]
+    return flag in head or any(
+        isinstance(item, str) and item.startswith(flag + "=") for item in head
+    )
+
+
+def _bootstrap_launch_tail(args: list) -> list:
+    try:
+        cut = args.index("--")
+    except ValueError:
+        return []
+    return args[cut + 1:]
+
+
+def bootstrap_check(store: Store, *, now_epoch: float,
+                    supervisor_config: dict | None = None,
+                    state: dict | None = None) -> dict:
+    """Read-only readiness check for turning a roster into a live team.
+
+    The check is intentionally CLI-neutral: Claude and Codex are both accepted
+    managed CLIs, and the wrapper invariants are the same for either one. It
+    answers the field-test question "is this identity merely in the roster, or
+    is it a configured, fresh, supervised agent that the lead can assign work
+    to?"
+    """
+    cfg = store.load_config()
+    roster = [a for a in (cfg.get("agents") or []) if isinstance(a, str)]
+    roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
+    supervisor_config = supervisor_config if isinstance(supervisor_config, dict) else {}
+    cfg_agents = (
+        supervisor_config.get("agents")
+        if isinstance(supervisor_config.get("agents"), dict) else {}
+    )
+    cfg_agent_names = set(cfg_agents)
+    checks: list[dict] = []
+
+    if roster:
+        _bootstrap_add(checks, "roster_present", "ok",
+                       f"roster has {len(roster)} agent(s)")
+    else:
+        _bootstrap_add(checks, "roster_missing", "error",
+                       "no roster identities are configured",
+                       suggestion="run agenttalk init or agenttalk roster add")
+
+    liaison = store.operator_facing()
+    if liaison is None:
+        _bootstrap_add(
+            checks, "operator_facing_missing", "error",
+            "no live operator-facing liaison is configured",
+            suggestion="run agenttalk roster set-operator-facing <lead-agent>",
+        )
+    else:
+        _bootstrap_add(checks, "operator_facing_present", "ok",
+                       f"operator-facing liaison is {liaison}", agent=liaison)
+
+    if cfg_agents:
+        _bootstrap_add(checks, "supervisor_agents_present", "ok",
+                       f"supervisor.json has {len(cfg_agents)} configured agent(s)")
+    else:
+        _bootstrap_add(
+            checks, "supervisor_agents_missing", "error",
+            "supervisor.json has no configured agents",
+            suggestion="run agenttalk supervise --init and fill the agents block",
+        )
+
+    report = build_report(
+        store, now_epoch=now_epoch, state=state if isinstance(state, dict) else None,
+        supervisor_config=supervisor_config,
+    )
+    report_agents = report.get("agents") if isinstance(report.get("agents"), dict) else {}
+
+    for name in sorted(cfg_agents):
+        raw_agent = cfg_agents.get(name)
+        cfg_agent = raw_agent if isinstance(raw_agent, dict) else None
+        if name not in roster:
+            _bootstrap_add(
+                checks, "supervisor_agent_not_in_roster", "error",
+                "supervisor has an agent that is not in the roster",
+                agent=name,
+                suggestion="add it with agenttalk roster add, or remove it from supervisor.json",
+            )
+        if cfg_agent is None:
+            _bootstrap_add(
+                checks, "supervisor_agent_config_invalid", "error",
+                "supervisor agent entry is not a JSON object",
+                agent=name,
+                suggestion="replace this entry with a normal supervisor agent block",
+            )
+            continue
+
+        cli_name = cfg_agent.get("cli")
+        if not isinstance(cli_name, str) or cli_name not in _BOOTSTRAP_SUPPORTED_CLIS:
+            _bootstrap_add(
+                checks, "supervisor_agent_cli_unsupported", "error",
+                f"cli must be one of {sorted(_BOOTSTRAP_SUPPORTED_CLIS)}",
+                agent=name,
+                facts={"cli": cli_name},
+                suggestion="set cli to claude or codex",
+            )
+        else:
+            _bootstrap_add(checks, "supervisor_agent_cli_supported", "ok",
+                           f"{cli_name} agent configured", agent=name,
+                           facts={"cli": cli_name})
+
+        if cfg_agent.get("auto_restart") is True:
+            _bootstrap_add(checks, "supervisor_agent_restart_enabled", "ok",
+                           "auto_restart is enabled", agent=name)
+        else:
+            _bootstrap_add(
+                checks, "supervisor_agent_restart_disabled", "warn",
+                "auto_restart is not enabled; the supervisor will not relaunch this agent",
+                agent=name,
+                suggestion="set auto_restart=true for unattended team members",
+            )
+
+        wrapped = bool(cfg_agent.get("wrapped"))
+        if wrapped:
+            _bootstrap_add(checks, "supervisor_agent_wrapped", "ok",
+                           "wrapped agent configured", agent=name)
+        else:
+            _bootstrap_add(
+                checks, "supervisor_agent_not_wrapped", "warn",
+                "agent is not wrapped; manual-listen supervision is best-effort",
+                agent=name,
+                suggestion="prefer agenttalk wrap --loop for unattended Claude or Codex agents",
+            )
+
+        launch = cfg_agent.get("launch")
+        launch = launch if isinstance(launch, dict) else None
+        if launch is None:
+            _bootstrap_add(
+                checks, "supervisor_agent_launch_missing", "error",
+                "launch block is missing or invalid",
+                agent=name,
+                suggestion="fill launch.windows_file and launch.windows_args",
+            )
+        else:
+            windows_file = launch.get("windows_file")
+            windows_args = launch.get("windows_args")
+            if not isinstance(windows_file, str) or not windows_file.strip():
+                _bootstrap_add(
+                    checks, "supervisor_agent_launch_file_missing", "error",
+                    "launch.windows_file is missing",
+                    agent=name,
+                    suggestion="set it to python.exe for wrapped agents or the real CLI exe for manual agents",
+                )
+            elif _bootstrap_has_placeholder(windows_file):
+                _bootstrap_add(
+                    checks, "supervisor_agent_launch_file_placeholder", "error",
+                    "launch.windows_file still contains scaffold placeholder text",
+                    agent=name,
+                    suggestion="replace it with a real executable path",
+                )
+            else:
+                _bootstrap_add(checks, "supervisor_agent_launch_file_set", "ok",
+                               "launch.windows_file is set", agent=name)
+
+            if not isinstance(windows_args, list):
+                _bootstrap_add(
+                    checks, "supervisor_agent_launch_args_invalid", "error",
+                    "launch.windows_args must be a JSON array",
+                    agent=name,
+                    suggestion="replace windows_args with an array of literal argument tokens",
+                )
+            elif _bootstrap_has_placeholder(windows_args):
+                _bootstrap_add(
+                    checks, "supervisor_agent_launch_args_placeholder", "error",
+                    "launch.windows_args still contains scaffold placeholder text",
+                    agent=name,
+                    suggestion="replace the placeholder wrapper or CLI arguments",
+                )
+            else:
+                _bootstrap_add(checks, "supervisor_agent_launch_args_set", "ok",
+                               "launch.windows_args is filled", agent=name)
+
+            if wrapped and isinstance(windows_args, list):
+                if "wrap" not in windows_args:
+                    _bootstrap_add(
+                        checks, "supervisor_wrapped_missing_wrap", "error",
+                        "wrapped=true but launch args do not call agenttalk wrap",
+                        agent=name,
+                    )
+                if not _bootstrap_flag_before(windows_args, "--root", "wrap"):
+                    _bootstrap_add(
+                        checks, "supervisor_wrapped_missing_root", "error",
+                        "wrapped launch does not include an explicit --root before wrap",
+                        agent=name,
+                        suggestion="add --root {ROOT} before wrap in windows_args",
+                    )
+                if "--loop" not in windows_args:
+                    _bootstrap_add(
+                        checks, "supervisor_wrapped_missing_loop", "error",
+                        "wrapped launch is missing --loop",
+                        agent=name,
+                    )
+                if "--" not in windows_args:
+                    _bootstrap_add(
+                        checks, "supervisor_wrapped_missing_cli_tail", "error",
+                        "wrapped launch is missing the -- separator and real CLI tail",
+                        agent=name,
+                    )
+                arg_for = _bootstrap_arg_value(windows_args, "--for")
+                if arg_for != name:
+                    _bootstrap_add(
+                        checks, "supervisor_wrapped_for_mismatch", "error",
+                        "wrapped --for does not match the supervisor agent name",
+                        agent=name,
+                        facts={"wrapped_for": arg_for},
+                        suggestion=f"set --for {name}",
+                    )
+                arg_cli = _bootstrap_arg_value(windows_args, "--cli")
+                if isinstance(cli_name, str) and arg_cli != cli_name:
+                    _bootstrap_add(
+                        checks, "supervisor_wrapped_cli_mismatch", "error",
+                        "wrapped --cli does not match the supervisor agent cli",
+                        agent=name,
+                        facts={"wrapped_cli": arg_cli, "cli": cli_name},
+                        suggestion=f"set --cli {cli_name}",
+                    )
+                tail = _bootstrap_launch_tail(windows_args)
+                if not tail:
+                    _bootstrap_add(
+                        checks, "supervisor_wrapped_cli_tail_empty", "error",
+                        "wrapped launch has no real CLI command after --",
+                        agent=name,
+                    )
+                elif _bootstrap_has_placeholder(tail[0]):
+                    _bootstrap_add(
+                        checks, "supervisor_wrapped_cli_tail_placeholder", "error",
+                        "wrapped launch real CLI tail still contains placeholder text",
+                        agent=name,
+                        suggestion="replace the tail after -- with the real claude.exe or codex.exe command",
+                    )
+
+        rpt = report_agents.get(name) if isinstance(report_agents.get(name), dict) else None
+        if rpt is None:
+            continue
+        if bool(rpt.get("heartbeat_stale")):
+            _bootstrap_add(
+                checks, "supervisor_agent_not_fresh", "error",
+                "managed agent has no fresh heartbeat",
+                agent=name,
+                facts={"heartbeat_age_seconds": rpt.get("heartbeat_age_seconds")},
+                suggestion="start the supervisor and wait for this agent to reach HEALTHY_IDLE",
+            )
+        else:
+            _bootstrap_add(
+                checks, "supervisor_agent_fresh", "ok",
+                "managed agent has a fresh heartbeat",
+                agent=name,
+                facts={"heartbeat_age_seconds": rpt.get("heartbeat_age_seconds")},
+            )
+
+    for name in roster:
+        if name in cfg_agent_names:
+            continue
+        rpt = report_agents.get(name) if isinstance(report_agents.get(name), dict) else None
+        fresh = bool(rpt is not None and not rpt.get("heartbeat_stale"))
+        if name == liaison:
+            if fresh:
+                _bootstrap_add(checks, "operator_facing_fresh", "ok",
+                               "operator-facing liaison has a fresh heartbeat", agent=name)
+            else:
+                _bootstrap_add(
+                    checks, "operator_facing_not_fresh", "warn",
+                    "operator-facing liaison is not supervisor-managed and has no fresh heartbeat",
+                    agent=name,
+                    suggestion="run a liaison heartbeat/listen hook, or manage the lead-loop separately",
+                )
+            continue
+        role = roles.get(name) if isinstance(roles.get(name), str) else None
+        if fresh:
+            _bootstrap_add(checks, "manual_roster_agent_fresh", "ok",
+                           "roster identity is not supervised but has a fresh heartbeat",
+                           agent=name, facts={"role": role})
+        else:
+            _bootstrap_add(
+                checks, "roster_identity_not_live", "warn",
+                "roster identity is not supervisor-managed and has no fresh heartbeat",
+                agent=name,
+                facts={"role": role},
+                suggestion="supervise it, retire it, or deliberately ignore it before assigning work",
+            )
+
+    summary = {
+        "ok": sum(1 for c in checks if c.get("status") == "ok"),
+        "warn": sum(1 for c in checks if c.get("status") == "warn"),
+        "error": sum(1 for c in checks if c.get("status") == "error"),
+    }
+    verdict = "error" if summary["error"] else "warn" if summary["warn"] else "ok"
+    return {
+        "schema_version": 1,
+        "root_key": _root_key(str(store.root.resolve())),
+        "now_epoch": now_epoch,
+        "now": datetime.fromtimestamp(now_epoch, timezone.utc).isoformat().replace(
+            "+00:00", "Z"),
+        "verdict": verdict,
+        "summary": summary,
+        "checks": checks,
+        "supported_clis": sorted(_BOOTSTRAP_SUPPORTED_CLIS),
+    }
+
+
 def _health_brief(view: dict | None) -> dict:
     state = health_model.label(view)
     age = view.get("age_seconds") if isinstance(view, dict) else None

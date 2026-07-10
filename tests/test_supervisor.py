@@ -66,6 +66,30 @@ _HOOK_CODEX_CONFIG = {
 }
 
 
+def _wrapped_supervisor_agent(name: str, cli_name: str, *, explicit_root: bool = True) -> dict:
+    args = ["-m", "agenttalk"]
+    if explicit_root:
+        args += ["--root", "{ROOT}"]
+    args += ["wrap", "--for", name, "--cli", cli_name, "--loop", "--", f"{cli_name}.exe"]
+    if cli_name == "codex":
+        args += ["--disable", "hooks"]
+    return {
+        "cli": cli_name,
+        "auto_restart": True,
+        "wrapped": True,
+        "cwd": TEST_ROOT,
+        "env": {"AGENTTALK_SELF": name},
+        "launch": {"windows_file": "python.exe", "windows_args": args},
+    }
+
+
+def _write_supervisor_config(store: Store, agents: dict) -> None:
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({"schema_version": 2, "agents": agents}, indent=2),
+        encoding="utf-8",
+    )
+
+
 def _auth_marker(rid: str = "rr-1", *, force_protected: bool = False,
                  live_ack: bool = False) -> dict:
     return {
@@ -1668,6 +1692,110 @@ def test_seed_claude_settings_cli_merges(tmp_path: Path) -> None:
     assert rc == 0
     data = json.loads((d / ".claude" / "settings.json").read_text(encoding="utf-8"))
     assert data["model"] == "opus" and data["defaultMode"] == "bypassPermissions"
+
+
+def test_supervise_bootstrap_check_accepts_wrapped_claude_and_codex(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    s = _team(tmp_path, "Polaris,Zeno,Ramanujan")
+    s.set_role("Polaris", "lead")
+    s.set_operator_facing("Polaris")
+    for name in ("Polaris", "Zeno", "Ramanujan"):
+        s.write_heartbeat(name)
+    _write_supervisor_config(s, {
+        "Zeno": _wrapped_supervisor_agent("Zeno", "codex"),
+        "Ramanujan": _wrapped_supervisor_agent("Ramanujan", "claude"),
+    })
+
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verdict"] == "ok"
+    assert payload["supported_clis"] == ["claude", "codex"]
+    assert not [c for c in payload["checks"] if c["status"] == "error"]
+    by_agent_cli = {
+        (c.get("agent"), c.get("facts", {}).get("cli"))
+        for c in payload["checks"]
+        if c["id"] == "supervisor_agent_cli_supported"
+    }
+    assert ("Zeno", "codex") in by_agent_cli
+    assert ("Ramanujan", "claude") in by_agent_cli
+
+
+def test_supervise_bootstrap_check_warns_on_roster_only_placeholders(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    s = _team(tmp_path, "Polaris,Zeno,claude,codex")
+    s.set_role("Polaris", "lead")
+    s.set_operator_facing("Polaris")
+    for name in ("Polaris", "Zeno"):
+        s.write_heartbeat(name)
+    _write_supervisor_config(s, {
+        "Zeno": _wrapped_supervisor_agent("Zeno", "codex"),
+    })
+
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verdict"] == "warn"
+    stale_roster = {
+        c.get("agent") for c in payload["checks"]
+        if c["id"] == "roster_identity_not_live"
+    }
+    assert {"claude", "codex"} <= stale_roster
+
+
+def test_supervise_bootstrap_check_errors_on_stale_managed_agent(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    s = _team(tmp_path, "Polaris,Zeno")
+    s.set_role("Polaris", "lead")
+    s.set_operator_facing("Polaris")
+    s.write_heartbeat("Polaris")
+    _write_supervisor_config(s, {
+        "Zeno": _wrapped_supervisor_agent("Zeno", "codex"),
+    })
+
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verdict"] == "error"
+    assert any(
+        c["id"] == "supervisor_agent_not_fresh" and c.get("agent") == "Zeno"
+        for c in payload["checks"]
+    )
+
+
+def test_supervise_bootstrap_check_requires_explicit_root_for_wrapped_claude_and_codex(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    s = _team(tmp_path, "Polaris,Cygnus,Altair")
+    s.set_role("Polaris", "lead")
+    s.set_operator_facing("Polaris")
+    for name in ("Polaris", "Cygnus", "Altair"):
+        s.write_heartbeat(name)
+    misplaced_claude = _wrapped_supervisor_agent(
+        "Cygnus", "claude", explicit_root=False)
+    misplaced_args = misplaced_claude["launch"]["windows_args"]
+    wrap_pos = misplaced_args.index("wrap") + 1
+    misplaced_args[wrap_pos:wrap_pos] = ["--root", "{ROOT}"]
+    _write_supervisor_config(s, {
+        "Cygnus": misplaced_claude,
+        "Altair": _wrapped_supervisor_agent("Altair", "codex", explicit_root=False),
+    })
+
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    missing_root_agents = {
+        c.get("agent") for c in payload["checks"]
+        if c["id"] == "supervisor_wrapped_missing_root"
+    }
+    assert missing_root_agents == {"Cygnus", "Altair"}
 
 
 def test_plan_emits_windows_sandbox_and_perm_mode() -> None:

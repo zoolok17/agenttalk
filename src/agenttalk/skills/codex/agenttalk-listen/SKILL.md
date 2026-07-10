@@ -309,6 +309,9 @@ to review it.
 1. **Parse the body.** Goal, Files changed, How to verify, Focus
    areas, Known caveats.
 2. **Verify scope.**
+   - Always run `git status --short` first; untracked or intent-to-add
+     implementation files are review scope even when a base/head diff is
+     present.
    - If `meta.base_sha` and `meta.head_sha` are present, run
      `git diff --name-only <base_sha>..<head_sha>` and compare with
      the declared file list. Note any excess in your review.

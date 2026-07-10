@@ -191,8 +191,8 @@ launch prompt drops the agent straight into `/agenttalk.listen`.
   "launch": {
     "windows_file": "C:\\Users\\you\\AppData\\Local\\Programs\\Python\\Python314\\python.exe",
     "windows_args": [
-      "-m", "agenttalk", "wrap", "--for", "codex-dev", "--cli", "codex",
-      "--loop", "--",
+      "-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for", "codex-dev",
+      "--cli", "codex", "--loop", "--",
       "C:\\path\\to\\codex.exe", "-a", "never", "-s", "workspace-write",
       "-C", "D:\\Projects\\example", "--disable", "hooks"
     ]
@@ -376,6 +376,12 @@ interactively (`agenttalk init` done long ago, agents in
 4. **Run the monitor**: `.\.agenttalk\supervisor.ps1`. It launches the
    configured agents (fresh on first launch) and keeps them alive from
    then on.
+5. **Run the bootstrap preflight**: `agenttalk supervise --bootstrap-check`.
+   Treat agents as assignable only after the JSON has no `error` checks.
+   Warnings for stale roster-only names mean those identities are not live
+   teammates yet; supervise them, retire them, or deliberately ignore them.
+   The check is neutral for wrapped Claude and wrapped Codex agents and also
+   catches missing explicit wrapped `--root` launch arguments.
 
 That's the whole migration. Because the store is shared, a supervised
 agent and the rest of your team see the same bus — a supervised

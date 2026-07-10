@@ -149,6 +149,9 @@ For ad-hoc cross-review, use this template:
 - path/a.py
 - path/b.py
 
+## Git status
+<paste `git status --short` so reviewers see untracked or intent-to-add files>
+
 ## How to verify
 <commands to run, fixtures, manual checks>
 

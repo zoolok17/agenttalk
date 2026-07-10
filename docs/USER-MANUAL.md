@@ -416,7 +416,15 @@ Read what the supervisor sees:
 ```powershell
 agenttalk supervise --report
 agenttalk supervise --plan
+agenttalk supervise --bootstrap-check
 ```
+
+Use `--bootstrap-check` before treating a roster as a live team. It emits JSON
+and verifies the operator-facing liaison, supervisor-managed agent entries,
+wrapped Claude/Codex launch invariants, explicit wrapped `--root`, filled launch
+placeholders, and fresh heartbeats. A roster identity with no supervisor entry
+and no fresh heartbeat is only a name, not an executing teammate; supervise it,
+retire it, or deliberately ignore it before assigning work.
 
 Run the monitor in a dedicated terminal on Windows:
 
@@ -764,7 +772,7 @@ This is a compact operator map, not a full argparse dump. Use
 | Lanes | `domain`, `lane assign`, `lane workspace`, `lane check`, `lane deliver`, `lane approve-shared` | Bound work to domain paths and deliver from isolated worktrees. |
 | Onboarding | `onboarding create`, `onboarding record`, `onboarding show`, `onboarding state`, `onboarding list` | Track codebase-analysis segments, claims, drift, and blocking unknowns before implementation. |
 | Knowledge | `knowledge publish`, `knowledge curate`, `knowledge pull`, `knowledge search`, `knowledge onboard` | Capture, verify, retrieve, and search durable project notes and lessons. |
-| Supervision | `supervise`, `wrap`, `heartbeat`, `request-restart`, `request-launch`, `managed-lead-loop`, `deadman` | Run unattended agents, maintain liveness, request restarts, and monitor stale work. |
+| Supervision | `supervise --bootstrap-check`, `supervise`, `wrap`, `heartbeat`, `request-restart`, `request-launch`, `managed-lead-loop`, `deadman` | Verify the roster is a live team, run unattended agents, maintain liveness, request restarts, and monitor stale work. |
 | Recovery | `dead-letter list`, `dead-letter show`, `dead-letter requeue`, `dead-letter resolve`, `dead-letter purge --resolved`, `prune`, `compact`, `reset` | Inspect poison messages, archive resolved poison evidence, quarantine invalid files, archive old messages, or clear active state. |
 | Web | `dashboard`, `serve`, `start` | Open local loopback UI surfaces and optional browser intent enqueueing. |
 

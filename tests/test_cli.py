@@ -1230,9 +1230,10 @@ def test_status_detects_soft_deadlock_between_two_waiters(
     store_root: Path,
     capsys: pytest.CaptureFixture,
 ) -> None:
-    """Two live waiters at once = soft-deadlock; status names both and
-    points at the remedy. We simulate live waits by writing fresh
-    heartbeats + waiting markers directly (no real blocking)."""
+    """Two live waiters with unread work = soft-deadlock; status names
+    both and points at the remedy. We simulate live waits by writing
+    fresh heartbeats + waiting markers directly (no real blocking)."""
+    store.send(sender="alpha", recipient="beta", kind="question", body="work?")
     now_epoch = time.time()
     for name in ("alpha", "beta"):
         s_path = store.state_dir / f"{name}.heartbeat"
@@ -1252,6 +1253,34 @@ def test_status_detects_soft_deadlock_between_two_waiters(
     out = capsys.readouterr().out
     assert "soft-deadlock" in out
     assert "alpha" in out and "beta" in out
+    assert "beta already has unread waiting" in out
+
+
+def test_status_does_not_warn_for_healthy_idle_live_waiters(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Multiple live waiters with empty inboxes are a healthy idle team,
+    not a soft-deadlock that needs operator action."""
+    now_epoch = time.time()
+    for name in ("alpha", "beta"):
+        s_path = store.state_dir / f"{name}.heartbeat"
+        from datetime import datetime, timezone
+        s_path.write_text(
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            encoding="utf-8",
+        )
+        store.write_waiting(name, {
+            "agent": name, "pid": 1234, "since": "now",
+            "cursor_at_start": "", "timeout_seconds": 120.0,
+            "deadline_epoch": now_epoch + 120,
+        })
+    capsys.readouterr()
+    rc = _run(["status"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "soft-deadlock" not in out
 
 
 def test_status_ignores_stale_waiting_marker_for_deadlock(

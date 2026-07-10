@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Team bootstrap preflight.** Added `agenttalk supervise --bootstrap-check`, a read-only JSON
+  check for roster readiness: operator-facing liaison, supervisor-managed agents, wrapped
+  Claude/Codex launch invariants, explicit wrapped `--root`, placeholder launch config, and fresh
+  heartbeats.
+
+### Changed
+
+- **Review handoffs now surface untracked files.** Agent manuals and bundled Claude/Codex handoff
+  and listen skills now require `git status --short` evidence so reviewers do not miss untracked or
+  intent-to-add implementation files.
+
+### Fixed
+
+- **Healthy idle waiters no longer look like a soft-deadlock.** `agenttalk status` only emits the
+  multi-waiter soft-deadlock warning when at least one live waiter already has unread work.
+
 ## [0.73.0] - 2026-07-09
 
 ### Added

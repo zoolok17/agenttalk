@@ -600,9 +600,9 @@ def _status_warnings(agents: list[dict]) -> list[str]:
     Two issue-#5 footguns made visible:
     1. An agent with unread but a never-set cursor — it has been reading
        with plain `recv` (or not at all) and its read state is a lie.
-    2. A soft-deadlock: two or more agents blocked in `wait` at the same
-       time. In normal flow exactly one waits while the other works, so
-       simultaneous live waiters means nobody is going to send next.
+    2. A soft-deadlock: two or more agents blocked in `wait` while at
+       least one of those agents already has unread work. Multiple empty
+       live waiters are a healthy idle team, not an actionable warning.
     """
     warnings: list[str] = []
     for a in agents:
@@ -616,23 +616,20 @@ def _status_warnings(agents: list[dict]) -> list[str]:
     live_waiters = sorted(
         (a["name"] for a in agents if a["waiting"] and not a["waiting_stale"])
     )
-    if len(live_waiters) >= 2:
-        with_unread = sorted(
-            a["name"] for a in agents
-            if a["waiting"] and not a["waiting_stale"] and a["unread"] > 0
-        )
+    with_unread = sorted(
+        a["name"] for a in agents
+        if a["waiting"] and not a["waiting_stale"] and a["unread"] > 0
+    )
+    if len(live_waiters) >= 2 and with_unread:
         msg = (
             f"soft-deadlock: {', '.join(live_waiters)} are all blocked in "
             f"`wait` simultaneously — nobody is positioned to send next."
         )
-        if with_unread:
-            verb = "has" if len(with_unread) == 1 else "have"
-            msg += (
-                f" {', '.join(with_unread)} already {verb} unread waiting: "
-                f"run `agenttalk drain --for <agent>`, then reply."
-            )
-        else:
-            msg += " Whoever owes the next reply should send it."
+        verb = "has" if len(with_unread) == 1 else "have"
+        msg += (
+            f" {', '.join(with_unread)} already {verb} unread waiting: "
+            f"run `agenttalk drain --for <agent>`, then reply."
+        )
         warnings.append(msg)
     return warnings
 
@@ -9035,6 +9032,13 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                                           state=_read_state() or None,
                                           supervisor_config=config), indent=2))
         return 0
+    if args.bootstrap_check:
+        payload = sup.bootstrap_check(
+            store, now_epoch=now, supervisor_config=config,
+            state=_read_state() or None,
+        )
+        print(json.dumps(payload, indent=2))
+        return 2 if payload.get("verdict") == "error" else 0
     if args.plan:
         if args.report_file:
             report = json.loads(Path(args.report_file).read_text(encoding="utf-8-sig"))
@@ -9056,7 +9060,8 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                 sup.record_supervisor_plan_events(store, plan, now_epoch=now)
         return 0
     sys.stderr.write("agenttalk supervise: choose --init, --report, --plan, "
-                     "--install-activity-hook, --launch-barrier, or --clear-restart\n")
+                     "--bootstrap-check, --install-activity-hook, --launch-barrier, "
+                     "or --clear-restart\n")
     return 2
 
 
@@ -10479,6 +10484,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Scaffold supervisor.json + PowerShell supervisor helpers.")
     gsup.add_argument("--report", action="store_true",
                       help="Emit the read-only per-agent liveness snapshot (JSON).")
+    gsup.add_argument("--bootstrap-check", dest="bootstrap_check", action="store_true",
+                      help="Emit a read-only team bootstrap readiness check (JSON): "
+                           "roster, operator-facing lead, supervisor config, wrapped "
+                           "Claude/Codex launch invariants, and fresh heartbeats.")
     gsup.add_argument("--plan", action="store_true",
                       help="Emit the action plan (the shared decision table) as JSON.")
     gsup.add_argument("--clear-restart", dest="clear_restart", action="store_true",

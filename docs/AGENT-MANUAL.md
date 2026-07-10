@@ -146,7 +146,7 @@ Publish your own headroom with `capacity refresh --for $SELF` (5h/weekly rate-li
 **Your cadence.**
 1. Resolve your assigned workspace with `lane workspace --id <lane_id>` and build only inside that path.
 2. Self-gate (formatter/linter/type-checker/tests) per `craft-code`'s mandatory AFTER gate - don't declare done on "probably works".
-3. Hand off with a `kind=review-request` carrying `base_sha`/`head_sha`/`branch`/`scope`; block on the `review-result`.
+3. Hand off with a `kind=review-request` carrying `base_sha`/`head_sha`/`branch`/`scope`; include the current `git status --short` summary so reviewers see untracked or intent-to-add files; block on the `review-result`.
 4. Fold review findings yourself (reviews never silently patch your code); push the final SHA; reviewers re-approve on it.
 
 **Hard boundaries.** Changes only your owned files. Outside spec-kitty, **no splitting implementation work with a peer without operator approval** (no proposal/broadcast backdoor); approved splits state ownership up front and every piece still gets a cross-review. Don't loop forever - 3 consecutive rejected reviews on the same scope -> surface to the operator. Reviews are read-only.
@@ -170,7 +170,7 @@ Publish your own headroom with `capacity refresh --for $SELF` (5h/weekly rate-li
 
 **Your cadence.**
 1. `wait`; on a `review-request`, `check` it's still current (exit 3 = rescinded -> stop).
-2. Review the diff on the **exact** candidate SHA; chunk diffs over ~400 LOC. Run the mandatory security pass when touching auth/input/data/secrets/path/deserialization/deps.
+2. Review the diff on the **exact** candidate SHA; run `git status --short` before `git diff` so untracked or intent-to-add implementation files are in scope, then chunk diffs over ~400 LOC. Run the mandatory security pass when touching auth/input/data/secrets/path/deserialization/deps.
 3. Conclude APPROVE / APPROVE-WITH-NITS / REQUEST-CHANGES; report findings P0-P3 with file:line evidence.
 4. Emit a typed `review-result` (or `close ack`); when the builder folds findings, **re-approve on the final SHA**.
 5. Loop back to `wait`.
@@ -282,7 +282,7 @@ Assurance closes (`agenttalk close`) aggregate gates + review lenses + remediati
 ### Supervisor (mostly script-driven)
 | Command | Use |
 |---|---|
-| `supervise --init / --report / --plan` | Scaffold / read-only liveness / action plan |
+| `supervise --init / --report / --plan / --bootstrap-check` | Scaffold / read-only liveness / action plan / live-team readiness preflight |
 | `supervise --install-activity-hook` | Wire the heartbeat hook |
 | `request-restart --for <agent>` | On-demand bounce |
 | `dead-letter list/show/requeue/resolve/purge --agent` | Inspect, recover, mark handled, or archive resolved poison messages |
