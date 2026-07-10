@@ -112,8 +112,11 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
   isolated `python -m build --outdir .tmp-dist-v0.73.1`, wheel install smoke (`agenttalk 0.73.1`),
   and a package-content probe confirming the user manual PDF, source, and bundled Claude/Codex
   skills are present while local `.agenttalk`/scratch/cache state is absent from the sdist.
-- **CI:** pending at tag creation; release close requires watching GitHub Actions tests matrix,
-  security, and wheel/packaging after push and reporting actual results.
+- **CI:** GitHub Actions green after push: `tests` run `29079387744` passed the Python
+  3.10-3.13 x Windows/macOS/Ubuntu matrix plus the wheel/sdist packaging gate; `security` run
+  `29079387725` passed ruff security rules, semgrep, gitleaks, bandit, pip-audit, zizmor, and
+  CodeQL. CI emitted non-blocking deprecation annotations for Node-20-forced actions and future
+  CodeQL v3 retirement; no release-blocking findings.
 - **Robust/Secure:** `supervise --bootstrap-check` is a read-only preflight over the existing roster,
   supervisor config, launch command, and heartbeat files. It introduces no new authority boundary and
   does not start, stop, or edit agents. It makes missing operator-facing liaisons, placeholder
