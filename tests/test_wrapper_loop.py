@@ -2755,10 +2755,13 @@ def test_one_shot_times_out_nonzero_when_request_never_arrives(tmp_path) -> None
         t["n"] += 100.0
         return t["n"]
 
-    turns = loop.run_loop(s, "beta", lambda rec: True, clock=clock,
-                          sleep=lambda d: None, only_request_id="rq-missing",
-                          max_wall=50.0)
+    waiting = []
+    turns = loop.run_loop(
+        s, "beta", lambda rec: True, clock=clock,
+        sleep=lambda d: None, only_request_id="rq-missing", max_wall=50.0,
+        on_health_idle=lambda: waiting.append(s.read_waiting("beta")))
     assert turns == 0                                  # never arrived -> no turn driven
+    assert re.fullmatch(r"[0-9a-f]{32}", waiting[0]["wait_token"])
     assert s.read_waiting("beta") is None              # waiting cleared on exit
 
 
@@ -2790,6 +2793,43 @@ def test_continuous_loop_clears_waiting_on_stop(tmp_path) -> None:
     loop.run_loop(s, "beta", lambda rec: True, clock=lambda: 0.0,
                   sleep=lambda d: None, max_polls=5)
     assert s.read_waiting("beta") is None
+
+
+def test_continuous_loop_poll_limit_clears_generation_wait_marker(tmp_path) -> None:
+    s = _store(tmp_path)
+    waiting = []
+
+    assert loop.run_loop(
+        s, "beta", lambda rec: True, clock=lambda: 0.0,
+        sleep=lambda _d: None, max_polls=0,
+        on_health_idle=lambda: waiting.append(s.read_waiting("beta")),
+    ) == 0
+
+    assert re.fullmatch(r"[0-9a-f]{32}", waiting[0]["wait_token"])
+    assert s.read_waiting("beta") is None
+
+
+def test_old_wrapper_teardown_preserves_replacement_wait_marker(tmp_path) -> None:
+    s = _store(tmp_path)
+    observed = []
+    replacement = {
+        "agent": "beta",
+        "mode": "wrapper-loop",
+        "wait_token": "replacement-generation",
+    }
+
+    def replace_waiter() -> None:
+        observed.append(s.read_waiting("beta"))
+        s.write_waiting("beta", replacement)
+
+    assert loop.run_loop(
+        s, "beta", lambda rec: True, clock=lambda: 0.0,
+        sleep=lambda _d: None, max_polls=0,
+        on_health_idle=replace_waiter,
+    ) == 0
+
+    assert re.fullmatch(r"[0-9a-f]{32}", observed[0]["wait_token"])
+    assert s.read_waiting("beta") == replacement
 
 
 def test_capacity_refresh_runs_after_idle_stamp_when_due(tmp_path) -> None:

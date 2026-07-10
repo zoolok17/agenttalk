@@ -230,12 +230,10 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
         (turns==0 -> the caller maps a nonzero process exit) instead of spinning
         forever if its request never arrives.
 
-    The ``.waiting`` marker is ALWAYS cleared on exit (try/finally) so a normal
-    stand-down / one-shot completion does not leave a stale waiting marker - UNLESS
-    ``manage_waiting`` is False (the managed lead-loop controller: its LEASE owns the
-    ``.waiting`` mirror, so the loop must neither write the generic wrapper-loop marker
-    at start - which would clobber the lease mirror - nor clear it on exit; the
-    controller's lease release handles the mirror, WP2).
+    The ``.waiting`` marker is generation-bound and cleared on exit (try/finally)
+    only while it still carries this loop's token, so an older wrapper cannot erase
+    a replacement marker. ``manage_waiting=False`` leaves the marker untouched (the
+    managed lead-loop controller's LEASE owns that mirror, WP2).
 
     ``heartbeat`` overrides the per-idle stamp (default ``store.write_heartbeat``);
     the managed lead-loop passes a combined ``write_heartbeat`` + ``renew lease`` so
@@ -254,11 +252,16 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
     interval-gated and failure-isolated; exceptions are swallowed so capacity
     cannot undo the just-completed liveness/cursor boundary."""
     stamp = heartbeat if heartbeat is not None else (lambda: store.write_heartbeat(agent))
-    if manage_waiting:
-        store.write_waiting(agent, {"agent": agent, "mode": "wrapper-loop"})
-    if on_health_idle is not None:
-        on_health_idle()
+    wait_token = uuid.uuid4().hex if manage_waiting else None
     try:
+        if wait_token is not None:
+            store.write_waiting(agent, {
+                "agent": agent,
+                "mode": "wrapper-loop",
+                "wait_token": wait_token,
+            })
+        if on_health_idle is not None:
+            on_health_idle()
         if only_request_id is not None:
             return _run_one_shot(
                 store, agent, drive, rid=only_request_id,
@@ -280,8 +283,8 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
             capacity_interval_seconds=capacity_interval_seconds,
             now_iso=now_iso)
     finally:
-        if manage_waiting:
-            store.clear_waiting(agent)
+        if wait_token is not None:
+            store.clear_waiting_if_token(agent, wait_token)
 
 
 def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
