@@ -34,6 +34,8 @@ import json
 import re
 from typing import Any
 
+from agenttalk.gates import CORE_RISK_CLASSES, is_valid_risk_class
+
 SCHEMA_VERSION = 1
 DIRNAME = "closes"
 
@@ -82,14 +84,6 @@ HOLD_WORKTREE_ISOLATION = "worktree_isolation_unverified"
 
 RELEASE_CLASS_SCOPES = {"release", "milestone", "feature", "hotfix"}
 
-# Core-neutral risk envelope (project: extensions allowed, like gates). Core
-# VALIDATES the string; it never DECIDES a change's risk - the project supplies
-# the risk inventory and the risk -> signoff policy mapping.
-CORE_RISK_CLASSES = frozenset({
-    "none", "unknown", "release", "security", "performance", "persistence",
-    "docs-contract", "quality"})
-_RISK_EXTENSION_RE = re.compile(r"\Aproject:[a-z0-9][a-z0-9_.-]{0,63}\Z")
-
 SIGNOFF_DIRNAME = "signoffs.json"
 
 _CLOSE_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
@@ -98,6 +92,10 @@ _FULL_SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 
 class CloseError(ValueError):
     """Invalid close input / state (CLI maps to a usage exit)."""
+
+
+class CloseConflict(CloseError):
+    """A close changed after a caller loaded it; the mutation was not persisted."""
 
 
 def empty_close(close_id: str, *, scope: str, revision: str, revision_kind: str,
@@ -109,6 +107,7 @@ def empty_close(close_id: str, *, scope: str, revision: str, revision_kind: str,
     """A freshly OPENED close record (pure; the CLI persists it)."""
     return {
         "schema_version": SCHEMA_VERSION,
+        "generation": 0,
         "close_id": close_id,
         "scope": scope,
         "revision": revision,
@@ -405,6 +404,9 @@ def _is_wellformed(record: object) -> bool:
         return False
     if record.get("schema_version") != SCHEMA_VERSION:
         return False
+    generation = record.get("generation", 0)
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+        return False
     for key in ("close_id", "scope", "revision", "gate_scope", "status"):
         if not isinstance(record.get(key), str) or not record.get(key):
             return False
@@ -457,15 +459,15 @@ def _str_list(value: object) -> list[str]:
 # ---------------------------------------------------- P3 signoff policy + derive
 
 def validate_risk_class(value: object) -> str:
-    """Core VALIDATES a risk_class string (envelope OR a project: extension); it
+    """Core VALIDATES a risk_class string (envelope OR a namespaced extension); it
     never DECIDES risk. Raises CloseError on a bad string."""
     if not isinstance(value, str) or not value:
         raise CloseError("risk_class must be a non-empty string")
-    if value in CORE_RISK_CLASSES or _RISK_EXTENSION_RE.match(value):
+    if is_valid_risk_class(value):
         return value
     raise CloseError(
         f"risk_class {value!r} is not in the core envelope {sorted(CORE_RISK_CLASSES)} "
-        "or a project:extension")
+        "or a namespaced extension like project:name")
 
 
 def _refset(raw: object) -> dict:
@@ -476,6 +478,15 @@ def _refset(raw: object) -> dict:
     return {"agents": _str_list(raw.get("agents")),
             "groups": _str_list(raw.get("groups")),
             "roles": _str_list(raw.get("roles"))}
+
+
+def _json_bool(raw: dict, key: str, *, context: str, default: bool = False) -> bool:
+    if key not in raw:
+        return default
+    value = raw[key]
+    if not isinstance(value, bool):
+        raise CloseError(f"{context} {key!r} must be a JSON boolean")
+    return value
 
 
 def validate_signoff_policy(raw: object) -> dict:
@@ -520,11 +531,14 @@ def validate_signoff_policy(raw: object) -> dict:
                 "id": sid,
                 "required_count": count,
                 "candidates": _refset(s.get("candidates")),
-                "use_default_reviewers": bool(s.get("use_default_reviewers", False)),
-                "include_domain_reviewers": bool(s.get("include_domain_reviewers", False)),
-                "allow_na": bool(s.get("allow_na", False)),
+                "use_default_reviewers": _json_bool(
+                    s, "use_default_reviewers", context=f"signoff set {sid!r}"),
+                "include_domain_reviewers": _json_bool(
+                    s, "include_domain_reviewers", context=f"signoff set {sid!r}"),
+                "allow_na": _json_bool(s, "allow_na", context=f"signoff set {sid!r}"),
                 "countable_statuses": statuses,
-                "override_counts": bool(s.get("override_counts", False)),
+                "override_counts": _json_bool(
+                    s, "override_counts", context=f"signoff set {sid!r}"),
             })
         risk_policies[risk_class] = norm_sets
     schema_version = raw.get("schema_version", SCHEMA_VERSION)
@@ -534,7 +548,8 @@ def validate_signoff_policy(raw: object) -> dict:
         "schema_version": schema_version,
         "defaults": {"reviewers": default_reviewers},
         "risk_policies": risk_policies,
-        "allow_unmapped": bool(raw.get("allow_unmapped", False)),
+        "allow_unmapped": _json_bool(
+            raw, "allow_unmapped", context="signoff policy"),
     }
 
 
@@ -661,15 +676,73 @@ def load_close(store, close_id: str) -> dict:
         raise CloseError(f"close {close_id!r} is unreadable/corrupt: {e}") from e
     if not _is_wellformed(data):
         raise CloseError(f"close {close_id!r} is malformed")
+    data.setdefault("generation", 0)
     return data
 
 
-def save_close(store, record: dict) -> None:
-    """Persist a close record atomically (sandbox-safe writer)."""
+def close_generation(record: dict) -> int:
+    """Return a validated generation token, treating legacy records as generation 0."""
+    generation = record.get("generation", 0)
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+        raise CloseError("close generation must be a non-negative integer")
+    return generation
+
+
+def _close_update_lock(store, close_id: str, *, timeout: float):
+    lock_path = closes_dir(store) / f".{validate_close_id(close_id)}.lock"
+    return store._exclusive_lock(
+        lock_path,
+        timeout=timeout,
+        what=f"close {close_id!r} update lock (another agent may be updating it)",
+    )
+
+
+def save_close(store, record: dict, *, expected_generation: int | None = None,
+               lock_timeout: float = 10.0) -> int:
+    """Persist a close under its per-close lock and return the new generation.
+
+    Pass the generation returned by :func:`load_close` to make the write a
+    compare-and-swap. A mismatch raises :class:`CloseConflict` without changing
+    the file. Omitting it preserves the legacy overwrite path for callers that
+    have not yet adopted generation checks.
+    """
     from agenttalk import _atomic
+
+    close_id = validate_close_id(record.get("close_id"))
+    generation = close_generation(record)
+    if expected_generation is not None:
+        if (not isinstance(expected_generation, int)
+                or isinstance(expected_generation, bool)
+                or expected_generation < 0):
+            raise CloseError("expected close generation must be a non-negative integer")
+        if generation != expected_generation:
+            raise CloseConflict(
+                f"close {close_id!r} record generation {generation} does not match "
+                f"expected generation {expected_generation}")
     closes_dir(store).mkdir(parents=True, exist_ok=True)
-    _atomic.write_text(close_path(store, record["close_id"]),
-                       json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True))
+    path = close_path(store, close_id)
+    with _close_update_lock(store, close_id, timeout=lock_timeout):
+        if expected_generation is not None:
+            if not path.exists():
+                raise CloseConflict(
+                    f"close {close_id!r} no longer exists; expected generation "
+                    f"{expected_generation}")
+            actual_generation = close_generation(load_close(store, close_id))
+            if actual_generation != expected_generation:
+                raise CloseConflict(
+                    f"close {close_id!r} changed from generation {expected_generation} "
+                    f"to {actual_generation}; reload before retrying")
+        next_generation = generation + 1
+        persisted = dict(record)
+        persisted["generation"] = next_generation
+        if not _is_wellformed(persisted):
+            raise CloseError(f"close {close_id!r} is malformed")
+        _atomic.write_text(
+            path,
+            json.dumps(persisted, ensure_ascii=False, indent=2, sort_keys=True),
+        )
+    record["generation"] = next_generation
+    return next_generation
 
 
 def list_close_ids(store) -> list[str]:
@@ -708,6 +781,8 @@ def apply_ack(record: dict, *, lens_id: str, status: str, agent: str,
         raise CloseError("an NA ack requires a reason")
     if status == COUNTER and not counter_id:
         raise CloseError("a COUNTER ack requires a counter_id")
+    if status == COUNTER and counter_id in record.get("counters", {}):
+        raise CloseError(f"duplicate counter id {counter_id!r} on this close")
     record["lens_acks"][lens_id] = {
         "lens": lens_id, "status": status, "from": agent, "from_role": from_role,
         "from_groups": list(from_groups or []),
@@ -716,11 +791,11 @@ def apply_ack(record: dict, *, lens_id: str, status: str, agent: str,
         "override": bool(override),
     }
     if status == COUNTER:
-        record["counters"].setdefault(counter_id, {
+        record["counters"][counter_id] = {
             "counter_id": counter_id, "lens": lens_id, "raised_by": agent,
             "at": at, "decision": COUNTER_PENDING, "remediation_id": None,
             "finding": (evidence or {}).get("finding") or reason or "",
-        })
+        }
     _event(record, f"ack:{status}", agent, at, lens=lens_id, counter_id=counter_id)
     return record
 

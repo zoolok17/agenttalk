@@ -29,6 +29,14 @@ CORE_RISK_CLASSES = frozenset({
     "docs-contract",
     "quality",
 })
+RESPONSE_STATUS_ENUMS = {
+    "review-result": frozenset({"approved", "rejected", "needs-info"}),
+    "proposal-response": frozenset({"accepted", "rejected", "countered"}),
+}
+TERMINAL_RESPONSE_STATUSES = {
+    "review-result": frozenset({"approved", "rejected"}),
+    "proposal-response": RESPONSE_STATUS_ENUMS["proposal-response"],
+}
 
 _SAFE_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _RISK_EXTENSION_RE = re.compile(r"\A[A-Za-z][A-Za-z0-9_.-]*:[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
@@ -241,6 +249,23 @@ def check_gates(root: Path, *, scope: str | None = None, now: datetime | None = 
     }
 
 
+def validate_response_status(kind: str, meta: dict) -> None:
+    """Validate a typed response status when present.
+
+    Missing status remains readable for mixed-version history, but it is not a
+    terminal thread event. A present status must be an exact member of the
+    response kind's enum.
+    """
+    allowed = RESPONSE_STATUS_ENUMS.get(kind)
+    if allowed is None or "status" not in meta:
+        return
+    status = meta["status"]
+    if not isinstance(status, str) or status not in allowed:
+        raise ValueError(
+            f"{kind} status must be one of {sorted(allowed)}, got {status!r}"
+        )
+
+
 def validate_review_result_evidence(kind: str, meta: dict[str, Any]) -> None:
     if kind != "review-result" or meta.get("status") != "approved":
         return
@@ -252,9 +277,9 @@ def validate_review_result_evidence(kind: str, meta: dict[str, Any]) -> None:
     if not (_has_value(meta.get("evidence")) or _has_value(meta.get("artifacts"))):
         errors.append("missing evidence or artifacts")
     risk_class = str(meta.get("risk_class", "")).strip()
-    if risk_class and risk_class not in CORE_RISK_CLASSES and not _RISK_EXTENSION_RE.match(risk_class):
+    if risk_class and not is_valid_risk_class(risk_class):
         errors.append(
-            "risk_class must be one of the core classes or a project extension like project:name"
+            "risk_class must be one of the core classes or a namespaced extension like project:name"
         )
     release_blocker = str(meta.get("release_blocker", "")).strip()
     if release_blocker and release_blocker not in VALID_RELEASE_BLOCKERS:
@@ -269,6 +294,13 @@ def validate_review_result_evidence(kind: str, meta: dict[str, Any]) -> None:
             + ". For a lightweight approval use risk_class=none, release_blocker=no, "
             "n/a evidence fields, and a na_reason."
         )
+
+
+def is_valid_risk_class(value: object) -> bool:
+    """Return whether a risk class is in the shared core or extension envelope."""
+    return isinstance(value, str) and (
+        value in CORE_RISK_CLASSES or _RISK_EXTENSION_RE.match(value) is not None
+    )
 
 
 def _gate_verdict(gate: dict, *, now: datetime) -> dict:

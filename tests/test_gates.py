@@ -34,6 +34,31 @@ def _run(argv: list[str], root: Path) -> int:
     return cli.main(["--root", str(root), *argv])
 
 
+@pytest.mark.parametrize(("kind", "status"), [
+    ("review-result", "approved"),
+    ("review-result", "rejected"),
+    ("review-result", "needs-info"),
+    ("proposal-response", "accepted"),
+    ("proposal-response", "rejected"),
+    ("proposal-response", "countered"),
+])
+def test_response_status_validator_accepts_exact_enum(kind: str, status: str) -> None:
+    gates.validate_response_status(kind, {"status": status})
+
+
+@pytest.mark.parametrize(("kind", "status"), [
+    ("review-result", "approve"),
+    ("review-result", 1),
+    ("proposal-response", "accept"),
+    ("proposal-response", False),
+])
+def test_response_status_validator_rejects_outside_enum(
+    kind: str, status: object,
+) -> None:
+    with pytest.raises(ValueError, match="status must be one of"):
+        gates.validate_response_status(kind, {"status": status})
+
+
 # --------------------------------------------- mutation fail-closed (the C1 core)
 
 def test_set_gate_refuses_on_corrupt_state_and_leaves_file_intact(tmp_path: Path) -> None:

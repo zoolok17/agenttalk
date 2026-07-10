@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import cli, close
+from agenttalk import cli, close, gates
 from agenttalk.store import Store
 
 SHA = "a" * 40
@@ -90,6 +90,42 @@ def test_signoff_policy_rejects_bad_inputs() -> None:
     ]:
         with pytest.raises(close.CloseError):
             close.validate_signoff_policy(bad)
+
+
+@pytest.mark.parametrize("field", [
+    "use_default_reviewers",
+    "include_domain_reviewers",
+    "allow_na",
+    "override_counts",
+])
+def test_signoff_policy_rejects_non_boolean_set_flags(field: str) -> None:
+    policy = {
+        "risk_policies": {"security": [{"id": "sec", field: "false"}]},
+    }
+    with pytest.raises(close.CloseError, match="JSON boolean"):
+        close.validate_signoff_policy(policy)
+
+
+@pytest.mark.parametrize("value", ["false", 0, 1, None, [], {}])
+def test_signoff_policy_rejects_non_boolean_allow_unmapped(value: object) -> None:
+    with pytest.raises(close.CloseError, match="JSON boolean"):
+        close.validate_signoff_policy({"risk_policies": {}, "allow_unmapped": value})
+
+
+def test_close_and_gate_risk_vocabularies_match() -> None:
+    assert close.CORE_RISK_CLASSES == gates.CORE_RISK_CLASSES
+    for risk_class in [*sorted(gates.CORE_RISK_CLASSES), "team:runtime"]:
+        assert close.validate_risk_class(risk_class) == risk_class
+        gates.validate_review_result_evidence("review-result", {
+            "status": "approved",
+            "risk_class": risk_class,
+            "release_blocker": "no",
+            "tests_referenced": "tests",
+            "tests_executed": "tests",
+            "residual_risk": "low",
+            "evidence": "pointer",
+            "na_reason": "vocabulary validation",
+        })
 
 
 def test_derive_maps_known_and_reports_unmapped() -> None:

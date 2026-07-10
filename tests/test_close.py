@@ -15,8 +15,10 @@ through to the pinned-SHA branch and `_worktree_clean` reports None -> clean.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -223,6 +225,19 @@ def test_apply_ack_refused_after_publish() -> None:
                         from_role=None, at="t")
 
 
+def test_apply_ack_rejects_duplicate_counter_id_without_mutating_ack() -> None:
+    rec = _satisfied()
+    close.apply_ack(rec, lens_id="sec", status="counter", agent="codex",
+                    from_role=None, at="t1", counter_id="ctr-1")
+    first_ack = dict(rec["lens_acks"]["sec"])
+
+    with pytest.raises(close.CloseError, match="duplicate counter"):
+        close.apply_ack(rec, lens_id="sec", status="counter", agent="codex",
+                        from_role=None, at="t2", counter_id="ctr-1")
+
+    assert rec["lens_acks"]["sec"] == first_ack
+
+
 def test_decide_counter_accept_requires_remediation() -> None:
     rec = _satisfied()
     rec["counters"]["ctr-1"] = {"counter_id": "ctr-1", "decision": close.COUNTER_PENDING}
@@ -281,6 +296,60 @@ def _accept(root: Path) -> int:
                  "--release-blocker", "no", "--tests-referenced", "n/a",
                  "--tests-executed", "n/a", "--residual-risk", "n/a",
                  "--na-reason", "lw", "--evidence", "pointer:rq-1"], root)
+
+
+def test_concurrent_close_saves_reject_one_stale_generation(tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    rec = close.empty_close(
+        "rel", scope="release", revision=SHA, revision_kind="sha",
+        gate_scope="release", opened_by="lead", opened_at="t0",
+        epoch_at_open=None, required_lenses=[], revision_clean=True,
+        dirty_artifact=None, non_lane_isolation_not_asserted=True)
+    close.save_close(store, rec)
+    generation = rec["generation"]
+    ready = threading.Barrier(3)
+
+    def update(body: str) -> str:
+        local = close.load_close(store, "rel")
+        close.set_draft(local, body=body, by="lead", at=body)
+        ready.wait()
+        try:
+            close.save_close(store, local, expected_generation=generation)
+        except close.CloseConflict:
+            return "conflict"
+        return "saved"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(update, body) for body in ("first", "second")]
+        ready.wait()
+        outcomes = sorted(f.result() for f in futures)
+
+    assert outcomes == ["conflict", "saved"]
+    stored = close.load_close(store, "rel")
+    assert stored["generation"] == generation + 1
+    assert stored["draft"]["body"] in {"first", "second"}
+
+
+def test_legacy_close_without_generation_upgrades_on_checked_save(tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    rec = close.empty_close(
+        "rel", scope="release", revision=SHA, revision_kind="sha",
+        gate_scope="release", opened_by="lead", opened_at="t0",
+        epoch_at_open=None, required_lenses=[], revision_clean=True,
+        dirty_artifact=None, non_lane_isolation_not_asserted=True)
+    rec.pop("generation")
+    path = close.close_path(store, "rel")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rec), encoding="utf-8")
+
+    loaded = close.load_close(store, "rel")
+    assert loaded["generation"] == 0
+    close.set_draft(loaded, body="migrated", by="lead", at="t1")
+    close.save_close(store, loaded, expected_generation=0)
+
+    assert close.load_close(store, "rel")["generation"] == 1
 
 
 def test_cli_full_go_lifecycle(tmp_path: Path) -> None:

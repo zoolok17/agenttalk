@@ -34,7 +34,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from agenttalk.store import CONTROL_KINDS, Message, OPENER_KINDS
+from agenttalk.gates import TERMINAL_RESPONSE_STATUSES
+from agenttalk.store import (
+    CONTROL_KINDS,
+    Message,
+    OPENER_KINDS,
+)
 
 # OPENER_KINDS — kinds that OPEN a trackable thread, mapped to the
 # kind(s) that COUNT as the peer's response — moved to store.py in
@@ -72,7 +77,9 @@ def _classify_event(opener_kind: str, m: Message, requester: str, responder: str
         if m.kind == "review-result" and m.sender == responder and m.recipient == requester:
             if meta.get("status") == "needs-info":
                 return ("ball", requester)   # reviewer kicked it back to requester
-            return ("terminal", None)        # approved / rejected (or any verdict)
+            if meta.get("status") in TERMINAL_RESPONSE_STATUSES["review-result"]:
+                return ("terminal", None)    # approved / rejected
+            return None
         # The requester answering a needs-info: a plain message/note from
         # requester -> responder, but ONLY while the ball is on the requester.
         if (
@@ -84,13 +91,19 @@ def _classify_event(opener_kind: str, m: Message, requester: str, responder: str
         return None
     if opener_kind == "proposal":
         if m.kind == "proposal-response" and m.sender == responder and m.recipient == requester:
-            return ("terminal", None)        # accepted/rejected/countered all close
+            if meta.get("status") in TERMINAL_RESPONSE_STATUSES["proposal-response"]:
+                return ("terminal", None)    # accepted/rejected/countered all close
         return None
     if opener_kind == "question":
         # A question is open-ended: ANY non-control response from the asked
         # party closes it, regardless of kind. (0.12.0 — fixes the
         # production case where a `review-result` was the real answer to a
         # broadcast question but a strict message/note check left it owed.)
+        if (
+            m.kind in TERMINAL_RESPONSE_STATUSES
+            and meta.get("status") not in TERMINAL_RESPONSE_STATUSES[m.kind]
+        ):
+            return None
         if m.kind not in CONTROL_KINDS and m.sender == responder and m.recipient == requester:
             return ("terminal", None)
         return None

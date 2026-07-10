@@ -207,6 +207,31 @@ def test_accepted_proposal_closes() -> None:
     assert _states(derive_threads(msgs, agent="alpha", cursor="002"))["p1"] == "closed"
 
 
+def test_unrecognized_review_result_status_does_not_close() -> None:
+    msgs = [
+        _msg("001", "alpha", "beta", "review-request", rid="r1"),
+        _msg("002", "beta", "alpha", "review-result", rid="r1", status="approve"),
+    ]
+    assert _states(derive_threads(msgs, agent="alpha", cursor="002"))["r1"] == "open-outbound"
+    assert _states(derive_threads(msgs, agent="beta", cursor="002"))["r1"] == "owed-inbound"
+
+
+def test_unrecognized_proposal_response_status_does_not_close() -> None:
+    msgs = [
+        _msg("001", "alpha", "beta", "proposal", rid="p1"),
+        _msg("002", "beta", "alpha", "proposal-response", rid="p1", status="accept"),
+    ]
+    assert _states(derive_threads(msgs, agent="alpha", cursor="002"))["p1"] == "open-outbound"
+
+
+def test_nonterminal_typed_response_does_not_close_question() -> None:
+    msgs = [
+        _msg("001", "alpha", "beta", "question", rid="q1"),
+        _msg("002", "beta", "alpha", "review-result", rid="q1", status="needs-info"),
+    ]
+    assert _states(derive_threads(msgs, agent="alpha", cursor="002"))["q1"] == "open-outbound"
+
+
 # -------------------------------------------------- question answered
 
 def test_question_closed_by_plain_message() -> None:
