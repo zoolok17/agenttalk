@@ -91,6 +91,22 @@ def test_init_prints_concrete_env_hint_for_two_agents(tmp_path: Path, capsys: py
     assert "Terminal B" in out
 
 
+def test_init_accepts_single_claude_agent(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    rc = cli.main(["init", "--path", str(tmp_path), "--agents", "claude"])
+
+    assert rc == 0
+    assert json.loads((tmp_path / ".agenttalk" / "config.json").read_text())["agents"] == ["claude"]
+    assert "AGENTTALK_SELF='claude'" in capsys.readouterr().out
+
+
+def test_init_accepts_single_codex_agent(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    rc = cli.main(["init", "--path", str(tmp_path), "--agents", "codex"])
+
+    assert rc == 0
+    assert json.loads((tmp_path / ".agenttalk" / "config.json").read_text())["agents"] == ["codex"]
+    assert "AGENTTALK_SELF='codex'" in capsys.readouterr().out
+
+
 def test_init_uses_generic_hint_for_three_agents(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     rc = cli.main(["init", "--path", str(tmp_path), "--agents", "a,b,c"])
     assert rc == 0

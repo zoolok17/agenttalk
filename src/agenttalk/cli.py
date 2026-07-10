@@ -367,8 +367,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         root = Path.cwd().resolve()
     store = Store(root)
     agents = [a.strip() for a in args.agents.split(",") if a.strip()]
-    if len(agents) < 2:
-        sys.stderr.write("agenttalk init: need at least two agents (e.g. --agents claude,codex)\n")
+    if not agents:
+        sys.stderr.write("agenttalk init: need at least one agent (e.g. --agents claude)\n")
         return 2
     # Up-tree guard (#13): two valid stores at different depths are the
     # real split-brain mechanism behind the production "--root gotcha" —
@@ -394,9 +394,14 @@ def cmd_init(args: argparse.Namespace) -> int:
     print(f"  agents:     {', '.join(cfg['agents'])}")
     print(f"  session_id: {cfg['session_id']}")
     # Identity hint: tell the user how to point each terminal at the
-    # right agent name. Concrete examples when the roster is exactly 2.
+    # right agent name. Concrete examples for one- and two-agent rosters.
     print()
-    if len(agents) == 2:
+    if len(agents) == 1:
+        (agent,) = agents
+        print("Tip: set this terminal's agent identity before invoking skills:")
+        print(f"  PowerShell: $env:AGENTTALK_SELF='{agent}'")
+        print(f"  Bash:       export AGENTTALK_SELF={agent}")
+    elif len(agents) == 2:
         a, b = agents
         print("Tip: in each terminal, set its agent identity before invoking skills:")
         print(f"  PowerShell (Terminal A): $env:AGENTTALK_SELF='{a}'; $env:AGENTTALK_PEER='{b}'")

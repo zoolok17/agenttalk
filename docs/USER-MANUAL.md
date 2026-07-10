@@ -80,6 +80,18 @@ agenttalk status
 agenttalk doctor
 ```
 
+The roster must contain at least one agent. You can initialize a project for a
+single Claude or Codex terminal and add another roster member later:
+
+```bash
+agenttalk init --here --agents claude
+agenttalk init --here --agents codex
+```
+
+With a single-agent roster, set only `AGENTTALK_SELF`; do not set
+`AGENTTALK_PEER` until another agent has been added. Messaging commands that
+target a peer require an explicit `--to` (or a peer in the roster).
+
 For Codex, enable the project sandbox block so Codex can call agenttalk from
 inside its workspace sandbox:
 
