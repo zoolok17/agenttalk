@@ -467,6 +467,26 @@ def test_legacy_close_requires_in_lock_upgrade_before_checked_save(tmp_path: Pat
     assert stored["draft"]["body"] == "migrated"
 
 
+def test_cli_mutation_upgrades_legacy_close_inside_transaction(tmp_path: Path) -> None:
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    store = Store(root)
+    path = close.close_path(store, "rel")
+    legacy = json.loads(path.read_text(encoding="utf-8"))
+    legacy.pop("generation")
+    legacy.pop("instance_id")
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    assert _run([
+        "close", "draft", "--id", "rel", "--from", "lead", "-m", "latest",
+    ], root) == 0
+
+    stored = close.load_close(store, "rel")
+    assert stored["generation"] == 2
+    assert close.close_instance_id(stored) is not None
+    assert stored["draft"]["body"] == "latest"
+
+
 def test_cli_full_go_lifecycle(tmp_path: Path) -> None:
     root = _init(tmp_path)
     assert _open(root) == 0
@@ -478,6 +498,114 @@ def test_cli_full_go_lifecycle(tmp_path: Path) -> None:
     rec = close.load_close(Store(root), "rel")
     assert rec["status"] == close.PUBLISHED
     assert rec["final"]["verdict"] == close.VERDICT_GO
+
+
+@pytest.mark.parametrize("mutation", ["ack", "counter"])
+def test_cli_publish_serializes_against_ack_and_counter(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str) -> None:
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    assert _accept(root) == 0
+    store = Store(root)
+    evaluated = threading.Event()
+    release_evaluation = threading.Event()
+    mutation_waiting = threading.Event()
+    real_compute = close.compute_verdict
+    real_update_lock = close._close_update_lock
+
+    def paused_compute(*args, **kwargs):
+        if threading.current_thread().name == "close-publisher":
+            evaluated.set()
+            if not release_evaluation.wait(5):
+                raise AssertionError("publisher evaluation was not released")
+        return real_compute(*args, **kwargs)
+
+    def observed_update_lock(lock_store, close_id, *, timeout):
+        if threading.current_thread().name == "close-mutation":
+            mutation_waiting.set()
+        return real_update_lock(lock_store, close_id, timeout=timeout)
+
+    monkeypatch.setattr(close, "compute_verdict", paused_compute)
+    monkeypatch.setattr(close, "_close_update_lock", observed_update_lock)
+    results: dict[str, int] = {}
+    errors: list[BaseException] = []
+
+    def invoke(key: str, argv: list[str]) -> None:
+        try:
+            results[key] = _run(argv, root)
+        except BaseException as error:  # surfaced in the test thread
+            errors.append(error)
+
+    publish = threading.Thread(
+        target=invoke,
+        args=("publish", [
+            "close", "publish", "--id", "rel", "--from", "lead",
+            "--verdict", "go",
+        ]),
+        name="close-publisher",
+    )
+    mutation_argv = [
+        "close", "ack", "--id", "rel", "--lens", "sec", "--from", "codex",
+    ]
+    if mutation == "counter":
+        mutation_argv += [
+            "--status", "counter", "--counter", "late-counter",
+            "--finding", "arrived during publish",
+        ]
+    else:
+        mutation_argv += ["--status", "na", "--reason", "arrived during publish"]
+    mutate = threading.Thread(
+        target=invoke, args=("mutation", mutation_argv), name="close-mutation")
+
+    publish.start()
+    assert evaluated.wait(5)
+    assert (close.closes_dir(store) / ".rel.lock").exists()
+    mutate.start()
+    assert mutation_waiting.wait(5)
+    assert close.load_close(store, "rel")["status"] == close.OPEN
+    release_evaluation.set()
+    publish.join(10)
+    mutate.join(10)
+
+    assert not publish.is_alive()
+    assert not mutate.is_alive()
+    assert errors == []
+    assert results == {"publish": 0, "mutation": 2}
+    stored = close.load_close(store, "rel")
+    assert stored["status"] == close.PUBLISHED
+    assert stored["final"]["verdict"] == close.VERDICT_GO
+    assert stored["lens_acks"]["sec"]["status"] == close.ACCEPT
+    assert "late-counter" not in stored["counters"]
+
+
+def test_cli_force_open_rejects_delete_recreate_aba(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture) -> None:
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    store = Store(root)
+    original = close.load_close(store, "rel")
+    real_replace = close.replace_close
+
+    def recreate_then_replace(replace_store, record, **expected):
+        close.close_path(replace_store, "rel").unlink()
+        recreated = close.empty_close(
+            "rel", scope="release", revision=OTHER_SHA, revision_kind="sha",
+            gate_scope="release", opened_by="lead", opened_at="recreated",
+            epoch_at_open=None, required_lenses=[], revision_clean=True,
+            dirty_artifact=None, non_lane_isolation_not_asserted=True)
+        close.create_close(replace_store, recreated)
+        return real_replace(replace_store, record, **expected)
+
+    monkeypatch.setattr(close, "replace_close", recreate_then_replace)
+
+    assert _open(root, "--force") == 3
+    error = capsys.readouterr().err
+    assert "HOLD" in error
+    assert "retry" in error
+    stored = close.load_close(store, "rel")
+    assert stored["revision"] == OTHER_SHA
+    assert stored["instance_id"] != original["instance_id"]
 
 
 def test_m6_release_close_without_lane_artifact_holds(tmp_path: Path) -> None:
@@ -544,6 +672,7 @@ def test_cli_publish_go_bump_barrier_fires_release_barrier(tmp_path: Path) -> No
     rec = close.load_close(store, "rel")
     epoch = rec["final"]["barrier_epoch"]
     assert epoch is not None
+    assert rec["generation"] == 4  # open, ack, publish, checked barrier stamp
     assert Store(root).current_epoch() == epoch  # the release barrier is now current
 
 

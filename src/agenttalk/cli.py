@@ -2016,6 +2016,13 @@ def close_na_error(msg: str):
     return close_mod.CloseError(msg)
 
 
+def _close_conflict_result(action: str, error: Exception) -> int:
+    sys.stderr.write(
+        f"agenttalk close {action}: HOLD - concurrent close update conflict: {error}. "
+        "Reload the close and retry.\n")
+    return 3
+
+
 def _signoff_set_for_lens(record: dict, lens_id: str) -> str | None:
     """The signoff set a generated lens belongs to, or None for a plain P2 lens."""
     for ln in record.get("required_lenses", []) or []:
@@ -2108,13 +2115,17 @@ def _cmd_close_signoffs(args, store, roster) -> int:
         return 0
 
     if sub == "apply":
-        record = close_mod.load_close(store, args.id)
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         _check_close_authority(store, actor, "signoffs apply")
-        rc = _close_derive_signoffs(args, store, record, actor)
-        if rc != 0:
-            return rc
-        close_mod.save_close(store, record)
+        try:
+            with close_mod.close_transaction(store, args.id) as transaction:
+                record = transaction.record
+                rc = _close_derive_signoffs(args, store, record, actor)
+                if rc != 0:
+                    return rc
+                transaction.commit()
+        except (close_mod.CloseConflict, TimeoutError) as e:
+            return _close_conflict_result("signoffs apply", e)
         n = len(record.get("required_signoffs") or [])
         unmapped = (record.get("signoff_route") or {}).get("unmapped_risks") or []
         print(f"applied signoffs to {args.id}: {n} required set(s)"
@@ -2122,7 +2133,6 @@ def _cmd_close_signoffs(args, store, roster) -> int:
         return 0
 
     if sub == "override":
-        record = close_mod.load_close(store, args.id)
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         # ENFORCED (not advisory): a signoff override bypasses a REQUIRED specialist
         # set -> false GO if anyone could record it (reviewer-1 blocker). It is a
@@ -2142,12 +2152,16 @@ def _cmd_close_signoffs(args, store, roster) -> int:
                 "Refusing.\n")
             return 2
         try:
-            close_mod.signoff_override(record, set_id=args.set, by=actor,
-                                       at=_iso_now(), reason=args.reason)
+            with close_mod.close_transaction(store, args.id) as transaction:
+                record = transaction.record
+                close_mod.signoff_override(record, set_id=args.set, by=actor,
+                                           at=_iso_now(), reason=args.reason)
+                transaction.commit()
+        except (close_mod.CloseConflict, TimeoutError) as e:
+            return _close_conflict_result("signoffs override", e)
         except close_mod.CloseError as e:
             sys.stderr.write(f"agenttalk close signoffs override: {e}\n")
             return 2
-        close_mod.save_close(store, record)
         print(f"signoff {args.set} overridden on {args.id} by {actor} (audited, not counted)")
         return 0
 
@@ -2256,11 +2270,6 @@ def cmd_close(args: argparse.Namespace) -> int:
             non_lane_isolation_not_asserted=bool(
                 getattr(args, "non_lane_isolation_not_asserted", False)))
         record["worktree_isolation"] = _close_worktree_eval(store, record)
-        if close_mod.close_path(store, close_id).exists() and not args.force:
-            sys.stderr.write(
-                f"agenttalk close open: {close_id!r} already exists "
-                "(use --force to overwrite, or `close reopen`).\n")
-            return 2
         if not clean and not args.dirty_artifact:
             sys.stderr.write(
                 "agenttalk close open: WARNING - worktree is dirty and no "
@@ -2270,7 +2279,29 @@ def cmd_close(args: argparse.Namespace) -> int:
             rc = _close_derive_signoffs(args, store, record, opener)
             if rc != 0:
                 return rc
-        close_mod.save_close(store, record)
+        try:
+            path = close_mod.close_path(store, close_id)
+            if not args.force and path.exists():
+                sys.stderr.write(
+                    f"agenttalk close open: {close_id!r} already exists "
+                    "(use --force to replace it, or `close reopen`).\n")
+                return 2
+            if args.force and path.exists():
+                current = close_mod.load_close(store, close_id)
+                if close_mod.close_instance_id(current) is None:
+                    current = close_mod.upgrade_legacy_close(store, close_id)
+                close_mod.replace_close(
+                    store, record,
+                    expected_generation=close_mod.close_generation(current),
+                    expected_instance_id=close_mod.close_instance_id(current),
+                )
+            else:
+                close_mod.create_close(store, record)
+        except (close_mod.CloseConflict, TimeoutError) as e:
+            return _close_conflict_result("open", e)
+        except close_mod.CloseError as e:
+            sys.stderr.write(f"agenttalk close open: {e}\n")
+            return 2
         if getattr(args, "json", False):
             print(json.dumps(record, indent=2))
         else:
@@ -2284,11 +2315,9 @@ def cmd_close(args: argparse.Namespace) -> int:
         return _cmd_close_signoffs(args, store, roster)
 
     if action == "ack":
-        record = close_mod.load_close(store, args.id)
         agent = _resolve_self(getattr(args, "actor", None), roster=roster)
         from_role = (store.load_config().get("roles") or {}).get(agent)
         evidence = None
-        counter_id = None
         if args.status == close_mod.ACCEPT:
             # typed-evidence reuse expects scalar string fields (gates._has_value);
             # join repeatable --evidence into one pointer string (pointer-not-mirror).
@@ -2309,7 +2338,6 @@ def cmd_close(args: argparse.Namespace) -> int:
                 return 2
             evidence = meta
         elif args.status == close_mod.COUNTER:
-            counter_id = args.counter or f"ctr-{args.lens}-{record.get('revision','')[:8]}"
             evidence = {"finding": args.finding, "request_id": args.request_id}
             evidence = {k: v for k, v in evidence.items() if v is not None}
         # An --override authorizes an otherwise-unauthorized ack, so it is a CLOSE
@@ -2327,44 +2355,55 @@ def cmd_close(args: argparse.Namespace) -> int:
                     f"recognized close lead {sorted(leads)}; the ack stays subject "
                     "to the lens authorization (override is a lead privilege).\n")
         from_groups = _agent_groups(store.load_config(), agent)
-        # A signoff-lens ack must come from a CURRENT candidate (resolved from the
-        # set's refsets). Refusing non-candidates gives a clear error AND stops a
-        # non-candidate from displacing a valid signer's slot ack. Override is the
-        # lead escape (recorded, advisory) and bypasses this candidacy gate.
-        sid = _signoff_set_for_lens(record, args.lens)
-        if sid is not None and not override:
-            ev = _build_signoff_eval(store, record) or {}
-            candidates = set((ev.get("resolved_candidates") or {}).get(sid, []))
-            if agent not in candidates:
-                sys.stderr.write(
-                    f"agenttalk close ack: {agent!r} is not a current candidate for "
-                    f"signoff {sid!r} (candidates: {sorted(candidates) or 'none'}); "
-                    "refusing. Use `close signoffs override` for the lead escape.\n")
-                return 2
         try:
-            close_mod.apply_ack(
-                record, lens_id=args.lens, status=args.status, agent=agent,
-                from_role=from_role, at=_iso_now(), evidence=evidence,
-                reason=args.reason, counter_id=counter_id,
-                override=override, from_groups=from_groups)
+            with close_mod.close_transaction(store, args.id) as transaction:
+                record = transaction.record
+                counter_id = None
+                if args.status == close_mod.COUNTER:
+                    counter_id = (args.counter
+                                  or f"ctr-{args.lens}-{record.get('revision', '')[:8]}")
+                # Signoff candidacy is state-dependent, so resolve it from the
+                # latest record while the same lock protects the eventual ack.
+                sid = _signoff_set_for_lens(record, args.lens)
+                if sid is not None and not override:
+                    ev = _build_signoff_eval(store, record) or {}
+                    candidates = set((ev.get("resolved_candidates") or {}).get(sid, []))
+                    if agent not in candidates:
+                        sys.stderr.write(
+                            f"agenttalk close ack: {agent!r} is not a current candidate for "
+                            f"signoff {sid!r} "
+                            f"(candidates: {sorted(candidates) or 'none'}); refusing. "
+                            "Use `close signoffs override` for the lead escape.\n")
+                        return 2
+                close_mod.apply_ack(
+                    record, lens_id=args.lens, status=args.status, agent=agent,
+                    from_role=from_role, at=_iso_now(), evidence=evidence,
+                    reason=args.reason, counter_id=counter_id,
+                    override=override, from_groups=from_groups)
+                transaction.commit()
+        except (close_mod.CloseConflict, TimeoutError) as e:
+            return _close_conflict_result("ack", e)
         except close_mod.CloseError as e:
             sys.stderr.write(f"agenttalk close ack: {e}\n")
             return 2
-        close_mod.save_close(store, record)
         msg = f"ack {args.status} lens {args.lens} by {agent}"
         print(msg + (f" (counter {counter_id})" if counter_id else ""))
         return 0
 
     if action == "draft":
-        record = close_mod.load_close(store, args.id)
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         _check_close_authority(store, actor, "draft")
         try:
-            close_mod.set_draft(record, body=args.message or "", by=actor, at=_iso_now())
+            with close_mod.close_transaction(store, args.id) as transaction:
+                record = transaction.record
+                close_mod.set_draft(
+                    record, body=args.message or "", by=actor, at=_iso_now())
+                transaction.commit()
+        except (close_mod.CloseConflict, TimeoutError) as e:
+            return _close_conflict_result("draft", e)
         except close_mod.CloseError as e:
             sys.stderr.write(f"agenttalk close draft: {e}\n")
             return 2
-        close_mod.save_close(store, record)
         print(f"draft recorded on {args.id} by {actor}")
         return 0
 
@@ -2372,7 +2411,6 @@ def cmd_close(args: argparse.Namespace) -> int:
         if getattr(args, "counter_cmd", None) != "decide":
             sys.stderr.write("agenttalk close counter: the only action is `decide`.\n")
             return 2
-        record = close_mod.load_close(store, args.id)
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         _check_close_authority(store, actor, "counter decide")
         remediation = None
@@ -2386,13 +2424,17 @@ def cmd_close(args: argparse.Namespace) -> int:
                 "regression_test": args.regression_test, "target": args.target,
             }
         try:
-            close_mod.decide_counter(
-                record, counter_id=args.counter, decision=args.decision, by=actor,
-                at=_iso_now(), reason=args.reason, remediation=remediation)
+            with close_mod.close_transaction(store, args.id) as transaction:
+                record = transaction.record
+                close_mod.decide_counter(
+                    record, counter_id=args.counter, decision=args.decision, by=actor,
+                    at=_iso_now(), reason=args.reason, remediation=remediation)
+                transaction.commit()
+        except (close_mod.CloseConflict, TimeoutError) as e:
+            return _close_conflict_result("counter decide", e)
         except close_mod.CloseError as e:
             sys.stderr.write(f"agenttalk close counter decide: {e}\n")
             return 2
-        close_mod.save_close(store, record)
         print(f"counter {args.counter} {args.decision}ed on {args.id} by {actor}")
         return 0
 
@@ -2422,51 +2464,60 @@ def cmd_close(args: argparse.Namespace) -> int:
         return 0 if result["verdict"] == close_mod.VERDICT_GO else 3
 
     if action == "publish":
-        record = close_mod.load_close(store, args.id)
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         _check_close_authority(store, actor, "publish")
-        if record.get("status") == close_mod.PUBLISHED:
-            sys.stderr.write(
-                f"agenttalk close publish: {args.id!r} is already published; "
-                "`close reopen` first.\n")
-            return 2
-        gate_check = gate_mod.check_gates(store.root, scope=record.get("gate_scope"))
-        signoff_eval = _build_signoff_eval(store, record)
-        worktree_eval = _close_worktree_eval(store, record)
-        record["worktree_isolation"] = worktree_eval
-        result = close_mod.compute_verdict(record, gate_check, signoff_eval, worktree_eval)
-        if args.verdict == "go" and result["verdict"] != close_mod.VERDICT_GO:
-            sys.stderr.write(
-                "agenttalk close publish: refusing GO - close check is HOLD:\n")
-            _print_verdict(args.id, result)
-            return 3
         verdict = close_mod.VERDICT_GO if args.verdict == "go" else close_mod.VERDICT_HOLD
-        # Durably record + persist the final verdict BEFORE any team-wide barrier
-        # bump, so a failed write can never leave the global epoch advanced without
-        # a published GO behind it (reviewer-1/codex finding 2).
-        close_mod.record_publish(
-            record, verdict=verdict, by=actor, at=_iso_now(),
-            reason=args.reason or "", gate_check=gate_check,
-            residual_risk=args.residual_risk, barrier_epoch=None)
-        close_mod.save_close(store, record)
         barrier_epoch = None
-        if verdict == close_mod.VERDICT_GO and args.bump_barrier:
-            msg = store.send(
-                sender=actor, recipient=actor, kind="message",
-                subject=f"release barrier: close {args.id}",
-                body=args.reason or f"close {args.id} published GO",
-                meta={"barrier": {"version": 1, "scope": "global",
-                                  "type": "epoch-bump"}, "close_id": args.id})
-            barrier_epoch = msg.id
-            # best-effort stamp the barrier id onto the already-persisted GO
-            record["final"]["barrier_epoch"] = barrier_epoch
-            close_mod.save_close(store, record)
+        try:
+            # The lock spans reload, all impure evaluations, verdict derivation,
+            # persistence, and the optional barrier stamp. No cooperating ack or
+            # counter can invalidate a GO between check and write.
+            with close_mod.close_transaction(store, args.id) as transaction:
+                record = transaction.record
+                if record.get("status") == close_mod.PUBLISHED:
+                    sys.stderr.write(
+                        f"agenttalk close publish: {args.id!r} is already published; "
+                        "`close reopen` first.\n")
+                    return 2
+                gate_check = gate_mod.check_gates(
+                    store.root, scope=record.get("gate_scope"))
+                signoff_eval = _build_signoff_eval(store, record)
+                worktree_eval = _close_worktree_eval(store, record)
+                record["worktree_isolation"] = worktree_eval
+                result = close_mod.compute_verdict(
+                    record, gate_check, signoff_eval, worktree_eval)
+                if args.verdict == "go" and result["verdict"] != close_mod.VERDICT_GO:
+                    sys.stderr.write(
+                        "agenttalk close publish: refusing GO - close check is HOLD:\n")
+                    _print_verdict(args.id, result)
+                    return 3
+                # Persist the final verdict before the barrier bump. The transaction
+                # remains locked so the subsequent stamp uses the next checked token.
+                close_mod.record_publish(
+                    record, verdict=verdict, by=actor, at=_iso_now(),
+                    reason=args.reason or "", gate_check=gate_check,
+                    residual_risk=args.residual_risk, barrier_epoch=None)
+                transaction.commit()
+                if verdict == close_mod.VERDICT_GO and args.bump_barrier:
+                    msg = store.send(
+                        sender=actor, recipient=actor, kind="message",
+                        subject=f"release barrier: close {args.id}",
+                        body=args.reason or f"close {args.id} published GO",
+                        meta={"barrier": {"version": 1, "scope": "global",
+                                          "type": "epoch-bump"}, "close_id": args.id})
+                    barrier_epoch = msg.id
+                    record["final"]["barrier_epoch"] = barrier_epoch
+                    transaction.commit()
+        except (close_mod.CloseConflict, TimeoutError) as e:
+            return _close_conflict_result("publish", e)
+        except close_mod.CloseError as e:
+            sys.stderr.write(f"agenttalk close publish: {e}\n")
+            return 2
         print(f"published close {args.id}: {verdict} by {actor}"
               + (f"; release barrier {barrier_epoch}" if barrier_epoch else ""))
         return 0 if verdict == close_mod.VERDICT_GO else 3
 
     if action == "reopen":
-        record = close_mod.load_close(store, args.id)
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         _check_close_authority(store, actor, "reopen")
         revision = None
@@ -2479,9 +2530,17 @@ def cmd_close(args: argparse.Namespace) -> int:
                 return 2
             wc = _worktree_clean(store.root)
             clean = True if wc is None else wc
-        close_mod.reopen(record, by=actor, at=_iso_now(),
-                         revision=revision, revision_clean=clean)
-        close_mod.save_close(store, record)
+        try:
+            with close_mod.close_transaction(store, args.id) as transaction:
+                record = transaction.record
+                close_mod.reopen(record, by=actor, at=_iso_now(),
+                                 revision=revision, revision_clean=clean)
+                transaction.commit()
+        except (close_mod.CloseConflict, TimeoutError) as e:
+            return _close_conflict_result("reopen", e)
+        except close_mod.CloseError as e:
+            sys.stderr.write(f"agenttalk close reopen: {e}\n")
+            return 2
         print(f"reopened close {args.id} by {actor}"
               + (f" @ {revision[:12]} (prior lens acks now stale)" if revision else ""))
         return 0

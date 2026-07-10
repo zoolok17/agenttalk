@@ -29,6 +29,7 @@ severity policy, ephemeral adversarial reviewers.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
@@ -724,6 +725,116 @@ def _write_close(path, record: dict) -> None:
     )
 
 
+def _validate_expected_tokens(expected_generation: int | None,
+                              expected_instance_id: str | None) -> None:
+    if expected_generation is None:
+        raise CloseConflict("close update requires expected_generation")
+    if (not isinstance(expected_generation, int)
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0):
+        raise CloseError("expected close generation must be a non-negative integer")
+    if expected_instance_id is None:
+        raise CloseConflict("close update requires expected_instance_id")
+    if (not isinstance(expected_instance_id, str)
+            or not _INSTANCE_ID_RE.match(expected_instance_id)):
+        raise CloseError("expected close instance_id must be a 32-character lowercase hex id")
+
+
+def _require_current_tokens(current: dict, *, close_id: str,
+                            expected_generation: int,
+                            expected_instance_id: str) -> None:
+    actual_generation = close_generation(current)
+    actual_instance_id = close_instance_id(current)
+    if actual_instance_id is None:
+        raise CloseConflict(
+            f"close {close_id!r} is a legacy record; upgrade it while locked first")
+    if actual_instance_id != expected_instance_id:
+        raise CloseConflict(
+            f"close {close_id!r} instance changed from {expected_instance_id!r} "
+            f"to {actual_instance_id!r}; reload before retrying")
+    if actual_generation != expected_generation:
+        raise CloseConflict(
+            f"close {close_id!r} changed from generation {expected_generation} "
+            f"to {actual_generation}; reload before retrying")
+
+
+def _upgrade_legacy_locked(store, close_id: str, current: dict) -> dict:
+    if close_instance_id(current) is not None:
+        raise CloseConflict(f"close {close_id!r} is already versioned; reload it")
+    upgraded = dict(current)
+    upgraded["instance_id"] = uuid.uuid4().hex
+    upgraded["generation"] = close_generation(current) + 1
+    if not _is_wellformed(upgraded):
+        raise CloseError(f"close {close_id!r} is malformed")
+    _write_close(close_path(store, close_id), upgraded)
+    return upgraded
+
+
+class CloseTransaction:
+    """A latest-record close mutation while the per-close lock is held."""
+
+    def __init__(self, store, close_id: str, record: dict) -> None:
+        self.store = store
+        self.close_id = close_id
+        self.record = record
+        self._generation = close_generation(record)
+        instance_id = close_instance_id(record)
+        if instance_id is None:
+            raise CloseConflict(f"close {close_id!r} is not versioned")
+        self._instance_id = instance_id
+        self._active = True
+
+    def commit(self) -> int:
+        """Persist the transaction record after rechecking its locked tokens."""
+        if not self._active:
+            raise CloseConflict("close transaction is no longer active")
+        if validate_close_id(self.record.get("close_id")) != self.close_id:
+            raise CloseConflict("close transaction close_id was modified")
+        generation = close_generation(self.record)
+        instance_id = close_instance_id(self.record)
+        if generation != self._generation or instance_id != self._instance_id:
+            raise CloseConflict(
+                f"close {self.close_id!r} transaction tokens were modified")
+        current = load_close(self.store, self.close_id)
+        _require_current_tokens(
+            current, close_id=self.close_id,
+            expected_generation=self._generation,
+            expected_instance_id=self._instance_id,
+        )
+        persisted = dict(self.record)
+        next_generation = self._generation + 1
+        persisted["generation"] = next_generation
+        if not _is_wellformed(persisted):
+            raise CloseError(f"close {self.close_id!r} is malformed")
+        _write_close(close_path(self.store, self.close_id), persisted)
+        self.record["generation"] = next_generation
+        self._generation = next_generation
+        return next_generation
+
+    def _finish(self) -> None:
+        self._active = False
+
+
+@contextlib.contextmanager
+def close_transaction(store, close_id: str, *, lock_timeout: float = 10.0):
+    """Lock, reload, and yield the latest versioned close for one mutation.
+
+    Legacy records are upgraded from the bytes read while holding the same lock.
+    This is the CLI read-evaluate-write boundary; callers commit through the yielded
+    transaction and must not retain it after the context exits.
+    """
+    close_id = validate_close_id(close_id)
+    with _close_update_lock(store, close_id, timeout=lock_timeout):
+        current = load_close(store, close_id)
+        if close_instance_id(current) is None:
+            current = _upgrade_legacy_locked(store, close_id, current)
+        transaction = CloseTransaction(store, close_id, current)
+        try:
+            yield transaction
+        finally:
+            transaction._finish()
+
+
 def create_close(store, record: dict, *, lock_timeout: float = 10.0) -> int:
     """Exclusively create a close and return its first persisted generation."""
     close_id = validate_close_id(record.get("close_id"))
@@ -763,15 +874,37 @@ def upgrade_legacy_close(store, close_id: str, *, lock_timeout: float = 10.0) ->
         if not path.exists():
             raise CloseError(f"no close {close_id!r} at {path}")
         current = load_close(store, close_id)
-        if close_instance_id(current) is not None:
-            raise CloseConflict(f"close {close_id!r} is already versioned; reload it")
-        upgraded = dict(current)
-        upgraded["instance_id"] = uuid.uuid4().hex
-        upgraded["generation"] = close_generation(current) + 1
-        if not _is_wellformed(upgraded):
-            raise CloseError(f"close {close_id!r} is malformed")
-        _write_close(path, upgraded)
+        upgraded = _upgrade_legacy_locked(store, close_id, current)
     return upgraded
+
+
+def replace_close(store, record: dict, *, expected_generation: int | None,
+                  expected_instance_id: str | None,
+                  lock_timeout: float = 10.0) -> int:
+    """Atomically replace an existing close with a new, independently identified one."""
+    close_id = validate_close_id(record.get("close_id"))
+    _validate_expected_tokens(expected_generation, expected_instance_id)
+    if close_generation(record) != 0 or close_instance_id(record) is not None:
+        raise CloseConflict("replacement close must be a fresh unpersisted record")
+    path = close_path(store, close_id)
+    with _close_update_lock(store, close_id, timeout=lock_timeout):
+        if not path.exists():
+            raise CloseConflict(f"close {close_id!r} no longer exists; reload before retrying")
+        current = load_close(store, close_id)
+        _require_current_tokens(
+            current, close_id=close_id,
+            expected_generation=expected_generation,
+            expected_instance_id=expected_instance_id,
+        )
+        persisted = dict(record)
+        persisted["instance_id"] = uuid.uuid4().hex
+        persisted["generation"] = 1
+        if not _is_wellformed(persisted):
+            raise CloseError(f"close {close_id!r} is malformed")
+        _write_close(path, persisted)
+    record["instance_id"] = persisted["instance_id"]
+    record["generation"] = 1
+    return 1
 
 
 def save_close(store, record: dict, *, expected_generation: int | None = None,
@@ -815,19 +948,11 @@ def save_close(store, record: dict, *, expected_generation: int | None = None,
         if not path.exists():
             raise CloseConflict(f"close {close_id!r} no longer exists; reload before retrying")
         current = load_close(store, close_id)
-        actual_generation = close_generation(current)
-        actual_instance_id = close_instance_id(current)
-        if actual_instance_id is None:
-            raise CloseConflict(
-                f"close {close_id!r} is a legacy record; run upgrade_legacy_close first")
-        if actual_instance_id != expected_instance_id:
-            raise CloseConflict(
-                f"close {close_id!r} instance changed from {expected_instance_id!r} "
-                f"to {actual_instance_id!r}; reload before retrying")
-        if actual_generation != expected_generation:
-            raise CloseConflict(
-                f"close {close_id!r} changed from generation {expected_generation} "
-                f"to {actual_generation}; reload before retrying")
+        _require_current_tokens(
+            current, close_id=close_id,
+            expected_generation=expected_generation,
+            expected_instance_id=expected_instance_id,
+        )
         next_generation = expected_generation + 1
         persisted = dict(record)
         persisted["generation"] = next_generation
