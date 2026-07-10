@@ -2346,11 +2346,16 @@ def _close_worktree_eval(store, record: dict) -> dict | None:
         return {"status": "unverified", "reason": "delivery artifact lacks lane/head"}
     try:
         data = lane_mod.validate_delivery_artifact(
-            path, lane_id=lane_id, head_sha=head, store=store, require_isolation=True)
+            path, lane_id=lane_id, head_sha=head, store=store,
+            require_isolation=True, reject_pending_transaction=True,
+        )
     except lane_mod.LaneError as e:
         return {"status": "unverified", "reason": str(e)}
     status = data.get("isolation_status")
-    if status == "verified":
+    if (status == "verified"
+            and data.get("integrity_version") != lane_mod.INTEGRITY_VERSION):
+        # Current v3 evidence is HMAC-bound point-in-time proof. Its lane branch
+        # may legitimately be deleted or reused after the completed transaction.
         rc, out = _git(store.root, ["rev-parse", "--verify", f"{lane_mod.lane_ref(lane_id)}^{{commit}}"])
         branch_tip = out.strip()
         if rc != 0 or branch_tip != head:
@@ -3166,6 +3171,15 @@ def _lane_transaction_matches(lane: dict, pending: dict) -> bool:
     )
 
 
+def _lane_transaction_lock_path(store, lane_id: str) -> Path:
+    safe_id = lane_mod.validate_lane_id(lane_id)
+    return store.dir / "locks" / f"lane-{safe_id}.transaction.lock"
+
+
+def _lane_reset_lock_path(store) -> Path:
+    return store.dir / "locks" / "lane-reset.lock"
+
+
 def _lane_checkpoint_publication(store, lane_id: str, pending: dict, artifact: Path) -> None:
     with store._config_lock():
         data = lane_mod.load_lanes(store)
@@ -3219,6 +3233,384 @@ def _lane_remove_prepared(pending: dict) -> None:
         pass
 
 
+def _lane_rebind_pending_delivery(store, lane_id: str) -> tuple[dict, str | None]:
+    """Re-evaluate a persisted, nonconsumable GO after its first state save.
+
+    The prepared snapshot is collected before the provisional delivery save. A
+    byte-for-byte equivalent snapshot collected after that save brackets the
+    transaction boundary; only then is publication allowed. Git and artifact I/O
+    stay outside the global config lock.
+    """
+    with store._config_lock():
+        data = lane_mod.load_lanes(store)
+        lane = (data.get("lanes") or {}).get(lane_id)
+        pending_raw = lane.get("publish_pending") if isinstance(lane, dict) else None
+        if (isinstance(lane, dict) and lane.get("status") == lane_mod.STATUS_DELIVERED
+                and pending_raw is False):
+            return {}, None
+        if (not isinstance(lane, dict) or not isinstance(pending_raw, dict)
+                or not _lane_transaction_matches(lane, pending_raw)):
+            raise lane_mod.LaneError("lane has no matching pending delivery to rebind")
+        pending = dict(pending_raw)
+        expected_active = pending.get("active_lane_fingerprints")
+        if not isinstance(expected_active, list):
+            raise lane_mod.LaneError("pending delivery active-lane snapshot is missing")
+        if lane_mod.active_lane_fingerprints(data, exclude=lane_id) != expected_active:
+            return pending, "active-lane set changed across the delivery state save"
+        others = [item for item in lane_mod.reservation_lanes(data)
+                  if item.get("lane_id") != lane_id]
+
+    lane_snapshot = pending.get("lane_snapshot")
+    if not isinstance(lane_snapshot, dict):
+        raise lane_mod.LaneError("pending delivery lane snapshot is missing")
+    head = pending.get("head_sha")
+    if not isinstance(head, str) or not lane_mod._FULL_SHA_RE.fullmatch(head):
+        raise lane_mod.LaneError("pending delivery head is malformed")
+    prepared_path = pending.get("prepared_artifact")
+    if not isinstance(prepared_path, str):
+        raise lane_mod.LaneError("pending delivery prepared artifact is missing")
+    prepared = lane_mod.validate_prepared_delivery_artifact(
+        Path(prepared_path), store=store, lane_id=lane_id, head_sha=head,
+        transaction_id=str(pending.get("transaction_id")),
+        lane_instance_id=str(pending.get("lane_instance_id")),
+        lane_generation=pending.get("lane_generation"),
+    )
+    expected_snapshot = prepared.get("evaluation_snapshot")
+    expected_evaluation = pending.get("evaluation_fingerprint")
+    expected_input = pending.get("input_fingerprint")
+    if (not isinstance(expected_snapshot, dict)
+            or lane_mod.fingerprint(expected_snapshot) != expected_evaluation):
+        raise lane_mod.LaneError("pending delivery evaluation snapshot differs from prepared evidence")
+    if lane_mod.fingerprint(lane_snapshot) != expected_snapshot.get("lane_fingerprint"):
+        raise lane_mod.LaneError("pending delivery lane snapshot differs from prepared evidence")
+    if expected_snapshot.get("active_lane_fingerprints") != expected_active:
+        raise lane_mod.LaneError("pending delivery active lanes differ from prepared evidence")
+    if (not re.fullmatch(r"[0-9a-f]{64}", str(expected_input or ""))
+            or expected_snapshot.get("cooperating_digest") != expected_input):
+        raise lane_mod.LaneError("pending delivery cooperating-input digest is malformed")
+
+    cooperating_before = lane_mod.cooperating_input_fingerprint(store)
+    if cooperating_before != expected_input:
+        return pending, "cooperating config/domain/gate/epoch/message inputs changed"
+    try:
+        rebound_head, provenance = _lane_candidate(
+            store, lane_snapshot, head, delivery=True,
+        )
+        verdict, ctx = _lane_eval(
+            store, lane_snapshot, others, rebound_head,
+            str(expected_snapshot.get("gate_scope")),
+        )
+        final_head, final_provenance = _lane_candidate(
+            store, lane_snapshot, head, delivery=True,
+        )
+        final_target = _lane_resolve(store, str(lane_snapshot.get("target_ref")))
+    except lane_mod.LaneError as exc:
+        return pending, f"terminal Git/worktree recheck failed ({exc})"
+    cooperating_after = lane_mod.cooperating_input_fingerprint(store)
+    if verdict["verdict"] != lane_mod.VERDICT_GO:
+        return pending, "terminal verdict is HOLD"
+    if (final_head != rebound_head or final_target != ctx.get("target_head_now")
+            or lane_mod.fingerprint(final_provenance or {})
+            != lane_mod.fingerprint(provenance or {})):
+        return pending, "target/head/worktree changed during terminal evaluation"
+    if cooperating_before != cooperating_after:
+        return pending, "cooperating inputs changed during terminal evaluation"
+    ctx["cooperating_input_fingerprint"] = cooperating_after
+    rebound_snapshot = lane_mod.build_evaluation_snapshot(
+        lane=lane_snapshot, active_lanes=others, context=ctx,
+        worktree_provenance=final_provenance,
+    )
+    if lane_mod.fingerprint(rebound_snapshot) != expected_evaluation:
+        return pending, "terminal evaluation differs from the prepared GO snapshot"
+    checkpoint_input = lane_mod.cooperating_input_fingerprint(store)
+    if checkpoint_input != cooperating_after:
+        return pending, "cooperating inputs changed before terminal binding checkpoint"
+
+    with store._config_lock():
+        data = lane_mod.load_lanes(store)
+        latest = (data.get("lanes") or {}).get(lane_id)
+        current_pending = latest.get("publish_pending") if isinstance(latest, dict) else None
+        if (isinstance(latest, dict) and current_pending is False
+                and _lane_transaction_matches(latest, pending)):
+            return pending, None
+        if (not isinstance(latest, dict) or not isinstance(current_pending, dict)
+                or not _lane_transaction_matches(latest, current_pending)):
+            raise lane_mod.LaneError("lane transaction changed before terminal binding checkpoint")
+        if lane_mod.active_lane_fingerprints(data, exclude=lane_id) != expected_active:
+            return dict(current_pending), "active-lane set changed before terminal binding checkpoint"
+        current_pending = dict(current_pending)
+        current_pending.pop("terminal_hold", None)
+        current_pending["terminal_rebound"] = True
+        current_pending["terminal_rebind_nonce"] = uuid.uuid4().hex
+        current_pending["terminal_rebound_at"] = _iso_now()
+        latest["publish_pending"] = current_pending
+        latest.pop("terminal_hold", None)
+        lane_mod.save_lanes(store, data)
+        return current_pending, None
+
+
+def _lane_rollback_pending_delivery(
+        store, lane_id: str, pending: dict) -> tuple[str, list[str]]:
+    """Restore the active lane, or retain a recoverable HOLD if that would overlap."""
+    lane_snapshot = pending.get("lane_snapshot")
+    if not isinstance(lane_snapshot, dict) or lane_snapshot.get("status") != lane_mod.STATUS_ACTIVE:
+        raise lane_mod.LaneError("pending delivery cannot restore its active lane snapshot")
+    with store._config_lock():
+        data = lane_mod.load_lanes(store)
+        latest = (data.get("lanes") or {}).get(lane_id)
+        current_pending = latest.get("publish_pending") if isinstance(latest, dict) else None
+        if (not isinstance(latest, dict) or not isinstance(current_pending, dict)
+                or not _lane_transaction_matches(latest, current_pending)):
+            raise lane_mod.LaneError("lane transaction changed before terminal rollback")
+        if (current_pending.get("terminal_rebind_nonce")
+                != pending.get("terminal_rebind_nonce")):
+            return "bound", []
+        conflicts = lane_mod.reservation_conflicts(data, lane_snapshot, exclude=lane_id)
+        if conflicts:
+            previous_hold = current_pending.get("terminal_hold")
+            held_at = previous_hold.get("held_at") \
+                if isinstance(previous_hold, dict) else None
+            hold = {
+                "code": "terminal_rollback_overlap",
+                "detail": (
+                    "restoring the original ACTIVE lane would overlap lanes assigned "
+                    "after provisional delivery"
+                ),
+                "conflicting_lane_ids": conflicts,
+                "held_at": held_at if isinstance(held_at, str) else _iso_now(),
+            }
+            current_pending = dict(current_pending)
+            current_pending["terminal_hold"] = hold
+            latest["publish_pending"] = current_pending
+            latest["terminal_hold"] = hold
+            lane_mod.save_lanes(store, data)
+            return "held", conflicts
+        data["lanes"][lane_id] = dict(lane_snapshot)
+        lane_mod.save_lanes(store, data)
+    return "restored", []
+
+
+def _lane_prepare_publication(store, lane_id: str) -> tuple[str | None, list[str]]:
+    with store._config_lock():
+        data = lane_mod.load_lanes(store)
+        lane = (data.get("lanes") or {}).get(lane_id)
+        pending_raw = lane.get("publish_pending") if isinstance(lane, dict) else None
+        if (isinstance(lane, dict) and lane.get("status") == lane_mod.STATUS_DELIVERED
+                and pending_raw is False):
+            return None, []
+        if (not isinstance(lane, dict) or not isinstance(pending_raw, dict)
+                or not _lane_transaction_matches(lane, pending_raw)):
+            raise lane_mod.LaneError("lane has no matching pending delivery to publish")
+        pending = dict(pending_raw)
+    if lane_mod.existing_committed_delivery_artifact(store, pending) is not None:
+        return None, []
+    pending, error = _lane_rebind_pending_delivery(store, lane_id)
+    if error is None:
+        return None, []
+    rollback, conflicts = _lane_rollback_pending_delivery(store, lane_id, pending)
+    if rollback == "restored":
+        _lane_remove_prepared(pending)
+        return error, []
+    if rollback == "held":
+        return error, conflicts
+    return None, []
+
+
+def _lane_terminal_boundary_error(error: str, conflicts: list[str]) -> str:
+    if conflicts:
+        conflict_ids = ", ".join(repr(item) for item in conflicts)
+        return (
+            "agenttalk lane deliver: terminal inputs changed at the delivery boundary "
+            f"({error}); no consumable evidence was published. The lane remains delivered "
+            "in a nonconsumable terminal HOLD because restoring it ACTIVE would overlap "
+            f"lane(s) {conflict_ids}. Resolve or abandon the conflicting lane(s), then "
+            "retry lane deliver with the same head.\n"
+        )
+    return (
+        "agenttalk lane deliver: terminal inputs changed at the delivery boundary "
+        f"({error}); no consumable evidence was published, and the lane was restored "
+        "active.\n"
+    )
+
+
+def _lane_recovery_diagnosis(store, lane: dict) -> tuple[str, str]:
+    if "publish_pending" not in lane:
+        return "marker_missing", "delivered lane has no publication marker"
+    pending = lane.get("publish_pending")
+    if pending is False:
+        cleanup = lane.get("cleanup_pending")
+        if cleanup is True:
+            return "cleanup_pending", "committed publication is waiting for worktree cleanup"
+        if cleanup is not False:
+            return "cleanup_marker_corrupt", "worktree cleanup marker is not explicit true/false"
+        return "complete", "publication marker is complete"
+    if not isinstance(pending, dict):
+        return "marker_corrupt", "publication marker is not an object or explicit false"
+    if not _lane_transaction_matches(lane, pending):
+        return "transaction_invalid", "publication marker does not match the lane transaction"
+    hold = pending.get("terminal_hold") or lane.get("terminal_hold")
+    if isinstance(hold, dict):
+        return "terminal_hold", str(hold.get("detail") or "terminal recovery is held")
+    try:
+        final = lane_mod.existing_committed_delivery_artifact(store, pending)
+    except lane_mod.LaneError as exc:
+        try:
+            committed = lane_mod.delivery_transaction_final_path(store, pending)
+        except lane_mod.LaneError:
+            committed = None
+        state = (
+            "final_invalid"
+            if committed is not None and committed.exists()
+            else "transaction_invalid"
+        )
+        return state, str(exc)
+    if final is not None:
+        return "final_pending_marker", "committed final exists but marker save is pending"
+    prepared_raw = pending.get("prepared_artifact")
+    prepared = Path(prepared_raw) if isinstance(prepared_raw, str) else None
+    if prepared is not None and not prepared.is_absolute():
+        prepared = store.root / prepared
+    if prepared is None or not prepared.exists():
+        return "prepared_missing", "prepared delivery evidence is missing"
+    try:
+        lane_mod.validate_prepared_delivery_artifact(
+            prepared, store=store, lane_id=str(pending.get("lane_id")),
+            head_sha=str(pending.get("head_sha")),
+            transaction_id=str(pending.get("transaction_id")),
+            lane_instance_id=str(pending.get("lane_instance_id")),
+            lane_generation=pending.get("lane_generation"),
+        )
+    except lane_mod.LaneError as exc:
+        return "prepared_invalid", str(exc)
+    return "publication_pending", "prepared evidence is waiting for terminal rebind/publication"
+
+
+def _lane_recovery_active_snapshot(lane: dict) -> dict:
+    restored = dict(lane)
+    for key in (
+        "cleanup_pending", "delivered_at", "delivered_by", "delivered_head",
+        "delivery_artifact", "delivery_transaction_id", "prepared_artifact",
+        "publish_pending", "published_at", "recovery_quarantined_final",
+        "terminal_hold", "worktree_cleanup_error",
+    ):
+        restored.pop(key, None)
+    restored["status"] = lane_mod.STATUS_ACTIVE
+    if restored.get("worktree_path"):
+        restored["worktree_state"] = lane_mod.STATUS_ACTIVE
+    return restored
+
+
+def _lane_recovery_final_candidate(store, lane_id: str, lane: dict,
+                                   pending: dict | None) -> Path | None:
+    transaction_id = lane.get("delivery_transaction_id")
+    delivered_head = lane.get("delivered_head")
+    if (re.fullmatch(r"[0-9a-f]{32}", str(transaction_id or ""))
+            and lane_mod._FULL_SHA_RE.fullmatch(str(delivered_head or ""))):
+        return lane_mod.delivery_artifact_path(
+            store, lane_id, str(delivered_head), str(transaction_id),
+        )
+    if pending is not None:
+        try:
+            return Path(lane_mod.delivery_transaction_final_path(store, pending))
+        except lane_mod.LaneError:
+            pass
+    marked = lane.get("delivery_artifact")
+    if not isinstance(marked, str) or not marked:
+        return None
+    candidate = Path(marked)
+    if not candidate.is_absolute():
+        candidate = store.root / candidate
+    if (lane_mod.canonical_host_path(candidate.parent)
+            != lane_mod.canonical_host_path(lane_mod.deliveries_dir(store))):
+        raise lane_mod.LaneError(
+            "corrupt delivery marker points outside the committed artifact directory"
+        )
+    return candidate
+
+
+def _lane_quarantine_rejected_final(store, final: Path) -> Path:
+    if (lane_mod.canonical_host_path(final.parent)
+            != lane_mod.canonical_host_path(lane_mod.deliveries_dir(store))):
+        raise lane_mod.LaneError(
+            "rejected delivery final is outside the committed artifact directory"
+        )
+    quarantine = lane_mod.deliveries_dir(store) / ".recovery-quarantine"
+    quarantine.mkdir(parents=True, exist_ok=True)
+    destination = quarantine / f"{final.name}.{uuid.uuid4().hex}.rejected"
+    os.replace(final, destination)
+    return destination
+
+
+def _lane_recover_delivery(
+        store, lane_id: str, *, reason: str) -> tuple[str, list[str]]:
+    with store._config_lock():
+        data = lane_mod.load_lanes(store)
+        lane = (data.get("lanes") or {}).get(lane_id)
+        if (not isinstance(lane, dict)
+                or not lane_mod.delivery_recovery_required(lane)):
+            raise lane_mod.LaneError("lane has no incomplete delivered transaction to recover")
+        expected = lane_mod.fingerprint(lane)
+        observed = dict(lane)
+        pending = lane.get("publish_pending")
+        pending_copy = dict(pending) if isinstance(pending, dict) else None
+
+    quarantined_final = None
+    final_candidate = _lane_recovery_final_candidate(
+        store, lane_id, observed, pending_copy,
+    )
+    if pending_copy is not None and _lane_transaction_matches(observed, pending_copy):
+        try:
+            final = lane_mod.existing_committed_delivery_artifact(store, pending_copy)
+        except lane_mod.LaneError:
+            final = None
+        if final is not None:
+            return "committed", []
+    if final_candidate is not None and final_candidate.exists():
+        quarantined_final = _lane_quarantine_rejected_final(store, final_candidate)
+
+    restored = _lane_recovery_active_snapshot(observed)
+    with store._config_lock():
+        data = lane_mod.load_lanes(store)
+        current = (data.get("lanes") or {}).get(lane_id)
+        if not isinstance(current, dict) or lane_mod.fingerprint(current) != expected:
+            suffix = (
+                f"; rejected final was quarantined at {quarantined_final}"
+                if quarantined_final is not None else ""
+            )
+            raise lane_mod.LaneError(
+                f"lane changed while preparing recovery; retry{suffix}"
+            )
+        conflicts = lane_mod.reservation_conflicts(data, restored, exclude=lane_id)
+        if conflicts:
+            hold = {
+                "code": "recovery_overlap",
+                "detail": "restoring ACTIVE would overlap a current path reservation",
+                "conflicting_lane_ids": conflicts,
+                "held_at": _iso_now(),
+            }
+            current["terminal_hold"] = hold
+            if quarantined_final is not None:
+                current["recovery_quarantined_final"] = str(quarantined_final)
+            marker = current.get("publish_pending")
+            if isinstance(marker, dict):
+                marker = dict(marker)
+                marker["terminal_hold"] = hold
+                current["publish_pending"] = marker
+            lane_mod.save_lanes(store, data)
+            return "held", conflicts
+        restored["delivery_recovery"] = {
+            "at": _iso_now(),
+            "reason": reason,
+            "transaction_id": observed.get("delivery_transaction_id"),
+        }
+        quarantine_record = quarantined_final or observed.get("recovery_quarantined_final")
+        if quarantine_record is not None:
+            restored["delivery_recovery"]["quarantined_final"] = str(quarantine_record)
+        data["lanes"][lane_id] = restored
+        lane_mod.save_lanes(store, data)
+    return "restored", []
+
+
 def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
     """Finish a persisted transaction without recomputing its delivery verdict."""
     with store._config_lock():
@@ -3229,7 +3621,13 @@ def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
         pending_raw = lane.get("publish_pending")
         if isinstance(pending_raw, dict):
             pending = dict(pending_raw)
+            publication_pending = True
+            if pending.get("terminal_rebound") is not True:
+                raise lane_mod.LaneError(
+                    "delivery transaction terminal inputs have not been rebound"
+                )
         elif pending_raw is False:
+            publication_pending = False
             pending = {
                 "transaction_id": lane.get("delivery_transaction_id"),
                 "lane_id": lane_id,
@@ -3243,9 +3641,15 @@ def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
             raise lane_mod.LaneError("delivered lane has no recoverable publication marker")
         lane_snapshot = dict(lane)
 
-    artifact = Path(lane_mod.publish_delivery_artifact(store, pending))
-    _lane_checkpoint_publication(store, lane_id, pending, artifact)
-    _lane_remove_prepared(pending)
+    if publication_pending:
+        artifact = Path(lane_mod.publish_delivery_artifact(store, pending))
+        _lane_checkpoint_publication(store, lane_id, pending, artifact)
+        _lane_remove_prepared(pending)
+    else:
+        artifact_raw = pending.get("committed_artifact")
+        if not isinstance(artifact_raw, str):
+            raise lane_mod.LaneError("completed delivery artifact marker is missing")
+        artifact = Path(artifact_raw)
     committed = lane_mod.validate_delivery_artifact(
         artifact, lane_id=lane_id, head_sha=str(pending.get("head_sha")), store=store,
         require_isolation=_release_class_lane(lane_snapshot),
@@ -3357,14 +3761,14 @@ def cmd_lane(args: argparse.Namespace) -> int:
                         "(use --force).\n")
                     return 2
                 if (args.force and isinstance(previous, dict)
-                        and previous.get("status") == lane_mod.STATUS_DELIVERED
-                        and isinstance(previous.get("publish_pending"), dict)):
+                        and lane_mod.delivery_recovery_required(previous)):
                     sys.stderr.write(
-                        "agenttalk lane assign: delivered lane has publication pending; "
-                        "retry lane deliver before force reassignment.\n"
+                        "agenttalk lane assign: delivered lane publication marker is not "
+                        "explicitly complete; retry lane deliver or repair the corrupt marker "
+                        "before force reassignment.\n"
                     )
                     return 2
-                for other in lane_mod.active_lanes(data):
+                for other in lane_mod.reservation_lanes(data):
                     if other.get("lane_id") == lane_id:
                         continue
                     # Disjointness is checked WITHIN a domain (an empty subset = the whole
@@ -3527,7 +3931,10 @@ def cmd_lane(args: argparse.Namespace) -> int:
         except lane_mod.LaneError as e:
             sys.stderr.write(f"agenttalk lane check: {e}\n")
             return 2
-        others = [ln for ln in lane_mod.active_lanes(data) if ln.get("lane_id") != args.id]
+        others = [
+            lane for lane in lane_mod.reservation_lanes(data)
+            if lane.get("lane_id") != args.id
+        ]
         verdict, ctx = _lane_eval(store, lane, others, head, getattr(args, "gate_scope", None))
         if getattr(args, "json", False):
             print(json.dumps({**verdict, "target_moved": ctx["target_moved"],
@@ -3587,16 +3994,37 @@ def cmd_lane(args: argparse.Namespace) -> int:
                     sys.stderr.write(f"agenttalk lane deliver: {exc}\n")
                     return 2
                 if resolved_head != lane_snapshot.get("delivered_head"):
+                    winner_head = str(lane_snapshot.get("delivered_head") or "unknown")
                     sys.stderr.write(
                         "agenttalk lane deliver: --head differs from the persisted "
-                        "delivered transaction; refusing retry.\n"
+                        f"delivered transaction at winner head {winner_head[:12]}; "
+                        "refusing retry.\n"
                     )
                     return 3
             try:
-                artifact, cleanup_pending, delivered_head = _lane_finalize_delivery(
-                    store, args.id,
-                )
-            except (OSError, lane_mod.LaneError, GitWriteError) as exc:
+                with store._exclusive_lock(
+                        _lane_transaction_lock_path(store, args.id),
+                        what=f"lane {args.id} delivery transaction lock"):
+                    if isinstance(lane_snapshot.get("publish_pending"), dict):
+                        try:
+                            terminal_error, terminal_conflicts = _lane_prepare_publication(
+                                store, args.id,
+                            )
+                        except (OSError, lane_mod.LaneError) as exc:
+                            sys.stderr.write(
+                                "agenttalk lane deliver: terminal input recovery failed "
+                                f"({exc}).\n"
+                            )
+                            return 2
+                        if terminal_error:
+                            sys.stderr.write(_lane_terminal_boundary_error(
+                                terminal_error, terminal_conflicts,
+                            ))
+                            return 3
+                    artifact, cleanup_pending, delivered_head = _lane_finalize_delivery(
+                        store, args.id,
+                    )
+            except (OSError, TimeoutError, lane_mod.LaneError, GitWriteError) as exc:
                 sys.stderr.write(
                     f"agenttalk lane deliver: pending delivery recovery failed ({exc}).\n"
                 )
@@ -3644,8 +4072,10 @@ def cmd_lane(args: argparse.Namespace) -> int:
                     "retry.\n"
                 )
                 return 3
-            others = [ln for ln in lane_mod.active_lanes(data)
-                      if ln.get("lane_id") != args.id]
+            others = [
+                lane for lane in lane_mod.reservation_lanes(data)
+                if lane.get("lane_id") != args.id
+            ]
         verdict, ctx = _lane_eval(
             store, current, others, head, getattr(args, "gate_scope", None),
         )
@@ -3680,6 +4110,7 @@ def cmd_lane(args: argparse.Namespace) -> int:
             )
             return 3
 
+        ctx["cooperating_input_fingerprint"] = cooperating_after
         evaluation_snapshot = lane_mod.build_evaluation_snapshot(
             lane=current, active_lanes=others, context=ctx,
             worktree_provenance=provenance,
@@ -3701,42 +4132,60 @@ def cmd_lane(args: argparse.Namespace) -> int:
         pending["lane_id"] = args.id
         pending["input_fingerprint"] = cooperating_after
         pending["evaluation_fingerprint"] = lane_mod.fingerprint(evaluation_snapshot)
+        pending["lane_snapshot"] = dict(current)
+        pending["active_lane_fingerprints"] = expected_active
+        pending["terminal_rebound"] = False
+        cas_input = lane_mod.cooperating_input_fingerprint(store)
 
         cas_error = None
         competing_delivery = False
         try:
-            with store._config_lock():
-                data = lane_mod.load_lanes(store)
-                latest = (data.get("lanes") or {}).get(args.id)
-                if isinstance(latest, dict) and latest.get("status") == lane_mod.STATUS_DELIVERED:
-                    if (latest.get("instance_id") == current.get("instance_id")
-                            and latest.get("generation") == current.get("generation")):
-                        competing_delivery = True
+            with store._exclusive_lock(
+                    _lane_reset_lock_path(store), what="lane delivery/reset lock"):
+                with store._config_lock():
+                    data = lane_mod.load_lanes(store)
+                    latest = (data.get("lanes") or {}).get(args.id)
+                    if (isinstance(latest, dict)
+                            and latest.get("status") == lane_mod.STATUS_DELIVERED):
+                        if (latest.get("instance_id") == current.get("instance_id")
+                                and latest.get("generation") == current.get("generation")):
+                            winner_head = latest.get("delivered_head")
+                            if winner_head == head:
+                                competing_delivery = True
+                            else:
+                                cas_error = (
+                                    "same lane instance was delivered concurrently at winner "
+                                    f"head {str(winner_head)[:12]}; requested head {head[:12]} "
+                                    "cannot converge"
+                                )
+                        else:
+                            cas_error = (
+                                "a replacement lane instance was delivered during delivery"
+                            )
+                    elif (not isinstance(latest, dict)
+                          or latest.get("status") != lane_mod.STATUS_ACTIVE):
+                        cas_error = "lane is no longer the active instance that was evaluated"
+                    elif (latest.get("instance_id") != current.get("instance_id")
+                          or latest.get("generation") != current.get("generation")
+                          or lane_mod.fingerprint(latest) != expected_lane_fingerprint):
+                        cas_error = "lane instance/generation changed during delivery"
+                    elif lane_mod.active_lane_fingerprints(data, exclude=args.id) != expected_active:
+                        cas_error = "active-lane set changed during delivery"
+                    elif cas_input != cooperating_after:
+                        cas_error = "cooperating config/domain/gate/epoch inputs changed"
                     else:
-                        cas_error = "a replacement lane instance was delivered during delivery"
-                elif not isinstance(latest, dict) or latest.get("status") != lane_mod.STATUS_ACTIVE:
-                    cas_error = "lane is no longer the active instance that was evaluated"
-                elif (latest.get("instance_id") != current.get("instance_id")
-                      or latest.get("generation") != current.get("generation")
-                      or lane_mod.fingerprint(latest) != expected_lane_fingerprint):
-                    cas_error = "lane instance/generation changed during delivery"
-                elif lane_mod.active_lane_fingerprints(data, exclude=args.id) != expected_active:
-                    cas_error = "active-lane set changed during delivery"
-                elif lane_mod.cooperating_input_fingerprint(store) != cooperating_after:
-                    cas_error = "cooperating config/domain/gate/epoch inputs changed"
-                else:
-                    latest["status"] = lane_mod.STATUS_DELIVERED
-                    latest["delivered_head"] = head
-                    latest["delivered_by"] = actor
-                    latest["delivered_at"] = pending["started_at"]
-                    latest["delivery_transaction_id"] = pending["transaction_id"]
-                    latest["publish_pending"] = dict(pending)
-                    latest["prepared_artifact"] = pending["prepared_artifact"]
-                    latest["cleanup_pending"] = bool(latest.get("worktree_path"))
-                    if latest.get("worktree_path"):
-                        latest["worktree_state"] = lane_mod.STATUS_CLEANUP_PENDING
-                    lane_mod.save_lanes(store, data)
-        except (OSError, lane_mod.LaneError) as exc:
+                        latest["status"] = lane_mod.STATUS_DELIVERED
+                        latest["delivered_head"] = head
+                        latest["delivered_by"] = actor
+                        latest["delivered_at"] = pending["started_at"]
+                        latest["delivery_transaction_id"] = pending["transaction_id"]
+                        latest["publish_pending"] = dict(pending)
+                        latest["prepared_artifact"] = pending["prepared_artifact"]
+                        latest["cleanup_pending"] = bool(latest.get("worktree_path"))
+                        if latest.get("worktree_path"):
+                            latest["worktree_state"] = lane_mod.STATUS_CLEANUP_PENDING
+                        lane_mod.save_lanes(store, data)
+        except (OSError, TimeoutError, lane_mod.LaneError) as exc:
             persisted = False
             try:
                 with store._config_lock():
@@ -3765,10 +4214,28 @@ def cmd_lane(args: argparse.Namespace) -> int:
             return 3
 
         try:
-            artifact, cleanup_pending, delivered_head = _lane_finalize_delivery(
-                store, args.id,
-            )
-        except (OSError, lane_mod.LaneError, GitWriteError) as exc:
+            with store._exclusive_lock(
+                    _lane_transaction_lock_path(store, args.id),
+                    what=f"lane {args.id} delivery transaction lock"):
+                try:
+                    terminal_error, terminal_conflicts = _lane_prepare_publication(
+                        store, args.id,
+                    )
+                except (OSError, lane_mod.LaneError) as exc:
+                    sys.stderr.write(
+                        f"agenttalk lane deliver: terminal input binding failed ({exc}); "
+                        "no consumable evidence was published.\n"
+                    )
+                    return 2
+                if terminal_error:
+                    sys.stderr.write(_lane_terminal_boundary_error(
+                        terminal_error, terminal_conflicts,
+                    ))
+                    return 3
+                artifact, cleanup_pending, delivered_head = _lane_finalize_delivery(
+                    store, args.id,
+                )
+        except (OSError, TimeoutError, lane_mod.LaneError, GitWriteError) as exc:
             sys.stderr.write(
                 f"agenttalk lane deliver: delivery is checkpointed but pending recovery "
                 f"({exc}); retry the same command.\n"
@@ -3777,6 +4244,36 @@ def cmd_lane(args: argparse.Namespace) -> int:
         print(
             f"delivered lane {args.id} @ {delivered_head[:12]} (GO); evidence: {artifact}"
             + ("; cleanup pending" if cleanup_pending else "")
+        )
+        return 0
+
+    if action == "recover":
+        lane_id = lane_mod.validate_lane_id(args.id)
+        try:
+            with store._exclusive_lock(
+                    _lane_transaction_lock_path(store, lane_id),
+                    what=f"lane {lane_id} delivery transaction lock"):
+                outcome, conflicts = _lane_recover_delivery(
+                    store, lane_id, reason=args.reason,
+                )
+        except (OSError, TimeoutError, lane_mod.LaneError) as exc:
+            sys.stderr.write(f"agenttalk lane recover: {exc}\n")
+            return 2
+        if outcome == "committed":
+            sys.stderr.write(
+                "agenttalk lane recover: an authoritative committed final exists; "
+                "run `lane deliver` to complete its publication marker.\n"
+            )
+            return 3
+        if outcome == "held":
+            sys.stderr.write(
+                "agenttalk lane recover: restoring ACTIVE would overlap current path "
+                f"reservation(s) {conflicts}; resolve them and retry recovery.\n"
+            )
+            return 3
+        print(
+            f"recovered lane {lane_id} to ACTIVE for fresh evaluation; "
+            "orphaned prepared evidence remains nonconsumable"
         )
         return 0
 
@@ -3810,11 +4307,11 @@ def cmd_lane(args: argparse.Namespace) -> int:
             data = lane_mod.load_lanes(store)
             lane = (data.get("lanes") or {}).get(lane_id)
             if isinstance(lane, dict):
-                if (lane.get("status") == lane_mod.STATUS_DELIVERED
-                        and isinstance(lane.get("publish_pending"), dict)):
+                if lane_mod.delivery_recovery_required(lane):
                     sys.stderr.write(
-                        "agenttalk lane abandon: delivered lane has publication pending; "
-                        "retry lane deliver before abandon.\n"
+                        "agenttalk lane abandon: delivered lane publication marker is not "
+                        "explicitly complete; retry lane deliver or repair the corrupt marker "
+                        "before abandon.\n"
                     )
                     return 2
                 lane["status"] = lane_mod.STATUS_ABANDONED
@@ -3939,35 +4436,56 @@ def cmd_lane(args: argparse.Namespace) -> int:
 
     if action == "status":
         data = lane_mod.load_lanes(store)
-        lanes = lane_mod.active_lanes(data)
+        active = lane_mod.active_lanes(data)
+        recovery = []
+        for lane in lane_mod.recovery_lanes(data):
+            diagnosis, detail = _lane_recovery_diagnosis(store, lane)
+            recovery.append({
+                **lane,
+                "recovery_state": diagnosis,
+                "recovery_detail": detail,
+            })
         if getattr(args, "json", False):
-            print(json.dumps(lanes, indent=2))
+            print(json.dumps([*active, *recovery], indent=2))
             return 0
-        if not lanes:
+        if not active and not recovery:
             print("active lanes: none")
             return 0
         reg = _load_domain_registry(store)
         cur_epoch = store.current_epoch()
-        print(f"active lanes ({len(lanes)}):")
-        for ln in lanes:
-            stale = []
-            if ln.get("epoch_at_assign") != cur_epoch:
-                stale.append("epoch")
-            if ln.get("registry_hash_at_assign") != reg.registry_hash:
-                stale.append("registry")
-            tag = f" STALE[{','.join(stale)}]" if stale else ""
-            if ln.get("worktree_path"):
-                wt = f" worktree={ln.get('worktree_state') or lane_mod.STATUS_ACTIVE}"
-            elif ln.get("worktree_waived"):
-                wt = " worktree=waived"
-            else:
-                wt = " worktree=missing"
-            print(f"  {ln['lane_id']}: {ln.get('assignee')} @ {ln.get('domain_id')} "
-                  f"{ln.get('path_subset') or '[whole domain]'} -> {ln.get('target_ref')}{tag}{wt}")
+        if active:
+            print(f"active lanes ({len(active)}):")
+            for lane in active:
+                stale = []
+                if lane.get("epoch_at_assign") != cur_epoch:
+                    stale.append("epoch")
+                if lane.get("registry_hash_at_assign") != reg.registry_hash:
+                    stale.append("registry")
+                tag = f" STALE[{','.join(stale)}]" if stale else ""
+                if lane.get("worktree_path"):
+                    wt = f" worktree={lane.get('worktree_state') or lane_mod.STATUS_ACTIVE}"
+                elif lane.get("worktree_waived"):
+                    wt = " worktree=waived"
+                else:
+                    wt = " worktree=missing"
+                print(
+                    f"  {lane['lane_id']}: {lane.get('assignee')} @ {lane.get('domain_id')} "
+                    f"{lane.get('path_subset') or '[whole domain]'} -> "
+                    f"{lane.get('target_ref')}{tag}{wt}"
+                )
+        else:
+            print("active lanes: none")
+        if recovery:
+            print(f"recovery lanes ({len(recovery)}):")
+            for lane in recovery:
+                print(
+                    f"  {lane.get('lane_id', '?')}: {lane['recovery_state']} - "
+                    f"{lane['recovery_detail']} (run `lane deliver` or `lane recover`)"
+                )
         return 0
 
     sys.stderr.write(
-        "agenttalk lane: expected assign, check, deliver, workspace, abandon, gc, "
+        "agenttalk lane: expected assign, check, deliver, recover, workspace, abandon, gc, "
         "status, or approve-shared.\n")
     return 2
 
@@ -7542,19 +8060,36 @@ def cmd_tail(args: argparse.Namespace) -> int:
 def cmd_reset(args: argparse.Namespace) -> int:
     """Clear messages/cursors/heartbeats and start a fresh session."""
     store = _get_store(args)
-    # reset deletes state/ — warn if it would drop ACTIVE lanes (coordination state
-    # is intentionally cleared, but the operator should see it go).
-    try:
-        active = lane_mod.active_lanes(lane_mod.load_lanes(store))
+    # Incomplete delivery is a journal, so reset blocks it; ordinary ACTIVE
+    # coordination remains resettable with an operator-visible warning. The
+    # dedicated lock serializes this check+teardown with the first pending save
+    # without putting filesystem teardown under the global config lock.
+    with store._exclusive_lock(_lane_reset_lock_path(store), what="lane delivery/reset lock"):
+        try:
+            lane_data = lane_mod.load_lanes(store)
+        except lane_mod.LaneError as exc:
+            sys.stderr.write(
+                f"agenttalk reset: refusing to erase corrupt lane recovery state ({exc}); "
+                "repair lanes.json before reset.\n"
+            )
+            return 2
+        recovery = lane_mod.recovery_lanes(lane_data)
+        if recovery:
+            lane_ids = ", ".join(str(lane.get("lane_id") or "?") for lane in recovery)
+            sys.stderr.write(
+                "agenttalk reset: refusing to erase incomplete lane delivery journal(s) "
+                f"({lane_ids}) while artifacts/worktrees survive; run `lane status`, then "
+                "`lane deliver` or `lane recover` first.\n"
+            )
+            return 2
+        active = lane_mod.active_lanes(lane_data)
         if active:
             sys.stderr.write(
                 f"warning: reset will clear {len(active)} ACTIVE lane(s) "
                 f"({', '.join(ln.get('lane_id', '?') for ln in active)}); lane "
                 "coordination state does not survive reset (delivery artifacts under "
                 ".agenttalk/lane-deliveries/ are NOT touched).\n")
-    except lane_mod.LaneError:
-        pass  # a malformed lanes.json must not block reset
-    cfg, archive_path = store.reset(archive=args.archive)
+        cfg, archive_path = store.reset(archive=args.archive)
     if archive_path is not None:
         print(f"archived previous session to: {archive_path}")
     else:
@@ -10185,6 +10720,17 @@ def build_parser() -> argparse.ArgumentParser:
     ldeliver.add_argument("--head", help="Head ref/SHA to deliver (default: HEAD).")
     ldeliver.add_argument("--gate-scope", help="Gate scope (default: lane:<id>).")
     ldeliver.set_defaults(func=cmd_lane)
+
+    lrecover = lsub.add_parser(
+        "recover",
+        help="Restore an incomplete/corrupt delivered transaction to ACTIVE safely.",
+    )
+    lrecover.add_argument("--id", required=True)
+    lrecover.add_argument(
+        "--reason", required=True,
+        help="Audit reason for discarding the incomplete publication attempt.",
+    )
+    lrecover.set_defaults(func=cmd_lane)
 
     lworkspace = lsub.add_parser("workspace", help="Show the provisioned workspace for a lane.")
     lworkspace.add_argument("--id", required=True)

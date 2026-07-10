@@ -56,7 +56,7 @@ INTEGRITY_KEY_FILENAME = ".worktree-integrity-secret"
 LEGACY_INTEGRITY_VERSION = 2
 INTEGRITY_VERSION = 3
 LEGACY_EVALUATION_VERSION = 1
-EVALUATION_VERSION = 2
+EVALUATION_VERSION = 3
 
 ARTIFACT_PREPARED = "prepared"
 ARTIFACT_COMMITTED = "committed"
@@ -634,6 +634,58 @@ def active_lanes(data: dict) -> list[dict]:
             if isinstance(ln, dict) and ln.get("status") == STATUS_ACTIVE]
 
 
+def delivery_recovery_required(lane: dict) -> bool:
+    return bool(
+        (lane.get("status") == STATUS_DELIVERED and lane.get("publish_pending") is not False)
+        or ("publish_pending" in lane and lane.get("publish_pending") is not False)
+    )
+
+
+def cleanup_recovery_required(lane: dict) -> bool:
+    return bool(
+        lane.get("status") == STATUS_DELIVERED
+        and lane.get("publish_pending") is False
+        and lane.get("cleanup_pending") is not False
+    )
+
+
+def reservation_lanes(data: dict) -> list[dict]:
+    """Lanes that reserve assignment paths, including incomplete delivery journals."""
+    return [
+        lane for lane in (data.get("lanes") or {}).values()
+        if isinstance(lane, dict)
+        and (
+            lane.get("status") == STATUS_ACTIVE
+            or delivery_recovery_required(lane)
+        )
+    ]
+
+
+def recovery_lanes(data: dict) -> list[dict]:
+    return [
+        lane for lane in (data.get("lanes") or {}).values()
+        if isinstance(lane, dict)
+        and (delivery_recovery_required(lane) or cleanup_recovery_required(lane))
+    ]
+
+
+def reservation_conflicts(data: dict, lane: dict, *, exclude: str | None = None) -> list[str]:
+    """Return same-domain path reservations that conflict under assign semantics."""
+    lane_domain = lane.get("domain_id")
+    lane_prefixes = lane.get("path_subset") or []
+    casefold = dom.default_casefold_paths()
+    conflicts = []
+    for other in reservation_lanes(data):
+        other_id = other.get("lane_id")
+        if other_id == exclude or other.get("domain_id") != lane_domain:
+            continue
+        if prefixes_disjoint(
+                lane_prefixes, other.get("path_subset") or [], casefold=casefold):
+            continue
+        conflicts.append(other_id if isinstance(other_id, str) else "<unknown>")
+    return sorted(conflicts)
+
+
 def _digest(value: Any) -> str:
     payload = json.dumps(
         value, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
@@ -671,71 +723,53 @@ def build_evaluation_snapshot(*, lane: dict, active_lanes: list[dict],
         "classifications_digest": _digest(context.get("classifications")),
         "merge_digest": _digest(context.get("merge")),
         "worktree_digest": _digest(worktree_provenance),
+        "cooperating_digest": context.get("cooperating_input_fingerprint"),
     }
 
 
 def _content_token(path) -> dict[str, Any]:
     try:
-        raw = path.read_bytes()
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as handle:
+            while chunk := handle.read(64 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
     except FileNotFoundError:
         return {"exists": False}
     except OSError as exc:
         return {"exists": True, "error": type(exc).__name__}
-    return {"exists": True, "sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw)}
+    return {"exists": True, "sha256": digest.hexdigest(), "size": size}
+
+
+def _barrier_evidence_token(store) -> dict[str, Any]:
+    """Bind only the validated global barrier that contributes to the verdict."""
+    current_epoch = store.current_epoch()
+    if current_epoch is None:
+        return {"current_epoch": None}
+    return {
+        "current_epoch": current_epoch,
+        "message": _content_token(store.messages_dir / f"{current_epoch}.json"),
+    }
 
 
 def cooperating_input_fingerprint(store) -> str:
-    """Cheap optimistic-CAS token for files that cooperate with lane delivery."""
-    messages = store.messages_dir
-    try:
-        stat = messages.stat()
-        count = 0
-        latest_name: str | None = None
-        with os.scandir(messages) as entries:
-            for entry in entries:
-                count += 1
-                if latest_name is None or entry.name > latest_name:
-                    latest_name = entry.name
-        message_token = {
-            "exists": True,
-            "mtime_ns": stat.st_mtime_ns,
-            "entry_count": count,
-            "latest_name": latest_name,
-        }
-    except FileNotFoundError:
-        message_token = {"exists": False}
-    except OSError as exc:
-        message_token = {"exists": True, "error": type(exc).__name__}
+    """Content-bound optimistic token for inputs that contribute to delivery."""
     return _digest({
         "config": _content_token(store.dir / "config.json"),
         "registry": _content_token(store.dir / dom.FILENAME),
         "gates": _content_token(store.dir / "gates.json"),
-        "messages": message_token,
+        "barrier": _barrier_evidence_token(store),
     })
 
 
 def active_lane_fingerprints(data: dict, *, exclude: str | None = None) -> list[dict]:
     return sorted(
         ({"lane_id": lane.get("lane_id"), "fingerprint": fingerprint(lane)}
-         for lane in active_lanes(data)
+         for lane in reservation_lanes(data)
          if lane.get("lane_id") != exclude),
         key=lambda item: str(item.get("lane_id") or ""),
     )
-    return {
-        "evaluation_version": EVALUATION_VERSION,
-        "lane_fingerprint": fingerprint(lane),
-        "active_lane_fingerprints": active,
-        "current_epoch": context.get("current_epoch"),
-        "current_registry_hash": context.get("current_registry_hash"),
-        "gate_scope": context.get("gate_scope"),
-        "candidate_head": context.get("head"),
-        "target_head": context.get("target_head_now"),
-        "gate_digest": _digest(context.get("gate_check")),
-        "changed_digest": _digest(context.get("changed")),
-        "classifications_digest": _digest(context.get("classifications")),
-        "merge_digest": _digest(context.get("merge")),
-        "worktree_digest": _digest(worktree_provenance),
-    }
 
 
 def delivery_artifact_path(store, lane_id: str, head_sha: str,
@@ -909,40 +943,79 @@ def validate_prepared_delivery_artifact(path, *, store, lane_id: str, head_sha: 
     return data
 
 
+def _delivery_transaction_paths(store, pending: dict) -> tuple[object, object]:
+    transaction_id = pending.get("transaction_id")
+    lane_id = pending.get("lane_id")
+    prepared = _artifact_path(pending.get("prepared_artifact"), store=store, prepared=True)
+    expected_prepared = prepared_delivery_artifact_path(store, lane_id, transaction_id)
+    if canonical_host_path(prepared) != canonical_host_path(expected_prepared):
+        raise LaneError("delivery transaction artifact path does not match its identity")
+    final = delivery_transaction_final_path(store, pending)
+    return prepared, final
+
+
+def validate_committed_transaction_artifact(path, *, store, pending: dict) -> dict:
+    """Validate exact current evidence for one recoverable publication transaction."""
+    data = validate_delivery_artifact(
+        path, lane_id=pending.get("lane_id"), head_sha=pending.get("head_sha"),
+        store=store,
+    )
+    expected = {
+        "integrity_version": INTEGRITY_VERSION,
+        "artifact_state": ARTIFACT_COMMITTED,
+        "transaction_id": pending.get("transaction_id"),
+        "lane_instance_id": pending.get("lane_instance_id"),
+        "lane_generation": pending.get("lane_generation"),
+        "delivered_head": pending.get("head_sha"),
+    }
+    for key, value in expected.items():
+        if data.get(key) != value:
+            raise LaneError(f"committed delivery artifact {key} does not match transaction")
+    expected_evaluation = pending.get("evaluation_fingerprint")
+    if (not re.fullmatch(r"[0-9a-f]{64}", str(expected_evaluation or ""))
+            or fingerprint(data.get("evaluation_snapshot")) != expected_evaluation):
+        raise LaneError("committed delivery artifact evaluation does not match transaction")
+    return data
+
+
+def existing_committed_delivery_artifact(store, pending: dict):
+    final = delivery_transaction_final_path(store, pending)
+    if final.exists():
+        validate_committed_transaction_artifact(final, store=store, pending=pending)
+        return final
+    return None
+
+
+def delivery_transaction_final_path(store, pending: dict):
+    transaction_id = pending.get("transaction_id")
+    lane_id = pending.get("lane_id")
+    head_sha = pending.get("head_sha")
+    final = _artifact_path(pending.get("committed_artifact"), store=store, prepared=False)
+    expected = delivery_artifact_path(store, lane_id, head_sha, transaction_id)
+    if canonical_host_path(final) != canonical_host_path(expected):
+        raise LaneError("committed artifact path does not match its transaction identity")
+    return final
+
+
 def publish_delivery_artifact(store, pending: dict) -> object:
     """Idempotently publish one committed artifact from a persisted pending record."""
     from agenttalk import _atomic
 
-    transaction_id = pending.get("transaction_id")
-    lane_id = pending.get("lane_id")
-    head_sha = pending.get("head_sha")
-    instance_id = pending.get("lane_instance_id")
-    generation = pending.get("lane_generation")
-    prepared = _artifact_path(pending.get("prepared_artifact"), store=store, prepared=True)
-    final = _artifact_path(pending.get("committed_artifact"), store=store, prepared=False)
-    expected_prepared = prepared_delivery_artifact_path(store, lane_id, transaction_id)
-    expected_final = delivery_artifact_path(store, lane_id, head_sha, transaction_id)
-    if (canonical_host_path(prepared) != canonical_host_path(expected_prepared)
-            or canonical_host_path(final) != canonical_host_path(expected_final)):
-        raise LaneError("delivery transaction artifact path does not match its identity")
-    if final.exists():
-        data = validate_delivery_artifact(
-            final, lane_id=lane_id, head_sha=head_sha, store=store,
-        )
-        if data.get("transaction_id") != transaction_id:
-            raise LaneError("committed artifact belongs to another transaction")
-        return final
+    existing = existing_committed_delivery_artifact(store, pending)
+    if existing is not None:
+        return existing
+    prepared, final = _delivery_transaction_paths(store, pending)
     data = validate_prepared_delivery_artifact(
-        prepared, store=store, lane_id=lane_id, head_sha=head_sha,
-        transaction_id=transaction_id, lane_instance_id=instance_id,
-        lane_generation=generation,
+        prepared, store=store, lane_id=pending.get("lane_id"),
+        head_sha=pending.get("head_sha"),
+        transaction_id=pending.get("transaction_id"),
+        lane_instance_id=pending.get("lane_instance_id"),
+        lane_generation=pending.get("lane_generation"),
     )
     data["artifact_state"] = ARTIFACT_COMMITTED
     data["integrity_token"] = compute_integrity_token(store, data)
     _atomic.write_text(final, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
-    validate_delivery_artifact(
-        final, lane_id=lane_id, head_sha=head_sha, store=store,
-    )
+    validate_committed_transaction_artifact(final, store=store, pending=pending)
     return final
 
 
@@ -976,7 +1049,7 @@ def _validate_evaluation_snapshot(snapshot: object, *, head_sha: str,
         generation = snapshot.get("lane_generation")
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
             raise LaneError("delivery artifact lane generation is malformed")
-        digest_keys.append("config_digest")
+        digest_keys.extend(("config_digest", "cooperating_digest"))
     for key in digest_keys:
         if not re.fullmatch(r"[0-9a-f]{64}", str(snapshot.get(key) or "")):
             raise LaneError(f"delivery artifact evaluation {key} is malformed")
@@ -1008,40 +1081,23 @@ def _validate_delivery_marker(store, path, data: dict) -> None:
         raise LaneError("committed delivery artifact path is not checkpointed")
 
 
-def _validate_evaluation_snapshot(snapshot: object, *, head_sha: str) -> None:
-    if not isinstance(snapshot, dict):
-        raise LaneError("delivery artifact has no evaluation snapshot")
-    if snapshot.get("evaluation_version") != EVALUATION_VERSION:
-        raise LaneError("delivery artifact evaluation snapshot version is unsupported")
-    if snapshot.get("candidate_head") != head_sha:
-        raise LaneError("delivery artifact evaluation candidate does not match delivered head")
-    if not _FULL_SHA_RE.match(str(snapshot.get("target_head") or "")):
-        raise LaneError("delivery artifact evaluation target_head is not a full SHA")
-    if not isinstance(snapshot.get("gate_scope"), str) or not snapshot["gate_scope"].strip():
-        raise LaneError("delivery artifact evaluation gate_scope is missing")
-    epoch = snapshot.get("current_epoch")
-    if epoch is not None and not isinstance(epoch, str):
-        raise LaneError("delivery artifact evaluation current_epoch is malformed")
-    for key in (
-        "lane_fingerprint", "current_registry_hash", "gate_digest",
-        "changed_digest", "classifications_digest", "merge_digest",
-        "worktree_digest",
-    ):
-        if not re.fullmatch(r"[0-9a-f]{64}", str(snapshot.get(key) or "")):
-            raise LaneError(f"delivery artifact evaluation {key} is malformed")
-    active = snapshot.get("active_lane_fingerprints")
-    if not isinstance(active, list):
-        raise LaneError("delivery artifact active-lane snapshot is malformed")
-    for item in active:
-        if (not isinstance(item, dict)
-                or not isinstance(item.get("lane_id"), str)
-                or not re.fullmatch(r"[0-9a-f]{64}", str(item.get("fingerprint") or ""))):
-            raise LaneError("delivery artifact active-lane fingerprint is malformed")
+def _reject_matching_pending_transaction(store, data: dict) -> None:
+    lane = (load_lanes(store).get("lanes") or {}).get(data.get("lane_id"))
+    if not isinstance(lane, dict):
+        return
+    matches = (
+        lane.get("instance_id") == data.get("lane_instance_id")
+        and lane.get("generation") == data.get("lane_generation")
+        and lane.get("delivery_transaction_id") == data.get("transaction_id")
+    )
+    if matches and lane.get("publish_pending") is not False:
+        raise LaneError("committed delivery artifact publication is still pending")
 
 
 def validate_delivery_artifact(path, *, lane_id: str, head_sha: str,
                                store=None, require_isolation: bool = False,
-                               require_live_marker: bool = False) -> dict:
+                               require_live_marker: bool = False,
+                               reject_pending_transaction: bool = False) -> dict:
     """Semantically validate durable delivery evidence.
 
     Committed v3 artifacts are historical, HMAC-bound pointers and do not depend on
@@ -1073,6 +1129,10 @@ def validate_delivery_artifact(path, *, lane_id: str, head_sha: str,
     integrity_version = data.get("integrity_version")
     if integrity_version not in {None, LEGACY_INTEGRITY_VERSION, INTEGRITY_VERSION}:
         raise LaneError("delivery artifact integrity version is unsupported")
+    if (store is not None
+            and canonical_host_path(path.parent)
+            != canonical_host_path(deliveries_dir(store))):
+        raise LaneError("delivery artifact is outside the committed directory")
     if integrity_version in {LEGACY_INTEGRITY_VERSION, INTEGRITY_VERSION}:
         _validate_evaluation_snapshot(
             data.get("evaluation_snapshot"), head_sha=head_sha,
@@ -1093,6 +1153,8 @@ def validate_delivery_artifact(path, *, lane_id: str, head_sha: str,
             raise LaneError("committed delivery artifact validation needs lane state")
         if require_live_marker:
             _validate_delivery_marker(store, path, data)
+        if reject_pending_transaction:
+            _reject_matching_pending_transaction(store, data)
     if require_isolation:
         if store is None:
             raise LaneError("delivery artifact isolation validation needs a store secret")

@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import builtins
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -451,7 +452,7 @@ def test_cli_assign_check_deliver_go(tmp_path: Path) -> None:
     for key in (
         "lane_fingerprint", "gate_digest", "changed_digest",
         "classifications_digest", "merge_digest", "worktree_digest",
-        "config_digest",
+        "config_digest", "cooperating_digest",
     ):
         assert re.fullmatch(r"[0-9a-f]{64}", snapshot[key])
     snapshot["gate_digest"] = "0" * 64
@@ -792,11 +793,15 @@ def test_cli_reset_warns_on_active_lanes(tmp_path: Path, capsys: pytest.CaptureF
 
 def test_cli_malformed_lanes_does_not_brick_status(tmp_path: Path) -> None:
     root, _base = _repo(tmp_path)
-    (Store(root).dir / "state").mkdir(parents=True, exist_ok=True)
-    (Store(root).dir / "state" / "lanes.json").write_text("{bad", encoding="utf-8")
+    state = Store(root).dir / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    lane_path = state / "lanes.json"
+    lane_path.write_text("{bad", encoding="utf-8")
     # lane status fails closed (exit 2), but an unrelated command still works
     assert _run(["lane", "status"], root) == 2
     assert _run(["status"], root) == 0
+    assert _run(["reset"], root) == 2
+    assert lane_path.read_text(encoding="utf-8") == "{bad"
 
 
 def _assign_worktree(root: Path, base: str, lane_id: str = "lwt") -> dict:
@@ -1396,6 +1401,10 @@ def test_committed_artifact_survives_same_id_reassignment(
         artifact, lane_id="historical-reassign", head_sha=head, store=store,
         require_isolation=True,
     )["transaction_id"] == historical["transaction_id"]
+    assert _git_rc(
+        root, "update-ref", "-d", lanes.lane_ref("historical-reassign"),
+    ).returncode == 0
+    assert not _git(root, "show-ref", "--verify", lanes.lane_ref("historical-reassign"))
     assert _run_raw([
         "close", "open", "--id", "historical-reassign-close", "--from", "lead",
         "--scope", "release", "--revision", head,
@@ -1419,6 +1428,113 @@ def _leave_publish_pending(
     pending = lanes.load_lanes(store)["lanes"][lane_id]
     assert isinstance(pending["publish_pending"], dict)
     return store, pending
+
+
+def _leave_rebound_publish_pending(
+        root: Path, argv: list[str], lane_id: str,
+        monkeypatch: pytest.MonkeyPatch) -> tuple[Store, dict]:
+    real_publish = lanes.publish_delivery_artifact
+    crashed = False
+
+    def crash_once(*args, **kwargs):  # noqa: ANN002,ANN003
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise OSError("injected crash after terminal rebind")
+        return real_publish(*args, **kwargs)
+
+    monkeypatch.setattr(lanes, "publish_delivery_artifact", crash_once)
+    assert _run_raw(argv, root) == 2
+    monkeypatch.setattr(lanes, "publish_delivery_artifact", real_publish)
+    store = Store(root)
+    pending = lanes.load_lanes(store)["lanes"][lane_id]
+    assert isinstance(pending["publish_pending"], dict)
+    assert pending["publish_pending"]["terminal_rebound"] is True
+    assert _committed_artifacts(store, lane_id) == []
+    return store, pending
+
+
+@pytest.mark.parametrize(
+    ("lane_kind", "artifact_case"),
+    [
+        ("advisory", "unsigned"), ("release", "unsigned"),
+        ("advisory", "legacy"), ("release", "legacy"),
+        ("advisory", "instance"), ("advisory", "generation"),
+        ("advisory", "evaluation"),
+    ],
+)
+def test_existing_final_recovery_requires_exact_current_committed_evidence(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture, lane_kind: str, artifact_case: str) -> None:
+    root, base = _repo(tmp_path)
+    lane_id = f"strict-{lane_kind}-{artifact_case}"
+    if lane_kind == "release":
+        lane = _assign_worktree(root, base, lane_id)
+        head = _commit(
+            Path(lane["worktree_path"]), "src/core/a.py", "base\nstrict final\n",
+        )
+        argv = ["lane", "deliver", "--id", lane_id, "--from", "dev"]
+    else:
+        head = _advisory_delivery_fixture(root, base, lane_id)
+        argv = [
+            "lane", "deliver", "--id", lane_id, "--from", "dev", "--head", head,
+        ]
+    store, lane_state = _leave_rebound_publish_pending(
+        root, argv, lane_id, monkeypatch,
+    )
+    pending = lane_state["publish_pending"]
+    prepared = Path(pending["prepared_artifact"])
+    final = Path(pending["committed_artifact"])
+    payload = json.loads(prepared.read_text(encoding="utf-8"))
+    payload["artifact_state"] = lanes.ARTIFACT_COMMITTED
+    if artifact_case == "unsigned":
+        payload.pop("integrity_token", None)
+    elif artifact_case == "legacy":
+        payload["integrity_version"] = lanes.LEGACY_INTEGRITY_VERSION
+        payload["evaluation_snapshot"]["evaluation_version"] = \
+            lanes.LEGACY_EVALUATION_VERSION
+        payload["integrity_token"] = lanes.compute_integrity_token(store, payload)
+    elif artifact_case == "instance":
+        payload["lane_instance_id"] = (
+            "f" * 32 if payload["lane_instance_id"] != "f" * 32 else "e" * 32
+        )
+        payload["integrity_token"] = lanes.compute_integrity_token(store, payload)
+    elif artifact_case == "generation":
+        payload["lane_generation"] += 1
+        payload["integrity_token"] = lanes.compute_integrity_token(store, payload)
+    else:
+        payload["evaluation_snapshot"]["gate_digest"] = "0" * 64
+        payload["integrity_token"] = lanes.compute_integrity_token(store, payload)
+    final.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    original_bytes = final.read_bytes()
+
+    assert _run_raw(argv, root) == 2
+    assert final.read_bytes() == original_bytes
+    saved = lanes.load_lanes(store)["lanes"][lane_id]
+    assert isinstance(saved["publish_pending"], dict)
+    assert saved["delivery_transaction_id"] == pending["transaction_id"]
+    if lane_kind == "release" and artifact_case == "legacy":
+        capsys.readouterr()
+        assert _run_raw(["lane", "status"], root) == 0
+        assert "final_invalid" in capsys.readouterr().out
+        assert _run_raw(["reset"], root) == 2
+        assert _run_raw([
+            "lane", "recover", "--id", lane_id,
+            "--reason", "quarantine rejected legacy final and reevaluate",
+        ], root) == 0
+        recovered = lanes.load_lanes(store)["lanes"][lane_id]
+        quarantined = Path(recovered["delivery_recovery"]["quarantined_final"])
+        assert not final.exists()
+        assert quarantined.exists()
+        with pytest.raises(lanes.LaneError, match="committed directory"):
+            lanes.validate_delivery_artifact(
+                quarantined, lane_id=lane_id, head_sha=head, store=store,
+                require_isolation=True,
+            )
+        assert _run_raw(argv, root) == 0
 
 
 def test_force_assign_refuses_delivered_publish_pending_lane(
@@ -1447,6 +1563,215 @@ def test_abandon_refuses_delivered_publish_pending_lane(
     assert saved["delivery_transaction_id"] == pending["delivery_transaction_id"]
     assert saved["status"] == lanes.STATUS_DELIVERED
     assert isinstance(saved["publish_pending"], dict)
+
+
+@pytest.mark.parametrize(
+    ("damage", "diagnosis"),
+    [("missing", "prepared_missing"), ("tampered", "prepared_invalid")],
+)
+def test_operator_can_recover_pending_delivery_with_broken_prepared_artifact(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture, damage: str, diagnosis: str) -> None:
+    root, base = _repo(tmp_path)
+    lane_id = f"recover-prepared-{damage}"
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    argv = [
+        "lane", "deliver", "--id", lane_id, "--from", "dev", "--head", head,
+    ]
+    store, lane_state = _leave_rebound_publish_pending(
+        root, argv, lane_id, monkeypatch,
+    )
+    prepared = Path(lane_state["publish_pending"]["prepared_artifact"])
+    if damage == "missing":
+        prepared.unlink()
+    else:
+        prepared.write_text('{"tampered": true}', encoding="utf-8")
+
+    assert _run_raw(argv, root) == 2
+    capsys.readouterr()
+    assert _run_raw(["lane", "status"], root) == 0
+    assert diagnosis in capsys.readouterr().out
+    assert _run_raw(["reset"], root) == 2
+    assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_DELIVERED
+
+    assert _run_raw([
+        "lane", "recover", "--id", lane_id,
+        "--reason", "discard broken prepared evidence and reevaluate",
+    ], root) == 0
+    recovered = lanes.load_lanes(store)["lanes"][lane_id]
+    assert recovered["status"] == lanes.STATUS_ACTIVE
+    assert _run_raw(argv, root) == 0
+    assert len(_committed_artifacts(store, lane_id)) == 1
+
+
+@pytest.mark.parametrize(
+    ("marker_case", "diagnosis"),
+    [("missing", "marker_missing"), ("scalar", "marker_corrupt")],
+)
+def test_operator_can_recover_delivered_lane_with_corrupt_publication_marker(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture, marker_case: str, diagnosis: str) -> None:
+    root, base = _repo(tmp_path)
+    lane_id = f"recover-marker-{marker_case}"
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    argv = [
+        "lane", "deliver", "--id", lane_id, "--from", "dev", "--head", head,
+    ]
+    store, _lane_state = _leave_rebound_publish_pending(
+        root, argv, lane_id, monkeypatch,
+    )
+    data = lanes.load_lanes(store)
+    if marker_case == "missing":
+        data["lanes"][lane_id].pop("publish_pending", None)
+    else:
+        data["lanes"][lane_id]["publish_pending"] = "corrupt"
+    lanes.save_lanes(store, data)
+
+    capsys.readouterr()
+    assert _run_raw(["lane", "status"], root) == 0
+    assert diagnosis in capsys.readouterr().out
+    assert _run_raw(["reset"], root) == 2
+    assert lane_id in lanes.load_lanes(store)["lanes"]
+    assert _run_raw([
+        "lane", "recover", "--id", lane_id,
+        "--reason", "restore corrupt publication marker to active evaluation",
+    ], root) == 0
+    assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_ACTIVE
+    assert _run_raw(argv, root) == 0
+    assert len(_committed_artifacts(store, lane_id)) == 1
+
+
+@pytest.mark.parametrize("marker_case", ["missing", "scalar"])
+def test_corrupt_marker_recovery_quarantines_an_existing_final(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        marker_case: str) -> None:
+    root, base = _repo(tmp_path)
+    lane_id = f"recover-final-{marker_case}"
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    argv = [
+        "lane", "deliver", "--id", lane_id, "--from", "dev", "--head", head,
+    ]
+    real_checkpoint = cli._lane_checkpoint_publication
+    monkeypatch.setattr(
+        cli, "_lane_checkpoint_publication",
+        lambda *_a, **_kw: (_ for _ in ()).throw(OSError("marker save crash")),
+    )
+    assert _run_raw(argv, root) == 2
+    monkeypatch.setattr(cli, "_lane_checkpoint_publication", real_checkpoint)
+
+    store = Store(root)
+    data = lanes.load_lanes(store)
+    pending = data["lanes"][lane_id]["publish_pending"]
+    final = Path(pending["committed_artifact"])
+    assert final.exists()
+    if marker_case == "missing":
+        data["lanes"][lane_id].pop("publish_pending")
+    else:
+        data["lanes"][lane_id]["publish_pending"] = "corrupt"
+    lanes.save_lanes(store, data)
+
+    assert _run_raw([
+        "lane", "recover", "--id", lane_id,
+        "--reason", "quarantine final whose publication marker was lost",
+    ], root) == 0
+    recovered = lanes.load_lanes(store)["lanes"][lane_id]
+    quarantine = Path(recovered["delivery_recovery"]["quarantined_final"])
+    assert recovered["status"] == lanes.STATUS_ACTIVE
+    assert not final.exists()
+    assert quarantine.exists()
+    with pytest.raises(lanes.LaneError, match="committed directory"):
+        lanes.validate_delivery_artifact(
+            quarantine, lane_id=lane_id, head_sha=head, store=store,
+        )
+
+
+def test_recover_serializes_against_pending_delivery_publication(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    lane_id = "recover-publication-race"
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    argv = [
+        "lane", "deliver", "--id", lane_id, "--from", "dev", "--head", head,
+    ]
+    store, _pending = _leave_rebound_publish_pending(
+        root, argv, lane_id, monkeypatch,
+    )
+
+    real_recover = cli._lane_recover_delivery
+    real_prepare = cli._lane_prepare_publication
+    recovery_entered = threading.Event()
+    release_recovery = threading.Event()
+    publication_entered = threading.Event()
+
+    def paused_recovery(*args, **kwargs):  # noqa: ANN002,ANN003
+        recovery_entered.set()
+        assert release_recovery.wait(5)
+        return real_recover(*args, **kwargs)
+
+    def observed_publication(*args, **kwargs):  # noqa: ANN002,ANN003
+        publication_entered.set()
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "_lane_recover_delivery", paused_recovery)
+    monkeypatch.setattr(cli, "_lane_prepare_publication", observed_publication)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        recover_result = pool.submit(
+            _run_raw,
+            ["lane", "recover", "--id", lane_id, "--reason", "discard attempt"],
+            root,
+        )
+        assert recovery_entered.wait(5)
+        delivery_result = pool.submit(_run_raw, argv, root)
+        raced = publication_entered.wait(1)
+        release_recovery.set()
+        assert recover_result.result(timeout=10) == 0
+        assert delivery_result.result(timeout=10) == 2
+
+    assert raced is False
+    assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_ACTIVE
+
+
+def test_reset_serializes_with_first_pending_delivery_save(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    lane_id = "reset-delivery-race"
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    argv = [
+        "lane", "deliver", "--id", lane_id, "--from", "dev", "--head", head,
+    ]
+    reset_entered = threading.Event()
+    release_reset = threading.Event()
+    pending_saved = threading.Event()
+    real_reset = Store.reset
+    real_save = lanes.save_lanes
+
+    def paused_reset(self, *args, **kwargs):  # noqa: ANN001,ANN002,ANN003
+        reset_entered.set()
+        assert release_reset.wait(5)
+        return real_reset(self, *args, **kwargs)
+
+    def observed_save(store, data):  # noqa: ANN001
+        result = real_save(store, data)
+        lane = (data.get("lanes") or {}).get(lane_id)
+        if (isinstance(lane, dict)
+                and lane.get("status") == lanes.STATUS_DELIVERED
+                and isinstance(lane.get("publish_pending"), dict)):
+            pending_saved.set()
+        return result
+
+    monkeypatch.setattr(Store, "reset", paused_reset)
+    monkeypatch.setattr(lanes, "save_lanes", observed_save)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reset_result = pool.submit(_run_raw, ["reset"], root)
+        assert reset_entered.wait(5)
+        delivery_result = pool.submit(_run_raw, argv, root)
+        raced = pending_saved.wait(1)
+        release_reset.set()
+        assert reset_result.result(timeout=10) == 0
+        assert delivery_result.result(timeout=10) in {2, 3}
+
+    assert raced is False
+    assert lanes.load_lanes(Store(root))["lanes"] == {}
 
 
 def test_delivered_retry_refuses_explicit_mismatched_head(tmp_path: Path) -> None:
@@ -1485,7 +1810,459 @@ def test_cooperating_message_token_detects_rapid_message_with_frozen_mtime(
     assert before != after
 
 
-def test_delivery_retry_after_publish_failure_does_not_reevaluate(
+def test_unrelated_message_during_evaluation_does_not_invalidate_delivery(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    lane_id = "unrelated-message"
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    store = Store(root)
+    real_prepare = lanes.write_prepared_delivery_artifact
+
+    def send_unrelated_after_prepare(*args, **kwargs):  # noqa: ANN002,ANN003
+        pending = real_prepare(*args, **kwargs)
+        store.send(
+            sender="lead", recipient="dev", kind="note",
+            body="ordinary coordination traffic unrelated to lane verdict",
+        )
+        return pending
+
+    monkeypatch.setattr(
+        lanes, "write_prepared_delivery_artifact", send_unrelated_after_prepare,
+    )
+    assert _run_raw([
+        "lane", "deliver", "--id", lane_id, "--from", "dev", "--head", head,
+    ], root) == 0
+    assert len(_committed_artifacts(store, lane_id)) == 1
+
+
+def test_barrier_token_detects_atomic_replacement_and_deletion_fallback(
+        tmp_path: Path) -> None:
+    root, _base = _repo(tmp_path)
+    store = Store(root)
+    earlier = store.send(
+        sender="lead", recipient="lead", body="earlier barrier",
+        meta={"barrier": {"version": 1, "scope": "global", "type": "release"}},
+    )
+    latest = store.send(
+        sender="lead", recipient="lead", body="latest barrier",
+        meta={"barrier": {"version": 1, "scope": "global", "type": "release"}},
+    )
+    latest_path = store.messages_dir / f"{latest.id}.json"
+    original = lanes.cooperating_input_fingerprint(store)
+
+    payload = json.loads(latest_path.read_text(encoding="utf-8"))
+    payload["body"] = "atomically replaced latest barrier"
+    replacement = store.dir / "barrier-replacement.json"
+    replacement.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(replacement, latest_path)
+    replaced = lanes.cooperating_input_fingerprint(store)
+    assert store.current_epoch() == latest.id
+    assert replaced != original
+
+    latest_path.unlink()
+    fallback = lanes.cooperating_input_fingerprint(store)
+    assert store.current_epoch() == earlier.id
+    assert fallback != replaced
+
+
+def test_delivery_terminal_rebind_rejects_target_move_after_last_git_recheck(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    target_ref = _branch(root)
+    lane = _assign_worktree(root, base, "terminal-target")
+    _commit(
+        Path(lane["worktree_path"]), "src/core/a.py", "base\nlane candidate\n",
+    )
+    _git(root, "checkout", "-q", "-b", "terminal-target-conflict", base)
+    conflicting = _commit(root, "src/core/a.py", "base\ntarget conflict\n")
+    _git(root, "checkout", "-q", target_ref)
+    assert _git(root, "rev-parse", "HEAD").strip() == base
+    real_prepare = lanes.write_prepared_delivery_artifact
+
+    def move_target_after_prepare(*args, **kwargs):  # noqa: ANN002,ANN003
+        pending = real_prepare(*args, **kwargs)
+        _git(root, "update-ref", f"refs/heads/{target_ref}", conflicting, base)
+        assert _git(root, "rev-parse", target_ref).strip() == conflicting
+        return pending
+
+    monkeypatch.setattr(lanes, "write_prepared_delivery_artifact", move_target_after_prepare)
+    assert _run_raw([
+        "lane", "deliver", "--id", "terminal-target", "--from", "dev",
+    ], root) == 3
+    saved = lanes.load_lanes(Store(root))["lanes"]["terminal-target"]
+    assert saved["status"] == lanes.STATUS_ACTIVE
+    assert _committed_artifacts(Store(root), "terminal-target") == []
+
+
+def test_delivery_terminal_rebind_rejects_gate_red_after_final_fingerprint_read(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    gates.set_gate(
+        root, name="ci", status="green", severity="blocker", scope="release",
+        actor="lead", evidence_source="automation_ci", evidence=["ci://green"],
+        required=True,
+    )
+    head = _advisory_delivery_fixture(root, base, "terminal-gate")
+    real_fingerprint = lanes.cooperating_input_fingerprint
+    reads = 0
+
+    def turn_gate_red_after_read(store):  # noqa: ANN001
+        nonlocal reads
+        token = real_fingerprint(store)
+        reads += 1
+        if reads == 3:
+            gates.set_gate(
+                root, name="ci", status="red", severity="blocker", scope="release",
+                actor="lead", evidence_source="local_command", reason="late failure",
+            )
+        return token
+
+    monkeypatch.setattr(lanes, "cooperating_input_fingerprint", turn_gate_red_after_read)
+    assert _run_raw([
+        "lane", "deliver", "--id", "terminal-gate", "--from", "dev",
+        "--head", head, "--gate-scope", "release",
+    ], root) == 3
+    saved = lanes.load_lanes(Store(root))["lanes"]["terminal-gate"]
+    assert saved["status"] == lanes.STATUS_ACTIVE
+    assert _committed_artifacts(Store(root), "terminal-gate") == []
+
+
+def test_delivery_terminal_rebind_rejects_dirty_worktree_after_provenance_recheck(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "terminal-dirty")
+    worktree = Path(lane["worktree_path"])
+    _commit(worktree, "src/core/a.py", "base\ncommitted candidate\n")
+    real_prepare = lanes.write_prepared_delivery_artifact
+
+    def dirty_after_prepare(*args, **kwargs):  # noqa: ANN002,ANN003
+        pending = real_prepare(*args, **kwargs)
+        (worktree / "src/core/a.py").write_text(
+            "base\ncommitted candidate\nuncommitted change\n", encoding="utf-8",
+        )
+        return pending
+
+    monkeypatch.setattr(lanes, "write_prepared_delivery_artifact", dirty_after_prepare)
+    assert _run_raw([
+        "lane", "deliver", "--id", "terminal-dirty", "--from", "dev",
+    ], root) == 3
+    saved = lanes.load_lanes(Store(root))["lanes"]["terminal-dirty"]
+    assert saved["status"] == lanes.STATUS_ACTIVE
+    assert _committed_artifacts(Store(root), "terminal-dirty") == []
+
+
+def test_delivery_terminal_rebind_hashes_in_place_barrier_contents(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    store = Store(root)
+    barrier = store.send(
+        sender="lead", recipient="lead", body="release barrier",
+        meta={"barrier": {"version": 1, "scope": "global", "type": "release"}},
+    )
+    message_path = store.messages_dir / f"{barrier.id}.json"
+    head = _advisory_delivery_fixture(root, base, "terminal-barrier")
+    message_stat = message_path.stat()
+    directory_stat = store.messages_dir.stat()
+    names_before = sorted(path.name for path in store.messages_dir.iterdir())
+    real_prepare = lanes.write_prepared_delivery_artifact
+
+    def rewrite_barrier_after_prepare(*args, **kwargs):  # noqa: ANN002,ANN003
+        pending = real_prepare(*args, **kwargs)
+        payload = json.loads(message_path.read_text(encoding="utf-8"))
+        payload["meta"]["barrier"]["type"] = "changed"
+        message_path.write_bytes(
+            json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"),
+        )
+        os.utime(message_path, ns=(message_stat.st_atime_ns, message_stat.st_mtime_ns))
+        os.utime(
+            store.messages_dir,
+            ns=(directory_stat.st_atime_ns, directory_stat.st_mtime_ns),
+        )
+        assert sorted(path.name for path in store.messages_dir.iterdir()) == names_before
+        assert store.messages_dir.stat().st_mtime_ns == directory_stat.st_mtime_ns
+        assert message_path.stat().st_size == message_stat.st_size
+        assert store.current_epoch() == barrier.id
+        return pending
+
+    monkeypatch.setattr(lanes, "write_prepared_delivery_artifact", rewrite_barrier_after_prepare)
+    assert _run_raw([
+        "lane", "deliver", "--id", "terminal-barrier", "--from", "dev",
+        "--head", head,
+    ], root) == 3
+    saved = lanes.load_lanes(store)["lanes"]["terminal-barrier"]
+    assert saved["status"] == lanes.STATUS_ACTIVE
+    assert _committed_artifacts(store, "terminal-barrier") == []
+
+
+def test_provisional_delivery_retains_overlapping_path_reservation(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    head = _advisory_delivery_fixture(root, base, "reserved-a")
+    store = Store(root)
+    real_prepare = cli._lane_prepare_publication
+    attempted_overlap = False
+
+    def reject_overlap_before_rebind(target_store, lane_id):  # noqa: ANN001
+        nonlocal attempted_overlap
+        if not attempted_overlap:
+            attempted_overlap = True
+            assert lane_id == "reserved-a"
+            assert _run([
+                "lane", "assign", "--id", "reserved-b", "--from", "lead",
+                "--assignee", "dev", "--domain", "core", "--base", base,
+                "--target", _branch(root), "--path", "src/core",
+            ], root) == 2
+        return real_prepare(target_store, lane_id)
+
+    monkeypatch.setattr(cli, "_lane_prepare_publication", reject_overlap_before_rebind)
+    assert _run_raw([
+        "lane", "deliver", "--id", "reserved-a", "--from", "dev",
+        "--head", head,
+    ], root) == 0
+    data = lanes.load_lanes(store)
+    assert "reserved-b" not in data["lanes"]
+    assert data["lanes"]["reserved-a"]["publish_pending"] is False
+    assert len(_committed_artifacts(store, "reserved-a")) == 1
+
+
+def test_terminal_rollback_holds_for_legacy_overlap_injected_after_provisional_save(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    head = _advisory_delivery_fixture(root, base, "rollback-a")
+    store = Store(root)
+    real_prepare = cli._lane_prepare_publication
+    injected_overlap = False
+
+    def inject_overlap_before_rebind(target_store, lane_id):  # noqa: ANN001
+        nonlocal injected_overlap
+        if not injected_overlap:
+            injected_overlap = True
+            assert lane_id == "rollback-a"
+            with target_store._config_lock():
+                data = lanes.load_lanes(target_store)
+                source = data["lanes"]["rollback-a"]["publish_pending"]["lane_snapshot"]
+                data["lanes"]["rollback-b"] = lanes.new_lane(
+                    "rollback-b", assignee="dev", assigned_by="legacy",
+                    assigned_at="injected", domain_id="core",
+                    path_subset=["src/core"], base_sha=base,
+                    target_ref=_branch(root), target_head_at_assign=head,
+                    epoch_at_assign=target_store.current_epoch(),
+                    registry_hash_at_assign=source["registry_hash_at_assign"],
+                    release_class=False,
+                    waiver={"reason": "legacy overlap", "by": "legacy",
+                            "at": "injected", "authority": "advisory_only"},
+                )
+                lanes.save_lanes(target_store, data)
+        return real_prepare(target_store, lane_id)
+
+    monkeypatch.setattr(cli, "_lane_prepare_publication", inject_overlap_before_rebind)
+    argv = [
+        "lane", "deliver", "--id", "rollback-a", "--from", "dev",
+        "--head", head,
+    ]
+
+    assert _run_raw(argv, root) == 3
+    first_error = capsys.readouterr().err
+    assert "nonconsumable terminal HOLD" in first_error
+    assert "rollback-b" in first_error
+    assert "retry lane deliver" in first_error
+
+    data = lanes.load_lanes(store)
+    held = data["lanes"]["rollback-a"]
+    assert held["status"] == lanes.STATUS_DELIVERED
+    assert isinstance(held["publish_pending"], dict)
+    assert held["publish_pending"]["terminal_rebound"] is False
+    assert held["terminal_hold"]["conflicting_lane_ids"] == ["rollback-b"]
+    assert [lane["lane_id"] for lane in lanes.active_lanes(data)] == ["rollback-b"]
+    assert len(_prepared_artifacts(store, "rollback-a")) == 1
+    assert _committed_artifacts(store, "rollback-a") == []
+    capsys.readouterr()
+    assert _run_raw(["lane", "status"], root) == 0
+    status_output = capsys.readouterr().out
+    assert "rollback-a" in status_output
+    assert "terminal_hold" in status_output
+    assert _run_raw(["reset"], root) == 2
+    assert "rollback-a" in lanes.load_lanes(store)["lanes"]
+
+    assert _run_raw(argv, root) == 3
+    retry_error = capsys.readouterr().err
+    assert "nonconsumable terminal HOLD" in retry_error
+    assert "rollback-b" in retry_error
+    retry_data = lanes.load_lanes(store)
+    assert [lane["lane_id"] for lane in lanes.active_lanes(retry_data)] == ["rollback-b"]
+    assert _committed_artifacts(store, "rollback-a") == []
+
+    assert _run_raw(["lane", "abandon", "--id", "rollback-b"], root) == 0
+    assert _run_raw(argv, root) == 0
+    final = lanes.load_lanes(store)["lanes"]["rollback-a"]
+    assert final["publish_pending"] is False
+    assert "terminal_hold" not in final
+    assert len(_committed_artifacts(store, "rollback-a")) == 1
+
+
+@pytest.mark.parametrize("drift", ["gate", "target", "message", "worktree"])
+def test_recovery_without_final_freshly_rebinds_live_inputs(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str) -> None:
+    root, base = _repo(tmp_path)
+    store = Store(root)
+    target_ref = _branch(root)
+    conflicting = None
+    message_path = None
+
+    if drift == "gate":
+        gates.set_gate(
+            root, name="ci", status="green", severity="blocker", scope="release",
+            actor="lead", evidence_source="automation_ci", evidence=["ci://green"],
+            required=True,
+        )
+    elif drift == "target":
+        _git(root, "checkout", "-q", "-b", "recovery-target-conflict", base)
+        conflicting = _commit(root, "src/core/a.py", "base\nconflicting target\n")
+        _git(root, "checkout", "-q", target_ref)
+    elif drift == "message":
+        barrier = store.send(
+            sender="lead", recipient="lead", body="release barrier",
+            meta={"barrier": {"version": 1, "scope": "global", "type": "release"}},
+        )
+        message_path = store.messages_dir / f"{barrier.id}.json"
+
+    lane_id = f"recovery-drift-{drift}"
+    if drift == "worktree":
+        lane = _assign_worktree(root, base, lane_id)
+        worktree = Path(lane["worktree_path"])
+        head = _commit(worktree, "src/core/a.py", "base\nrecovery candidate\n")
+        argv = ["lane", "deliver", "--id", lane_id, "--from", "dev"]
+    else:
+        head = _advisory_delivery_fixture(root, base, lane_id)
+        argv = [
+            "lane", "deliver", "--id", lane_id, "--from", "dev", "--head", head,
+        ]
+        if drift == "gate":
+            argv.extend(["--gate-scope", "release"])
+
+    real_publish = lanes.publish_delivery_artifact
+    crashed = False
+
+    def crash_after_rebind(*args, **kwargs):  # noqa: ANN002,ANN003
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise OSError("injected crash after terminal rebind")
+        return real_publish(*args, **kwargs)
+
+    monkeypatch.setattr(lanes, "publish_delivery_artifact", crash_after_rebind)
+    assert _run_raw(argv, root) == 2
+    pending = lanes.load_lanes(store)["lanes"][lane_id]
+    assert pending["publish_pending"]["terminal_rebound"] is True
+    assert _committed_artifacts(store, lane_id) == []
+
+    if drift == "gate":
+        gates.set_gate(
+            root, name="ci", status="red", severity="blocker", scope="release",
+            actor="lead", evidence_source="local_command", reason="late failure",
+        )
+    elif drift == "target":
+        assert conflicting is not None
+        _git(root, "update-ref", f"refs/heads/{target_ref}", conflicting, head)
+    elif drift == "message":
+        assert message_path is not None
+        message_stat = message_path.stat()
+        directory_stat = store.messages_dir.stat()
+        payload = json.loads(message_path.read_text(encoding="utf-8"))
+        payload["meta"]["barrier"]["type"] = "changed"
+        message_path.write_bytes(
+            json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"),
+        )
+        os.utime(message_path, ns=(message_stat.st_atime_ns, message_stat.st_mtime_ns))
+        os.utime(
+            store.messages_dir,
+            ns=(directory_stat.st_atime_ns, directory_stat.st_mtime_ns),
+        )
+    else:
+        (worktree / "src/core/a.py").write_text(
+            "base\nrecovery candidate\nlate dirty change\n", encoding="utf-8",
+        )
+
+    assert _run_raw(argv, root) == 3
+    saved = lanes.load_lanes(store)["lanes"][lane_id]
+    assert saved["status"] == lanes.STATUS_ACTIVE
+    assert _committed_artifacts(store, lane_id) == []
+
+
+@pytest.mark.parametrize("action", ["force", "abandon"])
+@pytest.mark.parametrize(
+    ("marker_case", "marker", "expected_rc"),
+    [("true", True, 2), ("scalar", "corrupt", 2), ("missing", None, 2),
+     ("complete", False, 0)],
+)
+def test_delivered_lane_mutation_requires_explicit_complete_publication_marker(
+        tmp_path: Path, action: str, marker_case: str, marker: object,
+        expected_rc: int) -> None:
+    root, base = _repo(tmp_path)
+    head = _advisory_delivery_fixture(root, base, f"marker-{action}-{marker_case}")
+    lane_id = f"marker-{action}-{marker_case}"
+    store = Store(root)
+    data = lanes.load_lanes(store)
+    previous = data["lanes"][lane_id]
+    previous_instance = previous["instance_id"]
+    previous["status"] = lanes.STATUS_DELIVERED
+    previous["delivered_head"] = head
+    previous["delivery_transaction_id"] = "f" * 32
+    if marker_case == "missing":
+        previous.pop("publish_pending", None)
+    else:
+        previous["publish_pending"] = marker
+    lanes.save_lanes(store, data)
+
+    if action == "force":
+        rc = _run_raw([
+            "lane", "assign", "--id", lane_id, "--force", "--from", "lead",
+            "--assignee", "dev", "--advisory", "--domain", "core", "--base", base,
+            "--target", _branch(root), "--path", "src/core", "--no-worktree",
+            "--worktree-waiver-reason", "marker policy fixture",
+        ], root)
+    else:
+        rc = _run_raw(["lane", "abandon", "--id", lane_id], root)
+
+    assert rc == expected_rc
+    saved = lanes.load_lanes(store)["lanes"][lane_id]
+    if expected_rc == 2:
+        assert saved["instance_id"] == previous_instance
+        assert saved["status"] == lanes.STATUS_DELIVERED
+    elif action == "force":
+        assert saved["instance_id"] != previous_instance
+        assert saved["status"] == lanes.STATUS_ACTIVE
+    else:
+        assert saved["status"] == lanes.STATUS_ABANDONED
+
+
+@pytest.mark.parametrize("marker_case", ["true", "scalar", "missing"])
+def test_corrupt_delivered_marker_retains_path_reservation(
+        tmp_path: Path, marker_case: str) -> None:
+    root, base = _repo(tmp_path)
+    _advisory_delivery_fixture(root, base, f"reserved-corrupt-{marker_case}")
+    store = Store(root)
+    data = lanes.load_lanes(store)
+    lane = data["lanes"][f"reserved-corrupt-{marker_case}"]
+    lane["status"] = lanes.STATUS_DELIVERED
+    if marker_case == "true":
+        lane["publish_pending"] = True
+    elif marker_case == "scalar":
+        lane["publish_pending"] = "corrupt"
+    else:
+        lane.pop("publish_pending", None)
+    lanes.save_lanes(store, data)
+
+    assert _run([
+        "lane", "assign", "--id", f"blocked-by-{marker_case}", "--from", "lead",
+        "--assignee", "dev", "--domain", "core", "--base", base,
+        "--target", _branch(root), "--path", "src/core",
+    ], root) == 2
+    assert f"blocked-by-{marker_case}" not in lanes.load_lanes(store)["lanes"]
+
+
+def test_delivery_retry_after_publish_failure_freshly_rebinds(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root, base = _repo(tmp_path)
     head = _advisory_delivery_fixture(root, base, "prepub")
@@ -1518,13 +2295,13 @@ def test_delivery_retry_after_publish_failure_does_not_reevaluate(
     assert _committed_artifacts(store, "prepub") == []
 
     assert _run_raw(argv, root) == 0
-    assert evals == 1
+    assert evals == 3  # initial GO, initial terminal rebind, and recovery rebind
     final = lanes.load_lanes(store)["lanes"]["prepub"]
     assert final["publish_pending"] is False
     assert len(_committed_artifacts(store, "prepub")) == 1
 
 
-def test_delivery_retry_after_atomic_final_write_failure_does_not_reevaluate(
+def test_delivery_retry_after_atomic_final_write_failure_freshly_rebinds(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from agenttalk import _atomic
 
@@ -1559,7 +2336,7 @@ def test_delivery_retry_after_atomic_final_write_failure_does_not_reevaluate(
     assert _committed_artifacts(store, "finalwrite") == []
 
     assert _run_raw(argv, root) == 0
-    assert evals == 1
+    assert evals == 3  # initial GO, initial terminal rebind, and recovery rebind
     assert len(_committed_artifacts(store, "finalwrite")) == 1
 
 
@@ -1584,7 +2361,7 @@ def test_delivery_retry_after_final_write_and_marker_save_failure_is_idempotent(
         lane = data["lanes"]["postpub"]
         if lane.get("status") == lanes.STATUS_DELIVERED:
             delivered_saves += 1
-            if delivered_saves == 2:
+            if delivered_saves == 3:
                 raise OSError("injected marker-save failure after final write")
         return real_save(target_store, data)
 
@@ -1610,11 +2387,75 @@ def test_delivery_retry_after_final_write_and_marker_save_failure_is_idempotent(
     assert _run_raw(["close", "check", "--id", "pending-close"], root) == 3
 
     assert _run_raw(argv, root) == 0
-    assert evals == 1
+    assert evals == 2  # initial GO plus the terminal post-state rebind; retry adds none
     assert _committed_artifacts(store, "postpub") == finals
     assert lanes.validate_delivery_artifact(
         finals[0], lane_id="postpub", head_sha=head, store=store,
     )["artifact_state"] == lanes.ARTIFACT_COMMITTED
+
+
+def test_release_close_rejects_final_until_matching_pending_marker_completes(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "pending-release-close")
+    head = _commit(
+        Path(lane["worktree_path"]), "src/core/a.py", "base\npending release close\n",
+    )
+    store = Store(root)
+    real_save = lanes.save_lanes
+    delivered_saves = 0
+
+    def fail_marker_checkpoint(target_store, data):  # noqa: ANN001
+        nonlocal delivered_saves
+        lane_state = data["lanes"]["pending-release-close"]
+        if lane_state.get("status") == lanes.STATUS_DELIVERED:
+            delivered_saves += 1
+            if delivered_saves == 3:
+                raise OSError("injected marker-save failure after committed final write")
+        return real_save(target_store, data)
+
+    monkeypatch.setattr(lanes, "save_lanes", fail_marker_checkpoint)
+    argv = [
+        "lane", "deliver", "--id", "pending-release-close", "--from", "dev",
+    ]
+    assert _run_raw(argv, root) == 2
+    finals = _committed_artifacts(store, "pending-release-close")
+    assert len(finals) == 1
+    assert isinstance(
+        lanes.load_lanes(store)["lanes"]["pending-release-close"]["publish_pending"],
+        dict,
+    )
+    pending_marker = lanes.load_lanes(store)["lanes"]["pending-release-close"][
+        "publish_pending"
+    ]
+    Path(pending_marker["prepared_artifact"]).unlink()
+    capsys.readouterr()
+    assert _run_raw(["lane", "status"], root) == 0
+    assert "final_pending_marker" in capsys.readouterr().out
+    assert _run_raw(["reset"], root) == 2
+    assert _run_raw([
+        "lane", "recover", "--id", "pending-release-close",
+        "--reason", "must finish the authoritative final",
+    ], root) == 3
+
+    assert _run_raw([
+        "close", "open", "--id", "pending-release-close-check", "--from", "lead",
+        "--scope", "release", "--revision", head,
+        "--lane-artifact", str(finals[0]),
+    ], root) == 0
+    capsys.readouterr()
+    assert _run_raw([
+        "close", "check", "--id", "pending-release-close-check", "--json",
+    ], root) == 3
+    close_result = json.loads(capsys.readouterr().out)
+    assert "publication is still pending" in close_result["worktree_isolation"]["reason"]
+
+    assert _run_raw(argv, root) == 0
+    assert _committed_artifacts(store, "pending-release-close") == finals
+    assert _run_raw([
+        "close", "check", "--id", "pending-release-close-check",
+    ], root) == 0
 
 
 def test_delivery_cas_rejects_force_reassign_aba(
@@ -1805,7 +2646,8 @@ def test_delivery_rechecks_target_ref_after_evaluation(
 
 
 def test_delivery_teardown_failure_is_retryable_without_reevaluation(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture) -> None:
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "teardown-fail")
     wt = Path(lane["worktree_path"])
@@ -1834,10 +2676,14 @@ def test_delivery_teardown_failure_is_retryable_without_reevaluation(
     assert pending["cleanup_pending"] is True
     assert pending["worktree_state"] == lanes.STATUS_CLEANUP_FAILED
     assert wt.exists()
+    capsys.readouterr()
+    assert _run_raw(["lane", "status"], root) == 0
+    assert "cleanup_pending" in capsys.readouterr().out
+    assert _run_raw(["reset"], root) == 2
 
     monkeypatch.setattr(cli, "_git_write", real_git_write)
     assert _run_raw(argv, root) == 0
-    assert evals == 1
+    assert evals == 2  # initial GO plus the terminal post-state rebind; retry adds none
     complete = lanes.load_lanes(store)["lanes"]["teardown-fail"]
     assert complete["cleanup_pending"] is False
     assert not wt.exists()
@@ -1866,7 +2712,7 @@ def test_delivery_recovers_when_teardown_succeeds_but_cleanup_save_fails(
         lane_state = data["lanes"]["cleanup-save"]
         if lane_state.get("status") == lanes.STATUS_DELIVERED:
             delivered_saves += 1
-            if delivered_saves == 3:
+            if delivered_saves == 4:
                 raise OSError("injected cleanup checkpoint failure")
         return real_save(target_store, data)
 
@@ -1879,7 +2725,7 @@ def test_delivery_recovers_when_teardown_succeeds_but_cleanup_save_fails(
     assert pending["cleanup_pending"] is True
 
     assert _run_raw(argv, root) == 0
-    assert evals == 1
+    assert evals == 2  # initial GO plus the terminal post-state rebind; retry adds none
     assert lanes.load_lanes(store)["lanes"]["cleanup-save"]["cleanup_pending"] is False
 
 
@@ -1898,7 +2744,9 @@ def test_concurrent_delivery_commits_one_artifact_and_retry_never_reevaluates(
         result = real_eval(*args, **kwargs)
         with eval_lock:
             evals += 1
-        barrier.wait(timeout=20)
+            rendezvous = evals <= 2
+        if rendezvous:
+            barrier.wait(timeout=20)
         return result
 
     monkeypatch.setattr(cli, "_lane_eval", rendezvous_eval)
@@ -1912,22 +2760,30 @@ def test_concurrent_delivery_commits_one_artifact_and_retry_never_reevaluates(
     state = lanes.load_lanes(store)["lanes"]["concurrent"]
     assert state["delivery_artifact"] == str(finals[0])
     assert _run_raw(argv, root) == 0
-    assert evals == 2
+    assert evals == 3  # two initial evaluations; only the winner rebinds, retry adds none
     assert _committed_artifacts(store, "concurrent") == finals
 
 
 def test_concurrent_delivery_loser_reports_winner_head(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture) -> None:
     root, base = _repo(tmp_path)
     first_head = _advisory_delivery_fixture(root, base, "concurrent-head")
     second_head = _commit(root, "src/core/a.py", "base\nsecond candidate\n")
     assert first_head != second_head
     barrier = threading.Barrier(2)
     real_eval = cli._lane_eval
+    evals = 0
+    eval_lock = threading.Lock()
 
     def rendezvous_eval(*args, **kwargs):  # noqa: ANN002,ANN003
+        nonlocal evals
         result = real_eval(*args, **kwargs)
-        barrier.wait(timeout=20)
+        with eval_lock:
+            evals += 1
+            rendezvous = evals <= 2
+        if rendezvous:
+            barrier.wait(timeout=20)
         return result
 
     output: list[str] = []
@@ -1948,11 +2804,13 @@ def test_concurrent_delivery_loser_reports_winner_head(
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda argv: _run_raw(argv, root), argvs))
 
-    assert results == [0, 0]
+    assert sorted(results) == [0, 3]
     winner = lanes.load_lanes(Store(root))["lanes"]["concurrent-head"]["delivered_head"]
     delivery_lines = [line for line in output if line.startswith("delivered lane concurrent-head")]
-    assert len(delivery_lines) == 2
-    assert all(winner[:12] in line for line in delivery_lines)
+    assert len(delivery_lines) == 1
+    assert winner[:12] in delivery_lines[0]
+    assert winner[:12] in capsys.readouterr().err
+    assert len(_committed_artifacts(Store(root), "concurrent-head")) == 1
 
 
 def test_delivery_keeps_git_artifact_io_and_teardown_outside_global_lock(
@@ -1993,7 +2851,10 @@ def test_delivery_keeps_git_artifact_io_and_teardown_outside_global_lock(
         (cli, "_git_write"),
         (lanes, "write_prepared_delivery_artifact"),
         (lanes, "publish_delivery_artifact"),
+        (lanes, "existing_committed_delivery_artifact"),
+        (lanes, "validate_prepared_delivery_artifact"),
         (lanes, "validate_delivery_artifact"),
+        (lanes, "cooperating_input_fingerprint"),
     ):
         outside(obj, name)
 
