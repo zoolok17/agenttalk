@@ -14,6 +14,7 @@ from agenttalk.store import (
     COMPOSING_INTENT_STALE_SECONDS,
     CONTROL_KINDS,
     KNOWN_KINDS,
+    Message,
     OPENER_KINDS,
     Store,
     _ID_RE,
@@ -88,6 +89,97 @@ def test_send_rejects_unknown_sender(store: Store) -> None:
 def test_send_rejects_unknown_recipient(store: Store) -> None:
     with pytest.raises(ValueError):
         store.send(sender="alpha", recipient="ghost", body="x")
+
+
+@pytest.mark.parametrize(
+    ("kind", "status"),
+    [
+        ("review-result", "approved"),
+        ("review-result", "rejected"),
+        ("review-result", "needs-info"),
+        ("proposal-response", "accepted"),
+        ("proposal-response", "rejected"),
+        ("proposal-response", "countered"),
+    ],
+)
+def test_send_accepts_exact_response_statuses(
+    store: Store,
+    kind: str,
+    status: str,
+) -> None:
+    msg = store.send(
+        sender="alpha",
+        recipient="beta",
+        kind=kind,
+        body="response",
+        meta={"request_id": "r-1", "status": status},
+    )
+
+    assert msg.meta["status"] == status
+
+
+@pytest.mark.parametrize(
+    ("kind", "meta"),
+    [
+        ("review-result", {"request_id": "r-1", "status": "approve"}),
+        ("review-result", {"request_id": "r-1", "status": 1}),
+        ("proposal-response", {"request_id": "r-1", "status": "accept"}),
+        ("proposal-response", {"request_id": "r-1", "status": None}),
+    ],
+)
+def test_send_rejects_invalid_response_status(
+    store: Store,
+    kind: str,
+    meta: dict,
+) -> None:
+    before = set(store.messages_dir.glob("*.json"))
+
+    with pytest.raises(ValueError, match=rf"{kind}.*status"):
+        store.send(
+            sender="alpha",
+            recipient="beta",
+            kind=kind,
+            body="response",
+            meta=meta,
+        )
+
+    assert set(store.messages_dir.glob("*.json")) == before
+
+
+@pytest.mark.parametrize(
+    ("opener_kind", "response_kind"),
+    [
+        ("review-request", "review-result"),
+        ("proposal", "proposal-response"),
+    ],
+)
+def test_send_missing_response_status_remains_nonterminal(
+    tmp_path: Path,
+    opener_kind: str,
+    response_kind: str,
+) -> None:
+    store = _store3(tmp_path)
+    request_id = f"r-missing-{response_kind}"
+    store.send(
+        sender="alpha",
+        recipient="gamma",
+        kind=opener_kind,
+        body="request",
+        meta={"request_id": request_id},
+    )
+    response = store.send(
+        sender="gamma",
+        recipient="alpha",
+        kind=response_kind,
+        body="legacy response",
+        meta={"request_id": request_id},
+    )
+
+    assert "status" not in response.meta
+    assert any(
+        row["request_id"] == request_id
+        for row in store._drain_check("gamma")
+    )
 
 
 def test_messages_ids_are_lexicographic(store: Store) -> None:
@@ -718,6 +810,96 @@ def test_validated_messages_returned_in_id_order(store: Store) -> None:
     got = [m.id for m in store.valid_messages()]
     assert got == sorted(got)
     assert set(sent).issubset(set(got))
+
+
+def test_persisted_invalid_response_status_is_rejected_and_nonterminal(
+    tmp_path: Path,
+) -> None:
+    store = _store3(tmp_path)
+    _opener(store, "alpha", "gamma", "r-invalid-status")
+    msg_id = _new_id()
+    path = store.messages_dir / f"{msg_id}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "id": msg_id,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "from": "gamma",
+                "to": "alpha",
+                "kind": "review-result",
+                "subject": "review",
+                "body": "looks good",
+                "meta": {
+                    "request_id": "r-invalid-status",
+                    "status": "approve",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    invalid = dict(store.list_invalid_messages())
+    assert msg_id in invalid
+    assert "review-result status" in invalid[msg_id]
+    assert any(
+        row["request_id"] == "r-invalid-status"
+        for row in store._drain_check("gamma")
+    )
+
+
+def test_persisted_legacy_missing_response_status_is_readable_but_nonterminal(
+    tmp_path: Path,
+) -> None:
+    store = _store3(tmp_path)
+    _opener(store, "alpha", "gamma", "r-missing-status")
+    msg_id = _new_id()
+    path = store.messages_dir / f"{msg_id}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "id": msg_id,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "from": "gamma",
+                "to": "alpha",
+                "kind": "review-result",
+                "subject": "review",
+                "body": "looks good",
+                "meta": {"request_id": "r-missing-status"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert msg_id in {message.id for message in store.all_messages()}
+    assert any(
+        row["request_id"] == "r-missing-status"
+        for row in store._drain_check("gamma")
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "status"),
+    [
+        ("review-result", "approve"),
+        ("proposal-response", "accept"),
+    ],
+)
+def test_message_validate_rejects_invalid_persisted_response_status(
+    kind: str,
+    status: str,
+) -> None:
+    message = Message(
+        id=_new_id(),
+        ts=datetime.now(timezone.utc).isoformat(),
+        sender="alpha",
+        recipient="beta",
+        kind=kind,
+        body="response",
+        meta={"request_id": "r-1", "status": status},
+    )
+
+    with pytest.raises(ValueError, match=rf"{kind} status"):
+        message.validate(["alpha", "beta"])
 
 
 def test_corrupt_config_delivers_nothing_failclosed(store: Store) -> None:

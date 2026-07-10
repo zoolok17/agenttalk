@@ -35,6 +35,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agenttalk import health as _health
+from agenttalk import gates as _gates
 from agenttalk._atomic import write_text as _atomic_write_text
 from agenttalk import avatars as _avatars
 from agenttalk.redaction import normalize_child_output_tail
@@ -573,6 +574,7 @@ class Message:
             raise ValueError(f"body must be a string, got {type(self.body).__name__}")
         if not isinstance(self.meta, dict):
             raise ValueError(f"meta must be a dict, got {type(self.meta).__name__}")
+        _gates.validate_response_status(self.kind, self.meta)
         if roster:
             principals = _bus_principals(roster)
             if self.sender not in principals:
@@ -1994,6 +1996,7 @@ class Store:
         # A caller that already supplied `epoch_at_send` wins (broadcast
         # snapshots one epoch for the whole fan-out — B3).
         meta = dict(meta or {})
+        _gates.validate_response_status(kind, meta)
         if kind in OPENER_KINDS and "epoch_at_send" not in meta:
             meta["epoch_at_send"] = self.current_epoch()
         msg = Message(
