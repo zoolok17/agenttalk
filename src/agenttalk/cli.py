@@ -641,13 +641,7 @@ def _status_warnings(agents: list[dict]) -> list[str]:
 
 def _read_supervisor_state(store: Store, path_value: str | None = None) -> dict:
     path = Path(path_value) if path_value else store.dir / "supervisor-state.json"
-    if not path.exists():
-        return {}
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (ValueError, OSError):
-        return {}
-    return raw if isinstance(raw, dict) else {}
+    return sup.load_supervisor_state(path)
 
 
 def _read_supervisor_snapshot(store: Store, path_value: str | None = None) -> list[dict] | None:
@@ -7392,14 +7386,7 @@ def cmd_release(args: argparse.Namespace) -> int:
 
 
 def _load_supervisor_config(store: Store) -> dict:
-    p = store.dir / "supervisor.json"
-    if not p.exists():
-        return {}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (ValueError, OSError):
-        return {}
+    return sup.load_supervisor_config(store.dir / "supervisor.json")
 
 
 def cmd_heartbeat(args: argparse.Namespace) -> int:
@@ -8956,18 +8943,14 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                     token=args.instance_token or "", pid=pid, pid_start=args.pid_start)
 
     def _read_state() -> dict:
-        if args.state_file and Path(args.state_file).exists():
-            try:
-                # utf-8-sig tolerates the PowerShell 5.1 Set-Content BOM.
-                return json.loads(Path(args.state_file).read_text(encoding="utf-8-sig"))
-            except (ValueError, OSError):
-                return {}
-        return {}
+        if not args.state_file:
+            return {"agents": {}}
+        return sup.load_supervisor_state(Path(args.state_file))
 
     def _write_state(state: dict) -> None:
         if not args.state_file:
             raise ValueError("need --state-file <path>")
-        Path(args.state_file).write_text(json.dumps(state, indent=2), encoding="utf-8")
+        sup.save_supervisor_state(Path(args.state_file), state)
 
     def _read_snapshot_file(path_value: str | None) -> list[dict] | None:
         if path_value and Path(path_value).exists():
@@ -9086,15 +9069,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk supervise --record-launch: need --for "
                              "<agent> and --state-file <path>\n")
             return 2
-        p = Path(args.state_file)
-        state = {}
-        if p.exists():
-            try:
-                # utf-8-sig: PowerShell 5.1 Set-Content writes a BOM that plain
-                # json.loads chokes on (state round-trip would silently fail).
-                state = json.loads(p.read_text(encoding="utf-8-sig")) or {}
-            except (ValueError, OSError):
-                state = {}
+        state = _read_state()
         rl_cfg = _load_supervisor_config(store)
         grace = rl_cfg.get("launch_grace_seconds")
         grace = float(grace) if isinstance(grace, (int, float)) else None
@@ -9114,7 +9089,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                           launcher_nonce_injected=bool(args.launcher_nonce_injected),
                           launcher_nonce_source=args.launcher_nonce_source,
                           launcher_nonce_missing_reason=args.launcher_nonce_missing_reason)
-        p.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        _write_state(state)
         return 0
     if args.clear_restart:
         if not args.agent or not args.request_id:

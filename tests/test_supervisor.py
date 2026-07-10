@@ -685,6 +685,146 @@ def test_supervisor_config_loader_accepts_utf8_bom(tmp_path: Path) -> None:
     assert sup.load_supervisor_config(path) == expected
 
 
+def test_supervise_plan_loads_bom_prefixed_project_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.json").write_text(
+        "\ufeff" + json.dumps(_CONFIG), encoding="utf-8",
+    )
+    state_file = s.dir / "supervisor-state.json"
+    state_file.write_text(
+        json.dumps({"agents": {"worker": {}}}), encoding="utf-8",
+    )
+    snapshot_file = s.dir / "supervisor-snapshot.json"
+    snapshot_file.write_text("[]", encoding="utf-8")
+
+    rc = _run([
+        "supervise", "--plan", "--state-file", str(state_file),
+        "--snapshot-file", str(snapshot_file), "--now", str(NOW),
+    ], tmp_path)
+
+    assert rc == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert set(plan["agents"]) == {"worker"}
+
+
+def test_supervise_rejects_non_object_project_config_without_emitting_plan(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.json").write_text("[]", encoding="utf-8")
+    state_file = s.dir / "supervisor-state.json"
+    state_file.write_text(
+        json.dumps({"agents": {"worker": {}}}), encoding="utf-8",
+    )
+
+    rc = _run([
+        "supervise", "--plan", "--state-file", str(state_file),
+        "--now", str(NOW),
+    ], tmp_path)
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    assert "supervisor config must be a JSON object" in captured.err
+
+
+def test_supervise_report_recovers_backup_without_rewriting_corrupt_primary(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.json").write_text(
+        json.dumps(_CONFIG), encoding="utf-8",
+    )
+    state_file = s.dir / "supervisor-state.json"
+    backup_file = sup.supervisor_state_backup_path(state_file)
+    state_file.write_text('{"agents":', encoding="utf-8")
+    backup_file.write_text(
+        json.dumps({"agents": {"worker": {"session_id": "backup-session"}}}),
+        encoding="utf-8",
+    )
+    primary_before = state_file.read_bytes()
+    backup_before = backup_file.read_bytes()
+
+    rc = _run([
+        "supervise", "--report", "--state-file", str(state_file),
+        "--now", str(NOW),
+    ], tmp_path)
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["agents"]["worker"]["session_id"] == "backup-session"
+    assert state_file.read_bytes() == primary_before
+    assert backup_file.read_bytes() == backup_before
+
+
+def test_supervise_record_launch_refuses_two_corrupt_state_copies(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _team(tmp_path)
+    state_file = s.dir / "supervisor-state.json"
+    backup_file = sup.supervisor_state_backup_path(state_file)
+    state_file.write_text('{"agents":', encoding="utf-8")
+    backup_file.write_text("[]", encoding="utf-8")
+    primary_before = state_file.read_bytes()
+    backup_before = backup_file.read_bytes()
+
+    rc = _run([
+        "supervise", "--record-launch", "--for", "worker", "--cli", "codex",
+        "--pid", "777", "--state-file", str(state_file), "--now", str(NOW),
+    ], tmp_path)
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    assert "supervisor state" in captured.err
+    assert state_file.read_bytes() == primary_before
+    assert backup_file.read_bytes() == backup_before
+
+
+def test_supervise_plan_refuses_two_corrupt_state_copies_without_actions(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    s = _team(tmp_path)
+    (s.dir / "supervisor.json").write_text(
+        json.dumps(_CONFIG), encoding="utf-8",
+    )
+    state_file = s.dir / "supervisor-state.json"
+    backup_file = sup.supervisor_state_backup_path(state_file)
+    state_file.write_text('{"agents":', encoding="utf-8")
+    backup_file.write_text("[]", encoding="utf-8")
+    primary_before = state_file.read_bytes()
+    backup_before = backup_file.read_bytes()
+
+    rc = _run([
+        "supervise", "--plan", "--state-file", str(state_file),
+        "--now", str(NOW),
+    ], tmp_path)
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    assert "supervisor state" in captured.err
+    assert state_file.read_bytes() == primary_before
+    assert backup_file.read_bytes() == backup_before
+
+
+def test_supervise_record_launch_creates_missing_state_with_atomic_codec(
+    tmp_path: Path,
+) -> None:
+    s = _team(tmp_path)
+    state_file = s.dir / "supervisor-state.json"
+
+    rc = _run([
+        "supervise", "--record-launch", "--for", "worker", "--cli", "codex",
+        "--pid", "777", "--state-file", str(state_file), "--now", str(NOW),
+    ], tmp_path)
+
+    assert rc == 0
+    state = sup.load_supervisor_state(state_file)
+    assert state["agents"]["worker"]["launcher_pid"] == 777
+
 def test_ps_state_helpers_are_atomic_backed_up_and_fail_closed() -> None:
     ps = sup.PS_TEMPLATE
     block = ps[ps.index("# region state-helpers"):ps.index("# endregion state-helpers")]
