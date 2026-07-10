@@ -2,7 +2,7 @@
 
 The single ``_lead_loop_authority`` source of truth (steal/armed/guard can never
 disagree), read-boundary ``expires_at`` normalization, the confirmed-dead-only
-lock-break, and the non-store timing resolver. cli-AGNOSTIC by construction.
+lease authority, and the non-store timing resolver. cli-AGNOSTIC by construction.
 """
 from __future__ import annotations
 
@@ -26,7 +26,6 @@ from agenttalk.store import (
 )
 
 ALIVE = os.getpid()
-DEAD = 2 ** 31 - 1
 
 
 def _store(tmp_path: Path, agents=("lead", "beta")) -> Store:
@@ -170,25 +169,21 @@ def test_config_gated_armed_unmanaged_stray_lease(tmp_path: Path) -> None:
     assert s.lead_loop_active_owner("beta") is None
 
 
-# --------------------------------------------- confirmed-dead-only lock-break
+# --------------------------------------------- persistent OS lock marker
 
-def test_lock_break_only_on_confirmed_dead(tmp_path: Path, monkeypatch) -> None:
-    # _break_stale_lock breaks ONLY a CONFIRMED-dead holder; an ALIVE or UNKNOWN
-    # holder is never broken (no fail-quiet breaking). pid==own is never broken.
+def test_lead_loop_lock_recovers_stale_owner_metadata(tmp_path: Path) -> None:
+    # The persistent marker is advisory only. A crashed process leaves stale JSON,
+    # but its OS lock is released automatically and the next holder can acquire.
     s = _store(tmp_path)
-    lock = s.state_dir / "probe.lock"
-    other_pid = DEAD  # a non-self pid value
-    for liveness, breakable in ((PROC_DEAD, True), (PROC_ALIVE, False),
-                                (PROC_UNKNOWN, False)):
-        lock.write_text(json.dumps({"pid": other_pid}), encoding="utf-8")
-        monkeypatch.setattr(store_mod, "_process_liveness", lambda pid, _v=liveness: _v)
-        assert s._break_stale_lock(lock) is breakable, liveness
-        if not breakable:
-            lock.unlink()  # clean up for the next iteration
-    # our own pid is never broken even if (hypothetically) reported dead
-    lock.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
-    monkeypatch.setattr(store_mod, "_process_liveness", lambda pid: PROC_DEAD)
-    assert s._break_stale_lock(lock) is False
+    lock = s.state_dir / "beta.lead-loop-lease.lock"
+    lock.write_text(json.dumps({"pid": 2 ** 31 - 1}), encoding="utf-8")
+
+    with s._lead_loop_lease_lock("beta"):
+        pass
+
+    marker = json.loads(lock.read_text(encoding="utf-8"))
+    assert marker["pid"] == os.getpid()
+    assert isinstance(marker["generation"], str)
 
 
 # --------------------------------------------- timing resolver (non-store module)

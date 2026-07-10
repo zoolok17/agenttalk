@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -137,6 +138,51 @@ def test_claim_no_double_launch_and_archive_is_request_id_checked(tmp_path: Path
     assert s.read_launch_request("lr-claim") is not None
     assert s.archive_launch_request("lr-claim", {"request_id": "lr-claim"}) is True
     assert s.read_launch_request("lr-claim") is None
+
+
+def test_launch_request_creation_is_exclusive_under_concurrency(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def create(prompt: str) -> None:
+        barrier.wait()
+        try:
+            s.write_launch_request(_marker("lr-exclusive", prompt=prompt))
+        except ValueError:
+            outcomes.append("duplicate")
+        else:
+            outcomes.append("created")
+
+    first = threading.Thread(target=create, args=("first",))
+    second = threading.Thread(target=create, args=("second",))
+    first.start()
+    second.start()
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert sorted(outcomes) == ["created", "duplicate"]
+    assert s.read_launch_request("lr-exclusive")["prompt"] in {"first", "second"}
+
+
+def test_launch_request_state_updates_cannot_regress(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    s.write_launch_request(_marker("lr-monotonic"))
+    assert s.claim_launch_request(
+        "lr-monotonic", claimed_by="supervisor", at_epoch=NOW,
+    )["state"] == eph.STATE_CLAIMED
+    assert s.update_launch_request(
+        "lr-monotonic", {"state": eph.STATE_REQUESTED},
+    )["state"] == eph.STATE_REQUESTED
+    assert s.update_launch_request(
+        "lr-monotonic", {"state": eph.STATE_LAUNCHED},
+    )["state"] == eph.STATE_LAUNCHED
+
+    with pytest.raises(ValueError, match="cannot transition launch request"):
+        s.update_launch_request("lr-monotonic", {"state": eph.STATE_CLAIMED})
+
+    assert s.read_launch_request("lr-monotonic")["state"] == eph.STATE_LAUNCHED
 
 
 def test_prepare_rosters_unique_identity_sends_request_and_completion_retires(tmp_path: Path) -> None:

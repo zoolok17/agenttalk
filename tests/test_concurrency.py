@@ -10,6 +10,7 @@ overwrite each other's <id>.json or drop a delivery (review M4b).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -19,7 +20,8 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk.store import PROC_DEAD, Store
+from agenttalk import store as store_mod
+from agenttalk.store import Store
 
 
 def test_concurrent_threads_send_no_loss(tmp_path: Path) -> None:
@@ -79,41 +81,183 @@ def test_concurrent_processes_send_no_loss(tmp_path: Path) -> None:
 
 # ----- M2: config.json read-modify-write must be serialized -------------
 
-def test_config_lock_times_out_when_held_by_live_pid(tmp_path: Path) -> None:
-    """A lock held by a LIVE pid is never stolen — acquisition waits and
-    then raises a clear timeout (no silent override of a live writer)."""
+def test_config_lock_times_out_while_another_holder_is_active(tmp_path: Path) -> None:
+    """Ownership comes from the held OS lock, not advisory marker contents."""
     s = Store(tmp_path)
     s.init(["a", "b"])
-    lockf = s.dir / "config.lock"
-    lockf.write_text(json.dumps({"pid": os.getpid(), "at": "x",
-                                 "root": str(s.root)}), encoding="utf-8")
+    entered = threading.Event()
+    release = threading.Event()
+    errors: list[Exception] = []
+
+    def hold() -> None:
+        try:
+            with s._config_lock(timeout=1.0, poll=0.01):
+                entered.set()
+                if not release.wait(5.0):
+                    raise TimeoutError("test did not release lock holder")
+        except Exception as e:  # noqa: BLE001 - asserted in the parent thread
+            errors.append(e)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert entered.wait(2.0)
     try:
         with pytest.raises(TimeoutError, match="config lock"):
-            with s._config_lock(timeout=0.3):
+            with s._config_lock(timeout=0.05, poll=0.005):
                 pass
     finally:
-        lockf.unlink()  # release the held lock we planted
+        release.set()
+        holder.join(timeout=2.0)
+    assert not holder.is_alive()
+    assert errors == []
 
 
-def test_config_lock_breaks_stale_dead_pid(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("raw", [b"", b"{}"])
+def test_config_lock_recovers_ownerless_or_zero_byte_marker(
+    tmp_path: Path, raw: bytes,
 ) -> None:
-    """A lock whose recorded pid is provably dead is broken atomically and
-    acquisition proceeds (a crashed writer must not wedge roster admin)."""
+    """A crashed creator cannot wedge the store before owner metadata lands."""
     s = Store(tmp_path)
     s.init(["a", "b"])
     lockf = s.dir / "config.lock"
-    lockf.write_text(json.dumps({"pid": 4242, "at": "x", "root": str(s.root)}),
-                     encoding="utf-8")
-    # _break_stale_lock decides via the tri-state _process_liveness (store.py:795), NOT the
-    # fail-quiet _process_alive - so mocking _process_alive was INEFFECTIVE for this path and
-    # the test relied on pid 4242 happening to be dead on the runner (the intermittent CI
-    # flake: it timed out wherever 4242 was a LIVE pid). Mock the function the code actually
-    # uses, forced DEFINITIVELY dead, so the stale-break is deterministic on every runner.
-    monkeypatch.setattr("agenttalk.store._process_liveness", lambda pid: PROC_DEAD)
-    with s._config_lock(timeout=2.0):
+    lockf.write_bytes(raw)
+
+    with s._config_lock(timeout=0.2, poll=0.005):
         pass
-    assert not lockf.exists()  # broken + released
+
+    data = json.loads(lockf.read_text(encoding="utf-8"))
+    assert data["pid"] == os.getpid()
+
+
+def test_config_lock_recovery_never_path_replaces_stale_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stale metadata is reusable without a read-then-replace ABA window."""
+    s = Store(tmp_path)
+    s.init(["a", "b"])
+    lockf = s.dir / "config.lock"
+    lockf.write_text(json.dumps({"pid": 4242, "at": "old"}), encoding="utf-8")
+    monkeypatch.setattr(store_mod, "_process_liveness", lambda _pid: store_mod.PROC_DEAD)
+
+    def forbid_replace(*_args, **_kwargs) -> None:
+        raise AssertionError("lock recovery must not replace a pathname generation")
+
+    monkeypatch.setattr(store_mod.os, "replace", forbid_replace)
+    with s._config_lock(timeout=0.2, poll=0.005):
+        pass
+
+
+def test_config_lock_release_failure_is_surfaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["a", "b"])
+
+    def fail_release(_fd: int) -> None:
+        raise OSError("injected unlock failure")
+
+    monkeypatch.setattr(store_mod, "_release_file_lock", fail_release)
+    with pytest.raises(OSError, match="release.*config lock"):
+        with s._config_lock(timeout=0.2):
+            pass
+
+
+def test_send_revalidates_recipient_after_concurrent_retirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["a", "b"])
+    prepared = threading.Event()
+    resume = threading.Event()
+    errors: list[Exception] = []
+    real_new_id = store_mod._new_id
+
+    def paused_new_id() -> str:
+        prepared.set()
+        if not resume.wait(5.0):
+            raise TimeoutError("test did not resume sender")
+        return real_new_id()
+
+    monkeypatch.setattr(store_mod, "_new_id", paused_new_id)
+
+    def send() -> None:
+        try:
+            s.send(sender="a", recipient="b", body="must not land")
+        except Exception as e:  # noqa: BLE001 - asserted in the parent thread
+            errors.append(e)
+
+    sender = threading.Thread(target=send)
+    sender.start()
+    assert prepared.wait(2.0)
+    s.retire_agent("b")
+    resume.set()
+    sender.join(timeout=2.0)
+
+    assert not sender.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert "retired" in str(errors[0])
+    assert list(s.messages_dir.glob("*.json")) == []
+
+
+def test_wait_marker_clear_is_serialized_against_new_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["a", "b"])
+    s.write_waiting("a", {"agent": "a", "wait_token": "old", "pid": 1})
+    clear_read = threading.Event()
+    resume_clear = threading.Event()
+    writer_attempted = threading.Event()
+    clear_result: list[bool] = []
+    errors: list[Exception] = []
+    real_read = s.read_waiting
+    real_waiting_lock = s._waiting_lock
+
+    def paused_read(agent: str) -> dict | None:
+        marker = real_read(agent)
+        if threading.current_thread().name == "clear-old":
+            clear_read.set()
+            if not resume_clear.wait(5.0):
+                raise TimeoutError("test did not resume marker clear")
+        return marker
+
+    @contextlib.contextmanager
+    def observed_waiting_lock(agent: str):
+        if threading.current_thread().name == "write-new":
+            writer_attempted.set()
+        with real_waiting_lock(agent):
+            yield
+
+    monkeypatch.setattr(s, "read_waiting", paused_read)
+    monkeypatch.setattr(s, "_waiting_lock", observed_waiting_lock)
+
+    def clear_old() -> None:
+        try:
+            clear_result.append(s.clear_waiting_if_token("a", "old"))
+        except Exception as e:  # noqa: BLE001 - asserted in the parent thread
+            errors.append(e)
+
+    def write_new() -> None:
+        try:
+            s.write_waiting("a", {"agent": "a", "wait_token": "new", "pid": 2})
+        except Exception as e:  # noqa: BLE001 - asserted in the parent thread
+            errors.append(e)
+
+    clearer = threading.Thread(target=clear_old, name="clear-old")
+    writer = threading.Thread(target=write_new, name="write-new")
+    clearer.start()
+    assert clear_read.wait(2.0)
+    writer.start()
+    assert writer_attempted.wait(2.0)
+    resume_clear.set()
+    clearer.join(timeout=2.0)
+    writer.join(timeout=2.0)
+
+    assert not clearer.is_alive() and not writer.is_alive()
+    assert errors == []
+    assert clear_result == [True]
+    assert s.read_waiting("a")["wait_token"] == "new"
 
 
 def test_concurrent_add_agent_no_lost_update(tmp_path: Path) -> None:
@@ -142,4 +286,7 @@ def test_concurrent_add_agent_no_lost_update(tmp_path: Path) -> None:
     assert not errors, errors
     agents = s.load_config()["agents"]
     assert "c" in agents and "d" in agents  # neither add lost
-    assert not (s.dir / "config.lock").exists()  # lock released
+    # The marker persists; OS ownership, not pathname existence, is the lock.
+    assert (s.dir / "config.lock").is_file()
+    with s._config_lock(timeout=0.2):
+        pass

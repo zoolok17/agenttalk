@@ -58,6 +58,15 @@ def test_init_with_force_overwrites_config(tmp_path: Path) -> None:
     assert cfg2["session_id"] != cfg1["session_id"] or cfg2["created_at"] != cfg1["created_at"]
 
 
+def test_load_config_rejects_non_object_json_root(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.dir.mkdir(parents=True)
+    s.config_path.write_text("[]", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="root must be a JSON object"):
+        s.load_config()
+
+
 # --------------------------------------------------------------------- send
 
 def test_send_writes_a_message_file(store: Store) -> None:

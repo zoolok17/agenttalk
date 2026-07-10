@@ -248,18 +248,32 @@ def test_send_operator_answer_atomic_fail_closed_paths(
 ) -> None:
     s = _store(tmp_path)
     _operator_question(s, rid="esc-lock")
-    lockf = s.dir / "config.lock"
-    lockf.write_text(
-        json.dumps({"pid": os.getpid(), "at": "x", "root": str(s.root)}),
-        encoding="utf-8",
-    )
+    entered = threading.Event()
+    release = threading.Event()
+    holder_errors: list[Exception] = []
+
+    def hold_config_lock() -> None:
+        try:
+            with s._config_lock():
+                entered.set()
+                if not release.wait(5.0):
+                    raise TimeoutError("test did not release config lock")
+        except Exception as e:  # noqa: BLE001 - asserted in the parent thread
+            holder_errors.append(e)
+
+    holder = threading.Thread(target=hold_config_lock)
+    holder.start()
+    assert entered.wait(2.0)
     try:
         locked = s.send_operator_answer_atomic(
             actor="lead", request_id="esc-lock", body="blocked",
             lock_timeout=0.01,
         )
     finally:
-        lockf.unlink()
+        release.set()
+        holder.join(timeout=2.0)
+    assert not holder.is_alive()
+    assert holder_errors == []
     assert locked.ok is False
     assert locked.denial_code == "operator_answer_lock_unavailable"
     assert _operator_answers(s, "esc-lock") == []
@@ -1214,6 +1228,30 @@ def test_drain_quarantines_invalid_active_intent_before_claim(tmp_path: Path) ->
     s.reset()
     assert payloads[0].exists()
     assert (sink / f"{payloads[0].name}.meta.json").exists()
+
+
+def test_drain_contains_malformed_attempts_and_continues_other_intents(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    poisoned = s.write_intent("send", {"target": "dev", "body": "poisoned"})
+    healthy = s.write_intent("send", {"target": "dev", "body": "healthy"})
+    poisoned_record = s.read_intent(poisoned["intent_id"])
+    healthy_record = s.read_intent(healthy["intent_id"])
+    poisoned_record["attempts"] = {"not": "an integer"}
+    poisoned_record["created_at"] = "2026-07-10T00:00:00Z"
+    healthy_record["created_at"] = "2026-07-10T00:00:01Z"
+    _write_raw_intent(s, poisoned_record)
+    _write_raw_intent(s, healthy_record)
+
+    summary = intents.drain_intents(s, pid=123, max_per_tick=2)
+
+    assert summary["examined"] == 2
+    assert summary["claimed"] == 1
+    assert summary["failed"] == 1
+    assert summary["applied"] == 1
+    assert s.read_intent(poisoned["intent_id"])["state"] == Store.INTENT_FAILED
+    assert s.read_intent(poisoned["intent_id"])["code"] == "invalid_intent_record"
+    assert s.read_intent(healthy["intent_id"])["state"] == Store.INTENT_APPLIED
+    assert [m.body for m in s.messages_for("dev")] == ["healthy"]
 
 
 def test_drain_kill_switch_active_short_circuits_without_mutation(tmp_path: Path) -> None:

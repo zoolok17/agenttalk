@@ -1142,8 +1142,20 @@ def drain_intents(store: Store, *, pid: int, pid_start: object = None,
     candidates.sort(key=lambda r: str(r.get("created_at") or ""))
     for rec in candidates[: max(0, int(max_per_tick))]:
         summary["examined"] += 1
-        claimed = store.claim_intent(rec["intent_id"], pid=pid,
-                                     pid_start=pid_start, now_epoch=now)
+        try:
+            claimed = store.claim_intent(rec["intent_id"], pid=pid,
+                                         pid_start=pid_start, now_epoch=now)
+        except (TypeError, ValueError, OverflowError) as e:
+            store.mark_intent_terminal(
+                rec["intent_id"],
+                state=Store.INTENT_FAILED,
+                code="invalid_intent_record",
+                error=f"{type(e).__name__}: {e}"[:500],
+            )
+            summary["failed"] += 1
+            if on_note is not None:
+                on_note(f"intent {rec['intent_id']}: {Store.INTENT_FAILED}")
+            continue
         if claimed is None:
             summary["skipped"] += 1
             continue

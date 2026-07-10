@@ -17,6 +17,7 @@ the invariant ``messages_for`` / dashboard rendering relies on.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import math
@@ -39,6 +40,11 @@ from agenttalk import avatars as _avatars
 from agenttalk.redaction import normalize_child_output_tail
 from agenttalk import signing as _signing
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 DIRNAME = ".agenttalk"
 _ID_ALPHABET = string.ascii_letters + string.digits
 # Canonical generated-message-id shape, built FROM _ID_ALPHABET so the
@@ -60,6 +66,73 @@ def _safe_int(value: object) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+_LOCK_BUSY_ERRNOS = frozenset({errno.EACCES, errno.EAGAIN, errno.EDEADLK})
+_LOCK_METADATA_BYTES = 4096
+
+
+def _ensure_lock_byte(fd: int) -> None:
+    """Make byte zero lockable without relying on owner metadata."""
+    if os.fstat(fd).st_size == 0:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, b"\0")
+        os.fsync(fd)
+
+
+def _try_acquire_file_lock(fd: int) -> bool:
+    """Try one non-blocking cross-platform exclusive byte/file lock."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    try:
+        if os.name == "nt":
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        if e.errno in _LOCK_BUSY_ERRNOS:
+            return False
+        raise
+    return True
+
+
+def _release_file_lock(fd: int) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    if os.name == "nt":
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _write_all(fd: int, raw: bytes) -> None:
+    remaining = memoryview(raw)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise OSError("short file write")
+        remaining = remaining[written:]
+
+
+def _write_lock_metadata(fd: int, payload: dict) -> None:
+    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if len(raw) > _LOCK_METADATA_BYTES:
+        raise OSError("lock metadata exceeds fixed record size")
+    os.lseek(fd, 0, os.SEEK_SET)
+    _write_all(fd, raw.ljust(_LOCK_METADATA_BYTES, b" "))
+
+
+def _write_text_exclusive(path: Path, text: str) -> None:
+    """Durably create ``path`` once; never overwrite an existing generation."""
+    fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        _write_all(fd, text.encode("utf-8"))
+        os.fsync(fd)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    os.close(fd)
 
 # Known message kinds. Receivers should silently skip anything else
 # rather than letting an unfamiliar kind smuggle through to the LLM
@@ -714,6 +787,10 @@ class Store:
                 f"agenttalk not initialized in {self.root}. Run `agenttalk init` first."
             )
         cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
+        if not isinstance(cfg, dict):
+            raise ValueError(
+                f"corrupt config at {self.config_path}: root must be a JSON object"
+            )
         # Validate roster on load so a malformed config can't smuggle
         # unsafe names through to downstream filename interpolation.
         agents = cfg.get("agents")
@@ -825,102 +902,66 @@ class Store:
     # ops both read the same base and the later writer silently clobbers the
     # earlier's change (a dropped retire/rename can even re-open a name #19
     # promises is permanent). There is no lock server, so serialize those
-    # critical sections with an O_EXCL sidecar lock file — portable on Windows
-    # and POSIX. Per-agent cursor/threadstate/heartbeat writes are deliberately
+    # critical sections with a cross-platform OS lock on a persistent sidecar.
+    # Per-agent cursor/threadstate/heartbeat writes are deliberately
     # NOT locked: they are single-writer under the documented one-window-per-
     # agent model; only shared config.json needs this.
-
-    def _read_lock_pid(self, lock: Path) -> int | None:
-        try:
-            data = json.loads(lock.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-        pid = data.get("pid") if isinstance(data, dict) else None
-        return pid if isinstance(pid, int) else None
-
-    def _break_stale_lock(self, lock: Path) -> bool:
-        """Break a lock held by a CONFIRMED-dead pid; return True if broken.
-
-        The claim is ATOMIC (``os.replace`` the lock onto a per-pid sidecar):
-        only one racing stealer wins the rename, the loser's replace raises
-        and it re-loops, so two processes can never both break the same lock
-        and then both enter the critical section. A lock that is unreadable,
-        garbage, our own pid, or held by an ALIVE *or* UNKNOWN pid is never
-        broken — we wait out the timeout instead (no mtime-only breaking). Uses
-        the tri-state :func:`_process_liveness`, NOT the fail-quiet
-        :func:`_process_alive`: an uncertain probe (access-denied / exception)
-        must NOT break a lock whose holder might still be alive (WP1, the lock
-        analogue of the no-false-steal rule)."""
-        pid = self._read_lock_pid(lock)
-        if pid is None or pid == os.getpid() or _process_liveness(pid) != PROC_DEAD:
-            return False
-        claimed = lock.with_name(f"{lock.name}.stale.{os.getpid()}")
-        try:
-            os.replace(str(lock), str(claimed))
-        except OSError:
-            return False  # lock vanished or another stealer won the claim
-        try:
-            os.unlink(str(claimed))
-        except OSError:
-            pass
-        return True
 
     @contextlib.contextmanager
     def _exclusive_lock(self, lock: Path, *, timeout: float = 10.0,
                         poll: float = 0.05, what: str = "lock"):
-        """Hold an exclusive O_EXCL sidecar lock across a read-modify-write.
+        """Hold an exclusive OS lock across a read-modify-write.
 
-        Portable on Windows + POSIX (atomic create); breaks a lock held by a
-        provably-dead pid (never a live one); times out otherwise. NOT re-entrant.
-        Shared by ``_config_lock`` (config.json) and the lead-loop lease lock so
-        both get the same battle-tested stale-break behavior."""
+        The sidecar path persists and contains advisory owner metadata, but file
+        existence and contents confer no ownership. The OS releases the lock when
+        a process exits, so zero-byte/ownerless files are recoverable and stale
+        pathname replacement cannot steal a newer generation. NOT re-entrant.
+        """
         lock.parent.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + timeout
         fd: int | None = None
-        while True:
-            try:
-                fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                break
-            except (FileExistsError, PermissionError) as e:
-                # FileExistsError: a holder exists — break it iff its pid is dead.
-                # PermissionError (Windows only): the lock file is in DELETE-PENDING
-                # state (a peer just unlink()ed it and the last handle is still
-                # closing), which makes O_EXCL create raise PermissionError, NOT
-                # FileExistsError. It clears in microseconds; the RELEASE side already
-                # documents+retries the same Windows behavior. Treat it as transient
-                # and poll to the SAME deadline rather than surfacing a spurious failure
-                # (else a disposition/config RMW can silently fail under contention).
-                if isinstance(e, FileExistsError) and self._break_stale_lock(lock):
-                    continue  # broke a dead holder — retry create immediately
+        acquired = False
+        try:
+            while fd is None:
+                try:
+                    fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
+                except PermissionError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"could not open the {what} at {lock} within {timeout:g}s"
+                        ) from None
+                    time.sleep(poll)
+            _ensure_lock_byte(fd)
+            while not _try_acquire_file_lock(fd):
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
-                        f"could not acquire the {what} at {lock} within {timeout:g}s. "
-                        f"If no agent is running, remove the stale lock file."
+                        f"could not acquire the {what} at {lock} within {timeout:g}s"
                     ) from None
                 time.sleep(poll)
-        try:
-            try:
-                os.write(fd, json.dumps({
-                    "pid": os.getpid(), "at": _now_iso(), "root": str(self.root),
-                }).encode("utf-8"))
-            finally:
-                os.close(fd)
+            acquired = True
+            _write_lock_metadata(fd, {
+                "pid": os.getpid(),
+                "generation": uuid.uuid4().hex,
+                "at": _now_iso(),
+                "root": str(self.root)[:512],
+            })
             yield
         finally:
-            # Release RELIABLY. On Windows a concurrent reader (a peer's
-            # _break_stale_lock reading the pid) holds the lock file open for a
-            # microsecond, and os.unlink of an open file raises PermissionError. If
-            # we swallowed that, the lock would orphan with OUR (live) pid - which no
-            # waiter can break (live pid) - livelocking them to the timeout. Retry
-            # briefly so a colliding read-open never strands the lock.
-            for _ in range(100):
+            release_error: OSError | None = None
+            if acquired and fd is not None:
                 try:
-                    lock.unlink()
-                    break
-                except FileNotFoundError:
-                    break
-                except OSError:
-                    time.sleep(0.01)
+                    _release_file_lock(fd)
+                except OSError as e:
+                    release_error = e
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError as e:
+                    release_error = release_error or e
+            if release_error is not None:
+                raise OSError(
+                    f"could not release the {what} at {lock}: {release_error}"
+                ) from release_error
 
     def _config_lock(self, *, timeout: float = 10.0, poll: float = 0.05):
         """Hold an exclusive lock across a config read-modify-write."""
@@ -1878,6 +1919,44 @@ class Store:
             return None
         return cfg.get("project_id")
 
+    def _validate_send_principals(
+        self,
+        cfg: dict,
+        *,
+        sender: str,
+        recipient: str,
+        allow_reserved_sender: bool,
+    ) -> None:
+        agents = set(cfg.get("agents", []))
+        principals = _bus_principals(list(agents))
+        retired = set(self._retired_names(cfg))
+        if sender in _avatars.RESERVED_PRINCIPALS and not allow_reserved_sender:
+            raise ValueError(
+                f"sender '{sender}' is a reserved bus principal and can only be "
+                "used by the lead-chat/operator-answer authority path"
+            )
+        sender_allowed = sender in agents or (
+            allow_reserved_sender and sender in _avatars.RESERVED_PRINCIPALS
+        )
+        if agents and not sender_allowed:
+            if sender in retired:
+                raise ValueError(
+                    f"sender '{sender}' is retired (a tombstone) and cannot "
+                    "send; tombstones are permanent (#19). See `agenttalk roster`."
+                )
+            raise ValueError(
+                f"sender '{sender}' not in registered bus principals {sorted(principals)}"
+            )
+        if agents and recipient not in principals:
+            if recipient in retired:
+                raise ValueError(
+                    f"recipient '{recipient}' is retired (a tombstone) and cannot "
+                    "receive new messages (#19). See `agenttalk roster`."
+                )
+            raise ValueError(
+                f"recipient '{recipient}' not in registered bus principals {sorted(principals)}"
+            )
+
     def send(
         self,
         *,
@@ -1889,38 +1968,17 @@ class Store:
         meta: dict | None = None,
         sign: bool | None = None,
         _allow_reserved_sender: bool = False,
+        _config_locked: bool = False,
     ) -> Message:
         if not self.initialized():
             raise FileNotFoundError("agenttalk not initialized; run `agenttalk init`.")
         cfg = self.load_config()
-        agents = set(cfg.get("agents", []))
-        principals = _bus_principals(list(agents))
-        # A retired identity (#19) is removed from the ACTIVE roster, so it
-        # already fails this membership check — but give it a tombstone-specific
-        # message rather than a confusing "not in registered agents" (FR-004).
-        retired = set(self._retired_names(cfg))
-        if sender in _avatars.RESERVED_PRINCIPALS and not _allow_reserved_sender:
-            raise ValueError(
-                f"sender '{sender}' is a reserved bus principal and can only be "
-                "used by the lead-chat/operator-answer authority path"
-            )
-        sender_allowed = sender in agents or (
-            _allow_reserved_sender and sender in _avatars.RESERVED_PRINCIPALS
+        self._validate_send_principals(
+            cfg,
+            sender=sender,
+            recipient=recipient,
+            allow_reserved_sender=_allow_reserved_sender,
         )
-        if agents and not sender_allowed:
-            if sender in retired:
-                raise ValueError(
-                    f"sender '{sender}' is retired (a tombstone) and cannot "
-                    f"send; tombstones are permanent (#19). See `agenttalk roster`."
-                )
-            raise ValueError(f"sender '{sender}' not in registered bus principals {sorted(principals)}")
-        if agents and recipient not in principals:
-            if recipient in retired:
-                raise ValueError(
-                    f"recipient '{recipient}' is retired (a tombstone) and cannot "
-                    f"receive new messages (#19). See `agenttalk roster`."
-                )
-            raise ValueError(f"recipient '{recipient}' not in registered bus principals {sorted(principals)}")
         # Reject unknown kinds at WRITE time so the sender sees an
         # immediate error rather than a silent receive-side skip.
         # Without this, `agenttalk send --kind typo` would exit 0 +
@@ -1965,7 +2023,19 @@ class Store:
             )
             msg = Message.from_dict(signed_dict)
         path = self.messages_dir / f"{msg.id}.json"
-        _atomic_write_text(path, json.dumps(msg.to_dict(), indent=2, ensure_ascii=False))
+        lock = contextlib.nullcontext() if _config_locked else self._config_lock()
+        with lock:
+            # Retirement and append share this lock. Revalidate at the last
+            # possible point so a sender/recipient cannot retire after the
+            # optimistic check above and still receive a new message.
+            cfg = self.load_config()
+            self._validate_send_principals(
+                cfg,
+                sender=sender,
+                recipient=recipient,
+                allow_reserved_sender=_allow_reserved_sender,
+            )
+            _atomic_write_text(path, json.dumps(msg.to_dict(), indent=2, ensure_ascii=False))
         return msg
 
     def send_operator_answer_atomic(
@@ -2026,6 +2096,7 @@ class Store:
                         body=body,
                         meta=meta,
                         _allow_reserved_sender=actor in _avatars.RESERVED_PRINCIPALS,
+                        _config_locked=True,
                     )
                 except (OSError, ValueError) as e:
                     return OperatorAnswerSendResult(
@@ -2846,6 +2917,20 @@ class Store:
     # left behind by a crashed shell is expected and handled at read
     # time (status cross-checks heartbeat age + the recorded deadline).
 
+    def _waiting_lock(self, agent: str):
+        name = validate_agent_name(agent)
+        return self._exclusive_lock(
+            self.state_dir / f"{name}.waiting.lock",
+            what=f"waiting marker lock for {name}",
+        )
+
+    def _unlink_waiting_locked(self, agent: str) -> bool:
+        try:
+            (self.state_dir / f"{agent}.waiting").unlink()
+        except FileNotFoundError:
+            return False
+        return True
+
     def _waiting_superseded_path(self, agent: str, wait_token: str) -> Path | None:
         try:
             validate_agent_name(agent)
@@ -2895,11 +2980,12 @@ class Store:
         non-fatal since this is observability-only. (Shared write_text, with the
         in-sandbox direct-write fallback - see _atomic.write_text.)
         """
-        p = self.state_dir / f"{agent}.waiting"
-        previous = self.read_waiting(agent)
-        if isinstance(previous, dict):
-            self._mark_waiting_superseded(agent, previous, info)
-        _atomic_write_text(p, json.dumps(info, ensure_ascii=False))
+        with self._waiting_lock(agent):
+            p = self.state_dir / f"{agent}.waiting"
+            previous = self.read_waiting(agent)
+            if isinstance(previous, dict):
+                self._mark_waiting_superseded(agent, previous, info)
+            _atomic_write_text(p, json.dumps(info, ensure_ascii=False))
 
     def read_waiting(self, agent: str) -> dict | None:
         """Return the parsed waiting record, or None if absent/corrupt.
@@ -2967,11 +3053,9 @@ class Store:
 
     def clear_waiting(self, agent: str) -> None:
         """Remove the waiting marker if present. Best-effort, never raises."""
-        p = self.state_dir / f"{agent}.waiting"
         try:
-            p.unlink()
-        except FileNotFoundError:
-            pass
+            with self._waiting_lock(agent):
+                self._unlink_waiting_locked(agent)
         except OSError:
             pass
 
@@ -2982,13 +3066,11 @@ class Store:
         that superseded it. Observational only; returns whether it unlinked.
         """
         try:
-            marker = self.read_waiting(agent)
-            if not marker or marker.get("wait_token") != wait_token:
-                return False
-            (self.state_dir / f"{agent}.waiting").unlink()
-            return True
-        except FileNotFoundError:
-            return False
+            with self._waiting_lock(agent):
+                marker = self.read_waiting(agent)
+                if not marker or marker.get("wait_token") != wait_token:
+                    return False
+                return self._unlink_waiting_locked(agent)
         except OSError:
             return False
 
@@ -3357,7 +3439,7 @@ class Store:
     def _lead_loop_lease_lock(self, agent: str):
         """Exclusive per-agent lock serializing acquire/renew/release/steal so the
         read-decide-write is ATOMIC - two contenders can never both 'acquire' an
-        empty lease (reviewer-1 blocker). Reuses the O_EXCL stale-break machinery."""
+        empty lease (reviewer-1 blocker). Reuses the cross-platform OS lock."""
         return self._exclusive_lock(
             self.state_dir / f"{validate_agent_name(agent)}.lead-loop-lease.lock",
             what="lead-loop lease lock")
@@ -3644,16 +3726,16 @@ class Store:
         handled separately) or our own pid. Best-effort, never raises.
         """
         try:
-            marker = self.read_waiting(agent)
-            if not marker:
-                return False
-            pid = marker.get("pid")
-            if not isinstance(pid, int) or pid == self_pid:
-                return False
-            if _process_alive(pid):
-                return False
-            self.clear_waiting(agent)
-            return True
+            with self._waiting_lock(agent):
+                marker = self.read_waiting(agent)
+                if not marker:
+                    return False
+                pid = marker.get("pid")
+                if not isinstance(pid, int) or pid == self_pid:
+                    return False
+                if _process_alive(pid):
+                    return False
+                return self._unlink_waiting_locked(agent)
         except Exception:  # noqa: BLE001 — observability only, never crash a wait
             return False
 
@@ -3922,15 +4004,23 @@ class Store:
         return self.launch_requests_dir / f"{request_id}.json"
 
     def write_launch_request(self, payload: dict) -> None:
-        """Atomically write a queued ephemeral launch request marker."""
+        """Create one launch request without overwriting an existing id."""
         from agenttalk import ephemeral as _eph
         rid = payload.get("request_id") if isinstance(payload, dict) else None
         if not _eph.is_safe_id(rid):
             raise ValueError(f"unsafe launch request_id {rid!r}")
         data = dict(payload)
         data.setdefault("state", _eph.STATE_QUEUED)
-        _atomic_write_text(self._launch_request_path(rid),
-                           json.dumps(data, indent=2, ensure_ascii=False))
+        self._launch_state_rank(data["state"])
+        with self._config_lock():
+            path = self._launch_request_path(rid)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                _write_text_exclusive(
+                    path, json.dumps(data, indent=2, ensure_ascii=False),
+                )
+            except FileExistsError:
+                raise ValueError(f"launch request {rid!r} already exists") from None
 
     def read_launch_request(self, request_id: str) -> dict | None:
         """Return one launch-request marker, or None if absent/corrupt."""
@@ -3984,13 +4074,42 @@ class Store:
                                json.dumps(marker, indent=2, ensure_ascii=False))
             return marker
 
+    @staticmethod
+    def _launch_state_rank(state: object) -> int:
+        from agenttalk import ephemeral as _eph
+        if not isinstance(state, str):
+            raise ValueError(f"invalid launch request state {state!r}")
+        active = (
+            _eph.STATE_QUEUED,
+            _eph.STATE_CLAIMED,
+            _eph.STATE_REQUESTED,
+            _eph.STATE_LAUNCHED,
+        )
+        if state in active:
+            return active.index(state)
+        if state in _eph.TERMINAL_STATES:
+            return len(active)
+        raise ValueError(f"invalid launch request state {state!r}")
+
     def update_launch_request(self, request_id: str, updates: dict) -> dict | None:
-        """Request-id checked marker update. None means absent/superseded."""
+        """Request-id checked, monotonic marker update."""
         with self._config_lock():
             marker = self.read_launch_request(request_id)
             if not marker:
                 return None
-            marker.update(dict(updates))
+            changes = dict(updates)
+            if changes.get("request_id", request_id) != request_id:
+                raise ValueError("launch request_id is immutable")
+            current_state = marker.get("state", "queued")
+            next_state = changes.get("state", current_state)
+            current_rank = self._launch_state_rank(current_state)
+            next_rank = self._launch_state_rank(next_state)
+            if next_state != current_state and next_rank <= current_rank:
+                raise ValueError(
+                    f"cannot transition launch request {request_id!r} "
+                    f"from {current_state!r} to {next_state!r}"
+                )
+            marker.update(changes)
             _atomic_write_text(self._launch_request_path(request_id),
                                json.dumps(marker, indent=2, ensure_ascii=False))
             return marker
