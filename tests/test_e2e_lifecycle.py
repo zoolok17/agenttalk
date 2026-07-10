@@ -48,8 +48,6 @@ def _commit(root: Path, rel: str, text: str) -> str:
 
 
 def _run(argv: list[str], root: Path) -> int:
-    if argv[:2] == ["lane", "assign"] and "--no-worktree" not in argv and "--worktrees-root" not in argv:
-        argv = [*argv, "--no-worktree", "--worktree-waiver-reason", "legacy e2e test"]
     return cli.main(["--root", str(root), *argv])
 
 
@@ -62,9 +60,10 @@ def test_e2e_lifecycle(tmp_path: Path, capsys) -> None:
     _git(root, "init", "-q")
     _git(root, "config", "user.email", "t@t")
     _git(root, "config", "user.name", "t")
-    (root / ".gitignore").write_text(".agenttalk/\n", encoding="utf-8")
+    (root / ".gitignore").write_text(".agenttalk/\n.worktrees/\n", encoding="utf-8")
     base = _commit(root, "src/core/a.py", "base\n")
     br = _git(root, "branch", "--show-current").strip()
+    worktrees_root = root / ".worktrees"
 
     s = Store(root)
     s.init(["lead", "dev", "dev2"])
@@ -100,10 +99,12 @@ def test_e2e_lifecycle(tmp_path: Path, capsys) -> None:
     assert _json_out(capsys)["verdict"] == "GO"
 
     # ---- LANE owned-path deliver: GO writes a durable artifact (preserved by reset)
-    head1 = _commit(root, "src/core/a.py", "base\nwork\n")
     assert _run(["lane", "assign", "--id", "lwork", "--from", "lead", "--assignee", "dev",
-                 "--domain", "core", "--base", base, "--target", br, "--path", "src/core"], root) == 0
+                 "--domain", "core", "--base", base, "--target", br, "--path", "src/core",
+                 "--worktrees-root", str(worktrees_root)], root) == 0
     capsys.readouterr()
+    lwork = lanes.load_lanes(s)["lanes"]["lwork"]
+    head1 = _commit(Path(lwork["worktree_path"]), "src/core/a.py", "base\nwork\n")
     # --gate-scope release: the required `ci` gate is release-scoped + now green, so the
     # lane's gate check is satisfied (a default lane:<id> scope would correctly HOLD on
     # the present-but-wrong-scope required gate - that fail-closed path is unit-tested).
@@ -111,14 +112,19 @@ def test_e2e_lifecycle(tmp_path: Path, capsys) -> None:
                  "--gate-scope", "release"], root) == 0
     arts = list((s.dir / "lane-deliveries").glob("lwork-*.json"))
     assert len(arts) == 1 and json.loads(arts[0].read_text(encoding="utf-8"))["verdict"] == "GO"
+    artifact = arts[0]
+    _git(root, "merge", "-q", "--ff-only", head1)
+    assert _git(root, "rev-parse", "HEAD").strip() == head1
 
     # ---- LANE shared approval (D-11: ALL matching entries must approve):
     # The touched path shared/secret.sql matches BOTH shared/** (dev2) and shared/secret.sql
     # (dev); under all-matching, BOTH approvers must sign off (no winner-picking bypass).
-    head2 = _commit(root, "shared/secret.sql", "create table t;\n")
     assert _run(["lane", "assign", "--id", "lsh", "--from", "lead", "--assignee", "dev",
-                 "--domain", "core", "--base", head1, "--target", br, "--path", "shared"], root) == 0
+                 "--domain", "core", "--base", head1, "--target", br, "--path", "shared",
+                 "--worktrees-root", str(worktrees_root)], root) == 0
     capsys.readouterr()
+    lsh = lanes.load_lanes(s)["lanes"]["lsh"]
+    head2 = _commit(Path(lsh["worktree_path"]), "shared/secret.sql", "create table t;\n")
     # missing approval -> HOLD
     assert _run(["lane", "check", "--id", "lsh", "--head", head2, "--gate-scope", "release", "--json"], root) == 3
     assert "shared_path_missing_approval" in {h["code"] for h in _json_out(capsys)["holds"]}
@@ -178,6 +184,11 @@ def test_e2e_lifecycle(tmp_path: Path, capsys) -> None:
     # the preserved gate state still reads back GO after reset
     assert _run(["gate", "check", "--release", "--json"], root) == 0
     assert _json_out(capsys)["verdict"] == "GO"
+    assert _run(["close", "open", "--id", "e2e-release", "--from", "lead",
+                 "--scope", "release", "--revision", head1,
+                 "--lane-artifact", str(artifact)], root) == 0
+    capsys.readouterr()
+    assert _run(["close", "check", "--id", "e2e-release"], root) == 0
 
 
 def test_e2e_worktree_isolation_negative_paths(tmp_path: Path, capsys) -> None:
