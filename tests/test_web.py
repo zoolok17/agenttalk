@@ -1536,6 +1536,9 @@ def test_actions_off_has_no_session_and_post_stays_405(tmp_path: Path) -> None:
 
 def test_valid_action_post_appends_exactly_one_intent_file(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
+    # Keep one-time persistent lock setup outside the endpoint mutation window.
+    with s._config_lock():
+        pass
     before = _tree_hashes(s.root)
     srv, _t, base = _serve(s, enable_actions=True)
     try:
