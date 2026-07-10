@@ -11,6 +11,7 @@ import pytest
 
 from agenttalk import avatars
 from agenttalk import cli
+from agenttalk import health as hm
 from agenttalk.store import (
     ACTIVE_WITHIN_SECONDS,
     Store,
@@ -285,6 +286,22 @@ def test_agent_active_invalid_name_is_false_not_path_probe(tmp_path: Path) -> No
     s.init(["codex"])
     assert s.agent_active("../evil") is False
     assert s.agent_active("a/b") is False
+
+
+def test_agent_active_bounds_future_heartbeat_skew(tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    store.init(["codex"])
+    store.write_heartbeat("codex")
+    heartbeat_epoch = store.read_heartbeat("codex").timestamp()
+
+    assert store.agent_active(
+        "codex",
+        now=heartbeat_epoch - hm.DEFAULT_HEARTBEAT_SKEW_SECONDS - 1.0,
+    ) is False
+    assert store.agent_active(
+        "codex",
+        now=heartbeat_epoch - hm.DEFAULT_HEARTBEAT_SKEW_SECONDS,
+    ) is True
 
 
 def test_roster_add_unique_rejects_unsafe_name_before_probe(tmp_path: Path) -> None:

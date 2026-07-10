@@ -4533,30 +4533,39 @@ def test_api_state_no_body_content_sentinel(tmp_path: Path) -> None:
 
 def test_api_state_verdict_latest_wins(tmp_path: Path) -> None:
     """0.58.0 §3b: the thread verdict is the LATEST decision on the rid; a
-    proposal-response verdict is emitted only for an allowlisted status."""
+    malformed legacy proposal-response does not emit a verdict."""
     s = _make_store(tmp_path)
-    # review-results: latest-wins (approved then changes_requested).
+    # Current review-result statuses are validated at Store.send: latest wins.
     s.send(sender="alpha", recipient="beta", kind="review-request",
            subject="r", body="please review", meta={"request_id": "rid-v"})
     s.send(sender="beta", recipient="alpha", kind="review-result",
            subject="v1", body="ok", meta={"request_id": "rid-v", "status": "approved"})
     s.send(sender="beta", recipient="alpha", kind="review-result",
            subject="v2", body="wait", meta={"request_id": "rid-v",
-                                            "status": "changes_requested"})
-    # proposal-response: allowlisted status accepted -> verdict; unknown -> omit.
+                                            "status": "rejected"})
+    # A current accepted response emits a verdict. Seed malformed legacy history
+    # directly because the strict Store.send path correctly refuses status=maybe.
     s.send(sender="alpha", recipient="beta", kind="proposal",
            subject="p", body="do X", meta={"request_id": "rid-p"})
     s.send(sender="beta", recipient="alpha", kind="proposal-response",
            subject="pr", body="sure", meta={"request_id": "rid-p", "status": "accepted"})
     s.send(sender="alpha", recipient="beta", kind="proposal",
            subject="p2", body="do Y", meta={"request_id": "rid-q"})
-    s.send(sender="beta", recipient="alpha", kind="proposal-response",
-           subject="pr2", body="hmm", meta={"request_id": "rid-q", "status": "maybe"})
+    _hand_write_message(s, {
+        "id": "20990101-000000-000000-MAYB",
+        "ts": "2099-01-01T00:00:00Z",
+        "from": "beta",
+        "to": "alpha",
+        "kind": "proposal-response",
+        "subject": "pr2",
+        "body": "hmm",
+        "meta": {"request_id": "rid-q", "status": "maybe"},
+    })
     srv, _t, base = _serve(s)
     try:
         (root,) = _state(base)["roots"]
         by_rid = {t["request_id"]: t for t in root["threads"]}
-        assert by_rid["rid-v"]["verdict"] == "changes_requested"
+        assert by_rid["rid-v"]["verdict"] == "rejected"
         assert by_rid["rid-p"]["verdict"] == "accepted"
         assert "verdict" not in by_rid["rid-q"]  # unknown status -> omitted
     finally:

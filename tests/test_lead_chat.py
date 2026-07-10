@@ -48,6 +48,12 @@ def _stale_heartbeat(store: Store, agent: str = "lead") -> None:
         old.isoformat().replace("+00:00", "Z"), encoding="utf-8")
 
 
+def _heartbeat_at(store: Store, agent: str, epoch: float) -> None:
+    value = datetime.fromtimestamp(epoch, timezone.utc)
+    (store.state_dir / f"{agent}.heartbeat").write_text(
+        value.isoformat().replace("+00:00", "Z"), encoding="utf-8")
+
+
 def _lead_question(
     store: Store, rid: str = "esc-choice", *, sender: str = "lead"
 ) -> None:
@@ -322,6 +328,26 @@ def test_lead_chat_liveness_allows_fresh_heartbeat_without_health_for_current_le
     assert live["status"] == "idle"
     assert live["code"] == "unwrapped_live"
     assert live["reason"] == "lead heartbeat is fresh"
+
+
+def test_lead_chat_liveness_bounds_future_heartbeat_skew(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    now = 1_000_000.0
+
+    _heartbeat_at(
+        store,
+        "lead",
+        now + hm.DEFAULT_HEARTBEAT_SKEW_SECONDS + 1.0,
+    )
+    future = store.lead_chat_liveness(lead="lead", now_epoch=now)
+    assert future["available"] is False
+    assert future["code"] == "lead_unavailable"
+    assert future["heartbeat_age_seconds"] is None
+
+    _heartbeat_at(store, "lead", now + hm.DEFAULT_HEARTBEAT_SKEW_SECONDS)
+    within_skew = store.lead_chat_liveness(lead="lead", now_epoch=now)
+    assert within_skew["available"] is True
+    assert within_skew["heartbeat_age_seconds"] == 0.0
 
 
 def test_queued_operator_answer_never_authorizes_operator_sender(

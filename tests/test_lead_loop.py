@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import cli, doctor
+from agenttalk import cli, doctor, health as hm
 from agenttalk import supervisor as sup
 from agenttalk.store import (
     LEAD_LOOP_TTL_DEFAULT,
@@ -470,6 +470,21 @@ def test_unarmed_only_when_expired_and_heartbeat_stale(tmp_path: Path) -> None:
     rep = doctor.run(tmp_path)
     lc = next((c for c in rep.checks if c.name == "lead_loop"), None)
     assert lc is not None and lc.status == "error" and "beta" in lc.details
+
+
+def test_heartbeat_stale_bounds_future_clock_skew(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    now = 1_000_000.0
+
+    _set_hb(
+        store,
+        "beta",
+        now + hm.DEFAULT_HEARTBEAT_SKEW_SECONDS + 1.0,
+    )
+    assert store._heartbeat_stale("beta", now, stale_after=120.0) is True
+
+    _set_hb(store, "beta", now + hm.DEFAULT_HEARTBEAT_SKEW_SECONDS)
+    assert store._heartbeat_stale("beta", now, stale_after=120.0) is False
 
 
 # ----------------------------------------------- active_owner config-gate (lead convergence)

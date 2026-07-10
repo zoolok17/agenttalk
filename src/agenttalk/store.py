@@ -1407,7 +1407,17 @@ class Store:
                 "heartbeat_age_seconds": None,
                 "heartbeat_stale_after_seconds": stale_after,
             }
-        heartbeat_age = max(0.0, now - hb.timestamp())
+        heartbeat_age = self._bounded_heartbeat_age_seconds(hb, now)
+        if heartbeat_age is None:
+            return {
+                "available": False,
+                "status": "unavailable",
+                "code": "lead_unavailable",
+                "lead": resolved_lead,
+                "reason": "lead heartbeat is outside allowed clock skew",
+                "heartbeat_age_seconds": None,
+                "heartbeat_stale_after_seconds": stale_after,
+            }
         if heartbeat_age > stale_after:
             return {
                 "available": False,
@@ -2909,6 +2919,29 @@ class Store:
             return None
         return dt
 
+    @staticmethod
+    def _bounded_heartbeat_age_seconds(
+        heartbeat: datetime | None,
+        now_epoch: float,
+    ) -> float | None:
+        """Return a nonnegative age only within the allowed future clock skew.
+
+        A timestamp farther in the future than the health protocol's shared
+        skew bound is not evidence of liveness. A timestamp inside the bound
+        is clamped to age zero so small clock differences remain tolerated.
+        """
+        if heartbeat is None:
+            return None
+        try:
+            age = float(now_epoch) - heartbeat.timestamp()
+        except (OSError, OverflowError, TypeError, ValueError):
+            return None
+        if not math.isfinite(age):
+            return None
+        if age < -_health.DEFAULT_HEARTBEAT_SKEW_SECONDS:
+            return None
+        return max(0.0, age)
+
     # ------------------------------------------------------ waiting markers
     #
     # The `.waiting` file is written by `agenttalk wait` while it is
@@ -3514,9 +3547,11 @@ class Store:
 
     def _heartbeat_stale(self, agent: str, now: float, stale_after: float) -> bool:
         """True when ``agent`` has no heartbeat, or its heartbeat is older than
-        ``stale_after`` seconds. WP1 single heartbeat-staleness predicate."""
+        ``stale_after`` seconds or beyond allowed future skew. WP1 single
+        heartbeat-staleness predicate."""
         hb = self.read_heartbeat(agent)
-        return hb is None or (now - hb.timestamp()) > stale_after
+        age = self._bounded_heartbeat_age_seconds(hb, now)
+        return age is None or age > stale_after
 
     def _lead_loop_authority(self, agent: str, lease: dict | None, *, now: float,
                              heartbeat_stale_after: float) -> dict:
@@ -3800,7 +3835,8 @@ class Store:
         if now is None:
             now = time.time()
         hb = self.read_heartbeat(name)
-        if hb is not None and (now - hb.timestamp()) <= ACTIVE_WITHIN_SECONDS:
+        heartbeat_age = self._bounded_heartbeat_age_seconds(hb, now)
+        if heartbeat_age is not None and heartbeat_age <= ACTIVE_WITHIN_SECONDS:
             return True
         marker = self.read_waiting(name)
         if isinstance(marker, dict):
