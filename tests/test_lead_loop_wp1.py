@@ -169,11 +169,12 @@ def test_config_gated_armed_unmanaged_stray_lease(tmp_path: Path) -> None:
     assert s.lead_loop_active_owner("beta") is None
 
 
-# --------------------------------------------- persistent OS lock marker
+# --------------------------------------------- compatible O_EXCL lock marker
 
 def test_lead_loop_lock_recovers_stale_owner_metadata(tmp_path: Path) -> None:
-    # The persistent marker is advisory only. A crashed process leaves stale JSON,
-    # but its OS lock is released automatically and the next holder can acquire.
+    # A crashed legacy/current process can leave stale owner JSON. The next
+    # holder removes that generation under the guard, acquires, then clears its
+    # own O_EXCL marker on release.
     s = _store(tmp_path)
     lock = s.state_dir / "beta.lead-loop-lease.lock"
     lock.write_text(json.dumps({"pid": 2 ** 31 - 1}), encoding="utf-8")
@@ -181,9 +182,7 @@ def test_lead_loop_lock_recovers_stale_owner_metadata(tmp_path: Path) -> None:
     with s._lead_loop_lease_lock("beta"):
         pass
 
-    marker = json.loads(lock.read_text(encoding="utf-8"))
-    assert marker["pid"] == os.getpid()
-    assert isinstance(marker["generation"], str)
+    assert not lock.exists()
 
 
 # --------------------------------------------- timing resolver (non-store module)

@@ -9,6 +9,7 @@ import pytest
 from agenttalk import ephemeral as eph
 from agenttalk import cli
 from agenttalk import lanes
+from agenttalk import store as store_mod
 from agenttalk import supervisor as sup
 from agenttalk.store import Store
 from agenttalk.wrapper import loop
@@ -164,6 +165,61 @@ def test_launch_request_creation_is_exclusive_under_concurrency(tmp_path: Path) 
     assert not first.is_alive() and not second.is_alive()
     assert sorted(outcomes) == ["created", "duplicate"]
     assert s.read_launch_request("lr-exclusive")["prompt"] in {"first", "second"}
+
+
+@pytest.mark.parametrize("failure_phase", ["write", "fsync", "close"])
+def test_partial_launch_request_create_cleans_creator_owned_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+) -> None:
+    store = _store(tmp_path)
+    request_id = f"lr-partial-{failure_phase}"
+    path = store._launch_request_path(request_id)
+    real_close = store_mod.os.close
+    real_fsync = store_mod.os.fsync
+    real_open = store_mod.os.open
+    real_write = store_mod._write_all
+    target_fds: set[int] = set()
+
+    def tracked_open(raw_path, flags, *args):
+        fd = real_open(raw_path, flags, *args)
+        if Path(raw_path) == path:
+            target_fds.add(fd)
+        return fd
+
+    monkeypatch.setattr(store_mod.os, "open", tracked_open)
+
+    if failure_phase == "write":
+        def fail_write(fd: int, raw: bytes) -> None:
+            if fd in target_fds:
+                target_fds.remove(fd)
+                raise OSError("injected launch write failure")
+            real_write(fd, raw)
+
+        monkeypatch.setattr(store_mod, "_write_all", fail_write)
+    elif failure_phase == "fsync":
+        def fail_fsync(fd: int) -> None:
+            if fd in target_fds:
+                target_fds.remove(fd)
+                raise OSError("injected launch fsync failure")
+            real_fsync(fd)
+
+        monkeypatch.setattr(store_mod.os, "fsync", fail_fsync)
+    else:
+        def fail_close(fd: int) -> None:
+            if fd in target_fds:
+                target_fds.remove(fd)
+                real_close(fd)
+                raise OSError("injected launch close failure")
+            real_close(fd)
+
+        monkeypatch.setattr(store_mod.os, "close", fail_close)
+
+    with pytest.raises(OSError, match=failure_phase):
+        store.write_launch_request(_marker(request_id))
+
+    assert not path.exists()
 
 
 def test_launch_request_state_updates_cannot_regress(tmp_path: Path) -> None:

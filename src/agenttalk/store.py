@@ -25,6 +25,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import string
 import threading
 import time
@@ -71,6 +72,9 @@ def _safe_int(value: object) -> int:
 
 _LOCK_BUSY_ERRNOS = frozenset({errno.EACCES, errno.EAGAIN, errno.EDEADLK})
 _LOCK_METADATA_BYTES = 4096
+_LOCK_OWNERLESS_STALE_SECONDS = 30.0
+_LOCK_OWNERLESS_CONFIRM_SECONDS = 0.05
+_LOCK_PID_PREFIX_RE = re.compile(rb'"pid"\s*:\s*([0-9]+)')
 
 
 def _ensure_lock_byte(fd: int) -> None:
@@ -113,27 +117,223 @@ def _write_all(fd: int, raw: bytes) -> None:
         remaining = remaining[written:]
 
 
-def _write_lock_metadata(fd: int, payload: dict) -> None:
-    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    if len(raw) > _LOCK_METADATA_BYTES:
-        raise OSError("lock metadata exceeds fixed record size")
-    os.lseek(fd, 0, os.SEEK_SET)
-    _write_all(fd, raw.ljust(_LOCK_METADATA_BYTES, b" "))
+def _is_reparse_point(info: os.stat_result) -> bool:
+    attributes = getattr(info, "st_file_attributes", 0)
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(flag and attributes & flag)
 
 
-def _write_text_exclusive(path: Path, text: str) -> None:
+def _validate_lock_file_stat(path: Path, info: os.stat_result) -> None:
+    if stat.S_ISLNK(info.st_mode) or _is_reparse_point(info):
+        raise OSError(f"unsafe lock path {path}: symlink or reparse point")
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(f"unsafe lock path {path}: not a regular file")
+    if info.st_nlink != 1:
+        raise OSError(
+            f"unsafe lock path {path}: hardlink count is {info.st_nlink}, expected 1"
+        )
+
+
+def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _file_revision(info: os.stat_result) -> tuple[int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def _open_existing_lock_file(path: Path, flags: int) -> tuple[int, os.stat_result]:
+    """Open one existing lock path without following or accepting links."""
+    before = os.lstat(path)
+    _validate_lock_file_stat(path, before)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags | nofollow)
+    try:
+        opened = os.fstat(fd)
+        _validate_lock_file_stat(path, opened)
+        if not _same_file(before, opened):
+            raise OSError(f"unsafe lock path {path}: pathname changed while opening")
+        current = os.lstat(path)
+        _validate_lock_file_stat(path, current)
+        if not _same_file(opened, current):
+            raise OSError(f"unsafe lock path {path}: pathname changed while opening")
+        return fd, opened
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _unlink_if_same_file(path: Path, expected: os.stat_result) -> bool:
+    """Remove only ``expected`` without deleting a replacement generation.
+
+    There is no portable compare-and-unlink syscall. Move the current pathname
+    to a private quarantine first, then inspect what the atomic rename moved.
+    If an old client replaced the path after our identity check, restore that
+    generation with a no-replace hardlink instead of unlinking it.
+    """
+    try:
+        current = os.lstat(path)
+    except FileNotFoundError:
+        return True
+    if stat.S_ISLNK(current.st_mode) or _is_reparse_point(current):
+        return False
+    if not _same_file(current, expected):
+        return False
+    quarantine = path.with_name(f".{path.name}.{uuid.uuid4().hex}.unlink")
+    try:
+        os.rename(path, quarantine)
+    except FileNotFoundError:
+        return True
+    moved = os.lstat(quarantine)
+    if _same_file(moved, expected):
+        os.unlink(quarantine)
+        return True
+
+    if stat.S_ISLNK(moved.st_mode) or _is_reparse_point(moved):
+        raise OSError(
+            f"pathname generation changed while removing {path}; "
+            f"replacement preserved at {quarantine}"
+        )
+    try:
+        os.link(quarantine, path, follow_symlinks=False)
+    except FileExistsError as exc:
+        raise OSError(
+            f"pathname generation changed while removing {path}; "
+            f"replacement preserved at {quarantine}"
+        ) from exc
+    os.unlink(quarantine)
+    return False
+
+
+def _read_lock_owner(path: Path) -> tuple[int | None, os.stat_result, dict | None]:
+    fd, identity = _open_existing_lock_file(path, os.O_RDONLY)
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        raw = os.read(fd, _LOCK_METADATA_BYTES)
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8").strip(" \t\r\n\x00"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        match = _LOCK_PID_PREFIX_RE.search(raw)
+        pid = int(match.group(1)) if match is not None else None
+        return pid if pid and pid > 0 else None, identity, None
+    pid = data.get("pid") if isinstance(data, dict) else None
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        pid = None
+    return pid, identity, data if isinstance(data, dict) else None
+
+
+def _existing_os_lock_available(path: Path) -> bool:
+    """Return False while a persistent-protocol peer holds the inode lock."""
+    fd, _identity = _open_existing_lock_file(path, os.O_RDWR)
+    acquired = False
+    try:
+        acquired = _try_acquire_file_lock(fd)
+        return acquired
+    finally:
+        release_error: OSError | None = None
+        if acquired:
+            try:
+                _release_file_lock(fd)
+            except OSError as exc:
+                release_error = exc
+        try:
+            os.close(fd)
+        except OSError as exc:
+            release_error = release_error or exc
+        if release_error is not None:
+            raise release_error
+
+
+def _write_text_exclusive(path: Path, text: str) -> os.stat_result:
     """Durably create ``path`` once; never overwrite an existing generation."""
     fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    identity = os.fstat(fd)
     try:
         _write_all(fd, text.encode("utf-8"))
         os.fsync(fd)
-    except Exception:
+        os.close(fd)
+        fd = -1
+    except BaseException:
+        cleanup_error: OSError | None = None
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
-            os.close(fd)
-        except OSError:
-            pass
+            if not _unlink_if_same_file(path, identity):
+                cleanup_error = OSError(
+                    f"could not clean partial exclusive file {path}: generation changed"
+                )
+        except OSError as exc:
+            cleanup_error = exc
+        if cleanup_error is not None:
+            raise OSError(
+                f"could not clean partial exclusive file {path}: {cleanup_error}"
+            ) from cleanup_error
         raise
-    os.close(fd)
+    return identity
+
+
+def _publish_text_no_replace(path: Path, text: str) -> os.stat_result:
+    """Publish fully written text at an absent path without replacement.
+
+    The public ownership marker never exists as a zero-byte current-client
+    file: write and fsync a private inode first, then hardlink it atomically to
+    the lock pathname. Hardlink creation is no-replace on Windows and POSIX.
+    """
+    prepared = path.with_name(f".{path.name}.{uuid.uuid4().hex}.prepare")
+    identity = _write_text_exclusive(prepared, text)
+    published = False
+    try:
+        os.link(prepared, path, follow_symlinks=False)
+        published = True
+        if not _unlink_if_same_file(prepared, identity):
+            raise OSError(f"prepared lock generation changed at {prepared}")
+        current = os.lstat(path)
+        _validate_lock_file_stat(path, current)
+        if not _same_file(identity, current):
+            raise OSError("ownership marker generation changed during publish")
+        _fsync_directory(path.parent)
+        return current
+    except BaseException:
+        cleanup_error: OSError | None = None
+        if published:
+            try:
+                if not _unlink_if_same_file(path, identity):
+                    cleanup_error = OSError(
+                        f"published lock generation changed at {path}"
+                    )
+            except OSError as exc:
+                cleanup_error = exc
+        try:
+            if not _unlink_if_same_file(prepared, identity):
+                cleanup_error = cleanup_error or OSError(
+                    f"prepared lock generation changed at {prepared}"
+                )
+        except OSError as exc:
+            cleanup_error = cleanup_error or exc
+        if cleanup_error is not None:
+            raise OSError(
+                f"could not clean failed lock publication for {path}: {cleanup_error}"
+            ) from cleanup_error
+        raise
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Best-effort POSIX directory fsync after publishing a prepared file."""
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 # Known message kinds. Receivers should silently skip anything else
 # rather than letting an unfamiliar kind smuggle through to the LLM
@@ -904,72 +1104,256 @@ class Store:
     # ops both read the same base and the later writer silently clobbers the
     # earlier's change (a dropped retire/rename can even re-open a name #19
     # promises is permanent). There is no lock server, so serialize those
-    # critical sections with a cross-platform OS lock on a persistent sidecar.
+    # critical sections with a legacy-compatible O_EXCL ownership marker.
     # Per-agent cursor/threadstate/heartbeat writes are deliberately
     # NOT locked: they are single-writer under the documented one-window-per-
     # agent model; only shared config.json needs this.
 
     @contextlib.contextmanager
-    def _exclusive_lock(self, lock: Path, *, timeout: float = 10.0,
-                        poll: float = 0.05, what: str = "lock"):
-        """Hold an exclusive OS lock across a read-modify-write.
+    def _lock_generation_guard(
+        self,
+        lock: Path,
+        *,
+        deadline: float,
+        poll: float,
+        what: str,
+    ):
+        """Serialize pathname-generation changes among current clients.
 
-        The sidecar path persists and contains advisory owner metadata, but file
-        existence and contents confer no ownership. The OS releases the lock when
-        a process exits, so zero-byte/ownerless files are recoverable and stale
-        pathname replacement cannot steal a newer generation. NOT re-entrant.
+        The guard is a persistent OS-locked byte. Legacy clients ignore it but
+        still interoperate through the public O_EXCL ownership marker.
         """
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        deadline = time.monotonic() + timeout
+        guard = lock.with_name(f".{lock.name}.generation")
         fd: int | None = None
         acquired = False
         try:
             while fd is None:
                 try:
-                    fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o600)
+                    fd = os.open(
+                        str(guard),
+                        os.O_CREAT | os.O_EXCL | os.O_RDWR,
+                        0o600,
+                    )
+                    created = os.fstat(fd)
+                    _validate_lock_file_stat(guard, created)
+                except FileExistsError:
+                    try:
+                        fd, _identity = _open_existing_lock_file(guard, os.O_RDWR)
+                    except FileNotFoundError:
+                        continue
                 except PermissionError:
                     if time.monotonic() >= deadline:
                         raise TimeoutError(
-                            f"could not open the {what} at {lock} within {timeout:g}s"
+                            f"could not open the generation guard for {what} "
+                            f"at {guard}"
                         ) from None
                     time.sleep(poll)
             _ensure_lock_byte(fd)
+            guard_identity = os.fstat(fd)
+            _validate_lock_file_stat(guard, guard_identity)
+            current_guard = os.lstat(guard)
+            _validate_lock_file_stat(guard, current_guard)
+            if not _same_file(guard_identity, current_guard):
+                raise OSError(
+                    f"unsafe lock path {guard}: generation changed before locking"
+                )
             while not _try_acquire_file_lock(fd):
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
-                        f"could not acquire the {what} at {lock} within {timeout:g}s"
+                        f"could not acquire the generation guard for {what} "
+                        f"at {guard}"
                     ) from None
                 time.sleep(poll)
             acquired = True
-            _write_lock_metadata(fd, {
-                "pid": os.getpid(),
-                "generation": uuid.uuid4().hex,
-                "at": _now_iso(),
-                "root": str(self.root)[:512],
-            })
+            current_guard = os.lstat(guard)
+            _validate_lock_file_stat(guard, current_guard)
+            if not _same_file(guard_identity, current_guard):
+                raise OSError(
+                    f"unsafe lock path {guard}: generation changed while locking"
+                )
             yield
         finally:
             release_error: OSError | None = None
             if acquired and fd is not None:
                 try:
                     _release_file_lock(fd)
-                except OSError as e:
-                    release_error = e
+                except OSError as exc:
+                    release_error = exc
             if fd is not None:
                 try:
                     os.close(fd)
-                except OSError as e:
-                    release_error = release_error or e
+                except OSError as exc:
+                    release_error = release_error or exc
             if release_error is not None:
                 raise OSError(
-                    f"could not release the {what} at {lock}: {release_error}"
+                    f"could not release the generation guard for {what} "
+                    f"at {guard}: {release_error}"
                 ) from release_error
+
+    @contextlib.contextmanager
+    def _exclusive_lock(self, lock: Path, *, timeout: float = 10.0,
+                        poll: float = 0.05, what: str = "lock"):
+        """Hold a legacy-compatible O_EXCL marker across a critical section.
+
+        Current clients serialize stale recovery and owner release with an
+        OS-locked generation guard, eliminating their read/replace ABA window.
+        Existing lock paths are read-only until validated as ordinary,
+        single-link files; owner metadata is written only to an inode created
+        by this process. Ownerless legacy crash remnants become recoverable
+        only after an explicit conservative stale age plus a stable-generation
+        observation. NOT re-entrant.
+        """
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + timeout
+        identity: os.stat_result | None = None
+        ownerless_generation: tuple[int, int] | None = None
+        ownerless_seen_at: float | None = None
+        try:
+            while identity is None:
+                with self._lock_generation_guard(
+                    lock,
+                    deadline=deadline,
+                    poll=poll,
+                    what=what,
+                ):
+                    try:
+                        created = _publish_text_no_replace(
+                            lock,
+                            json.dumps({
+                                "pid": os.getpid(),
+                                "protocol": "o_excl_v2",
+                                "generation": uuid.uuid4().hex,
+                                "at": _now_iso(),
+                                "root": str(self.root)[:512],
+                            }, ensure_ascii=False),
+                        )
+                    except FileExistsError:
+                        try:
+                            pid, existing, record = _read_lock_owner(lock)
+                        except FileNotFoundError:
+                            continue
+                        except PermissionError:
+                            # A Windows byte lock can deny reads of the locked
+                            # region. That is positive evidence of an active
+                            # persistent-protocol holder: wait, never recover.
+                            ownerless_generation = None
+                            ownerless_seen_at = None
+                        else:
+                            os_lock_available = (
+                                existing.st_size > 0
+                                and _existing_os_lock_available(lock)
+                            )
+                            persistent_v1 = (
+                                os_lock_available
+                                and existing.st_size == _LOCK_METADATA_BYTES
+                                and isinstance(record, dict)
+                                and isinstance(record.get("generation"), str)
+                                and "protocol" not in record
+                            )
+                            ownerless_candidate = (
+                                pid is None
+                                and (existing.st_size == 0 or os_lock_available)
+                            )
+                            existing_generation = (existing.st_dev, existing.st_ino)
+                            ownerless_stale = (
+                                ownerless_candidate
+                                and time.time() - existing.st_mtime
+                                >= _LOCK_OWNERLESS_STALE_SECONDS
+                            )
+                            if ownerless_stale:
+                                observed_at = time.monotonic()
+                                if ownerless_generation != existing_generation:
+                                    ownerless_generation = existing_generation
+                                    ownerless_seen_at = observed_at
+                                ownerless_old_enough = (
+                                    ownerless_seen_at is not None
+                                    and observed_at - ownerless_seen_at
+                                    >= _LOCK_OWNERLESS_CONFIRM_SECONDS
+                                )
+                            else:
+                                ownerless_generation = None
+                                ownerless_seen_at = None
+                                ownerless_old_enough = False
+                            owner_dead = (
+                                pid is not None
+                                and (existing.st_size == 0 or os_lock_available)
+                                and _process_liveness(pid) == PROC_DEAD
+                            )
+                            if persistent_v1 or ownerless_old_enough or owner_dead:
+                                if not _unlink_if_same_file(lock, existing):
+                                    continue
+                    else:
+                        identity = os.lstat(lock)
+                        try:
+                            _validate_lock_file_stat(lock, identity)
+                            if not _same_file(created, identity):
+                                raise OSError(
+                                    "ownership marker generation changed during create"
+                                )
+                        except OSError:
+                            _unlink_if_same_file(lock, created)
+                            identity = None
+                            raise
+                if identity is None:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"could not acquire the {what} at {lock} within "
+                            f"{timeout:g}s"
+                        ) from None
+                    time.sleep(poll)
+            yield
+        finally:
+            if identity is not None:
+                with self._lock_generation_guard(
+                    lock,
+                    deadline=max(deadline, time.monotonic() + timeout),
+                    poll=poll,
+                    what=what,
+                ):
+                    last_error: OSError | None = None
+                    for _ in range(100):
+                        try:
+                            current = os.lstat(lock)
+                            _validate_lock_file_stat(lock, current)
+                            if not _same_file(identity, current):
+                                raise OSError("ownership marker generation changed")
+                            if not _unlink_if_same_file(lock, identity):
+                                raise OSError("ownership marker generation changed")
+                            last_error = None
+                            break
+                        except FileNotFoundError as exc:
+                            last_error = exc
+                            break
+                        except PermissionError as exc:
+                            last_error = exc
+                            time.sleep(0.01)
+                        except OSError as exc:
+                            last_error = exc
+                            break
+                    if last_error is not None:
+                        raise OSError(
+                            f"could not release the {what} at {lock}: {last_error}"
+                        ) from last_error
 
     def _config_lock(self, *, timeout: float = 10.0, poll: float = 0.05):
         """Hold an exclusive lock across a config read-modify-write."""
         return self._exclusive_lock(self.dir / "config.lock", timeout=timeout,
                                     poll=poll, what="config lock (another agent may be "
                                     "mid roster-admin)")
+
+    def _retirement_lock(self, *, timeout: float = 10.0, poll: float = 0.005):
+        """Serialize roster retirement against final message publication.
+
+        This is a persistent OS-lock inode, so sends pay no per-message marker
+        creation, metadata fsync, or unlink cost. The durable payload is already
+        prepared before this narrow critical section begins.
+        """
+        return self._lock_generation_guard(
+            self.dir / "retirement",
+            deadline=time.monotonic() + timeout,
+            poll=poll,
+            what="retirement/message publication",
+        )
 
     @staticmethod
     def _cfg_dict(cfg: dict, key: str) -> dict:
@@ -1160,7 +1544,7 @@ class Store:
     def remove_agent(self, name: str) -> dict:
         """Remove an agent from the roster, its role, and all group
         memberships. Leaves its cursor/messages as historical record."""
-        with self._config_lock():
+        with self._retirement_lock(), self._config_lock():
             cfg = self.load_config()
             roster = list(cfg.get("agents", []))
             if name in roster:
@@ -1685,7 +2069,7 @@ class Store:
         referencing ``old`` stays valid; ``old`` is non-rebindable (FR-002/005/006).
         """
         validate_agent_name(new)
-        with self._config_lock():
+        with self._retirement_lock(), self._config_lock():
             cfg = self.load_config()
             active = cfg.get("agents", []) or []
             if old not in active:
@@ -1984,7 +2368,14 @@ class Store:
     ) -> Message:
         if not self.initialized():
             raise FileNotFoundError("agenttalk not initialized; run `agenttalk init`.")
+        config_before = os.stat(self.config_path)
         cfg = self.load_config()
+        config_after = os.stat(self.config_path)
+        config_revision = (
+            _file_revision(config_after)
+            if _file_revision(config_before) == _file_revision(config_after)
+            else None
+        )
         self._validate_send_principals(
             cfg,
             sender=sender,
@@ -2036,19 +2427,42 @@ class Store:
             )
             msg = Message.from_dict(signed_dict)
         path = self.messages_dir / f"{msg.id}.json"
-        lock = contextlib.nullcontext() if _config_locked else self._config_lock()
-        with lock:
-            # Retirement and append share this lock. Revalidate at the last
-            # possible point so a sender/recipient cannot retire after the
-            # optimistic check above and still receive a new message.
-            cfg = self.load_config()
-            self._validate_send_principals(
-                cfg,
-                sender=sender,
-                recipient=recipient,
-                allow_reserved_sender=_allow_reserved_sender,
+        payload = json.dumps(msg.to_dict(), indent=2, ensure_ascii=False)
+        pending = self.messages_dir / f".{msg.id}.{uuid.uuid4().hex}.pending"
+        pending_identity = _write_text_exclusive(pending, payload)
+        try:
+            lock = (
+                contextlib.nullcontext()
+                if _config_locked
+                else self._retirement_lock()
             )
-            _atomic_write_text(path, json.dumps(msg.to_dict(), indent=2, ensure_ascii=False))
+            with lock:
+                # Durable payload preparation is deliberately OUTSIDE this lock,
+                # so unrelated sends do not serialize their write+fsync cost.
+                # Retirement and final publication share only this persistent,
+                # narrow mutex. Revalidate immediately before the O(1) commit.
+                current_revision = _file_revision(os.stat(self.config_path))
+                if config_revision is None or current_revision != config_revision:
+                    cfg = self.load_config()
+                self._validate_send_principals(
+                    cfg,
+                    sender=sender,
+                    recipient=recipient,
+                    allow_reserved_sender=_allow_reserved_sender,
+                )
+                try:
+                    os.replace(pending, path)
+                    _fsync_directory(path.parent)
+                except PermissionError:
+                    # Codex's Windows sandbox can hold process-lifetime handles
+                    # that block rename. Preserve the established direct-write
+                    # fallback there; ordinary Windows/POSIX stays pre-staged.
+                    _atomic_write_text(path, payload)
+        finally:
+            try:
+                _unlink_if_same_file(pending, pending_identity)
+            except OSError:
+                pass
         return msg
 
     def send_operator_answer_atomic(
@@ -4051,7 +4465,7 @@ class Store:
         data = dict(payload)
         data.setdefault("state", _eph.STATE_QUEUED)
         self._launch_state_rank(data["state"])
-        with self._config_lock():
+        with self._retirement_lock(), self._config_lock():
             path = self._launch_request_path(rid)
             path.parent.mkdir(parents=True, exist_ok=True)
             try:
