@@ -2876,19 +2876,6 @@ def _verify_lane_worktree(store, lane: dict, *, expected_base: str | None = None
     }
 
 
-def _lane_has_valid_waiver(store, lane: dict) -> bool:
-    waived_by = lane.get("worktree_waived_by")
-    recorded_authority = lane.get("worktree_waiver_authority")
-    return bool(lane.get("worktree_waived")
-                and isinstance(lane.get("worktree_waiver_reason"), str)
-                and lane["worktree_waiver_reason"].strip()
-                and isinstance(waived_by, str)
-                and isinstance(lane.get("worktree_waived_at"), str)
-                and recorded_authority in {"operator_facing", "sole_lead"}
-                and lane_mod.worktree_waiver_authority(store, waived_by)
-                == recorded_authority)
-
-
 def _release_class_lane(lane: dict) -> bool:
     return lane.get("release_class", True) is not False
 
@@ -3140,7 +3127,8 @@ def _lane_eval(store, lane: dict, other_active: list[dict], head: str,
            "target_head_now": target_head_now,
            "target_moved": target_head_now != lane.get("target_head_at_assign"),
            "classifications": classifications, "current_epoch": current_epoch,
-           "current_registry_hash": reg.registry_hash, "gate_scope": scope}
+           "current_registry_hash": reg.registry_hash, "gate_scope": scope,
+           "config_snapshot": cfg}
     return verdict, ctx
 
 
@@ -3169,6 +3157,144 @@ def _lane_candidate(store, lane: dict, requested_head: str | None, *, delivery: 
     return head, provenance
 
 
+def _lane_transaction_matches(lane: dict, pending: dict) -> bool:
+    return bool(
+        lane.get("status") == lane_mod.STATUS_DELIVERED
+        and lane.get("instance_id") == pending.get("lane_instance_id")
+        and lane.get("generation") == pending.get("lane_generation")
+        and lane.get("delivery_transaction_id") == pending.get("transaction_id")
+    )
+
+
+def _lane_checkpoint_publication(store, lane_id: str, pending: dict, artifact: Path) -> None:
+    with store._config_lock():
+        data = lane_mod.load_lanes(store)
+        lane = (data.get("lanes") or {}).get(lane_id)
+        if not isinstance(lane, dict) or not _lane_transaction_matches(lane, pending):
+            raise lane_mod.LaneError(
+                "lane instance changed before the committed-artifact marker update"
+            )
+        current_pending = lane.get("publish_pending")
+        if current_pending is False:
+            marked = lane.get("delivery_artifact")
+            if (not isinstance(marked, str)
+                    or lane_mod.canonical_host_path(marked)
+                    != lane_mod.canonical_host_path(artifact)):
+                raise lane_mod.LaneError("lane publication marker conflicts with transaction")
+            return
+        if (not isinstance(current_pending, dict)
+                or current_pending.get("transaction_id") != pending.get("transaction_id")):
+            raise lane_mod.LaneError("lane publication marker no longer matches transaction")
+        lane["publish_pending"] = False
+        lane["delivery_artifact"] = str(artifact)
+        lane["published_at"] = _iso_now()
+        lane_mod.save_lanes(store, data)
+
+
+def _lane_checkpoint_cleanup(store, lane_id: str, pending: dict, *,
+                             success: bool, error: str | None = None) -> None:
+    with store._config_lock():
+        data = lane_mod.load_lanes(store)
+        lane = (data.get("lanes") or {}).get(lane_id)
+        if not isinstance(lane, dict) or not _lane_transaction_matches(lane, pending):
+            raise lane_mod.LaneError("lane instance changed before cleanup checkpoint")
+        lane["cleanup_pending"] = not success
+        lane["worktree_state"] = (
+            lane_mod.STATUS_DELIVERED if success else lane_mod.STATUS_CLEANUP_FAILED
+        )
+        if error:
+            lane["worktree_cleanup_error"] = error[:500]
+        else:
+            lane.pop("worktree_cleanup_error", None)
+        lane_mod.save_lanes(store, data)
+
+
+def _lane_remove_prepared(pending: dict) -> None:
+    raw = pending.get("prepared_artifact")
+    if not isinstance(raw, str):
+        return
+    try:
+        Path(raw).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
+    """Finish a persisted transaction without recomputing its delivery verdict."""
+    with store._config_lock():
+        data = lane_mod.load_lanes(store)
+        lane = (data.get("lanes") or {}).get(lane_id)
+        if not isinstance(lane, dict) or lane.get("status") != lane_mod.STATUS_DELIVERED:
+            raise lane_mod.LaneError("lane has no delivered transaction to resume")
+        pending_raw = lane.get("publish_pending")
+        if isinstance(pending_raw, dict):
+            pending = dict(pending_raw)
+        elif pending_raw is False:
+            pending = {
+                "transaction_id": lane.get("delivery_transaction_id"),
+                "lane_id": lane_id,
+                "lane_instance_id": lane.get("instance_id"),
+                "lane_generation": lane.get("generation"),
+                "head_sha": lane.get("delivered_head"),
+                "committed_artifact": lane.get("delivery_artifact"),
+                "prepared_artifact": lane.get("prepared_artifact"),
+            }
+        else:
+            raise lane_mod.LaneError("delivered lane has no recoverable publication marker")
+        lane_snapshot = dict(lane)
+
+    artifact = Path(lane_mod.publish_delivery_artifact(store, pending))
+    _lane_checkpoint_publication(store, lane_id, pending, artifact)
+    _lane_remove_prepared(pending)
+    committed = lane_mod.validate_delivery_artifact(
+        artifact, lane_id=lane_id, head_sha=str(pending.get("head_sha")), store=store,
+        require_isolation=_release_class_lane(lane_snapshot),
+        require_live_marker=True,
+    )
+    delivered_head = str(committed["delivered_head"])
+
+    cleanup_lock = store.dir / "state" / f"lane-{lane_id}.cleanup.lock"
+    with store._exclusive_lock(cleanup_lock, what=f"lane {lane_id} cleanup lock"):
+        with store._config_lock():
+            current = (lane_mod.load_lanes(store).get("lanes") or {}).get(lane_id)
+            if (not isinstance(current, dict)
+                    or not _lane_transaction_matches(current, pending)):
+                raise lane_mod.LaneError("lane instance changed before teardown")
+            cleanup_pending = bool(current.get("cleanup_pending"))
+            cleanup_lane = dict(current)
+        if not cleanup_pending:
+            return artifact, False, delivered_head
+
+        wt_raw = cleanup_lane.get("worktree_path")
+        if not isinstance(wt_raw, str) or not wt_raw:
+            _lane_checkpoint_cleanup(store, lane_id, pending, success=True)
+            return artifact, False, delivered_head
+        wt = Path(wt_raw)
+        if not wt.exists():
+            _lane_checkpoint_cleanup(store, lane_id, pending, success=True)
+            return artifact, False, delivered_head
+        if not _lane_worktree_idle(store, cleanup_lane):
+            return artifact, True, delivered_head
+        try:
+            provenance = _verify_lane_worktree(store, cleanup_lane)
+            if provenance.get("head") != pending.get("head_sha"):
+                raise lane_mod.LaneError("worktree HEAD changed before teardown")
+            rc, _out, err = _git_write(
+                store.root, ["worktree", "remove", "--", wt_raw],
+            )
+            if rc != 0:
+                _lane_checkpoint_cleanup(
+                    store, lane_id, pending, success=False,
+                    error=err.strip() or f"git worktree remove rc={rc}",
+                )
+                return artifact, True, delivered_head
+        except (lane_mod.LaneError, GitWriteError) as exc:
+            _lane_checkpoint_cleanup(store, lane_id, pending, success=False, error=str(exc))
+            return artifact, True, delivered_head
+        _lane_checkpoint_cleanup(store, lane_id, pending, success=True)
+        return artifact, False, delivered_head
+
+
 def cmd_lane(args: argparse.Namespace) -> int:
     """Lane deliver-gate (advisory, point-in-time coordination; see lanes.py)."""
     store = _get_store(args)
@@ -3179,6 +3305,7 @@ def cmd_lane(args: argparse.Namespace) -> int:
         lane_id = lane_mod.validate_lane_id(args.id)
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         _ensure_in_roster(args.assignee, roster, label="assignee")
+        advisory = bool(getattr(args, "advisory", False))
         provision_worktree = not bool(getattr(args, "no_worktree", False))
         waiver_reason = getattr(args, "worktree_waiver_reason", None)
         waiver_authority = None
@@ -3186,14 +3313,13 @@ def cmd_lane(args: argparse.Namespace) -> int:
             sys.stderr.write(
                 "agenttalk lane assign: --no-worktree requires --worktree-waiver-reason.\n")
             return 2
-        if not provision_worktree:
-            waiver_authority = lane_mod.worktree_waiver_authority(store, actor)
-            if waiver_authority is None:
-                sys.stderr.write(
-                    "agenttalk lane assign: --no-worktree is a lead/operator waiver; "
-                    f"{actor!r} is neither the operator-facing agent nor the sole lead. "
-                    "Refusing.\n")
-                return 2
+        if not provision_worktree and not advisory:
+            sys.stderr.write(
+                "agenttalk lane assign: release-class lanes require a provisioned "
+                "worktree; legacy --no-worktree release waivers are no longer accepted. "
+                "Use --advisory only for non-release coordination.\n"
+            )
+            return 2
         reg = _load_domain_registry(store)
         if args.domain not in (reg.data.get("domains") or {}):
             sys.stderr.write(
@@ -3224,10 +3350,19 @@ def cmd_lane(args: argparse.Namespace) -> int:
                     raise lane_mod.LaneError(
                         "assignment inputs changed while preparing lane assignment; retry assign")
                 data = lane_mod.load_lanes(store)
-                if lane_id in (data.get("lanes") or {}) and not args.force:
+                previous = (data.get("lanes") or {}).get(lane_id)
+                if previous is not None and not args.force:
                     sys.stderr.write(
                         f"agenttalk lane assign: lane {lane_id!r} already exists "
                         "(use --force).\n")
+                    return 2
+                if (args.force and isinstance(previous, dict)
+                        and previous.get("status") == lane_mod.STATUS_DELIVERED
+                        and isinstance(previous.get("publish_pending"), dict)):
+                    sys.stderr.write(
+                        "agenttalk lane assign: delivered lane has publication pending; "
+                        "retry lane deliver before force reassignment.\n"
+                    )
                     return 2
                 for other in lane_mod.active_lanes(data):
                     if other.get("lane_id") == lane_id:
@@ -3274,21 +3409,27 @@ def cmd_lane(args: argparse.Namespace) -> int:
                         "state": lane_mod.STATUS_ACTIVE,
                     }
                 else:
-                    current_authority = lane_mod.worktree_waiver_authority(store, actor)
-                    if current_authority is None or current_authority != waiver_authority:
-                        raise lane_mod.LaneError(
-                            "worktree-waiver authority changed while assigning; retry assign")
                     waiver = {
                         "reason": waiver_reason, "by": actor, "at": assigned_at,
-                        "authority": current_authority,
+                        "authority": "advisory_only",
                     }
+                previous_generation = (
+                    previous.get("generation") if isinstance(previous, dict) else None
+                )
+                generation = (
+                    previous_generation + 1
+                    if isinstance(previous_generation, int)
+                    and not isinstance(previous_generation, bool)
+                    else 2 if isinstance(previous, dict) else 1
+                )
                 lane = lane_mod.new_lane(
                     lane_id, assignee=args.assignee, assigned_by=actor, assigned_at=assigned_at,
                     domain_id=args.domain, path_subset=prefixes, base_sha=base,
                     target_ref=args.target, target_head_at_assign=target_head,
                     epoch_at_assign=planned_epoch,
                     registry_hash_at_assign=reg.registry_hash, notes=args.notes,
-                    worktree=worktree, waiver=waiver)
+                    worktree=worktree, waiver=waiver,
+                    release_class=not advisory, generation=generation)
                 if provision_worktree:
                     prov = _verify_lane_worktree(store, lane, expected_base=base)
                     lane["worktree_toplevel_canonical"] = prov["worktree_toplevel_canonical"]
@@ -3309,7 +3450,7 @@ def cmd_lane(args: argparse.Namespace) -> int:
               f"base {base[:12]} -> {args.target} ({target_head[:12]}); "
               f"subset {prefixes or '[whole domain]'}"
               + (f"; worktree {wt_path} [{branch}]" if provision_worktree
-                 else "; WORKTREE WAIVED (not isolated)"))
+                 else "; ADVISORY UNISOLATED (never release evidence)"))
         return 0
 
     if action == "approve-shared":
@@ -3397,102 +3538,246 @@ def cmd_lane(args: argparse.Namespace) -> int:
 
     if action == "deliver":
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+        try:
+            with store._config_lock():
+                data = lane_mod.load_lanes(store)
+                current = (data.get("lanes") or {}).get(args.id)
+                if not isinstance(current, dict):
+                    sys.stderr.write(f"agenttalk lane deliver: no lane {args.id!r}.\n")
+                    return 2
+                if current.get("status") == lane_mod.STATUS_DELIVERED:
+                    resume = True
+                    lane_snapshot = dict(current)
+                    expected_lane_fingerprint = None
+                    expected_active = None
+                elif current.get("status") != lane_mod.STATUS_ACTIVE:
+                    sys.stderr.write(
+                        f"agenttalk lane deliver: lane {args.id!r} is "
+                        f"{current.get('status')!r}, not active.\n"
+                    )
+                    return 2
+                else:
+                    resume = False
+                    migrated = False
+                    if not re.fullmatch(r"[0-9a-f]{32}", str(current.get("instance_id") or "")):
+                        current["instance_id"] = uuid.uuid4().hex
+                        migrated = True
+                    generation = current.get("generation")
+                    if (isinstance(generation, bool) or not isinstance(generation, int)
+                            or generation < 1):
+                        current["generation"] = 1
+                        migrated = True
+                    if migrated:
+                        lane_mod.save_lanes(store, data)
+                    lane_snapshot = dict(current)
+                    expected_lane_fingerprint = lane_mod.fingerprint(current)
+                    expected_active = lane_mod.active_lane_fingerprints(
+                        data, exclude=args.id,
+                    )
+        except (OSError, lane_mod.LaneError) as exc:
+            sys.stderr.write(f"agenttalk lane deliver: state read failed ({exc}).\n")
+            return 2
+
+        if resume:
+            requested_head = getattr(args, "head", None)
+            if requested_head:
+                try:
+                    resolved_head = _lane_resolve(store, requested_head)
+                except lane_mod.LaneError as exc:
+                    sys.stderr.write(f"agenttalk lane deliver: {exc}\n")
+                    return 2
+                if resolved_head != lane_snapshot.get("delivered_head"):
+                    sys.stderr.write(
+                        "agenttalk lane deliver: --head differs from the persisted "
+                        "delivered transaction; refusing retry.\n"
+                    )
+                    return 3
+            try:
+                artifact, cleanup_pending, delivered_head = _lane_finalize_delivery(
+                    store, args.id,
+                )
+            except (OSError, lane_mod.LaneError, GitWriteError) as exc:
+                sys.stderr.write(
+                    f"agenttalk lane deliver: pending delivery recovery failed ({exc}).\n"
+                )
+                return 2
+            print(
+                f"delivered lane {args.id} @ {delivered_head[:12]} "
+                f"(GO); evidence: {artifact}"
+                + ("; cleanup pending" if cleanup_pending else "")
+            )
+            return 0
+
+        current = lane_snapshot
+        if _release_class_lane(current) and not current.get("worktree_path"):
+            sys.stderr.write(
+                "agenttalk lane deliver: HOLD - release-class lane has no provisioned "
+                "worktree; legacy no-worktree waivers cannot authorize delivery.\n"
+            )
+            return 3
+
+        cooperating_before = lane_mod.cooperating_input_fingerprint(store)
+        try:
+            head, provenance = _lane_candidate(
+                store, current, getattr(args, "head", None), delivery=True,
+            )
+        except lane_mod.LaneError as exc:
+            sys.stderr.write(f"agenttalk lane deliver: {exc}\n")
+            msg = str(exc)
+            if (current.get("worktree_path") or "tracked changes" in msg
+                    or "--head does not match" in msg):
+                return 3
+            return 2
+        others = []
         with store._config_lock():
             data = lane_mod.load_lanes(store)
-            current = (data.get("lanes") or {}).get(args.id)
-            if not isinstance(current, dict):
-                sys.stderr.write(f"agenttalk lane deliver: no lane {args.id!r}.\n")
-                return 2
-            try:
-                head, provenance = _lane_candidate(
-                    store, current, getattr(args, "head", None), delivery=True)
-            except lane_mod.LaneError as e:
-                sys.stderr.write(f"agenttalk lane deliver: {e}\n")
-                msg = str(e)
-                if (current.get("worktree_path") or "tracked changes" in msg
-                        or "--head does not match" in msg):
-                    return 3
-                return 2
-            if (_release_class_lane(current) and not current.get("worktree_path")
-                    and not _lane_has_valid_waiver(store, current)):
+            observed = (data.get("lanes") or {}).get(args.id)
+            if (not isinstance(observed, dict)
+                    or lane_mod.fingerprint(observed) != expected_lane_fingerprint):
                 sys.stderr.write(
-                    "agenttalk lane deliver: HOLD - release-class lane has no worktree "
-                    "and no current lead/operator-authorized --no-worktree waiver.\n")
+                    "agenttalk lane deliver: lane changed before evaluation; retry.\n"
+                )
+                return 3
+            if lane_mod.active_lane_fingerprints(data, exclude=args.id) != expected_active:
+                sys.stderr.write(
+                    "agenttalk lane deliver: active-lane set changed before evaluation; "
+                    "retry.\n"
+                )
                 return 3
             others = [ln for ln in lane_mod.active_lanes(data)
                       if ln.get("lane_id") != args.id]
-            verdict, ctx = _lane_eval(
-                store, current, others, head, getattr(args, "gate_scope", None))
-            if verdict["verdict"] != lane_mod.VERDICT_GO:
-                sys.stderr.write("agenttalk lane deliver: HOLD - lane stays active.\n")
-                _print_lane_verdict(args.id, verdict, ctx)
-                return 3
-            if current.get("worktree_path"):
-                try:
-                    final_provenance = _verify_lane_worktree(store, current)
-                except lane_mod.LaneError as e:
-                    sys.stderr.write(
-                        "agenttalk lane deliver: worktree changed during final "
-                        f"evaluation ({e}); NO evidence written, lane stays active.\n")
-                    return 3
-                if final_provenance.get("head") != head:
-                    sys.stderr.write(
-                        "agenttalk lane deliver: worktree HEAD changed during final "
-                        "evaluation; NO evidence written, lane stays active.\n")
-                    return 3
-                provenance = final_provenance
-            evaluation_snapshot = lane_mod.build_evaluation_snapshot(
-                lane=current, active_lanes=others, context=ctx,
-                worktree_provenance=provenance)
-            try:
-                artifact = lane_mod.write_delivery_artifact(
-                    store, lane=current, head_sha=head, verdict=verdict,
-                    changed=ctx["changed"],
-                    merge=ctx["merge"], gate_check=ctx["gate_check"], delivered_by=actor,
-                    at=_iso_now(), evaluation_snapshot=evaluation_snapshot,
-                    worktree_provenance=provenance)
-            except OSError as e:
-                sys.stderr.write(
-                    f"agenttalk lane deliver: artifact write failed ({e}); lane stays "
-                    "active (NOT cleared).\n")
-                return 2
-            # C5a: READ BACK + validate the artifact we just wrote (covers BOTH the atomic
-            # and sandbox direct-write paths) BEFORE clearing the lane. A truncated/corrupt/
-            # wrong artifact -> lane stays ACTIVE + nonzero, so a caller gating on the
-            # printed evidence path can never get a false success on unreadable evidence.
-            try:
-                lane_mod.validate_delivery_artifact(
-                    artifact, lane_id=args.id, head_sha=head, store=store,
-                    require_isolation=_release_class_lane(current))
-            except lane_mod.LaneError as e:
-                sys.stderr.write(
-                    f"agenttalk lane deliver: {e}; lane stays active (NOT cleared).\n")
-                return 2
-            current["status"] = lane_mod.STATUS_DELIVERED
-            if current.get("worktree_path"):
-                if _lane_worktree_idle(store, current):
-                    try:
-                        teardown = _verify_lane_worktree(store, current)
-                        if teardown["head"] != head:
-                            raise lane_mod.LaneError(
-                                "worktree HEAD changed after delivery artifact was written")
-                        rc, _out, err = _git_write(
-                            store.root, ["worktree", "remove", "--", str(current["worktree_path"])])
-                        current["worktree_state"] = (
-                            lane_mod.STATUS_DELIVERED if rc == 0
-                            else lane_mod.STATUS_CLEANUP_FAILED)
-                        if rc != 0:
-                            current["worktree_cleanup_error"] = err.strip()[:500]
-                    except lane_mod.LaneError as e:
-                        current["worktree_state"] = lane_mod.STATUS_CLEANUP_PENDING
-                        current["worktree_cleanup_error"] = str(e)[:500]
-                    except GitWriteError as e:
-                        current["worktree_state"] = lane_mod.STATUS_CLEANUP_FAILED
-                        current["worktree_cleanup_error"] = str(e)[:500]
+        verdict, ctx = _lane_eval(
+            store, current, others, head, getattr(args, "gate_scope", None),
+        )
+        if verdict["verdict"] != lane_mod.VERDICT_GO:
+            sys.stderr.write("agenttalk lane deliver: HOLD - lane stays active.\n")
+            _print_lane_verdict(args.id, verdict, ctx)
+            return 3
+        try:
+            final_head, final_provenance = _lane_candidate(
+                store, current, getattr(args, "head", None), delivery=True,
+            )
+            final_target = _lane_resolve(store, current.get("target_ref"))
+        except lane_mod.LaneError as exc:
+            sys.stderr.write(
+                f"agenttalk lane deliver: final Git recheck failed ({exc}); retry.\n"
+            )
+            return 3
+        if (final_head != head or final_target != ctx.get("target_head_now")
+                or lane_mod.fingerprint(final_provenance or {})
+                != lane_mod.fingerprint(provenance or {})):
+            sys.stderr.write(
+                "agenttalk lane deliver: target/head/worktree changed during evaluation; "
+                "NO evidence committed, retry.\n"
+            )
+            return 3
+        provenance = final_provenance
+        cooperating_after = lane_mod.cooperating_input_fingerprint(store)
+        if cooperating_before != cooperating_after:
+            sys.stderr.write(
+                "agenttalk lane deliver: cooperating config/domain/gate/epoch inputs "
+                "changed during evaluation; NO evidence committed, retry.\n"
+            )
+            return 3
+
+        evaluation_snapshot = lane_mod.build_evaluation_snapshot(
+            lane=current, active_lanes=others, context=ctx,
+            worktree_provenance=provenance,
+        )
+        try:
+            pending = lane_mod.write_prepared_delivery_artifact(
+                store, lane=current, head_sha=head, verdict=verdict,
+                changed=ctx["changed"], merge=ctx["merge"],
+                gate_check=ctx["gate_check"], delivered_by=actor, at=_iso_now(),
+                evaluation_snapshot=evaluation_snapshot,
+                worktree_provenance=provenance,
+            )
+        except (OSError, lane_mod.LaneError) as exc:
+            sys.stderr.write(
+                f"agenttalk lane deliver: prepared artifact write failed ({exc}); "
+                "lane stays active.\n"
+            )
+            return 2
+        pending["lane_id"] = args.id
+        pending["input_fingerprint"] = cooperating_after
+        pending["evaluation_fingerprint"] = lane_mod.fingerprint(evaluation_snapshot)
+
+        cas_error = None
+        competing_delivery = False
+        try:
+            with store._config_lock():
+                data = lane_mod.load_lanes(store)
+                latest = (data.get("lanes") or {}).get(args.id)
+                if isinstance(latest, dict) and latest.get("status") == lane_mod.STATUS_DELIVERED:
+                    if (latest.get("instance_id") == current.get("instance_id")
+                            and latest.get("generation") == current.get("generation")):
+                        competing_delivery = True
+                    else:
+                        cas_error = "a replacement lane instance was delivered during delivery"
+                elif not isinstance(latest, dict) or latest.get("status") != lane_mod.STATUS_ACTIVE:
+                    cas_error = "lane is no longer the active instance that was evaluated"
+                elif (latest.get("instance_id") != current.get("instance_id")
+                      or latest.get("generation") != current.get("generation")
+                      or lane_mod.fingerprint(latest) != expected_lane_fingerprint):
+                    cas_error = "lane instance/generation changed during delivery"
+                elif lane_mod.active_lane_fingerprints(data, exclude=args.id) != expected_active:
+                    cas_error = "active-lane set changed during delivery"
+                elif lane_mod.cooperating_input_fingerprint(store) != cooperating_after:
+                    cas_error = "cooperating config/domain/gate/epoch inputs changed"
                 else:
-                    current["worktree_state"] = lane_mod.STATUS_CLEANUP_PENDING
-            lane_mod.save_lanes(store, data)
-        print(f"delivered lane {args.id} @ {head[:12]} (GO); evidence: {artifact}")
+                    latest["status"] = lane_mod.STATUS_DELIVERED
+                    latest["delivered_head"] = head
+                    latest["delivered_by"] = actor
+                    latest["delivered_at"] = pending["started_at"]
+                    latest["delivery_transaction_id"] = pending["transaction_id"]
+                    latest["publish_pending"] = dict(pending)
+                    latest["prepared_artifact"] = pending["prepared_artifact"]
+                    latest["cleanup_pending"] = bool(latest.get("worktree_path"))
+                    if latest.get("worktree_path"):
+                        latest["worktree_state"] = lane_mod.STATUS_CLEANUP_PENDING
+                    lane_mod.save_lanes(store, data)
+        except (OSError, lane_mod.LaneError) as exc:
+            persisted = False
+            try:
+                with store._config_lock():
+                    saved = (lane_mod.load_lanes(store).get("lanes") or {}).get(args.id)
+                    persisted = isinstance(saved, dict) and _lane_transaction_matches(
+                        saved, pending,
+                    )
+            except (OSError, lane_mod.LaneError, TimeoutError):
+                pass
+            if not persisted:
+                _lane_remove_prepared(pending)
+            sys.stderr.write(
+                f"agenttalk lane deliver: first delivery state save failed ({exc}); "
+                "no consumable artifact was published.\n"
+            )
+            return 2
+
+        if competing_delivery:
+            _lane_remove_prepared(pending)
+        elif cas_error:
+            _lane_remove_prepared(pending)
+            sys.stderr.write(
+                f"agenttalk lane deliver: CAS refused ({cas_error}); lane was not "
+                "committed.\n"
+            )
+            return 3
+
+        try:
+            artifact, cleanup_pending, delivered_head = _lane_finalize_delivery(
+                store, args.id,
+            )
+        except (OSError, lane_mod.LaneError, GitWriteError) as exc:
+            sys.stderr.write(
+                f"agenttalk lane deliver: delivery is checkpointed but pending recovery "
+                f"({exc}); retry the same command.\n"
+            )
+            return 2
+        print(
+            f"delivered lane {args.id} @ {delivered_head[:12]} (GO); evidence: {artifact}"
+            + ("; cleanup pending" if cleanup_pending else "")
+        )
         return 0
 
     if action == "workspace":
@@ -3525,6 +3810,13 @@ def cmd_lane(args: argparse.Namespace) -> int:
             data = lane_mod.load_lanes(store)
             lane = (data.get("lanes") or {}).get(lane_id)
             if isinstance(lane, dict):
+                if (lane.get("status") == lane_mod.STATUS_DELIVERED
+                        and isinstance(lane.get("publish_pending"), dict)):
+                    sys.stderr.write(
+                        "agenttalk lane abandon: delivered lane has publication pending; "
+                        "retry lane deliver before abandon.\n"
+                    )
+                    return 2
                 lane["status"] = lane_mod.STATUS_ABANDONED
                 if lane.get("worktree_path"):
                     branch_delete_block_reason = "worktree cleanup did not complete"
@@ -9869,8 +10161,13 @@ def build_parser() -> argparse.ArgumentParser:
     lassign.add_argument("--force", action="store_true", help="Overwrite an existing lane id.")
     lassign.add_argument("--worktrees-root",
                          help="Managed worktree root (default: <repo>/.worktrees).")
+    lassign.add_argument(
+        "--advisory", action="store_true",
+        help="Non-release coordination lane; may use --no-worktree but can never "
+             "satisfy release isolation.",
+    )
     lassign.add_argument("--no-worktree", action="store_true",
-                         help="Audited waiver: assign without isolation (requires reason).")
+                         help="Assign an --advisory lane without isolation (requires reason).")
     lassign.add_argument("--worktree-waiver-reason",
                          help="Required human-readable reason when --no-worktree is used.")
     lassign.set_defaults(func=cmd_lane)
