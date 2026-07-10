@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import uuid
 from typing import Any
 
 from agenttalk.gates import CORE_RISK_CLASSES, is_valid_risk_class
@@ -88,6 +89,7 @@ SIGNOFF_DIRNAME = "signoffs.json"
 
 _CLOSE_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _FULL_SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
+_INSTANCE_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 
 
 class CloseError(ValueError):
@@ -104,10 +106,11 @@ def empty_close(close_id: str, *, scope: str, revision: str, revision_kind: str,
                 revision_clean: bool, dirty_artifact: str | None,
                 lane_delivery_artifact: str | None = None,
                 non_lane_isolation_not_asserted: bool = False) -> dict[str, Any]:
-    """A freshly OPENED close record (pure; the CLI persists it)."""
+    """A freshly OPENED, unpersisted close record."""
     return {
         "schema_version": SCHEMA_VERSION,
         "generation": 0,
+        "instance_id": None,
         "close_id": close_id,
         "scope": scope,
         "revision": revision,
@@ -407,6 +410,11 @@ def _is_wellformed(record: object) -> bool:
     generation = record.get("generation", 0)
     if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
         return False
+    instance_id = record.get("instance_id")
+    if instance_id is not None and (
+        not isinstance(instance_id, str) or not _INSTANCE_ID_RE.match(instance_id)
+    ):
+        return False
     for key in ("close_id", "scope", "revision", "gate_scope", "status"):
         if not isinstance(record.get(key), str) or not record.get(key):
             return False
@@ -688,6 +696,16 @@ def close_generation(record: dict) -> int:
     return generation
 
 
+def close_instance_id(record: dict) -> str | None:
+    """Return the immutable instance id, or None for a legacy close record."""
+    instance_id = record.get("instance_id")
+    if instance_id is None:
+        return None
+    if not isinstance(instance_id, str) or not _INSTANCE_ID_RE.match(instance_id):
+        raise CloseError("close instance_id must be a 32-character lowercase hex id")
+    return instance_id
+
+
 def _close_update_lock(store, close_id: str, *, timeout: float):
     lock_path = closes_dir(store) / f".{validate_close_id(close_id)}.lock"
     return store._exclusive_lock(
@@ -697,50 +715,125 @@ def _close_update_lock(store, close_id: str, *, timeout: float):
     )
 
 
-def save_close(store, record: dict, *, expected_generation: int | None = None,
-               lock_timeout: float = 10.0) -> int:
-    """Persist a close under its per-close lock and return the new generation.
-
-    Pass the generation returned by :func:`load_close` to make the write a
-    compare-and-swap. A mismatch raises :class:`CloseConflict` without changing
-    the file. Omitting it preserves the legacy overwrite path for callers that
-    have not yet adopted generation checks.
-    """
+def _write_close(path, record: dict) -> None:
     from agenttalk import _atomic
 
+    _atomic.write_text(
+        path,
+        json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True),
+    )
+
+
+def create_close(store, record: dict, *, lock_timeout: float = 10.0) -> int:
+    """Exclusively create a close and return its first persisted generation."""
     close_id = validate_close_id(record.get("close_id"))
     generation = close_generation(record)
-    if expected_generation is not None:
-        if (not isinstance(expected_generation, int)
-                or isinstance(expected_generation, bool)
-                or expected_generation < 0):
-            raise CloseError("expected close generation must be a non-negative integer")
-        if generation != expected_generation:
-            raise CloseConflict(
-                f"close {close_id!r} record generation {generation} does not match "
-                f"expected generation {expected_generation}")
+    instance_id = close_instance_id(record)
+    if generation != 0:
+        raise CloseConflict(
+            f"new close {close_id!r} must start at generation 0, got {generation}")
+    if instance_id is not None:
+        raise CloseConflict("new close must not reuse an existing instance_id")
     closes_dir(store).mkdir(parents=True, exist_ok=True)
     path = close_path(store, close_id)
     with _close_update_lock(store, close_id, timeout=lock_timeout):
-        if expected_generation is not None:
-            if not path.exists():
-                raise CloseConflict(
-                    f"close {close_id!r} no longer exists; expected generation "
-                    f"{expected_generation}")
-            actual_generation = close_generation(load_close(store, close_id))
-            if actual_generation != expected_generation:
-                raise CloseConflict(
-                    f"close {close_id!r} changed from generation {expected_generation} "
-                    f"to {actual_generation}; reload before retrying")
-        next_generation = generation + 1
+        if path.exists():
+            raise CloseConflict(f"close {close_id!r} already exists; use a checked update")
+        persisted = dict(record)
+        persisted["instance_id"] = uuid.uuid4().hex
+        persisted["generation"] = 1
+        if not _is_wellformed(persisted):
+            raise CloseError(f"close {close_id!r} is malformed")
+        _write_close(path, persisted)
+    record["instance_id"] = persisted["instance_id"]
+    record["generation"] = 1
+    return 1
+
+
+def upgrade_legacy_close(store, close_id: str, *, lock_timeout: float = 10.0) -> dict:
+    """Add version identity to the latest legacy record under its close lock.
+
+    The caller supplies no stale record to overwrite: this function reads the
+    current bytes while locked, adds only identity metadata, persists, and returns
+    the upgraded record. Callers must then use checked saves.
+    """
+    close_id = validate_close_id(close_id)
+    path = close_path(store, close_id)
+    with _close_update_lock(store, close_id, timeout=lock_timeout):
+        if not path.exists():
+            raise CloseError(f"no close {close_id!r} at {path}")
+        current = load_close(store, close_id)
+        if close_instance_id(current) is not None:
+            raise CloseConflict(f"close {close_id!r} is already versioned; reload it")
+        upgraded = dict(current)
+        upgraded["instance_id"] = uuid.uuid4().hex
+        upgraded["generation"] = close_generation(current) + 1
+        if not _is_wellformed(upgraded):
+            raise CloseError(f"close {close_id!r} is malformed")
+        _write_close(path, upgraded)
+    return upgraded
+
+
+def save_close(store, record: dict, *, expected_generation: int | None = None,
+               expected_instance_id: str | None = None,
+               lock_timeout: float = 10.0) -> int:
+    """Checked update of an existing close; creation uses :func:`create_close`.
+
+    Both preconditions are mandatory. The generation prevents lost updates and
+    the immutable instance id prevents delete/recreate ABA from matching a stale
+    updater that happens to carry the recreated close's generation.
+    """
+    close_id = validate_close_id(record.get("close_id"))
+    generation = close_generation(record)
+    instance_id = close_instance_id(record)
+    if expected_generation is None:
+        raise CloseConflict(
+            f"close {close_id!r} update requires expected_generation; "
+            "use create_close for creation")
+    if (not isinstance(expected_generation, int)
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0):
+        raise CloseError("expected close generation must be a non-negative integer")
+    if instance_id is None:
+        raise CloseConflict(
+            f"close {close_id!r} is a legacy record; run upgrade_legacy_close first")
+    if expected_instance_id is None:
+        raise CloseConflict(f"close {close_id!r} update requires expected_instance_id")
+    if (not isinstance(expected_instance_id, str)
+            or not _INSTANCE_ID_RE.match(expected_instance_id)):
+        raise CloseError("expected close instance_id must be a 32-character lowercase hex id")
+    if generation != expected_generation:
+        raise CloseConflict(
+            f"close {close_id!r} record generation {generation} does not match "
+            f"expected generation {expected_generation}")
+    if instance_id != expected_instance_id:
+        raise CloseConflict(
+            f"close {close_id!r} record instance {instance_id!r} does not match "
+            f"expected instance {expected_instance_id!r}")
+    path = close_path(store, close_id)
+    with _close_update_lock(store, close_id, timeout=lock_timeout):
+        if not path.exists():
+            raise CloseConflict(f"close {close_id!r} no longer exists; reload before retrying")
+        current = load_close(store, close_id)
+        actual_generation = close_generation(current)
+        actual_instance_id = close_instance_id(current)
+        if actual_instance_id is None:
+            raise CloseConflict(
+                f"close {close_id!r} is a legacy record; run upgrade_legacy_close first")
+        if actual_instance_id != expected_instance_id:
+            raise CloseConflict(
+                f"close {close_id!r} instance changed from {expected_instance_id!r} "
+                f"to {actual_instance_id!r}; reload before retrying")
+        if actual_generation != expected_generation:
+            raise CloseConflict(
+                f"close {close_id!r} changed from generation {expected_generation} "
+                f"to {actual_generation}; reload before retrying")
+        next_generation = expected_generation + 1
         persisted = dict(record)
         persisted["generation"] = next_generation
         if not _is_wellformed(persisted):
             raise CloseError(f"close {close_id!r} is malformed")
-        _atomic.write_text(
-            path,
-            json.dumps(persisted, ensure_ascii=False, indent=2, sort_keys=True),
-        )
+        _write_close(path, persisted)
     record["generation"] = next_generation
     return next_generation
 
@@ -883,6 +976,8 @@ def reopen(record: dict, *, by: str, at: str, revision: str | None = None,
     record["status"] = REOPENED
     record["final"] = None
     if revision is not None:
+        if revision != record.get("revision"):
+            record["dirty_artifact"] = None
         record["revision"] = revision
     if revision_clean is not None:
         record["revision_clean"] = bool(revision_clean)

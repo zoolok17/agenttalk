@@ -270,6 +270,15 @@ def test_reopen_clears_final_and_revision_change_stales_acks() -> None:
     assert close.HOLD_STALE_ACK in _codes(close.compute_verdict(rec, _gate_go()))
 
 
+def test_reopen_revision_change_clears_prior_dirty_artifact() -> None:
+    rec = _satisfied()
+    rec["dirty_artifact"] = "artifacts/old-revision.diff"
+
+    close.reopen(rec, by="op", at="t", revision=OTHER_SHA, revision_clean=False)
+
+    assert rec["dirty_artifact"] is None
+
+
 # --------------------------------------------------------------- integration
 
 def _init(tmp_path: Path) -> Path:
@@ -306,8 +315,9 @@ def test_concurrent_close_saves_reject_one_stale_generation(tmp_path: Path) -> N
         gate_scope="release", opened_by="lead", opened_at="t0",
         epoch_at_open=None, required_lenses=[], revision_clean=True,
         dirty_artifact=None, non_lane_isolation_not_asserted=True)
-    close.save_close(store, rec)
+    close.create_close(store, rec)
     generation = rec["generation"]
+    instance_id = rec["instance_id"]
     ready = threading.Barrier(3)
 
     def update(body: str) -> str:
@@ -315,7 +325,10 @@ def test_concurrent_close_saves_reject_one_stale_generation(tmp_path: Path) -> N
         close.set_draft(local, body=body, by="lead", at=body)
         ready.wait()
         try:
-            close.save_close(store, local, expected_generation=generation)
+            close.save_close(
+                store, local, expected_generation=generation,
+                expected_instance_id=instance_id,
+            )
         except close.CloseConflict:
             return "conflict"
         return "saved"
@@ -331,7 +344,95 @@ def test_concurrent_close_saves_reject_one_stale_generation(tmp_path: Path) -> N
     assert stored["draft"]["body"] in {"first", "second"}
 
 
-def test_legacy_close_without_generation_upgrades_on_checked_save(tmp_path: Path) -> None:
+def test_existing_close_rejects_save_without_expected_generation(tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    rec = close.empty_close(
+        "rel", scope="release", revision=SHA, revision_kind="sha",
+        gate_scope="release", opened_by="lead", opened_at="t0",
+        epoch_at_open=None, required_lenses=[], revision_clean=True,
+        dirty_artifact=None, non_lane_isolation_not_asserted=True)
+    close.create_close(store, rec)
+    loaded = close.load_close(store, "rel")
+    close.set_draft(loaded, body="unchecked", by="lead", at="t1")
+
+    with pytest.raises(close.CloseConflict, match="expected_generation"):
+        close.save_close(store, loaded)
+
+    assert close.load_close(store, "rel")["draft"] is None
+
+
+def test_existing_close_rejects_save_without_expected_instance(tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    rec = close.empty_close(
+        "rel", scope="release", revision=SHA, revision_kind="sha",
+        gate_scope="release", opened_by="lead", opened_at="t0",
+        epoch_at_open=None, required_lenses=[], revision_clean=True,
+        dirty_artifact=None, non_lane_isolation_not_asserted=True)
+    close.create_close(store, rec)
+    loaded = close.load_close(store, "rel")
+
+    with pytest.raises(close.CloseConflict, match="expected_instance_id"):
+        close.save_close(store, loaded, expected_generation=loaded["generation"])
+
+
+def test_delete_recreate_rejects_stale_instance_at_same_generation(tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    original = close.empty_close(
+        "rel", scope="release", revision=SHA, revision_kind="sha",
+        gate_scope="release", opened_by="lead", opened_at="t0",
+        epoch_at_open=None, required_lenses=[], revision_clean=True,
+        dirty_artifact=None, non_lane_isolation_not_asserted=True)
+    close.create_close(store, original)
+    stale = close.load_close(store, "rel")
+    stale_generation = stale["generation"]
+    stale_instance = stale["instance_id"]
+    close.close_path(store, "rel").unlink()
+    replacement = close.empty_close(
+        "rel", scope="release", revision=OTHER_SHA, revision_kind="sha",
+        gate_scope="release", opened_by="lead", opened_at="t1",
+        epoch_at_open=None, required_lenses=[], revision_clean=True,
+        dirty_artifact=None, non_lane_isolation_not_asserted=True)
+    close.create_close(store, replacement)
+    assert replacement["generation"] == stale_generation
+    assert replacement["instance_id"] != stale_instance
+    close.set_draft(stale, body="stale overwrite", by="lead", at="t2")
+
+    with pytest.raises(close.CloseConflict, match="instance"):
+        close.save_close(
+            store, stale, expected_generation=stale_generation,
+            expected_instance_id=stale_instance,
+        )
+
+    stored = close.load_close(store, "rel")
+    assert stored["revision"] == OTHER_SHA
+    assert stored["draft"] is None
+
+
+def test_create_close_is_exclusive(tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    first = close.empty_close(
+        "rel", scope="release", revision=SHA, revision_kind="sha",
+        gate_scope="release", opened_by="lead", opened_at="t0",
+        epoch_at_open=None, required_lenses=[], revision_clean=True,
+        dirty_artifact=None, non_lane_isolation_not_asserted=True)
+    second = close.empty_close(
+        "rel", scope="release", revision=OTHER_SHA, revision_kind="sha",
+        gate_scope="release", opened_by="lead", opened_at="t1",
+        epoch_at_open=None, required_lenses=[], revision_clean=True,
+        dirty_artifact=None, non_lane_isolation_not_asserted=True)
+    close.create_close(store, first)
+
+    with pytest.raises(close.CloseConflict, match="already exists"):
+        close.create_close(store, second)
+
+    assert close.load_close(store, "rel")["revision"] == SHA
+
+
+def test_legacy_close_requires_in_lock_upgrade_before_checked_save(tmp_path: Path) -> None:
     store = Store(tmp_path)
     store.init(["lead"])
     rec = close.empty_close(
@@ -340,16 +441,30 @@ def test_legacy_close_without_generation_upgrades_on_checked_save(tmp_path: Path
         epoch_at_open=None, required_lenses=[], revision_clean=True,
         dirty_artifact=None, non_lane_isolation_not_asserted=True)
     rec.pop("generation")
+    rec.pop("instance_id")
     path = close.close_path(store, "rel")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(rec), encoding="utf-8")
 
     loaded = close.load_close(store, "rel")
     assert loaded["generation"] == 0
-    close.set_draft(loaded, body="migrated", by="lead", at="t1")
-    close.save_close(store, loaded, expected_generation=0)
+    assert loaded.get("instance_id") is None
+    with pytest.raises(close.CloseConflict, match="legacy"):
+        close.save_close(store, loaded, expected_generation=0,
+                         expected_instance_id=None)
 
-    assert close.load_close(store, "rel")["generation"] == 1
+    upgraded = close.upgrade_legacy_close(store, "rel")
+    assert upgraded["generation"] == 1
+    assert isinstance(upgraded["instance_id"], str)
+    close.set_draft(upgraded, body="migrated", by="lead", at="t1")
+    close.save_close(
+        store, upgraded, expected_generation=1,
+        expected_instance_id=upgraded["instance_id"],
+    )
+
+    stored = close.load_close(store, "rel")
+    assert stored["generation"] == 2
+    assert stored["draft"]["body"] == "migrated"
 
 
 def test_cli_full_go_lifecycle(tmp_path: Path) -> None:
