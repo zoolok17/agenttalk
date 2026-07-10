@@ -75,6 +75,7 @@ _LOCK_METADATA_BYTES = 4096
 _LOCK_OWNERLESS_STALE_SECONDS = 30.0
 _LOCK_OWNERLESS_CONFIRM_SECONDS = 0.05
 _LOCK_PID_PREFIX_RE = re.compile(rb'"pid"\s*:\s*([0-9]+)')
+_LOCK_GENERATION_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 
 
 def _ensure_lock_byte(fd: int) -> None:
@@ -123,14 +124,20 @@ def _is_reparse_point(info: os.stat_result) -> bool:
     return bool(flag and attributes & flag)
 
 
-def _validate_lock_file_stat(path: Path, info: os.stat_result) -> None:
+def _validate_lock_file_stat(
+    path: Path,
+    info: os.stat_result,
+    *,
+    expected_links: int = 1,
+) -> None:
     if stat.S_ISLNK(info.st_mode) or _is_reparse_point(info):
         raise OSError(f"unsafe lock path {path}: symlink or reparse point")
     if not stat.S_ISREG(info.st_mode):
         raise OSError(f"unsafe lock path {path}: not a regular file")
-    if info.st_nlink != 1:
+    if info.st_nlink != expected_links:
         raise OSError(
-            f"unsafe lock path {path}: hardlink count is {info.st_nlink}, expected 1"
+            f"unsafe lock path {path}: hardlink count is {info.st_nlink}, "
+            f"expected {expected_links}"
         )
 
 
@@ -142,19 +149,24 @@ def _file_revision(info: os.stat_result) -> tuple[int, int, int, int]:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
 
 
-def _open_existing_lock_file(path: Path, flags: int) -> tuple[int, os.stat_result]:
+def _open_existing_lock_file(
+    path: Path,
+    flags: int,
+    *,
+    expected_links: int = 1,
+) -> tuple[int, os.stat_result]:
     """Open one existing lock path without following or accepting links."""
     before = os.lstat(path)
-    _validate_lock_file_stat(path, before)
+    _validate_lock_file_stat(path, before, expected_links=expected_links)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(str(path), flags | nofollow)
     try:
         opened = os.fstat(fd)
-        _validate_lock_file_stat(path, opened)
+        _validate_lock_file_stat(path, opened, expected_links=expected_links)
         if not _same_file(before, opened):
             raise OSError(f"unsafe lock path {path}: pathname changed while opening")
         current = os.lstat(path)
-        _validate_lock_file_stat(path, current)
+        _validate_lock_file_stat(path, current, expected_links=expected_links)
         if not _same_file(opened, current):
             raise OSError(f"unsafe lock path {path}: pathname changed while opening")
         return fd, opened
@@ -203,6 +215,56 @@ def _unlink_if_same_file(path: Path, expected: os.stat_result) -> bool:
         ) from exc
     os.unlink(quarantine)
     return False
+
+
+def _recover_published_prepare_link(path: Path) -> bool:
+    """Remove only a current-client prepare alias left by a post-link crash."""
+    try:
+        fd, identity = _open_existing_lock_file(
+            path,
+            os.O_RDONLY,
+            expected_links=2,
+        )
+    except OSError:
+        return False
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        raw = os.read(fd, _LOCK_METADATA_BYTES)
+    finally:
+        os.close(fd)
+    try:
+        record = json.loads(raw.decode("utf-8").strip(" \t\r\n\x00"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(record, dict) or record.get("protocol") != "o_excl_v2":
+        return False
+    pid = record.get("pid")
+    generation = record.get("generation")
+    if (
+        isinstance(pid, bool)
+        or not isinstance(pid, int)
+        or pid <= 0
+        or not isinstance(generation, str)
+        or _LOCK_GENERATION_RE.fullmatch(generation) is None
+    ):
+        return False
+
+    prepared = path.with_name(f".{path.name}.{generation}.prepare")
+    try:
+        prepared_identity = os.lstat(prepared)
+        _validate_lock_file_stat(prepared, prepared_identity, expected_links=2)
+    except OSError:
+        return False
+    if not _same_file(identity, prepared_identity):
+        return False
+    if not _unlink_if_same_file(prepared, identity):
+        return False
+
+    current = os.lstat(path)
+    _validate_lock_file_stat(path, current)
+    if not _same_file(identity, current):
+        raise OSError(f"unsafe lock path {path}: generation changed during recovery")
+    return True
 
 
 def _read_lock_owner(path: Path) -> tuple[int | None, os.stat_result, dict | None]:
@@ -277,14 +339,21 @@ def _write_text_exclusive(path: Path, text: str) -> os.stat_result:
     return identity
 
 
-def _publish_text_no_replace(path: Path, text: str) -> os.stat_result:
+def _publish_text_no_replace(
+    path: Path,
+    text: str,
+    *,
+    prepare_token: str,
+) -> os.stat_result:
     """Publish fully written text at an absent path without replacement.
 
     The public ownership marker never exists as a zero-byte current-client
     file: write and fsync a private inode first, then hardlink it atomically to
     the lock pathname. Hardlink creation is no-replace on Windows and POSIX.
     """
-    prepared = path.with_name(f".{path.name}.{uuid.uuid4().hex}.prepare")
+    if _LOCK_GENERATION_RE.fullmatch(prepare_token) is None:
+        raise ValueError("prepare token must be a lowercase UUID hex value")
+    prepared = path.with_name(f".{path.name}.{prepare_token}.prepare")
     identity = _write_text_exclusive(prepared, text)
     published = False
     try:
@@ -1216,18 +1285,21 @@ class Store:
                     poll=poll,
                     what=what,
                 ):
+                    generation = uuid.uuid4().hex
                     try:
                         created = _publish_text_no_replace(
                             lock,
                             json.dumps({
                                 "pid": os.getpid(),
                                 "protocol": "o_excl_v2",
-                                "generation": uuid.uuid4().hex,
+                                "generation": generation,
                                 "at": _now_iso(),
                                 "root": str(self.root)[:512],
                             }, ensure_ascii=False),
+                            prepare_token=generation,
                         )
                     except FileExistsError:
+                        _recover_published_prepare_link(lock)
                         try:
                             pid, existing, record = _read_lock_owner(lock)
                         except FileNotFoundError:

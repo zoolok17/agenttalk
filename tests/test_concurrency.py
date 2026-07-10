@@ -250,6 +250,46 @@ def test_current_config_lock_publishes_complete_marker_without_replace(
     assert list(store.dir.glob(".config.lock.*.prepare")) == []
 
 
+def test_config_lock_recovers_prepare_link_left_by_post_publish_crash(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["a", "b"])
+    lock_path = store.dir / "config.lock"
+    prepared = store.dir / f".config.lock.{'a' * 32}.prepare"
+    crash_code = """
+import json, os, pathlib, sys
+lock, prepared = map(pathlib.Path, sys.argv[1:])
+record = json.dumps({
+    'pid': os.getpid(),
+    'protocol': 'o_excl_v2',
+    'generation': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    'at': '2026-07-10T00:00:00Z',
+    'root': str(lock.parent.parent),
+})
+fd = os.open(str(prepared), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+os.write(fd, record.encode('utf-8'))
+os.fsync(fd)
+os.close(fd)
+os.link(prepared, lock)
+os._exit(91)
+"""
+
+    crashed = subprocess.run(
+        [sys.executable, "-c", crash_code, str(lock_path), str(prepared)],
+        check=False,
+    )
+    assert crashed.returncode == 91
+    assert os.path.samefile(lock_path, prepared)
+    assert os.lstat(lock_path).st_nlink == 2
+
+    with store._config_lock(timeout=0.5, poll=0.005):
+        pass
+
+    assert not lock_path.exists()
+    assert not prepared.exists()
+
+
 def test_config_lock_safely_migrates_persistent_os_lock_marker(
     tmp_path: Path,
 ) -> None:
@@ -375,6 +415,66 @@ def test_config_lock_rejects_hardlink_without_overwriting_target(
         with store._config_lock(timeout=0.05, poll=0.005):
             pass
     assert target.read_text(encoding="utf-8") == "do not overwrite"
+
+
+def test_config_lock_rejects_hardlink_with_nonmatching_prepare_decoy(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["a", "b"])
+    target = tmp_path / "lock-target.txt"
+    marker = json.dumps({
+        "pid": 2147483647,
+        "protocol": "o_excl_v2",
+        "generation": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    })
+    target.write_text(marker, encoding="utf-8")
+    lock_path = store.dir / "config.lock"
+    os.link(target, lock_path)
+    decoy_target = tmp_path / "prepare-decoy-target.txt"
+    decoy_target.write_text(marker, encoding="utf-8")
+    decoy = store.dir / f".config.lock.{'b' * 32}.prepare"
+    os.link(decoy_target, decoy)
+    assert os.lstat(lock_path).st_nlink == 2
+    assert os.lstat(decoy).st_nlink == 2
+
+    with pytest.raises(OSError, match="hardlink count"):
+        with store._config_lock(timeout=0.05, poll=0.005):
+            pass
+
+    assert target.read_text(encoding="utf-8") == marker
+    assert decoy.read_text(encoding="utf-8") == marker
+    assert os.path.samefile(target, lock_path)
+    assert os.path.samefile(decoy_target, decoy)
+    assert not os.path.samefile(target, decoy)
+
+
+def test_config_lock_rejects_matching_prepare_with_extra_hardlink(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["a", "b"])
+    generation = "cccccccccccccccccccccccccccccccc"
+    target = tmp_path / "lock-target.txt"
+    marker = json.dumps({
+        "pid": 2147483647,
+        "protocol": "o_excl_v2",
+        "generation": generation,
+    })
+    target.write_text(marker, encoding="utf-8")
+    prepared = store.dir / f".config.lock.{generation}.prepare"
+    lock_path = store.dir / "config.lock"
+    os.link(target, prepared)
+    os.link(target, lock_path)
+    assert os.lstat(lock_path).st_nlink == 3
+
+    with pytest.raises(OSError, match="hardlink count"):
+        with store._config_lock(timeout=0.05, poll=0.005):
+            pass
+
+    assert target.read_text(encoding="utf-8") == marker
+    assert os.path.samefile(target, prepared)
+    assert os.path.samefile(target, lock_path)
 
 
 def test_config_lock_rejects_hardlinked_generation_guard_without_overwrite(
