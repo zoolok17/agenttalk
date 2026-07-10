@@ -346,7 +346,7 @@ def _publish_hold_close(s, close_id: str) -> None:
                                    at="2026-07-02T00:00:00Z", reason="gate not green",
                                    gate_check={"verdict": "HOLD", "blockers": [{"name": "tests"}]},
                                    residual_risk=None, barrier_epoch=None)
-    close_mod.save_close(s, rec)
+    close_mod.create_close(s, rec)
 
 
 def test_published_hold_close_surfaces_and_malformed_degrades(tmp_path: Path) -> None:
