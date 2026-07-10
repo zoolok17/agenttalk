@@ -298,6 +298,57 @@ def test_read_codex_rollout_skips_record_without_trustworthy_timestamp(tmp_path:
     assert cap.read_codex_rollout("codex", sessions_dir=tmp_path) is None
 
 
+def test_read_codex_rollout_falls_back_when_latest_eligible_timestamp_is_malformed(
+    tmp_path: Path,
+) -> None:
+    earlier = _token_count(dict(
+        _CODEX_RL,
+        primary={"used_percent": 23.0, "window_minutes": 300, "resets_at": 1},
+    ))
+    malformed_latest = _token_count(dict(
+        _CODEX_RL,
+        primary={"used_percent": 99.0, "window_minutes": 300, "resets_at": 2},
+    ))
+    malformed_latest["timestamp"] = "not-a-date"
+    _write_codex_rollout(tmp_path, "rollout-a.jsonl", earlier, malformed_latest)
+
+    snapshot = cap.read_codex_rollout("codex", sessions_dir=tmp_path)
+
+    assert snapshot is not None
+    assert snapshot.primary_used_percent == 23.0
+
+
+@pytest.mark.parametrize("unusable_payload", [
+    {
+        "type": "token_count",
+        "rate_limits": {},
+        "info": {"model_context_window": 258400},
+    },
+    {
+        "type": "token_count",
+        "rate_limits": {"primary": {"used_percent": "not-a-number"}},
+    },
+])
+def test_read_codex_rollout_falls_back_when_latest_candidate_has_no_usable_signal(
+    tmp_path: Path, unusable_payload: dict,
+) -> None:
+    earlier = _token_count(dict(
+        _CODEX_RL,
+        primary={"used_percent": 23.0, "window_minutes": 300, "resets_at": 1},
+    ))
+    unusable_latest = {
+        "timestamp": "2026-06-09T08:30:00Z",
+        "type": "event_msg",
+        "payload": unusable_payload,
+    }
+    _write_codex_rollout(tmp_path, "rollout-a.jsonl", earlier, unusable_latest)
+
+    snapshot = cap.read_codex_rollout("codex", sessions_dir=tmp_path)
+
+    assert snapshot is not None
+    assert snapshot.primary_used_percent == 23.0
+
+
 def test_normalize_ts_accepts_any_fractional_precision() -> None:
     """Providers emit variable sub-second precision (e.g. Codex's "...:00.0Z").
     Python 3.10's fromisoformat only accepts 3- or 6-digit fractions, so the

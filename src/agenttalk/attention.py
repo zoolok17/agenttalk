@@ -27,10 +27,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from agenttalk._jsonl import append_record, iter_lines
 
 SCHEMA_VERSION = 1
 
@@ -313,24 +314,26 @@ def read_notice_events(store) -> tuple[list[dict], list[str]]:
     p = _notice_log_path(store)
     if not p.exists():
         return [], []
-    try:
-        lines = p.read_text(encoding="utf-8").splitlines()
-    except OSError as e:
-        return [], [f"notice_log_unreadable:{e}"]
     events: list[dict] = []
     warnings: list[str] = []
-    for idx, line in enumerate(lines, start=1):
-        if not line.strip():
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            warnings.append(f"notice_log_torn:{idx}")
-            continue
-        if not isinstance(obj, dict):
-            warnings.append(f"notice_log_malformed:{idx}")
-            continue
-        events.append(obj)
+    try:
+        for idx, line in iter_lines(p):
+            if line is None:
+                warnings.append(f"notice_log_utf8:{idx}")
+                continue
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                warnings.append(f"notice_log_torn:{idx}")
+                continue
+            if not isinstance(obj, dict):
+                warnings.append(f"notice_log_malformed:{idx}")
+                continue
+            events.append(obj)
+    except (OSError, UnicodeError) as e:
+        warnings.append(f"notice_log_unreadable:{e}")
     return events, warnings
 
 
@@ -346,16 +349,8 @@ def latest_dead_letter_notices(events: list[dict]) -> dict[str, dict]:
 
 
 def append_notice_event(store, event: dict) -> None:
-    line = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str)
     with store._config_lock():
-        p = _notice_log_path(store)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.write(fd, (line + "\n").encode("utf-8"))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        append_record(_notice_log_path(store), event, default=str)
 
 
 def dead_letter_resolved_for_state(store, *, agent: str, message_id: str,
@@ -599,21 +594,7 @@ def write_disposition_locked(store, event: dict) -> None:
     """Append ONE disposition event durably. Caller MUST hold store._config_lock().
     Append-only + fsync + best-effort dir-fsync - the exact knowledge.write_event_locked
     contract, so the reader's skip-invalid/torn-tail tolerance is preserved."""
-    attention_dir(store).mkdir(parents=True, exist_ok=True)
-    path = dispositions_path(store)
-    line = json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(line)
-        fh.flush()
-        os.fsync(fh.fileno())
-    try:
-        dfd = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
-    except OSError:
-        pass
+    append_record(dispositions_path(store), event)
 
 
 def append_disposition(store, event: dict) -> None:
@@ -887,20 +868,22 @@ def read_dispositions(store) -> tuple[list[dict], list[dict]]:
     valid: list[dict] = []
     problems: list[dict] = []
     try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError as e:
-        return [], [{"line": 0, "error": f"unreadable: {e}"}]
-    for n, line in enumerate(raw.splitlines(), start=1):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            evt = json.loads(line)
-        except ValueError as e:
-            problems.append({"line": n, "error": f"invalid json: {e}"})
-            continue
-        if not validate_disposition_event(evt):
-            problems.append({"line": n, "error": "malformed disposition event"})
-            continue
-        valid.append(evt)
+        for n, line in iter_lines(path):
+            if line is None:
+                problems.append({"line": n, "error": "invalid utf-8"})
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except ValueError as e:
+                problems.append({"line": n, "error": f"invalid json: {e}"})
+                continue
+            if not validate_disposition_event(evt):
+                problems.append({"line": n, "error": "malformed disposition event"})
+                continue
+            valid.append(evt)
+    except (OSError, UnicodeError) as e:
+        problems.append({"line": 0, "error": f"unreadable: {e}"})
     return valid, problems

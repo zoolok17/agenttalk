@@ -4081,8 +4081,6 @@ def cmd_onboarding(args: argparse.Namespace) -> int:
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
         run_id = getattr(args, "run_id", None) or ob.new_run_id()
         try:
-            if ob.events_path(store, run_id).exists():
-                raise ob.OnboardingError(f"run {run_id!r} already exists")
             evt = ob.new_create_event(
                 run_id=run_id,
                 title=args.title,
@@ -4092,7 +4090,7 @@ def cmd_onboarding(args: argparse.Namespace) -> int:
                 state=getattr(args, "state", None) or "scanning",
                 at=_iso_now(),
             )
-            ob.append_event(store, evt)
+            ob.create_run(store, evt)
         except ob.OnboardingError as e:
             sys.stderr.write(f"agenttalk onboarding create: {e}\n")
             return 2

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agenttalk import attention as att
 from agenttalk.store import Store
 
@@ -272,12 +274,111 @@ def test_disposition_log_append_skip_invalid(tmp_path: Path) -> None:
     s.init(["claude", "beta"])
     good = _disp("dead_letter:beta:m1", att.SOURCE_DEAD_LETTER, att.ACTION_RESOLVE_DEAD_LETTER, "H")
     att.append_disposition(s, good)
-    # append a torn/invalid line by hand; the reader must skip it, not hide the valid one
+    # An unterminated torn line must be isolated before the next durable append.
     with open(att.dispositions_path(s), "a", encoding="utf-8") as fh:
-        fh.write("{not json\n")
+        fh.write("{not json")
     att.append_disposition(s, _disp("config_blocked:beta", att.SOURCE_CONFIG_BLOCKED, att.ACTION_DEFER, "H2"))
     valid, problems = att.read_dispositions(s)
     assert len(valid) == 2 and len(problems) == 1 and problems[0]["line"] == 2
+
+
+def test_disposition_append_after_invalid_utf8_tail_preserves_valid_events(
+    tmp_path: Path,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["claude", "beta"])
+    first = _disp(
+        "dead_letter:beta:m1",
+        att.SOURCE_DEAD_LETTER,
+        att.ACTION_RESOLVE_DEAD_LETTER,
+        "H",
+    )
+    second = _disp(
+        "config_blocked:beta",
+        att.SOURCE_CONFIG_BLOCKED,
+        att.ACTION_DEFER,
+        "H2",
+    )
+    att.append_disposition(s, first)
+    with open(att.dispositions_path(s), "ab") as fh:
+        fh.write(b'{"event":"disposition","reason":"\xe2')
+
+    att.append_disposition(s, second)
+
+    valid, problems = att.read_dispositions(s)
+    assert valid == [first, second]
+    assert problems == [{"line": 2, "error": "invalid utf-8"}]
+
+
+def test_notice_log_append_after_unterminated_tail_preserves_new_event(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["claude", "beta"])
+    path = att._notice_log_path(s)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"kind": "dead_letter"', encoding="utf-8")
+    event = {
+        "kind": att.NOTICE_DEAD_LETTER,
+        "notice_key": "dead_letter:beta:m1",
+        "request_id": "rq-notice",
+    }
+
+    att.append_notice_event(s, event)
+
+    events, warnings = att.read_notice_events(s)
+    assert events == [event]
+    assert warnings == ["notice_log_torn:1"]
+
+
+def test_notice_append_after_invalid_utf8_tail_preserves_valid_events(
+    tmp_path: Path,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["claude", "beta"])
+    path = att._notice_log_path(s)
+    first = {
+        "kind": att.NOTICE_DEAD_LETTER,
+        "notice_key": "dead_letter:beta:m1",
+        "request_id": "rq-first",
+    }
+    second = {
+        "kind": att.NOTICE_DEAD_LETTER,
+        "notice_key": "dead_letter:beta:m2",
+        "request_id": "rq-second",
+    }
+    att.append_notice_event(s, first)
+    with open(path, "ab") as fh:
+        fh.write(b'{"kind":"dead_letter","body":"\xe2')
+
+    att.append_notice_event(s, second)
+
+    events, warnings = att.read_notice_events(s)
+    assert events == [first, second]
+    assert warnings == ["notice_log_utf8:2"]
+
+
+def test_attention_readers_stream_without_path_read_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = Store(tmp_path)
+    s.init(["claude", "beta"])
+    notice = {"kind": att.NOTICE_DEAD_LETTER, "notice_key": "n1"}
+    disposition = _disp(
+        "dead_letter:beta:m1",
+        att.SOURCE_DEAD_LETTER,
+        att.ACTION_RESOLVE_DEAD_LETTER,
+        "H",
+    )
+    att.append_notice_event(s, notice)
+    att.append_disposition(s, disposition)
+
+    def fail_read_text(*args, **kwargs):
+        raise AssertionError("attention ledgers must be streamed")
+
+    monkeypatch.setattr(Path, "read_text", fail_read_text)
+    notices, notice_warnings = att.read_notice_events(s)
+    dispositions, disposition_problems = att.read_dispositions(s)
+    assert notices == [notice] and notice_warnings == []
+    assert dispositions == [disposition] and disposition_problems == []
 
 
 def test_disposition_survives_reset_and_archive(tmp_path: Path) -> None:

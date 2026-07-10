@@ -11,13 +11,13 @@ workflow state, not copied source or raw bus transcripts.
 from __future__ import annotations
 
 import json
-import os
 import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 from agenttalk import domains as dom
+from agenttalk._jsonl import append_record, iter_lines
 
 SCHEMA_VERSION = 1
 STORE_DIRNAME = "onboarding"
@@ -260,6 +260,8 @@ def new_record_event(*, run_id: str, kind: str, key: str, status: str,
                      source: str | None = None, confidence: str | None = None,
                      blocking: bool = False, at: str | None = None) -> dict[str, Any]:
     item_kind = validate_kind(kind)
+    if not isinstance(blocking, bool):
+        raise OnboardingError("blocking must be a boolean")
     evt: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "event": EVENT_RECORD,
@@ -269,7 +271,7 @@ def new_record_event(*, run_id: str, kind: str, key: str, status: str,
         "status": validate_status(item_kind, status),
         "summary": _bounded_text(summary, "summary", max_bytes=SUMMARY_MAX_BYTES),
         "actor": validate_agent(actor),
-        "blocking": bool(blocking),
+        "blocking": blocking,
         "updated_at": at or utc_now(),
     }
     if segment:
@@ -339,7 +341,7 @@ def event_problem(evt: object) -> str | None:
                 paths=evt.get("paths"),
                 source=evt.get("source"),
                 confidence=evt.get("confidence"),
-                blocking=bool(evt.get("blocking")),
+                blocking=evt.get("blocking"),
                 at=_bounded_text(evt.get("updated_at"), "updated_at", max_bytes=80),
             )
         else:
@@ -361,33 +363,29 @@ def events_path(store, run_id: str) -> Any:
     return run_dir(store, run_id) / EVENTS_FILENAME
 
 
-def _fsync_parent(path: Any) -> None:
-    try:
-        dfd = os.open(str(path), os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
-    except OSError:
-        pass
-
-
 def write_event_locked(store, event: dict[str, Any]) -> None:
     problem = event_problem(event)
     if problem is not None:
         raise OnboardingError(problem)
-    path = events_path(store, event["run_id"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(line)
-        fh.flush()
-        os.fsync(fh.fileno())
-    _fsync_parent(path.parent)
+    append_record(events_path(store, event["run_id"]), event)
 
 
 def append_event(store, event: dict[str, Any]) -> None:
     with store._config_lock():
+        write_event_locked(store, event)
+
+
+def create_run(store, event: dict[str, Any]) -> None:
+    """Create one run under the store lock, refusing an existing ledger."""
+    problem = event_problem(event)
+    if problem is not None:
+        raise OnboardingError(problem)
+    if event.get("event") != EVENT_CREATE:
+        raise OnboardingError("create_run requires a create event")
+    path = events_path(store, event["run_id"])
+    with store._config_lock():
+        if path.exists():
+            raise OnboardingError(f"run {event['run_id']!r} already exists")
         write_event_locked(store, event)
 
 
@@ -398,26 +396,28 @@ def read_events(store, run_id: str) -> tuple[list[dict[str, Any]], list[dict[str
     valid: list[dict[str, Any]] = []
     problems: list[dict[str, Any]] = []
     try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError as e:
-        return [], [{"line": 0, "error": f"unreadable: {e}"}]
-    for n, line in enumerate(raw.splitlines(), start=1):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            evt = json.loads(line)
-        except ValueError as e:
-            problems.append({"line": n, "error": f"invalid json: {e}"})
-            continue
-        if evt.get("run_id") != run_id:
-            problems.append({"line": n, "error": "run_id does not match directory"})
-            continue
-        problem = event_problem(evt)
-        if problem is not None:
-            problems.append({"line": n, "error": problem})
-            continue
-        valid.append(evt)
+        for n, line in iter_lines(path):
+            if line is None:
+                problems.append({"line": n, "error": "invalid utf-8"})
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except ValueError as e:
+                problems.append({"line": n, "error": f"invalid json: {e}"})
+                continue
+            problem = event_problem(evt)
+            if problem is not None:
+                problems.append({"line": n, "error": problem})
+                continue
+            if evt.get("run_id") != run_id:
+                problems.append({"line": n, "error": "run_id does not match directory"})
+                continue
+            valid.append(evt)
+    except (OSError, UnicodeError) as e:
+        problems.append({"line": 0, "error": f"unreadable: {e}"})
     return valid, problems
 
 

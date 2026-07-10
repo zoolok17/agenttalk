@@ -196,15 +196,14 @@ def _normalize_ts(ts: object) -> str | None:
     return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _last_capacity_record(path: Path) -> dict | None:
-    """Stream a rollout JSONL and return the LAST record carrying budget
-    (``payload.rate_limits``) AND/OR context (``payload.info`` with
-    ``model_context_window``) — the whole record, so the caller can read its
-    ``timestamp``. Eligibility is decoupled from ``rate_limits`` so a
-    context-only record still publishes. Only JSON-parses lines containing a
-    marker, so a multi-MB session file stays cheap to scan.
+def _last_capacity_snapshot(path: Path, source_agent: str) -> CapacitySnapshot | None:
+    """Stream a rollout JSONL and retain the LAST usable capacity snapshot.
+
+    Marker keys only make a record worth parsing. The semantic parser decides
+    eligibility, so an empty or malformed newer candidate cannot hide an
+    earlier usable budget or context snapshot in the same file.
     """
-    last: dict | None = None
+    last: CapacitySnapshot | None = None
     try:
         with path.open(encoding="utf-8") as fh:
             for line in fh:
@@ -214,14 +213,11 @@ def _last_capacity_record(path: Path) -> dict | None:
                     rec = json.loads(line)
                 except ValueError:
                     continue
-                payload = rec.get("payload") if isinstance(rec, dict) else None
-                if not isinstance(payload, dict):
+                if not isinstance(rec, dict):
                     continue
-                has_budget = isinstance(payload.get("rate_limits"), dict)
-                info = payload.get("info")
-                has_context = isinstance(info, dict) and "model_context_window" in info
-                if has_budget or has_context:
-                    last = rec
+                snapshot = _codex_snapshot(source_agent, rec)
+                if snapshot is not None:
+                    last = snapshot
     except OSError:
         return None
     return last
@@ -271,7 +267,9 @@ def _codex_snapshot(source_agent: str, rec: dict) -> CapacitySnapshot | None:
     rl = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), dict) else {}
     five, week = _pick_windows(rl.get("primary"), rl.get("secondary"))
     ctx_pct, ctx_size, ctx_tokens = _codex_context(payload.get("info"))
-    has_budget = not (five.get("used_percent") is None and week.get("used_percent") is None)
+    primary_used = _as_float(five.get("used_percent"))
+    secondary_used = _as_float(week.get("used_percent"))
+    has_budget = primary_used is not None or secondary_used is not None
     if not has_budget and ctx_pct is None:
         return None
     # observed_at = when CODEX took the reading (the record timestamp), not when
@@ -284,10 +282,10 @@ def _codex_snapshot(source_agent: str, rec: dict) -> CapacitySnapshot | None:
         return None
     return CapacitySnapshot(
         source_agent=source_agent, observed_at=observed, source="codex_rollout",
-        primary_used_percent=_as_float(five.get("used_percent")),
+        primary_used_percent=primary_used,
         primary_resets_at=_as_int(five.get("resets_at")),
         primary_window_minutes=_as_int(five.get("window_minutes")) or FIVE_HOUR_MINUTES,
-        secondary_used_percent=_as_float(week.get("used_percent")),
+        secondary_used_percent=secondary_used,
         secondary_resets_at=_as_int(week.get("resets_at")),
         secondary_window_minutes=_as_int(week.get("window_minutes")) or WEEKLY_MINUTES,
         plan_type=_as_str(rl.get("plan_type")),
@@ -394,11 +392,9 @@ def read_codex_rollout(
             else:
                 return None
     for f in candidates[:max_files]:
-        rec = _last_capacity_record(f)
-        if rec is not None:
-            snap = _codex_snapshot(source_agent, rec)
-            if snap is not None:
-                return snap
+        snapshot = _last_capacity_snapshot(f, source_agent)
+        if snapshot is not None:
+            return snapshot
     return None
 
 

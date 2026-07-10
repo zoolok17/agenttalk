@@ -24,12 +24,12 @@ Design (codex knowledge design, lead-gated; dev-2 + reviewer-1 consults folded i
 from __future__ import annotations
 
 import json
-import os
 import re
 from datetime import datetime, timezone
 from typing import Any
 
 from agenttalk import domains as dom
+from agenttalk._jsonl import append_record, iter_lines
 
 SCHEMA_VERSION = 1
 STORE_DIRNAME = "knowledge"
@@ -668,24 +668,7 @@ def write_event_locked(store, event: dict) -> None:
     ``store._config_lock()`` (curate reads-then-appends under one lock to avoid a nested
     lock; publish goes through :func:`append_event`). Append-only - never whole-file
     replace, so the reader's skip-invalid/torn-tail tolerance is preserved."""
-    knowledge_dir(store).mkdir(parents=True, exist_ok=True)
-    line = json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
-    path = notes_path(store)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(line)
-        fh.flush()
-        os.fsync(fh.fileno())
-    # Directory fsync is POSIX durability for the new dir entry; best-effort and guarded
-    # because opening/fsyncing a directory fd is not portable to Windows (the primary
-    # platform) - it raises there, so swallow OSError and rely on the file fsync.
-    try:
-        dfd = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
-    except OSError:
-        pass
+    append_record(notes_path(store), event)
 
 
 def append_event(store, event: dict) -> None:
@@ -706,20 +689,22 @@ def read_events(store) -> tuple[list[dict], list[dict]]:
     valid: list[dict] = []
     problems: list[dict] = []
     try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError as e:
-        return [], [{"line": 0, "error": f"unreadable: {e}"}]
-    for n, line in enumerate(raw.splitlines(), start=1):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            evt = json.loads(line)
-        except ValueError as e:
-            problems.append({"line": n, "error": f"invalid json: {e}"})
-            continue
-        if not _is_wellformed(evt):
-            problems.append({"line": n, "error": "malformed event (missing required structure)"})
-            continue
-        valid.append(evt)
+        for n, line in iter_lines(path):
+            if line is None:
+                problems.append({"line": n, "error": "invalid utf-8"})
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except ValueError as e:
+                problems.append({"line": n, "error": f"invalid json: {e}"})
+                continue
+            if not _is_wellformed(evt):
+                problems.append({"line": n, "error": "malformed event (missing required structure)"})
+                continue
+            valid.append(evt)
+    except (OSError, UnicodeError) as e:
+        problems.append({"line": 0, "error": f"unreadable: {e}"})
     return valid, problems

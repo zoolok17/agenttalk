@@ -408,6 +408,55 @@ def test_cli_malformed_line_is_failsafe(tmp_path: Path) -> None:
     assert _run(["status"], root) == 0
 
 
+def test_append_after_unterminated_knowledge_tail_preserves_new_event(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    store = Store(root)
+    first = _publish(note_id="kn-first", key="cli.first")
+    second = _publish(note_id="kn-second", key="cli.second")
+    kn.append_event(store, first)
+    with open(kn.notes_path(store), "a", encoding="utf-8") as fh:
+        fh.write('{"event": "publish", "id": "torn"')
+
+    kn.append_event(store, second)
+
+    events, problems = kn.read_events(store)
+    assert [event["id"] for event in events] == ["kn-first", "kn-second"]
+    assert len(problems) == 1 and problems[0]["line"] == 2
+
+
+def test_append_after_invalid_utf8_knowledge_tail_preserves_valid_events(
+    tmp_path: Path,
+) -> None:
+    root = _repo(tmp_path)
+    store = Store(root)
+    first = _publish(note_id="kn-first", key="cli.first")
+    second = _publish(note_id="kn-second", key="cli.second")
+    kn.append_event(store, first)
+    with open(kn.notes_path(store), "ab") as fh:
+        fh.write(b'{"event":"publish","body":"\xe2')
+
+    kn.append_event(store, second)
+
+    events, problems = kn.read_events(store)
+    assert [event["id"] for event in events] == ["kn-first", "kn-second"]
+    assert problems == [{"line": 2, "error": "invalid utf-8"}]
+
+
+def test_knowledge_reader_streams_without_path_read_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _repo(tmp_path)
+    store = Store(root)
+    kn.append_event(store, _publish())
+
+    def fail_read_text(*args, **kwargs):
+        raise AssertionError("knowledge ledger must be streamed")
+
+    monkeypatch.setattr(Path, "read_text", fail_read_text)
+    events, problems = kn.read_events(store)
+    assert len(events) == 1 and problems == []
+
+
 # ---- CLI integration: C4a/C4b/C4c/C4d (0.40.1)
 
 def _verify(root: Path, key: str) -> int:
