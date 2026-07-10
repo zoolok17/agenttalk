@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -184,7 +187,12 @@ def test_partial_launch_request_create_cleans_creator_owned_marker(
 
     def tracked_open(raw_path, flags, *args):
         fd = real_open(raw_path, flags, *args)
-        if Path(raw_path) == path:
+        opened = Path(raw_path)
+        if (
+            opened.parent == path.parent
+            and opened.name.startswith(f".{path.name}.")
+            and opened.name.endswith(".prepare")
+        ):
             target_fds.add(fd)
         return fd
 
@@ -220,6 +228,95 @@ def test_partial_launch_request_create_cleans_creator_owned_marker(
         store.write_launch_request(_marker(request_id))
 
     assert not path.exists()
+    assert list(path.parent.glob(f".{path.name}.*.prepare")) == []
+
+
+@pytest.mark.parametrize(
+    ("crash_phase", "public_expected"),
+    [("before-link", False), ("after-link", True)],
+)
+def test_launch_request_abrupt_publish_death_is_absent_or_complete(
+    tmp_path: Path,
+    crash_phase: str,
+    public_expected: bool,
+) -> None:
+    store = _store(tmp_path)
+    request_id = f"lr-crash-{crash_phase}"
+    payload = _marker(request_id)
+    path = store._launch_request_path(request_id)
+    crash_code = r"""
+import json, os, pathlib, sys
+from agenttalk import store as store_mod
+from agenttalk.store import Store
+
+root = pathlib.Path(sys.argv[1])
+request_path = pathlib.Path(sys.argv[2])
+phase = sys.argv[3]
+payload = json.loads(sys.argv[4])
+real_link = store_mod.os.link
+
+def crash_link(source, destination, *, follow_symlinks=True):
+    if pathlib.Path(destination) == request_path:
+        if phase == 'after-link':
+            real_link(source, destination, follow_symlinks=follow_symlinks)
+        os._exit(91)
+    return real_link(source, destination, follow_symlinks=follow_symlinks)
+
+store_mod.os.link = crash_link
+Store(root).write_launch_request(payload)
+"""
+
+    crashed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            crash_code,
+            str(tmp_path),
+            str(path),
+            crash_phase,
+            json.dumps(payload),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert crashed.returncode == 91, crashed.stderr
+    assert path.exists() is public_expected
+
+    if public_expected:
+        assert json.loads(path.read_text(encoding="utf-8"))["request_id"] == request_id
+    else:
+        assert store.read_launch_request(request_id) is None
+        store.write_launch_request(payload)
+
+    assert [marker["request_id"] for marker in store.list_launch_requests()] == [
+        request_id
+    ]
+    claimed = store.claim_launch_request(
+        request_id,
+        claimed_by="supervisor",
+        at_epoch=NOW,
+    )
+    assert claimed is not None and claimed["state"] == eph.STATE_CLAIMED
+
+
+def test_launch_request_create_rejects_hardlink_without_overwriting_target(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    request_id = "lr-hardlink"
+    path = store._launch_request_path(request_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    target = tmp_path / "launch-target.txt"
+    target.write_text("do not overwrite", encoding="utf-8")
+    os.link(target, path)
+
+    with pytest.raises(ValueError, match="already exists"):
+        store.write_launch_request(_marker(request_id))
+
+    assert target.read_text(encoding="utf-8") == "do not overwrite"
+    assert os.path.samefile(target, path)
+    assert list(path.parent.glob(f".{path.name}.*.prepare")) == []
 
 
 def test_launch_request_state_updates_cannot_regress(tmp_path: Path) -> None:

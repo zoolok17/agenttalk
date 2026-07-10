@@ -347,9 +347,10 @@ def _publish_text_no_replace(
 ) -> os.stat_result:
     """Publish fully written text at an absent path without replacement.
 
-    The public ownership marker never exists as a zero-byte current-client
-    file: write and fsync a private inode first, then hardlink it atomically to
-    the lock pathname. Hardlink creation is no-replace on Windows and POSIX.
+    The public path never exists as a zero-byte current-client file: write and
+    fsync a private inode first, then hardlink it atomically to the destination.
+    Hardlink creation is no-replace on Windows and POSIX. The parent directory
+    is fsynced after publishing the final name and removing the private alias.
     """
     if _LOCK_GENERATION_RE.fullmatch(prepare_token) is None:
         raise ValueError("prepare token must be a lowercase UUID hex value")
@@ -360,7 +361,7 @@ def _publish_text_no_replace(
         os.link(prepared, path, follow_symlinks=False)
         published = True
         if not _unlink_if_same_file(prepared, identity):
-            raise OSError(f"prepared lock generation changed at {prepared}")
+            raise OSError(f"prepared publication generation changed at {prepared}")
         current = os.lstat(path)
         _validate_lock_file_stat(path, current)
         if not _same_file(identity, current):
@@ -373,20 +374,20 @@ def _publish_text_no_replace(
             try:
                 if not _unlink_if_same_file(path, identity):
                     cleanup_error = OSError(
-                        f"published lock generation changed at {path}"
+                        f"published file generation changed at {path}"
                     )
             except OSError as exc:
                 cleanup_error = exc
         try:
             if not _unlink_if_same_file(prepared, identity):
                 cleanup_error = cleanup_error or OSError(
-                    f"prepared lock generation changed at {prepared}"
+                    f"prepared publication generation changed at {prepared}"
                 )
         except OSError as exc:
             cleanup_error = cleanup_error or exc
         if cleanup_error is not None:
             raise OSError(
-                f"could not clean failed lock publication for {path}: {cleanup_error}"
+                f"could not clean failed publication for {path}: {cleanup_error}"
             ) from cleanup_error
         raise
 
@@ -2110,7 +2111,7 @@ class Store:
         ``renamed_to`` links a rename's tombstone to its successor (set by
         :meth:`rename_agent`). Refuses a name that is not currently active.
         """
-        with self._config_lock():
+        with self._retirement_lock(), self._config_lock():
             cfg = self.load_config()
             active = cfg.get("agents", []) or []
             if name not in active:
@@ -4541,8 +4542,10 @@ class Store:
             path = self._launch_request_path(rid)
             path.parent.mkdir(parents=True, exist_ok=True)
             try:
-                _write_text_exclusive(
-                    path, json.dumps(data, indent=2, ensure_ascii=False),
+                _publish_text_no_replace(
+                    path,
+                    json.dumps(data, indent=2, ensure_ascii=False),
+                    prepare_token=uuid.uuid4().hex,
                 )
             except FileExistsError:
                 raise ValueError(f"launch request {rid!r} already exists") from None

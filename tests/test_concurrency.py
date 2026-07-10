@@ -623,38 +623,54 @@ def test_config_lock_release_failure_is_surfaced(
     assert not (s.dir / "config.lock").exists()
 
 
-def test_send_revalidates_recipient_after_concurrent_retirement(
+def test_retirement_commits_before_paused_sender_final_validation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     s = Store(tmp_path)
     s.init(["a", "b"])
     prepared = threading.Event()
     resume = threading.Event()
-    errors: list[Exception] = []
-    real_new_id = store_mod._new_id
+    errors: list[BaseException] = []
+    lock_users: list[str] = []
+    real_write = store_mod._write_text_exclusive
+    real_retirement_lock = s._retirement_lock
 
-    def paused_new_id() -> str:
-        prepared.set()
-        if not resume.wait(5.0):
-            raise TimeoutError("test did not resume sender")
-        return real_new_id()
+    def paused_write(path: Path, text: str) -> os.stat_result:
+        identity = real_write(path, text)
+        if path.name.endswith(".pending"):
+            prepared.set()
+            if not resume.wait(5.0):
+                raise TimeoutError("test did not resume sender")
+        return identity
 
-    monkeypatch.setattr(store_mod, "_new_id", paused_new_id)
+    @contextlib.contextmanager
+    def observed_retirement_lock(*args, **kwargs):
+        with real_retirement_lock(*args, **kwargs):
+            lock_users.append(threading.current_thread().name)
+            yield
+
+    monkeypatch.setattr(store_mod, "_write_text_exclusive", paused_write)
+    monkeypatch.setattr(s, "_retirement_lock", observed_retirement_lock)
 
     def send() -> None:
         try:
             s.send(sender="a", recipient="b", body="must not land")
-        except Exception as e:  # noqa: BLE001 - asserted in the parent thread
+        except BaseException as e:  # noqa: BLE001 - asserted in the parent thread
             errors.append(e)
 
-    sender = threading.Thread(target=send)
+    sender = threading.Thread(target=send, name="sender")
     sender.start()
-    assert prepared.wait(2.0)
-    s.retire_agent("b")
-    resume.set()
-    sender.join(timeout=2.0)
+    try:
+        assert prepared.wait(2.0)
+        s.retire_agent("b")
+        assert lock_users == ["MainThread"]
+        assert "b" in s.retired_agents()
+    finally:
+        resume.set()
+        sender.join(timeout=2.0)
 
     assert not sender.is_alive()
+    assert lock_users == ["MainThread", "sender"]
     assert len(errors) == 1
     assert isinstance(errors[0], ValueError)
     assert "retired" in str(errors[0])
