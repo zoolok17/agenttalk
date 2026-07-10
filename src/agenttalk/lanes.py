@@ -52,6 +52,8 @@ WORKTREE_MARKER_FILENAME = ".agenttalk-worktrees-root"
 WORKTREE_DEFAULT_DIRNAME = ".worktrees"
 WORKTREE_VERIFIER_VERSION = 1
 INTEGRITY_KEY_FILENAME = ".worktree-integrity-secret"
+INTEGRITY_VERSION = 2
+EVALUATION_VERSION = 1
 
 VERDICT_GO = "GO"
 VERDICT_HOLD = "HOLD"
@@ -231,6 +233,7 @@ def new_lane(lane_id: str, *, assignee: str, assigned_by: str, assigned_at: str,
             "worktree_waiver_reason": waiver.get("reason"),
             "worktree_waived_by": waiver.get("by"),
             "worktree_waived_at": waiver.get("at"),
+            "worktree_waiver_authority": waiver.get("authority"),
         })
     else:
         lane["worktree_waived"] = False
@@ -508,7 +511,7 @@ def _integrity_secret(store) -> bytes:
     return raw.encode("ascii")
 
 
-_INTEGRITY_FIELDS = (
+_INTEGRITY_FIELDS_V1 = (
     "delivery_id", "lane_id", "worktree_branch", "delivered_head", "base_sha",
     "worktree_toplevel_canonical", "common_git_dir_canonical", "tracked_tree_clean",
     "verifier_version", "delivered_at", "detached_at_lane_tip", "worktree_waived",
@@ -516,9 +519,23 @@ _INTEGRITY_FIELDS = (
     "worktree_waived_at",
 )
 
+_INTEGRITY_FIELDS_V2 = (
+    "schema_version", "integrity_version", "delivery_id", "lane_id", "domain_id",
+    "assignee", "base_sha", "target_ref", "worktree_branch", "delivered_head",
+    "delivered_by", "delivered_at", "verdict", "holds", "changed_paths", "merge",
+    "gate_verdict", "path_subset", "epoch_at_assign", "registry_hash_at_assign",
+    "evaluation_snapshot", "worktree_toplevel_canonical", "common_git_dir_canonical",
+    "tracked_tree_clean", "verifier_version", "detached_at_lane_tip",
+    "worktree_waived", "isolation_status", "worktree_waiver_reason",
+    "worktree_waived_by", "worktree_waived_at", "worktree_waiver_authority",
+)
+
 
 def _integrity_payload(artifact: dict) -> dict[str, Any]:
-    return {k: artifact.get(k) for k in _INTEGRITY_FIELDS if k in artifact}
+    fields = (_INTEGRITY_FIELDS_V2
+              if artifact.get("integrity_version") == INTEGRITY_VERSION
+              else _INTEGRITY_FIELDS_V1)
+    return {k: artifact.get(k) for k in fields if k in artifact}
 
 
 def compute_integrity_token(store, artifact: dict) -> str:
@@ -571,18 +588,50 @@ def active_lanes(data: dict) -> list[dict]:
             if isinstance(ln, dict) and ln.get("status") == STATUS_ACTIVE]
 
 
-def fingerprint(lane: dict) -> tuple:
-    """A stable identity for the EVALUATED lane. deliver re-checks this under the lock
-    before clearing, so a concurrent `assign --force` of the same id between eval and
-    clear cannot make deliver delete a DIFFERENT (newly assigned) lane."""
-    return (
-        lane.get("lane_id"), lane.get("assigned_at"), lane.get("base_sha"),
-        lane.get("target_ref"), lane.get("target_head_at_assign"),
-        lane.get("registry_hash_at_assign"),
-        tuple(lane.get("path_subset") or []),
-        lane.get("worktree_path"), lane.get("worktree_branch"),
-        lane.get("worktree_base_sha"), lane.get("worktree_waived"),
+def _digest(value: Any) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def fingerprint(lane: dict) -> str:
+    """Hash every persisted lane field that can identify or affect a verdict."""
+    return _digest(lane)
+
+
+def worktree_waiver_authority(store, actor: str) -> str | None:
+    """Return the actor's current authority class, or None when unauthorized."""
+    if actor == store.operator_facing():
+        return "operator_facing"
+    if actor == store.sole_lead():
+        return "sole_lead"
+    return None
+
+
+def build_evaluation_snapshot(*, lane: dict, active_lanes: list[dict],
+                              context: dict, worktree_provenance: dict | None) -> dict:
+    """Bind every resolved input used by one final lane-delivery verdict."""
+    active = sorted(
+        ({"lane_id": item.get("lane_id"), "fingerprint": fingerprint(item)}
+         for item in active_lanes if isinstance(item, dict)),
+        key=lambda item: str(item.get("lane_id") or ""),
     )
+    return {
+        "evaluation_version": EVALUATION_VERSION,
+        "lane_fingerprint": fingerprint(lane),
+        "active_lane_fingerprints": active,
+        "current_epoch": context.get("current_epoch"),
+        "current_registry_hash": context.get("current_registry_hash"),
+        "gate_scope": context.get("gate_scope"),
+        "candidate_head": context.get("head"),
+        "target_head": context.get("target_head_now"),
+        "gate_digest": _digest(context.get("gate_check")),
+        "changed_digest": _digest(context.get("changed")),
+        "classifications_digest": _digest(context.get("classifications")),
+        "merge_digest": _digest(context.get("merge")),
+        "worktree_digest": _digest(worktree_provenance),
+    }
 
 
 def delivery_artifact_path(store, lane_id: str, head_sha: str):
@@ -593,6 +642,7 @@ def delivery_artifact_path(store, lane_id: str, head_sha: str):
 def write_delivery_artifact(store, *, lane: dict, head_sha: str, verdict: dict,
                             changed: dict, merge: dict, gate_check: dict,
                             delivered_by: str, at: str,
+                            evaluation_snapshot: dict,
                             worktree_provenance: dict | None = None):
     """Durable delivery evidence OUTSIDE lanes.json (reset clears lanes.json). This is
     the stable pointer close/gate evidence can reference. Written BEFORE the lane is
@@ -604,6 +654,7 @@ def write_delivery_artifact(store, *, lane: dict, head_sha: str, verdict: dict,
     d.mkdir(parents=True, exist_ok=True)
     artifact = {
         "schema_version": SCHEMA_VERSION,
+        "integrity_version": INTEGRITY_VERSION,
         "delivery_id": f"{lane['lane_id']}-{head_sha[:12]}-{at}",
         "lane_id": lane["lane_id"],
         "domain_id": lane.get("domain_id"),
@@ -622,6 +673,7 @@ def write_delivery_artifact(store, *, lane: dict, head_sha: str, verdict: dict,
         "path_subset": lane.get("path_subset"),
         "epoch_at_assign": lane.get("epoch_at_assign"),
         "registry_hash_at_assign": lane.get("registry_hash_at_assign"),
+        "evaluation_snapshot": evaluation_snapshot,
     }
     if lane.get("worktree_waived"):
         artifact.update({
@@ -629,9 +681,9 @@ def write_delivery_artifact(store, *, lane: dict, head_sha: str, verdict: dict,
             "worktree_waiver_reason": lane.get("worktree_waiver_reason"),
             "worktree_waived_by": lane.get("worktree_waived_by"),
             "worktree_waived_at": lane.get("worktree_waived_at"),
+            "worktree_waiver_authority": lane.get("worktree_waiver_authority"),
             "isolation_status": "waived",
         })
-        artifact["integrity_token"] = compute_integrity_token(store, artifact)
     elif worktree_provenance:
         artifact.update({
             "worktree_waived": False,
@@ -642,12 +694,43 @@ def write_delivery_artifact(store, *, lane: dict, head_sha: str, verdict: dict,
             "detached_at_lane_tip": bool(worktree_provenance.get("detached_at_lane_tip")),
             "verifier_version": WORKTREE_VERIFIER_VERSION,
         })
-        artifact["integrity_token"] = compute_integrity_token(store, artifact)
     else:
         artifact.update({"worktree_waived": False, "isolation_status": "unverified"})
+    artifact["integrity_token"] = compute_integrity_token(store, artifact)
     path = delivery_artifact_path(store, lane["lane_id"], head_sha)
     _atomic.write_text(path, json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True))
     return path
+
+
+def _validate_evaluation_snapshot(snapshot: object, *, head_sha: str) -> None:
+    if not isinstance(snapshot, dict):
+        raise LaneError("delivery artifact has no evaluation snapshot")
+    if snapshot.get("evaluation_version") != EVALUATION_VERSION:
+        raise LaneError("delivery artifact evaluation snapshot version is unsupported")
+    if snapshot.get("candidate_head") != head_sha:
+        raise LaneError("delivery artifact evaluation candidate does not match delivered head")
+    if not _FULL_SHA_RE.match(str(snapshot.get("target_head") or "")):
+        raise LaneError("delivery artifact evaluation target_head is not a full SHA")
+    if not isinstance(snapshot.get("gate_scope"), str) or not snapshot["gate_scope"].strip():
+        raise LaneError("delivery artifact evaluation gate_scope is missing")
+    epoch = snapshot.get("current_epoch")
+    if epoch is not None and not isinstance(epoch, str):
+        raise LaneError("delivery artifact evaluation current_epoch is malformed")
+    for key in (
+        "lane_fingerprint", "current_registry_hash", "gate_digest",
+        "changed_digest", "classifications_digest", "merge_digest",
+        "worktree_digest",
+    ):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(snapshot.get(key) or "")):
+            raise LaneError(f"delivery artifact evaluation {key} is malformed")
+    active = snapshot.get("active_lane_fingerprints")
+    if not isinstance(active, list):
+        raise LaneError("delivery artifact active-lane snapshot is malformed")
+    for item in active:
+        if (not isinstance(item, dict)
+                or not isinstance(item.get("lane_id"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", str(item.get("fingerprint") or ""))):
+            raise LaneError("delivery artifact active-lane fingerprint is malformed")
 
 
 def validate_delivery_artifact(path, *, lane_id: str, head_sha: str,
@@ -687,6 +770,15 @@ def validate_delivery_artifact(path, *, lane_id: str, head_sha: str,
         raise LaneError(
             "delivery artifact lane_id/delivered_head does not match the delivered lane "
             f"(got {data.get('lane_id')!r}@{str(data.get('delivered_head'))[:12]})")
+    integrity_version = data.get("integrity_version")
+    if integrity_version is not None and integrity_version != INTEGRITY_VERSION:
+        raise LaneError("delivery artifact integrity version is unsupported")
+    if integrity_version == INTEGRITY_VERSION:
+        _validate_evaluation_snapshot(data.get("evaluation_snapshot"), head_sha=head_sha)
+        if store is None:
+            raise LaneError("versioned delivery artifact validation needs a store secret")
+        if not verify_integrity_token(store, data):
+            raise LaneError("delivery artifact integrity token is missing or invalid")
     if require_isolation:
         if store is None:
             raise LaneError("delivery artifact isolation validation needs a store secret")
@@ -697,6 +789,20 @@ def validate_delivery_artifact(path, *, lane_id: str, head_sha: str,
             for k in ("worktree_waiver_reason", "worktree_waived_by", "worktree_waived_at"):
                 if not isinstance(data.get(k), str) or not data[k].strip():
                     raise LaneError(f"waived delivery artifact is missing {k}")
+            try:
+                current_authority = worktree_waiver_authority(
+                    store, data["worktree_waived_by"])
+            except (FileNotFoundError, OSError, ValueError) as e:
+                raise LaneError(
+                    f"could not validate worktree-waiver authority: {e}") from e
+            recorded_authority = data.get("worktree_waiver_authority")
+            if integrity_version == INTEGRITY_VERSION:
+                if recorded_authority not in {"operator_facing", "sole_lead"}:
+                    raise LaneError("waived delivery artifact has no valid authority class")
+                if current_authority != recorded_authority:
+                    raise LaneError("worktree waiver is no longer backed by lead/operator authority")
+            elif current_authority is None:
+                raise LaneError("legacy worktree waiver is not backed by lead/operator authority")
         elif status == "verified":
             if data.get("worktree_waived") is not False:
                 raise LaneError("verified delivery artifact does not record worktree_waived=false")

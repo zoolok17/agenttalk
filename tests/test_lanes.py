@@ -12,6 +12,7 @@ Two layers, mirroring gates/close:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import subprocess
@@ -19,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import cli, lanes
+from agenttalk import cli, gates, lanes
 from agenttalk.store import Store
 
 SHA = "a" * 40
@@ -432,7 +433,26 @@ def test_cli_assign_check_deliver_go(tmp_path: Path) -> None:
     assert lanes.active_lanes(lanes.load_lanes(Store(root))) == []
     arts = list((Store(root).dir / "lane-deliveries").glob("l1-*.json"))
     assert len(arts) == 1
-    assert json.loads(arts[0].read_text(encoding="utf-8"))["verdict"] == "GO"
+    artifact = json.loads(arts[0].read_text(encoding="utf-8"))
+    assert artifact["verdict"] == "GO"
+    assert artifact["integrity_version"] == 2
+    snapshot = artifact["evaluation_snapshot"]
+    assert snapshot["candidate_head"] == head
+    assert snapshot["target_head"] == head
+    assert snapshot["current_registry_hash"]
+    assert snapshot["active_lane_fingerprints"] == []
+    for key in (
+        "lane_fingerprint", "gate_digest", "changed_digest",
+        "classifications_digest", "merge_digest", "worktree_digest",
+    ):
+        assert re.fullmatch(r"[0-9a-f]{64}", snapshot[key])
+    snapshot["gate_digest"] = "0" * 64
+    arts[0].write_text(json.dumps(artifact), encoding="utf-8")
+    with pytest.raises(lanes.LaneError, match="integrity token"):
+        lanes.validate_delivery_artifact(
+            arts[0], lane_id="l1", head_sha=head, store=Store(root),
+            require_isolation=True,
+        )
 
 
 def test_cli_check_out_of_bounds_holds(tmp_path: Path) -> None:
@@ -444,26 +464,29 @@ def test_cli_check_out_of_bounds_holds(tmp_path: Path) -> None:
     assert _run(["lane", "check", "--id", "l1", "--head", head], root) == 3
 
 
-def test_cli_deliver_aborts_fail_closed_on_concurrent_change(
+def test_cli_deliver_recomputes_gate_after_entering_final_lock(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # reviewer-1 BLOCKER: if the lane changed (concurrent reassign) between the
-    # pre-lock eval and the locked clear, deliver must FAIL CLOSED (exit 3, NO
-    # artifact, lane left active) - never a false success. Force a fingerprint
-    # mismatch by making fingerprint() unique per call (eval call != locked call).
+    # The old path evaluated GO before taking the final lock. Inject a blocker as
+    # the lock is entered: delivery must recompute there and leave no GO artifact.
     root, base = _repo(tmp_path)
     br = _branch(root)
     _run(["lane", "assign", "--id", "l1", "--from", "lead", "--assignee", "dev",
           "--domain", "core", "--base", base, "--target", br, "--path", "src/core"], root)
     head = _commit(root, "src/core/a.py", "base\nchange\n")
-    counter = {"n": 0}
+    real_lock = Store._config_lock
 
-    def _unique_fp(_lane):
-        counter["n"] += 1
-        return (counter["n"],)
+    @contextlib.contextmanager
+    def lock_with_new_blocker(self, *args, **kwargs):  # noqa: ANN001
+        with real_lock(self, *args, **kwargs):
+            gates.set_gate(
+                root, name="late-ci", status="red", severity="blocker",
+                scope="lane:l1", actor="lead", evidence_source="local_command",
+                reason="landed after the obsolete pre-lock evaluation", required=True,
+            )
+            yield
 
-    monkeypatch.setattr(lanes, "fingerprint", _unique_fp)
+    monkeypatch.setattr(Store, "_config_lock", lock_with_new_blocker)
     assert _run(["lane", "deliver", "--id", "l1", "--from", "dev", "--head", head], root) == 3
-    # no artifact written, lane still active
     deliveries = Store(root).dir / "lane-deliveries"
     assert not deliveries.exists() or not list(deliveries.glob("*.json"))
     assert [ln["lane_id"] for ln in lanes.active_lanes(lanes.load_lanes(Store(root)))] == ["l1"]
@@ -530,9 +553,68 @@ def test_lane_fingerprint_distinguishes_reassign() -> None:
     a = _lane()
     b = _lane(base_sha="c" * 40)
     c = _lane(assigned_at="later")
+    d = _lane(shared_approvals=[{
+        "path_or_glob": "shared/**", "approved_by": "lead", "reason": "ok",
+        "at": "t", "epoch": None, "registry_hash": "rh1",
+    }])
+    e = _lane(epoch_at_assign="epoch-2")
+    f = _lane(worktree_waived=True, worktree_waived_by="dev",
+              worktree_waiver_reason="forged", worktree_waived_at="t")
     assert lanes.fingerprint(a) != lanes.fingerprint(b)
     assert lanes.fingerprint(a) != lanes.fingerprint(c)
+    assert lanes.fingerprint(a) != lanes.fingerprint(d)
+    assert lanes.fingerprint(a) != lanes.fingerprint(e)
+    assert lanes.fingerprint(a) != lanes.fingerprint(f)
     assert lanes.fingerprint(a) == lanes.fingerprint(dict(a))
+
+
+def test_cli_no_worktree_waiver_requires_lead_or_operator(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    br = _branch(root)
+    common = ["--domain", "core", "--base", base, "--target", br,
+              "--path", "src/core", "--no-worktree",
+              "--worktree-waiver-reason", "explicit exception"]
+
+    assert _run_raw([
+        "lane", "assign", "--id", "denied", "--from", "dev",
+        "--assignee", "dev", *common,
+    ], root) == 2
+    assert "lead" in capsys.readouterr().err.lower()
+    assert "denied" not in lanes.load_lanes(Store(root))["lanes"]
+
+    assert _run_raw([
+        "lane", "assign", "--id", "lead-ok", "--from", "lead",
+        "--assignee", "dev", *common,
+    ], root) == 0
+
+    Store(root).set_operator_facing("dev2")
+    assert _run_raw([
+        "lane", "assign", "--id", "lead-ok", "--force", "--from", "dev2",
+        "--assignee", "dev", *common,
+    ], root) == 0
+
+
+def test_cli_deliver_rejects_forged_no_worktree_waiver(tmp_path: Path) -> None:
+    root, base = _repo(tmp_path)
+    br = _branch(root)
+    assert _run([
+        "lane", "assign", "--id", "forged", "--from", "lead",
+        "--assignee", "dev", "--domain", "core", "--base", base,
+        "--target", br, "--path", "src/core",
+    ], root) == 0
+    store = Store(root)
+    state = lanes.load_lanes(store)
+    state["lanes"]["forged"]["worktree_waived_by"] = "dev"
+    lanes.save_lanes(store, state)
+    head = _commit(root, "src/core/a.py", "base\nchange\n")
+
+    assert _run_raw([
+        "lane", "deliver", "--id", "forged", "--from", "dev", "--head", head,
+    ], root) == 3
+    assert lanes.load_lanes(store)["lanes"]["forged"]["status"] == lanes.STATUS_ACTIVE
+    deliveries = store.dir / "lane-deliveries"
+    assert not deliveries.exists() or not list(deliveries.glob("*.json"))
 
 
 def test_cli_shared_approval_authority_and_fail_closed(tmp_path: Path) -> None:
@@ -747,6 +829,31 @@ def test_m2_worktree_dirty_rules_and_main_head_mismatch(tmp_path: Path) -> None:
     main_head = _commit(root2, "src/core/a.py", "main checkout change\n")
     assert _run_raw(["lane", "deliver", "--id", "mismatch", "--from", "dev",
                      "--head", main_head], root2) == 3
+
+
+def test_deliver_rechecks_worktree_provenance_before_writing_artifact(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "moving")
+    wt = Path(lane["worktree_path"])
+    _commit(wt, "src/core/a.py", "base\nwork\n")
+    real_verify = cli._verify_lane_worktree
+    calls = {"count": 0}
+
+    def moving_verify(*args, **kwargs):  # noqa: ANN002,ANN003
+        result = real_verify(*args, **kwargs)
+        calls["count"] += 1
+        if calls["count"] == 2:
+            result = {**result, "head": base}
+        return result
+
+    monkeypatch.setattr(cli, "_verify_lane_worktree", moving_verify)
+
+    assert _run_raw(["lane", "deliver", "--id", "moving", "--from", "dev"], root) == 3
+    saved = lanes.load_lanes(Store(root))["lanes"]["moving"]
+    assert saved["status"] == lanes.STATUS_ACTIVE
+    deliveries = Store(root).dir / "lane-deliveries"
+    assert not deliveries.exists() or not list(deliveries.glob("*.json"))
 
 
 def test_m4_m7_close_validates_artifact_after_worktree_removed(tmp_path: Path) -> None:
