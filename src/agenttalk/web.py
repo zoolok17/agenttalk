@@ -113,6 +113,7 @@ from agenttalk import attention as _attention
 from agenttalk import avatars as _avatars
 from agenttalk import capacity as _capacity
 from agenttalk import domains as _domains
+from agenttalk import health as _health
 from agenttalk import knowledge as _knowledge
 from agenttalk import lesson_context as _lesson_context
 from agenttalk import onboarding as _onboarding
@@ -695,6 +696,16 @@ _STATIC_ASSETS = _load_static_assets()
 
 # ------------------------------------------------------------ data shaping
 
+def _heartbeat_age_seconds(
+    heartbeat: datetime | None, *, now_epoch: float,
+) -> float | None:
+    if heartbeat is None:
+        return None
+    timestamp = heartbeat.timestamp()
+    if timestamp > now_epoch + _health.DEFAULT_HEARTBEAT_SKEW_SECONDS:
+        return None
+    return max(0.0, now_epoch - timestamp)
+
 def _safe_load_config(store: Store) -> dict:
     try:
         return store.load_config()
@@ -702,7 +713,19 @@ def _safe_load_config(store: Store) -> dict:
         return {}
 
 
-def _all_messages(store: Store) -> list[Message]:
+def _projection_config(store: Store) -> tuple[dict | None, str | None]:
+    """Config boundary for roster-authorized dashboard projections."""
+    try:
+        cfg = store.load_config()
+    except (OSError, ValueError, FileNotFoundError) as exc:
+        return None, f"project config is unavailable: {type(exc).__name__}"
+    roster = cfg.get("agents")
+    if not isinstance(roster, list) or not roster:
+        return None, "project config roster is empty"
+    return cfg, None
+
+
+def _all_messages(store: Store, *, cfg: dict | None = None) -> list[Message]:
     """Return every renderable message in the store, most recent first.
 
     Mirrors the validation surface ``Store.messages_for()`` uses so
@@ -712,7 +735,10 @@ def _all_messages(store: Store) -> list[Message]:
     through ``store.list_invalid_messages()`` and is surfaced in
     ``/api/status.invalid_messages`` instead of being rendered.
     """
-    cfg = _safe_load_config(store)
+    if cfg is None:
+        cfg, config_error = _projection_config(store)
+        if config_error is not None or cfg is None:
+            return []
     # 0.18.0 (FR-004): validate against the KNOWN roster (active ∪ retired),
     # matching valid_messages / _validated_for_state — otherwise a retired
     # identity's historical messages vanish from /api/messages, /messages/<id>,
@@ -720,6 +746,8 @@ def _all_messages(store: Store) -> list[Message]:
     # must agree.
     roster = store._known_roster(cfg)  # noqa: SLF001 — D3 parity
     valid, _ = store._scan_messages()  # noqa: SLF001 — same call doctor uses
+    if not roster:
+        return []
     require_sig = store.signing_enforced()
     key: bytes | None = None
     project_id: str | None = None
@@ -749,8 +777,19 @@ def _all_messages(store: Store) -> list[Message]:
     return sorted(out, key=lambda x: x.id, reverse=True)
 
 
+def messages_payload(store: Store) -> dict:
+    cfg, config_error = _projection_config(store)
+    if config_error is not None or cfg is None:
+        return {"messages": [], "errors": [config_error or "project config unavailable"]}
+    return {
+        "messages": [m.to_dict() for m in _all_messages(store, cfg=cfg)],
+        "errors": [],
+    }
+
+
 def status_payload(store: Store) -> dict:
-    cfg = _safe_load_config(store)
+    cfg, config_error = _projection_config(store)
+    cfg = cfg or {}
     invalid = store.list_invalid_messages()
     health = _signing.inspect_key(store.project_id(), store.root)
     now = datetime.now(timezone.utc).timestamp()
@@ -772,6 +811,7 @@ def status_payload(store: Store) -> dict:
         "invalid_messages": [
             {"id": mid, "reason": reason} for mid, reason in invalid
         ],
+        "errors": [config_error] if config_error is not None else [],
     }
 
 
@@ -821,6 +861,8 @@ def _validated_for_state(store: Store, cfg: dict) -> tuple[list[Message], int]:
     """
     valid_scan, invalid_scan = store._scan_messages()  # noqa: SLF001 — same call doctor uses
     roster = store._known_roster(cfg)  # noqa: SLF001 — D3 parity with valid_messages()
+    if not roster:
+        raise ValueError("project config roster is empty")
     require_sig = store.signing_enforced()
     key: bytes | None = None
     project_id: str | None = None
@@ -1399,7 +1441,9 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
         hb = store.read_heartbeat(a)
         if hb is not None:
             e["last_seen"] = hb.isoformat()
-            e["last_seen_age_seconds"] = round((now - hb).total_seconds(), 3)
+            heartbeat_age = _heartbeat_age_seconds(hb, now_epoch=now_epoch)
+            if heartbeat_age is not None:
+                e["last_seen_age_seconds"] = round(heartbeat_age, 3)
         health = store.read_health(a, now_epoch=now_epoch, heartbeat=hb)
         e["health"] = health
         e["unread"] = _unread_count(msgs, a, store.cursor(a))
@@ -1497,6 +1541,8 @@ def _root_state(desc: RootDescriptor,
         store = desc.store
         cfg = store.load_config()
         roster = cfg.get("agents", []) or []
+        if not roster:
+            raise ValueError("project config roster is empty")
         avatar_prefs, _avatar_warnings = _avatars.sanitize_avatar_preferences(
             cfg.get("avatars"), roster)
         # ONE disk walk per root per request (D8) — see _validated_for_state.
@@ -3528,9 +3574,7 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 self._send_json(HTTPStatus.OK, thread)
                 return
             if path == "/api/messages":
-                msgs = _all_messages(store)
-                self._send_json(HTTPStatus.OK,
-                                {"messages": [m.to_dict() for m in msgs]})
+                self._send_json(HTTPStatus.OK, messages_payload(store))
                 return
             if path.startswith("/messages/"):
                 mid = path[len("/messages/"):]

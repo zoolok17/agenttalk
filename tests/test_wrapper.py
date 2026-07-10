@@ -7,7 +7,10 @@ by an injected line source (no real subprocess).
 
 from __future__ import annotations
 
+import errno
 import json
+
+import pytest
 
 from agenttalk.wrapper import codex_adapter, run
 from agenttalk.wrapper.degraded import DegradedConfig, DegradedDetector, classify_text
@@ -339,6 +342,51 @@ def test_run_wrapper_injected_stream_stamps_heartbeat() -> None:
     assert rc == 0
     assert len(stamps) >= 1            # progress events stamped the heartbeat
     assert restarts == []              # a clean run never escalates
+
+
+@pytest.mark.parametrize("error_number", [errno.EINVAL, errno.EPIPE])
+@pytest.mark.parametrize("phase", ["iterate", "close"])
+def test_run_wrapper_suppresses_benign_pipe_teardown(
+    monkeypatch, error_number: int, phase: str,
+) -> None:
+    error = OSError(error_number, "benign Windows pipe teardown")
+    lines = [json.dumps(obj) for obj in CATALOG_TOOL]
+
+    class _Stdout:
+        closed = False
+
+        def __iter__(self):
+            def stream():
+                yield from lines
+                if phase == "iterate":
+                    raise error
+
+            return stream()
+
+        def close(self):
+            self.closed = True
+            if phase == "close":
+                raise error
+
+    class _Popen:
+        def __init__(self, argv, **kwargs):
+            _ = argv, kwargs
+            self.stdout = _Stdout()
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(run.subprocess, "Popen", _Popen)
+
+    assert run.run_wrapper(
+        cli="codex",
+        agent="worker",
+        argv=["codex"],
+        render=False,
+        heartbeat_fn=lambda _event, _now: None,
+        restart_fn=lambda _signal: None,
+        info_fn=lambda _signal: None,
+    ) == 0
 
 
 def test_run_wrapper_degraded_codex_message_escalates_when_enabled() -> None:

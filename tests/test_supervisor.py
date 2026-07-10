@@ -419,6 +419,30 @@ def test_report_heartbeat_stale_and_waiting(tmp_path: Path, monkeypatch) -> None
     assert stale["agents"]["lead"]["heartbeat_age_seconds"] is None
 
 
+def test_report_rejects_heartbeat_beyond_future_skew(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    future = NOW + hm.DEFAULT_HEARTBEAT_SKEW_SECONDS + 1
+    (s.state_dir / "worker.heartbeat").write_text(_iso(future), encoding="utf-8")
+
+    report = sup.build_report(s, now_epoch=NOW, suspect_after_seconds=120)
+
+    worker = report["agents"]["worker"]
+    assert worker["heartbeat_stale"] is True
+    assert worker["heartbeat_age_seconds"] is None
+
+
+def test_report_allows_heartbeat_within_future_skew(tmp_path: Path) -> None:
+    s = _team(tmp_path)
+    future = NOW + hm.DEFAULT_HEARTBEAT_SKEW_SECONDS
+    (s.state_dir / "worker.heartbeat").write_text(_iso(future), encoding="utf-8")
+
+    report = sup.build_report(s, now_epoch=NOW, suspect_after_seconds=120)
+
+    worker = report["agents"]["worker"]
+    assert worker["heartbeat_stale"] is False
+    assert worker["heartbeat_age_seconds"] == 0.0
+
+
 def test_report_reflects_restart_request(tmp_path: Path) -> None:
     s = _team(tmp_path)
     s.set_role("lead", "lead")
@@ -617,6 +641,62 @@ def test_ps_template_kill_switch_guards_mutating_boundaries() -> None:
     assert "supervisor.kill" in ps
 
 
+def test_python_supervisor_state_recovers_only_from_validated_backup(tmp_path: Path) -> None:
+    path = tmp_path / "supervisor-state.json"
+    first = {"agents": {"worker": {"pid": 101}}}
+    second = {"agents": {"worker": {"pid": 202}}}
+    sup.save_supervisor_state(path, first)
+    sup.save_supervisor_state(path, second)
+
+    path.write_text('{"agents":', encoding="utf-8")
+    assert sup.load_supervisor_state(path) == first
+
+    sup.supervisor_state_backup_path(path).write_text("[]", encoding="utf-8")
+    with pytest.raises(sup.SupervisorPersistenceError):
+        sup.load_supervisor_state(path)
+
+
+def test_python_supervisor_state_interrupted_replace_preserves_primary(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    path = tmp_path / "supervisor-state.json"
+    first = {"agents": {"worker": {"pid": 101}}}
+    second = {"agents": {"worker": {"pid": 202}}}
+    sup.save_supervisor_state(path, first)
+    real_replace = sup.os.replace
+
+    def fail_primary_replace(src, dst) -> None:
+        if Path(dst) == path:
+            raise OSError("injected primary replace failure")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(sup.os, "replace", fail_primary_replace)
+    with pytest.raises(OSError, match="injected primary replace failure"):
+        sup.save_supervisor_state(path, second)
+
+    assert sup.load_supervisor_state(path) == first
+
+
+def test_supervisor_config_loader_accepts_utf8_bom(tmp_path: Path) -> None:
+    path = tmp_path / "supervisor.json"
+    expected = {"schema_version": 2, "agents": {"worker": {"cli": "codex"}}}
+    path.write_text("\ufeff" + json.dumps(expected), encoding="utf-8")
+
+    assert sup.load_supervisor_config(path) == expected
+
+
+def test_ps_state_helpers_are_atomic_backed_up_and_fail_closed() -> None:
+    ps = sup.PS_TEMPLATE
+    block = ps[ps.index("# region state-helpers"):ps.index("# endregion state-helpers")]
+    assert "$StateBackupPath" in ps
+    assert "[System.IO.FileStream]" in block
+    assert ".Flush($true)" in block
+    assert "[System.IO.File]::Replace" in block
+    assert "function Test-StateObject" in block
+    assert "throw" in block
+    assert "Set-Content $StatePath" not in ps
+
+
 def test_supervisor_hosting_doc_covers_degraded_mode_and_services() -> None:
     text = Path("docs/supervisor-hosting.md").read_text(encoding="utf-8")
     assert "Scheduled Task" in text
@@ -627,6 +707,13 @@ def test_supervisor_hosting_doc_covers_degraded_mode_and_services() -> None:
     assert "WinSW" in text and "NSSM" in text
     assert "session 0" in text
     assert "sc.exe" not in text.lower()
+
+
+def test_supervisor_tutorial_documents_disabled_work_heartbeat_recovery_limit() -> None:
+    text = Path("docs/supervisor-tutorial.md").read_text(encoding="utf-8")
+    assert "work_heartbeat.enabled=false" in text
+    assert "disables automatic stale recovery" in text
+    assert "warning-only" in text
 
 
 def test_ps_template_console_action_log_and_quiet() -> None:
@@ -2344,6 +2431,50 @@ def _pick_powershell() -> str | None:
     return None
 
 
+def test_ps_state_helpers_recover_backup_and_refuse_two_corrupt_copies(tmp_path: Path) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[ps.index("# region state-helpers"):ps.index("# endregion state-helpers")]
+    state_path = tmp_path / "supervisor-state.json"
+    result_path = tmp_path / "state-helper-result.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$StatePath = {_pslit(str(state_path))}",
+        "$StateBackupPath = \"$StatePath.bak\"",
+        "$KillSwitchPath = Join-Path (Split-Path -Parent $StatePath) 'supervisor.kill'",
+        "function Actions-Enabled { return $true }",
+        helpers,
+        "$first = [pscustomobject]@{ agents = [pscustomobject]@{ worker = "
+        "[pscustomobject]@{ pid = 101 } } }",
+        "$second = [pscustomobject]@{ agents = [pscustomobject]@{ worker = "
+        "[pscustomobject]@{ pid = 202 } } }",
+        "Save-State $first",
+        "Save-State $second",
+        "[IO.File]::WriteAllText($StatePath, '{broken')",
+        "$recovered = Load-State",
+        "[IO.File]::WriteAllText($StateBackupPath, '[]')",
+        "$failedClosed = $false",
+        "try { $null = Load-State } catch { $failedClosed = $true }",
+        "@{ recoveredPid = $recovered.agents.worker.pid; failedClosed = $failedClosed } | "
+        f"ConvertTo-Json | Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ])
+    script = tmp_path / "state-helper-test.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload == {"recoveredPid": 101, "failedClosed": True}
+
+
 def _replace_proc_start(ps1: Path, body: str) -> None:
     text = ps1.read_text(encoding="utf-8-sig")
     start = text.index("function Proc-Start($procId) {")
@@ -2568,7 +2699,7 @@ def test_manual_restart_marker_clears_only_after_readiness(tmp_path: Path) -> No
                             now_epoch=NOW)["agents"]["worker"]
     assert plan["action"] == sup.RELAUNCH and plan["clear_marker"] is None
     assert s.read_restart_request("worker") is not None
-    s.write_heartbeat("worker")
+    (s.state_dir / "worker.heartbeat").write_text(_iso(NOW), encoding="utf-8")
     clear = sup.plan_actions(
         sup.build_report(s, now_epoch=NOW),
         {"agents": {"worker": _ready(consumed_rids=["rr-1"], readiness_seen=True)}},

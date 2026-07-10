@@ -212,6 +212,11 @@ Key differences for a wrapped agent:
 - No activity hook needed: a wrapped agent is instrumented by
   construction, so a stale heartbeat past grace **recovers** rather than
   warn-only.
+- For wrapped Claude, that recovery guarantee depends on the in-turn work
+  heartbeat ticker. Setting `work_heartbeat.enabled=false`
+  disables automatic stale recovery for that agent: stale heartbeats produce
+  warning-only `suspect_warn` behavior and are never killed or relaunched automatically.
+  Re-enable the ticker or repair its configuration to restore stale recovery.
 - **`--disable hooks`** on the wrapped **codex** child (the safe default):
   the wrapper owns the heartbeat, so the codex activity hook is neither
   needed nor wanted, and disabling it sidesteps codex's hook-trust prompt

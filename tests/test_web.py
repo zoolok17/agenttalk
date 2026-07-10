@@ -340,6 +340,46 @@ def test_api_messages_lists_all(tmp_path: Path) -> None:
         srv.server_close()
 
 
+@pytest.mark.parametrize("config_state", ["corrupt", "empty"])
+def test_dashboard_projections_fail_closed_for_unusable_roster(
+    tmp_path: Path, config_state: str,
+) -> None:
+    s = _make_store(tmp_path)
+    message = s.send(sender="alpha", recipient="beta", body="must-not-render")
+    if config_state == "corrupt":
+        s.config_path.write_text("{broken", encoding="utf-8")
+    else:
+        cfg = s.load_config()
+        cfg["agents"] = []
+        cfg["roles"] = {}
+        cfg["groups"] = {}
+        cfg["operator_facing"] = None
+        s._write_config(cfg)
+
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/api/messages") as resp:
+            messages = json.loads(resp.read())
+        with _get(f"{base}/api/status") as resp:
+            status = json.loads(resp.read())
+        with _get(f"{base}/api/state") as resp:
+            state = json.loads(resp.read())
+
+        assert messages["messages"] == []
+        assert messages["errors"]
+        assert status["agents"] == []
+        assert status["errors"]
+        root = state["roots"][0]
+        assert root["errors"]
+        assert "agents" not in root and "recent" not in root
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _get(f"{base}/api/messages/{message.id}")
+        assert exc.value.code == 404
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_message_detail_renders_body(tmp_path: Path) -> None:
     s = _make_store(tmp_path)
     s.send(sender="alpha", recipient="beta",
@@ -1118,6 +1158,22 @@ def test_api_state_corrupt_root_isolated(tmp_path: Path) -> None:
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_api_state_does_not_project_far_future_heartbeat_as_fresh(tmp_path: Path) -> None:
+    from datetime import datetime, timezone
+
+    s = _make_store(tmp_path)
+    future = datetime.fromtimestamp(time.time() + 60.0, timezone.utc)
+    (s.state_dir / "alpha.heartbeat").write_text(
+        future.isoformat().replace("+00:00", "Z"), encoding="utf-8",
+    )
+
+    root = web.build_state([web.RootDescriptor(store=s, label="root")])["roots"][0]
+    alpha = next(agent for agent in root["agents"] if agent["name"] == "alpha")
+
+    assert alpha["last_seen"]
+    assert "last_seen_age_seconds" not in alpha
 
 
 def test_api_state_uninitialized_root_is_error_data(tmp_path: Path) -> None:

@@ -1309,10 +1309,10 @@ def run_wrapper(
     try:
         if health_writer is not None:
             health_writer.turn_start(None)
-        engine.run(_health_events(parse_lines(proc.stdout or [], mapper)), clock)
+        lines = _iter_suppressing_benign_pipe_teardown(proc.stdout or [])
+        engine.run(_health_events(parse_lines(lines, mapper)), clock)
     finally:
-        if proc.stdout:
-            proc.stdout.close()
+        _close_pipe_suppressing_benign_pipe_teardown(proc.stdout)
     rc = proc.wait()
     if health_writer is not None:
         if rc == 0:

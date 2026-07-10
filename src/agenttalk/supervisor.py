@@ -29,9 +29,11 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import re
 import shlex
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -90,6 +92,178 @@ SUPERVISOR_EVENT_SUMMARY_INTERVAL_SECONDS = 300.0
 _LAUNCH_BARRIER_ACTION = "launch_barrier"
 LEAD_LIVENESS_STALE_AFTER_SECONDS = 60.0
 _EVENT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
+
+
+class SupervisorPersistenceError(ValueError):
+    """Supervisor state/config cannot be trusted as a complete JSON object."""
+
+
+def supervisor_state_backup_path(path: Path) -> Path:
+    return Path(f"{path}.bak")
+
+
+def _validate_supervisor_state(value: object, *, source: str) -> dict:
+    if not isinstance(value, dict):
+        raise SupervisorPersistenceError(f"{source} must be a JSON object")
+    for field in ("agents", "ephemeral_reviewers"):
+        nested = value.get(field)
+        if nested is not None and not isinstance(nested, dict):
+            raise SupervisorPersistenceError(f"{source}.{field} must be a JSON object")
+    return value
+
+
+def _read_supervisor_json(path: Path, *, source: str) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise SupervisorPersistenceError(
+            f"{source} is unreadable or invalid: {type(exc).__name__}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise SupervisorPersistenceError(f"{source} must be a JSON object")
+    return value
+
+
+def _read_supervisor_state_copy(path: Path, *, source: str) -> tuple[dict | None, str | None]:
+    try:
+        value = _read_supervisor_json(path, source=source)
+        return _validate_supervisor_state(value, source=source), None
+    except SupervisorPersistenceError as exc:
+        return None, str(exc)
+
+
+def _supervisor_json_text(value: dict, *, source: str) -> str:
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+        ) + "\n"
+    except (TypeError, ValueError) as exc:
+        raise SupervisorPersistenceError(
+            f"{source} is not JSON serializable: {type(exc).__name__}"
+        ) from exc
+
+
+def _fsync_supervisor_directory(directory: Path) -> None:
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _atomic_write_supervisor_json(path: Path, value: dict, *, source: str) -> None:
+    """Strict temp+fsync+replace writer with no non-atomic fallback."""
+    text = _supervisor_json_text(value, source=source)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_name, path)
+        _fsync_supervisor_directory(path.parent)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def load_supervisor_state(path: Path) -> dict:
+    """Load state, recovering from a validated backup or failing closed."""
+    path = Path(path)
+    backup = supervisor_state_backup_path(path)
+    primary_exists = path.exists()
+    backup_exists = backup.exists()
+    primary, primary_problem = (
+        _read_supervisor_state_copy(path, source="supervisor state")
+        if primary_exists else (None, None)
+    )
+    if primary is not None:
+        return primary
+    fallback, backup_problem = (
+        _read_supervisor_state_copy(backup, source="supervisor state backup")
+        if backup_exists else (None, None)
+    )
+    if fallback is not None:
+        return fallback
+    if not primary_exists and not backup_exists:
+        return {"agents": {}}
+    problems = [p for p in (primary_problem, backup_problem) if p]
+    raise SupervisorPersistenceError("; ".join(problems) or "supervisor state is unavailable")
+
+
+def save_supervisor_state(path: Path, state: dict) -> None:
+    """Durably replace state after preserving a validated previous generation."""
+    path = Path(path)
+    state = _validate_supervisor_state(state, source="supervisor state")
+    _supervisor_json_text(state, source="supervisor state")
+    backup = supervisor_state_backup_path(path)
+    primary_exists = path.exists()
+    backup_exists = backup.exists()
+    current, primary_problem = (
+        _read_supervisor_state_copy(path, source="supervisor state")
+        if primary_exists else (None, None)
+    )
+    if current is not None:
+        _atomic_write_supervisor_json(
+            backup, current, source="supervisor state backup",
+        )
+    elif primary_exists:
+        fallback, backup_problem = (
+            _read_supervisor_state_copy(backup, source="supervisor state backup")
+            if backup_exists else (None, None)
+        )
+        if fallback is None:
+            problems = [p for p in (primary_problem, backup_problem) if p]
+            raise SupervisorPersistenceError(
+                "; ".join(problems) or "supervisor state has no valid recovery copy"
+            )
+    elif backup_exists:
+        fallback, backup_problem = _read_supervisor_state_copy(
+            backup, source="supervisor state backup",
+        )
+        if fallback is None:
+            raise SupervisorPersistenceError(
+                backup_problem or "supervisor state backup is invalid"
+            )
+    _atomic_write_supervisor_json(path, state, source="supervisor state")
+
+
+def load_supervisor_config(path: Path) -> dict:
+    """Load supervisor.json as a BOM-tolerant JSON object."""
+    path = Path(path)
+    if not path.exists():
+        return {}
+    return _read_supervisor_json(path, source="supervisor config")
+
+
+def authoritative_heartbeat_age_seconds(
+    heartbeat: datetime | None,
+    *,
+    now_epoch: float,
+    heartbeat_skew_seconds: float = health_model.DEFAULT_HEARTBEAT_SKEW_SECONDS,
+) -> float | None:
+    """Bound future clock skew before a heartbeat can authorize liveness."""
+    if heartbeat is None:
+        return None
+    now = float(now_epoch)
+    skew = max(0.0, float(heartbeat_skew_seconds))
+    timestamp = heartbeat.timestamp()
+    if timestamp > now + skew:
+        return None
+    return max(0.0, now - timestamp)
 
 # Per-CLI process-discovery defaults (config["agents"][n] overrides). These
 # values identify session metadata and best-effort cleanup targets only; they do
@@ -2472,14 +2646,14 @@ def build_report(store: Store, *, now_epoch: float,
         # (report parity with the planner); else the single global threshold.
         threshold_a = (resolve_stuck_after(sup_cfg, sup_agents.get(a) or {})
                        if sup_cfg is not None else float(threshold))
-        hb = store.read_heartbeat(a)
-        if hb is None:
-            hb_age = None
-            stale = True
-        else:
-            hb_age = max(0.0, now_epoch - hb.timestamp())
-            stale = hb_age > threshold_a
         health_timing = resolve_health_timing(sup_cfg or {}, sup_agents.get(a) or {})
+        hb = store.read_heartbeat(a)
+        hb_age = authoritative_heartbeat_age_seconds(
+            hb,
+            now_epoch=now_epoch,
+            heartbeat_skew_seconds=health_timing["heartbeat_skew_seconds"],
+        )
+        stale = hb_age is None or hb_age > threshold_a
         health = store.read_health(
             a,
             now_epoch=now_epoch,
@@ -4122,6 +4296,7 @@ if ($Quiet) { $WarningPreference = 'SilentlyContinue' }
 $Root      = Split-Path -Parent $PSScriptRoot   # the project root (.agenttalk/..)
 $ConfigPath = Join-Path $PSScriptRoot 'supervisor.json'
 $StatePath  = Join-Path $PSScriptRoot 'supervisor-state.json'   # SCRIPT-owned, not the bus
+$StateBackupPath = "$StatePath.bak"
 $KillSwitchPath = Join-Path $PSScriptRoot 'supervisor.kill'
 # Resolve the project-local shim once and use it for ALL of the SUPERVISOR's
 # own bus calls, so they work PATH-independently - the console script may not be
@@ -4134,20 +4309,98 @@ $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
 $AgenttalkPython = '__AGENTTALK_PYTHON__'
 $SrcOnPyPath = __SRC_ON_PYPATH__
 
-function Load-State {
-  if (Test-Path $StatePath) { return (Get-Content $StatePath -Raw | ConvertFrom-Json) }
-  return [pscustomobject]@{ agents = [pscustomobject]@{} }
-}
 function Actions-Enabled { return -not (Test-Path $KillSwitchPath) }
 function Assert-ActionsEnabled([string]$what) {
   if (Actions-Enabled) { return $true }
   if (-not $Quiet) { Write-Host ("supervisor: kill switch active; skipping {0}" -f $what) }
   return $false
 }
+# region state-helpers
+function Test-StateObject($state) {
+  if ($null -eq $state) { return $false }
+  if (($state -isnot [System.Management.Automation.PSCustomObject]) -and
+      ($state -isnot [hashtable])) { return $false }
+  foreach ($field in @('agents', 'ephemeral_reviewers')) {
+    $prop = $state.PSObject.Properties[$field]
+    if ($null -ne $prop -and $null -ne $prop.Value -and
+        ($prop.Value -isnot [System.Management.Automation.PSCustomObject]) -and
+        ($prop.Value -isnot [hashtable])) { return $false }
+  }
+  return $true
+}
+function Read-StateFile([string]$path) {
+  if (-not (Test-Path -LiteralPath $path)) { return $null }
+  try {
+    $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    $value = [System.IO.File]::ReadAllText($path, $utf8) | ConvertFrom-Json
+    if (Test-StateObject $value) { return $value }
+  } catch { }
+  return $null
+}
+function Write-StateFileAtomic([string]$path, $state) {
+  if (-not (Test-StateObject $state)) { throw "supervisor state must be a JSON object" }
+  $json = $state | ConvertTo-Json -Depth 8
+  $utf8 = New-Object System.Text.UTF8Encoding($false)
+  $bytes = $utf8.GetBytes($json)
+  $tmpName = ".at-{0}-{1}.tmp" -f $PID, ([Guid]::NewGuid().ToString('N'))
+  $tmp = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($path), $tmpName)
+  $stream = [System.IO.FileStream]::new(
+    $tmp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write,
+    [System.IO.FileShare]::None)
+  try {
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush($true)
+  } finally {
+    $stream.Dispose()
+  }
+  $replaced = $null
+  try {
+    if (Test-Path -LiteralPath $path) {
+      $replacedName = ".at-replaced-{0}-{1}.bak" -f $PID, ([Guid]::NewGuid().ToString('N'))
+      $replaced = [System.IO.Path]::Combine(
+        [System.IO.Path]::GetDirectoryName($path), $replacedName)
+      [System.IO.File]::Replace($tmp, $path, $replaced)
+    } else {
+      [System.IO.File]::Move($tmp, $path)
+    }
+  } finally {
+    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
+    if ($null -ne $replaced -and (Test-Path -LiteralPath $replaced)) {
+      Remove-Item -LiteralPath $replaced -Force
+    }
+  }
+}
+function Load-State {
+  $primaryExists = Test-Path -LiteralPath $StatePath
+  $backupExists = Test-Path -LiteralPath $StateBackupPath
+  $primary = Read-StateFile $StatePath
+  if ($null -ne $primary) { return $primary }
+  $backup = Read-StateFile $StateBackupPath
+  if ($null -ne $backup) { return $backup }
+  if (-not $primaryExists -and -not $backupExists) {
+    return [pscustomobject]@{ agents = [pscustomobject]@{} }
+  }
+  throw "supervisor state and backup are invalid; refusing to continue"
+}
 function Save-State($state) {
   if (-not (Actions-Enabled)) { return }
-  $state | ConvertTo-Json -Depth 8 | Set-Content $StatePath -Encoding utf8
+  if (-not (Test-StateObject $state)) { throw "supervisor state must be a JSON object" }
+  $primaryExists = Test-Path -LiteralPath $StatePath
+  $backupExists = Test-Path -LiteralPath $StateBackupPath
+  $prior = Read-StateFile $StatePath
+  if ($null -ne $prior) {
+    Write-StateFileAtomic $StateBackupPath $prior
+  } elseif ($primaryExists) {
+    $fallback = Read-StateFile $StateBackupPath
+    if ($null -eq $fallback) {
+      throw "supervisor state is invalid and no valid backup exists"
+    }
+  } elseif ($backupExists -and $null -eq (Read-StateFile $StateBackupPath)) {
+    throw "supervisor state backup is invalid"
+  }
+  Write-StateFileAtomic $StatePath $state
 }
+# endregion state-helpers
 function Pid-Alive($procId) {
   if (-not $procId) { return $false }
   return [bool](Get-Process -Id $procId -ErrorAction SilentlyContinue)
