@@ -95,6 +95,33 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.73.1 - supervised-team bootstrap preflight (2026-07-10)
+**GOOD / ROBUST / SECURE** · reviewed-SHA `538023c` · tag `v0.73.1`
+- **Review:** codex-agenttalk-reviewer-2 initially rejected the supervised wrapped-agent
+  documentation because one JSON launch example omitted the explicit pre-wrap `--root`; the example
+  was corrected and the reviewer re-approved. Live Claude reviewer agents were stale during this
+  release, so Claude compatibility was covered by mixed Claude/Codex supervisor-regression tests and
+  the bundled Claude skill updates rather than a live Claude second review.
+- **Verification:** focused tests passed for status deadlock warnings and the new bootstrap checker
+  (`7 passed`), then the supervisor module plus the relevant status tests passed (`211 passed`) and
+  the full CLI module passed (`197 passed`) using `PYTHONPATH=src`, no pytest cache provider, and
+  external `D:\tmp` basetemps. The final local gate passed the full pytest suite on Python 3.10
+  (`2104 passed, 3 skipped`) and Python 3.14 (`2104 passed, 3 skipped`), `python -m ruff check src
+  tests`, `python -m bandit -q -r src -x src/agenttalk/skills`, `node --check
+  src\agenttalk\web_static\console.js`, `git diff --check`, `python -m compileall -q src tests`,
+  isolated `python -m build --outdir .tmp-dist-v0.73.1`, wheel install smoke (`agenttalk 0.73.1`),
+  and a package-content probe confirming the user manual PDF, source, and bundled Claude/Codex
+  skills are present while local `.agenttalk`/scratch/cache state is absent from the sdist.
+- **CI:** pending at tag creation; release close requires watching GitHub Actions tests matrix,
+  security, and wheel/packaging after push and reporting actual results.
+- **Robust/Secure:** `supervise --bootstrap-check` is a read-only preflight over the existing roster,
+  supervisor config, launch command, and heartbeat files. It introduces no new authority boundary and
+  does not start, stop, or edit agents. It makes missing operator-facing liaisons, placeholder
+  launches, missing explicit wrapped `--root`, stale managed agents, and roster-only identities
+  visible before a field team is treated as live. The status warning change narrows an advisory
+  heuristic so healthy idle waiter loops no longer look like a soft-deadlock unless unread work is
+  actually owed.
+
 ### v0.73.0 - project onboarding ledger and dashboard view (2026-07-09)
 **GOOD / ROBUST / SECURE** · reviewed-SHA `1f7afc7` · tag `v0.73.0`
 - **Review:** feature release for the first native project-onboarding surface. The release adds

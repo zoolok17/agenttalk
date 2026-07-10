@@ -59,7 +59,7 @@ decisions are what make a GO credible.
 Install once per machine. Pin the version in repeatable setups.
 
 ```powershell
-python -m pip install git+https://github.com/zoolok17/agenttalk.git@v0.73.0
+python -m pip install git+https://github.com/zoolok17/agenttalk.git@v0.73.1
 agenttalk --version
 agenttalk --help
 agenttalk install-skills

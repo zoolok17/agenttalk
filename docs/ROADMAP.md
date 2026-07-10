@@ -1,9 +1,9 @@
 # agenttalk - Product Roadmap & Feasibility
 
-**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-07-09
+**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-07-10
 **Audience:** maintainers, operators, and agents deciding what to build next.
 **Horizon:** pragmatic next 2-3 quarters + a labeled "later" tier.
-**Current shipped baseline:** v0.73.0 (2026-07-09). `CHANGELOG.md` remains the release-history source of truth.
+**Current shipped baseline:** v0.73.1 (2026-07-10). `CHANGELOG.md` remains the release-history source of truth.
 
 Companion docs: `docs/DESIGN.md` (why / architecture) · `docs/ASSURANCE.md` (per-release GOOD/ROBUST/SECURE attestation) · `docs/ISSUES.md` (living work tracker + known limitations) · `docs/DASHBOARD-CONTROL-PLANE-ROADMAP.md` (dashboard control-plane design history) · `CHANGELOG.md`.
 
