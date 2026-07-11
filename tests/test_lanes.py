@@ -2323,6 +2323,116 @@ def test_delivery_finalize_rebind_rejects_gate_red_after_final_publish(
     assert _committed_artifacts(store, lane_id) == []
 
 
+def test_completion_checkpoint_rebind_rejects_gate_red_at_entry(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    gates.set_gate(
+        root, name="ci", status="green", severity="blocker", scope="release",
+        actor="lead", evidence_source="automation_ci", evidence=["ci://green"],
+        required=True,
+    )
+    lane_id = "checkpoint-entry-gate"
+    lane = _assign_worktree(root, base, lane_id)
+    head = _commit(
+        Path(lane["worktree_path"]), "src/core/a.py", "base\ncheckpoint candidate\n",
+    )
+    store = Store(root)
+    real_checkpoint = cli._lane_checkpoint_publication
+    artifact_seen = None
+
+    def turn_gate_red_at_checkpoint(
+            target_store, target_lane_id, pending, artifact):  # noqa: ANN001
+        nonlocal artifact_seen
+        artifact_seen = Path(artifact)
+        assert artifact_seen.exists()
+        saved = lanes.load_lanes(target_store)["lanes"][target_lane_id]
+        assert saved["publish_pending"]["terminal_rebound"] is True
+        gates.set_gate(
+            root, name="ci", status="red", severity="blocker", scope="release",
+            actor="lead", evidence_source="local_command", reason="checkpoint failure",
+        )
+        return real_checkpoint(target_store, target_lane_id, pending, artifact)
+
+    monkeypatch.setattr(cli, "_lane_checkpoint_publication", turn_gate_red_at_checkpoint)
+    assert _run_raw([
+        "lane", "deliver", "--id", lane_id, "--from", "dev",
+        "--gate-scope", "release",
+    ], root) == 3
+
+    saved = lanes.load_lanes(store)["lanes"][lane_id]
+    assert saved["status"] == lanes.STATUS_ACTIVE
+    assert saved.get("publish_pending") is not False
+    assert _committed_artifacts(store, lane_id) == []
+    assert artifact_seen is not None and not artifact_seen.exists()
+    quarantine = list(
+        (store.dir / "lane-deliveries" / ".recovery-quarantine").glob(
+            f"{artifact_seen.name}.*.rejected"
+        )
+    )
+    assert len(quarantine) == 1
+    assert _run_raw([
+        "close", "open", "--id", "checkpoint-entry-close", "--from", "lead",
+        "--scope", "release", "--revision", head,
+        "--lane-artifact", str(artifact_seen),
+    ], root) == 0
+    assert _run_raw([
+        "close", "check", "--id", "checkpoint-entry-close",
+    ], root) == 3
+
+
+def test_retry_quarantines_existing_final_before_target_drift_rollback(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    target_ref = _branch(root)
+    _git(root, "checkout", "-q", "-b", "retry-final-target-conflict", base)
+    conflicting = _commit(root, "src/core/a.py", "base\ntarget conflict\n")
+    _git(root, "checkout", "-q", target_ref)
+    lane_id = "retry-existing-final"
+    lane = _assign_worktree(root, base, lane_id)
+    head = _commit(
+        Path(lane["worktree_path"]), "src/core/a.py", "base\nlane candidate\n",
+    )
+    store = Store(root)
+    real_checkpoint = cli._lane_checkpoint_publication
+    monkeypatch.setattr(
+        cli, "_lane_checkpoint_publication",
+        lambda *_a, **_kw: (_ for _ in ()).throw(OSError("checkpoint crash")),
+    )
+    argv = ["lane", "deliver", "--id", lane_id, "--from", "dev"]
+    assert _run_raw(argv, root) == 2
+    monkeypatch.setattr(cli, "_lane_checkpoint_publication", real_checkpoint)
+
+    finals = _committed_artifacts(store, lane_id)
+    assert len(finals) == 1
+    stale_final = finals[0]
+    pending = lanes.load_lanes(store)["lanes"][lane_id]
+    assert isinstance(pending["publish_pending"], dict)
+    assert _git_rc(
+        root, "update-ref", f"refs/heads/{target_ref}", conflicting, base,
+    ).returncode == 0
+
+    assert _run_raw(argv, root) == 3
+    saved = lanes.load_lanes(store)["lanes"][lane_id]
+    assert saved["status"] == lanes.STATUS_ACTIVE
+    assert saved.get("publish_pending") is not False
+    assert _committed_artifacts(store, lane_id) == []
+    assert not stale_final.exists()
+    quarantine = list(
+        (store.dir / "lane-deliveries" / ".recovery-quarantine").glob(
+            f"{stale_final.name}.*.rejected"
+        )
+    )
+    assert len(quarantine) == 1
+    assert _run_raw([
+        "close", "open", "--id", "retry-existing-final-close", "--from", "lead",
+        "--scope", "release", "--revision", head,
+        "--lane-artifact", str(stale_final),
+    ], root) == 0
+    assert _run_raw([
+        "close", "check", "--id", "retry-existing-final-close",
+    ], root) == 3
+
+
 def test_provisional_delivery_retains_overlapping_path_reservation(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root, base = _repo(tmp_path)
@@ -2765,7 +2875,7 @@ def test_delivery_retry_after_final_write_and_marker_save_failure_is_idempotent(
     assert _run_raw(["close", "check", "--id", "pending-close"], root) == 3
 
     assert _run_raw(argv, root) == 0
-    assert evals == 6  # initial prepare/pre/post plus recovery pre/post; final is reused
+    assert evals == 7  # recovery freshly binds the existing final at prepare/pre/checkpoint
     assert _committed_artifacts(store, "postpub") == finals
     assert lanes.validate_delivery_artifact(
         finals[0], lane_id="postpub", head_sha=head, store=store,
