@@ -17,7 +17,7 @@ be labeled `SHIPPED` once the changelog closes them.
 
 ---
 
-## P1 · PLANNED — v0.74.0 release-contract integration (2026-07-11)
+## P1 · SHIPPED — v0.74.0 release-contract integration (2026-07-11)
 
 **What.** Integrate and release the reviewed hardening wave without weakening
 its failure contracts: strict typed response state; generation/instance-bound
@@ -42,10 +42,11 @@ rather than atomic tree termination. The production reporter's desktop-heap
 diagnosis remains plausible but is not upstream-confirmed. These are follow-up
 hardening items, not blockers for the narrow `taskkill.exe` removal.
 
-**Documentation disposition.** New behavior is described under Unreleased and
-as planned v0.74.0 only. Historical changelog, assurance, dashboard-roadmap, and
-frozen wire-contract statements remain preserved; the frozen dashboard spec is
-superseded by a dated addendum instead of being rewritten.
+**Documentation disposition.** The behavior is recorded in the dated v0.74.0
+release section and current contract docs. Historical changelog, assurance,
+dashboard-roadmap, and frozen wire-contract statements remain preserved; the
+frozen dashboard spec is superseded by a dated addendum instead of being
+rewritten.
 
 ## P1 · PLANNED — Native Work & Evidence Spine (2026-07-08)
 

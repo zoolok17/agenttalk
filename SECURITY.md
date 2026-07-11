@@ -348,7 +348,7 @@ do what is cheaper and more honest.
      the aggregate. JSON-unparseable configs therefore degrade
      visibly rather than silently vanishing.
 
-**Current multi-root supersession (planned v0.74.0).** The first-root body
+**Current multi-root supersession (v0.74.0).** The first-root body
 surface above remains historical behavior for legacy message-browser routes,
 but Team Console routes now select a store by path-derived `project_id`.
 Selected-root responses carry `root_info`. GET omission selects `root[0]`; a
@@ -391,7 +391,7 @@ Two limitations documented at 0.18.0 were:
   mis-order or hide messages. Id-shape validation does **not** fix this
   (a skewed id is well-formed); keep clocks in agreement.
 
-**Current persistence and schema hardening (planned v0.74.0).** The
+**Current persistence and schema hardening (v0.74.0).** The
 cursor/threadstate lost-update limitation above remains: writes are atomic, but
 their read-modify-write sequences are not cross-process serialized. One
 consuming window per agent is therefore required; duplicate consumers can lose

@@ -331,7 +331,7 @@ two parallel ownership concepts.
 - **Modules:** `web.py` (loopback server, CSRF/session, `/api/intent`,
   `/api/lead-chat`), `intents.py` (typed schema + executor), `store.py`
   (`write_intent`, `list_intents`, lead-chat identity), `web_static/console.js`.
-- **Project identity and routing (planned v0.74.0):** every watched root has a
+- **Project identity and routing (v0.74.0):** every watched root has a
   stable path-derived `project_id`; labels are presentation plus read-only
   legacy compatibility, never write-routing identity, and duplicate basenames
   receive stable id suffixes. Selected-root responses return

@@ -11,7 +11,7 @@ design history for the dashboard control plane; current contracts live in
 behind `--enable-actions`; v0.68.0 added dashboard lead-chat; v0.69.0 aligned
 dashboard liveness render for fresh-heartbeat unwrapped agents.
 
-**Planned v0.74.0 supersession (2026-07-11):** multi-root Team Console state
+**v0.74.0 supersession (2026-07-11):** multi-root Team Console state
 uses stable path-derived `project_id` as its canonical identity, not a root-list
 index. Selected-root responses carry `root_info {project_id,label,path}`. GET
 omission selects `root[0]`, and a unique display label remains a legacy

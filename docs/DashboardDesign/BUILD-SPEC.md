@@ -17,7 +17,7 @@ Use: headings/wordmark → `"Segoe UI", system-ui, sans-serif`; mono/IDs → `ui
 `font-src` needed) and matches the design's typographic *hierarchy* if not the exact
 letterforms.
 
-> **Superseding addendum — 2026-07-11, planned v0.74.0.** This file remains the
+> **Superseding addendum — shipped in v0.74.0 on 2026-07-11.** This file remains the
 > frozen v0.58.0 contract. The following current contract supersedes only its
 > root-routing and client root-state statements (especially §3c and §7):
 >

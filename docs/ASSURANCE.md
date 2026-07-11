@@ -95,6 +95,36 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.74.0 - concurrency hardening, native Windows teardown, and project-aware dashboard (2026-07-12)
+**GOOD / ROBUST / SECURE candidate** - reviewed-SHA `5a0200f` - tag `v0.74.0`
+- **Review:** a third-party adversarial review placed revision `fdea125` on HOLD with 27
+  confirmed findings (5 blockers, 14 major, 1 medium, and 7 lower-severity defects). The
+  remediation matrix in `docs/reviews/v0.74.0-remediation.md` maps every finding to its fix,
+  regression tests, and review evidence. The final lane transaction fix `c4838af` was approved
+  independently by `codex-test` and `claude-test`; the dashboard project-identity change was
+  independently reviewed by Claude and Codex/Edge reviewers. Release-candidate review still
+  applies to the exact versioned commit before publication.
+- **Verification:** the full suite passed on Python 3.10 (`2370 passed, 5 skipped`) and Python
+  3.14 (`2370 passed, 5 skipped`) with pinned `PYTHONPATH=src`, no pytest cache provider, and
+  external basetemps. Exact lane evidence also passed `160` lane tests plus `133` supporting
+  coordination tests on Python 3.14; the selected-root dashboard suite passed `173 passed, 1
+  skipped`. Ruff, the project-scoped Bandit command, Node syntax checking, `compileall`, and
+  `git diff --check` passed. Documentation checks covered 12 changed Markdown files, 21 internal
+  links, 376 fences, executable CLI help/version examples, and the regenerated 16-page manual PDF
+  (37 bookmarks, no blank/overflow pages, and visual contact-sheet review).
+- **Packaging/CI:** pending on the exact versioned candidate. Publication remains HOLD until a
+  clean sdist/wheel build, non-editable wheel install smoke, package-content probe, GitHub Actions
+  test matrix, packaging gate, and security workflow all pass.
+- **Robust/Secure:** close and lane publication now bind mutable inputs at their serialization
+  boundaries; lock, waiter, launch-request, onboarding, supervisor-state, and JSONL persistence
+  paths have generation/atomicity and malformed-state regressions. Windows turn teardown no
+  longer launches `taskkill.exe`; it uses native process signaling with bounded PowerShell/CIM
+  fallbacks. Multi-root dashboard reads and writes use a stable full project id, while the visible
+  path remains display context rather than authorization. Accepted limits remain explicit: one
+  live consumer per mailbox, same-user lock/project identity mechanisms are correctness rather
+  than security boundaries, lane evidence is point-in-time, and process-tree teardown is
+  best-effort under OS denial or PID reuse.
+
 ### v0.73.1 - supervised-team bootstrap preflight (2026-07-10)
 **GOOD / ROBUST / SECURE** · reviewed-SHA `538023c` · tag `v0.73.1`
 - **Review:** codex-agenttalk-reviewer-2 initially rejected the supervised wrapped-agent
