@@ -50,11 +50,13 @@ release section.
 
 - **Windows turn-watchdog termination no longer launches `taskkill.exe`.** Verified
   per-turn process targets are terminated with `os.kill(pid, signal.SIGTERM)`;
-  on Windows this is an abrupt `TerminateProcess` path, not graceful shutdown.
-  This removes one subprocess and its initialization-dialog risk. Desktop-heap
-  exhaustion remains an unproven production hypothesis, PowerShell/CIM snapshot
-  subprocesses remain, and the separate start-time recheck cannot eliminate PID
-  reuse between verification and kill.
+  on Windows this is abrupt termination, not graceful shutdown. This eliminates
+  the `taskkill.exe` subprocess path that produced the reported popup. The
+  production reporter's desktop-heap exhaustion diagnosis is plausible but is
+  not an upstream-confirmed root cause. Windows snapshot and start-time helpers
+  still launch PowerShell/CIM subprocesses; PID reuse remains possible after
+  the recheck, and leaf-first snapshot termination is not an atomic tree kill.
+  Those residuals are follow-up hardening, not blockers for this narrow fix.
 - **An old wrapper can no longer erase a replacement waiting marker.** Each
   wrapper loop writes a unique wait token and clears the marker only while that
   token still matches.

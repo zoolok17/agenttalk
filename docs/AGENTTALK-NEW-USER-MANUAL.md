@@ -542,9 +542,12 @@ Persistence and teardown are fail-closed:
 - Each wrapper waiting marker has a unique generation token. An old wrapper's
   `finally` clears only its own token, so it cannot erase a replacement marker.
 - On Windows, the turn watchdog uses `os.kill(pid, SIGTERM)` and never launches
-  `taskkill.exe`. The kill is abrupt. PowerShell/CIM snapshot subprocesses and
-  the PID-reuse window after start-time verification remain; desktop-heap
-  exhaustion is not a proven root cause.
+  `taskkill.exe`. The kill is abrupt and eliminates that popup-producing
+  subprocess path. The production reporter's desktop-heap diagnosis is
+  plausible, not upstream-confirmed. Windows snapshot and start-time helpers
+  still launch PowerShell/CIM subprocesses; PID reuse after the recheck and
+  best-effort, non-atomic tree termination remain follow-up hardening, not
+  blockers for this narrow fix.
 
 Protected agents are the operator-facing liaison and active lead-role agents.
 The supervisor never auto-kills them. A manual restart of a protected agent

@@ -521,9 +521,13 @@ wrapper's waiting state.
 
 On Windows, the turn watchdog terminates a verified target with
 `os.kill(pid, signal.SIGTERM)` and does not start `taskkill.exe`. Windows maps
-that call to abrupt termination, not graceful signal handling. This hotfix does
-not prove the reported desktop-heap theory, remove the remaining PowerShell/CIM
-snapshot subprocesses, or eliminate PID reuse after the start-time recheck.
+that call to abrupt termination, not graceful signal handling. This eliminates
+the popup-producing `taskkill.exe` subprocess path. The production reporter's
+desktop-heap exhaustion diagnosis is plausible, not an upstream-confirmed root
+cause. Windows snapshot and start-time helpers still launch PowerShell/CIM
+subprocesses; PID reuse remains possible after the recheck, and snapshot-based
+leaf-first termination is not an atomic tree kill. Treat those limits as
+follow-up hardening, not blockers for this narrow fix.
 
 In supervisor config, wrapped agents use Python as `windows_file`; the real CLI
 goes after `--` in `windows_args`. See

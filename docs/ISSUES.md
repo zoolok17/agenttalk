@@ -37,7 +37,10 @@ same-user authorization boundaries. One model consumer per mailbox remains the
 supported topology. Close file plus barrier message and lane state plus
 delivery artifact use explicit retry protocols rather than cross-file ACID.
 Windows still launches PowerShell/CIM for process snapshots, retains a
-start-time-recheck PID ABA window, and has no proven desktop-heap root cause.
+start-time-recheck PID ABA window, and performs best-effort snapshot-based
+rather than atomic tree termination. The production reporter's desktop-heap
+diagnosis remains plausible but is not upstream-confirmed. These are follow-up
+hardening items, not blockers for the narrow `taskkill.exe` removal.
 
 **Documentation disposition.** New behavior is described under Unreleased and
 as planned v0.74.0 only. Historical changelog, assurance, dashboard-roadmap, and

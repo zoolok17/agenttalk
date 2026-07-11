@@ -1286,10 +1286,13 @@ wrapper cannot erase a replacement's live marker.
 
 On Windows, the per-turn watchdog no longer launches `taskkill.exe`; verified
 targets use `os.kill(pid, signal.SIGTERM)`, which maps to abrupt process
-termination rather than graceful SIGTERM handling. The production desktop-heap
-exhaustion theory is not proven. PowerShell/CIM subprocesses still perform the
-snapshot and start-time query, and PID reuse remains possible in the gap
-between the start-time recheck and kill.
+termination rather than graceful SIGTERM handling. This eliminates the
+`taskkill.exe` subprocess path that produced the reported popup. The production
+reporter's desktop-heap exhaustion diagnosis is plausible but is not an
+upstream-confirmed root cause. Windows snapshot and start-time helpers still
+launch PowerShell/CIM subprocesses, PID reuse remains possible after the
+recheck, and the leaf-first snapshot operation is not an atomic tree kill.
+Those limitations are follow-up hardening, not blockers for this narrow fix.
 
 Protected agents — the operator-facing liaison and every active
 `role=lead` — are **never auto-killed** (warn/note only), and a manual

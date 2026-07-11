@@ -77,12 +77,14 @@ only the marker generation it created.
 
 The wrapped-turn watchdog no longer starts `taskkill.exe`. It calls
 `os.kill(pid, signal.SIGTERM)` for a start-time-verified Windows target; Windows
-implements that as abrupt process termination. This removes one executable
-launch and its modal-initialization risk, but does not prove desktop-heap
-exhaustion caused the production event. PowerShell/CIM subprocesses still build
-the process snapshot and query creation time, and PID reuse remains possible
-between the separate recheck and kill. Size service recovery thresholds with
-those residuals in mind.
+implements that as abrupt process termination. This eliminates the
+popup-producing `taskkill.exe` subprocess path. The production reporter's
+desktop-heap exhaustion diagnosis is plausible but is not an upstream-confirmed
+root cause. Windows snapshot and start-time helpers still launch PowerShell/CIM
+subprocesses; PID reuse remains possible after the separate recheck, and the
+leaf-first snapshot operation is not an atomic tree kill. These are follow-up
+hardening items, not blockers for this narrow fix. Size service recovery
+thresholds with those residuals in mind.
 
 ## Degraded Mode
 

@@ -486,10 +486,13 @@ without ever rebuilding state.
   does not make duplicate consumers supported.
 - **Windows watchdog termination is narrower, not complete process hardening.**
   The per-turn watchdog uses `os.kill(pid, signal.SIGTERM)` and does not launch
-  `taskkill.exe`; on Windows that is abrupt termination. The observed desktop-
-  heap explanation is not proven. PowerShell/CIM subprocesses still collect the
-  process snapshot and creation time, and a PID can be reused after the separate
-  start-time recheck but before kill.
+  `taskkill.exe`; on Windows that is abrupt termination and eliminates that
+  popup-producing subprocess path. The production reporter's desktop-heap
+  diagnosis is plausible, not upstream-confirmed. Windows snapshot and
+  start-time helpers still launch PowerShell/CIM subprocesses; a PID can be
+  reused after the separate recheck, and leaf-first snapshot termination is not
+  an atomic tree kill. These are follow-up hardening items, not blockers for the
+  narrow fix.
 - **Pinned executables.** `windows_file` must be the real CLI exe (or
   Python for wrapped), never a `.cmd`/npm/PowerShell shim — a shim hands
   off and exits, and the supervisor would track the wrong process.

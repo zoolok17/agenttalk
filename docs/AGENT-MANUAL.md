@@ -51,8 +51,11 @@ The wrapper owns a generation-bound waiting marker: teardown clears only its
 own token, never a replacement loop's marker. Supervisor heartbeat timestamps
 farther in the future than the configured skew cannot establish freshness, and
 invalid primary plus backup supervisor state fails closed. On Windows, the
-turn watchdog uses native `os.kill(..., SIGTERM)` rather than `taskkill.exe`;
-remaining PowerShell/CIM snapshots and PID-reuse timing are residual risks.
+turn watchdog uses `os.kill(..., SIGTERM)` and never launches `taskkill.exe`,
+eliminating that popup-producing subprocess path. The production reporter's
+desktop-heap diagnosis is plausible, not upstream-confirmed. PowerShell/CIM
+snapshot and start-time helpers, post-recheck PID reuse, and best-effort
+non-atomic tree termination remain follow-up hardening, not narrow-fix blockers.
 
 Listening is latency, not correctness state. Messages, thread state, lanes, gates, and knowledge are durable files; a missed wait or wake costs time, not data. The existing wakes-are-latency-not-state rule still applies: use `sync` and `threads` after any restart or compaction to rebuild obligations, then re-arm the wait.
 

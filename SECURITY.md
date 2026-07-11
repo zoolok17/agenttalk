@@ -424,9 +424,13 @@ Additional current contracts:
   closed if both copies are invalid. A heartbeat beyond the allowed future
   skew cannot prove liveness.
 - Windows watchdog termination no longer launches `taskkill.exe`; it uses
-  `os.kill(..., SIGTERM)`, which is abrupt on Windows. Desktop-heap exhaustion
-  is not proven, PowerShell/CIM snapshot launches remain, and start-time
-  verification cannot eliminate PID reuse after the recheck.
+  `os.kill(..., SIGTERM)`, which is abrupt on Windows. This eliminates the
+  popup-producing `taskkill.exe` subprocess path. The production reporter's
+  desktop-heap exhaustion diagnosis is plausible, not an upstream-confirmed
+  root cause. Windows snapshot and start-time helpers still launch
+  PowerShell/CIM subprocesses, PID reuse remains possible after the recheck,
+  and snapshot-based termination is not an atomic tree kill. These are
+  follow-up hardening items, not blockers for the narrow termination fix.
 
 ### Still planned
 

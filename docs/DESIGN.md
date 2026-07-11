@@ -275,9 +275,12 @@ two parallel ownership concepts.
   only a matching token, so an old loop cannot erase a replacement marker.
   The Windows per-turn watchdog kills a verified target with
   `os.kill(pid, SIGTERM)` instead of launching `taskkill.exe`; this is abrupt on
-  Windows. PowerShell/CIM snapshots and the start-time-recheck-to-kill PID ABA
-  window remain, and desktop-heap exhaustion is a hypothesis rather than a
-  proven root cause.
+  Windows and eliminates the popup-producing `taskkill.exe` subprocess path.
+  The production reporter's desktop-heap exhaustion diagnosis is plausible,
+  not an upstream-confirmed root cause. Windows snapshot and start-time helpers
+  still launch PowerShell/CIM subprocesses; the recheck-to-kill PID ABA window
+  remains, and leaf-first snapshot termination is not an atomic tree kill.
+  These are follow-up hardening items, not blockers for the narrow fix.
 - **Managed lead-loop controller (`lead_loop_runtime.py`,
   `lead_loop_cadence.py`):** the split-identity lead can own a durable lease,
   resolve one heartbeat-stale threshold for both stealability and visibility,
