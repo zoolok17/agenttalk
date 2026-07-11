@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The entries below are planned for v0.74.0. They do not constitute a dated
+release section.
+
+### Added
+
+- **Single-agent project initialization.** `agenttalk init --agents claude`
+  and `--agents codex` now create valid one-agent rosters that can grow later;
+  peer-targeted commands still require an explicit recipient until a peer is
+  configured.
+
 ### Changed
 
 - **The Team Console keeps project identity visible and root-safe.** Every view now shows the
@@ -17,13 +27,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   primary project, duplicate descriptors for one project ID are rejected at startup, and switching
   projects clears root-bound message, answer, and lead-chat drafts. Project selection now follows
   browser Back/Forward history, and narrow viewports wrap filters and long lead-chat identifiers.
+- **Close updates are serialized and generation-bound.** Existing close
+  mutations require both the current generation and immutable instance id;
+  force-open creates a new instance, and release-barrier publication is bound
+  to the published close generation so a failed send or stamp can be resumed
+  without sending a second barrier.
+- **Lane delivery is recoverable and two-phase.** A non-consumable prepared
+  artifact precedes a generation-bound `publish_pending` checkpoint; only a
+  committed artifact is valid evidence. Publication and worktree cleanup are
+  separately retryable, and no-worktree waivers are advisory records rather
+  than release-isolation authority.
+- **Runtime persistence is explicitly serialized and recoverable.** Cooperating
+  state writers use hardened cross-process locks; append-only JSONL readers
+  isolate malformed physical lines; supervisor state uses a validated backup;
+  future heartbeats are bounded; and wrapper waiter teardown is generation-bound.
+- **Typed review and proposal statuses are strict.** `review-result` accepts
+  only `approved|rejected|needs-info`; `proposal-response` accepts only
+  `accepted|rejected|countered`. Missing legacy status remains readable but is
+  nonterminal, while an invalid present status is rejected or skipped.
 
 ### Fixed
 
 - **Windows turn-watchdog termination no longer launches `taskkill.exe`.** Verified
-  per-turn process targets are terminated through Python's native process kill path,
-  avoiding `taskkill.exe` initialization dialogs under host resource pressure. The
-  existing PowerShell/CIM snapshot and start-time checks are unchanged by this hotfix.
+  per-turn process targets are terminated with `os.kill(pid, signal.SIGTERM)`;
+  on Windows this is an abrupt `TerminateProcess` path, not graceful shutdown.
+  This removes one subprocess and its initialization-dialog risk. Desktop-heap
+  exhaustion remains an unproven production hypothesis, PowerShell/CIM snapshot
+  subprocesses remain, and the separate start-time recheck cannot eliminate PID
+  reuse between verification and kill.
+- **An old wrapper can no longer erase a replacement waiting marker.** Each
+  wrapper loop writes a unique wait token and clears the marker only while that
+  token still matches.
 
 ## [0.73.1] - 2026-07-10
 

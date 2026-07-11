@@ -21,7 +21,7 @@ exploit details before a fix is shipped.
 
 ## Trust model
 
-agenttalk is designed for **two or more coding agents running on the
+agenttalk is designed for **one or more coding agents running on the
 same machine, owned by the same OS user, sharing one project
 directory**. That's the trust boundary.
 
@@ -348,6 +348,16 @@ do what is cheaper and more honest.
      the aggregate. JSON-unparseable configs therefore degrade
      visibly rather than silently vanishing.
 
+**Current multi-root supersession (planned v0.74.0).** The first-root body
+surface above remains historical behavior for legacy message-browser routes,
+but Team Console routes now select a store by path-derived `project_id`.
+Selected-root responses carry `root_info`; an explicit unknown id returns HTTP
+400 `bad_root` and never falls back. `/api/thread/<id>` and `/api/lead-chat`
+therefore carry bodies for the selected root. Any local process that can reach
+the loopback port can query every exposed root; `project_id` is routing, not
+authorization or cross-root isolation. The browser clears root-bound state and
+rejects late responses whose project id no longer matches the selection.
+
 ### Delivered in 0.18.0 (review-hardening)
 
 Two fresh-context full-codebase reviews surfaced robustness gaps that the
@@ -362,7 +372,7 @@ per-feature review loop had missed. The fixes:
   a hand-written id can no longer be delivered or poison a recipient's cursor.
   Both are quarantinable.
 
-Two **documented, unfixed** limitations (stated honestly, not closed):
+Two limitations documented at 0.18.0 were:
 
 - **Same-agent concurrency is unsupported.** One window per agent is the
   assumed model. The cursor/threadstate writers are atomic but not
@@ -375,6 +385,43 @@ Two **documented, unfixed** limitations (stated honestly, not closed):
   ids; a `.agenttalk/` synced across machines with disagreeing clocks can
   mis-order or hide messages. Id-shape validation does **not** fix this
   (a skewed id is well-formed); keep clocks in agreement.
+
+**Current persistence and schema hardening (planned v0.74.0).** The historical
+cursor/threadstate lost-update limitation above is superseded for cooperating
+writers by cross-process read-modify-write serialization. One consuming window
+per agent remains the supported model because two consumers can execute the
+same work and send conflicting replies before either advances state. A wrapper
+waiting marker also has a generation token, so an old teardown cannot erase a
+replacement marker.
+
+Additional current contracts:
+
+- Present `review-result` status is restricted to
+  `approved|rejected|needs-info`; present `proposal-response` status is
+  restricted to `accepted|rejected|countered`. Only approved/rejected reviews
+  and all three proposal responses are terminal. Missing legacy status is
+  readable but nonterminal; invalid persisted status is skipped.
+- Sign-off policy booleans must be actual JSON booleans, duplicate counter ids
+  are rejected across the whole close, and close/gate share the same core risk
+  vocabulary, including `device` and `accessibility`.
+- Close updates compare a generation and immutable instance id under a
+  per-close lock. Release-barrier retry is bound to that close identity and
+  generation; it is recoverable exactly-once behavior among cooperating
+  writers, not a transaction spanning the filesystem and bus.
+- Lane `prepared` evidence is non-consumable. Only a committed artifact whose
+  lane marker has completed publication is valid. No-worktree waiver metadata
+  is an advisory audit record and cannot authorize release-class isolation.
+- Cooperating lock publication rejects unsafe lock-path shapes and stale lock
+  generations, but these locks are not a defense against a hostile same-user
+  writer. JSONL append owners serialize and fsync records; readers surface a
+  malformed physical line without letting it hide later valid lines.
+- `supervisor-state.json` falls back only to a validated `.bak` and fails
+  closed if both copies are invalid. A heartbeat beyond the allowed future
+  skew cannot prove liveness.
+- Windows watchdog termination no longer launches `taskkill.exe`; it uses
+  `os.kill(..., SIGTERM)`, which is abrupt on Windows. Desktop-heap exhaustion
+  is not proven, PowerShell/CIM snapshot launches remain, and start-time
+  verification cannot eliminate PID reuse after the recheck.
 
 ### Still planned
 

@@ -52,10 +52,14 @@ these win.
 
 3. **Writes are atomic and serialized; readers are fail-safe.** Mutations go
    through `_atomic.write_text` (temp + fsync + `os.replace`, with a latched
-   sandbox-direct fallback) and, for read-modify-write state, under
-   `store._config_lock`. Readers tolerate torn/partial/invalid lines (skip and
-   surface via `doctor`), and cursors bias toward re-delivery rather than
-   skipping a message.
+   sandbox-direct fallback). Cooperating read-modify-write paths use hardened
+   cross-process locks, and narrowly scoped resources such as closes and lane
+   cleanup use their own serialization boundaries. Lock publication rejects
+   stale generations and unsafe non-regular/reparse paths, but it is not a
+   same-user security boundary. JSONL append owners serialize and fsync complete
+   records; readers isolate malformed physical lines, surface them, and retain
+   later valid records. Cursors bias toward re-delivery rather than skipping a
+   message.
 
 4. **Advisory, not an authorization boundary.** Leases, lanes, stand-down
    authority, and the like are *coordination* gates that produce auditable
@@ -74,9 +78,11 @@ these win.
    process/locking primitives are chosen to work on Windows.
 
 7. **One live consumer per agent mailbox.** Each agent name has a single active
-   listen loop. Stacked listeners race the same cursor; `status`/`doctor` warn,
-   and the design avoids second consumers (e.g. the wrapper owns the loop and the
-   model is a pure per-turn handler).
+   listen loop. Cooperating cursor updates are serialized, but stacked listeners
+   can still execute the same inbound work and emit conflicting replies before
+   either advances state. `status`/`doctor` warn, and the design avoids second
+   consumers (e.g. the wrapper owns the loop and the model is a pure per-turn
+   handler).
 
 8. **Human authority is explicit and typed.** Irreversible or human-only
    decisions (operator escalation, stand-down, waivers) flow through typed
@@ -91,10 +97,14 @@ these win.
 - `domains.json` — the durable ownership/domain registry (survives `reset`).
 - `gates.json` — assurance gate state.
 - `closes/` — milestone-close records and sign-offs.
+- `supervisor-state.json` + `.bak` — script/runtime session state with a
+  validated previous-generation recovery copy (read-only fallback never repairs
+  a corrupt primary implicitly).
 - `knowledge/notes.jsonl` — append-only durable team memory (survives `reset`).
 - `attention/dispositions.jsonl` — append-only operator decisions over the
   derived attention queue (survives `reset`).
-- `lane-deliveries/` — durable lane delivery artifacts.
+- `lane-deliveries/` — durable committed lane delivery artifacts;
+  `.prepared/` contains non-consumable transaction staging.
 - `dead-letter/<agent>/` — quarantined poison-message payloads and sidecars
   (survives `reset`; requeue copies, it does not rewind).
 - `state/intents/active/` — current-session dashboard intents (cleared by
@@ -121,6 +131,12 @@ it is asserted by the end-to-end regression test.
   from messages — there is no second task-state machine.
 - **Why:** durable, inspectable, recoverable after a restart (`sync` rebuilds the
   picture from files). No daemon to crash; no DB to corrupt.
+- Response state is a typed protocol, not free-form metadata. A present
+  `review-result` status must be `approved|rejected|needs-info`; only the first
+  two terminate review. A present `proposal-response` status must be
+  `accepted|rejected|countered`, all terminal. Missing status remains readable
+  for legacy history but is nonterminal; invalid present status is rejected at
+  write time and skipped during derivation.
 
 ### 4.2 Roster, authority & stand-down
 - **Modules:** `store.py` (roster, `protected_agents`, `is_release_authorized` →
@@ -160,9 +176,21 @@ adds typed evidence and fail-closed verdicts to the human/agent claim of "done."
   `tests_executed`, `na_reason`). Review prose helps humans, but gates consume
   typed metadata; a corrupt/unreadable gate state HOLDs.
 - **`close` (`close.py`, v0.33.0):** milestone-close with a *pure* `compute_verdict`
-  and stable HOLD codes; lens authorization; blocker-gate-must-be-green.
+  and stable HOLD codes; lens authorization; blocker-gate-must-be-green. Existing
+  records update under a per-close lock with mandatory generation plus immutable
+  instance preconditions. The instance prevents delete/recreate ABA; creation is
+  exclusive, force-open replaces under lock, and legacy records upgrade under
+  lock without an unchecked overwrite. Publish recomputes impure evidence at the
+  serialization boundary. A requested barrier is bound to close id, instance,
+  revision, and generation so send/stamp failure resumes idempotently; duplicate
+  matching barriers fail closed.
 - **Sign-offs (v0.34.0):** specialist sign-off by risk class, `signoffs.json`,
-  distinct-agent counting, override-with-reason.
+  distinct-agent counting, override-with-reason. Boolean policy fields require
+  real JSON booleans, counter ids are globally unique within a close across all
+  lenses, and close shares the gate
+  risk vocabulary (`none`, `unknown`, `release`, `device`, `accessibility`,
+  `security`, `performance`, `persistence`, `docs-contract`, `quality`, plus
+  namespaced project extensions).
 - **Devkit skills (v0.35.0):** generic review/tester skill pack (risk-class
   lenses, failure-injection, contract-drift, NA-needs-reason).
 - **Ephemeral adversarial reviewers (v0.36.0):** the lead can launch one-shot
@@ -183,8 +211,12 @@ two parallel ownership concepts.
   subset). `lane deliver` gives a point-in-time GO/HOLD that the diff is
   in-bounds, current (epoch/registry), merge-tree-clean (honest-degraded — never
   *infers* clean), and gate-clean. Pure `compute_verdict` core + a thin git
-  adapter (so verdict logic is unit-testable with no live repo); durable delivery
-  artifact written before the lane is cleared; fingerprint re-validated under lock.
+  adapter (so verdict logic is unit-testable with no live repo). Delivery is a
+  recoverable two-phase transaction: signed `prepared` evidence is
+  non-consumable, a lane generation/instance checkpoint records
+  `publish_pending`, terminal inputs are rebound, and only then is a `committed`
+  artifact published and marked consumable. Retry resumes the same transaction;
+  force, abandon, and reassign cannot bypass an incomplete publication.
   Shared-path approvals are registry-entry authority, not raw path-prefix
   authority: a touched shared path is cleared only when **every** matching shared
   entry has a fresh approval recorded against that entry by an authorized approver
@@ -192,13 +224,18 @@ two parallel ownership concepts.
   between overlapping entries — that ordering heuristic was twice unsound — so a
   path governed by two entries must satisfy both; duplicate normalized shared
   globs are rejected at validation.
-  Worktree isolation extends this lane layer: `lane assign` provisions a managed
-  `git worktree` and `lane/<id>` branch by default, with only an audited
-  `--no-worktree --worktree-waiver-reason ...` waiver. Mutating git goes through
+  Worktree isolation extends this lane layer: a release-class `lane assign`
+  provisions a managed `git worktree` and `lane/<id>` branch. `--no-worktree`
+  is available only for an explicitly advisory lane with a recorded reason;
+  the waiver authority is `advisory_only`, does not trust role labels, and can
+  never satisfy release isolation. Mutating git goes through
   `_git_write` (argv-list, prompt-disabled env, bounded timeout, `--` before
   positionals, full-SHA base). `lane deliver` derives HEAD from the registered
   worktree, signs canonical worktree/branch provenance into the delivery artifact,
   and keeps the branch so `close` can re-verify after the worktree is removed.
+  Publication and teardown are separate checkpoints: committed evidence remains
+  valid during `cleanup_pending`/`cleanup_failed`, and cleanup is recoverable
+  without holding the broad config lock across expensive Git work.
 - **Knowledge (`knowledge.py`, v0.38.0):** an append-only **pointer** layer
   (`notes.jsonl`), latest valid event by `(domain_id, key)`. Capture-open +
   curate-gated (anyone publishes `uncurated`; owners/curators/lead verify/
@@ -224,13 +261,23 @@ two parallel ownership concepts.
   to `window_style=hidden` (global setting, per-agent/profile override) so a
   supervised fleet does not cover the operator's desktop; hidden wrapped agents
   also pass a no-child-window marker into the wrapper so its CLI child uses
-  Windows `CREATE_NO_WINDOW`.
+  Windows `CREATE_NO_WINDOW`. `supervisor-state.json` is shape-validated and
+  backed by a validated `.bak`; a valid backup supports read-only recovery, while
+  two invalid copies fail closed. Heartbeats beyond the configured future-skew
+  bound cannot authorize freshness.
 - **Wrapper (`wrapper/`):** `agenttalk wrap` runs an agent's listen loop *for* it
   (`loop.py`), giving visibility, a working-turn heartbeat, degraded-output
   detection (`degraded.py`), and session continuity (`session.py`; codex
   `thread_id` / claude session-id). The wrapped **model is a pure per-turn
   handler** — the wrapper owns the loop and loop-exit, so a resumed session
   re-enters listening regardless of the model (principle #7).
+  Wrapper waiting markers carry unique generation tokens and teardown clears
+  only a matching token, so an old loop cannot erase a replacement marker.
+  The Windows per-turn watchdog kills a verified target with
+  `os.kill(pid, SIGTERM)` instead of launching `taskkill.exe`; this is abrupt on
+  Windows. PowerShell/CIM snapshots and the start-time-recheck-to-kill PID ABA
+  window remain, and desktop-heap exhaustion is a hypothesis rather than a
+  proven root cause.
 - **Managed lead-loop controller (`lead_loop_runtime.py`,
   `lead_loop_cadence.py`):** the split-identity lead can own a durable lease,
   resolve one heartbeat-stale threshold for both stealability and visibility,
@@ -279,6 +326,15 @@ two parallel ownership concepts.
 - **Modules:** `web.py` (loopback server, CSRF/session, `/api/intent`,
   `/api/lead-chat`), `intents.py` (typed schema + executor), `store.py`
   (`write_intent`, `list_intents`, lead-chat identity), `web_static/console.js`.
+- **Project identity and routing (planned v0.74.0):** every watched root has a
+  stable path-derived `project_id`; labels are display-only and duplicate
+  basenames receive stable id suffixes. Selected-root routes use
+  `?root=<project_id>`, return `root_info {project_id,label,path}`, and reject an
+  unknown explicit root with HTTP 400 `bad_root` rather than falling back.
+  The top bar always shows label plus full path. A root switch clears root-bound
+  caches/drill-ins/action state, and late responses are accepted only when their
+  project id matches the current selection. This prevents accidental cross-root
+  UI writes; it is not authentication or isolation from another local process.
 - **Intent write spine:** for ordinary dashboard controls on `/api/intent`, the
   browser never calls `store.send()` directly. With `--enable-actions` off,
   `POST` stays disabled and no session token exists. With actions enabled, the
@@ -621,6 +677,36 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   sink on requeue (destroys forensic evidence). *Honest ceiling:* classification
   is conservative but not omniscient; config-blocked and infra-heavy histories
   surface to the operator rather than pretending the tool can prove intent.
+
+- **D-20 Cooperating persistence uses generation-aware serialization
+  (2026-07-11).** *Why:* atomic replacement alone does not protect a
+  read-modify-write sequence, an old teardown can erase replacement state, and
+  a valid backup is more useful than silently resetting corrupt supervisor
+  state. *Decision:* hardened store locks serialize cooperating RMW paths;
+  close and waiter instances carry immutable tokens; supervisor state keeps one
+  validated backup; JSONL owners serialize complete fsynced appends and readers
+  isolate bad physical lines. *Ceiling:* same-user hostile writers and duplicate
+  model consumers remain outside the guarantee.
+- **D-21 A release barrier is a recoverable close-bound effect
+  (2026-07-11).** *Why:* close state and bus publication cannot be one atomic
+  filesystem transaction. *Decision:* persist GO with a unique binding to close
+  id, instance id, revision, and generation; on retry, validate and reuse the one
+  matching barrier or send once if absent, then stamp the epoch. Duplicate or
+  mismatched effects HOLD. *Rejected:* stale pre-lock GO and sending a fresh
+  unbound barrier after any partial failure.
+- **D-22 Lane GO becomes consumable only after commit (2026-07-11).** *Why:* an
+  artifact published before durable lane state could expose GO that teardown or
+  state failure could not recover. *Decision:* prepared evidence is hidden,
+  `publish_pending` is generation/instance-bound, terminal inputs are rebound,
+  committed evidence is then published, and cleanup is a separately retryable
+  checkpoint. Advisory no-worktree records can never stand in for release
+  isolation.
+- **D-23 Dashboard routes by stable project identity (2026-07-11).** *Why:*
+  root-list indexes and duplicate labels are unstable and allow late responses
+  to paint or mutate the wrong project after a switch. *Decision:* path-derived
+  `project_id` is the routing key, selected-root responses echo `root_info`, an
+  unknown explicit root fails with `bad_root`, and the client generation-checks
+  all root-bound responses. *Ceiling:* the id is not an authorization token.
 
 ## 6. How we work (process)
 

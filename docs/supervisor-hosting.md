@@ -58,6 +58,32 @@ The generated wrapper is:
 .\.agenttalk\deadman.ps1 -ThresholdSeconds 900 -Json
 ```
 
+## State Recovery and Freshness
+
+The monitor persists launch/session/backoff bookkeeping in
+`.agenttalk/supervisor-state.json` and preserves one validated previous
+generation in `.bak`. A valid backup may be used read-only when the primary is
+corrupt; that read does not rewrite the primary. If both copies are invalid,
+the supervisor fails closed and emits no plan/action until an operator repairs
+the state deliberately.
+
+Cooperating state writers use cross-process locks, but those locks are not a
+security boundary against another same-user process. Heartbeat timestamps are
+future-bounded: a value beyond the configured skew allowance cannot authorize
+liveness. Wrapper waiting markers carry unique tokens, so old teardown removes
+only the marker generation it created.
+
+## Windows Watchdog Residuals
+
+The wrapped-turn watchdog no longer starts `taskkill.exe`. It calls
+`os.kill(pid, signal.SIGTERM)` for a start-time-verified Windows target; Windows
+implements that as abrupt process termination. This removes one executable
+launch and its modal-initialization risk, but does not prove desktop-heap
+exhaustion caused the production event. PowerShell/CIM subprocesses still build
+the process snapshot and query creation time, and PID reuse remains possible
+between the separate recheck and kill. Size service recovery thresholds with
+those residuals in mind.
+
 ## Degraded Mode
 
 The supervisor is a convenience layer, not the message broker. If it is stopped,

@@ -74,8 +74,9 @@ Keep these rules in mind before learning commands.
   metadata, repository reads, and explicit human decisions, not prose.
 - Roles, lanes, gates, and dashboard sessions are coordination and audit tools.
   They are not Git or OS permissions.
-- One live consumer per agent mailbox is the supported model. Duplicate waiters
-  can race cursors.
+- One live consumer per agent mailbox is the supported model. Cooperating cursor
+  updates are serialized, but duplicate consumers can still execute and answer
+  the same inbound work before either advances state.
 - `sync` is a read-only rejoin digest. Run it before acting after a restart.
 - `recv` peeks by default. `drain`, `recv --ack`, and `wait` consume.
 - A request needs a `request_id`. Replies anchor to that id.
@@ -91,7 +92,7 @@ Keep these rules in mind before learning commands.
 Install from a pinned release:
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.72.3"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.73.1"
 agenttalk --version
 agenttalk install-skills
 ```
@@ -103,6 +104,17 @@ agenttalk init --here --agents claude,codex
 agenttalk status
 agenttalk doctor
 ```
+
+One agent is enough to start:
+
+```powershell
+agenttalk init --here --agents claude
+# or
+agenttalk init --here --agents codex
+```
+
+Set only `AGENTTALK_SELF` for a one-agent roster. Add another member later;
+until then, commands that need a peer require an explicit `--to`.
 
 If Codex must call agenttalk from inside its sandbox, enable the per-project
 config block:
@@ -179,6 +191,11 @@ The bus accepts a fixed vocabulary of message kinds. Important kinds are:
 
 Unknown kinds are rejected or skipped so a typo does not become a new instruction
 surface.
+
+Statuses are exact, case-sensitive enums. `approved` and `rejected` terminate a
+review; `needs-info` returns the ball to the requester. All three proposal
+responses terminate their proposal. Missing status remains readable in legacy
+history but is nonterminal; an invalid present status is rejected or skipped.
 
 ### Thread state machine
 
@@ -383,6 +400,20 @@ agenttalk dashboard --enable-actions
 The dashboard is loopback-only. It is for the local operator, not a remote
 multi-user web app. Actions are disabled unless `--enable-actions` is passed.
 
+The top bar always shows the selected project label and full root path. In a
+multi-root dashboard, a stable path-derived `project_id` routes selected-root
+reads and actions; the label is display only. API requests use
+`?root=<project_id>` and responses include
+`root_info {project_id,label,path}`. Omitting the parameter defaults to the
+first root for compatibility; an unknown explicit id returns HTTP 400
+`bad_root` instead of silently choosing another project.
+
+When the operator switches projects, the client clears root-bound drill-ins,
+caches, queued answers, and the action session, then refetches. It ignores late
+responses whose project id belongs to the old selection. This protects routing
+correctness, not access control: every exposed root remains readable to local
+processes that can reach the loopback server.
+
 Main views:
 
 | View | What it shows | Body text? |
@@ -495,6 +526,20 @@ valid message repeatedly poisons the wrapper
         -> operator can inspect, requeue, or resolve
 ```
 
+Persistence and teardown are fail-closed:
+
+- `supervisor-state.json` has a validated `.bak`. A valid backup supports
+  read-only recovery from a corrupt primary; if both are invalid, planning and
+  action stop rather than resetting session state.
+- A heartbeat farther in the future than the configured skew allowance cannot
+  authorize freshness.
+- Each wrapper waiting marker has a unique generation token. An old wrapper's
+  `finally` clears only its own token, so it cannot erase a replacement marker.
+- On Windows, the turn watchdog uses `os.kill(pid, SIGTERM)` and never launches
+  `taskkill.exe`. The kill is abrupt. PowerShell/CIM snapshot subprocesses and
+  the PID-reuse window after start-time verification remain; desktop-heap
+  exhaustion is not a proven root cause.
+
 Protected agents are the operator-facing liaison and active lead-role agents.
 The supervisor never auto-kills them. A manual restart of a protected agent
 requires `--force-protected`; if the protected agent still has a fresh heartbeat,
@@ -537,16 +582,25 @@ agenttalk lane check --id docs-manual
 agenttalk lane deliver --id docs-manual --from codex-dev
 ```
 
-Lane states are best understood as:
+Release-class lanes require the provisioned worktree. `--no-worktree` is only
+valid with `--advisory` plus a recorded reason; that audit record does not prove
+isolation and cannot satisfy a release close.
+
+Lane delivery is best understood as:
 
 ```text
-assigned/active -> checked -> delivered -> cleared from active lanes
-                         |
-                         +-> HOLD until scope, registry, epoch, merge, shared-path,
-                             active-overlap, and gate problems are fixed
+assigned/active -> checked -> prepared (hidden/non-consumable)
+                              -> publish_pending (generation + instance bound)
+                              -> committed delivery evidence
+                              -> cleanup_pending|cleanup_failed -> cleanup complete
+                 |
+                 +-> HOLD until scope, registry, epoch, merge, shared-path,
+                     active-overlap, and gate problems are fixed
 ```
 
-Lane verdicts are advisory HOLD/GO evidence, not file locks.
+Retry the same `lane deliver` after a publication or teardown failure. It
+resumes the bound transaction, and a committed artifact remains valid while
+cleanup is pending. Lane verdicts are advisory HOLD/GO evidence, not file locks.
 
 ## 12a. Onboarding an existing codebase
 
@@ -599,6 +653,25 @@ agenttalk close publish --id rel-071 --from codex-lead --verdict go
 A GO requires the computed close verdict to be GO. A published close is
 terminal unless reopened through the supported command path.
 
+Close persistence is compare-and-swap. Every existing-record mutation checks
+the loaded generation and immutable instance id under a per-close lock. A
+conflict, missing token, or delete/recreate ABA fails closed; reload and retry.
+Force-open creates a new instance under lock, and legacy closes are upgraded in
+that lock. Reopen with a new revision clears the old dirty-worktree artifact.
+
+`close publish --bump-barrier` binds one release barrier to the close id,
+instance, revision, and generation after recomputing gates, sign-offs, and
+worktree evidence at the serialization boundary. If sending or stamping fails,
+retry the exact publish. It resumes the unique validated barrier and never
+sends a second one; duplicate matches HOLD. The close file and bus are not one
+ACID transaction, so this explicit recovery path is part of the contract.
+
+Sign-off policy booleans must be real JSON booleans, not strings. Counter ids
+are unique across the whole close, including different lenses. The shared core
+risk classes are `none`, `unknown`,
+`release`, `device`, `accessibility`, `security`, `performance`, `persistence`,
+`docs-contract`, and `quality`, plus validated namespaced project extensions.
+
 ## 14. Knowledge and lessons
 
 Knowledge notes are pointer-shaped memory:
@@ -647,6 +720,9 @@ agenttalk threads --for <agent> --all
 | Dashboard reply box needs more context | Attention card shows a bounded excerpt, not the whole transcript | Open Conversations or Sessions for the full thread; use typed escalation fields |
 | Lead chat unavailable | Liaison heartbeat stale or missing | Start `wait`, run wrapped, or install activity hook |
 | Duplicate wrappers/windows | Same mailbox consumed twice | Stop duplicate; use `wait --refuse-stacked-wait`; inspect supervisor. Exit 6 can also mean an older scoped wait was superseded by a newer same-thread waiter; it did not consume the reply. |
+| Lane says publication or cleanup pending | A two-phase delivery stopped at a durable checkpoint | Retry the same `lane deliver`; do not force-reassign or mint another artifact |
+| Close barrier send/stamp failed | Published GO has a recoverable bound barrier | Retry the exact `close publish --bump-barrier`; do not send an ad hoc barrier |
+| Supervisor state primary is corrupt | A previous valid generation may exist | Inspect the `.bak`; if both copies are invalid, keep the fail-closed stop and repair deliberately |
 | Poison message blocks wrapped agent | Repeated deterministic failure | `dead-letter list`, `show`, `requeue`, `resolve`, or `purge --resolved` |
 | Invalid message files | Corrupt or forged files | `prune --invalid --dry-run`, then `prune --invalid` |
 | Store too large | Old closed history accumulated | `compact`; remember old closed checks can become unknown |
@@ -679,6 +755,15 @@ closed
 closed-superseded
 ```
 
+Typed response statuses:
+
+```text
+review-result: approved | rejected | needs-info
+  terminal: approved | rejected
+proposal-response: accepted | rejected | countered
+  terminal: accepted | rejected | countered
+```
+
 ### Thread next-action hints
 
 ```text
@@ -708,7 +793,19 @@ waived
 ### Close lifecycle
 
 ```text
-draft/open -> acked/countered lenses -> check HOLD|GO -> published HOLD|GO
+draft/open(instance_id, generation)
+  -> checked generation-bound mutations
+  -> acked/countered lenses
+  -> check HOLD|GO
+  -> published HOLD|GO
+  -> optional bound barrier pending/send/stamp recovery
+```
+
+### Lane delivery lifecycle
+
+```text
+active -> prepared (non-consumable) -> publish_pending -> committed
+committed -> cleanup_pending | cleanup_failed -> cleanup complete
 ```
 
 ### Lesson statuses

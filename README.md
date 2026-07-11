@@ -101,6 +101,11 @@ agenttalk init --here --agents claude,codex
 agenttalk codex-config --enable   # lets Codex call agenttalk from its sandbox
 ```
 
+A one-window project is valid too: initialize with `--agents claude` or
+`--agents codex`, set only `AGENTTALK_SELF`, and add peers later. Until then,
+commands that need another agent require an explicit `--to` and cannot infer a
+peer.
+
 Open one terminal per active agent at the project root:
 
 ### For spec-kitty missions (the canonical workflow)
@@ -286,6 +291,10 @@ From your project root:
 ```powershell
 agenttalk init --here --agents claude,codex
 ```
+
+The roster must contain at least one agent. For a single-agent start, use
+`agenttalk init --here --agents claude` or `--agents codex`; set only
+`AGENTTALK_SELF` until another roster member is added.
 
 This creates `.agenttalk/` with:
 
@@ -909,13 +918,26 @@ Hold codes: `stale_epoch`, `stale_registry`, `diff_unavailable`,
 `shared_path_wrong_approval`, `active_lane_overlap`, `merge_conflict`,
 `merge_unknown_degraded`, `gate_hold`.
 
-`lane deliver --id L` runs the same gate; on GO it writes a durable
-delivery artifact under `.agenttalk/lane-deliveries/` (the stable pointer
-for close/gate evidence) **first**, then clears the lane under the lock —
-if the artifact write fails the lane stays active. On HOLD it exits 3 and
-the lane stays active. A shared path needs `lane approve-shared --id L
---path P --reason …` from a close lead or the shared path's
-`default_reviewers` first.
+`lane deliver --id L` is a recoverable two-phase publication. It first writes a
+signed `prepared` artifact under `.agenttalk/lane-deliveries/.prepared/`; that
+file is deliberately non-consumable. It then checkpoints the lane generation,
+immutable instance, candidate head, terminal evaluation, and a
+`publish_pending` transaction. Only after the terminal inputs are rebound and
+the final artifact is marked `committed` can close or gate consumers accept it.
+Retry the same `lane deliver` after an interrupted save or publication: the
+command resumes the bound transaction rather than creating a second delivery.
+
+Worktree teardown is a later checkpoint. A committed delivery remains valid
+while `cleanup_pending` or `cleanup_failed` is visible; retrying delivery (or
+the scoped cleanup path) can finish teardown. Expensive Git evaluation and
+worktree removal do not hold the broad config lock. A shared path still needs
+`lane approve-shared --id L --path P --reason ...` from an authorized reviewer
+before GO.
+
+Release-class lanes require a provisioned worktree. `--no-worktree` is limited
+to an explicitly `--advisory` lane with a recorded waiver reason. That record
+is audit context only: it does not trust mutable role labels, does not prove
+isolation, and cannot satisfy release isolation.
 
 Like gates and close, lanes are **advisory, point-in-time coordination**:
 a GO means "as of the current target head your work is in bounds and
@@ -1252,6 +1274,23 @@ best-effort diagnostics record lands in
 `state/work-heartbeat/<agent>.json` for doctor/status forensics; the
 supervisor does not read it.
 
+Supervisor state is persisted as `supervisor-state.json` with a validated
+`.bak` generation. Readers prefer a valid primary, fall back to a valid backup
+without rewriting a corrupt primary, and fail closed when both copies are
+invalid. Heartbeats farther in the future than the configured skew allowance
+cannot establish freshness; timestamps within that bounded allowance can.
+
+Wrapper waiting markers are generation-bound. Each loop writes a unique token
+and clears the marker only when its token still matches, so an exiting old
+wrapper cannot erase a replacement's live marker.
+
+On Windows, the per-turn watchdog no longer launches `taskkill.exe`; verified
+targets use `os.kill(pid, signal.SIGTERM)`, which maps to abrupt process
+termination rather than graceful SIGTERM handling. The production desktop-heap
+exhaustion theory is not proven. PowerShell/CIM subprocesses still perform the
+snapshot and start-time query, and PID reuse remains possible in the gap
+between the start-time recheck and kill.
+
 Protected agents — the operator-facing liaison and every active
 `role=lead` — are **never auto-killed** (warn/note only), and a manual
 `request-restart` of one needs `--force-protected`; if that protected agent
@@ -1333,6 +1372,12 @@ evidence metadata: `risk_class`, `release_blocker`,
 approval can use `risk_class=none`, `release_blocker=no`, `n/a` evidence
 fields, and a short `na_reason`.
 
+Response statuses are exact enums. `review-result` accepts
+`approved|rejected|needs-info`; only `approved` and `rejected` are terminal.
+`proposal-response` accepts `accepted|rejected|countered`, all terminal. A
+mixed-version message with no status remains readable but nonterminal; a
+present unknown or wrong-typed status is refused on write and skipped on read.
+
 ### Milestone/release close (`agenttalk close`)
 
 `agenttalk close {open,ack,draft,counter decide,check,publish,reopen,list,show}`
@@ -1344,7 +1389,13 @@ published by a lead. State is a per-close atomic JSON file in
 default) and **advisory**: like gates, agenttalk authenticates the sender but
 does not enforce identity, so close records *who acted* and is a strong release
 signal + audit trail, never an enforced lock. The bus carries the evidence text;
-the close file stores pointers, not copies.
+the close file stores pointers, not copies. Every update of an existing close
+is serialized by close id and compares both a monotonically increasing
+`generation` and an immutable `instance_id`. A stale writer, a missing token,
+or a delete/recreate ABA therefore fails closed and must reload. Creation is
+exclusive; `open --force` performs a locked replacement with a new instance.
+Legacy records are upgraded under that same lock and are never overwritten by
+an unchecked compatibility path.
 
 `close open --id ID --scope release --revision REF --lens NAME --allow NAME:AGENT`
 freezes `REF` to a full SHA via git (a dirty worktree needs `--dirty-artifact`
@@ -1369,13 +1420,22 @@ well-formed record on a frozen, clean (or dirty-with-artifact) revision, a gate
 `GO`, every required lens satisfied by an authorized non-stale ack, every
 counter decided, and every accepted blocker remediation resolved by its gate. A
 revision change stales prior acks (they reviewed different code).
+When reopen changes the revision, it also clears the prior dirty-worktree
+artifact so evidence for the old revision cannot be reused.
 
 `close publish --id ID --from LEAD --verdict go|hold` records the terminal
 snapshot; a `go` is refused unless `check` is `GO`. Post-publish acks are
 rejected until a lead runs `close reopen`, so a close is stale-proof **without**
 a team-wide epoch bump. The global epoch is audit-only at open; only an explicit
-`close publish --verdict go --bump-barrier` fires the release barrier (after
-recording `GO`), and a `hold` never bumps it.
+`close publish --verdict go --bump-barrier` recomputes gate, sign-off, and
+worktree evidence while holding the cooperating close serialization boundary,
+then persists GO with a barrier binding containing close id, instance id,
+revision, and generation. Sending the barrier and stamping its epoch are
+recoverable steps. If either fails, retry the identical publish command: it
+finds the uniquely matching validated barrier and stamps it, or sends exactly
+one when absent. Duplicate matching barriers or changed bindings fail closed.
+This is an idempotent recovery protocol, not one ACID transaction across the
+close file and message bus. A `hold` never bumps the barrier.
 
 ### Specialist sign-off by risk class (`agenttalk close signoffs`)
 
@@ -1390,9 +1450,15 @@ of signoff sets `{id, required_count, candidates: {agents, groups, roles},
 use_default_reviewers, include_domain_reviewers, allow_na, countable_statuses,
 override_counts}`, plus `defaults.reviewers` and `allow_unmapped`. The core
 **validates** the policy and the risk-class strings (the envelope `none`,
-`unknown`, `release`, `security`, `performance`, `persistence`, `docs-contract`,
-`quality`, plus `project:…` extensions) but never **decides** a change's risk —
+`unknown`, `release`, `device`, `accessibility`, `security`, `performance`,
+`persistence`, `docs-contract`, `quality`, plus `project:...` extensions) but
+never **decides** a change's risk —
 the lead/project supplies the close's risk inventory.
+
+Policy flags `use_default_reviewers`, `include_domain_reviewers`, `allow_na`,
+and `override_counts` must be literal JSON booleans; strings such as `"false"`
+are invalid. Every `counter_id` must be unique across the entire close, even
+when counters come from different lenses.
 
 `close open … --derive-signoffs --risk-class X` (or `close signoffs apply`)
 freezes the route: it records the policy hash, the risk-inventory hash, and the
@@ -1537,9 +1603,10 @@ Thread states from `--for A`'s perspective:
 - Broadcast `open-outbound`: the broadcaster is waiting on one or
   more pending recipients. Output shows responded/pending counts and
   names.
-- `closed`: a terminal correlated response exists (`approved`,
-  `rejected`, `accepted`, any non-control question answer, or
-  `proposal-response status=countered` for that proposal thread).
+- `closed`: a terminal correlated response exists (`review-result`
+  `approved|rejected`, `proposal-response` `accepted|rejected|countered`, any
+  non-control question answer), or a local ack closed the view. `needs-info`
+  remains nonterminal and moves the ball back.
 
 Default output shows only actionable rows. `--all` includes closed
 threads. `--json` emits:
@@ -1710,11 +1777,23 @@ For automation, `GET /api/state` returns the same aggregate as
 versioned JSON (`schema_version: 1`): an array of root objects, each
 fully namespaced (no cross-root merging), with per-root `errors` as
 data — one corrupt store renders as a degraded panel while the others
-stay live. Thread rows carry subjects and derived fields only, never
-message bodies; body detail stays on the existing `/messages/<id>`
-routes (first root only). If a watched project contains `kitty-specs/`,
+stay live. Each root carries a stable path-derived `project_id`; the display
+label is not a routing key. Selected-root Team Console APIs accept
+`?root=<project_id>` and return `root_info` with `project_id`, label, and full
+path. Omitting `root` retains first-root compatibility. Supplying an unknown id
+returns HTTP 400 `bad_root` rather than falling back or mutating another store.
+Thread rows carry subjects and derived fields only, never message bodies; raw
+thread bodies are available through the selected-root `/api/thread/<id>` and
+lead-chat transcript surfaces. If a watched project contains `kitty-specs/`,
 the panel lists its missions — detection is filesystem-only, agenttalk
 never imports spec-kitty.
+
+The top bar always shows the current project label and full root path, even for
+a single watched root. Duplicate basenames receive stable project-id suffixes.
+Switching projects clears root-bound drill-ins, caches, and action sessions;
+every asynchronous payload is checked against the selected `project_id`, so a
+late response from the previous project is discarded. The id is routing and
+display state, not authentication or cross-root security.
 
 The loopback story is unchanged and non-negotiable: no auth, no
 remote-bind flag on any spelling — SSH-tunnel the port if you need it
@@ -1762,11 +1841,12 @@ usage; it shows what the message store actually contains.
 
 Two operating assumptions are worth stating plainly (0.18.0):
 
-- **One window per agent.** Each agent is meant to run in exactly one
-  window per store. Same-agent concurrent consumers are **unsupported**:
-  `advance_cursor` / `mark_thread_seen` / `close_thread` are atomic
-  *writes* but not process-safe read-modify-write, so two windows draining
-  the same agent can lose cursor/threadstate updates. 0.18.0 *warns* when
+- **One consumer per agent.** Each agent is meant to run in exactly one
+  consuming window per store. Cooperating cursor and threadstate
+  read-modify-write paths are now cross-process serialized, so the old
+  lost-update limitation is superseded. Duplicate consumers remain
+  **unsupported** because they can both execute the same inbound work and
+  produce conflicting replies before either cursor advances. 0.18.0 *warns* when
   `agenttalk wait` detects another live process already waiting as the same
   agent (advisory, best-effort — it never blocks and never changes the exit
   code), and `agenttalk doctor` reports the current waiter's PID. It does
@@ -1777,6 +1857,9 @@ Two operating assumptions are worth stating plainly (0.18.0):
   live waiters share one store (leftover loops from old sessions). If a newer
   scoped wait for the same request arms, the older scoped wait exits **6** with
   `superseded` on stderr rather than later reporting a misleading timeout.
+  Wrapper-owned waiting markers also carry a unique generation token; an old
+  wrapper clears its marker only if the token still matches, so teardown cannot
+  erase a replacement wrapper's marker.
 - **Idle waiters back off.** `agenttalk wait` adaptively grows its poll
   interval from `--interval` up to `--max-poll-interval` (default 2.0s)
   while the bus is quiet, resetting to `--interval` the instant a message,
@@ -1856,8 +1939,11 @@ chronological) and renders it as markdown.
 
 - **No daemon.** Just files. Survives reboots, terminal crashes, agent
   restarts.
-- **No append contention.** One JSON file per message, written atomically
-  via temp-file + `os.replace` (atomic on NTFS and POSIX).
+- **Message publication avoids append contention.** One JSON file per message
+  is prepared and atomically published under the cooperating store lock.
+  Append-only ledgers are separate JSONL surfaces: their owning modules
+  serialize appends, fsync complete records, and readers isolate a malformed
+  physical line without hiding later valid events.
 - **Global cursor plus per-thread state.** Plain inbox reading lists
   messages newer than the agent's global cursor; global ack moves that
   cursor. Scoped waits use additive per-thread `seen_msg_id` /

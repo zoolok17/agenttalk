@@ -17,6 +17,33 @@ be labeled `SHIPPED` once the changelog closes them.
 
 ---
 
+## P1 · PLANNED — v0.74.0 release-contract integration (2026-07-11)
+
+**What.** Integrate and release the reviewed hardening wave without weakening
+its failure contracts: strict typed response state; generation/instance-bound
+close updates and recoverable bound barriers; two-phase lane delivery;
+cross-process state/JSONL/lock hardening; supervisor backup/future-heartbeat and
+wait-token safety; single-agent initialization; native Windows watchdog
+termination; and stable multi-root dashboard project routing.
+
+**Release checks.** Run the final candidate on Python 3.10 and 3.14, repeat the
+failure-injection suites for close/barrier and lane publication, run supervisor
+PowerShell parsing/recovery tests, verify selected-root dashboard reads and
+actions plus stale-response rejection, and append the release assurance record
+only after all reviewers approve the exact integrated SHA.
+
+**Accepted residuals.** The coordination locks and `project_id` are not
+same-user authorization boundaries. One model consumer per mailbox remains the
+supported topology. Close file plus barrier message and lane state plus
+delivery artifact use explicit retry protocols rather than cross-file ACID.
+Windows still launches PowerShell/CIM for process snapshots, retains a
+start-time-recheck PID ABA window, and has no proven desktop-heap root cause.
+
+**Documentation disposition.** New behavior is described under Unreleased and
+as planned v0.74.0 only. Historical changelog, assurance, dashboard-roadmap, and
+frozen wire-contract statements remain preserved; the frozen dashboard spec is
+superseded by a dated addendum instead of being rewritten.
+
 ## P1 · PLANNED — Native Work & Evidence Spine (2026-07-08)
 
 **What.** agenttalk needs a native, domain-neutral work/evidence contract that

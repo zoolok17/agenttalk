@@ -1,13 +1,25 @@
 # Dashboard Control Plane — Roadmap & Design
 
-**Status:** shipped/current through v0.69.0. This document is retained as the
-design history for the dashboard control plane.
+**Status:** shipped history through v0.69.0. This document is retained as the
+design history for the dashboard control plane; current contracts live in
+`docs/DESIGN.md`, `docs/USER-MANUAL.md`, and the dated addendum in
+`docs/DashboardDesign/BUILD-SPEC.md`.
 
 **Goal (operator, 2026-07-03):** let a *non-developer* drive everything the CLI does from the browser — send/answer messages, manage the roster, start/stop/restart agents, run gates, onboard a team — without touching a terminal.
 
 **Shipped baseline:** v0.59.0 added the action-gated intent-queue write spine
 behind `--enable-actions`; v0.68.0 added dashboard lead-chat; v0.69.0 aligned
 dashboard liveness render for fresh-heartbeat unwrapped agents.
+
+**Planned v0.74.0 supersession (2026-07-11):** multi-root Team Console state
+routes by stable path-derived `project_id`, not root-list index or display
+label. Selected-root responses carry `root_info {project_id,label,path}`;
+unknown explicit roots return HTTP 400 `bad_root`; the project label and full
+path remain visible in every view; and root switches clear bound state and
+discard stale/mismatched responses. Selected-root reads and actions still pass
+through the existing loopback/session/CSRF/intent authority boundaries.
+`project_id` is routing, not authentication. This paragraph supersedes root
+selection details only; the phased intent-queue history below is unchanged.
 
 **Historical baseline:** v0.58.3 was the read-only Team Console: loopback-only,
 GET/HEAD-only, `/api/state` carries no body, split CSP, `/api/thread` the only

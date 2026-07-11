@@ -117,7 +117,16 @@ overwrite):
 Once you start the monitor it also writes **`supervisor-state.json`** —
 script-owned bookkeeping (per-agent launcher pids, pinned Claude session
 ids, backoff timers). That is the monitor's own state, **not** bus state,
-and it's safe to delete while the monitor isn't running.
+and its validated previous generation lives in `supervisor-state.json.bak`.
+Readers prefer a valid primary and can fall back to the backup without
+rewriting a corrupt primary. If both copies are invalid, planning and action
+fail closed. Do not delete these files casually: doing so while the monitor is
+stopped discards launch/session/backoff continuity even though bus messages and
+cursors remain.
+
+Heartbeat freshness is also future-bounded. A timestamp farther ahead than the
+configured clock-skew allowance cannot authorize a healthy state; a timestamp
+within the allowance can.
 
 The scaffold ships **two example agent blocks** so you can copy whichever
 archetype you need:
@@ -471,6 +480,16 @@ without ever rebuilding state.
   throttles it (base..cap). Once the wrapper dead-letters the message, use
   `agenttalk dead-letter list`, `show`, `requeue`, or `resolve` to inspect and
   make an operator decision without rewinding cursors.
+- **Generation-bound waiter teardown.** A wrapper loop writes a unique token in
+  its waiting marker and clears only that token in `finally`. An old wrapper
+  therefore cannot erase a replacement marker. This protects observability; it
+  does not make duplicate consumers supported.
+- **Windows watchdog termination is narrower, not complete process hardening.**
+  The per-turn watchdog uses `os.kill(pid, signal.SIGTERM)` and does not launch
+  `taskkill.exe`; on Windows that is abrupt termination. The observed desktop-
+  heap explanation is not proven. PowerShell/CIM subprocesses still collect the
+  process snapshot and creation time, and a PID can be reused after the separate
+  start-time recheck but before kill.
 - **Pinned executables.** `windows_file` must be the real CLI exe (or
   Python for wrapped), never a `.cmd`/npm/PowerShell shim — a shim hands
   off and exits, and the supervisor would track the wrong process.

@@ -17,6 +17,33 @@ Use: headings/wordmark → `"Segoe UI", system-ui, sans-serif`; mono/IDs → `ui
 `font-src` needed) and matches the design's typographic *hierarchy* if not the exact
 letterforms.
 
+> **Superseding addendum — 2026-07-11, planned v0.74.0.** This file remains the
+> frozen v0.58.0 contract. The following current contract supersedes only its
+> root-routing and client root-state statements (especially §3c and §7):
+>
+> - Every watched root has a stable path-derived `project_id`. Display labels
+>   are not routing keys; duplicate basenames receive stable project-id suffixes
+>   independent of root-list order.
+> - Team Console selected-root endpoints accept `?root=<project_id>`. Omitting
+>   the parameter preserves first-root compatibility. An explicit unknown id
+>   returns HTTP 400 with `error=bad_root`; it never falls back or mutates a
+>   different root.
+> - Every selected-root response carries
+>   `root_info: {project_id, label, path}` (or the equivalent target project id
+>   in the action envelope), so clients can validate routing before applying a
+>   response.
+> - Frontend state uses `selectedRootId`, not an array index. The top bar always
+>   displays the selected label and full root path, including single-root mode;
+>   the document title includes project and view.
+> - A root switch clears root-bound drill-ins, transcript/learning/onboarding
+>   caches, queued answers, archived state, and action-session state. Each
+>   asynchronous request is bound to the selected project plus a local root
+>   generation; late or mismatched responses are discarded.
+>
+> `project_id` is a routing and stale-response invariant, not authentication or
+> cross-root isolation. All original v0.58.0 wire statements below remain
+> historical evidence of that release.
+
 ---
 
 ## 0. Non-negotiable invariants (any change that breaks these is wrong)

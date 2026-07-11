@@ -250,7 +250,7 @@ and prints it.
 Use `reply` for the answer:
 
 ```powershell
-agenttalk reply --from codex-rev --to-request <request-id> --kind review-result -m "REQUEST-CHANGES: missing test."
+agenttalk reply --from codex-rev --to-request <request-id> --kind review-result --meta status=rejected -m "REQUEST-CHANGES: missing test."
 ```
 
 Use `threads` to see who owes the next move:
@@ -268,6 +268,18 @@ Useful thread states:
 - `reply-waiting`: a response is in your inbox but not consumed.
 - `closed`: the thread has a terminal response or local closure.
 - `closed-superseded`: the opener rescinded the request.
+
+Typed response status is strict:
+
+- `review-result`: `approved`, `rejected`, or `needs-info`; only approved and
+  rejected close the review. `needs-info` returns the obligation to the
+  requester.
+- `proposal-response`: `accepted`, `rejected`, or `countered`; all three are
+  terminal for that proposal.
+
+A missing status remains readable in old history but does not close a thread.
+An invalid present status is rejected on send/reply and skipped if encountered
+in persisted input.
 
 Use `sync` after every restart or before taking over a stale window:
 
@@ -371,6 +383,19 @@ agenttalk serve
 `dashboard` has no `--host` option. `serve` accepts only loopback hosts:
 `127.0.0.1`, `::1`, or `localhost`.
 
+The top bar always identifies the selected project by display label and full
+root path. In a multi-root dashboard, the path-derived `project_id` is the
+routing key; labels are display-only. Selected-root API calls use
+`?root=<project_id>` and return `root_info` containing id, label, and path.
+Omitting `root` keeps first-root compatibility. An unknown explicit id returns
+HTTP 400 `bad_root` and never falls back to another store.
+
+Changing the project clears thread drill-ins, caches, queued answers, and the
+action session before refetching. Responses from the old project are ignored
+unless their `root_info.project_id` still matches. This prevents accidental
+cross-root UI actions; `project_id` is not authentication, and any local process
+that can reach the loopback server can inspect every exposed root.
+
 Browser actions are off by default:
 
 ```powershell
@@ -456,6 +481,12 @@ A stale heartbeat can recover only when the agent is instrumented by the
 activity hook or by `agenttalk wrap --loop`. Otherwise the supervisor warns and
 does not kill the agent.
 
+Freshness is bounded against clock error: a heartbeat farther in the future
+than the configured allowance cannot make an agent healthy. The monitor's
+`supervisor-state.json` has a validated `.bak`; a corrupt primary can be read
+from the backup without silently rewriting it, while two invalid copies stop
+planning and action rather than resetting session state.
+
 Manual windows plus hook:
 
 ```powershell
@@ -474,6 +505,16 @@ Recommended unattended path:
 ```powershell
 agenttalk wrap --for codex-dev --cli codex --loop -- codex -a never -s workspace-write -C D:\Projects\example
 ```
+
+Each wrapper idle marker has a unique wait token. An exiting old wrapper clears
+the marker only while that token still matches, so it cannot erase a newer
+wrapper's waiting state.
+
+On Windows, the turn watchdog terminates a verified target with
+`os.kill(pid, signal.SIGTERM)` and does not start `taskkill.exe`. Windows maps
+that call to abrupt termination, not graceful signal handling. This hotfix does
+not prove the reported desktop-heap theory, remove the remaining PowerShell/CIM
+snapshot subprocesses, or eliminate PID reuse after the start-time recheck.
 
 In supervisor config, wrapped agents use Python as `windows_file`; the real CLI
 goes after `--` in `windows_args`. See
@@ -566,6 +607,22 @@ Deliver:
 agenttalk lane deliver --id docs-manual --from codex-dev
 ```
 
+Delivery is two-phase and retryable:
+
+```text
+active -> prepared (not consumable)
+       -> publish_pending (lane generation + instance checkpoint)
+       -> committed (consumable delivery evidence)
+       -> cleanup_pending|cleanup_failed -> cleanup complete
+```
+
+The terminal diff, target, gates, registry, epoch, and worktree provenance are
+rebound before publication. If preparation, the first state save, publication,
+or cleanup fails, run the same `lane deliver` again. It resumes the bound
+transaction; it does not expose an uncommitted GO or mint a second delivery.
+A committed artifact stays valid while cleanup is pending. Force, abandon, and
+reassign refuse to bypass `publish_pending`.
+
 Shared path approval:
 
 ```powershell
@@ -576,9 +633,11 @@ Lanes are advisory deliver gates, not file locks. A GO means the current
 evidence says the lane is in bounds and mergeable now. It does not prevent
 someone from editing files in Git or the OS.
 
-Use `--no-worktree` only with an explicit `--worktree-waiver-reason`. A waiver
-means the operator accepts reduced isolation for that lane; it is evidence, not
-a claim that isolation happened.
+Release-class lanes require their provisioned worktree. `--no-worktree` is
+limited to a lane declared `--advisory` and still requires an explicit
+`--worktree-waiver-reason`. The recorded authority is advisory audit context:
+it does not trust mutable role labels, does not claim isolation happened, and
+cannot satisfy a release close.
 
 Common HOLD causes include stale epoch, stale domain registry, out-of-bounds
 paths, unowned paths, active lane overlap, shared path missing approval, merge
@@ -648,6 +707,33 @@ agenttalk close open --id rel-070 --from claude-lead --scope release --revision 
 agenttalk close check --id rel-070
 agenttalk close publish --id rel-070 --from claude-lead --verdict go
 ```
+
+Every mutation of an existing close is serialized and compares the loaded
+`generation` plus immutable `instance_id`. A conflict means another writer or
+replacement won; the command fails closed, and the safe action is to reload and
+retry. Creation is exclusive, force-open creates a new instance under lock, and
+a legacy close is upgraded inside that lock rather than overwritten unchecked.
+Changing the revision on reopen clears the old dirty-worktree artifact.
+
+For a release barrier, use the idempotent form:
+
+```powershell
+agenttalk close publish --id rel-070 --from claude-lead --verdict go --bump-barrier
+```
+
+The persisted GO binds the barrier to close id, instance, revision, and
+generation. If the barrier send or epoch stamp fails, rerun the exact command.
+It resumes the one validated binding and sends at most once; a duplicate or
+mismatch HOLDs. Do not send a separate fresh barrier to work around a partial
+publish.
+
+In `signoffs.json`, boolean fields such as `use_default_reviewers`,
+`include_domain_reviewers`, `allow_na`, and `override_counts` must be literal
+JSON booleans. Counter ids must be unique across the whole close, including
+different lenses. Core risk classes are `none`,
+`unknown`, `release`, `device`, `accessibility`, `security`, `performance`,
+`persistence`, `docs-contract`, and `quality`; projects may use a validated
+namespaced extension such as `project:mobile`.
 
 Review results should separate inspected evidence from executed evidence.
 `tests_referenced` means read or considered. `tests_executed` means actually
