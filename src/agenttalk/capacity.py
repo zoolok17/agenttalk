@@ -34,6 +34,8 @@ from datetime import datetime, timezone
 from heapq import heappop, heappush
 from pathlib import Path
 
+from agenttalk._jsonl import iter_lines
+
 # Provider window lengths in minutes. Codex reports them; Claude omits them, so
 # we fill the conventional 5-hour / 7-day values.
 FIVE_HOUR_MINUTES = 300
@@ -205,19 +207,20 @@ def _last_capacity_snapshot(path: Path, source_agent: str) -> CapacitySnapshot |
     """
     last: CapacitySnapshot | None = None
     try:
-        with path.open(encoding="utf-8") as fh:
-            for line in fh:
-                if '"rate_limits"' not in line and '"model_context_window"' not in line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(rec, dict):
-                    continue
-                snapshot = _codex_snapshot(source_agent, rec)
-                if snapshot is not None:
-                    last = snapshot
+        for _line_number, line in iter_lines(path):
+            if line is None:
+                continue
+            if '"rate_limits"' not in line and '"model_context_window"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            snapshot = _codex_snapshot(source_agent, rec)
+            if snapshot is not None:
+                last = snapshot
     except OSError:
         return None
     return last
@@ -226,10 +229,9 @@ def _last_capacity_snapshot(path: Path, source_agent: str) -> CapacitySnapshot |
 def _file_contains(path: Path, needle: str) -> bool:
     """True if ``needle`` appears anywhere in the file (streamed, stops early)."""
     try:
-        with path.open(encoding="utf-8") as fh:
-            for line in fh:
-                if needle in line:
-                    return True
+        for _line_number, line in iter_lines(path):
+            if line is not None and needle in line:
+                return True
     except OSError:
         return False
     return False

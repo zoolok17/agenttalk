@@ -2137,6 +2137,54 @@ def test_cli_capacity_refresh_unknown_when_no_signal(
     assert "unknown" in capsys.readouterr().out.lower()
 
 
+def test_cli_capacity_refresh_isolates_invalid_utf8_rollout_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    sessions = tmp_path / "external-codex-sessions"
+    rollout = sessions / "2026" / "06" / "09" / "rollout-external.jsonl"
+    rollout.parent.mkdir(parents=True)
+    thread_id = "thread-after-invalid-byte"
+
+    def record(used_percent: float, *, selected: bool = False) -> dict:
+        result = {
+            "timestamp": "2026-06-09T08:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "primary": {
+                        "used_percent": used_percent,
+                        "window_minutes": 300,
+                        "resets_at": 9_999_999_999,
+                    },
+                },
+            },
+        }
+        if selected:
+            result["thread_id"] = thread_id
+        return result
+
+    rollout.write_bytes(
+        json.dumps(record(11.0)).encode("utf-8") + b"\n"
+        + b'{"invalid":"\xff"}\n'
+        + json.dumps(record(77.0, selected=True)).encode("utf-8") + b"\n"
+    )
+    monkeypatch.setenv("CODEX_THREAD_ID", thread_id)
+    cli.main(["init", "--path", str(project), "--agents", "alpha,beta"])
+
+    rc = cli.main([
+        "--root", str(project), "capacity", "refresh", "--for", "alpha",
+        "--source", "codex", "--sessions-dir", str(sessions),
+    ])
+
+    assert rc == 0
+    assert "source=codex_rollout" in capsys.readouterr().out
+    published = Store(project).read_capacity("alpha")
+    assert published is not None
+    assert published["primary_used_percent"] == 77.0
+
+
 # --------------------------------------- roster set-operator-facing (T012)
 
 def test_set_operator_facing_roundtrip_and_displays(tmp_path: Path, capsys) -> None:

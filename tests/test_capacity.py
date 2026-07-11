@@ -50,6 +50,19 @@ def _write_codex_rollout_file(p: Path, *records: dict) -> Path:
     return p
 
 
+def _write_codex_rollout_with_invalid_utf8(
+    sessions: Path, name: str, before: dict, after: dict,
+) -> Path:
+    p = sessions / "2026" / "06" / "09" / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(
+        json.dumps(before).encode("utf-8") + b"\n"
+        + b'{"invalid":"\xff"}\n'
+        + json.dumps(after).encode("utf-8") + b"\n"
+    )
+    return p
+
+
 _CODEX_INFO = {
     "total_token_usage": {"input_tokens": 141298351, "total_tokens": 141709863},
     "last_token_usage": {"input_tokens": 125244, "total_tokens": 125386},
@@ -173,6 +186,29 @@ def test_read_codex_rollout_takes_last_record(tmp_path: Path) -> None:
                          _token_count(early), {"type": "other"}, _token_count(late))
     snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path)
     assert snap is not None and snap.primary_used_percent == 88.0  # last wins
+
+
+def test_read_local_codex_isolates_invalid_utf8_physical_line(tmp_path: Path) -> None:
+    thread_id = "thread-after-invalid-byte"
+    early = _token_count(dict(
+        _CODEX_RL,
+        primary={"used_percent": 11.0, "window_minutes": 300, "resets_at": 1},
+    ))
+    late = _token_count(dict(
+        _CODEX_RL,
+        primary={"used_percent": 77.0, "window_minutes": 300, "resets_at": 2},
+    ))
+    late["thread_id"] = thread_id
+    _write_codex_rollout_with_invalid_utf8(
+        tmp_path, "rollout-external.jsonl", early, late,
+    )
+
+    snap = cap.read_local(
+        "codex", source="codex", sessions_dir=tmp_path, thread_id=thread_id,
+    )
+
+    assert snap.source == "codex_rollout"
+    assert snap.primary_used_percent == 77.0
 
 
 def test_read_codex_rollout_prefers_newest_file(tmp_path: Path) -> None:
