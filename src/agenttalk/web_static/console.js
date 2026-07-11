@@ -554,7 +554,7 @@
       (data && data.target_root_project_id) || '';
     return !!responseId && responseId === projectId;
   }
-  function updateProjectUrl() {
+  function updateProjectUrl(mode) {
     if (typeof window === 'undefined' || !window.location || !window.history ||
       typeof URLSearchParams === 'undefined') return;
     try {
@@ -565,7 +565,9 @@
       var query = params.toString();
       var next = (window.location.pathname || '/') + (query ? '?' + query : '') +
         (window.location.hash || '');
-      window.history.replaceState(null, '', next);
+      var method = mode === 'push' ? 'pushState' : 'replaceState';
+      if (typeof window.history[method] !== 'function') return;
+      window.history[method]({ projectId: projectId }, '', next);
     } catch (e) { /* history may be unavailable in embedded browsers */ }
   }
   function updateDocumentTitle() {
@@ -612,14 +614,14 @@
     answerComposerState = {};
     leadChatComposerState.body = '';
   }
-  function applyProjectSelection(projectId) {
+  function applyProjectSelection(projectId, historyMode) {
     if (!projectId || !rootById(projectId) || projectId === state.selectedRootId) {
       return false;
     }
     state.selectedRootId = projectId;
     rootGeneration += 1;
     clearRootContext();
-    updateProjectUrl();
+    if (historyMode !== null) updateProjectUrl(historyMode || 'replace');
     updateDocumentTitle();
     return true;
   }
@@ -627,14 +629,35 @@
     var rs = roots();
     if (!rs.length) return false;
     if (rootById(state.selectedRootId)) {
-      updateProjectUrl();
+      updateProjectUrl('replace');
       updateDocumentTitle();
       return false;
     }
-    return applyProjectSelection(rs[0].project_id);
+    return applyProjectSelection(rs[0].project_id, 'replace');
   }
   function selectProject(projectId) {
-    if (!applyProjectSelection(projectId)) return;
+    if (!applyProjectSelection(projectId, 'push')) return;
+    renderChrome();
+    renderActiveView();
+    fetchRootPayloads();
+  }
+  function restoreProjectFromHistory() {
+    var projectId = initialRootId();
+    var rs = roots();
+    if (!rs.length) {
+      state.selectedRootId = projectId;
+      return;
+    }
+    var historyMode = null;
+    if (!rootById(projectId)) {
+      projectId = rs[0].project_id;
+      historyMode = 'replace';
+    }
+    if (!applyProjectSelection(projectId, historyMode)) {
+      if (historyMode) updateProjectUrl(historyMode);
+      updateDocumentTitle();
+      return;
+    }
     renderChrome();
     renderActiveView();
     fetchRootPayloads();
@@ -3496,6 +3519,10 @@
     setInterval(fetchLeadChat, POLL_MS);
     setInterval(fetchIntents, POLL_MS);
     setInterval(clockTick, CLOCK_MS);
+  }
+
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('popstate', restoreProjectFromHistory);
   }
 
   if (document.readyState === 'loading') {

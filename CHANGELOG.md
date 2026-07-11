@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project. Multi-root writes require one explicit full project ID and never resolve display labels;
   explicit unknown, blank, repeated, or ambiguous roots fail closed instead of falling back to the
   primary project, duplicate descriptors for one project ID are rejected at startup, and switching
-  projects clears root-bound message, answer, and lead-chat drafts.
+  projects clears root-bound message, answer, and lead-chat drafts. Project selection now follows
+  browser Back/Forward history, and narrow viewports wrap filters and long lead-chat identifiers.
 
 ### Fixed
 

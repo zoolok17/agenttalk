@@ -483,6 +483,10 @@ body {
   gap: 16px;
   margin-bottom: 20px;
 }
+.tc-view-head > :first-child {
+  min-width: 0;
+  max-width: 100%;
+}
 .tc-h1 {
   margin: 0;
   font-family: var(--font-head);
@@ -495,6 +499,7 @@ body {
   margin: 5px 0 0;
   color: var(--ink3);
   font-size: 13px;
+  overflow-wrap: anywhere;
 }
 
 .tc-card {
@@ -776,9 +781,15 @@ body {
    --------------------------------------------------------------------------- */
 
 /* Filter chips (right of the H1) */
-.tc-filters { display: flex; gap: 6px; }
+.tc-filters {
+  display: flex;
+  min-width: 0;
+  gap: 6px;
+  flex-wrap: wrap;
+}
 .tc-filter {
   display: inline-flex;
+  min-width: 0;
   align-items: center;
   gap: 7px;
   padding: 6px 11px;
@@ -2156,6 +2167,13 @@ body {
   }
   .tc-stats {
     grid-template-columns: minmax(0, 1fr);
+  }
+  .tc-filters {
+    width: 100%;
+  }
+  .tc-filter {
+    flex: 1 1 calc(50% - 3px);
+    justify-content: center;
   }
   .tc-learning-stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));

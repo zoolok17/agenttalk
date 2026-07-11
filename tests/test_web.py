@@ -3605,6 +3605,240 @@ const hooks = ctx.__agenttalkConsoleTestHooks;
                    capture_output=True, text=True)
 
 
+def test_console_project_history_back_forward_restores_root_context(
+    tmp_path: Path,
+) -> None:
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console project-history test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkHistoryTestHooks = {\n"
+        "    setState: function (payload, projectId) {\n"
+        "      lastState = payload;\n"
+        "      state.selectedRootId = projectId;\n"
+        "    },\n"
+        "    seedRootContext: function (prefix) {\n"
+        "      state.view = 'agent';\n"
+        "      state.selectedAgent = 'alpha';\n"
+        "      state.sessionRid = 'rid-shared';\n"
+        "      threadCache = {};\n"
+        "      threadCache[currentRootId() + '|rid-shared'] = {request_id: 'rid-shared'};\n"
+        "      attentionData = {root_info: {project_id: currentRootId()}, count: 7};\n"
+        "      composerState.body = prefix + ' message';\n"
+        "      answerComposerState = {'rid-shared': prefix + ' answer'};\n"
+        "      leadChatComposerState.body = prefix + ' lead chat';\n"
+        "    },\n"
+        "    selectProject: selectProject,\n"
+        "    reconcileProjectSelection: reconcileProjectSelection,\n"
+        "    snapshot: function () {\n"
+        "      return {\n"
+        "        projectId: state.selectedRootId,\n"
+        "        view: state.view,\n"
+        "        selectedAgent: state.selectedAgent,\n"
+        "        sessionRid: state.sessionRid,\n"
+        "        threadKeys: Object.keys(threadCache),\n"
+        "        attention: attentionData,\n"
+        "        messageBody: composerState.body,\n"
+        "        answerKeys: Object.keys(answerComposerState),\n"
+        "        leadChatBody: leadChatComposerState.body,\n"
+        "      };\n"
+        "    }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-history.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-history.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg);
+}
+function response(ok, data) {
+  return { ok, status: ok ? 200 : 404, json() { return Promise.resolve(data || {}); } };
+}
+async function flush() {
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+}
+
+const calls = [];
+function deferredFetch(url) {
+  return new Promise((resolve) => calls.push({url: String(url), resolve}));
+}
+const listeners = {};
+const historyWrites = [];
+const locationState = {pathname: '/dashboard', search: '', hash: ''};
+function applyUrl(value) {
+  const parsed = new URL(String(value), 'http://agenttalk.local');
+  locationState.pathname = parsed.pathname;
+  locationState.search = parsed.search;
+  locationState.hash = parsed.hash;
+}
+const history = {
+  entries: [],
+  states: [],
+  index: -1,
+  reset(value, state) {
+    this.entries = [String(value)];
+    this.states = [state || null];
+    this.index = 0;
+    applyUrl(value);
+  },
+  pushState(state, _title, value) {
+    this.entries = this.entries.slice(0, this.index + 1);
+    this.states = this.states.slice(0, this.index + 1);
+    this.entries.push(String(value));
+    this.states.push(state || null);
+    this.index += 1;
+    applyUrl(value);
+    historyWrites.push({method: 'push', value: String(value)});
+  },
+  replaceState(state, _title, value) {
+    if (this.index < 0) this.reset(value, state);
+    else {
+      this.entries[this.index] = String(value);
+      this.states[this.index] = state || null;
+      applyUrl(value);
+    }
+    historyWrites.push({method: 'replace', value: String(value)});
+  },
+  back() {
+    if (this.index <= 0) return;
+    this.index -= 1;
+    applyUrl(this.entries[this.index]);
+    if (listeners.popstate) listeners.popstate({state: this.states[this.index]});
+  },
+  forward() {
+    if (this.index + 1 >= this.entries.length) return;
+    this.index += 1;
+    applyUrl(this.entries[this.index]);
+    if (listeners.popstate) listeners.popstate({state: this.states[this.index]});
+  },
+};
+history.reset('/dashboard?root=project-a', {projectId: 'project-a'});
+
+const document = {
+  readyState: 'loading',
+  title: '',
+  addEventListener() {},
+  getElementById() { return null; },
+  querySelector() { return null; },
+  querySelectorAll() { return []; },
+  createElement() { return {}; },
+  createElementNS() { return {}; },
+};
+const ctx = {
+  console,
+  document,
+  location: locationState,
+  history,
+  addEventListener(type, fn) { listeners[type] = fn; },
+  URL,
+  URLSearchParams,
+  localStorage: {getItem() { return null; }, setItem() {}, removeItem() {}},
+  setInterval() {},
+  clearInterval() {},
+  fetch: deferredFetch,
+  __agenttalkHistoryTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+const hooks = ctx.__agenttalkHistoryTestHooks;
+
+(async () => {
+  const rootA = {
+    label: 'project [aaaa1111]', path: 'D:\\one\\project',
+    project_id: 'project-a', agents: [{name: 'alpha'}],
+  };
+  const rootB = {
+    label: 'project [bbbb2222]', path: 'D:\\two\\project',
+    project_id: 'project-b', agents: [{name: 'alpha'}],
+  };
+  hooks.setState({roots: [rootA, rootB]}, rootA.project_id);
+  assert(!hooks.reconcileProjectSelection(), 'initial deep link changed the project');
+  assert(history.entries.length === 1 && historyWrites.at(-1).method === 'replace',
+    `initial reconciliation did not replace: ${JSON.stringify(historyWrites)}`);
+
+  hooks.selectProject(rootB.project_id);
+  assert(history.entries.length === 2 && history.index === 1,
+    `user selection did not add history: ${JSON.stringify(history)}`);
+  assert(historyWrites.at(-1).method === 'push' &&
+    history.entries[1].includes('root=project-b'),
+    `user selection was not a project-B push: ${JSON.stringify(historyWrites)}`);
+  assert(calls.length === 6 && calls.every((call) => call.url.includes('root=project-b')),
+    `project-B selection did not refetch B: ${JSON.stringify(calls)}`);
+  const staleB = calls.find((call) => call.url.startsWith('/api/attention'));
+  hooks.seedRootContext('project B');
+
+  const writesBeforeBack = historyWrites.length;
+  history.back();
+  let snapshot = hooks.snapshot();
+  assert(snapshot.projectId === rootA.project_id,
+    `Back did not restore A: ${JSON.stringify(snapshot)}`);
+  assert(snapshot.view === 'overview' && snapshot.selectedAgent === null &&
+    snapshot.sessionRid === null && snapshot.threadKeys.length === 0,
+    `Back did not clear B drill-ins/cache: ${JSON.stringify(snapshot)}`);
+  assert(snapshot.messageBody === '' && snapshot.answerKeys.length === 0 &&
+    snapshot.leadChatBody === '',
+    `Back did not clear B drafts: ${JSON.stringify(snapshot)}`);
+  assert(history.entries.length === 2 && history.index === 0 &&
+    historyWrites.length === writesBeforeBack,
+    `Back wrote history: ${JSON.stringify(historyWrites)}`);
+  const aCalls = calls.slice(6);
+  assert(aCalls.length === 6 && aCalls.every((call) => call.url.includes('root=project-a')),
+    `Back did not refetch A: ${JSON.stringify(aCalls)}`);
+
+  const currentA = aCalls.find((call) => call.url.startsWith('/api/attention'));
+  currentA.resolve(response(true, {
+    root_info: {project_id: rootA.project_id}, count: 3, items: [],
+  }));
+  for (const call of aCalls) if (call !== currentA) call.resolve(response(false, {}));
+  for (const call of calls.slice(0, 6)) {
+    if (call !== staleB) call.resolve(response(false, {}));
+  }
+  await flush();
+  staleB.resolve(response(true, {
+    root_info: {project_id: rootB.project_id}, count: 99, items: [],
+  }));
+  await flush();
+  snapshot = hooks.snapshot();
+  assert(snapshot.attention && snapshot.attention.count === 3,
+    `stale B data replaced A after Back: ${JSON.stringify(snapshot.attention)}`);
+
+  hooks.seedRootContext('project A');
+  const writesBeforeForward = historyWrites.length;
+  history.forward();
+  snapshot = hooks.snapshot();
+  assert(snapshot.projectId === rootB.project_id,
+    `Forward did not restore B: ${JSON.stringify(snapshot)}`);
+  assert(snapshot.messageBody === '' && snapshot.answerKeys.length === 0 &&
+    snapshot.leadChatBody === '' && snapshot.threadKeys.length === 0,
+    `Forward did not clear A root context: ${JSON.stringify(snapshot)}`);
+  assert(history.entries.length === 2 && history.index === 1 &&
+    historyWrites.length === writesBeforeForward,
+    `Forward wrote history: ${JSON.stringify(historyWrites)}`);
+  const forwardCalls = calls.slice(12);
+  assert(forwardCalls.length === 6 &&
+    forwardCalls.every((call) => call.url.includes('root=project-b')),
+    `Forward did not refetch B: ${JSON.stringify(forwardCalls)}`);
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : err);
+  process.exitCode = 1;
+});
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
 def _density_vars(css: str, density: str) -> dict[str, str]:
     m = re.search(rf'#app\[data-density="{density}"\]\s*\{{(?P<body>.*?)\}}',
                   css, flags=re.S)
@@ -3653,6 +3887,31 @@ def test_console_compact_density_has_material_size_delta_and_mobile_guards(tmp_p
     assert ".tc-project-path" in css
     assert "text-overflow: ellipsis;" in css
     assert "max-width: calc(100vw - 24px);" in css
+
+
+def test_console_mobile_filters_and_lead_subtitle_have_fit_contracts(
+    tmp_path: Path,
+) -> None:
+    s = _make_store(tmp_path)
+    srv, _t, base = _serve(s)
+    try:
+        with _get(f"{base}/static/console.css") as resp:
+            css = resp.read().decode("utf-8")
+        with _get(f"{base}/static/console.js") as resp:
+            js = resp.read().decode("utf-8")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert "el('div', 'tc-filters')" in js
+    assert "el('p', 'tc-subtitle', leadChatSubtitle(data, root))" in js
+    assert re.search(r"\.tc-filters\s*\{[^}]*flex-wrap:\s*wrap", css, re.S)
+    assert re.search(r"\.tc-view-head\s*>\s*:first-child\s*\{[^}]*min-width:\s*0", css, re.S)
+    assert re.search(r"\.tc-subtitle\s*\{[^}]*overflow-wrap:\s*anywhere", css, re.S)
+    assert re.search(
+        r"@media \(max-width: 560px\)[\s\S]*?\.tc-filter\s*\{[^}]*flex:\s*1 1",
+        css,
+    )
 
 
 def test_shaped_avatar_css_is_scoped_and_preserves_originals(tmp_path: Path) -> None:
