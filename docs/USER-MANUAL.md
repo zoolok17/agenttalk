@@ -383,17 +383,19 @@ agenttalk serve
 `dashboard` has no `--host` option. `serve` accepts only loopback hosts:
 `127.0.0.1`, `::1`, or `localhost`.
 
-The top bar always identifies the selected project by display label and full
-root path. In a multi-root dashboard, the path-derived `project_id` is the
-routing identity; labels are display-only for writes. Selected-root responses
-return `root_info` containing id, label, and path. GET may omit `root` to select
-root 0 and may use a legacy label only when it uniquely identifies one root.
-Blank, repeated, unknown, or ambiguous GET selectors return HTTP 400
-`bad_root`.
+The top bar always shows selected-project and path context. If CSS ellipsizes
+the path visually, its complete value remains available through the element
+text, title, and accessibility label. In a multi-root dashboard, the
+path-derived `project_id` is the routing identity; labels are display-only for
+writes. Selected-root responses return `root_info` containing id, label, and
+path. GET may omit `root` to select `root[0]` and may use a unique display label
+as a legacy best-effort selector. Blank, repeated, unknown, or ambiguous GET
+selectors return HTTP 400 `bad_root`.
 
 Mutating POST `/api/intent` and `/api/lead-chat` are stricter: when multiple
-roots are served, they require exactly one full `?root=<project_id>`. They never
-fall back to a label, and an omitted selector is accepted only with one root.
+roots are served, they require exactly one explicit full
+`?root=<project_id>`. They never accept a label, and an omitted selector is
+accepted only with one root.
 Unknown, blank, repeated, ambiguous, or non-full selectors return HTTP 400
 `bad_root` before anything is written.
 

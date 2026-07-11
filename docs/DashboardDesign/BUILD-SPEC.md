@@ -25,20 +25,23 @@ letterforms.
 >   are not canonical or write-routing keys; their only routing use is the
 >   unique-match GET compatibility below. Duplicate basenames receive stable
 >   project-id suffixes independent of root-list order.
-> - Selected-root GET endpoints accept `?root=<project_id>`, may omit it for
->   root 0, and may retain a display-label fallback only when exactly one root
->   matches. Blank, repeated, unknown, or ambiguous GET selectors return HTTP
+> - Selected-root GET endpoints accept `?root=<project_id>`, map omission to
+>   `root[0]`, and may retain a unique display label as a legacy best-effort
+>   selector. Blank, repeated, unknown, or ambiguous GET selectors return HTTP
 >   400 `bad_root`. Multi-root POST `/api/intent` and `/api/lead-chat`
->   require exactly one full project id; labels and omission are forbidden,
->   while single-root POST may omit it. Unknown, blank, repeated, ambiguous, or
->   non-full write selectors return HTTP 400 `bad_root` before mutation.
+>   require exactly one explicit full project id; labels and omission are
+>   forbidden, while single-root POST may omit it. Unknown, blank, repeated,
+>   ambiguous, or non-full write selectors return HTTP 400 `bad_root` before
+>   mutation.
 > - Every selected-root response carries
 >   `root_info: {project_id, label, path}` (or the equivalent target project id
 >   in the action envelope), so clients can validate routing before applying a
 >   response.
-> - Frontend state uses `selectedRootId`, not an array index. The top bar always
->   displays the selected label and full root path, including single-root mode;
->   the document title includes project and view.
+> - Frontend state uses `selectedRootId`, not an array index. The top bar keeps
+>   project and path context visible, including in single-root mode. CSS may
+>   ellipsize the path visually; the full value remains available through the
+>   text, title, and accessibility surfaces. The document title includes
+>   project and view.
 > - A root switch clears root-bound drill-ins, transcript/learning/onboarding
 >   caches, queued answers, archived state, and action-session state. Each
 >   asynchronous request is bound to the selected project plus a local root

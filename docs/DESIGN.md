@@ -330,16 +330,18 @@ two parallel ownership concepts.
   stable path-derived `project_id`; labels are presentation plus read-only
   legacy compatibility, never write-routing identity, and duplicate basenames
   receive stable id suffixes. Selected-root responses return
-  `root_info {project_id,label,path}`. The read resolver permits omitted root 0
-  and exactly-one-label legacy compatibility; other read selectors fail with
-  HTTP 400 `bad_root`. The write resolver permits omission only for one served
-  root and otherwise requires one exact full project id; it never accepts
-  labels. Blank, repeated, unknown, ambiguous, or non-full write selectors fail
-  with HTTP 400 `bad_root` before mutation.
-  The top bar always shows label plus full path. A root switch clears root-bound
-  caches/drill-ins/action state, and late responses are accepted only when their
-  project id matches the current selection. This prevents accidental cross-root
-  UI writes; it is not authentication or isolation from another local process.
+  `root_info {project_id,label,path}`. The read resolver maps omission to
+  `root[0]` and retains a unique display label as a legacy best-effort selector;
+  other read selectors fail with HTTP 400 `bad_root`. The write resolver permits
+  omission only for one served root and otherwise requires exactly one explicit
+  full project id; it never accepts labels. Blank, repeated, unknown, ambiguous,
+  or non-full write selectors fail with HTTP 400 `bad_root` before mutation.
+  The top bar keeps project and path context visible; when CSS ellipsizes the
+  path, the full value remains in text, title, and accessibility surfaces. A
+  root switch clears root-bound caches/drill-ins/action state, and late
+  responses are accepted only when their project id matches the current
+  selection. This prevents accidental cross-root UI writes; it is not
+  authentication or isolation from another local process.
 - **Intent write spine:** for ordinary dashboard controls on `/api/intent`, the
   browser never calls `store.send()` directly. With `--enable-actions` off,
   `POST` stays disabled and no session token exists. With actions enabled, the
@@ -710,9 +712,10 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   root-list indexes and duplicate labels are unstable and allow late responses
   to paint or mutate the wrong project after a switch. *Decision:* path-derived
   `project_id` is the write-routing identity and selected-root responses echo
-  `root_info`. Reads retain root-0 omission and unique-label compatibility;
-  multi-root writes require one exact full id, never a label or omission. Bad,
-  repeated, or ambiguous selectors fail before mutation, and the client
+  `root_info`. Read omission selects `root[0]`, with unique display labels kept
+  only as legacy best-effort selectors; multi-root writes require exactly one
+  explicit full id, never a label or omission. Bad, repeated, or ambiguous
+  selectors fail before mutation, and the client
   generation-checks all root-bound responses. *Ceiling:* the id is not an
   authorization token.
 

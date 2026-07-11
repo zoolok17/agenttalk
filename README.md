@@ -1780,13 +1780,14 @@ data — one corrupt store renders as a degraded panel while the others
 stay live. Each root carries a stable path-derived `project_id`; the display
 label is not a write-routing key. Selected-root Team Console responses return
 `root_info` with `project_id`, label, and full path. GET routes may omit `root`
-for first-root compatibility and may accept a legacy display label only when it
-identifies exactly one root. A blank, repeated, unknown, or ambiguous GET
-selector returns HTTP 400 `bad_root`.
+to select `root[0]` and may accept a unique display label as a legacy
+best-effort selector. A blank, repeated, unknown, or ambiguous GET selector
+returns HTTP 400 `bad_root`.
 
 Writes are stricter. When several roots are served, POST `/api/intent` and
-`/api/lead-chat` require exactly one full `?root=<project_id>`; label fallback
-and omission are forbidden. Omission is accepted only in single-root mode.
+`/api/lead-chat` require exactly one explicit full `?root=<project_id>`; label
+fallback and omission are forbidden. Omission is accepted only in single-root
+mode.
 Blank, repeated, unknown, ambiguous, or non-full selectors return HTTP 400
 `bad_root` before any mutation.
 Thread rows carry subjects and derived fields only, never message bodies; raw
@@ -1795,12 +1796,14 @@ lead-chat transcript surfaces. If a watched project contains `kitty-specs/`,
 the panel lists its missions — detection is filesystem-only, agenttalk
 never imports spec-kitty.
 
-The top bar always shows the current project label and full root path, even for
-a single watched root. Duplicate basenames receive stable project-id suffixes.
-Switching projects clears root-bound drill-ins, caches, and action sessions;
-every asynchronous payload is checked against the selected `project_id`, so a
-late response from the previous project is discarded. The id is routing and
-display state, not authentication or cross-root security.
+The top bar always shows current project and path context, even for a single
+watched root. If CSS ellipsizes the path visually, its complete value remains
+available through the element text, title, and accessibility label. Duplicate
+basenames receive stable project-id suffixes. Switching projects clears
+root-bound drill-ins, caches, and action sessions; every asynchronous payload
+is checked against the selected `project_id`, so a late response from the
+previous project is discarded. The id is routing and display state, not
+authentication or cross-root security.
 
 The loopback story is unchanged and non-negotiable: no auth, no
 remote-bind flag on any spelling — SSH-tunnel the port if you need it

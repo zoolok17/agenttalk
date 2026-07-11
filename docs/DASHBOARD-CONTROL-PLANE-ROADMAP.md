@@ -14,12 +14,15 @@ dashboard liveness render for fresh-heartbeat unwrapped agents.
 **Planned v0.74.0 supersession (2026-07-11):** multi-root Team Console state
 uses stable path-derived `project_id` as its canonical identity, not a root-list
 index. Selected-root responses carry `root_info {project_id,label,path}`. GET
-may omit root 0 or use a unique legacy label; multi-root POST requires one exact
-full project id, never a label or omission. Invalid, blank, repeated, or
-ambiguous selectors return HTTP 400 `bad_root` before mutation. The project
-label and full path remain visible in every view, and root switches clear bound
-state and discard stale/mismatched responses. Selected-root reads and actions
-still pass through the existing loopback/session/CSRF/intent authority boundaries.
+omission selects `root[0]`, and a unique display label remains a legacy
+best-effort selector. Multi-root POST requires exactly one explicit full
+project id, never a label or omission. Invalid, blank, repeated, or ambiguous
+selectors return HTTP 400 `bad_root` before mutation. Project and path context
+remain visible in every view; the full path remains available through text,
+title, and accessibility surfaces if CSS ellipsizes it. Root switches clear
+bound state and discard stale/mismatched responses. Selected-root reads and
+actions still pass through the existing loopback/session/CSRF/intent authority
+boundaries.
 `project_id` is routing, not authentication. This paragraph supersedes root
 selection details only; the phased intent-queue history below is unchanged.
 

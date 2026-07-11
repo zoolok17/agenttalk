@@ -400,17 +400,19 @@ agenttalk dashboard --enable-actions
 The dashboard is loopback-only. It is for the local operator, not a remote
 multi-user web app. Actions are disabled unless `--enable-actions` is passed.
 
-The top bar always shows the selected project label and full root path. In a
-multi-root dashboard, a stable path-derived `project_id` routes selected-root
-reads and actions; the label is never write authority. Responses include
-`root_info {project_id,label,path}`. GET may omit the selector for root 0 or use
-a legacy label only when it uniquely identifies one root. Blank, repeated,
-unknown, or ambiguous GET selectors return HTTP 400 `bad_root`.
+The top bar always shows selected-project and path context. If CSS ellipsizes
+the path visually, its complete value remains available through the element
+text, title, and accessibility label. In a multi-root dashboard, a stable
+path-derived `project_id` routes selected-root reads and actions; the label is
+never write authority. Responses include `root_info {project_id,label,path}`.
+GET may omit the selector to select `root[0]` or use a unique display label as a
+legacy best-effort selector. Blank, repeated, unknown, or ambiguous GET
+selectors return HTTP 400 `bad_root`.
 
-For POST `/api/intent` and `/api/lead-chat`, a multi-root server requires one
-exact full `?root=<project_id>`. Label fallback is forbidden; omission is valid
-only for a single-root server. Unknown, blank, repeated, ambiguous, or non-full
-selectors return HTTP 400 `bad_root` before mutation.
+For POST `/api/intent` and `/api/lead-chat`, a multi-root server requires
+exactly one explicit full `?root=<project_id>`. Labels are forbidden; omission
+is valid only for a single-root server. Unknown, blank, repeated, ambiguous, or
+non-full selectors return HTTP 400 `bad_root` before mutation.
 
 When the operator switches projects, the client clears root-bound drill-ins,
 caches, queued answers, and the action session, then refetches. It ignores late
