@@ -1386,6 +1386,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     meta = _parse_meta(args.meta)
     _maybe_autogen_request_id(args.kind, meta, quiet=args.quiet)
     _warn_missing_request_id(args.kind, meta)
+    gate_mod.validate_response_status(args.kind, meta)
     gate_mod.validate_review_result_evidence(args.kind, meta)
     _warn_owed_decision_to_peer(store, sender, recipient, meta.get("request_id"))
     msg = store.send(
@@ -1891,6 +1892,129 @@ def _check_close_authority(store, actor: str, action: str) -> bool:
             f"close lead {sorted(leads)}; recording anyway (close authority is "
             "advisory, not enforced). The action and actor are logged.\n")
     return authorized
+
+
+_CLOSE_BARRIER_BINDING_VERSION = 1
+_CLOSE_BARRIER_BINDING_KEYS = {
+    "version", "close_id", "instance_id", "revision", "generation",
+}
+
+
+def _new_close_barrier_binding(record: dict) -> dict:
+    """Bind one requested release barrier to the persisted publish generation."""
+    from agenttalk import close as close_mod
+
+    instance_id = close_mod.close_instance_id(record)
+    revision = record.get("revision")
+    if instance_id is None:
+        raise close_mod.CloseError("release barrier requires a versioned close instance")
+    if not isinstance(revision, str) or not revision:
+        raise close_mod.CloseError("release barrier requires a frozen close revision")
+    return {
+        "version": _CLOSE_BARRIER_BINDING_VERSION,
+        "close_id": close_mod.validate_close_id(record.get("close_id")),
+        "instance_id": instance_id,
+        "revision": revision,
+        "generation": close_mod.close_generation(record) + 1,
+    }
+
+
+def _validated_close_barrier_binding(record: dict) -> dict:
+    """Return the durable barrier intent, rejecting ambiguous or stale bindings."""
+    from agenttalk import close as close_mod
+
+    final = record.get("final")
+    if not isinstance(final, dict):
+        raise close_mod.CloseError("published close has no final barrier state")
+    binding = final.get("barrier_binding")
+    if not isinstance(binding, dict) or set(binding) != _CLOSE_BARRIER_BINDING_KEYS:
+        raise close_mod.CloseError(
+            "published close has no valid release-barrier binding; it is not resumable")
+    generation = binding.get("generation")
+    expected_identity = {
+        "version": _CLOSE_BARRIER_BINDING_VERSION,
+        "close_id": close_mod.validate_close_id(record.get("close_id")),
+        "instance_id": close_mod.close_instance_id(record),
+        "revision": record.get("revision"),
+    }
+    if any(binding.get(key) != value for key, value in expected_identity.items()):
+        raise close_mod.CloseError("release-barrier binding does not match this close instance")
+    if (not isinstance(generation, int) or isinstance(generation, bool)
+            or generation < 1):
+        raise close_mod.CloseError("release-barrier binding generation is invalid")
+    barrier_epoch = final.get("barrier_epoch")
+    if barrier_epoch is not None and (
+        not isinstance(barrier_epoch, str) or not barrier_epoch
+    ):
+        raise close_mod.CloseError("published close barrier_epoch is invalid")
+    expected_generation = generation + (1 if barrier_epoch is not None else 0)
+    if close_mod.close_generation(record) != expected_generation:
+        raise close_mod.CloseConflict(
+            "published close generation no longer matches its release-barrier binding")
+    return dict(binding)
+
+
+def _bound_close_barriers(store, binding: dict) -> list:
+    """Find validated global barriers carrying exactly one close binding."""
+    matches = []
+    for message in store.valid_messages():
+        meta = message.meta or {}
+        barrier = meta.get("barrier")
+        if not (
+            message.kind == "message"
+            and isinstance(barrier, dict)
+            and barrier.get("version") == 1
+            and barrier.get("scope") == "global"
+            and barrier.get("type") == "epoch-bump"
+            and meta.get("close_id") == binding["close_id"]
+            and meta.get("close_barrier") == binding
+        ):
+            continue
+        matches.append(message)
+    return matches
+
+
+def _ensure_close_release_barrier(store, transaction, *, actor: str) -> str:
+    """Send or resume one bound barrier, then stamp its validated message id.
+
+    The caller holds the per-close lock for the whole scan/send/stamp sequence.
+    A failed send leaves the durable binding pending; a failed stamp leaves the
+    bound message discoverable by the next retry.
+    """
+    from agenttalk import close as close_mod
+
+    record = transaction.record
+    binding = _validated_close_barrier_binding(record)
+    matches = _bound_close_barriers(store, binding)
+    if len(matches) > 1:
+        raise close_mod.CloseError(
+            "multiple validated release barriers match this close; refusing an ambiguous stamp")
+    final = record["final"]
+    barrier_epoch = final.get("barrier_epoch")
+    if barrier_epoch is not None:
+        if len(matches) != 1 or matches[0].id != barrier_epoch:
+            raise close_mod.CloseError(
+                "stamped release barrier is missing or does not match its close binding")
+        return barrier_epoch
+    if not matches:
+        store.send(
+            sender=actor, recipient=actor, kind="message",
+            subject=f"release barrier: close {binding['close_id']}",
+            body=final.get("reason") or f"close {binding['close_id']} published GO",
+            meta={
+                "barrier": {"version": 1, "scope": "global", "type": "epoch-bump"},
+                "close_id": binding["close_id"],
+                "close_barrier": binding,
+            },
+        )
+        matches = _bound_close_barriers(store, binding)
+    if len(matches) != 1:
+        raise close_mod.CloseError(
+            "release barrier was not durably validated exactly once; retry the publish")
+    barrier_epoch = matches[0].id
+    final["barrier_epoch"] = barrier_epoch
+    transaction.commit()
+    return barrier_epoch
 
 
 # ----- P3 signoff helpers (the impure resolution shell; the verdict stays pure) -
@@ -2474,43 +2598,55 @@ def cmd_close(args: argparse.Namespace) -> int:
             with close_mod.close_transaction(store, args.id) as transaction:
                 record = transaction.record
                 if record.get("status") == close_mod.PUBLISHED:
-                    sys.stderr.write(
-                        f"agenttalk close publish: {args.id!r} is already published; "
-                        "`close reopen` first.\n")
-                    return 2
-                gate_check = gate_mod.check_gates(
-                    store.root, scope=record.get("gate_scope"))
-                signoff_eval = _build_signoff_eval(store, record)
-                worktree_eval = _close_worktree_eval(store, record)
-                record["worktree_isolation"] = worktree_eval
-                result = close_mod.compute_verdict(
-                    record, gate_check, signoff_eval, worktree_eval)
-                if args.verdict == "go" and result["verdict"] != close_mod.VERDICT_GO:
-                    sys.stderr.write(
-                        "agenttalk close publish: refusing GO - close check is HOLD:\n")
-                    _print_verdict(args.id, result)
-                    return 3
-                # Persist the final verdict before the barrier bump. The transaction
-                # remains locked so the subsequent stamp uses the next checked token.
-                close_mod.record_publish(
-                    record, verdict=verdict, by=actor, at=_iso_now(),
-                    reason=args.reason or "", gate_check=gate_check,
-                    residual_risk=args.residual_risk, barrier_epoch=None)
-                transaction.commit()
-                if verdict == close_mod.VERDICT_GO and args.bump_barrier:
-                    msg = store.send(
-                        sender=actor, recipient=actor, kind="message",
-                        subject=f"release barrier: close {args.id}",
-                        body=args.reason or f"close {args.id} published GO",
-                        meta={"barrier": {"version": 1, "scope": "global",
-                                          "type": "epoch-bump"}, "close_id": args.id})
-                    barrier_epoch = msg.id
-                    record["final"]["barrier_epoch"] = barrier_epoch
+                    final = record.get("final") or {}
+                    if not (
+                        verdict == close_mod.VERDICT_GO
+                        and args.bump_barrier
+                        and final.get("verdict") == close_mod.VERDICT_GO
+                        and final.get("barrier_binding") is not None
+                    ):
+                        sys.stderr.write(
+                            f"agenttalk close publish: {args.id!r} is already published; "
+                            "`close reopen` first.\n")
+                        return 2
+                    barrier_epoch = _ensure_close_release_barrier(
+                        store, transaction, actor=actor)
+                else:
+                    gate_check = gate_mod.check_gates(
+                        store.root, scope=record.get("gate_scope"))
+                    signoff_eval = _build_signoff_eval(store, record)
+                    worktree_eval = _close_worktree_eval(store, record)
+                    record["worktree_isolation"] = worktree_eval
+                    result = close_mod.compute_verdict(
+                        record, gate_check, signoff_eval, worktree_eval)
+                    if args.verdict == "go" and result["verdict"] != close_mod.VERDICT_GO:
+                        sys.stderr.write(
+                            "agenttalk close publish: refusing GO - close check is HOLD:\n")
+                        _print_verdict(args.id, result)
+                        return 3
+                    # Persist the final verdict and a generation-bound barrier intent
+                    # before attempting the message write. A retry can then resume
+                    # either side of the send/stamp boundary without duplicating it.
+                    close_mod.record_publish(
+                        record, verdict=verdict, by=actor, at=_iso_now(),
+                        reason=args.reason or "", gate_check=gate_check,
+                        residual_risk=args.residual_risk, barrier_epoch=None)
+                    if verdict == close_mod.VERDICT_GO and args.bump_barrier:
+                        record["final"]["barrier_binding"] = (
+                            _new_close_barrier_binding(record))
                     transaction.commit()
+                    if verdict == close_mod.VERDICT_GO and args.bump_barrier:
+                        barrier_epoch = _ensure_close_release_barrier(
+                            store, transaction, actor=actor)
         except (close_mod.CloseConflict, TimeoutError) as e:
             return _close_conflict_result("publish", e)
         except close_mod.CloseError as e:
             sys.stderr.write(f"agenttalk close publish: {e}\n")
+            return 2
+        except (OSError, ValueError) as e:
+            sys.stderr.write(
+                f"agenttalk close publish: release barrier is incomplete but "
+                f"recoverable: {e}. Retry the same publish command.\n")
             return 2
         print(f"published close {args.id}: {verdict} by {actor}"
               + (f"; release barrier {barrier_epoch}" if barrier_epoch else ""))
@@ -7002,6 +7138,7 @@ def cmd_reply(args: argparse.Namespace) -> int:
         print(f"(dry-run) reply {sender} -> {anchor.sender}  thread={rid}  "
               f"kind={kind}; nothing sent.")
         return 0
+    gate_mod.validate_response_status(kind, meta)
     gate_mod.validate_review_result_evidence(kind, meta)
     msg = store.send(
         sender=sender,

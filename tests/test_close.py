@@ -307,6 +307,13 @@ def _accept(root: Path) -> int:
                  "--na-reason", "lw", "--evidence", "pointer:rq-1"], root)
 
 
+def _release_barriers(store: Store) -> list:
+    return [
+        message for message in store.valid_messages()
+        if isinstance((message.meta or {}).get("close_barrier"), dict)
+    ]
+
+
 def test_concurrent_close_saves_reject_one_stale_generation(tmp_path: Path) -> None:
     store = Store(tmp_path)
     store.init(["lead"])
@@ -674,6 +681,159 @@ def test_cli_publish_go_bump_barrier_fires_release_barrier(tmp_path: Path) -> No
     assert epoch is not None
     assert rec["generation"] == 4  # open, ack, publish, checked barrier stamp
     assert Store(root).current_epoch() == epoch  # the release barrier is now current
+
+
+def test_cli_publish_barrier_send_failure_resumes_exactly_once(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture) -> None:
+    root = _init(tmp_path)
+    store = Store(root)
+    assert _open(root, "--dirty-artifact", "test:working-tree") == 0
+    assert _accept(root) == 0
+    real_send = Store.send
+    failed = False
+
+    def fail_first_barrier(self, **kwargs):
+        nonlocal failed
+        message = real_send(self, **kwargs)
+        if not failed and (kwargs.get("meta") or {}).get("close_barrier"):
+            failed = True
+            raise OSError("injected post-write barrier send failure")
+        return message
+
+    monkeypatch.setattr(Store, "send", fail_first_barrier)
+    capsys.readouterr()
+    publish = ["close", "publish", "--id", "rel", "--from", "lead",
+               "--verdict", "go", "--bump-barrier", "--reason", "ship"]
+    assert _run(publish, root) == 2
+    assert "retry" in capsys.readouterr().err.lower()
+    pending = close.load_close(store, "rel")
+    assert pending["status"] == close.PUBLISHED
+    assert pending["final"]["barrier_epoch"] is None
+    binding = pending["final"]["barrier_binding"]
+    assert binding == {
+        "version": 1,
+        "close_id": "rel",
+        "instance_id": pending["instance_id"],
+        "revision": pending["revision"],
+        "generation": pending["generation"],
+    }
+    sent = _release_barriers(store)
+    assert len(sent) == 1
+    assert sent[0].meta["close_barrier"] == binding
+
+    monkeypatch.setattr(Store, "send", real_send)
+    assert _run(publish, root) == 0
+    assert _run(publish, root) == 0
+    stored = close.load_close(store, "rel")
+    barriers = _release_barriers(store)
+    assert len(barriers) == 1
+    assert barriers[0].id == sent[0].id
+    assert stored["final"]["barrier_epoch"] == barriers[0].id
+
+
+def test_cli_publish_barrier_stamp_failure_resumes_existing_message(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture) -> None:
+    root = _init(tmp_path)
+    store = Store(root)
+    assert _open(root, "--dirty-artifact", "test:working-tree") == 0
+    assert _accept(root) == 0
+    real_commit = close.CloseTransaction.commit
+    commits = 0
+
+    def fail_second_commit(transaction):
+        nonlocal commits
+        commits += 1
+        if commits == 2:
+            raise OSError("injected barrier stamp failure")
+        return real_commit(transaction)
+
+    monkeypatch.setattr(close.CloseTransaction, "commit", fail_second_commit)
+    capsys.readouterr()
+    publish = ["close", "publish", "--id", "rel", "--from", "lead",
+               "--verdict", "go", "--bump-barrier", "--reason", "ship"]
+    assert _run(publish, root) == 2
+    assert "retry" in capsys.readouterr().err.lower()
+    pending = close.load_close(store, "rel")
+    barriers = _release_barriers(store)
+    assert pending["final"]["barrier_epoch"] is None
+    assert len(barriers) == 1
+
+    monkeypatch.setattr(close.CloseTransaction, "commit", real_commit)
+    assert _run(publish, root) == 0
+    stored = close.load_close(store, "rel")
+    assert stored["final"]["barrier_epoch"] == barriers[0].id
+    assert len(_release_barriers(store)) == 1
+
+
+def test_cli_concurrent_publish_barrier_retries_send_once(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _init(tmp_path)
+    store = Store(root)
+    assert _open(root, "--dirty-artifact", "test:working-tree") == 0
+    assert _accept(root) == 0
+    real_send = Store.send
+
+    def fail_barrier(self, **kwargs):
+        if (kwargs.get("meta") or {}).get("close_barrier"):
+            raise OSError("injected initial send failure")
+        return real_send(self, **kwargs)
+
+    monkeypatch.setattr(Store, "send", fail_barrier)
+    publish = ["close", "publish", "--id", "rel", "--from", "lead",
+               "--verdict", "go", "--bump-barrier", "--reason", "ship"]
+    assert _run(publish, root) == 2
+
+    send_started = threading.Event()
+    release_send = threading.Event()
+    second_waiting = threading.Event()
+    send_count = 0
+    real_update_lock = close._close_update_lock
+
+    def paused_send(self, **kwargs):
+        nonlocal send_count
+        if (kwargs.get("meta") or {}).get("close_barrier"):
+            send_count += 1
+            send_started.set()
+            if not release_send.wait(5):
+                raise AssertionError("barrier send was not released")
+        return real_send(self, **kwargs)
+
+    def observed_update_lock(lock_store, close_id, *, timeout):
+        if threading.current_thread().name == "close-retry-2":
+            second_waiting.set()
+        return real_update_lock(lock_store, close_id, timeout=timeout)
+
+    monkeypatch.setattr(Store, "send", paused_send)
+    monkeypatch.setattr(close, "_close_update_lock", observed_update_lock)
+    results: list[int] = []
+    errors: list[BaseException] = []
+
+    def retry() -> None:
+        try:
+            results.append(_run(publish, root))
+        except BaseException as error:
+            errors.append(error)
+
+    first = threading.Thread(target=retry, name="close-retry-1")
+    second = threading.Thread(target=retry, name="close-retry-2")
+    first.start()
+    assert send_started.wait(5)
+    second.start()
+    assert second_waiting.wait(5)
+    release_send.set()
+    first.join(10)
+    second.join(10)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert sorted(results) == [0, 0]
+    assert send_count == 1
+    barriers = _release_barriers(store)
+    assert len(barriers) == 1
+    assert close.load_close(store, "rel")["final"]["barrier_epoch"] == barriers[0].id
 
 
 def test_cli_publish_records_go_even_without_barrier_bump(tmp_path: Path) -> None:

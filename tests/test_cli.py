@@ -1364,6 +1364,24 @@ def test_send_review_result_without_request_id_warns_soft(
     assert "no request_id" in capsys.readouterr().err
 
 
+def test_send_rejects_invalid_review_result_status_before_persisting(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    before = len(store.valid_messages())
+
+    rc = _run([
+        "send", "--from", "alpha", "--to", "beta",
+        "--kind", "review-result", "--meta", "status=approve",
+        "-m", "not a valid verdict",
+    ], store_root)
+
+    assert rc == 2
+    assert "review-result status must be one of" in capsys.readouterr().err
+    assert len(store.valid_messages()) == before
+
+
 def test_reply_review_request_autogenerates_request_id(
     store: Store,
     store_root: Path,
@@ -1481,6 +1499,26 @@ def test_reply_proposal_response_echoes_request_id(
     assert resp.kind == "proposal-response"
     assert resp.meta.get("request_id") == "pp-abc"
     assert resp.meta.get("status") == "accepted"
+
+
+def test_reply_rejects_invalid_proposal_response_status_before_persisting(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    store.send(
+        sender="alpha", recipient="beta", kind="proposal", body="do X",
+        meta={"request_id": "pp-invalid-status"},
+    )
+    before = len(store.valid_messages())
+    capsys.readouterr()
+
+    rc = _run([
+        "reply", "--from", "beta", "--kind", "proposal-response",
+        "--meta", "status=accept", "-m", "not a valid response",
+    ], store_root)
+
+    assert rc == 2
+    assert "proposal-response status must be one of" in capsys.readouterr().err
+    assert len(store.valid_messages()) == before
 
 
 def test_reply_counter_proposal_opens_fresh_thread(
