@@ -17,7 +17,7 @@ be labeled `SHIPPED` once the changelog closes them.
 
 ---
 
-## P1 · SHIPPED — v0.74.0 release-contract integration (2026-07-11)
+## P1 · SHIPPED — v0.74.0 release-contract integration (2026-07-12)
 
 **What.** Integrate and release the reviewed hardening wave without weakening
 its failure contracts: strict typed response state; generation/instance-bound

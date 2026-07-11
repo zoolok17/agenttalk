@@ -11526,7 +11526,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run an agent CLI under the progress-adapter wrapper: launch it in "
              "structured-stream mode, stamp heartbeat on real progress events "
              "(throttled), render readable output, and detect degraded output. "
-             "Phase 1: --cli codex (`codex exec --json`).",
+             "Codex (`codex exec --json`) and Claude (`stream-json`) structured "
+             "streams are supported.",
     )
     pwrap.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
     pwrap.add_argument("--cli", default="codex",

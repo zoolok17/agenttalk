@@ -3076,6 +3076,19 @@ def _exit_code(argv: list[str]) -> tuple[int, None]:
         return (0 if e.code is None else int(e.code)), None
 
 
+def test_top_level_help_advertises_supported_wrap_clis(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    code, _ = _exit_code(["--help"])
+    assert code == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert (
+        "Codex (`codex exec --json`) and Claude (`stream-json`) structured streams"
+        in out
+    )
+    assert "Phase 1: --cli codex" not in out
+
+
 def test_dashboard_help_surface(capsys: pytest.CaptureFixture) -> None:
     code, _ = _exit_code(["dashboard", "--help"])
     assert code == 0
