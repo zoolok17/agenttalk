@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows turn-watchdog termination no longer launches `taskkill.exe`.** Verified
+  per-turn process targets are terminated through Python's native process kill path,
+  avoiding `taskkill.exe` initialization dialogs under host resource pressure. The
+  existing PowerShell/CIM snapshot and start-time checks are unchanged by this hotfix.
+
 ## [0.73.1] - 2026-07-10
 
 ### Added

@@ -1,6 +1,6 @@
 """Tests for the per-turn watchdog (wrapper/turn_watchdog.py) and its wiring into
-make_drive / run_loop. The OS adapter (real snapshot/kill) is NOT exercised - everything
-uses a deterministic FAKE snapshot/spawner so no real process is ever killed.
+make_drive / run_loop. The OS snapshot adapter is tested with deterministic fakes; one
+Windows-only integration test exercises native termination against an isolated sleeper.
 
 Covers codex's acceptance gates: the pure two-factor discriminator matrix, config
 resolution, the daemon controller's clean stop/join (no kill race) + fire/kill path, the
@@ -11,7 +11,13 @@ invariant (cursor unchanged + message pending + one ambiguous attempt after a wa
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import signal
+import subprocess
+import sys
+
+import pytest
 
 from agenttalk.store import Store
 from agenttalk.wrapper import loop, run
@@ -194,6 +200,65 @@ def test_controller_fires_and_kills_when_descendant_hangs() -> None:
 
 
 # ----------------------------------------------------------- kill-time start guard (Issue A)
+
+def test_kill_one_windows_uses_sigterm_without_subprocess_or_sigkill_lookup(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    killed: list[tuple[int, int]] = []
+    sigterm = signal.SIGTERM
+    monkeypatch.setattr(twd.sys, "platform", "win32")
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.delattr(signal, "SIGKILL", raising=False)
+    monkeypatch.setattr(
+        twd.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("Windows termination must not launch taskkill"),
+    )
+
+    assert twd._kill_one(42) is True
+    assert killed == [(42, sigterm)]
+
+
+def test_kill_one_posix_uses_sigkill(monkeypatch: pytest.MonkeyPatch) -> None:
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(twd.sys, "platform", "linux")
+    monkeypatch.setattr(signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    assert twd._kill_one(42) is True
+    assert killed == [(42, 9)]
+
+
+@pytest.mark.parametrize("error", [OSError(), ProcessLookupError(), PermissionError()])
+def test_kill_one_failure_returns_false(
+        monkeypatch: pytest.MonkeyPatch, error: OSError) -> None:
+    def fail_kill(pid: int, sig: int) -> None:
+        raise error
+
+    monkeypatch.setattr(twd.sys, "platform", "win32")
+    monkeypatch.setattr(os, "kill", fail_kill)
+    monkeypatch.setattr(
+        twd.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("Windows termination must not launch taskkill"),
+    )
+
+    assert twd._kill_one(42) is False
+
+
+@pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows-only termination path")
+def test_kill_one_windows_real_no_window_sleeper_exits_with_sigterm() -> None:
+    sleeper = subprocess.Popen(  # noqa: S603  # nosec B603
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        assert twd._kill_one(sleeper.pid) is True
+        assert sleeper.wait(timeout=10) == 15
+    finally:
+        if sleeper.poll() is None:
+            sleeper.kill()
+        sleeper.wait(timeout=10)
+
 
 def test_kill_targets_kills_matching_start() -> None:
     killed: list = []

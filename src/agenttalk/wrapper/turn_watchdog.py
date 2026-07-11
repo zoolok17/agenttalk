@@ -292,14 +292,12 @@ def proc_start(pid: int) -> float | None:
 
 def _kill_one(pid: int) -> bool:
     try:
-        if sys.platform.startswith("win"):
-            return subprocess.run(  # noqa: S603,S607  # nosec
-                ["taskkill", "/F", "/PID", str(pid)],
-                capture_output=True, text=True, timeout=10, check=False,
-            ).returncode == 0
         import os
         import signal
-        os.kill(pid, signal.SIGKILL)
+        if sys.platform.startswith("win"):
+            os.kill(pid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGKILL)
         return True
     except (OSError, subprocess.SubprocessError, ProcessLookupError):
         return False
