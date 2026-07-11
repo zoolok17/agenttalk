@@ -22,12 +22,16 @@ letterforms.
 > root-routing and client root-state statements (especially §3c and §7):
 >
 > - Every watched root has a stable path-derived `project_id`. Display labels
->   are not routing keys; duplicate basenames receive stable project-id suffixes
->   independent of root-list order.
-> - Team Console selected-root endpoints accept `?root=<project_id>`. Omitting
->   the parameter preserves first-root compatibility. An explicit unknown id
->   returns HTTP 400 with `error=bad_root`; it never falls back or mutates a
->   different root.
+>   are not canonical or write-routing keys; their only routing use is the
+>   unique-match GET compatibility below. Duplicate basenames receive stable
+>   project-id suffixes independent of root-list order.
+> - Selected-root GET endpoints accept `?root=<project_id>`, may omit it for
+>   root 0, and may retain a display-label fallback only when exactly one root
+>   matches. Blank, repeated, unknown, or ambiguous GET selectors return HTTP
+>   400 `bad_root`. Multi-root POST `/api/intent` and `/api/lead-chat`
+>   require exactly one full project id; labels and omission are forbidden,
+>   while single-root POST may omit it. Unknown, blank, repeated, ambiguous, or
+>   non-full write selectors return HTTP 400 `bad_root` before mutation.
 > - Every selected-root response carries
 >   `root_info: {project_id, label, path}` (or the equivalent target project id
 >   in the action envelope), so clients can validate routing before applying a

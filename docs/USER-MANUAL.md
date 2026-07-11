@@ -385,10 +385,17 @@ agenttalk serve
 
 The top bar always identifies the selected project by display label and full
 root path. In a multi-root dashboard, the path-derived `project_id` is the
-routing key; labels are display-only. Selected-root API calls use
-`?root=<project_id>` and return `root_info` containing id, label, and path.
-Omitting `root` keeps first-root compatibility. An unknown explicit id returns
-HTTP 400 `bad_root` and never falls back to another store.
+routing identity; labels are display-only for writes. Selected-root responses
+return `root_info` containing id, label, and path. GET may omit `root` to select
+root 0 and may use a legacy label only when it uniquely identifies one root.
+Blank, repeated, unknown, or ambiguous GET selectors return HTTP 400
+`bad_root`.
+
+Mutating POST `/api/intent` and `/api/lead-chat` are stricter: when multiple
+roots are served, they require exactly one full `?root=<project_id>`. They never
+fall back to a label, and an omitted selector is accepted only with one root.
+Unknown, blank, repeated, ambiguous, or non-full selectors return HTTP 400
+`bad_root` before anything is written.
 
 Changing the project clears thread drill-ins, caches, queued answers, and the
 action session before refetching. Responses from the old project are ignored

@@ -1778,10 +1778,17 @@ versioned JSON (`schema_version: 1`): an array of root objects, each
 fully namespaced (no cross-root merging), with per-root `errors` as
 data — one corrupt store renders as a degraded panel while the others
 stay live. Each root carries a stable path-derived `project_id`; the display
-label is not a routing key. Selected-root Team Console APIs accept
-`?root=<project_id>` and return `root_info` with `project_id`, label, and full
-path. Omitting `root` retains first-root compatibility. Supplying an unknown id
-returns HTTP 400 `bad_root` rather than falling back or mutating another store.
+label is not a write-routing key. Selected-root Team Console responses return
+`root_info` with `project_id`, label, and full path. GET routes may omit `root`
+for first-root compatibility and may accept a legacy display label only when it
+identifies exactly one root. A blank, repeated, unknown, or ambiguous GET
+selector returns HTTP 400 `bad_root`.
+
+Writes are stricter. When several roots are served, POST `/api/intent` and
+`/api/lead-chat` require exactly one full `?root=<project_id>`; label fallback
+and omission are forbidden. Omission is accepted only in single-root mode.
+Blank, repeated, unknown, ambiguous, or non-full selectors return HTTP 400
+`bad_root` before any mutation.
 Thread rows carry subjects and derived fields only, never message bodies; raw
 thread bodies are available through the selected-root `/api/thread/<id>` and
 lead-chat transcript surfaces. If a watched project contains `kitty-specs/`,

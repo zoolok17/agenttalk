@@ -351,8 +351,12 @@ do what is cheaper and more honest.
 **Current multi-root supersession (planned v0.74.0).** The first-root body
 surface above remains historical behavior for legacy message-browser routes,
 but Team Console routes now select a store by path-derived `project_id`.
-Selected-root responses carry `root_info`; an explicit unknown id returns HTTP
-400 `bad_root` and never falls back. `/api/thread/<id>` and `/api/lead-chat`
+Selected-root responses carry `root_info`. GET may omit the selector for root 0
+and may retain unique-label legacy compatibility. Multi-root POST to
+`/api/intent` or `/api/lead-chat` requires exactly one full project id; labels
+and omission are rejected, with omission allowed only for a single-root server.
+Unknown, blank, repeated, ambiguous, or otherwise invalid selectors return HTTP
+400 `bad_root` before mutation. `/api/thread/<id>` and `/api/lead-chat`
 therefore carry bodies for the selected root. Any local process that can reach
 the loopback port can query every exposed root; `project_id` is routing, not
 authorization or cross-root isolation. The browser clears root-bound state and

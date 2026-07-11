@@ -327,10 +327,15 @@ two parallel ownership concepts.
   `/api/lead-chat`), `intents.py` (typed schema + executor), `store.py`
   (`write_intent`, `list_intents`, lead-chat identity), `web_static/console.js`.
 - **Project identity and routing (planned v0.74.0):** every watched root has a
-  stable path-derived `project_id`; labels are display-only and duplicate
-  basenames receive stable id suffixes. Selected-root routes use
-  `?root=<project_id>`, return `root_info {project_id,label,path}`, and reject an
-  unknown explicit root with HTTP 400 `bad_root` rather than falling back.
+  stable path-derived `project_id`; labels are presentation plus read-only
+  legacy compatibility, never write-routing identity, and duplicate basenames
+  receive stable id suffixes. Selected-root responses return
+  `root_info {project_id,label,path}`. The read resolver permits omitted root 0
+  and exactly-one-label legacy compatibility; other read selectors fail with
+  HTTP 400 `bad_root`. The write resolver permits omission only for one served
+  root and otherwise requires one exact full project id; it never accepts
+  labels. Blank, repeated, unknown, ambiguous, or non-full write selectors fail
+  with HTTP 400 `bad_root` before mutation.
   The top bar always shows label plus full path. A root switch clears root-bound
   caches/drill-ins/action state, and late responses are accepted only when their
   project id matches the current selection. This prevents accidental cross-root
@@ -704,9 +709,12 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
 - **D-23 Dashboard routes by stable project identity (2026-07-11).** *Why:*
   root-list indexes and duplicate labels are unstable and allow late responses
   to paint or mutate the wrong project after a switch. *Decision:* path-derived
-  `project_id` is the routing key, selected-root responses echo `root_info`, an
-  unknown explicit root fails with `bad_root`, and the client generation-checks
-  all root-bound responses. *Ceiling:* the id is not an authorization token.
+  `project_id` is the write-routing identity and selected-root responses echo
+  `root_info`. Reads retain root-0 omission and unique-label compatibility;
+  multi-root writes require one exact full id, never a label or omission. Bad,
+  repeated, or ambiguous selectors fail before mutation, and the client
+  generation-checks all root-bound responses. *Ceiling:* the id is not an
+  authorization token.
 
 ## 6. How we work (process)
 

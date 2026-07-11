@@ -402,11 +402,15 @@ multi-user web app. Actions are disabled unless `--enable-actions` is passed.
 
 The top bar always shows the selected project label and full root path. In a
 multi-root dashboard, a stable path-derived `project_id` routes selected-root
-reads and actions; the label is display only. API requests use
-`?root=<project_id>` and responses include
-`root_info {project_id,label,path}`. Omitting the parameter defaults to the
-first root for compatibility; an unknown explicit id returns HTTP 400
-`bad_root` instead of silently choosing another project.
+reads and actions; the label is never write authority. Responses include
+`root_info {project_id,label,path}`. GET may omit the selector for root 0 or use
+a legacy label only when it uniquely identifies one root. Blank, repeated,
+unknown, or ambiguous GET selectors return HTTP 400 `bad_root`.
+
+For POST `/api/intent` and `/api/lead-chat`, a multi-root server requires one
+exact full `?root=<project_id>`. Label fallback is forbidden; omission is valid
+only for a single-root server. Unknown, blank, repeated, ambiguous, or non-full
+selectors return HTTP 400 `bad_root` before mutation.
 
 When the operator switches projects, the client clears root-bound drill-ins,
 caches, queued answers, and the action session, then refetches. It ignores late
