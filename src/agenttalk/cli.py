@@ -3206,6 +3206,14 @@ def _lane_checkpoint_publication(store, lane_id: str, pending: dict, artifact: P
         if (not isinstance(current_pending, dict)
                 or current_pending.get("transaction_id") != pending.get("transaction_id")):
             raise lane_mod.LaneError("lane publication marker no longer matches transaction")
+        expected_nonce = pending.get("terminal_rebind_nonce")
+        if (pending.get("terminal_rebound") is not True
+                or current_pending.get("terminal_rebound") is not True
+                or not re.fullmatch(r"[0-9a-f]{32}", str(expected_nonce or ""))
+                or current_pending.get("terminal_rebind_nonce") != expected_nonce):
+            raise lane_mod.LaneError(
+                "lane publication marker no longer matches terminal binding"
+            )
         lane["publish_pending"] = False
         lane["delivery_artifact"] = str(artifact)
         lane["published_at"] = _iso_now()

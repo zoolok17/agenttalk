@@ -2804,6 +2804,41 @@ def test_delivery_retry_recovers_when_publication_checkpoint_commits_then_fails(
     assert _committed_artifacts(store, lane_id) == first_final
 
 
+def test_publication_checkpoint_rejects_stale_terminal_rebind_nonce(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    lane_id = "checkpoint-stale-rebind"
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    argv = [
+        "lane", "deliver", "--id", lane_id, "--from", "dev", "--head", head,
+    ]
+    store, lane_state = _leave_rebound_publish_pending(
+        root, argv, lane_id, monkeypatch,
+    )
+    pending = dict(lane_state["publish_pending"])
+    artifact = Path(lanes.publish_delivery_artifact(store, pending))
+    replacement_nonce = (
+        "f" * 32 if pending["terminal_rebind_nonce"] != "f" * 32 else "e" * 32
+    )
+    data = lanes.load_lanes(store)
+    current_pending = dict(data["lanes"][lane_id]["publish_pending"])
+    current_pending["terminal_rebind_nonce"] = replacement_nonce
+    data["lanes"][lane_id]["publish_pending"] = current_pending
+    lanes.save_lanes(store, data)
+
+    with pytest.raises(lanes.LaneError, match="terminal binding"):
+        cli._lane_checkpoint_publication(store, lane_id, pending, artifact)
+
+    saved = lanes.load_lanes(store)["lanes"][lane_id]
+    assert saved["publish_pending"]["terminal_rebind_nonce"] == replacement_nonce
+    assert saved["publish_pending"] is not False
+    with pytest.raises(lanes.LaneError, match="pending"):
+        lanes.validate_delivery_artifact(
+            artifact, lane_id=lane_id, head_sha=head, store=store,
+            require_live_marker=True,
+        )
+
+
 def test_release_close_rejects_final_until_matching_pending_marker_completes(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture) -> None:
