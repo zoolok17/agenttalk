@@ -233,17 +233,20 @@ def test_handle_one_request_swallows_only_disconnects(
     assert handler.close_connection is False
 
 
-def _session(base: str) -> dict:
-    with _get(f"{base}/api/session") as resp:
+def _session(base: str, *, root: str | None = None) -> dict:
+    suffix = f"?root={urllib.parse.quote(root)}" if root else ""
+    with _get(f"{base}/api/session{suffix}") as resp:
         assert resp.status == 200
         return json.loads(resp.read())
 
 
 def _post_intent(base: str, token: str, payload: dict,
-                 *, origin: str | None = None, method: str = "POST"):
+                 *, origin: str | None = None, method: str = "POST",
+                 root: str | None = None):
     data = json.dumps(payload).encode("utf-8")
+    suffix = f"?root={urllib.parse.quote(root)}" if root else ""
     req = urllib.request.Request(  # noqa: S310  # nosemgrep
-        f"{base}/api/intent", method=method, data=data,
+        f"{base}/api/intent{suffix}", method=method, data=data,
         headers={
             "Content-Type": "application/json",
             "X-CSRF-Token": token,
@@ -734,6 +737,22 @@ def _make_two_stores(tmp_path: Path) -> tuple[Store, Store]:
     return a, b
 
 
+def _make_same_named_store_list(tmp_path: Path, count: int) -> list[Store]:
+    roots = [tmp_path / f"parent-{index}" / "project" for index in range(count)]
+    stores: list[Store] = []
+    for root in roots:
+        root.mkdir(parents=True)
+        store = Store(root)
+        store.init(["alpha", "beta"])
+        stores.append(store)
+    return stores
+
+
+def _make_same_named_stores(tmp_path: Path) -> tuple[Store, Store]:
+    stores = _make_same_named_store_list(tmp_path, 2)
+    return stores[0], stores[1]
+
+
 def _serve_multi(first: Store, *rest: Store):
     extra = [web.RootDescriptor(store=s, label=s.root.name) for s in rest]
     return web.serve_in_thread(first, extra=extra)
@@ -1128,11 +1147,421 @@ def test_api_state_multi_root_separation(tmp_path: Path) -> None:
         srv.server_close()
 
 
-def test_dedup_labels_case_insensitive() -> None:
-    labels = web._dedup_labels([
-        Path("C:/x/proj"), Path("C:/y/PROJ"), Path("C:/z/other"),
-    ])
-    assert labels == ["proj", "PROJ~2", "other"]
+def test_same_name_root_labels_are_stable_distinct_and_order_independent(
+    tmp_path: Path,
+) -> None:
+    a, b = _make_same_named_stores(tmp_path)
+    forward = web.make_descriptors([a.root, b.root])
+    reverse = web.make_descriptors([b.root, a.root])
+
+    by_path = {str(desc.store.root): desc.label for desc in forward}
+    reversed_by_path = {str(desc.store.root): desc.label for desc in reverse}
+    assert by_path == reversed_by_path
+    assert len(set(by_path.values())) == 2
+    assert a.project_id()[:8] in by_path[str(a.root)]
+    assert b.project_id()[:8] in by_path[str(b.root)]
+
+
+def test_multi_root_explicit_project_id_routes_every_console_get(
+    tmp_path: Path,
+) -> None:
+    a, b = _make_same_named_stores(tmp_path)
+    for store, marker in ((a, "from-a"), (b, "from-b")):
+        store.send(
+            sender="alpha",
+            recipient="beta",
+            kind="question",
+            subject=marker,
+            body=marker,
+            meta={"request_id": "rid-shared"},
+        )
+    b.write_intent("send", {"target": "beta", "body": "only-b"})
+
+    srv, _t, base = web.serve_in_thread(
+        a,
+        extra=[web.RootDescriptor(store=b, label=b.root.name)],
+        enable_actions=True,
+    )
+    try:
+        state_roots = _state(base)["roots"]
+        assert len({root["label"] for root in state_roots}) == 2
+        assert all(root["project_id"][:8] in root["label"] for root in state_roots)
+        project_id = urllib.parse.quote(b.project_id())
+        paths = (
+            "/api/session",
+            "/api/intents",
+            "/api/preflight",
+            "/api/attention",
+            "/api/learning",
+            "/api/onboarding",
+            "/api/lead-chat",
+            "/api/threads?state=closed",
+            "/api/thread/rid-shared",
+        )
+        for path in paths:
+            separator = "&" if "?" in path else "?"
+            with _get(f"{base}{path}{separator}root={project_id}") as resp:
+                assert resp.status == 200, path
+                payload = json.loads(resp.read())
+            assert payload["root_info"]["project_id"] == b.project_id(), path
+            assert payload["root_info"]["path"] == str(b.root), path
+            assert payload["target_root_project_id"] == b.project_id(), path
+
+        with _get(f"{base}/api/thread/rid-shared?root={project_id}") as resp:
+            thread = json.loads(resp.read())
+        assert [message["body"] for message in thread["messages"]] == ["from-b"]
+
+        with _get(f"{base}/api/intents") as resp:
+            primary = json.loads(resp.read())
+        assert primary["root_info"]["project_id"] == a.project_id()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_multi_root_session_and_post_mutate_only_selected_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a, b = _make_same_named_stores(tmp_path)
+    srv, _t, base = web.serve_in_thread(
+        a,
+        extra=[web.RootDescriptor(store=b, label=b.root.name)],
+        enable_actions=True,
+    )
+    try:
+        session = _session(base, root=b.project_id())
+        assert session["root_info"]["project_id"] == b.project_id()
+        with _post_intent(
+            base,
+            session["csrf_token"],
+            {
+                "kind": "send",
+                "payload": {
+                    "target": "beta",
+                    "body": "selected project only",
+                    "message_kind": "message",
+                },
+            },
+            root=b.project_id(),
+        ) as resp:
+            assert resp.status == 202
+            accepted = json.loads(resp.read())
+        assert accepted["root_info"]["project_id"] == b.project_id()
+        assert accepted["target_root_project_id"] == b.project_id()
+        assert a.list_intents() == []
+        assert [record["intent_id"] for record in b.list_intents()] == [
+            accepted["intent_id"]
+        ]
+
+        selected_chat_roots: list[Path] = []
+
+        class _Sent:
+            id = "lead-chat-selected-root"
+
+        def fake_lead_chat(target_store: Store, *, body: str):
+            selected_chat_roots.append(target_store.root)
+            assert body == "selected lead chat"
+            return _Sent(), {"request_id": "lc-selected"}, None
+
+        monkeypatch.setattr(web, "_send_authenticated_lead_chat", fake_lead_chat)
+        lead_body = json.dumps({"body": "selected lead chat"}).encode("utf-8")
+        request = urllib.request.Request(  # noqa: S310  # nosemgrep
+            f"{base}/api/lead-chat?root={b.project_id()}",
+            method="POST",
+            data=lead_body,
+            headers={
+                "Content-Type": "application/json",
+                "X-CSRF-Token": session["csrf_token"],
+                "Origin": base,
+            },
+        )
+        with _urlopen(request, timeout=5) as resp:
+            assert resp.status == 202
+            lead_chat = json.loads(resp.read())
+        assert selected_chat_roots == [b.root]
+        assert lead_chat["root_info"]["project_id"] == b.project_id()
+        assert lead_chat["target_root_project_id"] == b.project_id()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "payload"),
+    [
+        (
+            "/api/intent",
+            {
+                "kind": "send",
+                "payload": {"target": "beta", "body": "must not route"},
+            },
+        ),
+        ("/api/lead-chat", {"body": "must not route"}),
+    ],
+)
+@pytest.mark.parametrize("selector", ["omitted", "label", "blank", "repeated"])
+def test_multi_root_posts_require_one_full_project_id_without_mutation(
+    tmp_path: Path, endpoint: str, payload: dict, selector: str,
+) -> None:
+    a, b = _make_same_named_stores(tmp_path)
+    srv, _t, base = web.serve_in_thread(
+        a,
+        extra=[web.RootDescriptor(store=b, label=b.root.name)],
+        enable_actions=True,
+    )
+    try:
+        token = _session(base)["csrf_token"]
+        roots = _state(base)["roots"]
+        if selector == "omitted":
+            suffix = ""
+        elif selector == "label":
+            suffix = "?root=" + urllib.parse.quote(roots[1]["label"])
+        elif selector == "blank":
+            suffix = "?root="
+        else:
+            suffix = f"?root={a.project_id()}&root={a.project_id()}"
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(  # noqa: S310  # nosemgrep
+            f"{base}{endpoint}{suffix}",
+            method="POST",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-CSRF-Token": token,
+                "Origin": base,
+            },
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _urlopen(request, timeout=5)
+        assert exc.value.code == 400
+        assert json.loads(exc.value.read())["error"] == "bad_root"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert a.list_intents() == []
+    assert b.list_intents() == []
+    assert list(a.valid_messages()) == []
+    assert list(b.valid_messages()) == []
+
+
+def test_single_root_omitted_posts_remain_compatible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _make_store(tmp_path)
+    selected_chat_roots: list[Path] = []
+
+    class _Sent:
+        id = "single-root-lead-chat"
+
+    def fake_lead_chat(target_store: Store, *, body: str):
+        selected_chat_roots.append(target_store.root)
+        assert body == "single root"
+        return _Sent(), {"request_id": "lc-single"}, None
+
+    monkeypatch.setattr(web, "_send_authenticated_lead_chat", fake_lead_chat)
+    srv, _t, base = _serve(store, enable_actions=True)
+    try:
+        token = _session(base)["csrf_token"]
+        with _post_intent(
+            base,
+            token,
+            {
+                "kind": "send",
+                "payload": {"target": "beta", "body": "single root"},
+            },
+        ) as resp:
+            intent_result = json.loads(resp.read())
+        assert intent_result["target_root_project_id"] == store.project_id()
+
+        body = json.dumps({"body": "single root"}).encode("utf-8")
+        request = urllib.request.Request(  # noqa: S310  # nosemgrep
+            f"{base}/api/lead-chat",
+            method="POST",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-CSRF-Token": token,
+                "Origin": base,
+            },
+        )
+        with _urlopen(request, timeout=5) as resp:
+            lead_result = json.loads(resp.read())
+        assert lead_result["target_root_project_id"] == store.project_id()
+        assert selected_chat_roots == [store.root]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_multi_root_bad_csrf_is_rejected_for_each_selected_project(
+    tmp_path: Path,
+) -> None:
+    a, b = _make_same_named_stores(tmp_path)
+    srv, _t, base = web.serve_in_thread(
+        a,
+        extra=[web.RootDescriptor(store=b, label=b.root.name)],
+        enable_actions=True,
+    )
+    try:
+        token = _session(base)["csrf_token"]
+        for selected in (a, b):
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                _post_intent(
+                    base,
+                    token + "-wrong",
+                    {
+                        "kind": "send",
+                        "payload": {"target": "beta", "body": "bad csrf"},
+                    },
+                    root=selected.project_id(),
+                )
+            assert exc.value.code == 403
+            assert json.loads(exc.value.read())["error"] == "bad_csrf"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert a.list_intents() == []
+    assert b.list_intents() == []
+
+
+def test_three_same_name_roots_route_by_id_and_unique_legacy_label(
+    tmp_path: Path,
+) -> None:
+    stores = _make_same_named_store_list(tmp_path, 3)
+    for index, store in enumerate(stores):
+        store.send(
+            sender="alpha",
+            recipient="beta",
+            body=f"root-{index}",
+            meta={"request_id": "rid-three"},
+        )
+    srv, _t, base = _serve_multi(stores[0], *stores[1:])
+    try:
+        roots = _state(base)["roots"]
+        assert len({root["label"] for root in roots}) == 3
+        for index, (store, root) in enumerate(zip(stores, roots, strict=True)):
+            assert root["project_id"] == store.project_id()
+            for selector in (store.project_id(), root["label"]):
+                with _get(
+                    f"{base}/api/thread/rid-three?root={urllib.parse.quote(selector)}"
+                ) as resp:
+                    payload = json.loads(resp.read())
+                assert payload["target_root_project_id"] == store.project_id()
+                assert [item["body"] for item in payload["messages"]] == [
+                    f"root-{index}"
+                ]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_duplicate_project_id_descriptors_are_rejected(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    roots = [
+        web.RootDescriptor(store=store, label="first"),
+        web.RootDescriptor(store=store, label="second"),
+    ]
+    with pytest.raises(ValueError, match="duplicate dashboard project_id"):
+        web._make_handler(roots)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/intents",
+        "/api/preflight",
+        "/api/attention",
+        "/api/learning",
+        "/api/onboarding",
+        "/api/lead-chat",
+        "/api/threads?state=closed",
+        "/api/thread/rid-shared",
+    ],
+)
+def test_explicit_unknown_root_fails_closed_for_console_gets(
+    tmp_path: Path, path: str,
+) -> None:
+    a, b = _make_same_named_stores(tmp_path)
+    a.send(
+        sender="alpha",
+        recipient="beta",
+        body="must not leak",
+        meta={"request_id": "rid-shared"},
+    )
+    srv, _t, base = _serve_multi(a, b)
+    try:
+        separator = "&" if "?" in path else "?"
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _get(f"{base}{path}{separator}root=missing-project")
+        assert exc.value.code == 400, path
+        assert json.loads(exc.value.read())["error"] == "bad_root", path
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_repeated_root_query_fails_closed_for_console_get(tmp_path: Path) -> None:
+    a, b = _make_same_named_stores(tmp_path)
+    srv, _t, base = _serve_multi(a, b)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _get(
+                f"{base}/api/intents?root={a.project_id()}&root={a.project_id()}"
+            )
+        assert exc.value.code == 400
+        assert json.loads(exc.value.read())["error"] == "bad_root"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_explicit_unknown_root_post_fails_without_mutation(tmp_path: Path) -> None:
+    a, b = _make_same_named_stores(tmp_path)
+    srv, _t, base = web.serve_in_thread(
+        a,
+        extra=[web.RootDescriptor(store=b, label=b.root.name)],
+        enable_actions=True,
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _session(base, root="missing-project")
+        assert exc.value.code == 400
+        assert json.loads(exc.value.read())["error"] == "bad_root"
+
+        token = _session(base)["csrf_token"]
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post_intent(
+                base,
+                token,
+                {
+                    "kind": "send",
+                    "payload": {"target": "beta", "body": "wrong root"},
+                },
+                root="missing-project",
+            )
+        assert exc.value.code == 400
+        assert json.loads(exc.value.read())["error"] == "bad_root"
+
+        body = json.dumps({"body": "wrong root"}).encode("utf-8")
+        request = urllib.request.Request(  # noqa: S310  # nosemgrep
+            f"{base}/api/lead-chat?root=missing-project",
+            method="POST",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-CSRF-Token": token,
+                "Origin": base,
+            },
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _urlopen(request, timeout=5)
+        assert exc.value.code == 400
+        assert json.loads(exc.value.read())["error"] == "bad_root"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert a.list_intents() == []
+    assert b.list_intents() == []
 
 
 def test_api_state_corrupt_root_isolated(tmp_path: Path) -> None:
@@ -2339,6 +2768,7 @@ def test_console_all_dashboard_views_render_smoke_non_empty_main(tmp_path: Path)
         marker,
         "  globalThis.__agenttalkConsoleTestHooks = {\n"
         "    state: state,\n"
+        "    renderChrome: renderChrome,\n"
         "    renderActiveView: renderActiveView,\n"
         "    setPayloads: function (payloads) {\n"
         "      lastState = payloads.lastState;\n"
@@ -2499,6 +2929,7 @@ const main = makeNode('main');
 main.setAttribute('id', 'main');
 const document = {
   body: makeNode('body'),
+  title: '',
   activeElement: null,
   readyState: 'loading',
   createElement: makeNode,
@@ -2538,6 +2969,8 @@ const now = Date.now();
 const iso = new Date(now - 30_000).toISOString();
 const root = {
   label: 'demo-root',
+  path: 'D:\\work\\demo-root',
+  project_id: 'project-demo-id',
   operator: { principal: 'operator', label: 'Operator', role_label: 'operator' },
   spec_kitty: { missions: ['smoke-mission'] },
   counts: { closed_threads: 1 },
@@ -2806,7 +3239,7 @@ const payloads = {
     items: [{ intent_id: 'intent-1', kind: 'send', state: 'queued', code: 'queued' }],
   },
   threadCache: {
-    'demo-root|rid-qa': {
+    'project-demo-id|rid-qa': {
       request_id: 'rid-qa',
       subject: 'All views QA task',
       participants: ['claude-lead', 'codex-test'],
@@ -2857,21 +3290,246 @@ const cases = [
 for (const tc of cases) {
   hooks.setPayloads(payloads);
   hooks.state.view = tc.view;
-  hooks.state.selectedRoot = 0;
+  hooks.state.selectedRootId = root.project_id;
   hooks.state.selectedAgent = tc.selectedAgent || null;
   hooks.state.sessionRid = tc.sessionRid || null;
   hooks.state.filter = 'all';
   main.children = [];
   main.firstChild = null;
   main.textContent = '';
+  hooks.renderChrome();
   hooks.renderActiveView();
   const text = collectText(main).replace(/\s+/g, ' ').trim();
+  const topbarText = collectText(topbar).replace(/\s+/g, ' ').trim();
+  const pathNode = findByClass(topbar, 'tc-project-path');
   assert(main.children.length > 0, `${tc.view} did not append content`);
   assert(text.length > 0, `${tc.view} rendered an empty main pane`);
+  assert(topbarText.includes('demo-root'), `${tc.view} missing project label`);
+  assert(topbarText.includes('D:\\work\\demo-root'), `${tc.view} missing project path`);
+  assert(pathNode && pathNode.getAttribute('title') === 'D:\\work\\demo-root',
+    `${tc.view} missing full accessible project path`);
+  assert(document.title.includes('demo-root'), `${tc.view} title missing project`);
+  assert(document.title.toLowerCase().includes(tc.view === 'lead-chat' ? 'lead chat' : tc.view),
+    `${tc.view} title missing view: ${document.title}`);
   for (const expected of tc.expected) {
     assert(text.includes(expected), `${tc.view} missing expected text: ${expected}\nrendered: ${text}`);
   }
 }
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+def test_console_project_switch_uses_ids_resets_context_and_drops_stale_data(
+    tmp_path: Path,
+) -> None:
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console project-switch test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  var testQueuedCallbacks = 0;\n"
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    setState: function (payload, projectId) {\n"
+        "      lastState = payload;\n"
+        "      state.selectedRootId = projectId;\n"
+        "    },\n"
+        "    setDrillIns: function () {\n"
+        "      state.view = 'agent';\n"
+        "      state.selectedAgent = 'alpha';\n"
+        "      state.sessionRid = 'rid-old';\n"
+        "      threadCache = {'project-a|rid-old': {request_id: 'rid-old'}};\n"
+        "      attentionData = {root_info: {project_id: 'project-a'}, count: 7};\n"
+        "    },\n"
+        "    applyProjectSelection: applyProjectSelection,\n"
+        "    reconcileProjectSelection: reconcileProjectSelection,\n"
+        "    fetchRootPayloads: fetchRootPayloads,\n"
+        "    fetchAttention: fetchAttention,\n"
+        "    enableActions: function () {\n"
+        "      actionSession.enabled = true;\n"
+        "      actionSession.token = 'test-token';\n"
+        "      actionSession.pending = false;\n"
+        "      actionSession.error = '';\n"
+        "    },\n"
+        "    postTestIntent: function () {\n"
+        "      postIntent({kind: 'send', payload: {target: 'beta', body: 'captured A'}},\n"
+        "        false, function () { testQueuedCallbacks += 1; });\n"
+        "    },\n"
+        "    rootUrl: rootUrl,\n"
+        "    snapshot: function () {\n"
+        "      return {\n"
+        "        projectId: state.selectedRootId,\n"
+        "        view: state.view,\n"
+        "        selectedAgent: state.selectedAgent,\n"
+        "        sessionRid: state.sessionRid,\n"
+        "        threadKeys: Object.keys(threadCache),\n"
+        "        attention: attentionData,\n"
+        "        actionPending: actionSession.pending,\n"
+        "        actionError: actionSession.error,\n"
+        "        queuedCallbacks: testQueuedCallbacks,\n"
+        "      };\n"
+        "    }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-project.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-project-switch.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg);
+}
+
+const calls = [];
+function deferredFetch(url) {
+  return new Promise((resolve) => calls.push({ url: String(url), resolve }));
+}
+function response(ok, data) {
+  return { ok, status: ok ? 200 : 404, json() { return Promise.resolve(data || {}); } };
+}
+async function flush() {
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+}
+
+const historyValues = [];
+const document = {
+  readyState: 'loading',
+  title: '',
+  addEventListener() {},
+  getElementById() { return null; },
+  querySelector() { return null; },
+  querySelectorAll() { return []; },
+  createElement() { return {}; },
+  createElementNS() { return {}; },
+};
+const ctx = {
+  console,
+  document,
+  location: { pathname: '/dashboard', search: '', hash: '' },
+  history: { replaceState(_state, _title, value) { historyValues.push(String(value)); } },
+  URL,
+  URLSearchParams,
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  setInterval() {},
+  clearInterval() {},
+  fetch: deferredFetch,
+  __agenttalkConsoleTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+ctx.__agenttalkConsoleTestHooks = {};
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+const hooks = ctx.__agenttalkConsoleTestHooks;
+
+(async () => {
+  const rootA = { label: 'project [aaaa1111]', path: 'D:\\one\\project', project_id: 'project-a', agents: [] };
+  const rootB = { label: 'project [bbbb2222]', path: 'D:\\two\\project', project_id: 'project-b', agents: [] };
+  hooks.setState({ roots: [rootA, rootB] }, rootA.project_id);
+  hooks.setDrillIns();
+
+  hooks.enableActions();
+  hooks.postTestIntent();
+  assert(calls.length === 1 && calls[0].url.startsWith('/api/intent') &&
+    calls[0].url.includes('root=project-a'),
+    `in-flight POST was not captured for project A: ${JSON.stringify(calls)}`);
+  const inFlightPost = calls[0];
+  assert(hooks.applyProjectSelection(rootB.project_id), 'POST-time project switch failed');
+  let snapshot = hooks.snapshot();
+  assert(!snapshot.actionPending,
+    `project switch retained project A pending state: ${JSON.stringify(snapshot)}`);
+  inFlightPost.resolve(response(true, {
+    root_info: { project_id: rootA.project_id },
+    target_root_project_id: rootA.project_id,
+    intent_id: 'intent-a',
+    state: 'queued',
+  }));
+  await flush();
+  snapshot = hooks.snapshot();
+  assert(snapshot.projectId === rootB.project_id, 'POST response changed the selected project');
+  assert(snapshot.queuedCallbacks === 0 && snapshot.actionError === '' && !snapshot.actionPending,
+    `stale project-A POST response affected project B: ${JSON.stringify(snapshot)}`);
+  assert(calls.length === 1, 'stale POST response triggered current-project refetches');
+
+  assert(hooks.applyProjectSelection(rootA.project_id), 'switch back before attention failed');
+  hooks.fetchAttention();
+  assert(calls.length === 2 && calls[1].url.includes('root=project-a'),
+    `initial attention was not project scoped: ${JSON.stringify(calls)}`);
+  const staleAttention = calls[1];
+
+  assert(hooks.applyProjectSelection(rootB.project_id), 'project switch was rejected');
+  snapshot = hooks.snapshot();
+  assert(snapshot.projectId === rootB.project_id, 'selected project id did not change');
+  assert(snapshot.view === 'overview', 'agent drill-in did not return to overview');
+  assert(snapshot.selectedAgent === null && snapshot.sessionRid === null,
+    'root-bound drill-ins were not cleared');
+  assert(snapshot.threadKeys.length === 0 && snapshot.attention === null,
+    'root-bound caches were not cleared');
+  assert(historyValues.at(-1).includes('root=project-b'),
+    `URL was not persisted by project id: ${historyValues.at(-1)}`);
+  assert(document.title.includes(rootB.label) && document.title.toLowerCase().includes('overview'),
+    `document title lacks project/view context: ${document.title}`);
+
+  hooks.fetchRootPayloads();
+  const selectedCalls = calls.slice(2);
+  const expected = ['/api/session', '/api/intents', '/api/attention', '/api/lead-chat',
+    '/api/learning', '/api/onboarding'];
+  for (const endpoint of expected) {
+    const call = selectedCalls.find((item) => item.url.startsWith(endpoint));
+    assert(call, `project switch did not refetch ${endpoint}`);
+    assert(call.url.includes('root=project-b'), `${endpoint} used the wrong root: ${call.url}`);
+  }
+
+  const currentAttention = selectedCalls.find((item) => item.url.startsWith('/api/attention'));
+  currentAttention.resolve(response(true, {
+    root_info: { project_id: rootB.project_id }, count: 2, items: [],
+  }));
+  for (const call of selectedCalls) {
+    if (call !== currentAttention) call.resolve(response(false, {}));
+  }
+  await flush();
+  snapshot = hooks.snapshot();
+  assert(snapshot.attention && snapshot.attention.count === 2,
+    `current project response did not commit: ${JSON.stringify(snapshot.attention)}`);
+
+  assert(hooks.applyProjectSelection(rootA.project_id), 'switch back to project A failed');
+  hooks.fetchAttention();
+  const currentA = calls.at(-1);
+  currentA.resolve(response(true, {
+    root_info: { project_id: rootA.project_id }, count: 3, items: [],
+  }));
+  await flush();
+  staleAttention.resolve(response(true, {
+    root_info: { project_id: rootA.project_id }, count: 99, items: [],
+  }));
+  await flush();
+
+  snapshot = hooks.snapshot();
+  assert(snapshot.attention && snapshot.attention.count === 3,
+    `pre-switch response became current after A-B-A: ${JSON.stringify(snapshot.attention)}`);
+
+  hooks.setState({ roots: [rootB, rootA] }, rootA.project_id);
+  assert(!hooks.reconcileProjectSelection(), 'root reorder changed the selected project');
+  assert(hooks.snapshot().projectId === rootA.project_id,
+    'root reorder changed project-id selection');
+
+  hooks.setState({ roots: [rootB] }, rootA.project_id);
+  assert(hooks.reconcileProjectSelection(), 'removed project did not select the fallback');
+  assert(hooks.snapshot().projectId === rootB.project_id,
+    'removed project did not fall back to root 0');
+  assert(historyValues.at(-1).includes('root=project-b'),
+    'fallback project id was not persisted to the URL');
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : err);
+  process.exitCode = 1;
+});
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)
@@ -2921,6 +3579,10 @@ def test_console_compact_density_has_material_size_delta_and_mobile_guards(tmp_p
     assert _px(compact["--agent-card-min"]) < _px(comfortable["--agent-card-min"])
     assert "grid-template-columns: minmax(0, 1fr);" in css
     assert "overflow-wrap: anywhere;" in css
+    assert ".tc-project-context" in css
+    assert ".tc-project-path" in css
+    assert "text-overflow: ellipsis;" in css
+    assert "max-width: calc(100vw - 24px);" in css
 
 
 def test_shaped_avatar_css_is_scoped_and_preserves_originals(tmp_path: Path) -> None:
@@ -3872,7 +4534,20 @@ def test_api_attention_shape_and_gate_hold(tmp_path: Path) -> None:
     srv, _t, base = _serve(s)
     try:
         payload = _attention(base)
-        assert set(payload) == {"root", "items", "count"}
+        assert set(payload) == {
+            "root",
+            "root_path",
+            "root_info",
+            "target_root_project_id",
+            "items",
+            "count",
+        }
+        assert payload["target_root_project_id"] == s.project_id()
+        assert payload["root_info"] == {
+            "project_id": s.project_id(),
+            "label": s.root.name,
+            "path": str(s.root),
+        }
         assert payload["count"] == len(payload["items"])
         assert payload["root"] == s.root.name
         for it in payload["items"]:

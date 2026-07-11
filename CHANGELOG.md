@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The Team Console keeps project identity visible and root-safe.** Every view now shows the
+  selected project's stable display label and absolute root, persists selection by path-derived
+  project ID in the dashboard URL and browser title, and scopes dashboard reads and writes to that
+  project. Multi-root writes require one explicit full project ID and never resolve display labels;
+  explicit unknown, blank, repeated, or ambiguous roots fail closed instead of falling back to the
+  primary project, and duplicate descriptors for one project ID are rejected at startup.
+
 ### Fixed
 
 - **Windows turn-watchdog termination no longer launches `taskkill.exe`.** Verified

@@ -54,7 +54,7 @@ Routes
 - ``GET  /dashboard``           — the Team Console HTML shell (all roots; 0.58.0)
 - ``GET  /static/<name>``       — allowlisted console assets (css/js/png; 0.58.0/0.61.0)
 - ``GET  /api/state``           — multi-root obligation aggregate, schema v1 (0.17.0)
-- ``GET  /api/attention``       — ranked "needs a human" queue for root[0] (0.58.0)
+- ``GET  /api/attention``       — ranked "needs a human" queue for a selected root
 - ``GET  /api/learning``        — lesson ledger + pointer-only exposure telemetry
 - ``GET  /api/onboarding``      — project/codebase onboarding runs + evidence pointers
 - ``GET  /api/thread/<rid>``    — one thread's full transcript, CARRIES bodies (0.58.0)
@@ -69,12 +69,16 @@ Routes
 Multi-root (0.17.0)
 ===================
 One server can watch several stores (``agenttalk dashboard --store A
---store B``). The first root is **root[0]**: every pre-0.17.0 route keeps
-binding to it unchanged, so single-root ``serve`` behavior is preserved
-byte-for-byte. ``/api/state`` and ``/dashboard`` render all roots, each
-namespaced under its own entry — never merged. A corrupt or uninitialized
-root degrades to an ``errors`` entry in the payload; it cannot 5xx the
-aggregate or affect sibling roots.
+--store B``). Legacy status/message routes remain bound to **root[0]**.
+Team Console feeds accept an optional path-derived project ID in ``?root=``;
+omission preserves root[0] compatibility, and a unique display label remains a
+read-only legacy selector. With multiple roots, actions require exactly one
+explicit full project ID and never resolve display labels; single-root actions
+may omit ``root`` for compatibility. Unknown, blank, repeated, or ambiguous
+selectors fail closed. ``/api/state`` and ``/dashboard`` render all roots, each
+namespaced under its own entry — never merged. A corrupt or uninitialized root
+degrades to an ``errors`` entry in the payload; it cannot 5xx the aggregate or
+affect sibling roots.
 
 CSP note: ``/dashboard`` is the ONLY route whose Content-Security-Policy
 allows (self-hosted) script + stylesheet + fetch — it renders no
@@ -274,22 +278,60 @@ class _RootThreadRows:
     terminal: list[dict]
 
 
-def _dedup_labels(paths: list[Path]) -> list[str]:
-    """Directory basenames, deduplicated case-insensitively with ~2/~3…
+def _stable_root_labels(labels: list[str], project_ids: list[str]) -> list[str]:
+    """Make duplicate display labels stable under root-list reordering."""
+    out = list(labels)
+    groups: dict[str, list[int]] = {}
+    for index, label in enumerate(labels):
+        groups.setdefault(label.casefold(), []).append(index)
+    for indexes in groups.values():
+        if len(indexes) == 1:
+            continue
+        width = 8
+        while (
+            width < 64
+            and len({project_ids[index][:width] for index in indexes}) < len(indexes)
+        ):
+            width += 1
+        for index in indexes:
+            out[index] = f"{labels[index]} [{project_ids[index][:width]}]"
+    return out
 
-    Windows-first: two paths differing only in case still collide, so
-    the comparison key is casefolded while the emitted label keeps the
-    original spelling.
-    """
+
+def _dedup_labels(paths: list[Path]) -> list[str]:
+    """Directory basenames with stable path-derived duplicate suffixes."""
+    stores = [Store(path) for path in paths]
+    labels = [store.root.name or str(store.root) for store in stores]
+    return _stable_root_labels(labels, [store.project_id() for store in stores])
+
+
+def _normalize_descriptors(roots: list[RootDescriptor]) -> list[RootDescriptor]:
+    """Normalize caller labels and reject duplicate project identities."""
     labels: list[str] = []
-    seen: dict[str, int] = {}
-    for p in paths:
-        base = p.name or str(p)
-        key = base.casefold()
-        n = seen.get(key, 0) + 1
-        seen[key] = n
-        labels.append(base if n == 1 else f"{base}~{n}")
-    return labels
+    project_ids: list[str] = []
+    for desc in roots:
+        project_id = desc.store.project_id()
+        label = desc.label.strip() or desc.store.root.name or str(desc.store.root)
+        match = re.search(r" \[([0-9a-f]{8,64})\]$", label)
+        if match and project_id.startswith(match.group(1)):
+            label = label[:match.start()]
+        labels.append(label)
+        project_ids.append(project_id)
+    if len(set(project_ids)) != len(project_ids):
+        raise ValueError("duplicate dashboard project_id descriptors are unsupported")
+    stable = _stable_root_labels(labels, project_ids)
+    return [
+        RootDescriptor(store=desc.store, label=label)
+        for desc, label in zip(roots, stable, strict=True)
+    ]
+
+
+def _root_info(desc: RootDescriptor) -> dict[str, str]:
+    return {
+        "project_id": desc.store.project_id(),
+        "label": desc.label,
+        "path": str(desc.store.root),
+    }
 
 
 def make_descriptors(paths: list[Path]) -> list[RootDescriptor]:
@@ -384,12 +426,15 @@ def _intent_public_record(rec: dict, *, now: datetime) -> dict:
     return out
 
 
-def build_intents(roots: list[RootDescriptor], *, limit: int = 100) -> dict:
+def build_intents(roots: list[RootDescriptor], *, limit: int = 100,
+                  root_index: int = 0) -> dict:
     """Read-only intent status feed. Message bodies are deliberately omitted."""
     now = datetime.now(timezone.utc)
-    root = roots[0]
+    root = roots[root_index]
     return {
-        "target_root_index": 0,
+        "root_info": _root_info(root),
+        "target_root_index": root_index,
+        "target_root_project_id": root.store.project_id(),
         "target_root_label": root.label,
         "target_root_path": str(root.store.root),
         "items": [
@@ -399,7 +444,8 @@ def build_intents(roots: list[RootDescriptor], *, limit: int = 100) -> dict:
     }
 
 
-def build_preflight(root: RootDescriptor, *, actions_enabled: bool) -> dict:
+def build_preflight(root: RootDescriptor, *, actions_enabled: bool,
+                    root_index: int = 0) -> dict:
     """Read-only dashboard bootstrap/preflight checks. No store writes."""
     store = root.store
     initialized = store.initialized()
@@ -434,7 +480,9 @@ def build_preflight(root: RootDescriptor, *, actions_enabled: bool) -> dict:
         "browser intent enqueueing is enabled" if actions_enabled
         else "restart dashboard with --enable-actions to enqueue intents")
     return {
-        "target_root_index": 0,
+        "root_info": _root_info(root),
+        "target_root_index": root_index,
+        "target_root_project_id": store.project_id(),
         "target_root_label": root.label,
         "target_root_path": str(store.root),
         "checks": checks,
@@ -1537,6 +1585,7 @@ def _root_state(desc: RootDescriptor,
     the build pure.
     """
     label, path = desc.label, str(desc.store.root)
+    project_id = desc.store.project_id()
     try:
         store = desc.store
         cfg = store.load_config()
@@ -1566,7 +1615,7 @@ def _root_state(desc: RootDescriptor,
         out: dict[str, Any] = {
             "label": label,
             "path": path,
-            "project_id": store.project_id(),
+            "project_id": project_id,
             "errors": [],
             "signing_enforced": store.signing_enforced(),
             "epoch": current,
@@ -1640,7 +1689,12 @@ def _root_state(desc: RootDescriptor,
         # never escape and 500 the entire /api/state aggregate. A broad catch is
         # strictly safer than propagating an unanticipated exception type
         # (review). The errors-as-data shape is the documented degraded form.
-        return {"label": label, "path": path, "errors": [str(e)]}
+        return {
+            "label": label,
+            "path": path,
+            "project_id": project_id,
+            "errors": [str(e)],
+        }
 
 
 def build_state(roots: list[RootDescriptor],
@@ -1669,6 +1723,9 @@ def build_threads_index(desc: RootDescriptor, *, state: str = "closed",
     limit = max(1, min(_THREADS_MAX_LIMIT, limit))
     payload: dict[str, Any] = {
         "root": desc.label,
+        "root_path": str(desc.store.root),
+        "root_info": _root_info(desc),
+        "target_root_project_id": desc.store.project_id(),
         "state": state,
         "limit": limit,
         "total_count": 0,
@@ -1984,7 +2041,8 @@ def build_learning(desc: RootDescriptor, *, status: str = "active",
         "generated_at": _learning_now(),
         "root": desc.label,
         "root_path": str(desc.store.root),
-        "root_info": {"label": desc.label, "path": str(desc.store.root)},
+        "root_info": _root_info(desc),
+        "target_root_project_id": desc.store.project_id(),
         "filters": {
             "status": status,
             "scope": scope or "",
@@ -2155,7 +2213,8 @@ def build_onboarding(desc: RootDescriptor, *,
         "generated_at": _onboarding_now(),
         "root": desc.label,
         "root_path": str(desc.store.root),
-        "root_info": {"label": desc.label, "path": str(desc.store.root)},
+        "root_info": _root_info(desc),
+        "target_root_project_id": desc.store.project_id(),
         "filters": {"limit": limit},
         "runs": [],
         "counts": {
@@ -2224,7 +2283,7 @@ def build_onboarding(desc: RootDescriptor, *,
 
 # --------------------------------------------------- /api/attention (§4a)
 #
-# The ranked "needs a human" queue for root[0]. Composed from the PURE
+# The ranked "needs a human" queue for one selected root. Composed from the PURE
 # attention.build_queue (escalations / gate HOLD / dead-letter / lead-unarmed /
 # capacity / config-blocked / close HOLD) PLUS a derived STUCK item per agent
 # whose advisory health.state == "stuck_suspected" (stuck is NOT a build_queue
@@ -2405,7 +2464,7 @@ def build_attention(desc: RootDescriptor,
                     actions_enabled: bool = False) -> dict:
     """The /api/attention payload for one root (§4a). Envelope-only: every
     string here is envelope-derived — a raw message body NEVER lands in a
-    field. ``agents`` (root[0]'s /api/state agent rows) supplies the derived
+    field. ``agents`` (the selected root's /api/state rows) supplies the derived
     STUCK items; when omitted they are computed from a fresh scan.
 
     FAIL-SAFE (parity with /api/state's errors-as-data, review B1): a corrupt or
@@ -2479,9 +2538,24 @@ def build_attention(desc: RootDescriptor,
             except Exception:  # noqa: BLE001 — stuck items are best-effort
                 agents = []
         wire.extend(_derive_stuck_items(agents, now=now))
-        return {"root": desc.label, "items": wire, "count": len(wire)}
+        return {
+            "root": desc.label,
+            "root_path": str(store.root),
+            "root_info": _root_info(desc),
+            "target_root_project_id": store.project_id(),
+            "items": wire,
+            "count": len(wire),
+        }
     except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500 (B1)
-        return {"root": desc.label, "items": [], "count": 0, "errors": [str(e)]}
+        return {
+            "root": desc.label,
+            "root_path": str(store.root),
+            "root_info": _root_info(desc),
+            "target_root_project_id": store.project_id(),
+            "items": [],
+            "count": 0,
+            "errors": [str(e)],
+        }
 
 
 # NEEDS_OPERATOR titles/details are typed single-line fields the attention layer
@@ -2756,6 +2830,8 @@ def build_lead_chat(desc: RootDescriptor, *, limit: int = _LEAD_CHAT_LIMIT) -> d
     payload: dict[str, Any] = {
         "root": desc.label,
         "root_path": str(store.root),
+        "root_info": _root_info(desc),
+        "target_root_project_id": store.project_id(),
         "available": False,
         "status": "unavailable",
         "messages": [],
@@ -2802,9 +2878,10 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
     """Build a request handler class closed over the watched roots.
 
     Returns a class (not an instance) because ``ThreadingHTTPServer``
-    instantiates it per connection. ``roots[0]`` is the binding target
-    for every pre-0.17.0 route (FR-009).
+    instantiates it per connection. Legacy routes stay bound to ``roots[0]``;
+    Team Console routes resolve their optional ``?root=`` selection here.
     """
+    roots = _normalize_descriptors(roots)
     store = roots[0].store
     # Health-timeline ring (§5): one instance per SERVER (closed over here, not
     # a module global) so parallel test servers never share history. In-memory
@@ -3025,8 +3102,10 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 rate["tokens"] = float(rate["tokens"]) - 1.0
                 return True
 
-        def _active_intent_capacity_ok(self) -> tuple[bool, str, str]:
-            count, size = store._intent_active_usage()  # noqa: SLF001 - web maps the store cap to HTTP before parse
+        def _active_intent_capacity_ok(
+            self, target_store: Store,
+        ) -> tuple[bool, str, str]:
+            count, size = target_store._intent_active_usage()  # noqa: SLF001 - web maps the store cap to HTTP before parse
             if count >= Store.INTENT_MAX_ACTIVE:
                 return False, "intent_cap", "too many active intents"
             if size >= Store.INTENT_MAX_ACTIVE_BYTES:
@@ -3065,12 +3144,19 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 self._json_problem(HTTPStatus.FORBIDDEN, "bad_origin",
                                    "session endpoint requires same-origin loopback headers")
                 return
+            selected = self._root_selection(self._request_params())
+            if selected is None:
+                self._bad_root()
+                return
+            root_index, root = selected
             self._send_json(HTTPStatus.OK, {
                 "session_id": session_id,
                 "csrf_token": csrf_token,
-                "target_root_index": 0,
-                "target_root_label": roots[0].label,
-                "target_root_path": str(store.root),
+                "root_info": _root_info(root),
+                "target_root_index": root_index,
+                "target_root_project_id": root.store.project_id(),
+                "target_root_label": root.label,
+                "target_root_path": str(root.store.root),
             })
 
         def _handle_intent_post(self) -> None:
@@ -3104,7 +3190,13 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                                    "CSRF token is missing or expired",
                                    close=True)
                 return
-            kill = store.supervisor_kill_switch()
+            selected = self._write_root_selection(self._request_params())
+            if selected is None:
+                self._bad_root()
+                return
+            root_index, root = selected
+            target_store = root.store
+            kill = target_store.supervisor_kill_switch()
             if kill is not False:
                 code = "executor_disabled" if kill else "executor_state_unreadable"
                 self._json_problem(HTTPStatus.LOCKED, code,
@@ -3118,7 +3210,7 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 self._json_problem(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited",
                                    "too many dashboard write attempts")
                 return
-            ok, cap_code, cap_detail = self._active_intent_capacity_ok()
+            ok, cap_code, cap_detail = self._active_intent_capacity_ok(target_store)
             if not ok:
                 self._json_problem(HTTPStatus.TOO_MANY_REQUESTS, cap_code, cap_detail)
                 return
@@ -3141,7 +3233,7 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                                 {"error": "invalid_intent", "details": errors})
                 return
             try:
-                rec = store.write_intent(
+                rec = target_store.write_intent(
                     kind, intent_payload,
                     origin={"source": "web-console", "session_id": session_id,
                             "host": self.headers.get("Host", ""),
@@ -3155,7 +3247,10 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 return
             self._send_json(HTTPStatus.ACCEPTED,
                             {"intent_id": rec["intent_id"], "state": rec["state"],
-                             "target_root_index": 0, "target_root_label": roots[0].label})
+                             "root_info": _root_info(root),
+                             "target_root_index": root_index,
+                             "target_root_project_id": target_store.project_id(),
+                             "target_root_label": root.label})
 
         def _handle_lead_chat_post(self) -> None:
             if not self._host_allowed():
@@ -3188,7 +3283,13 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                                    "CSRF token is missing or expired",
                                    close=True)
                 return
-            kill = store.supervisor_kill_switch()
+            selected = self._write_root_selection(self._request_params())
+            if selected is None:
+                self._bad_root()
+                return
+            root_index, root = selected
+            target_store = root.store
+            kill = target_store.supervisor_kill_switch()
             if kill is not False:
                 code = "executor_disabled" if kill else "executor_state_unreadable"
                 self._json_problem(HTTPStatus.LOCKED, code,
@@ -3202,7 +3303,7 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 self._json_problem(HTTPStatus.TOO_MANY_REQUESTS, "rate_limited",
                                    "too many dashboard write attempts")
                 return
-            ok, cap_code, cap_detail = self._active_intent_capacity_ok()
+            ok, cap_code, cap_detail = self._active_intent_capacity_ok(target_store)
             if not ok:
                 self._json_problem(HTTPStatus.TOO_MANY_REQUESTS, cap_code, cap_detail)
                 return
@@ -3228,7 +3329,7 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                                      "details": errors})
                     return
                 msg, chat_ids, problem = _send_authenticated_lead_chat(
-                    store, body=intent_payload["body"])
+                    target_store, body=intent_payload["body"])
                 if problem is not None:
                     status = problem.pop("status")
                     self._send_json(status, problem)
@@ -3238,8 +3339,10 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                     "state": "sent",
                     "kind": kind,
                     "request_id": (chat_ids or {}).get("request_id", ""),
-                    "target_root_index": 0,
-                    "target_root_label": roots[0].label,
+                    "root_info": _root_info(root),
+                    "target_root_index": root_index,
+                    "target_root_project_id": target_store.project_id(),
+                    "target_root_label": root.label,
                 })
                 return
             elif keys == {"to_request", "body"}:
@@ -3255,7 +3358,7 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                                     {"error": "invalid_intent",
                                      "details": errors})
                     return
-                chat = build_lead_chat(roots[0])
+                chat = build_lead_chat(root)
                 if not chat.get("available"):
                     self._send_json(HTTPStatus.CONFLICT, {
                         "error": "lead_unavailable",
@@ -3276,7 +3379,7 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                     })
                     return
                 msg, answer_ids, problem = _send_authenticated_lead_chat_answer(
-                    store,
+                    target_store,
                     request_id=intent_payload["to_request"],
                     body=intent_payload["body"],
                 )
@@ -3292,8 +3395,10 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                     "lead_chat_request_id": (
                         (answer_ids or {}).get("lead_chat_request_id", "")
                     ),
-                    "target_root_index": 0,
-                    "target_root_label": roots[0].label,
+                    "root_info": _root_info(root),
+                    "target_root_index": root_index,
+                    "target_root_project_id": target_store.project_id(),
+                    "target_root_label": root.label,
                 })
                 return
             else:
@@ -3306,39 +3411,55 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 })
                 return
 
-        # ---- root resolution for the root-scoped thread route (P2-5)
-        def _thread_store(self) -> Store:
-            """The Store for the ``?root=<label>`` query arg, else ``roots[0]``.
-
-            The client fetches the SELECTED root's transcript; binding
-            ``roots[0]`` unconditionally would 404 a non-primary-root thread —
-            or, worse, LEAK ``roots[0]``'s transcript when both roots happen to
-            carry the same request_id. Match by label (the same label the wire
-            exposes); an absent or unmatched ``root`` degrades to ``roots[0]``.
-            """
-            query = self.path.split("?", 1)[1] if "?" in self.path else ""
-            params = urllib.parse.parse_qs(query)
-            wanted = (params.get("root") or [None])[0]
-            if wanted:
-                for d in roots:
-                    if d.label == wanted:
-                        return d.store
-            return roots[0].store
-
         def _request_params(self) -> dict[str, list[str]]:
             parsed = urllib.parse.urlsplit(self.path)
             return urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
 
+        def _root_selection(
+            self, params: dict[str, list[str]],
+        ) -> tuple[int, RootDescriptor] | None:
+            if "root" not in params:
+                return 0, roots[0]
+            values = params.get("root") or []
+            if len(values) != 1 or not values[0]:
+                return None
+            wanted = values[0]
+            for index, desc in enumerate(roots):
+                if desc.store.project_id() == wanted:
+                    return index, desc
+            matches = [
+                (index, desc)
+                for index, desc in enumerate(roots)
+                if desc.label == wanted
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            return None
+
+        def _write_root_selection(
+            self, params: dict[str, list[str]],
+        ) -> tuple[int, RootDescriptor] | None:
+            if "root" not in params:
+                return (0, roots[0]) if len(roots) == 1 else None
+            values = params.get("root") or []
+            if len(values) != 1 or not values[0]:
+                return None
+            wanted = values[0]
+            matches = [
+                (index, desc)
+                for index, desc in enumerate(roots)
+                if desc.store.project_id() == wanted
+            ]
+            return matches[0] if len(matches) == 1 else None
+
         def _root_descriptor_for_threads(
             self, params: dict[str, list[str]],
         ) -> RootDescriptor | None:
-            wanted = (params.get("root") or [None])[0]
-            if not wanted:
-                return roots[0]
-            for d in roots:
-                if d.label == wanted:
-                    return d
-            return None
+            selected = self._root_selection(params)
+            return selected[1] if selected is not None else None
+
+        def _bad_root(self) -> None:
+            self._json_problem(HTTPStatus.BAD_REQUEST, "bad_root", "unknown root")
 
         def _threads_bad_request(self, code: str, detail: str) -> None:
             self._send_json(HTTPStatus.BAD_REQUEST, {
@@ -3504,18 +3625,41 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 self._handle_session_get()
                 return
             if path == "/api/intents":
-                self._send_json(HTTPStatus.OK, build_intents(roots))
+                selected = self._root_selection(self._request_params())
+                if selected is None:
+                    self._bad_root()
+                    return
+                root_index, _root = selected
+                self._send_json(
+                    HTTPStatus.OK,
+                    build_intents(roots, root_index=root_index),
+                )
                 return
             if path == "/api/preflight":
-                self._send_json(HTTPStatus.OK,
-                                build_preflight(roots[0],
-                                                actions_enabled=enable_actions))
+                selected = self._root_selection(self._request_params())
+                if selected is None:
+                    self._bad_root()
+                    return
+                root_index, root = selected
+                self._send_json(
+                    HTTPStatus.OK,
+                    build_preflight(
+                        root,
+                        actions_enabled=enable_actions,
+                        root_index=root_index,
+                    ),
+                )
                 return
             if path == "/api/attention":
-                # Ranked "needs a human" queue for root[0] (§4a). Envelope-only,
+                selected = self._root_selection(self._request_params())
+                if selected is None:
+                    self._bad_root()
+                    return
+                _root_index, root = selected
+                # Ranked "needs a human" queue for the selected root. Envelope-only,
                 # read-only, strict _DEFAULT_CSP (JSON is not executed).
                 self._send_json(HTTPStatus.OK,
-                                build_attention(roots[0],
+                                build_attention(root,
                                                 actions_enabled=enable_actions))
                 return
             if path == "/api/learning":
@@ -3529,9 +3673,14 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                 self._handle_onboarding_get()
                 return
             if path == "/api/lead-chat":
+                selected = self._root_selection(self._request_params())
+                if selected is None:
+                    self._bad_root()
+                    return
+                _root_index, root = selected
                 # Dedicated operator<->lead transcript. Carries bodies, but only
                 # from the stable lc-* thread between the configured principals.
-                self._send_json(HTTPStatus.OK, build_lead_chat(roots[0]))
+                self._send_json(HTTPStatus.OK, build_lead_chat(root))
                 return
             if path == "/api/threads":
                 self._handle_threads_get()
@@ -3562,15 +3711,19 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False) 
                     self._send_json(HTTPStatus.NOT_FOUND,
                                     {"error": "thread not found"})
                     return
-                # Root-scoped (review P2-5): the client fetches the SELECTED
-                # root's thread via ?root=<label>. Bind that root's store so a
-                # non-primary-root thread resolves — and a same-rid thread in
-                # root[0] can NOT leak across roots. Absent/unmatched → root[0].
-                thread = build_thread(self._thread_store(), rid)
+                selected = self._root_selection(self._request_params())
+                if selected is None:
+                    self._bad_root()
+                    return
+                _root_index, root = selected
+                thread = build_thread(root.store, rid)
                 if thread is None:
                     self._send_json(HTTPStatus.NOT_FOUND,
                                     {"error": "thread not found"})
                     return
+                thread["root"] = root.label
+                thread["root_info"] = _root_info(root)
+                thread["target_root_project_id"] = root.store.project_id()
                 self._send_json(HTTPStatus.OK, thread)
                 return
             if path == "/api/messages":
@@ -3628,9 +3781,11 @@ def make_server(store: Store, host: str, port: int,
     need to view it from another machine.
 
     ``extra`` (0.17.0, additive): further roots to watch alongside
-    ``store``. ``store`` is always root[0] — the pre-0.17.0 routes bind
-    to it; ``/api/state`` and ``/dashboard`` cover all roots. Omitted →
-    exactly the historical single-root behavior.
+    ``store``. ``store`` is always root[0] for legacy routes; Team Console
+    routes may select any root by project ID. ``/api/state`` and
+    ``/dashboard`` cover all roots. Omitted → exactly the historical
+    single-root behavior. Duplicate project IDs are rejected because no
+    selector can distinguish two descriptors for the same store.
 
     The caller is expected to ``serve_forever`` (in this thread or
     another).

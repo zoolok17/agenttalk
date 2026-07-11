@@ -37,6 +37,11 @@
   var PREF_KEYS = { theme: 'tc.theme', accent: 'tc.accent', density: 'tc.density' };
 
   var VIEWS = ['overview', 'flow', 'attention', 'lead-chat', 'learning', 'onboarding', 'sessions', 'agent'];
+  var VIEW_LABELS = nullMap({
+    overview: 'Overview', flow: 'Flow', attention: 'Attention',
+    'lead-chat': 'Lead chat', learning: 'Learning', onboarding: 'Onboarding',
+    sessions: 'Sessions', agent: 'Agent',
+  });
 
   // Graph geometry (frozen: §7 / prototype). 640x480 canvas, nodes on a
   // circle radius 178 around center (320,240), node i at angle -90 + i*36 deg.
@@ -84,14 +89,25 @@
   });
 
   // ------------------------------------------------------------ client state
+  function initialRootId() {
+    if (typeof window === 'undefined' || !window.location ||
+      typeof URLSearchParams === 'undefined') return '';
+    try {
+      return new URLSearchParams(window.location.search).get('root') || '';
+    } catch (e) {
+      return '';
+    }
+  }
+
   var state = {
     view: 'overview',
     selectedAgent: null,   // agent name
     sessionRid: null,      // thread request_id
     filter: 'all',         // all | working | idle | attention
-    selectedRoot: 0,
+    selectedRootId: initialRootId(),
     now: Date.now(),
   };
+  var rootGeneration = 0;
   // Prefs (persisted). Loaded/validated below.
   var prefs = { theme: 'light', accent: 'blue', density: 'comfortable' };
 
@@ -100,16 +116,15 @@
   var attentionData = null;           // /api/attention (per open)
   var leadChatData = null;            // /api/lead-chat (operator<->lead bodies)
   var learningData = null;            // /api/learning (lessons + exposure telemetry)
-  var learningRootLabel = '';         // root label for learningData
   var onboardingData = null;          // /api/onboarding (project analysis runs)
-  var onboardingRootLabel = '';       // root label for onboardingData
   var leadChatPayloadHash = null;      // unchanged-payload guard for lead-chat
   var intentsData = null;             // /api/intents (body-free queue state)
-  var attentionPending = false;
-  var leadChatPending = false;
-  var learningPending = false;
-  var onboardingPending = false;
-  var intentsPending = false;
+  var attentionPending = null;
+  var leadChatPending = null;
+  var learningPending = null;
+  var onboardingPending = null;
+  var intentsPending = null;
+  var sessionPending = null;
   var statePending = false;           // /api/state in-flight guard (P2-4)
   var stateSeq = 0;                   // request sequence id (issued)
   var stateCommitted = 0;             // newest committed sequence id (stale-drop)
@@ -496,12 +511,17 @@
 
   // ------------------------------------------------------------ root helpers
   function roots() { return (lastState && lastState.roots) || []; }
+  function rootById(projectId) {
+    var rs = roots();
+    for (var i = 0; i < rs.length; i++) {
+      if (rs[i].project_id === projectId) return rs[i];
+    }
+    return null;
+  }
   function currentRoot() {
     var rs = roots();
     if (!rs.length) return null;
-    var i = state.selectedRoot;
-    if (i < 0 || i >= rs.length) i = 0;
-    return rs[i];
+    return rootById(state.selectedRootId) || rs[0];
   }
   function agentsOf(root) { return (root && root.agents) || []; }
   function findAgent(root, name) {
@@ -514,15 +534,111 @@
     var r = currentRoot();
     return (r && r.label) || '';
   }
-  // Thread cache key: root-label + rid (P2-5). Keying by rid ALONE would let a
+  function currentRootId() {
+    var r = currentRoot();
+    return (r && r.project_id) || state.selectedRootId || '';
+  }
+  function rootUrl(path, projectId) {
+    var rootId = projectId === undefined ? currentRootId() : projectId;
+    if (!rootId) return path;
+    return path + (path.indexOf('?') === -1 ? '?' : '&') +
+      'root=' + encodeURIComponent(rootId);
+  }
+  function rootRequestKey(projectId, generation) {
+    return projectId + '@' + generation;
+  }
+  function rootPayloadMatches(data, projectId, generation) {
+    if (projectId !== currentRootId() || generation !== rootGeneration) return false;
+    var info = data && data.root_info;
+    var responseId = (info && info.project_id) ||
+      (data && data.target_root_project_id) || '';
+    return !!responseId && responseId === projectId;
+  }
+  function updateProjectUrl() {
+    if (typeof window === 'undefined' || !window.location || !window.history ||
+      typeof URLSearchParams === 'undefined') return;
+    try {
+      var params = new URLSearchParams(window.location.search || '');
+      var projectId = currentRootId();
+      if (projectId) params.set('root', projectId);
+      else params.delete('root');
+      var query = params.toString();
+      var next = (window.location.pathname || '/') + (query ? '?' + query : '') +
+        (window.location.hash || '');
+      window.history.replaceState(null, '', next);
+    } catch (e) { /* history may be unavailable in embedded browsers */ }
+  }
+  function updateDocumentTitle() {
+    var root = currentRoot();
+    var project = (root && root.label) || 'agenttalk';
+    var view = VIEW_LABELS[state.view] || 'Console';
+    document.title = project + ' - ' + view + ' - agenttalk';
+  }
+  function clearRootContext() {
+    if (state.view === 'agent') state.view = 'overview';
+    state.selectedAgent = null;
+    state.sessionRid = null;
+    attentionData = null;
+    leadChatData = null;
+    leadChatPayloadHash = null;
+    learningData = null;
+    onboardingData = null;
+    intentsData = null;
+    threadCache = {};
+    threadNotFound = {};
+    threadPending = {};
+    queuedAnswers = {};
+    seenFeedIds = {};
+    freshFeedIds = {};
+    archivedState.root = '';
+    archivedState.open = false;
+    archivedState.loading = false;
+    archivedState.stale = false;
+    archivedState.error = '';
+    archivedState.count = null;
+    archivedState.nextCursor = null;
+    archivedState.items = [];
+    actionSession.enabled = false;
+    actionSession.token = null;
+    actionSession.pending = false;
+    actionSession.error = '';
+  }
+  function applyProjectSelection(projectId) {
+    if (!projectId || !rootById(projectId) || projectId === state.selectedRootId) {
+      return false;
+    }
+    state.selectedRootId = projectId;
+    rootGeneration += 1;
+    clearRootContext();
+    updateProjectUrl();
+    updateDocumentTitle();
+    return true;
+  }
+  function reconcileProjectSelection() {
+    var rs = roots();
+    if (!rs.length) return false;
+    if (rootById(state.selectedRootId)) {
+      updateProjectUrl();
+      updateDocumentTitle();
+      return false;
+    }
+    return applyProjectSelection(rs[0].project_id);
+  }
+  function selectProject(projectId) {
+    if (!applyProjectSelection(projectId)) return;
+    renderChrome();
+    renderActiveView();
+    fetchRootPayloads();
+  }
+  // Thread cache key: project id + rid (P2-5). Keying by rid ALONE would let a
   // same-request_id thread in another root leak / cross-bleed once cached.
-  function threadKey(rid) { return currentRootLabel() + '|' + rid; }
+  function threadKey(rid) { return currentRootId() + '|' + rid; }
   function rootClosedCount(root) {
     var c = root && root.counts;
     return c && typeof c.closed_threads === 'number' ? c.closed_threads : 0;
   }
   function syncArchivedRoot(root) {
-    var label = (root && root.label) || '';
+    var label = (root && root.project_id) || '';
     var count = rootClosedCount(root);
     if (archivedState.root !== label) {
       archivedState.root = label;
@@ -764,6 +880,7 @@
 
   // ------------------------------------------------------------ chrome (top bar + sidebar)
   function renderChrome() {
+    updateDocumentTitle();
     renderTopbar();
     renderSidebar();
   }
@@ -784,35 +901,34 @@
 
     var root = currentRoot();
 
-    // Multi-root project switcher (only when >1 root). Each root is a
-    // .tc-project-switcher pill; the wrapper only lays them out (CSSOM geometry).
-    if (roots().length > 1) {
-      var sw = el('div');
-      sw.style.display = 'flex';
-      sw.style.gap = '6px';
-      var rs = roots();
+    var project = el('div', 'tc-project-context');
+    project.appendChild(el('span', 'tc-project-caption', 'Project'));
+    var rs = roots();
+    if (rs.length > 1) {
+      var select = el('select', 'tc-project-select');
+      select.setAttribute('aria-label', 'Current Agenttalk project');
       for (var i = 0; i < rs.length; i++) {
-        (function (idx) {
-          var b = el('button', 'tc-project-switcher' + (idx === state.selectedRoot ? ' is-active' : ''), rs[idx].label || ('root ' + idx));
-          on(b, 'click', function () {
-            state.selectedRoot = idx;
-            // Reset drill-in state that references the old root.
-            state.selectedAgent = null;
-            state.sessionRid = null;
-            learningData = null;
-            learningRootLabel = '';
-            onboardingData = null;
-            onboardingRootLabel = '';
-            renderChrome();
-            renderActiveView();
-            if (state.view === 'learning') fetchLearning();
-            if (state.view === 'onboarding') fetchOnboarding();
-          });
-          sw.appendChild(b);
-        })(i);
+        var option = el('option', '', rs[i].label || ('root ' + (i + 1)));
+        option.value = rs[i].project_id || '';
+        select.appendChild(option);
       }
-      bar.appendChild(sw);
+      select.value = currentRootId();
+      on(select, 'change', function () { selectProject(select.value); });
+      project.appendChild(select);
+    } else {
+      project.appendChild(el(
+        'span', 'tc-project-name', (root && root.label) || 'Loading project'
+      ));
     }
+    var projectPath = el(
+      'span', 'tc-project-path tc-mono', (root && root.path) || 'Resolving root'
+    );
+    if (root && root.path) {
+      projectPath.setAttribute('title', root.path);
+      projectPath.setAttribute('aria-label', 'Project root ' + root.path);
+    }
+    project.appendChild(projectPath);
+    bar.appendChild(project);
 
     // Mission pill (from root.spec_kitty.missions — name only, no x/y).
     if (root && root.spec_kitty && isArray(root.spec_kitty.missions) && root.spec_kitty.missions.length) {
@@ -2526,7 +2642,7 @@
     var root = currentRoot();
     var threads = (root && root.threads) || [];
     for (var i = 0; i < threads.length; i++) if (threads[i].request_id === rid) return threads[i];
-    if (archivedState.root === currentRootLabel()) {
+    if (archivedState.root === currentRootId()) {
       var archived = archivedState.items || [];
       for (var j = 0; j < archived.length; j++) if (archived[j].request_id === rid) return archived[j];
     }
@@ -2963,21 +3079,29 @@
 
   // ------------------------------------------------------------ data fetching
   function fetchSession(cb) {
-    fetch('/api/session', { cache: 'no-store' }).then(function (r) {
-      if (!r.ok) {
-        actionSession.enabled = false;
-        actionSession.token = null;
-        return null;
-      }
+    var projectId = currentRootId();
+    var generation = rootGeneration;
+    var requestKey = rootRequestKey(projectId, generation);
+    if (sessionPending === requestKey) return;
+    sessionPending = requestKey;
+    fetch(rootUrl('/api/session', projectId), { cache: 'no-store' }).then(function (r) {
+      if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
+      if (sessionPending === requestKey) sessionPending = null;
+      if (!rootPayloadMatches(data, projectId, generation)) return;
       if (data && data.csrf_token) {
         actionSession.enabled = true;
         actionSession.token = data.csrf_token;
+      } else {
+        actionSession.enabled = false;
+        actionSession.token = null;
       }
       if (cb) cb();
       if (state.view === 'sessions' || state.view === 'lead-chat') renderActiveViewFromPoll();
     }).catch(function () {
+      if (sessionPending === requestKey) sessionPending = null;
+      if (projectId !== currentRootId() || generation !== rootGeneration) return;
       actionSession.enabled = false;
       actionSession.token = null;
       if (cb) cb();
@@ -2985,24 +3109,31 @@
   }
 
   function fetchIntents() {
-    if (intentsPending) return;
-    intentsPending = true;
-    fetch('/api/intents').then(function (r) {
+    var projectId = currentRootId();
+    var generation = rootGeneration;
+    var requestKey = rootRequestKey(projectId, generation);
+    if (intentsPending === requestKey) return;
+    intentsPending = requestKey;
+    fetch(rootUrl('/api/intents', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
-      intentsPending = false;
-      if (!data) return;
+      if (intentsPending === requestKey) intentsPending = null;
+      if (!data || !rootPayloadMatches(data, projectId, generation)) return;
       intentsData = data;
       if (state.view === 'sessions') renderActiveViewFromPoll();
-    }).catch(function () { intentsPending = false; });
+    }).catch(function () {
+      if (intentsPending === requestKey) intentsPending = null;
+    });
   }
 
   function postIntent(envelope, retried, onQueued) {
     if (!actionSession.enabled || !actionSession.token || actionSession.pending) return;
+    var projectId = currentRootId();
+    var generation = rootGeneration;
     actionSession.pending = true;
     actionSession.error = '';
-    fetch('/api/intent', {
+    fetch(rootUrl('/api/intent', projectId), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -3014,6 +3145,7 @@
         return { status: r.status, ok: r.ok, data: data };
       });
     }).then(function (res) {
+      if (projectId !== currentRootId() || generation !== rootGeneration) return;
       actionSession.pending = false;
       if (res.status === 403 && res.data && res.data.error === 'bad_csrf' && !retried) {
         fetchSession(function () { postIntent(envelope, true, onQueued); });
@@ -3022,6 +3154,11 @@
       if (!res.ok) {
         actionSession.error = (res.data && (res.data.detail || res.data.error)) || 'intent rejected';
       } else {
+        if (!rootPayloadMatches(res.data, projectId, generation)) {
+          actionSession.error = 'project response mismatch';
+          renderActiveView();
+          return;
+        }
         actionSession.error = 'Queued ' + (res.data.intent_id || 'intent');
         if (onQueued) onQueued(res.data);
         fetchIntents();
@@ -3030,6 +3167,7 @@
       if (state.view === 'sessions' || state.view === 'attention'
         || state.view === 'lead-chat') renderActiveView();
     }).catch(function () {
+      if (projectId !== currentRootId() || generation !== rootGeneration) return;
       actionSession.pending = false;
       actionSession.error = 'network error';
       if (state.view === 'sessions' || state.view === 'attention'
@@ -3039,9 +3177,11 @@
 
   function postLeadChat(payload, retried, onQueued) {
     if (!actionSession.enabled || !actionSession.token || actionSession.pending) return;
+    var projectId = currentRootId();
+    var generation = rootGeneration;
     actionSession.pending = true;
     actionSession.error = '';
-    fetch('/api/lead-chat', {
+    fetch(rootUrl('/api/lead-chat', projectId), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -3053,6 +3193,7 @@
         return { status: r.status, ok: r.ok, data: data };
       });
     }).then(function (res) {
+      if (projectId !== currentRootId() || generation !== rootGeneration) return;
       actionSession.pending = false;
       if (res.status === 403 && res.data && res.data.error === 'bad_csrf' && !retried) {
         fetchSession(function () { postLeadChat(payload, true, onQueued); });
@@ -3062,6 +3203,11 @@
         actionSession.error = (res.data && (res.data.detail || res.data.error))
           || 'lead chat rejected';
       } else {
+        if (!rootPayloadMatches(res.data, projectId, generation)) {
+          actionSession.error = 'project response mismatch';
+          renderActiveView();
+          return;
+        }
         actionSession.error = res.data && res.data.message_id
           ? 'Sent ' + res.data.message_id
           : 'Queued ' + (res.data.intent_id || 'lead chat');
@@ -3072,6 +3218,7 @@
       }
       if (state.view === 'lead-chat' || state.view === 'attention') renderActiveView();
     }).catch(function () {
+      if (projectId !== currentRootId() || generation !== rootGeneration) return;
       actionSession.pending = false;
       actionSession.error = 'network error';
       if (state.view === 'lead-chat') renderActiveView();
@@ -3097,10 +3244,11 @@
       if (seq < stateCommitted) return;        // stale response — drop (P2-4)
       stateCommitted = seq;
       data._fetchedAt = Date.now();
-      updateFreshFeed(data);
+      var hadState = !!lastState;
       lastState = data;
-      // Clamp selectedRoot.
-      if (state.selectedRoot >= (data.roots || []).length) state.selectedRoot = 0;
+      var projectChanged = reconcileProjectSelection();
+      updateFreshFeed(data);
+      if (!hadState || projectChanged) fetchRootPayloads();
       // Refetch the open transcript so new replies land (P2-2): force past the
       // cache; the fetch caches only 200s and re-validates a prior 404.
       if (state.view === 'sessions' && state.sessionRid) {
@@ -3116,8 +3264,14 @@
   function updateFreshFeed(data) {
     freshFeedIds = {};
     var rs = data.roots || [];
-    var ri = state.selectedRoot < rs.length ? state.selectedRoot : 0;
-    var root = rs[ri];
+    var root = null;
+    for (var ri = 0; ri < rs.length; ri++) {
+      if (rs[ri].project_id === state.selectedRootId) {
+        root = rs[ri];
+        break;
+      }
+    }
+    if (!root) root = rs[0];
     var recent = (root && root.recent) || [];
     var nextSeen = {};
     for (var i = 0; i < recent.length; i++) {
@@ -3130,80 +3284,95 @@
   }
 
   function fetchAttention() {
-    if (attentionPending) return;
-    attentionPending = true;
-    fetch('/api/attention').then(function (r) { return r.json(); }).then(function (data) {
-      attentionData = data;
-      attentionPending = false;
-      renderSidebar();  // count badge
-      if (state.view === 'attention') renderActiveViewFromPoll();
-    }).catch(function () { attentionPending = false; });
-  }
-
-  function fetchLeadChat() {
-    if (leadChatPending) return;
-    leadChatPending = true;
-    fetch('/api/lead-chat').then(function (r) {
+    var projectId = currentRootId();
+    var generation = rootGeneration;
+    var requestKey = rootRequestKey(projectId, generation);
+    if (attentionPending === requestKey) return;
+    attentionPending = requestKey;
+    fetch(rootUrl('/api/attention', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
-      leadChatPending = false;
-      if (!data) return;
+      if (attentionPending === requestKey) attentionPending = null;
+      if (!data || !rootPayloadMatches(data, projectId, generation)) return;
+      attentionData = data;
+      renderSidebar();  // count badge
+      if (state.view === 'attention') renderActiveViewFromPoll();
+    }).catch(function () {
+      if (attentionPending === requestKey) attentionPending = null;
+    });
+  }
+
+  function fetchLeadChat() {
+    var projectId = currentRootId();
+    var generation = rootGeneration;
+    var requestKey = rootRequestKey(projectId, generation);
+    if (leadChatPending === requestKey) return;
+    leadChatPending = requestKey;
+    fetch(rootUrl('/api/lead-chat', projectId)).then(function (r) {
+      if (!r.ok) return null;
+      return r.json();
+    }).then(function (data) {
+      if (leadChatPending === requestKey) leadChatPending = null;
+      if (!data || !rootPayloadMatches(data, projectId, generation)) return;
       var nextHash = leadChatPayloadFingerprint(data);
       var changed = leadChatPayloadHash !== nextHash;
       leadChatPayloadHash = nextHash;
       leadChatData = data;
       renderSidebar();
       if (changed && state.view === 'lead-chat') renderActiveViewFromPoll();
-    }).catch(function () { leadChatPending = false; });
+    }).catch(function () {
+      if (leadChatPending === requestKey) leadChatPending = null;
+    });
   }
 
   function fetchLearning() {
-    if (learningPending) return;
-    var label = currentRootLabel();
-    var url = '/api/learning?status=active&limit=100';
-    if (label) url += '&root=' + encodeURIComponent(label);
-    learningPending = true;
+    var projectId = currentRootId();
+    var generation = rootGeneration;
+    var requestKey = rootRequestKey(projectId, generation);
+    if (learningPending === requestKey) return;
+    var url = rootUrl('/api/learning?status=active&limit=100', projectId);
+    learningPending = requestKey;
     fetch(url).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
-      learningPending = false;
-      if (!data) return;
-      if (label && label !== currentRootLabel()) return;
-      if (label && data.root && data.root !== label) return;
-      learningRootLabel = data.root || label || '';
+      if (learningPending === requestKey) learningPending = null;
+      if (!data || !rootPayloadMatches(data, projectId, generation)) return;
       learningData = data;
       renderSidebar();
       if (state.view === 'learning') renderActiveViewFromPoll();
-    }).catch(function () { learningPending = false; });
+    }).catch(function () {
+      if (learningPending === requestKey) learningPending = null;
+    });
   }
 
   function fetchOnboarding() {
-    if (onboardingPending) return;
-    var label = currentRootLabel();
-    var url = '/api/onboarding?limit=50';
-    if (label) url += '&root=' + encodeURIComponent(label);
-    onboardingPending = true;
+    var projectId = currentRootId();
+    var generation = rootGeneration;
+    var requestKey = rootRequestKey(projectId, generation);
+    if (onboardingPending === requestKey) return;
+    var url = rootUrl('/api/onboarding?limit=50', projectId);
+    onboardingPending = requestKey;
     fetch(url).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
-      onboardingPending = false;
-      if (!data) return;
-      if (label && label !== currentRootLabel()) return;
-      if (label && data.root && data.root !== label) return;
-      onboardingRootLabel = data.root || label || '';
+      if (onboardingPending === requestKey) onboardingPending = null;
+      if (!data || !rootPayloadMatches(data, projectId, generation)) return;
       onboardingData = data;
       renderSidebar();
       if (state.view === 'onboarding') renderActiveViewFromPoll();
-    }).catch(function () { onboardingPending = false; });
+    }).catch(function () {
+      if (onboardingPending === requestKey) onboardingPending = null;
+    });
   }
 
   function fetchArchivedThreads(reset) {
     if (archivedState.loading) return;
-    var label = currentRootLabel();
-    if (!label) return;
+    var projectId = currentRootId();
+    var generation = rootGeneration;
+    if (!projectId) return;
     archivedState.loading = true;
     archivedState.error = '';
     if (reset) {
@@ -3212,17 +3381,17 @@
       archivedState.stale = false;
     }
     if (state.view === 'sessions') renderActiveView();
-    var url = '/api/threads?state=closed&limit=50&root=' + encodeURIComponent(label);
+    var url = rootUrl('/api/threads?state=closed&limit=50', projectId);
     if (!reset && archivedState.nextCursor) {
       url += '&cursor=' + encodeURIComponent(archivedState.nextCursor);
     }
     fetch(url, { cache: 'no-store' }).then(function (r) {
       return r.json().then(function (data) { return { ok: r.ok, data: data }; });
     }).then(function (res) {
-      if (archivedState.root !== label) return;
+      if (archivedState.root !== projectId || generation !== rootGeneration) return;
       archivedState.loading = false;
       var data = res.data || {};
-      if (!res.ok || data.error) {
+      if (!res.ok || data.error || !rootPayloadMatches(data, projectId, generation)) {
         archivedState.error = data.detail || data.error || 'archived threads unavailable';
         archivedState.items = reset ? [] : archivedState.items;
         archivedState.nextCursor = null;
@@ -3235,31 +3404,34 @@
       }
       if (state.view === 'sessions') renderActiveView();
     }).catch(function () {
-      if (archivedState.root !== label) return;
+      if (archivedState.root !== projectId || generation !== rootGeneration) return;
       archivedState.loading = false;
       archivedState.error = 'archived threads unavailable';
       if (state.view === 'sessions') renderActiveView();
     });
   }
 
-  // Fetch the SELECTED root's transcript (P2-5): pass ?root=<label> and key the
+  // Fetch the SELECTED root's transcript (P2-5): pass ?root=<project_id> and key the
   // cache by root+rid so a same-request_id thread in another root can't bleed.
   // Only successful 200 payloads are cached (P2-2); a 404 sets a transient
   // not-found marker that the data poll re-validates, so new replies appear.
   // `force` (used by the poll refresh) bypasses the cache/pending short-circuit.
   function fetchThread(rid, force) {
     if (!rid) return;
-    var label = currentRootLabel();
+    var projectId = currentRootId();
+    var generation = rootGeneration;
     var key = threadKey(rid);  // single source of truth (matches transcriptCard read)
-    if (!force && (threadCache[key] || threadPending[key])) return;
-    threadPending[key] = true;
-    var url = '/api/thread/' + encodeURIComponent(rid) + '?root=' + encodeURIComponent(label);
+    var pendingKey = key + '@' + generation;
+    if (!force && (threadCache[key] || threadPending[pendingKey])) return;
+    threadPending[pendingKey] = true;
+    var url = rootUrl('/api/thread/' + encodeURIComponent(rid), projectId);
     fetch(url).then(function (r) {
       if (r.status === 404) return { __notfound: true };
       if (!r.ok) return { __error: true };
       return r.json();
     }).then(function (data) {
-      threadPending[key] = false;
+      delete threadPending[pendingKey];
+      if (projectId !== currentRootId() || generation !== rootGeneration) return;
       if (!data || data.__notfound) {
         // 404 → transient not-found; never cached as a permanent transcript.
         delete threadCache[key];
@@ -3267,14 +3439,25 @@
       } else if (data.__error) {
         // Non-404 error: keep any last-good payload; do NOT cache the error.
         return;
+      } else if (!rootPayloadMatches(data, projectId, generation)) {
+        return;
       } else {
         threadCache[key] = data;
         delete threadNotFound[key];
       }
       if (state.view === 'sessions' && state.sessionRid === rid) renderActiveViewFromPoll();
     }).catch(function () {
-      threadPending[key] = false;
+      delete threadPending[pendingKey];
     });
+  }
+
+  function fetchRootPayloads() {
+    fetchSession();
+    fetchIntents();
+    fetchAttention();
+    fetchLeadChat();
+    fetchLearning();
+    fetchOnboarding();
   }
 
   // ------------------------------------------------------------ loops
@@ -3298,12 +3481,7 @@
     // Fetch attention at boot AND poll it (P2-3), regardless of the initial
     // view: the sidebar count badge is the open-attention count and must be
     // current from the start, not blank until the Attention view is opened.
-    fetchAttention();
-    fetchLeadChat();
-    fetchLearning();
-    fetchOnboarding();
-    fetchSession();
-    fetchIntents();
+    fetchRootPayloads();
     setInterval(fetchState, POLL_MS);
     setInterval(fetchAttention, POLL_MS);
     setInterval(fetchLeadChat, POLL_MS);
