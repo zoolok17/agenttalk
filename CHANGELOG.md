@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project ID in the dashboard URL and browser title, and scopes dashboard reads and writes to that
   project. Multi-root writes require one explicit full project ID and never resolve display labels;
   explicit unknown, blank, repeated, or ambiguous roots fail closed instead of falling back to the
-  primary project, and duplicate descriptors for one project ID are rejected at startup.
+  primary project, duplicate descriptors for one project ID are rejected at startup, and switching
+  projects clears root-bound message, answer, and lead-chat drafts.
 
 ### Fixed
 

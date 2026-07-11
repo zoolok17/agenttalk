@@ -602,6 +602,15 @@
     actionSession.token = null;
     actionSession.pending = false;
     actionSession.error = '';
+    composerState.mode = 'send';
+    composerState.target = '';
+    composerState.audienceKind = 'all';
+    composerState.audienceValue = '';
+    composerState.kind = 'message';
+    composerState.subject = '';
+    composerState.body = '';
+    answerComposerState = {};
+    leadChatComposerState.body = '';
   }
   function applyProjectSelection(projectId) {
     if (!projectId || !rootById(projectId) || projectId === state.selectedRootId) {

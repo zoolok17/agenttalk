@@ -3345,6 +3345,17 @@ def test_console_project_switch_uses_ids_resets_context_and_drops_stale_data(
         "      threadCache = {'project-a|rid-old': {request_id: 'rid-old'}};\n"
         "      attentionData = {root_info: {project_id: 'project-a'}, count: 7};\n"
         "    },\n"
+        "    setDrafts: function () {\n"
+        "      composerState.mode = 'broadcast';\n"
+        "      composerState.target = 'alpha';\n"
+        "      composerState.audienceKind = 'group';\n"
+        "      composerState.audienceValue = 'project-a-reviewers';\n"
+        "      composerState.kind = 'question';\n"
+        "      composerState.subject = 'project A subject';\n"
+        "      composerState.body = 'project A body';\n"
+        "      answerComposerState = {'rid-shared': 'project A answer'};\n"
+        "      leadChatComposerState.body = 'project A lead chat';\n"
+        "    },\n"
         "    applyProjectSelection: applyProjectSelection,\n"
         "    reconcileProjectSelection: reconcileProjectSelection,\n"
         "    fetchRootPayloads: fetchRootPayloads,\n"
@@ -3371,6 +3382,18 @@ def test_console_project_switch_uses_ids_resets_context_and_drops_stale_data(
         "        actionPending: actionSession.pending,\n"
         "        actionError: actionSession.error,\n"
         "        queuedCallbacks: testQueuedCallbacks,\n"
+        "        composer: {\n"
+        "          mode: composerState.mode,\n"
+        "          target: composerState.target,\n"
+        "          audienceKind: composerState.audienceKind,\n"
+        "          audienceValue: composerState.audienceValue,\n"
+        "          kind: composerState.kind,\n"
+        "          subject: composerState.subject,\n"
+        "          body: composerState.body,\n"
+        "        },\n"
+        "        answerKeys: Object.keys(answerComposerState).sort(),\n"
+        "        sharedAnswer: answerComposerState['rid-shared'] || '',\n"
+        "        leadChatBody: leadChatComposerState.body,\n"
         "      };\n"
         "    }\n"
         "  };\n\n" + marker,
@@ -3396,6 +3419,37 @@ function response(ok, data) {
 }
 async function flush() {
   for (let i = 0; i < 8; i += 1) await Promise.resolve();
+}
+function assertProjectADrafts(snapshot, context) {
+  assert(JSON.stringify(snapshot.composer) === JSON.stringify({
+    mode: 'broadcast',
+    target: 'alpha',
+    audienceKind: 'group',
+    audienceValue: 'project-a-reviewers',
+    kind: 'question',
+    subject: 'project A subject',
+    body: 'project A body',
+  }), `${context} changed generic draft: ${JSON.stringify(snapshot.composer)}`);
+  assert(JSON.stringify(snapshot.answerKeys) === JSON.stringify(['rid-shared']) &&
+    snapshot.sharedAnswer === 'project A answer',
+    `${context} changed answer draft: ${JSON.stringify(snapshot)}`);
+  assert(snapshot.leadChatBody === 'project A lead chat',
+    `${context} changed lead-chat draft: ${JSON.stringify(snapshot)}`);
+}
+function assertDraftsCleared(snapshot, context) {
+  assert(JSON.stringify(snapshot.composer) === JSON.stringify({
+    mode: 'send',
+    target: '',
+    audienceKind: 'all',
+    audienceValue: '',
+    kind: 'message',
+    subject: '',
+    body: '',
+  }), `${context} retained generic draft: ${JSON.stringify(snapshot.composer)}`);
+  assert(snapshot.answerKeys.length === 0 && snapshot.sharedAnswer === '',
+    `${context} retained answer draft: ${JSON.stringify(snapshot)}`);
+  assert(snapshot.leadChatBody === '',
+    `${context} retained lead-chat draft: ${JSON.stringify(snapshot)}`);
 }
 
 const historyValues = [];
@@ -3430,10 +3484,22 @@ vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
 const hooks = ctx.__agenttalkConsoleTestHooks;
 
 (async () => {
-  const rootA = { label: 'project [aaaa1111]', path: 'D:\\one\\project', project_id: 'project-a', agents: [] };
-  const rootB = { label: 'project [bbbb2222]', path: 'D:\\two\\project', project_id: 'project-b', agents: [] };
+  const rootA = {
+    label: 'project [aaaa1111]', path: 'D:\\one\\project',
+    project_id: 'project-a', agents: [{name: 'alpha'}],
+  };
+  const rootB = {
+    label: 'project [bbbb2222]', path: 'D:\\two\\project',
+    project_id: 'project-b', agents: [{name: 'alpha'}],
+  };
   hooks.setState({ roots: [rootA, rootB] }, rootA.project_id);
   hooks.setDrillIns();
+  hooks.setDrafts();
+
+  hooks.setState({ roots: [rootA, rootB], generated_at: 'same-project-poll' }, rootA.project_id);
+  assert(!hooks.reconcileProjectSelection(), 'same-project poll changed the project');
+  let snapshot = hooks.snapshot();
+  assertProjectADrafts(snapshot, 'same-project poll');
 
   hooks.enableActions();
   hooks.postTestIntent();
@@ -3442,9 +3508,10 @@ const hooks = ctx.__agenttalkConsoleTestHooks;
     `in-flight POST was not captured for project A: ${JSON.stringify(calls)}`);
   const inFlightPost = calls[0];
   assert(hooks.applyProjectSelection(rootB.project_id), 'POST-time project switch failed');
-  let snapshot = hooks.snapshot();
+  snapshot = hooks.snapshot();
   assert(!snapshot.actionPending,
     `project switch retained project A pending state: ${JSON.stringify(snapshot)}`);
+  assertDraftsCleared(snapshot, 'A-to-B switch');
   inFlightPost.resolve(response(true, {
     root_info: { project_id: rootA.project_id },
     target_root_project_id: rootA.project_id,
@@ -3456,9 +3523,12 @@ const hooks = ctx.__agenttalkConsoleTestHooks;
   assert(snapshot.projectId === rootB.project_id, 'POST response changed the selected project');
   assert(snapshot.queuedCallbacks === 0 && snapshot.actionError === '' && !snapshot.actionPending,
     `stale project-A POST response affected project B: ${JSON.stringify(snapshot)}`);
+  assertDraftsCleared(snapshot, 'stale project-A completion');
   assert(calls.length === 1, 'stale POST response triggered current-project refetches');
 
   assert(hooks.applyProjectSelection(rootA.project_id), 'switch back before attention failed');
+  snapshot = hooks.snapshot();
+  assertDraftsCleared(snapshot, 'B-to-A switch');
   hooks.fetchAttention();
   assert(calls.length === 2 && calls[1].url.includes('root=project-a'),
     `initial attention was not project scoped: ${JSON.stringify(calls)}`);
