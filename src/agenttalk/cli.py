@@ -3712,7 +3712,6 @@ def cmd_lane(args: argparse.Namespace) -> int:
         advisory = bool(getattr(args, "advisory", False))
         provision_worktree = not bool(getattr(args, "no_worktree", False))
         waiver_reason = getattr(args, "worktree_waiver_reason", None)
-        waiver_authority = None
         if not provision_worktree and not (isinstance(waiver_reason, str) and waiver_reason.strip()):
             sys.stderr.write(
                 "agenttalk lane assign: --no-worktree requires --worktree-waiver-reason.\n")

@@ -1968,11 +1968,12 @@ def test_delivery_terminal_rebind_hashes_in_place_barrier_contents(
 
     def rewrite_barrier_after_prepare(*args, **kwargs):  # noqa: ANN002,ANN003
         pending = real_prepare(*args, **kwargs)
-        payload = json.loads(message_path.read_text(encoding="utf-8"))
-        payload["meta"]["barrier"]["type"] = "changed"
-        message_path.write_bytes(
-            json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"),
-        )
+        raw = message_path.read_bytes()
+        before = b'"type": "release"'
+        after = b'"type": "changed"'
+        assert len(before) == len(after)
+        assert raw.count(before) == 1
+        message_path.write_bytes(raw.replace(before, after, 1))
         os.utime(message_path, ns=(message_stat.st_atime_ns, message_stat.st_mtime_ns))
         os.utime(
             store.messages_dir,
