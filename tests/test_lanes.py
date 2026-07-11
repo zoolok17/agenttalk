@@ -1537,6 +1537,45 @@ def test_existing_final_recovery_requires_exact_current_committed_evidence(
         assert _run_raw(argv, root) == 0
 
 
+def test_recover_quarantines_invalid_current_v3_final_before_fresh_delivery(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    lane_id = "recover-invalid-v3"
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    argv = ["lane", "deliver", "--id", lane_id, "--from", "dev", "--head", head]
+    store, lane_state = _leave_rebound_publish_pending(
+        root, argv, lane_id, monkeypatch,
+    )
+    pending = lane_state["publish_pending"]
+    prepared = Path(pending["prepared_artifact"])
+    final = Path(pending["committed_artifact"])
+    payload = json.loads(prepared.read_text(encoding="utf-8"))
+    payload["artifact_state"] = lanes.ARTIFACT_COMMITTED
+    payload["integrity_token"] = lanes.compute_integrity_token(store, payload)
+    payload["delivered_by"] = "tampered-after-signing"
+    final.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    rejected_bytes = final.read_bytes()
+
+    assert _run_raw(argv, root) == 2
+    assert final.read_bytes() == rejected_bytes
+    assert _run_raw([
+        "lane", "recover", "--id", lane_id,
+        "--reason", "quarantine invalid current v3 final and reevaluate",
+    ], root) == 0
+
+    restored = lanes.load_lanes(store)["lanes"][lane_id]
+    quarantine = Path(restored["delivery_recovery"]["quarantined_final"])
+    assert restored["status"] == lanes.STATUS_ACTIVE
+    assert not final.exists()
+    assert quarantine.exists()
+    assert quarantine.read_bytes() == rejected_bytes
+
+    assert _run_raw(argv, root) == 0
+    completed = lanes.load_lanes(store)["lanes"][lane_id]
+    assert completed["publish_pending"] is False
+    assert len(_committed_artifacts(store, lane_id)) == 1
+
+
 def test_force_assign_refuses_delivered_publish_pending_lane(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root, base = _repo(tmp_path)
@@ -1835,6 +1874,69 @@ def test_unrelated_message_during_evaluation_does_not_invalidate_delivery(
     assert len(_committed_artifacts(store, lane_id)) == 1
 
 
+@pytest.mark.parametrize(
+    ("message_change", "expected_rc"),
+    [("ordinary", 0), ("barrier_create", 3), ("barrier_mutate", 3)],
+)
+def test_message_change_after_pending_save_only_invalidates_verdict_evidence(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        message_change: str, expected_rc: int) -> None:
+    root, base = _repo(tmp_path)
+    lane_id = f"post-save-{message_change}"
+    store = Store(root)
+    barrier_path = None
+    if message_change == "barrier_mutate":
+        barrier = store.send(
+            sender="lead", recipient="lead", body="release barrier",
+            meta={"barrier": {"version": 1, "scope": "global", "type": "release"}},
+        )
+        barrier_path = store.messages_dir / f"{barrier.id}.json"
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    real_boundary = cli._lane_prepare_publication
+    changed = False
+
+    def change_message_at_publication_boundary(target_store, target_lane_id):  # noqa: ANN001
+        nonlocal changed
+        if not changed:
+            changed = True
+            saved = lanes.load_lanes(target_store)["lanes"][target_lane_id]
+            assert saved["status"] == lanes.STATUS_DELIVERED
+            assert isinstance(saved["publish_pending"], dict)
+            if message_change == "ordinary":
+                target_store.send(
+                    sender="lead", recipient="dev", kind="note",
+                    body="ordinary traffic after the pending journal save",
+                )
+            elif message_change == "barrier_create":
+                target_store.send(
+                    sender="lead", recipient="lead", body="new release barrier",
+                    meta={
+                        "barrier": {
+                            "version": 1, "scope": "global", "type": "release",
+                        },
+                    },
+                )
+            else:
+                assert barrier_path is not None
+                payload = json.loads(barrier_path.read_text(encoding="utf-8"))
+                payload["body"] = "mutated release barrier"
+                barrier_path.write_text(json.dumps(payload), encoding="utf-8")
+        return real_boundary(target_store, target_lane_id)
+
+    monkeypatch.setattr(cli, "_lane_prepare_publication", change_message_at_publication_boundary)
+    assert _run_raw([
+        "lane", "deliver", "--id", lane_id, "--from", "dev", "--head", head,
+    ], root) == expected_rc
+
+    saved = lanes.load_lanes(store)["lanes"][lane_id]
+    if expected_rc == 0:
+        assert saved["publish_pending"] is False
+        assert len(_committed_artifacts(store, lane_id)) == 1
+    else:
+        assert saved["status"] == lanes.STATUS_ACTIVE
+        assert _committed_artifacts(store, lane_id) == []
+
+
 def test_barrier_token_detects_atomic_replacement_and_deletion_fallback(
         tmp_path: Path) -> None:
     root, _base = _repo(tmp_path)
@@ -2046,7 +2148,7 @@ def test_terminal_rollback_holds_for_legacy_overlap_injected_after_provisional_s
                 data["lanes"]["rollback-b"] = lanes.new_lane(
                     "rollback-b", assignee="dev", assigned_by="legacy",
                     assigned_at="injected", domain_id="core",
-                    path_subset=["src/core"], base_sha=base,
+                    path_subset=["src/core/legacy-conflict"], base_sha=base,
                     target_ref=_branch(root), target_head_at_assign=head,
                     epoch_at_assign=target_store.current_epoch(),
                     registry_hash_at_assign=source["registry_hash_at_assign"],
@@ -2085,6 +2187,25 @@ def test_terminal_rollback_holds_for_legacy_overlap_injected_after_provisional_s
     assert "terminal_hold" in status_output
     assert _run_raw(["reset"], root) == 2
     assert "rollback-a" in lanes.load_lanes(store)["lanes"]
+
+    assert lanes.prefixes_disjoint(
+        ["src/core/legacy-conflict"], ["src/core/future"], casefold=False,
+    )
+    assert _run([
+        "lane", "assign", "--id", "rollback-c", "--from", "lead",
+        "--assignee", "dev", "--domain", "core", "--base", base,
+        "--target", _branch(root), "--path", "src/core/future",
+    ], root) == 2
+    assert "rollback-c" not in lanes.load_lanes(store)["lanes"]
+    assert _run([
+        "lane", "assign", "--id", "rollback-a", "--force", "--from", "lead",
+        "--assignee", "dev", "--domain", "core", "--base", base,
+        "--target", _branch(root), "--path", "src/core",
+    ], root) == 2
+    assert _run_raw(["lane", "abandon", "--id", "rollback-a"], root) == 2
+    still_held = lanes.load_lanes(store)["lanes"]["rollback-a"]
+    assert still_held["status"] == lanes.STATUS_DELIVERED
+    assert isinstance(still_held["publish_pending"], dict)
 
     assert _run_raw(argv, root) == 3
     retry_error = capsys.readouterr().err
@@ -2195,6 +2316,9 @@ def test_recovery_without_final_freshly_rebinds_live_inputs(
 @pytest.mark.parametrize(
     ("marker_case", "marker", "expected_rc"),
     [("true", True, 2), ("scalar", "corrupt", 2), ("missing", None, 2),
+     ("zero", 0, 2), ("none", None, 2), ("list", [], 2),
+     ("empty-dict", {}, 2),
+     ("wrong-transaction", {"transaction_id": "e" * 32}, 2),
      ("complete", False, 0)],
 )
 def test_delivered_lane_mutation_requires_explicit_complete_publication_marker(
@@ -2236,6 +2360,33 @@ def test_delivered_lane_mutation_requires_explicit_complete_publication_marker(
         assert saved["status"] == lanes.STATUS_ACTIVE
     else:
         assert saved["status"] == lanes.STATUS_ABANDONED
+
+
+@pytest.mark.parametrize(
+    ("marker_case", "marker"),
+    [
+        ("zero", 0), ("none", None), ("list", []), ("empty-dict", {}),
+        ("wrong-transaction", {"transaction_id": "e" * 32}),
+    ],
+)
+def test_reset_refuses_every_non_false_publication_marker(
+        tmp_path: Path, marker_case: str, marker: object) -> None:
+    root, base = _repo(tmp_path)
+    lane_id = f"reset-marker-{marker_case}"
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    store = Store(root)
+    data = lanes.load_lanes(store)
+    lane = data["lanes"][lane_id]
+    lane["status"] = lanes.STATUS_DELIVERED
+    lane["delivered_head"] = head
+    lane["delivery_transaction_id"] = "f" * 32
+    lane["publish_pending"] = marker
+    lanes.save_lanes(store, data)
+
+    assert _run_raw(["reset"], root) == 2
+    saved = lanes.load_lanes(store)["lanes"][lane_id]
+    assert saved["status"] == lanes.STATUS_DELIVERED
+    assert saved["publish_pending"] == marker
 
 
 @pytest.mark.parametrize("marker_case", ["true", "scalar", "missing"])
@@ -2395,6 +2546,38 @@ def test_delivery_retry_after_final_write_and_marker_save_failure_is_idempotent(
     )["artifact_state"] == lanes.ARTIFACT_COMMITTED
 
 
+def test_delivery_retry_recovers_when_publication_checkpoint_commits_then_fails(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    lane_id = "checkpoint-ambiguous"
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    store = Store(root)
+    real_checkpoint = cli._lane_checkpoint_publication
+    failed = False
+
+    def checkpoint_then_fail(*args, **kwargs):  # noqa: ANN002,ANN003
+        nonlocal failed
+        real_checkpoint(*args, **kwargs)
+        if not failed:
+            failed = True
+            raise OSError("injected failure after publication checkpoint commit")
+
+    monkeypatch.setattr(cli, "_lane_checkpoint_publication", checkpoint_then_fail)
+    argv = ["lane", "deliver", "--id", lane_id, "--from", "dev", "--head", head]
+    assert _run_raw(argv, root) == 2
+    first_final = _committed_artifacts(store, lane_id)
+    assert len(first_final) == 1
+    checkpointed = lanes.load_lanes(store)["lanes"][lane_id]
+    assert checkpointed["publish_pending"] is False
+    assert Path(checkpointed["delivery_artifact"]) == first_final[0]
+
+    monkeypatch.setattr(cli, "_lane_checkpoint_publication", real_checkpoint)
+    assert _run_raw(argv, root) == 0
+    completed = lanes.load_lanes(store)["lanes"][lane_id]
+    assert completed["publish_pending"] is False
+    assert _committed_artifacts(store, lane_id) == first_final
+
+
 def test_release_close_rejects_final_until_matching_pending_marker_completes(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture) -> None:
@@ -2457,6 +2640,73 @@ def test_release_close_rejects_final_until_matching_pending_marker_completes(
     assert _run_raw([
         "close", "check", "--id", "pending-release-close-check",
     ], root) == 0
+
+
+def test_historical_v1_v2_close_evidence_is_distinct_from_pending_v3_transaction(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    lane_id = "legacy-distinct"
+    lane = _assign_worktree(root, base, lane_id)
+    head = _commit(
+        Path(lane["worktree_path"]), "src/core/a.py", "base\nlegacy evidence\n",
+    )
+    argv = ["lane", "deliver", "--id", lane_id, "--from", "dev"]
+    store, lane_state = _leave_rebound_publish_pending(
+        root, argv, lane_id, monkeypatch,
+    )
+    pending = lane_state["publish_pending"]
+    prepared = json.loads(Path(pending["prepared_artifact"]).read_text(encoding="utf-8"))
+
+    def write_legacy(label: str, version: int | None, *,
+                     waived: bool = False, malformed: bool = False) -> Path:
+        payload = json.loads(json.dumps(prepared))
+        for key in (
+            "artifact_state", "transaction_id", "lane_instance_id",
+            "lane_generation", "release_class",
+        ):
+            payload.pop(key, None)
+        if version is None:
+            payload.pop("integrity_version", None)
+        else:
+            payload["integrity_version"] = version
+            payload["evaluation_snapshot"]["evaluation_version"] = \
+                lanes.LEGACY_EVALUATION_VERSION
+        if waived:
+            payload["isolation_status"] = "waived"
+            payload["worktree_waived"] = True
+            payload["worktree_waiver_reason"] = "legacy waiver"
+            payload["worktree_waived_by"] = "lead"
+            payload["worktree_waived_at"] = "legacy"
+        payload["delivery_id"] = f"{lane_id}-{label}"
+        payload["integrity_token"] = lanes.compute_integrity_token(store, payload)
+        if malformed:
+            payload.pop("integrity_token")
+        path = lanes.deliveries_dir(store) / f"{lane_id}-{label}.json"
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        return path
+
+    cases = [
+        ("v1", write_legacy("v1", None), 0),
+        ("v2", write_legacy("v2", lanes.LEGACY_INTEGRITY_VERSION), 0),
+        ("v2-waived", write_legacy(
+            "v2-waived", lanes.LEGACY_INTEGRITY_VERSION, waived=True,
+        ), 3),
+        ("v1-malformed", write_legacy("v1-malformed", None, malformed=True), 3),
+    ]
+    for label, artifact, expected_rc in cases:
+        close_id = f"legacy-distinct-{label}"
+        assert _run_raw([
+            "close", "open", "--id", close_id, "--from", "lead",
+            "--scope", "release", "--revision", head,
+            "--lane-artifact", str(artifact),
+        ], root) == 0
+        assert _run_raw(["close", "check", "--id", close_id], root) == expected_rc
+
+    still_pending = lanes.load_lanes(store)["lanes"][lane_id]
+    assert still_pending["status"] == lanes.STATUS_DELIVERED
+    assert isinstance(still_pending["publish_pending"], dict)
+    assert still_pending["delivery_transaction_id"] == pending["transaction_id"]
+    assert set(_committed_artifacts(store, lane_id)) == {case[1] for case in cases}
 
 
 def test_delivery_cas_rejects_force_reassign_aba(
