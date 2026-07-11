@@ -1,9 +1,9 @@
 # agenttalk - Product Roadmap & Feasibility
 
-**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-07-10
+**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-07-11
 **Audience:** maintainers, operators, and agents deciding what to build next.
 **Horizon:** pragmatic next 2-3 quarters + a labeled "later" tier.
-**Current shipped baseline:** v0.73.1 (2026-07-10). `CHANGELOG.md` remains the release-history source of truth.
+**Current shipped baseline:** v0.74.0 (2026-07-11). `CHANGELOG.md` remains the release-history source of truth.
 
 Companion docs: `docs/DESIGN.md` (why / architecture) · `docs/ASSURANCE.md` (per-release GOOD/ROBUST/SECURE attestation) · `docs/ISSUES.md` (living work tracker + known limitations) · `docs/DASHBOARD-CONTROL-PLANE-ROADMAP.md` (dashboard control-plane design history) · `CHANGELOG.md`.
 
@@ -187,7 +187,7 @@ Legacy adoption remains a flagship workflow, but it is no longer the whole roadm
 ### Quarter 1 - prove the delivery spine
 
 1. **Wrapped-agent runtime ergonomics.** First-class per-agent model / reasoning-effort config, restart-safe session fingerprinting when runtime config changes, and the planned no-visible-CLI/headless supervised mode with full dashboard status.
-2. **Project onboarding MVP.** Native onboarding runs for segments, claims, drift, and blocking unknowns, plus a read-only dashboard projection. This is the first step for existing-codebase adoption and the input to later work routing.
+2. **Project onboarding MVP.** ✅ Shipped in v0.73.0. Native onboarding runs for segments, claims, drift, and blocking unknowns, plus a read-only dashboard projection. This is the first step for existing-codebase adoption and the input to later work routing.
 3. **Native Work RFC.** Specify work item schema, event model, artifact schema, lifecycle, source-of-truth boundaries with lanes/gates/close, evidence tiers, reset semantics, and safety invariants.
 4. **Work item MVP.** `work create|list|show|status|assign|start|deliver|abandon`, with one record per item and links to existing lanes, domains, request threads, gates, closes, onboarding runs, and artifacts.
 5. **Evidence registry MVP.** Write-once artifacts, hash validation, bounded logs, redaction status, exact input binding, trust tiers, and stale-at-head detection.
