@@ -3176,6 +3176,13 @@ def _lane_transaction_lock_path(store, lane_id: str) -> Path:
     return store.dir / "locks" / f"lane-{safe_id}.transaction.lock"
 
 
+class _LaneTerminalBoundaryChanged(lane_mod.LaneError):
+    def __init__(self, error: str, conflicts: list[str]) -> None:
+        super().__init__(error)
+        self.error = error
+        self.conflicts = conflicts
+
+
 def _lane_reset_lock_path(store) -> Path:
     return store.dir / "locks" / "lane-reset.lock"
 
@@ -3233,13 +3240,15 @@ def _lane_remove_prepared(pending: dict) -> None:
         pass
 
 
-def _lane_rebind_pending_delivery(store, lane_id: str) -> tuple[dict, str | None]:
+def _lane_rebind_pending_delivery(
+        store, lane_id: str, *, checkpoint: bool = True) -> tuple[dict, str | None]:
     """Re-evaluate a persisted, nonconsumable GO after its first state save.
 
-    The prepared snapshot is collected before the provisional delivery save. A
-    byte-for-byte equivalent snapshot collected after that save brackets the
-    transaction boundary; only then is publication allowed. Git and artifact I/O
-    stay outside the global config lock.
+    Transaction evidence is collected before the provisional delivery save. An
+    equivalent live snapshot after that save brackets the transaction boundary.
+    ``checkpoint=False`` performs the same observation without rotating the durable
+    binding nonce, for the checks immediately around publication. Git and artifact
+    I/O stay outside the global config lock.
     """
     with store._config_lock():
         data = lane_mod.load_lanes(store)
@@ -3266,25 +3275,37 @@ def _lane_rebind_pending_delivery(store, lane_id: str) -> tuple[dict, str | None
     head = pending.get("head_sha")
     if not isinstance(head, str) or not lane_mod._FULL_SHA_RE.fullmatch(head):
         raise lane_mod.LaneError("pending delivery head is malformed")
-    prepared_path = pending.get("prepared_artifact")
-    if not isinstance(prepared_path, str):
-        raise lane_mod.LaneError("pending delivery prepared artifact is missing")
-    prepared = lane_mod.validate_prepared_delivery_artifact(
-        Path(prepared_path), store=store, lane_id=lane_id, head_sha=head,
-        transaction_id=str(pending.get("transaction_id")),
-        lane_instance_id=str(pending.get("lane_instance_id")),
-        lane_generation=pending.get("lane_generation"),
-    )
-    expected_snapshot = prepared.get("evaluation_snapshot")
+    committed = lane_mod.existing_committed_delivery_artifact(store, pending)
+    if committed is not None:
+        transaction_evidence = lane_mod.validate_committed_transaction_artifact(
+            committed, store=store, pending=pending,
+        )
+    else:
+        prepared_path = pending.get("prepared_artifact")
+        if not isinstance(prepared_path, str):
+            raise lane_mod.LaneError("pending delivery prepared artifact is missing")
+        transaction_evidence = lane_mod.validate_prepared_delivery_artifact(
+            Path(prepared_path), store=store, lane_id=lane_id, head_sha=head,
+            transaction_id=str(pending.get("transaction_id")),
+            lane_instance_id=str(pending.get("lane_instance_id")),
+            lane_generation=pending.get("lane_generation"),
+        )
+    expected_snapshot = transaction_evidence.get("evaluation_snapshot")
     expected_evaluation = pending.get("evaluation_fingerprint")
     expected_input = pending.get("input_fingerprint")
     if (not isinstance(expected_snapshot, dict)
             or lane_mod.fingerprint(expected_snapshot) != expected_evaluation):
-        raise lane_mod.LaneError("pending delivery evaluation snapshot differs from prepared evidence")
+        raise lane_mod.LaneError(
+            "pending delivery evaluation snapshot differs from transaction evidence"
+        )
     if lane_mod.fingerprint(lane_snapshot) != expected_snapshot.get("lane_fingerprint"):
-        raise lane_mod.LaneError("pending delivery lane snapshot differs from prepared evidence")
+        raise lane_mod.LaneError(
+            "pending delivery lane snapshot differs from transaction evidence"
+        )
     if expected_snapshot.get("active_lane_fingerprints") != expected_active:
-        raise lane_mod.LaneError("pending delivery active lanes differ from prepared evidence")
+        raise lane_mod.LaneError(
+            "pending delivery active lanes differ from transaction evidence"
+        )
     if (not re.fullmatch(r"[0-9a-f]{64}", str(expected_input or ""))
             or expected_snapshot.get("cooperating_digest") != expected_input):
         raise lane_mod.LaneError("pending delivery cooperating-input digest is malformed")
@@ -3338,6 +3359,8 @@ def _lane_rebind_pending_delivery(store, lane_id: str) -> tuple[dict, str | None
             raise lane_mod.LaneError("lane transaction changed before terminal binding checkpoint")
         if lane_mod.active_lane_fingerprints(data, exclude=lane_id) != expected_active:
             return dict(current_pending), "active-lane set changed before terminal binding checkpoint"
+        if not checkpoint:
+            return dict(current_pending), None
         current_pending = dict(current_pending)
         current_pending.pop("terminal_hold", None)
         current_pending["terminal_rebound"] = True
@@ -3390,6 +3413,20 @@ def _lane_rollback_pending_delivery(
     return "restored", []
 
 
+def _lane_abort_terminal_binding(
+        store, lane_id: str, pending: dict, *, artifact: Path | None = None) -> list[str]:
+    if artifact is not None and artifact.exists():
+        _lane_quarantine_rejected_final(store, artifact)
+    rollback, conflicts = _lane_rollback_pending_delivery(store, lane_id, pending)
+    if rollback == "restored":
+        _lane_remove_prepared(pending)
+    elif rollback == "bound":
+        raise lane_mod.LaneError(
+            "lane terminal binding changed before the stale transaction could be rolled back"
+        )
+    return conflicts
+
+
 def _lane_prepare_publication(store, lane_id: str) -> tuple[str | None, list[str]]:
     with store._config_lock():
         data = lane_mod.load_lanes(store)
@@ -3407,13 +3444,8 @@ def _lane_prepare_publication(store, lane_id: str) -> tuple[str | None, list[str
     pending, error = _lane_rebind_pending_delivery(store, lane_id)
     if error is None:
         return None, []
-    rollback, conflicts = _lane_rollback_pending_delivery(store, lane_id, pending)
-    if rollback == "restored":
-        _lane_remove_prepared(pending)
-        return error, []
-    if rollback == "held":
-        return error, conflicts
-    return None, []
+    conflicts = _lane_abort_terminal_binding(store, lane_id, pending)
+    return error, conflicts
 
 
 def _lane_terminal_boundary_error(error: str, conflicts: list[str]) -> str:
@@ -3612,7 +3644,7 @@ def _lane_recover_delivery(
 
 
 def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
-    """Finish a persisted transaction without recomputing its delivery verdict."""
+    """Publish only while the persisted transaction remains a freshly bound GO."""
     with store._config_lock():
         data = lane_mod.load_lanes(store)
         lane = (data.get("lanes") or {}).get(lane_id)
@@ -3642,7 +3674,21 @@ def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
         lane_snapshot = dict(lane)
 
     if publication_pending:
+        pending, error = _lane_rebind_pending_delivery(
+            store, lane_id, checkpoint=False,
+        )
+        if error is not None:
+            conflicts = _lane_abort_terminal_binding(store, lane_id, pending)
+            raise _LaneTerminalBoundaryChanged(error, conflicts)
         artifact = Path(lane_mod.publish_delivery_artifact(store, pending))
+        pending, error = _lane_rebind_pending_delivery(
+            store, lane_id, checkpoint=False,
+        )
+        if error is not None:
+            conflicts = _lane_abort_terminal_binding(
+                store, lane_id, pending, artifact=artifact,
+            )
+            raise _LaneTerminalBoundaryChanged(error, conflicts)
         _lane_checkpoint_publication(store, lane_id, pending, artifact)
         _lane_remove_prepared(pending)
     else:
@@ -4023,6 +4069,11 @@ def cmd_lane(args: argparse.Namespace) -> int:
                     artifact, cleanup_pending, delivered_head = _lane_finalize_delivery(
                         store, args.id,
                     )
+            except _LaneTerminalBoundaryChanged as exc:
+                sys.stderr.write(_lane_terminal_boundary_error(
+                    exc.error, exc.conflicts,
+                ))
+                return 3
             except (OSError, TimeoutError, lane_mod.LaneError, GitWriteError) as exc:
                 sys.stderr.write(
                     f"agenttalk lane deliver: pending delivery recovery failed ({exc}).\n"
@@ -4234,6 +4285,11 @@ def cmd_lane(args: argparse.Namespace) -> int:
                 artifact, cleanup_pending, delivered_head = _lane_finalize_delivery(
                     store, args.id,
                 )
+        except _LaneTerminalBoundaryChanged as exc:
+            sys.stderr.write(_lane_terminal_boundary_error(
+                exc.error, exc.conflicts,
+            ))
+            return 3
         except (OSError, TimeoutError, lane_mod.LaneError, GitWriteError) as exc:
             sys.stderr.write(
                 f"agenttalk lane deliver: delivery is checkpointed but pending recovery "

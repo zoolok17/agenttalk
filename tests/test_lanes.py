@@ -2207,6 +2207,122 @@ def test_delivery_terminal_rebind_hashes_in_place_barrier_contents(
     assert _committed_artifacts(store, "terminal-barrier") == []
 
 
+def test_delivery_finalize_rebind_rejects_gate_red_after_prepare_returns(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    gates.set_gate(
+        root, name="ci", status="green", severity="blocker", scope="release",
+        actor="lead", evidence_source="automation_ci", evidence=["ci://green"],
+        required=True,
+    )
+    lane_id = "post-prepare-gate"
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    store = Store(root)
+    real_prepare = cli._lane_prepare_publication
+    changed = False
+
+    def turn_gate_red_after_prepare(target_store, target_lane_id):  # noqa: ANN001
+        nonlocal changed
+        result = real_prepare(target_store, target_lane_id)
+        if not changed:
+            changed = True
+            saved = lanes.load_lanes(target_store)["lanes"][target_lane_id]
+            assert saved["publish_pending"]["terminal_rebound"] is True
+            gates.set_gate(
+                root, name="ci", status="red", severity="blocker", scope="release",
+                actor="lead", evidence_source="local_command", reason="late failure",
+            )
+        return result
+
+    monkeypatch.setattr(cli, "_lane_prepare_publication", turn_gate_red_after_prepare)
+    assert _run_raw([
+        "lane", "deliver", "--id", lane_id, "--from", "dev", "--head", head,
+        "--gate-scope", "release",
+    ], root) == 3
+
+    saved = lanes.load_lanes(store)["lanes"][lane_id]
+    assert saved["status"] == lanes.STATUS_ACTIVE
+    assert saved.get("publish_pending") is not False
+    assert _committed_artifacts(store, lane_id) == []
+
+
+def test_delivery_finalize_rebind_rejects_conflicting_target_after_prepare_returns(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    target_ref = _branch(root)
+    lane_id = "post-prepare-target"
+    lane = _assign_worktree(root, base, lane_id)
+    _commit(
+        Path(lane["worktree_path"]), "src/core/a.py", "base\nlane candidate\n",
+    )
+    _git(root, "checkout", "-q", "-b", "post-prepare-target-conflict", base)
+    conflicting = _commit(root, "src/core/a.py", "base\ntarget conflict\n")
+    _git(root, "checkout", "-q", target_ref)
+    assert _git(root, "rev-parse", "HEAD").strip() == base
+    store = Store(root)
+    real_prepare = cli._lane_prepare_publication
+    moved = False
+
+    def move_target_after_prepare(target_store, target_lane_id):  # noqa: ANN001
+        nonlocal moved
+        result = real_prepare(target_store, target_lane_id)
+        if not moved:
+            moved = True
+            saved = lanes.load_lanes(target_store)["lanes"][target_lane_id]
+            assert saved["publish_pending"]["terminal_rebound"] is True
+            assert _git_rc(
+                root, "update-ref", f"refs/heads/{target_ref}", conflicting, base,
+            ).returncode == 0
+        return result
+
+    monkeypatch.setattr(cli, "_lane_prepare_publication", move_target_after_prepare)
+    assert _run_raw([
+        "lane", "deliver", "--id", lane_id, "--from", "dev",
+    ], root) == 3
+
+    saved = lanes.load_lanes(store)["lanes"][lane_id]
+    assert saved["status"] == lanes.STATUS_ACTIVE
+    assert saved.get("publish_pending") is not False
+    assert _committed_artifacts(store, lane_id) == []
+
+
+def test_delivery_finalize_rebind_rejects_gate_red_after_final_publish(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root, base = _repo(tmp_path)
+    gates.set_gate(
+        root, name="ci", status="green", severity="blocker", scope="release",
+        actor="lead", evidence_source="automation_ci", evidence=["ci://green"],
+        required=True,
+    )
+    lane_id = "post-publish-gate"
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    store = Store(root)
+    real_publish = lanes.publish_delivery_artifact
+    changed = False
+
+    def publish_then_turn_gate_red(*args, **kwargs):  # noqa: ANN002,ANN003
+        nonlocal changed
+        artifact = real_publish(*args, **kwargs)
+        if not changed:
+            changed = True
+            gates.set_gate(
+                root, name="ci", status="red", severity="blocker", scope="release",
+                actor="lead", evidence_source="local_command", reason="late failure",
+            )
+        return artifact
+
+    monkeypatch.setattr(lanes, "publish_delivery_artifact", publish_then_turn_gate_red)
+    assert _run_raw([
+        "lane", "deliver", "--id", lane_id, "--from", "dev", "--head", head,
+        "--gate-scope", "release",
+    ], root) == 3
+
+    saved = lanes.load_lanes(store)["lanes"][lane_id]
+    assert saved["status"] == lanes.STATUS_ACTIVE
+    assert saved.get("publish_pending") is not False
+    assert _committed_artifacts(store, lane_id) == []
+
+
 def test_provisional_delivery_retains_overlapping_path_reservation(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root, base = _repo(tmp_path)
@@ -2557,7 +2673,7 @@ def test_delivery_retry_after_publish_failure_freshly_rebinds(
     assert _committed_artifacts(store, "prepub") == []
 
     assert _run_raw(argv, root) == 0
-    assert evals == 3  # initial GO, initial terminal rebind, and recovery rebind
+    assert evals == 6  # initial, prepare/pre-publish, then recovery prepare/pre/post
     final = lanes.load_lanes(store)["lanes"]["prepub"]
     assert final["publish_pending"] is False
     assert len(_committed_artifacts(store, "prepub")) == 1
@@ -2598,7 +2714,7 @@ def test_delivery_retry_after_atomic_final_write_failure_freshly_rebinds(
     assert _committed_artifacts(store, "finalwrite") == []
 
     assert _run_raw(argv, root) == 0
-    assert evals == 3  # initial GO, initial terminal rebind, and recovery rebind
+    assert evals == 6  # initial, prepare/pre-publish, then recovery prepare/pre/post
     assert len(_committed_artifacts(store, "finalwrite")) == 1
 
 
@@ -2649,7 +2765,7 @@ def test_delivery_retry_after_final_write_and_marker_save_failure_is_idempotent(
     assert _run_raw(["close", "check", "--id", "pending-close"], root) == 3
 
     assert _run_raw(argv, root) == 0
-    assert evals == 2  # initial GO plus the terminal post-state rebind; retry adds none
+    assert evals == 6  # initial prepare/pre/post plus recovery pre/post; final is reused
     assert _committed_artifacts(store, "postpub") == finals
     assert lanes.validate_delivery_artifact(
         finals[0], lane_id="postpub", head_sha=head, store=store,
@@ -3044,7 +3160,7 @@ def test_delivery_teardown_failure_is_retryable_without_reevaluation(
 
     monkeypatch.setattr(cli, "_git_write", real_git_write)
     assert _run_raw(argv, root) == 0
-    assert evals == 2  # initial GO plus the terminal post-state rebind; retry adds none
+    assert evals == 4  # initial GO plus prepare/pre/post; cleanup retry adds none
     complete = lanes.load_lanes(store)["lanes"]["teardown-fail"]
     assert complete["cleanup_pending"] is False
     assert not wt.exists()
@@ -3086,7 +3202,7 @@ def test_delivery_recovers_when_teardown_succeeds_but_cleanup_save_fails(
     assert pending["cleanup_pending"] is True
 
     assert _run_raw(argv, root) == 0
-    assert evals == 2  # initial GO plus the terminal post-state rebind; retry adds none
+    assert evals == 4  # initial GO plus prepare/pre/post; cleanup retry adds none
     assert lanes.load_lanes(store)["lanes"]["cleanup-save"]["cleanup_pending"] is False
 
 
@@ -3121,7 +3237,7 @@ def test_concurrent_delivery_commits_one_artifact_and_retry_never_reevaluates(
     state = lanes.load_lanes(store)["lanes"]["concurrent"]
     assert state["delivery_artifact"] == str(finals[0])
     assert _run_raw(argv, root) == 0
-    assert evals == 3  # two initial evaluations; only the winner rebinds, retry adds none
+    assert evals == 5  # two initial evaluations; winner performs prepare/pre/post
     assert _committed_artifacts(store, "concurrent") == finals
 
 
