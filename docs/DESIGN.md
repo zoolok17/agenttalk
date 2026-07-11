@@ -50,16 +50,18 @@ these win.
    it does not silently pass. (The 2026-06-28 audit found several *write-path*
    violations of this in `gates.py` — see `docs/ISSUES.md`.)
 
-3. **Writes are atomic and serialized; readers are fail-safe.** Mutations go
-   through `_atomic.write_text` (temp + fsync + `os.replace`, with a latched
-   sandbox-direct fallback). Cooperating read-modify-write paths use hardened
-   cross-process locks, and narrowly scoped resources such as closes and lane
-   cleanup use their own serialization boundaries. Lock publication rejects
-   stale generations and unsafe non-regular/reparse paths, but it is not a
-   same-user security boundary. JSONL append owners serialize and fsync complete
-   records; readers isolate malformed physical lines, surface them, and retain
-   later valid records. Cursors bias toward re-delivery rather than skipping a
-   message.
+3. **Durable writes are atomic; serialization is resource-specific; readers are
+   fail-safe.** Mutations go through `_atomic.write_text` (temp + fsync +
+   `os.replace`, with a latched sandbox-direct fallback). Hardened
+   cross-process locks cover shared config, retirement versus final send
+   publication, launch requests, and waiting markers; closes and lane cleanup
+   use their own serialization boundaries. Per-agent cursor and threadstate
+   read-modify-write sequences remain unlocked under the one-consumer model.
+   Lock publication rejects stale generations and unsafe
+   non-regular/reparse paths, but it is not a same-user security boundary.
+   JSONL append owners serialize and fsync complete records; readers isolate
+   malformed physical lines, surface them, and retain later valid records.
+   Cursors bias toward re-delivery rather than skipping a message.
 
 4. **Advisory, not an authorization boundary.** Leases, lanes, stand-down
    authority, and the like are *coordination* gates that produce auditable
@@ -78,11 +80,11 @@ these win.
    process/locking primitives are chosen to work on Windows.
 
 7. **One live consumer per agent mailbox.** Each agent name has a single active
-   listen loop. Cooperating cursor updates are serialized, but stacked listeners
-   can still execute the same inbound work and emit conflicting replies before
-   either advances state. `status`/`doctor` warn, and the design avoids second
-   consumers (e.g. the wrapper owns the loop and the model is a pure per-turn
-   handler).
+   listen loop. Cursor and threadstate writes are atomic, but their surrounding
+   read-modify-write sequences are not cross-process serialized. Stacked
+   listeners can lose state, execute the same inbound work, and emit conflicting
+   replies. `status`/`doctor` warn, and the design avoids second consumers (e.g.
+   the wrapper owns the loop and the model is a pure per-turn handler).
 
 8. **Human authority is explicit and typed.** Irreversible or human-only
    decisions (operator escalation, stand-down, waivers) flow through typed
@@ -341,10 +343,13 @@ two parallel ownership concepts.
   or non-full write selectors fail with HTTP 400 `bad_root` before mutation.
   The top bar keeps project and path context visible; when CSS ellipsizes the
   path, the full value remains in text, title, and accessibility surfaces. A
-  root switch clears root-bound caches/drill-ins/action state, and late
-  responses are accepted only when their project id matches the current
-  selection. This prevents accidental cross-root UI writes; it is not
-  authentication or isolation from another local process.
+  selector change pushes the project id into browser history; Back and Forward
+  restore that selection and refetch its root-bound feeds. An actual root
+  change clears root-bound caches, drill-ins, action state, queued-answer text,
+  and generic/lead-chat composer drafts. Late responses are accepted only when
+  their project id matches the current selection. This prevents accidental
+  cross-root UI writes; it is not authentication or isolation from another
+  local process.
 - **Intent write spine:** for ordinary dashboard controls on `/api/intent`, the
   browser never calls `store.send()` directly. With `--enable-actions` off,
   `POST` stays disabled and no session token exists. With actions enabled, the
@@ -688,15 +693,16 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   is conservative but not omniscient; config-blocked and infra-heavy histories
   surface to the operator rather than pretending the tool can prove intent.
 
-- **D-20 Cooperating persistence uses generation-aware serialization
-  (2026-07-11).** *Why:* atomic replacement alone does not protect a
-  read-modify-write sequence, an old teardown can erase replacement state, and
-  a valid backup is more useful than silently resetting corrupt supervisor
-  state. *Decision:* hardened store locks serialize cooperating RMW paths;
-  close and waiter instances carry immutable tokens; supervisor state keeps one
-  validated backup; JSONL owners serialize complete fsynced appends and readers
-  isolate bad physical lines. *Ceiling:* same-user hostile writers and duplicate
-  model consumers remain outside the guarantee.
+- **D-20 Shared control paths use scoped generation-aware serialization
+  (2026-07-11).** *Why:* atomic replacement alone does not protect a shared
+  read-modify-write sequence, and an old teardown can erase replacement state.
+  *Decision:* hardened store locks serialize config mutation, retirement versus
+  final send publication, launch-request creation/transitions/archive, and
+  waiting-marker replacement/clear. Waiting instances carry immutable tokens,
+  so stale teardown clears only its own generation. *Ceiling:* per-agent cursor
+  and threadstate writes are atomic file replacements, but their surrounding
+  read-modify-write sequences are not cross-process serialized. The supported
+  model is one consumer per agent; duplicates can lose state and duplicate work.
 - **D-21 A release barrier is a recoverable close-bound effect
   (2026-07-11).** *Why:* close state and bus publication cannot be one atomic
   filesystem transaction. *Decision:* persist GO with a unique binding to close

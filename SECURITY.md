@@ -391,13 +391,15 @@ Two limitations documented at 0.18.0 were:
   mis-order or hide messages. Id-shape validation does **not** fix this
   (a skewed id is well-formed); keep clocks in agreement.
 
-**Current persistence and schema hardening (planned v0.74.0).** The historical
-cursor/threadstate lost-update limitation above is superseded for cooperating
-writers by cross-process read-modify-write serialization. One consuming window
-per agent remains the supported model because two consumers can execute the
-same work and send conflicting replies before either advances state. A wrapper
-waiting marker also has a generation token, so an old teardown cannot erase a
-replacement marker.
+**Current persistence and schema hardening (planned v0.74.0).** The
+cursor/threadstate lost-update limitation above remains: writes are atomic, but
+their read-modify-write sequences are not cross-process serialized. One
+consuming window per agent is therefore required; duplicate consumers can lose
+state and execute or answer the same work more than once. Scoped locks instead
+protect shared config mutation, retirement against final send publication,
+launch-request transitions, and waiting-marker replacement or teardown. A
+wrapper waiting marker also has a generation token, so an old teardown cannot
+erase a replacement marker.
 
 Additional current contracts:
 

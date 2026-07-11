@@ -83,9 +83,11 @@ Publish your own headroom with `capacity refresh --for $SELF` (5h/weekly rate-li
 ### Store hygiene
 `prune --invalid` quarantines invalid message files into `.agenttalk/quarantine/` (recoverable, never deletes valid files); use `--dry-run` first. `compact` archives a safe prefix of old messages; `doctor` runs health checks (init state, skill freshness, codex-config, heartbeats, knowledge/dead-letter integrity).
 
-Cooperating state updates are cross-process serialized, but that does not make
-two model consumers safe: both can execute and answer the same inbound record
-before either advances its cursor. JSONL ledgers isolate malformed physical
+Cursor and threadstate file writes are atomic, but their read-modify-write
+sequences are not cross-process serialized. Run one consumer per agent:
+duplicates can lose state and execute or answer the same inbound record more
+than once. Scoped locks protect shared config, retirement/send publication,
+launch requests, and waiting markers. JSONL ledgers isolate malformed physical
 lines and keep later valid records visible; never hand-edit a live ledger to
 repair it.
 

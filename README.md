@@ -1802,11 +1802,14 @@ never imports spec-kitty.
 The top bar always shows current project and path context, even for a single
 watched root. If CSS ellipsizes the path visually, its complete value remains
 available through the element text, title, and accessibility label. Duplicate
-basenames receive stable project-id suffixes. Switching projects clears
-root-bound drill-ins, caches, and action sessions; every asynchronous payload
-is checked against the selected `project_id`, so a late response from the
-previous project is discarded. The id is routing and display state, not
-authentication or cross-root security.
+basenames receive stable project-id suffixes. A selector change pushes the
+selected `project_id` into browser history; Back and Forward restore that
+project and refetch its root-bound feeds. Every actual project change clears
+root-bound drill-ins, caches, the action session, queued-answer text, and the
+generic and lead-chat composer drafts. Every asynchronous payload is checked
+against the selected id, so a late response from the previous project is
+discarded. The id is routing and display state, not authentication or
+cross-root security.
 
 The loopback story is unchanged and non-negotiable: no auth, no
 remote-bind flag on any spelling — SSH-tunnel the port if you need it
@@ -1855,11 +1858,11 @@ usage; it shows what the message store actually contains.
 Two operating assumptions are worth stating plainly (0.18.0):
 
 - **One consumer per agent.** Each agent is meant to run in exactly one
-  consuming window per store. Cooperating cursor and threadstate
-  read-modify-write paths are now cross-process serialized, so the old
-  lost-update limitation is superseded. Duplicate consumers remain
-  **unsupported** because they can both execute the same inbound work and
-  produce conflicting replies before either cursor advances. 0.18.0 *warns* when
+  consuming window per store. Cursor and threadstate file writes are atomic,
+  but their surrounding read-modify-write sequences are not cross-process
+  serialized. Duplicate consumers are **unsupported**: they can lose cursor or
+  threadstate updates, execute the same inbound work, and produce conflicting
+  replies before either advances state. 0.18.0 *warns* when
   `agenttalk wait` detects another live process already waiting as the same
   agent (advisory, best-effort — it never blocks and never changes the exit
   code), and `agenttalk doctor` reports the current waiter's PID. It does

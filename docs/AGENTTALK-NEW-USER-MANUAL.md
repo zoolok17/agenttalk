@@ -74,9 +74,10 @@ Keep these rules in mind before learning commands.
   metadata, repository reads, and explicit human decisions, not prose.
 - Roles, lanes, gates, and dashboard sessions are coordination and audit tools.
   They are not Git or OS permissions.
-- One live consumer per agent mailbox is the supported model. Cooperating cursor
-  updates are serialized, but duplicate consumers can still execute and answer
-  the same inbound work before either advances state.
+- One live consumer per agent mailbox is the supported model. Cursor and
+  threadstate writes are atomic, but their read-modify-write sequences are not
+  cross-process serialized. Duplicate consumers can lose state and execute or
+  answer the same inbound work more than once.
 - `sync` is a read-only rejoin digest. Run it before acting after a restart.
 - `recv` peeks by default. `drain`, `recv --ack`, and `wait` consume.
 - A request needs a `request_id`. Replies anchor to that id.
@@ -414,11 +415,14 @@ exactly one explicit full `?root=<project_id>`. Labels are forbidden; omission
 is valid only for a single-root server. Unknown, blank, repeated, ambiguous, or
 non-full selectors return HTTP 400 `bad_root` before mutation.
 
-When the operator switches projects, the client clears root-bound drill-ins,
-caches, queued answers, and the action session, then refetches. It ignores late
-responses whose project id belongs to the old selection. This protects routing
-correctness, not access control: every exposed root remains readable to local
-processes that can reach the loopback server.
+Changing the selector to a different project pushes its id into browser
+history. Back and Forward restore the selected project and refetch its
+root-bound feeds. Any actual project change clears root-bound drill-ins,
+caches, the action session, queued-answer text, and generic and lead-chat
+composer drafts. The client
+ignores late responses whose project id belongs to the old selection. This
+protects routing correctness, not access control: every exposed root remains
+readable to local processes that can reach the loopback server.
 
 Main views:
 

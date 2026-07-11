@@ -399,11 +399,15 @@ accepted only with one root.
 Unknown, blank, repeated, ambiguous, or non-full selectors return HTTP 400
 `bad_root` before anything is written.
 
-Changing the project clears thread drill-ins, caches, queued answers, and the
-action session before refetching. Responses from the old project are ignored
-unless their `root_info.project_id` still matches. This prevents accidental
-cross-root UI actions; `project_id` is not authentication, and any local process
-that can reach the loopback server can inspect every exposed root.
+Changing the selector to a different project pushes its id into browser
+history. Back and Forward restore the selected project and refetch its
+root-bound feeds. Any actual project change clears thread drill-ins, caches,
+the action session, queued-answer text, and generic and lead-chat composer
+drafts. Responses from
+the old project are ignored unless their `root_info.project_id` still matches.
+This prevents accidental cross-root UI actions; `project_id` is not
+authentication, and any local process that can reach the loopback server can
+inspect every exposed root.
 
 Browser actions are off by default:
 
