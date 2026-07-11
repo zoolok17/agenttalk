@@ -596,10 +596,21 @@ def test_cli_release_lane_refuses_no_worktree_and_advisory_is_never_release_evid
     assert "release-class" in capsys.readouterr().err.lower()
     assert "denied" not in lanes.load_lanes(Store(root))["lanes"]
 
+    Store(root).set_operator_facing("dev2")
+    assert _run_raw([
+        "lane", "assign", "--id", "operator-denied", "--from", "dev2",
+        "--assignee", "dev", *common,
+    ], root) == 2
+    assert "release-class" in capsys.readouterr().err.lower()
+    assert "operator-denied" not in lanes.load_lanes(Store(root))["lanes"]
+
     assert _run_raw([
         "lane", "assign", "--id", "advisory", "--from", "dev",
         "--assignee", "dev", "--advisory", *common,
     ], root) == 0
+    advisory_lane = lanes.load_lanes(Store(root))["lanes"]["advisory"]
+    assert advisory_lane["release_class"] is False
+    assert advisory_lane["worktree_waiver_authority"] == "advisory_only"
     head = _commit(root, "src/core/a.py", "base\nadvisory\n")
     assert _run_raw([
         "lane", "deliver", "--id", "advisory", "--from", "dev", "--head", head,
@@ -607,6 +618,11 @@ def test_cli_release_lane_refuses_no_worktree_and_advisory_is_never_release_evid
     artifact = next((Store(root).dir / "lane-deliveries").glob("advisory-*.json"))
     payload = json.loads(artifact.read_text(encoding="utf-8"))
     assert payload["isolation_status"] == "advisory_unisolated"
+    assert payload["release_class"] is False
+    assert payload["worktree_waiver_authority"] == "advisory_only"
+    assert lanes.validate_delivery_artifact(
+        artifact, lane_id="advisory", head_sha=head, store=Store(root),
+    )["release_class"] is False
     with pytest.raises(lanes.LaneError, match="isolation"):
         lanes.validate_delivery_artifact(
             artifact, lane_id="advisory", head_sha=head, store=Store(root),
@@ -619,20 +635,47 @@ def test_cli_release_lane_refuses_no_worktree_and_advisory_is_never_release_evid
     ], root) == 0
     assert _run_raw(["close", "check", "--id", "advisory-close"], root) == 3
 
-    legacy = dict(payload)
-    legacy["integrity_version"] = lanes.LEGACY_INTEGRITY_VERSION
-    legacy["evaluation_snapshot"] = dict(legacy["evaluation_snapshot"])
-    legacy["evaluation_snapshot"]["evaluation_version"] = lanes.LEGACY_EVALUATION_VERSION
-    legacy["isolation_status"] = "waived"
-    legacy["worktree_waiver_authority"] = "sole_lead"
-    legacy["integrity_token"] = lanes.compute_integrity_token(Store(root), legacy)
-    legacy_path = Store(root).dir / "lane-deliveries" / "legacy-waived.json"
-    legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
-    with pytest.raises(lanes.LaneError, match="legacy waived"):
-        lanes.validate_delivery_artifact(
-            legacy_path, lane_id="advisory", head_sha=head, store=Store(root),
-            require_isolation=True,
-        )
+    authority_cases = (
+        ("sole-lead", "lead", "sole_lead"),
+        ("operator", "dev2", "operator_facing"),
+    )
+    for name, waived_by, authority in authority_cases:
+        if authority == "operator_facing":
+            Store(root).set_operator_facing(waived_by)
+        legacy = dict(payload)
+        legacy["integrity_version"] = lanes.LEGACY_INTEGRITY_VERSION
+        legacy["evaluation_snapshot"] = dict(legacy["evaluation_snapshot"])
+        legacy["evaluation_snapshot"]["evaluation_version"] = \
+            lanes.LEGACY_EVALUATION_VERSION
+        legacy["isolation_status"] = "waived"
+        legacy["worktree_waiver_authority"] = authority
+        legacy["worktree_waived_by"] = waived_by
+        legacy["integrity_token"] = lanes.compute_integrity_token(Store(root), legacy)
+        legacy_path = Store(root).dir / "lane-deliveries" / f"legacy-{name}.json"
+        legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+        with pytest.raises(lanes.LaneError, match="legacy waived"):
+            lanes.validate_delivery_artifact(
+                legacy_path, lane_id="advisory", head_sha=head, store=Store(root),
+                require_isolation=True,
+            )
+        close_id = f"legacy-{name}-close"
+        assert _run_raw([
+            "close", "open", "--id", close_id, "--from", "lead",
+            "--scope", "release", "--revision", head,
+            "--lane-artifact", str(legacy_path),
+        ], root) == 0
+        assert _run_raw(["close", "check", "--id", close_id], root) == 3
+
+        if authority == "sole_lead":
+            Store(root).set_role("dev2", "lead")
+        else:
+            Store(root).set_operator_facing("lead")
+        with pytest.raises(lanes.LaneError, match="legacy waived"):
+            lanes.validate_delivery_artifact(
+                legacy_path, lane_id="advisory", head_sha=head, store=Store(root),
+                require_isolation=True,
+            )
+        assert _run_raw(["close", "check", "--id", close_id], root) == 3
 
     assert _run_raw([
         "lane", "assign", "--id", "advisory-isolated", "--from", "dev",
@@ -662,7 +705,63 @@ def test_cli_release_lane_refuses_no_worktree_and_advisory_is_never_release_evid
     assert _run_raw(["close", "check", "--id", "advisory-isolated-close"], root) == 3
 
 
-def test_cli_deliver_rejects_forged_no_worktree_waiver(tmp_path: Path) -> None:
+def test_historical_v2_verified_compatibility_and_v3_release_class_integrity(
+        tmp_path: Path) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "integrity-versions")
+    head = _commit(
+        Path(lane["worktree_path"]), "src/core/a.py", "base\nintegrity versions\n",
+    )
+    assert _run_raw([
+        "lane", "deliver", "--id", "integrity-versions", "--from", "dev",
+    ], root) == 0
+    store = Store(root)
+    artifact = _committed_artifacts(store, "integrity-versions")[0]
+    v3 = json.loads(artifact.read_text(encoding="utf-8"))
+    assert v3["integrity_version"] == lanes.INTEGRITY_VERSION
+    assert v3["release_class"] is True
+
+    tampered = json.loads(json.dumps(v3))
+    tampered["release_class"] = False
+    tampered_path = store.dir / "lane-deliveries" / "v3-release-class-tampered.json"
+    tampered_path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(lanes.LaneError, match="integrity token"):
+        lanes.validate_delivery_artifact(
+            tampered_path, lane_id="integrity-versions", head_sha=head,
+            store=store, require_isolation=True,
+        )
+
+    historical = json.loads(json.dumps(v3))
+    historical["integrity_version"] = lanes.LEGACY_INTEGRITY_VERSION
+    for key in (
+        "artifact_state", "transaction_id", "lane_instance_id", "lane_generation",
+        "release_class",
+    ):
+        historical.pop(key, None)
+    historical["evaluation_snapshot"]["evaluation_version"] = \
+        lanes.LEGACY_EVALUATION_VERSION
+    for key in (
+        "lane_instance_id", "lane_generation", "config_digest", "cooperating_digest",
+    ):
+        historical["evaluation_snapshot"].pop(key, None)
+    historical["integrity_token"] = lanes.compute_integrity_token(store, historical)
+    historical_path = store.dir / "lane-deliveries" / "historical-v2-verified.json"
+    historical_path.write_text(json.dumps(historical), encoding="utf-8")
+
+    validated = lanes.validate_delivery_artifact(
+        historical_path, lane_id="integrity-versions", head_sha=head,
+        store=store, require_isolation=True,
+    )
+    assert validated["integrity_version"] == lanes.LEGACY_INTEGRITY_VERSION
+    assert "release_class" not in validated
+
+
+@pytest.mark.parametrize(
+    ("waived_by", "authority"),
+    (("lead", "sole_lead"), ("dev2", "operator_facing")),
+)
+def test_cli_deliver_rejects_forged_no_worktree_waiver(
+        tmp_path: Path, waived_by: str, authority: str) -> None:
     root, base = _repo(tmp_path)
     br = _branch(root)
     assert _run([
@@ -671,10 +770,12 @@ def test_cli_deliver_rejects_forged_no_worktree_waiver(tmp_path: Path) -> None:
         "--target", br, "--path", "src/core",
     ], root) == 0
     store = Store(root)
+    if authority == "operator_facing":
+        store.set_operator_facing(waived_by)
     state = lanes.load_lanes(store)
     state["lanes"]["forged"]["release_class"] = True
-    state["lanes"]["forged"]["worktree_waived_by"] = "lead"
-    state["lanes"]["forged"]["worktree_waiver_authority"] = "sole_lead"
+    state["lanes"]["forged"]["worktree_waived_by"] = waived_by
+    state["lanes"]["forged"]["worktree_waiver_authority"] = authority
     lanes.save_lanes(store, state)
     head = _commit(root, "src/core/a.py", "base\nchange\n")
 
@@ -684,6 +785,15 @@ def test_cli_deliver_rejects_forged_no_worktree_waiver(tmp_path: Path) -> None:
     assert lanes.load_lanes(store)["lanes"]["forged"]["status"] == lanes.STATUS_ACTIVE
     deliveries = store.dir / "lane-deliveries"
     assert not deliveries.exists() or not list(deliveries.glob("*.json"))
+
+    if authority == "sole_lead":
+        store.set_role("dev2", "lead")
+    else:
+        store.set_operator_facing("lead")
+    assert _run_raw([
+        "lane", "deliver", "--id", "forged", "--from", "dev", "--head", head,
+    ], root) == 3
+    assert lanes.load_lanes(store)["lanes"]["forged"]["status"] == lanes.STATUS_ACTIVE
 
 
 def test_cli_shared_approval_authority_and_fail_closed(tmp_path: Path) -> None:
