@@ -4850,6 +4850,56 @@ def _attention(base: str) -> dict:
         return json.loads(resp.read())
 
 
+def test_api_attention_hides_resolved_dead_letter_and_keeps_unresolved(
+    tmp_path: Path,
+) -> None:
+    from agenttalk import cli as cli_mod
+    from agenttalk.wrapper import recv_api
+
+    s = Store(tmp_path)
+    s.init(["alpha", "beta"])
+    s.set_operator_facing("alpha")
+
+    def dead_letter(body: str) -> str:
+        message = s.send(
+            sender="alpha", recipient="beta", body=body, kind="message", meta={}
+        )
+        record = recv_api.next_record(s, "beta")
+        assert record["id"] == message.id
+        s.dead_letter(
+            "beta",
+            record,
+            reason="turn failed deterministically",
+            failure_class="poison_eligible",
+            at="2026-07-12T00:00:00Z",
+        )
+        return message.id
+
+    resolved_id = dead_letter("resolved poison")
+    unresolved_id = dead_letter("unresolved poison")
+    assert cli_mod.main([
+        "--root", str(tmp_path),
+        "dead-letter", "resolve",
+        "--from", "alpha",
+        "--agent", "beta",
+        "--id", resolved_id,
+        "--reason", "handled out of band",
+    ]) == 0
+
+    srv, _t, base = _serve(s)
+    try:
+        payload = _attention(base)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    dead_letters = {
+        item["id"] for item in payload["items"] if item["source"] == "deadletter"
+    }
+    assert f"dead_letter:beta:{resolved_id}" not in dead_letters
+    assert f"dead_letter:beta:{unresolved_id}" in dead_letters
+
+
 def test_api_attention_shape_and_gate_hold(tmp_path: Path) -> None:
     """§4a: /api/attention returns the ranked envelope, and a gate HOLD surfaces
     with the frozen wire fields. Envelope-only — no raw body leaks."""

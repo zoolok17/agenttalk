@@ -2332,9 +2332,7 @@ def _collect_web_attention_items(store: Store, roster: list[str],
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("config_blocked", str(e)))
     try:
-        items += A.dead_letter_items(
-            [{"agent": d.get("agent"), "message_id": d.get("message_id")}
-             for d in store.list_dead_letters()])
+        items += A.dead_letter_items(store.list_dead_letters())
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("dead_letter", str(e)))
     try:
