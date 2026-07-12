@@ -95,15 +95,44 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.74.1 - resolved dead-letter dashboard parity (2026-07-12)
+**GOOD / ROBUST / SECURE** - reviewed-SHA `6ed5382` - tag `v0.74.1`
+- **Review:** `codex-agenttalk-reviewer-1` approved the exact two-file
+  implementation after reproducing the failure on `b9533c3`, verifying the fix
+  on `6ed5382`, and injecting corrupt-sidecar and source-read failures. A separate
+  release-docs review rejected release-prep SHA `bd647aa` because this ledger row
+  was missing and the `dead_letter_items` docstring described the retired caller
+  contract; both findings were corrected and re-reviewed before tagging.
+- **Verification:** the exact patch passed all `157` focused Attention and
+  dead-letter tests, the full web module (`174 passed, 1 skipped`), and `23`
+  release/version tests. Ruff, version parity, strict UTF-8/NUL checks, and
+  `git diff --check` passed. A live dashboard against the production-shaped
+  project state reported the stable `agenttalk` project id/path and zero active
+  Attention rows after the CLI also reported zero; the released v0.74.0 endpoint
+  reproduced all 15 already-resolved rows before the fix.
+- **Lead gate / CI:** the v0.74.0 baseline had already passed the full suite on
+  Python 3.10 and 3.14. Release-prep SHA `bd647aa` then passed all 12 full-suite
+  Python 3.10-3.13 jobs on Windows, macOS, and Ubuntu plus the sdist/wheel build,
+  non-editable install, and package-content gate in GitHub `tests` run
+  `29173776132`; Ruff, Bandit, pip-audit, gitleaks, Semgrep, CodeQL, and zizmor
+  passed in `security` run `29173776138`. The final ledger/docstring-only commit
+  was required to pass the same exact-SHA workflows before the tag was created;
+  the GitHub release records those final run ids.
+- **Robust/Secure:** the web and CLI projections now hash the same canonical
+  dead-letter state. Snapshot drift intentionally resurfaces an item, malformed
+  state remains visible, and a source exception produces a bounded source-error
+  item instead of blanking the queue. This patch changes no authority boundary,
+  browser action, message payload, or dead-letter retention policy.
+
 ### v0.74.0 - concurrency hardening, native Windows teardown, and project-aware dashboard (2026-07-12)
-**GOOD / ROBUST / SECURE candidate** - reviewed-SHA `5a0200f` - tag `v0.74.0`
+**GOOD / ROBUST / SECURE** - reviewed-SHA `b9533c3` - tag `v0.74.0`
 - **Review:** a third-party adversarial review placed revision `fdea125` on HOLD with 27
   confirmed findings (5 blockers, 14 major, 1 medium, and 7 lower-severity defects). The
   remediation matrix in `docs/reviews/v0.74.0-remediation.md` maps every finding to its fix,
   regression tests, and review evidence. The final lane transaction fix `c4838af` was approved
   independently by `codex-test` and `claude-test`; the dashboard project-identity change was
-  independently reviewed by Claude and Codex/Edge reviewers. Release-candidate review still
-  applies to the exact versioned commit before publication.
+  independently reviewed by Claude and Codex/Edge reviewers. The exact versioned commit
+  `b9533c3` received a final documentation re-review and an independent release-readiness GO.
 - **Verification:** the full suite passed on Python 3.10 (`2370 passed, 5 skipped`) and Python
   3.14 (`2370 passed, 5 skipped`) with pinned `PYTHONPATH=src`, no pytest cache provider, and
   external basetemps. Exact lane evidence also passed `160` lane tests plus `133` supporting
@@ -112,9 +141,11 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
   `git diff --check` passed. Documentation checks covered 12 changed Markdown files, 21 internal
   links, 376 fences, executable CLI help/version examples, and the regenerated 16-page manual PDF
   (37 bookmarks, no blank/overflow pages, and visual contact-sheet review).
-- **Packaging/CI:** pending on the exact versioned candidate. Publication remains HOLD until a
-  clean sdist/wheel build, non-editable wheel install smoke, package-content probe, GitHub Actions
-  test matrix, packaging gate, and security workflow all pass.
+- **Packaging/CI:** GitHub `tests` run `29172438616` passed all 12 full-suite jobs and packaging
+  job `86595712534`, including sdist/wheel builds, non-editable install, exclusion sentinels,
+  dashboard assets, and the new-user manual PDF. `security` run `29172438655` passed Ruff,
+  Bandit, pip-audit, gitleaks, Semgrep, CodeQL, and zizmor. Tag `v0.74.0` and its GitHub release
+  were published from exact commit `b9533c3` after those gates were green.
 - **Robust/Secure:** close and lane publication now bind mutable inputs at their serialization
   boundaries; lock, waiter, launch-request, onboarding, supervisor-state, and JSONL persistence
   paths have generation/atomicity and malformed-state regressions. Windows turn teardown no

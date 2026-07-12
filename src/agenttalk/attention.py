@@ -672,8 +672,11 @@ def config_blocked_items(holds: list[dict]) -> list[dict]:
 
 
 def dead_letter_items(entries: list[dict]) -> list[dict]:
-    """Each entry: {agent, message_id, ...}. Unresolved dead letters (the caller excludes
-    resolved). Content-bound on (agent, message_id)."""
+    """Build items from canonical dead-letter entries.
+
+    Resolution filtering is applied centrally by ``build_queue`` against each
+    entry's source snapshot, so callers pass both resolved and unresolved rows.
+    """
     out = []
     for e in entries:
         ag, mid = e.get("agent", ""), e.get("message_id", "")
