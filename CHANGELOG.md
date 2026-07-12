@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.74.1] - 2026-07-12
+
+### Fixed
+
+- **Resolved dead letters stay resolved in the Team Console.** The dashboard
+  Attention endpoint now evaluates the canonical dead-letter records used by
+  the CLI, so a supported `agenttalk dead-letter resolve` disposition hides the
+  matching row while unresolved dead letters remain visible.
+
 ## [0.74.0] - 2026-07-12
 
 ### Added
