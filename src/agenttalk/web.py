@@ -1552,6 +1552,22 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
         task = _agent_task(a, threads_rows, composing)
         if task is not None:
             e["task"] = task
+        # --- v0.75.0 wrapped-agent runtime (additive, absent-not-null) ---
+        # A fail-safe allow-list projection: model / reasoning_effort and a nested
+        # `runtime` = {state, reset_reason?}. NO raw session/thread ids (dropped at
+        # the store boundary), NO fingerprint. Named `runtime` (NOT `session`) to
+        # avoid colliding with /api/session, the Sessions thread view, or the launch
+        # epoch. STATE_SCHEMA_VERSION unchanged (purely additive).
+        rt = store.read_wrapper_runtime(a)
+        if rt is not None:
+            if rt.get("model"):
+                e["model"] = rt["model"]
+            if rt.get("reasoning_effort"):
+                e["reasoning_effort"] = rt["reasoning_effort"]
+            runtime: dict[str, Any] = {"state": rt.get("session_state", "fresh")}
+            if rt.get("reset_reason"):
+                runtime["reset_reason"] = rt["reset_reason"]
+            e["runtime"] = runtime
         # health_timeline: best-effort in-memory ring (§5). Record this tick,
         # then emit the collapsed segments — omitted entirely when history is
         # None (build_state stays pure) or no meaningful samples have

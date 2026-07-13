@@ -5231,6 +5231,74 @@ class Store:
                 out[agent] = d
         return out
 
+    # ----------------------------------------- wrapper runtime (v0.75.0)
+    #
+    # A fail-safe ALLOW-LIST PROJECTION of a wrapped agent's session state for the
+    # dashboard. The raw <agent>.wrapper-session.json holds durable session
+    # identities (codex_thread_id / claude_session_id); this reader DROPS them at
+    # the boundary so they can NEVER reach web.py / the wire. reset_reason is mapped
+    # through a CLOSED space-free token set (free text is never leaked).
+
+    _RESET_REASON_TOKENS = frozenset({
+        "runtime_config_changed",   # v0.75.0 model/effort drift forced a fresh session
+        "resume_unavailable",       # codex/claude resume gave up (2 session failures)
+        "session_full",             # a session-full reset (forward-compat)
+    })
+
+    @classmethod
+    def _map_reset_reason(cls, raw: object) -> str | None:
+        """Map a (possibly multi-word) ``continuity_lost_reason`` to a CLOSED
+        space-free token, or None. Takes the first whitespace-delimited token and
+        returns it ONLY if it is in the closed set — so free text is never leaked.
+        'resume_unavailable after 2 session failures' -> 'resume_unavailable';
+        'runtime_config_changed' -> itself; 'stream disconnected' -> None."""
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        token = raw.strip().split()[0]
+        return token if token in cls._RESET_REASON_TOKENS else None
+
+    def read_wrapper_runtime(self, agent: str) -> dict | None:
+        """Fail-safe allow-list projection of ``agent``'s wrapper-session state:
+        ``{model?, reasoning_effort?, session_state, reset_reason?, turns}``. The
+        durable session ids are DROPPED here (never returned). Missing / empty /
+        corrupt / non-dict -> None; never raises."""
+        p = self.state_dir / f"{agent}.wrapper-session.json"
+        if not p.exists():
+            return None
+        try:
+            raw = p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not raw:
+            return None
+        try:
+            d = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(d, dict):
+            return None
+        out: dict = {}
+        model = d.get("model")
+        if isinstance(model, str) and model.strip():
+            out["model"] = model
+        effort = d.get("reasoning_effort")
+        if isinstance(effort, str) and effort.strip():
+            out["reasoning_effort"] = effort
+        turns = d.get("turns")
+        turns = turns if isinstance(turns, int) and not isinstance(turns, bool) else 0
+        out["turns"] = turns
+        thread_id = d.get("codex_thread_id")
+        session_id = d.get("claude_session_id")
+        has_id = bool(
+            (isinstance(thread_id, str) and thread_id)
+            or (isinstance(session_id, str) and session_id))
+        resumed = bool(d.get("resume_available")) and has_id and turns > 0
+        out["session_state"] = "resumed" if resumed else "fresh"
+        reason = self._map_reset_reason(d.get("continuity_lost_reason"))
+        if reason is not None:
+            out["reset_reason"] = reason
+        return out
+
     # ------------------------------------------------------- thread state
     #
     # Per-(agent, request_id) state for SCOPED thread work, kept separate

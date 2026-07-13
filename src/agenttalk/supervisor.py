@@ -1252,6 +1252,73 @@ def claude_permission_mode(config: dict, cfg_agent: dict) -> str:
     return "bypassPermissions"
 
 
+# --- v0.75.0 runtime ergonomics: per-agent model + reasoning_effort ------------
+#
+# Per-CLI CLOSED reasoning-effort sets (BUILD-CONFIRMED, 2026-07-13, this session):
+#   codex  (codex-cli 0.144.1): the `ReasoningEffortParam` enum surfaced by codex
+#          is {none, minimal, low, medium, high, xhigh}; `low|medium|high|xhigh`
+#          were LIVE-honored on the default account model (returned OK). We expose
+#          the confirmed ergonomic subset below. `none` (disable reasoning) and the
+#          undocumented `max` CLI alias are intentionally excluded. NOTE: a specific
+#          model may still reject an in-enum value at request time (e.g. this
+#          account's model rejects `minimal`) — the allow-list is a launch-time typo
+#          guard, not a per-model validator (documented limitation).
+#   claude (Claude Code 2.1.207): `--effort {low,medium,high,xhigh,max}` (from
+#          `claude --help`; the full wrapped argv accepts it fresh + resume).
+_CODEX_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
+_CLAUDE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_REASONING_EFFORTS = {"codex": _CODEX_EFFORTS, "claude": _CLAUDE_EFFORTS}
+
+
+def validate_model(raw: object, *, source: str = "per-agent") -> tuple[str | None, str | None]:
+    """Validate a model value (warn + drop, never brick launch). Returns
+    ``(value|None, warning|None)``. Absent -> ``(None, None)``. A non-str, empty,
+    or LEADING-DASH value (would be parsed as a flag) -> ``(None, warning)``."""
+    if raw is None:
+        return None, None
+    if not isinstance(raw, str) or not raw.strip():
+        return None, (f"invalid {source} model={raw!r}; expected a non-empty string; "
+                      "ignoring (provider default applies)")
+    value = raw.strip()
+    if value.startswith("-"):
+        return None, (f"invalid {source} model={raw!r}; must not start with '-' "
+                      "(would parse as a flag); ignoring")
+    return value, None
+
+
+def validate_reasoning_effort(raw: object, cli: str,
+                              *, source: str = "per-agent") -> tuple[str | None, str | None]:
+    """Validate a reasoning-effort value against the per-CLI closed set (case-folded).
+    Returns ``(value|None, warning|None)``. Absent -> ``(None, None)``. Unknown /
+    wrong-CLI / non-str -> ``(None, warning)`` (warn + drop)."""
+    if raw is None:
+        return None, None
+    allowed = _REASONING_EFFORTS.get(cli, frozenset())
+    if not isinstance(raw, str) or not raw.strip():
+        return None, (f"invalid {source} reasoning_effort={raw!r}; expected a string; ignoring")
+    value = raw.strip().casefold()
+    if value not in allowed:
+        return None, (f"invalid {source} reasoning_effort={raw!r} for cli {cli!r}; "
+                      f"expected one of {sorted(allowed)}; ignoring")
+    return value, None
+
+
+def resolve_model(cfg_agent: dict) -> tuple[str | None, str | None]:
+    """Resolve the per-agent ``model`` (NO global fallback — v0.75.0 D2). Coerce
+    with ``isinstance`` (D-13): a corrupt/non-dict entry reads as unset, never
+    raises. Returns ``(value|None, warning|None)``."""
+    cfg_agent = cfg_agent if isinstance(cfg_agent, dict) else {}
+    return validate_model(cfg_agent.get("model"), source="per-agent")
+
+
+def resolve_reasoning_effort(cfg_agent: dict, cli: str) -> tuple[str | None, str | None]:
+    """Resolve the per-agent ``reasoning_effort`` for ``cli`` (NO global fallback —
+    v0.75.0 D2). Coerce with ``isinstance`` (D-13). Returns
+    ``(value|None, warning|None)``."""
+    cfg_agent = cfg_agent if isinstance(cfg_agent, dict) else {}
+    return validate_reasoning_effort(cfg_agent.get("reasoning_effort"), cli, source="per-agent")
+
+
 def _launch_detail(st: dict, cfg_agent: dict, perm_mode: str = "bypassPermissions") -> dict:
     """Resume/launch fields for a launch action. RESUME once the agent has
     reached readiness in its (isolated, for codex) home before - ``resume_available``

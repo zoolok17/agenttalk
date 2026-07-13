@@ -8817,6 +8817,151 @@ def _handle_launch_config_blocked(store, agent: str, cli_name: str, *,
     return 1
 
 
+def _unquote_toml_scalar(value: str) -> str:
+    """Strip ONE matching pair of surrounding quotes from a codex ``-c key="V"``
+    TOML scalar so ``model="opus"`` and ``model=opus`` scan the same. Pure."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1]
+    return value
+
+
+def scan_model_effort(argv: list[str], cli: str) -> dict:
+    """Return the model/effort tokens PRESENT in ``argv`` for ``cli`` (v0.75.0),
+    recognizing ALL forms. Pure; used for BOTH operator-tail conflict detection
+    and EFFECTIVE-value extraction for the runtime fingerprint. Last occurrence
+    wins (mirrors CLI last-flag-wins).
+
+    codex: ``-m V`` / ``--model V`` / ``--model=V`` / ``-c model=V`` / ``-c model="V"``
+    / ``--config model=V``; effort ``-c model_reasoning_effort=V`` (and ``="V"``) /
+    ``--config model_reasoning_effort=V``.
+    claude: ``--model V`` / ``--model=V`` / ``--effort V`` / ``--effort=V``.
+    """
+    model: str | None = None
+    effort: str | None = None
+    i = 0
+    n = len(argv)
+    while i < n:
+        tok = argv[i]
+        nxt = argv[i + 1] if i + 1 < n else None
+        if cli == "codex":
+            if tok in ("-m", "--model") and nxt is not None:
+                model = nxt
+                i += 2
+                continue
+            if tok.startswith("--model="):
+                model = tok[len("--model="):]
+                i += 1
+                continue
+            if tok in ("-c", "--config") and nxt is not None:
+                key, sep, val = nxt.partition("=")
+                if sep:
+                    k = key.strip()
+                    if k == "model":
+                        model = _unquote_toml_scalar(val)
+                    elif k == "model_reasoning_effort":
+                        effort = _unquote_toml_scalar(val)
+                i += 2
+                continue
+        elif cli == "claude":
+            if tok == "--model" and nxt is not None:
+                model = nxt
+                i += 2
+                continue
+            if tok.startswith("--model="):
+                model = tok[len("--model="):]
+                i += 1
+                continue
+            if tok == "--effort" and nxt is not None:
+                effort = nxt
+                i += 2
+                continue
+            if tok.startswith("--effort="):
+                effort = tok[len("--effort="):]
+                i += 1
+                continue
+        i += 1
+    return {"model": model, "effort": effort}
+
+
+def inject_model_flags(argv: list[str], cli: str, model: str | None,
+                       effort: str | None) -> tuple[list[str], list[str]]:
+    """Append BARE model/effort tokens to a wrapped child's base argv (v0.75.0),
+    unless the operator tail already sets that flag (in ANY form) — then no-op +
+    warn (explicit tail wins). SELF-VALIDATING (D7): re-asserts the per-CLI
+    preconditions and never emits a malformed or dash-shaped token, even though
+    normal callers pre-validate. Pure + idempotent (a second call with the value
+    already present no-ops). Returns ``(argv, warnings)``.
+
+    Shell=False children (subprocess.Popen with a list): inject bare tokens —
+    codex ``["-m", M]`` + ``["-c", f"model_reasoning_effort={E}"]`` (NO quotes);
+    claude ``["--model", M]`` + ``["--effort", E]``.
+    """
+    from agenttalk import supervisor as _sup
+    argv = list(argv)
+    warnings: list[str] = []
+    if cli not in ("codex", "claude"):
+        return argv, warnings
+    v_model, mw = _sup.validate_model(model, source="inject")
+    if mw:
+        warnings.append(mw)
+    v_effort, ew = _sup.validate_reasoning_effort(effort, cli, source="inject")
+    if ew:
+        warnings.append(ew)
+    present = scan_model_effort(argv, cli)
+    if v_model is not None:
+        if present["model"] is not None:
+            warnings.append(
+                f"model already set in the launch command ({present['model']!r}); "
+                f"not injecting model={v_model!r} (explicit tail wins)")
+        elif cli == "codex":
+            argv += ["-m", v_model]
+        else:
+            argv += ["--model", v_model]
+    if v_effort is not None:
+        if present["effort"] is not None:
+            warnings.append(
+                f"reasoning_effort already set in the launch command "
+                f"({present['effort']!r}); not injecting effort={v_effort!r} "
+                "(explicit tail wins)")
+        elif cli == "codex":
+            argv += ["-c", f"model_reasoning_effort={v_effort}"]
+        else:
+            argv += ["--effort", v_effort]
+    return argv, warnings
+
+
+def _resolve_runtime_model_effort(cfg_agent, cli: str, flag_model: str | None,
+                                  flag_effort: str | None
+                                  ) -> tuple[str | None, str | None, list[str]]:
+    """Resolve the effective (model, effort) for a wrapped loop child (v0.75.0):
+    per-agent config first, then an explicit ``wrap --model/--effort`` flag OVERRIDES
+    it (flag > per-agent config; NO global fallback). Every value is validated the
+    same way; an invalid one is dropped with a warning (never bricks launch). An
+    explicit launch-TAIL flag still wins over both — that layer is applied later by
+    :func:`inject_model_flags`. Pure; returns ``(model, effort, warnings)``."""
+    from agenttalk import supervisor as _sup
+    warnings: list[str] = []
+    model, w = _sup.resolve_model(cfg_agent)
+    if w:
+        warnings.append(w)
+    effort, w = _sup.resolve_reasoning_effort(cfg_agent, cli)
+    if w:
+        warnings.append(w)
+    if flag_model is not None:
+        fm, w = _sup.validate_model(flag_model, source="--model")
+        if w:
+            warnings.append(w)
+        if fm is not None:
+            model = fm
+    if flag_effort is not None:
+        fe, w = _sup.validate_reasoning_effort(flag_effort, cli, source="--effort")
+        if w:
+            warnings.append(w)
+        if fe is not None:
+            effort = fe
+    return model, effort, warnings
+
+
 def _inject_claude_permission_mode(argv: list[str], cli: str,
                                    perm_mode: str | None) -> list[str]:
     """Ensure a wrapped Claude child receives the resolved ``--permission-mode``.
@@ -8850,7 +8995,10 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     lead_loop: bool = False,
                     supervisor_config: dict | None = None,
                     turn_watchdog: object | None = None,
-                    work_heartbeat: object | None = None) -> int:
+                    work_heartbeat: object | None = None,
+                    runtime_model: str | None = None,
+                    runtime_effort: str | None = None,
+                    runtime_fingerprint: str | None = None) -> int:
     """The long-running supervised wrapper loop (design C): own the idle bus-wait +
     heartbeat, drive the CLI ONE turn per inbound message in structured-stream mode
     (session continuity owned here), then return to the wait. Runs until killed -
@@ -8931,6 +9079,17 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             store.release_lead_loop_lease(agent, lease_id=lease_id)
 
     state = wsession.load_session(store, agent, cli)
+    # v0.75.0 runtime fingerprint: reconcile the EFFECTIVE launch (model, effort)
+    # against the persisted baseline AFTER load, then PERSIST immediately — BEFORE
+    # make_drive — so the early-return path (a make_drive ValueError) cannot lose
+    # the stamp and cause a reset on every relaunch (spec §3.4, P3). Absent baseline
+    # is adopted silently; a present-but-different fingerprint forces a fresh
+    # session (runtime_config_changed). Loop-path only.
+    if runtime_fingerprint is not None:
+        wsession.reconcile_runtime_fingerprint(state, runtime_fingerprint)
+        state.model = runtime_model
+        state.reasoning_effort = runtime_effort
+        wsession.save_session(store, agent, state)
     health_mode = (
         "lead-loop" if lead_loop else
         "wrapper-one-shot" if one_shot_request_id else
@@ -9237,6 +9396,27 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         # mode here (no-op if an explicit --permission-mode is already in the tail).
         argv = _inject_claude_permission_mode(
             argv, args.cli, _sup.claude_permission_mode(sup_cfg, cfg_agent))
+        # v0.75.0 runtime ergonomics: resolve per-agent model + reasoning_effort
+        # (flag > per-agent config; NO global fallback), then inject BARE tokens into
+        # the child argv (no-op + warn when the operator tail already sets the flag —
+        # explicit tail wins). A bad value is dropped with a warning, never bricks
+        # launch. The runtime fingerprint is computed from the EFFECTIVE model/effort
+        # scanned from the FINAL argv (so a hand-written tail flag, which wins, is
+        # tracked correctly) and threaded into the loop for restart-safe reconcile.
+        from agenttalk.wrapper import session as _wsession_mod
+        eff_model, eff_effort, _rt_warnings = _resolve_runtime_model_effort(
+            cfg_agent, args.cli, getattr(args, "model", None),
+            getattr(args, "effort", None))
+        for _w in _rt_warnings:
+            sys.stderr.write(f"agenttalk wrap: {_w}\n")
+        argv, _inj_warnings = inject_model_flags(argv, args.cli, eff_model, eff_effort)
+        for _w in _inj_warnings:
+            sys.stderr.write(f"agenttalk wrap: {_w}\n")
+        _scanned = scan_model_effort(argv, args.cli)
+        runtime_model = _scanned["model"]
+        runtime_effort = _scanned["effort"]
+        runtime_fingerprint = _wsession_mod.compute_runtime_fingerprint(
+            runtime_model, runtime_effort)
         res_poison, res_escalate = _sup.resolve_dead_letter_caps(sup_cfg, cfg_agent)
         flag_poison = getattr(args, "dead_letter_max_attempts", None)
         flag_escalate = getattr(args, "dead_letter_escalate_after", None)
@@ -9300,7 +9480,10 @@ def cmd_wrap(args: argparse.Namespace) -> int:
                                noninfra_sub_ceiling=infra_ceiling["noninfra_sub_ceiling"],
                                lead_loop=lead_loop, supervisor_config=sup_cfg,
                                turn_watchdog=watchdog_cfg,
-                               work_heartbeat=whb_cfg)
+                               work_heartbeat=whb_cfg,
+                               runtime_model=runtime_model,
+                               runtime_effort=runtime_effort,
+                               runtime_fingerprint=runtime_fingerprint)
     try:
         return wrapper_run.run_wrapper(
             cli=args.cli, agent=agent, argv=argv, store=store, sender=sender,
@@ -11543,6 +11726,15 @@ def build_parser() -> argparse.ArgumentParser:
                             "seconds (default 5).")
     pwrap.add_argument("--no-render", dest="no_render", action="store_true",
                        help="Do not echo the agent's output to this console.")
+    pwrap.add_argument("--model", dest="model", default=None,
+                       help="(--loop) Override the per-agent supervisor.json model for "
+                            "the wrapped child (flag > per-agent config). Injected as a "
+                            "bare token; an explicit model in the launch tail still wins.")
+    pwrap.add_argument("--effort", dest="effort", default=None,
+                       help="(--loop) Override the per-agent reasoning_effort (flag > "
+                            "per-agent config). codex {minimal,low,medium,high,xhigh}; "
+                            "claude {low,medium,high,xhigh,max}. Invalid values are "
+                            "dropped with a warning; a launch-tail value still wins.")
     pwrap.add_argument("--loop", action="store_true",
                        help="Run as the long-running SUPERVISED wrapper: own the "
                             "idle bus-wait + heartbeat and drive the CLI one turn "

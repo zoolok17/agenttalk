@@ -45,6 +45,13 @@ class SessionState:
     continuity_lost_reason: str = ""
     continuity_loss_notified_key: str = ""
     fresh_session_success_reason: str = ""
+    # v0.75.0 runtime ergonomics: the EFFECTIVE model/effort the child launched
+    # with (scanned from the FINAL injected argv) + their normalized fingerprint.
+    # A PRESENT-but-DIFFERENT fingerprint on relaunch forces a fresh session
+    # (runtime_config_changed); an ABSENT fingerprint is adopted silently (D5).
+    model: str | None = None
+    reasoning_effort: str | None = None
+    runtime_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -121,6 +128,40 @@ def reset_claude_session(state: SessionState, reason: str) -> None:
     state.resume_available = False
     state.resume_unavailable_reason = reason
     state.continuity_lost_reason = reason
+
+
+def compute_runtime_fingerprint(model: str | None, effort: str | None) -> str:
+    """The normalized ``(model, effort)`` fingerprint of the EFFECTIVE child argv
+    (v0.75.0). A plain debuggable string (not a hash; never exposed on the wire):
+    model compared as-is (alias vs full-id counts as drift — documented), effort
+    case-folded + trimmed. Pure."""
+    return f"{(model or '').strip()}|{(effort or '').strip().lower()}"
+
+
+def reconcile_runtime_fingerprint(state: SessionState, current_fp: str) -> str:
+    """Compare the launch fingerprint against the persisted one and apply the
+    ADOPT / UNCHANGED / RESET policy (v0.75.0, D5). Pure — no I/O; the caller
+    persists. Returns the action taken.
+
+    - ``runtime_fingerprint is None`` (first launch OR pre-v0.75.0 upgrade) ->
+      **adopt**: stamp it silently, NO reset, NO continuity_lost_reason.
+    - equal -> **unchanged**: resume normally.
+    - PRESENT-but-DIFFERENT -> **reset**: force a fresh session for this CLI
+      (claude: new session id; codex: cleared thread_id) with
+      ``continuity_lost_reason == "runtime_config_changed"``, then re-stamp.
+    """
+    prior = state.runtime_fingerprint
+    if prior is None:
+        state.runtime_fingerprint = current_fp
+        return "adopt"
+    if prior == current_fp:
+        return "unchanged"
+    if state.cli == "claude":
+        reset_claude_session(state, "runtime_config_changed")
+    else:
+        mark_resume_unavailable(state, "runtime_config_changed")
+    state.runtime_fingerprint = current_fp
+    return "reset"
 
 
 def _safe_int(value: object) -> int:

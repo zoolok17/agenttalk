@@ -2917,6 +2917,10 @@
       supRows.appendChild(supRow('Restartable', restartable ? 'yes' : 'no',
         'tc-chip ' + (restartable ? 'tc-sup-restartable-yes' : 'tc-sup-restartable-no')));
     }
+    // v0.75.0 runtime ergonomics: Model / Effort / Runtime rows. All values are
+    // UNTRUSTED wire data rendered via supRow -> el() (textContent) -> XSS-safe.
+    var runtimeRows = supRuntimeRows(a);
+    for (var rri = 0; rri < runtimeRows.length; rri++) supRows.appendChild(runtimeRows[rri]);
     sup.appendChild(supRows);
     col.appendChild(sup);
 
@@ -2943,6 +2947,24 @@
     row.appendChild(el('span', 'tc-sup-key', k));
     row.appendChild(el('span', chipCls, v));
     return row;
+  }
+
+  // v0.75.0: the Model / Effort / Runtime Supervisor-card rows. Returns an array
+  // of rows so it is unit-testable in isolation. Values (model, effort, runtime
+  // state + reset_reason) are UNTRUSTED wire data and land in textContent via
+  // supRow -> el(). Shows an em-dash when a field is absent.
+  function supRuntimeRows(a) {
+    var rows = [];
+    rows.push(supRow('Model', (a && a.model) ? a.model : '—', 'tc-chip'));
+    rows.push(supRow('Effort', (a && a.reasoning_effort) ? a.reasoning_effort : '—', 'tc-chip'));
+    var rt = a && a.runtime;
+    var rtText = '—';
+    if (rt && rt.state) {
+      rtText = rt.state;
+      if (rt.reset_reason) rtText += ' · ' + rt.reset_reason;
+    }
+    rows.push(supRow('Runtime', rtText, 'tc-chip'));
+    return rows;
   }
 
   function capacitySummary(agent) {
