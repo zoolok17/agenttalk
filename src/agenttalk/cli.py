@@ -8831,9 +8831,13 @@ def scan_model_effort(argv: list[str], cli: str) -> dict:
     and EFFECTIVE-value extraction for the runtime fingerprint. Last occurrence
     wins (mirrors CLI last-flag-wins).
 
-    codex: ``-m V`` / ``--model V`` / ``--model=V`` / ``-c model=V`` / ``-c model="V"``
-    / ``--config model=V``; effort ``-c model_reasoning_effort=V`` (and ``="V"``) /
-    ``--config model_reasoning_effort=V``.
+    All BUILD-CONFIRMED (codex clap 0.144.1) flag spellings are recognized so the
+    operator-tail-wins contract holds for every one:
+    codex model: ``-m V`` / ``-m=V`` / ``-mV`` / ``--model V`` / ``--model=V`` /
+      ``-c model=V`` / ``-c model="V"`` / ``-c=model=V`` / ``-cmodel=V`` /
+      ``--config model=V`` / ``--config=model=V``;
+    codex effort: the same ``-c`` / ``--config`` families with key
+      ``model_reasoning_effort`` (space / ``=``-attached / value-attached, quoted or not).
     claude: ``--model V`` / ``--model=V`` / ``--effort V`` / ``--effort=V``.
     """
     model: str | None = None
@@ -8844,23 +8848,43 @@ def scan_model_effort(argv: list[str], cli: str) -> dict:
         tok = argv[i]
         nxt = argv[i + 1] if i + 1 < n else None
         if cli == "codex":
+            # model: -m V | --model V
             if tok in ("-m", "--model") and nxt is not None:
                 model = nxt
                 i += 2
                 continue
+            # model: --model=V
             if tok.startswith("--model="):
                 model = tok[len("--model="):]
                 i += 1
                 continue
+            # model: -m=V | -mV (short attached, clap strips a single leading '=')
+            if tok != "-m" and tok.startswith("-m") and not tok.startswith("--"):
+                rest = tok[2:]
+                model = rest[1:] if rest.startswith("=") else rest
+                i += 1
+                continue
+            # config (model / model_reasoning_effort): extract the key=value token in
+            # ANY form, then split on the FIRST '='.
+            cfgval: str | None = None
+            consumed = 1
             if tok in ("-c", "--config") and nxt is not None:
-                key, sep, val = nxt.partition("=")
+                cfgval = nxt
+                consumed = 2
+            elif tok.startswith("--config="):
+                cfgval = tok[len("--config="):]
+            elif tok != "-c" and tok.startswith("-c") and not tok.startswith("--"):
+                rest = tok[2:]
+                cfgval = rest[1:] if rest.startswith("=") else rest
+            if cfgval is not None:
+                key, sep, val = cfgval.partition("=")
                 if sep:
                     k = key.strip()
                     if k == "model":
                         model = _unquote_toml_scalar(val)
                     elif k == "model_reasoning_effort":
                         effort = _unquote_toml_scalar(val)
-                i += 2
+                i += consumed
                 continue
         elif cli == "claude":
             if tok == "--model" and nxt is not None:

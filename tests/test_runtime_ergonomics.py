@@ -129,6 +129,15 @@ def test_crit3_inject_idempotent():
     ("codex", ["codex", "-c", 'model="X"'], "model"),
     ("codex", ["codex", "--config", "model=X"], "model"),
     ("codex", ["codex", "-c", "model_reasoning_effort=low"], "effort"),
+    # BUILD-CONFIRMED clap attached/`=` spellings (the folded P3 gap):
+    ("codex", ["codex", "-m=X"], "model"),
+    ("codex", ["codex", "-mX"], "model"),
+    ("codex", ["codex", "--config=model=X"], "model"),
+    ("codex", ["codex", "-c=model=X"], "model"),
+    ("codex", ["codex", "-cmodel=X"], "model"),
+    ("codex", ["codex", "--config=model_reasoning_effort=low"], "effort"),
+    ("codex", ["codex", "-c=model_reasoning_effort=low"], "effort"),
+    ("codex", ["codex", "-cmodel_reasoning_effort=low"], "effort"),
     ("claude", ["claude", "--model", "X"], "model"),
     ("claude", ["claude", "--model=X"], "model"),
     ("claude", ["claude", "--effort", "low"], "effort"),
@@ -199,6 +208,44 @@ def test_scan_recognizes_all_codex_and_claude_forms():
     got = cli.scan_model_effort(["c", "-c", "model_reasoning_effort=high"], "codex")
     assert got["effort"] == "high"
     assert cli.scan_model_effort(["c", "--effort=low"], "claude")["effort"] == "low"
+
+
+def test_fold_scan_recognizes_codex_attached_and_equals_forms():
+    """FOLD (P3): the BUILD-CONFIRMED clap attached/`=` codex spellings scan correctly.
+    Includes the code reviewer's EXACT repro: `--config=model=op-tail` -> 'op-tail'
+    (previously returned None, silently inverting the tail-wins contract)."""
+    # reviewer's exact repro
+    assert cli.scan_model_effort(["codex", "--config=model=op-tail"], "codex")["model"] == "op-tail"
+    # model attached/= forms
+    for form in ("-m=op", "-mop", "--model=op", "--config=model=op", "-c=model=op", "-cmodel=op"):
+        assert cli.scan_model_effort(["codex", form], "codex")["model"] == "op", form
+    # effort attached/= forms
+    for form in ("--config=model_reasoning_effort=high", "-c=model_reasoning_effort=high",
+                 "-cmodel_reasoning_effort=high"):
+        assert cli.scan_model_effort(["codex", form], "codex")["effort"] == "high", form
+    # quoted attached value still unquotes
+    assert cli.scan_model_effort(["codex", '-c=model="op"'], "codex")["model"] == "op"
+    # canonical space-separated forms MUST keep working
+    assert cli.scan_model_effort(["codex", "-m", "op", "exec"], "codex")["model"] == "op"
+    assert cli.scan_model_effort(["codex", "-c", "model=op"], "codex")["model"] == "op"
+
+
+@pytest.mark.parametrize("tail", [
+    ["codex", "-m=op-tail"],
+    ["codex", "-mop-tail"],
+    ["codex", "--config=model=op-tail"],
+    ["codex", "-c=model=op-tail"],
+    ["codex", "-cmodel=op-tail"],
+])
+def test_fold_inject_noops_and_warns_for_attached_tail_forms(tail):
+    """FOLD (P3): with the tail carrying an attached/`=` model spelling, inject must
+    NOT append a duplicate `-m` (the silent-inversion bug) — it no-ops + warns, and
+    the effective model stays the operator tail's value."""
+    argv, warns = cli.inject_model_flags(tail, "codex", "config-model", "high")
+    assert argv.count("-m") == 0, argv           # no duplicate model token appended
+    assert any("already set" in w for w in warns), warns
+    assert cli.scan_model_effort(argv, "codex")["model"] == "op-tail"  # tail wins
+    assert "config-model" not in argv
 
 
 # ============================================================ integration argv
