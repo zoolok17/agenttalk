@@ -95,6 +95,51 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.75.0 - wrapped-agent runtime model/effort config + restart-safe session fingerprint (2026-07-14)
+**GOOD / ROBUST / SECURE** - reviewed-SHA `d53d429` - tag `v0.75.0`
+- **Design:** a four-lens adversarial design critique (correctness/fail-closed,
+  security/redaction/injection, CLI-reality, scope) returned `changes_needed` on every
+  lens; all P1/P2 findings were folded into the built spec *before* implementation —
+  the fingerprint derives from the EFFECTIVE post-injection argv (not resolved config);
+  an absent fingerprint adopts-not-resets so an upgrade never wipes a live session; the
+  dashboard store reader is an id-dropping allow-list projection; `SessionState` carries
+  model/effort; the codex effort token is injected bare; and the cross-CLI global
+  fallback was dropped. Real CLI flags were verified live before wiring (codex 0.144.1,
+  Claude Code 2.1.207) rather than assumed.
+- **Review (four independent verifications on the final SHA):** `claude-test` behavioral
+  QA APPROVED (executed 53→72 feature tests plus repro scripts, including a seeded
+  negative id-redaction test); an adversarial code/security lens and an e2e-wiring lens
+  both returned `ship` after reproducing the redaction projection, the fingerprint
+  adopt/unchanged/reset paths, and the real call-site wiring; a test-integrity lens
+  found and drove the one substantive gap (the untested `cmd_wrap` integration seam,
+  folded); and `claude-remediation-reviewer` APPROVED (security risk-class, no blocker),
+  independently reproducing all five risk areas and confirming the fold is core
+  byte-identical. One reproduced non-blocking P3 — the scanner missed three
+  non-canonical codex flag spellings (silent tail-precedence inversion; fingerprint
+  unaffected) — was folded before shipping, not banked.
+- **Verification / lead gate:** full suite green on Python 3.14 (`2444 passed, 5
+  skipped`, runtime interpreter) and Python 3.10 (`2442 passed, 5 skipped, 2
+  deselected`). The two deselected tests (`test_coordination` scoped-wait,
+  `test_intents` escalation-order) are pre-existing gate-venv/timing artifacts that fail
+  identically on clean master `66780b3` and pass on the runtime interpreter / in
+  isolation (tracked under the P2 CI-timing item) — not v0.75.0 regressions. Ruff, the
+  project-scoped Bandit (0 findings), `node --check` + the console render smoke,
+  `compileall`, `git diff --check`, and gitleaks (`66780b3..d53d429`, no leaks) all
+  passed. Live provider smokes confirmed codex `-m` / `-c model_reasoning_effort=` and
+  claude `--model` / `--effort` are HONORED (a bad codex effort fails cleanly with the
+  `reasoning.effort` enum error, not silent).
+- **Robust/Secure:** a runtime-config change starts a fresh session via the existing
+  self-heal (new claude uuid / cleared codex thread) instead of resuming under the old
+  config; per-agent config is untrusted data (D-13 isinstance coercion — a corrupt entry
+  cannot brick wrap/supervise/doctor/web). Dashboard runtime status is an allow-list
+  projection that never exposes a raw session/thread id, and reset reasons map to a
+  closed token set, so no free text reaches `/api/state`. *Accepted limits:* effort
+  validation is a launch-time typo guard, not a per-model validator; injection covers
+  `--loop` wrapped agents only; the headless/no-CLI mode and dynamic model routing
+  remain later slices. Architecture decision recorded as DESIGN **D-24**.
+- **CI:** GitHub `tests` + `security` workflows were watched on the exact release
+  commit; the run ids are recorded in the GitHub release.
+
 ### v0.74.1 - resolved dead-letter dashboard parity (2026-07-12)
 **GOOD / ROBUST / SECURE** - reviewed-SHA `6ed5382` - tag `v0.74.1`
 - **Review:** `codex-agenttalk-reviewer-1` approved the exact two-file

@@ -79,7 +79,7 @@ workflows.
 
 ---
 
-## P2 · PLANNED — wrapped-agent runtime config and headless status (2026-07-08)
+## SHIPPED (v0.75.0, 2026-07-14) — wrapped-agent runtime model/effort config (was P2 PLANNED, 2026-07-08)
 
 **What.** Wrapped supervised agents need first-class runtime settings and a
 clean headless operating mode. Today an operator can pass Codex model/effort
@@ -89,8 +89,8 @@ to combine accidentally with stale wrapper sessions.
 **Scope.**
 - Add per-agent `model` and `reasoning_effort` config for wrapped agents.
 - For Codex, inject `-m <model>` and `-c model_reasoning_effort="<effort>"`.
-- For Claude, inject `--model <model>` only; leave effort unsupported unless a
-  verified headless flag exists.
+- For Claude, inject `--model <model>` and `--effort <level>` — verified real
+  (Claude Code 2.1.207, effort `{low,medium,high,xhigh,max}`).
 - Store a runtime fingerprint with wrapper session state; when model/effort
   changes, start a fresh session instead of resuming an old thread.
 - Surface configured runtime in status/dashboard, and warn when raw
@@ -98,9 +98,15 @@ to combine accidentally with stale wrapper sessions.
 - Design the adjacent no-visible-CLI/headless supervised-agent mode so the
   dashboard exposes full liveness, runtime, mailbox, and failure state.
 
-**Disposition.** `P2 PLANNED`. Implement the model/effort config as the small
-first slice; keep headless/no-CLI execution as the next runtime-design slice if
-it grows beyond argument injection and dashboard display.
+**Disposition.** `SHIPPED` in v0.75.0 as the model/effort config slice for wrapped
+`--loop` agents: per-agent supervisor.json config + `wrap --model/--effort`
+overrides, effective-argv-based restart fingerprint (adopt-not-reset on an absent
+baseline so upgrades never wipe live sessions), and dashboard runtime status via an
+id-redacting projection. Claude effort is now supported (`--effort` verified real).
+Deferred to a later runtime-design slice: the headless/no-visible-CLI mode,
+non-loop/non-wrapped agents, and dynamic model routing. Known limitation:
+reasoning-effort is a launch-time typo guard, not a per-model validator (e.g. Codex
+`minimal` is in the CLI enum but a given account model may reject it at request time).
 
 ---
 

@@ -727,6 +727,22 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   selectors fail before mutation, and the client
   generation-checks all root-bound responses. *Ceiling:* the id is not an
   authorization token.
+- **D-24 Wrapped runtime config is injected into base_argv, fingerprinted from the
+  EFFECTIVE argv, and adopts (never resets) an absent baseline (2026-07-14).** *Why:*
+  per-agent model/effort must ride the same operator-authored launch tail the wrapper
+  already owns, so injection mirrors `_inject_claude_permission_mode` and an explicit
+  tail flag always wins (across every canonical and attached/`=` codex spelling). The
+  restart-safe session fingerprint is computed from the model/effort actually present
+  in the POST-injection argv, not the resolved config, so a hand-written tail model is
+  tracked and a benign config edit that doesn't change the effective model doesn't
+  reset. *Decision:* an ABSENT prior fingerprint is adopted silently (baseline); only
+  PRESENT-but-different forces a fresh session (new claude uuid / cleared codex
+  thread), so upgrading never wipes a live conversation — fail-closed still holds on
+  the read side (a corrupt/unreadable session is already fresh). Dashboard status
+  reads the wrapper session file through an allow-list projection that DROPS raw
+  session/thread ids at the store boundary (D-2), and reset reasons map to a closed
+  token set. *Ceiling:* effort validation is a per-CLI launch-time typo guard, not a
+  per-model validator; injection covers `--loop` wrapped agents only.
 
 ## 6. How we work (process)
 

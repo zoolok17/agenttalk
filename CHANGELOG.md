@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.75.0] - 2026-07-14
+
+### Added
+
+- **Per-agent model and reasoning-effort for wrapped agents.** `supervisor.json`
+  per-agent `model` / `reasoning_effort` (resolved per agent, validated against a
+  per-CLI effort set), plus `agenttalk wrap --model/--effort` overrides. On the
+  `--loop` path the wrapped child argv is injected — Codex `-m <model> -c
+  model_reasoning_effort=<effort>`, Claude `--model <model> --effort <level>` — and
+  an explicit model/effort already present in the raw launch tail always wins (a
+  conflicting config value is skipped with a warning, across every canonical and
+  attached/`=` codex flag spelling). Claude reasoning-effort is now supported
+  (`--effort {low,medium,high,xhigh,max}`, verified on Claude Code 2.1.207).
+- **Restart-safe runtime session fingerprint.** Wrapped session state records a
+  fingerprint of the effective `(model, effort)`; when it changes, the next launch
+  starts a fresh session instead of resuming a thread built under the old runtime
+  config. A first launch — or a pre-0.75.0 session with no fingerprint — adopts the
+  current fingerprint silently (no spurious reset), so upgrading does not wipe a live
+  conversation.
+- **Runtime status in the Team Console.** The agent detail view's Supervisor card
+  shows the configured model, reasoning-effort, and session runtime state
+  (fresh/resumed + last reset reason), through a projection that never exposes raw
+  session/thread ids.
+
+### Notes
+
+- Reasoning-effort validation is a launch-time typo guard against a per-CLI value
+  set, not a per-model validator: a value a specific model rejects still fails at
+  request time. `--model/--effort` apply only to `--loop` wrapped agents (a warning
+  is emitted if passed without `--loop`). Non-wrapped/non-loop agents and the
+  headless no-visible-CLI supervised mode remain a later runtime-design slice.
+
 ## [0.74.1] - 2026-07-12
 
 ### Fixed
