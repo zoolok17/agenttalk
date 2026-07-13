@@ -9337,6 +9337,13 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         sys.stderr.write("agenttalk wrap: --lead-loop is a continuous controller; "
                          "it cannot be combined with --one-shot\n")
         return 2
+    # v0.75.0: model/effort injection + fingerprinting live in the --loop path only
+    # (D2). Warn (don't fail) so an operator's --model/--effort isn't silently dropped
+    # on the non-loop one-shot `wrap` path.
+    if not getattr(args, "loop", False) and (
+            getattr(args, "model", None) or getattr(args, "effort", None)):
+        sys.stderr.write(
+            "agenttalk wrap: --model/--effort only apply with --loop; ignoring\n")
     sender = (_resolve_self(args.sender, roster=roster)
               if getattr(args, "sender", None) else agent)
     launch_cwd = store.root

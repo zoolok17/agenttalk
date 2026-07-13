@@ -5,9 +5,11 @@ projection. Each test maps to a §5 acceptance criterion of the design spec.
 
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 import subprocess
+import types
 from pathlib import Path
 
 import pytest
@@ -385,18 +387,24 @@ def _build_root(store):
 
 
 def test_crit14_negative_redaction_ids_never_on_wire(tmp_path):
-    """Crit 14: real session ids in the file NEVER appear anywhere in /api/state."""
+    """Crit 14 (hardened): the session ids AND the runtime_fingerprint value NEVER
+    appear anywhere in the FULL /api/state result (not just roots[0]) — neither the
+    seeded values nor their key names."""
     s = Store(tmp_path)
     s.init(["codexer"])
     (s.state_dir / "codexer.wrapper-session.json").write_text(json.dumps({
         "cli": "codex", "codex_thread_id": "THREAD-SECRET-123",
         "claude_session_id": "CLAUDE-SECRET-XYZ", "resume_available": True,
-        "turns": 3, "model": "gpt5", "reasoning_effort": "high"}), encoding="utf-8")
-    blob = json.dumps(_build_root(s))
-    assert "THREAD-SECRET-123" not in blob
-    assert "CLAUDE-SECRET-XYZ" not in blob
-    assert "codex_thread_id" not in blob
-    assert "claude_session_id" not in blob
+        "turns": 3, "model": "gpt5", "reasoning_effort": "high",
+        "runtime_fingerprint": "gpt5|high"}), encoding="utf-8")
+    # serialize the ENTIRE build_state result, not just one root
+    blob = json.dumps(web.build_state([web.RootDescriptor(store=s, label="root")]))
+    for forbidden in ("THREAD-SECRET-123", "CLAUDE-SECRET-XYZ",
+                      "codex_thread_id", "claude_session_id",
+                      "runtime_fingerprint", "gpt5|high"):
+        assert forbidden not in blob, f"{forbidden!r} leaked into /api/state"
+    # the allow-listed model/effort DO still surface (sanity: redaction didn't drop everything)
+    assert "gpt5" in blob and "high" in blob
 
 
 def test_crit15_agent_entries_expose_when_known(tmp_path):
@@ -487,3 +495,147 @@ def test_crit17_render_pins_textcontent_primitive():
     assert ".innerHTML" not in src  # the console builds every node via textContent
     assert "function supRuntimeRows(a)" in src
     assert "supRuntimeRows(a)" in src  # wired into the Supervisor card
+
+
+# ============================================================ fold: seam + cadence
+
+def _codex_turn_lines():
+    return [json.dumps(o) for o in [
+        {"type": "thread.started", "thread_id": "T"},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "OK"}},
+        {"type": "turn.completed"},
+    ]]
+
+
+def _claude_turn_lines():
+    return [json.dumps(o) for o in [
+        {"type": "system", "subtype": "init", "session_id": "s"},
+        {"type": "stream_event",
+         "event": {"type": "message_start", "message": {"role": "assistant"}}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "OK"}]}},
+        {"type": "result", "subtype": "success", "is_error": False, "result": "OK"},
+    ]]
+
+
+def test_fold_cmd_wrap_seam_fingerprint_from_post_injection_argv(tmp_path, monkeypatch):
+    """FOLD item 1 (P2): drive the REAL cmd_wrap resolve->inject->scan->fingerprint
+    ->_wrap_loop_mode seam. With per-agent config model + a `wrap --effort` flag + an
+    operator tail `--model`, assert the model/effort/fingerprint cmd_wrap hands
+    downstream are derived from the POST-injection argv: tail model WINS over config,
+    flag effort WINS over config (tail > flag > config)."""
+    s = Store(tmp_path)
+    s.init(["ag"])
+    (s.dir / "supervisor.json").write_text(json.dumps({"agents": {"ag": {
+        "cli": "claude", "model": "config-model", "reasoning_effort": "low"}}}),
+        encoding="utf-8")
+
+    captured: dict = {}
+
+    def fake_loop(store, agent, **kw):
+        captured.update(kw)
+        captured["agent"] = agent
+        return 0
+
+    monkeypatch.setattr(cli, "_wrap_loop_mode", fake_loop)
+    monkeypatch.setattr(cli, "_get_store", lambda args, **k: s)
+    # pass-through preflight (no real binary resolution / launcher-nonce in the unit test)
+    monkeypatch.setattr(
+        wrapper_run, "preflight_launch_runtime",
+        lambda argv, cli_, cwd, env: types.SimpleNamespace(blocked=None, argv=list(argv)))
+
+    args = argparse.Namespace(
+        agent="ag", cli="claude", sender=None, lane_id=None, min_interval=5.0,
+        no_render=True, model=None, effort="high", loop=True, lead_loop=False,
+        one_shot=False, to_request=None, dead_letter_max_attempts=None,
+        dead_letter_escalate_after=None,
+        cmd=["--", "claude", "--model", "tail-model"])
+
+    rc = cli.cmd_wrap(args)
+    assert rc == 0
+    # tail model wins over config-model; flag effort wins over config low
+    assert captured["runtime_model"] == "tail-model"
+    assert captured["runtime_effort"] == "high"
+    assert captured["runtime_fingerprint"] == S.compute_runtime_fingerprint(
+        "tail-model", "high")
+    # and the fingerprint reflects the FINAL child argv actually passed downstream
+    base = captured["base_argv"]
+    assert cli.scan_model_effort(base, "claude") == {"model": "tail-model", "effort": "high"}
+
+
+@pytest.mark.parametrize("cli_name", ["codex", "claude"])
+def test_fold_crit7_injected_tokens_reach_spawned_argv_both_paths(tmp_path, cli_name):
+    """FOLD item 1 (P2) / spec crit7 cadence: the injected model/effort tokens reach
+    the ACTUAL spawned argv on BOTH the message path (make_drive, run.py:1664) and the
+    cadence path (make_cadence_drive, run.py:2016), in the correct position."""
+    s = Store(tmp_path)
+    s.init(["ag"])
+    base = [cli_name]
+    base, _ = cli.inject_model_flags(base, cli_name, "the-model", "high")
+
+    def _drive_once(factory):
+        spawned: list[list[str]] = []
+
+        def fake_spawn(argv, _second):
+            spawned.append(list(argv))
+            return _codex_turn_lines() if cli_name == "codex" else _claude_turn_lines()
+
+        st = S.SessionState(cli=cli_name)
+        if cli_name == "claude":
+            st.claude_session_id = "SID"
+        drv = factory(s, "ag", cli_name, st, base, spawn=fake_spawn,
+                      clock=lambda: 0.0, render=False)
+        if factory is wrapper_run.make_cadence_drive:
+            drv({"agent": "ag"}, [{"type": "dead_letter"}])
+        else:
+            drv({"id": "m1", "from": "x", "to": "ag", "kind": "question",
+                 "subject": "s", "body": "b", "correlation_id": "q", "request_id": "q",
+                 "broadcast_id": None, "meta": {"request_id": "q"}})
+        assert spawned, "spawn was invoked"
+        return spawned[0]
+
+    for factory in (wrapper_run.make_drive, wrapper_run.make_cadence_drive):
+        argv = _drive_once(factory)
+        if cli_name == "codex":
+            assert "-m" in argv and "the-model" in argv
+            assert "model_reasoning_effort=high" in argv
+            assert argv.index("-m") < argv.index("exec")
+            assert argv.index("-c") < argv.index("exec")
+        else:
+            assert "--model" in argv and "the-model" in argv
+            assert "--effort" in argv and "high" in argv
+            assert argv.index("--model") < argv.index("-p")
+            assert argv.index("--effort") < argv.index("-p")
+
+
+def test_fold_crit1_resolvers_never_raise_on_none_or_nondict():
+    """FOLD item 3 (P3): defense-in-depth for the load-failure path — the resolvers
+    return unset WITHOUT raising when handed None or any non-dict config."""
+    for bad in (None, "a-string", ["l"], 42, True, ("t",)):
+        assert sup.resolve_model(bad) == (None, None)
+        assert sup.resolve_reasoning_effort(bad, "codex") == (None, None)
+        assert sup.resolve_reasoning_effort(bad, "claude") == (None, None)
+
+
+def test_fold_crit4_warns_when_model_effort_without_loop(tmp_path, monkeypatch, capsys):
+    """FOLD item 4 (P3): `wrap --model/--effort` WITHOUT `--loop` emits a one-line
+    stderr warning (not silently dropped) and does not enter the loop path."""
+    s = Store(tmp_path)
+    s.init(["ag"])
+    monkeypatch.setattr(cli, "_get_store", lambda args, **k: s)
+    # stub the non-loop runner so we exercise only the warning + branch
+    monkeypatch.setattr(wrapper_run, "run_wrapper", lambda **k: 0)
+    monkeypatch.setattr(
+        wrapper_run, "preflight_launch_runtime",
+        lambda argv, cli_, cwd, env: types.SimpleNamespace(blocked=None, argv=list(argv)))
+
+    args = argparse.Namespace(
+        agent="ag", cli="codex", sender=None, lane_id=None, min_interval=5.0,
+        no_render=True, model="gpt5", effort="high", loop=False, lead_loop=False,
+        one_shot=False, to_request=None, dead_letter_max_attempts=None,
+        dead_letter_escalate_after=None, cmd=["--", "codex"])
+
+    rc = cli.cmd_wrap(args)
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "--model/--effort only apply with --loop; ignoring" in err
