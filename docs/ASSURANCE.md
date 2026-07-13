@@ -137,8 +137,13 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
   validation is a launch-time typo guard, not a per-model validator; injection covers
   `--loop` wrapped agents only; the headless/no-CLI mode and dynamic model routing
   remain later slices. Architecture decision recorded as DESIGN **D-24**.
-- **CI:** GitHub `tests` + `security` workflows were watched on the exact release
-  commit; the run ids are recorded in the GitHub release.
+- **CI:** on the exact release commit `56bcf74`, `security` run `29291786489` passed on
+  the first attempt; `tests` run `29291786502` passed after re-running a single job — the
+  `windows-latest / 3.12` cell alone flaked on two pre-existing timing tests
+  (`test_concurrency::test_config_lock_safely_migrates_persistent_os_lock_marker`, a 0.2s
+  lock-acquire timeout, and `test_coordination::test_scoped_wait_composing_extends_mid_wait`,
+  a deadline-extension race), both unrelated to this change and green on all other 11 matrix
+  cells; the re-run passed clean (`2444 passed`). Tracked under the P2 CI-timing-flakiness item.
 
 ### v0.74.1 - resolved dead-letter dashboard parity (2026-07-12)
 **GOOD / ROBUST / SECURE** - reviewed-SHA `6ed5382` - tag `v0.74.1`
