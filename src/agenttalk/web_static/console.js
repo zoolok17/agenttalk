@@ -1819,9 +1819,15 @@
 
     var items = (attentionData && attentionData.items) || [];
     var errs = (attentionData && isArray(attentionData.errors)) ? attentionData.errors : [];
+    var fresh = attentionFresh();   // false when null, error-as-data, or aged-out stale
     var count = attentionData && typeof attentionData.count === 'number' ? attentionData.count : items.length;
-    // An error-as-data 200 makes the count meaningless — say "status unknown", never "0 open".
-    header.appendChild(el('span', 'tc-attn-count', errs.length ? 'status unknown' : (count + ' open')));
+    // Never assert "0 open" from an untrustworthy payload: an error-as-data 200 is
+    // "status unknown"; a stale-but-empty payload is "status stale". A real, fresh
+    // count is shown as "N open".
+    var countLabel = errs.length ? 'status unknown'
+      : (attentionData && !fresh && !items.length) ? 'status stale'
+      : (count + ' open');
+    header.appendChild(el('span', 'tc-attn-count', countLabel));
     wrap.appendChild(header);
 
     if (!attentionData) {
@@ -1831,7 +1837,9 @@
       // "All clear" — say plainly that the list is unavailable right now.
       wrap.appendChild(attentionError(errs));
     } else if (!items.length) {
-      wrap.appendChild(attentionEmpty());
+      // Fresh + empty is a genuine all-clear; STALE + empty must NOT claim "All clear"
+      // — the topbar verdict already gates on staleness and this view must match it.
+      wrap.appendChild(fresh ? attentionEmpty() : attentionStale());
     } else {
       var list = el('div', 'tc-attn-list');
       for (var i = 0; i < items.length; i++) list.appendChild(attentionCard(items[i]));
@@ -1970,6 +1978,16 @@
     card.appendChild(badge);
     card.appendChild(el('div', 'tc-empty-title', 'All clear'));
     card.appendChild(el('div', 'tc-empty-text', 'Nothing is waiting on you right now.'));
+    return card;
+  }
+
+  // Shown when the attention payload is STALE (aged-out, no errors): last-good data may
+  // be out of date, so this is NOT a confirmed "All clear" either (same trust contract).
+  function attentionStale() {
+    var card = el('div', 'tc-empty is-error');
+    card.appendChild(el('div', 'tc-empty-title', 'Queue status is out of date'));
+    card.appendChild(el('div', 'tc-empty-text',
+      'The last update from the bus is stale, so this may not be current — reconnecting…'));
     return card;
   }
 

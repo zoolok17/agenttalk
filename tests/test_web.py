@@ -3402,6 +3402,31 @@ hooks.renderActiveView();
   assert(!tb2.includes('Healthy'), `stale-zero overview: topbar must not read "Healthy": ${tb2}`);
   assert(/Connecting/.test(tb2), `stale-zero overview: topbar should read Connecting: ${tb2}`);
 }
+
+// v0.76.0 (trust contract): a STALE-but-empty /api/attention payload (no errors, aged-out
+// _fetchedAt) must NOT render the green "All clear" — the queue view must say it's out of
+// date, mirroring the top-bar staleness gate.
+{
+  hooks.setPayloads(Object.assign({}, payloads, {
+    attentionData: { root: root.project_id, count: 0, items: [], _fetchedAt: 0 },
+  }));
+  hooks.state.now = 600000;   // aged-out beyond ATTENTION_STALE_MS (4*POLL_MS)
+  hooks.state.view = 'attention';
+  hooks.state.selectedRootId = root.project_id;
+  hooks.state.selectedAgent = null;
+  hooks.state.sessionRid = null;
+  hooks.state.filter = 'all';
+  main.children = [];
+  main.firstChild = null;
+  main.textContent = '';
+  hooks.renderChrome();
+  hooks.renderActiveView();
+  const stext = collectText(main).replace(/\s+/g, ' ').trim();
+  assert(!stext.includes('All clear'),
+    `stale-attention: must NOT claim "All clear" from a stale payload: ${stext}`);
+  assert(/out of date|stale/i.test(stext),
+    `stale-attention: should say the queue status is out of date: ${stext}`);
+}
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)
