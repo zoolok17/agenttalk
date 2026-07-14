@@ -3254,7 +3254,7 @@ const payloads = {
 };
 
 const cases = [
-  { view: 'overview', expected: ['Who', 'Health attention', 'human queue', 'codex-test'] },
+  { view: 'overview', expected: ['Who', 'Health attention', 'need a human', 'codex-test'] },
   { view: 'flow', expected: ['talking to whom', 'Active threads', 'All views QA task'] },
   {
     view: 'attention',

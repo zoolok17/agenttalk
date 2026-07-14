@@ -55,6 +55,18 @@
   // inherited Object property and produce a garbage className.
   var SEV_COLOR = nullMap({ high: 'danger', med: 'warn', low: 'gray' });
   var SEV_LABEL = nullMap({ high: 'HIGH', med: 'MED', low: 'LOW' });
+  // Plain-language hover text for a zero-context viewer (v0.76.0). Keyed by the
+  // UNTRUSTED wire severity/source, so null-proto (a bad key misses -> no tooltip).
+  var SEV_DESC = nullMap({
+    high: 'Needs a human soon', med: 'Should be looked at', low: 'Informational',
+  });
+  var SRC_DESC = nullMap({
+    escalation: 'An agent is asking you a question',
+    gate: 'A release/quality step is blocked pending a decision',
+    deadletter: 'A message failed repeatedly and was set aside — a human should look',
+    stuck: 'An agent appears stuck and may need a human',
+    supervisor: 'The automation itself needs attention',
+  });
   var ROLE_ALIAS = nullMap({
     developer: 'dev', dev: 'dev',
     reviewer: 'rev', rev: 'rev',
@@ -162,6 +174,13 @@
     var n = document.createElement(tag);
     if (cls) n.className = cls;
     if (text !== undefined && text !== null) n.textContent = String(text);
+    return n;
+  }
+  // Attach a plain-language hover tooltip (C0 legibility, v0.76.0). No-op for an
+  // empty title so callers can pass a maybe-undefined desc unconditionally. The
+  // precise agenttalk term always stays visible; the tooltip only ADDS meaning.
+  function titled(n, title) {
+    if (n && title) n.setAttribute('title', String(title));
     return n;
   }
   function svgEl(tag, attrs) {
@@ -323,7 +342,34 @@
     if (opts.nullText) n.setAttribute('data-age-null', opts.nullText);
     if (opts.noHb) n.setAttribute('data-age-nohb', '1');
     n.textContent = ageText(n);
+    // Absolute wall-clock time on hover (v0.76.0): relative ages ("5m", "2h ago")
+    // need interpretation; the tooltip lets a viewer judge "has this been stuck
+    // long enough to worry?" without mental math. Static (the event time doesn't
+    // change); skipped for a no-heartbeat/unknown node.
+    titled(n, absTimeTitle(item, opts));
     return n;
+  }
+  // The absolute local time an age refers to, for the hover tooltip. Prefers the
+  // wire `ts`; else derives from `age_seconds` relative to the last poll (like
+  // liveAge). Returns '' for a no-heartbeat node or an unparseable time.
+  function absTimeTitle(item, opts) {
+    opts = opts || {};
+    var meaning = opts.title || '';   // optional plain-language prefix (e.g. heartbeat)
+    if (opts.noHb) return meaning;    // no time to show, but still explain the field
+    var ms = null;
+    if (item && item.ts) {
+      var t = Date.parse(item.ts);
+      if (!isNaN(t)) ms = t;
+    }
+    if (ms === null && item && typeof item.age_seconds === 'number') {
+      var base = lastState && lastState._fetchedAt ? lastState._fetchedAt : state.now;
+      ms = base - item.age_seconds * 1000;
+    }
+    if (ms === null) return meaning;
+    var abs;
+    try { abs = new Date(ms).toLocaleString(); } catch (e) { abs = ''; }
+    if (!abs) return meaning;
+    return meaning ? (meaning + ' · ' + abs) : abs;
   }
   // Format the current text for a tagged age node from its data-* inputs + the
   // live `state.now`. Shared by `ageEl` (initial render) and `updateAges` (tick).
@@ -379,18 +425,18 @@
   var UNWRAPPED_LIVE_STALE_AFTER_SECONDS = 120;
   function stateInfo(st) {
     switch (st) {
-      case 'working_turn': return { label: 'Working', key: 'working_turn', color: 'ok', grp: 'work', pulse: true };
-      case 'working_silent': return { label: 'Working · quiet', key: 'working_silent', color: 'info', grp: 'work' };
-      case 'idle_waiting': return { label: 'Idle · waiting', key: 'idle_waiting', color: 'warn', grp: 'idle' };
-      case 'stuck_suspected': return { label: 'Stuck?', key: 'stuck_suspected', color: 'attn', grp: 'attn' };
-      case 'rate_limited_or_outage': return { label: 'Rate-limited', key: 'rate_limited_or_outage', color: 'danger', grp: 'attn' };
-      case 'degraded_output': return { label: 'Degraded', key: 'degraded_output', color: 'danger', grp: 'attn' };
-      case 'crashed_or_exited': return { label: 'Exited', key: 'crashed_or_exited', color: 'gray', grp: 'attn' };
+      case 'working_turn': return { label: 'Working', key: 'working_turn', color: 'ok', grp: 'work', pulse: true, desc: 'Actively taking a turn right now' };
+      case 'working_silent': return { label: 'Working · quiet', key: 'working_silent', color: 'info', grp: 'work', desc: 'Running, but not sending messages right now (normal while it thinks)' };
+      case 'idle_waiting': return { label: 'Idle · waiting', key: 'idle_waiting', color: 'warn', grp: 'idle', desc: 'Healthy — waiting for its next message (this is normal, not a problem)' };
+      case 'stuck_suspected': return { label: 'Stuck?', key: 'stuck_suspected', color: 'attn', grp: 'attn', desc: 'No progress for a while — may need a human' };
+      case 'rate_limited_or_outage': return { label: 'Rate-limited', key: 'rate_limited_or_outage', color: 'danger', grp: 'attn', desc: 'Paused because it hit an AI usage limit or an outage' };
+      case 'degraded_output': return { label: 'Degraded', key: 'degraded_output', color: 'danger', grp: 'attn', desc: 'Producing low-quality output — may need a human' };
+      case 'crashed_or_exited': return { label: 'Exited', key: 'crashed_or_exited', color: 'gray', grp: 'attn', desc: 'The process has stopped' };
       case 'errored_recoverable':
-      case 'errored_poison': return { label: 'Errored', key: 'errored_recoverable', color: 'attn', grp: 'attn' };
+      case 'errored_poison': return { label: 'Errored', key: 'errored_recoverable', color: 'attn', grp: 'attn', desc: 'Hit an error it may recover from' };
       case 'errored_fatal':
-      case 'errored_ambiguous': return { label: 'Errored', key: 'errored_fatal', color: 'danger', grp: 'attn' };
-      default: return { label: 'Unknown', key: 'unknown', color: 'gray', grp: 'unknown', noHb: true };
+      case 'errored_ambiguous': return { label: 'Errored', key: 'errored_fatal', color: 'danger', grp: 'attn', desc: 'Hit an error and needs a human' };
+      default: return { label: 'Unknown', key: 'unknown', color: 'gray', grp: 'unknown', noHb: true, desc: 'Not reporting in — may be offline' };
     }
   }
   function freshHeartbeat(agent) {
@@ -401,7 +447,7 @@
     var raw = ((agent && agent.health) || {}).state;
     var info = stateInfo(raw);
     if (info.key === 'unknown' && freshHeartbeat(agent) && agent && agent.wrapped !== true) {
-      return { label: 'Active', key: 'unwrapped_live', color: 'teal', grp: 'work', heartbeatOnly: true };
+      return { label: 'Active', key: 'unwrapped_live', color: 'teal', grp: 'work', heartbeatOnly: true, desc: 'Alive and checking in, but not running under the supervisor' };
     }
     return info;
   }
@@ -426,11 +472,27 @@
     'question': 1, 'note': 1, 'message': 1, 'reply': 1, 'wake': 1, 'end': 1,
     'escalate': 1, 'broadcast': 1, 'gate': 1,
   });
+  // Plain-English gloss for each message kind (C0 legibility, v0.76.0).
+  var KIND_DESC = nullMap({
+    'review-request': 'Asking a teammate to review some work',
+    'review-result': 'A review verdict came back',
+    'proposal': 'Proposing a plan for the team to agree on',
+    'proposal-response': 'A reply to a proposal (accept / reject / counter)',
+    'question': 'Asking a teammate a question',
+    'note': 'An FYI note (no reply expected)',
+    'message': 'A general message',
+    'reply': 'A reply to an earlier message',
+    'wake': 'A nudge to pick up queued work',
+    'end': 'A request to stand down',
+    'escalate': 'Raising something to a human',
+    'broadcast': 'The same message sent to several teammates',
+    'gate': 'A release/quality gate check',
+  });
   function kindInfo(kind) {
     var k = kind || 'message';
     // Null-proto lookup (P3): an untrusted kind like "constructor" misses and
     // falls back to the neutral .kind-note rather than a garbage className.
-    return { label: k, cls: 'kind-' + (KNOWN_KINDS[k] ? k : 'note') };
+    return { label: k, cls: 'kind-' + (KNOWN_KINDS[k] ? k : 'note'), desc: KIND_DESC[k] || '' };
   }
 
   // Thread verdict/status -> chip class. `verdict` (§3b) maps to the CSS
@@ -440,10 +502,10 @@
     if (!verdict) return null;
     var v = String(verdict);
     var lc = v.toLowerCase();
-    if (lc === 'approved' || lc === 'go' || lc === 'accepted') return { label: v, cls: 'tstatus-go' };
-    if (lc === 'hold' || lc === 'rejected' || lc === 'blocked') return { label: v, cls: 'tstatus-hold' };
-    if (lc === 'countered') return { label: v, cls: 'tstatus-countered' };
-    if (lc.indexOf('replied') >= 0) return { label: v, cls: 'tstatus-replied' };
+    if (lc === 'approved' || lc === 'go' || lc === 'accepted') return { label: v, cls: 'tstatus-go', desc: 'Cleared / approved' };
+    if (lc === 'hold' || lc === 'rejected' || lc === 'blocked') return { label: v, cls: 'tstatus-hold', desc: 'Blocked — waiting on a decision or a fix' };
+    if (lc === 'countered') return { label: v, cls: 'tstatus-countered', desc: 'Countered with a different proposal' };
+    if (lc.indexOf('replied') >= 0) return { label: v, cls: 'tstatus-replied', desc: 'How many recipients have replied' };
     return { label: v, cls: 'tstatus-neutral' };
   }
 
@@ -711,10 +773,40 @@
     }
     return out;
   }
+  // Sort rank for the overview grid (v0.76.0): attention-needing first, then
+  // offline/unknown, then working, then idle — so the top-left card is the one
+  // that matters to a viewer.
+  function agentAttnRank(a) {
+    var grp = agentStateInfo(a).grp;
+    return grp === 'attn' ? 0 : grp === 'unknown' ? 1 : grp === 'work' ? 2 : 3;
+  }
   function humanQueueCount() {
     return attentionData && typeof attentionData.count === 'number'
       ? attentionData.count
       : (attentionData && attentionData.items ? attentionData.items.length : 0);
+  }
+  // ONE plain-language "is the team OK?" verdict for a zero-context viewer
+  // (v0.76.0), derived from counts already on hand. Returns { text (full
+  // sentence for the overview subtitle), pill (short label for the top-bar
+  // pill), tone ('ok' | 'warn' | 'danger' | 'idle') }. Never color-only — every
+  // caller renders the WORD; tone only adds a color. "needs a human" = the
+  // human-action queue (escalations/gate holds/dead letters/stuck); "needs
+  // attention" = agent health group; "offline" = not reporting in.
+  function teamHealthVerdict(root) {
+    var n = agentsOf(root).length;
+    if (!n) return { text: 'No agents running yet', pill: 'No agents', tone: 'idle' };
+    var c = agentCounts(root);
+    var q = humanQueueCount();
+    if (q === 0 && c.attn === 0 && c.unknown === 0) {
+      return { text: 'All ' + n + ' agents healthy — nothing needs you', pill: 'Healthy', tone: 'ok' };
+    }
+    var parts = [n + ' agent' + (n === 1 ? '' : 's')];
+    if (q > 0) parts.push(q + (q === 1 ? ' needs' : ' need') + ' a human');
+    if (c.attn > 0) parts.push(c.attn + (c.attn === 1 ? ' needs' : ' need') + ' attention');
+    if (c.unknown > 0) parts.push(c.unknown + ' offline');
+    var pill = q > 0 ? (q + (q === 1 ? ' needs' : ' need') + ' a human')
+      : (c.attn > 0 ? (c.attn + (c.attn === 1 ? ' needs' : ' need') + ' attention') : 'Some offline');
+    return { text: parts.join(' · '), pill: pill, tone: q > 0 ? 'danger' : 'warn' };
   }
 
   // ------------------------------------------------------------ shared bits
@@ -726,16 +818,17 @@
   }
   function statusChip(st) {
     var info = stateInfoFrom(st);
-    return el('span', 'tc-chip ' + statusClass(info), info.label);
+    return titled(el('span', 'tc-chip ' + statusClass(info), info.label), info.desc);
   }
   function kindChip(kind) {
     var info = kindInfo(kind);
-    return el('span', 'tc-chip ' + info.cls, info.label);
+    return titled(el('span', 'tc-chip ' + info.cls, info.label), info.desc);
   }
   function cliBadge(cli, name) {
     var info = cliInfo(cli, name);
     if (!info) return null;
-    return el('span', 'tc-chip ' + info.cls, info.label);
+    return titled(el('span', 'tc-chip ' + info.cls, info.label),
+      'Which AI powers this agent (Claude or Codex)');
   }
   // Prettify a lowercase model/CLI alias for display: 'sonnet' -> 'Sonnet'.
   // Robust to ANY string (null/empty -> ''; already-cased or multi-word values
@@ -806,8 +899,8 @@
   }
   // A rate/ctx mini-meter (label + value + track/fill). .tc-meter-head lays out
   // its two spans as a space-between row; the fill state comes from meterClass.
-  function miniMeter(label, pct) {
-    var wrap = el('div', 'tc-meter');
+  function miniMeter(label, pct, title) {
+    var wrap = titled(el('div', 'tc-meter'), title);
     var head = el('div', 'tc-meter-head');
     head.appendChild(el('span', null, label));
     head.appendChild(el('span', null, pct === null || pct === undefined ? '—' : (Math.round(pct) + '%')));
@@ -983,9 +1076,20 @@
     // Live indicator + clock (recomputed each tick).
     var live = el('div', 'tc-live');
     live.appendChild(el('span', 'tc-live-dot'));
+    titled(live, 'The page is polling the bus live');
     live.appendChild(el('span', 'tc-live-label', 'Live'));
     live.appendChild(el('span', 'tc-clock', new Date(state.now).toLocaleTimeString('en-US', { hour12: false })));
     bar.appendChild(live);
+
+    // Overall team-health pill (v0.76.0): the green "Live" dot only means the page
+    // is polling — this shows the TRUE team status (word + color, not color alone),
+    // glanceable from every view. Full sentence on hover.
+    var verdict = teamHealthVerdict(root);
+    var pill = el('div', 'tc-health-pill is-' + verdict.tone);
+    pill.appendChild(el('span', 'tc-health-dot'));
+    pill.appendChild(el('span', 'tc-health-label', verdict.pill));
+    titled(pill, verdict.text);
+    bar.appendChild(pill);
 
     bar.appendChild(el('div', 'tc-divider'));
 
@@ -1073,7 +1177,10 @@
     var items = [
       { key: 'overview', label: 'Team overview', icon: navIconGrid, activeWith: 'agent' },
       { key: 'flow', label: 'Conversations', icon: navIconChat },
-      { key: 'attention', label: 'Human queue', icon: navIconAlert, badge: attnCount },
+      // clearWhenZero (v0.76.0): show a subtle green "0" so "nothing waiting on you"
+      // is visible in the always-on sidebar, not only after opening the queue view.
+      { key: 'attention', label: 'Human queue', icon: navIconAlert, badge: attnCount,
+        clearWhenZero: true, title: 'Things that need a human decision (escalations, blocked gates, stuck agents, failed messages)' },
       { key: 'lead-chat', label: 'Lead chat', icon: navIconChat, badge: leadPendingCount },
       { key: 'learning', label: 'Learning', icon: navIconFile, badge: learningCount },
       { key: 'onboarding', label: 'Onboarding', icon: navIconFile, badge: onboardingCount },
@@ -1082,10 +1189,11 @@
     for (var i = 0; i < items.length; i++) {
       (function (it) {
         var active = state.view === it.key || (it.activeWith && state.view === it.activeWith);
-        var row = el('button', 'tc-nav-item' + (active ? ' is-active' : ''));
+        var row = titled(el('button', 'tc-nav-item' + (active ? ' is-active' : '')), it.title);
         row.appendChild(it.icon());
         row.appendChild(el('span', 'tc-nav-item-label', it.label));
         if (it.badge) row.appendChild(el('span', 'tc-nav-badge', it.badge));
+        else if (it.clearWhenZero) row.appendChild(el('span', 'tc-nav-badge is-clear', '0'));
         on(row, 'click', function () { go(it.key, { selectedAgent: null }); });
         nav.appendChild(row);
       })(items[i]);
@@ -1099,15 +1207,17 @@
     var legend = el('div', 'tc-legend');
     legend.appendChild(el('div', 'tc-legend-label', 'Status legend'));
     var c = agentCounts(root);
+    // Plain-language meaning per row (v0.76.0) — the legend doubles as a glossary,
+    // and kills the biggest false alarm: amber "Idle · waiting" is NORMAL, not broken.
     var rows = [
-      { label: 'Working', grp: 'work', count: c.work },
-      { label: 'Idle · waiting', grp: 'idle', count: c.idle },
-      { label: 'Health attention', grp: 'attn', count: c.attn },
-      { label: 'Unknown / offline', grp: 'unknown', count: c.unknown },
+      { label: 'Working', grp: 'work', count: c.work, desc: 'Actively taking a turn' },
+      { label: 'Idle · waiting', grp: 'idle', count: c.idle, desc: 'Healthy — waiting for a message (normal, not a problem)' },
+      { label: 'Health attention', grp: 'attn', count: c.attn, desc: 'May need a human — stuck, rate-limited, errored, or exited' },
+      { label: 'Unknown / offline', grp: 'unknown', count: c.unknown, desc: 'Not reporting in — may be offline' },
     ];
     var legendRows = el('div', 'tc-legend-rows');
     for (var j = 0; j < rows.length; j++) {
-      var lr = el('div', 'tc-legend-row');
+      var lr = titled(el('div', 'tc-legend-row'), rows[j].desc);
       lr.appendChild(el('span', 'tc-legend-dot status-' + groupState(rows[j].grp)));
       lr.appendChild(el('span', 'tc-legend-text', rows[j].label));
       lr.appendChild(el('span', 'tc-legend-count', rows[j].count));
@@ -1163,10 +1273,14 @@
     var header = el('div', 'tc-view-head');
     var titleBox = el('div');
     titleBox.appendChild(el('h1', 'tc-h1', "Who's doing what"));
+    // One plain-language, color-coded health verdict — the 5-second "is the team
+    // OK?" answer (v0.76.0), replacing the four jargon count-clauses (the raw
+    // numbers still live in the stat tiles + sidebar legend below).
     var missionN = (root.spec_kitty && isArray(root.spec_kitty.missions)) ? root.spec_kitty.missions.length : 0;
-    var sub = all.length + ' agents · ' + missionN + ' mission' + (missionN === 1 ? '' : 's')
-      + ' active · ' + humanQueueCount() + ' human queue · ' + counts.attn + ' health attention';
-    titleBox.appendChild(el('p', 'tc-subtitle', sub));
+    var verdict = teamHealthVerdict(root);
+    var subText = verdict.text
+      + (missionN ? ' · ' + missionN + ' mission' + (missionN === 1 ? '' : 's') + ' active' : '');
+    titleBox.appendChild(el('p', 'tc-subtitle is-' + verdict.tone, subText));
     header.appendChild(titleBox);
     header.appendChild(el('div', 'tc-spacer'));
     header.appendChild(filterChips(root, counts));
@@ -1194,9 +1308,22 @@
     // Two-column body: agent grid + live-activity rail.
     var body = el('div', 'tc-overview-body');
     var grid = el('div', 'tc-agent-grid');
-    var shown = filterAgents(root);
+    // Attention-first (v0.76.0): float agents that need a human/attention (and
+    // then offline) to the top-left where the eye lands, so the first card a
+    // viewer sees is the one that matters. Stable within a rank (ES2019 sort).
+    var shown = filterAgents(root).slice().sort(function (x, y) {
+      return agentAttnRank(x) - agentAttnRank(y);
+    });
     if (!shown.length) {
-      grid.appendChild(emptyState('No agents match', 'Try a different filter.'));
+      // Distinguish "team hasn't started" from "filter hid everything" (v0.76.0):
+      // the old copy always implied a broken filter even with zero agents.
+      if (!all.length) {
+        grid.appendChild(emptyState('No agents running yet',
+          'Agents will appear here as soon as the team starts.'));
+      } else {
+        grid.appendChild(emptyState('No agents match this filter',
+          'Clear the filter to see all ' + all.length + ' agents.'));
+      }
     } else {
       for (var g = 0; g < shown.length; g++) grid.appendChild(agentCard(root, shown[g]));
     }
@@ -1265,13 +1392,16 @@
     r4.appendChild(el('span', 'tc-spacer'));
     r4.appendChild(ageEl('tc-agent-hb',
       { ts: a.last_seen, age_seconds: a.last_seen_age_seconds },
-      { nullText: 'no hb', noHb: info.noHb }));
+      { nullText: 'no hb', noHb: info.noHb,
+        title: "Last check-in (heartbeat) — how long since this agent reported it's alive; \"no hb\" = it hasn't" }));
     card.appendChild(r4);
 
-    // Row 5: RATE + CTX mini-meters.
+    // Row 5: RATE + CTX mini-meters (v0.76.0: hover explains what each gauge means).
     var meters = el('div', 'tc-agent-meters');
-    meters.appendChild(miniMeter('RATE', capPct(a, 'rate_used_pct')));
-    meters.appendChild(miniMeter('CTX', capPct(a, 'context_used_pct')));
+    meters.appendChild(miniMeter('RATE', capPct(a, 'rate_used_pct'),
+      'AI usage budget used — red means the agent is near its rate limit and may pause'));
+    meters.appendChild(miniMeter('CTX', capPct(a, 'context_used_pct'),
+      'Context window filled — red means the agent is running low on room and may compact'));
     card.appendChild(meters);
 
     on(card, 'click', function () { openAgent(a.name); });
@@ -1303,10 +1433,18 @@
     head.appendChild(el('span', 'tc-rail-live-dot'));
     head.appendChild(el('span', 'tc-card-title', 'Live activity'));
     head.appendChild(el('span', 'tc-spacer'));
-    head.appendChild(el('span', 'tc-rail-sub', 'bus messages'));
+    var recent = root.recent || [];
+    // De-jargon the caption + show freshness (v0.76.0): "last message 2m ago"
+    // answers "is anything happening right now?" at a glance. "bus messages" was
+    // internal vocabulary a stakeholder can't map to real work.
+    var sub = el('span', 'tc-rail-sub', "who's messaging whom");
+    if (recent.length) {
+      sub.appendChild(el('span', null, ' · last '));
+      sub.appendChild(ageEl('tc-rail-lastage', recent[0], { suffix: ' ago' }));
+    }
+    head.appendChild(sub);
     card.appendChild(head);
 
-    var recent = root.recent || [];
     var body = el('div', 'tc-feed');
     if (!recent.length) {
       body.appendChild(el('p', 'tc-recent-empty', 'No messages yet.'));
@@ -1596,8 +1734,8 @@
     // the CSS .src-<source> / .sev-<level> rules own the color.
     var body = el('div', 'tc-attn-body');
     var tagRow = el('div', 'tc-attn-tagrow');
-    tagRow.appendChild(el('span', 'tc-src src-' + item.source, item.source_label || (item.source || '').toUpperCase()));
-    tagRow.appendChild(el('span', 'tc-chip sev-' + item.severity, SEV_LABEL[item.severity] || (item.severity || '').toUpperCase()));
+    tagRow.appendChild(titled(el('span', 'tc-src src-' + item.source, item.source_label || (item.source || '').toUpperCase()), SRC_DESC[item.source]));
+    tagRow.appendChild(titled(el('span', 'tc-chip sev-' + item.severity, SEV_LABEL[item.severity] || (item.severity || '').toUpperCase()), SEV_DESC[item.severity]));
     tagRow.appendChild(el('span', 'tc-spacer'));
     tagRow.appendChild(ageEl('tc-attn-age', item, { suffix: ' ago' }));
     body.appendChild(tagRow);
@@ -3143,6 +3281,11 @@
     var svg = iconPath('M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2', 2);
     svg.setAttribute('width', '13'); svg.setAttribute('height', '13');
     svg.setAttribute('class', 'tc-icon tc-agent-wrapped');
+    // SVG-native tooltip (v0.76.0): a <title> child, since an inline SVG ignores
+    // the HTML title attribute. Explains the otherwise-mysterious bracket icon.
+    var t = document.createElementNS(SVG_NS, 'title');
+    t.textContent = 'Supervised — auto-managed (launched & restarted) by the supervisor';
+    svg.appendChild(t);
     return svg;
   }
   function arrowIcon() {

@@ -28,13 +28,20 @@ function extract(name) {
   throw new Error('unbalanced braces for ' + name);
 }
 
-const combined = [extract('el'), extract('supRow'), extract('supRuntimeRows')].join('\n');
+const combined = [
+  extract('el'), extract('titled'), extract('stateInfo'),
+  extract('supRow'), extract('supRuntimeRows'),
+].join('\n');
 
 const document = {
   createElement(tag) {
     const node = {
-      tag: tag, className: '', _text: undefined, children: [],
+      tag: tag, className: '', _text: undefined, children: [], attributes: {},
       appendChild(c) { this.children.push(c); return c; },
+      setAttribute(k, v) { this.attributes[k] = String(v); },
+      getAttribute(k) {
+        return Object.prototype.hasOwnProperty.call(this.attributes, k) ? this.attributes[k] : null;
+      },
       set textContent(v) { this._text = v; },
       get textContent() { return this._text; },
     };
@@ -44,7 +51,8 @@ const document = {
 
 // eslint-disable-next-line no-new-func
 const factory = new Function('document',
-  combined + '\nreturn { el: el, supRow: supRow, supRuntimeRows: supRuntimeRows };');
+  combined + '\nreturn { el: el, titled: titled, stateInfo: stateInfo,'
+  + ' supRow: supRow, supRuntimeRows: supRuntimeRows };');
 const api = factory(document);
 
 // --- 1) XSS-safe: an attacker-controlled model renders inert via textContent ---
@@ -72,5 +80,23 @@ assert.equal(empty[2].children[1].textContent, '—', 'Runtime unset -> em-dash'
 // --- 3) runtime state with no reset_reason shows just the state ---
 const noReason = api.supRuntimeRows({ runtime: { state: 'fresh' } });
 assert.equal(noReason[2].children[1].textContent, 'fresh');
+
+// --- 4) titled() adds a plain-language hover tooltip; empty title is a no-op (v0.76.0) ---
+const withT = api.titled(api.el('span', 'x', 'HOLD'), 'Blocked — waiting on a decision');
+assert.equal(withT.getAttribute('title'), 'Blocked — waiting on a decision');
+const noT = api.titled(api.el('span', 'x', 'GO'), '');
+assert.equal(noT.getAttribute('title'), null, 'empty title must not set the attribute');
+
+// --- 5) stateInfo carries a plain-language desc for every state, alongside the
+//        word label (C0 legibility is never color-alone), and the amber
+//        "Idle · waiting" is explicitly framed as NORMAL, not broken (v0.76.0) ---
+['working_turn', 'idle_waiting', 'stuck_suspected', 'crashed_or_exited', 'unknown'].forEach((s) => {
+  const info = api.stateInfo(s);
+  assert.ok(info.label && info.label.length > 0, s + ' has a word label');
+  assert.ok(info.desc && info.desc.length > 0, s + ' has a plain-language desc');
+});
+const idle = api.stateInfo('idle_waiting');
+assert.ok(/normal|healthy/i.test(idle.desc),
+  'idle_waiting desc must say it is normal/healthy (kills the "idle = broken" false alarm)');
 
 console.log('console runtime render smoke: PASS');

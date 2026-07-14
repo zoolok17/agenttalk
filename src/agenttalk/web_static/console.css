@@ -310,6 +310,28 @@ body {
 
 .tc-divider { width: 1px; height: 24px; background: var(--border); flex: none; }
 
+/* Overall team-health pill (v0.76.0): word + color (never color alone). */
+.tc-health-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--ink2);
+  white-space: nowrap;
+}
+.tc-health-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--gray); }
+.tc-health-pill.is-ok { background: var(--ok-soft); color: var(--ok); border-color: var(--ok); }
+.tc-health-pill.is-ok .tc-health-dot { background: var(--ok); }
+.tc-health-pill.is-warn { background: var(--warn-soft); color: var(--warn); border-color: var(--warn); }
+.tc-health-pill.is-warn .tc-health-dot { background: var(--warn); }
+.tc-health-pill.is-danger { background: var(--danger-soft); color: var(--danger); border-color: var(--danger); }
+.tc-health-pill.is-danger .tc-health-dot { background: var(--danger); }
+.tc-health-pill.is-idle { background: var(--gray-soft); color: var(--ink2); }
+
 .tc-project-context {
   flex: 0 1 390px;
   min-width: 180px;
@@ -447,6 +469,9 @@ body {
   border-radius: 9px;
   padding: 1px 5px;
 }
+/* Cleared human-queue state (v0.76.0): a subtle green "0" so "nothing waiting on
+   you" is visible in the always-on sidebar, not only inside the queue view. */
+.tc-nav-badge.is-clear { background: var(--ok-soft); color: var(--ok); }
 
 .tc-legend {
   border-top: 1px solid var(--border2);
@@ -501,6 +526,12 @@ body {
   font-size: 13px;
   overflow-wrap: anywhere;
 }
+/* Team-health verdict tone (v0.76.0): the one-line "is the team OK?" answer is
+   color-coded (traffic light) but ALWAYS carries the words, never color alone. */
+.tc-subtitle.is-ok { color: var(--ok); font-weight: 600; }
+.tc-subtitle.is-warn { color: var(--warn); font-weight: 600; }
+.tc-subtitle.is-danger { color: var(--danger); font-weight: 600; }
+.tc-subtitle.is-idle { color: var(--ink3); }
 
 .tc-card {
   background: var(--surface);
