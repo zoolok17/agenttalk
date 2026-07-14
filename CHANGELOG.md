@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.76.0] - 2026-07-15
+
+### Added
+
+- **Team Console — plain-language, at-a-glance legibility for a zero-context (C0) viewer.**
+  The dashboard now answers "is the team OK, and does anything need me?" in words, not just
+  colour — for a non-technical viewer glancing at the screen.
+  - A single **team-health verdict** in the top-bar pill and the overview subtitle
+    ("All N agents healthy — nothing needs you", "N need a human", "reconnecting…"…). It is
+    **honest under failure**: a green all-clear shows ONLY when both the agent-health feed
+    (`/api/state`) and the human-attention feed (`/api/attention`) are fresh, known, and
+    empty. A loading / failed / stale / error-as-data feed reads as "reconnecting" /
+    "status unavailable" / "queue status unknown" — never a false "nothing needs you". A
+    known non-empty human queue is always surfaced as urgent even when the state feed is
+    stale or degraded, and the verdict re-evaluates once per second so a green pill flips to
+    "reconnecting…" in place when a poll outage ages the data out.
+  - **Plain-language tooltips** on every status / kind / verdict / severity / source chip,
+    the heartbeat and rate/context meters, the supervised and CLI badges, and the sidebar
+    legend (now a glossary). Every signal shows the WORD plus colour — never colour alone.
+  - Absolute-time hover on every relative age; attention-needing agents sort first in the
+    overview grid; a real "No agents running yet" empty state; an activity-rail
+    "last message Xm ago" summary; and an errored / stale attention or state feed surfaces
+    the failure ("status unknown" / "out of date" / last-known banner) in its own view
+    instead of a false "All clear".
+
 ## [0.75.3] - 2026-07-14
 
 ### Fixed

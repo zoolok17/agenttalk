@@ -95,6 +95,46 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.76.0 - Team Console C0-legibility + honest-under-failure health signalling (2026-07-15)
+**GOOD / ROBUST / SECURE** - reviewed-SHA `5b95b5b` - tag `v0.76.0`
+- **Origin:** an operator ask for "quick and easy dashboard wins for a zero-context (C0),
+  non-technical viewer," implemented as one display-only batch. A team ideation (workflow +
+  bus consult) converged on: a single plain-language team-health verdict (top-bar pill +
+  overview subtitle), plain-language tooltips on every chip/meter/badge/legend (WORD + colour,
+  never colour-alone), absolute-time hover on ages, attention-first grid sort, and a real
+  "No agents running yet" empty state.
+- **Review:** two independent reviewers on the exact final SHA `5b95b5b`, both APPROVED. The
+  cross-family reviewer (`codex-agenttalk-reviewer-1`) drove **six** rounds of reproduced
+  CHANGES_REQUESTED on the new team-health verdict — every one a real *false-confirmed-status*
+  trust bug where the dashboard would tell a C0 viewer "nothing needs you" (or a confirmed
+  "No agents" / "All clear") from data that was actually loading, failed, stale, errored, or
+  contradicted by a separate feed: (1) `attentionData` null → green; (2) stale agent-state →
+  green + a green pill persisting in the DOM through a poll outage; (3) a zero-agent verdict
+  bypassing state-freshness + a degraded root still painting green; (4) an error-as-data
+  `/api/attention` 200 read as a confirmed-empty queue + a known human queue masked by a stale
+  state feed; (5) the zero-agent OVERVIEW GRID still asserting "No agents running yet" while
+  the top bar said "Connecting…"; (5b) a stale non-empty attention queue rendering an
+  unqualified "N open" with live action cards. Each was reproduced via an independent VM
+  render harness before folding, and re-reviewed on the new SHA — a strong live validation of
+  the both-reviewers-on-the-final-SHA discipline (a single-reviewer or read-only pass would
+  have shipped several of these). `claude-test` independently QA'd each fold and, in its final
+  pass, credited codex for finding a gap in `claude-test`'s own prior test coverage.
+- **Verification / lead gate** on the exact ship SHA: full suite green on Python 3.14 (`2456
+  passed, 5 skipped`) and Python 3.10 (`2452 passed, 5 skipped, 4 deselected`; the four are the
+  pre-existing gate-venv timing flakes). Ruff, `bandit -r src -x src/agenttalk/skills`, `node
+  --check`, the console runtime render smoke (`tests/console_runtime_smoke.mjs`, now covering
+  the full team-health verdict matrix + `attentionKnownFrom`), gitleaks (`c80dedf..5b95b5b`,
+  no leaks), and `git diff --check` all passed.
+- **Robust/Secure:** the change is **display-only** — no server, `/api/*`, or data-shape
+  change. Every new node is built through the existing `el()` / `textContent` / `setAttribute`
+  path (no `innerHTML`, no new XSS sink), verified by the render smoke's untrusted-value
+  assertions. The single trust invariant added: the dashboard never asserts a *confirmed*
+  all-clear/empty from data that isn't fresh-and-known, enforced consistently across the
+  top-bar verdict, the overview subtitle + grid, the attention view (empty / errored /
+  stale-empty / stale-non-empty), and the sidebar cleared-"0" badge.
+- **CI:** GitHub `tests` + `security` workflows watched on the exact release commit; run ids
+  recorded in the GitHub release.
+
 ### v0.75.3 - BOM defense-in-depth across the PowerShell/Python file boundary (2026-07-14)
 **GOOD / ROBUST / SECURE** - reviewed-SHA `5caa001` - tag `v0.75.3`
 - **Origin:** the 2026-07-14 orbit-launcher incident (`docs/agenttalk-incident-report-20260714.md`).
