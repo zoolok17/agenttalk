@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.75.2] - 2026-07-14
+
+### Changed
+
+- **Governance policy encoded into the durable docs and skills** (docs + skills only, no
+  code): how agents and operators pick a model + reasoning-effort, keep to the live roster,
+  and manage session context.
+  - `AGENT-MANUAL.md` §1 gains: *the live roster is authoritative* (never dispatch from a
+    memorized/handed-off roster; `sync` on a manual rejoin, read-only `roster`/`whoami`
+    inside a wrapped turn); a per-task-class **model/effort selection** table with
+    evidence-based escalation and provider asymmetry (Codex = shared load-balanced pool →
+    cap/stagger, vary effort not model; Claude = weekly budget → sonnet workhorse, reserve
+    opus); and a **context lifecycle** section (when to reset a session vs. spin up a
+    one-off, preferably different-model-family, independent reviewer). The runtime-source
+    precedence is stated as three layers — explicit child tail after `--` > `wrap
+    --model`/`--effort` > `supervisor.json` — and the honest ceiling that there is **no
+    bus context-reset command** (`request-restart` preserves the session).
+  - `DESIGN.md` decision **D-25**: model/effort selection and agent-context lifecycle are
+    operator/project policy, not core mechanism (the core only injects + fingerprints per
+    D-24). Stale `D-1..D-15` decision-log cross-references corrected to `D-1..D-25`.
+  - `USER-MANUAL.md` §8: an operator model/effort config rubric + how to verify the flags
+    reached the CLI (idle-until-dispatch; inspect the `claude.exe`/`codex.exe` child, whose
+    spelling differs by provider); §4 roster common-mistake.
+  - Skills: Claude + Codex lead and listen skills and `devkit/_shared/references/routing.md`
+    carry the matching rules; `reviewed-against` re-stamped `0.75` on the five touched skills.
+
 ## [0.75.1] - 2026-07-14
 
 ### Added

@@ -95,6 +95,37 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.75.2 - governance policy: model/effort selection, live-roster discipline, context lifecycle (2026-07-14)
+**GOOD / ROBUST / SECURE** - reviewed-SHA `3be2a37` - tag `v0.75.2`
+- **Review:** two independent verifications on the exact final SHA `3be2a37`, both APPROVED.
+  This one is a live validation of the very rule it encodes: the cross-family reviewer
+  (`codex-agenttalk-reviewer-1`) drove **two rounds** of reproduced CHANGES_REQUESTED that
+  the same-family reviewer (`claude-remediation-reviewer`) had approved past — round 1:
+  over-strong reset semantics, invalid rubric tokens (`primary`/`medium-high`), a
+  live-roster rule that told wrapped children to run `sync`, and provider-neutrality gaps;
+  round 2: the runtime-source precedence is three layers (raw child tail > `wrap
+  --model/--effort` > `supervisor.json`), the wrapped-turn `sync` split had to cover every
+  recovery instruction, and the reset guidance implied a mechanism agenttalk lacks
+  (`request-restart` preserves the session; there is no bus reset command). Every finding was
+  verified against `cli.py`/`store.py` before folding; both reviewers then confirmed the
+  final SHA (`3be2a37`) with zero open findings.
+- **Verification / lead gate:** full suite green on the exact ship SHA — Python 3.14
+  (`2444 passed, 5 skipped`) and Python 3.10 (`2440 passed, 5 skipped, 4 deselected`; the
+  four deselected are the pre-existing gate-venv timing flakes tracked under the P2
+  CI-timing item, not this change). Ruff, gitleaks (`25a492f..3be2a37`, no leaks), `git diff
+  --check`, and the skill-currency check (0 blocking) all passed; `skill_lint` /
+  `skill_currency` / `doctor` / `install_skills` = `162 passed`.
+- **Robust/Secure:** docs + skills only (`+272/-18` across 8 files); **no code path
+  touched**. The policy is explicitly stated as discipline, not an enforced boundary (D-25
+  ceiling): the core neither validates a chosen profile against a task nor the effort token
+  against a model at request time, `send` rejects an off-roster/retired recipient but cannot
+  stop a wrong still-active recipient, and there is no bus context-reset command. New
+  decision **D-25** records the design rationale; stale `D-1..D-15` cross-refs corrected to
+  `D-1..D-25`. Known limitations (advisory-policy, provider effort compatibility at request
+  time, operator/host-level context clearing) recorded in the policy text itself.
+- **CI:** GitHub `tests` + `security` workflows watched on the exact release commit; run
+  ids recorded in the GitHub release.
+
 ### v0.75.1 - runtime identity on the Team Console (contact cards + profile Skill row) (2026-07-14)
 **GOOD / ROBUST / SECURE** - reviewed-SHA `ddb37cb` - tag `v0.75.1`
 - **Review:** two independent verifications on the exact SHA, both APPROVED. A
