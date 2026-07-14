@@ -3344,6 +3344,34 @@ for (const tc of cases) {
       `detail: Supervisor missing Model row (keys: ${keys.join(', ')})`);
   }
 }
+
+// v0.76.0 (codex P1, r4): an error-as-data /api/attention 200 (200 body with a non-empty
+// errors[] and count=0/items=[]) is a COLLECTION FAILURE, not a confirmed-empty queue. The
+// attention view must say so — never "All clear" — and the topbar health verdict must not
+// paint a green "Healthy / nothing needs you".
+hooks.setPayloads(Object.assign({}, payloads, {
+  attentionData: { root: root.project_id, count: 0, items: [], errors: ['attention collection failed'] },
+}));
+hooks.state.view = 'attention';
+hooks.state.selectedRootId = root.project_id;
+hooks.state.selectedAgent = null;
+hooks.state.sessionRid = null;
+hooks.state.filter = 'all';
+main.children = [];
+main.firstChild = null;
+main.textContent = '';
+hooks.renderChrome();
+hooks.renderActiveView();
+{
+  const atext = collectText(main).replace(/\s+/g, ' ').trim();
+  assert(/Can.?t read the human queue/.test(atext),
+    `attention-error: missing collection-failure message: ${atext}`);
+  assert(!atext.includes('All clear'),
+    `attention-error: must NOT claim "All clear" when the queue failed to build: ${atext}`);
+  const tb = collectText(topbar).replace(/\s+/g, ' ').trim();
+  assert(!tb.includes('Healthy'), `attention-error: topbar must not read "Healthy": ${tb}`);
+  assert(!/nothing needs you/.test(tb), `attention-error: topbar must not read all-clear: ${tb}`);
+}
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)

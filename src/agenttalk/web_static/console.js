@@ -439,7 +439,7 @@
       case 'degraded_output': return { label: 'Degraded', key: 'degraded_output', color: 'danger', grp: 'attn', desc: 'Producing low-quality output — may need a human' };
       case 'crashed_or_exited': return { label: 'Exited', key: 'crashed_or_exited', color: 'gray', grp: 'attn', desc: 'The process has stopped' };
       case 'errored_recoverable': return { label: 'Errored', key: 'errored_recoverable', color: 'attn', grp: 'attn', desc: 'Hit an error it may recover from' };
-      case 'errored_poison': return { label: 'Errored', key: 'errored_recoverable', color: 'attn', grp: 'attn', desc: 'Keeps failing on the same message — it will be set aside for a human if it can’t get past it' };
+      case 'errored_poison': return { label: 'Errored', key: 'errored_recoverable', color: 'attn', grp: 'attn', desc: 'This message is failing in a way that retrying won’t fix — it will be set aside for a human' };
       case 'errored_fatal':
       case 'errored_ambiguous': return { label: 'Errored', key: 'errored_fatal', color: 'danger', grp: 'attn', desc: 'Hit an error and needs a human' };
       default: return { label: 'Unknown', key: 'unknown', color: 'gray', grp: 'unknown', noHb: true, desc: 'Not reporting in — may be offline' };
@@ -804,12 +804,19 @@
   // during an outage". A stamped _fetchedAt (set on each successful fetchAttention,
   // which polls every POLL_MS) ages out during an outage -> unknown. An unstamped
   // non-null payload (e.g. a test harness) is treated as known.
-  function attentionFresh() {
-    if (attentionData == null) return false;
-    var at = attentionData._fetchedAt;
+  // PURE (testable without module state): an attention payload counts as KNOWN — safe
+  // to drive a confirmed verdict or a cleared "0" badge — only if it exists, carries NO
+  // collection errors, and is within the freshness window. An error-as-data 200
+  // (count=0, items=[], errors=[...]) is a COLLECTION FAILURE, not a confirmed-empty
+  // queue, so it must read as unknown and never paint a green all-clear (codex P1).
+  function attentionKnownFrom(data, now) {
+    if (data == null) return false;
+    if (Array.isArray(data.errors) && data.errors.length) return false;
+    var at = data._fetchedAt;
     if (typeof at !== 'number' || !isFinite(at)) return true;
-    return (state.now - at) <= ATTENTION_STALE_MS;
+    return (now - at) <= ATTENTION_STALE_MS;
   }
+  function attentionFresh() { return attentionKnownFrom(attentionData, state.now); }
   // Is the agent-health data (from /api/state) KNOWN-fresh? Same rationale as
   // attentionFresh: fetchState stamps _fetchedAt on each successful poll and retains
   // last-good on failure, so a stale lastState means agent health is obsolete and the
@@ -834,10 +841,26 @@
   // (loading / failed / stale) must never render as a confirmed all-clear — an outage
   // would otherwise leave a false green on screen (C0 trust contract).
   function teamHealthVerdictFrom(n, stateKnown, attnKnown, q, attnCount, unknownCount, rootDegraded) {
-    // Freshness gates EVERYTHING: with no fresh agent-health data we can assert
-    // nothing — not "healthy", and not even "no agents" (a cold start or a stale
-    // zero-agent payload must never read as a CONFIRMED empty team, codex P1a).
-    // Show reconnecting (had data, now stale) / connecting (never loaded yet).
+    // A KNOWN, non-empty human queue is CONFIRMED urgent work from a SEPARATE feed
+    // (/api/attention). It must NEVER be masked by a stale agent-state feed or a
+    // degraded root — surface it as danger FIRST and append a status caveat so BOTH
+    // facts show (codex P2). attnKnown is false for an errored/stale/loading attention
+    // payload, so this fires only on a trustworthy non-empty queue.
+    if (attnKnown && q > 0) {
+      var humanPill = (q === 1 ? '1 needs' : q + ' need') + ' a human';
+      var hparts = [n + ' agent' + (n === 1 ? '' : 's'), humanPill];
+      if (stateKnown && !rootDegraded) {
+        if (attnCount > 0) hparts.push(attnCount + (attnCount === 1 ? ' needs' : ' need') + ' attention');
+        if (unknownCount > 0) hparts.push(unknownCount + ' offline');
+      } else {
+        hparts.push(!stateKnown ? 'agent status stale' : 'status unavailable');
+      }
+      return { text: hparts.join(' · '), pill: humanPill, tone: 'danger' };
+    }
+    // Freshness gates the rest: with no fresh agent-health data we can assert nothing —
+    // not "healthy", and not even "no agents" (a cold start or a stale zero-agent payload
+    // must never read as a CONFIRMED empty team, codex P1a). Show reconnecting (had data,
+    // now stale) / connecting (never loaded yet).
     if (!stateKnown) {
       return n
         ? { text: n + ' agents · status stale (reconnecting…)', pill: 'Reconnecting…', tone: 'idle' }
@@ -854,15 +877,15 @@
         ? { text: 'Your agent is healthy — nothing needs you', pill: 'Healthy', tone: 'ok' }
         : { text: 'All ' + n + ' agents healthy — nothing needs you', pill: 'Healthy', tone: 'ok' };
     }
+    // Known but not all-clear, and not an urgent human queue (handled above): itemize
+    // what we DO know (agent-health attention / offline / unknown queue).
     var parts = [n + ' agent' + (n === 1 ? '' : 's')];
-    if (attnKnown && q > 0) parts.push(q + (q === 1 ? ' needs' : ' need') + ' a human');
     if (attnCount > 0) parts.push(attnCount + (attnCount === 1 ? ' needs' : ' need') + ' attention');
     if (unknownCount > 0) parts.push(unknownCount + ' offline');
     if (!attnKnown) parts.push('queue status unknown');
-    var pill = (attnKnown && q > 0) ? (q + (q === 1 ? ' needs' : ' need') + ' a human')
-      : (attnCount > 0 ? (attnCount + (attnCount === 1 ? ' needs' : ' need') + ' attention')
-      : (!attnKnown ? 'Checking…' : 'Some offline'));
-    var tone = (attnKnown && q > 0) ? 'danger' : (attnCount > 0 ? 'warn' : (!attnKnown ? 'idle' : 'warn'));
+    var pill = (attnCount > 0) ? (attnCount + (attnCount === 1 ? ' needs' : ' need') + ' attention')
+      : (!attnKnown ? 'Checking…' : 'Some offline');
+    var tone = (attnCount > 0) ? 'warn' : (!attnKnown ? 'idle' : 'warn');
     return { text: parts.join(' · '), pill: pill, tone: tone };
   }
   // The verdict currently painted (set by renderTopbar). The 1 Hz clockTick compares
@@ -1786,12 +1809,18 @@
     header.appendChild(el('div', 'tc-spacer'));
 
     var items = (attentionData && attentionData.items) || [];
+    var errs = (attentionData && isArray(attentionData.errors)) ? attentionData.errors : [];
     var count = attentionData && typeof attentionData.count === 'number' ? attentionData.count : items.length;
-    header.appendChild(el('span', 'tc-attn-count', count + ' open'));
+    // An error-as-data 200 makes the count meaningless — say "status unknown", never "0 open".
+    header.appendChild(el('span', 'tc-attn-count', errs.length ? 'status unknown' : (count + ' open')));
     wrap.appendChild(header);
 
     if (!attentionData) {
       wrap.appendChild(el('p', 'tc-recent-empty', 'Loading attention queue…'));
+    } else if (errs.length) {
+      // Collection failed (codex P1): the queue could NOT be built, so don't claim
+      // "All clear" — say plainly that the list is unavailable right now.
+      wrap.appendChild(attentionError(errs));
     } else if (!items.length) {
       wrap.appendChild(attentionEmpty());
     } else {
@@ -1932,6 +1961,17 @@
     card.appendChild(badge);
     card.appendChild(el('div', 'tc-empty-title', 'All clear'));
     card.appendChild(el('div', 'tc-empty-text', 'Nothing is waiting on you right now.'));
+    return card;
+  }
+
+  // Shown when /api/attention returns an error-as-data payload (200 with errors): the
+  // queue couldn't be built, so this is NOT an all-clear — no green check (codex P1).
+  function attentionError(errs) {
+    var card = el('div', 'tc-empty is-error');
+    card.appendChild(el('div', 'tc-empty-title', 'Can’t read the human queue right now'));
+    card.appendChild(el('div', 'tc-empty-text',
+      'The dashboard hit an error building this list, so it can’t tell you what’s waiting. '
+      + 'This is a dashboard problem, not an all-clear. (' + (errs || []).join('; ') + ')'));
     return card;
   }
 

@@ -1248,6 +1248,9 @@ body {
   color: var(--ink);
 }
 .tc-empty-text { color: var(--ink3); font-size: 13px; }
+/* Attention-queue collection failure (error-as-data 200) — warn, NOT a green all-clear. */
+.tc-empty.is-error { border-color: var(--warn); background: var(--warn-soft); }
+.tc-empty.is-error .tc-empty-title { color: var(--warn); }
 
 /* Degraded-root error line */
 .tc-root-error {

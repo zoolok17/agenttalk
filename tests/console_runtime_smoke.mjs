@@ -30,7 +30,7 @@ function extract(name) {
 
 const combined = [
   extract('el'), extract('titled'), extract('stateInfo'),
-  extract('teamHealthVerdictFrom'),
+  extract('teamHealthVerdictFrom'), extract('attentionKnownFrom'),
   extract('supRow'), extract('supRuntimeRows'),
 ].join('\n');
 
@@ -52,8 +52,12 @@ const document = {
 
 // eslint-disable-next-line no-new-func
 const factory = new Function('document',
-  combined + '\nreturn { el: el, titled: titled, stateInfo: stateInfo,'
+  // attentionKnownFrom references the module const ATTENTION_STALE_MS; the tests below
+  // pin now===_fetchedAt so the window value is irrelevant, but it must be defined.
+  'var ATTENTION_STALE_MS = 8000;\n'
+  + combined + '\nreturn { el: el, titled: titled, stateInfo: stateInfo,'
   + ' teamHealthVerdictFrom: teamHealthVerdictFrom,'
+  + ' attentionKnownFrom: attentionKnownFrom,'
   + ' supRow: supRow, supRuntimeRows: supRuntimeRows };');
 const api = factory(document);
 
@@ -157,5 +161,36 @@ const oneHealthy = hv(1, true, true, 0, 0, 0);
 assert.equal(oneHealthy.pill, 'Healthy');
 assert.ok(/nothing needs you/.test(oneHealthy.text));
 assert.ok(!/1 agents/.test(oneHealthy.text), 'singular must not say "1 agents"');
+
+// --- 10) codex P1 (r4): an error-as-data attention 200 (count=0, items=[], errors=[...])
+//         reads as UNKNOWN, not a confirmed-empty queue — so it can never paint green. ---
+const akf = api.attentionKnownFrom;
+assert.equal(akf(null, 1000), false, 'null attention -> unknown');
+assert.equal(akf({ count: 0, items: [], _fetchedAt: 1000 }, 1000), true, 'fresh empty (no errors) -> known');
+assert.equal(akf({ count: 0, items: [], errors: ['attention collection failed'], _fetchedAt: 1000 }, 1000), false,
+  'error-as-data 200 -> unknown (never a confirmed empty queue)');
+assert.equal(akf({ count: 0, items: [], errors: [], _fetchedAt: 1000 }, 1000), true, 'empty errors array -> known');
+// an unknown attention feed (attnKnown=false, as attentionKnownFrom returns on errors)
+// must not produce a green verdict:
+const errAttn = hv(1, true, false, null, 0, 0);
+assert.notEqual(errAttn.pill, 'Healthy');
+assert.ok(!/nothing needs you/.test(errAttn.text), 'unknown attention must not read all-clear');
+
+// --- 11) codex P2 (r4): a KNOWN human queue (q>0) must NOT be masked by stale
+//         agent-state or a degraded root — danger "need a human" + a status caveat. ---
+const staleButQueue = hv(3, false, true, 2, 0, 0);          // stale state, fresh known q=2
+assert.equal(staleButQueue.tone, 'danger', 'known q>0 stays danger even when state is stale');
+assert.ok(/2 need a human/.test(staleButQueue.text));
+assert.ok(/stale/i.test(staleButQueue.text), 'stale state surfaced as a caveat, not a mask');
+const degradedButQueue = hv(3, true, true, 2, 0, 0, true);  // degraded root, fresh known q=2
+assert.equal(degradedButQueue.tone, 'danger', 'known q>0 stays danger even when root is degraded');
+assert.ok(/2 need a human/.test(degradedButQueue.text));
+assert.ok(/unavailable/i.test(degradedButQueue.text), 'degraded surfaced as a caveat, not a mask');
+
+// --- 12) codex P3 (r4): errored_poison can be set on the FIRST failed turn, so its
+//         tooltip must not assert repetition; it keeps the "set aside" dead-letter note. ---
+const poison = api.stateInfo('errored_poison');
+assert.ok(!/keeps? failing/i.test(poison.desc), 'poison desc must not assert repeated failure');
+assert.ok(/set aside/i.test(poison.desc), 'poison desc keeps the dead-letter (set aside) explanation');
 
 console.log('console runtime render smoke: PASS');
