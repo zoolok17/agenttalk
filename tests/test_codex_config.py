@@ -317,3 +317,29 @@ def test_bom_prefixed_config_section_is_recognized_not_duplicated(tmp_path: Path
     # re-enable must NOT append a duplicate [projects] table
     enable_project(cfg, project)
     assert cfg.read_text(encoding="utf-8-sig").count("[projects.") == 1
+
+
+def test_duplicate_projects_tables_are_repaired_on_enable(tmp_path: Path) -> None:
+    """A config ALREADY corrupted by the pre-0.75.3 BOM bug holds two identical
+    [projects."<key>"] tables — invalid TOML the external codex CLI refuses, so the
+    agent can't start. enable_project must COLLAPSE them to one (self-repair the
+    already-affected user on the next seed), and status must REPORT the duplication
+    instead of falsely presenting the broken file as healthy."""
+    cfg = tmp_path / "config.toml"
+    project = tmp_path / "proj"
+    project.mkdir()
+    enable_project(cfg, project)                       # create one managed block
+    block = cfg.read_text(encoding="utf-8-sig")
+    assert block.count("[projects.") == 1
+    # simulate the pre-fix corrupted output: the same managed block twice
+    cfg.write_text(block.strip("\n") + "\n\n" + block.strip("\n") + "\n", encoding="utf-8")
+    assert cfg.read_text(encoding="utf-8-sig").count("[projects.") == 2   # genuinely corrupted
+    # status must DETECT the duplication (not lie)
+    st = status(cfg, project)
+    assert st["section_present"] is True
+    assert st["duplicate_sections"] == 1
+    # enable must REPAIR: collapse to a single valid table
+    res = enable_project(cfg, project)
+    assert any("duplicate" in c for c in res.changes)
+    assert cfg.read_text(encoding="utf-8-sig").count("[projects.") == 1
+    assert status(cfg, project)["duplicate_sections"] == 0

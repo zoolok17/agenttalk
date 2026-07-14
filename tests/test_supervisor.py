@@ -4734,3 +4734,32 @@ def test_seed_claude_settings_tolerates_bom_and_preserves_operator_keys(tmp_path
     data = json.loads(settings.read_text(encoding="utf-8-sig"))
     assert data.get("customOperatorKey") == 123, "operator key must survive, not be discarded"
     assert "defaultMode" in data
+
+
+def test_install_activity_hook_preserves_bom_prefixed_operator_settings(tmp_path: Path) -> None:
+    """An operator .claude/settings.json saved with a UTF-8 BOM must be READ and MERGED,
+    not treated as unreadable (which skips the hook install and forces manual merge).
+    v0.75.3/D-26: the hook installer reads with utf-8-sig."""
+    s = _team(tmp_path)
+    settings = s.root / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_bytes(b"\xef\xbb\xbf" + b'{"customOperatorKey": 42}')
+    out = sup.install_activity_hook(s, claude=True, codex=False)
+    st = out[str(settings)]
+    assert "unreadable" not in st                      # was "skipped (unreadable...)" before the fix
+    assert st in ("installed", "already")
+    data = json.loads(settings.read_text(encoding="utf-8-sig"))
+    assert data.get("customOperatorKey") == 42         # operator key preserved through the merge
+
+
+def test_generated_supervisor_ps1_uses_bom_free_json_writes(tmp_path: Path) -> None:
+    """Guard against reintroducing `Set-Content -Encoding utf8` (which emits a UTF-8 BOM
+    under Windows PowerShell 5.1) for JSON/TOML writes: the generated supervisor.ps1 must
+    write process snapshots and the codex config.toml seed via BOM-free WriteAllText
+    (v0.75.3, D-26)."""
+    _team(tmp_path)
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    ps1 = (tmp_path / ".agenttalk" / "supervisor.ps1").read_text(encoding="utf-8-sig")
+    assert "WriteAllText" in ps1
+    assert "Set-Content $path -Encoding utf8" not in ps1          # snapshot writes
+    assert "Set-Content $dc '' -Encoding utf8" not in ps1         # config.toml empty seed

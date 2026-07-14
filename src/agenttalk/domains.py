@@ -77,7 +77,7 @@ def load_registry(path: Path, cfg: dict[str, Any]) -> Registry:
         data = empty_registry()
     else:
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
         except json.JSONDecodeError as e:
             raise DomainError(f"domain registry {path} is not valid JSON: {e}") from e
         except OSError as e:

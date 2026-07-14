@@ -498,3 +498,18 @@ def test_cli_signoff_domain_reviewers_additive(tmp_path: Path) -> None:
     s1 = rec["required_signoffs"][0]["generated_lens_ids"][0]
     assert _sign(root, "bob", s1) == 0            # bob is a candidate ONLY via domain
     assert _run(["close", "check", "--id", "rel"], root) == 0
+
+
+def test_load_signoff_policy_tolerates_utf8_bom(tmp_path: Path) -> None:
+    """signoffs.json is PROJECT-OWNED policy (README); a BOM-prefixed hand-edit must
+    load, not surface invalid_signoff_policy citing 'Unexpected UTF-8 BOM' (v0.75.3, D-26)."""
+    root = _init_signoff(tmp_path)
+    s = Store(root)
+    pol = {"schema_version": 1,
+           "risk_policies": {"security": [{"id": "sec", "required_count": 2,
+                                           "candidates": {"roles": ["sec"]}}]},
+           "allow_unmapped": False}
+    (s.dir / "signoffs.json").write_bytes(b"\xef\xbb\xbf" + json.dumps(pol).encode("utf-8"))
+    policy, err = close.load_signoff_policy(s)
+    assert err is None                            # BOM must not read as corrupt
+    assert policy is not None

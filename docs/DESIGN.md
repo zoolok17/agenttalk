@@ -783,14 +783,21 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   BOM-only under 5.1 produced duplicate `[projects]` tables → invalid TOML the external codex
   CLI refuses → the agent can't start. *Decision:* every JSON/TOML artifact the generated PS
   writes uses a **BOM-free** UTF-8 write (`[System.IO.File]::WriteAllText(path, text,
-  UTF8Encoding($false))`, matching `Write-StateFileAtomic`), and every Python/PS reader of a
-  possibly-operator-or-PS-written config uses **BOM-tolerant** decoding (`utf-8-sig` /
-  `ConvertFrom-Json`). Generated `.ps1` files are the deliberate exception — they keep a BOM
-  because the 5.1 script engine needs it to decode a UTF-8 script (a BOM-less `.ps1` is read as
-  Windows-1252); `.cmd` shims stay BOM-free because `cmd.exe` fuses a BOM onto `@echo off`.
-  *Ceiling:* this is a robustness invariant, not enforced by a test harness that runs PS 5.1;
-  new PS writes / strict readers must follow the rule by convention (the incident audit is the
-  backstop). pwsh 7+ remains the recommended host.
+  UTF8Encoding($false))`, matching `Write-StateFileAtomic`), and every reader of a
+  **operator-authored or PowerShell-written** config uses **BOM-tolerant** decoding (`utf-8-sig`
+  / `ConvertFrom-Json`) — the supervisor state/snapshot files, the codex `config.toml`, the
+  operator `settings.json`/`hooks.json`, and the hand-authored `domains.json` / `signoffs.json`.
+  (agenttalk's own bus/store artifacts are written atomically BOM-free, so their strict `utf-8`
+  reads have no BOM source and are safe as-is — they are not blanket-converted.) `codex_config`
+  additionally **self-repairs** an already-corrupted config: `enable`/`disable` collapse duplicate
+  `[projects."<key>"]` tables and `status` reports them, so a user bitten by the old behavior is
+  healed on the next seed rather than left with un-parseable TOML. Generated `.ps1` files are the
+  deliberate exception — they keep a BOM because the 5.1 script engine needs it to decode a UTF-8
+  script (a BOM-less `.ps1` is read as Windows-1252); `.cmd` shims stay BOM-free because
+  `cmd.exe` fuses a BOM onto `@echo off`. *Ceiling:* this is a robustness invariant, not enforced
+  by a harness that runs PS 5.1; new PS writes / operator-config readers must follow the rule by
+  convention (the incident audit + a generated-`.ps1` content assertion are the backstops).
+  pwsh 7+ remains the recommended host.
 
 ## 6. How we work (process)
 

@@ -73,7 +73,7 @@ future-bounded: a value beyond the configured skew allowance cannot authorize
 liveness. Wrapper waiting markers carry unique tokens, so old teardown removes
 only the marker generation it created.
 
-Every JSON artifact the generated PowerShell writes (state, snapshots, and the
+Every JSON/TOML artifact the generated PowerShell writes (state, snapshots, and the
 per-agent codex `config.toml` seed) is written **BOM-free** (UTF-8 without a byte-order
 mark), and the Python/PowerShell readers use BOM-tolerant decoding, so the host works
 under both PowerShell 7+ and Windows PowerShell 5.1. (Under 5.1, `Set-Content -Encoding

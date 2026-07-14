@@ -193,16 +193,20 @@ def _parse_table_header(line: str) -> tuple[str, str] | None:
     return None
 
 
-def _find_section(lines: list[str], project_dir: str) -> tuple[int, int] | None:
-    """Return (start, end) line indices for the matching [projects.'...'] block.
+def _find_all_sections(lines: list[str], project_dir: str) -> list[tuple[int, int]]:
+    """All (start, end) ranges for matching [projects.'...'] blocks, in order.
 
-    Match is case-insensitive on the path. `end` is the index AFTER the last
-    line of the block (i.e. the next section header or EOF). Handles both
-    single-quoted literal keys and double-quoted basic-string keys (with
-    backslash escapes), and allows inline `# comment` after the header.
+    Normally at most one, but a config corrupted by the pre-0.75.3 BOM bug can hold
+    DUPLICATES: a leading U+FEFF hid the existing header from the section scan
+    (`str.strip()` does not drop U+FEFF), so a second identical table was appended —
+    invalid TOML the external codex CLI refuses to parse. Callers detect/repair that
+    instead of silently editing only the first copy. Match is case-insensitive on the
+    path; `end` is the index AFTER the block (next section header or EOF). Handles
+    single-quoted literal and double-quoted basic-string keys + inline `# comment`.
     """
     target = project_dir.casefold()
     n = len(lines)
+    out: list[tuple[int, int]] = []
     for i, line in enumerate(lines):
         stripped = line.strip()
         if not stripped.startswith("[projects."):
@@ -221,8 +225,26 @@ def _find_section(lines: list[str], project_dir: str) -> tuple[int, int] | None:
         j = i + 1
         while j < n and not lines[j].strip().startswith("["):
             j += 1
-        return (i, j)
-    return None
+        out.append((i, j))
+    return out
+
+
+def _find_section(lines: list[str], project_dir: str) -> tuple[int, int] | None:
+    """Return (start, end) for the FIRST matching [projects.'...'] block, or None.
+    See :func:`_find_all_sections` for the duplicate-table contract."""
+    sections = _find_all_sections(lines, project_dir)
+    return sections[0] if sections else None
+
+
+def _collapse_duplicate_sections(lines: list[str], project_key: str) -> int:
+    """Repair a BOM-corrupted config in place: keep the FIRST matching
+    [projects.'<key>'] table and delete the rest (they are duplicates of the same
+    managed project block, and duplicate tables are invalid TOML). Deletes from
+    LAST to FIRST so earlier indices stay valid. Returns the number removed."""
+    sections = _find_all_sections(lines, project_key)
+    for start, end in sections[1:][::-1]:
+        del lines[start:end]
+    return max(0, len(sections) - 1)
 
 
 def _parse_kv(line: str) -> tuple[str, str] | None:
@@ -263,8 +285,15 @@ def enable_project(config_path: Path, project_dir: Path) -> Result:
     if trailing_newline:
         lines = lines[:-1]
 
-    section = _find_section(lines, project_key)
     changes: list[str] = []
+    # Self-repair a config corrupted by the pre-0.75.3 BOM bug (duplicate
+    # [projects."<key>"] tables -> invalid TOML the codex CLI refuses). Collapse to
+    # the first BEFORE applying managed keys, so every seed heals an affected user.
+    removed_dups = _collapse_duplicate_sections(lines, project_key)
+    if removed_dups:
+        changes.append(f"removed {removed_dups} duplicate [projects] table(s)")
+
+    section = _find_section(lines, project_key)
 
     if section is None:
         # Append a fresh block
@@ -344,6 +373,11 @@ def disable_project(config_path: Path, project_dir: Path) -> Result:
     if trailing_newline:
         lines = lines[:-1]
 
+    dup_changes: list[str] = []
+    removed_dups = _collapse_duplicate_sections(lines, project_key)
+    if removed_dups:
+        dup_changes.append(f"removed {removed_dups} duplicate [projects] table(s)")
+
     section = _find_section(lines, project_key)
     if section is None:
         return Result(action="no-op", config_path=config_path, project_dir=project_key,
@@ -360,7 +394,7 @@ def disable_project(config_path: Path, project_dir: Path) -> Result:
             continue
         new_block.append(lines[idx])
 
-    if not removed:
+    if not removed and not dup_changes:
         return Result(action="unchanged", config_path=config_path, project_dir=project_key,
                       changes=["nothing to remove"])
 
@@ -372,7 +406,7 @@ def disable_project(config_path: Path, project_dir: Path) -> Result:
     # open() translate again would double them (\r\n -> \r\r\n) — review M4a.
     _atomic_write_text(config_path, newline.join(lines), newline="")
     return Result(action="removed", config_path=config_path, project_dir=project_key,
-                  changes=removed)
+                  changes=dup_changes + removed)
 
 
 def status(config_path: Path, project_dir: Path) -> dict:
@@ -384,6 +418,7 @@ def status(config_path: Path, project_dir: Path) -> dict:
         "config_exists": config_path.exists(),
         "project_dir": project_key,
         "section_present": False,
+        "duplicate_sections": 0,
         "keys": dict.fromkeys(MANAGED_KEYS),
     }
     if not config_path.exists():
@@ -391,11 +426,14 @@ def status(config_path: Path, project_dir: Path) -> dict:
     text = config_path.read_text(encoding="utf-8-sig")
     newline = "\r\n" if "\r\n" in text else "\n"
     lines = text.split(newline)
-    section = _find_section(lines, project_key)
-    if section is None:
+    sections = _find_all_sections(lines, project_key)
+    if not sections:
         return result
     result["section_present"] = True
-    start, end = section
+    # A pre-0.75.3 BOM-corrupted config can hold duplicate tables (invalid TOML);
+    # report it so status does not falsely present a broken file as healthy.
+    result["duplicate_sections"] = max(0, len(sections) - 1)
+    start, end = sections[0]
     for idx in range(start + 1, end):
         kv = _parse_kv(lines[idx])
         if kv and kv[0] in MANAGED_KEYS:

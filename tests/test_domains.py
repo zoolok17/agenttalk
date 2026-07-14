@@ -190,3 +190,15 @@ def test_domain_cli_missing_registry_is_valid_empty(tmp_path: Path, capsys: pyte
     payload = json.loads(capsys.readouterr().out)
     assert payload["source_exists"] is False
     assert payload["domains"] == []
+
+
+def test_load_registry_tolerates_utf8_bom(tmp_path: Path) -> None:
+    """domains.json is authored BY HAND (README: 'author domains.json by hand'); a
+    Notepad/PowerShell save can prepend a UTF-8 BOM. The loader must decode it
+    BOM-tolerantly, not raise DomainError citing 'Unexpected UTF-8 BOM' (v0.75.3, D-26)."""
+    root = _root(tmp_path)
+    cfg = Store(root).load_config()
+    p = root / ".agenttalk" / dom.FILENAME
+    p.write_bytes(b"\xef\xbb\xbf" + json.dumps(_registry(), indent=2).encode("utf-8"))
+    reg = dom.load_registry(p, cfg)          # must NOT raise on the leading BOM
+    assert "cli" in reg.data["domains"]

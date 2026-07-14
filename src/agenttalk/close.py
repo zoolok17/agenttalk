@@ -651,7 +651,7 @@ def load_signoff_policy(store) -> tuple[dict | None, str | None]:
     if not path.exists():
         return None, None
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except (ValueError, OSError) as e:
         return None, f"signoffs.json is unreadable/corrupt: {e}"
     try:

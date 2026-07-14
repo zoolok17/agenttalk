@@ -110,22 +110,26 @@ reasoning-effort is a launch-time typo guard, not a per-model validator (e.g. Co
 
 ---
 
-## SHIPPED (v0.75.3, 2026-07-14) — BOM defense-in-depth + supervisor docs (from the incident audit)
+## v0.75.3 (2026-07-14) — BOM defense-in-depth + supervisor docs (from the incident audit)
 
 **What.** An exhaustive audit (workflow) of every PowerShell-writes ↔ Python/PS-reads
 encoding pair. Under **Windows PowerShell 5.1**, `Set-Content -Encoding utf8` emits a UTF-8
 BOM that strict readers reject / TOML scans mis-handle. Fixes (see D-26): two PS writers made
 BOM-free (`Get-ProcSnapshot`; the codex-home `config.toml` empty-seed — the one **live**
 mismatch: a BOM-only placeholder produced duplicate `[projects]` tables → invalid TOML → the
-codex CLI wouldn't start the agent) and six/eight readers switched to `utf-8-sig`
-(`codex_config.py:30/391`, `cli.py:2905/10160/10174`, `doctor.py:187/465`,
-`supervisor.py:5367/5511/5534` — the last group prevents a BOM'd operator `settings.json`/
-`hooks.json` from being **silently discarded**). Docs: prefer pwsh 7 host, single-WT SPOF,
-self-matching-`CommandLine` forensics gotcha, state-encoding robustness note. 3 regression
+codex CLI wouldn't start the agent). Ten readers switched to `utf-8-sig`: `codex_config.py`
+(30, 391), `cli.py` (2905, 10160, 10174), `doctor.py` (187, 465), `supervisor.py` (5367, 5511,
+5534 — this group prevents a BOM'd operator `settings.json`/`hooks.json` from being skipped as
+unreadable), plus the operator-authored `domains.json` (`domains.py`) and `signoffs.json`
+(`close.py`). `codex_config` also gained duplicate-`[projects]` **self-repair** (enable/disable
+collapse duplicate tables; `status` reports them) so a user ALREADY corrupted by the old BOM
+behavior is healed on the next seed. Docs: prefer pwsh 7 host, single-WT SPOF,
+self-matching-`CommandLine` forensics gotcha, state-encoding robustness note. 8 regression
 tests. Root-caused from the orbit-launcher 2026-07-14 incident (`docs/agenttalk-incident-report-20260714.md`);
 the "all CLIs crashed" symptom itself was a Windows Terminal segfault, **not** agenttalk.
 
-**Disposition.** `SHIPPED v0.75.3`. Reviewed on the final SHA, lead-gated 3.10+3.14.
+**Disposition.** Built + reviewed on the final SHA; ships as `v0.75.3` once lead-gated
+(3.10+3.14) and merged. (This heading flips to `SHIPPED` with the release commit + tag.)
 
 ---
 
