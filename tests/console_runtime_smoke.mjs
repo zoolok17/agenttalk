@@ -104,7 +104,7 @@ assert.ok(/normal|healthy/i.test(idle.desc),
 // --- 6) team-health verdict: UNKNOWN attention must NOT read as a green all-clear
 //        (v0.76.0 trust contract — an API outage / not-yet-loaded queue was rendering
 //        a confirmed "nothing needs you"). Green only on a KNOWN, empty queue. ---
-const hv = api.teamHealthVerdictFrom;  // (n, stateKnown, attnKnown, q, attnCount, unknownCount)
+const hv = api.teamHealthVerdictFrom;  // (n, stateKnown, attnKnown, q, attnCount, unknownCount, rootDegraded)
 // attnKnown=false (queue loading/failed/stale) + fresh state + clear agents -> NOT green:
 const unknown = hv(3, true, false, null, 0, 0);
 assert.notEqual(unknown.tone, 'ok', 'unknown attention must not be tone=ok');
@@ -125,7 +125,37 @@ assert.ok(/nothing needs you/.test(clear.text));
 const needHuman = hv(3, true, true, 2, 1, 0);
 assert.equal(needHuman.tone, 'danger');
 assert.ok(/need a human/.test(needHuman.text));
-// no agents -> neutral:
+// no agents, but state is FRESH+known -> the confirmed "No agents" is correct:
 assert.equal(hv(0, true, false, null, 0, 0).text, 'No agents running yet');
+
+// --- 7) codex P1a: a zero-agent verdict must NOT bypass state freshness. A cold
+//        start (state never loaded) or a stale last-good zero payload must read as
+//        connecting/reconnecting, never a CONFIRMED "No agents running yet". ---
+const coldZero = hv(0, false, false, null, 0, 0);
+assert.notEqual(coldZero.text, 'No agents running yet', 'cold-start zero must not confirm "No agents"');
+assert.notEqual(coldZero.tone, 'ok', 'cold-start zero must not be tone=ok');
+assert.ok(/connect/i.test(coldZero.text), 'cold-start zero should say connecting/reconnecting');
+const staleZero = hv(0, false, true, 0, 0, 0);   // stale zero even with a fresh queue
+assert.notEqual(staleZero.text, 'No agents running yet', 'stale zero must not confirm "No agents"');
+assert.ok(/connect/i.test(staleZero.text) && staleZero.tone !== 'ok', 'stale zero -> connecting, not confirmed');
+
+// --- 8) codex P1b: a degraded root (server state scan errored) must never paint a
+//        green all-clear beside the "Degraded" main view. Warn/neutral, not "Healthy". ---
+const degraded = hv(3, true, true, 0, 0, 0, true);
+assert.notEqual(degraded.tone, 'ok', 'degraded root must not be tone=ok');
+assert.notEqual(degraded.pill, 'Healthy', 'degraded root must not read "Healthy"');
+assert.ok(!/nothing needs you/.test(degraded.text), 'degraded root must not claim all-clear');
+assert.ok(/can.?t read|status unavailable|unavailable/i.test(degraded.text + ' ' + degraded.pill),
+  'degraded root should say the status is unavailable/unreadable');
+// ordering: a STALE degraded root -> freshness wins (reconnecting), still not green:
+const staleDegraded = hv(3, false, true, 0, 0, 0, true);
+assert.equal(staleDegraded.tone, 'idle');
+assert.ok(/reconnect|stale/i.test(staleDegraded.text), 'stale+degraded -> reconnecting (freshness gates first)');
+
+// --- 9) n===1 green uses singular grammar ("Your agent is healthy"), never "1 agents" ---
+const oneHealthy = hv(1, true, true, 0, 0, 0);
+assert.equal(oneHealthy.pill, 'Healthy');
+assert.ok(/nothing needs you/.test(oneHealthy.text));
+assert.ok(!/1 agents/.test(oneHealthy.text), 'singular must not say "1 agents"');
 
 console.log('console runtime render smoke: PASS');

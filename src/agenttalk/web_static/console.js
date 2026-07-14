@@ -438,8 +438,8 @@
       case 'rate_limited_or_outage': return { label: 'Rate-limited', key: 'rate_limited_or_outage', color: 'danger', grp: 'attn', desc: 'Paused because it hit an AI usage limit or an outage' };
       case 'degraded_output': return { label: 'Degraded', key: 'degraded_output', color: 'danger', grp: 'attn', desc: 'Producing low-quality output — may need a human' };
       case 'crashed_or_exited': return { label: 'Exited', key: 'crashed_or_exited', color: 'gray', grp: 'attn', desc: 'The process has stopped' };
-      case 'errored_recoverable':
-      case 'errored_poison': return { label: 'Errored', key: 'errored_recoverable', color: 'attn', grp: 'attn', desc: 'Hit an error it may recover from' };
+      case 'errored_recoverable': return { label: 'Errored', key: 'errored_recoverable', color: 'attn', grp: 'attn', desc: 'Hit an error it may recover from' };
+      case 'errored_poison': return { label: 'Errored', key: 'errored_recoverable', color: 'attn', grp: 'attn', desc: 'Keeps failing on the same message — it will be set aside for a human if it can’t get past it' };
       case 'errored_fatal':
       case 'errored_ambiguous': return { label: 'Errored', key: 'errored_fatal', color: 'danger', grp: 'attn', desc: 'Hit an error and needs a human' };
       default: return { label: 'Unknown', key: 'unknown', color: 'gray', grp: 'unknown', noHb: true, desc: 'Not reporting in — may be offline' };
@@ -823,22 +823,36 @@
   function teamHealthVerdict(root) {
     var c = agentCounts(root);
     var attnKnown = attentionFresh();
+    // A degraded root (server couldn't scan state) must not let a green pill sit
+    // beside the "Degraded" main view (codex P1b). Same predicate renderActiveView uses.
+    var degraded = !!(root && root.errors && root.errors.length);
     return teamHealthVerdictFrom(agentsOf(root).length, stateFresh(), attnKnown,
-      attnKnown ? humanQueueCount() : null, c.attn, c.unknown);
+      attnKnown ? humanQueueCount() : null, c.attn, c.unknown, degraded);
   }
   // PURE verdict (testable). Green "nothing needs you" requires BOTH freshness buckets:
   // stateKnown (agent health) AND attnKnown (the human queue). Either being unknown
   // (loading / failed / stale) must never render as a confirmed all-clear — an outage
   // would otherwise leave a false green on screen (C0 trust contract).
-  function teamHealthVerdictFrom(n, stateKnown, attnKnown, q, attnCount, unknownCount) {
-    if (!n) return { text: 'No agents running yet', pill: 'No agents', tone: 'idle' };
+  function teamHealthVerdictFrom(n, stateKnown, attnKnown, q, attnCount, unknownCount, rootDegraded) {
+    // Freshness gates EVERYTHING: with no fresh agent-health data we can assert
+    // nothing — not "healthy", and not even "no agents" (a cold start or a stale
+    // zero-agent payload must never read as a CONFIRMED empty team, codex P1a).
+    // Show reconnecting (had data, now stale) / connecting (never loaded yet).
     if (!stateKnown) {
-      // agent health is obsolete (state poll failing) — show last-known size but
-      // never assert health; the dashboard is reconnecting.
-      return { text: n + ' agents · status stale (reconnecting…)', pill: 'Reconnecting…', tone: 'idle' };
+      return n
+        ? { text: n + ' agents · status stale (reconnecting…)', pill: 'Reconnecting…', tone: 'idle' }
+        : { text: 'Connecting… (status not loaded yet)', pill: 'Connecting…', tone: 'idle' };
     }
+    // A degraded root (the server's state scan errored) must never paint a green
+    // all-clear next to the "Degraded" main view (codex P1b) — neutral/warn instead.
+    if (rootDegraded) {
+      return { text: 'The dashboard can’t read the team’s status right now', pill: 'Status unavailable', tone: 'warn' };
+    }
+    if (!n) return { text: 'No agents running yet', pill: 'No agents', tone: 'idle' };
     if (attnKnown && q === 0 && attnCount === 0 && unknownCount === 0) {
-      return { text: 'All ' + n + ' agents healthy — nothing needs you', pill: 'Healthy', tone: 'ok' };
+      return n === 1
+        ? { text: 'Your agent is healthy — nothing needs you', pill: 'Healthy', tone: 'ok' }
+        : { text: 'All ' + n + ' agents healthy — nothing needs you', pill: 'Healthy', tone: 'ok' };
     }
     var parts = [n + ' agent' + (n === 1 ? '' : 's')];
     if (attnKnown && q > 0) parts.push(q + (q === 1 ? ' needs' : ' need') + ' a human');
