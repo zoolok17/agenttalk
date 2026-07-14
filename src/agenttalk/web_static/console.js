@@ -1418,8 +1418,17 @@
       // Distinguish "team hasn't started" from "filter hid everything" (v0.76.0):
       // the old copy always implied a broken filter even with zero agents.
       if (!all.length) {
-        grid.appendChild(emptyState('No agents running yet',
-          'Agents will appear here as soon as the team starts.'));
+        if (!stateFresh()) {
+          // Stale / never-loaded state: we can't CONFIRM the team is empty, so the
+          // agent grid must mirror the topbar's "Connecting…" verdict rather than
+          // assert a false "No agents running yet" (codex P1 r5 — the grid empty state
+          // is a SECOND render path the top-bar verdict fix didn't cover).
+          grid.appendChild(emptyState('Connecting…',
+            'Waiting for current team status — the last update is stale.'));
+        } else {
+          grid.appendChild(emptyState('No agents running yet',
+            'Agents will appear here as soon as the team starts.'));
+        }
       } else {
         grid.appendChild(emptyState('No agents match this filter',
           'Clear the filter to see all ' + all.length + ' agents.'));

@@ -3372,6 +3372,36 @@ hooks.renderActiveView();
   assert(!tb.includes('Healthy'), `attention-error: topbar must not read "Healthy": ${tb}`);
   assert(!/nothing needs you/.test(tb), `attention-error: topbar must not read all-clear: ${tb}`);
 }
+
+// v0.76.0 (codex P1, r5): a stale (aged-out) zero-agent state must NOT paint a CONFIRMED
+// "No agents running yet" in the OVERVIEW GRID — that empty state is a second render path
+// the top-bar verdict fix didn't cover. Grid + topbar must both read "Connecting…".
+{
+  const zeroRoot = Object.assign({}, root, { agents: [], threads: [], recent: [] });
+  hooks.setPayloads(Object.assign({}, payloads, {
+    lastState: { roots: [zeroRoot], _fetchedAt: 0 },                 // aged-out => stale
+    attentionData: { root: zeroRoot.project_id, count: 0, items: [], _fetchedAt: 600000 },  // fresh empty
+  }));
+  hooks.state.now = 600000;   // 600s >> STATE_STALE_MS (4*POLL_MS) => state feed is stale
+  hooks.state.view = 'overview';
+  hooks.state.selectedRootId = zeroRoot.project_id;
+  hooks.state.selectedAgent = null;
+  hooks.state.sessionRid = null;
+  hooks.state.filter = 'all';
+  main.children = [];
+  main.firstChild = null;
+  main.textContent = '';
+  hooks.renderChrome();
+  hooks.renderActiveView();
+  const otext = collectText(main).replace(/\s+/g, ' ').trim();
+  assert(!otext.includes('No agents running yet'),
+    `stale-zero overview: grid must NOT claim "No agents running yet" when state is stale: ${otext}`);
+  assert(/Connecting/.test(otext),
+    `stale-zero overview: grid should show a connecting/unavailable state: ${otext}`);
+  const tb2 = collectText(topbar).replace(/\s+/g, ' ').trim();
+  assert(!tb2.includes('Healthy'), `stale-zero overview: topbar must not read "Healthy": ${tb2}`);
+  assert(/Connecting/.test(tb2), `stale-zero overview: topbar should read Connecting: ${tb2}`);
+}
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)
