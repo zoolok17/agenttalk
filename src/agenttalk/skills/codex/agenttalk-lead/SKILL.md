@@ -1,7 +1,7 @@
 ---
 name: agenttalk-lead
 description: Coordinate a named multi-agent team over agenttalk as a lead. Use when Codex should decompose work, dispatch to named agents or groups, track replies with threads, and report back without spawning worker processes.
-reviewed-against: "0.55"
+reviewed-against: "0.75"
 ---
 
 # agenttalk-lead - Coordinate a named team (codex side)
@@ -160,6 +160,44 @@ when supported, or a status-line script that writes the latest input
 JSON to that path). The snapshot may contain rate-limit budget,
 context-window fill, or both; treat either signal as useful but never
 authoritative.
+
+## Model, effort & context discipline (0.75.2)
+
+A supervised `wrap --loop` agent runs at a per-agent `model` +
+`reasoning_effort` from `supervisor.json` (0.75.0). Changing either RESETS
+that agent's session, so configure a STABLE profile per role and retune only
+on evidence - churn trades context and latency for marginal capability.
+
+- **Baseline by task class.** Design/architecture: a strong model at high
+  effort (xhigh if novel or security-critical). Build: a mid model at
+  medium-high. Independent review: a strong model, ideally a DIFFERENT model
+  family than the builder, at high. Security/release/irreversible review: the
+  strongest model at high-xhigh. Test/QA: mid at medium. Routine
+  coordination/relay/acks: cheap and fast. (Codex: keep one validated primary
+  model and vary effort; Claude peers map to opus / sonnet / haiku.)
+- **Escalate on evidence, never "just in case."** Raise the MODEL when
+  judgment or novelty is the ceiling; raise EFFORT for depth on a hard,
+  well-scoped problem. A second INDEPENDENT lens usually beats maxing one
+  agent. Raising both model and effort "to be safe" on a mechanical or
+  already-decided step is the common overspend.
+- **Providers differ.** Codex draws on a shared load-balanced pool:
+  downgrading its model does NOT free capacity, so cap/stagger concurrent
+  high/xhigh Codex turns and vary effort not model; avoid a `minimal` effort
+  default (a model may reject it at request time - fall back visibly). Claude
+  peers are weekly-budget bound: sonnet workhorse, reserve opus + top efforts
+  for short high-risk passes.
+- **Reset vs fresh.** RESET an agent's context at a task/milestone boundary or
+  on any drift signal (a stale SHA/roster/verdict, conflated tasks, a repeated
+  corrected error), NEVER mid-task, and CHECKPOINT first (objective,
+  SHA/worktree, invariants, open threads, tests). A reset reduces stale context
+  but is NOT independence. For an INDEPENDENT review use a ONE-OFF FRESH agent
+  (didn't build it, didn't see the build reasoning), preferably a different
+  model family; give it scope and refs but not your conclusions. Independence is
+  not ignorance - a zero-context reviewer gives a shallow, false-clean GO.
+- **The live roster is authoritative.** Resolve membership, roles, the liaison,
+  and recipients from `python -m agenttalk roster` / `sync` / `whoami` at
+  act-time, NEVER from a memorized or handed-off roster; a cached roster fails
+  silently (a wrong recipient, a retired name, a missed reviewer).
 
 ## Lead-loop, relay, and review modes (0.42.0)
 

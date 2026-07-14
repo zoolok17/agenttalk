@@ -228,6 +228,9 @@ Common mistakes:
 
 - Relying on default `claude` and `codex` names in a larger team. Set
   `AGENTTALK_SELF` or pass `--from` and `--for` explicitly.
+- Trusting a roster you copied into a doc, memorized, or received in a handoff.
+  Membership, roles, and the operator-facing liaison change over time; re-check with
+  `roster`, `status`, or `sync` at the moment you act, not from a cached snapshot.
 - Removing an agent with history. Prefer `roster retire`; it keeps history
   readable and prevents unsafe name reuse.
 - Treating `operator_facing` as security authority. It is routing metadata and
@@ -536,6 +539,34 @@ follow-up hardening, not blockers for this narrow fix.
 In supervisor config, wrapped agents use Python as `windows_file`; the real CLI
 goes after `--` in `windows_args`. See
 [supervisor-tutorial.md](supervisor-tutorial.md) for complete config examples.
+
+### Per-agent model and reasoning effort
+
+Each wrapped agent can pin a `model` and `reasoning_effort` in `supervisor.json`
+(v0.75.0); the wrapper injects them into the launch command and fingerprints the
+session, so changing either starts a clean conversation instead of continuing a stale
+one. The dashboard contact card shows each agent's live CLI, model, and effort (v0.75.1).
+
+Configure a STABLE profile per role, not per task — because a model/effort change resets
+the session, churn costs context and latency for little gain. As a rule of thumb:
+
+- **Routine listeners, relays, acks:** cheap and fast (Claude `haiku` · low; Codex
+  primary · low).
+- **Builders / implementers:** a mid model at medium-high effort (Claude `sonnet`; Codex
+  primary · medium).
+- **Reviewers, architects, and the lead's design/gate/release turns:** a strong model at
+  high effort (xhigh for security or release) — and for an INDEPENDENT review prefer a
+  different model family than the builder's.
+
+Providers behave differently. Codex draws on a shared, load-balanced pool: downgrading its
+model does not free capacity, so keep one validated primary model, cap and stagger
+concurrent high/xhigh Codex turns, and vary effort rather than model. Claude is
+weekly-budget bound: make `sonnet` the workhorse and reserve `opus` plus the highest efforts
+for short, high-risk passes. `fable` is an experimental/specialist model, not a routine
+default.
+
+The agents' own model/effort, context-reset, and fresh-reviewer discipline is documented
+for them in `docs/AGENT-MANUAL.md` §1.
 
 Request a restart:
 

@@ -1,6 +1,6 @@
 ---
 description: Enter listen mode as a Claude Code agent - repeatedly wait for messages from named agents and handle reviews, proposals, broadcast questions, consults, wake signals, or cross-review requests.
-reviewed-against: "0.51"
+reviewed-against: "0.75"
 ---
 
 # /agenttalk.listen - Listen for agenttalk messages
@@ -84,9 +84,11 @@ $PEER = if ($env:AGENTTALK_PEER) { $env:AGENTTALK_PEER } else { "codex" }
 `PEER` is only the default partner for the canonical two-agent pair.
 In a team roster, use the sender, `meta.request_id`, and
 `agenttalk roster` / `agenttalk threads --for $SELF` to decide what is
-owed; do not assume every message comes from one peer. Always resolve
-inside your current shell - env from prior tool calls does not persist
-across separate tool-call processes.
+owed; do not assume every message comes from one peer. Resolve the roster
+and recipients from the LIVE store (`roster` / `sync` / `whoami`) each time
+you act - never from a memorized or handed-off roster, which goes stale
+silently. Always resolve inside your current shell - env from prior tool
+calls does not persist across separate tool-call processes.
 
 If `.agenttalk/` is not under the current directory, pass `--root
 <path>` before the subcommand on every invocation, for example
