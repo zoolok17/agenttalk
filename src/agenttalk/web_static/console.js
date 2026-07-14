@@ -737,6 +737,14 @@
     if (!info) return null;
     return el('span', 'tc-chip ' + info.cls, info.label);
   }
+  // Prettify a lowercase model/CLI alias for display: 'sonnet' -> 'Sonnet'.
+  // Robust to ANY string (null/empty -> ''; already-cased or multi-word values
+  // are left readable — we only touch the first character).
+  function prettyAlias(s) {
+    var str = String(s === undefined || s === null ? '' : s).trim();
+    if (!str) return '';
+    return str.charAt(0).toUpperCase() + str.slice(1);
+  }
   function normalizedRole(role) {
     if (!role) return '';
     var key = String(role).toLowerCase().trim();
@@ -1242,6 +1250,12 @@
     else if (a.group) roleParts.push(a.group);
     card.appendChild(el('div', 'tc-agent-role', roleParts.join(' · ')));
 
+    // Runtime identity (v0.75.1): "<CLI> · <Model>" + a small effort chip.
+    // Omitted entirely when the model is unknown (absent-not-null), matching
+    // the card's existing conventions.
+    var runtime = agentCardRuntime(a);
+    if (runtime) card.appendChild(runtime);
+
     // Row 3: current task (untrusted -> textContent).
     card.appendChild(el('div', 'tc-agent-task', a.task || ''));
 
@@ -1262,6 +1276,22 @@
 
     on(card, 'click', function () { openAgent(a.name); });
     return card;
+  }
+
+  // Overview-card runtime identity: "<CLI> · <Model>" plus a small
+  // reasoning-effort chip. model / reasoning_effort are UNTRUSTED wire data and
+  // land in textContent via el() (XSS-safe). Returns null when the model is
+  // unknown (absent-not-null) so the caller omits the whole row.
+  function agentCardRuntime(a) {
+    if (!a || !a.model) return null;
+    var row = el('div', 'tc-agent-runtime');
+    var family = cliFamily(a);
+    var label = (family ? prettyAlias(family) + ' · ' : '') + prettyAlias(a.model);
+    row.appendChild(el('span', 'tc-agent-runtime-model', label));
+    if (a.reasoning_effort) {
+      row.appendChild(el('span', 'tc-chip tc-agent-effort', a.reasoning_effort));
+    }
+    return row;
   }
 
   // Live-activity rail (recent messages from root.recent). Newest on top;
@@ -2903,6 +2933,9 @@
     supRows.appendChild(supRow('CLI', cliI ? cliI.label : '—', cliI ? ('tc-chip ' + cliI.cls) : 'tc-chip'));
     var mode = a.wrapped ? 'wrapped · loop' : 'manual listen';
     supRows.appendChild(supRow('Mode', mode, 'tc-chip'));
+    // Skill (v0.75.1): the agent's role/function, READ-ONLY. Role is UNTRUSTED
+    // wire data -> supRow -> el() (textContent). Em-dash when absent.
+    supRows.appendChild(supRow('Skill', a.role ? a.role : '—', 'tc-chip'));
     var info = agentStateInfo(a);
     // Heartbeat age is a live-ticked chip (B2a): build the row with an ageEl
     // chip so the 1 Hz ticker advances it without a DOM rebuild.

@@ -2980,6 +2980,8 @@ const root = {
       cli: 'codex',
       role: 'tester',
       groups: ['qa'],
+      model: 'sonnet',
+      reasoning_effort: 'high',
       task: 'Smoke every dashboard view',
       wrapped: true,
       restartable: true,
@@ -3285,6 +3287,11 @@ const cases = [
   },
   { view: 'sessions', sessionRid: 'rid-qa', expected: ['Sessions', 'All views QA task', 'smoke every view'] },
   { view: 'agent', selectedAgent: 'stuck-agent', expected: ['stuck-agent', 'Restart with context', 'Supervisor'] },
+  {
+    view: 'agent',
+    selectedAgent: 'codex-test',
+    expected: ['codex-test', 'Supervisor', 'Skill', 'tester', 'sonnet', 'high'],
+  },
 ];
 
 for (const tc of cases) {
@@ -3313,6 +3320,28 @@ for (const tc of cases) {
     `${tc.view} title missing view: ${document.title}`);
   for (const expected of tc.expected) {
     assert(text.includes(expected), `${tc.view} missing expected text: ${expected}\nrendered: ${text}`);
+  }
+  if (tc.view === 'overview') {
+    // v0.75.1: the runtime-identity line renders ONLY for agents with a model.
+    // codex-test has model 'sonnet' + effort 'high'; claude-lead / stuck-agent
+    // have neither, so the row is OMITTED for them (absent-not-null, no crash).
+    const runtimeLines = main.querySelectorAll('.tc-agent-runtime');
+    assert(runtimeLines.length === 1,
+      `overview: expected exactly 1 runtime line (only codex-test has a model), got ${runtimeLines.length}`);
+    const rtText = collectText(runtimeLines[0]).replace(/\s+/g, ' ').trim();
+    assert(rtText.includes('Codex') && rtText.includes('Sonnet'),
+      `overview: runtime line missing prettified 'Codex ... Sonnet': ${rtText}`);
+    assert(rtText.includes('high'),
+      `overview: runtime line missing effort 'high': ${rtText}`);
+  }
+  if (tc.view === 'agent' && tc.selectedAgent === 'codex-test') {
+    // v0.75.1: read-only Skill row (role) alongside the v0.75.0 Model row.
+    // supRow builds spans only (no input controls) -> the card stays read-only.
+    const keys = main.querySelectorAll('.tc-sup-key').map((n) => collectText(n).trim());
+    assert(keys.includes('Skill'),
+      `detail: Supervisor missing read-only Skill row (keys: ${keys.join(', ')})`);
+    assert(keys.includes('Model'),
+      `detail: Supervisor missing Model row (keys: ${keys.join(', ')})`);
   }
 }
 """, encoding="utf-8")
