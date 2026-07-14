@@ -95,6 +95,33 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.75.1 - runtime identity on the Team Console (contact cards + profile Skill row) (2026-07-14)
+**GOOD / ROBUST / SECURE** - reviewed-SHA `ddb37cb` - tag `v0.75.1`
+- **Review:** two independent verifications on the exact SHA, both APPROVED. A
+  code/security review (`claude-remediation-reviewer`) reproduced XSS-safety (an
+  `<img onerror>` payload lands inert via `textContent`; grep innerHTML=0),
+  absent-not-null omission, console.js-only (web.py diff empty), and no regression;
+  behavioral QA (`claude-test`) executed the web suite (`174 passed`) plus an
+  independent 17/17 Node-VM render repro (alias prettification, effort chip,
+  absent-not-null, cliFamily fallback, read-only XSS-safe Skill row) and confirmed the
+  node-absent skip guard. Both agents ran on their newly-configured v0.75.0 per-agent
+  models (a live dogfood of that feature).
+- **Verification / lead gate:** full suite green on Python 3.14 (`2444 passed, 5
+  skipped`) and Python 3.10 (`2440 passed, 5 skipped, 4 deselected`). The four deselected
+  are pre-existing gate-venv/timing flakes (scoped-wait ×2, intents escalation-order,
+  config-lock) that pass on the runtime interpreter / in isolation and are tracked under
+  the P2 CI-timing item — not this change. Ruff, `node --check` + the console render
+  smoke, `git diff --check`, and gitleaks (`5696c1d..ddb37cb`, no leaks) all passed.
+- **Robust/Secure:** additive `+73/-0`, no existing lines modified; a display-only change
+  reading already-projected model/role/effort — no server, data-model, or redaction
+  surface touched (session/thread ids remain absent from `/api/state`). Extends D-24's
+  dashboard projection (no new architecture decision). Two accepted cosmetic non-blocking
+  notes: `cliFamily` falls back to the agent-name prefix when `cli` is absent;
+  `prettyAlias` title-cases only the first char (a full id like `gpt-5-codex` shows as
+  `Gpt-5-codex`).
+- **CI:** GitHub `tests` + `security` workflows watched on the exact release commit; run
+  ids recorded in the GitHub release.
+
 ### v0.75.0 - wrapped-agent runtime model/effort config + restart-safe session fingerprint (2026-07-14)
 **GOOD / ROBUST / SECURE** - reviewed-SHA `d53d429` - tag `v0.75.0`
 - **Design:** a four-lens adversarial design critique (correctness/fail-closed,

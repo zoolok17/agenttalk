@@ -110,6 +110,28 @@ reasoning-effort is a launch-time typo guard, not a per-model validator (e.g. Co
 
 ---
 
+## P3 · PLANNED — supervisor: manual restart deadlocks on a state-unattributed live agent (2026-07-14)
+
+**What.** When `request-restart` targets a wrapped agent whose LIVE process is not
+attributed in supervisor state (e.g. after a machine-sleep gap or a cross-session
+launch), the plan emits `relaunch` with `kill_first=False` / empty `kill_targets` (it
+believes nothing is running to kill), while the launch barrier correctly refuses to
+double-launch over the still-running wrapper — so the restart never completes and the
+marker never clears (a silent "skipping relaunch this tick" loop). Observed 2026-07-14
+while applying v0.75.0 model/effort config to two prior-session Claude agents.
+
+**Fix options.** On a manual restart, either kill a command-line-visible survivor even
+when it is unattributed in supervisor state, or surface the deadlock loudly (the barrier
+already knows it is holding) instead of looping silently.
+
+**Workaround.** A targeted `Stop-Process` of the agent's wrap PID lets the supervisor
+relaunch it clean on the next poll.
+
+**Disposition.** `P3 PLANNED`. Recoverable + low-frequency (needs a state/PID desync,
+typically post-sleep or cross-session).
+
+---
+
 ## P2 · PLANNED — CI test-suite timing flakiness (systematic hardening pass) (2026-07-06)
 
 **What.** The CI matrix (3.10–3.13 × win/mac/ubuntu) intermittently reddens on

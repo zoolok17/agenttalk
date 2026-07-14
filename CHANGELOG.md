@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.75.1] - 2026-07-14
+
+### Added
+
+- **Runtime identity on the Team Console.** Each agent's contact card now shows its
+  configured model and reasoning-effort (e.g. "Claude · Sonnet" plus an effort chip),
+  and the agent-detail Supervisor card adds a read-only Skill (role) row alongside the
+  existing model / effort / session rows. Display-only, rendered via `textContent`
+  (XSS-safe); fields are omitted cleanly when unset. No server/API change — the data was
+  already projected into `/api/state` by v0.75.0.
+
 ## [0.75.0] - 2026-07-14
 
 ### Added
