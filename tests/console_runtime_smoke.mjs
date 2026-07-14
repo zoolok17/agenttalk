@@ -104,23 +104,28 @@ assert.ok(/normal|healthy/i.test(idle.desc),
 // --- 6) team-health verdict: UNKNOWN attention must NOT read as a green all-clear
 //        (v0.76.0 trust contract — an API outage / not-yet-loaded queue was rendering
 //        a confirmed "nothing needs you"). Green only on a KNOWN, empty queue. ---
-const hv = api.teamHealthVerdictFrom;
-// attnKnown=false (loading/failed/stale) + otherwise-clear agents -> NOT green:
-const unknown = hv(3, false, null, 0, 0);
+const hv = api.teamHealthVerdictFrom;  // (n, stateKnown, attnKnown, q, attnCount, unknownCount)
+// attnKnown=false (queue loading/failed/stale) + fresh state + clear agents -> NOT green:
+const unknown = hv(3, true, false, null, 0, 0);
 assert.notEqual(unknown.tone, 'ok', 'unknown attention must not be tone=ok');
 assert.notEqual(unknown.pill, 'Healthy', 'unknown attention must not read "Healthy"');
 assert.ok(!/nothing needs you/.test(unknown.text), 'unknown must not claim "nothing needs you"');
 assert.ok(/unknown/i.test(unknown.text), 'unknown attention should say the queue status is unknown');
-// known + empty + healthy -> green:
-const clear = hv(3, true, 0, 0, 0);
+// STALE STATE (agent health obsolete) even with a fresh empty queue -> NOT green (codex P1b):
+const staleState = hv(3, false, true, 0, 0, 0);
+assert.notEqual(staleState.tone, 'ok', 'stale agent-health state must not be tone=ok');
+assert.ok(!/nothing needs you/.test(staleState.text), 'stale state must not claim all-clear');
+assert.ok(/stale|reconnect/i.test(staleState.text), 'stale state should say reconnecting/stale');
+// BOTH fresh + empty + healthy -> green:
+const clear = hv(3, true, true, 0, 0, 0);
 assert.equal(clear.tone, 'ok');
 assert.equal(clear.pill, 'Healthy');
 assert.ok(/nothing needs you/.test(clear.text));
-// known + queue has items -> danger + "need a human":
-const needHuman = hv(3, true, 2, 1, 0);
+// both fresh + queue has items -> danger + "need a human":
+const needHuman = hv(3, true, true, 2, 1, 0);
 assert.equal(needHuman.tone, 'danger');
 assert.ok(/need a human/.test(needHuman.text));
 // no agents -> neutral:
-assert.equal(hv(0, false, null, 0, 0).text, 'No agents running yet');
+assert.equal(hv(0, true, false, null, 0, 0).text, 'No agents running yet');
 
 console.log('console runtime render smoke: PASS');

@@ -35,6 +35,7 @@
   // (outage) ages the data out -> the verdict shows "queue status unknown", never a
   // false green all-clear.
   var ATTENTION_STALE_MS = 4 * POLL_MS;
+  var STATE_STALE_MS = 4 * POLL_MS;   // same freshness window for /api/state (agent health)
 
   var ACCENTS = ['blue', 'green', 'rust', 'violet', 'azure'];
   var THEMES = ['light', 'dark'];
@@ -809,17 +810,33 @@
     if (typeof at !== 'number' || !isFinite(at)) return true;
     return (state.now - at) <= ATTENTION_STALE_MS;
   }
+  // Is the agent-health data (from /api/state) KNOWN-fresh? Same rationale as
+  // attentionFresh: fetchState stamps _fetchedAt on each successful poll and retains
+  // last-good on failure, so a stale lastState means agent health is obsolete and the
+  // verdict must NOT assert green from it (v0.76.0 trust contract).
+  function stateFresh() {
+    if (lastState == null) return false;
+    var at = lastState._fetchedAt;
+    if (typeof at !== 'number' || !isFinite(at)) return true;
+    return (state.now - at) <= STATE_STALE_MS;
+  }
   function teamHealthVerdict(root) {
     var c = agentCounts(root);
-    var known = attentionFresh();
-    return teamHealthVerdictFrom(agentsOf(root).length, known,
-      known ? humanQueueCount() : null, c.attn, c.unknown);
+    var attnKnown = attentionFresh();
+    return teamHealthVerdictFrom(agentsOf(root).length, stateFresh(), attnKnown,
+      attnKnown ? humanQueueCount() : null, c.attn, c.unknown);
   }
-  // PURE verdict from explicit inputs (testable). `attnKnown` false = the queue is
-  // unknown (loading / failed / stale) — we must NOT assert a green "nothing needs
-  // you", or an API outage would show a false all-clear (C0 trust contract).
-  function teamHealthVerdictFrom(n, attnKnown, q, attnCount, unknownCount) {
+  // PURE verdict (testable). Green "nothing needs you" requires BOTH freshness buckets:
+  // stateKnown (agent health) AND attnKnown (the human queue). Either being unknown
+  // (loading / failed / stale) must never render as a confirmed all-clear — an outage
+  // would otherwise leave a false green on screen (C0 trust contract).
+  function teamHealthVerdictFrom(n, stateKnown, attnKnown, q, attnCount, unknownCount) {
     if (!n) return { text: 'No agents running yet', pill: 'No agents', tone: 'idle' };
+    if (!stateKnown) {
+      // agent health is obsolete (state poll failing) — show last-known size but
+      // never assert health; the dashboard is reconnecting.
+      return { text: n + ' agents · status stale (reconnecting…)', pill: 'Reconnecting…', tone: 'idle' };
+    }
     if (attnKnown && q === 0 && attnCount === 0 && unknownCount === 0) {
       return { text: 'All ' + n + ' agents healthy — nothing needs you', pill: 'Healthy', tone: 'ok' };
     }
@@ -833,6 +850,26 @@
       : (!attnKnown ? 'Checking…' : 'Some offline'));
     var tone = (attnKnown && q > 0) ? 'danger' : (attnCount > 0 ? 'warn' : (!attnKnown ? 'idle' : 'warn'));
     return { text: parts.join(' · '), pill: pill, tone: tone };
+  }
+  // The verdict currently painted (set by renderTopbar). The 1 Hz clockTick compares
+  // the freshly-computed verdict to this and refreshes the health summary in place when
+  // it changes — so a green pill/subtitle FLIPS to "reconnecting…" once a poll outage
+  // ages the data past the freshness window, even though no data poll rendered (v0.76.0).
+  var lastHealthSig = null;
+  function healthSig(v) { return (v.tone || '') + '|' + (v.pill || '') + '|' + (v.text || ''); }
+  function subtitleTextFor(verdict, root) {
+    var missionN = (root.spec_kitty && isArray(root.spec_kitty.missions)) ? root.spec_kitty.missions.length : 0;
+    return verdict.text + (missionN ? ' · ' + missionN + ' mission' + (missionN === 1 ? '' : 's') + ' active' : '');
+  }
+  function refreshHealthIfChanged() {
+    var root = currentRoot();
+    var v = root ? teamHealthVerdict(root) : { tone: '', pill: '', text: '' };
+    if (healthSig(v) === lastHealthSig) return;
+    renderChrome();   // re-renders topbar pill + sidebar badge (no scrollable content); resets lastHealthSig
+    if (state.view === 'overview' && root) {
+      var sub = document.querySelector('#main .tc-subtitle');
+      if (sub) { sub.className = 'tc-subtitle is-' + v.tone; sub.textContent = subtitleTextFor(v, root); }
+    }
   }
 
   // ------------------------------------------------------------ shared bits
@@ -1111,6 +1148,7 @@
     // is polling — this shows the TRUE team status (word + color, not color alone),
     // glanceable from every view. Full sentence on hover.
     var verdict = teamHealthVerdict(root);
+    lastHealthSig = healthSig(verdict);   // record what's painted, for the clockTick freshness refresh
     var pill = el('div', 'tc-health-pill is-' + verdict.tone);
     pill.appendChild(el('span', 'tc-health-dot'));
     pill.appendChild(el('span', 'tc-health-label', verdict.pill));
@@ -1304,11 +1342,8 @@
     // One plain-language, color-coded health verdict — the 5-second "is the team
     // OK?" answer (v0.76.0), replacing the four jargon count-clauses (the raw
     // numbers still live in the stat tiles + sidebar legend below).
-    var missionN = (root.spec_kitty && isArray(root.spec_kitty.missions)) ? root.spec_kitty.missions.length : 0;
     var verdict = teamHealthVerdict(root);
-    var subText = verdict.text
-      + (missionN ? ' · ' + missionN + ' mission' + (missionN === 1 ? '' : 's') + ' active' : '');
-    titleBox.appendChild(el('p', 'tc-subtitle is-' + verdict.tone, subText));
+    titleBox.appendChild(el('p', 'tc-subtitle is-' + verdict.tone, subtitleTextFor(verdict, root)));
     header.appendChild(titleBox);
     header.appendChild(el('div', 'tc-spacer'));
     header.appendChild(filterChips(root, counts));
@@ -3729,6 +3764,11 @@
     // transcript inner-scroll and any in-progress text selection are destroyed
     // every second. Only the 2s DATA poll re-renders the view.
     updateAges();
+    // Flip the team-health summary when a poll outage ages state/attention past the
+    // freshness window (v0.76.0): re-renders only the chrome (topbar/sidebar) + patches
+    // the overview subtitle in place — never the scrollable grid/feed — and only when
+    // the verdict actually changed.
+    refreshHealthIfChanged();
   }
 
   // ------------------------------------------------------------ boot
