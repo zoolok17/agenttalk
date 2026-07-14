@@ -545,7 +545,8 @@ goes after `--` in `windows_args`. See
 Each wrapped agent can pin a `model` and `reasoning_effort` in `supervisor.json`
 (v0.75.0); the wrapper injects them into the launch command and fingerprints the
 session, so changing either starts a clean conversation instead of continuing a stale
-one. The dashboard contact card shows each agent's live CLI, model, and effort (v0.75.1).
+one. The dashboard contact card shows each agent's live CLI, model, and effort, plus a
+read-only Skill row on the profile (v0.75.1).
 
 Configure a STABLE profile per role, not per task — because a model/effort change resets
 the session, churn costs context and latency for little gain. As a rule of thumb:

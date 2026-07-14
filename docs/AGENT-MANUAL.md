@@ -84,7 +84,7 @@ Before an irreversible action gated on a request, run `check --for $SELF --to-re
 Publish your own headroom with `capacity refresh --for $SELF` (5h/weekly rate-limit budget + context-window fill); a lead reads `capacity` (or `capacity show`) to plan work. Advisory only.
 
 ### Model & reasoning-effort selection (wrapped `--loop` agents)
-A supervised `wrap --loop` agent runs at a per-agent `model` + `reasoning_effort` set in `supervisor.json` (v0.75.0). Changing either **resets the wrapped session** (a new conversation), so configure a STABLE profile for your role/task-class and retune only on evidence - churn trades context and latency for marginal capability.
+A supervised `wrap --loop` agent runs at a per-agent `model` + `reasoning_effort` set in `supervisor.json` (v0.75.0). Changing either **resets the wrapped session** (a new conversation) — precisely, it is the *effective post-injection* model/effort that is fingerprinted, so the first (absent) baseline is adopted without a reset and an edit a launch-tail flag already overrides is a no-op (D-24). So configure a STABLE profile for your role/task-class and retune only on evidence - churn trades context and latency for marginal capability.
 
 Baseline by task class:
 

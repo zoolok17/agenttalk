@@ -166,7 +166,9 @@ authoritative.
 A supervised `wrap --loop` agent runs at a per-agent `model` +
 `reasoning_effort` from `supervisor.json` (0.75.0). Changing either RESETS
 that agent's session, so configure a STABLE profile per role and retune only
-on evidence - churn trades context and latency for marginal capability.
+on evidence - churn trades context and latency for marginal capability. Your
+own interactive window is whatever the operator set; this table is advisory
+for you, a wrap setting for the agents you plan.
 
 - **Baseline by task class.** Design/architecture: a strong model at high
   effort (xhigh if novel or security-critical). Build: a mid model at
