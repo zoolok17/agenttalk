@@ -409,6 +409,33 @@ def disable_project(config_path: Path, project_dir: Path) -> Result:
                   changes=dup_changes + removed)
 
 
+def repair_duplicate_project_tables(config_path: Path, project_dir: Path) -> int:
+    """Collapse duplicate ``[projects.'<project>']`` tables to the first, healing a config
+    a pre-0.75.3 BOM bug left with duplicates (invalid TOML the codex CLI refuses). Matches
+    SEMANTICALLY via :func:`_find_all_sections` (so single/double/bare/escaped/case-variant
+    key spellings of the SAME normalized path collapse — e.g. an operator's ``"x"`` header +
+    agenttalk's canonical ``'x'`` header), and is SCOPED to ``project_dir`` (it never touches
+    other tables). Idempotent; returns the number of duplicate tables removed. Used by the
+    launch-time seed so an already-corrupted user heals on the next launch, and independent of
+    the key-setting done by :func:`enable_project`."""
+    config_path = config_path.expanduser()
+    if not config_path.exists():
+        return 0
+    project_key = _normalize_path(project_dir)
+    text = _read_text_no_translate(config_path)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.split(newline)
+    trailing_newline = lines and lines[-1] == ""
+    if trailing_newline:
+        lines = lines[:-1]
+    removed = _collapse_duplicate_sections(lines, project_key)
+    if removed:
+        if trailing_newline:
+            lines.append("")
+        _atomic_write_text(config_path, newline.join(lines), newline="")
+    return removed
+
+
 def status(config_path: Path, project_dir: Path) -> dict:
     """Return current key states for the project block."""
     project_key = _normalize_path(project_dir)

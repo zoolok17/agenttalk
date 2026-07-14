@@ -790,11 +790,14 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   (agenttalk's own bus/store artifacts are written atomically BOM-free, so their strict `utf-8`
   reads have no BOM source and are safe as-is — they are not blanket-converted.) The system also
   **self-repairs** an already-corrupted config: the launch-time seed (`supervise
-  --seed-codex-config` → `codex_config_overlay`) collapses duplicate tables, `codex_config`'s
-  `enable`/`disable` do the same for `[projects."<key>"]`, and both `codex-config --status` and
-  `doctor` report a duplicated (invalid-TOML) config instead of presenting it as healthy — so a
-  user bitten by the old behavior is healed on the next launch/seed rather than left with
-  un-parseable TOML the codex CLI refuses. Generated `.ps1` files are the
+  --seed-codex-config`) runs a SEMANTIC, project-scoped collapse
+  (`codex_config.repair_duplicate_project_tables`) that matches single-/double-/bare-/
+  case-variant key spellings of the SAME normalized path (so an operator's `[projects."x"]`
+  and agenttalk's canonical `[projects.'x']` collapse) and touches only the seeded project's
+  table; `codex_config`'s `enable`/`disable` collapse the same way; and both `codex-config
+  --status` and `doctor` report a duplicated (invalid-TOML) config instead of presenting it as
+  healthy — so a user bitten by the old behavior is healed on the next launch/seed rather than
+  left with un-parseable TOML the codex CLI refuses. Generated `.ps1` files are the
   deliberate exception — they keep a BOM because the 5.1 script engine needs it to decode a UTF-8
   script (a BOM-less `.ps1` is read as Windows-1252); `.cmd` shims stay BOM-free because
   `cmd.exe` fuses a BOM onto `@echo off`. *Ceiling:* this is a robustness invariant, not enforced

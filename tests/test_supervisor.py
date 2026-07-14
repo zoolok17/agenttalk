@@ -4765,28 +4765,36 @@ def test_generated_supervisor_ps1_uses_bom_free_json_writes(tmp_path: Path) -> N
     assert "Set-Content $dc '' -Encoding utf8" not in ps1         # config.toml empty seed
 
 
-def test_seed_codex_config_repairs_duplicate_tables(tmp_path: Path) -> None:
-    """The LAUNCH seed (`supervise --seed-codex-config` -> codex_config_overlay) must
-    self-heal a config ALREADY corrupted with duplicate tables (invalid TOML the codex
-    CLI refuses) — not only codex_config.enable_project. Otherwise a wrapped Codex agent
-    on an affected machine still can't start (codex-reviewer-1 P1, v0.75.3)."""
+def test_seed_codex_config_repairs_semantically_equal_duplicate_tables(tmp_path: Path) -> None:
+    """The LAUNCH seed (`supervise --seed-codex-config`) must self-heal the REAL pre-fix
+    corruption: an operator's DOUBLE-quoted [projects."<repo>"] header PLUS agenttalk's
+    canonical LITERAL-quoted [projects.'<repo>'] header for the SAME normalized path —
+    different spellings, one TOML table, so tomllib rejects the second. The collapse must
+    match SEMANTICALLY (not byte-identically) and be SCOPED to the seeded project, else the
+    wrapped Codex agent on an affected machine still can't start (codex-reviewer-1 P1,
+    v0.75.3). Regression drives the EXACT seed command."""
+    from agenttalk import codex_config as cxc
     _team(tmp_path)
     home = tmp_path / "codexhome"
     home.mkdir()
-    dup = ('[projects."x"]\ntrust_level = "trusted"\n\n'
-           '[projects."x"]\ntrust_level = "trusted"\n')
-    (home / "config.toml").write_text(dup, encoding="utf-8")
-    assert dup.count('[projects."x"]') == 2
+    cfg = home / "config.toml"
+    cxc.enable_project(cfg, tmp_path)                       # canonical literal-quoted block
+    literal = cfg.read_text(encoding="utf-8-sig")
+    norm = cxc._normalize_path(tmp_path)
+    double_hdr = '[projects."' + norm.replace("\\", "\\\\").replace('"', '\\"') + '"]'
+    # operator double-quoted header for the SAME path, then agenttalk's literal-quoted block
+    cfg.write_text(f'{double_hdr}\ntrust_level = "trusted"\n\n' + literal, encoding="utf-8")
+    assert cfg.read_text(encoding="utf-8-sig").count("[projects.") == 2   # semantically-equal dup
     rc = _run(["supervise", "--seed-codex-config", "--home", str(home),
                "--repo", str(tmp_path)], tmp_path)
     assert rc == 0
-    text = (home / "config.toml").read_text(encoding="utf-8")
-    assert text.count('[projects."x"]') == 1              # duplicate collapsed
-    try:                                                  # and it is valid TOML now
+    healed = cfg.read_text(encoding="utf-8")
+    assert healed.count("[projects.") == 1                 # SEMANTICALLY collapsed to one table
+    try:                                                   # and it parses as valid TOML now
         import tomllib
-        tomllib.loads(text)                               # must not raise "declare twice"
+        tomllib.loads(healed)                              # must not raise "Cannot declare ... twice"
     except ModuleNotFoundError:
-        pass                                              # tomllib is 3.11+; count check suffices on 3.10
+        pass                                               # tomllib is 3.11+; count check suffices on 3.10
 
 
 def test_codex_config_status_reports_duplicate_tables(tmp_path: Path, capsys) -> None:

@@ -122,10 +122,12 @@ codex CLI wouldn't start the agent). Ten readers switched to `utf-8-sig`: `codex
 5534 — this group prevents a BOM'd operator `settings.json`/`hooks.json` from being skipped as
 unreadable), plus the operator-authored `domains.json` (`domains.py`) and `signoffs.json`
 (`close.py`). Added duplicate-`[projects]` **self-repair** on the launch path: the seed
-(`supervise --seed-codex-config` → `codex_config_overlay`) AND `codex_config` enable/disable
-collapse duplicate tables, and `codex-config --status` + `doctor` now WARN on a duplicated
-(invalid-TOML) config instead of showing it healthy — so a user ALREADY corrupted by the old
-BOM behavior heals on the next launch/seed. Docs: prefer pwsh 7 host, single-WT SPOF,
+(`supervise --seed-codex-config`) runs a SEMANTIC, project-scoped collapse
+(`codex_config.repair_duplicate_project_tables`, matching single/double/bare/case key
+spellings of the same normalized path) and `codex_config` enable/disable collapse the same way;
+`codex-config --status` + `doctor` now WARN on a duplicated (invalid-TOML) config instead of
+showing it healthy — so a user ALREADY corrupted by the old BOM behavior heals on the next
+launch/seed. Docs: prefer pwsh 7 host, single-WT SPOF,
 self-matching-`CommandLine` forensics gotcha, state-encoding robustness note. 12 regression
 tests. Root-caused from the orbit-launcher 2026-07-14 incident (`docs/agenttalk-incident-report-20260714.md`);
 the "all CLIs crashed" symptom itself was a Windows Terminal segfault, **not** agenttalk.

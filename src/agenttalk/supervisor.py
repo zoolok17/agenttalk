@@ -5209,24 +5209,6 @@ def _toml_table(secs: list[dict], name: str) -> dict:
     return s
 
 
-def _dedupe_toml_tables(secs: list[dict]) -> list[dict]:
-    """Drop duplicate ``[table]`` sections (keep the FIRST of each name), repairing a
-    config a pre-0.75.3 BOM bug left with duplicate tables — invalid TOML the external
-    codex CLI refuses to parse. The root table (name None) is always kept. Duplicate
-    managed tables are identical, and a duplicate is invalid TOML either way, so keeping
-    the first is a safe heal. Returns whether any were dropped via the caller's diff."""
-    seen: set[str] = set()
-    out: list[dict] = []
-    for s in secs:
-        name = s.get("name")
-        if name is not None:
-            if name in seen:
-                continue
-            seen.add(name)
-        out.append(s)
-    return out
-
-
 def _toml_basic_str(value: str) -> str:
     """A TOML BASIC (double-quoted) string with backslashes/quotes escaped - used
     for the writable_roots path so a Windows path survives (double-quoted per the
@@ -5242,10 +5224,11 @@ def codex_config_overlay(text: str, *, repo_path: str,
     ``sandbox_mode="workspace-write"``; ``[windows] sandbox="<windows_sandbox>"``
     (the UAC fix - "unelevated" avoids the per-home elevated-sandbox admin
     install); ``[sandbox_workspace_write] writable_roots=["<repo>"]``. Idempotent:
-    re-applying replaces our managed lines in place. Also self-heals a config a
-    pre-0.75.3 BOM bug left with duplicate tables (invalid TOML) by collapsing them,
-    so the launch-time seed repairs an already-corrupted user (D-26)."""
-    secs = _dedupe_toml_tables(_toml_sections(text))
+    re-applying replaces our managed lines in place. (Healing a BOM-corrupted config's
+    duplicate [projects] tables is done by the seed via
+    ``codex_config.repair_duplicate_project_tables`` — a SEMANTIC, project-scoped
+    collapse — not here, so this overlay never drops unrelated operator tables; D-26.)"""
+    secs = _toml_sections(text)
     root = secs[0]
     _toml_set_key(root, "approval_policy", '"never"')
     _toml_set_key(root, "sandbox_mode", '"workspace-write"')

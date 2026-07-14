@@ -10161,9 +10161,14 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk supervise --seed-codex-config: need --home <dir>\n")
             return 2
         cfg_p = Path(args.home) / "config.toml"
-        existing = cfg_p.read_text(encoding="utf-8-sig") if cfg_p.exists() else ""
         repo = str(Path(args.repo).resolve() if args.repo else store.root.resolve())
         sandbox = args.sandbox or "unelevated"
+        # Heal a pre-0.75.3 BOM-corrupted config: collapse duplicate [projects.<repo>]
+        # tables (SEMANTIC key match, project-scoped) BEFORE overlaying, so the launch
+        # seed emits valid TOML the external codex CLI can parse (D-26).
+        if cfg_p.exists():
+            cxc.repair_duplicate_project_tables(cfg_p, Path(repo))
+        existing = cfg_p.read_text(encoding="utf-8-sig") if cfg_p.exists() else ""
         cfg_p.parent.mkdir(parents=True, exist_ok=True)
         cfg_p.write_text(sup.codex_config_overlay(existing, repo_path=repo,
                                                   windows_sandbox=sandbox), encoding="utf-8")
