@@ -30,6 +30,11 @@
   // ------------------------------------------------------------ constants
   var POLL_MS = 2000;   // /api/state data poll
   var CLOCK_MS = 1000;  // relative-age recompute + wall clock tick
+  // How long a successful /api/attention payload stays "fresh" for the team-health
+  // verdict (v0.76.0). fetchAttention polls every POLL_MS; a few missed polls
+  // (outage) ages the data out -> the verdict shows "queue status unknown", never a
+  // false green all-clear.
+  var ATTENTION_STALE_MS = 4 * POLL_MS;
 
   var ACCENTS = ['blue', 'green', 'rust', 'violet', 'azure'];
   var THEMES = ['light', 'dark'];
@@ -519,7 +524,7 @@
     var audience = t.audience || [];
     if (t.is_broadcast && audience.length) {
       var responded = (t.responded || []).length;
-      return { label: responded + '/' + audience.length + ' replied', cls: 'tstatus-replied' };
+      return { label: responded + '/' + audience.length + ' replied', cls: 'tstatus-replied', desc: 'How many recipients have replied so far' };
     }
     return null;
   }
@@ -792,21 +797,42 @@
   // caller renders the WORD; tone only adds a color. "needs a human" = the
   // human-action queue (escalations/gate holds/dead letters/stuck); "needs
   // attention" = agent health group; "offline" = not reporting in.
+  // Is the human-attention queue KNOWN (loaded + fresh)? attentionData is null
+  // until the first successful fetch and is retained (not blanked) on a failed
+  // poll, so a bare count can't tell "confirmed empty" from "never loaded / stale
+  // during an outage". A stamped _fetchedAt (set on each successful fetchAttention,
+  // which polls every POLL_MS) ages out during an outage -> unknown. An unstamped
+  // non-null payload (e.g. a test harness) is treated as known.
+  function attentionFresh() {
+    if (attentionData == null) return false;
+    var at = attentionData._fetchedAt;
+    if (typeof at !== 'number' || !isFinite(at)) return true;
+    return (state.now - at) <= ATTENTION_STALE_MS;
+  }
   function teamHealthVerdict(root) {
-    var n = agentsOf(root).length;
-    if (!n) return { text: 'No agents running yet', pill: 'No agents', tone: 'idle' };
     var c = agentCounts(root);
-    var q = humanQueueCount();
-    if (q === 0 && c.attn === 0 && c.unknown === 0) {
+    var known = attentionFresh();
+    return teamHealthVerdictFrom(agentsOf(root).length, known,
+      known ? humanQueueCount() : null, c.attn, c.unknown);
+  }
+  // PURE verdict from explicit inputs (testable). `attnKnown` false = the queue is
+  // unknown (loading / failed / stale) — we must NOT assert a green "nothing needs
+  // you", or an API outage would show a false all-clear (C0 trust contract).
+  function teamHealthVerdictFrom(n, attnKnown, q, attnCount, unknownCount) {
+    if (!n) return { text: 'No agents running yet', pill: 'No agents', tone: 'idle' };
+    if (attnKnown && q === 0 && attnCount === 0 && unknownCount === 0) {
       return { text: 'All ' + n + ' agents healthy — nothing needs you', pill: 'Healthy', tone: 'ok' };
     }
     var parts = [n + ' agent' + (n === 1 ? '' : 's')];
-    if (q > 0) parts.push(q + (q === 1 ? ' needs' : ' need') + ' a human');
-    if (c.attn > 0) parts.push(c.attn + (c.attn === 1 ? ' needs' : ' need') + ' attention');
-    if (c.unknown > 0) parts.push(c.unknown + ' offline');
-    var pill = q > 0 ? (q + (q === 1 ? ' needs' : ' need') + ' a human')
-      : (c.attn > 0 ? (c.attn + (c.attn === 1 ? ' needs' : ' need') + ' attention') : 'Some offline');
-    return { text: parts.join(' · '), pill: pill, tone: q > 0 ? 'danger' : 'warn' };
+    if (attnKnown && q > 0) parts.push(q + (q === 1 ? ' needs' : ' need') + ' a human');
+    if (attnCount > 0) parts.push(attnCount + (attnCount === 1 ? ' needs' : ' need') + ' attention');
+    if (unknownCount > 0) parts.push(unknownCount + ' offline');
+    if (!attnKnown) parts.push('queue status unknown');
+    var pill = (attnKnown && q > 0) ? (q + (q === 1 ? ' needs' : ' need') + ' a human')
+      : (attnCount > 0 ? (attnCount + (attnCount === 1 ? ' needs' : ' need') + ' attention')
+      : (!attnKnown ? 'Checking…' : 'Some offline'));
+    var tone = (attnKnown && q > 0) ? 'danger' : (attnCount > 0 ? 'warn' : (!attnKnown ? 'idle' : 'warn'));
+    return { text: parts.join(' · '), pill: pill, tone: tone };
   }
 
   // ------------------------------------------------------------ shared bits
@@ -1193,7 +1219,9 @@
         row.appendChild(it.icon());
         row.appendChild(el('span', 'tc-nav-item-label', it.label));
         if (it.badge) row.appendChild(el('span', 'tc-nav-badge', it.badge));
-        else if (it.clearWhenZero) row.appendChild(el('span', 'tc-nav-badge is-clear', '0'));
+        // green "0" ONLY when the queue is confirmed fresh-empty — never on unknown/
+        // stale attention, which must not read as a false all-clear (v0.76.0).
+        else if (it.clearWhenZero && attentionFresh()) row.appendChild(el('span', 'tc-nav-badge is-clear', '0'));
         on(row, 'click', function () { go(it.key, { selectedAgent: null }); });
         nav.appendChild(row);
       })(items[i]);
@@ -1682,7 +1710,7 @@
     top.appendChild(kindChip(t.opener_kind || t.kind));
     top.appendChild(el('span', 'tc-spacer'));
     var vi = threadChip(t);
-    if (vi) top.appendChild(el('span', 'tc-chip ' + vi.cls, vi.label));
+    if (vi) top.appendChild(titled(el('span', 'tc-chip ' + vi.cls, vi.label), vi.desc));
     row.appendChild(top);
     row.appendChild(el('div', 'tc-thread-subject', t.subject || t.request_id || ''));
     var bot = el('div', 'tc-thread-meta');
@@ -2779,7 +2807,7 @@
     top.appendChild(kindChip(t.opener_kind || t.kind));
     top.appendChild(el('span', 'tc-spacer'));
     var vi = threadChip(t) || terminalChip(t);
-    if (vi) top.appendChild(el('span', 'tc-chip ' + vi.cls, vi.label));
+    if (vi) top.appendChild(titled(el('span', 'tc-chip ' + vi.cls, vi.label), vi.desc));
     row.appendChild(top);
     row.appendChild(el('div', 'tc-session-subject', t.subject || t.request_id || ''));
     row.appendChild(el('div', 'tc-session-parts', threadParts(t)));
@@ -2820,7 +2848,7 @@
     // Verdict chip from the matching thread, if we have it.
     var t = findThreadMeta(rid);
     var vi = threadChip(t);
-    if (vi) head.appendChild(el('span', 'tc-chip ' + vi.cls, vi.label));
+    if (vi) head.appendChild(titled(el('span', 'tc-chip ' + vi.cls, vi.label), vi.desc));
     card.appendChild(head);
 
     // Body: bubbles + system-event separators.
@@ -3525,6 +3553,7 @@
     }).then(function (data) {
       if (attentionPending === requestKey) attentionPending = null;
       if (!data || !rootPayloadMatches(data, projectId, generation)) return;
+      data._fetchedAt = Date.now();   // freshness stamp for the team-health verdict (v0.76.0)
       attentionData = data;
       renderSidebar();  // count badge
       if (state.view === 'attention') renderActiveViewFromPoll();

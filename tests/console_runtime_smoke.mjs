@@ -30,6 +30,7 @@ function extract(name) {
 
 const combined = [
   extract('el'), extract('titled'), extract('stateInfo'),
+  extract('teamHealthVerdictFrom'),
   extract('supRow'), extract('supRuntimeRows'),
 ].join('\n');
 
@@ -52,6 +53,7 @@ const document = {
 // eslint-disable-next-line no-new-func
 const factory = new Function('document',
   combined + '\nreturn { el: el, titled: titled, stateInfo: stateInfo,'
+  + ' teamHealthVerdictFrom: teamHealthVerdictFrom,'
   + ' supRow: supRow, supRuntimeRows: supRuntimeRows };');
 const api = factory(document);
 
@@ -98,5 +100,27 @@ assert.equal(noT.getAttribute('title'), null, 'empty title must not set the attr
 const idle = api.stateInfo('idle_waiting');
 assert.ok(/normal|healthy/i.test(idle.desc),
   'idle_waiting desc must say it is normal/healthy (kills the "idle = broken" false alarm)');
+
+// --- 6) team-health verdict: UNKNOWN attention must NOT read as a green all-clear
+//        (v0.76.0 trust contract — an API outage / not-yet-loaded queue was rendering
+//        a confirmed "nothing needs you"). Green only on a KNOWN, empty queue. ---
+const hv = api.teamHealthVerdictFrom;
+// attnKnown=false (loading/failed/stale) + otherwise-clear agents -> NOT green:
+const unknown = hv(3, false, null, 0, 0);
+assert.notEqual(unknown.tone, 'ok', 'unknown attention must not be tone=ok');
+assert.notEqual(unknown.pill, 'Healthy', 'unknown attention must not read "Healthy"');
+assert.ok(!/nothing needs you/.test(unknown.text), 'unknown must not claim "nothing needs you"');
+assert.ok(/unknown/i.test(unknown.text), 'unknown attention should say the queue status is unknown');
+// known + empty + healthy -> green:
+const clear = hv(3, true, 0, 0, 0);
+assert.equal(clear.tone, 'ok');
+assert.equal(clear.pill, 'Healthy');
+assert.ok(/nothing needs you/.test(clear.text));
+// known + queue has items -> danger + "need a human":
+const needHuman = hv(3, true, 2, 1, 0);
+assert.equal(needHuman.tone, 'danger');
+assert.ok(/need a human/.test(needHuman.text));
+// no agents -> neutral:
+assert.equal(hv(0, false, null, 0, 0).text, 'No agents running yet');
 
 console.log('console runtime render smoke: PASS');
