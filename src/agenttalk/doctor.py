@@ -184,7 +184,7 @@ def _check_lead_unarmed(store) -> Check | None:
     try:
         _sp = store.dir / "supervisor.json"
         if _sp.exists():
-            _data = json.loads(_sp.read_text(encoding="utf-8"))
+            _data = json.loads(_sp.read_text(encoding="utf-8-sig"))
             sup_cfg = _data if isinstance(_data, dict) else {}
     except (ValueError, OSError):
         sup_cfg = {}
@@ -462,7 +462,7 @@ def _is_wrapped_or_managed_lead(store: Store, agent: str) -> bool:
         return True
     p = store.dir / "supervisor.json"
     try:
-        cfg = json.loads(p.read_text(encoding="utf-8"))
+        cfg = json.loads(p.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return False
     if not isinstance(cfg, dict):

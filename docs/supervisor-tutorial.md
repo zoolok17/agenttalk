@@ -282,6 +282,12 @@ Wrapped agents skip this entirely.
 .\.agenttalk\supervisor.ps1
 ```
 
+> **Prefer PowerShell 7 (`pwsh`) as the host.** Windows PowerShell 5.1 works — the
+> generated JSON writes are BOM-free and the readers tolerate a BOM either way — but
+> pwsh 7+ is the tested default and avoids a class of edition-specific encoding
+> surprises. Launch it explicitly if you use a Scheduled Task or a shortcut:
+> `Start-Process pwsh -ArgumentList '-NoProfile','-File','<repo>\.agenttalk\supervisor.ps1' -WorkingDirectory '<repo>\.agenttalk'`.
+
 The monitor loops every `poll_seconds`: it asks `agenttalk supervise
 --plan` for the decision table and executes it — launching agents that
 aren't running, relaunching (resuming each agent's session — see section
@@ -496,6 +502,20 @@ without ever rebuilding state.
 - **Pinned executables.** `windows_file` must be the real CLI exe (or
   Python for wrapped), never a `.cmd`/npm/PowerShell shim — a shim hands
   off and exits, and the supervisor would track the wrong process.
+- **Don't host the whole fleet in one Windows Terminal.** A single
+  `WindowsTerminal.exe` hosting every agent tab plus the supervisor is a single
+  point of failure: one WT crash (e.g. an access violation in its render DLL)
+  kills every hosted console at once, which presents as "all CLIs crashed
+  simultaneously" even though agenttalk is fine (state and threads are durable on
+  disk; the wrap `python.exe` processes survive with orphaned CLI children). Prefer
+  separate hosts, or a Scheduled Task host (see `supervisor-hosting.md`), and pin a
+  known-good WT build.
+- **Forensics gotcha: a process query matches its own command line.** When you
+  hunt for a stray supervisor with
+  `Get-CimInstance Win32_Process | Where CommandLine -like '*supervisor.ps1*'`, the
+  query process itself matches, so it can *look* like two supervisors are running.
+  Check `ParentProcessId` (and start time) before concluding you have duelling
+  supervisors.
 
 ---
 

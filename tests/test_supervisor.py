@@ -4688,3 +4688,49 @@ def test_lead_loop_manual_restart_overrides_stood_down_marker() -> None:
               {"agents": {"worker": _ready(backoff_next_epoch=NOW + 9999)}},
               snapshot=_snap(), config=_HOOK_CODEX_CONFIG)
     assert p["action"] == sup.RELAUNCH and p["state"] == "MANUAL_RESTART"
+
+
+# --------------------------------------------- UTF-8 BOM tolerance (PowerShell 5.1)
+
+def test_seed_codex_config_tolerates_bom_only_placeholder(tmp_path: Path) -> None:
+    """A codex-home config.toml seeded by Windows PowerShell 5.1
+    `Set-Content '' -Encoding utf8` is a BOM-only file. `supervise --seed-codex-config`
+    must read it with utf-8-sig so the BOM does not propagate into the overlaid config
+    the external codex CLI parses — a leading BOM + duplicate [projects] tables make the
+    agent fail to start (the live mismatch from the 2026-07-14 incident audit)."""
+    _team(tmp_path)
+    home = tmp_path / "codexhome"
+    home.mkdir()
+    (home / "config.toml").write_bytes(b"\xef\xbb\xbf")          # BOM-only placeholder
+    rc = _run(["supervise", "--seed-codex-config", "--home", str(home),
+               "--repo", str(tmp_path)], tmp_path)
+    assert rc == 0
+    raw = (home / "config.toml").read_bytes()
+    assert not raw.startswith(b"\xef\xbb\xbf"), "overlaid config.toml must not carry a BOM"
+    text = (home / "config.toml").read_text(encoding="utf-8")
+    # managed overlay applied cleanly, not skewed/duplicated by a leading BOM
+    assert text.count('approval_policy = "never"') == 1
+    assert "[sandbox_workspace_write]" in text
+    # re-seed is idempotent: still exactly one managed root key (no BOM re-injected)
+    assert _run(["supervise", "--seed-codex-config", "--home", str(home),
+                 "--repo", str(tmp_path)], tmp_path) == 0
+    text2 = (home / "config.toml").read_text(encoding="utf-8")
+    assert text2.count('approval_policy = "never"') == 1
+    assert not (home / "config.toml").read_bytes().startswith(b"\xef\xbb\xbf")
+
+
+def test_seed_claude_settings_tolerates_bom_and_preserves_operator_keys(tmp_path: Path) -> None:
+    """An operator .claude/settings.json saved by Notepad/PowerShell can carry a UTF-8
+    BOM. `supervise --seed-claude-settings` must read it with utf-8-sig; otherwise
+    json.loads raises, `existing` is dropped, and the operator's settings are SILENTLY
+    DISCARDED instead of merged (data loss)."""
+    _team(tmp_path)
+    d = tmp_path / "proj"
+    (d / ".claude").mkdir(parents=True)
+    settings = d / ".claude" / "settings.json"
+    settings.write_bytes(b"\xef\xbb\xbf" + b'{"customOperatorKey": 123}')
+    rc = _run(["supervise", "--seed-claude-settings", "--dir", str(d)], tmp_path)
+    assert rc == 0
+    data = json.loads(settings.read_text(encoding="utf-8-sig"))
+    assert data.get("customOperatorKey") == 123, "operator key must survive, not be discarded"
+    assert "defaultMode" in data

@@ -774,6 +774,23 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   command** — a wrapped session resets only on an effective-fingerprint change (D-24) or a
   resume self-heal, so `request-restart` preserves the session and a deliberate context clear
   is an operator/host action, not an agenttalk operation.
+- **D-26 The PowerShell↔Python file boundary is BOM-free-write + BOM-tolerant-read
+  (2026-07-14).** *Why:* the supervisor is generated PowerShell that writes JSON/TOML the
+  Python core reads back (and vice-versa). Under **Windows PowerShell 5.1**, `Set-Content
+  -Encoding utf8` emits a UTF-8 BOM (EF BB BF); Python's strict `json.loads`/`read_text("utf-8")`
+  *rejects* a leading BOM, and `str.strip()` does not remove U+FEFF (skewing a TOML section
+  scan). A 2026-07-14 incident-audit found a live case: the codex-home `config.toml` seeded
+  BOM-only under 5.1 produced duplicate `[projects]` tables → invalid TOML the external codex
+  CLI refuses → the agent can't start. *Decision:* every JSON/TOML artifact the generated PS
+  writes uses a **BOM-free** UTF-8 write (`[System.IO.File]::WriteAllText(path, text,
+  UTF8Encoding($false))`, matching `Write-StateFileAtomic`), and every Python/PS reader of a
+  possibly-operator-or-PS-written config uses **BOM-tolerant** decoding (`utf-8-sig` /
+  `ConvertFrom-Json`). Generated `.ps1` files are the deliberate exception — they keep a BOM
+  because the 5.1 script engine needs it to decode a UTF-8 script (a BOM-less `.ps1` is read as
+  Windows-1252); `.cmd` shims stay BOM-free because `cmd.exe` fuses a BOM onto `@echo off`.
+  *Ceiling:* this is a robustness invariant, not enforced by a test harness that runs PS 5.1;
+  new PS writes / strict readers must follow the rule by convention (the incident audit is the
+  backstop). pwsh 7+ remains the recommended host.
 
 ## 6. How we work (process)
 

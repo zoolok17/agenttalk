@@ -27,7 +27,7 @@ def _read_text_no_translate(path: Path) -> str:
     Python 3.13; on 3.10-3.12 it raises ``TypeError``. ``open(newline="")`` has
     accepted it for far longer, so go through it directly to stay portable.
     """
-    with open(path, encoding="utf-8", newline="") as f:
+    with open(path, encoding="utf-8-sig", newline="") as f:
         return f.read()
 
 
@@ -388,7 +388,7 @@ def status(config_path: Path, project_dir: Path) -> dict:
     }
     if not config_path.exists():
         return result
-    text = config_path.read_text(encoding="utf-8")
+    text = config_path.read_text(encoding="utf-8-sig")
     newline = "\r\n" if "\r\n" in text else "\n"
     lines = text.split(newline)
     section = _find_section(lines, project_key)

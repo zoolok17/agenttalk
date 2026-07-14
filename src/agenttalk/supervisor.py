@@ -4523,11 +4523,15 @@ function Get-ProcSnapshot($path) {
     # count; a pipe would unroll it into a {"value":..,"Count":..} wrapper. Empty
     # is written as a literal [] (an empty captured table, NOT unavailable).
     $arr = @($rows)
-    if ($arr.Count -eq 0) { '[]' | Set-Content $path -Encoding utf8 }
-    else { ConvertTo-Json -InputObject $arr -Depth 4 | Set-Content $path -Encoding utf8 }
+    # BOM-free UTF-8 (matches Write-StateFileAtomic): Set-Content -Encoding utf8
+    # emits a UTF-8 BOM under Windows PowerShell 5.1, which every JSON write in
+    # this template must avoid so a strict Python reader never chokes.
+    $u8 = New-Object System.Text.UTF8Encoding($false)
+    if ($arr.Count -eq 0) { [System.IO.File]::WriteAllText($path, '[]', $u8) }
+    else { [System.IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $arr -Depth 4), $u8) }
     return $true
   } catch {
-    @{ unavailable = $true } | ConvertTo-Json | Set-Content $path -Encoding utf8
+    [System.IO.File]::WriteAllText($path, (@{ unavailable = $true } | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
     return $false
   }
 }
@@ -4612,7 +4616,10 @@ function Seed-CodexHome($name, $sandbox) {
   # config.toml: ALWAYS copy fresh (pick up operator changes) then overlay the
   # unattended keys via the tested Python core. NEVER seed .sandbox-secrets.
   $sc = Join-Path $src 'config.toml'; $dc = Join-Path $isoHome 'config.toml'
-  if (Test-Path $sc) { Copy-Item $sc $dc -Force } elseif (-not (Test-Path $dc)) { Set-Content $dc '' -Encoding utf8 }
+  # BOM-free empty seed: Set-Content -Encoding utf8 writes a BOM-only file under
+  # Windows PowerShell 5.1, which skews the codex_config TOML section scan and
+  # can produce duplicate [projects] tables (invalid TOML the codex CLI rejects).
+  if (Test-Path $sc) { Copy-Item $sc $dc -Force } elseif (-not (Test-Path $dc)) { [System.IO.File]::WriteAllText($dc, '', (New-Object System.Text.UTF8Encoding($false))) }
   & $AgenttalkCmd --root $Root supervise --seed-codex-config --home $isoHome --repo $Root --sandbox $sandbox | Out-Null
   foreach ($dn in @('skills','plugins','rules')) {
     $s = Join-Path $src $dn; $d = Join-Path $isoHome $dn
@@ -5364,7 +5371,7 @@ def classify_claude_activity_hook_state(root: Path, target_agent: str) -> str:
     if not p.exists():
         return "none"
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
     except (ValueError, OSError):
         return "unreadable"
     if not isinstance(data, dict):
@@ -5508,7 +5515,7 @@ def install_activity_hook(store: Store, *, claude: bool = True,
         settings = {}
         if p.exists():
             try:
-                settings = json.loads(p.read_text(encoding="utf-8")) or {}
+                settings = json.loads(p.read_text(encoding="utf-8-sig")) or {}
             except (ValueError, OSError):
                 out[str(p)] = "skipped (unreadable - merge by hand)"
                 settings = None
@@ -5531,7 +5538,7 @@ def install_activity_hook(store: Store, *, claude: bool = True,
         cfg = {}
         if p.exists():
             try:
-                cfg = json.loads(p.read_text(encoding="utf-8")) or {}
+                cfg = json.loads(p.read_text(encoding="utf-8-sig")) or {}
             except (ValueError, OSError):
                 out[str(p)] = "skipped (unreadable - merge by hand)"
                 cfg = None

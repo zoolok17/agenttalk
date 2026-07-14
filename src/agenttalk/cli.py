@@ -2902,7 +2902,7 @@ def _lane_worktree_idle(store, lane: dict) -> bool:
         return False
     try:
         state_path = store.dir / "state" / "supervisor-state.json"
-        state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+        state = json.loads(state_path.read_text(encoding="utf-8-sig")) if state_path.exists() else {}
     except (OSError, ValueError):
         return False
     for section in ("agents", "ephemeral_reviewers"):
@@ -10157,7 +10157,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk supervise --seed-codex-config: need --home <dir>\n")
             return 2
         cfg_p = Path(args.home) / "config.toml"
-        existing = cfg_p.read_text(encoding="utf-8") if cfg_p.exists() else ""
+        existing = cfg_p.read_text(encoding="utf-8-sig") if cfg_p.exists() else ""
         repo = str(Path(args.repo).resolve() if args.repo else store.root.resolve())
         sandbox = args.sandbox or "unelevated"
         cfg_p.parent.mkdir(parents=True, exist_ok=True)
@@ -10171,7 +10171,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk supervise --seed-claude-settings: need --dir <dir>\n")
             return 2
         sp = Path(args.dir) / ".claude" / "settings.json"
-        existing = sp.read_text(encoding="utf-8") if sp.exists() else None
+        existing = sp.read_text(encoding="utf-8-sig") if sp.exists() else None
         sp.parent.mkdir(parents=True, exist_ok=True)
         mode = args.mode or "bypassPermissions"
         sp.write_text(sup.seed_claude_settings(existing, mode=mode), encoding="utf-8")

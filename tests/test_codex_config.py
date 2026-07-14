@@ -293,3 +293,27 @@ def test_all_write_sites_use_atomic_write(tmp_path: Path, monkeypatch) -> None:
     calls.clear()
     disable_project(cfg, project)
     assert len(calls) >= 1, "disable_project must call atomic write"
+
+
+# ------------------------------------------------- UTF-8 BOM (PowerShell 5.1)
+
+def test_bom_prefixed_config_section_is_recognized_not_duplicated(tmp_path: Path) -> None:
+    """A config.toml written by Windows PowerShell 5.1 `Set-Content -Encoding utf8`
+    carries a leading UTF-8 BOM (U+FEFF). The old strict `utf-8` read left the BOM on
+    the first line, so `[projects."..."]` failed the section scan (`str.strip()` does
+    NOT drop U+FEFF) -> enable_project appended a DUPLICATE [projects] table -> invalid
+    TOML that the external codex CLI refuses to parse (agent can't start). Reading with
+    `utf-8-sig` strips the BOM so the section is found and re-enable is idempotent."""
+    cfg = tmp_path / "config.toml"
+    project = tmp_path / "proj"
+    project.mkdir()
+    enable_project(cfg, project)                       # create the block
+    body = cfg.read_text(encoding="utf-8-sig")
+    assert body.count("[projects.") == 1
+    # simulate the PS 5.1 BOM: prepend U+FEFF (its UTF-8 encoding is EF BB BF)
+    cfg.write_text("﻿" + body, encoding="utf-8")
+    # status must still see the section (was False with the BOM before the fix)
+    assert status(cfg, project)["section_present"] is True
+    # re-enable must NOT append a duplicate [projects] table
+    enable_project(cfg, project)
+    assert cfg.read_text(encoding="utf-8-sig").count("[projects.") == 1

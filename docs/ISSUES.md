@@ -110,6 +110,38 @@ reasoning-effort is a launch-time typo guard, not a per-model validator (e.g. Co
 
 ---
 
+## SHIPPED (v0.75.3, 2026-07-14) — BOM defense-in-depth + supervisor docs (from the incident audit)
+
+**What.** An exhaustive audit (workflow) of every PowerShell-writes ↔ Python/PS-reads
+encoding pair. Under **Windows PowerShell 5.1**, `Set-Content -Encoding utf8` emits a UTF-8
+BOM that strict readers reject / TOML scans mis-handle. Fixes (see D-26): two PS writers made
+BOM-free (`Get-ProcSnapshot`; the codex-home `config.toml` empty-seed — the one **live**
+mismatch: a BOM-only placeholder produced duplicate `[projects]` tables → invalid TOML → the
+codex CLI wouldn't start the agent) and six/eight readers switched to `utf-8-sig`
+(`codex_config.py:30/391`, `cli.py:2905/10160/10174`, `doctor.py:187/465`,
+`supervisor.py:5367/5511/5534` — the last group prevents a BOM'd operator `settings.json`/
+`hooks.json` from being **silently discarded**). Docs: prefer pwsh 7 host, single-WT SPOF,
+self-matching-`CommandLine` forensics gotcha, state-encoding robustness note. 3 regression
+tests. Root-caused from the orbit-launcher 2026-07-14 incident (`docs/agenttalk-incident-report-20260714.md`);
+the "all CLIs crashed" symptom itself was a Windows Terminal segfault, **not** agenttalk.
+
+**Disposition.** `SHIPPED v0.75.3`. Reviewed on the final SHA, lead-gated 3.10+3.14.
+
+---
+
+## P3 · PLANNED — `_lane_worktree_idle` reads a nonexistent supervisor-state path (2026-07-14)
+
+**What.** `cli.py:2905` (`_lane_worktree_idle`) reads `store.dir/'state'/'supervisor-state.json'`,
+but the supervisor writes `store.dir/'supervisor-state.json'` (no `state/` subdir; PS
+`$StatePath` supervisor.py:4365) and every canonical reader uses that path (e.g. cli.py:643).
+So the read always misses → `{}` → the `agents`/`ephemeral_reviewers` liveness branch of the
+idle check is effectively **dormant**. **Where.** `src/agenttalk/cli.py:2905`. **Why deferred.**
+Found by the v0.75.3 BOM audit while fixing the *encoding* on that line (done); correcting the
+*path* would ACTIVATE dormant logic and change lane/close idle behavior, so it needs its own
+analysis + review. **Disposition.** `P3 PLANNED` (candidate for a standalone fix or v0.75.4).
+
+---
+
 ## P3 · PLANNED — supervisor: manual restart deadlocks on a state-unattributed live agent (2026-07-14)
 
 **What.** When `request-restart` targets a wrapped agent whose LIVE process is not
