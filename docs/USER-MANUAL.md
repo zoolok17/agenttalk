@@ -543,11 +543,13 @@ goes after `--` in `windows_args`. See
 ### Per-agent model and reasoning effort
 
 Each wrapped agent can pin a `model` and `reasoning_effort` in `supervisor.json`
-(v0.75.0); the wrapper injects them into the launch command and fingerprints the
-*effective* (post-injection) value. Changing it starts a clean conversation only when a
-prior baseline is present and the effective value actually changes — the first/absent
-baseline is adopted without a reset, and an edit that a `wrap --model`/`--effort` launch
-tail already overrides is a no-op. The dashboard contact card shows each agent's
+(v0.75.0); the wrapper injects them and fingerprints the *effective* (post-injection)
+value. Three layers resolve it, highest first: an explicit model/effort in the child
+command after `--` (the raw launch tail) beats a `wrap --model`/`--effort` wrapper option,
+which beats `supervisor.json`. Changing it starts a clean conversation only when a prior
+baseline is present and the effective value actually changes — the first/absent baseline is
+adopted without a reset, and a config or `wrap` value a higher layer already sets is a
+no-op. The dashboard contact card shows each agent's
 last-recorded effective CLI, model, and effort (it can persist while the agent is down),
 plus a read-only Skill row on the profile (v0.75.1).
 

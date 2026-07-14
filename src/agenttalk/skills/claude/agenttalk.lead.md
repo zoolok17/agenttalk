@@ -173,14 +173,15 @@ authoritative.
 ## Model, effort & context discipline (0.75.2)
 
 A supervised `wrap --loop` agent runs at a per-agent `model` +
-`reasoning_effort` (from `supervisor.json`, or a `wrap --model`/`--effort`
-launch tail, which wins). The wrapper fingerprints the EFFECTIVE value and
-resets that agent's session only when a present baseline's effective value
-CHANGES (an absent baseline is adopted, a tail-overridden edit is a no-op), so
-configure a STABLE profile per role and retune only on evidence. Your own
-interactive window is whatever the operator set in that CLI (not
-`supervisor.json`); this table is advisory for you, a wrap setting for the
-agents you plan.
+`reasoning_effort` resolved in three layers (highest first): an explicit
+model/effort in the child command after `--` beats a `wrap --model`/`--effort`
+wrapper option, which beats `supervisor.json`. The wrapper fingerprints the
+EFFECTIVE value and resets that agent's session only when a present baseline's
+effective value CHANGES (an absent baseline is adopted, a value a higher layer
+already sets is a no-op), so configure a STABLE profile per role and retune only
+on evidence. Your own interactive window is whatever the operator set in that
+CLI (not `supervisor.json`); this table is advisory for you, a wrap setting for
+the agents you plan.
 
 - **Baseline by task class.** Design/architecture: a strong model at high
   effort (xhigh if novel or security-critical). Build: a mid model at medium or
@@ -206,7 +207,11 @@ agents you plan.
   repeated corrected error) - including mid-task when necessary, always
   CHECKPOINT first (objective, SHA/worktree, invariants, open threads, tests)
   and transfer any unresolved transaction; do NOT reset electively just because
-  a task ended. A reset reduces stale context but is NOT independence. For an
+  a task ended. There is no bus "reset context" command: a wrapped session
+  resets automatically only on an effective model/effort change, so a plain
+  `request-restart` bounces the process but PRESERVES the session (not a reset) -
+  a real context clear is an operator/host action in the agent's own CLI. A reset
+  reduces stale context but is NOT independence. For an
   INDEPENDENT review use a ONE-OFF FRESH reviewer (didn't build it, didn't see
   the build reasoning), preferably a different model family; give it scope and
   refs but not your conclusions - independence is not ignorance, a zero-context

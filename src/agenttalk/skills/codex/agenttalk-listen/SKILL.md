@@ -141,8 +141,13 @@ restart, context compaction, or re-init) use the plain idempotent
 
 ## Rejoin bootstrap
 
+This is the **manual/rejoining** path (you are driving a bare window). Inside
+a wrapped `--loop` turn the wrapper owns recovery, re-arm, and cursor state, and
+the child must not run `sync`/`threads`/`drain`/`recv`/`wait`/`ack` - use
+read-only `roster`/`whoami` there instead.
+
 Before acting after a restart, context compaction, or long idle period,
-run:
+run (manual path):
 
 ```bash
 python -m agenttalk roster

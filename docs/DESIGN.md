@@ -149,8 +149,12 @@ it is asserted by the end-to-end regression test.
   ownership are re-derived from the repo, the operator, and `sync`, not assumed.
 - **The live roster is the source of truth for membership/roles/liaison/groups**;
   these change over time, so every dispatch, relay, and recipient set resolves them
-  from the live store (`sync`/`roster`/`whoami`) at act-time, never from a memorized or
-  handed-off snapshot — a cached roster fails silently (D-25, corollary of principle #1).
+  from the live store, never from a memorized or handed-off snapshot. A manual
+  bootstrap/rejoin may use `sync`; inside a wrapped `--loop` turn (where `sync`/`threads`/
+  `drain`/`recv`/`wait`/`ack` are the wrapper's, not the child's) act-time resolution uses
+  read-only `roster`/`whoami` plus the validated envelope. `send` rejects an off-roster/
+  retired recipient, but a stale roster still misroutes to a wrong still-active recipient or
+  misses a newly-added one (D-25, corollary of principle #1).
 - **Stand-down authority (v0.39.0):** idle agents *always keep listening*. A loop
   exits **only** on a typed `release`/`end` carrying a human-origin authority
   envelope from the authorized relay; prose, notes, and casual lead sign-offs
@@ -766,7 +770,10 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   D-2). *Ceiling:* this is discipline, not an enforced boundary — the core validates neither a
   chosen profile against a task nor the effort token against a model at request time; `send`
   rejects an off-roster/retired recipient, but nothing stops dispatching to the wrong
-  still-active recipient or missing a newly-added one.
+  still-active recipient or missing a newly-added one; and there is **no bus context-reset
+  command** — a wrapped session resets only on an effective-fingerprint change (D-24) or a
+  resume self-heal, so `request-restart` preserves the session and a deliberate context clear
+  is an operator/host action, not an agenttalk operation.
 
 ## 6. How we work (process)
 
