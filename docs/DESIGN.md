@@ -788,10 +788,13 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   / `ConvertFrom-Json`) — the supervisor state/snapshot files, the codex `config.toml`, the
   operator `settings.json`/`hooks.json`, and the hand-authored `domains.json` / `signoffs.json`.
   (agenttalk's own bus/store artifacts are written atomically BOM-free, so their strict `utf-8`
-  reads have no BOM source and are safe as-is — they are not blanket-converted.) `codex_config`
-  additionally **self-repairs** an already-corrupted config: `enable`/`disable` collapse duplicate
-  `[projects."<key>"]` tables and `status` reports them, so a user bitten by the old behavior is
-  healed on the next seed rather than left with un-parseable TOML. Generated `.ps1` files are the
+  reads have no BOM source and are safe as-is — they are not blanket-converted.) The system also
+  **self-repairs** an already-corrupted config: the launch-time seed (`supervise
+  --seed-codex-config` → `codex_config_overlay`) collapses duplicate tables, `codex_config`'s
+  `enable`/`disable` do the same for `[projects."<key>"]`, and both `codex-config --status` and
+  `doctor` report a duplicated (invalid-TOML) config instead of presenting it as healthy — so a
+  user bitten by the old behavior is healed on the next launch/seed rather than left with
+  un-parseable TOML the codex CLI refuses. Generated `.ps1` files are the
   deliberate exception — they keep a BOM because the 5.1 script engine needs it to decode a UTF-8
   script (a BOM-less `.ps1` is read as Windows-1252); `.cmd` shims stay BOM-free because
   `cmd.exe` fuses a BOM onto `@echo off`. *Ceiling:* this is a robustness invariant, not enforced

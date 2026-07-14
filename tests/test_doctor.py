@@ -1218,3 +1218,21 @@ def test_doctor_config_blocked_holds_warns_separately_and_ignores_malformed(tmp_
     assert "request-restart" in chk.fix
     assert [h["agent"] for h in chk.data["holds"]] == ["worker"]
     assert any(c.name == "config_blocked_holds" for c in doctor.run(tmp_path).checks)
+
+
+def test_check_codex_config_warns_on_duplicate_tables(tmp_path: Path, monkeypatch) -> None:
+    """`doctor` must WARN (with a repair hint) when a codex config.toml holds duplicate
+    [projects] tables — invalid TOML the codex CLI rejects — instead of returning ok as
+    if the per-project block were healthy (codex-reviewer-1 P1, v0.75.3)."""
+    from agenttalk import codex_config as cxc
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    cfg = tmp_path / "config.toml"
+    cxc.enable_project(cfg, proj)
+    block = cfg.read_text(encoding="utf-8-sig")
+    cfg.write_text(block.strip("\n") + "\n\n" + block.strip("\n") + "\n", encoding="utf-8")
+    monkeypatch.setattr(cxc, "default_config_path", lambda: cfg)
+    chk = doctor._check_codex_config(proj)
+    assert chk.status == "warn"
+    assert "duplicate" in chk.details.lower()
+    assert "codex-config --enable" in chk.fix

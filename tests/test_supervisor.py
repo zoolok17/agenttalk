@@ -4763,3 +4763,58 @@ def test_generated_supervisor_ps1_uses_bom_free_json_writes(tmp_path: Path) -> N
     assert "WriteAllText" in ps1
     assert "Set-Content $path -Encoding utf8" not in ps1          # snapshot writes
     assert "Set-Content $dc '' -Encoding utf8" not in ps1         # config.toml empty seed
+
+
+def test_seed_codex_config_repairs_duplicate_tables(tmp_path: Path) -> None:
+    """The LAUNCH seed (`supervise --seed-codex-config` -> codex_config_overlay) must
+    self-heal a config ALREADY corrupted with duplicate tables (invalid TOML the codex
+    CLI refuses) — not only codex_config.enable_project. Otherwise a wrapped Codex agent
+    on an affected machine still can't start (codex-reviewer-1 P1, v0.75.3)."""
+    _team(tmp_path)
+    home = tmp_path / "codexhome"
+    home.mkdir()
+    dup = ('[projects."x"]\ntrust_level = "trusted"\n\n'
+           '[projects."x"]\ntrust_level = "trusted"\n')
+    (home / "config.toml").write_text(dup, encoding="utf-8")
+    assert dup.count('[projects."x"]') == 2
+    rc = _run(["supervise", "--seed-codex-config", "--home", str(home),
+               "--repo", str(tmp_path)], tmp_path)
+    assert rc == 0
+    text = (home / "config.toml").read_text(encoding="utf-8")
+    assert text.count('[projects."x"]') == 1              # duplicate collapsed
+    try:                                                  # and it is valid TOML now
+        import tomllib
+        tomllib.loads(text)                               # must not raise "declare twice"
+    except ModuleNotFoundError:
+        pass                                              # tomllib is 3.11+; count check suffices on 3.10
+
+
+def test_codex_config_status_reports_duplicate_tables(tmp_path: Path, capsys) -> None:
+    """`codex-config --status` must SURFACE a duplicated (invalid-TOML) config instead
+    of printing section_present=True as if healthy (codex-reviewer-1 P1, v0.75.3)."""
+    from agenttalk import codex_config as cxc
+    _team(tmp_path)
+    cfg = tmp_path / "config.toml"
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    cxc.enable_project(cfg, proj)
+    block = cfg.read_text(encoding="utf-8-sig")
+    cfg.write_text(block.strip("\n") + "\n\n" + block.strip("\n") + "\n", encoding="utf-8")
+    rc = _run(["codex-config", "--status", "--project", str(proj),
+               "--config-path", str(cfg)], tmp_path)
+    assert rc == 0
+    assert "duplicate_sections" in capsys.readouterr().out
+
+
+def test_install_activity_hook_preserves_bom_prefixed_codex_hooks(tmp_path: Path) -> None:
+    """The .codex/hooks.json branch must also read a BOM'd operator file, not skip it as
+    unreadable (codex-reviewer-1 P2, v0.75.3)."""
+    s = _team(tmp_path)
+    hooks = s.root / ".codex" / "hooks.json"
+    hooks.parent.mkdir(parents=True, exist_ok=True)
+    hooks.write_bytes(b"\xef\xbb\xbf" + b'{"customOperatorKey": 7}')
+    out = sup.install_activity_hook(s, claude=False, codex=True)
+    st = out[str(hooks)]
+    assert "unreadable" not in st
+    data = json.loads(hooks.read_text(encoding="utf-8-sig"))
+    assert data.get("customOperatorKey") == 7

@@ -7899,6 +7899,10 @@ def cmd_codex_config(args: argparse.Namespace) -> int:
         print(f"config_exists:   {st['config_exists']}")
         print(f"project_dir:     {st['project_dir']}")
         print(f"section_present: {st['section_present']}")
+        if st.get("duplicate_sections"):
+            print(f"duplicate_sections: {st['duplicate_sections']}  "
+                  "(INVALID TOML the codex CLI rejects — run "
+                  "`agenttalk codex-config --enable` to collapse the duplicates)")
         for k, v in st["keys"].items():
             print(f"  {k:<18} {v if v is not None else '(unset)'}")
         return 0

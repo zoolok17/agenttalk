@@ -950,6 +950,15 @@ def _check_codex_config(project_root: Path) -> Check:
             details=f"no per-project block for {st['project_dir']}",
             fix="run `agenttalk codex-config --enable` to let Codex call agenttalk from its sandbox",
         )
+    if st.get("duplicate_sections"):
+        return Check(
+            name="codex_config",
+            status="warn",
+            details=(f"{st['duplicate_sections']} duplicate [projects] table(s) for "
+                     f"{st['project_dir']} — invalid TOML the codex CLI rejects "
+                     "(pre-0.75.3 BOM corruption)"),
+            fix="run `agenttalk codex-config --enable` to collapse the duplicates",
+        )
     keys = st["keys"]
     missing_keys = [k for k, v in keys.items() if v is None]
     if missing_keys:
