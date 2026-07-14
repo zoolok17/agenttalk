@@ -544,42 +544,54 @@ goes after `--` in `windows_args`. See
 
 Each wrapped agent can pin a `model` and `reasoning_effort` in `supervisor.json`
 (v0.75.0); the wrapper injects them into the launch command and fingerprints the
-session, so changing either starts a clean conversation instead of continuing a stale
-one. The dashboard contact card shows each agent's live CLI, model, and effort, plus a
-read-only Skill row on the profile (v0.75.1).
+*effective* (post-injection) value. Changing it starts a clean conversation only when a
+prior baseline is present and the effective value actually changes — the first/absent
+baseline is adopted without a reset, and an edit that a `wrap --model`/`--effort` launch
+tail already overrides is a no-op. The dashboard contact card shows each agent's
+last-recorded effective CLI, model, and effort (it can persist while the agent is down),
+plus a read-only Skill row on the profile (v0.75.1).
 
-Configure a STABLE profile per role, not per task — because a model/effort change resets
-the session, churn costs context and latency for little gain. As a rule of thumb:
+Configure a STABLE profile per role, not per task — because a change to the effective
+value resets the session, churn costs context and latency for little gain. As a rule of
+thumb:
 
-- **Routine listeners, relays, acks:** cheap and fast (Claude `haiku` · low; Codex
-  primary · low).
-- **Builders / implementers:** a mid model at medium-high effort (Claude `sonnet`; Codex
-  primary · medium).
+- **Routine listeners, relays, acks:** cheap and fast (Claude `haiku` · low; Codex low).
+- **Builders / implementers:** a mid model at medium/high effort (Claude `sonnet`; Codex
+  medium).
 - **Reviewers, architects, and the lead's design/gate/release turns:** a strong model at
   high effort (xhigh for security or release) — and for an INDEPENDENT review prefer a
-  different model family than the builder's.
+  different model family than the builder's. Note an *interactive* lead is configured in
+  its own CLI window, not in `supervisor.json`.
 
 Providers behave differently. Codex draws on a shared, load-balanced pool: downgrading its
-model does not free capacity, so keep one validated primary model, cap and stagger
-concurrent high/xhigh Codex turns, and vary effort rather than model. Claude is
-weekly-budget bound: make `sonnet` the workhorse and reserve `opus` plus the highest efforts
-for short, high-risk passes. `fable` is an experimental/specialist model, not a routine
-default.
+model does not free capacity, so keep one validated model (or leave it unset for the
+provider default), cap and stagger concurrent high/xhigh Codex turns, and vary effort
+rather than model. Claude is weekly-budget bound: make `sonnet` the workhorse and reserve
+`opus` plus the highest efforts for short, high-risk passes. `fable` is an
+experimental/specialist model, not a routine default. Use discrete effort tokens
+(`low`/`medium`/`high`/`xhigh`/`max`, per each CLI's own set) — a hyphenated range like
+`medium-high` is not a valid value.
 
 The agents' own model/effort, context-reset, and fresh-reviewer discipline is documented
 for them in `docs/AGENT-MANUAL.md` §1.
 
-**Verifying the flags reached the CLI.** Two things trip up a check done right after a
+**Verifying the flags reached the CLI.** A few things trip up a check done right after a
 relaunch:
 
-- A wrapped agent is **idle until first dispatched**, so no CLI child process exists yet
-  and `--model` appears **nowhere** in the process tree until it handles its first message.
-  Send it work, then check.
-- Inspect the **child** `claude.exe` / `codex.exe`, not the wrap. The wrapper's own command
-  line contains `python -m agenttalk`, so a naive search for `-m`/`--model` on the wrap
-  false-matches. Match the model on the child, e.g.
-  `Get-CimInstance Win32_Process -Filter "ParentProcessId=<wrapPid>"` then read the child's
-  `--model <value>`. The operator-facing interactive agent is intentionally left unset.
+- When the value lives **only** in `supervisor.json`, a wrapped agent is idle until first
+  dispatched, so no CLI child exists and the model flag appears nowhere in the process tree
+  until it handles a message. (A `wrap --model`/explicit-tail model, by contrast, is already
+  on the wrapper argv.) Send it work, then inspect **while the turn is active** — a
+  short-lived child can exit before you look.
+- Inspect the **child** `claude.exe` / `codex.exe`, not the wrap: the wrapper's own command
+  line contains `python -m agenttalk`, which false-matches a naive `-m`/`--model` search.
+  The child spelling differs by provider — Claude passes `--model <m> --effort <e>`, Codex
+  passes `-m <m> -c model_reasoning_effort=<e>`. e.g.
+  `Get-CimInstance Win32_Process -Filter "ParentProcessId=<wrapPid>" | Select-Object ProcessId,Name,CommandLine`.
+  This is a best-effort diagnostic — CIM command-line access can be denied by OS policy, so
+  don't treat it as verification authority. Supervisor model/effort does not configure an
+  interactive liaison window (that is set in the window's own CLI), so an unset interactive
+  agent is expected, not a fault.
 
 Request a restart:
 

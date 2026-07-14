@@ -754,16 +754,19 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   judgment calls that belong to the operator and the team's working policy (principle #5 —
   human authority stays outside the mechanism). *Decision:* the governance policy lives in
   the manuals (`docs/AGENT-MANUAL.md` §1, `docs/USER-MANUAL.md` §8) and the skills, not in
-  code: configure STABLE role/task-class profiles and retune only on evidence (a model/effort
-  change resets the session, D-24); prefer a second INDEPENDENT lens over maxing one agent;
-  treat Codex (shared load-balanced pool — cap/stagger concurrent high turns, vary effort not
-  model) and Claude (weekly budget — sonnet workhorse, reserve opus) asymmetrically; reset
-  context at task boundaries or on drift (never mid-task, always checkpoint first) while noting
-  a reset is NOT independence; use a fresh, preferably different-model-family agent for an
+  code: configure STABLE role/task-class profiles and retune only on evidence (a change to the
+  *effective* model/effort resets a present baseline's session, D-24); prefer a second
+  INDEPENDENT lens over maxing one agent; treat Codex (shared load-balanced pool — cap/stagger
+  concurrent high turns, vary effort not model) and Claude (weekly budget — sonnet workhorse,
+  reserve opus) asymmetrically; reset context on scope discontinuity or contamination (not
+  electively at task end; mid-task only when necessary, always checkpoint first) while noting a
+  reset is NOT independence; use a fresh, preferably different-model-family agent for an
   independent review, giving it scope but not the build reasoning. The live roster/config is
   the source of truth; a cached or handed-off roster is stale (corollary of principle #1 /
-  D-2). *Ceiling:* this is discipline, not an enforced boundary — the core neither validates a
-  chosen profile against a task nor blocks a stale-roster dispatch.
+  D-2). *Ceiling:* this is discipline, not an enforced boundary — the core validates neither a
+  chosen profile against a task nor the effort token against a model at request time; `send`
+  rejects an off-roster/retired recipient, but nothing stops dispatching to the wrong
+  still-active recipient or missing a newly-added one.
 
 ## 6. How we work (process)
 

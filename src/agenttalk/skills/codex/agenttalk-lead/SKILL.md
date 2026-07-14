@@ -164,19 +164,23 @@ authoritative.
 ## Model, effort & context discipline (0.75.2)
 
 A supervised `wrap --loop` agent runs at a per-agent `model` +
-`reasoning_effort` from `supervisor.json` (0.75.0). Changing either RESETS
-that agent's session, so configure a STABLE profile per role and retune only
-on evidence - churn trades context and latency for marginal capability. Your
-own interactive window is whatever the operator set; this table is advisory
-for you, a wrap setting for the agents you plan.
+`reasoning_effort` (from `supervisor.json`, or a `wrap --model`/`--effort`
+launch tail, which wins). The wrapper fingerprints the EFFECTIVE value and
+resets that agent's session only when a present baseline's effective value
+CHANGES (an absent baseline is adopted, a tail-overridden edit is a no-op), so
+configure a STABLE profile per role and retune only on evidence. Your own
+interactive window is whatever the operator set in that CLI (not
+`supervisor.json`); this table is advisory for you, a wrap setting for the
+agents you plan.
 
 - **Baseline by task class.** Design/architecture: a strong model at high
-  effort (xhigh if novel or security-critical). Build: a mid model at
-  medium-high. Independent review: a strong model, ideally a DIFFERENT model
-  family than the builder, at high. Security/release/irreversible review: the
-  strongest model at high-xhigh. Test/QA: mid at medium. Routine
-  coordination/relay/acks: cheap and fast. (Codex: keep one validated primary
-  model and vary effort; Claude peers map to opus / sonnet / haiku.)
+  effort (xhigh if novel or security-critical). Build: a mid model at medium or
+  high. Independent review: a strong model, ideally a DIFFERENT model family
+  than the builder, at high. Security/release/irreversible review: the strongest
+  model at high or xhigh. Test/QA: mid at medium. Routine coordination/relay/acks:
+  cheap and fast. (Codex: keep one validated model — or leave it unset — and vary
+  the effort; Claude peers map to opus / sonnet / haiku.) Use discrete effort
+  tokens, not a hyphenated range.
 - **Escalate on evidence, never "just in case."** Raise the MODEL when
   judgment or novelty is the ceiling; raise EFFORT for depth on a hard,
   well-scoped problem. A second INDEPENDENT lens usually beats maxing one
@@ -188,18 +192,25 @@ for you, a wrap setting for the agents you plan.
   default (a model may reject it at request time - fall back visibly). Claude
   peers are weekly-budget bound: sonnet workhorse, reserve opus + top efforts
   for short high-risk passes.
-- **Reset vs fresh.** RESET an agent's context at a task/milestone boundary or
-  on any drift signal (a stale SHA/roster/verdict, conflated tasks, a repeated
-  corrected error), NEVER mid-task, and CHECKPOINT first (objective,
-  SHA/worktree, invariants, open threads, tests). A reset reduces stale context
-  but is NOT independence. For an INDEPENDENT review use a ONE-OFF FRESH agent
-  (didn't build it, didn't see the build reasoning), preferably a different
-  model family; give it scope and refs but not your conclusions. Independence is
-  not ignorance - a zero-context reviewer gives a shallow, false-clean GO.
+- **Reset vs fresh.** RESET an agent's context on a scope/domain discontinuity
+  or on contamination/drift (a stale SHA/roster/verdict, conflated tasks, a
+  repeated corrected error) - including mid-task when necessary, always
+  CHECKPOINT first (objective, SHA/worktree, invariants, open threads, tests)
+  and transfer any unresolved transaction; do NOT reset electively just because
+  a task ended. A reset reduces stale context but is NOT independence. For an
+  INDEPENDENT review use a ONE-OFF FRESH reviewer (didn't build it, didn't see
+  the build reasoning), preferably a different model family; give it scope and
+  refs but not your conclusions - independence is not ignorance, a zero-context
+  reviewer gives a shallow false-clean GO. The auditable bus mechanism is
+  `request-launch` / a one-shot `wrap` reviewer (evidence-only, never a signoff);
+  a host sub-agent is an advisory cross-check only, never a bus signoff or a
+  spawned bus worker.
 - **The live roster is authoritative.** Resolve membership, roles, the liaison,
-  and recipients from `python -m agenttalk roster` / `sync` / `whoami` at
-  act-time, NEVER from a memorized or handed-off roster; a cached roster fails
-  silently (a wrong recipient, a retired name, a missed reviewer).
+  and recipients from the live store at act-time (`python -m agenttalk roster` /
+  `whoami`; `sync` on a manual rejoin, not inside a wrapped turn), NEVER from a
+  memorized or handed-off roster. Sending off-roster/retired is rejected, but a
+  stale roster still bites where the bus can't catch it: the wrong still-active
+  recipient or a missed newly-added reviewer.
 
 ## Lead-loop, relay, and review modes (0.42.0)
 

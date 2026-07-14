@@ -86,10 +86,12 @@ PEER="${AGENTTALK_PEER:-claude}"
 In a team roster, use the sender, `meta.request_id`, and
 `python -m agenttalk roster` / `python -m agenttalk threads --for "$SELF"` to decide what
 is owed; do not assume every message comes from one peer. Resolve the
-roster and recipients from the LIVE store (`roster` / `sync` / `whoami`)
-each time you act - never from a memorized or handed-off roster, which
-goes stale silently. Always resolve inside your current shell - env from
-prior tool calls does not persist across separate tool-call processes.
+roster and recipients from the LIVE store each time you act - read-only
+`roster` / `whoami` are fine inside a wrapped turn (where `sync`/`threads`/
+`drain`/`recv`/`wait`/`ack` are off-limits); `sync` is for a manual
+bootstrap/rejoin. Never rely on a memorized or handed-off roster, which goes
+stale silently. Always resolve inside your current shell - env from prior
+tool calls does not persist across separate tool-call processes.
 
 If `.agenttalk/` is not under the current directory, pass `--root
 <path>` before the subcommand on every invocation, for example

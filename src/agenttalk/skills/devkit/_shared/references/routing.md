@@ -89,10 +89,10 @@ unique evidence).
   EVIDENCE ONLY (evidence_only=true, signoff_eligible=false), never a close signoff; a fresh
   rejection is a counter to disposition. Prefer one strong fresh review with a distinct
   question over several duplicate green reviews. Prefer a fresh reviewer of a DIFFERENT model
-  family than the builder - a same-family reviewer shares training blind spots and catches
-  fewer bug classes. Independence is not ignorance: give the fresh reviewer enough scope and
-  domain refs to be rigorous, but NOT the build reasoning or expected verdict (a zero-context
-  review is shallow and reads clean-but-wrong).
+  family than the builder - a same-family reviewer may share correlated blind spots.
+  Independence is not ignorance: give the fresh reviewer enough scope and domain refs to be
+  rigorous, but NOT the build reasoning or expected verdict (a zero-context review is shallow
+  and reads clean-but-wrong).
 
 ## Lead GO checklist
 
