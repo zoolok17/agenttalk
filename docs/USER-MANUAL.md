@@ -568,6 +568,18 @@ default.
 The agents' own model/effort, context-reset, and fresh-reviewer discipline is documented
 for them in `docs/AGENT-MANUAL.md` §1.
 
+**Verifying the flags reached the CLI.** Two things trip up a check done right after a
+relaunch:
+
+- A wrapped agent is **idle until first dispatched**, so no CLI child process exists yet
+  and `--model` appears **nowhere** in the process tree until it handles its first message.
+  Send it work, then check.
+- Inspect the **child** `claude.exe` / `codex.exe`, not the wrap. The wrapper's own command
+  line contains `python -m agenttalk`, so a naive search for `-m`/`--model` on the wrap
+  false-matches. Match the model on the child, e.g.
+  `Get-CimInstance Win32_Process -Filter "ParentProcessId=<wrapPid>"` then read the child's
+  `--model <value>`. The operator-facing interactive agent is intentionally left unset.
+
 Request a restart:
 
 ```powershell
