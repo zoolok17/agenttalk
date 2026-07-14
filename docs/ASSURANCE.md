@@ -95,6 +95,41 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.75.3 - BOM defense-in-depth across the PowerShell/Python file boundary (2026-07-14)
+**GOOD / ROBUST / SECURE** - reviewed-SHA `5caa001` - tag `v0.75.3`
+- **Origin:** the 2026-07-14 orbit-launcher incident (`docs/agenttalk-incident-report-20260714.md`).
+  Verdict: the "all CLIs crashed" symptom was a **Windows Terminal segfault, not agenttalk**;
+  the report's headline "state-write BOM bug" was **already fixed** in 0.75.1 (the atomic state
+  writer is BOM-free). An **exhaustive 5-agent audit workflow** of every PS-writes↔Python/PS-reads
+  encoding pair then found the *real* residual: the codex-home `config.toml` empty-seed wrote a
+  BOM-only file under Windows PowerShell 5.1 → duplicate `[projects]` tables → invalid TOML → the
+  wrapped Codex agent couldn't start.
+- **Review:** two independent reviewers on the exact final SHA `5caa001`, both APPROVED. The
+  cross-family reviewer (`codex-agenttalk-reviewer-1`) drove **three** rounds of reproduced
+  CHANGES_REQUESTED that the same-family reviewer had approved past — each legitimate and
+  progressively deeper (round 1: the fix repaired *clean* input but not already-corrupted users +
+  D-26 missed `domains.json`/`signoffs.json`; round 2: the self-heal sat in `codex_config`, not the
+  `codex_config_overlay` the launch seed actually uses; round 3: the collapse compared *raw* header
+  text, so a semantically-equal `[projects."x"]`+`[projects.'x']` still wasn't healed). Every finding
+  was reproduced against the code before folding; the final semantic, project-scoped repair actually
+  heals the launch path (verified by driving the real `supervise --seed-codex-config`).
+- **Verification / lead gate** on the exact ship SHA: full suite green on Python 3.14 (`2456 passed,
+  5 skipped`) and Python 3.10 (`2452 passed, 5 skipped, 4 deselected`; the four are the pre-existing
+  gate-venv timing flakes). Ruff, `bandit -r src -x src/agenttalk/skills`, gitleaks
+  (`94a0dc4..5caa001`, no leaks), and `git diff --check` all passed. The generated `supervisor.ps1`
+  **AST-parses with 0 errors under Windows PowerShell 5.1**, and a functional 5.1 probe confirmed the
+  new `WriteAllText(UTF8Encoding($false))` writes emit no BOM while the old `Set-Content -Encoding
+  utf8` emitted `EF BB BF`. 12 BOM regression tests (incl. the real double-vs-literal seed repair).
+- **Robust/Secure:** the `utf-8-sig` reader changes are pure wideners (plain UTF-8 decodes
+  identically; only a leading BOM is stripped); the PS writer paths are all absolute and no more
+  non-atomic than the `Set-Content` they replaced; the duplicate-collapse is project-scoped and
+  never drops unrelated operator tables. New decision **D-26** records the BOM-free-write +
+  BOM-tolerant-read invariant. Known limitation carried forward: a separate `cli.py:2905` wrong-path
+  bug (the encoding was fixed here; the path change is deferred as it activates dormant lane/close
+  logic — tracked P3 in `docs/ISSUES.md`).
+- **CI:** GitHub `tests` + `security` workflows watched on the exact release commit; run ids
+  recorded in the GitHub release.
+
 ### v0.75.2 - governance policy: model/effort selection, live-roster discipline, context lifecycle (2026-07-14)
 **GOOD / ROBUST / SECURE** - reviewed-SHA `3be2a37` - tag `v0.75.2`
 - **Review:** two independent verifications on the exact final SHA `3be2a37`, both APPROVED.

@@ -110,7 +110,7 @@ reasoning-effort is a launch-time typo guard, not a per-model validator (e.g. Co
 
 ---
 
-## v0.75.3 (2026-07-14) — BOM defense-in-depth + supervisor docs (from the incident audit)
+## SHIPPED (v0.75.3, 2026-07-14) — BOM defense-in-depth + supervisor docs (from the incident audit)
 
 **What.** An exhaustive audit (workflow) of every PowerShell-writes ↔ Python/PS-reads
 encoding pair. Under **Windows PowerShell 5.1**, `Set-Content -Encoding utf8` emits a UTF-8
@@ -132,8 +132,8 @@ self-matching-`CommandLine` forensics gotcha, state-encoding robustness note. 12
 tests. Root-caused from the orbit-launcher 2026-07-14 incident (`docs/agenttalk-incident-report-20260714.md`);
 the "all CLIs crashed" symptom itself was a Windows Terminal segfault, **not** agenttalk.
 
-**Disposition.** Built + reviewed on the final SHA; ships as `v0.75.3` once lead-gated
-(3.10+3.14) and merged. (This heading flips to `SHIPPED` with the release commit + tag.)
+**Disposition.** `SHIPPED v0.75.3` (reviewed-SHA `5caa001`, both reviewers APPROVED on the
+final SHA after 3 cross-family fold rounds; lead-gated 3.10+3.14 + PS-5.1 parse/functional).
 
 ---
 

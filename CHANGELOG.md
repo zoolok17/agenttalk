@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.75.3] - 2026-07-14
+
+### Fixed
+
+- **BOM defense-in-depth across the PowerShell↔Python file boundary** (from an exhaustive
+  audit prompted by the 2026-07-14 orbit-launcher incident; the "all CLIs crashed" symptom
+  itself was a Windows Terminal crash, **not** agenttalk). Under **Windows PowerShell 5.1**,
+  `Set-Content -Encoding utf8` writes a UTF-8 BOM that a strict Python reader rejects and a
+  TOML section scan mishandles.
+  - **Live bug:** the per-agent codex-home `config.toml` empty-seed wrote a BOM-only file
+    under 5.1, which skewed the `[projects]` section scan into **duplicate tables → invalid
+    TOML the codex CLI refuses → the wrapped Codex agent couldn't start**. The two PowerShell
+    JSON/TOML writers (`Get-ProcSnapshot`, the config.toml seed) now write **BOM-free** via
+    `WriteAllText(UTF8Encoding($false))`.
+  - **Self-repair:** the launch seed (`supervise --seed-codex-config`) and `codex-config
+    --enable`/`--disable` now **collapse duplicate `[projects]` tables** (a semantic,
+    project-scoped match, so an operator's `[projects."x"]` and agenttalk's `[projects.'x']`
+    for the same path are recognized as one), and `codex-config --status` + `doctor` **warn**
+    on a duplicated config instead of reporting it healthy — so an already-corrupted machine
+    heals on the next launch.
+  - **BOM-tolerant reads:** every reader of an operator-authored or PowerShell-written config
+    now decodes with `utf-8-sig` — supervisor `settings.json`/`hooks.json` (a BOM no longer
+    silently skips the merge), `config.toml`, `supervisor-state.json` (the one strict outlier),
+    `domains.json`, and `signoffs.json`. (agenttalk's own atomically-written artifacts are
+    BOM-free by construction and unchanged.) See decision **D-26**.
+- Docs: prefer the **pwsh 7** host, don't host the whole fleet in one Windows Terminal
+  (single point of failure), and the self-matching-`CommandLine` process-forensics gotcha.
+
 ## [0.75.2] - 2026-07-14
 
 ### Changed
