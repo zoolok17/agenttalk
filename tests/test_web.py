@@ -3427,6 +3427,36 @@ hooks.renderActiveView();
   assert(/out of date|stale/i.test(stext),
     `stale-attention: should say the queue status is out of date: ${stext}`);
 }
+
+// v0.76.0 (codex r5b P1): a stale NON-EMPTY attention payload preserves its last-known cards
+// but must QUALIFY them (banner + "N open · stale"), never present an unqualified current
+// "N open" while the topbar says the feed is uncertain.
+{
+  hooks.setPayloads(Object.assign({}, payloads, {
+    attentionData: Object.assign({}, payloads.attentionData, { _fetchedAt: 0 }),  // stale, 2 items, no errors
+  }));
+  hooks.state.now = 600000;   // aged-out beyond ATTENTION_STALE_MS
+  hooks.state.view = 'attention';
+  hooks.state.selectedRootId = root.project_id;
+  hooks.state.selectedAgent = null;
+  hooks.state.sessionRid = null;
+  hooks.state.filter = 'all';
+  main.children = [];
+  main.firstChild = null;
+  main.textContent = '';
+  hooks.renderChrome();
+  hooks.renderActiveView();
+  const nstext = collectText(main).replace(/\s+/g, ' ').trim();
+  assert(/last-known|out of date|Reconnecting/i.test(nstext),
+    `stale-nonempty-attention: must show a stale/last-known banner: ${nstext}`);
+  assert(nstext.includes('stale'),
+    `stale-nonempty-attention: header must qualify the count as stale (not a bare "N open"): ${nstext}`);
+  assert(nstext.includes('Operator decision needed'),
+    `stale-nonempty-attention: last-known cards must still be preserved: ${nstext}`);
+  const tb3 = collectText(topbar).replace(/\s+/g, ' ').trim();
+  assert(!tb3.includes('Healthy') && !/nothing needs you/.test(tb3),
+    `stale-nonempty-attention: topbar must not read all-clear: ${tb3}`);
+}
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)

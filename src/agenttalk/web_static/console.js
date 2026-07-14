@@ -1820,12 +1820,14 @@
     var items = (attentionData && attentionData.items) || [];
     var errs = (attentionData && isArray(attentionData.errors)) ? attentionData.errors : [];
     var fresh = attentionFresh();   // false when null, error-as-data, or aged-out stale
+    var stale = !!attentionData && !errs.length && !fresh;   // aged-out last-known, no errors
     var count = attentionData && typeof attentionData.count === 'number' ? attentionData.count : items.length;
-    // Never assert "0 open" from an untrustworthy payload: an error-as-data 200 is
-    // "status unknown"; a stale-but-empty payload is "status stale". A real, fresh
-    // count is shown as "N open".
+    // Never assert a current "N open" from an untrustworthy payload: error-as-data is
+    // "status unknown"; a STALE payload is qualified — "status stale" when empty, or
+    // "N open · stale" when we're showing last-known cards. Only a FRESH payload claims
+    // an unqualified "N open".
     var countLabel = errs.length ? 'status unknown'
-      : (attentionData && !fresh && !items.length) ? 'status stale'
+      : stale ? (items.length ? (count + ' open · stale') : 'status stale')
       : (count + ' open');
     header.appendChild(el('span', 'tc-attn-count', countLabel));
     wrap.appendChild(header);
@@ -1841,6 +1843,10 @@
       // — the topbar verdict already gates on staleness and this view must match it.
       wrap.appendChild(fresh ? attentionEmpty() : attentionStale());
     } else {
+      // Non-empty: preserve the last-known cards, but if the feed is STALE, qualify them
+      // as last-known/out-of-date (codex r5b P1 — don't present obsolete items as current
+      // authority, and don't show an unqualified "N open").
+      if (stale) wrap.appendChild(attentionStaleBanner());
       var list = el('div', 'tc-attn-list');
       for (var i = 0; i < items.length; i++) list.appendChild(attentionCard(items[i]));
       wrap.appendChild(list);
@@ -1979,6 +1985,15 @@
     card.appendChild(el('div', 'tc-empty-title', 'All clear'));
     card.appendChild(el('div', 'tc-empty-text', 'Nothing is waiting on you right now.'));
     return card;
+  }
+
+  // Slim banner above a NON-empty but STALE queue: the cards are last-known and may already
+  // be resolved, so they must not read as current authority (codex r5b P1).
+  function attentionStaleBanner() {
+    var b = el('div', 'tc-attn-stale-banner');
+    b.appendChild(el('span', null,
+      'Showing the last-known queue — the feed is out of date, so these may already be resolved. Reconnecting…'));
+    return b;
   }
 
   // Shown when the attention payload is STALE (aged-out, no errors): last-good data may

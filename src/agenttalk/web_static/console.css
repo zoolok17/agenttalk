@@ -1251,6 +1251,16 @@ body {
 /* Attention-queue collection failure (error-as-data 200) — warn, NOT a green all-clear. */
 .tc-empty.is-error { border-color: var(--warn); background: var(--warn-soft); }
 .tc-empty.is-error .tc-empty-title { color: var(--warn); }
+/* Stale non-empty queue banner: last-known cards, qualified as out-of-date. */
+.tc-attn-stale-banner {
+  border: 1px solid var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
 
 /* Degraded-root error line */
 .tc-root-error {
