@@ -130,8 +130,8 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
   generation -> UNKNOWN / no warning, never a false DOWN or a brick); only 4 consult/handoff skills
   adopt the flag, all other skills and manual scoped wait unchanged. Honest ceiling (recorded): with
   signing off, edges rest on the from/to/request_id honest-local assumption.
-- **CI:** GitHub `tests` + `security` workflows watched on the exact release commit; run ids recorded
-  in the GitHub release.
+- **CI:** GitHub `tests` (`29398648067`) + `security` (`29398648065`) on the exact release commit
+  `c000f7f` — **both green on the first attempt** (no flake re-run needed).
 
 ### v0.76.1 - Knowledge base: lessons visible by default + hardened curate/provenance boundary (2026-07-15)
 **GOOD / ROBUST / SECURE** - reviewed-SHA `79b6c8f` - tag `v0.76.1`
