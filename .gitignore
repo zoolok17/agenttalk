@@ -74,3 +74,9 @@ htmlcov/
 /docs/audit-wrapped-*.md
 /docs/full-codebase-review-*.md
 /docs/skill_proposals.md
+
+# --- Secrets: never commit API keys/tokens ---
+docs/ovhcloud_api_key.txt
+*api_key*
+*.pat
+.secrets/

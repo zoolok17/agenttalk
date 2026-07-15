@@ -273,6 +273,12 @@ timing only, no product defect):
   `capfd` capture raced the write (macOS-3.11). Hardened with `_read_stderr_until` — a
   bounded poll that accumulates drained `capfd` output until the needles appear or a
   timeout, assertions unchanged (a real missing-traceback regression still fails).
+  **RE-FLAKED in the v0.78.1 CI (2026-07-15): same test, single Windows cell (3.11 then
+  3.10 on consecutive runs), re-run green.** The `_read_stderr_until` bounded poll's
+  default timeout still loses the race on a heavily-loaded runner even after the assertion
+  was retargeted to `"RuntimeError: boom"`. The systematic hardening pass should lengthen
+  the poll deadline / wait-for-condition on the handler-thread flush so this stops
+  rotating through CI cells. Still timing-only, no product defect.
 - **OPEN** — `tests/test_work_heartbeat.py::test_make_drive_long_silent_claude_turn_stays_live_and_ends_fresh`
   (~line 358) asserts `status["stamps"] >= 2` — the work-heartbeat ticker (0.05s interval)
   is expected to fire ≥2× during a 0.5s silent child turn, but a starved ticker thread on
