@@ -47,12 +47,66 @@ def _windows_only_functions(path: Path) -> set[str]:
     }
 
 
+def _requires_known_process_start_token(node: ast.AST) -> bool:
+    token_names = {
+        target.id
+        for item in ast.walk(node)
+        if isinstance(item, ast.Assign)
+        and any(
+            isinstance(descendant, ast.Call)
+            and isinstance(descendant.func, ast.Name)
+            and descendant.func.id == "_process_start_token"
+            for descendant in ast.walk(item.value)
+        )
+        for target in item.targets
+        if isinstance(target, ast.Name)
+    }
+    for item in ast.walk(node):
+        if not isinstance(item, ast.Assert) or not isinstance(item.test, ast.Compare):
+            continue
+        comparison = item.test
+        if len(comparison.ops) != 1 or not isinstance(comparison.ops[0], ast.IsNot):
+            continue
+        operands = (comparison.left, *comparison.comparators)
+        has_none = any(
+            isinstance(operand, ast.Constant) and operand.value is None
+            for operand in operands
+        )
+        has_token = any(
+            isinstance(operand, ast.Name) and operand.id in token_names
+            for operand in operands
+        )
+        if has_none and has_token:
+            return True
+    return False
+
+
 def test_mixed_powershell_modules_guard_only_windows_specific_tests() -> None:
     actual = {
         filename: _windows_only_functions(TESTS / filename)
         for filename in EXPECTED_WINDOWS_ONLY
     }
     assert actual == EXPECTED_WINDOWS_ONLY
+
+
+def test_portable_powershell_tests_allow_unknown_process_start_tokens() -> None:
+    paths = sorted(TESTS.glob("test_powershell_*.py")) + [
+        TESTS / "test_supervisor_lifecycle.py",
+    ]
+    violations: set[str] = set()
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if any(
+                _decorator_name(item) == "WINDOWS_ONLY"
+                for item in node.decorator_list
+            ):
+                continue
+            if _requires_known_process_start_token(node):
+                violations.add(f"{path.name}::{node.name}")
+    assert violations == set()
 
 
 def test_real_powershell_module_skips_only_outside_win32() -> None:

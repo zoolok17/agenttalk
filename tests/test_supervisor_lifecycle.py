@@ -418,12 +418,22 @@ def test_lifecycle_barrier_blocks_claim_select_and_refresh_without_mutation(
 def test_generic_python_claim_remains_host_agnostic(tmp_path: Path) -> None:
     store = _store(tmp_path)
     start = _process_start_token(os.getpid())
-    assert start is not None
     claim = store.claim_supervisor_instance(pid=os.getpid(), pid_start=start)
     assert claim is not None
+    assert claim["pid_start"] == start
     assert not lifecycle.selection_path(store).exists()
     assert store.release_supervisor_instance(
         token=claim["token"], pid=os.getpid(), pid_start=start,
+    )
+
+
+def test_generic_python_claim_accepts_unknown_process_start(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    claim = store.claim_supervisor_instance(pid=os.getpid(), pid_start=None)
+    assert claim is not None
+    assert claim["pid_start"] is None
+    assert store.release_supervisor_instance(
+        token=claim["token"], pid=os.getpid(), pid_start=None,
     )
 
 

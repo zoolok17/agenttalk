@@ -167,16 +167,25 @@ def test_partial_replace_is_detected_cleaned_and_rerunnable(
     sup.validate_artifact_bundle(store, python_exe=r"C:\PythonB\python.exe")
 
 
-def test_live_instance_refuses_refresh_with_zero_replacements(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "unknown_start",
+    [False, True],
+    ids=["observed-start", "unknown-start"],
+)
+def test_live_instance_refuses_refresh_with_zero_replacements(
+    tmp_path: Path,
+    unknown_start: bool,
+) -> None:
     store = _store(tmp_path)
     sup.init(store, python_exe=r"C:\PythonA\python.exe")
     before = {
         relative: (store.dir / Path(relative)).read_bytes()
         for relative in sup.ARTIFACT_RELATIVE_PATHS
     }
-    start = _process_start_token(os.getpid())
-    assert start is not None
-    assert store.claim_supervisor_instance(pid=os.getpid(), pid_start=start)
+    start = None if unknown_start else _process_start_token(os.getpid())
+    claim = store.claim_supervisor_instance(pid=os.getpid(), pid_start=start)
+    assert claim is not None
+    assert claim["pid_start"] == start
 
     with pytest.raises(supervisor_lifecycle.SupervisorLifecycleError, match="live or unqueryable"):
         sup.refresh_artifacts(store, python_exe=r"C:\PythonB\python.exe")

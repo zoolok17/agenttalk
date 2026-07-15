@@ -158,8 +158,7 @@ def test_thread_route_real_error_returns_500_and_logs(
         srv.shutdown()
         srv.server_close()
 
-    err = _read_stderr_until(capfd, ("Traceback", "RuntimeError: boom"))
-    assert "Traceback" in err
+    err = _read_stderr_until(capfd, ("RuntimeError: boom",))
     assert "RuntimeError: boom" in err
 
 

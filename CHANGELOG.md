@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   host cases.** Windows path, process, selection, and Scheduled Task assertions
   skip on Linux and macOS, while portable policy, fingerprint, artifact marker,
   generation, parsing, and diagnostic tests continue to run on every platform.
+- Portable supervisor tests now tolerate unavailable process-start tokens on
+  macOS, and web error-log assertions no longer depend on Python's traceback
+  header format.
 
 ## [0.78.0] - 2026-07-15
 
