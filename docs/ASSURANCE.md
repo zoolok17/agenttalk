@@ -95,6 +95,46 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.76.1 - Knowledge base: lessons visible by default + hardened curate/provenance boundary (2026-07-15)
+**GOOD / ROBUST / SECURE** - reviewed-SHA `79b6c8f` - tag `v0.76.1`
+- **Origin:** the orbit-launcher lead's report that the shipped knowledge subsystem's notes were
+  invisible in the default views (zero team uptake). Reproduced against our own store — `knowledge
+  pull` / `onboard` / `search` / `pull --domain` all returned 0 while curated process-lessons
+  existed — and traced to a pointer-note-only default view that hard-skipped lessons, plus a global
+  registry-hash staleness that hard-hid the whole base on any `domains.json` edit, and one-at-a-time
+  publish validation.
+- **Fix:** one mixed retrieval pipeline (pointer notes AND lessons in the defaults; `--scope`/`--tags`
+  select lessons; a versioned `knowledge-view-v1` JSON envelope with a `--output-schema legacy`
+  escape); per-domain scoped freshness (an unrelated `domains.json` edit is a caution, not a base-wide
+  hard-stale; `curate verify`/`retract` re-stamp); aggregated publish preflight; a first-class virtual
+  `process` domain for cross-cutting lessons; and a hardened causal-curation fold. New decision **D-27**.
+- **Review:** builder was `codex-agenttalk-developer-3` (the usual builder, `claude-agenttalk-developer-2`,
+  was down on a Claude rate-limit). Three independent reviewers on the exact final SHA `79b6c8f`, all
+  APPROVED. The cross-family adversarial reviewer (`codex-agenttalk-reviewer-1`) drove **four** reproduced
+  CHANGES_REQUESTED rounds on the curate/provenance boundary — each a real, reproduced forgeable-provenance
+  hole with observable consumer impact: a forged curate that (r1) referenced a stale parent to regress
+  authority / reopen a tombstone, (r2) mutated `supersedes` to hide an unrelated accepted lesson, (r3)
+  rewrote `author` to poison `roster --expertise`, and (r4) forged `created_at` shown on the dashboard.
+  These converged to an **event-level exhaustive-partition integrity invariant**: every persisted event
+  field is classified BOUND (hashed into the immutable causal payload) xor CURATION-MUTABLE, both sets
+  pinned to exact literals with a construction test, so a future field left unclassified — or
+  misclassified — fails the test. The class is closed by construction, not by whack-a-mole. The lead
+  confirmed the primary acceptance (the two previously-invisible lessons now surface) live against the
+  real ledger before and on every round. A textbook live validation of both-reviewers-on-the-final-SHA
+  + reproduce-don't-believe on a security-sensitive path agents rely on for shared truth.
+- **Verification / lead gate** on the exact ship SHA: full suite green on Python 3.14 (`2513 passed,
+  5 skipped`) and Python 3.10 (`2509 passed, 5 skipped, 4 deselected`; the four are the pre-existing
+  gate-venv timing flakes). Ruff, `bandit -r src -x src/agenttalk/skills`, gitleaks (`d7bc9ec..79b6c8f`,
+  no leaks), `compileall`, and `git diff --check` all passed.
+- **Robust/Secure:** the fail-safe JSONL reader + lock/skip-invalid contract is preserved (a torn or
+  forged line never hides a prior valid row); the causal fold anchors on the current predecessor and
+  binds complete inherited content, so a forged curate cannot regress authority, reopen a tombstone,
+  hide another lesson, or forge attribution/creation-time; scoped freshness fails closed on out-of-band
+  registry edits. Display-adjacent consumers (`roster --expertise`, the dashboard learning view) now
+  read integrity-bound provenance.
+- **CI:** GitHub `tests` + `security` workflows watched on the exact release commit; run ids recorded
+  in the GitHub release.
+
 ### v0.76.0 - Team Console C0-legibility + honest-under-failure health signalling (2026-07-15)
 **GOOD / ROBUST / SECURE** - reviewed-SHA `5b95b5b` - tag `v0.76.0`
 - **Origin:** an operator ask for "quick and easy dashboard wins for a zero-context (C0),
