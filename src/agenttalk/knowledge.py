@@ -110,6 +110,35 @@ LESSON_TEXT_MAX_BYTES = 500
 LESSON_TAG_LIMIT = 16
 LESSON_SUPERSEDES_LIMIT = 16
 
+_AUTHORITY_FIELDS = frozenset({"state", "resolved_from", "reason"})
+_ANCHOR_FIELDS_BY_KIND = {
+    "path": frozenset({"kind", "path", "anchor_evidence"}),
+    "symbol": frozenset({"kind", "path", "symbol", "anchor_evidence"}),
+    "request": frozenset({"kind", "request_id", "msg_id", "anchor_evidence"}),
+    "wp": frozenset({"kind", "mission", "wp_id", "path", "anchor_evidence"}),
+    "sha": frozenset({"kind", "sha", "anchor_evidence"}),
+}
+_LESSON_BASE_FIELDS = frozenset({
+    "scope", "trigger", "evidence_ref", "applies_to", "owner", "status",
+    "review_after", "expires_at", "supersedes", "anchor",
+})
+_EVENT_BASE_FIELDS = frozenset({
+    "schema_version", "event", "id", "key", "type", "domain_id", "body",
+    "verified_against_sha", "domain_registry_hash", "domain_definition_hash",
+    "authority", "updated_at", "supersedes_id", "supersedes_key", "author",
+    "created_at",
+})
+_EVENT_FIELDS_BY_KIND = {
+    EVENT_PUBLISH: _EVENT_BASE_FIELDS,
+    EVENT_CURATE: _EVENT_BASE_FIELDS | frozenset({
+        "curated_by", "curated_at", "curates_id", "payload_hash",
+    }),
+    EVENT_RETRACT: _EVENT_BASE_FIELDS | frozenset({
+        "curated_by", "curated_at", "curates_id", "payload_hash",
+        "retract_reason",
+    }),
+}
+
 
 class KnowledgeError(ValueError):
     """Invalid knowledge input / state (CLI maps to a usage exit)."""
@@ -164,22 +193,21 @@ def effective_domain(domain_id: str, note_type: str,
 
 
 def immutable_payload(note: dict[str, Any]) -> dict[str, Any]:
-    """Return the curation-bound semantic payload from an explicit whitelist."""
+    """Return curation-bound content, excluding mutable verification metadata."""
     note_type = validate_type(note.get("type"))
     payload: dict[str, Any] = {
         "domain_id": note.get("domain_id"),
         "key": validate_key(note.get("key")),
         "type": note_type,
         "body": validate_body(note.get("body")),
-        "verified_against_sha": note.get("verified_against_sha"),
     }
     if note_type == TYPE_LESSON:
         lesson = validate_lesson(note.get("lesson"))
         semantic_lesson = {
             key: lesson.get(key)
             for key in (
-                "scope", "trigger", "evidence_ref", "applies_to", "owner",
-                "review_after", "expires_at", "supersedes", "anchor",
+                "scope", "trigger", "evidence_ref", "applies_to",
+                "review_after", "expires_at", "anchor",
             )
             if lesson.get(key) is not None
         }
@@ -496,6 +524,97 @@ def new_curate_event(*, base: dict, action: str, curated_by: str, resolved_from:
 
 # --------------------------------------------------------------- current view
 
+def _event_allowed_fields(event: str, note_type: str) -> frozenset[str]:
+    note_field = "lesson" if note_type == TYPE_LESSON else "anchor"
+    return _EVENT_FIELDS_BY_KIND[event] | frozenset({note_field})
+
+
+def _unexpected_fields(raw: object, allowed: frozenset[str], label: str) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    extras = sorted(set(raw) - allowed)
+    if not extras:
+        return None
+    return f"unexpected {label} field(s): {', '.join(extras)}"
+
+
+def _anchor_schema_problem(raw: object) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    allowed = _ANCHOR_FIELDS_BY_KIND.get(
+        raw.get("kind"), frozenset({"kind", "anchor_evidence"}))
+    return _unexpected_fields(raw, allowed, "anchor")
+
+
+def _event_schema_problem(evt: dict, event: str, note_type: str) -> str | None:
+    problem = _unexpected_fields(
+        evt, _event_allowed_fields(event, note_type), "top-level")
+    if problem is not None:
+        return problem
+    problem = _unexpected_fields(evt.get("authority"), _AUTHORITY_FIELDS, "authority")
+    if problem is not None:
+        return problem
+    if note_type == TYPE_LESSON:
+        lesson = evt.get("lesson")
+        lesson_fields = _LESSON_BASE_FIELDS | (
+            frozenset({"curator"}) if event != EVENT_PUBLISH else frozenset())
+        problem = _unexpected_fields(lesson, lesson_fields, "lesson")
+        if problem is not None:
+            return problem
+        if isinstance(lesson, dict) and lesson.get("anchor") is not None:
+            return _anchor_schema_problem(lesson.get("anchor"))
+        return None
+    return _anchor_schema_problem(evt.get("anchor"))
+
+
+def _is_legacy_persisted_event(evt: object) -> bool:
+    return isinstance(evt, dict) and all(
+        evt.get(field) is None
+        for field in ("domain_definition_hash", "curates_id", "payload_hash")
+    )
+
+
+def _canonical_anchor(raw: object) -> object:
+    if not isinstance(raw, dict):
+        return raw
+    allowed = _ANCHOR_FIELDS_BY_KIND.get(
+        raw.get("kind"), frozenset({"kind", "anchor_evidence"}))
+    return {key: value for key, value in raw.items() if key in allowed}
+
+
+def _canonical_legacy_event(evt: object) -> object:
+    """Drop unknown fields from historical rows before validation and output."""
+    if not _is_legacy_persisted_event(evt):
+        return evt
+    event = evt.get("event")
+    note_type = evt.get("type")
+    if event not in _EVENT_FIELDS_BY_KIND or note_type not in NOTE_TYPES:
+        return evt
+    allowed = _event_allowed_fields(event, note_type)
+    out = {key: value for key, value in evt.items() if key in allowed}
+    authority = out.get("authority")
+    if isinstance(authority, dict):
+        out["authority"] = {
+            key: value for key, value in authority.items()
+            if key in _AUTHORITY_FIELDS
+        }
+    if note_type == TYPE_LESSON:
+        lesson = out.get("lesson")
+        if isinstance(lesson, dict):
+            lesson_fields = _LESSON_BASE_FIELDS | (
+                frozenset({"curator"}) if event != EVENT_PUBLISH else frozenset())
+            clean_lesson = {
+                key: value for key, value in lesson.items()
+                if key in lesson_fields
+            }
+            if clean_lesson.get("anchor") is not None:
+                clean_lesson["anchor"] = _canonical_anchor(clean_lesson["anchor"])
+            out["lesson"] = clean_lesson
+    elif out.get("anchor") is not None:
+        out["anchor"] = _canonical_anchor(out["anchor"])
+    return out
+
+
 def event_problem(evt: object) -> str | None:
     """FULL structural validation of one persisted event AS AN EVENT - the reader/
     fold use this so a JSON-valid-but-malformed line can NEVER become current, hide a
@@ -512,6 +631,13 @@ def event_problem(evt: object) -> str | None:
     event = evt.get("event")
     if event not in (EVENT_PUBLISH, EVENT_CURATE, EVENT_RETRACT):
         return "event must be publish|curate|retract"
+    try:
+        note_type = validate_type(evt.get("type"))
+    except KnowledgeError as e:
+        return str(e)
+    schema_problem = _event_schema_problem(evt, event, note_type)
+    if schema_problem is not None:
+        return schema_problem
     for key in ("id", "key", "domain_id"):
         if not isinstance(evt.get(key), str) or not evt.get(key):
             return f"{key} is required"
@@ -567,7 +693,6 @@ def event_problem(evt: object) -> str | None:
     try:
         validate_key(evt["key"])
         validate_note_id(evt["id"])
-        note_type = validate_type(evt.get("type"))
         validate_body(evt.get("body"))
         if note_type == TYPE_LESSON:
             lesson = validate_lesson(evt.get("lesson"))
@@ -607,9 +732,9 @@ def _curation_causal_problem(evt: dict, prior: list[dict]) -> str | None:
             return "legacy curation payload differs from its prior current event"
         return None
 
-    parent = next((row for row in prior if row.get("id") == curates_id), None)
-    if parent is None:
-        return "curates_id does not reference a prior valid same-key event"
+    parent = prior[-1]
+    if curates_id != parent.get("id"):
+        return "curates_id does not reference the current prior same-key event"
     parent_hash = payload_hash(parent)
     if semantic_hash != parent_hash:
         return "payload_hash does not match the referenced prior event"
@@ -628,7 +753,8 @@ def resolve_views_with_problems(
     out: dict[tuple, dict] = {}
     history: dict[tuple, list[dict]] = {}
     problems: list[dict] = []
-    for line, evt in enumerate(events, 1):
+    for line, raw_evt in enumerate(events, 1):
+        evt = _canonical_legacy_event(raw_evt)
         structural = event_problem(evt)
         if structural is not None:
             problems.append({"line": line, "error": f"malformed event: {structural}"})
@@ -693,11 +819,13 @@ def compute_domain_freshness(
     """Evaluate only registry/domain freshness for pointer and lesson views."""
     reasons: list[str] = []
     cautions: list[str] = []
+    stored_subject_hash = note.get("domain_definition_hash")
+    if stored_subject_hash is None:
+        cautions.append(CAUTION_LEGACY_UNSCOPED)
     if not domain_exists:
         reasons.append(STALE_DOMAIN_GONE)
         return {"stale_reasons": reasons, "caution_flags": cautions}
 
-    stored_subject_hash = note.get("domain_definition_hash")
     global_changed = (
         current_registry_hash is not None
         and note.get("domain_registry_hash") != current_registry_hash
@@ -707,13 +835,8 @@ def compute_domain_freshness(
             reasons.append(STALE_DOMAIN_DEFINITION_CHANGED)
         elif global_changed:
             cautions.append(CAUTION_REGISTRY_CHANGED)
-    elif global_changed:
-        # Historical rows cannot prove which registry subject changed. Keep them
-        # readable but make that weaker freshness visible to consumers.
-        cautions.append(
-            CAUTION_LEGACY_UNSCOPED if stored_subject_hash is None
-            else CAUTION_REGISTRY_CHANGED
-        )
+    elif global_changed and stored_subject_hash is not None:
+        cautions.append(CAUTION_REGISTRY_CHANGED)
     return {"stale_reasons": reasons, "caution_flags": cautions}
 
 
@@ -1089,6 +1212,7 @@ def read_events(store) -> tuple[list[dict], list[dict]]:
             except ValueError as e:
                 problems.append({"line": n, "error": f"invalid json: {e}"})
                 continue
+            evt = _canonical_legacy_event(evt)
             if not _is_wellformed(evt):
                 problems.append({"line": n, "error": "malformed event (missing required structure)"})
                 continue

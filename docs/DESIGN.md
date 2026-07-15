@@ -822,13 +822,19 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   stale, an unrelated global change is caution, and legacy unscoped rows remain
   visible with caution. The lesson-only virtual `process` policy has a fixed subject
   hash and yields to a real registry entry. New curate/retract rows carry
-  `curates_id` and a hash of an explicit immutable-payload whitelist; the fold accepts
-  them only after a matching prior event. Curate holds the shared config/knowledge
-  lock, re-reads the registry before append, and re-stamps both hashes. Publish
-  aggregates independent field errors before registry, Git, or ledger I/O and refuses
-  changing a live key's type. *Compatibility ceiling:* legacy curation has no causal id
-  or subject hash, so it is accepted only when its payload matches the prior current
-  event and its registry freshness is necessarily advisory until re-verification.
+  `curates_id` and a hash of an explicit content whitelist; the fold accepts them only
+  when they name the current prior same-key event and their content matches it.
+  Verification metadata such as `verified_against_sha` is deliberately outside that
+  content identity. Modern rows reject unknown event/authority/lesson/anchor fields;
+  historical rows are canonicalized to the same allowlists before folding or output.
+  Curate holds the shared config/knowledge lock, re-reads the registry before append,
+  and re-stamps both hashes. That A/B check covers supported writers that honor the
+  lock. An out-of-band hand edit can bypass it; the per-event subject hash then fails
+  closed by making the appended event hard-stale on its first read. Publish aggregates
+  independent field errors before registry, Git, or ledger I/O and refuses changing a
+  live key's type. *Compatibility ceiling:* legacy curation has no causal id or subject
+  hash, so it is accepted only when its content matches the prior current event and its
+  registry freshness is necessarily advisory until re-verification.
 
 ## 6. How we work (process)
 

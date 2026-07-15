@@ -156,6 +156,53 @@ def test_causal_curation_rejects_missing_parent_wrong_id_and_mutated_payload() -
     assert any("payload_hash" in problem["error"] for problem in problems)
 
 
+def test_causal_curation_cannot_replace_newer_proposal_from_stale_parent() -> None:
+    old_publish = _publish(note_id="kn-old", body="old content")
+    old_verify = kn.new_curate_event(
+        base=old_publish, action="verify", curated_by="owner",
+        resolved_from="owner", at="t2", reason=None,
+    )
+    proposal = _publish(note_id="kn-new", body="new proposal")
+    forged = kn.new_curate_event(
+        base=old_publish, action="verify", curated_by="lead",
+        resolved_from="lead", at="t4", reason=None,
+    )
+
+    rows, problems = kn.resolve_views_with_problems(
+        [old_publish, old_verify, proposal, forged])
+
+    rec = rows[("cli", "cli.seam")]
+    assert rec["latest"]["id"] == proposal["id"]
+    assert rec["curated"]["id"] == old_verify["id"]
+    assert rec["tombstoned"] is False
+    assert any("current" in problem["error"] for problem in problems)
+
+
+def test_causal_curation_cannot_reopen_tombstone_from_pre_retract_parent() -> None:
+    publish = _publish(note_id="kn-publish")
+    verify = kn.new_curate_event(
+        base=publish, action="verify", curated_by="owner",
+        resolved_from="owner", at="t2", reason=None,
+    )
+    retract = kn.new_curate_event(
+        base=verify, action="retract", curated_by="owner",
+        resolved_from="owner", at="t3", reason="retired",
+    )
+    forged = kn.new_curate_event(
+        base=publish, action="verify", curated_by="lead",
+        resolved_from="lead", at="t4", reason=None,
+    )
+
+    rows, problems = kn.resolve_views_with_problems(
+        [publish, verify, retract, forged])
+
+    rec = rows[("cli", "cli.seam")]
+    assert rec["latest"]["id"] == retract["id"]
+    assert rec["curated"]["id"] == retract["id"]
+    assert rec["tombstoned"] is True
+    assert any("current" in problem["error"] for problem in problems)
+
+
 def test_legacy_curation_without_causal_fields_remains_readable() -> None:
     pub = _publish(note_id="kn-parent")
     legacy = kn.new_curate_event(
@@ -174,6 +221,84 @@ def test_legacy_curation_without_causal_fields_remains_readable() -> None:
     rec = rows[("cli", "cli.seam")]
     assert rec["curated"]["id"] == legacy["id"]
     assert problems == []
+
+
+def test_legacy_curation_may_add_verified_sha_without_changing_content() -> None:
+    publish = _publish(note_id="kn-legacy-publish", verified_against_sha=None)
+    legacy = kn.new_curate_event(
+        base=publish, action="verify", curated_by="owner",
+        resolved_from="owner", at="t2", reason=None,
+    )
+    legacy["verified_against_sha"] = SHA
+    legacy.pop("curates_id")
+    legacy.pop("payload_hash")
+    legacy.pop("domain_definition_hash")
+
+    views, problems = kn.resolve_views_with_problems([publish, legacy])
+    rec = views[("cli", "cli.seam")]
+    assert rec["curated"]["id"] == legacy["id"]
+    assert problems == []
+
+    selected = kn.select_knowledge_view(
+        views,
+        domains={"cli": {}},
+        registry_hash="rh1",
+        anchor_status_by_id={legacy["id"]: _anchor_status()},
+    )
+    assert [note["id"] for note, _verdict in selected["notes"]] == [legacy["id"]]
+
+
+def test_modern_unknown_fields_rejected_and_legacy_unknown_fields_not_surfaced(
+        tmp_path: Path) -> None:
+    publish = _lesson_event(note_id="kn-schema-publish")
+    verify = kn.new_curate_event(
+        base=publish, action="verify", curated_by="lead",
+        resolved_from="lead", at="2026-07-08T00:01:00Z", reason=None,
+    )
+    bad_top = {**verify, "lesson_shadow": "x" * (kn.BODY_MAX_BYTES + 1)}
+    bad_lesson = {
+        **verify,
+        "id": "kn-schema-nested",
+        "lesson": {**verify["lesson"], "lesson_shadow": "hidden"},
+    }
+    bad_authority = {
+        **verify,
+        "id": "kn-schema-authority",
+        "authority": {**verify["authority"], "shadow": "hidden"},
+    }
+    pointer = _publish(note_id="kn-schema-pointer")
+    bad_anchor = {
+        **pointer,
+        "anchor": {**pointer["anchor"], "shadow": "hidden"},
+    }
+    for bad in (bad_top, bad_lesson, bad_authority, bad_anchor):
+        problem = kn.event_problem(bad)
+        assert problem is not None
+        assert "unexpected" in problem
+
+    legacy = dict(verify)
+    legacy.pop("curates_id")
+    legacy.pop("payload_hash")
+    legacy.pop("domain_definition_hash")
+    legacy["lesson_shadow"] = "legacy extra"
+    legacy["lesson"] = {**legacy["lesson"], "lesson_shadow": "legacy nested"}
+    root = _repo(tmp_path)
+    store = Store(root)
+    kn.knowledge_dir(store).mkdir(parents=True, exist_ok=True)
+    kn.notes_path(store).write_text(
+        "\n".join(json.dumps(event) for event in (
+            publish, bad_top, bad_lesson, legacy,
+        )) + "\n",
+        encoding="utf-8",
+    )
+
+    events, read_problems = kn.read_events(store)
+    assert len(read_problems) == 2
+    assert len(events) == 2
+    assert "lesson_shadow" not in events[-1]
+    assert "lesson_shadow" not in events[-1]["lesson"]
+    rec = kn.resolve_views(events)[("process", "process.flake")]
+    assert rec["curated"]["id"] == legacy["id"]
 
 
 def test_unsafe_path_anchors_rejected() -> None:
@@ -280,6 +405,16 @@ def test_scoped_registry_freshness_distinguishes_subject_change_from_global_chan
     )
     assert legacy_view["hard_stale"] is False
     assert kn.CAUTION_LEGACY_UNSCOPED in legacy_view["caution_flags"]
+
+    same_registry = kn.compute_staleness(
+        legacy,
+        domain_exists=True,
+        current_registry_hash="rh1",
+        current_domain_definition_hash=subject_hash,
+        anchor_status=_anchor_status(),
+    )
+    assert same_registry["hard_stale"] is False
+    assert kn.CAUTION_LEGACY_UNSCOPED in same_registry["caution_flags"]
 
 
 def test_stale_retracted() -> None:
@@ -725,6 +860,37 @@ def test_curate_aborts_without_append_when_registry_changes_during_transaction(
     assert "registry changed during curation" in capsys.readouterr().err
     events, _ = kn.read_events(Store(root))
     assert len(events) == 1
+
+
+def test_out_of_band_registry_edit_after_recheck_appends_only_hard_stale_event(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    assert _pub(root) == 0
+    store = Store(root)
+    real_write = kn.write_event_locked
+
+    def edit_without_lock_then_write(target_store, event):
+        path = target_store.dir / "domains.json"
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["domains"]["cli"]["title"] = "CLI edited out of band"
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        real_write(target_store, event)
+
+    monkeypatch.setattr(kn, "write_event_locked", edit_without_lock_then_write)
+    assert _verify(root, "cli.seam") == 0
+    events, problems = kn.read_events(store)
+    assert problems == []
+    assert len(events) == 2
+
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--type", "gotcha", "--json"], root) == 0
+    assert json.loads(capsys.readouterr().out) == []
+    assert _run([
+        "knowledge", "pull", "--type", "gotcha", "--include-stale", "--json",
+    ], root) == 0
+    stale = json.loads(capsys.readouterr().out)
+    assert kn.STALE_DOMAIN_DEFINITION_CHANGED in stale[0]["_verdict"]["stale_reasons"]
 
 
 def test_curate_reverify_restamps_global_and_subject_hashes(

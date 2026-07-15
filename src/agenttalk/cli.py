@@ -5060,6 +5060,9 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
             except kn.KnowledgeError as e:
                 sys.stderr.write(f"agenttalk knowledge curate: {e}\n")
                 return 2
+            # This A/B check linearizes supported registry writers, which honor the
+            # shared config lock. An out-of-band hand edit can bypass that lock; the
+            # stamped subject hash then makes the event hard-stale on its first read.
             current_reg = _load_domain_registry(store)
             if current_reg.registry_hash != reg.registry_hash:
                 sys.stderr.write(

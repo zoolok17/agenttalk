@@ -888,6 +888,9 @@ unrelated domain adds a caution but does not hide the note; editing its own doma
 requires re-verification. Historical rows without the scoped hash remain visible
 with a legacy-freshness caution. Verify and retract re-stamp registry hashes while
 preserving the original Git/anchor baseline.
+The curation registry recheck coordinates supported writers that honor the shared
+lock. A manual `domains.json` edit can bypass that lock, but the stored domain hash
+makes the resulting event stale rather than silently authoritative.
 
 `agenttalk sync --for <agent>` includes a capped Lessons to check section when
 accepted, not-expired lessons match the current work context or supplied

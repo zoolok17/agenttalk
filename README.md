@@ -1035,8 +1035,10 @@ New publish/curate/retract events bind the normalized effective-domain
 definition. Editing some other domain is only a caution; editing this note's
 domain makes it stale until a curator verifies it again. Legacy events that
 predate scoped hashes remain readable with a `legacy_unscoped_registry_freshness`
-caution. Curate/retract also bind the exact prior event and immutable payload, so
-a malformed or non-causal row cannot replace or hide valid history.
+caution. Curate/retract also bind the current prior event and immutable payload, so
+a malformed or non-causal row cannot replace or hide valid history. The registry
+recheck coordinates supported writers that use the shared lock; a manual edit that
+bypasses the lock still fails closed because the scoped hash makes the event stale.
 
 `agenttalk sync --for A` includes a capped **Lessons to check** section when
 active lessons match the current work context. Process-scope lessons rank

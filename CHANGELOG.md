@@ -20,10 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-verification; an unrelated registry change is a caution. Historical events without
   the scoped hash remain curated and visible with a legacy-freshness caution.
 - **Curation is causally bound and publish validation is complete in one pass.** New
-  curate/retract events name the prior event and hash an immutable semantic payload;
-  non-causal rows are skipped without hiding valid history. Curation rechecks the
-  registry before append, and publish reports all independent field errors before any
-  registry, Git, or ledger I/O.
+  curate/retract events must name the current prior event and hash its content;
+  non-causal rows are skipped without hiding valid history or reopening tombstones.
+  Modern events reject unknown persisted fields, while historical rows are
+  canonicalized before output. Curation rechecks the registry against supported locked
+  writers before append; an out-of-band edit is caught fail-closed by scoped freshness.
+  Publish reports all independent field errors before registry, Git, or ledger I/O.
 
 ## [0.76.0] - 2026-07-15
 
