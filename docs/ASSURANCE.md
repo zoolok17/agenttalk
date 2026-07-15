@@ -132,8 +132,8 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
   hide another lesson, or forge attribution/creation-time; scoped freshness fails closed on out-of-band
   registry edits. Display-adjacent consumers (`roster --expertise`, the dashboard learning view) now
   read integrity-bound provenance.
-- **CI:** GitHub `tests` + `security` workflows watched on the exact release commit; run ids recorded
-  in the GitHub release.
+- **CI:** GitHub `tests` (`29385790197`) + `security` (`29385790149`) on the exact release commit
+  `bf37e59` — **both green on the first attempt** (no flake re-run needed).
 
 ### v0.76.0 - Team Console C0-legibility + honest-under-failure health signalling (2026-07-15)
 **GOOD / ROBUST / SECURE** - reviewed-SHA `5b95b5b` - tag `v0.76.0`
