@@ -17,6 +17,37 @@ be labeled `SHIPPED` once the changelog closes them.
 
 ---
 
+## P1 · SHIPPED — knowledge base visibility + curate/provenance hardening (2026-07-15)
+
+**What.** The shipped knowledge subsystem's notes were invisible in the default
+retrieval surfaces (reported by the orbit-launcher lead; reproduced against our own
+store — `knowledge pull` / `onboard` / `search` / `pull --domain` returned 0 while
+curated process-lessons existed), so the shared "team brain" got zero uptake.
+**Where.** `src/agenttalk/knowledge.py`, `cli.py` (`cmd_knowledge`), `lesson_context.py`,
+`web.py`, `doctor.py`. **Root cause.** The default `pull`/`search`/`onboard` view was
+pointer-note-only and hard-skipped lessons (`--scope`/`--domain` silently no-op'd without
+`--type lesson`); a *global* registry-hash staleness hard-hid the whole base on any
+`domains.json` edit; publish validated one field at a time.
+**Fix.** One mixed retrieval pipeline (pointer notes AND lessons in the defaults; versioned
+`knowledge-view-v1` JSON envelope + `--output-schema legacy` escape); per-domain scoped
+freshness (unrelated edit = caution, not hard-stale; `verify`/`retract` re-stamp);
+aggregated publish preflight; a first-class virtual `process` domain for cross-cutting
+lessons; and a hardened causal-curation fold that binds *complete* inherited content — a
+forged curate cannot regress authority, reopen a tombstone, hide another lesson (forged
+`supersedes`), or forge attribution/creation-time (`author`/`created_at`, which had poisoned
+`roster --expertise` and the dashboard). The integrity boundary is **complete-by-construction**
+(every persisted event field is classified bound xor curation-mutable, both sets pinned with
+a construction test). See decision **D-27**.
+
+**Disposition.** `SHIPPED v0.76.1` (reviewed-SHA `79b6c8f`; builder codex-dev-3; three
+cross-family reviewers APPROVED the final SHA after the adversarial reviewer drove **four**
+reproduced provenance-forgery rounds; lead-gated full 3.10=2509 / 3.14=2513 + ruff/bandit/
+gitleaks/compileall/diff). Closes the orbit-launcher knowledge-visibility report (B1–B7).
+Deferred/known-limitation: no HMAC/signing (this detects malformed/forged ledger *semantics*,
+not a full-history rewrite); a durable WP anchor resolver remains future work.
+
+---
+
 ## P1 · SHIPPED — v0.74.0 release-contract integration (2026-07-12)
 
 **What.** Integrate and release the reviewed hardening wave without weakening
