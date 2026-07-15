@@ -579,8 +579,9 @@ def _gather_status(store: Store) -> dict:
         "agents": agents,
         "stale_threshold_seconds": STALE_THRESHOLD_SECONDS,
         "warnings": warnings,
-        "coordination_stalls": coordination_items,
     }
+    if coordination_items:
+        payload["coordination_stalls"] = coordination_items
     if quarantined:
         payload["quarantined"] = quarantined  # additive: absent when zero
     if dead_lettered:

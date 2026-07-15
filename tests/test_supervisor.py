@@ -2637,6 +2637,23 @@ def _replace_proc_start(ps1: Path, body: str) -> None:
     )
 
 
+def _replace_proc_snapshot_with_empty(ps1: Path) -> None:
+    """Keep generated-script tests independent of the host process table."""
+    text = ps1.read_text(encoding="utf-8-sig")
+    start = text.index("function Get-ProcSnapshot($path) {")
+    end = text.index("function Stop-Tree", start)
+    replacement = """function Get-ProcSnapshot($path) {
+  $u8 = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($path, '[]', $u8)
+  return $true
+}
+"""
+    ps1.write_text(
+        text[:start] + replacement + text[end:],
+        encoding="utf-8-sig",
+    )
+
+
 def test_generated_ps1_runs_bus_calls_without_console_script_on_path(tmp_path: Path) -> None:
     """0.28.1 BLOCKER 1 (RUNTIME): the generated supervisor.ps1 must make ITS OWN
     bus calls via the project-local shim (`& $AgenttalkCmd`), so they work even
@@ -2766,6 +2783,7 @@ def test_generated_ps1_quiet_suppresses_relaunch_helper_warnings(tmp_path: Path)
     (s.dir / "supervisor.json").write_text(json.dumps(config), encoding="utf-8")
     assert _run(["supervise", "--init"], tmp_path) == 0
     ps1 = s.dir / "supervisor.ps1"
+    _replace_proc_snapshot_with_empty(ps1)
     state_file = s.dir / "supervisor-state.json"
 
     def _once(*extra: str) -> str:
