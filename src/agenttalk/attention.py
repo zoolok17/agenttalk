@@ -58,12 +58,14 @@ SOURCE_GATE_HOLD = "gate_hold"
 SOURCE_CLOSE_HOLD = "close_hold"
 SOURCE_LEAD_UNARMED = "lead_unarmed"
 SOURCE_CAPACITY = "capacity"
+SOURCE_COORDINATION_STALL = "coordination_stall"
 SOURCE_ERROR = "source_error"
 
 # rank weight per source (higher = more urgent to a human)
 _SOURCE_WEIGHT = {
     SOURCE_NEEDS_OPERATOR: 100,
     SOURCE_CONFIG_BLOCKED: 90,
+    SOURCE_COORDINATION_STALL: 85,
     SOURCE_DEAD_LETTER: 80,
     SOURCE_GATE_HOLD: 70,
     SOURCE_CLOSE_HOLD: 70,
@@ -76,8 +78,13 @@ _SOURCE_WEIGHT = {
 # silently hide a real need). config/gate/close/lead_unarmed are dismissable ONLY when the
 # collector classifies that specific item advisory (see item["advisory"]).
 _ALWAYS_BLOCKING = frozenset({SOURCE_NEEDS_OPERATOR, SOURCE_DEAD_LETTER})
-_ADVISORY_CAPABLE = frozenset(
-    {SOURCE_CONFIG_BLOCKED, SOURCE_GATE_HOLD, SOURCE_CLOSE_HOLD, SOURCE_LEAD_UNARMED})
+_ADVISORY_CAPABLE = frozenset({
+    SOURCE_CONFIG_BLOCKED,
+    SOURCE_GATE_HOLD,
+    SOURCE_CLOSE_HOLD,
+    SOURCE_LEAD_UNARMED,
+    SOURCE_COORDINATION_STALL,
+})
 # capacity is advisory by nature; source_error is defer-only (fix the reader).
 
 # --- disposition actions ---
@@ -723,6 +730,49 @@ def lead_unarmed_items(signals: list[dict]) -> list[dict]:
                       fields={"why_it_matters": s.get("reason") or "", "priority": "normal"},
                       source_refs=[{"kind": "lead_unarmed", "agent": ag}])
         it["dedupe_key"] = dedupe_key(SOURCE_LEAD_UNARMED, identity=ag)
+        out.append(it)
+    return out
+
+
+def coordination_stall_items(signals: list[dict]) -> list[dict]:
+    """Project pure detector signals as stable, dismissable advisories."""
+    out = []
+    for signal in signals:
+        stall_id = str(signal.get("stall_id") or "")
+        if not stall_id:
+            continue
+        waiter = str(signal.get("waiter") or signal.get("agent") or "")
+        request_id = str(signal.get("request_id") or "")
+        reason = str(signal.get("reason") or "coordination is stalled")
+        action = str(signal.get("action") or "Inspect and reassign the blocked work.")
+        it = _mk_item(
+            SOURCE_COORDINATION_STALL,
+            item_id(SOURCE_COORDINATION_STALL, stall_id),
+            title=f"team coordination stalled: {waiter}",
+            ident_content={
+                "identity_hash": signal.get("identity_hash"),
+                "content_hash": signal.get("content_hash"),
+            },
+            human_can_unblock_now=True,
+            advisory=True,
+            age_seconds=float(signal.get("age_seconds") or 0),
+            fields={
+                "why_it_matters": reason,
+                "recommendation": action,
+                "priority": "high",
+                "risk_severity": "medium",
+                "confidence": "high",
+            },
+            source_refs=[{
+                "kind": "coordination_stall",
+                "agent": waiter,
+                "request_id": request_id,
+            }],
+        )
+        it["dedupe_key"] = dedupe_key(
+            SOURCE_COORDINATION_STALL,
+            identity=str(signal.get("identity_hash") or stall_id),
+        )
         out.append(it)
     return out
 

@@ -323,6 +323,14 @@ If an older scoped wait exits 6 with `superseded` on stderr, a newer wait for
 the same request replaced it; the older wait did not consume a message or move
 the thread cursor.
 
+Managed-wrapper consult and handoff skills do not start a child `wait`. They
+send their tracked opener with `--await-reply`, record a generation-bound,
+body-free wait token, and return to the wrapper that owns the inbox cursor. The
+wrapper delivers the correlated response in a later turn. Only the bundled
+consult and handoff skills opt in; ordinary `send`/`reply` and every other skill
+behave as before. To abandon an explicit wait while its token is still current,
+run `agenttalk await-cancel --from <agent> --token <await_reply_token>`.
+
 ## 6. Running a lead and a team
 
 The lead coordinates work, but does not become an authority boundary. A lead's
@@ -525,6 +533,11 @@ agenttalk wrap --for codex-dev --cli codex --loop -- codex -a never -s workspace
 Each wrapper idle marker has a unique wait token. An exiting old wrapper clears
 the marker only while that token still matches, so it cannot erase a newer
 wrapper's waiting state.
+
+An explicit wrapped reply wait is active only while its wrapper generation is
+current, the waiter is freshly idle, and its validated outbound thread remains
+open. A missing, torn, or generation-mismatched marker fails quiet. Generic
+wrapper idleness and ordinary open outbound requests do not imply a stall.
 
 On Windows, the turn watchdog terminates a verified target with
 `os.kill(pid, signal.SIGTERM)` and does not start `taskkill.exe`. Windows maps
@@ -931,6 +944,11 @@ Common cases:
 - Stacked waiters. If `wait --refuse-stacked-wait` exits 6 or doctor reports a
   duplicate waiter, close the duplicate terminal. One live consumer per mailbox
   is supported.
+- Coordination stall. `attention`, `doctor`, `status`, and the dashboard show
+  the same advisory when an explicit waiter targets a supervisor-confirmed
+  unavailable agent, or when a requested restart remains behind a launch
+  barrier. Reassign the request or restore the named agent. These warnings never
+  kill, restart, release, reroute, or change a gate.
 - Stale open threads. Run `agenttalk sync --for <agent>` and
   `agenttalk threads --for <agent> --all`. Use `reply`, `rescind`, or
   `ack --to-request` only when the thread is actually handled.

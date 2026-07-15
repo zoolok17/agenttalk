@@ -27,6 +27,7 @@ targets for recovery.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import os
@@ -92,6 +93,51 @@ SUPERVISOR_EVENT_SUMMARY_INTERVAL_SECONDS = 300.0
 _LAUNCH_BARRIER_ACTION = "launch_barrier"
 LEAD_LIVENESS_STALE_AFTER_SECONDS = 60.0
 _EVENT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
+
+AVAILABILITY_AVAILABLE = "available"
+AVAILABILITY_UNAVAILABLE = "unavailable"
+AVAILABILITY_TERMINAL = "terminal_by_design"
+AVAILABILITY_UNKNOWN = "unknown"
+_COORDINATION_AVAILABILITY_SCHEMA = 1
+_COORDINATION_AVAILABILITY_FILE = "coordination-availability.json"
+_COORDINATION_BARRIER_SCHEMA = 1
+_COORDINATION_BARRIER_DIR = "coordination-restart-barrier"
+_COORDINATION_AVAILABILITY_MAX_BYTES = 262_144
+_COORDINATION_BARRIER_MAX_BYTES = 4096
+_COORDINATION_MAX_DIAGNOSTICS = 20
+_COORDINATION_AVAILABILITY_FIELDS = frozenset({
+    "schema_version", "updated_at_epoch", "agents",
+})
+_COORDINATION_AVAILABILITY_ROW_FIELDS = frozenset({
+    "state",
+    "subtype",
+    "evidence_code",
+    "consecutive",
+    "first_observed_epoch",
+    "last_observed_epoch",
+})
+_COORDINATION_BARRIER_FIELDS = frozenset({
+    "schema_version",
+    "agent",
+    "request_id",
+    "marker_epoch",
+    "barrier_reason",
+    "survivor_fingerprint",
+    "blocked",
+    "first_observed_epoch",
+    "last_observed_epoch",
+    "consecutive_blocked_polls",
+})
+_EXPLICIT_UNAVAILABLE_HEALTH = frozenset({
+    health_model.STATE_RATE_LIMITED_OR_OUTAGE,
+    health_model.STATE_ERRORED_POISON,
+    health_model.STATE_ERRORED_AMBIGUOUS,
+    health_model.STATE_CRASHED_OR_EXITED,
+})
+_UNTRUSTED_TIME_REASONS = frozenset({
+    "health_future_timestamp",
+    "health_invalid",
+})
 
 
 class SupervisorPersistenceError(ValueError):
@@ -550,6 +596,255 @@ def resolve_health_timing(config: dict, cfg_agent: dict) -> dict:
     }
 
 
+def project_coordination_availability(
+    name: str,
+    report_agent: dict | None,
+    plan_agent: dict | None,
+    config_agent: dict | None,
+    *,
+    retired: bool = False,
+) -> dict:
+    """Pure, read-only responder availability for coordination warnings.
+
+    This is deliberately narrower than the supervisor action table.  It does
+    not grant kill/relaunch authority; it only classifies whether another agent
+    can plausibly answer an explicit wait edge.  Missing evidence stays UNKNOWN.
+    """
+    if retired:
+        return {
+            "agent": name,
+            "state": AVAILABILITY_TERMINAL,
+            "subtype": "retired",
+            "evidence_code": "retired_identity",
+        }
+    if not isinstance(report_agent, dict):
+        return {
+            "agent": name,
+            "state": AVAILABILITY_UNKNOWN,
+            "subtype": "missing_supervisor_evidence",
+            "evidence_code": "report_missing",
+        }
+    rpt = report_agent if isinstance(report_agent, dict) else {}
+    plan = plan_agent if isinstance(plan_agent, dict) else {}
+    cfg = config_agent if isinstance(config_agent, dict) else {}
+    health = rpt.get("health") if isinstance(rpt.get("health"), dict) else {}
+    health_state = health_model.label(health)
+    health_reason = health.get("reason_code") if isinstance(
+        health.get("reason_code"), str) else None
+    plan_state = plan.get("state") if isinstance(plan.get("state"), str) else None
+
+    if plan_state == "LEAD_LOOP_STOOD_DOWN":
+        return {
+            "agent": name,
+            "state": AVAILABILITY_TERMINAL,
+            "subtype": "stood_down",
+            "evidence_code": "lead_loop_stood_down",
+        }
+    if health_reason in _UNTRUSTED_TIME_REASONS:
+        return {
+            "agent": name,
+            "state": AVAILABILITY_UNKNOWN,
+            "subtype": "malformed_liveness",
+            "evidence_code": health_reason,
+        }
+    if plan_state == "LAUNCHING":
+        return {
+            "agent": name,
+            "state": AVAILABILITY_UNKNOWN,
+            "subtype": "launch_grace",
+            "evidence_code": "launch_grace",
+        }
+    if health_state in _EXPLICIT_UNAVAILABLE_HEALTH and health.get("stale") is not True:
+        return {
+            "agent": name,
+            "state": AVAILABILITY_UNAVAILABLE,
+            "subtype": "explicit_health_error",
+            "evidence_code": health_state,
+        }
+    heartbeat_stale_value = rpt.get("heartbeat_stale")
+    if heartbeat_stale_value is not True and heartbeat_stale_value is not False:
+        return {
+            "agent": name,
+            "state": AVAILABILITY_UNKNOWN,
+            "subtype": "malformed_liveness",
+            "evidence_code": "heartbeat_state_missing",
+        }
+    heartbeat_stale = heartbeat_stale_value is True
+    if not heartbeat_stale:
+        return {
+            "agent": name,
+            "state": AVAILABILITY_AVAILABLE,
+            "subtype": "heartbeat_fresh",
+            "evidence_code": "heartbeat_fresh",
+        }
+
+    heartbeat_expected = bool(cfg.get("wrapped") or cfg.get("activity_hook"))
+    if not heartbeat_expected:
+        return {
+            "agent": name,
+            "state": AVAILABILITY_UNKNOWN,
+            "subtype": "heartbeat_not_authoritative",
+            "evidence_code": "manual_or_uninstrumented",
+        }
+    if plan_state in {"ACTIVE_OR_BUSY", "RESTART_COOLDOWN", "RESTART_UNAUTHORIZED"}:
+        return {
+            "agent": name,
+            "state": AVAILABILITY_UNKNOWN,
+            "subtype": "supervisor_uncertain",
+            "evidence_code": plan_state.lower(),
+        }
+    return {
+        "agent": name,
+        "state": AVAILABILITY_UNAVAILABLE,
+        "subtype": "heartbeat_stale",
+        "evidence_code": "heartbeat_stale_past_threshold",
+    }
+
+
+def _coordination_availability_path(store: Store) -> Path:
+    return store.state_dir / _COORDINATION_AVAILABILITY_FILE
+
+
+def read_coordination_availability_observation(store: Store) -> tuple[dict, list[dict]]:
+    """Read the bounded two-poll debounce state, failing quiet on damage."""
+    path = _coordination_availability_path(store)
+    if not path.exists():
+        return {}, []
+    try:
+        if path.stat().st_size > _COORDINATION_AVAILABILITY_MAX_BYTES:
+            raise ValueError("oversized")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}, [{"code": "availability_observation_invalid"}]
+    if (
+        not isinstance(raw, dict)
+        or frozenset(raw) != _COORDINATION_AVAILABILITY_FIELDS
+        or raw.get("schema_version") != _COORDINATION_AVAILABILITY_SCHEMA
+        or _event_epoch(raw.get("updated_at_epoch")) is None
+    ):
+        return {}, [{"code": "availability_observation_invalid"}]
+    agents = raw.get("agents")
+    if not isinstance(agents, dict) or len(agents) > 1024:
+        return {}, [{"code": "availability_observation_invalid"}]
+    clean: dict[str, dict] = {}
+    problems: list[dict] = []
+    for name, row in agents.items():
+        invalid = (
+            not isinstance(name, str)
+            or _EVENT_TOKEN_RE.fullmatch(name) is None
+            or not isinstance(row, dict)
+            or frozenset(row) != _COORDINATION_AVAILABILITY_ROW_FIELDS
+        )
+        if invalid:
+            if len(problems) < _COORDINATION_MAX_DIAGNOSTICS:
+                problems.append({"code": "availability_observation_entry_invalid"})
+            continue
+        state = row.get("state")
+        if state not in {
+            AVAILABILITY_AVAILABLE,
+            AVAILABILITY_UNAVAILABLE,
+            AVAILABILITY_TERMINAL,
+            AVAILABILITY_UNKNOWN,
+        }:
+            if len(problems) < _COORDINATION_MAX_DIAGNOSTICS:
+                problems.append({"code": "availability_observation_entry_invalid"})
+            continue
+        consecutive = row.get("consecutive")
+        first_epoch = _event_epoch(row.get("first_observed_epoch"))
+        last_epoch = row.get("last_observed_epoch")
+        if (
+            not isinstance(row.get("subtype"), str)
+            or _EVENT_TOKEN_RE.fullmatch(row["subtype"]) is None
+            or not isinstance(row.get("evidence_code"), str)
+            or _EVENT_TOKEN_RE.fullmatch(row["evidence_code"]) is None
+            or not isinstance(consecutive, int)
+            or isinstance(consecutive, bool)
+            or consecutive < 1
+            or first_epoch is None
+            or not isinstance(last_epoch, (int, float))
+            or isinstance(last_epoch, bool)
+            or not math.isfinite(float(last_epoch))
+            or float(last_epoch) < first_epoch
+        ):
+            if len(problems) < _COORDINATION_MAX_DIAGNOSTICS:
+                problems.append({"code": "availability_observation_entry_invalid"})
+            continue
+        clean[name] = {
+            "state": state,
+            "subtype": row["subtype"],
+            "evidence_code": row["evidence_code"],
+            "consecutive": consecutive,
+            "first_observed_epoch": first_epoch,
+            "last_observed_epoch": float(last_epoch),
+        }
+    return clean, problems
+
+
+def record_coordination_availability_observation(
+    store: Store,
+    report: dict,
+    plan: dict,
+    config: dict,
+    *,
+    now_epoch: float,
+) -> None:
+    """Best-effort supervisor-cadence debounce bookkeeping.
+
+    Planning output is an input only and is never changed.  Two consecutive
+    semantically identical projections are required before a detector may warn.
+    """
+    try:
+        prior, _ = read_coordination_availability_observation(store)
+        report_agents = report.get("agents") if isinstance(report.get("agents"), dict) else {}
+        plan_agents = plan.get("agents") if isinstance(plan.get("agents"), dict) else {}
+        config_agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
+        retired = set(store.retired_agents())
+        poll = config.get("poll_seconds", _DEFAULTS["poll_seconds"])
+        poll = float(poll) if isinstance(poll, (int, float)) and not isinstance(poll, bool) else 15.0
+        max_gap = max(5.0, poll * 3.0)
+        rows: dict[str, dict] = {}
+        names = set(report_agents) | set(config_agents) | retired
+        for name in sorted(names):
+            projection = project_coordination_availability(
+                name,
+                report_agents.get(name),
+                plan_agents.get(name),
+                config_agents.get(name),
+                retired=name in retired,
+            )
+            old = prior.get(name) if isinstance(prior.get(name), dict) else {}
+            same = all(old.get(key) == projection.get(key) for key in (
+                "state", "subtype", "evidence_code"))
+            last = old.get("last_observed_epoch")
+            contiguous = (
+                same
+                and isinstance(last, (int, float))
+                and 0 <= float(now_epoch) - float(last) <= max_gap
+            )
+            rows[name] = {
+                "state": projection["state"],
+                "subtype": projection["subtype"],
+                "evidence_code": projection["evidence_code"],
+                "consecutive": int(old.get("consecutive", 0)) + 1 if contiguous else 1,
+                "first_observed_epoch": (
+                    old.get("first_observed_epoch") if contiguous else float(now_epoch)
+                ),
+                "last_observed_epoch": float(now_epoch),
+            }
+        payload = {
+            "schema_version": _COORDINATION_AVAILABILITY_SCHEMA,
+            "updated_at_epoch": float(now_epoch),
+            "agents": rows,
+        }
+        with store._config_lock(timeout=0.05, poll=0.01):
+            _atomic_write_text(
+                _coordination_availability_path(store),
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            )
+    except Exception:
+        return
+
+
 def _restart_request_with_live_authority(store: Store, marker: dict | None) -> dict | None:
     if not isinstance(marker, dict):
         return marker
@@ -887,6 +1182,167 @@ def record_supervisor_launch_barrier_event(store: Store, agent: str, *,
                     return
                 break
         append_supervisor_events(store, [_decision_event(agent, plan, now_epoch=now_epoch)], cap=cap)
+    except Exception:
+        return
+
+
+def _coordination_barrier_path(store: Store, agent: str) -> Path:
+    return store.state_dir / _COORDINATION_BARRIER_DIR / f"{validate_agent_name(agent)}.json"
+
+
+def read_coordination_barrier_observations(store: Store) -> tuple[list[dict], list[dict]]:
+    """Read strict manual-restart barrier observations, skipping damaged rows."""
+    root = store.state_dir / _COORDINATION_BARRIER_DIR
+    if not root.is_dir():
+        return [], []
+    rows: list[dict] = []
+    problems: list[dict] = []
+    paths = []
+    for index, path in enumerate(root.glob("*.json")):
+        if index >= 256:
+            problems.append({"code": "restart_barrier_observation_limit_reached"})
+            break
+        paths.append(path)
+    for path in sorted(paths):
+        try:
+            if path.stat().st_size > _COORDINATION_BARRIER_MAX_BYTES:
+                raise ValueError("oversized")
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(raw, dict)
+                or frozenset(raw) != _COORDINATION_BARRIER_FIELDS
+                or raw.get("schema_version") != _COORDINATION_BARRIER_SCHEMA
+            ):
+                raise ValueError("schema")
+            agent = validate_agent_name(raw.get("agent"))
+            request_id = raw.get("request_id")
+            fingerprint = raw.get("survivor_fingerprint")
+            if (
+                path.stem != agent
+                or not isinstance(request_id, str)
+                or _EVENT_TOKEN_RE.fullmatch(request_id) is None
+                or not isinstance(fingerprint, str)
+                or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                or raw.get("blocked") is not True
+                or not isinstance(raw.get("barrier_reason"), str)
+                or _EVENT_TOKEN_RE.fullmatch(raw["barrier_reason"]) is None
+            ):
+                raise ValueError("identity")
+            marker_epoch = _event_epoch(raw.get("marker_epoch"))
+            first_epoch = _event_epoch(raw.get("first_observed_epoch"))
+            last_epoch = _event_epoch(raw.get("last_observed_epoch"))
+            consecutive = raw.get("consecutive_blocked_polls")
+            if (
+                marker_epoch is None
+                or first_epoch is None
+                or last_epoch is None
+                or not isinstance(consecutive, int)
+                or isinstance(consecutive, bool)
+                or consecutive < 1
+                or first_epoch < marker_epoch
+                or last_epoch < first_epoch
+            ):
+                raise ValueError("timing")
+            rows.append({
+                "schema_version": _COORDINATION_BARRIER_SCHEMA,
+                "agent": agent,
+                "request_id": request_id,
+                "marker_epoch": marker_epoch,
+                "barrier_reason": raw["barrier_reason"],
+                "survivor_fingerprint": fingerprint,
+                "blocked": True,
+                "first_observed_epoch": first_epoch,
+                "last_observed_epoch": last_epoch,
+                "consecutive_blocked_polls": consecutive,
+            })
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            if len(problems) < _COORDINATION_MAX_DIAGNOSTICS:
+                problems.append({
+                    "code": "restart_barrier_observation_invalid",
+                    "path": path.name,
+                })
+    return rows, problems
+
+
+def record_supervisor_launch_barrier_observation(
+    store: Store,
+    agent: str,
+    barrier: dict,
+    *,
+    now_epoch: float,
+) -> None:
+    """Record or clear the observational two-poll manual-restart barrier state.
+
+    Only a current manual restart marker can create state.  Automatic stale
+    recovery has no request id and is intentionally excluded.  A clear barrier
+    deletes the observation; the detector independently re-checks the live
+    marker id/epoch before projecting anything.
+    """
+    try:
+        path = _coordination_barrier_path(store, agent)
+        with store._config_lock(timeout=0.05, poll=0.01):
+            if not isinstance(barrier, dict) or barrier.get("blocked") is not True:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                return
+            marker = store.read_restart_request(agent)
+            if not isinstance(marker, dict) or marker.get("source") != "manual":
+                return
+            request_id = marker.get("request_id")
+            marker_epoch = _event_epoch(marker.get("at_epoch"))
+            if (
+                not isinstance(request_id, str)
+                or _EVENT_TOKEN_RE.fullmatch(request_id) is None
+                or marker_epoch is None
+            ):
+                return
+            survivors = []
+            raw_survivors = barrier.get("survivors")
+            if isinstance(raw_survivors, list):
+                for row in raw_survivors[:8]:
+                    if not isinstance(row, dict):
+                        continue
+                    survivors.append({
+                        "kind": _event_token(row.get("kind")),
+                        "pid": row.get("pid") if isinstance(row.get("pid"), int) else None,
+                        "name": _event_token(row.get("name")),
+                    })
+            survivors.sort(key=lambda row: (row["kind"], row["pid"] or -1, row["name"]))
+            reason = _event_token(barrier.get("reason"))
+            fingerprint = hashlib.sha256(json.dumps(
+                {"reason": reason, "survivors": survivors},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            prior_rows, _ = read_coordination_barrier_observations(store)
+            prior = next((row for row in prior_rows if row.get("agent") == agent), None)
+            same = (
+                isinstance(prior, dict)
+                and prior.get("request_id") == request_id
+                and prior.get("marker_epoch") == marker_epoch
+                and prior.get("survivor_fingerprint") == fingerprint
+                and float(now_epoch) >= float(prior.get("last_observed_epoch", now_epoch))
+            )
+            payload = {
+                "schema_version": _COORDINATION_BARRIER_SCHEMA,
+                "agent": agent,
+                "request_id": request_id,
+                "marker_epoch": marker_epoch,
+                "barrier_reason": reason,
+                "survivor_fingerprint": fingerprint,
+                "blocked": True,
+                "first_observed_epoch": (
+                    prior.get("first_observed_epoch") if same else float(now_epoch)
+                ),
+                "last_observed_epoch": float(now_epoch),
+                "consecutive_blocked_polls": (
+                    int(prior.get("consecutive_blocked_polls", 0)) + 1 if same else 1
+                ),
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, sort_keys=True))
     except Exception:
         return
 

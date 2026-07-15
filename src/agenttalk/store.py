@@ -77,6 +77,24 @@ _LOCK_OWNERLESS_CONFIRM_SECONDS = 0.05
 _LOCK_PID_PREFIX_RE = re.compile(rb'"pid"\s*:\s*([0-9]+)')
 _LOCK_GENERATION_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 
+_AWAIT_SCHEMA_VERSION = 1
+_AWAIT_ID_RE = re.compile(r"\A[A-Za-z0-9_.:-]{1,128}\Z")
+_AWAIT_PATH_TOKEN_RE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
+_AWAIT_SOURCES = frozenset({"send", "reply"})
+_AWAIT_FIELDS = frozenset({
+    "schema_version",
+    "agent",
+    "request_id",
+    "wrapper_generation",
+    "wait_token",
+    "started_at",
+    "source",
+})
+_AWAIT_MAX_RECORD_BYTES = 4096
+_AWAIT_MAX_RECORDS_PER_AGENT = 64
+_AWAIT_MAX_ROOT_ENTRIES = 256
+_AWAIT_MAX_DIAGNOSTICS = 64
+
 
 def _ensure_lock_byte(fd: int) -> None:
     """Make byte zero lockable without relying on owner metadata."""
@@ -2536,6 +2554,17 @@ class Store:
                 _unlink_if_same_file(pending, pending_identity)
             except OSError:
                 pass
+        request_id = (msg.meta or {}).get("request_id")
+        if isinstance(request_id, str) and request_id and kind not in CONTROL_KINDS:
+            # Observational cleanup only. The validated thread remains the
+            # authority, so a cleanup failure can neither lose the message nor
+            # leave a false active wait edge.
+            try:
+                from agenttalk.coordination_stall import clear_terminal_awaits
+
+                clear_terminal_awaits(self, request_id)
+            except Exception as exc:  # noqa: BLE001 - observational cleanup only
+                _ = exc
         return msg
 
     def send_operator_answer_atomic(
@@ -3533,6 +3562,26 @@ class Store:
             return None
         return data
 
+    def wrapper_wait_generation(self, agent: str) -> str | None:
+        """Return the current ordinary or managed wrapper generation.
+
+        Ordinary wrapper loops own a ``mode=wrapper-loop`` marker. Managed
+        lead loops mirror their lease as ``lead_loop`` + ``managed`` instead.
+        Both are observational wrapper markers and carry the same opaque
+        generation; all other waiting records are deliberately excluded.
+        """
+        marker = self.read_waiting(agent)
+        if not isinstance(marker, dict):
+            return None
+        ordinary = marker.get("mode") == "wrapper-loop"
+        managed = marker.get("lead_loop") is True and marker.get("managed") is True
+        generation = marker.get("wrapper_generation")
+        if not (ordinary or managed) or not isinstance(generation, str):
+            return None
+        if _AWAIT_PATH_TOKEN_RE.fullmatch(generation) is None:
+            return None
+        return generation
+
     def foreign_wait_pid(self, agent: str, self_pid: int, *,
                          now: float | None = None,
                          stale_after: float | None = None) -> int | None:
@@ -3620,6 +3669,181 @@ class Store:
             pass
         except OSError:
             pass
+
+    # ------------------------------------------ wrapped reply-await markers
+
+    @property
+    def awaiting_dir(self) -> Path:
+        """Token-keyed observational waits created by wrapped ``--await-reply``.
+
+        These records never affect delivery, cursors, supervisor actions, or
+        thread closure.  They only prove that a wrapped turn explicitly chose
+        to wait across turns for one outbound request.
+        """
+        return self.state_dir / "awaiting"
+
+    @staticmethod
+    def _valid_await_record(raw: object) -> dict | None:
+        if not isinstance(raw, dict) or frozenset(raw) != _AWAIT_FIELDS:
+            return None
+        if raw.get("schema_version") != _AWAIT_SCHEMA_VERSION:
+            return None
+        try:
+            validate_agent_name(raw.get("agent"))
+        except (TypeError, ValueError):
+            return None
+        request_id = raw.get("request_id")
+        if not isinstance(request_id, str) or _AWAIT_ID_RE.fullmatch(request_id) is None:
+            return None
+        for key in ("wrapper_generation", "wait_token"):
+            value = raw.get(key)
+            if not isinstance(value, str) or _AWAIT_PATH_TOKEN_RE.fullmatch(value) is None:
+                return None
+        if raw.get("source") not in _AWAIT_SOURCES:
+            return None
+        started_at = raw.get("started_at")
+        if not isinstance(started_at, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return dict(raw)
+
+    def _awaiting_lock(self, agent: str):
+        name = validate_agent_name(agent)
+        return self._exclusive_lock(
+            self.awaiting_dir / f"{name}.lock",
+            what=f"wrapped awaiting marker lock for {name}",
+        )
+
+    def _awaiting_path(self, agent: str, generation: str, wait_token: str) -> Path:
+        name = validate_agent_name(agent)
+        if not isinstance(generation, str) or _AWAIT_PATH_TOKEN_RE.fullmatch(generation) is None:
+            raise ValueError("unsafe wrapper generation")
+        if not isinstance(wait_token, str) or _AWAIT_PATH_TOKEN_RE.fullmatch(wait_token) is None:
+            raise ValueError("unsafe await token")
+        return self.awaiting_dir / name / generation / f"{wait_token}.json"
+
+    def write_awaiting(self, agent: str, record: dict) -> None:
+        """Atomically persist one strict, body-free wrapped reply wait.
+
+        The path is keyed by agent/generation/token so concurrent or superseded
+        wrapper generations cannot overwrite one another.  A small per-agent
+        retention cap bounds crash leftovers; active-state readers still require
+        the current generation and validated open thread.
+        """
+        clean = self._valid_await_record(record)
+        if clean is None or clean.get("agent") != agent:
+            raise ValueError("invalid wrapped await record")
+        path = self._awaiting_path(
+            agent,
+            clean["wrapper_generation"],
+            clean["wait_token"],
+        )
+        with self._awaiting_lock(agent):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(path, json.dumps(clean, ensure_ascii=False, sort_keys=True))
+            files = sorted(
+                (p for p in (self.awaiting_dir / agent).glob("*/*.json") if p.is_file()),
+                key=lambda p: (p.stat().st_mtime_ns, str(p)),
+            )
+            for old in files[:-_AWAIT_MAX_RECORDS_PER_AGENT]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+
+    def list_awaiting(self, agent: str | None = None) -> tuple[list[dict], list[dict]]:
+        """Return strict wrapped-await records plus body-free diagnostics.
+
+        Torn, oversized, path-mismatched, or forward-unknown records are skipped.
+        The detector therefore fails quiet while doctor can report the bounded
+        diagnostic.  This reader never raises.
+        """
+        records: list[dict] = []
+        problems: list[dict] = []
+        try:
+            if agent:
+                roots = [self.awaiting_dir / validate_agent_name(agent)]
+            else:
+                roots = []
+                for index, path in enumerate(self.awaiting_dir.iterdir()):
+                    if index >= _AWAIT_MAX_ROOT_ENTRIES:
+                        problems.append({"code": "await_root_limit_reached"})
+                        break
+                    if path.is_dir():
+                        roots.append(path)
+                roots.sort()
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return records, problems
+        for agent_dir in roots:
+            try:
+                path_agent = validate_agent_name(agent_dir.name)
+            except ValueError:
+                if len(problems) < _AWAIT_MAX_DIAGNOSTICS:
+                    problems.append({
+                        "code": "await_record_invalid",
+                        "path": agent_dir.name,
+                    })
+                continue
+            try:
+                paths = []
+                for index, path in enumerate(agent_dir.glob("*/*.json")):
+                    if index >= _AWAIT_MAX_RECORDS_PER_AGENT:
+                        if len(problems) < _AWAIT_MAX_DIAGNOSTICS:
+                            problems.append({
+                                "code": "await_record_limit_reached",
+                                "path": path_agent,
+                            })
+                        break
+                    paths.append(path)
+                paths.sort()
+            except OSError:
+                if len(problems) < _AWAIT_MAX_DIAGNOSTICS:
+                    problems.append({
+                        "code": "await_record_unreadable",
+                        "path": path_agent,
+                    })
+                continue
+            for path in paths:
+                rel = "/".join(path.relative_to(self.awaiting_dir).parts)
+                try:
+                    if path.stat().st_size > _AWAIT_MAX_RECORD_BYTES:
+                        raise ValueError("oversized")
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                    clean = self._valid_await_record(raw)
+                    generation = path.parent.name
+                    if (
+                        clean is None
+                        or clean.get("agent") != path_agent
+                        or clean.get("wrapper_generation") != generation
+                        or path.stem != clean.get("wait_token")
+                    ):
+                        raise ValueError("invalid")
+                except (OSError, ValueError, json.JSONDecodeError):
+                    if len(problems) < _AWAIT_MAX_DIAGNOSTICS:
+                        problems.append({"code": "await_record_invalid", "path": rel})
+                    continue
+                records.append(clean)
+        return records, problems
+
+    def clear_awaiting_if_token(self, agent: str, wait_token: str) -> bool:
+        """Remove only the wrapped-await record carrying ``wait_token``."""
+        try:
+            validate_agent_name(agent)
+            if _AWAIT_PATH_TOKEN_RE.fullmatch(wait_token) is None:
+                return False
+            with self._awaiting_lock(agent):
+                matches = list((self.awaiting_dir / agent).glob(f"*/{wait_token}.json"))
+                if len(matches) != 1:
+                    return False
+                matches[0].unlink()
+                return True
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return False
 
     def clear_heartbeat(self, agent: str) -> None:
         """Remove the heartbeat marker if present. Best-effort, never raises. The
@@ -4018,6 +4242,8 @@ class Store:
             "pid": lease.get("owner_pid"),
             "since": lease.get("acquired_at"),
             "deadline_epoch": lease.get("expires_at"),
+            "wait_token": lease.get("wrapper_generation"),
+            "wrapper_generation": lease.get("wrapper_generation"),
             "lead_loop": True,
             "managed": True,
         })
@@ -4113,6 +4339,7 @@ class Store:
                                 now: float | None = None,
                                 session_id: str | None = None,
                                 lease_id: str | None = None,
+                                wrapper_generation: str | None = None,
                                 heartbeat_stale_after: float | None = None) -> dict | None:
         """Acquire (or re-acquire / steal) the lease. Returns the lease dict on
         success, or None when a live lease held by ANOTHER owner is not stealable
@@ -4135,10 +4362,19 @@ class Store:
                              if existing and existing.get("lease_id") == lid else iso)
             keep_start = (existing.get("owner_start")
                           if existing and existing.get("lease_id") == lid else iso)
+            if existing and existing.get("lease_id") == lid:
+                keep_generation = (
+                    existing.get("wrapper_generation")
+                    or wrapper_generation
+                    or uuid.uuid4().hex
+                )
+            else:
+                keep_generation = wrapper_generation or uuid.uuid4().hex
             lease = {
                 "schema_version": 1, "managed": True, "mode": LEAD_LOOP_MODE,
                 "agent": agent, "owner_pid": int(owner_pid), "owner_start": keep_start,
                 "session_id": session_id, "lease_id": lid,
+                "wrapper_generation": keep_generation,
                 "acquired_at": keep_acquired, "renewed_at": iso,
                 "expires_at": float(now) + ttl,
             }

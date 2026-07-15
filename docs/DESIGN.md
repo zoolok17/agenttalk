@@ -844,6 +844,25 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   live key's type. *Compatibility ceiling:* legacy curation has no causal id or subject
   hash, so it is accepted only when its content matches the prior current event and its
   registry freshness is necessarily advisory until re-verification.
+- **D-28 Coordination stalls require an explicit wait edge and one liveness
+  authority (2026-07-15).** *Why:* generic wrapper idleness and concurrent
+  mailbox waits are normal, while a wrapped consult can return to its cursor-owning
+  loop and leave no durable evidence that it depends on a specific peer.
+  *Decision:* manual scoped waits and wrapped `--await-reply` markers normalize to
+  one pure wait edge. Wrapped markers are body-free, token-keyed, atomically written,
+  and accepted only while their generation matches the live wrapper marker, the
+  waiter is freshly `idle_waiting`, and the HMAC-valid (when enabled) outbound thread
+  remains open. Supervisor availability is one pure projection of the existing
+  heartbeat, health, launch-grace, skew, and planner rules; two matching supervisor
+  polls confirm unavailable state. A separate generation-bound observation reports
+  a manual restart that remains behind a launch barrier. The detector has no
+  kill/restart/release/message/cursor/gate effects. One `coordination_stall` advisory
+  source feeds attention, doctor, status, and the dashboard, with stable identity
+  independent of age. Consult and handoff opt in; other skills remain unchanged.
+  *Deferred:* global all-idle and wait-cycle detection need a cross-subsystem progress
+  contract and are not inferred in this release. A launch-barrier observation guards
+  supported supervisor polls; an out-of-band state edit is outside that guarantee and
+  degrades to unknown or fails closed through the existing marker checks.
 
 ## 6. How we work (process)
 

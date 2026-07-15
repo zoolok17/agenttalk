@@ -14,6 +14,7 @@ injected, so the loop is unit-testable with a fixture Store and NO real CLI.
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from collections.abc import Callable
@@ -213,6 +214,7 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              on_health_idle: Callable[[], None] | None = None,
              capacity_refresh: Callable[[], None] | None = None,
              capacity_interval_seconds: float = 60.0,
+             wrapper_generation: str | None = None,
              now_iso: Callable[[], str] = _iso_now) -> int:
     """Run the wrapper listen loop. ``drive(record)`` handles ONE turn (injected).
     Returns the number of turns driven. ``max_turns`` / ``max_polls`` / ``max_wall``
@@ -252,13 +254,16 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
     interval-gated and failure-isolated; exceptions are swallowed so capacity
     cannot undo the just-completed liveness/cursor boundary."""
     stamp = heartbeat if heartbeat is not None else (lambda: store.write_heartbeat(agent))
-    wait_token = uuid.uuid4().hex if manage_waiting else None
+    wait_token = (wrapper_generation or uuid.uuid4().hex) if manage_waiting else None
     try:
         if wait_token is not None:
             store.write_waiting(agent, {
                 "agent": agent,
+                "pid": os.getpid(),
+                "since": now_iso(),
                 "mode": "wrapper-loop",
                 "wait_token": wait_token,
+                "wrapper_generation": wait_token,
             })
         if on_health_idle is not None:
             on_health_idle()

@@ -552,6 +552,23 @@ def _gather_status(store: Store) -> dict:
     # project_id is path-derived; surfaces here for diagnostics
     project_id = store.project_id()
     lead_chat = _lead_chat_status(store)
+    try:
+        from agenttalk import coordination_stall as _coordination_stall
+
+        coordination = _coordination_stall.build_snapshot(
+            store,
+            supervisor_config=sup_cfg,
+        )
+    except Exception:  # noqa: BLE001 - status stays fail-safe
+        coordination = {"items": [], "diagnostics": []}
+    coordination_items = coordination.get("items") or []
+    warnings = (
+        _status_warnings(agents) + _thread_warnings(store, cfg) + supervisor_warnings
+    )
+    for item in coordination_items:
+        reason = item.get("reason") if isinstance(item, dict) else None
+        if isinstance(reason, str) and reason and reason not in warnings:
+            warnings.append(reason)
     payload = {
         "root": str(store.root),
         "session_id": cfg.get("session_id"),
@@ -561,9 +578,8 @@ def _gather_status(store: Store) -> dict:
         "invalid_messages": [{"id": mid, "reason": reason} for mid, reason in invalid],
         "agents": agents,
         "stale_threshold_seconds": STALE_THRESHOLD_SECONDS,
-        "warnings": (
-            _status_warnings(agents) + _thread_warnings(store, cfg) + supervisor_warnings
-        ),
+        "warnings": warnings,
+        "coordination_stalls": coordination_items,
     }
     if quarantined:
         payload["quarantined"] = quarantined  # additive: absent when zero
@@ -602,12 +618,10 @@ def _lead_chat_status(store: Store) -> dict:
 def _status_warnings(agents: list[dict]) -> list[str]:
     """Actionable diagnostics derived from the per-agent status rows.
 
-    Two issue-#5 footguns made visible:
-    1. An agent with unread but a never-set cursor — it has been reading
-       with plain `recv` (or not at all) and its read state is a lie.
-    2. A soft-deadlock: two or more agents blocked in `wait` while at
-       least one of those agents already has unread work. Multiple empty
-       live waiters are a healthy idle team, not an actionable warning.
+    An agent with unread but a never-set cursor has been reading with plain
+    ``recv`` (or not at all), so its read state is a lie. Coordination stalls
+    come only from the explicit-edge detector; generic concurrent waiters are
+    healthy idle and never imply deadlock.
     """
     warnings: list[str] = []
     for a in agents:
@@ -618,24 +632,6 @@ def _status_warnings(agents: list[dict]) -> list[str]:
                 f"It is likely peeking with `recv`; run "
                 f"`agenttalk drain --for {a['name']}` to consume + advance."
             )
-    live_waiters = sorted(
-        (a["name"] for a in agents if a["waiting"] and not a["waiting_stale"])
-    )
-    with_unread = sorted(
-        a["name"] for a in agents
-        if a["waiting"] and not a["waiting_stale"] and a["unread"] > 0
-    )
-    if len(live_waiters) >= 2 and with_unread:
-        msg = (
-            f"soft-deadlock: {', '.join(live_waiters)} are all blocked in "
-            f"`wait` simultaneously — nobody is positioned to send next."
-        )
-        verb = "has" if len(with_unread) == 1 else "have"
-        msg += (
-            f" {', '.join(with_unread)} already {verb} unread waiting: "
-            f"run `agenttalk drain --for <agent>`, then reply."
-        )
-        warnings.append(msg)
     return warnings
 
 
@@ -1349,6 +1345,78 @@ def _warn_owed_decision_to_peer(store, sender: str, recipient: str,
         return  # advisory only; a derivation failure must never disturb the send
 
 
+_WRAPPER_GENERATION_ENV = "AGENTTALK_WRAPPER_GENERATION"
+_INBOUND_REQUEST_ID_ENV = "AGENTTALK_INBOUND_REQUEST_ID"
+
+
+def _prepare_await_reply(
+    store: Store,
+    *,
+    sender: str,
+    kind: str,
+    meta: dict,
+    source: str,
+    enabled: bool,
+) -> dict | None:
+    """Validate and build a body-free across-turn wrapped wait record."""
+    if not enabled:
+        return None
+    if kind not in OPENER_KINDS:
+        raise ValueError(
+            "--await-reply requires a thread-opening kind: question, "
+            "review-request, or proposal"
+        )
+    generation = os.environ.get(_WRAPPER_GENERATION_ENV)
+    if not (
+        isinstance(generation, str)
+        and generation
+        and store.wrapper_wait_generation(sender) == generation
+    ):
+        raise ValueError(
+            "--await-reply is only valid inside the current managed wrapper turn"
+        )
+    request_id = meta.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError("--await-reply requires a tracked request_id")
+    parent = os.environ.get(_INBOUND_REQUEST_ID_ENV)
+    if parent:
+        existing = meta.get("parent_request")
+        if existing is not None and existing != parent:
+            raise ValueError(
+                "--await-reply parent_request conflicts with the current inbound request"
+            )
+        meta["parent_request"] = parent
+    return {
+        "schema_version": 1,
+        "agent": sender,
+        "request_id": request_id,
+        "wrapper_generation": generation,
+        "wait_token": f"await-{uuid.uuid4().hex}",
+        "started_at": _iso_now(),
+        "source": source,
+    }
+
+
+def _register_await_reply(store: Store, record: dict | None, *, quiet: bool) -> None:
+    if record is None:
+        return
+    if store.wrapper_wait_generation(record["agent"]) != record["wrapper_generation"]:
+        sys.stderr.write(
+            "agenttalk: warning: wrapper generation changed after send; "
+            "reply-await marker was not recorded\n"
+        )
+        return
+    try:
+        store.write_awaiting(record["agent"], record)
+    except (OSError, ValueError) as exc:
+        sys.stderr.write(
+            f"agenttalk: warning: reply-await marker was not recorded: {exc}\n"
+        )
+        return
+    if not quiet:
+        print(f"await_reply_token={record['wait_token']}")
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     # rescind/end have dedicated commands that handle multi-recipient fan-out
     # and anchoring; a hand-rolled `send --kind rescind` would only address one
@@ -1385,6 +1453,14 @@ def cmd_send(args: argparse.Namespace) -> int:
         return 2
     meta = _parse_meta(args.meta)
     _maybe_autogen_request_id(args.kind, meta, quiet=args.quiet)
+    await_record = _prepare_await_reply(
+        store,
+        sender=sender,
+        kind=args.kind,
+        meta=meta,
+        source="send",
+        enabled=bool(getattr(args, "await_reply", False)),
+    )
     _warn_missing_request_id(args.kind, meta)
     gate_mod.validate_response_status(args.kind, meta)
     gate_mod.validate_review_result_evidence(args.kind, meta)
@@ -1399,8 +1475,24 @@ def cmd_send(args: argparse.Namespace) -> int:
     )
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: SENT  {msg.sender} -> {msg.recipient}"))
+    _register_await_reply(store, await_record, quiet=args.quiet)
     if args.print_id:
         print(msg.id)
+    return 0
+
+
+def cmd_await_cancel(args: argparse.Namespace) -> int:
+    """Conditionally cancel one wrapped reply wait by its opaque token."""
+    store = _get_store(args)
+    cfg = store.load_config()
+    sender = _resolve_self(args.sender, roster=cfg.get("agents") or [])
+    if not store.clear_awaiting_if_token(sender, args.token):
+        sys.stderr.write(
+            "agenttalk await-cancel: no matching active token; nothing cleared\n"
+        )
+        return 3
+    if not args.quiet:
+        print(f"cancelled reply wait {args.token}")
     return 0
 
 
@@ -5687,6 +5779,14 @@ def _collect_attention_items(store: Store, *, for_agent: str | None, roster: lis
         items += A.lead_unarmed_items(signals)
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("lead_unarmed", str(e)))
+    # Explicit coordination stalls (pure detector; generic idle never enters).
+    try:
+        from agenttalk import coordination_stall as _coordination_stall
+
+        snapshot = _coordination_stall.build_snapshot(store)
+        items += A.coordination_stall_items(snapshot.get("items") or [])
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("coordination_stall", str(e)))
     # capacity (threshold-tripped only, from the cheap persisted snapshots - gate 8)
     try:
         items += A.capacity_items(_tripped_capacity_signals(store))
@@ -8187,6 +8287,18 @@ def cmd_reply(args: argparse.Namespace) -> int:
                 f"{'review-result' if opener_kind == 'review-request' else 'proposal-response'}.\n")
             return 2
     dry = getattr(args, "dry_run", False)
+    if dry and getattr(args, "await_reply", False):
+        sys.stderr.write(
+            "agenttalk reply: --await-reply cannot be combined with --dry-run "
+            "because no outbound request is created.\n"
+        )
+        return 2
+    if getattr(args, "await_reply", False) and kind not in {"review-request", "proposal"}:
+        sys.stderr.write(
+            "agenttalk reply: --await-reply requires a counter-review "
+            "(--kind review-request) or counter-proposal (--kind proposal).\n"
+        )
+        return 2
     # --dry-run only resolves routing (recipient + request_id + kind) and
     # sends nothing, so it must NOT require a body. Skip the body read +
     # empty-body check entirely in that case.
@@ -8220,6 +8332,14 @@ def cmd_reply(args: argparse.Namespace) -> int:
     ):
         meta["request_id"] = anchor.meta["request_id"]
     _maybe_autogen_request_id(kind, meta, quiet=args.quiet)
+    await_record = _prepare_await_reply(
+        store,
+        sender=sender,
+        kind=kind,
+        meta=meta,
+        source="reply",
+        enabled=bool(getattr(args, "await_reply", False)),
+    )
     _warn_missing_request_id(kind, meta)
     if dry:
         # Resolve-and-show without sending — guards against echoing the
@@ -8242,6 +8362,7 @@ def cmd_reply(args: argparse.Namespace) -> int:
     )
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: REPLY  {msg.sender} -> {msg.recipient}"))
+    _register_await_reply(store, await_record, quiet=args.quiet)
     return 0
 
 
@@ -9214,6 +9335,11 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     from .wrapper.health import WrapperHealthWriter
     from .wrapper import session as wsession
 
+    # One observational generation spans this wrapper process.  It is safe to
+    # expose to the child (unlike the lead-loop lease id): it grants no mailbox
+    # authority and only binds body-free --await-reply markers to this loop.
+    wrapper_generation = uuid.uuid4().hex
+
     # --- managed lead-loop CONTROLLER lease lifecycle (WP2) -------------------
     lease_id: str | None = None
     heartbeat = None     # Callable[[], None] | None - combined stamp (lead-loop)
@@ -9232,6 +9358,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         # the owner stuck - and the steal threshold must match the visibility paths.
         lease = store.acquire_lead_loop_lease(
             agent, owner_pid=os.getpid(), ttl_seconds=ttl,
+            wrapper_generation=wrapper_generation,
             heartbeat_stale_after=timing["heartbeat_stale_after"])
         if lease is None:
             existing = store.read_lead_loop_lease(agent) or {}
@@ -9301,6 +9428,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             turn_watchdog=turn_watchdog,
             health_writer=health_writer,
             work_heartbeat=work_heartbeat,
+            wrapper_generation=wrapper_generation,
             # the lead-loop combined stamp raises _LeadLoopLeaseLost on a lost lease:
             # the ticker treats it as TYPED loss (permanent stop for the turn, status
             # lost_lease, never a bus heartbeat without the lease), while the
@@ -9452,6 +9580,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             cadence=cadence_hook,  # WP3 proactive sweep (lead-loop only)
             on_health_idle=health_writer.idle,
             capacity_refresh=capacity_refresh,
+            wrapper_generation=wrapper_generation,
         )
     except _LeadLoopLeaseLost:
         # LOST the lease mid-run (stolen / torn / force-released): the ownership gate /
@@ -10515,6 +10644,14 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                     reason_code=str(result.get("reason") or "launch_barrier"),
                     now_epoch=now,
                 )
+        if getattr(args, "record_events", False):
+            with contextlib.suppress(Exception):
+                sup.record_supervisor_launch_barrier_observation(
+                    store,
+                    args.agent,
+                    result,
+                    now_epoch=now,
+                )
         print(json.dumps(result, indent=2))
         return 0
 
@@ -10607,6 +10744,14 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                                 now_epoch=now, snapshot=snapshot)
         print(json.dumps(plan, indent=2))
         if getattr(args, "record_events", False):
+            with contextlib.suppress(Exception):
+                sup.record_coordination_availability_observation(
+                    store,
+                    report,
+                    plan,
+                    config,
+                    now_epoch=now,
+                )
             with contextlib.suppress(Exception):
                 sup.record_supervisor_plan_events(store, plan, now_epoch=now)
         return 0
@@ -10911,9 +11056,27 @@ def build_parser() -> argparse.ArgumentParser:
     pse.add_argument("-m", "--message", help="Body text (else --file or stdin)")
     pse.add_argument("--file", help="Read body from this file path ('-' = stdin)")
     pse.add_argument("--allow-empty", action="store_true")
+    pse.add_argument(
+        "--await-reply",
+        action="store_true",
+        help="Record an explicit across-turn reply wait for this opener. "
+             "Managed-wrapper turns only; consult/handoff use this and return "
+             "to the wrapper instead of owning the inbox cursor.",
+    )
     pse.add_argument("--print-id", action="store_true", help="Print the new message id on its own line")
     pse.add_argument("--quiet", action="store_true")
     pse.set_defaults(func=cmd_send)
+
+    pac = sub.add_parser(
+        "await-cancel",
+        help="Cancel one wrapped --await-reply marker by its opaque token.",
+    )
+    pac.add_argument("--from", dest="sender",
+                     help="Waiting agent name (default: $AGENTTALK_SELF)")
+    pac.add_argument("--token", required=True,
+                     help="Exact await_reply_token printed by send/reply")
+    pac.add_argument("--quiet", action="store_true")
+    pac.set_defaults(func=cmd_await_cancel)
 
     pcomp = sub.add_parser(
         "composing",
@@ -12241,6 +12404,12 @@ def build_parser() -> argparse.ArgumentParser:
     prpl.add_argument("-m", "--message", help="Body text (else --file or stdin)")
     prpl.add_argument("--file", help="Read body from this file path ('-' = stdin)")
     prpl.add_argument("--allow-empty", action="store_true")
+    prpl.add_argument(
+        "--await-reply",
+        action="store_true",
+        help="Record an explicit across-turn reply wait when this reply opens "
+             "a counter-review or counter-proposal. Managed-wrapper turns only.",
+    )
     prpl.add_argument("--na", action="store_true",
                       help="Not-applicable response (0.15.0): closes your "
                            "obligation on a question thread, displayed as "

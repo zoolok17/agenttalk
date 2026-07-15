@@ -52,6 +52,8 @@ _ADAPTERS: dict[str, Callable[[object], list[Event]]] = {
 # high-confidence signature -> escalation-enabled.
 _TELEMETRY_ONLY = {"codex": True, "claude": False}
 _NO_CHILD_WINDOW_ENV = "AGENTTALK_NO_CHILD_WINDOW"
+WRAPPER_GENERATION_ENV = "AGENTTALK_WRAPPER_GENERATION"
+INBOUND_REQUEST_ID_ENV = "AGENTTALK_INBOUND_REQUEST_ID"
 _BENIGN_PIPE_TEARDOWN_ERRNOS = {errno.EINVAL, errno.EPIPE}
 
 # Legacy infra-like text markers. These are low-confidence hints only; they deliberately
@@ -423,11 +425,24 @@ def _agenttalk_py() -> str:
     return str(Path(sys.executable).resolve())
 
 
-def _child_env(workspace_root: str | os.PathLike[str] | None = None) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k != LEAD_LOOP_LEASE_ENV}
+def _child_env(
+    workspace_root: str | os.PathLike[str] | None = None,
+    *,
+    wrapper_generation: str | None = None,
+    inbound_request_id: str | None = None,
+) -> dict[str, str]:
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in {LEAD_LOOP_LEASE_ENV, WRAPPER_GENERATION_ENV, INBOUND_REQUEST_ID_ENV}
+    }
     workspace = Path(workspace_root).resolve() if workspace_root else _workspace_root()
     env["AGENTTALK_PY"] = _agenttalk_py()
     env["AGENTTALK_ROOT"] = str(workspace)
+    if isinstance(wrapper_generation, str) and wrapper_generation:
+        env[WRAPPER_GENERATION_ENV] = wrapper_generation
+    if isinstance(inbound_request_id, str) and inbound_request_id:
+        env[INBOUND_REQUEST_ID_ENV] = inbound_request_id
     return env
 
 
@@ -1337,6 +1352,7 @@ class _ProcStream:
                  watchdog_clock=time.monotonic, watchdog_wall_clock=time.time,
                  work_heartbeat=None, work_heartbeat_stamp=None,
                  work_heartbeat_status=None,
+                 child_env: dict[str, str] | None = None,
                  lease_lost_exceptions: tuple = ()) -> None:
         # argv is the operator-provided launch command; never shell=True.
         # Explicit encoding/errors (see run_wrapper): UTF-8 child output must not be
@@ -1348,7 +1364,7 @@ class _ProcStream:
         # an accidental model-side `agenttalk drain` bypass the single-consumer guard.
         # Always stripped (harmless for non-lead-loop children; defense-in-depth even
         # if a future parent sets it). The child otherwise inherits the parent env.
-        child_env = _child_env()
+        child_env = dict(child_env) if child_env is not None else _child_env()
         self._proc = subprocess.Popen(  # noqa: S603  # nosec B603
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
@@ -1519,6 +1535,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                watchdog_snapshot_fn=None, watchdog_kill_fn=None,
                health_writer: WrapperHealthWriter | None = None,
                work_heartbeat=None,
+               wrapper_generation: str | None = None,
                lease_lost_exceptions: tuple = ()) -> Callable[[dict], object]:
     """Build the per-turn ``drive(record)`` callback for loop.run_loop. Each call
     drives ONE real CLI turn and returns a :class:`loop.DriveOutcome` (ok + a failure
@@ -1625,6 +1642,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         on_info=_health_info,
         min_interval=min_interval,
     )
+    active_parent_request_id: str | None = None
     if spawn is not None:
         spawner = spawn                     # tests inject their own (argv, stdin) spawner
     else:
@@ -1642,12 +1660,18 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             # Bind the per-turn watchdog onto the real spawner. When turn_watchdog is None
             # or disabled, _ProcStream starts no thread (zero overhead, behavior unchanged).
             # Same for a disabled/invalid work_heartbeat config.
+            child_env = _child_env(
+                store.root,
+                wrapper_generation=wrapper_generation,
+                inbound_request_id=active_parent_request_id,
+            )
             return _ProcStream(argv, stdin_text, watchdog=turn_watchdog,
                                watchdog_snapshot_fn=watchdog_snapshot_fn,
                                watchdog_kill_fn=watchdog_kill_fn,
                                work_heartbeat=work_heartbeat,
                                work_heartbeat_stamp=_whb_stamp,
                                work_heartbeat_status=_whb_status,
+                               child_env=child_env,
                                lease_lost_exceptions=lease_lost_exceptions)
     preflight = agenttalk_preflight
     if preflight is None and cli == "codex" and spawn is None:
@@ -1785,6 +1809,10 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         return _classify_drive_failure(sig)
 
     def drive(record: dict) -> DriveOutcome:
+        nonlocal active_parent_request_id
+        meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+        parent = meta.get("request_id")
+        active_parent_request_id = parent if isinstance(parent, str) and parent else None
         lesson_selection = _lesson_context.select_for_record(store, record)
         lesson_prompt = _lesson_context.render_prompt_section(lesson_selection)
         lesson_turn_id = f"turn-{uuid.uuid4().hex[:12]}"

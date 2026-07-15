@@ -2327,6 +2327,8 @@ _ATTENTION_SOURCE_MAP: dict[str, tuple[str, str, str]] = {
     _attention.SOURCE_GATE_HOLD: ("gate", "GATE HOLD", "high"),
     _attention.SOURCE_CLOSE_HOLD: ("gate", "GATE HOLD", "high"),
     _attention.SOURCE_DEAD_LETTER: ("deadletter", "DEAD LETTER", "med"),
+    _attention.SOURCE_COORDINATION_STALL: (
+        "coordination_stall", "TEAM STALL", "high"),
     _attention.SOURCE_LEAD_UNARMED: ("supervisor", "SUPERVISOR", "low"),
     _attention.SOURCE_CAPACITY: ("supervisor", "SUPERVISOR", "low"),
     _attention.SOURCE_ERROR: ("supervisor", "SUPERVISOR", "low"),
@@ -2378,6 +2380,13 @@ def _collect_web_attention_items(store: Store, roster: list[str],
         items += A.lead_unarmed_items(signals)
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("lead_unarmed", str(e)))
+    try:
+        from agenttalk import coordination_stall as _coordination_stall
+
+        snapshot = _coordination_stall.build_snapshot(store)
+        items += A.coordination_stall_items(snapshot.get("items") or [])
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("coordination_stall", str(e)))
     return items
 
 

@@ -164,6 +164,24 @@ For ad-hoc cross-review, use this template:
 
 ### 5. Send + wait
 
+Inside a managed wrapper turn (`AGENTTALK_WRAPPER_GENERATION` is set),
+send with `--await-reply` and **return immediately to the wrapper**. The
+wrapper owns the inbox cursor and will deliver the correlated review result
+in a later turn; do not run `wait`, `sync`, `recv`, or `drain` from that
+child turn.
+
+```bash
+if [ -n "${AGENTTALK_WRAPPER_GENERATION:-}" ]; then
+  python -m agenttalk send --from "$SELF" --to "$TARGET" --kind review-request \
+    --subject "<one-line>" --meta request_id="$REQ_ID" \
+    --meta base_sha=<sha> --meta head_sha=<sha> --meta lane_id=<lane-id> \
+    --await-reply -m "$BODY"
+  return
+fi
+```
+
+In a manual/unwrapped session, keep the existing scoped blocking wait:
+
 ```bash
 python -m agenttalk send --from "$SELF" --to "$TARGET" --kind review-request \
   --subject "<one-line>" \

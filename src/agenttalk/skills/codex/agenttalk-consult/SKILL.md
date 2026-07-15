@@ -146,6 +146,24 @@ Frame it to invite attack, not endorsement. Template:
 
 ### 5. Send + wait
 
+Inside a managed wrapper turn (`AGENTTALK_WRAPPER_GENERATION` is set),
+send with `--await-reply` and **return immediately to the wrapper**. The
+wrapper owns the inbox cursor and will deliver the correlated reply in a
+later turn; do not run `wait`, `sync`, `recv`, or `drain` from that child
+turn.
+
+```bash
+if [ -n "${AGENTTALK_WRAPPER_GENERATION:-}" ]; then
+  python -m agenttalk send --from "$SELF" --to "$TARGET" --kind question \
+    --subject "consult: <one-line summary>" \
+    --meta request_id="$REQ_ID" --meta consult=true --meta round=1 \
+    --await-reply -m "$BODY"
+  return
+fi
+```
+
+In a manual/unwrapped session, keep the existing scoped blocking wait:
+
 ```bash
 python -m agenttalk send --from "$SELF" --to "$TARGET" --kind question \
   --subject "consult: <one-line summary>" \

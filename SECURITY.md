@@ -114,6 +114,15 @@ trust model:
 - **The reply-in-flight marker (`state/<agent>.composing.json`) is
   observational**, with the same tamper profile as heartbeat/waiting
   markers: corrupting it degrades displays, never delivery or validity.
+- **Wrapped reply-await markers (`state/awaiting/...`) are observational.** A
+  marker cannot establish or close a warning by itself: the reader also requires
+  the current wrapper generation, fresh idle health, and an open request derived
+  from the validated message ledger. With HMAC enforcement, only HMAC-valid
+  messages establish or close that ledger edge. Without HMAC enforcement, the
+  derived sender, recipient, and request id retain the documented honest-local
+  trust ceiling. Marker tampering can suppress a warning or create a diagnostic,
+  but cannot deliver a message, move a cursor, authorize a supervisor action, or
+  change a gate.
 
 ### Quarantine, frozen audiences, and batch facts (0.15.0)
 

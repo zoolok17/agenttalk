@@ -115,6 +115,9 @@ def run(project_root: Path | None = None) -> Report:
         waiters = _check_active_waiters(store)
         if waiters is not None:  # additive: absent unless a live waiter exists
             report.checks.append(waiters)
+        coordination = _check_coordination_stalls(store)
+        if coordination is not None:
+            report.checks.append(coordination)
         codex_vis = _check_supervised_codex(store, runtime_checker=_check_agenttalk_runtime)
         if codex_vis is not None:  # additive: absent unless a supervised codex agent
             report.checks.append(codex_vis)
@@ -140,6 +143,47 @@ def run(project_root: Path | None = None) -> Report:
         if lead_check is not None:  # additive: absent unless a lead-loop concern exists
             report.checks.append(lead_check)
     return report
+
+
+def _check_coordination_stalls(store: Store) -> Check | None:
+    """Surface explicit-edge stalls and malformed observational evidence."""
+    try:
+        from agenttalk import coordination_stall
+
+        snapshot = coordination_stall.build_snapshot(store)
+    except Exception as exc:  # noqa: BLE001 - doctor never crashes
+        return Check(
+            name="coordination_stall",
+            status="warn",
+            details=f"coordination stall evidence could not be read: {exc}",
+            fix="Inspect .agenttalk/state coordination records.",
+        )
+    items = snapshot.get("items") or []
+    diagnostics = snapshot.get("diagnostics") or []
+    if not items and not diagnostics:
+        return None
+    details = [
+        str(item.get("reason"))
+        for item in items
+        if isinstance(item, dict) and item.get("reason")
+    ]
+    details.extend(
+        f"invalid coordination evidence: {row.get('code', 'unknown')}"
+        for row in diagnostics
+        if isinstance(row, dict)
+    )
+    actions = [
+        str(item.get("action"))
+        for item in items
+        if isinstance(item, dict) and item.get("action")
+    ]
+    return Check(
+        name="coordination_stall",
+        status="warn",
+        details="; ".join(details),
+        fix=actions[0] if actions else "Inspect .agenttalk/state coordination records.",
+        data=snapshot,
+    )
 
 
 def _check_lead_unarmed(store) -> Check | None:

@@ -119,6 +119,24 @@ Frame it to invite attack, not endorsement. Template:
 
 ### 5. Send + wait
 
+Inside a managed wrapper turn (`$env:AGENTTALK_WRAPPER_GENERATION` is
+set), send with `--await-reply` and **return immediately to the wrapper**.
+The wrapper owns the inbox cursor and will deliver the correlated reply in
+a later turn; do not run `wait`, `sync`, `recv`, or `drain` from that child
+turn.
+
+```powershell
+if ($env:AGENTTALK_WRAPPER_GENERATION) {
+  agenttalk send --from $SELF --to $TARGET --kind question `
+    --subject "consult: <one-line summary>" `
+    --meta request_id=$reqId --meta consult=true --meta round=1 `
+    --await-reply -m $body
+  return
+}
+```
+
+In a manual/unwrapped session, keep the existing scoped blocking wait:
+
 ```powershell
 agenttalk send --from $SELF --to $TARGET --kind question `
   --subject "consult: <one-line summary>" `

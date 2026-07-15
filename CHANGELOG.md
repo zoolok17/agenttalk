@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Explicit coordination stalls are loud without treating healthy idle as
+  deadlock.** Wrapped consult/handoff sends can record a generation-bound
+  `--await-reply` edge; manual scoped waits remain compatible. A pure detector
+  warns only for a supervisor-confirmed unavailable target or a persistent manual
+  restart barrier, after two matching polls, and projects one stable advisory to
+  attention, doctor, status, and Team Console. Generic idle, ordinary outbound
+  requests, uncertain manual agents, and short waits remain silent. The detector
+  never kills, restarts, releases, reroutes, moves a cursor, sends a message, or
+  changes a gate; global all-idle/cycle inference remains deferred.
+
 ## [0.76.1] - 2026-07-15
 
 ### Fixed
