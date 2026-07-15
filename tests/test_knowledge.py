@@ -178,6 +178,47 @@ def test_causal_curation_binds_publisher_author(note_type: str) -> None:
     assert any("payload_hash" in problem["error"] for problem in problems)
 
 
+@pytest.mark.parametrize("note_type", ["pointer", "lesson"])
+def test_causal_curation_binds_publisher_created_at(note_type: str) -> None:
+    publish = (
+        _lesson_event(note_id="kn-created-parent")
+        if note_type == "lesson"
+        else _publish(note_id="kn-created-parent")
+    )
+    forged = kn.new_curate_event(
+        base=publish, action="verify", curated_by="lead",
+        resolved_from="lead", at="2026-07-07T01:00:00Z", reason=None,
+    )
+    forged["created_at"] = "2099-12-31T23:59:59Z"
+    assert kn.event_problem(forged) is None
+
+    views, problems = kn.resolve_views_with_problems([publish, forged])
+
+    rec = views[(publish["domain_id"], publish["key"])]
+    assert rec["latest"]["id"] == publish["id"]
+    assert rec["curated"] is None
+    assert any("payload_hash" in problem["error"] for problem in problems)
+
+
+@pytest.mark.parametrize("action", ["verify", "retract"])
+def test_modern_lesson_curator_must_match_top_level_curated_by(action: str) -> None:
+    publish = _lesson_event(note_id="kn-curator-parent")
+    forged = kn.new_curate_event(
+        base=publish, action=action, curated_by="lead",
+        resolved_from="lead", at="2026-07-07T01:00:00Z",
+        reason="obsolete" if action == "retract" else None,
+    )
+    forged["lesson"] = {**forged["lesson"], "curator": "attacker"}
+    assert kn.event_problem(forged) is None
+
+    views, problems = kn.resolve_views_with_problems([publish, forged])
+
+    rec = views[(kn.PROCESS_DOMAIN, "process.flake")]
+    assert rec["latest"]["id"] == publish["id"]
+    assert rec["curated"] is None
+    assert any("lesson.curator" in problem["error"] for problem in problems)
+
+
 def test_causal_curation_cannot_replace_newer_proposal_from_stale_parent() -> None:
     old_publish = _publish(note_id="kn-old", body="old content")
     old_verify = kn.new_curate_event(
@@ -1212,11 +1253,25 @@ def test_lesson_immutable_payload_matches_validated_schema_minus_curation_state(
 
 
 def test_event_integrity_partition_is_exhaustive_and_disjoint() -> None:
+    expected_bound_common = {
+        "domain_id", "key", "type", "body", "author", "created_at",
+        "supersedes_id", "supersedes_key",
+    }
+    expected_bound = expected_bound_common | {"anchor", "lesson"}
+    expected_mutable = {
+        "schema_version", "event", "id", "verified_against_sha",
+        "domain_registry_hash", "domain_definition_hash", "authority",
+        "updated_at", "curated_by", "curated_at", "curates_id",
+        "payload_hash", "retract_reason",
+    }
     complete_event_schema = (
         frozenset().union(*kn._EVENT_FIELDS_BY_KIND.values())
         | {"anchor", "lesson"}
     )
     assert kn._EVENT_PERSISTED_FIELDS == complete_event_schema
+    assert kn._EVENT_BOUND_COMMON_FIELDS == expected_bound_common
+    assert kn._EVENT_BOUND_FIELDS == expected_bound
+    assert kn._EVENT_CURATION_MUTABLE_FIELDS == expected_mutable
     assert (
         kn._EVENT_BOUND_FIELDS | kn._EVENT_CURATION_MUTABLE_FIELDS
         == complete_event_schema
@@ -1224,10 +1279,6 @@ def test_event_integrity_partition_is_exhaustive_and_disjoint() -> None:
     assert not (
         kn._EVENT_BOUND_FIELDS & kn._EVENT_CURATION_MUTABLE_FIELDS
     )
-    assert kn._EVENT_BOUND_COMMON_FIELDS == {
-        "domain_id", "key", "type", "body", "author",
-        "supersedes_id", "supersedes_key",
-    }
 
     complete_lesson_schema = kn._LESSON_BASE_FIELDS | {"curator"}
     assert kn._LESSON_PERSISTED_FIELDS == complete_lesson_schema

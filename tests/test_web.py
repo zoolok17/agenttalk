@@ -4620,6 +4620,39 @@ def test_api_learning_surfaces_lessons_and_exposure_without_message_body(
     assert wire["lessons"][0]["key"] == "review.final-sha"
 
 
+@pytest.mark.parametrize(("field", "forged_value"), [
+    ("created_at", "2099-12-31T23:59:59Z"),
+    ("curator", "attacker"),
+])
+def test_api_learning_ignores_causal_curation_with_forged_display_provenance(
+        tmp_path: Path, field: str, forged_value: str) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "dev"])
+    current = _write_verified_lesson(store)
+    forged = kn.new_curate_event(
+        base=current,
+        action="verify",
+        curated_by="lead",
+        resolved_from="lead",
+        at="2026-07-08T00:02:00Z",
+        reason=None,
+    )
+    if field == "curator":
+        forged["lesson"] = {**forged["lesson"], "curator": forged_value}
+    else:
+        forged[field] = forged_value
+    assert kn.event_problem(forged) is None
+    kn.append_event(store, forged)
+
+    payload = web.build_learning(web.RootDescriptor(store, "root"))
+
+    lesson = payload["lessons"][0]
+    assert lesson["created_at"] == "2026-07-08T00:00:00Z"
+    assert lesson["curated_by"] == "lead"
+    assert lesson["curator"] == "lead"
+    assert forged_value not in {lesson["created_at"], lesson["curator"]}
+
+
 def test_api_learning_anchor_evidence_is_pointer_allowlisted(tmp_path: Path) -> None:
     s = Store(tmp_path)
     s.init(["lead", "dev"])

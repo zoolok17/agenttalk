@@ -823,13 +823,18 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   visible with caution. The lesson-only virtual `process` policy has a fixed subject
   hash and yields to a real registry entry. New curate/retract rows carry
   `curates_id` and a hash of an exhaustive event-field partition. Bound content
-  includes publisher author, inherited supersession lineage, and the note body;
+  includes publisher author and creation time, inherited supersession lineage, and
+  the note body;
   lesson content includes every persisted field except status/curator, while pointer
   content includes the complete normalized anchor. All remaining event fields are
-  explicitly classified as curation/action attestations. The fold accepts curation
+  explicitly classified as curation/action attestations. Exhaustiveness and
+  disjointness guarantee that every field is covered; exact-set tests pin both
+  buckets so each field's semantic classification remains an explicit review choice.
+  The fold accepts curation
   only when it names the current prior same-key event and its bound content matches.
   Verification metadata such as `verified_against_sha` is deliberately outside that
-  content identity. Modern rows reject unknown event/authority/lesson/anchor fields;
+  content identity. A modern lesson's nested curator must agree with its top-level
+  curation actor. Modern rows reject unknown event/authority/lesson/anchor fields;
   historical rows are canonicalized to the same allowlists before folding or output.
   Curate holds the shared config/knowledge lock, re-reads the registry before append,
   and re-stamps both hashes. That A/B check covers supported writers that honor the

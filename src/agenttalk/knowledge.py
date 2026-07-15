@@ -146,18 +146,18 @@ _EVENT_FIELDS_BY_KIND = {
 }
 # Exhaustive event-level partition. Bound common fields are publisher content and
 # inherited provenance; anchor/lesson is the type-specific bound projection. Every
-# other persisted field is an explicitly named curation/action attestation. Tests
-# compare this partition with the union of _EVENT_FIELDS_BY_KIND so a new field cannot
-# silently fall outside the integrity boundary.
+# other persisted field is an explicitly named curation/action attestation. The
+# union/disjoint checks guarantee coverage only; exact-set tests make every field's
+# semantic bucket a reviewed classification.
 _EVENT_BOUND_COMMON_FIELDS = frozenset({
-    "domain_id", "key", "type", "body", "author",
+    "domain_id", "key", "type", "body", "author", "created_at",
     "supersedes_id", "supersedes_key",
 })
 _EVENT_BOUND_FIELDS = _EVENT_BOUND_COMMON_FIELDS | frozenset({"anchor", "lesson"})
 _EVENT_CURATION_MUTABLE_FIELDS = frozenset({
     "schema_version", "event", "id", "verified_against_sha",
     "domain_registry_hash", "domain_definition_hash", "authority",
-    "created_at", "updated_at", "curated_by", "curated_at",
+    "updated_at", "curated_by", "curated_at",
     "curates_id", "payload_hash", "retract_reason",
 })
 _EVENT_PERSISTED_FIELDS = (
@@ -754,6 +754,10 @@ def _curation_causal_problem(evt: dict, prior: list[dict]) -> str | None:
         if payload_hash(evt) != payload_hash(parent):
             return "legacy curation payload differs from its prior current event"
         return None
+
+    if evt.get("type") == TYPE_LESSON and (
+            (evt.get("lesson") or {}).get("curator") != evt.get("curated_by")):
+        return "lesson.curator must match top-level curated_by"
 
     parent = prior[-1]
     if curates_id != parent.get("id"):
