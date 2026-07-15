@@ -411,12 +411,15 @@ def test_report_heartbeat_stale_and_waiting(tmp_path: Path, monkeypatch) -> None
     # just after the heartbeat -> fresh; far later -> stale
     fresh = sup.build_report(s, now_epoch=hb_ts + 1, suspect_after_seconds=120)
     assert fresh["agents"]["worker"]["heartbeat_stale"] is False
+    assert fresh["agents"]["worker"]["heartbeat_evidence"] == sup.HEARTBEAT_EVIDENCE_OBSERVED
     assert fresh["agents"]["worker"]["waiting_pid_alive"] is True
     stale = sup.build_report(s, now_epoch=hb_ts + 999, suspect_after_seconds=120)
     assert stale["agents"]["worker"]["heartbeat_stale"] is True
+    assert stale["agents"]["worker"]["heartbeat_evidence"] == sup.HEARTBEAT_EVIDENCE_OBSERVED
     # an agent that never heartbeated reads as stale
     assert stale["agents"]["lead"]["heartbeat_stale"] is True
     assert stale["agents"]["lead"]["heartbeat_age_seconds"] is None
+    assert stale["agents"]["lead"]["heartbeat_evidence"] == sup.HEARTBEAT_EVIDENCE_MISSING
 
 
 def test_report_rejects_heartbeat_beyond_future_skew(tmp_path: Path) -> None:
@@ -429,6 +432,14 @@ def test_report_rejects_heartbeat_beyond_future_skew(tmp_path: Path) -> None:
     worker = report["agents"]["worker"]
     assert worker["heartbeat_stale"] is True
     assert worker["heartbeat_age_seconds"] is None
+    assert worker["heartbeat_evidence"] == sup.HEARTBEAT_EVIDENCE_FUTURE_SKEW
+
+    legacy_report = json.loads(json.dumps(report))
+    for agent in legacy_report["agents"].values():
+        agent.pop("heartbeat_evidence")
+    assert sup.plan_actions(report, {}, _CONFIG, now_epoch=NOW, snapshot=[]) == (
+        sup.plan_actions(legacy_report, {}, _CONFIG, now_epoch=NOW, snapshot=[])
+    )
 
 
 def test_report_allows_heartbeat_within_future_skew(tmp_path: Path) -> None:
@@ -441,6 +452,7 @@ def test_report_allows_heartbeat_within_future_skew(tmp_path: Path) -> None:
     worker = report["agents"]["worker"]
     assert worker["heartbeat_stale"] is False
     assert worker["heartbeat_age_seconds"] == 0.0
+    assert worker["heartbeat_evidence"] == sup.HEARTBEAT_EVIDENCE_OBSERVED
 
 
 def test_report_reflects_restart_request(tmp_path: Path) -> None:

@@ -213,6 +213,42 @@ def test_available_or_manual_unknown_responder_suppresses_warning(tmp_path: Path
     assert _snapshot(store, config, now=NOW + 3)["items"] == []
 
 
+@pytest.mark.parametrize(
+    ("heartbeat_offset", "expected_state", "expects_stall"),
+    [
+        (
+            health.DEFAULT_HEARTBEAT_SKEW_SECONDS + 300,
+            supervisor.AVAILABILITY_UNKNOWN,
+            False,
+        ),
+        (
+            health.DEFAULT_HEARTBEAT_SKEW_SECONDS - 1,
+            supervisor.AVAILABILITY_AVAILABLE,
+            False,
+        ),
+        (-10_000, supervisor.AVAILABILITY_UNAVAILABLE, True),
+    ],
+)
+def test_heartbeat_time_evidence_controls_coordination_availability(
+    tmp_path: Path,
+    heartbeat_offset: float,
+    expected_state: str,
+    expects_stall: bool,
+) -> None:
+    store, config = _team(tmp_path)
+    _open_wait(store)
+    _heartbeat(store, "dev-2", at=NOW + heartbeat_offset)
+
+    _poll_availability(store, config, now=NOW)
+    _poll_availability(store, config, now=NOW + 1)
+    observed, problems = supervisor.read_coordination_availability_observation(store)
+
+    assert problems == []
+    assert observed["dev-2"]["state"] == expected_state
+    items = _snapshot(store, config, now=NOW + 1)["items"]
+    assert bool(items) is expects_stall
+
+
 def test_missing_liveness_is_unknown_and_retired_state_is_debounced(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

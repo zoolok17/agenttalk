@@ -98,6 +98,14 @@ AVAILABILITY_AVAILABLE = "available"
 AVAILABILITY_UNAVAILABLE = "unavailable"
 AVAILABILITY_TERMINAL = "terminal_by_design"
 AVAILABILITY_UNKNOWN = "unknown"
+HEARTBEAT_EVIDENCE_MISSING = "missing"
+HEARTBEAT_EVIDENCE_OBSERVED = "observed"
+HEARTBEAT_EVIDENCE_FUTURE_SKEW = "future_skew"
+_HEARTBEAT_EVIDENCE_CLASSES = frozenset({
+    HEARTBEAT_EVIDENCE_MISSING,
+    HEARTBEAT_EVIDENCE_OBSERVED,
+    HEARTBEAT_EVIDENCE_FUTURE_SKEW,
+})
 _COORDINATION_AVAILABILITY_SCHEMA = 1
 _COORDINATION_AVAILABILITY_FILE = "coordination-availability.json"
 _COORDINATION_BARRIER_SCHEMA = 1
@@ -660,6 +668,24 @@ def project_coordination_availability(
             "state": AVAILABILITY_UNAVAILABLE,
             "subtype": "explicit_health_error",
             "evidence_code": health_state,
+        }
+    heartbeat_evidence = rpt.get("heartbeat_evidence")
+    if heartbeat_evidence == HEARTBEAT_EVIDENCE_FUTURE_SKEW:
+        return {
+            "agent": name,
+            "state": AVAILABILITY_UNKNOWN,
+            "subtype": "heartbeat_time_untrusted",
+            "evidence_code": "heartbeat_future_skew",
+        }
+    if (
+        heartbeat_evidence is not None
+        and heartbeat_evidence not in _HEARTBEAT_EVIDENCE_CLASSES
+    ):
+        return {
+            "agent": name,
+            "state": AVAILABILITY_UNKNOWN,
+            "subtype": "malformed_liveness",
+            "evidence_code": "heartbeat_evidence_invalid",
         }
     heartbeat_stale_value = rpt.get("heartbeat_stale")
     if heartbeat_stale_value is not True and heartbeat_stale_value is not False:
@@ -3147,7 +3173,10 @@ def build_report(store: Store, *, now_epoch: float,
     planner's per-CLI decision (a wrapped Codex is not shown stale at the global
     threshold while the planner correctly holds to 900s). Without it the single
     global threshold applies (legacy behavior). The resolved per-agent threshold
-    is reported as ``stuck_after_seconds`` on each agent entry.
+    is reported as ``stuck_after_seconds`` on each agent entry. The additive
+    ``heartbeat_evidence`` field preserves missing/observed/future-skew evidence
+    for read-only coordination warnings; planning continues to consume the
+    unchanged age and stale fields.
     """
     threshold = stuck_after_seconds
     if threshold is None:
@@ -3176,6 +3205,15 @@ def build_report(store: Store, *, now_epoch: float,
             now_epoch=now_epoch,
             heartbeat_skew_seconds=health_timing["heartbeat_skew_seconds"],
         )
+        heartbeat_evidence = (
+            HEARTBEAT_EVIDENCE_MISSING
+            if hb is None
+            else (
+                HEARTBEAT_EVIDENCE_FUTURE_SKEW
+                if hb_age is None
+                else HEARTBEAT_EVIDENCE_OBSERVED
+            )
+        )
         stale = hb_age is None or hb_age > threshold_a
         health = store.read_health(
             a,
@@ -3193,6 +3231,7 @@ def build_report(store: Store, *, now_epoch: float,
             "protected": a in protected,
             "heartbeat_age_seconds": hb_age,
             "heartbeat_stale": stale,
+            "heartbeat_evidence": heartbeat_evidence,
             "stuck_after_seconds": threshold_a,
             "health": health,
             "waiting": marker is not None,
