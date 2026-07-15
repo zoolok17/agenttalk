@@ -248,6 +248,93 @@ class _BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
     ]
 
 
+def _open_windows_file(path: str, *, share_mode: int) -> int:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        path,
+        0x0080,  # FILE_READ_ATTRIBUTES
+        share_mode,
+        None,
+        3,  # OPEN_EXISTING
+        0x00000080,  # FILE_ATTRIBUTE_NORMAL
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        raise PowerShellHostError(
+            f"cannot open candidate (winerror {ctypes.get_last_error()})"
+        )
+    return int(handle)
+
+
+def _windows_identity_from_handle(handle: int) -> NativeFileIdentity:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    native_handle = wintypes.HANDLE(handle)
+    info = _BY_HANDLE_FILE_INFORMATION()
+    if not kernel32.GetFileInformationByHandle(native_handle, ctypes.byref(info)):
+        raise PowerShellHostError(
+            f"cannot query candidate identity (winerror {ctypes.get_last_error()})"
+        )
+    needed = kernel32.GetFinalPathNameByHandleW(native_handle, None, 0, 0)
+    if not needed:
+        raise PowerShellHostError(
+            f"cannot query candidate final path (winerror {ctypes.get_last_error()})"
+        )
+    buf = ctypes.create_unicode_buffer(needed + 1)
+    if not kernel32.GetFinalPathNameByHandleW(native_handle, buf, len(buf), 0):
+        raise PowerShellHostError(
+            f"cannot read candidate final path (winerror {ctypes.get_last_error()})"
+        )
+    final_path = _normalize_final_path(buf.value)
+    if not Path(final_path).is_file():
+        raise PowerShellHostError("candidate is not a regular file")
+    last_write = (
+        int(info.ftLastWriteTime.dwHighDateTime) << 32
+    ) | int(info.ftLastWriteTime.dwLowDateTime)
+    size = (int(info.nFileSizeHigh) << 32) | int(info.nFileSizeLow)
+    file_id = (int(info.nFileIndexHigh) << 32) | int(info.nFileIndexLow)
+    return NativeFileIdentity(
+        scheme="win32-file-id-v1",
+        final_path=final_path,
+        volume_serial=f"{int(info.dwVolumeSerialNumber):08x}",
+        file_id=f"{file_id:016x}",
+        size=size,
+        last_write=last_write,
+    )
+
+
+def close_native_file_handle(handle: int) -> None:
+    if handle:
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(
+            wintypes.HANDLE(handle)
+        )
+
+
+def open_stable_native_file_identity(
+    path: str | os.PathLike[str],
+) -> tuple[NativeFileIdentity, int]:
+    """Hold a Windows file handle that denies image writes and replacement."""
+    if os.name != "nt":
+        raise PowerShellHostError("stable native file handles are Windows-only")
+    raw = _validate_local_exe_shape(path, subject="process image")
+    handle = _open_windows_file(raw, share_mode=0x00000001)  # FILE_SHARE_READ
+    try:
+        return _windows_identity_from_handle(handle), handle
+    except Exception:
+        close_native_file_handle(handle)
+        raise
+
+
 def native_file_identity(path: str | os.PathLike[str]) -> NativeFileIdentity:
     """Return a reopenable native identity for an existing regular file."""
     raw = os.fspath(path)
@@ -265,66 +352,14 @@ def native_file_identity(path: str | os.PathLike[str]) -> NativeFileIdentity:
             last_write=int(stat.st_mtime_ns),
         )
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    create_file = kernel32.CreateFileW
-    create_file.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    ]
-    create_file.restype = wintypes.HANDLE
-    close_handle = kernel32.CloseHandle
-    close_handle.argtypes = [wintypes.HANDLE]
-    close_handle.restype = wintypes.BOOL
-    handle = create_file(
+    handle = _open_windows_file(
         raw,
-        0x0080,  # FILE_READ_ATTRIBUTES
-        0x00000001 | 0x00000002 | 0x00000004,
-        None,
-        3,  # OPEN_EXISTING
-        0x00000080,  # FILE_ATTRIBUTE_NORMAL
-        None,
+        share_mode=0x00000001 | 0x00000002 | 0x00000004,
     )
-    if handle == wintypes.HANDLE(-1).value:
-        raise PowerShellHostError(f"cannot open candidate (winerror {ctypes.get_last_error()})")
     try:
-        info = _BY_HANDLE_FILE_INFORMATION()
-        if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
-            raise PowerShellHostError(
-                f"cannot query candidate identity (winerror {ctypes.get_last_error()})"
-            )
-        needed = kernel32.GetFinalPathNameByHandleW(handle, None, 0, 0)
-        if not needed:
-            raise PowerShellHostError(
-                f"cannot query candidate final path (winerror {ctypes.get_last_error()})"
-            )
-        buf = ctypes.create_unicode_buffer(needed + 1)
-        if not kernel32.GetFinalPathNameByHandleW(handle, buf, len(buf), 0):
-            raise PowerShellHostError(
-                f"cannot read candidate final path (winerror {ctypes.get_last_error()})"
-            )
-        final_path = _normalize_final_path(buf.value)
-        if not Path(final_path).is_file():
-            raise PowerShellHostError("candidate is not a regular file")
-        last_write = (
-            int(info.ftLastWriteTime.dwHighDateTime) << 32
-        ) | int(info.ftLastWriteTime.dwLowDateTime)
-        size = (int(info.nFileSizeHigh) << 32) | int(info.nFileSizeLow)
-        file_id = (int(info.nFileIndexHigh) << 32) | int(info.nFileIndexLow)
-        return NativeFileIdentity(
-            scheme="win32-file-id-v1",
-            final_path=final_path,
-            volume_serial=f"{int(info.dwVolumeSerialNumber):08x}",
-            file_id=f"{file_id:016x}",
-            size=size,
-            last_write=last_write,
-        )
+        return _windows_identity_from_handle(handle)
     finally:
-        close_handle(handle)
+        close_native_file_handle(handle)
 
 
 def _windows_drive_type(path: str) -> int:
@@ -535,13 +570,72 @@ def probe_candidate(
     return ProbeResult(after.final_path, source, edition, version, after)
 
 
-def program_files_candidates(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
-    env = environ or os.environ
-    keys = ("ProgramW6432", "ProgramFiles", "ProgramFiles(Arm)", "ProgramFiles(x86)")
+def native_program_files_roots() -> tuple[str, ...]:
+    """Read machine-owned Program Files roots from the native HKLM registry view."""
+    if os.name != "nt":
+        return ()
+    try:
+        import winreg
+    except ImportError:
+        return ()
+
+    key_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion"
+    value_names = (
+        "ProgramW6432Dir",
+        "ProgramFilesDir",
+        "ProgramFilesDir (Arm)",
+        "ProgramFilesDir (x86)",
+    )
+    access_modes = (
+        winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0),
+        winreg.KEY_READ,
+    )
+    key = None
+    for access in dict.fromkeys(access_modes):
+        try:
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path, 0, access)
+            break
+        except OSError:
+            continue
+    if key is None:
+        return ()
+
+    roots: list[str] = []
+    try:
+        for name in value_names:
+            try:
+                root, value_type = winreg.QueryValueEx(key, name)
+            except OSError:
+                continue
+            if (
+                value_type not in {winreg.REG_SZ, winreg.REG_EXPAND_SZ}
+                or not isinstance(root, str)
+            ):
+                continue
+            root = root.strip()
+            # Registry values are expected to be concrete paths. Expanding a
+            # token here would reintroduce process-environment authority.
+            if (
+                not root
+                or "%" in root
+                or not os.path.isabs(root)
+                or root.startswith("\\\\")
+            ):
+                continue
+            roots.append(root)
+    finally:
+        winreg.CloseKey(key)
+    return tuple(roots)
+
+
+def program_files_candidates(
+    roots: Iterable[str] | None = None,
+) -> tuple[str, ...]:
+    trusted_roots = native_program_files_roots() if roots is None else roots
     seen: set[str] = set()
     out: list[str] = []
-    for key in keys:
-        root = (env.get(key) or "").strip()
+    for raw_root in trusted_roots:
+        root = str(raw_root).strip()
         if not root or not os.path.isabs(root) or root.startswith("\\\\"):
             continue
         candidate = os.path.join(root, "PowerShell", "7", "pwsh.exe")
@@ -554,21 +648,18 @@ def program_files_candidates(environ: Mapping[str, str] | None = None) -> tuple[
 
 
 def path_candidate_remediations(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
-    env = environ or os.environ
+    env = os.environ if environ is None else environ
     out: list[str] = []
     seen: set[str] = set()
-    for entry in (env.get("PATH") or "").split(os.pathsep):
-        entry = entry.strip().strip('"')
-        if not entry or not os.path.isabs(entry) or entry.startswith("\\\\"):
-            continue
-        candidate = os.path.join(entry, "pwsh.exe")
+
+    def add(candidate: str) -> None:
         try:
             _validate_local_exe_shape(candidate, subject="PATH candidate")
         except PowerShellHostError:
-            continue
+            return
         key = normalized_path_key(candidate)
         if key in seen:
-            continue
+            return
         seen.add(key)
         try:
             exists = Path(candidate).is_file()
@@ -578,6 +669,17 @@ def path_candidate_remediations(environ: Mapping[str, str] | None = None) -> tup
             out.append(
                 f'agenttalk supervise --select-pwsh --pwsh "{candidate}"'
             )
+
+    for entry in (env.get("PATH") or "").split(os.pathsep):
+        entry = entry.strip().strip('"')
+        if not entry or not os.path.isabs(entry) or entry.startswith("\\\\"):
+            continue
+        add(os.path.join(entry, "pwsh.exe"))
+    for name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(Arm)", "ProgramFiles(x86)"):
+        root = (env.get(name) or "").strip().strip('"')
+        if not root or not os.path.isabs(root) or root.startswith("\\\\"):
+            continue
+        add(os.path.join(root, "PowerShell", "7", "pwsh.exe"))
     return tuple(out)
 
 
@@ -586,6 +688,7 @@ def resolve_candidate(
     explicit_path: str | None = None,
     current_path: str | None = None,
     environ: Mapping[str, str] | None = None,
+    program_files_roots: Iterable[str] | None = None,
     probe: Callable[..., ProbeResult] = probe_candidate,
 ) -> Resolution:
     if explicit_path is not None and current_path is not None:
@@ -597,7 +700,12 @@ def resolve_candidate(
         candidates = ((current_path, "current_host"),)
         terminal = True
     else:
-        candidates = ((path, "program_files") for path in program_files_candidates(environ))
+        # Process environment roots are diagnostics only. Automatic execution
+        # is sourced exclusively from machine-owned native registry values.
+        candidates = (
+            (path, "program_files")
+            for path in program_files_candidates(program_files_roots)
+        )
         terminal = False
     attempts: list[CandidateAttempt] = []
     for path, source in candidates:
@@ -681,6 +789,7 @@ def selection_fingerprint_payload(record: Mapping[str, object]) -> dict:
         "project_id": record.get("project_id"),
         "source": record.get("source"),
         "path": record.get("path"),
+        "task_name": record.get("task_name"),
         "identity": {
             "scheme": identity.get("scheme"),
             "final_path": identity.get("final_path"),
@@ -743,6 +852,27 @@ def make_selection_record(
     base["selection_revision"] = previous_revision if same and previous_revision > 0 else previous_revision + 1
     base["selection_fingerprint"] = compute_selection_fingerprint(base)
     return base
+
+
+def with_task_binding(
+    record: Mapping[str, object],
+    task_name: str | None,
+) -> dict:
+    """Return the same selection with a revisioned task-binding update."""
+    if task_name is not None and (
+        not isinstance(task_name, str) or not task_name.strip() or len(task_name) > 256
+    ):
+        raise PowerShellHostError("selection task_name is invalid")
+    updated = selection_public_view(record)
+    if updated.get("task_name") == task_name:
+        return updated
+    revision = updated.get("selection_revision")
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+        raise PowerShellHostError("selection_revision must be a positive integer")
+    updated["task_name"] = task_name
+    updated["selection_revision"] = revision + 1
+    updated["selection_fingerprint"] = compute_selection_fingerprint(updated)
+    return updated
 
 
 def validate_selection_record(

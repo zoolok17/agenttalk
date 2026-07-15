@@ -33,9 +33,7 @@ from agenttalk.store import Store, find_root, find_stores_upward
 _TASK_QUERY_SENTINEL = "AGENTTALK_TASK_QUERY_V1:"
 _TASK_QUERY_COMMAND = (
     "$ErrorActionPreference='Stop';"
-    "$items=@(Get-ScheduledTask -TaskName "
-    "([WildcardPattern]::Escape($env:AGENTTALK_TASK_NAME)) "
-    "-ErrorAction SilentlyContinue | ForEach-Object {"
+    "$items=@(Get-ScheduledTask -ErrorAction Stop | ForEach-Object {"
     "$actions=@($_.Actions | ForEach-Object { [ordered]@{"
     "execute=[string]$_.Execute;arguments=[string]$_.Arguments;"
     "working_directory=[string]$_.WorkingDirectory} });"
@@ -43,6 +41,10 @@ _TASK_QUERY_COMMAND = (
     "state=[string]$_.State;actions=$actions} });"
     "$out=[ordered]@{sentinel='agenttalk-task-query-v1';tasks=$items};"
     f"Write-Output ('{_TASK_QUERY_SENTINEL}'+($out|ConvertTo-Json -Compress -Depth 6))"
+)
+_TASK_FILE_ARGUMENT_RE = re.compile(
+    r"(?:^|\s)-File\s+(?:\"([^\"]+)\"|'([^']+)'|(\S+))",
+    re.IGNORECASE,
 )
 
 
@@ -197,7 +199,13 @@ def _check_powershell_host(store: Store) -> Check:
     task_error = task["status"] not in {"not_configured", "ok"}
     task_name = str(record.get("task_name") or "agenttalk-supervisor")
     fix = ""
-    if task_error:
+    if task["status"] == "orphan":
+        names = ", ".join(repr(item["name"]) for item in task.get("tasks", []))
+        fix = (
+            f"stop and uninstall orphan Scheduled Task binding(s) {names} before "
+            "installing or starting the recorded binding"
+        )
+    elif task_error:
         fix = sup.task_recovery_remediation(store, str(record["path"]), task_name)
     elif warning:
         fix = f'agenttalk supervise --select-pwsh --pwsh "{record["path"]}"'
@@ -256,11 +264,8 @@ def _inspect_selected_task(
     runner=subprocess.run,
 ) -> dict:
     task_name = record.get("task_name")
-    if not isinstance(task_name, str) or not task_name:
-        return {"status": "not_configured", "detail": "no task binding is recorded"}
     env = os.environ.copy()
     env["POWERSHELL_UPDATECHECK"] = "Off"
-    env["AGENTTALK_TASK_NAME"] = task_name
     try:
         with supervisor_lifecycle.selected_host_for_spawn(store) as current:
             if (
@@ -286,15 +291,42 @@ def _inspect_selected_task(
     except (OSError, ValueError, subprocess.SubprocessError,
             supervisor_lifecycle.SupervisorLifecycleError) as exc:
         return {"status": "unknown", "detail": str(exc)}
-    if not tasks:
+    supervisor_path = store.dir / "supervisor.ps1"
+
+    def targets_checkout(task: dict) -> bool:
+        for action in task["actions"]:
+            match = _TASK_FILE_ARGUMENT_RE.search(action["arguments"])
+            if match is None:
+                continue
+            file_arg = next((value for value in match.groups() if value is not None), "")
+            if psh.normalized_path_key(file_arg) == psh.normalized_path_key(supervisor_path):
+                return True
+        return False
+
+    targeted = [task for task in tasks if targets_checkout(task)]
+    orphans = [
+        task for task in targeted
+        if not isinstance(task_name, str) or not task_name or task["name"] != task_name
+    ]
+    if orphans:
+        names = ", ".join(repr(task["name"]) for task in orphans)
+        return {
+            "status": "orphan",
+            "detail": f"task binding(s) {names} also target this checkout",
+            "tasks": orphans,
+        }
+    if not isinstance(task_name, str) or not task_name:
+        return {"status": "not_configured", "detail": "no task binding is recorded"}
+    named = [task for task in tasks if task["name"] == task_name]
+    if not named:
         return {"status": "missing", "detail": f"recorded task {task_name!r} is absent"}
-    if len(tasks) != 1:
+    if len(named) != 1:
         return {
             "status": "ambiguous",
-            "detail": f"{len(tasks)} tasks match recorded name {task_name!r}",
-            "tasks": tasks,
+            "detail": f"{len(named)} tasks match recorded name {task_name!r}",
+            "tasks": named,
         }
-    task = tasks[0]
+    task = named[0]
     actions = task["actions"]
     if len(actions) != 1:
         return {

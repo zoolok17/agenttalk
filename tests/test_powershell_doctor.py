@@ -50,10 +50,10 @@ def _query_output(tasks: list[dict]) -> str:
     return doctor._TASK_QUERY_SENTINEL + json.dumps(payload) + "\n"
 
 
-def _task(store: Store, *, execute: str = PWSH) -> dict:
+def _task(store: Store, *, name: str = "custom-task", execute: str = PWSH) -> dict:
     expected = sup.expected_task_action(store)
     return {
-        "name": "custom-task",
+        "name": name,
         "path": "\\",
         "state": "Ready",
         "actions": [{
@@ -92,7 +92,32 @@ def test_doctor_queries_task_only_through_selected_host_and_treats_action_as_dat
     assert evil not in argv
     assert kwargs["check"] is False
     assert "shell" not in kwargs
-    assert kwargs["env"]["AGENTTALK_TASK_NAME"] == "custom-task"
+
+
+def test_doctor_reports_orphan_task_targeting_checkout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = _store(tmp_path)
+    record = _record(store, task_name="new-task")
+
+    @contextlib.contextmanager
+    def selected(_store):
+        yield record
+
+    monkeypatch.setattr(lifecycle, "selected_host_for_spawn", selected)
+
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            _query_output([_task(store, name="old-task")]),
+            "",
+        )
+
+    result = doctor._inspect_selected_task(store, record, runner=runner)
+    assert result["status"] == "orphan"
+    assert "old-task" in result["detail"]
 
 
 def test_doctor_task_status_ok_missing_ambiguous_and_garbage(

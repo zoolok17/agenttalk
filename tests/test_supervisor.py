@@ -614,6 +614,12 @@ def test_supervise_init_generates_and_is_idempotent(tmp_path: Path, capsys) -> N
     assert "-NoLogo -NoProfile -NonInteractive -File" in task
     assert "--prepare-task-install" in task
     assert "--commit-task-install" in task
+    assert "--clear-task-binding" in task
+    assert "function Find-CheckoutTasks" in task
+    assert "function Get-ActionSupervisorPath" in task
+    assert "[System.IO.Path]::GetFullPath($path)" in task
+    assert "different task binding(s) already target this checkout" in task
+    assert "remains installed; binding was not cleared" in task
     assert "Register-ScheduledTask" in task and "-Force" not in task
     assert "function Remove-PreparedTaskIfOwned" in task
     assert "Remove-PreparedTaskIfOwned $PowerShell $Arguments $Root" in task

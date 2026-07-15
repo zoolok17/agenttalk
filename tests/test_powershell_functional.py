@@ -112,6 +112,31 @@ def test_real_core_accepts_direct_powershell_to_python_claim_chain(tmp_path: Pat
     assert not store.supervisor_instance_path().exists()
 
 
+def test_real_core_override_claim_uses_baked_fallback_for_validation(
+    tmp_path: Path,
+) -> None:
+    pwsh = shutil.which("pwsh")
+    if not pwsh:
+        pytest.skip("PowerShell Core is not installed")
+    store = Store(tmp_path)
+    store.init(["lead", "worker"])
+    sup.init(store, python_exe=r"C:\BakedFallback\python.exe")
+    lifecycle.select_powershell_host(store, explicit_path=pwsh)
+
+    result = subprocess.run(  # noqa: S603  # nosec B603
+        [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-File",
+         str(store.dir / "supervisor.ps1"), "-Once", "-Quiet"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=tmp_path,
+        env=_environment(),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not store.supervisor_instance_path().exists()
+
+
 def test_windows_powershell_51_rejects_each_script_before_sentinel(tmp_path: Path) -> None:
     pwsh = shutil.which("pwsh")
     desktop = Path(os.environ.get("SystemRoot", r"C:\Windows")) / (

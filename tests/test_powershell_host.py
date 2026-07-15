@@ -134,7 +134,7 @@ def test_explicit_candidate_failure_is_terminal_even_with_program_files() -> Non
 
     resolved = psh.resolve_candidate(
         explicit_path=r"D:\portable\pwsh.exe",
-        environ={"ProgramW6432": r"C:\Program Files"},
+        program_files_roots=(r"C:\Program Files",),
         probe=probe,
     )
     assert resolved.result is None
@@ -150,7 +150,7 @@ def test_current_candidate_failure_is_terminal_even_with_program_files() -> None
 
     resolved = psh.resolve_candidate(
         current_path=r"D:\current\pwsh.exe",
-        environ={"ProgramW6432": r"C:\Program Files"},
+        program_files_roots=(r"C:\Program Files",),
         probe=probe,
     )
     assert resolved.result is None
@@ -167,12 +167,7 @@ def test_automatic_candidates_continue_in_native_order() -> None:
         return _result(path=path, source=source)
 
     resolved = psh.resolve_candidate(
-        environ={
-            "ProgramW6432": r"C:\Native",
-            "ProgramFiles": r"D:\Arm",
-            "ProgramFiles(Arm)": r"D:\Arm",
-            "ProgramFiles(x86)": r"C:\x86",
-        },
+        program_files_roots=(r"C:\Native", r"D:\Arm", r"D:\Arm", r"C:\x86"),
         probe=probe,
     )
     assert resolved.result is not None
@@ -192,16 +187,34 @@ def test_automatic_candidate_cannot_redirect_outside_program_files() -> None:
         return _result(path=path, source=source)
 
     resolved = psh.resolve_candidate(
-        environ={
-            "ProgramW6432": r"C:\Native",
-            "ProgramFiles": r"D:\Program Files",
-        },
+        program_files_roots=(r"C:\Native", r"D:\Program Files"),
         probe=probe,
     )
     assert resolved.result is not None
     assert resolved.result.path == r"D:\Program Files\PowerShell\7\pwsh.exe"
     assert resolved.attempts[0].accepted is False
     assert "outside" in resolved.attempts[0].reason
+
+
+def test_automatic_discovery_never_trusts_environment_program_files_root(
+    tmp_path: Path,
+) -> None:
+    injected_root = tmp_path / "OwnedRoot"
+    calls: list[str] = []
+
+    def probe(path, *, source):
+        calls.append(path)
+        raise psh.PowerShellHostError("missing")
+
+    psh.resolve_candidate(
+        environ={"ProgramW6432": str(injected_root)},
+        program_files_roots=(),
+        probe=probe,
+    )
+
+    injected_key = psh.normalized_path_key(injected_root)
+    assert all(not psh.normalized_path_key(path).startswith(injected_key) for path in calls)
+    assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -311,22 +324,50 @@ def test_selection_validation_rejects_ineligible_serialized_paths(
 def test_selection_validation_rejects_invalid_task_name(task_name: object) -> None:
     record = psh.make_selection_record(_result(), project_id="project", now=1000.0)
     record["task_name"] = task_name
+    record["selection_fingerprint"] = psh.compute_selection_fingerprint(record)
     with pytest.raises(psh.PowerShellHostError, match="task_name"):
         psh.validate_selection_record(record, project_id="project", now=1001.0)
 
 
-def test_selection_fingerprint_excludes_probe_time_and_task_name() -> None:
+def test_selection_fingerprint_excludes_probe_time_and_includes_task_name() -> None:
     record = psh.make_selection_record(_result(), project_id="project", now=1000.0)
-    changed = copy.deepcopy(record)
-    changed["probed_at"] = "2030-01-01T00:00:00.000000Z"
-    changed["task_name"] = "custom-task"
-    assert psh.compute_selection_fingerprint(record) == psh.compute_selection_fingerprint(changed)
+    changed_time = copy.deepcopy(record)
+    changed_time["probed_at"] = "2030-01-01T00:00:00.000000Z"
+    changed_task = copy.deepcopy(record)
+    changed_task["task_name"] = "custom-task"
+    assert psh.compute_selection_fingerprint(record) == psh.compute_selection_fingerprint(
+        changed_time
+    )
+    assert psh.compute_selection_fingerprint(record) != psh.compute_selection_fingerprint(
+        changed_task
+    )
+
+    rebound = psh.make_selection_record(
+        _result(),
+        project_id="project",
+        previous=record,
+        task_name="custom-task",
+        now=2000.0,
+    )
+    assert rebound["selection_revision"] == record["selection_revision"] + 1
 
 
 def test_path_diagnostics_are_data_only(tmp_path: Path) -> None:
     candidate = tmp_path / "pwsh.exe"
     candidate.write_bytes(b"")
     commands = psh.path_candidate_remediations({"PATH": str(tmp_path)})
+    assert commands == (
+        f'agenttalk supervise --select-pwsh --pwsh "{candidate}"',
+    )
+
+
+def test_environment_program_files_root_is_diagnostic_only(tmp_path: Path) -> None:
+    candidate = tmp_path / "PowerShell" / "7" / "pwsh.exe"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"")
+
+    commands = psh.path_candidate_remediations({"ProgramW6432": str(tmp_path)})
+
     assert commands == (
         f'agenttalk supervise --select-pwsh --pwsh "{candidate}"',
     )

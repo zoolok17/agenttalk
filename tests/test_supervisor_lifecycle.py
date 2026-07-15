@@ -140,8 +140,45 @@ def test_claim_rechecks_selection_before_marker_write(
     monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid: host)
     monkeypatch.setattr(lifecycle, "_validate_ancestry", lambda observed: (current,))
     monkeypatch.setattr(lifecycle, "_require_process_active", lambda observed: None)
+    monkeypatch.setattr(psh, "native_file_identity", lambda path: host.identity)
 
     with pytest.raises(lifecycle.SupervisorLifecycleError, match="selection changed"):
+        lifecycle.claim_powershell_supervisor(
+            store,
+            pid=host.pid,
+            pid_start=host.creation_token,
+            validate_artifacts=lambda: None,
+        )
+    assert not store.supervisor_instance_path().exists()
+
+
+def test_claim_revalidates_image_identity_after_config_lock_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    selected = _selected(store, file_id="01")
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    current = _observation(
+        os.getpid(), parent=100, path=r"C:\Python\python.exe", ticks=200,
+    )
+    disk_identity = {"value": _identity(PWSH, "01")}
+
+    @contextlib.contextmanager
+    def replace_on_entry():
+        disk_identity["value"] = _identity(PWSH, "02")
+        yield
+
+    monkeypatch.setattr(store, "_config_lock", replace_on_entry)
+    monkeypatch.setattr(lifecycle, "_read_valid_selection_locked", lambda store: selected)
+    monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid: host)
+    monkeypatch.setattr(lifecycle, "_validate_ancestry", lambda observed: (current,))
+    monkeypatch.setattr(lifecycle, "_require_process_active", lambda observed: None)
+    monkeypatch.setattr(
+        psh, "native_file_identity", lambda path: disk_identity["value"],
+    )
+
+    with pytest.raises(lifecycle.SupervisorLifecycleError, match="image identity changed"):
         lifecycle.claim_powershell_supervisor(
             store,
             pid=host.pid,
@@ -309,6 +346,7 @@ def test_generated_claim_lock_order_is_lifecycle_selection_config(
     monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid: host)
     monkeypatch.setattr(lifecycle, "_validate_ancestry", lambda observed: (current,))
     monkeypatch.setattr(lifecycle, "_require_process_active", lambda observed: None)
+    monkeypatch.setattr(psh, "native_file_identity", lambda path: host.identity)
 
     claim = lifecycle.claim_powershell_supervisor(
         store,
@@ -476,3 +514,69 @@ def test_task_install_commit_refuses_concurrent_selection_change(
         "task_name"
     ] is None
     assert lifecycle.selection_path(store).read_bytes() == before
+
+
+def test_task_install_prepare_refuses_different_existing_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    initial = psh.make_selection_record(
+        _probe(),
+        project_id=store.project_id(),
+        task_name="old-task",
+    )
+    lifecycle._atomic_write_selection(lifecycle.selection_path(store), initial)
+    before = lifecycle.selection_path(store).read_bytes()
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid: host)
+    monkeypatch.setattr(lifecycle, "_probe_observed_current_host", lambda observed: _probe())
+    monkeypatch.setattr(lifecycle, "_require_process_active", lambda observed: None)
+
+    with pytest.raises(
+        lifecycle.SupervisorLifecycleError,
+        match="different Scheduled Task binding",
+    ):
+        lifecycle.prepare_task_install(
+            store,
+            pid=host.pid,
+            pid_start=host.creation_token,
+            task_name="new-task",
+            validate_artifacts=lambda: None,
+        )
+
+    assert lifecycle.selection_path(store).read_bytes() == before
+
+
+def test_task_uninstall_clears_binding_before_new_name_prepare(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    initial = psh.make_selection_record(
+        _probe(),
+        project_id=store.project_id(),
+        task_name="old-task",
+    )
+    lifecycle._atomic_write_selection(lifecycle.selection_path(store), initial)
+    monkeypatch.setattr(psh, "native_file_identity", lambda path: _identity())
+
+    cleared = lifecycle.clear_task_binding(store, task_name="old-task")
+
+    assert cleared["task_name"] is None
+    assert cleared["selection_revision"] == initial["selection_revision"] + 1
+    assert cleared["selection_fingerprint"] != initial["selection_fingerprint"]
+
+    host = _observation(100, parent=1, path=PWSH, ticks=100)
+    monkeypatch.setattr(lifecycle, "_open_process_observation", lambda pid: host)
+    monkeypatch.setattr(lifecycle, "_probe_observed_current_host", lambda observed: _probe())
+    monkeypatch.setattr(lifecycle, "_require_process_active", lambda observed: None)
+
+    prepared = lifecycle.prepare_task_install(
+        store,
+        pid=host.pid,
+        pid_start=host.creation_token,
+        task_name="new-task",
+        validate_artifacts=lambda: None,
+    )
+    assert prepared["task_name"] == "new-task"

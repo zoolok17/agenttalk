@@ -10468,7 +10468,14 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         for path, status in res.items():
             print(f"  {status}: {path}")
         wrote = [p for p, s in res.items() if s == "written"]
-        if not wrote:
+        missing = [p for p, s in res.items() if s == "missing"]
+        if missing:
+            print(
+                "supervise --init: generated artifacts are partially scaffolded; "
+                "run `agenttalk supervise --refresh-scripts` or rerun "
+                "`agenttalk supervise --init --force`."
+            )
+        elif not wrote:
             print("supervise --init: all files already exist (use --force to "
                   "regenerate).")
         else:
@@ -10550,6 +10557,7 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                 store,
                 pid=args.pid if args.pid is not None else os.getpid(),
                 pid_start=args.pid_start,
+                task_name=args.task_name or "agenttalk-supervisor",
                 validate_artifacts=lambda: sup.validate_artifact_bundle(
                     store, boundary="task"
                 ),
@@ -10576,6 +10584,17 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         except (OSError, sup.ArtifactValidationError,
                 supervisor_lifecycle.SupervisorLifecycleError) as e:
             sys.stderr.write(f"agenttalk supervise --commit-task-install: {e}\n")
+            return 3
+        print(json.dumps(payload, separators=(",", ":")))
+        return 0
+    if args.clear_task_binding:
+        try:
+            payload = supervisor_lifecycle.clear_task_binding(
+                store,
+                task_name=args.task_name or "agenttalk-supervisor",
+            )
+        except (OSError, supervisor_lifecycle.SupervisorLifecycleError) as e:
+            sys.stderr.write(f"agenttalk supervise --clear-task-binding: {e}\n")
             return 3
         print(json.dumps(payload, separators=(",", ":")))
         return 0
@@ -12498,6 +12517,8 @@ def build_parser() -> argparse.ArgumentParser:
     gsup.add_argument("--prepare-task-install", dest="prepare_task_install",
                       action="store_true", help=argparse.SUPPRESS)
     gsup.add_argument("--commit-task-install", dest="commit_task_install",
+                      action="store_true", help=argparse.SUPPRESS)
+    gsup.add_argument("--clear-task-binding", dest="clear_task_binding",
                       action="store_true", help=argparse.SUPPRESS)
     gsup.add_argument("--validate-task-start", dest="validate_task_start",
                       action="store_true", help=argparse.SUPPRESS)

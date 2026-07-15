@@ -179,3 +179,18 @@ def test_non_windows_start_never_launches_generated_powershell(
         "--root", str(tmp_path), "start", "--no-browser", "--port", "0",
     ]) == 0
     assert events == ["serve", "close"]
+
+
+def test_supervise_init_reports_partially_scaffolded_artifacts(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    store = _store(tmp_path)
+    (store.dir / "deadman.ps1").unlink()
+
+    assert cli.main(["--root", str(tmp_path), "supervise", "--init"]) == 0
+
+    output = capsys.readouterr().out
+    assert "partially scaffolded" in output
+    assert "--refresh-scripts" in output
+    assert "all files already exist" not in output

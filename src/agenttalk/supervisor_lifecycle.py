@@ -37,6 +37,7 @@ class ProcessObservation:
     creation_ticks: int
     identity: psh.NativeFileIdentity
     handle: int
+    image_handle: int = 0
 
 
 def selection_path(store: Store) -> Path:
@@ -338,6 +339,7 @@ def _open_process_observation(pid: int, *, parents: Mapping[int, int] | None = N
         raise SupervisorLifecycleError(
             f"cannot query process {pid} (winerror {ctypes.get_last_error()})"
         )
+    image_handle = 0
     try:
         creation = wintypes.FILETIME()
         exit_time = wintypes.FILETIME()
@@ -358,7 +360,7 @@ def _open_process_observation(pid: int, *, parents: Mapping[int, int] | None = N
         code = wintypes.DWORD()
         if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:
             raise SupervisorLifecycleError(f"process {pid} is not active")
-        identity = psh.native_file_identity(buf.value)
+        identity, image_handle = psh.open_stable_native_file_identity(buf.value)
         parent_map = parents if parents is not None else _process_parent_map()
         ticks = _filetime_ticks(creation)
         return ProcessObservation(
@@ -369,13 +371,18 @@ def _open_process_observation(pid: int, *, parents: Mapping[int, int] | None = N
             creation_ticks=ticks,
             identity=identity,
             handle=int(handle),
+            image_handle=image_handle,
         )
     except Exception:
+        psh.close_native_file_handle(image_handle)
         kernel32.CloseHandle(handle)
         raise
 
 
 def _close_process_observation(observation: ProcessObservation) -> None:
+    if observation.image_handle:
+        psh.close_native_file_handle(observation.image_handle)
+        observation.image_handle = 0
     if observation.handle:
         ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(
             wintypes.HANDLE(observation.handle)
@@ -461,6 +468,29 @@ def _host_matches_selection(host: ProcessObservation, record: Mapping[str, objec
     )
 
 
+def _revalidate_process_image(
+    host: ProcessObservation,
+    record: Mapping[str, object],
+) -> None:
+    try:
+        current = psh.native_file_identity(host.path)
+    except (OSError, ValueError) as exc:
+        raise SupervisorLifecycleError(
+            f"PowerShell process image became inaccessible: {exc}"
+        ) from exc
+    selected = record.get("_identity")
+    if (
+        not isinstance(selected, psh.NativeFileIdentity)
+        or not psh.same_identity(host.identity, current)
+        or not psh.same_identity(current, selected)
+        or psh.normalized_path_key(current.final_path)
+        != psh.normalized_path_key(str(record.get("path")))
+    ):
+        raise SupervisorLifecycleError(
+            "PowerShell process image identity changed during supervisor claim"
+        )
+
+
 def validate_current_powershell(
     store: Store,
     *,
@@ -500,6 +530,7 @@ def prepare_task_install(
     *,
     pid: int,
     pid_start: object,
+    task_name: str,
     validate_artifacts: Callable[[], None],
 ) -> dict:
     """Read-only first phase for task registration under the current Core host."""
@@ -533,6 +564,13 @@ def prepare_task_install(
                             "task install cannot replace a different PowerShell selection; "
                             f"{psh.explicit_select_remediation(result.path)} first"
                         )
+                    existing_task_name = existing.get("task_name")
+                    if existing_task_name not in {None, task_name}:
+                        raise SupervisorLifecycleError(
+                            "task install found a different Scheduled Task binding "
+                            f"{existing_task_name!r}; stop and uninstall it before "
+                            f"installing {task_name!r}"
+                        )
                     revision = existing["selection_revision"]
                     fingerprint = existing["selection_fingerprint"]
                     source = str(existing["source"])
@@ -549,6 +587,7 @@ def prepare_task_install(
                     "warning": result.warning,
                     "selection_revision": revision,
                     "selection_fingerprint": fingerprint,
+                    "task_name": task_name,
                 }
     finally:
         _close_process_observation(host)
@@ -603,6 +642,11 @@ def commit_task_install(
                         raise SupervisorLifecycleError(
                             "registered task host no longer matches the project selection"
                         )
+                    previous_task_name = previous.get("task_name")
+                    if previous_task_name not in {None, task_name}:
+                        raise SupervisorLifecycleError(
+                            "PowerShell task binding changed during task registration"
+                        )
                     result = psh.ProbeResult(
                         result.path,
                         str(previous["source"]),
@@ -628,6 +672,25 @@ def commit_task_install(
                 return psh.selection_public_view(post)
     finally:
         _close_process_observation(host)
+
+
+def clear_task_binding(store: Store, *, task_name: str) -> dict:
+    """Clear exactly the binding an operator has explicitly uninstalled."""
+    with store._supervisor_lifecycle_lock():
+        _strict_marker_allows_mutation_locked(store)
+        with store._powershell_selection_lock():
+            record = _read_valid_selection_locked(store)
+            existing = record.get("task_name")
+            if existing is None:
+                return psh.selection_public_view(record)
+            if existing != task_name:
+                raise SupervisorLifecycleError(
+                    f"cannot clear Scheduled Task binding {task_name!r}; "
+                    f"the selection records {existing!r}"
+                )
+            updated = psh.with_task_binding(record, None)
+            _atomic_write_selection(selection_path(store), updated)
+            return updated
 
 
 def claim_powershell_supervisor(
@@ -679,6 +742,17 @@ def claim_powershell_supervisor(
                 with store._config_lock():
                     for observation in ancestry:
                         _require_process_active(observation)
+                    _require_process_active(host)
+                    final = _read_valid_selection_locked(store)
+                    if (
+                        final["selection_revision"] != second["selection_revision"]
+                        or final["selection_fingerprint"] != second["selection_fingerprint"]
+                        or not _host_matches_selection(host, final)
+                    ):
+                        raise SupervisorLifecycleError(
+                            "PowerShell host selection changed before supervisor marker write"
+                        )
+                    _revalidate_process_image(host, final)
                     _require_process_active(host)
                     return store._claim_supervisor_instance_locked(
                         pid=pid,

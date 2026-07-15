@@ -4778,9 +4778,44 @@ try { $CurrentStart = ([datetimeoffset](Get-Process -Id $PID -ErrorAction Stop).
 $IdentityArgs = @('--pid', $CurrentPid)
 if ($CurrentStart) { $IdentityArgs += @('--pid-start', $CurrentStart) }
 $User = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$SupervisorArguments = '-NoLogo -NoProfile -NonInteractive -File "' + $Supervisor + '" -Quiet'
+$FileArgumentPattern = '(?:^|\s)-File\s+(?:"([^"]+)"|''([^'']+)''|(\S+))'
 
 function Find-Task {
   return Get-ScheduledTask -TaskName ([WildcardPattern]::Escape($TaskName)) -ErrorAction SilentlyContinue
+}
+
+function Get-ActionSupervisorPath([object]$Action) {
+  $match = [regex]::Match(
+    [string]$Action.Arguments,
+    $FileArgumentPattern,
+    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+  )
+  if (-not $match.Success) { return $null }
+  foreach ($index in 1..3) {
+    if ($match.Groups[$index].Success) { return $match.Groups[$index].Value }
+  }
+  return $null
+}
+
+function Test-CheckoutAction([object]$Action) {
+  $path = Get-ActionSupervisorPath $Action
+  if (-not $path) { return $false }
+  try {
+    return [string]::Equals(
+      [System.IO.Path]::GetFullPath($path),
+      [System.IO.Path]::GetFullPath($Supervisor),
+      [System.StringComparison]::OrdinalIgnoreCase
+    )
+  } catch {
+    return $false
+  }
+}
+
+function Find-CheckoutTasks {
+  return @(Get-ScheduledTask -ErrorAction Stop | Where-Object {
+    @($_.Actions | Where-Object { Test-CheckoutAction $_ }).Count -gt 0
+  })
 }
 
 function Remove-PreparedTaskIfOwned([string]$Execute, [string]$Arguments, [string]$WorkingDirectory) {
@@ -4829,13 +4864,18 @@ switch ($Action) {
     if (Find-Task) {
       throw "task '$TaskName' already exists; run status/stop/uninstall before install"
     }
+    $conflicts = @(Find-CheckoutTasks | Where-Object { [string]$_.TaskName -ine $TaskName })
+    if ($conflicts.Count -gt 0) {
+      $names = (($conflicts | ForEach-Object { [string]$_.TaskName }) -join ', ')
+      throw "different task binding(s) already target this checkout: $names; stop and uninstall them first"
+    }
     $prepareArgs = @('--root', $Root, 'supervise', '--prepare-task-install',
                      '--task-name', $TaskName) + $IdentityArgs
     $preparedText = & $AgenttalkCmd @prepareArgs
     if ($LASTEXITCODE -ne 0) { throw 'PowerShell host/task artifact validation failed' }
     $prepared = $preparedText | ConvertFrom-Json
     $PowerShell = [string]$prepared.path
-    $Arguments = '-NoLogo -NoProfile -NonInteractive -File "' + $Supervisor + '" -Quiet'
+    $Arguments = $SupervisorArguments
     $TaskAction = New-ScheduledTaskAction -Execute $PowerShell -Argument $Arguments -WorkingDirectory $Root
     $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $User
     $Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
@@ -4853,6 +4893,11 @@ switch ($Action) {
   }
   'uninstall' {
     Unregister-ScheduledTask -TaskName ([WildcardPattern]::Escape($TaskName)) -Confirm:$false -ErrorAction SilentlyContinue
+    if (Find-Task) { throw "task '$TaskName' remains installed; binding was not cleared" }
+    $clearArgs = @('--root', $Root, 'supervise', '--clear-task-binding',
+                   '--task-name', $TaskName)
+    & $AgenttalkCmd @clearArgs | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'failed to clear the uninstalled task binding' }
   }
   'start' {
     $task = Find-Task
@@ -5892,10 +5937,30 @@ _MARKER_RE = re.compile(
     rb'^(?:#|@rem) agenttalk-artifact: \{"artifact_schema":([0-9]+),'
     rb'"generator_generation":"([0-9a-f]{64})"\}$'
 )
+_SHIM_PYTHON_PIN_RE = re.compile(
+    rb'^if not defined AGENTTALK_PYTHON set "AGENTTALK_PYTHON=([^"\r\n]+)"\r?$',
+    re.MULTILINE,
+)
 
 
 class ArtifactValidationError(RuntimeError):
     pass
+
+
+def _baked_python_pin(raw: bytes) -> str:
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise ArtifactValidationError("bin/agenttalk.cmd must be BOM-free")
+    matches = _SHIM_PYTHON_PIN_RE.findall(raw)
+    if len(matches) != 1:
+        raise ArtifactValidationError(
+            "bin/agenttalk.cmd has a missing or duplicate baked Python fallback"
+        )
+    try:
+        return matches[0].decode("utf-8")
+    except UnicodeError as exc:
+        raise ArtifactValidationError(
+            "bin/agenttalk.cmd baked Python fallback is not UTF-8"
+        ) from exc
 
 
 def _marker_placeholder_bundle(
@@ -5977,9 +6042,20 @@ def inspect_artifact_bundle(
     required: Iterable[str] = ARTIFACT_RELATIVE_PATHS,
     python_exe: str | None = None,
 ) -> dict:
-    expected = render_artifact_bundle(store, python_exe=python_exe)
     errors: list[str] = []
     markers: dict[str, tuple[int, str]] = {}
+    if python_exe is None:
+        try:
+            python_exe = _baked_python_pin(
+                (store.dir / "bin" / "agenttalk.cmd").read_bytes()
+            )
+        except OSError as exc:
+            errors.append(f"bin/agenttalk.cmd: unreadable or missing ({exc})")
+        except ArtifactValidationError as exc:
+            errors.append(str(exc))
+    if python_exe is None:
+        return {"ok": False, "errors": errors, "markers": {}}
+    expected = render_artifact_bundle(store, python_exe=python_exe)
     for relative in required:
         path = store.dir / Path(relative)
         try:

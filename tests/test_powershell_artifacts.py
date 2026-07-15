@@ -49,6 +49,17 @@ def test_generation_changes_with_python_pin_and_is_deterministic(tmp_path: Path)
     assert one != two
 
 
+def test_validation_uses_baked_python_pin_not_runtime_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    sup.init(store, python_exe=r"C:\PythonA\python.exe")
+    monkeypatch.setattr(sup.sys, "executable", r"C:\PythonB\python.exe")
+
+    sup.validate_artifact_bundle(store, boundary="supervisor")
+
+
 def test_generation_changes_with_checkout_identity(tmp_path: Path) -> None:
     first = _store(tmp_path / "first")
     second = _store(tmp_path / "second")
