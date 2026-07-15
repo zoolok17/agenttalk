@@ -95,6 +95,44 @@ passed the lead gate but a clean CI runner did not), fixed test-only in the foll
 `748ca74`. Reviewed-SHA = the exact code reviewed + lead-gated (fast-forward
 merged); Tag = the release commit (adds version/CHANGELOG only).
 
+### v0.77.0 - Loud coordination-stall warnings (advisory, false-positive-disciplined) (2026-07-15)
+**GOOD / ROBUST / SECURE** - reviewed-SHA `39bc1e9` - tag `v0.77.0`
+- **Origin:** during this session `codex` idle-waited ~10 minutes on a design-critique reply from a
+  developer agent that was DOWN — the awaited reply could never arrive, yet there was **no
+  operator-visible signal** (the lead found it only by manually inspecting heartbeats). Plus the
+  2026-07-14 request-restart deadlock that was silent until hand-diagnosed.
+- **Fix:** two LOW-NOISE **advisory** detectors — `wait_target_unavailable` (a wrapped `--await-reply`
+  or manual scoped-wait edge whose target is a supervisor-confirmed-unavailable peer) and
+  `manual_restart_blocked` (a human restart held behind the launch barrier past grace) — projected as
+  one advisory `coordination_stall` across attention / doctor / status / dashboard. It is **advisory
+  only**: zero kill/restart/release/reroute/gate mutation (respects the stand-down authority model —
+  TERMINAL_BY_DESIGN routes a stood-down/released peer to reassign, never peer-down). Healthy idle,
+  short consults, uncertain (UNKNOWN) peers, and within-skew heartbeats stay **silent**; the broad
+  all-idle and cycle detectors are deliberately DEFERRED (no cross-subsystem progress contract yet).
+  New module `coordination_stall.py`, decision **D-28**, new `--await-reply` consult/handoff flag.
+- **Review/gate:** builder `codex-agenttalk-developer-3` (the usual builder, dev-2, was down on a
+  Claude rate-limit). Two independent reviewers on the final SHA (`codex-agenttalk-reviewer-1`
+  adversarial + `claude-test` executed acceptance), all APPROVED. False-positive discipline was the
+  crux and the review earned it: codex-reviewer-1 first caught a real false alarm (a future/skewed
+  heartbeat mapped to UNAVAILABLE instead of UNKNOWN — a clock jump would fire a false stall), folded
+  to an additive `heartbeat_evidence` class (`future_skew -> UNKNOWN`). The **lead full-suite gate then
+  caught 3 issues the affected-suite self-gate + targeted reviews structurally missed**: two
+  strict-additivity breaks (`status --json` gained an unconditional `coordination_stalls` key) and one
+  non-hermetic test (a quiet PS1 test sampling the machine-wide process table). Folded: omit the key
+  when empty (contract preserved), and stub the generated process snapshot deterministically.
+- **Verification / lead gate** on the exact ship SHA: full suite green on Python 3.14 (`2545 passed,
+  5 skipped`) and Python 3.10 (`2541 passed, 5 skipped, 4 deselected` gate-venv timing flakes). Ruff,
+  `bandit -r src -x src/agenttalk/skills`, gitleaks (`e1d8675..39bc1e9`, no leaks), `compileall`, and
+  `git diff --check` all passed; `status --json` verified to omit `coordination_stalls` when empty.
+- **Robust/Secure:** the detector is pure and side-effect-free (spies assert zero kill/restart/release/
+  cursor/message/gate); the supervisor planner is unchanged (a read-only availability projection); the
+  wrapped `--await-reply` state is generation-bound, body-free, and fail-safe (malformed / mismatched
+  generation -> UNKNOWN / no warning, never a false DOWN or a brick); only 4 consult/handoff skills
+  adopt the flag, all other skills and manual scoped wait unchanged. Honest ceiling (recorded): with
+  signing off, edges rest on the from/to/request_id honest-local assumption.
+- **CI:** GitHub `tests` + `security` workflows watched on the exact release commit; run ids recorded
+  in the GitHub release.
+
 ### v0.76.1 - Knowledge base: lessons visible by default + hardened curate/provenance boundary (2026-07-15)
 **GOOD / ROBUST / SECURE** - reviewed-SHA `79b6c8f` - tag `v0.76.1`
 - **Origin:** the orbit-launcher lead's report that the shipped knowledge subsystem's notes were
