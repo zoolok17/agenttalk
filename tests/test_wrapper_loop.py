@@ -387,6 +387,7 @@ def _append_accepted_lesson(
         anchor=None,
         verified_against_sha=None,
         domain_registry_hash="rh-test",
+        domain_definition_hash=kn.VIRTUAL_PROCESS_DOMAIN_HASH,
         author="alpha",
         resolved_from="active_agent",
         at="2026-07-08T00:00:00Z",
@@ -561,7 +562,30 @@ def test_make_drive_lesson_context_skips_corrupt_knowledge_tail(tmp_path) -> Non
     stdin = spawned[0][1] or ""
     assert outcome.ok is True
     assert "docs.root [docs]" in stdin
-    assert "WARN: knowledge skipped 1 corrupt line(s)" in stdin
+    assert "WARN: knowledge skipped 1 invalid or non-causal ledger line(s)" in stdin
+
+
+def test_lesson_context_warns_and_keeps_prior_lesson_after_noncausal_row(
+        tmp_path) -> None:
+    s = _store(tmp_path)
+    _append_accepted_lesson(s)
+    events, problems = kn.read_events(s)
+    assert problems == []
+    forged = kn.new_curate_event(
+        base=events[-1], action="verify", curated_by="alpha",
+        resolved_from="lead", at="2026-07-08T00:02:00Z", reason=None,
+    )
+    forged["curates_id"] = "kn-missing"
+    kn.append_event(s, forged)
+
+    selection = lesson_context.select_for_record(
+        s, {"subject": "docs update", "body": "please update docs"})
+
+    assert [note["key"] for note, _verdict in selection.rows] == ["docs.root"]
+    assert selection.warnings == [
+        "knowledge skipped 1 invalid or non-causal ledger line(s); "
+        "affected lessons were ignored"
+    ]
 
 
 def test_lesson_exposure_reader_skips_malformed_tail(tmp_path) -> None:

@@ -1,4 +1,4 @@
-"""Knowledge layer MVP (middle-tier Phase 2): durable, pointer-shaped project memory.
+"""Durable pointer notes and advisory process lessons.
 
 A *note* preserves the small piece of human/agent insight that is NOT in the
 artifact (a seam, a gotcha, a decision + rationale); its ANCHOR points to the code/
@@ -9,10 +9,13 @@ when their anchor changes (anchor-relative, not HEAD-relative).
 Design (codex knowledge design, lead-gated; dev-2 + reviewer-1 consults folded in):
   * Store is ``.agenttalk/knowledge/notes.jsonl`` - append-only, one immutable event
     per line, preserved by reset (durable memory, not active bus state). The current
-    view is the latest valid event per ``(domain_id, key)``.
+    view is the latest structurally valid and causally foldable event per
+    ``(domain_id, key)``.
   * CAPTURE is open (any active agent publishes an ``uncurated`` note); CURATION is
     gated (a domain owner/curator, or a lead override, verifies/retracts).
-  * Staleness is ANCHOR-RELATIVE + PURE: :func:`compute_staleness` derives
+  * Registry freshness is scoped to the effective domain definition; unrelated
+    registry edits are cautions, not hard stale. Pointer staleness remains
+    ANCHOR-RELATIVE + PURE: :func:`compute_staleness` derives
     stale_reasons / caution_flags from already-resolved inputs (the CLI/git adapter
     does the I/O). A note is hard-stale only when its anchor actually changed; a
     moved HEAD with an unchanged anchor is a CAUTION, not stale (over-staling would
@@ -23,6 +26,7 @@ Design (codex knowledge design, lead-gated; dev-2 + reviewer-1 consults folded i
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -71,6 +75,7 @@ STALE_SUPERSEDED = "superseded"
 STALE_RETRACTED = "retracted"
 STALE_DOMAIN_GONE = "domain_gone"
 STALE_REGISTRY_CHANGED = "domain_registry_hash_changed"
+STALE_DOMAIN_DEFINITION_CHANGED = "domain_definition_hash_changed"
 STALE_SHA_UNREACHABLE = "verified_sha_unreachable"
 STALE_ANCHOR_GONE = "anchor_disappeared"
 STALE_ANCHOR_CHANGED = "anchor_path_changed"
@@ -84,12 +89,23 @@ CAUTION_SHA_NOT_HEAD = "verified_sha_not_head"
 CAUTION_UNCURATED = "uncurated"
 CAUTION_WEAK_SYMBOL = "weak_symbol_evidence"
 CAUTION_REVIEW_DUE = "review_due"
+CAUTION_REGISTRY_CHANGED = "domain_registry_changed_elsewhere"
+CAUTION_LEGACY_UNSCOPED = "legacy_unscoped_registry_freshness"
+
+_VIRTUAL_PROCESS_POLICY = {
+    "domain_id": PROCESS_DOMAIN,
+    "kind": "virtual-process-lessons",
+    "lesson_only": True,
+    "curation_policy": "operator-facing-or-lead",
+    "schema_version": 1,
+}
 
 _KEY_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _NOTE_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _FULL_SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 _SAFE_TAG_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _AGENT_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 LESSON_TEXT_MAX_BYTES = 500
 LESSON_TAG_LIMIT = 16
 LESSON_SUPERSEDES_LIMIT = 16
@@ -102,6 +118,79 @@ class KnowledgeError(ValueError):
 def new_note_id() -> str:
     import uuid
     return "kn-" + uuid.uuid4().hex[:12]
+
+
+def _canonical_hash(value: object) -> str:
+    blob = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def domain_definition_hash(entry: dict[str, Any]) -> str:
+    """Hash one normalized domain definition, independent of unrelated domains."""
+    if not isinstance(entry, dict):
+        raise KnowledgeError("domain definition must be an object")
+    return _canonical_hash(entry)
+
+
+VIRTUAL_PROCESS_DOMAIN_HASH = domain_definition_hash(_VIRTUAL_PROCESS_POLICY)
+
+
+def effective_domain(domain_id: str, note_type: str,
+                     domains: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the real domain, or the lesson-only virtual process policy.
+
+    A real ``process`` entry always overrides the virtual policy. Callers use the
+    returned subject hash for scoped freshness and curation restamping.
+    """
+    entry = (domains or {}).get(domain_id)
+    if isinstance(entry, dict):
+        return {
+            "exists": True,
+            "virtual": False,
+            "entry": entry,
+            "definition_hash": domain_definition_hash(entry),
+        }
+    if domain_id == PROCESS_DOMAIN and note_type == TYPE_LESSON:
+        return {
+            "exists": True,
+            "virtual": True,
+            "entry": None,
+            "definition_hash": VIRTUAL_PROCESS_DOMAIN_HASH,
+        }
+    return {"exists": False, "virtual": False, "entry": None,
+            "definition_hash": None}
+
+
+def immutable_payload(note: dict[str, Any]) -> dict[str, Any]:
+    """Return the curation-bound semantic payload from an explicit whitelist."""
+    note_type = validate_type(note.get("type"))
+    payload: dict[str, Any] = {
+        "domain_id": note.get("domain_id"),
+        "key": validate_key(note.get("key")),
+        "type": note_type,
+        "body": validate_body(note.get("body")),
+        "verified_against_sha": note.get("verified_against_sha"),
+    }
+    if note_type == TYPE_LESSON:
+        lesson = validate_lesson(note.get("lesson"))
+        semantic_lesson = {
+            key: lesson.get(key)
+            for key in (
+                "scope", "trigger", "evidence_ref", "applies_to", "owner",
+                "review_after", "expires_at", "supersedes", "anchor",
+            )
+            if lesson.get(key) is not None
+        }
+        payload["lesson"] = semantic_lesson
+    else:
+        payload["anchor"] = validate_anchor(note.get("anchor"))
+    return payload
+
+
+def payload_hash(note: dict[str, Any]) -> str:
+    return _canonical_hash(immutable_payload(note))
 
 
 # --------------------------------------------------------------- validators
@@ -117,6 +206,12 @@ def validate_key(value: object) -> str:
 def validate_note_id(value: object) -> str:
     if not isinstance(value, str) or not _NOTE_ID_RE.match(value):
         raise KnowledgeError(f"note id {value!r} is not a safe identifier")
+    return value
+
+
+def validate_domain_definition_hash(value: object) -> str:
+    if not isinstance(value, str) or not _SHA256_RE.match(value):
+        raise KnowledgeError("domain_definition_hash must be a sha256 hex digest")
     return value
 
 
@@ -149,6 +244,10 @@ def _validate_agent(value: object, field: str) -> str:
     if not isinstance(value, str) or not _AGENT_RE.match(value):
         raise KnowledgeError(f"lesson.{field} must be a valid agent name")
     return value
+
+
+def validate_lesson_owner(value: object) -> str:
+    return _validate_agent(value, "owner")
 
 
 def _validate_bounded_text(value: object, field: str,
@@ -303,7 +402,8 @@ def anchor_path(anchor: dict) -> str | None:
 
 def new_publish_event(*, note_id: str, key: str, type: str, domain_id: str, body: str,
                       anchor: dict | None, verified_against_sha: str | None,
-                      domain_registry_hash: str, author: str, resolved_from: str,
+                      domain_registry_hash: str, domain_definition_hash: str,
+                      author: str, resolved_from: str,
                       at: str, supersedes_id: str | None = None,
                       supersedes_key: str | None = None,
                       lesson: dict | None = None) -> dict[str, Any]:
@@ -322,6 +422,8 @@ def new_publish_event(*, note_id: str, key: str, type: str, domain_id: str, body
         "body": validate_body(body),
         "verified_against_sha": verified_against_sha,
         "domain_registry_hash": domain_registry_hash,
+        "domain_definition_hash": validate_domain_definition_hash(
+            domain_definition_hash),
         "author": author,
         "authority": {"state": AUTH_UNCURATED, "resolved_from": resolved_from, "reason": None},
         "created_at": at,
@@ -341,7 +443,9 @@ def new_publish_event(*, note_id: str, key: str, type: str, domain_id: str, body
 
 
 def new_curate_event(*, base: dict, action: str, curated_by: str, resolved_from: str,
-                     at: str, reason: str | None) -> dict[str, Any]:
+                     at: str, reason: str | None,
+                     domain_registry_hash: str | None = None,
+                     domain_definition_hash: str | None = None) -> dict[str, Any]:
     """A CURATE (verify) or RETRACT event over an existing note (same key/domain).
     verify -> authority.state=verified (or lead_override); retract -> terminal
     tombstone for that key until a later publish supersedes it."""
@@ -351,18 +455,40 @@ def new_curate_event(*, base: dict, action: str, curated_by: str, resolved_from:
         raise KnowledgeError("a retract requires a reason")
     state = AUTH_RETRACTED if action == "retract" else (
         AUTH_LEAD_OVERRIDE if resolved_from == "lead" else AUTH_VERIFIED)
-    evt = dict(base)
-    evt["event"] = EVENT_RETRACT if action == "retract" else EVENT_CURATE
-    evt["id"] = new_note_id()
-    evt["authority"] = {"state": state, "resolved_from": resolved_from, "reason": reason}
-    evt["curated_by"] = curated_by
-    evt["curated_at"] = at
-    evt["updated_at"] = at
-    if evt.get("type") == TYPE_LESSON:
-        lesson = validate_lesson(evt.get("lesson"))
+    definition_hash = domain_definition_hash or base.get("domain_definition_hash")
+    definition_hash = validate_domain_definition_hash(definition_hash)
+    registry_hash = domain_registry_hash or base.get("domain_registry_hash")
+    if not isinstance(registry_hash, str) or not registry_hash:
+        raise KnowledgeError("domain_registry_hash is required")
+    note_type = validate_type(base.get("type"))
+    evt: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "event": EVENT_RETRACT if action == "retract" else EVENT_CURATE,
+        "id": new_note_id(),
+        "key": validate_key(base.get("key")),
+        "type": note_type,
+        "domain_id": base.get("domain_id"),
+        "body": validate_body(base.get("body")),
+        "verified_against_sha": base.get("verified_against_sha"),
+        "domain_registry_hash": registry_hash,
+        "domain_definition_hash": definition_hash,
+        "authority": {"state": state, "resolved_from": resolved_from, "reason": reason},
+        "curated_by": curated_by,
+        "curated_at": at,
+        "updated_at": at,
+        "curates_id": validate_note_id(base.get("id")),
+        "payload_hash": payload_hash(base),
+    }
+    for field in ("author", "created_at", "supersedes_id", "supersedes_key"):
+        if field in base:
+            evt[field] = base.get(field)
+    if note_type == TYPE_LESSON:
+        lesson = validate_lesson(base.get("lesson"))
         lesson["status"] = LESSON_STATUS_RETIRED if action == "retract" else LESSON_STATUS_ACCEPTED
         lesson["curator"] = curated_by
         evt["lesson"] = validate_lesson(lesson)
+    else:
+        evt["anchor"] = validate_anchor(base.get("anchor"))
     if action == "retract":
         evt["retract_reason"] = reason
     return evt
@@ -391,6 +517,10 @@ def event_problem(evt: object) -> str | None:
             return f"{key} is required"
     if not isinstance(evt.get("domain_registry_hash"), str) or not evt.get("domain_registry_hash"):
         return "domain_registry_hash is required"
+    definition_hash = evt.get("domain_definition_hash")
+    if definition_hash is not None and not (
+            isinstance(definition_hash, str) and _SHA256_RE.match(definition_hash)):
+        return "domain_definition_hash must be a sha256 hex digest"
     vsha = evt.get("verified_against_sha")
     if vsha is not None and not (isinstance(vsha, str) and _FULL_SHA_RE.match(vsha)):
         return "verified_against_sha must be null or a full 40-char SHA"
@@ -415,6 +545,22 @@ def event_problem(evt: object) -> str | None:
     if event in (EVENT_CURATE, EVENT_RETRACT) and not (
             isinstance(evt.get("curated_by"), str) and evt.get("curated_by")):
         return "a curate/retract event requires curated_by"
+    curates_id = evt.get("curates_id")
+    semantic_hash = evt.get("payload_hash")
+    if event == EVENT_PUBLISH and (curates_id is not None or semantic_hash is not None):
+        return "a publish event cannot carry curation lineage"
+    if event in (EVENT_CURATE, EVENT_RETRACT):
+        if (curates_id is None) != (semantic_hash is None):
+            return "curates_id and payload_hash must be present together"
+        if curates_id is not None:
+            try:
+                validate_note_id(curates_id)
+            except KnowledgeError as e:
+                return str(e)
+            if not isinstance(semantic_hash, str) or not _SHA256_RE.match(semantic_hash):
+                return "payload_hash must be a sha256 hex digest"
+            if definition_hash is None:
+                return "new curation events require domain_definition_hash"
     if event == EVENT_RETRACT and not (
             isinstance(evt.get("retract_reason"), str) and evt.get("retract_reason").strip()):
         return "a retract event requires a non-empty retract_reason"
@@ -445,16 +591,73 @@ def _is_wellformed(evt: object) -> bool:
     return event_problem(evt) is None
 
 
+def _curation_causal_problem(evt: dict, prior: list[dict]) -> str | None:
+    if evt.get("event") == EVENT_PUBLISH:
+        return None
+    if not prior:
+        return "curation has no prior valid same-key event"
+
+    curates_id = evt.get("curates_id")
+    semantic_hash = evt.get("payload_hash")
+    if curates_id is None and semantic_hash is None:
+        # Legacy rows copied their current base. Preserve them only when that
+        # immutable payload still matches the current accepted same-key event.
+        parent = prior[-1]
+        if payload_hash(evt) != payload_hash(parent):
+            return "legacy curation payload differs from its prior current event"
+        return None
+
+    parent = next((row for row in prior if row.get("id") == curates_id), None)
+    if parent is None:
+        return "curates_id does not reference a prior valid same-key event"
+    parent_hash = payload_hash(parent)
+    if semantic_hash != parent_hash:
+        return "payload_hash does not match the referenced prior event"
+    if payload_hash(evt) != semantic_hash:
+        return "payload_hash does not match the curation event payload"
+    return None
+
+
+def resolve_views_with_problems(
+        events: list[dict]) -> tuple[dict[tuple, dict], list[dict]]:
+    """Causally fold valid events and report non-foldable semantic rows.
+
+    Structurally or semantically invalid curation is skipped entirely, so it can
+    neither become current nor hide a prior publish/curation.
+    """
+    out: dict[tuple, dict] = {}
+    history: dict[tuple, list[dict]] = {}
+    problems: list[dict] = []
+    for line, evt in enumerate(events, 1):
+        structural = event_problem(evt)
+        if structural is not None:
+            problems.append({"line": line, "error": f"malformed event: {structural}"})
+            continue
+        k = (evt["domain_id"], evt["key"])
+        causal = _curation_causal_problem(evt, history.get(k, []))
+        if causal is not None:
+            problems.append({"line": line, "error": causal})
+            continue
+        history.setdefault(k, []).append(evt)
+        rec = out.setdefault(
+            k, {"latest": None, "curated": None, "tombstoned": False})
+        rec["latest"] = evt
+        state = (evt.get("authority") or {}).get("state")
+        if evt.get("event") == EVENT_RETRACT or state == AUTH_RETRACTED:
+            rec["curated"] = evt
+            rec["tombstoned"] = True
+        elif state in (AUTH_VERIFIED, AUTH_LEAD_OVERRIDE):
+            rec["curated"] = evt
+            rec["tombstoned"] = False
+    return out, problems
+
+
 def current_view(events: list[dict]) -> dict[tuple, dict]:
     """PURE: fold append-only events into the latest VALID event per (domain_id, key),
     in file order (later wins). Invalid events are skipped (fail-safe - a malformed
     latest line never hides a valid note). A retract is kept as the terminal event."""
-    view: dict[tuple, dict] = {}
-    for evt in events:
-        if not _is_wellformed(evt):
-            continue
-        view[(evt["domain_id"], evt["key"])] = evt
-    return view
+    views, _problems = resolve_views_with_problems(events)
+    return {key: rec["latest"] for key, rec in views.items()}
 
 
 def resolve_views(events: list[dict]) -> dict[tuple, dict]:
@@ -469,21 +672,7 @@ def resolve_views(events: list[dict]) -> dict[tuple, dict]:
     Default pull shows ``curated`` (verified, non-tombstoned); a later uncurated
     publish updates ``latest`` only, so the verified note never silently disappears.
     Re-opening a retracted key requires a fresh publish AND re-curation."""
-    out: dict[tuple, dict] = {}
-    for evt in events:
-        if not _is_wellformed(evt):
-            continue
-        k = (evt["domain_id"], evt["key"])
-        rec = out.setdefault(k, {"latest": None, "curated": None, "tombstoned": False})
-        rec["latest"] = evt
-        state = (evt.get("authority") or {}).get("state")
-        if evt.get("event") == EVENT_RETRACT or state == AUTH_RETRACTED:
-            rec["curated"] = evt
-            rec["tombstoned"] = True
-        elif state in (AUTH_VERIFIED, AUTH_LEAD_OVERRIDE):
-            rec["curated"] = evt
-            rec["tombstoned"] = False
-        # an uncurated publish updates `latest` only (capture-open, curate-gated)
+    out, _problems = resolve_views_with_problems(events)
     return out
 
 
@@ -498,8 +687,39 @@ def is_curated(note: dict) -> bool:
 
 # --------------------------------------------------------------- pure staleness
 
+def compute_domain_freshness(
+        note: dict, *, domain_exists: bool, current_registry_hash: str | None,
+        current_domain_definition_hash: str | None) -> dict[str, list[str]]:
+    """Evaluate only registry/domain freshness for pointer and lesson views."""
+    reasons: list[str] = []
+    cautions: list[str] = []
+    if not domain_exists:
+        reasons.append(STALE_DOMAIN_GONE)
+        return {"stale_reasons": reasons, "caution_flags": cautions}
+
+    stored_subject_hash = note.get("domain_definition_hash")
+    global_changed = (
+        current_registry_hash is not None
+        and note.get("domain_registry_hash") != current_registry_hash
+    )
+    if stored_subject_hash is not None and current_domain_definition_hash is not None:
+        if stored_subject_hash != current_domain_definition_hash:
+            reasons.append(STALE_DOMAIN_DEFINITION_CHANGED)
+        elif global_changed:
+            cautions.append(CAUTION_REGISTRY_CHANGED)
+    elif global_changed:
+        # Historical rows cannot prove which registry subject changed. Keep them
+        # readable but make that weaker freshness visible to consumers.
+        cautions.append(
+            CAUTION_LEGACY_UNSCOPED if stored_subject_hash is None
+            else CAUTION_REGISTRY_CHANGED
+        )
+    return {"stale_reasons": reasons, "caution_flags": cautions}
+
+
 def compute_staleness(note: dict, *, domain_exists: bool, current_registry_hash: str,
-                      anchor_status: dict) -> dict[str, Any]:
+                      anchor_status: dict,
+                      current_domain_definition_hash: str | None = None) -> dict[str, Any]:
     """PURE: derive {stale_reasons, caution_flags, hard_stale} for a CURRENT note.
     All anchor/git resolution is done by the CLI and passed in ``anchor_status``:
 
@@ -518,10 +738,14 @@ def compute_staleness(note: dict, *, domain_exists: bool, current_registry_hash:
 
     if is_retracted(note):
         reasons.append(STALE_RETRACTED)
-    if not domain_exists:
-        reasons.append(STALE_DOMAIN_GONE)
-    if note.get("domain_registry_hash") != current_registry_hash:
-        reasons.append(STALE_REGISTRY_CHANGED)
+    domain_verdict = compute_domain_freshness(
+        note,
+        domain_exists=domain_exists,
+        current_registry_hash=current_registry_hash,
+        current_domain_definition_hash=current_domain_definition_hash,
+    )
+    reasons.extend(domain_verdict["stale_reasons"])
+    cautions.extend(domain_verdict["caution_flags"])
 
     if not is_curated(note):
         cautions.append(CAUTION_UNCURATED)
@@ -593,7 +817,10 @@ def lesson_updated_at(note: dict) -> datetime:
 
 
 def compute_lesson_state(note: dict, *, now: datetime | str | None = None,
-                         superseded_keys: set[str] | None = None) -> dict[str, Any]:
+                         superseded_keys: set[str] | None = None,
+                         domain_exists: bool = True,
+                         current_registry_hash: str | None = None,
+                         current_domain_definition_hash: str | None = None) -> dict[str, Any]:
     """PURE lesson freshness. Lesson staleness is date/status/key based only.
 
     The optional lesson anchor is provenance and filtering context, never freshness
@@ -603,6 +830,16 @@ def compute_lesson_state(note: dict, *, now: datetime | str | None = None,
     lesson = validate_lesson(note.get("lesson"))
     reasons: list[str] = []
     cautions: list[str] = []
+    domain_verdict = compute_domain_freshness(
+        note,
+        domain_exists=domain_exists,
+        current_registry_hash=(current_registry_hash
+                               if current_registry_hash is not None
+                               else note.get("domain_registry_hash")),
+        current_domain_definition_hash=current_domain_definition_hash,
+    )
+    reasons.extend(domain_verdict["stale_reasons"])
+    cautions.extend(domain_verdict["caution_flags"])
     review_at = _parse_iso_datetime(lesson.get("review_after"), "review_after")
     expires_at = _parse_iso_datetime(lesson.get("expires_at"), "expires_at")
     status = lesson.get("status")
@@ -632,6 +869,160 @@ def compute_lesson_state(note: dict, *, now: datetime | str | None = None,
         "active": active,
         "review_after": lesson.get("review_after"),
         "expires_at": lesson.get("expires_at"),
+    }
+
+
+def _knowledge_search_text(note: dict) -> str:
+    if note.get("type") == TYPE_LESSON:
+        lesson = note.get("lesson") or {}
+        value = {
+            "key": note.get("key"),
+            "body": note.get("body"),
+            "type": note.get("type"),
+            "scope": lesson.get("scope"),
+            "trigger": lesson.get("trigger"),
+            "evidence_ref": lesson.get("evidence_ref"),
+            "applies_to": lesson.get("applies_to") or [],
+        }
+    else:
+        value = {
+            "key": note.get("key"),
+            "body": note.get("body"),
+            "type": note.get("type"),
+            "anchor": note.get("anchor") or {},
+        }
+    return json.dumps(value, ensure_ascii=False, sort_keys=True).casefold()
+
+
+def _lesson_rank_key(row: tuple[dict, dict], context_scope: str) -> tuple:
+    note, verdict = row
+    lesson = note.get("lesson") or {}
+    return (
+        0 if lesson.get("scope") == PROCESS_DOMAIN else 1,
+        0 if lesson.get("scope") == context_scope else 1,
+        0 if verdict.get("review_due") else 1,
+        -lesson_updated_at(note).timestamp(),
+        note.get("domain_id") or "",
+        note.get("key") or "",
+    )
+
+
+def select_knowledge_view(
+        views: dict[tuple, dict], *, domains: dict[str, Any],
+        registry_hash: str, anchor_status_by_id: dict[str, dict],
+        semantic_problems: list[dict] | None = None,
+        domain_id: str | None = None, type_filter: str | None = None,
+        scope: str | None = None, tags: list[str] | None = None,
+        query: str | None = None, include_uncurated: bool = False,
+        include_stale: bool = False, note_limit: int | None = None,
+        lesson_limit: int | None = None, context_scope: str = PROCESS_DOMAIN,
+        now: datetime | str | None = None,
+        exclude_lessons: bool = False) -> dict[str, Any]:
+    """Select a deterministic mixed knowledge view from one resolved snapshot."""
+    for name, limit in (("note_limit", note_limit), ("lesson_limit", lesson_limit)):
+        if limit is not None and limit < 0:
+            raise KnowledgeError(f"{name} must be non-negative")
+
+    curated_lessons = [
+        rec.get("curated")
+        for rec in views.values()
+        if rec.get("curated") is not None
+        and rec["curated"].get("type") == TYPE_LESSON
+        and is_curated(rec["curated"])
+        and not is_retracted(rec["curated"])
+    ]
+    superseded = lesson_superseded_keys(curated_lessons)
+    wanted_tags = {str(tag).casefold() for tag in (tags or [])}
+    needle = (query or "").casefold()
+    note_rows: list[tuple[dict, dict]] = []
+    lesson_rows: list[tuple[dict, dict]] = []
+
+    for (candidate_domain, _key), rec in views.items():
+        if domain_id and candidate_domain != domain_id:
+            continue
+        latest = rec.get("latest")
+        curated = rec.get("curated")
+        if (include_uncurated and latest is not None
+                and not is_curated(latest) and not is_retracted(latest)):
+            note = latest
+            view_kind = "proposal"
+        else:
+            note = curated
+            view_kind = "curated"
+        if note is None:
+            continue
+        note_type = note.get("type")
+        if exclude_lessons and note_type == TYPE_LESSON:
+            continue
+        if type_filter and note_type != type_filter:
+            continue
+        if (scope or wanted_tags) and note_type != TYPE_LESSON:
+            continue
+        if is_retracted(note) and not include_stale:
+            continue
+
+        effective = effective_domain(
+            str(note.get("domain_id") or ""), str(note_type or ""), domains)
+        if note_type == TYPE_LESSON:
+            lesson = note.get("lesson") or {}
+            if scope and lesson.get("scope") != scope:
+                continue
+            applies_to = {
+                str(tag).casefold() for tag in lesson.get("applies_to", [])
+            }
+            if wanted_tags and not (wanted_tags & applies_to):
+                continue
+            verdict = compute_lesson_state(
+                note,
+                now=now,
+                superseded_keys=superseded,
+                domain_exists=effective["exists"],
+                current_registry_hash=registry_hash,
+                current_domain_definition_hash=effective["definition_hash"],
+            )
+        else:
+            verdict = compute_staleness(
+                note,
+                domain_exists=effective["exists"],
+                current_registry_hash=registry_hash,
+                current_domain_definition_hash=effective["definition_hash"],
+                anchor_status=anchor_status_by_id.get(str(note.get("id") or ""), {}),
+            )
+        if verdict.get("hard_stale") and not include_stale:
+            continue
+        if view_kind == "proposal" and not include_uncurated:
+            continue
+        if needle and needle not in _knowledge_search_text(note):
+            continue
+
+        row = dict(note)
+        row["view"] = view_kind
+        if note_type == TYPE_LESSON:
+            lesson_rows.append((row, verdict))
+        else:
+            note_rows.append((row, verdict))
+
+    note_rows.sort(key=lambda row: (
+        row[0].get("domain_id") or "",
+        row[0].get("type") or "",
+        row[0].get("key") or "",
+    ))
+    lesson_rows.sort(key=lambda row: _lesson_rank_key(row, context_scope))
+    totals = {"notes": len(note_rows), "lessons": len(lesson_rows)}
+    totals["all"] = totals["notes"] + totals["lessons"]
+    shown_notes = note_rows if note_limit is None else note_rows[:note_limit]
+    shown_lessons = lesson_rows if lesson_limit is None else lesson_rows[:lesson_limit]
+    truncation = {
+        "notes": max(0, len(note_rows) - len(shown_notes)),
+        "lessons": max(0, len(lesson_rows) - len(shown_lessons)),
+    }
+    truncation["all"] = truncation["notes"] + truncation["lessons"]
+    return {
+        "notes": shown_notes,
+        "lessons": shown_lessons,
+        "totals": totals,
+        "truncation": truncation,
+        "problems": list(semantic_problems or []),
     }
 
 
@@ -665,16 +1056,13 @@ def write_event_locked(store, event: dict) -> None:
     """The SINGLE durable append path for a knowledge event (C4c) - used by BOTH publish
     and curate. Encodes exactly one event line, appends, flushes, and fsyncs the file so
     a crash cannot lose a just-recorded note/curation. The CALLER must already hold
-    ``store._config_lock()`` (curate reads-then-appends under one lock to avoid a nested
-    lock; publish goes through :func:`append_event`). Append-only - never whole-file
-    replace, so the reader's skip-invalid/torn-tail tolerance is preserved."""
+    ``store._config_lock()``. Append-only - never whole-file replace, so the reader's
+    skip-invalid/torn-tail tolerance is preserved."""
     append_record(notes_path(store), event)
 
 
 def append_event(store, event: dict) -> None:
-    """Append exactly one event under the shared store lock (public publish path).
-    Delegates the durable write to :func:`write_event_locked` so publish and curate share
-    ONE write path (reuse the lane/gate file-lock primitive - no new locking scheme)."""
+    """Append one event under the shared lock for callers without a transaction lock."""
     with store._config_lock():
         write_event_locked(store, event)
 

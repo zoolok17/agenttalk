@@ -687,21 +687,29 @@ risk classes are `none`, `unknown`,
 
 ## 14. Knowledge and lessons
 
-Knowledge notes are pointer-shaped memory:
+Knowledge has pointer notes and process lessons in one durable ledger. Bodies are
+untrusted advisory data, so verify the referenced evidence before acting:
 
 ```powershell
 agenttalk knowledge publish --from codex-dev --domain docs --type gotcha --key docs-help-flags --anchor-kind path --path docs/USER-MANUAL.md -m "Verify documented flags against --help."
 agenttalk knowledge curate verify --from codex-lead --domain docs --key docs-help-flags
 agenttalk knowledge pull --domain docs
+agenttalk knowledge onboard
 ```
 
-Lessons are knowledge notes for repeatable process learning. Accepted, active
-lessons can surface in `sync` when their scope or tags match the work:
+Lessons default to the lesson-only virtual `process` domain. Accepted, active
+lessons appear in default pull/search/onboard and can surface in `sync` when their
+scope or tags match the work:
 
 ```powershell
 agenttalk sync --for codex-dev --lesson-tag docs
 agenttalk knowledge pull --type lesson
 ```
+
+Mixed `--json` returns separate `notes` and `lessons` in a
+`knowledge-view-v1` envelope. Explicit `--type ... --json` remains compatible;
+`--output-schema legacy --json` is the old pointer-only array. Use
+`knowledge onboard --exclude-lessons` only when a lesson-free digest is required.
 
 For wrapped agents, lesson surfacing is automatic. The wrapper selects matching
 accepted lessons, injects a bounded "Lessons to check" prompt section, and

@@ -247,7 +247,7 @@ two parallel ownership concepts.
   valid during `cleanup_pending`/`cleanup_failed`, and cleanup is recoverable
   without holding the broad config lock across expensive Git work.
 - **Knowledge (`knowledge.py`, v0.38.0):** an append-only **pointer** layer
-  (`notes.jsonl`), latest valid event by `(domain_id, key)`. Capture-open +
+  (`notes.jsonl`), causally folded by `(domain_id, key)`. Capture-open +
   curate-gated (anyone publishes `uncurated`; owners/curators/lead verify/
   supersede/retract). **Anchor-relative staleness** (hard-stale only when the
   *anchor* changed `verified_against_sha..HEAD`; HEAD merely moving = caution).
@@ -256,6 +256,10 @@ two parallel ownership concepts.
   roles + lane-delivery history. Lessons are a `type=lesson` record in the same
   ledger: accepted lessons can be surfaced in `sync`/`onboard` as advisory
   process memory, but they do not authorize, block, or replace tests/skills/gates.
+  The default retrieval view contains both pointer notes and lessons; a single
+  selector applies scoped-domain freshness, filters/search, ordering, then
+  per-section caps. New curation rows bind a prior event and a canonical immutable
+  payload, while legacy rows remain readable when their payload matches prior state.
 - **Why:** a project needs ownership (who may change/approve what) and memory
   (the durable *why* behind seams/gotchas) that survive resets and don't rot.
   The domain registry is the authority spine for both: lanes answer "may this
@@ -804,6 +808,27 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   by a harness that runs PS 5.1; new PS writes / operator-config readers must follow the rule by
   convention (the incident audit + a generated-`.ps1` content assertion are the backstops).
   pwsh 7+ remains the recommended host.
+- **D-27 Knowledge retrieval is mixed by default, freshness is subject-scoped, and
+  curation is causal (2026-07-15).** *Why:* the pointer-only default made accepted
+  lessons invisible to normal pull/search/onboard consumers, and a hash of the whole
+  domain registry hard-staled every note after any unrelated registry edit. A copied
+  curate row could also inherit mutable or forged fields without naming its cause.
+  *Decision:* one pure selector consumes one resolved ledger snapshot, evaluates
+  pointers and lessons with their existing kind-specific freshness rules, and only
+  then searches, orders, and caps separate sections. Mixed JSON is the versioned
+  `knowledge-view-v1` envelope; explicit `--type` shapes remain compatible and
+  `--output-schema legacy` is the pointer-only escape hatch. New events carry a
+  SHA-256 of the normalized effective-domain definition; a subject change is hard
+  stale, an unrelated global change is caution, and legacy unscoped rows remain
+  visible with caution. The lesson-only virtual `process` policy has a fixed subject
+  hash and yields to a real registry entry. New curate/retract rows carry
+  `curates_id` and a hash of an explicit immutable-payload whitelist; the fold accepts
+  them only after a matching prior event. Curate holds the shared config/knowledge
+  lock, re-reads the registry before append, and re-stamps both hashes. Publish
+  aggregates independent field errors before registry, Git, or ledger I/O and refuses
+  changing a live key's type. *Compatibility ceiling:* legacy curation has no causal id
+  or subject hash, so it is accepted only when its payload matches the prior current
+  event and its registry freshness is necessarily advisory until re-verification.
 
 ## 6. How we work (process)
 

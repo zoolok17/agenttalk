@@ -1955,6 +1955,8 @@ def _lesson_learning_item(note: dict, verdict: dict,
         "authority_from": _learning_short(authority.get("resolved_from"), limit=64),
         "verified_against_sha": _learning_short(note.get("verified_against_sha"), limit=40),
         "domain_registry_hash": _learning_short(note.get("domain_registry_hash"), limit=96),
+        "domain_definition_hash": _learning_short(
+            note.get("domain_definition_hash"), limit=96),
         "evidence_ref": _learning_short(lesson.get("evidence_ref"), limit=240),
         "anchor": _learning_anchor(lesson.get("anchor") or note.get("anchor")),
         "supersedes": [_learning_short(t, limit=128) for t in lesson.get("supersedes") or []
@@ -1977,17 +1979,21 @@ def _lesson_learning_item(note: dict, verdict: dict,
 
 
 def _learning_rows(events: list[dict], *, scope: str | None,
-                   tags: list[str], now: str | None) -> list[tuple[dict, dict]]:
+                   tags: list[str], now: str | None,
+                   domains: dict[str, Any] | None = None,
+                   registry_hash: str | None = None) -> list[tuple[dict, dict]]:
     rows: dict[str, tuple[dict, dict]] = {}
     for group in (
         _lesson_context.lesson_rows(
-            events, scope=scope, tags=tags, now=now, active_only=True),
+            events, scope=scope, tags=tags, now=now, active_only=True,
+            domains=domains, registry_hash=registry_hash),
         _lesson_context.lesson_rows(
             events, scope=scope, tags=tags, now=now,
-            include_uncurated=True, include_stale=True),
+            include_uncurated=True, include_stale=True,
+            domains=domains, registry_hash=registry_hash),
         _lesson_context.lesson_rows(
             events, scope=scope, tags=tags, now=now,
-            include_stale=True),
+            include_stale=True, domains=domains, registry_hash=registry_hash),
     ):
         for note, verdict in group:
             note_id = str(note.get("id") or f"{note.get('domain_id')}:{note.get('key')}")
@@ -2092,9 +2098,16 @@ def build_learning(desc: RootDescriptor, *, status: str = "active",
     }
     try:
         events, knowledge_problems = _knowledge.read_events(desc.store)
+        _views, semantic_problems = _knowledge.resolve_views_with_problems(events)
+        knowledge_problems = [*knowledge_problems, *semantic_problems]
+        registry = _domains.load_registry(
+            desc.store.dir / _domains.FILENAME, desc.store.load_config())
         exposures, exposure_problems = _lesson_context.read_exposure_events(desc.store)
         exposure_by_lesson, recent = _exposure_index(exposures)
-        rows = _learning_rows(events, scope=scope, tags=tags, now=now)
+        rows = _learning_rows(
+            events, scope=scope, tags=tags, now=now,
+            domains=registry.data.get("domains") or {},
+            registry_hash=registry.registry_hash)
         items = []
         for note, verdict in rows:
             item = _lesson_learning_item(note, verdict, None)

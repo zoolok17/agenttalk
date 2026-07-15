@@ -384,19 +384,21 @@ def _check_knowledge(store) -> Check | None:
         return None
     try:
         events, problems = kn.read_events(store)
+        _views, semantic_problems = kn.resolve_views_with_problems(events)
+        problems = [*problems, *semantic_problems]
     except Exception as e:  # noqa: BLE001 - doctor never crashes
         return Check(name="knowledge_notes", status="warn",
                      details=f"could not scan notes.jsonl: {e}")
     if problems:
         return Check(
             name="knowledge_notes", status="warn",
-            details=(f"{len(problems)} corrupt/torn line(s) in notes.jsonl "
+            details=(f"{len(problems)} invalid or non-causal line(s) in notes.jsonl "
                      f"(skipped; valid notes unaffected): "
                      + "; ".join(f"line {p['line']}: {p['error']}" for p in problems[:5])),
             data={"valid": len(events), "problems": problems},
         )
     return Check(name="knowledge_notes", status="ok",
-                 details=f"{len(events)} valid knowledge event(s), no corrupt lines")
+                 details=f"{len(events)} valid knowledge event(s), no ledger problems")
 
 
 # ---------------------------------------------------------- individual checks

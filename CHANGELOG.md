@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Knowledge notes and lessons are visible from the default retrieval surfaces.**
+  `knowledge pull`, `search`, and `onboard` now select curated pointer notes and
+  accepted lessons through one mixed-view pipeline; scope/tag filters include lessons
+  without requiring `--type lesson`, and JSON callers receive a versioned
+  `knowledge-view-v1` envelope. Explicit `--type` output stays compatible, while
+  `--output-schema legacy` preserves the old pointer-only JSON array.
+- **Registry edits no longer hard-stale unrelated knowledge.** New events bind the
+  normalized definition of their effective domain. A change to that domain requires
+  re-verification; an unrelated registry change is a caution. Historical events without
+  the scoped hash remain curated and visible with a legacy-freshness caution.
+- **Curation is causally bound and publish validation is complete in one pass.** New
+  curate/retract events name the prior event and hash an immutable semantic payload;
+  non-causal rows are skipped without hiding valid history. Curation rechecks the
+  registry before append, and publish reports all independent field errors before any
+  registry, Git, or ledger I/O.
+
 ## [0.76.0] - 2026-07-15
 
 ### Added

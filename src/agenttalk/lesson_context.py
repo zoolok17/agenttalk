@@ -17,6 +17,7 @@ import uuid
 from collections.abc import Iterable
 from typing import Any
 
+from agenttalk import domains as dom
 from agenttalk import knowledge as kn
 
 DEFAULT_LESSON_LIMIT = 5
@@ -58,7 +59,9 @@ def trim(value: object, limit: int = 160) -> str:
 def lesson_rows(events: list[dict], *, include_uncurated: bool = False,
                 include_stale: bool = False, scope: str | None = None,
                 tags: Iterable[str] | None = None, now: str | None = None,
-                active_only: bool = False) -> list[tuple[dict, dict]]:
+                active_only: bool = False,
+                domains: dict[str, Any] | None = None,
+                registry_hash: str | None = None) -> list[tuple[dict, dict]]:
     accepted = []
     views = kn.resolve_views(events)
     for rec in views.values():
@@ -84,7 +87,19 @@ def lesson_rows(events: list[dict], *, include_uncurated: bool = False,
         applies_to = {str(t).casefold() for t in lesson.get("applies_to", [])}
         if wanted_tags and not (applies_to & wanted_tags):
             continue
-        verdict = kn.compute_lesson_state(note, now=now, superseded_keys=superseded)
+        effective = kn.effective_domain(
+            str(note.get("domain_id") or ""), kn.TYPE_LESSON, domains or {},
+        ) if domains is not None else {
+            "exists": True, "definition_hash": None,
+        }
+        verdict = kn.compute_lesson_state(
+            note,
+            now=now,
+            superseded_keys=superseded,
+            domain_exists=effective["exists"],
+            current_registry_hash=registry_hash,
+            current_domain_definition_hash=effective["definition_hash"],
+        )
         if active_only:
             if not verdict.get("active"):
                 continue
@@ -222,7 +237,9 @@ def rank_lessons(rows: list[tuple[dict, dict]], *,
 
 
 def select_lessons(events: list[dict], *, context_scope: str, tags: Iterable[str],
-                   limit: int = DEFAULT_LESSON_LIMIT) -> list[tuple[dict, dict]]:
+                   limit: int = DEFAULT_LESSON_LIMIT,
+                   domains: dict[str, Any] | None = None,
+                   registry_hash: str | None = None) -> list[tuple[dict, dict]]:
     lesson_tags = {str(t).casefold() for t in tags}
 
     def lesson_matches(note: dict) -> bool:
@@ -233,17 +250,18 @@ def select_lessons(events: list[dict], *, context_scope: str, tags: Iterable[str
         applies_to = {str(t).casefold() for t in lesson.get("applies_to", [])}
         return not applies_to or bool(applies_to & lesson_tags)
 
-    raw_rows = lesson_rows(events, active_only=True)
+    raw_rows = lesson_rows(
+        events, active_only=True, domains=domains, registry_hash=registry_hash)
     return rank_lessons(
         [(n, v) for (n, v) in raw_rows if lesson_matches(n)],
         context_scope=context_scope,
     )[:limit]
 
 
-def _corrupt_line_warning(problems: list[dict]) -> str:
+def _ledger_problem_warning(problems: list[dict]) -> str:
     return (
-        f"knowledge skipped {min(len(problems), 99)} corrupt line(s); "
-        "malformed lessons were ignored"
+        f"knowledge skipped {min(len(problems), 99)} invalid or non-causal "
+        "ledger line(s); affected lessons were ignored"
     )
 
 
@@ -257,10 +275,15 @@ def select_for_sync(store, msgs: list, rows: list[dict],
     try:
         context_scope, tags = sync_lesson_context(msgs, rows, explicit_tags)
         events, problems = kn.read_events(store)
+        _views, semantic_problems = kn.resolve_views_with_problems(events)
+        problems = [*problems, *semantic_problems]
+        registry = dom.load_registry(store.dir / dom.FILENAME, store.load_config())
         lesson_rows_out = select_lessons(
-            events, context_scope=context_scope, tags=tags, limit=limit)
+            events, context_scope=context_scope, tags=tags, limit=limit,
+            domains=registry.data.get("domains") or {},
+            registry_hash=registry.registry_hash)
         if problems:
-            warnings.append(_corrupt_line_warning(problems))
+            warnings.append(_ledger_problem_warning(problems))
     except Exception as e:  # noqa: BLE001 - lesson telemetry must not block sync
         warnings.append(f"lessons unavailable: {trim(e, 160)}")
     return LessonSelection(lesson_rows_out, warnings, context_scope, tags)
@@ -276,10 +299,15 @@ def select_for_record(store, record: dict,
     try:
         context_scope, tags = record_lesson_context(record, explicit_tags)
         events, problems = kn.read_events(store)
+        _views, semantic_problems = kn.resolve_views_with_problems(events)
+        problems = [*problems, *semantic_problems]
+        registry = dom.load_registry(store.dir / dom.FILENAME, store.load_config())
         lesson_rows_out = select_lessons(
-            events, context_scope=context_scope, tags=tags, limit=limit)
+            events, context_scope=context_scope, tags=tags, limit=limit,
+            domains=registry.data.get("domains") or {},
+            registry_hash=registry.registry_hash)
         if problems:
-            warnings.append(_corrupt_line_warning(problems))
+            warnings.append(_ledger_problem_warning(problems))
     except Exception as e:  # noqa: BLE001 - wrapper turns must continue without lessons
         warnings.append(f"lessons unavailable: {trim(e, 160)}")
     return LessonSelection(lesson_rows_out, warnings, context_scope, tags)

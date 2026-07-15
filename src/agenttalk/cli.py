@@ -4668,18 +4668,6 @@ def _knowledge_anchor_status(store, note: dict) -> dict:
     return status
 
 
-def _knowledge_eval(store, note: dict, registry):
-    from agenttalk import knowledge as kn
-    if note.get("type") == kn.TYPE_LESSON:
-        return kn.compute_lesson_state(note)
-    domains = registry.data.get("domains") or {}
-    domain_exists = note.get("domain_id") in domains
-    return kn.compute_staleness(
-        note, domain_exists=domain_exists,
-        current_registry_hash=registry.registry_hash,
-        anchor_status=_knowledge_anchor_status(store, note))
-
-
 def _knowledge_process_is_lead(store, actor: str) -> bool:
     cfg = store.load_config()
     roster = cfg.get("agents") or []
@@ -4709,12 +4697,11 @@ def _knowledge_resolve_domain_for_publish(store, args, reg):
     if not domain_id:
         raise kn.KnowledgeError("domain is required")
     domains = reg.data.get("domains") or {}
-    if domain_id == kn.PROCESS_DOMAIN and note_type == kn.TYPE_LESSON and domain_id not in domains:
-        return domain_id, None
-    if domain_id not in domains:
+    effective = kn.effective_domain(domain_id, note_type, domains)
+    if not effective["exists"]:
         known = sorted(domains)
         raise kn.KnowledgeError(f"unknown domain {domain_id!r} (known: {known})")
-    return domain_id, domains[domain_id]
+    return domain_id, effective
 
 
 def _knowledge_resolve_registry_curators(store, domain_id: str, reg):
@@ -4731,8 +4718,10 @@ def _knowledge_resolve_curators_for_note(store, note: dict, reg):
     from agenttalk import knowledge as kn
     domain_id = note.get("domain_id")
     domains = reg.data.get("domains") or {}
-    if note.get("type") == kn.TYPE_LESSON and domain_id == kn.PROCESS_DOMAIN \
-            and domain_id not in domains:
+    effective = kn.effective_domain(domain_id, note.get("type"), domains)
+    if not effective["exists"]:
+        raise kn.KnowledgeError(f"unknown domain {domain_id!r}")
+    if effective["virtual"]:
         return [], list(_knowledge_process_curators(store))
     return _knowledge_resolve_registry_curators(store, domain_id, reg)
 
@@ -4773,20 +4762,135 @@ def _kn_lesson_from_args(args, actor: str, anchor: dict | None):
         lesson, default_owner=actor, default_status=kn.LESSON_STATUS_PROPOSED)
 
 
-def _kn_lesson_rows(events: list[dict], *, include_uncurated: bool = False,
-                    include_stale: bool = False, scope: str | None = None,
-                    tags: list[str] | None = None, now: str | None = None,
-                    active_only: bool = False) -> list[tuple[dict, dict]]:
-    from agenttalk import lesson_context as lc
-    return lc.lesson_rows(
-        events,
-        include_uncurated=include_uncurated,
-        include_stale=include_stale,
-        scope=scope,
-        tags=tags,
-        now=now,
-        active_only=active_only,
+def _kn_publish_preflight(args, actor: str) -> tuple[list[str], dict | None, dict | None]:
+    """Validate publish fields without registry, Git, or event-store I/O."""
+    from agenttalk import knowledge as kn
+
+    errors: list[str] = []
+    try:
+        kn.validate_key(args.key)
+    except kn.KnowledgeError as exc:
+        errors.append(str(exc))
+    try:
+        kn.validate_body(args.message)
+    except kn.KnowledgeError as exc:
+        errors.append(str(exc))
+
+    is_lesson = args.type == kn.TYPE_LESSON
+    if not is_lesson and not args.domain:
+        errors.append("domain is required for non-lesson notes")
+
+    anchor_fields = (
+        "path", "symbol", "request_id", "msg_id", "mission", "wp_id", "sha")
+    has_anchor_values = any(getattr(args, field, None) for field in anchor_fields)
+    anchor: dict | None = None
+    anchor_kind = getattr(args, "anchor_kind", None)
+    if not anchor_kind:
+        if not is_lesson:
+            errors.append("anchor-kind is required for non-lesson notes")
+        elif has_anchor_values:
+            errors.append("anchor-kind is required when lesson anchor fields are supplied")
+    else:
+        required_by_kind = {
+            "path": ("path",),
+            "symbol": ("path", "symbol"),
+            "request": ("request_id",),
+            "wp": ("mission", "wp_id"),
+            "sha": ("sha",),
+        }
+        missing = [
+            field for field in required_by_kind.get(anchor_kind, ())
+            if not getattr(args, field, None)
+        ]
+        errors.extend(
+            f"anchor.{field} is required for anchor kind {anchor_kind}"
+            for field in missing
+        )
+        if not missing:
+            try:
+                anchor = _kn_anchor_from_args(args)
+            except kn.KnowledgeError as exc:
+                errors.append(str(exc))
+
+    lesson: dict | None = None
+    lesson_only = (
+        ("scope", "--scope"),
+        ("trigger", "--trigger"),
+        ("evidence_ref", "--evidence-ref"),
+        ("applies_to", "--applies-to"),
+        ("owner", "--owner"),
+        ("review_after", "--review-after"),
+        ("expires_at", "--expires-at"),
+        ("supersedes", "--supersedes"),
     )
+    if not is_lesson:
+        errors.extend(
+            f"{flag} is only valid with --type lesson"
+            for field, flag in lesson_only
+            if getattr(args, field, None) is not None
+        )
+        return errors, anchor, None
+
+    for field, flag in lesson_only:
+        if field in {"applies_to", "owner", "supersedes"}:
+            continue
+        if not getattr(args, field, None):
+            errors.append(f"{flag} is required for --type lesson")
+
+    for field, flag in (("trigger", "--trigger"), ("evidence_ref", "--evidence-ref")):
+        value = getattr(args, field, None)
+        if isinstance(value, str) and len(value.encode("utf-8")) > kn.LESSON_TEXT_MAX_BYTES:
+            errors.append(
+                f"{flag} is above the {kn.LESSON_TEXT_MAX_BYTES}-byte cap")
+
+    try:
+        kn.validate_lesson_owner(getattr(args, "owner", None) or actor)
+    except kn.KnowledgeError as exc:
+        errors.append(str(exc))
+
+    applies_to = _kn_split_csv(getattr(args, "applies_to", None))
+    if len(applies_to) > kn.LESSON_TAG_LIMIT:
+        errors.append(
+            f"--applies-to may contain at most {kn.LESSON_TAG_LIMIT} tags")
+    for tag in applies_to:
+        try:
+            kn.validate_lesson_tag(tag)
+        except kn.KnowledgeError as exc:
+            errors.append(str(exc))
+
+    supersedes = _kn_split_csv(getattr(args, "supersedes", None))
+    if len(supersedes) > kn.LESSON_SUPERSEDES_LIMIT:
+        errors.append(
+            f"--supersedes may contain at most {kn.LESSON_SUPERSEDES_LIMIT} keys")
+    for key in supersedes:
+        try:
+            kn.validate_key(key)
+        except kn.KnowledgeError as exc:
+            errors.append(f"supersedes: {exc}")
+
+    parsed_dates: dict[str, datetime] = {}
+    for field, flag in (("review_after", "--review-after"),
+                        ("expires_at", "--expires-at")):
+        value = getattr(args, field, None)
+        if not value:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            parsed_dates[field] = parsed.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            errors.append(f"{flag} must be an ISO date or datetime")
+    if ("review_after" in parsed_dates and "expires_at" in parsed_dates
+            and parsed_dates["expires_at"] <= parsed_dates["review_after"]):
+        errors.append("--expires-at must be after --review-after")
+
+    if not errors:
+        try:
+            lesson = _kn_lesson_from_args(args, actor, anchor)
+        except kn.KnowledgeError as exc:
+            errors.append(str(exc))
+    return errors, anchor, lesson
 
 
 def _kn_lesson_marker(verdict: dict) -> str:
@@ -4821,27 +4925,6 @@ def _kn_format_lesson_line(note: dict, verdict: dict) -> str:
     return lc.format_lesson_line(note, verdict)
 
 
-def _kn_lesson_scope_for_text(text: str) -> str:
-    from agenttalk import lesson_context as lc
-    return lc.lesson_scope_for_text(text)
-
-
-def _kn_tokenize_tags(text: str) -> set[str]:
-    from agenttalk import lesson_context as lc
-    return lc.tokenize_tags(text)
-
-
-def _kn_sync_lesson_context(msgs: list, rows: list[dict],
-                            explicit_tags: list[str] | None) -> tuple[str, set[str]]:
-    from agenttalk import lesson_context as lc
-    return lc.sync_lesson_context(msgs, rows, explicit_tags)
-
-
-def _kn_rank_lessons(rows: list[tuple[dict, dict]], *, context_scope: str) -> list[tuple[dict, dict]]:
-    from agenttalk import lesson_context as lc
-    return lc.rank_lessons(rows, context_scope=context_scope)
-
-
 def _kn_print_note(note: dict, verdict: dict) -> None:
     from agenttalk import knowledge as kn
     if note.get("type") == kn.TYPE_LESSON:
@@ -4869,13 +4952,13 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
 
     if action == "publish":
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
-        reg = _load_domain_registry(store)
-        try:
-            domain_id, dentry = _knowledge_resolve_domain_for_publish(store, args, reg)
-        except kn.KnowledgeError as e:
-            sys.stderr.write(f"agenttalk knowledge publish: {e}\n")
+        errors, anchor, lesson = _kn_publish_preflight(args, actor)
+        if errors:
+            for error in errors:
+                sys.stderr.write(f"agenttalk knowledge publish: {error}\n")
             return 2
-        # verified-against defaults to HEAD; capture is OPEN (any active agent).
+
+        # Resolve Git only after the pure aggregate preflight succeeds.
         if args.verified_against:
             try:
                 vsha = _lane_resolve(store, args.verified_against)
@@ -4884,29 +4967,45 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
                 return 2
         else:
             vsha = _kn_full_head(store)
-        if dentry is not None:
-            owners = dom.resolve_refset(dentry.get("owners") or {}, store.load_config())
-            curators = dom.resolve_refset(dentry.get("curators") or {}, store.load_config())
-        else:
-            owners, curators = [], _knowledge_process_curators(store)
-        resolved_from = "curator" if actor in curators else "owner" if actor in owners else \
-            "lead" if (actor in _close_lead_set(store) or
-                        _knowledge_process_is_lead(store, actor)) else "active_agent"
-        try:
-            anchor = _kn_anchor_from_args(args)
-            if args.type != kn.TYPE_LESSON and anchor is None:
-                raise kn.KnowledgeError("anchor-kind is required for non-lesson notes")
-            lesson = _kn_lesson_from_args(args, actor, anchor) if args.type == kn.TYPE_LESSON else None
-            evt = kn.new_publish_event(
-                note_id=kn.new_note_id(), key=args.key, type=args.type,
-                domain_id=domain_id, body=args.message, anchor=anchor,
-                verified_against_sha=vsha, domain_registry_hash=reg.registry_hash,
-                author=actor, resolved_from=resolved_from, at=_iso_now(),
-                lesson=lesson)
-        except kn.KnowledgeError as e:
-            sys.stderr.write(f"agenttalk knowledge publish: {e}\n")
-            return 2
-        kn.append_event(store, evt)
+        with store._config_lock():
+            reg = _load_domain_registry(store)
+            try:
+                domain_id, effective = _knowledge_resolve_domain_for_publish(
+                    store, args, reg)
+                dentry = effective["entry"]
+                if not effective["virtual"]:
+                    owners = dom.resolve_refset(
+                        dentry.get("owners") or {}, store.load_config())
+                    curators = dom.resolve_refset(
+                        dentry.get("curators") or {}, store.load_config())
+                else:
+                    owners, curators = [], _knowledge_process_curators(store)
+                resolved_from = (
+                    "curator" if actor in curators else
+                    "owner" if actor in owners else
+                    "lead" if (actor in _close_lead_set(store)
+                               or _knowledge_process_is_lead(store, actor)) else
+                    "active_agent"
+                )
+                events, _problems = kn.read_events(store)
+                live = kn.current_view(events).get((domain_id, args.key))
+                if (live is not None and not kn.is_retracted(live)
+                        and live.get("type") != args.type):
+                    raise kn.KnowledgeError(
+                        f"live key {domain_id}/{args.key} already has type "
+                        f"{live.get('type')!r}; changing a key's type is refused")
+                evt = kn.new_publish_event(
+                    note_id=kn.new_note_id(), key=args.key, type=args.type,
+                    domain_id=domain_id, body=args.message, anchor=anchor,
+                    verified_against_sha=vsha,
+                    domain_registry_hash=reg.registry_hash,
+                    domain_definition_hash=effective["definition_hash"],
+                    author=actor, resolved_from=resolved_from, at=_iso_now(),
+                    lesson=lesson)
+            except kn.KnowledgeError as e:
+                sys.stderr.write(f"agenttalk knowledge publish: {e}\n")
+                return 2
+            kn.write_event_locked(store, evt)
         print(f"published note {evt['id']} {domain_id}/{args.key} ({args.type}, uncurated)")
         return 0
 
@@ -4916,8 +5015,8 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk knowledge curate: expected verify or retract.\n")
             return 2
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
-        reg = _load_domain_registry(store)
         with store._config_lock():
+            reg = _load_domain_registry(store)
             events, _ = kn.read_events(store)
             view = kn.current_view(events)
             base = view.get((args.domain, args.key))
@@ -4934,9 +5033,10 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
             # process domain, the virtual liaison/lead curators apply only when no
             # real registry domain named process exists.
             is_virtual_process_lesson = (
-                base.get("type") == kn.TYPE_LESSON
-                and base.get("domain_id") == kn.PROCESS_DOMAIN
-                and kn.PROCESS_DOMAIN not in (reg.data.get("domains") or {})
+                kn.effective_domain(
+                    base.get("domain_id"), base.get("type"),
+                    reg.data.get("domains") or {},
+                )["virtual"]
             )
             resolved_from = kn.resolve_curation_authority(
                 actor, owner_agents=owners, curator_agents=curators,
@@ -4948,11 +5048,24 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
                     f"{args.domain!r} (or a lead) - refusing (curation gates the verified set).\n")
                 return 2
             try:
+                effective = kn.effective_domain(
+                    base.get("domain_id"), base.get("type"),
+                    reg.data.get("domains") or {},
+                )
                 evt = kn.new_curate_event(base=base, action=sub, curated_by=actor,
                                           resolved_from=resolved_from, at=_iso_now(),
-                                          reason=args.reason)
+                                          reason=args.reason,
+                                          domain_registry_hash=reg.registry_hash,
+                                          domain_definition_hash=effective["definition_hash"])
             except kn.KnowledgeError as e:
                 sys.stderr.write(f"agenttalk knowledge curate: {e}\n")
+                return 2
+            current_reg = _load_domain_registry(store)
+            if current_reg.registry_hash != reg.registry_hash:
+                sys.stderr.write(
+                    "agenttalk knowledge curate: domain registry changed during "
+                    "curation; no event was appended. Retry against the new registry.\n"
+                )
                 return 2
             # C4c: route through the SAME durable writer publish uses (one append path,
             # fsync). We already hold _config_lock (curate is read-view-build-append under
@@ -4962,120 +5075,172 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
         return 0
 
     if action in ("pull", "search", "onboard"):
-        events, problems = kn.read_events(store)
-        reg = _load_domain_registry(store)
-        include_stale = getattr(args, "include_stale", False)
-        include_uncurated = getattr(args, "include_uncurated", False)
         type_filter = getattr(args, "type", None)
+        scope = getattr(args, "scope", None)
         lesson_tags = _kn_split_csv(getattr(args, "tags", None))
-        if type_filter == kn.TYPE_LESSON and action in ("pull", "search"):
-            rows = _kn_lesson_rows(
-                events, include_uncurated=include_uncurated,
-                include_stale=include_stale, scope=getattr(args, "scope", None),
-                tags=lesson_tags)
-            if action == "search":
-                q = (args.query or "").casefold()
-                rows = [(n, v) for (n, v) in rows if q in json.dumps(
-                    {"k": n.get("key"), "b": n.get("body"), "t": n.get("type"),
-                     "lesson": n.get("lesson")}, ensure_ascii=False).casefold()]
-            rows = _kn_rank_lessons(rows, context_scope=getattr(args, "scope", None) or "process")
-            limit = getattr(args, "limit", None)
-            if isinstance(limit, int) and limit >= 0:
-                rows = rows[:limit]
-            if getattr(args, "json", False):
-                print(json.dumps([_kn_lesson_dict(n, v) for (n, v) in rows], indent=2))
-                return 0
-            label = "matching" if action == "search" else "active"
-            print(f"knowledge {action}: {len(rows)} {label} lesson(s)"
-                  + (f"; {len(problems)} corrupt line(s) (see doctor)" if problems else ""))
-            for n, v in rows:
-                _kn_print_lesson(n, v)
-            return 0
-        # Curated/capture split (codex blocker): default shows the latest CURATED
-        # note per key; a later uncurated publish only appears with --include-uncurated
-        # and NEVER shadows the verified note in the default view.
-        rows = []
-        for (domain_id, _key), rec in sorted(kn.resolve_views(events).items()):
-            if getattr(args, "domain", None) and domain_id != args.domain:
-                continue
-            latest, curated = rec["latest"], rec["curated"]
-            if include_uncurated and latest is not None and not kn.is_curated(latest) \
-                    and not kn.is_retracted(latest):
-                note = latest          # an uncurated proposal (capture)
-            else:
-                note = curated         # the authoritative verified note
-            if note is None or kn.is_retracted(note):
-                continue
-            if note.get("type") == kn.TYPE_LESSON and type_filter != kn.TYPE_LESSON:
-                continue
-            if type_filter and note.get("type") != type_filter:
-                continue
-            rows.append((note, _knowledge_eval(store, note, reg)))
+        if (scope or lesson_tags) and type_filter not in (None, kn.TYPE_LESSON):
+            sys.stderr.write(
+                "agenttalk knowledge: --scope/--tags can only be combined with "
+                "--type lesson (or no --type).\n"
+            )
+            return 2
+        for field in ("limit", "lesson_limit"):
+            value = getattr(args, field, None)
+            if isinstance(value, int) and value < 0:
+                sys.stderr.write(
+                    f"agenttalk knowledge: --{field.replace('_', '-')} must be zero or greater.\n"
+                )
+                return 2
+        output_schema = getattr(args, "output_schema", None)
+        if output_schema and not getattr(args, "json", False):
+            sys.stderr.write("agenttalk knowledge: --output-schema requires --json.\n")
+            return 2
+        if output_schema == "legacy" and type_filter == kn.TYPE_LESSON:
+            sys.stderr.write(
+                "agenttalk knowledge: legacy output is the pointer-only array and "
+                "cannot be combined with --type lesson.\n"
+            )
+            return 2
+        if output_schema == "legacy" and (scope or lesson_tags):
+            sys.stderr.write(
+                "agenttalk knowledge: legacy pointer-only output cannot be combined "
+                "with lesson scope/tag filters.\n"
+            )
+            return 2
 
-        def visible(note, verdict):
-            if verdict["hard_stale"] and not include_stale:
-                return False
-            if not kn.is_curated(note) and not include_uncurated:
-                return False
-            return True
+        events, read_problems = kn.read_events(store)
+        views, semantic_problems = kn.resolve_views_with_problems(events)
+        reg = _load_domain_registry(store)
+        anchor_status_by_id: dict[str, dict] = {}
+        for rec in views.values():
+            for note in (rec.get("latest"), rec.get("curated")):
+                if note is None or note.get("type") == kn.TYPE_LESSON:
+                    continue
+                note_id = str(note.get("id") or "")
+                if note_id not in anchor_status_by_id:
+                    anchor_status_by_id[note_id] = _knowledge_anchor_status(store, note)
 
-        if action == "search":
-            q = (args.query or "").casefold()
-            rows = [(n, v) for (n, v) in rows if q in json.dumps(
-                {"k": n.get("key"), "b": n.get("body"), "t": n.get("type"),
-                 "a": n.get("anchor")}, ensure_ascii=False).casefold()]
-        shown = [(n, v) for (n, v) in rows if visible(n, v)]
-        # C4d: onboard is a BOUNDED digest, grouped by domain then type, deterministic
-        # order, truncated to --limit. (pull/search are unbounded.) Apply before the JSON
-        # branch so both renderings agree.
-        onboard_total = len(shown)
-        onboard_truncated = False
         if action == "onboard":
-            shown = sorted(shown, key=lambda nv: (
-                nv[0].get("domain_id") or "", nv[0].get("type") or "", nv[0].get("key") or ""))
-            limit = getattr(args, "limit", 20)
-            if isinstance(limit, int) and limit >= 0 and onboard_total > limit:
-                shown = shown[:limit]
-                onboard_truncated = True
-        lesson_rows = []
-        if action == "onboard" and getattr(args, "include_lessons", False):
-            lesson_rows = _kn_rank_lessons(
-                _kn_lesson_rows(events, active_only=True),
-                context_scope="process")
+            note_limit = getattr(args, "limit", 20)
             lesson_limit = getattr(args, "lesson_limit", 5)
-            if isinstance(lesson_limit, int) and lesson_limit >= 0:
-                lesson_rows = lesson_rows[:lesson_limit]
+        elif action == "pull":
+            note_limit = None
+            lesson_limit = getattr(args, "limit", 5)
+        else:
+            note_limit = None
+            lesson_limit = getattr(args, "limit", None)
+        exclude_lessons = (
+            bool(getattr(args, "exclude_lessons", False))
+            or output_schema == "legacy"
+        )
+        selected = kn.select_knowledge_view(
+            views,
+            domains=reg.data.get("domains") or {},
+            registry_hash=reg.registry_hash,
+            anchor_status_by_id=anchor_status_by_id,
+            semantic_problems=semantic_problems,
+            domain_id=getattr(args, "domain", None),
+            type_filter=type_filter,
+            scope=scope,
+            tags=lesson_tags,
+            query=(getattr(args, "query", None) if action == "search" else None),
+            include_uncurated=getattr(args, "include_uncurated", False),
+            include_stale=getattr(args, "include_stale", False),
+            note_limit=note_limit,
+            lesson_limit=lesson_limit,
+            context_scope=scope or kn.PROCESS_DOMAIN,
+            exclude_lessons=exclude_lessons,
+        )
+        selected["problems"] = [*read_problems, *selected["problems"]]
+        note_rows = selected["notes"]
+        lesson_rows = selected["lessons"]
+
         if getattr(args, "json", False):
-            if action == "onboard" and getattr(args, "include_lessons", False):
-                print(json.dumps({
-                    "notes": [{**n, "_verdict": v} for (n, v) in shown],
-                    "lessons": [_kn_lesson_dict(n, v) for (n, v) in lesson_rows],
-                }, indent=2))
+            if output_schema == "legacy":
+                print(json.dumps(
+                    [{**{key: value for key, value in note.items() if key != "view"},
+                      "_verdict": verdict}
+                     for note, verdict in note_rows],
+                    indent=2,
+                ))
                 return 0
-            print(json.dumps([{**n, "_verdict": v} for (n, v) in shown], indent=2))
+            if type_filter == kn.TYPE_LESSON:
+                print(json.dumps(
+                    [_kn_lesson_dict(note, verdict) for note, verdict in lesson_rows],
+                    indent=2,
+                ))
+                return 0
+            if type_filter is not None:
+                print(json.dumps(
+                    [{**{key: value for key, value in note.items() if key != "view"},
+                      "_verdict": verdict}
+                     for note, verdict in note_rows],
+                    indent=2,
+                ))
+                return 0
+            print(json.dumps({
+                "schema_version": "knowledge-view-v1",
+                "notes": [{**note, "_verdict": verdict}
+                          for note, verdict in note_rows],
+                "lessons": [{**note, "_verdict": verdict}
+                            for note, verdict in lesson_rows],
+                "totals": selected["totals"],
+                "truncation": selected["truncation"],
+                "problems": selected["problems"],
+            }, indent=2))
             return 0
-        if action == "onboard":
-            who = (" for " + args.for_agent) if getattr(args, "for_agent", None) else ""
-            trunc = (f" (showing {len(shown)} of {onboard_total}; --limit to adjust)"
-                     if onboard_truncated else "")
-            print(f"knowledge onboard{who}: {len(shown)} active note(s){trunc}")
-            by_domain: dict = {}
-            for n, v in shown:
-                by_domain.setdefault(n["domain_id"], []).append((n, v))
-            for d in sorted(by_domain):
-                print(f"domain {d}:")
-                for n, v in by_domain[d]:
-                    _kn_print_note(n, v)
-            if getattr(args, "include_lessons", False) and lesson_rows:
-                print(f"Lessons to check ({len(lesson_rows)}):")
-                for n, v in lesson_rows:
-                    print(_kn_format_lesson_line(n, v))
+
+        label = "matching" if action == "search" else (
+            "selected" if (getattr(args, "include_stale", False)
+                           or getattr(args, "include_uncurated", False))
+            else "active"
+        )
+        problem_text = (
+            f"; {len(selected['problems'])} ledger problem(s) (see doctor)"
+            if selected["problems"] else ""
+        )
+        if type_filter == kn.TYPE_LESSON:
+            total = selected["totals"]["lessons"]
+            shown = len(lesson_rows)
+            count = f"{shown} shown of {total}" if shown != total else str(total)
+            print(f"knowledge {action}: {count} {label} lesson(s){problem_text}")
+            for note, verdict in lesson_rows:
+                _kn_print_lesson(note, verdict)
             return 0
-        label = "matching" if action == "search" else "active"
-        print(f"knowledge {action}: {len(shown)} {label} note(s)"
-              + (f"; {len(problems)} corrupt line(s) (see doctor)" if problems else ""))
-        for n, v in shown:
-            _kn_print_note(n, v)
+        if type_filter is not None:
+            total = selected["totals"]["notes"]
+            shown = len(note_rows)
+            count = f"{shown} shown of {total}" if shown != total else str(total)
+            print(f"knowledge {action}: {count} {label} note(s){problem_text}")
+            for note, verdict in note_rows:
+                _kn_print_note(note, verdict)
+            return 0
+
+        who = (
+            " for " + args.for_agent
+            if action == "onboard" and getattr(args, "for_agent", None)
+            else ""
+        )
+        print(
+            f"knowledge {action}{who}: {selected['totals']['notes']} {label} note(s); "
+            f"{selected['totals']['lessons']} {label} lesson(s){problem_text}"
+        )
+        print(
+            f"Notes ({len(note_rows)} shown of {selected['totals']['notes']}):"
+        )
+        current_domain = None
+        for note, verdict in note_rows:
+            if action == "onboard" and note.get("domain_id") != current_domain:
+                current_domain = note.get("domain_id")
+                print(f"domain {current_domain}:")
+            _kn_print_note(note, verdict)
+        if not exclude_lessons:
+            print(
+                f"Lessons ({len(lesson_rows)} shown of "
+                f"{selected['totals']['lessons']}):"
+            )
+            for note, verdict in lesson_rows:
+                _kn_print_lesson(note, verdict)
         return 0
 
     sys.stderr.write(
@@ -11142,11 +11307,11 @@ def build_parser() -> argparse.ArgumentParser:
     roc.add_argument("--quiet", action="store_true")
     roc.set_defaults(func=cmd_relay)
 
-    # ----- knowledge (durable pointer notes; capture-open, curate-gated, opt-in) -----
+    # ----- knowledge (mixed pointer notes and lessons; capture-open, curate-gated) -----
     pkn = sub.add_parser(
         "knowledge",
-        help="Durable, pointer-shaped project memory hung off the domain registry: "
-             "publish/curate/pull/search/onboard notes with anchor-relative staleness.",
+        help="Durable pointer notes and advisory process lessons: publish/curate, "
+             "then pull/search/onboard a scoped mixed view.",
     )
     pkn.set_defaults(func=cmd_knowledge, knowledge_cmd=None)
     knsub = pkn.add_subparsers(dest="knowledge_cmd")
@@ -11164,7 +11329,10 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--wp-id", dest="wp_id", help="anchor wp id (wp).")
         p.add_argument("--sha", help="anchor sha (sha).")
 
-    knpub = knsub.add_parser("publish", help="Capture a note (any active agent; uncurated).")
+    knpub = knsub.add_parser(
+        "publish",
+        help="Capture an uncurated pointer note or advisory lesson; lessons default "
+             "to the virtual process domain.")
     knpub.add_argument("--from", dest="actor", help="Publishing agent.")
     knpub.add_argument("--domain", help="Domain id (lessons default to process).")
     knpub.add_argument("--type", required=True,
@@ -11201,7 +11369,8 @@ def build_parser() -> argparse.ArgumentParser:
         c.set_defaults(func=cmd_knowledge)
     kncur.set_defaults(func=cmd_knowledge, curate_cmd=None)
 
-    knpull = knsub.add_parser("pull", help="List active notes (default: curated, non-stale).")
+    knpull = knsub.add_parser(
+        "pull", help="List active notes and lessons (default: curated, non-stale).")
     knpull.add_argument("--domain", help="Limit to a domain.")
     knpull.add_argument("--type", choices=sorted(["seam", "gotcha", "decision", "pointer", "lesson"]))
     knpull.add_argument("--scope", choices=lesson_scope_choices,
@@ -11211,9 +11380,13 @@ def build_parser() -> argparse.ArgumentParser:
     knpull.add_argument("--include-stale", dest="include_stale", action="store_true")
     knpull.add_argument("--include-uncurated", dest="include_uncurated", action="store_true")
     knpull.add_argument("--json", action="store_true")
+    knpull.add_argument(
+        "--output-schema", choices=["legacy"],
+        help="With --json, emit the legacy pointer-only array.")
     knpull.set_defaults(func=cmd_knowledge)
 
-    knsearch = knsub.add_parser("search", help="Substring search over key/body/type/anchor.")
+    knsearch = knsub.add_parser(
+        "search", help="Substring search over pointer and lesson fields.")
     knsearch.add_argument("query", help="Search string.")
     knsearch.add_argument("--domain")
     knsearch.add_argument("--type", choices=sorted(["seam", "gotcha", "decision", "pointer", "lesson"]))
@@ -11224,10 +11397,19 @@ def build_parser() -> argparse.ArgumentParser:
     knsearch.add_argument("--include-stale", dest="include_stale", action="store_true")
     knsearch.add_argument("--include-uncurated", dest="include_uncurated", action="store_true")
     knsearch.add_argument("--json", action="store_true")
+    knsearch.add_argument(
+        "--output-schema", choices=["legacy"],
+        help="With --json, emit the legacy pointer-only array.")
     knsearch.set_defaults(func=cmd_knowledge)
 
-    knonb = knsub.add_parser("onboard", help="Bounded digest grouped by domain/type.")
+    knonb = knsub.add_parser(
+        "onboard", help="Bounded mixed digest (20 pointer notes plus 5 lessons by default).")
     knonb.add_argument("--domain")
+    knonb.add_argument("--type",
+                       choices=sorted(["seam", "gotcha", "decision", "pointer", "lesson"]))
+    knonb.add_argument("--scope", choices=lesson_scope_choices,
+                       help="Limit lessons to a scope (implies lesson-only).")
+    knonb.add_argument("--tags", help="Comma-separated lesson applies_to tags.")
     knonb.add_argument("--for", dest="for_agent", help="Agent the digest is for (label only).")
     knonb.add_argument("--include-uncurated", dest="include_uncurated", action="store_true")
     knonb.add_argument("--include-stale", dest="include_stale", action="store_true")
@@ -11235,10 +11417,15 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Max notes in the digest (default 20; deterministic order, "
                             "grouped by domain then type). Truncated beyond this.")
     knonb.add_argument("--include-lessons", dest="include_lessons", action="store_true",
-                       help="Append a capped active lesson digest.")
+                       help="Deprecated no-op; lessons are included by default.")
+    knonb.add_argument("--exclude-lessons", dest="exclude_lessons", action="store_true",
+                       help="Exclude lessons from the onboarding digest.")
     knonb.add_argument("--lesson-limit", dest="lesson_limit", type=int, default=5,
                        help="Max active lessons in the digest (default 5).")
     knonb.add_argument("--json", action="store_true")
+    knonb.add_argument(
+        "--output-schema", choices=["legacy"],
+        help="With --json, emit the legacy pointer-only array.")
     knonb.set_defaults(func=cmd_knowledge)
 
     # ----- onboarding (project/codebase analysis ledger) -----

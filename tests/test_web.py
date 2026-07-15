@@ -4514,6 +4514,7 @@ def _write_verified_lesson(
         anchor=anchor,
         verified_against_sha=None,
         domain_registry_hash="registry-hash",
+        domain_definition_hash=kn.VIRTUAL_PROCESS_DOMAIN_HASH,
         author="dev",
         resolved_from="active",
         at=at,
@@ -4553,6 +4554,7 @@ def _write_proposed_lesson(store: Store, *, key: str = "review.final-sha") -> di
         anchor=None,
         verified_against_sha=None,
         domain_registry_hash="registry-hash",
+        domain_definition_hash=kn.VIRTUAL_PROCESS_DOMAIN_HASH,
         author="dev",
         resolved_from="active",
         at="2026-07-08T00:04:00Z",
@@ -4719,6 +4721,26 @@ def test_api_learning_empty_state_shape(tmp_path: Path) -> None:
         srv.shutdown()
         srv.server_close()
     assert wire["lessons"] == []
+
+
+def test_api_learning_keeps_real_legacy_process_lessons_visible(tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "dev"])
+    fixture = (
+        Path(__file__).parent / "fixtures" / "knowledge"
+        / "legacy-process-lessons.jsonl"
+    )
+    kn.knowledge_dir(store).mkdir(parents=True, exist_ok=True)
+    kn.notes_path(store).write_bytes(fixture.read_bytes())
+
+    payload = web.build_learning(web.RootDescriptor(store, "root"))
+    assert {row["key"] for row in payload["lessons"]} == {
+        "model-effort-selection", "roster-and-context-lifecycle"}
+    assert payload["counts"]["active"] == 2
+    assert all(
+        kn.CAUTION_LEGACY_UNSCOPED in row["caution_flags"]
+        for row in payload["lessons"]
+    )
 
 
 def test_api_learning_retired_filter_is_explicit(tmp_path: Path) -> None:

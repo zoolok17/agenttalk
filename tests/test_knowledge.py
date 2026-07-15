@@ -19,6 +19,7 @@ from agenttalk import cli, knowledge as kn
 from agenttalk.store import Store
 
 SHA = "a" * 40
+DOMAIN_HASH = "d" * 64
 
 
 def _publish(**over) -> dict:
@@ -26,7 +27,8 @@ def _publish(**over) -> dict:
         "note_id": "kn-1", "key": "cli.seam", "type": "seam", "domain_id": "cli",
         "body": "the insight not in the code",
         "anchor": {"kind": "path", "path": "src/cli.py"},
-        "verified_against_sha": SHA, "domain_registry_hash": "rh1", "author": "dev",
+        "verified_against_sha": SHA, "domain_registry_hash": "rh1",
+        "domain_definition_hash": DOMAIN_HASH, "author": "dev",
         "resolved_from": "active_agent", "at": "t1"}
     base.update(over)
     return kn.new_publish_event(**base)
@@ -52,6 +54,12 @@ def test_validators_reject_bad_inputs() -> None:
     ]:
         with pytest.raises(kn.KnowledgeError):
             bad()
+
+    with pytest.raises(kn.KnowledgeError, match="lesson_limit must be non-negative"):
+        kn.select_knowledge_view(
+            {}, domains={}, registry_hash="", anchor_status_by_id={},
+            lesson_limit=-1,
+        )
 
 
 def test_publish_is_always_uncurated() -> None:
@@ -122,6 +130,52 @@ def test_resolve_views_uncurated_publish_does_not_shadow_verified() -> None:
     assert rec["tombstoned"] is False
 
 
+def test_causal_curation_rejects_missing_parent_wrong_id_and_mutated_payload() -> None:
+    pub = _publish(note_id="kn-parent")
+    verify = kn.new_curate_event(
+        base=pub,
+        action="verify",
+        curated_by="owner",
+        resolved_from="owner",
+        at="t2",
+        reason=None,
+    )
+
+    rows, problems = kn.resolve_views_with_problems([verify])
+    assert rows == {}
+    assert any("prior" in problem["error"] for problem in problems)
+
+    wrong_id = dict(verify, id="kn-wrong-id", curates_id="kn-not-parent")
+    rows, problems = kn.resolve_views_with_problems([pub, wrong_id])
+    assert rows[("cli", "cli.seam")]["curated"] is None
+    assert any("curates_id" in problem["error"] for problem in problems)
+
+    mutated = dict(verify, id="kn-mutated", body="forged replacement body")
+    rows, problems = kn.resolve_views_with_problems([pub, mutated])
+    assert rows[("cli", "cli.seam")]["curated"] is None
+    assert any("payload_hash" in problem["error"] for problem in problems)
+
+
+def test_legacy_curation_without_causal_fields_remains_readable() -> None:
+    pub = _publish(note_id="kn-parent")
+    legacy = kn.new_curate_event(
+        base=pub,
+        action="verify",
+        curated_by="owner",
+        resolved_from="owner",
+        at="t2",
+        reason=None,
+    )
+    legacy.pop("curates_id")
+    legacy.pop("payload_hash")
+    legacy.pop("domain_definition_hash", None)
+
+    rows, problems = kn.resolve_views_with_problems([pub, legacy])
+    rec = rows[("cli", "cli.seam")]
+    assert rec["curated"]["id"] == legacy["id"]
+    assert problems == []
+
+
 def test_unsafe_path_anchors_rejected() -> None:
     # codex finding 3: path-bearing anchors must be safe repo-relative paths.
     for bad in ("../outside.py", "C:/outside.py", "..\\outside.py", "/abs/x.py"):
@@ -181,7 +235,51 @@ def test_stale_registry_changed_and_domain_gone() -> None:
     v = kn.compute_staleness(_publish(), domain_exists=False, current_registry_hash="rhX",
                              anchor_status=_anchor_status())
     assert kn.STALE_DOMAIN_GONE in v["stale_reasons"]
-    assert kn.STALE_REGISTRY_CHANGED in v["stale_reasons"]
+    assert kn.STALE_REGISTRY_CHANGED not in v["stale_reasons"]
+
+
+def test_scoped_registry_freshness_distinguishes_subject_change_from_global_change() -> None:
+    entry = {
+        "title": "CLI",
+        "owners": {"agents": ["lead"], "groups": [], "roles": []},
+        "reviewers": {"agents": [], "groups": [], "roles": []},
+        "curators": {"agents": ["curator"], "groups": [], "roles": []},
+        "owned_globs": ["src/**"],
+    }
+    subject_hash = kn.domain_definition_hash(entry)
+    note = _publish(domain_definition_hash=subject_hash)
+
+    unrelated = kn.compute_staleness(
+        note,
+        domain_exists=True,
+        current_registry_hash="rh-unrelated-edit",
+        current_domain_definition_hash=subject_hash,
+        anchor_status=_anchor_status(),
+    )
+    assert unrelated["hard_stale"] is False
+    assert kn.CAUTION_REGISTRY_CHANGED in unrelated["caution_flags"]
+
+    changed = kn.compute_staleness(
+        note,
+        domain_exists=True,
+        current_registry_hash="rh-domain-edit",
+        current_domain_definition_hash=kn.domain_definition_hash({**entry, "title": "CLI 2"}),
+        anchor_status=_anchor_status(),
+    )
+    assert changed["hard_stale"] is True
+    assert kn.STALE_DOMAIN_DEFINITION_CHANGED in changed["stale_reasons"]
+
+    legacy = _publish()
+    legacy.pop("domain_definition_hash")
+    legacy_view = kn.compute_staleness(
+        legacy,
+        domain_exists=True,
+        current_registry_hash="rh-unrelated-edit",
+        current_domain_definition_hash=subject_hash,
+        anchor_status=_anchor_status(),
+    )
+    assert legacy_view["hard_stale"] is False
+    assert kn.CAUTION_LEGACY_UNSCOPED in legacy_view["caution_flags"]
 
 
 def test_stale_retracted() -> None:
@@ -313,7 +411,7 @@ def test_cli_capture_open_curate_gated(tmp_path: Path, capsys: pytest.CaptureFix
     assert _run(["knowledge", "pull"], root) == 0   # uncurated hidden by default
     assert "0 active" in capsys.readouterr().out
     assert _run(["knowledge", "pull", "--include-uncurated"], root) == 0
-    assert "1 active" in capsys.readouterr().out
+    assert "1 selected" in capsys.readouterr().out
     # a non-curator cannot verify
     assert _run(["knowledge", "curate", "verify", "--from", "dev", "--domain", "cli",
                  "--key", "cli.seam"], root) == 2
@@ -369,7 +467,9 @@ def test_cli_retract_hides_note(tmp_path: Path, capsys: pytest.CaptureFixture) -
                  "--key", "cli.seam", "--reason", "obsolete"], root) == 0
     capsys.readouterr()
     assert _run(["knowledge", "pull", "--include-stale", "--include-uncurated"], root) == 0
-    assert "0 active" in capsys.readouterr().out          # retracted excluded always
+    out = capsys.readouterr().out
+    assert "1 selected note" in out
+    assert "STALE[retracted]" in out
 
 
 def test_cli_search_and_onboard(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
@@ -534,6 +634,182 @@ def test_cli_curate_routes_single_durable_writer(
     assert calls["n"] == 2
 
 
+def test_publish_preflight_reports_all_errors_before_registry_git_or_ledger_io(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("preflight errors must stop before I/O")
+
+    monkeypatch.setattr(cli, "_load_domain_registry", forbidden)
+    monkeypatch.setattr(cli, "_kn_full_head", forbidden)
+    monkeypatch.setattr(kn, "write_event_locked", forbidden)
+    rc = _run([
+        "knowledge", "publish", "--from", "dev", "--type", "lesson",
+        "--key", "bad key", "-m", "", "--anchor-kind", "symbol",
+        "--owner", "bad owner",
+        "--review-after", "not-a-date", "--expires-at", "also-bad",
+    ], root)
+    assert rc == 2
+    err = capsys.readouterr().err
+    expected = [
+        "key 'bad key'", "body is required", "anchor.path is required",
+        "anchor.symbol is required", "--scope is required",
+        "--trigger is required", "--evidence-ref is required",
+        "lesson.owner must be a valid agent name",
+        "--review-after must be an ISO", "--expires-at must be an ISO",
+    ]
+    assert all(text in err for text in expected)
+    assert not kn.notes_path(Store(root)).exists()
+
+
+def test_non_lesson_preflight_reports_domain_anchor_and_lesson_flag_misuse(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("preflight errors must stop before I/O")
+
+    monkeypatch.setattr(cli, "_load_domain_registry", forbidden)
+    monkeypatch.setattr(cli, "_kn_full_head", forbidden)
+    rc = _run([
+        "knowledge", "publish", "--from", "dev", "--type", "gotcha",
+        "--key", "cli.bad", "-m", "bad", "--scope", "process",
+        "--trigger", "lesson-only",
+    ], root)
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "domain is required for non-lesson" in err
+    assert "anchor-kind is required" in err
+    assert "--scope is only valid" in err
+    assert "--trigger is only valid" in err
+
+
+def test_publish_refuses_changing_a_live_keys_type(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    assert _pub(root) == 0
+    before, _ = kn.read_events(Store(root))
+    assert _run([
+        "knowledge", "publish", "--from", "dev", "--domain", "cli",
+        "--type", "decision", "--key", "cli.seam", "-m", "new type",
+        "--anchor-kind", "path", "--path", "src/cli.py",
+    ], root) == 2
+    assert "changing a key's type is refused" in capsys.readouterr().err
+    after, _ = kn.read_events(Store(root))
+    assert after == before
+
+
+def test_curate_aborts_without_append_when_registry_changes_during_transaction(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    assert _pub(root) == 0
+    real_load = cli._load_domain_registry
+    calls = 0
+
+    def changing_registry(store):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            path = store.dir / "domains.json"
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw["domains"]["cli"]["title"] = "CLI changed concurrently"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+        return real_load(store)
+
+    monkeypatch.setattr(cli, "_load_domain_registry", changing_registry)
+    assert _verify(root, "cli.seam") == 2
+    assert "registry changed during curation" in capsys.readouterr().err
+    events, _ = kn.read_events(Store(root))
+    assert len(events) == 1
+
+
+def test_curate_reverify_restamps_global_and_subject_hashes(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    assert _pub(root) == 0
+    store = Store(root)
+    first, _ = kn.read_events(store)
+    baseline_sha = first[0]["verified_against_sha"]
+    registry_path = store.dir / "domains.json"
+    raw = json.loads(registry_path.read_text(encoding="utf-8"))
+    raw["domains"]["docs"] = {
+        "title": "Docs", "owners": {"agents": ["lead"]},
+        "curators": {"agents": ["curator"]}, "owned_globs": ["docs/**"],
+    }
+    registry_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    assert _verify(root, "cli.seam") == 0
+    events, _ = kn.read_events(store)
+    curated = events[-1]
+    registry = cli._load_domain_registry(store)
+    effective = kn.effective_domain(
+        "cli", kn.TYPE_GOTCHA, registry.data["domains"])
+    assert curated["domain_registry_hash"] == registry.registry_hash
+    assert curated["domain_definition_hash"] == effective["definition_hash"]
+    assert curated["verified_against_sha"] == baseline_sha
+    assert curated["curates_id"] == events[0]["id"]
+    assert curated["payload_hash"] == kn.payload_hash(events[0])
+
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--type", "gotcha", "--json"], root) == 0
+    row = json.loads(capsys.readouterr().out)[0]
+    assert row["_verdict"]["hard_stale"] is False
+    assert kn.CAUTION_REGISTRY_CHANGED not in row["_verdict"]["caution_flags"]
+
+
+def test_retract_restamps_hashes_without_changing_anchor_baseline(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    assert _pub(root) == 0
+    assert _verify(root, "cli.seam") == 0
+    store = Store(root)
+    events, _ = kn.read_events(store)
+    baseline_sha = events[-1]["verified_against_sha"]
+    path = store.dir / "domains.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["domains"]["docs"] = {
+        "title": "Docs", "owners": {"agents": ["lead"]},
+        "curators": {"agents": ["curator"]}, "owned_globs": ["docs/**"],
+    }
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    assert _run([
+        "knowledge", "curate", "retract", "--from", "curator",
+        "--domain", "cli", "--key", "cli.seam", "--reason", "obsolete",
+    ], root) == 0
+    events, _ = kn.read_events(store)
+    retract = events[-1]
+    registry = cli._load_domain_registry(store)
+    effective = kn.effective_domain("cli", kn.TYPE_GOTCHA, registry.data["domains"])
+    assert retract["domain_registry_hash"] == registry.registry_hash
+    assert retract["domain_definition_hash"] == effective["definition_hash"]
+    assert retract["verified_against_sha"] == baseline_sha
+
+
+def test_non_causal_event_is_reported_and_cannot_hide_curated_view(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    assert _pub(root) == 0
+    assert _verify(root, "cli.seam") == 0
+    store = Store(root)
+    events, _ = kn.read_events(store)
+    forged = dict(events[-1])
+    forged["id"] = "kn-forged"
+    forged["curates_id"] = "kn-missing-parent"
+    with store._config_lock():
+        kn.write_event_locked(store, forged)
+
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--json"], root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [row["key"] for row in payload["notes"]] == ["cli.seam"]
+    assert len(payload["problems"]) == 1
+    assert "curates_id" in payload["problems"][0]["error"]
+
+
 def test_cli_torn_tail_cannot_hide_prior_curated(tmp_path: Path,
                                                  capsys: pytest.CaptureFixture) -> None:
     # C4c: a truncated/garbage trailing line never hides the prior valid curated event.
@@ -559,15 +835,24 @@ def test_cli_onboard_limit_and_grouping(tmp_path: Path,
         _verify(root, f"k{i}")
     capsys.readouterr()
     assert _run(["knowledge", "onboard", "--limit", "2", "--json"], root) == 0
-    rows = json.loads(capsys.readouterr().out)
+    payload = json.loads(capsys.readouterr().out)
+    rows = payload["notes"]
     assert len(rows) == 2                                      # bounded
+    assert payload["totals"]["notes"] == 5
+    assert payload["truncation"]["notes"] == 3
     # deterministic: same keys both runs
     assert _run(["knowledge", "onboard", "--limit", "2", "--json"], root) == 0
-    rows2 = json.loads(capsys.readouterr().out)
+    rows2 = json.loads(capsys.readouterr().out)["notes"]
     assert [r["key"] for r in rows] == [r["key"] for r in rows2]
     # text shows the truncation note
     assert _run(["knowledge", "onboard", "--limit", "2"], root) == 0
-    assert "showing 2 of 5" in capsys.readouterr().out
+    assert "Notes (2 shown of 5)" in capsys.readouterr().out
+
+    assert _run(["knowledge", "onboard", "--limit", "2", "--json",
+                 "--output-schema", "legacy"], root) == 0
+    legacy = json.loads(capsys.readouterr().out)
+    assert len(legacy) == 2
+    assert all("view" not in row for row in legacy)
 
 
 # ---- lessons: capture-learning ledger (v0.70.0)
@@ -575,6 +860,9 @@ def test_cli_onboard_limit_and_grouping(tmp_path: Path,
 PAST = "2000-01-01T00:00:00Z"
 FUTURE_REVIEW = "2099-01-01T00:00:00Z"
 FUTURE_EXPIRES = "2100-01-01T00:00:00Z"
+REAL_LEGACY_LESSONS = (
+    Path(__file__).parent / "fixtures" / "knowledge" / "legacy-process-lessons.jsonl"
+)
 
 
 def _lesson_obj(**over) -> dict:
@@ -598,7 +886,8 @@ def _lesson_event(*, note_id="kn-lesson", key="process.flake", author="dev",
     return kn.new_publish_event(
         note_id=note_id, key=key, type=kn.TYPE_LESSON, domain_id=domain_id,
         body=body, anchor=None, verified_against_sha=None,
-        domain_registry_hash="rh1", author=author, resolved_from="active_agent",
+        domain_registry_hash="rh1", domain_definition_hash=DOMAIN_HASH,
+        author=author, resolved_from="active_agent",
         at="2026-07-07T00:00:00Z", lesson=lesson or _lesson_obj(owner=author))
 
 
@@ -709,6 +998,19 @@ def test_real_process_domain_non_lesson_uses_registry_curator(
                  "--domain", "process", "--key", "process.seam"], root) == 0
 
 
+def test_virtual_process_domain_rejects_non_lesson_notes(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+
+    assert _run([
+        "knowledge", "publish", "--from", "dev", "--domain", "process",
+        "--type", "seam", "--key", "process.seam", "-m", "not a lesson",
+        "--anchor-kind", "path", "--path", "src/cli.py",
+    ], root) == 2
+    assert "unknown domain 'process'" in capsys.readouterr().err
+    assert not kn.notes_path(Store(root)).exists()
+
+
 def test_process_lesson_uses_real_domain_curator_when_registered(
         tmp_path: Path) -> None:
     root = _repo(tmp_path)
@@ -788,7 +1090,7 @@ def test_lesson_pull_defaults_to_five_row_cap(
 
     assert _run(["knowledge", "pull", "--type", "lesson"], root) == 0
     out = capsys.readouterr().out
-    assert "5 active lesson" in out
+    assert "5 shown of 6 active lesson" in out
     assert out.count("process.pull") == 5
 
     assert _run(["knowledge", "pull", "--type", "lesson", "--limit", "6"], root) == 0
@@ -824,7 +1126,7 @@ def test_sync_lessons_are_capped_ranked_contextual_and_failsafe(
     assert "review_due" in out
     assert "wrong tag" not in out
     assert "craft lesson" not in out
-    assert "malformed lessons were ignored" in out
+    assert "invalid or non-causal ledger line(s)" in out
 
     cap_path = tmp_path / "cap"
     cap_path.mkdir()
@@ -846,7 +1148,31 @@ def test_sync_lessons_are_capped_ranked_contextual_and_failsafe(
     assert "Lessons to check" not in capsys.readouterr().out
 
 
-def test_knowledge_onboard_can_include_capped_lessons_without_changing_default(
+def test_sync_digest_preserves_real_legacy_lesson_consumer_contract(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    store = Store(root)
+    kn.knowledge_dir(store).mkdir(parents=True, exist_ok=True)
+    kn.notes_path(store).write_bytes(REAL_LEGACY_LESSONS.read_bytes())
+    store.send(
+        sender="lead", recipient="dev", kind="review-request",
+        subject="Review model effort selection",
+        body="Check the model and roster lifecycle guidance",
+        meta={"request_id": "rq-real-lessons", "assignment": "model"},
+    )
+
+    capsys.readouterr()
+    assert _run(["sync", "--for", "dev", "--json"], root) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert {row["key"] for row in payload["lessons"]} == {
+        "model-effort-selection", "roster-and-context-lifecycle"}
+    assert all(
+        kn.CAUTION_LEGACY_UNSCOPED in row["_verdict"]["caution_flags"]
+        for row in payload["lessons"]
+    )
+
+
+def test_knowledge_onboard_includes_capped_lessons_by_default(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     root = _repo(tmp_path)
     for i in range(3):
@@ -855,11 +1181,15 @@ def test_knowledge_onboard_can_include_capped_lessons_without_changing_default(
         _lesson_verify(root, key)
     capsys.readouterr()
     assert _run(["knowledge", "onboard", "--json"], root) == 0
-    assert isinstance(json.loads(capsys.readouterr().out), list)
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload["lessons"]) == 3
+    assert payload["notes"] == []
     assert _run(["knowledge", "onboard", "--include-lessons", "--lesson-limit", "2"], root) == 0
     out = capsys.readouterr().out
-    assert "Lessons to check (2)" in out
+    assert "Lessons (2 shown of 3)" in out
     assert out.count("process.lesson") == 2
+    assert _run(["knowledge", "onboard", "--exclude-lessons", "--json"], root) == 0
+    assert json.loads(capsys.readouterr().out)["lessons"] == []
 
 
 def test_reset_preserves_lesson_events(tmp_path: Path) -> None:
@@ -870,3 +1200,176 @@ def test_reset_preserves_lesson_events(tmp_path: Path) -> None:
     events, _ = kn.read_events(Store(root))
     assert len(events) == 1
     assert events[0]["type"] == kn.TYPE_LESSON
+
+
+def test_real_legacy_process_lessons_are_visible_on_every_default_surface(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    store = Store(root)
+    kn.knowledge_dir(store).mkdir(parents=True, exist_ok=True)
+    kn.notes_path(store).write_bytes(REAL_LEGACY_LESSONS.read_bytes())
+
+    cases = [
+        (["knowledge", "pull", "--json"], {
+            "model-effort-selection", "roster-and-context-lifecycle"}),
+        (["knowledge", "onboard", "--json"], {
+            "model-effort-selection", "roster-and-context-lifecycle"}),
+        (["knowledge", "search", "model", "--json"], {
+            "model-effort-selection", "roster-and-context-lifecycle"}),
+        (["knowledge", "search", "effort", "--json"], {
+            "model-effort-selection"}),
+        (["knowledge", "pull", "--domain", "process", "--json"], {
+            "model-effort-selection", "roster-and-context-lifecycle"}),
+        (["knowledge", "pull", "--scope", "process", "--json"], {
+            "model-effort-selection", "roster-and-context-lifecycle"}),
+    ]
+    for argv, expected_keys in cases:
+        capsys.readouterr()
+        assert _run(argv, root) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["schema_version"] == "knowledge-view-v1"
+        keys = {row["key"] for row in payload["lessons"]}
+        assert keys == expected_keys
+        assert payload["notes"] == []
+        assert all(row["view"] == "curated" for row in payload["lessons"])
+        assert all(
+            kn.CAUTION_LEGACY_UNSCOPED in row["_verdict"]["caution_flags"]
+            for row in payload["lessons"]
+        )
+
+
+def test_mixed_view_filters_search_caps_and_explicit_json_compatibility(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    assert _pub(root, key="cli.pointer") == 0
+    assert _verify(root, "cli.pointer") == 0
+    for key, scope, tag, evidence in (
+        ("process.one", "process", "orbit", "evidence-alpha"),
+        ("review.two", "review", "parser", "evidence-beta"),
+        ("review.three", "review", "orbit", "evidence-gamma"),
+    ):
+        assert _lesson_pub(
+            root, key=key, scope=scope, applies_to=tag,
+            evidence=evidence, body=f"body {key}") == 0
+        assert _lesson_verify(root, key) == 0
+
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--json", "--limit", "2"], root) == 0
+    mixed = json.loads(capsys.readouterr().out)
+    assert mixed["schema_version"] == "knowledge-view-v1"
+    assert len(mixed["notes"]) == 1
+    assert len(mixed["lessons"]) == 2
+    assert mixed["totals"] == {"notes": 1, "lessons": 3, "all": 4}
+    assert mixed["truncation"] == {"notes": 0, "lessons": 1, "all": 1}
+    assert all({"type", "view", "_verdict"} <= set(row)
+               for row in [*mixed["notes"], *mixed["lessons"]])
+
+    assert _run(["knowledge", "pull", "--scope", "review", "--json"], root) == 0
+    scoped = json.loads(capsys.readouterr().out)
+    assert scoped["notes"] == []
+    assert {row["key"] for row in scoped["lessons"]} == {"review.two", "review.three"}
+
+    assert _run(["knowledge", "pull", "--tags", "orbit", "--json"], root) == 0
+    tagged = json.loads(capsys.readouterr().out)
+    assert {row["key"] for row in tagged["lessons"]} == {"process.one", "review.three"}
+
+    assert _run(["knowledge", "search", "evidence-beta", "--json"], root) == 0
+    searched = json.loads(capsys.readouterr().out)
+    assert [row["key"] for row in searched["lessons"]] == ["review.two"]
+
+    assert _run(["knowledge", "pull", "--type", "lesson", "--json"], root) == 0
+    explicit_lessons = json.loads(capsys.readouterr().out)
+    assert isinstance(explicit_lessons, list)
+    assert {row["key"] for row in explicit_lessons} == {
+        "process.one", "review.two", "review.three"}
+    assert "schema_version" not in explicit_lessons[0]
+
+    assert _run(["knowledge", "pull", "--type", "gotcha", "--json"], root) == 0
+    explicit_notes = json.loads(capsys.readouterr().out)
+    assert isinstance(explicit_notes, list)
+    assert [row["key"] for row in explicit_notes] == ["cli.pointer"]
+
+    assert _run(["knowledge", "pull", "--limit", "0", "--json"], root) == 0
+    zero = json.loads(capsys.readouterr().out)
+    assert zero["lessons"] == []
+    assert zero["totals"]["lessons"] == 3
+    assert zero["truncation"]["lessons"] == 3
+
+    for argv in (
+        ["knowledge", "pull", "--limit", "-1"],
+        ["knowledge", "search", "body", "--limit", "-1"],
+        ["knowledge", "onboard", "--lesson-limit", "-1"],
+        ["knowledge", "pull", "--type", "gotcha", "--scope", "process"],
+    ):
+        assert _run(argv, root) == 2
+
+
+def test_unrelated_orbit_domain_edit_is_caution_not_global_hard_stale(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    store = Store(root)
+    registry_path = store.dir / "domains.json"
+    raw = json.loads(registry_path.read_text(encoding="utf-8"))
+    raw["domains"]["orbit"] = {
+        "title": "Orbit", "owners": {"agents": ["lead"]},
+        "curators": {"agents": ["curator"]}, "owned_globs": ["orbit/**"],
+    }
+    registry_path.write_text(json.dumps(raw), encoding="utf-8")
+    assert _pub(root) == 0
+    assert _verify(root, "cli.seam") == 0
+
+    raw["domains"]["orbit"]["title"] = "Orbit renamed"
+    registry_path.write_text(json.dumps(raw), encoding="utf-8")
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--type", "gotcha", "--json"], root) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [row["key"] for row in rows] == ["cli.seam"]
+    assert rows[0]["_verdict"]["hard_stale"] is False
+    assert kn.CAUTION_REGISTRY_CHANGED in rows[0]["_verdict"]["caution_flags"]
+
+
+def test_subject_edit_hard_stales_until_reverified(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    assert _pub(root) == 0
+    assert _verify(root, "cli.seam") == 0
+    store = Store(root)
+    path = store.dir / "domains.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["domains"]["cli"]["title"] = "CLI changed"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--type", "gotcha", "--json"], root) == 0
+    assert json.loads(capsys.readouterr().out) == []
+    assert _run(["knowledge", "pull", "--type", "gotcha", "--include-stale",
+                 "--json"], root) == 0
+    stale = json.loads(capsys.readouterr().out)
+    assert kn.STALE_DOMAIN_DEFINITION_CHANGED in stale[0]["_verdict"]["stale_reasons"]
+
+    assert _verify(root, "cli.seam") == 0
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--type", "gotcha", "--json"], root) == 0
+    assert [row["key"] for row in json.loads(capsys.readouterr().out)] == ["cli.seam"]
+
+
+def test_real_process_domain_override_requires_virtual_lesson_reverification(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    assert _lesson_pub(root, key="process.override") == 0
+    assert _lesson_verify(root, "process.override") == 0
+    _write_process_domain(root)
+
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--type", "lesson", "--json"], root) == 0
+    assert json.loads(capsys.readouterr().out) == []
+    assert _run(["knowledge", "pull", "--type", "lesson", "--include-stale",
+                 "--json"], root) == 0
+    stale = json.loads(capsys.readouterr().out)
+    assert kn.STALE_DOMAIN_DEFINITION_CHANGED in stale[0]["_verdict"]["stale_reasons"]
+
+    assert _lesson_verify(root, "process.override", who="curator") == 0
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--type", "lesson", "--json"], root) == 0
+    assert [row["key"] for row in json.loads(capsys.readouterr().out)] == [
+        "process.override"]

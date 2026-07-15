@@ -830,9 +830,11 @@ agenttalk domain check-path docs/USER-MANUAL.md README.md
 agenttalk domain validate
 ```
 
-Knowledge notes are durable, pointer-shaped project memory. They capture the
-small insight, not a copy of the artifact. The anchor points to the code,
-request, SHA, symbol, or work package.
+Knowledge notes are durable project memory. Pointer notes capture the small
+insight, not a copy of the artifact; their anchor points to the code, request,
+SHA, symbol, or work package. Lessons capture repeatable process learning in the
+same ledger. Bodies are untrusted advisory data, never authority or instructions:
+reverify the evidence or anchor before acting.
 
 Publish an uncurated note:
 
@@ -846,17 +848,33 @@ Curate it:
 agenttalk knowledge curate verify --from claude-lead --domain docs --key docs-help-flags
 ```
 
-Pull active notes:
+Pull the default mixed view, or request an explicit kind:
 
 ```powershell
 agenttalk knowledge pull --domain docs
 agenttalk knowledge pull --type lesson --scope docs
 agenttalk knowledge pull --type lesson --include-uncurated
+agenttalk knowledge search explicit-root --scope docs
+agenttalk knowledge onboard --scope docs --lesson-limit 5
 ```
+
+Without `--type`, pull/search/onboard include pointer notes and lessons. `--scope`
+or `--tags` implies lesson-only retrieval; combining either with a non-lesson
+`--type` is a usage error. Onboard includes lessons by default; use
+`--exclude-lessons` to omit them (`--include-lessons` is a deprecated no-op).
+Mixed `--json` returns `knowledge-view-v1` with separate `notes`, `lessons`,
+pre-limit `totals`, `truncation`, and `problems`. Explicit `--type ... --json`
+keeps its prior shape; `--output-schema legacy --json` emits the old pointer-only
+array for compatibility.
 
 Lessons are a note type. They capture repeatable process learning, can have
 review and expiry dates, and should eventually be promoted into skills, tests,
 gates, or docs when they become permanent practice.
+
+Lessons default to the virtual `process` domain, curated by the current
+operator-facing liaison or a lead. That virtual domain is lesson-only. A real
+registered `process` domain overrides it and supplies normal owner/curator
+authority; non-lesson process notes always require that real registry entry.
 
 Publish a lesson with its required review fields:
 
@@ -864,6 +882,12 @@ Publish a lesson with its required review fields:
 agenttalk knowledge publish --from claude-lead --type lesson --key docs.explicit-root --scope docs --trigger manual-docqa --evidence-ref q-docqa-001 --applies-to docs --review-after 2026-08-01 --expires-at 2027-01-01 --anchor-kind request --request-id q-docqa-001 -m "Use explicit roots when documenting reusable commands."
 agenttalk knowledge pull --type lesson --scope docs --tags docs --include-uncurated
 ```
+
+Knowledge freshness is scoped to the effective domain definition. Editing an
+unrelated domain adds a caution but does not hide the note; editing its own domain
+requires re-verification. Historical rows without the scoped hash remain visible
+with a legacy-freshness caution. Verify and retract re-stamp registry hashes while
+preserving the original Git/anchor baseline.
 
 `agenttalk sync --for <agent>` includes a capped Lessons to check section when
 accepted, not-expired lessons match the current work context or supplied
