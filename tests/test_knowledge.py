@@ -1114,6 +1114,175 @@ def test_lesson_schema_validation_and_existing_notes_unchanged() -> None:
     assert _publish()["anchor"]["path"] == "src/cli.py"
 
 
+@pytest.mark.parametrize(("field", "value"), [
+    ("scope", "review"),
+    ("trigger", "When the semantic trigger changes"),
+    ("evidence_ref", "rr-mutated-evidence"),
+    ("applies_to", ["knowledge"]),
+    ("owner", "attacker"),
+    ("review_after", "2098-01-01T00:00:00Z"),
+    ("expires_at", "2101-01-01T00:00:00Z"),
+    ("supersedes", ["process.victim"]),
+    ("anchor", {"kind": "request", "request_id": "q-mutated-anchor"}),
+])
+def test_causal_lesson_curation_binds_each_semantic_content_field(
+        field: str, value: object) -> None:
+    publish = _lesson_event(note_id="kn-content-parent")
+    forged = kn.new_curate_event(
+        base=publish, action="verify", curated_by="lead",
+        resolved_from="lead", at="2026-07-07T01:00:00Z", reason=None,
+    )
+    forged["lesson"] = {**forged["lesson"], field: value}
+    assert kn.event_problem(forged) is None
+
+    views, problems = kn.resolve_views_with_problems([publish, forged])
+
+    rec = views[(kn.PROCESS_DOMAIN, "process.flake")]
+    assert rec["latest"]["id"] == publish["id"]
+    assert rec["curated"] is None
+    assert any("payload_hash" in problem["error"] for problem in problems)
+
+
+def test_lesson_immutable_payload_matches_validated_schema_minus_curation_state() -> None:
+    publish = _lesson_event(
+        note_id="kn-complete-boundary",
+        lesson=_lesson_obj(
+            applies_to=["knowledge"],
+            supersedes=["process.older"],
+            anchor={"kind": "symbol", "path": "src/cli.py", "symbol": "main"},
+        ),
+    )
+    verify = kn.new_curate_event(
+        base=publish, action="verify", curated_by="lead",
+        resolved_from="lead", at="2026-07-07T01:00:00Z", reason=None,
+    )
+    validated_lesson = kn.validate_lesson(verify["lesson"])
+    validated_lesson.pop("status")
+    validated_lesson.pop("curator")
+
+    payload = kn.immutable_payload(verify)
+
+    assert set(payload) == {"domain_id", "key", "type", "body", "lesson"}
+    assert payload["lesson"] == validated_lesson
+
+
+@pytest.mark.parametrize(("anchor", "mutated"), [
+    (
+        {"kind": "path", "path": "src/cli.py"},
+        {"kind": "path", "path": "src/knowledge.py"},
+    ),
+    (
+        {"kind": "path", "path": "src/cli.py", "anchor_evidence": {"sha": "one"}},
+        {"kind": "path", "path": "src/cli.py", "anchor_evidence": {"sha": "two"}},
+    ),
+    (
+        {"kind": "symbol", "path": "src/cli.py", "symbol": "main"},
+        {"kind": "symbol", "path": "src/other.py", "symbol": "main"},
+    ),
+    (
+        {"kind": "symbol", "path": "src/cli.py", "symbol": "main"},
+        {"kind": "symbol", "path": "src/cli.py", "symbol": "run"},
+    ),
+    (
+        {"kind": "request", "request_id": "q-one", "msg_id": "m-one"},
+        {"kind": "request", "request_id": "q-two", "msg_id": "m-one"},
+    ),
+    (
+        {"kind": "request", "request_id": "q-one", "msg_id": "m-one"},
+        {"kind": "request", "request_id": "q-one", "msg_id": "m-two"},
+    ),
+    (
+        {"kind": "wp", "mission": "mission-one", "wp_id": "WP01"},
+        {"kind": "wp", "mission": "mission-two", "wp_id": "WP01"},
+    ),
+    (
+        {"kind": "wp", "mission": "mission-one", "wp_id": "WP01"},
+        {"kind": "wp", "mission": "mission-one", "wp_id": "WP02"},
+    ),
+    (
+        {"kind": "wp", "mission": "mission-one", "wp_id": "WP01"},
+        {"kind": "wp", "mission": "mission-one", "wp_id": "WP01", "path": "src/cli.py"},
+    ),
+    (
+        {"kind": "sha", "sha": "a" * 40},
+        {"kind": "sha", "sha": "b" * 40},
+    ),
+    (
+        {"kind": "path", "path": "src/cli.py"},
+        {"kind": "sha", "sha": "a" * 40},
+    ),
+])
+def test_causal_pointer_curation_binds_every_validated_anchor_field(
+        anchor: dict, mutated: dict) -> None:
+    publish = _publish(note_id="kn-anchor-parent", anchor=anchor)
+    forged = kn.new_curate_event(
+        base=publish, action="verify", curated_by="lead",
+        resolved_from="lead", at="t2", reason=None,
+    )
+    forged["anchor"] = mutated
+    assert kn.event_problem(forged) is None
+
+    views, problems = kn.resolve_views_with_problems([publish, forged])
+
+    rec = views[("cli", "cli.seam")]
+    assert rec["latest"]["id"] == publish["id"]
+    assert rec["curated"] is None
+    assert any("payload_hash" in problem["error"] for problem in problems)
+
+
+def test_forged_lesson_supersedes_cannot_hide_an_accepted_lesson() -> None:
+    domain = {"title": "Process lessons"}
+    definition_hash = kn.domain_definition_hash(domain)
+    victim_publish = _lesson_event(
+        note_id="kn-victim-publish", key="process.victim")
+    victim_publish["domain_definition_hash"] = definition_hash
+    victim_verify = kn.new_curate_event(
+        base=victim_publish, action="verify", curated_by="lead",
+        resolved_from="lead", at="2026-07-07T01:00:00Z", reason=None,
+    )
+    source_publish = _lesson_event(
+        note_id="kn-source-publish", key="process.source")
+    source_publish["domain_definition_hash"] = definition_hash
+    forged = kn.new_curate_event(
+        base=source_publish, action="verify", curated_by="lead",
+        resolved_from="lead", at="2026-07-07T02:00:00Z", reason=None,
+    )
+    forged["lesson"] = {
+        **forged["lesson"],
+        "owner": "attacker",
+        "supersedes": ["process.victim"],
+    }
+    assert kn.event_problem(forged) is None
+
+    views, problems = kn.resolve_views_with_problems([
+        victim_publish, victim_verify, source_publish, forged,
+    ])
+    assert any("payload_hash" in problem["error"] for problem in problems)
+    selected = kn.select_knowledge_view(
+        views,
+        domains={kn.PROCESS_DOMAIN: domain},
+        registry_hash="rh1",
+        anchor_status_by_id={},
+        now="2026-07-08T00:00:00Z",
+    )
+    assert [note["key"] for note, _verdict in selected["lessons"]] == [
+        "process.victim",
+    ]
+
+
+def test_legitimate_causal_lesson_verify_changes_only_attestation() -> None:
+    publish = _lesson_event(note_id="kn-legitimate-parent")
+    verify = kn.new_curate_event(
+        base=publish, action="verify", curated_by="lead",
+        resolved_from="lead", at="2026-07-07T01:00:00Z", reason=None,
+    )
+
+    views, problems = kn.resolve_views_with_problems([publish, verify])
+
+    assert problems == []
+    assert views[(kn.PROCESS_DOMAIN, "process.flake")]["curated"]["id"] == verify["id"]
+
+
 def test_lesson_invalid_line_skips_without_hiding_valid() -> None:
     valid = _lesson_event(note_id="kn-good")
     bad = dict(valid)

@@ -122,6 +122,16 @@ _LESSON_BASE_FIELDS = frozenset({
     "scope", "trigger", "evidence_ref", "applies_to", "owner", "status",
     "review_after", "expires_at", "supersedes", "anchor",
 })
+# Curation integrity boundary: top-level content is domain_id/key/type/body.
+# Lesson content is EVERY validated base field except status: scope, trigger,
+# evidence_ref, applies_to, owner, review_after, expires_at, supersedes, and the
+# full normalized anchor. New base fields therefore bind by default. Status and
+# curator are curation state; event ids, authority, timestamps, verification SHA,
+# and registry/payload hashes are attestations. Pointer content binds the complete
+# normalized anchor returned by validate_anchor(), including anchor_evidence.
+_LESSON_CURATION_STATE_FIELDS = frozenset({"status"})
+_LESSON_CONTENT_FIELDS = tuple(sorted(
+    _LESSON_BASE_FIELDS - _LESSON_CURATION_STATE_FIELDS))
 _EVENT_BASE_FIELDS = frozenset({
     "schema_version", "event", "id", "key", "type", "domain_id", "body",
     "verified_against_sha", "domain_registry_hash", "domain_definition_hash",
@@ -205,10 +215,7 @@ def immutable_payload(note: dict[str, Any]) -> dict[str, Any]:
         lesson = validate_lesson(note.get("lesson"))
         semantic_lesson = {
             key: lesson.get(key)
-            for key in (
-                "scope", "trigger", "evidence_ref", "applies_to",
-                "review_after", "expires_at", "anchor",
-            )
+            for key in _LESSON_CONTENT_FIELDS
             if lesson.get(key) is not None
         }
         payload["lesson"] = semantic_lesson
