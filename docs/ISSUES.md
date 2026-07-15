@@ -17,6 +17,33 @@ be labeled `SHIPPED` once the changelog closes them.
 
 ---
 
+## P1 · SHIPPED — loud coordination-stall warnings (2026-07-15)
+
+**What.** Agents could stall silently: one agent idle-waiting on a reply from a peer that is
+**down** (the reply can never arrive), or a human restart stuck behind the launch barrier — with
+no operator-visible signal. Observed live this session (codex idle-waited ~10 min on a down
+developer agent; the lead found it only by inspecting heartbeats) and on 2026-07-14 (a silent
+request-restart deadlock). **Where.** `src/agenttalk/coordination_stall.py` (new),
+`supervisor.py` (read-only availability projection), `attention.py`, `cli.py` (`--await-reply`,
+`status`), `doctor.py`, `web.py`, `wrapper/*`, 4 consult/handoff skills. **Fix.** Two low-noise
+**advisory** detectors — `wait_target_unavailable` (an explicit wrapped `--await-reply` / manual
+scoped-wait edge whose target the supervisor confirms unavailable) and `manual_restart_blocked`
+(a human restart held past grace) — projected as one advisory `coordination_stall` across
+attention / doctor / status / dashboard. Advisory only (zero kill/restart/release; respects the
+stand-down model); false-positive-disciplined (single supervisor liveness authority; healthy
+idle / short consults / UNKNOWN peers / future-skew heartbeats stay silent; two-snapshot
+debounce); broad all-idle + cycle detection deferred. Decision **D-28**.
+
+**Disposition.** `SHIPPED v0.77.0` (reviewed-SHA `39bc1e9`; builder codex-dev-3; 2 cross-family
+reviewers approved the final SHA after a future-skew false-positive fold; lead full-suite gate
+caught + closed 2 additivity breaks + 1 non-hermetic test the affected-suite self-gate missed;
+gated full 3.10=2541 / 3.14=2545). **This closes the backlogged P3 "surface the silent
+skipping-relaunch loop loudly"** (the manual-restart-deadlock note from v0.75.1) — a blocked
+manual restart is now a loud `coordination_stall`. Deferred/known-limitation: global all-idle +
+circular-wait detection (needs a cross-subsystem progress contract); signing-off honest-local edge ceiling.
+
+---
+
 ## P1 · SHIPPED — knowledge base visibility + curate/provenance hardening (2026-07-15)
 
 **What.** The shipped knowledge subsystem's notes were invisible in the default
