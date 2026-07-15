@@ -21,7 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the scoped hash remain curated and visible with a legacy-freshness caution.
 - **Curation is causally bound and publish validation is complete in one pass.** New
   curate/retract events must name the current prior event and hash its complete
-  validated content, including lesson ownership and supersession declarations;
+  validated content, including publisher attribution, inherited supersession
+  lineage, lesson ownership, and lesson supersession declarations;
   non-causal rows are skipped without hiding valid history or reopening tombstones.
   Modern events reject unknown persisted fields, while historical rows are
   canonicalized before output. Curation rechecks the registry against supported locked

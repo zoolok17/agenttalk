@@ -156,6 +156,28 @@ def test_causal_curation_rejects_missing_parent_wrong_id_and_mutated_payload() -
     assert any("payload_hash" in problem["error"] for problem in problems)
 
 
+@pytest.mark.parametrize("note_type", ["pointer", "lesson"])
+def test_causal_curation_binds_publisher_author(note_type: str) -> None:
+    publish = (
+        _lesson_event(note_id="kn-author-parent")
+        if note_type == "lesson"
+        else _publish(note_id="kn-author-parent")
+    )
+    forged = kn.new_curate_event(
+        base=publish, action="verify", curated_by="lead",
+        resolved_from="lead", at="2026-07-07T01:00:00Z", reason=None,
+    )
+    forged["author"] = "attacker"
+    assert kn.event_problem(forged) is None
+
+    views, problems = kn.resolve_views_with_problems([publish, forged])
+
+    rec = views[(publish["domain_id"], publish["key"])]
+    assert rec["latest"]["id"] == publish["id"]
+    assert rec["curated"] is None
+    assert any("payload_hash" in problem["error"] for problem in problems)
+
+
 def test_causal_curation_cannot_replace_newer_proposal_from_stale_parent() -> None:
     old_publish = _publish(note_id="kn-old", body="old content")
     old_verify = kn.new_curate_event(
@@ -718,6 +740,29 @@ def test_cli_expertise_curated_view_survives_later_uncurated(
     assert by.get("dev") == 1 and "lead" not in by             # A credited, B not
 
 
+def test_cli_expertise_ignores_causal_curate_with_forged_author(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    assert _pub(root, who="dev") == 0
+    assert _verify(root, "cli.seam") == 0
+    store = Store(root)
+    events, problems = kn.read_events(store)
+    assert problems == []
+    current = kn.resolve_views(events)[("cli", "cli.seam")]["curated"]
+    forged = kn.new_curate_event(
+        base=current, action="verify", curated_by="curator",
+        resolved_from="curator", at="2026-07-07T02:00:00Z", reason=None,
+    )
+    forged["author"] = "attacker"
+    assert kn.event_problem(forged) is None
+    kn.append_event(store, forged)
+
+    capsys.readouterr()
+    assert _run(["roster", "--expertise", "--json"], root) == 0
+    by = json.loads(capsys.readouterr().out)["cli"]["curated_notes_by"]
+    assert by == {"dev": 1}
+
+
 def test_anchor_status_request_msg_id_exact(tmp_path: Path) -> None:
     # C4b: msg_id is EXACT (no fallback to request_id); scan failure -> unresolvable.
     root = _repo(tmp_path)
@@ -1162,8 +1207,40 @@ def test_lesson_immutable_payload_matches_validated_schema_minus_curation_state(
 
     payload = kn.immutable_payload(verify)
 
-    assert set(payload) == {"domain_id", "key", "type", "body", "lesson"}
+    assert set(payload) == kn._EVENT_BOUND_COMMON_FIELDS | {"lesson"}
     assert payload["lesson"] == validated_lesson
+
+
+def test_event_integrity_partition_is_exhaustive_and_disjoint() -> None:
+    complete_event_schema = (
+        frozenset().union(*kn._EVENT_FIELDS_BY_KIND.values())
+        | {"anchor", "lesson"}
+    )
+    assert kn._EVENT_PERSISTED_FIELDS == complete_event_schema
+    assert (
+        kn._EVENT_BOUND_FIELDS | kn._EVENT_CURATION_MUTABLE_FIELDS
+        == complete_event_schema
+    )
+    assert not (
+        kn._EVENT_BOUND_FIELDS & kn._EVENT_CURATION_MUTABLE_FIELDS
+    )
+    assert kn._EVENT_BOUND_COMMON_FIELDS == {
+        "domain_id", "key", "type", "body", "author",
+        "supersedes_id", "supersedes_key",
+    }
+
+    complete_lesson_schema = kn._LESSON_BASE_FIELDS | {"curator"}
+    assert kn._LESSON_PERSISTED_FIELDS == complete_lesson_schema
+    assert (
+        set(kn._LESSON_CONTENT_FIELDS) | kn._LESSON_CURATION_MUTABLE_FIELDS
+        == complete_lesson_schema
+    )
+    assert not (
+        set(kn._LESSON_CONTENT_FIELDS) & kn._LESSON_CURATION_MUTABLE_FIELDS
+    )
+
+    pointer_payload = kn.immutable_payload(_publish())
+    assert set(pointer_payload) == kn._EVENT_BOUND_COMMON_FIELDS | {"anchor"}
 
 
 @pytest.mark.parametrize(("anchor", "mutated"), [

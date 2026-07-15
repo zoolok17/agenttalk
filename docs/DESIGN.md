@@ -822,10 +822,12 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   stale, an unrelated global change is caution, and legacy unscoped rows remain
   visible with caution. The lesson-only virtual `process` policy has a fixed subject
   hash and yields to a real registry entry. New curate/retract rows carry
-  `curates_id` and a hash of an explicit content whitelist; lesson content includes
-  every validated base field except curation status, including owner and supersedes,
-  while pointer content includes the complete normalized anchor. The fold accepts
-  curation only when it names the current prior same-key event and its content matches.
+  `curates_id` and a hash of an exhaustive event-field partition. Bound content
+  includes publisher author, inherited supersession lineage, and the note body;
+  lesson content includes every persisted field except status/curator, while pointer
+  content includes the complete normalized anchor. All remaining event fields are
+  explicitly classified as curation/action attestations. The fold accepts curation
+  only when it names the current prior same-key event and its bound content matches.
   Verification metadata such as `verified_against_sha` is deliberately outside that
   content identity. Modern rows reject unknown event/authority/lesson/anchor fields;
   historical rows are canonicalized to the same allowlists before folding or output.

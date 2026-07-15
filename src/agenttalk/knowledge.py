@@ -122,16 +122,12 @@ _LESSON_BASE_FIELDS = frozenset({
     "scope", "trigger", "evidence_ref", "applies_to", "owner", "status",
     "review_after", "expires_at", "supersedes", "anchor",
 })
-# Curation integrity boundary: top-level content is domain_id/key/type/body.
-# Lesson content is EVERY validated base field except status: scope, trigger,
-# evidence_ref, applies_to, owner, review_after, expires_at, supersedes, and the
-# full normalized anchor. New base fields therefore bind by default. Status and
-# curator are curation state; event ids, authority, timestamps, verification SHA,
-# and registry/payload hashes are attestations. Pointer content binds the complete
-# normalized anchor returned by validate_anchor(), including anchor_evidence.
-_LESSON_CURATION_STATE_FIELDS = frozenset({"status"})
+# Curation integrity boundary for nested lesson fields. Every persisted lesson field
+# is content-bound by default except the two explicit curation-state fields.
+_LESSON_PERSISTED_FIELDS = _LESSON_BASE_FIELDS | frozenset({"curator"})
+_LESSON_CURATION_MUTABLE_FIELDS = frozenset({"status", "curator"})
 _LESSON_CONTENT_FIELDS = tuple(sorted(
-    _LESSON_BASE_FIELDS - _LESSON_CURATION_STATE_FIELDS))
+    _LESSON_PERSISTED_FIELDS - _LESSON_CURATION_MUTABLE_FIELDS))
 _EVENT_BASE_FIELDS = frozenset({
     "schema_version", "event", "id", "key", "type", "domain_id", "body",
     "verified_against_sha", "domain_registry_hash", "domain_definition_hash",
@@ -148,6 +144,26 @@ _EVENT_FIELDS_BY_KIND = {
         "retract_reason",
     }),
 }
+# Exhaustive event-level partition. Bound common fields are publisher content and
+# inherited provenance; anchor/lesson is the type-specific bound projection. Every
+# other persisted field is an explicitly named curation/action attestation. Tests
+# compare this partition with the union of _EVENT_FIELDS_BY_KIND so a new field cannot
+# silently fall outside the integrity boundary.
+_EVENT_BOUND_COMMON_FIELDS = frozenset({
+    "domain_id", "key", "type", "body", "author",
+    "supersedes_id", "supersedes_key",
+})
+_EVENT_BOUND_FIELDS = _EVENT_BOUND_COMMON_FIELDS | frozenset({"anchor", "lesson"})
+_EVENT_CURATION_MUTABLE_FIELDS = frozenset({
+    "schema_version", "event", "id", "verified_against_sha",
+    "domain_registry_hash", "domain_definition_hash", "authority",
+    "created_at", "updated_at", "curated_by", "curated_at",
+    "curates_id", "payload_hash", "retract_reason",
+})
+_EVENT_PERSISTED_FIELDS = (
+    frozenset().union(*_EVENT_FIELDS_BY_KIND.values())
+    | frozenset({"anchor", "lesson"})
+)
 
 
 class KnowledgeError(ValueError):
@@ -206,11 +222,11 @@ def immutable_payload(note: dict[str, Any]) -> dict[str, Any]:
     """Return curation-bound content, excluding mutable verification metadata."""
     note_type = validate_type(note.get("type"))
     payload: dict[str, Any] = {
-        "domain_id": note.get("domain_id"),
-        "key": validate_key(note.get("key")),
-        "type": note_type,
-        "body": validate_body(note.get("body")),
+        field: note.get(field) for field in _EVENT_BOUND_COMMON_FIELDS
     }
+    payload["key"] = validate_key(note.get("key"))
+    payload["type"] = note_type
+    payload["body"] = validate_body(note.get("body"))
     if note_type == TYPE_LESSON:
         lesson = validate_lesson(note.get("lesson"))
         semantic_lesson = {
