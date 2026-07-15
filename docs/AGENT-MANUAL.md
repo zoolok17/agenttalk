@@ -338,7 +338,7 @@ Assurance closes (`agenttalk close`) aggregate gates + review lenses + remediati
 ### Supervisor (mostly script-driven)
 | Command | Use |
 |---|---|
-| `supervise --init / --report / --plan / --bootstrap-check` | Scaffold / read-only liveness / action plan / live-team readiness preflight |
+| `supervise --init / --refresh-scripts / --select-pwsh / --report / --plan / --bootstrap-check` | Scaffold / config-preserving generated-artifact refresh / PowerShell Core host selection / read-only liveness / action plan / live-team readiness preflight |
 | `supervise --install-activity-hook` | Wire the heartbeat hook |
 | `request-restart --for <agent>` | On-demand bounce |
 | `dead-letter list/show/requeue/resolve/purge --agent` | Inspect, recover, mark handled, or archive resolved poison messages |

@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -610,7 +611,13 @@ def test_supervise_init_generates_and_is_idempotent(tmp_path: Path, capsys) -> N
     assert "RestartCount" in task and "ExecutionTimeLimit" in task
     assert "WorkingDirectory" in task
     assert "LastRunTime" in task and "LastTaskResult" in task
-    assert "-NoProfile -ExecutionPolicy Bypass -File" in task
+    assert "-NoLogo -NoProfile -NonInteractive -File" in task
+    assert "--prepare-task-install" in task
+    assert "--commit-task-install" in task
+    assert "Register-ScheduledTask" in task and "-Force" not in task
+    assert "function Remove-PreparedTaskIfOwned" in task
+    assert "Remove-PreparedTaskIfOwned $PowerShell $Arguments $Root" in task
+    assert "powershell.exe" not in task.casefold()
     assert "supervisor.ps1" in task and "-Quiet" in task
     deadman_ps = (s.dir / "deadman.ps1").read_text(encoding="utf-8-sig")
     assert "deadman" in deadman_ps
@@ -2491,34 +2498,25 @@ def test_install_activity_hook_interactive_refuses_codex_modes(
 
 
 def test_generated_ps1_is_bom_ascii_and_parses(tmp_path: Path) -> None:
-    """0.28.1 regression: the GENERATED supervisor.ps1 must (a) be ASCII-only
-    (no em-dash etc.) and BOM-prefixed so Windows PowerShell 5.1 decodes it, and
-    (b) actually PARSE under PowerShell. The prior tests structural-checked the
-    template but never ran the .ps1 through PS — so a non-ASCII char + BOM-less
-    write cascaded into parse errors and the script never ran."""
+    """Generated PowerShell is BOM-free ASCII and parses under supported Core."""
     s = _team(tmp_path)
     assert _run(["supervise", "--init"], tmp_path) == 0
     ps1 = s.dir / "supervisor.ps1"
     raw = ps1.read_bytes()
-    # (a) UTF-8 BOM + the BODY is ASCII-only (a non-ASCII regression fails here)
-    assert raw[:3] == b"\xef\xbb\xbf", "supervisor.ps1 must be written with a UTF-8 BOM"
-    body = raw[3:]
-    non_ascii = [b for b in body if b > 0x7F]
+    assert not raw.startswith(b"\xef\xbb\xbf"), "supervisor.ps1 must be BOM-free"
+    non_ascii = [b for b in raw if b > 0x7F]
     assert not non_ascii, f"supervisor.ps1 body must be ASCII-only; found {non_ascii[:5]}"
-    # (b) it actually parses — under EVERY PowerShell present, PREFERRING
-    # Windows PowerShell 5.1 (the bug was 5.1-specific); skip only if none.
-    shells = [sh for sh in (shutil.which("powershell"), shutil.which("pwsh")) if sh]
-    if not shells:
+    shell = shutil.which("pwsh")
+    if not shell:
         return
     check = (
         "$e=$null; "
         f"[void][System.Management.Automation.Language.Parser]::ParseFile('{ps1}',"
         "[ref]$null,[ref]$e); if($e -and $e.Count){ $e[0].Message; exit 1 }")
-    for sh in shells:
-        res = subprocess.run([sh, "-NoProfile", "-Command", check],
-                             capture_output=True, text=True, timeout=60)
-        assert res.returncode == 0, (
-            f"supervisor.ps1 failed to parse under {sh}: {res.stdout}{res.stderr}")
+    res = subprocess.run([shell, "-NoProfile", "-Command", check],
+                         capture_output=True, text=True, timeout=60)
+    assert res.returncode == 0, (
+        f"supervisor.ps1 failed to parse under {shell}: {res.stdout}{res.stderr}")
 
 def test_generated_helper_ps1_are_bom_ascii_and_parse(tmp_path: Path) -> None:
     s = _team(tmp_path)
@@ -2526,24 +2524,22 @@ def test_generated_helper_ps1_are_bom_ascii_and_parse(tmp_path: Path) -> None:
     ps_files = [s.dir / "supervisor-task.ps1", s.dir / "deadman.ps1"]
     for ps1 in ps_files:
         raw = ps1.read_bytes()
-        assert raw[:3] == b"\xef\xbb\xbf", f"{ps1.name} must have a UTF-8 BOM"
-        body = raw[3:]
-        non_ascii = [b for b in body if b > 0x7F]
+        assert not raw.startswith(b"\xef\xbb\xbf"), f"{ps1.name} must be BOM-free"
+        non_ascii = [b for b in raw if b > 0x7F]
         assert not non_ascii, f"{ps1.name} body must be ASCII-only; found {non_ascii[:5]}"
 
-    shells = [sh for sh in (shutil.which("powershell"), shutil.which("pwsh")) if sh]
-    if not shells:
+    shell = shutil.which("pwsh")
+    if not shell:
         return
-    for sh in shells:
-        for ps1 in ps_files:
-            check = (
-                "$e=$null; "
-                f"[void][System.Management.Automation.Language.Parser]::ParseFile('{ps1}',"
-                "[ref]$null,[ref]$e); if($e -and $e.Count){ $e[0].Message; exit 1 }")
-            res = subprocess.run([sh, "-NoProfile", "-Command", check],
-                                 capture_output=True, text=True, timeout=60)
-            assert res.returncode == 0, (
-                f"{ps1.name} failed to parse under {sh}: {res.stdout}{res.stderr}")
+    for ps1 in ps_files:
+        check = (
+            "$e=$null; "
+            f"[void][System.Management.Automation.Language.Parser]::ParseFile('{ps1}',"
+            "[ref]$null,[ref]$e); if($e -and $e.Count){ $e[0].Message; exit 1 }")
+        res = subprocess.run([shell, "-NoProfile", "-Command", check],
+                             capture_output=True, text=True, timeout=60)
+        assert res.returncode == 0, (
+            f"{ps1.name} failed to parse under {shell}: {res.stdout}{res.stderr}")
 
 
 def test_supervise_plan_exact_generated_command_runs(tmp_path: Path, capsys) -> None:
@@ -2567,8 +2563,7 @@ def test_supervise_plan_exact_generated_command_runs(tmp_path: Path, capsys) -> 
 
 
 def _pick_powershell() -> str | None:
-    """Windows PowerShell 5.1 first (the launch-layer bugs are 5.1-specific), then
-    pwsh. None if neither is present (skip the Windows-gated runtime tests).
+    """Return supported PowerShell Core on Windows, if installed.
 
     These runtime tests exercise the .cmd shim and Windows Start-Process arg
     quoting, which are Windows-only - a `.cmd` batch file can't execute under
@@ -2576,11 +2571,21 @@ def _pick_powershell() -> str | None:
     which() check is not enough). Gate on the OS, not just shell presence."""
     if os.name != "nt":
         return None
-    for sh in ("powershell", "pwsh"):
-        found = shutil.which(sh)
-        if found:
-            return found
-    return None
+    return shutil.which("pwsh")
+
+
+def _select_test_powershell(root: Path, shell: str) -> None:
+    assert _run(["supervise", "--select-pwsh", "--pwsh", shell], root) == 0
+
+
+def _checkout_runtime_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Make generated-shim subprocesses execute the checkout under test."""
+    env = dict(os.environ if base is None else base)
+    source = str(Path(__file__).resolve().parents[1] / "src")
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = source + (os.pathsep + existing if existing else "")
+    env["AGENTTALK_PYTHON"] = sys.executable
+    return env
 
 
 def test_ps_state_helpers_recover_backup_and_refuse_two_corrupt_copies(tmp_path: Path) -> None:
@@ -2670,12 +2675,13 @@ def test_generated_ps1_runs_bus_calls_without_console_script_on_path(tmp_path: P
     # write it BEFORE --init so init leaves it intact and only emits the .ps1 + shim.
     (s.dir / "supervisor.json").write_text(json.dumps(_CONFIG), encoding="utf-8")
     assert _run(["supervise", "--init"], tmp_path) == 0
+    _select_test_powershell(tmp_path, shell)
     ps1 = s.dir / "supervisor.ps1"
     assert ps1.exists() and (s.dir / "bin" / "agenttalk.cmd").exists()
     # PATH reduced to the Windows dirs only: no Python Scripts dir, so a bare
     # `agenttalk[.exe]` console script is unreachable - only the baked shim works.
     windir = os.environ.get("WINDIR", r"C:\Windows")
-    reduced = dict(os.environ)
+    reduced = _checkout_runtime_env()
     reduced["PATH"] = os.pathsep.join([
         os.path.join(windir, "System32"), windir,
         os.path.join(windir, "System32", "WindowsPowerShell", "v1.0")])
@@ -2710,21 +2716,28 @@ def test_proc_start_falls_back_to_get_process_when_cim_denied(tmp_path: Path) ->
     assert json.loads(out.read_text(encoding="utf-8-sig"))["has_start"] is True
 
 
-def test_generated_ps1_null_supervisor_start_does_not_argparse_abort(tmp_path: Path) -> None:
+def test_generated_ps1_tamper_refuses_before_claim(tmp_path: Path) -> None:
     shell = _pick_powershell()
     if not shell:
         return
     s = _team(tmp_path)
     (s.dir / "supervisor.json").write_text(json.dumps(_CONFIG), encoding="utf-8")
     assert _run(["supervise", "--init"], tmp_path) == 0
+    _select_test_powershell(tmp_path, shell)
     ps1 = s.dir / "supervisor.ps1"
     _replace_proc_start(ps1, "  return $null")
 
-    res = subprocess.run([shell, "-NoProfile", "-File", str(ps1), "-Once", "-Quiet"],
-                         capture_output=True, text=True, timeout=120, cwd=str(tmp_path))
+    res = subprocess.run(
+        [shell, "-NoProfile", "-File", str(ps1), "-Once", "-Quiet"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(tmp_path),
+        env=_checkout_runtime_env(),
+    )
     combined = res.stdout + res.stderr
-    assert "expected one argument" not in combined
-    assert res.returncode == 0, combined
+    assert res.returncode != 0
+    assert "refresh-scripts" in combined
     assert s.read_supervisor_instance() is None
 
 
@@ -2747,14 +2760,21 @@ def test_generated_ps1_quiet_suppresses_warning_path(tmp_path: Path) -> None:
               "suspect_warn_interval_seconds": 300, "launch_grace_seconds": 120}
     (s.dir / "supervisor.json").write_text(json.dumps(config), encoding="utf-8")
     assert _run(["supervise", "--init"], tmp_path) == 0
+    _select_test_powershell(tmp_path, shell)
     ps1 = s.dir / "supervisor.ps1"
     # readiness state (past initial launch grace) + NO heartbeat written => stale.
     (s.dir / "supervisor-state.json").write_text(
         json.dumps({"agents": {"lead": _ready()}}), encoding="utf-8")
 
     def _once(*extra: str) -> str:
-        r = subprocess.run([shell, "-NoProfile", "-File", str(ps1), "-Once", *extra],
-                           capture_output=True, text=True, timeout=120, cwd=str(tmp_path))
+        r = subprocess.run(
+            [shell, "-NoProfile", "-File", str(ps1), "-Once", *extra],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=str(tmp_path),
+            env=_checkout_runtime_env(),
+        )
         return r.stdout + r.stderr
 
     noisy = _once()                                       # normal run -> warning prints
@@ -2782,8 +2802,8 @@ def test_generated_ps1_quiet_suppresses_relaunch_helper_warnings(tmp_path: Path)
               "suspect_warn_interval_seconds": 300, "launch_grace_seconds": 120}
     (s.dir / "supervisor.json").write_text(json.dumps(config), encoding="utf-8")
     assert _run(["supervise", "--init"], tmp_path) == 0
+    _select_test_powershell(tmp_path, shell)
     ps1 = s.dir / "supervisor.ps1"
-    _replace_proc_snapshot_with_empty(ps1)
     state_file = s.dir / "supervisor-state.json"
 
     def _once(*extra: str) -> str:
@@ -2796,8 +2816,14 @@ def test_generated_ps1_quiet_suppresses_relaunch_helper_warnings(tmp_path: Path)
         state_file.write_text(
             json.dumps({"agents": {"worker": _ready(backoff_next_epoch=0)}}),
             encoding="utf-8")
-        r = subprocess.run([shell, "-NoProfile", "-File", str(ps1), "-Once", *extra],
-                           capture_output=True, text=True, timeout=120, cwd=str(tmp_path))
+        r = subprocess.run(
+            [shell, "-NoProfile", "-File", str(ps1), "-Once", *extra],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=str(tmp_path),
+            env=_checkout_runtime_env(),
+        )
         return r.stdout + r.stderr
 
     noisy = _once()

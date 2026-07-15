@@ -27,12 +27,17 @@ SEMANTICS (leaves-first, start-time guarded) are mirrored here in pure Python.
 """
 from __future__ import annotations
 
+import os
 import subprocess  # nosec B404
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
+
+from agenttalk.store import Store
+from agenttalk import supervisor_lifecycle
 
 # A snapshot maps pid -> {"ppid": int, "name": str, "create_epoch": float | None}.
 # ``create_epoch`` is POSIX seconds (the adapter normalizes OS-specific time); None when
@@ -208,14 +213,63 @@ def snapshot_processes(timeout: float = 5.0) -> Snapshot | None:
         return None
 
 
-def _run(argv: list[str], timeout: float) -> str | None:
+def _run(argv: list[str], timeout: float, *, env: dict[str, str] | None = None) -> str | None:
     try:
         out = subprocess.run(  # noqa: S603  # nosec B603
-            argv, capture_output=True, text=True, timeout=timeout, check=False,
+            argv, capture_output=True, text=True, timeout=timeout, check=False, env=env,
         )
     except (OSError, subprocess.SubprocessError):
         return None
     return out.stdout if out.returncode == 0 else None
+
+
+_PWSH_CACHE_LOCK = threading.Lock()
+_PWSH_CACHE: dict[str, object] | None = None
+
+
+def _run_selected_pwsh(command: str, timeout: float) -> str | None:
+    """Run one watchdog probe under the current selected-host read lock.
+
+    Every call rereads revision/fingerprint/TTL/native identity. Any ambiguity
+    returns unavailable, preserving the watchdog's fail-open no-kill contract.
+    """
+    global _PWSH_CACHE
+    root_text = os.environ.get("AGENTTALK_ROOT")
+    if not root_text:
+        return None
+    try:
+        store = Store(Path(root_text).resolve())
+        with _PWSH_CACHE_LOCK:
+            with store._powershell_selection_lock():
+                first = supervisor_lifecycle.read_selected_host_locked(store)
+                cache_key = (
+                    str(store.root),
+                    first["selection_revision"],
+                    first["selection_fingerprint"],
+                )
+                if _PWSH_CACHE is None or _PWSH_CACHE.get("key") != cache_key:
+                    _PWSH_CACHE = {"key": cache_key, "path": first["path"]}
+                # Re-read immediately before spawn while the writer lock is held.
+                second = supervisor_lifecycle.read_selected_host_locked(store)
+                if (
+                    second["selection_revision"] != first["selection_revision"]
+                    or second["selection_fingerprint"] != first["selection_fingerprint"]
+                    or second["path"] != _PWSH_CACHE["path"]
+                ):
+                    _PWSH_CACHE = None
+                    return None
+                env = os.environ.copy()
+                env["POWERSHELL_UPDATECHECK"] = "Off"
+                return _run(
+                    [str(second["path"]), "-NoLogo", "-NoProfile", "-NonInteractive",
+                     "-Command", command],
+                    timeout,
+                    env=env,
+                )
+    except (OSError, ValueError, TimeoutError,
+            supervisor_lifecycle.SupervisorLifecycleError):
+        _PWSH_CACHE = None
+        return None
 
 
 def _snapshot_windows(timeout: float) -> Snapshot | None:
@@ -226,7 +280,7 @@ def _snapshot_windows(timeout: float) -> Snapshot | None:
         "\"$($_.ProcessId)|$($_.ParentProcessId)|$($_.Name)|"
         "$(if ($_.CreationDate) { ([datetimeoffset]$_.CreationDate).ToUnixTimeSeconds() })\" }"
     )
-    out = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout)
+    out = _run_selected_pwsh(ps, timeout)
     if out is None:
         return None
     snap: Snapshot = {}
@@ -278,7 +332,7 @@ def proc_start(pid: int) -> float | None:
         if sys.platform.startswith("win"):
             ps = (f"Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}' | "
                   "ForEach-Object { ([datetimeoffset]$_.CreationDate).ToUnixTimeSeconds() }")
-            out = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], 5.0)
+            out = _run_selected_pwsh(ps, 5.0)
             if not out or not out.strip():
                 return None
             return float(out.strip().splitlines()[0])

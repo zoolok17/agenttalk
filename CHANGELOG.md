@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.78.0] - 2026-07-15
+
+### Added
+
+- **One durable PowerShell Core host selection for every Windows supervisor
+  boundary.** `supervise --select-pwsh` probes only trusted Program Files
+  candidates unless the operator supplies an absolute `--pwsh`; explicit and
+  current-host selections are terminal and never fall through. The selected
+  canonical path, discrete version, native file identity, 24-hour probe time,
+  monotonic revision, and deterministic fingerprint are stored atomically in
+  `.agenttalk/powershell-host.json`. PATH and Scheduled Task action paths are
+  data only and are never probed or auto-executed.
+- **Claim-time host consistency and detectable generated artifacts.** A generated
+  supervisor claim independently checks the live PowerShell ancestor, native
+  image identity, start time, direct/cmd-hop ancestry, and current selection while
+  holding lifecycle -> selection -> config locks. All three generated `.ps1`
+  files plus `bin/agenttalk.cmd` carry one deterministic schema/generation marker;
+  covered entry points reject missing, stale, mixed, or edited files with the
+  exact `agenttalk supervise --refresh-scripts` remediation.
+- **PowerShell diagnostics and recovery controls.** `doctor`, human/JSON `status`,
+  `start`, the Scheduled Task helper, and the Windows watchdog now consume the
+  selected absolute host. `supervise --repair-instance-marker --quarantine
+  --acknowledge-no-live-supervisor` is the explicit corrupt-marker recovery path.
+
+### Changed
+
+- **PowerShell Core 7+ is the supported Windows supervisor baseline; Windows
+  PowerShell 5.1 is refused.** Stable 7.0-7.3 remains accepted with an end-of-life
+  warning, every prerelease warns, and stable 7.4+ is recommended and quiet.
+  Generated scripts use `#requires -Version 7` and `#requires -PSEdition Core`
+  plus an in-process edition/major guard.
+- **The real launch sites no longer use a bare shell name.** `agenttalk start`,
+  Scheduled Task registration, and both watchdog CIM probes use the validated
+  selected path. Watchdog selection or revalidation failure remains fail-open:
+  no snapshot means no kill.
+- **Generated PowerShell and CMD artifacts are BOM-free.** Existing
+  `utf-8-sig` readers remain in place for legacy, operator-authored, and
+  PowerShell-written inputs. `supervise --init --force` and
+  `--refresh-scripts` preserve an existing `supervisor.json` byte-for-byte and
+  do not touch runtime state.
+
+### Known limitations
+
+- Generated artifact replacement is deliberately per-file, not group-atomic;
+  marker/content validation detects a partial set and a refresh rerun converges.
+  A same-selected-Core process that already parsed old script bytes but has not
+  claimed remains a narrow launcher-mutex race. Task rebinding/multi-binding
+  migration and executable signer/ACL attestation remain deferred.
+
 ## [0.77.0] - 2026-07-15
 
 ### Added

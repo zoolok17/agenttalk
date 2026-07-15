@@ -25,7 +25,25 @@ from agenttalk import codex_config as cxc
 from agenttalk import install_skills as iskl
 from agenttalk import signing as _signing
 from agenttalk import supervisor as sup
+from agenttalk import powershell_host as psh
+from agenttalk import supervisor_lifecycle
 from agenttalk.store import Store, find_root, find_stores_upward
+
+
+_TASK_QUERY_SENTINEL = "AGENTTALK_TASK_QUERY_V1:"
+_TASK_QUERY_COMMAND = (
+    "$ErrorActionPreference='Stop';"
+    "$items=@(Get-ScheduledTask -TaskName "
+    "([WildcardPattern]::Escape($env:AGENTTALK_TASK_NAME)) "
+    "-ErrorAction SilentlyContinue | ForEach-Object {"
+    "$actions=@($_.Actions | ForEach-Object { [ordered]@{"
+    "execute=[string]$_.Execute;arguments=[string]$_.Arguments;"
+    "working_directory=[string]$_.WorkingDirectory} });"
+    "[ordered]@{name=[string]$_.TaskName;path=[string]$_.TaskPath;"
+    "state=[string]$_.State;actions=$actions} });"
+    "$out=[ordered]@{sentinel='agenttalk-task-query-v1';tasks=$items};"
+    f"Write-Output ('{_TASK_QUERY_SENTINEL}'+($out|ConvertTo-Json -Compress -Depth 6))"
+)
 
 
 @dataclass
@@ -95,6 +113,10 @@ def run(project_root: Path | None = None) -> Report:
     # package's bundled skills, independent of any project store), distinct from the install-
     # freshness checks (_check_skills / _check_devkit).
     report.checks.append(_check_skill_currency())
+    report.checks.append(_check_powershell_host(store))
+    artifact_check = _check_powershell_artifacts(store)
+    if artifact_check is not None:
+        report.checks.append(artifact_check)
     # Config-dependent checks are gated on a LOADABLE config: `_check_init`
     # already reports a corrupt config as an `error` (e.g. an active∩retired
     # overlap, #19), so running these would just re-raise the same
@@ -143,6 +165,187 @@ def run(project_root: Path | None = None) -> Report:
         if lead_check is not None:  # additive: absent unless a lead-loop concern exists
             report.checks.append(lead_check)
     return report
+
+
+def _check_powershell_host(store: Store) -> Check:
+    if not sys.platform.startswith("win"):
+        return Check(
+            name="powershell_host",
+            status="ok",
+            details="N/A: generated PowerShell supervisor and Scheduled Tasks are Windows-only",
+            data={"status": "n/a", "task_status": "n/a"},
+        )
+    try:
+        record = supervisor_lifecycle.read_selected_host(store)
+    except (OSError, supervisor_lifecycle.SupervisorLifecycleError) as exc:
+        return Check(
+            name="powershell_host",
+            status="error",
+            details=f"PowerShell Core host unavailable: {exc}; task status UNKNOWN",
+            fix=psh.INSTALL_REMEDIATION,
+            data={"status": "error", "task_status": "unknown"},
+        )
+    warning = record.get("_warning")
+    public = psh.selection_public_view(record)
+    task = _inspect_selected_task(store, record)
+    public.update({
+        "age_seconds": record.get("_age_seconds"),
+        "warning": warning,
+        "task_status": task["status"],
+        "task": task,
+    })
+    task_error = task["status"] not in {"not_configured", "ok"}
+    task_name = str(record.get("task_name") or "agenttalk-supervisor")
+    fix = ""
+    if task_error:
+        fix = sup.task_recovery_remediation(store, str(record["path"]), task_name)
+    elif warning:
+        fix = f'agenttalk supervise --select-pwsh --pwsh "{record["path"]}"'
+    return Check(
+        name="powershell_host",
+        status="error" if task_error else ("warn" if warning else "ok"),
+        details=(
+            f"{record['path']} ({record['source']}, {record['edition']} "
+            f"{record['_version'].display}, age={record['_age_seconds']:.0f}s)"
+            + (f"; {warning}" if warning else "")
+            + (f"; task {task['status']}: {task.get('detail', '')}" if task_error else "")
+        ),
+        fix=fix,
+        data=public,
+    )
+
+
+def _parse_task_query(stdout: str) -> list[dict]:
+    rows = [
+        line[len(_TASK_QUERY_SENTINEL):]
+        for line in stdout.splitlines()
+        if line.startswith(_TASK_QUERY_SENTINEL)
+    ]
+    if len(rows) != 1:
+        raise ValueError("task query did not emit exactly one sentinel record")
+    value = json.loads(rows[0])
+    if not isinstance(value, dict) or set(value) != {"sentinel", "tasks"}:
+        raise ValueError("task query schema mismatch")
+    if value.get("sentinel") != "agenttalk-task-query-v1":
+        raise ValueError("task query sentinel mismatch")
+    tasks = value.get("tasks")
+    if not isinstance(tasks, list):
+        raise ValueError("task query tasks must be an array")
+    for task in tasks:
+        if not isinstance(task, dict) or set(task) != {"name", "path", "state", "actions"}:
+            raise ValueError("task query task schema mismatch")
+        if any(not isinstance(task.get(key), str) for key in ("name", "path", "state")):
+            raise ValueError("task query task fields must be strings")
+        actions = task.get("actions")
+        if not isinstance(actions, list):
+            raise ValueError("task query actions must be an array")
+        for action in actions:
+            if not isinstance(action, dict) or set(action) != {
+                "execute", "arguments", "working_directory"
+            }:
+                raise ValueError("task query action schema mismatch")
+            if any(not isinstance(action.get(key), str) for key in action):
+                raise ValueError("task query action fields must be strings")
+    return tasks
+
+
+def _inspect_selected_task(
+    store: Store,
+    record: dict,
+    *,
+    runner=subprocess.run,
+) -> dict:
+    task_name = record.get("task_name")
+    if not isinstance(task_name, str) or not task_name:
+        return {"status": "not_configured", "detail": "no task binding is recorded"}
+    env = os.environ.copy()
+    env["POWERSHELL_UPDATECHECK"] = "Off"
+    env["AGENTTALK_TASK_NAME"] = task_name
+    try:
+        with supervisor_lifecycle.selected_host_for_spawn(store) as current:
+            if (
+                current["selection_revision"] != record["selection_revision"]
+                or current["selection_fingerprint"] != record["selection_fingerprint"]
+            ):
+                raise ValueError("selection changed before task query")
+            completed = runner(  # noqa: S603  # nosec B603
+                [str(current["path"]), "-NoLogo", "-NoProfile", "-NonInteractive",
+                 "-Command", _TASK_QUERY_COMMAND],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5.0,
+                check=False,
+                env=env,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        if completed.returncode != 0:
+            raise ValueError(f"selected-host task query exited {completed.returncode}")
+        tasks = _parse_task_query(completed.stdout or "")
+    except (OSError, ValueError, subprocess.SubprocessError,
+            supervisor_lifecycle.SupervisorLifecycleError) as exc:
+        return {"status": "unknown", "detail": str(exc)}
+    if not tasks:
+        return {"status": "missing", "detail": f"recorded task {task_name!r} is absent"}
+    if len(tasks) != 1:
+        return {
+            "status": "ambiguous",
+            "detail": f"{len(tasks)} tasks match recorded name {task_name!r}",
+            "tasks": tasks,
+        }
+    task = tasks[0]
+    actions = task["actions"]
+    if len(actions) != 1:
+        return {
+            "status": "mismatch",
+            "detail": f"registered task has {len(actions)} actions; expected exactly one",
+            "task": task,
+        }
+    action = actions[0]
+    expected = sup.expected_task_action(store)
+    mismatches: list[str] = []
+    if psh.normalized_path_key(action["execute"]) != psh.normalized_path_key(str(record["path"])):
+        mismatches.append("Execute")
+    if action["arguments"] != expected["arguments"]:
+        mismatches.append("Arguments")
+    if psh.normalized_path_key(action["working_directory"]) != psh.normalized_path_key(
+        expected["working_directory"]
+    ):
+        mismatches.append("WorkingDirectory")
+    if task["name"] != task_name:
+        mismatches.append("TaskName")
+    if mismatches:
+        return {
+            "status": "mismatch",
+            "detail": "registered task fields differ: " + ", ".join(mismatches),
+            "task": task,
+        }
+    return {"status": "ok", "detail": f"{task_name} is {task['state']}", "task": task}
+
+
+def _check_powershell_artifacts(store: Store) -> Check | None:
+    if not any((store.dir / Path(relative)).exists() for relative in sup.ARTIFACT_RELATIVE_PATHS):
+        return None
+    result = sup.inspect_artifact_bundle(store)
+    if result["ok"]:
+        marker = next(iter(result["markers"].values()), {})
+        return Check(
+            name="powershell_artifacts",
+            status="ok",
+            details=(
+                "all four generated artifacts match schema/generation/content "
+                f"({marker.get('generator_generation', 'unknown')})"
+            ),
+            data=result,
+        )
+    return Check(
+        name="powershell_artifacts",
+        status="error",
+        details="generated PowerShell artifacts are stale or mixed: " + "; ".join(result["errors"]),
+        fix=psh.REFRESH_REMEDIATION,
+        data=result,
+    )
 
 
 def _check_coordination_stalls(store: Store) -> Check | None:

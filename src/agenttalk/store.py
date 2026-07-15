@@ -1432,6 +1432,31 @@ class Store:
                                     poll=poll, what="config lock (another agent may be "
                                     "mid roster-admin)")
 
+    def _supervisor_lifecycle_lock(self, *, timeout: float = 10.0,
+                                   poll: float = 0.05):
+        """Serialize supervisor claim/release, host selection, and refresh.
+
+        When more than one supervisor lock is needed, the owning layer must
+        acquire ``lifecycle -> PowerShell selection -> config`` in that order.
+        These helpers are intentionally non-reentrant.
+        """
+        return self._exclusive_lock(
+            self.dir / "supervisor-lifecycle.lock",
+            timeout=timeout,
+            poll=poll,
+            what="supervisor lifecycle lock",
+        )
+
+    def _powershell_selection_lock(self, *, timeout: float = 10.0,
+                                   poll: float = 0.05):
+        """Serialize reads/writes that linearize PowerShell host use."""
+        return self._exclusive_lock(
+            self.dir / "powershell-host.lock",
+            timeout=timeout,
+            poll=poll,
+            what="PowerShell host selection lock",
+        )
+
     def _retirement_lock(self, *, timeout: float = 10.0, poll: float = 0.005):
         """Serialize roster retirement against final message publication.
 
@@ -5282,15 +5307,114 @@ class Store:
     def supervisor_instance_path(self) -> Path:
         return self.dir / "supervisor.instance.lock"
 
-    def read_supervisor_instance(self) -> dict | None:
-        p = self.supervisor_instance_path()
-        if not p.exists():
-            return None
+    def _read_supervisor_instance_strict_locked(
+        self,
+    ) -> tuple[str, dict | None, str | None]:
+        """Read the singleton marker without conflating corruption with absence.
+
+        The caller owns the lifecycle lock.  Status is ``absent``, ``valid``, or
+        ``invalid``.  A marker is valid only when all fields needed for a
+        token/pid/start checked release are well-formed and rooted here.
+        """
+        path = self.supervisor_instance_path()
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return "absent", None, None
+        except OSError as exc:
+            return "invalid", None, f"unreadable marker: {exc}"
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            return "invalid", None, f"malformed marker JSON: {exc}"
+        if not isinstance(data, dict):
+            return "invalid", None, "marker is not a JSON object"
+        if data.get("root") != str(self.root):
+            return "invalid", None, "marker root does not match this project"
+        pid = data.get("pid")
+        token = data.get("token")
+        started_at = data.get("started_at")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return "invalid", None, "marker pid is invalid"
+        if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+            return "invalid", None, "marker token is invalid"
+        if not isinstance(started_at, str) or _parse_start_token(started_at) is None:
+            return "invalid", None, "marker started_at is invalid"
+        pid_start = data.get("pid_start")
+        if pid_start is not None and (not isinstance(pid_start, str) or not pid_start):
+            return "invalid", None, "marker pid_start is invalid"
+        return "valid", data, None
+
+    def read_supervisor_instance_strict(self) -> tuple[str, dict | None, str | None]:
+        """Strict singleton read for diagnostics; mutation paths read under lock."""
+        return self._read_supervisor_instance_strict_locked()
+
+    def read_supervisor_instance(self) -> dict | None:
+        status, data, _ = self._read_supervisor_instance_strict_locked()
+        return data if status == "valid" else None
+
+    def _quarantine_supervisor_instance_locked(self, *, reason: str) -> Path:
+        """Move the current marker aside while the lifecycle lock is held."""
+        source = self.supervisor_instance_path()
+        suffix = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        target = source.with_name(f"{source.name}.quarantine-{suffix}")
+        os.replace(source, target)
+        audit = self.dir / "supervisor-instance-repairs.jsonl"
+        with audit.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps({
+                "at": _now_iso(),
+                "action": "quarantine",
+                "reason": reason,
+                "source": str(source),
+                "target": str(target),
+            }, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return target
+
+    def quarantine_invalid_supervisor_instance(self, *, reason: str) -> Path | None:
+        """Explicit operator recovery for an invalid/unreadable marker only."""
+        with self._supervisor_lifecycle_lock():
+            status, _data, detail = self._read_supervisor_instance_strict_locked()
+            if status == "absent":
+                return None
+            if status == "valid":
+                raise ValueError("refusing to quarantine a structurally valid supervisor marker")
+            return self._quarantine_supervisor_instance_locked(
+                reason=f"{reason}: {detail or 'invalid marker'}"
+            )
+
+    def _claim_supervisor_instance_locked(self, *, pid: int,
+                                          pid_start: object = None) -> dict | None:
+        """Generic marker fold/write; caller holds lifecycle and config locks."""
+        status, existing, _detail = self._read_supervisor_instance_strict_locked()
+        if status == "invalid":
             return None
-        return data if isinstance(data, dict) else None
+        if existing is not None:
+            existing_pid = existing.get("pid")
+            if existing_pid == pid:
+                reclaim = _same_pid_claim_allowed(
+                    existing_pid, existing.get("pid_start"), pid_start,
+                )
+            else:
+                reclaim = _owner_identity_gone(
+                    existing_pid, existing.get("pid_start"),
+                )
+            if not reclaim:
+                return None
+            self._quarantine_supervisor_instance_locked(reason="confirmed stale or pid-reused owner")
+        record = {
+            "root": str(self.root),
+            "pid": int(pid),
+            "pid_start": pid_start,
+            "token": secrets.token_hex(16),
+            "started_at": _now_iso(),
+        }
+        _atomic_write_text(
+            self.supervisor_instance_path(),
+            json.dumps(record, indent=2, ensure_ascii=False),
+        )
+        return record
 
     def claim_supervisor_instance(self, *, pid: int,
                                   pid_start: object = None) -> dict | None:
@@ -5304,47 +5428,32 @@ class Store:
         to every ``--drain-intents`` tick. ANTI-ACCIDENT, not a security
         boundary: the token rides the command line and the pid is the
         caller's own claim (documented in SECURITY.md)."""
-        with self._config_lock():
-            existing = self.read_supervisor_instance()
-            if existing is not None:
-                existing_pid = existing.get("pid")
-                if existing_pid == pid:
-                    if not _same_pid_claim_allowed(
-                        existing_pid, existing.get("pid_start"), pid_start,
-                    ):
-                        return None
-                elif not _owner_identity_gone(
-                    existing_pid, existing.get("pid_start"),
-                ):
-                    return None
-            record = {
-                "root": str(self.root),
-                "pid": int(pid),
-                "pid_start": pid_start,
-                "token": secrets.token_hex(16),
-                "started_at": _now_iso(),
-            }
-            _atomic_write_text(self.supervisor_instance_path(),
-                               json.dumps(record, indent=2, ensure_ascii=False))
-            return record
+        with self._supervisor_lifecycle_lock():
+            with self._config_lock():
+                return self._claim_supervisor_instance_locked(
+                    pid=pid, pid_start=pid_start,
+                )
 
     def release_supervisor_instance(self, *, token: str, pid: int | None = None,
                                     pid_start: object = None) -> bool:
         """Token/pid-checked release. A mismatched/absent token releases nothing
         (a stale releaser can never evict a newer live instance)."""
-        with self._config_lock():
-            existing = self.read_supervisor_instance()
-            if not existing or not token or existing.get("token") != token:
-                return False
-            if pid is not None and existing.get("pid") != int(pid):
-                return False
-            if pid_start is not None and existing.get("pid_start") != pid_start:
-                return False
-            try:
-                self.supervisor_instance_path().unlink()
-            except OSError:
-                return False
-            return True
+        with self._supervisor_lifecycle_lock():
+            with self._config_lock():
+                status, existing, _detail = self._read_supervisor_instance_strict_locked()
+                if status != "valid" or not existing:
+                    return False
+                if not token or existing.get("token") != token:
+                    return False
+                if pid is not None and existing.get("pid") != int(pid):
+                    return False
+                if pid_start is not None and existing.get("pid_start") != pid_start:
+                    return False
+                try:
+                    self.supervisor_instance_path().unlink()
+                except OSError:
+                    return False
+                return True
 
     # ------------------------------------------- reply-in-flight markers
     #

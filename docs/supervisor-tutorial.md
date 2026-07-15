@@ -76,6 +76,9 @@ agent is never mistaken for stuck.
 
 - agenttalk installed and a store initialized in your project
   (`agenttalk init --here --agents ...`). See the README quickstart.
+- PowerShell Core 7+ on Windows. Stable 7.4+ is recommended. Stable
+  7.0-7.3 and prereleases run with warnings; Windows PowerShell 5.1 is
+  unsupported and refused.
 - The **real** CLI executables (not shims):
   - Claude Code: e.g. `C:\Users\you\.local\bin\claude.exe`
   - Codex: the native exe, e.g.
@@ -102,8 +105,9 @@ From your project root:
 agenttalk supervise --init
 ```
 
-This creates three things under `.agenttalk/` (use `--force` to
-overwrite):
+This creates the operator config plus four generated artifacts under
+`.agenttalk/`. `--init --force` refreshes only generated files; it preserves an
+existing `supervisor.json` byte-for-byte and does not touch runtime state.
 
 - **`supervisor.json`** — the config you fill in: cadence knobs plus a
   per-agent block describing how to launch each agent.
@@ -113,6 +117,16 @@ overwrite):
 - **`bin/agenttalk.cmd`** — a tiny shim the monitor calls so its own bus
   commands resolve to the right Python/agenttalk regardless of your PATH.
   You don't invoke it directly.
+- **`supervisor-task.ps1`** — the generated Scheduled Task helper.
+- **`deadman.ps1`** — the generated content-blind mail-age check wrapper.
+
+The four generated files carry one deterministic schema/generation marker and
+are validated as a set. If an upgrade or interrupted refresh leaves stale or
+mixed files, regenerate them without changing the operator config:
+
+```powershell
+agenttalk supervise --refresh-scripts
+```
 
 Once you start the monitor it also writes **`supervisor-state.json`** —
 script-owned bookkeeping (per-agent launcher pids, pinned Claude session
@@ -277,16 +291,27 @@ Wrapped agents skip this entirely.
 
 ## 6. Run the monitor
 
+Select and record the PowerShell Core host first. Automatic selection considers
+only canonical Program Files installations; PATH entries are diagnostics, not
+execution candidates.
+
 ```powershell
-# from the project root, in a dedicated terminal:
-.\.agenttalk\supervisor.ps1
+$pwshPath = (agenttalk supervise --select-pwsh | ConvertFrom-Json).path
+& $pwshPath -NoLogo -NoProfile -NonInteractive `
+  -File .\.agenttalk\supervisor.ps1
 ```
 
-> **Prefer PowerShell 7 (`pwsh`) as the host.** Windows PowerShell 5.1 works — the
-> generated JSON writes are BOM-free and the readers tolerate a BOM either way — but
-> pwsh 7+ is the tested default and avoids a class of edition-specific encoding
-> surprises. Launch it explicitly if you use a Scheduled Task or a shortcut:
-> `Start-Process pwsh -ArgumentList '-NoProfile','-File','<repo>\.agenttalk\supervisor.ps1' -WorkingDirectory '<repo>\.agenttalk'`.
+To select a portable or nonstandard installation, use an absolute path:
+
+```powershell
+$pwshPath = (agenttalk supervise --select-pwsh `
+  --pwsh 'D:\Tools\PowerShell\pwsh.exe' | ConvertFrom-Json).path
+```
+
+An explicit candidate is terminal: a missing, inaccessible, wrong-edition, or
+changed file fails that request instead of falling back. The project record and
+native file checks provide same-user consistency, not executable signing or ACL
+attestation; every generated script also keeps its in-process Core/major guard.
 
 The monitor loops every `poll_seconds`: it asks `agenttalk supervise
 --plan` for the decision table and executes it — launching agents that
@@ -310,6 +335,26 @@ agenttalk dashboard            # browser view: heartbeat age, who's composing, o
 
 `--report` and `--plan` are pure read-only derivations — safe to run any
 time, they change nothing.
+
+### Use the Scheduled Task host
+
+For durable logon hosting, run the task helper through the selected host:
+
+```powershell
+& $pwshPath -NoLogo -NoProfile -NonInteractive `
+  -File .\.agenttalk\supervisor-task.ps1 -Action install
+& $pwshPath -NoLogo -NoProfile -NonInteractive `
+  -File .\.agenttalk\supervisor-task.ps1 -Action start
+```
+
+The task action freezes that absolute path. It is compared to the project
+selection before start and is never executed as a discovery/probe candidate.
+`status`, `stop`, and `uninstall` remain available to recover a stale binding.
+
+To change the selected task host, stop it, wait until task status is no longer
+`Running` and the old supervisor process has exited, uninstall it, select the
+new absolute host, refresh/install, then start. The full copy-paste sequence is
+in [Supervisor Hosting](supervisor-hosting.md#scheduled-task).
 
 ---
 
@@ -393,7 +438,9 @@ interactively (`agenttalk init` done long ago, agents in
 3. **Stop your hand-run listener terminals** for the agents you're now
    supervising — the supervisor will launch them. Leave any agent you want
    to keep driving by hand alone.
-4. **Run the monitor**: `.\.agenttalk\supervisor.ps1`. It launches the
+4. **Select and run the monitor**: record the Core host with `supervise
+   --select-pwsh`, then invoke `supervisor.ps1` through the returned absolute
+   path as shown in section 6. It launches the
    configured agents (fresh on first launch) and keeps them alive from
    then on.
 5. **Run the bootstrap preflight**: `agenttalk supervise --bootstrap-check`.
@@ -495,10 +542,10 @@ without ever rebuilding state.
   `taskkill.exe`; on Windows that is abrupt termination and eliminates that
   popup-producing subprocess path. The production reporter's desktop-heap
   diagnosis is plausible, not upstream-confirmed. Windows snapshot and
-  start-time helpers still launch PowerShell/CIM subprocesses; a PID can be
+  start-time helpers run CIM through the selected Core host; selection, TTL, or
+  native-identity ambiguity returns unavailable and never kills. A PID can be
   reused after the separate recheck, and leaf-first snapshot termination is not
-  an atomic tree kill. These are follow-up hardening items, not blockers for the
-  narrow fix.
+  an atomic tree kill.
 - **Pinned executables.** `windows_file` must be the real CLI exe (or
   Python for wrapped), never a `.cmd`/npm/PowerShell shim — a shim hands
   off and exits, and the supervisor would track the wrong process.
@@ -523,7 +570,10 @@ without ever rebuilding state.
 
 | Command | What it does |
 | --- | --- |
-| `agenttalk supervise --init [--force]` | Scaffold `supervisor.json` + `supervisor.ps1`. |
+| `agenttalk supervise --init [--force]` | Scaffold config plus four generated artifacts. `--force` refreshes generated files and preserves existing config/state. |
+| `agenttalk supervise --select-pwsh [--pwsh ABSOLUTE_PATH]` | Probe and record the PowerShell Core 7+ host. An explicit candidate never falls through. |
+| `agenttalk supervise --refresh-scripts [--pwsh ABSOLUTE_PATH]` | Regenerate/validate all four artifacts under the lifecycle lock; preserve config/runtime state. |
+| `agenttalk supervise --repair-instance-marker --quarantine --acknowledge-no-live-supervisor` | Explicitly quarantine an invalid singleton marker after the operator confirms no supervisor is live. |
 | `agenttalk supervise --report` | Read-only per-agent liveness JSON (fresh/stale + threshold). |
 | `agenttalk supervise --plan` | The action plan (decision table) the monitor executes. |
 | `agenttalk supervise --install-activity-hook [--codex\|--codex-only]` | Merge the identity-neutral heartbeat PostToolUse hook into the **project** `.claude/settings.json` (and/or `.codex/hooks.json`). Never global, never clobbers. |

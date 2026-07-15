@@ -93,7 +93,7 @@ a prerequisite.
 
 ```powershell
 # one-time install (canonical, tag-pinned)
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.74.1"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.78.0"
 agenttalk install-skills          # installs bus skills + the dev-discipline devkit
 
 # in your project root, once per project
@@ -203,7 +203,7 @@ assigns the part per WP and the sk-loop skills follow.
 **End users (canonical, tag-pinned):**
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.74.1"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.78.0"
 ```
 
 Pin to a specific tag so you control upgrades. Replace the tag with
@@ -1207,13 +1207,27 @@ Quick start:
 
 ```powershell
 agenttalk supervise --init                 # scaffold .agenttalk/supervisor.{json,ps1}
+$pwshPath = (agenttalk supervise --select-pwsh | ConvertFrom-Json).path
 # fill in supervisor.json: per-agent launch command, cwd, cli
 agenttalk supervise --install-activity-hook  # (manual-listen agents) unlock stuck-recovery
 agenttalk supervise --install-activity-hook --interactive-for claude  # human liaison window
-.\.agenttalk\supervisor.ps1                # run the monitor in its own terminal
+& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor.ps1
 agenttalk supervise --bootstrap-check       # verify roster + wrapped Claude/Codex liveness
 agenttalk request-restart --for codex-dev  # bounce an agent on demand (resumes its session)
 ```
+
+The Windows supervisor requires **PowerShell Core 7+**. Stable 7.4+ is
+recommended; stable 7.0-7.3 runs with an end-of-life warning, prereleases warn,
+and Windows PowerShell 5.1 is refused. To use a portable or nonstandard host,
+select it explicitly with `agenttalk supervise --select-pwsh --pwsh
+"C:\absolute\path\pwsh.exe"`; the explicit candidate is validated once and
+never falls back to another installation.
+
+After upgrading agenttalk, stop the claimed supervisor, wait for its process to
+exit, and run `agenttalk supervise --refresh-scripts`. Refresh preserves the
+existing `supervisor.json` byte-for-byte and leaves runtime state alone. The four
+generated files are replaced individually, not as one atomic group; every entry
+point detects a partial/stale set, and rerunning refresh converges.
 
 `--bootstrap-check` is the ready-to-assign preflight. It emits JSON and
 checks that roster names are not just inert identities: an operator-facing
@@ -1313,8 +1327,9 @@ termination rather than graceful SIGTERM handling. This eliminates the
 `taskkill.exe` subprocess path that produced the reported popup. The production
 reporter's desktop-heap exhaustion diagnosis is plausible but is not an
 upstream-confirmed root cause. Windows snapshot and start-time helpers still
-launch PowerShell/CIM subprocesses, PID reuse remains possible after the
-recheck, and the leaf-first snapshot operation is not an atomic tree kill.
+run CIM through the validated selected Core host; selection/TTL/native-identity
+ambiguity returns no snapshot and therefore no kill. PID reuse remains possible
+after the recheck, and the leaf-first snapshot operation is not an atomic tree kill.
 Those limitations are follow-up hardening, not blockers for this narrow fix.
 
 Protected agents — the operator-facing liaison and every active
@@ -1360,7 +1375,7 @@ still has a fresh heartbeat, the operator-facing requester must also pass
 | `agenttalk end --from A [--reason ...]` | Notify the other agent(s) and write the transcript. In a team, sends `end` to every other roster member. |
 | `agenttalk release --from A (--to B \| --to-group G \| --all) [-m reason]` | Signal an agent (or team) to **stand down and exit its listen loop** — distinct from `end`: no transcript export, and the agent may be restarted later. A listener exits ONLY on `kind=release` or `kind=end`; a prose "done for now" never stops it. A single `--to` opens no thread (no `request_id`/`broadcast_id`); `--to-group`/`--all` fan out the same signal (re-run to retry any missed — no `--resume`). Authoritative only from the `operator_facing`/sole-`lead` sender; the command warns otherwise and the listen skill reports-and-ignores an unauthorized release. |
 | `agenttalk reset [--archive]` | Clear **active bus state** (messages + cursors + heartbeats); preserves historical transcripts under `.agenttalk/sessions/` so past exports aren't lost. Bumps `session_id`. With `--archive`, instead moves **everything** (messages + state + sessions) under `.agenttalk/archived/<old_session>/`. Preserves config (roster) either way. |
-| `agenttalk supervise (--init \| --report \| --plan \| --bootstrap-check \| --install-activity-hook \| --clear-restart)` | Thin support for the **external agent supervisor** (24/7 outage auto-restart + stuck-recovery). `--init` scaffolds `.agenttalk/supervisor.{json,ps1}` (a config you fill with per-agent launch commands + a generated PowerShell monitor script; POSIX is a follow-up). `--report`/`--plan` emit the read-only liveness JSON and the **action plan** (the shared decision table the script executes). `--bootstrap-check` emits a JSON ready-to-assign preflight for the roster, operator-facing lead, supervisor config, wrapped Claude/Codex launch invariants, explicit wrapped `--root`, and fresh heartbeats. Heartbeat freshness is the liveness authority: a fresh heartbeat is healthy even when process discovery is missing or misleading; a stale heartbeat becomes `stuck_recover` (best-effort kill + resume) only when the activity hook is installed (`activity_hook=true`), else it is warn-only (`suspect_warn`), never a kill. `--install-activity-hook` merges the identity-neutral `agenttalk heartbeat --hook` PostToolUse hook into the **project** `.claude/settings.json` (`--codex` for `.codex/hooks.json`; never global, never clobbers). Add `--interactive-for <lead>` only for the current operator-facing human Claude liaison; it writes a Claude-only fallback hook and refuses Codex hook modes. Every recovery **resumes the pinned session** so context survives a force-kill. Protected agents (`operator_facing` ∪ every active `role=lead`) are never auto-killed (warn/note). |
+| `agenttalk supervise (--init \| --refresh-scripts \| --select-pwsh \| --repair-instance-marker \| --report \| --plan \| --bootstrap-check \| --install-activity-hook \| --clear-restart)` | Thin support for the **external agent supervisor** (24/7 outage auto-restart + stuck-recovery). `--init` scaffolds the operator config plus four generated Windows artifacts; `--refresh-scripts` regenerates only those artifacts and preserves config/runtime state. `--select-pwsh [--pwsh ABSOLUTE_PATH]` records the validated PowerShell Core 7+ host used by start/task/watchdog boundaries. `--repair-instance-marker --quarantine --acknowledge-no-live-supervisor` is the explicit invalid-marker recovery. `--report`/`--plan` emit the read-only liveness JSON and shared action plan; `--bootstrap-check` verifies the roster, operator-facing lead, supervisor config, wrapped launch invariants, explicit wrapped `--root`, and fresh heartbeats. Heartbeat freshness remains the liveness authority. `--install-activity-hook` merges the identity-neutral project hook; protected agents are never auto-killed. |
 | `agenttalk wrap --for A --cli claude\|codex [--loop] [--no-render] [--from S] [--min-interval N] -- <real-exe> <base-args>` | Run agent `A` through the **progress wrapper** (0.30.0): a per-CLI structured-stream adapter giving **visibility** (echoes the agent's stream — token/thinking deltas for Claude, item-level events for Codex; `--no-render` to silence), a **working-turn heartbeat** (stays fresh while the agent works, not just idles), and **degraded-output detection** (confirmed garble-then-silence can request a self-restart, recorded as `--from`). `--loop` makes it the long-running **supervised** wrapper: it owns the idle bus-wait + heartbeat and drives the CLI **one turn per inbound message**, persisting+reloading the Codex `thread_id`/Claude `session-id` so a relaunch reload-resumes. Each inbound wrapped turn also receives matching accepted lessons as advisory prompt context and records pointer-only exposure telemetry after prompt handoff. The real CLI exe + its base args go after `--`; the wrapper appends the per-turn session/stream args. For durable unattended listening, this is the documented default; manual `/agenttalk.listen` is best-effort for interactive use. |
 | `agenttalk request-restart --for A [--from L] [--reason ...] [--force-protected] [--acknowledge-live-protected-kill]` | Queue a **manual** restart of agent `A`: writes an atomic, request-id-scoped `state/<A>.restart-request` marker the supervisor relaunches (resuming the session) from and clears. Healthy idle agents are eligible for manual restart at the next supervisor poll. Restarting a protected agent requires `--force-protected`; if that protected agent still has a fresh heartbeat, the operator-facing requester must also pass `--acknowledge-live-protected-kill`. |
 | `agenttalk heartbeat [--for A] [--min-interval 5]` | Stamp this agent's **activity heartbeat** (the supervisor's stuck signal). Wire as a Claude PostToolUse / Codex hook so it's stamped at **tool boundaries** (PostToolUse) **plus** the wait-loop heartbeat while idle — so it stays fresh whether the agent is waiting or running tools, and goes stale only when the model is genuinely stuck. Hook identity resolves from `--for`, then `AGENTTALK_SELF`; the installer uses the hook-only fallback form for the operator-facing interactive liaison. Choose `stuck_after_seconds` generously for the longest expected no-tool model/API turn or long-running tool call; production configs may need a larger value than the 120s default. **Throttled** — a no-op if the heartbeat is younger than `--min-interval`, so the per-tool-call hook costs almost nothing. |

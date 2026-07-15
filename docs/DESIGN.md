@@ -292,8 +292,9 @@ two parallel ownership concepts.
   Windows and eliminates the popup-producing `taskkill.exe` subprocess path.
   The production reporter's desktop-heap exhaustion diagnosis is plausible,
   not an upstream-confirmed root cause. Windows snapshot and start-time helpers
-  still launch PowerShell/CIM subprocesses; the recheck-to-kill PID ABA window
-  remains, and leaf-first snapshot termination is not an atomic tree kill.
+  run CIM through the selected Core host and fail open to unavailable/no-kill
+  when selection validation fails; the recheck-to-kill PID ABA window remains,
+  and leaf-first snapshot termination is not an atomic tree kill.
   These are follow-up hardening items, not blockers for the narrow fix.
 - **Managed lead-loop controller (`lead_loop_runtime.py`,
   `lead_loop_cadence.py`):** the split-identity lead can own a durable lease,
@@ -801,13 +802,13 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   table; `codex_config`'s `enable`/`disable` collapse the same way; and both `codex-config
   --status` and `doctor` report a duplicated (invalid-TOML) config instead of presenting it as
   healthy — so a user bitten by the old behavior is healed on the next launch/seed rather than
-  left with un-parseable TOML the codex CLI refuses. Generated `.ps1` files are the
-  deliberate exception — they keep a BOM because the 5.1 script engine needs it to decode a UTF-8
-  script (a BOM-less `.ps1` is read as Windows-1252); `.cmd` shims stay BOM-free because
-  `cmd.exe` fuses a BOM onto `@echo off`. *Ceiling:* this is a robustness invariant, not enforced
-  by a harness that runs PS 5.1; new PS writes / operator-config readers must follow the rule by
-  convention (the incident audit + a generated-`.ps1` content assertion are the backstops).
-  pwsh 7+ remains the recommended host.
+  left with un-parseable TOML the codex CLI refuses. **D-29 supersedes only the generated-script
+  write exception:** generated `.ps1` and `.cmd` artifacts are now BOM-free because their host is
+  PowerShell Core 7+ and Windows PowerShell 5.1 is refused before work. The historical incident
+  evidence and every `utf-8-sig` tolerant reader remain valid defense in depth for legacy,
+  operator-authored, and PowerShell-written files. *Ceiling:* this is a robustness invariant;
+  new PS writes and operator-config readers must still follow the BOM-free-write /
+  BOM-tolerant-read rule.
 - **D-27 Knowledge retrieval is mixed by default, freshness is subject-scoped, and
   curation is causal (2026-07-15).** *Why:* the pointer-only default made accepted
   lessons invisible to normal pull/search/onboard consumers, and a hash of the whole
@@ -863,6 +864,39 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   contract and are not inferred in this release. A launch-barrier observation guards
   supported supervisor polls; an out-of-band state edit is outside that guarantee and
   degrades to unknown or fails closed through the existing marker checks.
+- **D-29 PowerShell Core 7+ is the edition baseline, selected once and revalidated
+  at every Windows supervisor boundary (2026-07-15).** This decision supersedes the
+  rejected pre-build proposal to require 7.4 as a hard floor. The hard gate is exactly
+  `PSEdition == Core && Major >= 7`: stable 7.0-7.3 is accepted with an end-of-life
+  warning, every prerelease warns, and stable 7.4+ is recommended and quiet. Windows
+  PowerShell 5.1 and Core 6 are refused. One stdlib-only authority owns the policy,
+  profile-free structured probe, Program Files discovery, native file identity, and
+  atomic `.agenttalk/powershell-host.json` record. An explicit `--pwsh` or a generated
+  helper's kernel-observed current host is a terminal one-candidate mode; neither falls
+  through. PATH and Scheduled Task action strings are diagnostics/data only and are
+  never auto-executed or probed.
+
+  A generated supervisor claim holds locks in lifecycle -> selection -> config order,
+  retains a query handle to the locator PID, independently checks its image, creation
+  time, native identity, activity, and direct or `agenttalk.cmd -> cmd.exe` ancestry to
+  the Python CLI, then rechecks the current selection before publishing the singleton
+  marker. This prevents accidental wrong-host claims under the existing trusted
+  same-user model; it is not authentication, signer/ACL attestation, or proof of mapped
+  image/DLL bytes, so the in-process `#requires` and edition guard remain mandatory.
+  Selection revisions and fingerprints invalidate the watchdog's process cache; every
+  CIM/start-time use rereads TTL and native identity under the selection lock and fails
+  open to no snapshot/no kill on ambiguity.
+
+  All three generated `.ps1` files and `bin/agenttalk.cmd` carry one deterministic
+  schema/generation marker derived from the fully rendered four-file bundle. Covered
+  entry points compare both marker and exact marker-stripped content; partial per-file
+  replacement is loud and rerunnable, but is deliberately not group-atomic.
+  `--refresh-scripts` and `--init --force` preserve an existing `supervisor.json`
+  byte-for-byte and leave runtime state untouched while excluding every *claimed*
+  supervisor through the lifecycle lock. *Deferred:* a same-selected-Core process that
+  already parsed old script bytes but has not claimed is still a narrow launcher-mutex
+  race; atomic task rebind/multi-binding migration and executable signer/ACL attestation
+  are also outside this release.
 
 ## 6. How we work (process)
 
@@ -890,6 +924,7 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
 | Concern | Module(s) |
 |---|---|
 | Bus, mailbox, cursors, config, locking, validation, authority | `store.py` |
+| PowerShell Core host policy, probing, selection, lifecycle claims | `powershell_host.py`, `supervisor_lifecycle.py` |
 | Threads / who-owes-whom | `threads.py` |
 | Terminal display / transcripts | `display.py`, `transcript.py` |
 | Atomic writes | `_atomic.py` |

@@ -17,6 +17,28 @@ be labeled `SHIPPED` once the changelog closes them.
 
 ---
 
+## P2 · KNOWN LIMITATION — PowerShell artifact launch/refresh residuals (2026-07-15)
+
+**What.** v0.78.0 validates the selected PowerShell Core host at claim time and
+stamps/validates the complete four-file generated set on disk. Replacement is
+deliberately one `os.replace` per file, so the set is not group-atomic; a crash can
+leave mixed generations. The markers and exact-content checks make that state loud,
+and rerunning `agenttalk supervise --refresh-scripts` converges.
+
+There is still one narrower race: a same-selected-Core process may have parsed old
+script bytes before refresh, but not yet reached its singleton claim. The lifecycle
+lock excludes every *claimed* supervisor and the claim revalidates the live host, but
+it cannot revoke bytes already parsed in that pre-claim window. A launcher-level mutex
+or equivalent in-memory generation proof is required to close it.
+
+**Disposition.** `KNOWN LIMITATION` for v0.78.0. Do not describe refresh as fully
+quiescent or the artifacts as group-atomic. Atomic Scheduled Task rebind/multi-binding
+migration and executable signer/ACL attestation are also deferred; the supported task
+host-change workflow remains stop -> wait -> uninstall -> select -> refresh/install ->
+start.
+
+---
+
 ## P1 · SHIPPED — loud coordination-stall warnings (2026-07-15)
 
 **What.** Agents could stall silently: one agent idle-waiting on a reply from a peer that is
@@ -192,6 +214,13 @@ the "all CLIs crashed" symptom itself was a Windows Terminal segfault, **not** a
 
 **Disposition.** `SHIPPED v0.75.3` (reviewed-SHA `5caa001`, both reviewers APPROVED on the
 final SHA after 3 cross-family fold rounds; lead-gated 3.10+3.14 + PS-5.1 parse/functional).
+
+**v0.78.0 closure addendum (2026-07-15).** The generated Windows supervisor now has a
+PowerShell Core 7+ edition gate and refuses Windows PowerShell 5.1. The three generated
+`.ps1` files and the `.cmd` shim are therefore written BOM-free. This supersedes only
+D-26's former generated-`.ps1` BOM exception: the original 5.1 incident evidence remains
+the reason every legacy/operator/PowerShell-written input reader stays `utf-8-sig`
+tolerant, and those defenses were not removed.
 
 ---
 

@@ -52,6 +52,8 @@ from agenttalk import onboarding as ob
 from agenttalk import signing as _signing
 from agenttalk import threads as th
 from agenttalk import supervisor as sup
+from agenttalk import powershell_host as psh
+from agenttalk import supervisor_lifecycle as supervisor_lifecycle
 
 # Hard ceiling on cumulative deadline extension from `composing` pings,
 # regardless of how many arrive. Prevents a misbehaving (or stuck) peer
@@ -580,6 +582,23 @@ def _gather_status(store: Store) -> dict:
         "stale_threshold_seconds": STALE_THRESHOLD_SECONDS,
         "warnings": warnings,
     }
+    if os.name == "nt" and (
+        (store.dir / psh.SELECTION_FILENAME).exists()
+        or (store.dir / "supervisor.ps1").exists()
+    ):
+        try:
+            host = supervisor_lifecycle.read_selected_host(store)
+            payload["powershell_host"] = {
+                **psh.selection_public_view(host),
+                "status": "warn" if host.get("_warning") else "ok",
+                "warning": host.get("_warning"),
+                "age_seconds": host.get("_age_seconds"),
+            }
+        except (OSError, supervisor_lifecycle.SupervisorLifecycleError) as exc:
+            payload["powershell_host"] = {
+                "status": "error",
+                "warning": str(exc),
+            }
     if coordination_items:
         payload["coordination_stalls"] = coordination_items
     if quarantined:
@@ -1132,6 +1151,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"session_id: {payload['session_id']}")
     print(f"agents:     {', '.join(a['name'] for a in payload['agents'])}")
     print(f"messages:   {payload['message_count']}")
+    if "powershell_host" in payload:
+        host = payload["powershell_host"]
+        print(
+            "powershell: "
+            f"{host.get('status', 'unknown').upper()} "
+            f"{host.get('path', 'unavailable')}"
+        )
+        if host.get("warning"):
+            print(f"  warning:  {host['warning']}")
     if payload["signing_enforced"]:
         hk = payload.get("hmac_key") or {}
         status_label = "OK" if hk.get("exists") and hk.get("readable") and not hk.get("mode_warning") else "PROBLEM"
@@ -8597,14 +8625,33 @@ def cmd_start(args: argparse.Namespace) -> int:
         if rc != 0:
             return rc
     supervisor_present = (store.dir / "supervisor.ps1").exists()
+    would_start_supervisor = bool(
+        supervisor_present and not args.no_supervisor and os.name == "nt"
+    )
     if args.dry_run:
         print(json.dumps({
             "root": str(root), "initialized": store.initialized(),
             "actions_enabled": bool(args.enable_actions),
             "supervisor_present": supervisor_present,
-            "would_start_supervisor": bool(supervisor_present and not args.no_supervisor),
+            "would_start_supervisor": would_start_supervisor,
         }, indent=2))
         return 0
+    selected_host = None
+    if would_start_supervisor:
+        try:
+            if args.pwsh:
+                supervisor_lifecycle.select_powershell_host(
+                    store, explicit_path=args.pwsh,
+                )
+            sup.validate_artifact_bundle(store, boundary="full")
+            selected_host = supervisor_lifecycle.read_selected_host(store)
+        except (OSError, sup.ArtifactValidationError,
+                supervisor_lifecycle.SupervisorLifecycleError) as e:
+            sys.stderr.write(f"agenttalk start: {e}\n")
+            return 3
+        warning = selected_host.get("_warning")
+        if warning:
+            sys.stderr.write(f"agenttalk start: WARN: {warning}\n")
     try:
         srv = _web.make_server(
             store, args.host, args.port, quiet=args.quiet,
@@ -8619,17 +8666,20 @@ def cmd_start(args: argparse.Namespace) -> int:
     actual_port = srv.server_address[1]
     url = _web._format_url(args.host, actual_port)
     proc = None
-    if supervisor_present and not args.no_supervisor:
+    if would_start_supervisor:
         try:
-            proc = subprocess.Popen(  # noqa: S603  # nosec B603 B607
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                 "-File", str(store.dir / "supervisor.ps1")],
-                cwd=str(store.dir),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError as e:
-            sys.stderr.write(f"agenttalk start: supervisor.ps1 launch skipped ({e})\n")
+            with supervisor_lifecycle.selected_host_for_spawn(store) as launch_host:
+                proc = subprocess.Popen(  # noqa: S603  # nosec B603
+                    [str(launch_host["path"]), "-NoLogo", "-NoProfile",
+                     "-NonInteractive", "-File", str(store.dir / "supervisor.ps1")],
+                    cwd=str(store.dir),
+                    stdout=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+        except (OSError, supervisor_lifecycle.SupervisorLifecycleError) as e:
+            srv.server_close()
+            sys.stderr.write(f"agenttalk start: supervisor.ps1 launch failed ({e})\n")
+            return 3
     if not args.no_browser:
         webbrowser.open(url)
     sys.stderr.write(f"agenttalk: serving team console at {url}\n")
@@ -10391,8 +10441,13 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         "prepare_launch_request",
         "record_ephemeral_launch",
         "record_launch",
+        "refresh_scripts",
         "seed_claude_settings",
         "seed_codex_config",
+        "select_pwsh",
+        "prepare_task_install",
+        "commit_task_install",
+        "validate_task_start",
     )
     if (
         any(bool(getattr(args, name, False)) for name in supervisor_mutations)
@@ -10404,7 +10459,12 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         )
         return 3
     if args.init:
-        res = sup.init(store, force=args.force)
+        try:
+            res = sup.init(store, force=args.force)
+        except (OSError, sup.ArtifactValidationError,
+                supervisor_lifecycle.SupervisorLifecycleError) as e:
+            sys.stderr.write(f"agenttalk supervise --init: {e}\n")
+            return 3
         for path, status in res.items():
             print(f"  {status}: {path}")
         wrote = [p for p, s in res.items() if s == "written"]
@@ -10413,8 +10473,9 @@ def cmd_supervise(args: argparse.Namespace) -> int:
                   "regenerate).")
         else:
             print("supervise --init: fill in each agent's launch command in "
-                  "supervisor.json, then run supervisor.ps1 in its own window. "
-                  "(v1 ships the PowerShell supervisor; a POSIX bash supervisor "
+                  "supervisor.json, run `agenttalk supervise --select-pwsh`, "
+                  "then launch supervisor.ps1 with the returned absolute host. "
+                  "(PowerShell Core 7+ is required; a POSIX bash supervisor "
                   "is a follow-up — the Python core is already cross-platform.)")
         print("\nActivity hook (UNLOCKS stuck-recovery — set activity_hook=true "
               "per agent after installing it):\n"
@@ -10422,6 +10483,136 @@ def cmd_supervise(args: argparse.Namespace) -> int:
               ".claude/settings.json (add --codex for .codex/hooks.json)\n"
               "Or paste this PostToolUse hook into your project .claude/settings.json:\n"
               f"{sup.claude_hook_snippet()}")
+        return 0
+    if args.refresh_scripts:
+        try:
+            if args.pwsh:
+                supervisor_lifecycle.select_powershell_host(
+                    store, explicit_path=args.pwsh,
+                )
+            res = sup.refresh_artifacts(store)
+            sup.validate_artifact_bundle(store)
+        except (OSError, sup.ArtifactValidationError,
+                supervisor_lifecycle.SupervisorLifecycleError) as e:
+            sys.stderr.write(f"agenttalk supervise --refresh-scripts: {e}\n")
+            return 3
+        for path, status in res.items():
+            print(f"  {status}: {path}")
+        return 0
+    if args.select_pwsh:
+        try:
+            record, attempts = supervisor_lifecycle.select_powershell_host(
+                store, explicit_path=args.pwsh,
+            )
+        except (OSError, supervisor_lifecycle.SupervisorLifecycleError) as e:
+            sys.stderr.write(f"agenttalk supervise --select-pwsh: {e}\n")
+            return 3
+        payload = dict(record)
+        payload["attempts"] = [attempt.to_dict() for attempt in attempts]
+        print(json.dumps(payload, indent=2))
+        if payload.get("version"):
+            version = psh.PowerShellVersion(**payload["version"])
+            warning = psh.host_warning(payload.get("edition"), version)
+            if warning:
+                sys.stderr.write(f"agenttalk supervise --select-pwsh: WARN: {warning}\n")
+        return 0
+    if args.repair_instance_marker:
+        if not args.quarantine or not args.acknowledge_no_live_supervisor:
+            sys.stderr.write(
+                "agenttalk supervise --repair-instance-marker requires "
+                "--quarantine --acknowledge-no-live-supervisor\n"
+            )
+            return 2
+        try:
+            path = supervisor_lifecycle.repair_invalid_instance_marker(store)
+        except (OSError, ValueError) as e:
+            sys.stderr.write(f"agenttalk supervise --repair-instance-marker: {e}\n")
+            return 3
+        print("no instance marker present" if path is None else f"quarantined: {path}")
+        return 0
+    if args.validate_current_pwsh:
+        try:
+            sup.validate_artifact_bundle(store, boundary=args.artifact_boundary)
+            record = supervisor_lifecycle.validate_current_powershell(
+                store,
+                pid=args.pid if args.pid is not None else os.getpid(),
+                pid_start=args.pid_start,
+            )
+        except (OSError, sup.ArtifactValidationError,
+                supervisor_lifecycle.SupervisorLifecycleError) as e:
+            sys.stderr.write(f"agenttalk supervise --validate-current-pwsh: {e}\n")
+            return 3
+        print(json.dumps(psh.selection_public_view(record), separators=(",", ":")))
+        return 0
+    if args.prepare_task_install:
+        try:
+            payload = supervisor_lifecycle.prepare_task_install(
+                store,
+                pid=args.pid if args.pid is not None else os.getpid(),
+                pid_start=args.pid_start,
+                validate_artifacts=lambda: sup.validate_artifact_bundle(
+                    store, boundary="task"
+                ),
+            )
+        except (OSError, sup.ArtifactValidationError,
+                supervisor_lifecycle.SupervisorLifecycleError) as e:
+            sys.stderr.write(f"agenttalk supervise --prepare-task-install: {e}\n")
+            return 3
+        print(json.dumps(payload, separators=(",", ":")))
+        return 0
+    if args.commit_task_install:
+        try:
+            payload = supervisor_lifecycle.commit_task_install(
+                store,
+                pid=args.pid if args.pid is not None else os.getpid(),
+                pid_start=args.pid_start,
+                task_name=args.task_name or "agenttalk-supervisor",
+                expected_revision=args.selection_revision,
+                expected_fingerprint=args.selection_fingerprint or "",
+                validate_artifacts=lambda: sup.validate_artifact_bundle(
+                    store, boundary="task"
+                ),
+            )
+        except (OSError, sup.ArtifactValidationError,
+                supervisor_lifecycle.SupervisorLifecycleError) as e:
+            sys.stderr.write(f"agenttalk supervise --commit-task-install: {e}\n")
+            return 3
+        print(json.dumps(payload, separators=(",", ":")))
+        return 0
+    if args.validate_task_start:
+        try:
+            sup.validate_artifact_bundle(store, boundary="task")
+            record = supervisor_lifecycle.validate_current_powershell(
+                store,
+                pid=args.pid if args.pid is not None else os.getpid(),
+                pid_start=args.pid_start,
+            )
+            expected = sup.expected_task_action(store)
+            mismatches = []
+            if os.path.normcase(os.path.normpath(args.task_execute or "")) != os.path.normcase(
+                os.path.normpath(str(record["path"]))
+            ):
+                mismatches.append("Execute")
+            if (args.task_arguments or "") != expected["arguments"]:
+                mismatches.append("Arguments")
+            if os.path.normcase(os.path.normpath(args.task_working_directory or "")) != os.path.normcase(
+                os.path.normpath(expected["working_directory"])
+            ):
+                mismatches.append("WorkingDirectory")
+            if record.get("task_name") != (args.task_name or "agenttalk-supervisor"):
+                mismatches.append("TaskName")
+            if mismatches:
+                raise supervisor_lifecycle.SupervisorLifecycleError(
+                    "registered task mismatch: " + ", ".join(mismatches)
+                    + "; " + sup.task_recovery_remediation(
+                        store, str(record["path"]), args.task_name or "agenttalk-supervisor"
+                    )
+                )
+        except (OSError, sup.ArtifactValidationError,
+                supervisor_lifecycle.SupervisorLifecycleError) as e:
+            sys.stderr.write(f"agenttalk supervise --validate-task-start: {e}\n")
+            return 3
+        print("task action matches selected PowerShell host and checkout")
         return 0
     if args.install_activity_hook:
         interactive_for = getattr(args, "interactive_for", None)
@@ -10486,7 +10677,19 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         return 0
     if args.claim_instance:
         pid = args.pid if args.pid is not None else os.getpid()
-        rec = store.claim_supervisor_instance(pid=pid, pid_start=args.pid_start)
+        try:
+            rec = supervisor_lifecycle.claim_powershell_supervisor(
+                store,
+                pid=pid,
+                pid_start=args.pid_start,
+                validate_artifacts=lambda: sup.validate_artifact_bundle(
+                    store, boundary="supervisor"
+                ),
+            )
+        except (OSError, sup.ArtifactValidationError,
+                supervisor_lifecycle.SupervisorLifecycleError) as e:
+            sys.stderr.write(f"agenttalk supervise --claim-instance: {e}\n")
+            return 3
         if rec is None:
             sys.stderr.write("agenttalk supervise --claim-instance: another live supervisor instance owns this root\n")
             return 3
@@ -12245,6 +12448,13 @@ def build_parser() -> argparse.ArgumentParser:
     gsup = psup.add_mutually_exclusive_group(required=True)
     gsup.add_argument("--init", action="store_true",
                       help="Scaffold supervisor.json + PowerShell supervisor helpers.")
+    gsup.add_argument("--refresh-scripts", dest="refresh_scripts", action="store_true",
+                      help="Refresh generated PowerShell helpers and shim; preserve config/state.")
+    gsup.add_argument("--select-pwsh", dest="select_pwsh", action="store_true",
+                      help="Select and probe PowerShell Core 7+ for this project.")
+    gsup.add_argument("--repair-instance-marker", dest="repair_instance_marker",
+                      action="store_true",
+                      help="Explicitly recover an invalid singleton marker.")
     gsup.add_argument("--report", action="store_true",
                       help="Emit the read-only per-agent liveness snapshot (JSON).")
     gsup.add_argument("--bootstrap-check", dest="bootstrap_check", action="store_true",
@@ -12283,6 +12493,14 @@ def build_parser() -> argparse.ArgumentParser:
                            "<--dir>/.claude/settings.json (the Claude unattended seed).")
     gsup.add_argument("--claim-instance", dest="claim_instance", action="store_true",
                       help="(script use) Claim the singleton supervisor instance lock.")
+    gsup.add_argument("--validate-current-pwsh", dest="validate_current_pwsh",
+                      action="store_true", help=argparse.SUPPRESS)
+    gsup.add_argument("--prepare-task-install", dest="prepare_task_install",
+                      action="store_true", help=argparse.SUPPRESS)
+    gsup.add_argument("--commit-task-install", dest="commit_task_install",
+                      action="store_true", help=argparse.SUPPRESS)
+    gsup.add_argument("--validate-task-start", dest="validate_task_start",
+                      action="store_true", help=argparse.SUPPRESS)
     gsup.add_argument("--release-instance", dest="release_instance", action="store_true",
                       help="(script use) Release the singleton supervisor instance lock.")
     gsup.add_argument("--drain-intents", dest="drain_intents", action="store_true",
@@ -12303,6 +12521,25 @@ def build_parser() -> argparse.ArgumentParser:
     psup.add_argument("--pid-start", dest="pid_start", default=None,
                       help="(--record-launch) the launcher process start-time "
                            "(anti-pid-reuse guard).")
+    psup.add_argument("--pwsh",
+                      help="Absolute pwsh.exe path (terminal explicit selection; no fallback).")
+    psup.add_argument("--artifact-boundary", dest="artifact_boundary",
+                      choices=sorted(sup.ARTIFACT_BOUNDARIES), default="full",
+                      help=argparse.SUPPRESS)
+    psup.add_argument("--task-name", dest="task_name", help=argparse.SUPPRESS)
+    psup.add_argument("--selection-revision", dest="selection_revision", type=int,
+                      default=0, help=argparse.SUPPRESS)
+    psup.add_argument("--selection-fingerprint", dest="selection_fingerprint",
+                      help=argparse.SUPPRESS)
+    psup.add_argument("--task-execute", dest="task_execute", help=argparse.SUPPRESS)
+    psup.add_argument("--task-arguments", dest="task_arguments", help=argparse.SUPPRESS)
+    psup.add_argument("--task-working-directory", dest="task_working_directory",
+                      help=argparse.SUPPRESS)
+    psup.add_argument("--quarantine", action="store_true",
+                      help="(--repair-instance-marker) move the invalid marker aside.")
+    psup.add_argument("--acknowledge-no-live-supervisor",
+                      dest="acknowledge_no_live_supervisor", action="store_true",
+                      help="(--repair-instance-marker) acknowledge no supervisor is live.")
     psup.add_argument("--instance-token", dest="instance_token",
                       help="(--release-instance/--drain-intents) supervisor instance token.")
     psup.add_argument("--max-per-tick", dest="max_per_tick", type=int, default=25,
@@ -12350,7 +12587,11 @@ def build_parser() -> argparse.ArgumentParser:
     psup.add_argument("--interactive-for", dest="interactive_for",
                       help="(--install-activity-hook) install a Claude hook "
                            "bound to the operator-facing liaison identity.")
-    psup.add_argument("--force", action="store_true", help="(--init) overwrite existing files.")
+    psup.add_argument(
+        "--force",
+        action="store_true",
+        help="(--init) refresh generated scripts/shim; preserve config and runtime state.",
+    )
     psup.add_argument("--now", type=float, default=None,
                       help="Override 'now' (epoch seconds) for report/plan — test hook.")
     psup.add_argument("--report-file", dest="report_file",
@@ -12461,6 +12702,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Do not open the browser after the server starts.")
     pst.add_argument("--no-supervisor", action="store_true",
                      help="Do not start an existing supervisor.ps1 scaffold.")
+    pst.add_argument("--pwsh",
+                     help="Absolute pwsh.exe path to select before starting the supervisor.")
     pst.add_argument("--dry-run", action="store_true",
                      help="Validate the bootstrap decision and print JSON without starting processes.")
     pst.add_argument("--quiet", action="store_true", default=True,

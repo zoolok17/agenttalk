@@ -10,6 +10,7 @@ invariant (cursor unchanged + message pending + one ambiguous attempt after a wa
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,110 @@ def _snap(*procs) -> dict:
     """procs = (pid, ppid, name, create_epoch) tuples -> snapshot dict."""
     return {pid: {"ppid": ppid, "name": name, "create_epoch": ce}
             for (pid, ppid, name, ce) in procs}
+
+
+class _WatchdogSelectionStore:
+    def __init__(self, root: Path):
+        self.root = root
+
+    def _powershell_selection_lock(self):
+        return contextlib.nullcontext()
+
+
+def _watchdog_selection(path: str, revision: int, fingerprint: str) -> dict:
+    return {
+        "path": path,
+        "selection_revision": revision,
+        "selection_fingerprint": fingerprint,
+    }
+
+
+def test_watchdog_cache_uses_new_selection_or_unavailable_never_cached_a(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENTTALK_ROOT", str(tmp_path))
+    monkeypatch.setattr(twd, "Store", _WatchdogSelectionStore)
+    twd._PWSH_CACHE = None
+    spawned: list[str] = []
+    monkeypatch.setattr(
+        twd,
+        "_run",
+        lambda argv, timeout, env=None: spawned.append(argv[0]) or "ok",
+    )
+    a = _watchdog_selection(r"C:\PowerShellA\pwsh.exe", 1, "a" * 64)
+    b = _watchdog_selection(r"D:\PowerShellB\pwsh.exe", 2, "b" * 64)
+    reads = iter((a, a, b, b))
+    monkeypatch.setattr(
+        twd.supervisor_lifecycle,
+        "read_selected_host_locked",
+        lambda store: next(reads),
+    )
+
+    assert twd._run_selected_pwsh("one", 1.0) == "ok"
+    assert twd._run_selected_pwsh("two", 1.0) == "ok"
+    assert spawned == [a["path"], b["path"]]
+    assert twd._PWSH_CACHE["key"][1:] == (2, "b" * 64)
+
+
+def test_watchdog_selection_change_during_final_recheck_fails_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENTTALK_ROOT", str(tmp_path))
+    monkeypatch.setattr(twd, "Store", _WatchdogSelectionStore)
+    twd._PWSH_CACHE = None
+    spawned: list[str] = []
+    monkeypatch.setattr(
+        twd,
+        "_run",
+        lambda argv, timeout, env=None: spawned.append(argv[0]) or "unexpected",
+    )
+    b = _watchdog_selection(r"D:\PowerShellB\pwsh.exe", 2, "b" * 64)
+    c = _watchdog_selection(r"E:\PowerShellC\pwsh.exe", 3, "c" * 64)
+    reads = iter((b, c))
+    monkeypatch.setattr(
+        twd.supervisor_lifecycle,
+        "read_selected_host_locked",
+        lambda store: next(reads),
+    )
+
+    assert twd._run_selected_pwsh("probe", 1.0) is None
+    assert spawned == []
+    assert twd._PWSH_CACHE is None
+
+
+@pytest.mark.parametrize("reason", ["unreadable", "future", "expired", "identity changed"])
+def test_watchdog_selection_validation_error_fails_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+) -> None:
+    monkeypatch.setenv("AGENTTALK_ROOT", str(tmp_path))
+    monkeypatch.setattr(twd, "Store", _WatchdogSelectionStore)
+    twd._PWSH_CACHE = {"key": ("old", 1, "a" * 64), "path": "A"}
+    monkeypatch.setattr(
+        twd.supervisor_lifecycle,
+        "read_selected_host_locked",
+        lambda store: (_ for _ in ()).throw(
+            twd.supervisor_lifecycle.SupervisorLifecycleError(reason)
+        ),
+    )
+    monkeypatch.setattr(
+        twd,
+        "_run",
+        lambda *args, **kwargs: pytest.fail("an invalid selection must never execute"),
+    )
+    assert twd._run_selected_pwsh("probe", 1.0) is None
+    assert twd._PWSH_CACHE is None
+
+
+def test_windows_proc_start_selection_failure_is_no_kill_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(twd.sys, "platform", "win32")
+    monkeypatch.setattr(twd, "_run_selected_pwsh", lambda command, timeout: None)
+    assert twd.proc_start(1234) is None
 
 
 # ----------------------------------------------------------- pure discriminator matrix

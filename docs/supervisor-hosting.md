@@ -10,20 +10,72 @@ Audience: operators running an agenttalk team on Windows.
 - `deadman.ps1`: a content-blind mail-age SLO check wrapper.
 - `bin/agenttalk.cmd`: a project-local shim that runs the pinned Python.
 
+## PowerShell host
+
+The generated Windows supervisor requires **PowerShell Core 7+**. Stable 7.4+
+is recommended and quiet. Stable 7.0-7.3 runs with an end-of-life warning;
+every prerelease warns; Windows PowerShell 5.1 and Core 6 are refused.
+
+Select the host once per project. Automatic selection probes only canonical
+PowerShell 7 locations under native Program Files roots:
+
+```powershell
+$pwshPath = (agenttalk supervise --select-pwsh | ConvertFrom-Json).path
+```
+
+To use a portable or nonstandard installation, provide its absolute executable
+path. An explicit candidate is terminal: if it fails validation, the command
+fails instead of falling through to Program Files.
+
+```powershell
+$pwshPath = (agenttalk supervise --select-pwsh --pwsh 'D:\Tools\PowerShell\pwsh.exe' |
+  ConvertFrom-Json).path
+```
+
+The selection records the canonical path, Core version, probe time, native file
+identity, revision, and fingerprint in `.agenttalk/powershell-host.json`. PATH
+entries and registered task actions are diagnostics/data only; agenttalk never
+auto-executes either to establish trust. This is an anti-accident consistency
+control under the same-user model, not signer, ACL, mapped-image, or DLL-tree
+attestation.
+
+For a direct foreground host, launch the generated script through the selected
+absolute path:
+
+```powershell
+& $pwshPath -NoLogo -NoProfile -NonInteractive `
+  -File .\.agenttalk\supervisor.ps1
+```
+
 ## Scheduled Task
 
 The supported durable host is a current-user Scheduled Task. It starts at logon,
-runs from the project root, and launches:
+runs from the project root, and freezes the selected absolute Core host in its
+single action. Run the helper under that same host:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File <root>\.agenttalk\supervisor.ps1 -Quiet
+& $pwshPath -NoLogo -NoProfile -NonInteractive `
+  -File .\.agenttalk\supervisor-task.ps1 -Action install
+& $pwshPath -NoLogo -NoProfile -NonInteractive `
+  -File .\.agenttalk\supervisor-task.ps1 -Action status
 ```
 
-Install and inspect it from the checkout:
+Task `start` compares the registered action to the selected path and this
+checkout without executing the action path. `status`, `stop`, and `uninstall`
+remain usable for recovery when a task binding or generated artifact set is
+stale. A custom `-TaskName` is persisted in the selection record.
+
+To change the task host, use the deliberate migration sequence. Replace the
+example path and task name as needed:
 
 ```powershell
-.\.agenttalk\supervisor-task.ps1 -Action install
-.\.agenttalk\supervisor-task.ps1 -Action status
+& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action stop -TaskName 'agenttalk-supervisor'
+# Wait until status is not Running and the old supervisor process has exited.
+& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action uninstall -TaskName 'agenttalk-supervisor'
+$pwshPath = (agenttalk supervise --select-pwsh --pwsh 'D:\Tools\PowerShell\pwsh.exe' | ConvertFrom-Json).path
+agenttalk supervise --refresh-scripts
+& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action install -TaskName 'agenttalk-supervisor'
+& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action start -TaskName 'agenttalk-supervisor'
 ```
 
 The generated task helper sets `StartWhenAvailable`, `MultipleInstances
@@ -55,7 +107,8 @@ passed.
 The generated wrapper is:
 
 ```powershell
-.\.agenttalk\deadman.ps1 -ThresholdSeconds 900 -Json
+& $pwshPath -NoLogo -NoProfile -NonInteractive `
+  -File .\.agenttalk\deadman.ps1 -ThresholdSeconds 900 -Json
 ```
 
 ## State Recovery and Freshness
@@ -75,11 +128,24 @@ only the marker generation it created.
 
 Every JSON/TOML artifact the generated PowerShell writes (state, snapshots, and the
 per-agent codex `config.toml` seed) is written **BOM-free** (UTF-8 without a byte-order
-mark), and the Python/PowerShell readers use BOM-tolerant decoding, so the host works
-under both PowerShell 7+ and Windows PowerShell 5.1. (Under 5.1, `Set-Content -Encoding
-utf8` would emit a BOM that a strict UTF-8 reader rejects — the templates deliberately
-avoid it. The generated `.ps1` files themselves keep a BOM on purpose: the 5.1 script
-engine needs it to decode a UTF-8 script correctly.)
+mark), and readers of legacy/operator/PowerShell-written inputs remain BOM-tolerant.
+The three generated `.ps1` files and `bin/agenttalk.cmd` are also BOM-free now that
+Windows PowerShell 5.1 is unsupported. This supersedes only D-26's former generated
+script exception; its incident evidence and tolerant-reader defense remain in force.
+
+All four generated artifacts carry the same deterministic schema/generation marker
+and are checked against their exact current rendered content. Refresh stages and
+replaces each file separately, so it is not group-atomic. A partial set is detected
+loudly and rerunning this command converges without rewriting `supervisor.json` or
+runtime state:
+
+```powershell
+agenttalk supervise --refresh-scripts
+```
+
+Refresh excludes a claimed supervisor through the lifecycle lock. It does not prove
+that a same-selected-Core process has not already parsed old bytes before claiming;
+that narrow launcher-mutex race remains a documented limitation.
 
 ## Windows Watchdog Residuals
 
@@ -88,8 +154,9 @@ The wrapped-turn watchdog no longer starts `taskkill.exe`. It calls
 implements that as abrupt process termination. This eliminates the
 popup-producing `taskkill.exe` subprocess path. The production reporter's
 desktop-heap exhaustion diagnosis is plausible but is not an upstream-confirmed
-root cause. Windows snapshot and start-time helpers still launch PowerShell/CIM
-subprocesses; PID reuse remains possible after the separate recheck, and the
+root cause. Windows snapshot and start-time helpers launch CIM through the current
+validated selected Core host; selection, TTL, or native-identity ambiguity returns no
+snapshot and therefore no kill. PID reuse remains possible after the separate recheck, and the
 leaf-first snapshot operation is not an atomic tree kill. These are follow-up
 hardening items, not blockers for this narrow fix. Size service recovery
 thresholds with those residuals in mind.
@@ -118,8 +185,9 @@ command) when the host layer is unavailable. Keep working manually, then remove
 ## Windows Service Caveats
 
 A Windows Service can be useful for a headless host, but it is an advanced
-deployment. Prefer a wrapper such as WinSW or NSSM and point it at the generated
-PowerShell command with explicit absolute paths and working directory.
+deployment. Prefer a wrapper such as WinSW or NSSM and point it at the selected
+absolute `pwsh.exe` plus the generated script, with explicit paths and working
+directory.
 
 Service hosting runs in session 0 and may not have the same user profile,
 credentials, PATH, desktop interaction, or token behavior as the interactive

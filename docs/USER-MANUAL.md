@@ -59,7 +59,7 @@ decisions are what make a GO credible.
 Install once per machine. Pin the version in repeatable setups.
 
 ```powershell
-python -m pip install git+https://github.com/zoolok17/agenttalk.git@v0.74.1
+python -m pip install git+https://github.com/zoolok17/agenttalk.git@v0.78.0
 agenttalk --version
 agenttalk --help
 agenttalk install-skills
@@ -472,6 +472,22 @@ This writes `.agenttalk/supervisor.json`, `.agenttalk/supervisor.ps1`,
 `.agenttalk/supervisor-task.ps1`, `.agenttalk/deadman.ps1`, and
 `.agenttalk/bin/agenttalk.cmd`.
 
+The Windows scripts require PowerShell Core 7+. Stable 7.4+ is recommended;
+stable 7.0-7.3 and prereleases run with warnings, while Windows PowerShell 5.1
+is refused. Select the host once, then run the monitor through the returned
+absolute path:
+
+```powershell
+$pwshPath = (agenttalk supervise --select-pwsh | ConvertFrom-Json).path
+& $pwshPath -NoLogo -NoProfile -NonInteractive `
+  -File .\.agenttalk\supervisor.ps1
+```
+
+Use `--select-pwsh --pwsh 'C:\absolute\path\pwsh.exe'` for a nonstandard
+installation. That explicit candidate is terminal and never falls through to
+another installation. Selection and native file identity are same-user
+consistency controls, not executable signer/ACL attestation.
+
 Read what the supervisor sees:
 
 ```powershell
@@ -487,18 +503,31 @@ placeholders, and fresh heartbeats. A roster identity with no supervisor entry
 and no fresh heartbeat is only a name, not an executing teammate; supervise it,
 retire it, or deliberately ignore it before assigning work.
 
-Run the monitor in a dedicated terminal on Windows:
-
-```powershell
-.\.agenttalk\supervisor.ps1
-```
-
 For durable hosting, use the generated Scheduled Task helper:
 
 ```powershell
-.\.agenttalk\supervisor-task.ps1 -Action install
-.\.agenttalk\supervisor-task.ps1 -Action status
+& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action install
+& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action status
 ```
+
+The task freezes the selected absolute host. To change it, stop, wait for the
+task and old supervisor process to exit, uninstall, select the new host, run
+`agenttalk supervise --refresh-scripts`, then install and start. Task action
+paths are compared as data and are never executed to discover or probe a host.
+
+After an agenttalk upgrade, stop and wait for the claimed supervisor to exit,
+then refresh the four generated files:
+
+```powershell
+agenttalk supervise --refresh-scripts
+```
+
+Refresh preserves an existing `supervisor.json` byte-for-byte and leaves
+runtime state unchanged. The four replacements are individually atomic, not
+group-atomic; stale/mixed sets are detected and a rerun converges. An invalid
+singleton marker is recovered only with the explicit
+`supervise --repair-instance-marker --quarantine
+--acknowledge-no-live-supervisor` acknowledgement.
 
 Heartbeat freshness is the liveness authority. A fresh heartbeat means healthy.
 A stale heartbeat can recover only when the agent is instrumented by the
@@ -544,9 +573,10 @@ On Windows, the turn watchdog terminates a verified target with
 that call to abrupt termination, not graceful signal handling. This eliminates
 the popup-producing `taskkill.exe` subprocess path. The production reporter's
 desktop-heap exhaustion diagnosis is plausible, not an upstream-confirmed root
-cause. Windows snapshot and start-time helpers still launch PowerShell/CIM
-subprocesses; PID reuse remains possible after the recheck, and snapshot-based
-leaf-first termination is not an atomic tree kill. Treat those limits as
+cause. Windows snapshot and start-time helpers launch CIM through the selected
+absolute Core host; a missing, changed, expired, or unreadable selection yields
+no snapshot and therefore no kill. PID reuse remains possible after the
+recheck, and snapshot-based leaf-first termination is not an atomic tree kill. Treat those limits as
 follow-up hardening, not blockers for this narrow fix.
 
 In supervisor config, wrapped agents use Python as `windows_file`; the real CLI

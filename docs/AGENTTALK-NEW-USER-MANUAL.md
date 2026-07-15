@@ -504,11 +504,20 @@ deadman.ps1
 bin/agenttalk.cmd
 ```
 
-Run the monitor in a dedicated terminal:
+The scripts require PowerShell Core 7+. Stable 7.4+ is recommended; stable
+7.0-7.3 and prereleases warn, while Windows PowerShell 5.1 is refused. Select
+the host and run the monitor through the returned absolute path:
 
 ```powershell
-.\.agenttalk\supervisor.ps1
+$pwshPath = (agenttalk supervise --select-pwsh | ConvertFrom-Json).path
+& $pwshPath -NoLogo -NoProfile -NonInteractive `
+  -File .\.agenttalk\supervisor.ps1
 ```
+
+After an upgrade, stop the supervisor, wait for its process to exit, and run
+`agenttalk supervise --refresh-scripts`. Refresh preserves `supervisor.json`
+byte-for-byte and does not touch runtime state. A partial four-file replacement
+is detectable and safely rerunnable; the set is not group-atomic.
 
 Recommended wrapped launch shape:
 
@@ -549,7 +558,8 @@ Persistence and teardown are fail-closed:
   `taskkill.exe`. The kill is abrupt and eliminates that popup-producing
   subprocess path. The production reporter's desktop-heap diagnosis is
   plausible, not upstream-confirmed. Windows snapshot and start-time helpers
-  still launch PowerShell/CIM subprocesses; PID reuse after the recheck and
+  launch CIM through the selected Core host and return unavailable/no-kill when
+  selection validation fails; PID reuse after the recheck and
   best-effort, non-atomic tree termination remain follow-up hardening, not
   blockers for this narrow fix.
 
