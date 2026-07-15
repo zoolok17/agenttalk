@@ -132,8 +132,14 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
   all-clear/empty from data that isn't fresh-and-known, enforced consistently across the
   top-bar verdict, the overview subtitle + grid, the attention view (empty / errored /
   stale-empty / stale-non-empty), and the sidebar cleared-"0" badge.
-- **CI:** GitHub `tests` + `security` workflows watched on the exact release commit; run ids
-  recorded in the GitHub release.
+- **CI:** GitHub `tests` (`29376099173`) + `security` (`29376099183`) on the exact release commit
+  `54b0896` — **both green**. `security` passed first attempt. `tests` first attempt went red on a
+  **single cell** (`pytest 3.12 on windows-latest`) at
+  `test_work_heartbeat.py::test_make_drive_long_silent_claude_turn_stays_live_and_ends_fresh`
+  (`assert status["stamps"] >= 2` got `1` — a wall-clock heartbeat-cadence assertion on a slow
+  ~598s runner, unrelated to this display-only change; it passed on windows-3.10/3.11/3.13, all
+  macOS/Ubuntu cells, and both lead-gate interpreters). Per the flake policy the failed job was
+  **re-run and passed**, confirming the flake (more evidence for the tracked P2 CI-timing item).
 
 ### v0.75.3 - BOM defense-in-depth across the PowerShell/Python file boundary (2026-07-14)
 **GOOD / ROBUST / SECURE** - reviewed-SHA `5caa001` - tag `v0.75.3`
