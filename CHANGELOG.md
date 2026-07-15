@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.78.1] - 2026-07-15
+
+### Fixed
+
+- **The cross-platform test matrix now guards only Windows-specific PowerShell
+  host cases.** Windows path, process, selection, and Scheduled Task assertions
+  skip on Linux and macOS, while portable policy, fingerprint, artifact marker,
+  generation, parsing, and diagnostic tests continue to run on every platform.
+
 ## [0.78.0] - 2026-07-15
 
 ### Added

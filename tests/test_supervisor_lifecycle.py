@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,16 @@ from agenttalk import supervisor_lifecycle as lifecycle
 from agenttalk.store import Store, _process_start_token
 
 
-PWSH = r"C:\Program Files\PowerShell\7\pwsh.exe"
+PWSH = (
+    r"C:\Program Files\PowerShell\7\pwsh.exe"
+    if sys.platform == "win32"
+    else "/opt/microsoft/powershell/7/pwsh.exe"
+)
+IDENTITY_SCHEME = "win32-file-id-v1" if sys.platform == "win32" else "stat-v1"
+WINDOWS_ONLY = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="PowerShell host is Windows-only",
+)
 
 
 def _store(tmp_path: Path) -> Store:
@@ -24,7 +34,7 @@ def _store(tmp_path: Path) -> Store:
 
 def _identity(path: str = PWSH, file_id: str = "01") -> psh.NativeFileIdentity:
     return psh.NativeFileIdentity(
-        "win32-file-id-v1", path, "aabbccdd", file_id, 123, 456,
+        IDENTITY_SCHEME, path, "aabbccdd", file_id, 123, 456,
     )
 
 
@@ -84,6 +94,7 @@ def test_dotnet_seven_digit_creation_locator_matches_kernel_token() -> None:
     )
 
 
+@WINDOWS_ONLY
 def test_validate_ancestry_accepts_direct_and_cmd_hop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -361,6 +372,7 @@ def test_generated_claim_lock_order_is_lifecycle_selection_config(
     ]
 
 
+@WINDOWS_ONLY
 def test_lifecycle_barrier_blocks_claim_select_and_refresh_without_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -463,6 +475,7 @@ def test_atomic_selection_failure_preserves_old_bytes_and_cleans_temp(
     assert not list(path.parent.glob(f".{path.name}.*.tmp"))
 
 
+@WINDOWS_ONLY
 def test_explicit_selection_repairs_invalid_record_under_writer_locks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -483,6 +496,7 @@ def test_explicit_selection_repairs_invalid_record_under_writer_locks(
     assert lifecycle.read_selected_host(store)["path"] == PWSH
 
 
+@WINDOWS_ONLY
 def test_task_install_commit_refuses_concurrent_selection_change(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -516,6 +530,7 @@ def test_task_install_commit_refuses_concurrent_selection_change(
     assert lifecycle.selection_path(store).read_bytes() == before
 
 
+@WINDOWS_ONLY
 def test_task_install_prepare_refuses_different_existing_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -548,6 +563,7 @@ def test_task_install_prepare_refuses_different_existing_binding(
     assert lifecycle.selection_path(store).read_bytes() == before
 
 
+@WINDOWS_ONLY
 def test_task_uninstall_clears_binding_before_new_name_prepare(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

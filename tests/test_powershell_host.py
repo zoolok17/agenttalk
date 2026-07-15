@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -10,9 +11,21 @@ import pytest
 from agenttalk import powershell_host as psh
 
 
-def _identity(path: str = r"C:\Program Files\PowerShell\7\pwsh.exe", *, file_id: str = "01"):
+PWSH = (
+    r"C:\Program Files\PowerShell\7\pwsh.exe"
+    if sys.platform == "win32"
+    else "/opt/microsoft/powershell/7/pwsh.exe"
+)
+IDENTITY_SCHEME = "win32-file-id-v1" if sys.platform == "win32" else "stat-v1"
+WINDOWS_ONLY = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="PowerShell host is Windows-only",
+)
+
+
+def _identity(path: str = PWSH, *, file_id: str = "01"):
     return psh.NativeFileIdentity(
-        scheme="win32-file-id-v1",
+        scheme=IDENTITY_SCHEME,
         final_path=path,
         volume_serial="aabbccdd",
         file_id=file_id,
@@ -24,7 +37,7 @@ def _identity(path: str = r"C:\Program Files\PowerShell\7\pwsh.exe", *, file_id:
 def _result(
     version: psh.PowerShellVersion | None = None,
     *,
-    path: str = r"C:\Program Files\PowerShell\7\pwsh.exe",
+    path: str = PWSH,
     source: str = "program_files",
     edition: str = "Core",
     file_id: str = "01",
@@ -157,6 +170,7 @@ def test_current_candidate_failure_is_terminal_even_with_program_files() -> None
     assert calls == [(r"D:\current\pwsh.exe", "current_host")]
 
 
+@WINDOWS_ONLY
 def test_automatic_candidates_continue_in_native_order() -> None:
     calls = []
 
@@ -177,6 +191,7 @@ def test_automatic_candidates_continue_in_native_order() -> None:
     ]
 
 
+@WINDOWS_ONLY
 def test_automatic_candidate_cannot_redirect_outside_program_files() -> None:
     calls: list[str] = []
 
@@ -222,16 +237,34 @@ def test_automatic_discovery_never_trusts_environment_program_files_root(
     [
         ("pwsh.exe", "absolute"),
         (r".\pwsh.exe", "absolute"),
+    ],
+)
+def test_candidate_path_rejects_relative_shapes_before_identity(
+    path: str,
+    reason: str,
+) -> None:
+    with pytest.raises(psh.PowerShellHostError, match=reason):
+        psh.validate_candidate_path(path)
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize(
+    ("path", "reason"),
+    [
         (r"\\server\share\pwsh.exe", "UNC"),
         (r"C:\Tools\pwsh.cmd", ".exe"),
         (r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\pwsh.exe", "WindowsApps"),
     ],
 )
-def test_candidate_path_rejects_untrusted_shapes_before_identity(path: str, reason: str) -> None:
+def test_candidate_path_rejects_windows_shapes_before_identity(
+    path: str,
+    reason: str,
+) -> None:
     with pytest.raises(psh.PowerShellHostError, match=reason):
         psh.validate_candidate_path(path)
 
 
+@WINDOWS_ONLY
 def test_candidate_path_rejects_mapped_drive_before_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -307,6 +340,7 @@ def test_selection_validation_rejects_wrong_project_and_schema() -> None:
         (r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\pwsh.exe", "WindowsApps"),
     ],
 )
+@WINDOWS_ONLY
 def test_selection_validation_rejects_ineligible_serialized_paths(
     path: str,
     reason: str,

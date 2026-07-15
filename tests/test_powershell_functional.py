@@ -16,7 +16,10 @@ from agenttalk import supervisor_lifecycle as lifecycle
 from agenttalk.store import Store
 
 
-pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell integration")
+pytestmark = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="PowerShell host is Windows-only",
+)
 
 
 def _store(tmp_path: Path, pwsh: str) -> Store:

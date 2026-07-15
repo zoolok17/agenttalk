@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import contextlib
+import sys
 import types
 from pathlib import Path
+
+import pytest
 
 from agenttalk import cli
 from agenttalk import supervisor as sup
@@ -12,6 +15,10 @@ from agenttalk.store import Store
 
 
 PWSH = r"C:\Program Files\PowerShell\7\pwsh.exe"
+WINDOWS_ONLY = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="PowerShell host is Windows-only",
+)
 
 
 class _Server:
@@ -45,6 +52,7 @@ def _host() -> dict:
     }
 
 
+@WINDOWS_ONLY
 def test_start_host_failure_occurs_before_server_bind(
     tmp_path: Path,
     monkeypatch,
@@ -83,6 +91,7 @@ def test_select_lock_failure_is_a_deterministic_cli_refusal(
     assert "selection lock is busy" in capsys.readouterr().err
 
 
+@WINDOWS_ONLY
 def test_start_validates_before_bind_and_launches_absolute_selected_host(
     tmp_path: Path,
     monkeypatch,
