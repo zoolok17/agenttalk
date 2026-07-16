@@ -430,12 +430,62 @@ def _child_env(
     *,
     wrapper_generation: str | None = None,
     inbound_request_id: str | None = None,
+    backend_profile: str | None = None,
+    profile_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in {LEAD_LOOP_LEASE_ENV, WRAPPER_GENERATION_ENV, INBOUND_REQUEST_ID_ENV}
-    }
+    if backend_profile == "ovh-qwen":
+        allowed_names = {
+            "path",
+            "systemroot",
+            "windir",
+            "temp",
+            "tmp",
+            "pythonutf8",
+            "pythonioencoding",
+        }
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key.casefold() in allowed_names or key.upper().startswith("AGENTTALK_")
+        }
+        injected = dict(profile_env or {})
+        allowed_injected = {
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_MODEL",
+        }
+        unexpected = set(injected) - allowed_injected
+        if unexpected:
+            raise ValueError(f"ovh-qwen profile env contains unsupported keys: {sorted(unexpected)}")
+        if injected.get("ANTHROPIC_BASE_URL") != "http://127.0.0.1:4000":
+            raise ValueError("ovh-qwen requires the pinned loopback gateway URL")
+        if not injected.get("ANTHROPIC_AUTH_TOKEN"):
+            raise ValueError("ovh-qwen requires an injected front token")
+        if injected.get("ANTHROPIC_MODEL") not in {None, "Qwen3.5-397B-A17B"}:
+            raise ValueError("ovh-qwen requires the pinned model alias")
+        injected["ANTHROPIC_MODEL"] = "Qwen3.5-397B-A17B"
+        # Never inherit provider credentials or an ambient Claude token. The
+        # front token is the only Anthropic credential injected below.
+        for key in list(env):
+            if key.casefold() in {
+                "anthropic_api_key",
+                "anthropic_auth_token",
+                "ovh_key",
+            }:
+                env.pop(key, None)
+        for key in (LEAD_LOOP_LEASE_ENV, WRAPPER_GENERATION_ENV, INBOUND_REQUEST_ID_ENV):
+            env.pop(key, None)
+        env.update(injected)
+    elif backend_profile is not None:
+        raise ValueError(f"unsupported backend_profile {backend_profile!r}")
+    else:
+        # Preserve the historical environment byte-for-byte for every ordinary
+        # backend; the restrictive profile is intentionally opt-in.
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in {LEAD_LOOP_LEASE_ENV, WRAPPER_GENERATION_ENV, INBOUND_REQUEST_ID_ENV}
+        }
     workspace = Path(workspace_root).resolve() if workspace_root else _workspace_root()
     env["AGENTTALK_PY"] = _agenttalk_py()
     env["AGENTTALK_ROOT"] = str(workspace)
@@ -1466,7 +1516,21 @@ class _ProcStream:
             _ = exc
 
 
-def _classify_drive_failure(sig: dict) -> tuple[str, str]:
+def _ovh_qwen_failure_text(sig: dict) -> str:
+    values = [sig.get("error"), sig.get("terminal_text"), sig.get("config_blocked_text")]
+    tail = sig.get("child_output_tail")
+    if isinstance(tail, dict):
+        for row in tail.get("lines") or []:
+            if isinstance(row, dict):
+                values.append(row.get("text"))
+    return " ".join(str(value) for value in values if value).casefold()
+
+
+def _classify_drive_failure(
+    sig: dict,
+    *,
+    backend_profile: str | None = None,
+) -> tuple[str, str]:
     """Map failed-turn signals to the wrapper dead-letter/resume taxonomy."""
     from .loop import (
         CLASS_AMBIGUOUS,
@@ -1474,6 +1538,33 @@ def _classify_drive_failure(sig: dict) -> tuple[str, str]:
         CLASS_INFRA,
         CLASS_POISON,
     )
+
+    if backend_profile == "ovh-qwen":
+        text = _ovh_qwen_failure_text(sig)
+        if "atgw_policy_blocked" in text or "atgw_ledger_blocked" in text:
+            return CLASS_CONFIG_BLOCKED, "OVH trial policy or accounting hold"
+        if "atgw_config_error" in text or "status code: 422" in text or "http 422" in text:
+            return CLASS_CONFIG_BLOCKED, "OVH gateway route or configuration error"
+        infra_markers = (
+            "atgw_infra_unavailable",
+            "atgw_infra_busy",
+            "connection refused",
+            "actively refused",
+            "connect timeout",
+            "connection timeout",
+            "status code: 429",
+            "http 429",
+            "status code: 500",
+            "status code: 502",
+            "status code: 503",
+            "status code: 504",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+        )
+        if any(marker in text for marker in infra_markers):
+            return CLASS_INFRA, "OVH gateway transport is unavailable"
 
     wd = sig.get("watchdog")
     if wd:
@@ -1536,6 +1627,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                health_writer: WrapperHealthWriter | None = None,
                work_heartbeat=None,
                wrapper_generation: str | None = None,
+               backend_profile: str | None = None,
+               profile_env: dict[str, str] | None = None,
                lease_lost_exceptions: tuple = ()) -> Callable[[dict], object]:
     """Build the per-turn ``drive(record)`` callback for loop.run_loop. Each call
     drives ONE real CLI turn and returns a :class:`loop.DriveOutcome` (ok + a failure
@@ -1664,6 +1757,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 store.root,
                 wrapper_generation=wrapper_generation,
                 inbound_request_id=active_parent_request_id,
+                backend_profile=backend_profile,
+                profile_env=profile_env,
             )
             return _ProcStream(argv, stdin_text, watchdog=turn_watchdog,
                                watchdog_snapshot_fn=watchdog_snapshot_fn,
@@ -1806,7 +1901,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         return sig
 
     def _classify(sig: dict) -> tuple[str, str]:
-        return _classify_drive_failure(sig)
+        return _classify_drive_failure(sig, backend_profile=backend_profile)
 
     def drive(record: dict) -> DriveOutcome:
         nonlocal active_parent_request_id

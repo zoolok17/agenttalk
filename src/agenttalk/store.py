@@ -667,6 +667,29 @@ def validate_roles(roles: dict, roster: list[str]) -> dict:
     return roles
 
 
+TRUST_CLASS_EXTERNAL_WORKER = "external-worker"
+KNOWN_TRUST_CLASSES = frozenset({TRUST_CLASS_EXTERNAL_WORKER})
+
+
+def validate_trust_classes(trust_classes: dict, roster: list[str]) -> dict:
+    """Validate opt-in model trust metadata for active roster identities."""
+    if not isinstance(trust_classes, dict):
+        raise ValueError(
+            f"'trust_classes' must be a dict, got {type(trust_classes).__name__}"
+        )
+    rset = set(roster)
+    for agent, trust_class in trust_classes.items():
+        if agent not in rset:
+            raise ValueError(
+                f"trust class key {agent!r} is not in the roster {sorted(rset)}"
+            )
+        if trust_class not in KNOWN_TRUST_CLASSES:
+            raise ValueError(
+                f"trust class for {agent!r} must be one of {sorted(KNOWN_TRUST_CLASSES)}"
+            )
+    return trust_classes
+
+
 def validate_managed_lead_loop(managed: object, roster: list[str]) -> dict:
     """Validate the ``{agent: {enabled, ttl_seconds, cadence_seconds}}`` map.
 
@@ -1120,6 +1143,11 @@ class Store:
                 validate_roles(cfg["roles"], agents)
             except ValueError as e:
                 raise ValueError(f"corrupt config at {self.config_path}: {e}.") from e
+        if cfg.get("trust_classes") is not None:
+            try:
+                validate_trust_classes(cfg["trust_classes"], agents)
+            except ValueError as e:
+                raise ValueError(f"corrupt config at {self.config_path}: {e}.") from e
         # Identity registry tombstones (0.16.0, #19 Phase A). Absent OR null ⇒
         # no retirements (full 0.15.0 behavior). Validated fail-closed so a
         # corrupt registry can't alias an active name or smuggle an unsafe one.
@@ -1495,6 +1523,13 @@ class Store:
         """Return the ``{agent: role}`` map ({} if none defined)."""
         return self.load_config().get("roles", {}) or {}
 
+    def trust_classes(self) -> dict[str, str]:
+        return self.load_config().get("trust_classes", {}) or {}
+
+    def trust_class(self, name: str) -> str | None:
+        value = self.trust_classes().get(name)
+        return value if value in KNOWN_TRUST_CLASSES else None
+
     def avatar_preferences(self) -> dict[str, str]:
         """Return sanitized display-avatar preferences.
 
@@ -1608,8 +1643,65 @@ class Store:
             )
         return out
 
+    @staticmethod
+    def _agent_matches_refset(cfg: dict, agent: str, refset: dict) -> bool:
+        if agent in (refset.get("agents") or []):
+            return True
+        role = (cfg.get("roles") or {}).get(agent)
+        if role in (refset.get("roles") or []):
+            return True
+        groups = cfg.get("groups") or {}
+        return any(agent in (groups.get(group) or []) for group in (refset.get("groups") or []))
+
+    def _assert_external_worker_authority_safe(self, cfg: dict) -> None:
+        """Prevent accidental authority assignment at roster mutation time.
+
+        This is deliberately the narrow watched-trial guard. Broader hostile-
+        model enforcement at close/release time remains a production follow-up.
+        """
+        external = {
+            agent
+            for agent, value in (cfg.get("trust_classes") or {}).items()
+            if value == TRUST_CLASS_EXTERNAL_WORKER
+        }
+        if not external:
+            return
+        roles = cfg.get("roles") or {}
+        for agent in sorted(external):
+            if isinstance(roles.get(agent), str) and roles[agent].casefold() == "lead":
+                raise ValueError(
+                    f"external-worker {agent!r} cannot hold the lead role"
+                )
+            if cfg.get("operator_facing") == agent:
+                raise ValueError(
+                    f"external-worker {agent!r} cannot be operator-facing"
+                )
+
+        from agenttalk import close as _close
+
+        policy, error = _close.load_signoff_policy(self)
+        if error:
+            raise ValueError(
+                "cannot prove external-worker signoff exclusion while "
+                f"signoffs.json is invalid: {error}"
+            )
+        if policy is None:
+            return
+        refsets = [policy["defaults"]["reviewers"]]
+        for sets in policy["risk_policies"].values():
+            for signoff_set in sets:
+                refsets.append(signoff_set["candidates"])
+                if signoff_set["use_default_reviewers"]:
+                    refsets.append(policy["defaults"]["reviewers"])
+        for agent in sorted(external):
+            if any(self._agent_matches_refset(cfg, agent, refset) for refset in refsets):
+                raise ValueError(
+                    f"external-worker {agent!r} cannot be a signoff candidate"
+                )
+
     def add_agent(self, name: str, *, role: str | None = None,
-                  groups: list[str] | None = None) -> dict:
+                  groups: list[str] | None = None,
+                  trust_class: str | None = None) -> dict:
         """Add an agent to the roster (idempotent) and optionally set its
         role / group memberships. A deliberate local admin op — NOT a
         security boundary and NOT process supervision."""
@@ -1648,6 +1740,11 @@ class Store:
                     if name not in members:
                         members.append(name)
                 validate_groups(g, roster)
+            if trust_class is not None:
+                trust_classes = self._cfg_dict(cfg, "trust_classes")
+                trust_classes[name] = trust_class
+                validate_trust_classes(trust_classes, roster)
+            self._assert_external_worker_authority_safe(cfg)
             # All validation passed — only now perform side effects, so a bad
             # role/group never orphans a freshly-written cursor file.
             self._write_config(cfg)
@@ -1677,6 +1774,24 @@ class Store:
                 cfg["managed_lead_loop"].pop(name, None)
             if isinstance(cfg.get("avatars"), dict):
                 cfg["avatars"].pop(name, None)
+            if isinstance(cfg.get("trust_classes"), dict):
+                cfg["trust_classes"].pop(name, None)
+            self._write_config(cfg)
+        return cfg
+
+    def set_trust_class(self, name: str, trust_class: str | None) -> dict:
+        with self._config_lock():
+            cfg = self.load_config()
+            roster = cfg.get("agents", []) or []
+            if name not in roster:
+                raise ValueError(f"agent {name!r} is not in the roster {sorted(roster)}")
+            values = self._cfg_dict(cfg, "trust_classes")
+            if trust_class is None:
+                values.pop(name, None)
+            else:
+                values[name] = trust_class
+            validate_trust_classes(values, roster)
+            self._assert_external_worker_authority_safe(cfg)
             self._write_config(cfg)
         return cfg
 
@@ -1703,6 +1818,7 @@ class Store:
             roles = self._cfg_dict(cfg, "roles")
             demoted = self._assign_role_enforcing_lead(roles, name, role)
             validate_roles(roles, roster)
+            self._assert_external_worker_authority_safe(cfg)
             self._write_config(cfg)
         return demoted
 
@@ -1767,6 +1883,7 @@ class Store:
             groups = self._cfg_dict(cfg, "groups")
             groups[group] = list(dict.fromkeys(members))  # de-dupe, preserve order
             validate_groups(groups, roster)
+            self._assert_external_worker_authority_safe(cfg)
             self._write_config(cfg)
         return cfg
 
@@ -2046,6 +2163,7 @@ class Store:
                         f"agent {name!r} is not in the roster {sorted(roster)}"
                     )
                 cfg["operator_facing"] = name
+            self._assert_external_worker_authority_safe(cfg)
             self._write_config(cfg)
         return cfg
 
@@ -2084,6 +2202,9 @@ class Store:
         avatars = cfg.get("avatars")
         if isinstance(avatars, dict):
             avatars.pop(name, None)
+        trust_classes = cfg.get("trust_classes")
+        if isinstance(trust_classes, dict):
+            trust_classes.pop(name, None)
 
     def set_avatar(self, name: str, avatar_id: str) -> dict:
         """Set an active roster member's display-avatar preference."""
@@ -2209,6 +2330,7 @@ class Store:
                           if old in members]
             was_liaison = cfg.get("operator_facing") == old
             old_managed = (cfg.get("managed_lead_loop") or {}).get(old)
+            old_trust_class = (cfg.get("trust_classes") or {}).get(old)
             avatars = cfg.get("avatars")
             old_avatar = avatars.get(old) if isinstance(avatars, dict) else None
             # Retire old -> tombstone(renamed_to=new), then activate new + carryover.
@@ -2241,6 +2363,8 @@ class Store:
             # rename would SILENTLY DROP the managed flag.
             if old_managed is not None:
                 self._cfg_dict(cfg, "managed_lead_loop")[new] = old_managed
+            if old_trust_class is not None:
+                self._cfg_dict(cfg, "trust_classes")[new] = old_trust_class
             avatar_id = _avatars.normalize_avatar_id(old_avatar)
             if avatar_id is not None:
                 self._cfg_dict(cfg, "avatars")[new] = avatar_id
@@ -2253,6 +2377,9 @@ class Store:
                 validate_groups(cfg["groups"], roster)
             if cfg.get("managed_lead_loop"):
                 validate_managed_lead_loop(cfg["managed_lead_loop"], roster)
+            if cfg.get("trust_classes"):
+                validate_trust_classes(cfg["trust_classes"], roster)
+            self._assert_external_worker_authority_safe(cfg)
             self._write_config(cfg)
             cur = self.state_dir / f"{new}.cursor"
             if not cur.exists():

@@ -3474,6 +3474,44 @@ def bootstrap_check(store: Store, *, now_epoch: float,
                            f"{cli_name} agent configured", agent=name,
                            facts={"cli": cli_name})
 
+        backend_profile = cfg_agent.get("backend_profile")
+        if backend_profile is not None:
+            if backend_profile != "ovh-qwen":
+                _bootstrap_add(
+                    checks,
+                    "supervisor_backend_profile_unsupported",
+                    "error",
+                    "backend_profile must be ovh-qwen when present",
+                    agent=name,
+                )
+            else:
+                trust_class = cfg_agent.get("trust_class")
+                roster_trust = (cfg.get("trust_classes") or {}).get(name)
+                errors = []
+                if cli_name != "claude":
+                    errors.append("cli must be claude")
+                if cfg_agent.get("wrapped") is not True:
+                    errors.append("wrapped must be true")
+                if cfg_agent.get("model") != "Qwen3.5-397B-A17B":
+                    errors.append("model must be Qwen3.5-397B-A17B")
+                if trust_class != "external-worker" or roster_trust != "external-worker":
+                    errors.append("supervisor and roster trust_class must be external-worker")
+                if cfg_agent.get("env"):
+                    errors.append("literal per-agent env is forbidden")
+                ambient = [
+                    key for key in ("OVH_KEY", "ANTHROPIC_API_KEY") if os.environ.get(key)
+                ]
+                if ambient:
+                    errors.append("supervisor ambient provider keys must be absent")
+                _bootstrap_add(
+                    checks,
+                    "supervisor_ovh_qwen_profile",
+                    "error" if errors else "ok",
+                    "; ".join(errors) if errors else "ovh-qwen profile is constrained",
+                    agent=name,
+                    facts={"backend_profile": backend_profile, "trust_class": trust_class},
+                )
+
         if cfg_agent.get("auto_restart") is True:
             _bootstrap_add(checks, "supervisor_agent_restart_enabled", "ok",
                            "auto_restart is enabled", agent=name)
@@ -5411,6 +5449,16 @@ function Preflight($name, $plan, $file, $codexHome) {
 function Launch($name, $plan, $codexHome) {
   if (-not (Assert-ActionsEnabled ("launch {0}" -f $name))) { return $null }
   $a = $cfg.agents.$name
+  if ($a.backend_profile -eq 'ovh-qwen') {
+    if ($env:OVH_KEY -or $env:ANTHROPIC_API_KEY) {
+      Write-Warning "supervisor: agent '$name': ovh-qwen refuses ambient OVH_KEY/ANTHROPIC_API_KEY; NOT launching"
+      return $null
+    }
+    if ($a.env) {
+      Write-Warning "supervisor: agent '$name': ovh-qwen forbids literal per-agent env; NOT launching"
+      return $null
+    }
+  }
   $file = $a.launch.windows_file
   if (-not $file -or $file -like 'REPLACE:*') {
     Write-Warning "supervisor: agent '$name' has no real launch.windows_file (the agent EXECUTABLE) - fill supervisor.json"; return $null
