@@ -10,7 +10,42 @@ from agenttalk import ovh_gateway
 from agenttalk import ovh_gateway_service
 from agenttalk.ovh_gateway import SpendLedger, default_install_marker_path, default_ledger_path
 from agenttalk.ovh_gateway import MODEL_ALIAS
+from agenttalk.wrapper import run as wrapper_run
 from agenttalk.store import Store
+
+
+def _make_qwen_wrap_store(tmp_path) -> Store:
+    store = Store(tmp_path)
+    store.init(["lead", "qwen-dev-1"])
+    store.set_role("lead", "lead")
+    store.set_operator_facing("lead")
+    store.set_trust_class("qwen-dev-1", "external-worker")
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({
+            "agents": {
+                "qwen-dev-1": {
+                    "backend_profile": "ovh-qwen",
+                    "cli": "claude",
+                    "model": "Qwen3.5-397B-A17B",
+                    "trust_class": "external-worker",
+                    "wrapped": True,
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    return store
+
+
+def _worker_gateway_projection(ledger: SpendLedger) -> dict:
+    ledger_status = ledger.status()
+    return {
+        "ready": True,
+        "operational_ready": True,
+        "errors": [],
+        "worker_spend_ready": ledger_status["worker_spend_ready"],
+        "worker_spend_errors": ledger_status["worker_spend_errors"],
+    }
 
 
 def test_gateway_cli_initializes_once_and_controls_manual_hold(
@@ -125,25 +160,7 @@ def test_qwen_wrap_requires_authenticated_gateway_readiness_before_token_read(
     tmp_path,
     monkeypatch,
 ) -> None:
-    store = Store(tmp_path)
-    store.init(["lead", "qwen-dev-1"])
-    store.set_role("lead", "lead")
-    store.set_operator_facing("lead")
-    store.set_trust_class("qwen-dev-1", "external-worker")
-    (store.dir / "supervisor.json").write_text(
-        json.dumps({
-            "agents": {
-                "qwen-dev-1": {
-                    "backend_profile": "ovh-qwen",
-                    "cli": "claude",
-                    "model": "Qwen3.5-397B-A17B",
-                    "trust_class": "external-worker",
-                    "wrapped": True,
-                },
-            },
-        }),
-        encoding="utf-8",
-    )
+    store = _make_qwen_wrap_store(tmp_path)
     monkeypatch.delenv("OVH_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setattr(
@@ -176,3 +193,128 @@ def test_qwen_wrap_requires_authenticated_gateway_readiness_before_token_read(
     hold = store.read_config_blocked_hold("qwen-dev-1")
     assert hold is not None
     assert "internal_liveliness_failed" in hold["summary"]
+
+
+@pytest.mark.parametrize(
+    ("canary_state", "expected_reason"),
+    [
+        ("absent", "dashboard_canary_absent"),
+        ("mismatch", "dashboard_canary_mismatch"),
+        ("mismatch-cleared", "dashboard_canary_mismatch"),
+    ],
+)
+def test_qwen_wrap_worker_spend_preflight_blocks_unaccepted_canary_before_token_read(
+    tmp_path,
+    monkeypatch,
+    canary_state,
+    expected_reason,
+) -> None:
+    store = _make_qwen_wrap_store(tmp_path)
+    ledger = SpendLedger(tmp_path / "ledger.sqlite3", tmp_path / "install.json")
+    ledger.initialize(
+        opening_micro_eur=0,
+        opening_evidence="test dashboard, observed 2026-07-16",
+        generation="a" * 32,
+    )
+    if canary_state != "absent":
+        ledger.reserve("1" * 32)
+        ledger.settle(
+            "1" * 32,
+            model=MODEL_ALIAS,
+            input_tokens=1_000,
+            output_tokens=100,
+        )
+        ledger.verify_dashboard_canary("1" * 32, observed_delta_micro_eur=0)
+    if canary_state == "mismatch-cleared":
+        ledger.clear_hold(reason="operator inspected mismatch")
+
+    def status_projection(_root):
+        return _worker_gateway_projection(ledger)
+
+    monkeypatch.delenv("OVH_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(ovh_gateway_service, "gateway_status", status_projection)
+
+    def token_must_not_be_read(_path):
+        raise AssertionError("front token read before worker/spend readiness")
+
+    monkeypatch.setattr(ovh_gateway, "read_secret_file", token_must_not_be_read)
+
+    rc = cli.main([
+        "--root",
+        str(tmp_path),
+        "wrap",
+        "--for",
+        "qwen-dev-1",
+        "--cli",
+        "claude",
+        "--loop",
+        "--",
+        sys.executable,
+        "-c",
+        "pass",
+    ])
+
+    assert rc == 1
+    hold = store.read_config_blocked_hold("qwen-dev-1")
+    assert hold is not None
+    assert expected_reason in hold["summary"]
+
+
+def test_qwen_wrap_worker_spend_preflight_allows_accepted_canary(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _make_qwen_wrap_store(tmp_path)
+    ledger = SpendLedger(tmp_path / "ledger.sqlite3", tmp_path / "install.json")
+    ledger.initialize(
+        opening_micro_eur=0,
+        opening_evidence="test dashboard, observed 2026-07-16",
+        generation="a" * 32,
+    )
+    ledger.reserve("1" * 32)
+    ledger.settle(
+        "1" * 32,
+        model=MODEL_ALIAS,
+        input_tokens=1_000,
+        output_tokens=100,
+    )
+    ledger.verify_dashboard_canary("1" * 32, observed_delta_micro_eur=960)
+
+    def status_projection(_root):
+        return _worker_gateway_projection(ledger)
+
+    token_reads: list[str] = []
+
+    def read_front_token(path):
+        token_reads.append(str(path))
+        return "front-token"
+
+    monkeypatch.delenv("OVH_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(ovh_gateway_service, "gateway_status", status_projection)
+    monkeypatch.setattr(ovh_gateway, "read_secret_file", read_front_token)
+    monkeypatch.setattr(
+        wrapper_run,
+        "preflight_launch_runtime",
+        lambda argv, _cli, _root, _env: wrapper_run.LaunchPreflightResult(list(argv)),
+    )
+    monkeypatch.setattr(cli, "_wrap_loop_mode", lambda *_args, **_kwargs: 0)
+
+    rc = cli.main([
+        "--root",
+        str(tmp_path),
+        "wrap",
+        "--for",
+        "qwen-dev-1",
+        "--cli",
+        "claude",
+        "--loop",
+        "--",
+        sys.executable,
+        "-c",
+        "pass",
+    ])
+
+    assert rc == 0
+    assert len(token_reads) == 1

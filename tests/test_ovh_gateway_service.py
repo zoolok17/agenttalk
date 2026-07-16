@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from agenttalk import ovh_gateway_service as service
-from agenttalk.ovh_gateway import GatewayConfigError, SpendLedger, price_policy_hash
+from agenttalk.ovh_gateway import GatewayConfigError, MODEL_ALIAS, SpendLedger, price_policy_hash
 from agenttalk.ovh_gateway_service import (
     MAX_TASK_RESTARTS,
     TaskCommands,
@@ -409,6 +409,9 @@ def test_status_requires_attested_runtime_front_and_internal_liveliness(
     )
 
     assert status["ready"] is True
+    assert status["operational_ready"] is True
+    assert status["worker_spend_ready"] is False
+    assert status["worker_spend_errors"] == ["dashboard_canary_absent"]
     assert status["ledger"]["opening_micro_eur"] == 580_000
     assert status["ledger"]["current_committed_micro_eur"] == 580_000
     assert status["ledger"]["opening_evidence"] == (
@@ -417,6 +420,25 @@ def test_status_requires_attested_runtime_front_and_internal_liveliness(
     encoded = str(status)
     assert "atgw-" not in encoded
     assert "provider-key" not in encoded
+
+    ledger.reserve("1" * 32)
+    ledger.settle(
+        "1" * 32,
+        model=MODEL_ALIAS,
+        input_tokens=1_000,
+        output_tokens=100,
+    )
+    ledger.verify_dashboard_canary("1" * 32, observed_delta_micro_eur=960)
+    accepted = gateway_status(
+        root,
+        commands=commands,
+        ledger=ledger,
+        front_token_path=front_token,
+        internal_token_path=internal_token,
+    )
+    assert accepted["operational_ready"] is True
+    assert accepted["worker_spend_ready"] is True
+    assert accepted["worker_spend_errors"] == []
 
     front_token.write_text("replacement-token\n", encoding="utf-8")
     replaced = gateway_status(

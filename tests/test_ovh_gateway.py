@@ -544,6 +544,64 @@ def test_dashboard_canary_enforces_nonzero_delta_and_numeric_tolerance(tmp_path)
     assert other.status()["service_hold"] == "dashboard_canary_mismatch"
 
 
+def test_dashboard_canary_gates_worker_spend_readiness_until_accepted(tmp_path) -> None:
+    ledger = make_ledger(tmp_path)
+    initial = ledger.status()
+    assert initial["ready"] is True
+    assert initial["worker_spend_ready"] is False
+    assert initial["worker_spend_errors"] == ["dashboard_canary_absent"]
+
+    ledger.reserve("1" * 32)
+    ledger.settle(
+        "1" * 32,
+        model=MODEL_ALIAS,
+        input_tokens=1_000,
+        output_tokens=100,
+    )
+    ledger.verify_dashboard_canary("1" * 32, observed_delta_micro_eur=0)
+    mismatched = ledger.status()
+    assert mismatched["ready"] is False
+    assert mismatched["worker_spend_ready"] is False
+    assert mismatched["worker_spend_errors"] == [
+        "ledger_not_ready",
+        "dashboard_canary_mismatch",
+    ]
+
+    ledger.clear_hold(reason="operator inspected mismatch")
+    cleared = ledger.status()
+    assert cleared["ready"] is True
+    assert cleared["dashboard_canary"]["status"] == "mismatch"
+    assert cleared["worker_spend_ready"] is False
+    assert cleared["worker_spend_errors"] == ["dashboard_canary_mismatch"]
+
+    ledger.verify_dashboard_canary("1" * 32, observed_delta_micro_eur=960)
+    accepted = ledger.status()
+    assert accepted["ready"] is True
+    assert accepted["dashboard_canary"]["status"] == "accepted"
+    assert accepted["worker_spend_ready"] is True
+    assert accepted["worker_spend_errors"] == []
+
+
+def test_dashboard_canary_readiness_rejects_stale_attempt_policy_binding(tmp_path) -> None:
+    ledger = make_ledger(tmp_path)
+    ledger.reserve("1" * 32)
+    ledger.settle(
+        "1" * 32,
+        model=MODEL_ALIAS,
+        input_tokens=1_000,
+        output_tokens=100,
+    )
+    ledger.verify_dashboard_canary("1" * 32, observed_delta_micro_eur=960)
+    with sqlite3.connect(ledger.db_path) as conn:
+        conn.execute(
+            "UPDATE attempts SET policy_hash='stale' WHERE attempt_id=?",
+            ("1" * 32,),
+        )
+
+    with pytest.raises(LedgerBlocked, match="canary attempt binding"):
+        ledger.status()
+
+
 def test_begin_immediate_serializes_concurrent_admission(tmp_path) -> None:
     ledger = make_ledger(tmp_path)
     outcomes: list[str] = []

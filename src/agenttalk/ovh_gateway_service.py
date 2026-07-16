@@ -759,6 +759,8 @@ def gateway_status(
         "task_identity_ok": False,
         "runtime_marker_present": False,
         "runtime": None,
+        "worker_spend_ready": False,
+        "worker_spend_errors": ["ledger_unavailable"],
         "errors": [],
     }
     manifest: dict | None = None
@@ -771,6 +773,10 @@ def gateway_status(
     try:
         result["ledger"] = ledger.status()
         result["ledger_ok"] = True
+        result["worker_spend_ready"] = result["ledger"]["worker_spend_ready"]
+        result["worker_spend_errors"] = list(
+            result["ledger"]["worker_spend_errors"]
+        )
     except (LedgerBlocked, LedgerHold):
         result["errors"].append("ledger_blocked")
     try:
@@ -832,5 +838,6 @@ def gateway_status(
     if not result["ambient_provider_keys_absent"]:
         result["errors"].append("supervisor_ambient_provider_key")
     result["errors"] = sorted(set(result["errors"]))
-    result["ready"] = not result["errors"]
+    result["operational_ready"] = not result["errors"]
+    result["ready"] = result["operational_ready"]
     return result

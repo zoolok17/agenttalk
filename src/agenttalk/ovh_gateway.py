@@ -667,13 +667,16 @@ class SpendLedger:
             ):
                 raise LedgerBlocked("dashboard canary status is invalid")
             canary_attempt = conn.execute(
-                "SELECT state, actual_micro_eur FROM attempts WHERE attempt_id=?",
+                "SELECT state, actual_micro_eur, model, policy_hash "
+                "FROM attempts WHERE attempt_id=?",
                 (attempt_id,),
             ).fetchone()
             if (
                 canary_attempt is None
                 or canary_attempt["state"] != "settled"
                 or int(canary_attempt["actual_micro_eur"] or 0) != expected
+                or canary_attempt["model"] != MODEL_ALIAS
+                or canary_attempt["policy_hash"] != price_policy_hash()
             ):
                 raise LedgerBlocked("dashboard canary attempt binding is invalid")
         return metadata
@@ -1153,6 +1156,30 @@ class SpendLedger:
             current_opening = (
                 opening_micro_eur if current_period == metadata["opening_period"] else 0
             )
+            dashboard_canary = (
+                {
+                    "attempt_id": metadata["canary_attempt_id"],
+                    "checked_at": metadata["canary_checked_at"],
+                    "expected_micro_eur": int(metadata["canary_expected_micro_eur"]),
+                    "observed_delta_micro_eur": int(
+                        metadata["canary_observed_micro_eur"]
+                    ),
+                    "tolerance_micro_eur": int(
+                        metadata["canary_tolerance_micro_eur"]
+                    ),
+                    "status": metadata["canary_status"],
+                }
+                if metadata.get("canary_attempt_id")
+                else None
+            )
+            accounting_ready = not unresolved and not metadata.get("service_hold")
+            worker_spend_errors: list[str] = []
+            if not accounting_ready:
+                worker_spend_errors.append("ledger_not_ready")
+            if dashboard_canary is None:
+                worker_spend_errors.append("dashboard_canary_absent")
+            elif dashboard_canary["status"] != "accepted":
+                worker_spend_errors.append("dashboard_canary_mismatch")
             return {
                 "schema_version": LEDGER_SCHEMA_VERSION,
                 "generation": metadata["generation"],
@@ -1174,25 +1201,10 @@ class SpendLedger:
                 "periods": periods,
                 "unresolved": unresolved,
                 "service_hold": metadata.get("service_hold") or None,
-                "dashboard_canary": (
-                    {
-                        "attempt_id": metadata["canary_attempt_id"],
-                        "checked_at": metadata["canary_checked_at"],
-                        "expected_micro_eur": int(
-                            metadata["canary_expected_micro_eur"]
-                        ),
-                        "observed_delta_micro_eur": int(
-                            metadata["canary_observed_micro_eur"]
-                        ),
-                        "tolerance_micro_eur": int(
-                            metadata["canary_tolerance_micro_eur"]
-                        ),
-                        "status": metadata["canary_status"],
-                    }
-                    if metadata.get("canary_attempt_id")
-                    else None
-                ),
-                "ready": not unresolved and not metadata.get("service_hold"),
+                "dashboard_canary": dashboard_canary,
+                "ready": accounting_ready,
+                "worker_spend_ready": not worker_spend_errors,
+                "worker_spend_errors": worker_spend_errors,
             }
 
 

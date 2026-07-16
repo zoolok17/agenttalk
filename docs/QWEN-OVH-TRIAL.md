@@ -133,11 +133,13 @@ The profile also forces `CLAUDE_CONFIG_DIR` to the disposable clone's
 `.agenttalk/gateway/claude-profile` directory. It never inherits the operator's
 `HOME`, `USERPROFILE`, or ambient Claude profile path.
 
-`wrap --loop` refuses to launch this worker unless the gateway is fully ready,
-the roster and supervisor trust classes agree, the model and CLI are pinned,
-and provider keys are absent from the supervisor environment. A failed
-readiness check creates the normal durable `config_blocked` hold before any
-message is consumed.
+Gateway operational readiness remains available before the live canary so the
+operator can run that canary. `wrap --loop` separately requires worker/spend
+readiness: the accounting ledger must be ready and its policy-bound dashboard
+canary must be accepted. The roster and supervisor trust classes must also
+agree, the model and CLI are pinned, and provider keys are absent from the
+supervisor environment. A failed readiness check creates the normal durable
+`config_blocked` hold before any message is consumed.
 
 ## Spend and Failure Semantics
 
@@ -176,7 +178,9 @@ agenttalk gateway hold --reason "dashboard mismatch"
 agenttalk gateway clear-hold --reason "operator reconciled mismatch"
 ```
 
-Clearing a manual hold is refused while any attempt remains unresolved.
+Clearing a manual hold is refused while any attempt remains unresolved. Clearing
+a dashboard mismatch hold does not admit a worker while the persisted canary is
+still absent or mismatched; a fresh accepted canary is required.
 
 ## Stop and Recovery
 

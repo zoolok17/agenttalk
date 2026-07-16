@@ -212,3 +212,45 @@ def test_domain_reviewer_cannot_be_reclassified_as_external_worker(tmp_path) -> 
         store.set_trust_class("worker", "external-worker")
 
     assert store.trust_class("worker") is None
+
+
+def test_domain_referenced_rename_cannot_make_external_worker_countable(tmp_path) -> None:
+    store = make_store(tmp_path)
+    (store.dir / "signoffs.json").write_text(
+        json.dumps({
+            "schema_version": 1,
+            "defaults": {"reviewers": {}},
+            "risk_policies": {
+                "security": [{
+                    "id": "domain-security",
+                    "required_count": 1,
+                    "candidates": {},
+                    "include_domain_reviewers": True,
+                }],
+            },
+        }),
+        encoding="utf-8",
+    )
+    (store.dir / "domains.json").write_text(
+        json.dumps({
+            "schema_version": 1,
+            "domains": {
+                "auth": {
+                    "title": "Auth",
+                    "owners": {"agents": ["lead"]},
+                    "reviewers": {"agents": ["qwen-worker"]},
+                    "owned_globs": ["src/auth/**"],
+                },
+            },
+            "shared_paths": [],
+        }),
+        encoding="utf-8",
+    )
+    store.set_trust_class("worker", "external-worker")
+
+    with pytest.raises(ValueError, match="cannot be a signoff candidate"):
+        store.rename_agent("worker", "qwen-worker")
+
+    assert "worker" in store.active_agents()
+    assert "qwen-worker" not in store.active_agents()
+    assert store.trust_class("worker") == "external-worker"

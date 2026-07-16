@@ -9858,12 +9858,41 @@ def cmd_wrap(args: argparse.Namespace) -> int:
             try:
                 gateway = gateway_status(store.root)
             except (GatewayConfigError, OSError) as exc:
-                gateway = {"ready": False, "errors": [type(exc).__name__]}
-            if not gateway.get("ready"):
-                reasons = gateway.get("errors")
-                safe_reasons = ",".join(
-                    str(reason) for reason in reasons if isinstance(reason, str)
-                ) if isinstance(reasons, list) else "readiness_unavailable"
+                gateway = {
+                    "ready": False,
+                    "operational_ready": False,
+                    "worker_spend_ready": False,
+                    "errors": [type(exc).__name__],
+                    "worker_spend_errors": ["worker_spend_readiness_unavailable"],
+                }
+            operational_ready = (
+                gateway.get("operational_ready", gateway.get("ready")) is True
+            )
+            worker_spend_ready = gateway.get("worker_spend_ready") is True
+            if not operational_ready or not worker_spend_ready:
+                reasons: list[str] = []
+                if not operational_ready:
+                    operational_errors = gateway.get("errors")
+                    if isinstance(operational_errors, list):
+                        reasons.extend(
+                            reason
+                            for reason in operational_errors
+                            if isinstance(reason, str)
+                        )
+                if not worker_spend_ready:
+                    worker_errors = gateway.get("worker_spend_errors")
+                    safe_worker_errors = (
+                        [reason for reason in worker_errors if isinstance(reason, str)]
+                        if isinstance(worker_errors, list)
+                        else []
+                    )
+                    if safe_worker_errors:
+                        reasons.extend(safe_worker_errors)
+                    else:
+                        reasons.append("worker_spend_readiness_unavailable")
+                if not reasons:
+                    reasons.append("readiness_unavailable")
+                safe_reasons = ",".join(dict.fromkeys(reasons))
                 summary = f"ovh-qwen gateway is not ready ({safe_reasons})"
                 mode = (
                     "lead-loop" if lead_loop else
