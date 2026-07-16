@@ -49,6 +49,94 @@ Every release passes the same pipeline before it ships:
 - **Documented threat-model non-goals** (see §2) — we state what we do *not* defend
   against, rather than implying we do.
 
+### 1a. Review tiers — keyed to the surface, not the self-described change
+
+The tier sets ONLY the **pre-build adversarial DESIGN gate**. For **every** tier, these
+remain mandatory and unchanged: build-in-isolation, **≥2 independent final-SHA
+reviewers**, the lead gate (ruff + bandit + node --check + git diff --check + full pytest
+on 3.10 AND 3.14), the security + packaging gates, and the CI matrix. Final-SHA reviewers
+additionally revalidate the tier/risk-drift record and can force an upward gate.
+**Tier 1 never means "skip review."**
+
+**Classification is by SEMANTIC EFFECT, not provenance.** "docs-only / test-only /
+comment / mechanical refactor" are provenance labels, not risk levels. Path/file-type
+rules are a **floor, never a ceiling. Uncertainty rounds UP.**
+
+**Tier the UNION of semantic effects from the release base to the exact candidate ship
+SHA** — not per-commit/lane/filename/claimed-intent. Every matching dimension applies;
+the **highest wins.** Record a pre-build tier, then run a **final risk-drift check against
+the ship SHA**; upward drift triggers the missing design gate before merge; no downgrade
+without independent ratification. (D-11 all-matching analogue.)
+
+**Surface → tier table:**
+- **Tier 3 (adversarial cross-family DESIGN panel):** the diff touches ANY of — authority
+  / permission / approval / gate; trust / security; provenance / integrity (knowledge,
+  lessons, signing, generated-artifact markers); concurrency / locks / ordering;
+  **fail-open/fail-closed error semantics, durability / atomicity / recovery,
+  persistent-state contracts, or external side-effect boundaries** (NOT every routine file
+  read or try/except); process launch / kill / supervisor / wrap; bus message schema;
+  ledger / spend; or **normative** policy / runbooks / operational skills.
+- **Tier 2 (design-first note + standard review):** other product code; OR a public
+  contract (CLI flag, JSON schema, config key, packaging input); OR **removes/weakens an
+  existing test assertion** or changes CI / scanners / goldens / fixtures / snapshots /
+  harnesses / skips.
+- **Tier 1 (no design gate — NARROW ALLOWLIST only):** ONLY non-normative prose / typo /
+  format / comment changes AND **additive** tests that do not alter fixtures, goldens,
+  snapshots, harnesses, CI, skips, expected contracts, packaging inputs, generated
+  artifacts, or operational skills. Anything else is ≥Tier 2.
+
+**Anti-self-serve:** the change owner proposes tier + risk inventory; an **independent**
+reviewer/lead **ratifies** it. When owner == lead, one independent cross-family
+tier-ratification is mandatory **even for Tier 1** (a short classification, not a full
+panel).
+
+**Tier-3 design panel:** a **hard floor of 3 eligible independent reviewers** (≥2 model
+families; distinct predeclared lenses; NO designer / builder / lead counted; a prior
+design consultant is not independent for the lens they shaped; ephemeral evidence-only
+reviews may add counters but do NOT satisfy the minimum — DESIGN D-9). **Scale above 3 for
+larger scope/novelty/blast-radius; never below 3.** Line count is not a risk proxy — a
+one-line fail-open/permission/lock-order change can be system-wide — so control the cost of
+a small Tier-3 change by making each review SHORT and focused, never by dropping
+independent lenses. Panel composition (who was asked + their lens) is **recorded in the
+release ledger.** A design-panel reviewer MAY also serve as one of the ≥2 final-SHA
+reviewers for the same change (distinct phases), not double-counted within a phase.
+
+**Verdict handling:** the lead synthesizes but **cannot erase an open REVISE/REJECT or a
+P0/P1.** Every finding gets a disposition: fold + re-review on the new SHA, OR — for an
+open REVISE/P0/P1 — a genuine operator decision captured through the **authenticated
+operator path** (the server-derived operator-answer / escalation inbox, where the actor is
+derived server-side, never caller-asserted), recorded with the finding IDs + scope.
+**Neither lead-authored prose, a role label, nor a caller-asserted `agenttalk gate waive
+--operator <name>` is sufficient authority** — `gate waive`'s operator field is currently
+unauthenticated free text, so it MUST NOT be treated as operator authority until it is
+hardened to consume + validate a typed operator-answer reference (tracked follow-up).
+**Until that hardening lands, a lead may not self-waive an open REVISE/P0/P1** — the only
+dispositions are fold + re-review or an authenticated operator decision. PASS-WITH-
+CONDITIONS may carry assigned testable build gates, not unresolved design questions.
+**REJECT** = directionally unacceptable / new proposal required; **REVISE** = bounded
+amendment.
+
+**Risk record (mechanically reproducible, in the release ledger):** `release base` = an
+exact recorded SHA (normally the previous shipped tag; any deviation carries a rationale).
+The record contains: base SHA, design/candidate ref, semantic dimensions matched, proposed
+tier, ratifier identity + verdict, panel members + lenses, final ship SHA, and final drift
+result. Prose alone does not satisfy it.
+
+**Docs-testing pass — trigger + evidence + block:** runs when a release changes docs OR
+any **user/operator-facing contract, workflow, config default, JSON/CLI output,
+packaging/install behavior, or remediation path** (a stale-doc risk can exist with no
+command change). When triggered it requires BOTH evidence producers — `test-docs`
+(executes the doc examples; a Windows/PowerShell example CI cannot run is recorded
+*referenced-not-executed*, never counted green) AND an independent `review-docs` accuracy
+review — and a **`test-docs` failure, or an unresolved accuracy/contract finding that
+yields `review-docs status=rejected`, HOLDs the merge** (an approved review with a recorded
+nit does not block). Record an explicit N/A reason ONLY when no trigger exists.
+
+**One authoritative source:** this §1 is canonical. `docs/DESIGN.md` references it (one-line
+pointer). The lead skills carry a **mandatory operational STEP** that reads this §1 and
+records the risk-record fields above as a checklist — referencing the table, never copying
+it (copies drift — cf. v0.75.2).
+
 ---
 
 ## 2. Codebase security posture
