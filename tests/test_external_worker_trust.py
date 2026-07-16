@@ -132,7 +132,7 @@ def test_add_agent_group_path_uses_same_candidate_guard(tmp_path) -> None:
     assert "qwen" not in store.active_agents()
 
 
-def test_rename_carries_external_worker_metadata_and_remove_clears_it(tmp_path) -> None:
+def test_rename_carries_external_worker_metadata_and_remove_tombstones_it(tmp_path) -> None:
     store = make_store(tmp_path)
     store.set_trust_class("worker", "external-worker")
     store.rename_agent("worker", "qwen-worker")
@@ -140,3 +140,75 @@ def test_rename_carries_external_worker_metadata_and_remove_clears_it(tmp_path) 
     assert "worker" not in store.trust_classes()
     store.remove_agent("qwen-worker")
     assert "qwen-worker" not in store.trust_classes()
+    assert "qwen-worker" in store.retired_agents()
+    with pytest.raises(ValueError, match="retired tombstone"):
+        store.add_agent("qwen-worker", role="reviewer")
+
+
+def test_external_worker_trust_is_sticky_and_survives_force_init(tmp_path) -> None:
+    store = make_store(tmp_path)
+    store.set_trust_class("worker", "external-worker")
+
+    with pytest.raises(ValueError, match="cannot be cleared"):
+        store.set_trust_class("worker", None)
+
+    store.init(["lead", "worker", "reviewer"], force=True)
+    assert store.trust_class("worker") == "external-worker"
+
+    store.init(["lead", "reviewer"], force=True)
+    assert "worker" in store.retired_agents()
+    with pytest.raises(ValueError, match="retired tombstone"):
+        store.add_agent("worker")
+
+
+def test_force_init_recovers_external_trust_from_a_partly_malformed_config(
+    tmp_path,
+) -> None:
+    store = make_store(tmp_path)
+    store.set_trust_class("worker", "external-worker")
+    raw = json.loads(store.config_path.read_text(encoding="utf-8"))
+    raw["agents"] = "malformed-but-trust-record-is-recoverable"
+    store.config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    store.init(["lead", "worker", "reviewer"], force=True)
+
+    assert store.trust_class("worker") == "external-worker"
+
+
+def test_domain_reviewer_cannot_be_reclassified_as_external_worker(tmp_path) -> None:
+    store = make_store(tmp_path)
+    (store.dir / "signoffs.json").write_text(
+        json.dumps({
+            "schema_version": 1,
+            "defaults": {"reviewers": {}},
+            "risk_policies": {
+                "security": [{
+                    "id": "domain-security",
+                    "required_count": 1,
+                    "candidates": {},
+                    "include_domain_reviewers": True,
+                }],
+            },
+        }),
+        encoding="utf-8",
+    )
+    (store.dir / "domains.json").write_text(
+        json.dumps({
+            "schema_version": 1,
+            "domains": {
+                "auth": {
+                    "title": "Auth",
+                    "owners": {"agents": ["lead"]},
+                    "reviewers": {"agents": ["worker"]},
+                    "owned_globs": ["src/auth/**"],
+                },
+            },
+            "shared_paths": [],
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="cannot be a signoff candidate"):
+        store.set_trust_class("worker", "external-worker")
+
+    assert store.trust_class("worker") is None

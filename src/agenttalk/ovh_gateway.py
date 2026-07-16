@@ -27,18 +27,19 @@ from typing import Callable, Iterator
 
 MODEL_ALIAS = "Qwen3.5-397B-A17B"
 POLICY_SOURCE = "https://www.ovhcloud.com/en/public-cloud/ai-endpoints/catalog/"
-POLICY_OBSERVED_DATE = "2026-07-15"
+POLICY_OBSERVED_DATE = "2026-07-16"
 POLICY_CURRENCY = "EUR"
 TOKENS_PER_RATE_UNIT = 1_000_000
-INPUT_RATE_MICRO_EUR = 710_000
-OUTPUT_RATE_MICRO_EUR = 4_250_000
-RESERVE_INPUT_RATE_MICRO_EUR = 852_000
-RESERVE_OUTPUT_RATE_MICRO_EUR = 5_100_000
+INPUT_RATE_MICRO_EUR = 600_000
+OUTPUT_RATE_MICRO_EUR = 3_600_000
+RESERVE_INPUT_RATE_MICRO_EUR = 720_000
+RESERVE_OUTPUT_RATE_MICRO_EUR = 4_320_000
 MAX_CONTEXT_TOKENS = 262_144
 MAX_OUTPUT_TOKENS = 4_096
 TRIAL_CUTOFF_MICRO_EUR = 25_000_000
 SOFT_STOP_MICRO_EUR = 20_000_000
 EXTERNAL_CEILING_MICRO_EUR = 100_000_000
+CANARY_TOLERANCE_BPS = 1_000
 LEDGER_SCHEMA_VERSION = 1
 INSTALL_MARKER_SCHEMA_VERSION = 1
 BACKEND_PROFILE = "ovh-qwen"
@@ -128,6 +129,10 @@ def price_policy() -> dict:
         "trial_cutoff_micro_eur": TRIAL_CUTOFF_MICRO_EUR,
         "soft_stop_micro_eur": SOFT_STOP_MICRO_EUR,
         "external_ceiling_micro_eur": EXTERNAL_CEILING_MICRO_EUR,
+        "dashboard_canary": {
+            "requires_nonzero_delta": True,
+            "tolerance_basis_points": CANARY_TOLERANCE_BPS,
+        },
     }
 
 
@@ -448,8 +453,14 @@ class SpendLedger:
             _durable_write_json(self.marker_path, marker)
             return marker
         finally:
-            with contextlib.suppress(FileNotFoundError):
-                temp_db.unlink()
+            for temporary in (
+                temp_db,
+                Path(f"{temp_db}-journal"),
+                Path(f"{temp_db}-wal"),
+                Path(f"{temp_db}-shm"),
+            ):
+                with contextlib.suppress(FileNotFoundError):
+                    temporary.unlink()
 
     @staticmethod
     def _configure(conn: sqlite3.Connection) -> None:
@@ -616,6 +627,55 @@ class SpendLedger:
         ).fetchone()
         if opening_row is None or int(opening_row[0]) < opening_micro_eur:
             raise LedgerBlocked("ledger opening balance is not represented in its period")
+        canary_keys = (
+            "canary_attempt_id",
+            "canary_checked_at",
+            "canary_expected_micro_eur",
+            "canary_observed_micro_eur",
+            "canary_tolerance_micro_eur",
+            "canary_status",
+        )
+        canary_present = [key in metadata for key in canary_keys]
+        if any(canary_present) and not all(canary_present):
+            raise LedgerBlocked("dashboard canary metadata is incomplete")
+        if all(canary_present):
+            attempt_id = metadata["canary_attempt_id"]
+            try:
+                self._validate_attempt_id(attempt_id)
+            except ValueError as exc:
+                raise LedgerBlocked("dashboard canary attempt id is invalid") from exc
+            _parse_utc(metadata["canary_checked_at"])
+            try:
+                expected = int(metadata["canary_expected_micro_eur"])
+                observed = int(metadata["canary_observed_micro_eur"])
+                tolerance = int(metadata["canary_tolerance_micro_eur"])
+            except ValueError as exc:
+                raise LedgerBlocked("dashboard canary amount is invalid") from exc
+            if (
+                str(expected) != metadata["canary_expected_micro_eur"]
+                or str(observed) != metadata["canary_observed_micro_eur"]
+                or str(tolerance) != metadata["canary_tolerance_micro_eur"]
+                or expected <= 0
+                or observed < 0
+                or tolerance <= 0
+            ):
+                raise LedgerBlocked("dashboard canary amount is invalid")
+            status = metadata["canary_status"]
+            mathematically_accepted = observed > 0 and abs(observed - expected) <= tolerance
+            if status not in {"accepted", "mismatch"} or (
+                (status == "accepted") != mathematically_accepted
+            ):
+                raise LedgerBlocked("dashboard canary status is invalid")
+            canary_attempt = conn.execute(
+                "SELECT state, actual_micro_eur FROM attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            if (
+                canary_attempt is None
+                or canary_attempt["state"] != "settled"
+                or int(canary_attempt["actual_micro_eur"] or 0) != expected
+            ):
+                raise LedgerBlocked("dashboard canary attempt binding is invalid")
         return metadata
 
     @staticmethod
@@ -626,11 +686,14 @@ class SpendLedger:
             raise LedgerBlocked("ledger writer lock could not be acquired") from exc
 
     def _commit(self, conn: sqlite3.Connection) -> None:
+        # PRAGMA synchronous=FULL makes SQLite's successful commit return the
+        # sole durability authority for ledger transactions. A second file
+        # flush after commit can fail after the terminal row is already visible,
+        # falsely reporting failure while leaving the ledger ready.
         try:
             conn.commit()
-            self._durability_barrier(self.db_path)
-        except (OSError, sqlite3.Error) as exc:
-            raise LedgerBlocked("ledger durability barrier failed") from exc
+        except sqlite3.Error as exc:
+            raise LedgerBlocked("ledger transaction commit failed") from exc
 
     @staticmethod
     def _rollback(conn: sqlite3.Connection) -> None:
@@ -723,6 +786,17 @@ class SpendLedger:
                 )
                 if projected > opening_allowance + TRIAL_CUTOFF_MICRO_EUR:
                     raise PolicyBlocked("trial spend cutoff would be exceeded")
+                cumulative_row = conn.execute(
+                    "SELECT COALESCE(SUM(committed_micro_eur), 0) FROM periods"
+                ).fetchone()
+                # The opening balance is seeded into the opening period, so the
+                # SUM already includes it. Adding metadata.opening_micro_eur
+                # again would double-count the operator-observed balance.
+                cumulative_projected = (
+                    int(cumulative_row[0]) + unresolved_total + reserve
+                )
+                if cumulative_projected > EXTERNAL_CEILING_MICRO_EUR:
+                    raise PolicyBlocked("external ceiling would be exceeded")
                 try:
                     conn.execute(
                         """
@@ -985,6 +1059,84 @@ class SpendLedger:
                 raise
         return {"held": False, "prior_hold": prior or None, "cleared_at": timestamp}
 
+    def verify_dashboard_canary(
+        self,
+        attempt_id: str,
+        *,
+        observed_delta_micro_eur: int,
+        now: datetime | None = None,
+    ) -> dict:
+        """Persist a fail-closed live dashboard comparison for one settled call."""
+        self._validate_attempt_id(attempt_id)
+        if (
+            not isinstance(observed_delta_micro_eur, int)
+            or isinstance(observed_delta_micro_eur, bool)
+            or observed_delta_micro_eur < 0
+        ):
+            raise ValueError("observed dashboard delta must be non-negative micro-EUR")
+        timestamp = _iso_utc((now or self.now()).astimezone(timezone.utc))
+        with self._connect() as conn:
+            self._begin(conn)
+            try:
+                row = conn.execute(
+                    "SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)
+                ).fetchone()
+                if row is None:
+                    raise LedgerBlocked("attempt does not exist")
+                expected = int(row["actual_micro_eur"] or 0)
+                if (
+                    row["state"] != "settled"
+                    or row["model"] != MODEL_ALIAS
+                    or row["policy_hash"] != price_policy_hash()
+                    or expected <= 0
+                ):
+                    raise LedgerBlocked(
+                        "dashboard canary requires a positive policy-matched settled attempt"
+                    )
+                tolerance = max(
+                    1,
+                    (
+                        expected * CANARY_TOLERANCE_BPS
+                        + 10_000
+                        - 1
+                    )
+                    // 10_000,
+                )
+                accepted = (
+                    observed_delta_micro_eur > 0
+                    and abs(observed_delta_micro_eur - expected) <= tolerance
+                )
+                values = {
+                    "canary_attempt_id": attempt_id,
+                    "canary_checked_at": timestamp,
+                    "canary_expected_micro_eur": str(expected),
+                    "canary_observed_micro_eur": str(observed_delta_micro_eur),
+                    "canary_tolerance_micro_eur": str(tolerance),
+                    "canary_status": "accepted" if accepted else "mismatch",
+                }
+                conn.executemany(
+                    "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
+                    values.items(),
+                )
+                if not accepted:
+                    conn.execute(
+                        "UPDATE metadata SET value='dashboard_canary_mismatch' "
+                        "WHERE key='service_hold'"
+                    )
+                self._commit(conn)
+                return {
+                    "attempt_id": attempt_id,
+                    "accepted": accepted,
+                    "expected_micro_eur": expected,
+                    "observed_delta_micro_eur": observed_delta_micro_eur,
+                    "tolerance_micro_eur": tolerance,
+                    "held": not accepted,
+                    "checked_at": timestamp,
+                }
+            except Exception:
+                self._rollback(conn)
+                raise
+
     def status(self) -> dict:
         with self._connect() as conn:
             marker = self._marker()
@@ -1022,6 +1174,24 @@ class SpendLedger:
                 "periods": periods,
                 "unresolved": unresolved,
                 "service_hold": metadata.get("service_hold") or None,
+                "dashboard_canary": (
+                    {
+                        "attempt_id": metadata["canary_attempt_id"],
+                        "checked_at": metadata["canary_checked_at"],
+                        "expected_micro_eur": int(
+                            metadata["canary_expected_micro_eur"]
+                        ),
+                        "observed_delta_micro_eur": int(
+                            metadata["canary_observed_micro_eur"]
+                        ),
+                        "tolerance_micro_eur": int(
+                            metadata["canary_tolerance_micro_eur"]
+                        ),
+                        "status": metadata["canary_status"],
+                    }
+                    if metadata.get("canary_attempt_id")
+                    else None
+                ),
                 "ready": not unresolved and not metadata.get("service_hold"),
             }
 

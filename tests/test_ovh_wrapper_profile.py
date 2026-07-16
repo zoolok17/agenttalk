@@ -43,6 +43,9 @@ def test_ovh_qwen_child_environment_starts_from_allowlist(tmp_path, monkeypatch)
             "AGENTTALK_INBOUND_REQUEST_ID": "stale-must-not-pass",
             "ANTHROPIC_API_KEY": "must-not-pass",
             "ANTHROPIC_AUTH_TOKEN": "ambient-must-not-pass",
+            "CLAUDE_CONFIG_DIR": "C:\\Users\\operator\\.claude",
+            "HOME": "C:\\Users\\operator",
+            "USERPROFILE": "C:\\Users\\operator",
             "OVH_KEY": "must-not-pass",
             "UNRELATED_SECRET": "must-not-pass",
         },
@@ -63,11 +66,17 @@ def test_ovh_qwen_child_environment_starts_from_allowlist(tmp_path, monkeypatch)
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:4000"
     assert env["ANTHROPIC_AUTH_TOKEN"] == "front-token"
     assert env["ANTHROPIC_MODEL"] == "Qwen3.5-397B-A17B"
+    assert env["CLAUDE_CONFIG_DIR"] == str(
+        (tmp_path / ".agenttalk" / "gateway" / "claude-profile").resolve()
+    )
     assert env["AGENTTALK_WRAPPER_GENERATION"] == "generation"
     assert env["AGENTTALK_INBOUND_REQUEST_ID"] == "request"
     assert "ANTHROPIC_API_KEY" not in env
     assert "OVH_KEY" not in env
     assert "UNRELATED_SECRET" not in env
+    assert "HOME" not in env
+    assert "USERPROFILE" not in env
+    assert "C:\\Users\\operator\\.claude" not in env.values()
     assert "AGENTTALK_LEAD_LOOP_LEASE" not in env
     assert "ambient-must-not-pass" not in env.values()
     assert "stale-must-not-pass" not in env.values()
@@ -101,6 +110,30 @@ def test_ovh_qwen_profile_rejects_unpinned_gateway_or_extra_env(tmp_path) -> Non
                 "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000",
                 "ANTHROPIC_AUTH_TOKEN": "token",
                 "ANTHROPIC_MODEL": "other-model",
+            },
+        )
+
+
+def test_ovh_qwen_profile_refuses_a_path_resolving_outside_workspace(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    original_resolve = run.Path.resolve
+    outside = tmp_path.parent / "operator-claude-profile"
+
+    def resolve_with_profile_escape(path, *args, **kwargs):
+        if path.name == "claude-profile":
+            return outside
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(run.Path, "resolve", resolve_with_profile_escape)
+    with pytest.raises(ValueError, match="must resolve inside"):
+        run._child_env(
+            tmp_path,
+            backend_profile="ovh-qwen",
+            profile_env={
+                "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000",
+                "ANTHROPIC_AUTH_TOKEN": "token",
             },
         )
 

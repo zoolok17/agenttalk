@@ -941,6 +941,7 @@ class Store:
         # re-validatable tombstone; only a config damaged beyond JSON-parse has
         # nothing recoverable to carry.
         retired_carry: list = []
+        external_carry: set[str] = set()
         if self.initialized():
             try:
                 raw = json.loads(self.config_path.read_text(encoding="utf-8"))
@@ -975,6 +976,42 @@ class Store:
                         "reason": (e.get("reason")
                                    if isinstance(e.get("reason"), str) else None),
                     })
+            raw_trust = raw.get("trust_classes") if isinstance(raw, dict) else None
+            if isinstance(raw_trust, dict):
+                for name, trust_class in raw_trust.items():
+                    if trust_class != TRUST_CLASS_EXTERNAL_WORKER:
+                        continue
+                    try:
+                        validate_agent_name(name)
+                    except (TypeError, ValueError):
+                        continue
+                    external_carry.add(name)
+        retired_keys = {
+            e["name"].casefold()
+            for e in retired_carry
+            if isinstance(e, dict) and isinstance(e.get("name"), str)
+        }
+        active_external: list[str] = []
+        for historical_name in sorted(external_carry):
+            matches = [
+                name for name in agents
+                if name.casefold() == historical_name.casefold()
+            ]
+            if matches:
+                if matches[0] != historical_name:
+                    raise ValueError(
+                        f"cannot init with case-variant {matches[0]!r} of historical "
+                        f"external-worker {historical_name!r}; identities are non-rebindable"
+                    )
+                active_external.append(historical_name)
+            elif historical_name.casefold() not in retired_keys:
+                retired_carry.append({
+                    "name": historical_name,
+                    "retired_at": _now_iso(),
+                    "renamed_to": None,
+                    "reason": "external-worker omitted by force init",
+                })
+                retired_keys.add(historical_name.casefold())
         if retired_carry:
             tomb_keys = {
                 e["name"].casefold() for e in retired_carry
@@ -1003,6 +1040,10 @@ class Store:
         }
         if retired_carry:
             cfg["retired"] = retired_carry  # tombstones survive a force re-init
+        if active_external:
+            cfg["trust_classes"] = dict.fromkeys(
+                active_external, TRUST_CLASS_EXTERNAL_WORKER
+            )
         _atomic_write_text(self.config_path, json.dumps(cfg, indent=2))
         for a in agents:
             cur = self.state_dir / f"{a}.cursor"
@@ -1668,7 +1709,6 @@ class Store:
                 )
 
         from agenttalk import close as _close
-        from agenttalk import domains as _domains
 
         policy, error = _close.load_signoff_policy(self)
         if error:
@@ -1678,14 +1718,32 @@ class Store:
             )
         if policy is None:
             return
-        refsets = [policy["defaults"]["reviewers"]]
+        default_reviewers = policy["defaults"]["reviewers"]
+        all_domain_reviewers = _close.signoff_domain_refset(self, cfg, None)
+        candidate_sets = [
+            _close.resolve_signoff_candidates(
+                cfg,
+                candidate_refset=default_reviewers,
+                default_reviewers={},
+                use_default_reviewers=False,
+                domain_refset={},
+                include_domain_reviewers=False,
+            )
+        ]
         for sets in policy["risk_policies"].values():
             for signoff_set in sets:
-                refsets.append(signoff_set["candidates"])
-                if signoff_set["use_default_reviewers"]:
-                    refsets.append(policy["defaults"]["reviewers"])
+                candidate_sets.append(
+                    _close.resolve_signoff_candidates(
+                        cfg,
+                        candidate_refset=signoff_set["candidates"],
+                        default_reviewers=default_reviewers,
+                        use_default_reviewers=signoff_set["use_default_reviewers"],
+                        domain_refset=all_domain_reviewers,
+                        include_domain_reviewers=signoff_set["include_domain_reviewers"],
+                    )
+                )
         for agent in sorted(external):
-            if any(agent in _domains.resolve_refset(refset, cfg) for refset in refsets):
+            if any(agent in candidates for candidates in candidate_sets):
                 raise ValueError(
                     f"external-worker {agent!r} cannot be a signoff candidate"
                 )
@@ -1747,10 +1805,16 @@ class Store:
 
     def remove_agent(self, name: str) -> dict:
         """Remove an agent from the roster, its role, and all group
-        memberships. Leaves its cursor/messages as historical record."""
+        memberships. External workers become permanent tombstones; ordinary
+        force-removed identities retain the historical re-addable behavior."""
         with self._retirement_lock(), self._config_lock():
             cfg = self.load_config()
             roster = list(cfg.get("agents", []))
+            was_external = (
+                name in roster
+                and (cfg.get("trust_classes") or {}).get(name)
+                == TRUST_CLASS_EXTERNAL_WORKER
+            )
             if name in roster:
                 roster.remove(name)
                 cfg["agents"] = roster
@@ -1767,6 +1831,18 @@ class Store:
                 cfg["avatars"].pop(name, None)
             if isinstance(cfg.get("trust_classes"), dict):
                 cfg["trust_classes"].pop(name, None)
+            if was_external:
+                retired = cfg.get("retired")
+                if not isinstance(retired, list):
+                    retired = []
+                retired.append({
+                    "name": name,
+                    "retired_at": _now_iso(),
+                    "renamed_to": None,
+                    "reason": "removed external-worker identity",
+                })
+                cfg["retired"] = retired
+                validate_retired(retired, roster)
             self._write_config(cfg)
         return cfg
 
@@ -1777,6 +1853,14 @@ class Store:
             if name not in roster:
                 raise ValueError(f"agent {name!r} is not in the roster {sorted(roster)}")
             values = self._cfg_dict(cfg, "trust_classes")
+            if (
+                values.get(name) == TRUST_CLASS_EXTERNAL_WORKER
+                and trust_class != TRUST_CLASS_EXTERNAL_WORKER
+            ):
+                raise ValueError(
+                    f"external-worker trust for {name!r} cannot be cleared or reclassified; "
+                    "retire the identity instead"
+                )
             if trust_class is None:
                 values.pop(name, None)
             else:

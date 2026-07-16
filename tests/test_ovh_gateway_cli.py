@@ -9,6 +9,7 @@ from agenttalk import cli
 from agenttalk import ovh_gateway
 from agenttalk import ovh_gateway_service
 from agenttalk.ovh_gateway import SpendLedger, default_install_marker_path, default_ledger_path
+from agenttalk.ovh_gateway import MODEL_ALIAS
 from agenttalk.store import Store
 
 
@@ -66,6 +67,26 @@ def test_gateway_cli_initializes_once_and_controls_manual_hold(
     cleared = json.loads(capsys.readouterr().out)
     assert cleared["held"] is False
     assert ledger.status()["service_hold"] is None
+
+    ledger.reserve("1" * 32)
+    ledger.settle(
+        "1" * 32,
+        model=MODEL_ALIAS,
+        input_tokens=1_000,
+        output_tokens=100,
+    )
+    assert cli.main([
+        "--root",
+        str(root),
+        "gateway",
+        "canary-verify",
+        "1" * 32,
+        "--dashboard-delta-eur",
+        "0.00096",
+    ]) == 0
+    canary = json.loads(capsys.readouterr().out)
+    assert canary["accepted"] is True
+    assert canary["expected_micro_eur"] == 960
 
 
 def test_gateway_cli_rejects_caller_supplied_actual_reconciliation(

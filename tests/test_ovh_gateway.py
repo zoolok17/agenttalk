@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from agenttalk.ovh_gateway import (
+    CANARY_TOLERANCE_BPS,
     EXTERNAL_CEILING_MICRO_EUR,
     INPUT_RATE_MICRO_EUR,
     MAX_CONTEXT_TOKENS,
@@ -62,17 +63,18 @@ def make_ledger(tmp_path, clock: Clock | None = None) -> SpendLedger:
 
 def test_exact_price_policy_and_charge_fixture() -> None:
     assert POLICY_CURRENCY == "EUR"
-    assert INPUT_RATE_MICRO_EUR == 710_000
-    assert OUTPUT_RATE_MICRO_EUR == 4_250_000
-    assert RESERVE_INPUT_RATE_MICRO_EUR == 852_000
-    assert RESERVE_OUTPUT_RATE_MICRO_EUR == 5_100_000
+    assert INPUT_RATE_MICRO_EUR == 600_000
+    assert OUTPUT_RATE_MICRO_EUR == 3_600_000
+    assert RESERVE_INPUT_RATE_MICRO_EUR == 720_000
+    assert RESERVE_OUTPUT_RATE_MICRO_EUR == 4_320_000
     assert MAX_CONTEXT_TOKENS == 262_144
     assert MAX_OUTPUT_TOKENS == 4_096
     assert TRIAL_CUTOFF_MICRO_EUR == 25_000_000
     assert SOFT_STOP_MICRO_EUR == 20_000_000
     assert EXTERNAL_CEILING_MICRO_EUR == 100_000_000
-    assert settlement_cost_micro_eur(1_000, 100) == 1_135
-    assert reservation_cost_micro_eur() == 244_237
+    assert CANARY_TOLERANCE_BPS == 1_000
+    assert settlement_cost_micro_eur(1_000, 100) == 960
+    assert reservation_cost_micro_eur() == 206_439
     assert len(price_policy_hash()) == 64
 
 
@@ -130,6 +132,21 @@ def test_initialize_durability_failure_never_creates_complete_install(tmp_path) 
     assert ledger.installation_state() == "absent"
 
 
+def test_initialize_removes_temporary_persist_journal(tmp_path) -> None:
+    ledger = SpendLedger(tmp_path / "ledger.sqlite3", tmp_path / "install.json")
+    ledger.initialize(
+        opening_micro_eur=0,
+        opening_evidence=TEST_OPENING_EVIDENCE,
+        generation="a" * 32,
+    )
+
+    assert not [
+        path.name
+        for path in tmp_path.iterdir()
+        if path.name.startswith(".ledger.sqlite3.")
+    ]
+
+
 def test_corrupt_marker_or_database_fails_closed(tmp_path) -> None:
     ledger = make_ledger(tmp_path)
     ledger.marker_path.write_text("not-json", encoding="utf-8")
@@ -175,8 +192,8 @@ def test_opening_balance_is_bound_seeded_and_surfaced(tmp_path) -> None:
         output_tokens=100,
     )
     status = ledger.status()
-    assert status["current_committed_micro_eur"] == 581_135
-    assert status["current_trial_committed_micro_eur"] == 1_135
+    assert status["current_committed_micro_eur"] == 580_960
+    assert status["current_trial_committed_micro_eur"] == 960
 
 
 def test_opening_balance_external_envelope_blocks_init_and_readiness(tmp_path) -> None:
@@ -218,7 +235,7 @@ def test_opening_balance_external_envelope_blocks_init_and_readiness(tmp_path) -
 def test_reserve_then_settle_commits_exact_actual(tmp_path) -> None:
     ledger = make_ledger(tmp_path)
     reservation = ledger.reserve("1" * 32)
-    assert reservation.reserved_micro_eur == 244_237
+    assert reservation.reserved_micro_eur == 206_439
     assert ledger.status()["ready"] is False
 
     result = ledger.settle(
@@ -227,14 +244,14 @@ def test_reserve_then_settle_commits_exact_actual(tmp_path) -> None:
         input_tokens=1_000,
         output_tokens=100,
     )
-    assert result["actual_micro_eur"] == 1_135
+    assert result["actual_micro_eur"] == 960
     status = ledger.status()
     assert status["ready"] is True
-    assert status["current_committed_micro_eur"] == 1_135
+    assert status["current_committed_micro_eur"] == 960
     assert status["unresolved"] == []
 
 
-def test_reservation_barrier_failure_never_allows_transport_and_remains_held(tmp_path) -> None:
+def test_sqlite_full_commit_is_the_reservation_durability_authority(tmp_path) -> None:
     ledger = make_ledger(tmp_path)
 
     def fail_barrier(_path) -> None:
@@ -246,11 +263,76 @@ def test_reservation_barrier_failure_never_allows_transport_and_remains_held(tmp
         now=ledger.now,
         durability_barrier=fail_barrier,
     )
-    with pytest.raises(LedgerBlocked, match="durability barrier"):
-        failing.reserve("1" * 32)
+    failing.reserve("1" * 32)
     status = ledger.status()
     assert status["ready"] is False
     assert status["unresolved"][0]["attempt_id"] == "1" * 32
+
+
+def test_settle_does_not_depend_on_a_fallible_post_commit_barrier(tmp_path) -> None:
+    ledger = make_ledger(tmp_path)
+    ledger.reserve("1" * 32)
+
+    def fail_barrier(_path) -> None:
+        raise OSError("post-commit barrier must not run")
+
+    failing = SpendLedger(
+        ledger.db_path,
+        ledger.marker_path,
+        now=ledger.now,
+        durability_barrier=fail_barrier,
+    )
+    result = failing.settle(
+        "1" * 32,
+        model=MODEL_ALIAS,
+        input_tokens=1_000,
+        output_tokens=100,
+    )
+
+    assert result["actual_micro_eur"] == 960
+    assert ledger.status()["ready"] is True
+
+
+def test_reconcile_does_not_depend_on_a_fallible_post_commit_barrier(tmp_path) -> None:
+    ledger = make_ledger(tmp_path)
+    ledger.reserve("1" * 32)
+
+    def fail_barrier(_path) -> None:
+        raise OSError("post-commit barrier must not run")
+
+    failing = SpendLedger(
+        ledger.db_path,
+        ledger.marker_path,
+        now=ledger.now,
+        durability_barrier=fail_barrier,
+    )
+    result = failing.reconcile(
+        "1" * 32,
+        outcome="no-send",
+        reason="provider proves transport never started",
+    )
+
+    assert result["total_actual_micro_eur"] == 0
+    assert ledger.status()["ready"] is True
+
+
+def test_clear_hold_does_not_depend_on_a_fallible_post_commit_barrier(tmp_path) -> None:
+    ledger = make_ledger(tmp_path)
+    ledger.place_hold(reason="dashboard mismatch")
+
+    def fail_barrier(_path) -> None:
+        raise OSError("post-commit barrier must not run")
+
+    failing = SpendLedger(
+        ledger.db_path,
+        ledger.marker_path,
+        now=ledger.now,
+        durability_barrier=fail_barrier,
+    )
+    result = failing.clear_hold(reason="operator completed reconciliation")
+
+    assert result["held"] is False
+    assert ledger.status()["ready"] is True
 
 
 def test_unresolved_attempt_blocks_restart_until_explicit_reconcile(tmp_path) -> None:
@@ -268,7 +350,7 @@ def test_unresolved_attempt_blocks_restart_until_explicit_reconcile(tmp_path) ->
         outcome="charge-reserve",
         reason="operator could not prove no-send",
     )
-    assert result["total_actual_micro_eur"] == 244_237
+    assert result["total_actual_micro_eur"] == reservation_cost_micro_eur()
     restarted.reserve("2" * 32)
 
 
@@ -399,6 +481,67 @@ def test_cutoff_counts_committed_and_the_new_worst_case_reservation(tmp_path) ->
         )
     with pytest.raises(PolicyBlocked, match="cutoff"):
         ledger.reserve("1" * 32)
+
+
+def test_running_external_ceiling_counts_committed_across_all_periods(tmp_path) -> None:
+    clock = Clock(datetime(2026, 11, 1, 0, 1, tzinfo=timezone.utc))
+    ledger = make_ledger(tmp_path, clock)
+    with sqlite3.connect(ledger.db_path) as conn:
+        conn.execute("DELETE FROM periods")
+        conn.executemany(
+            "INSERT INTO periods(period, committed_micro_eur) VALUES (?, ?)",
+            [
+                ("2026-07", TRIAL_CUTOFF_MICRO_EUR),
+                ("2026-08", TRIAL_CUTOFF_MICRO_EUR),
+                ("2026-09", TRIAL_CUTOFF_MICRO_EUR),
+                ("2026-10", TRIAL_CUTOFF_MICRO_EUR),
+                ("2026-11", 0),
+            ],
+        )
+        conn.execute(
+            "UPDATE metadata SET value='2026-11' WHERE key='last_accepted_period'"
+        )
+        conn.execute(
+            "UPDATE metadata SET value=? WHERE key='last_accepted_utc'",
+            ("2026-11-01T00:00:00.000000Z",),
+        )
+
+    with pytest.raises(PolicyBlocked, match="external ceiling"):
+        ledger.reserve("1" * 32)
+
+
+def test_dashboard_canary_enforces_nonzero_delta_and_numeric_tolerance(tmp_path) -> None:
+    ledger = make_ledger(tmp_path)
+    ledger.reserve("1" * 32)
+    ledger.settle(
+        "1" * 32,
+        model=MODEL_ALIAS,
+        input_tokens=1_000,
+        output_tokens=100,
+    )
+
+    accepted = ledger.verify_dashboard_canary(
+        "1" * 32,
+        observed_delta_micro_eur=1_056,
+    )
+    assert accepted["accepted"] is True
+    assert accepted["expected_micro_eur"] == 960
+    assert accepted["tolerance_micro_eur"] == 96
+
+    other = make_ledger(tmp_path / "zero")
+    other.reserve("2" * 32)
+    other.settle(
+        "2" * 32,
+        model=MODEL_ALIAS,
+        input_tokens=1_000,
+        output_tokens=100,
+    )
+    rejected = other.verify_dashboard_canary(
+        "2" * 32,
+        observed_delta_micro_eur=0,
+    )
+    assert rejected["accepted"] is False
+    assert other.status()["service_hold"] == "dashboard_canary_mismatch"
 
 
 def test_begin_immediate_serializes_concurrent_admission(tmp_path) -> None:

@@ -425,6 +425,17 @@ def _agenttalk_py() -> str:
     return str(Path(sys.executable).resolve())
 
 
+def _ovh_qwen_claude_config_dir(workspace: Path) -> str:
+    profile = (workspace / ".agenttalk" / "gateway" / "claude-profile").resolve()
+    try:
+        profile.relative_to(workspace)
+    except ValueError as exc:
+        raise ValueError(
+            "ovh-qwen Claude profile must resolve inside the project workspace"
+        ) from exc
+    return str(profile)
+
+
 def _child_env(
     workspace_root: str | os.PathLike[str] | None = None,
     *,
@@ -433,6 +444,7 @@ def _child_env(
     backend_profile: str | None = None,
     profile_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
+    workspace = Path(workspace_root).resolve() if workspace_root else _workspace_root()
     if backend_profile == "ovh-qwen":
         allowed_names = {
             "path",
@@ -476,6 +488,11 @@ def _child_env(
         for key in (LEAD_LOOP_LEASE_ENV, WRAPPER_GENERATION_ENV, INBOUND_REQUEST_ID_ENV):
             env.pop(key, None)
         env.update(injected)
+        # Claude Code must not discover the operator's normal ~/.claude profile
+        # through the same-user OS home fallback. This workspace-scoped profile
+        # is disposable with the watched-trial clone and contains no operator
+        # credentials or history.
+        env["CLAUDE_CONFIG_DIR"] = _ovh_qwen_claude_config_dir(workspace)
     elif backend_profile is not None:
         raise ValueError(f"unsupported backend_profile {backend_profile!r}")
     else:
@@ -486,7 +503,6 @@ def _child_env(
             for k, v in os.environ.items()
             if k not in {LEAD_LOOP_LEASE_ENV, WRAPPER_GENERATION_ENV, INBOUND_REQUEST_ID_ENV}
         }
-    workspace = Path(workspace_root).resolve() if workspace_root else _workspace_root()
     env["AGENTTALK_PY"] = _agenttalk_py()
     env["AGENTTALK_ROOT"] = str(workspace)
     if isinstance(wrapper_generation, str) and wrapper_generation:

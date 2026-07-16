@@ -14,14 +14,18 @@ hostile same-user process.
 - Provider route: Claude Code -> `127.0.0.1:4000` -> LiteLLM on
   `127.0.0.1:4001` -> OVH OpenAI Chat Completions.
 - Model: `Qwen3.5-397B-A17B` only.
-- Settlement rates: EUR 0.71/M input tokens and EUR 4.25/M output tokens.
-- Reservation rates: EUR 0.852/M input tokens and EUR 5.10/M output tokens.
+- Settlement rates: OVH's EUR tariff, EUR 0.60/M input tokens and EUR 3.60/M
+  output tokens.
+- Reservation rates: the tariff plus 20%, EUR 0.72/M input tokens and EUR
+  4.32/M output tokens.
 - Maximum output: 4096 tokens; maximum input context: 262144 tokens.
-- Maximum one-attempt reservation: EUR 0.244237.
+- Maximum one-attempt reservation: EUR 0.206439.
 - Trial cutoff: EUR 25; operator soft stop: EUR 20.
 - External account ceiling: EUR 100. Initialization and readiness require the
   operator-observed opening balance plus the EUR 25 trial cutoff plus one
-  maximum reservation to remain within this ceiling.
+  maximum reservation to remain within this ceiling. Every admission also
+  checks cumulative committed spend across all UTC periods plus unresolved
+  reservations against the same EUR 100 ceiling.
 - Provider attempts: one. LiteLLM, router, and front retries are disabled.
 
 The policy hash is persisted in the install marker, ledger, config manifest,
@@ -125,6 +129,10 @@ variables, and injects the loopback URL and front token. It excludes ambient
 `ANTHROPIC_API_KEY`, `OVH_KEY`, and `ANTHROPIC_AUTH_TOKEN`. Every non-Qwen
 profile retains its prior environment behavior.
 
+The profile also forces `CLAUDE_CONFIG_DIR` to the disposable clone's
+`.agenttalk/gateway/claude-profile` directory. It never inherits the operator's
+`HOME`, `USERPROFILE`, or ambient Claude profile path.
+
 `wrap --loop` refuses to launch this worker unless the gateway is fully ready,
 the roster and supervisor trust classes agree, the model and CLI are pinned,
 and provider keys are absent from the supervisor environment. A failed
@@ -134,9 +142,11 @@ message is consumed.
 ## Spend and Failure Semantics
 
 Before the single provider transport, SQLite `BEGIN IMMEDIATE` durably records
-a unique attempt reservation and flushes it. Admission counts committed spend
-plus every unresolved reservation. The concurrency permit remains held through
-settlement or durable hold.
+a unique attempt reservation. SQLite `synchronous=FULL` commit is the sole
+transaction durability authority; there is no fallible second flush after a
+committed terminal transition. Admission counts committed spend plus every
+unresolved reservation. The concurrency permit remains held through settlement
+or durable hold.
 
 A complete response with exact-model, present, positive integer token usage is
 settled to the original UTC admission period. Missing or invalid usage,
@@ -190,6 +200,9 @@ failures remain stopped and visible after that ceiling.
 lead, operator-facing, a Tier-3 reviewer, release actor, close/signoff/shared
 path approver, or counted quorum. Roster mutations prevent assigning lead,
 operator-facing, or signoff-candidate eligibility to this trust class.
+External-worker trust is sticky: removal creates a permanent non-rebindable
+tombstone, rename carries the trust class, and `init --force` cannot silently
+reclassify or resurrect the identity.
 
 For this watched trial, the non-Qwen lead additionally controls reviewer
 selection. Every Qwen-built final SHA requires two distinct non-Qwen,
@@ -201,5 +214,15 @@ reversible work.
 
 The live acceptance step is deliberately not part of automated tests. With the
 operator watching the OVH dashboard, run one streamed Claude Code
-Read/Edit/Read turn, verify the exact model and ledger settlement against OVH,
-and place a durable hold on any mismatch before launching the wrapped worker.
+Read/Edit/Read turn, then enforce the observed nonzero dashboard delta against
+the settled attempt:
+
+```powershell
+agenttalk gateway canary-verify ATTEMPT_ID --dashboard-delta-eur OBSERVED_DELTA
+```
+
+The delta must be nonzero and within 10% of the ledger's tariff-derived
+settlement. The deterministic 1000-input/100-output fixture settles to 960
+micro-EUR, so its tolerance is 96 micro-EUR. The command persists the numeric
+comparison; zero or out-of-tolerance deltas set a durable
+`dashboard_canary_mismatch` hold and return nonzero before the worker launches.

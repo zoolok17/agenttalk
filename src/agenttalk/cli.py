@@ -2164,45 +2164,6 @@ def _agent_groups(cfg: dict, agent: str) -> list[str]:
             if isinstance(members, list) and agent in members]
 
 
-def _merge_refsets(*refsets: dict) -> dict:
-    merged = {"agents": [], "groups": [], "roles": []}
-    for rs in refsets:
-        for key in merged:
-            merged[key].extend((rs or {}).get(key) or [])
-    return merged
-
-
-def _signoff_domain_refset(store, changed_paths: list[str]) -> dict:
-    """Additive ONLY: the union of matched owned-domain reviewers + matched
-    shared-path default_reviewers for the close's changed paths. Touching a domain
-    never mints a requirement; this only widens an existing set's candidates. Missing
-    registry = empty."""
-    merged = _merge_refsets()
-    if not changed_paths:
-        return merged
-    try:
-        reg = _load_domain_registry(store)
-        data = reg.data
-    except Exception:  # noqa: BLE001 - a broken registry must not crash close check
-        return merged
-    verdicts = dom.check_paths(data, changed_paths)
-    domains = data.get("domains", {})
-    shared = data.get("shared_paths", [])
-    matched_domains: set[str] = set()
-    matched_globs: set[str] = set()
-    for v in verdicts:
-        matched_domains.update(v.get("domains", []))
-        for sm in v.get("shared_paths", []):
-            matched_globs.add(sm.get("glob"))
-    parts = [merged]
-    for did in matched_domains:
-        parts.append(domains.get(did, {}).get("reviewers") or {})
-    for entry in shared:
-        if entry.get("glob") in matched_globs:
-            parts.append(entry.get("default_reviewers") or {})
-    return _merge_refsets(*parts)
-
-
 def _changed_paths_of(record: dict) -> list[str]:
     inv = record.get("risk_inventory") or []
     return sorted({p for e in inv if isinstance(e, dict)
@@ -2228,15 +2189,22 @@ def _build_signoff_eval(store, record: dict):
     cur_inv_hash = close_mod.risk_inventory_hash(inv)
     unmapped = (close_mod.derive_required_signoffs(policy, inv)["unmapped"]
                 if policy else [])
-    domain_refset = _signoff_domain_refset(store, _changed_paths_of(record))
+    domain_refset = close_mod.signoff_domain_refset(
+        store,
+        cfg,
+        _changed_paths_of(record),
+    )
     default_reviewers = ((policy or {}).get("defaults", {}) or {}).get("reviewers") or {}
     resolved: dict[str, list[str]] = {}
     for s in record["required_signoffs"]:
-        merged = _merge_refsets(
-            s.get("candidate_refset") or {},
-            default_reviewers if s.get("use_default_reviewers") else {},
-            domain_refset if s.get("include_domain_reviewers") else {})
-        resolved[s["id"]] = dom.resolve_refset(merged, cfg)
+        resolved[s["id"]] = close_mod.resolve_signoff_candidates(
+            cfg,
+            candidate_refset=s.get("candidate_refset") or {},
+            default_reviewers=default_reviewers,
+            use_default_reviewers=bool(s.get("use_default_reviewers")),
+            domain_refset=domain_refset,
+            include_domain_reviewers=bool(s.get("include_domain_reviewers")),
+        )
     return {"policy_present": policy is not None, "policy_error": None,
             "current_policy_hash": cur_policy_hash,
             "current_risk_inventory_hash": cur_inv_hash,
@@ -2325,15 +2293,18 @@ def _resolve_signoff_audit(store, policy, inv, record) -> dict:
     derived = close_mod.derive_required_signoffs(policy, inv)["signoffs"]
     changed = sorted({p for e in inv if isinstance(e, dict)
                       for p in (e.get("affected_paths") or [])})
-    domain_refset = _signoff_domain_refset(store, changed)
+    domain_refset = close_mod.signoff_domain_refset(store, cfg, changed)
     default_reviewers = ((policy or {}).get("defaults", {}) or {}).get("reviewers") or {}
     audit = {}
     for s in derived:
-        merged = _merge_refsets(
-            s.get("candidate_refset") or {},
-            default_reviewers if s.get("use_default_reviewers") else {},
-            domain_refset if s.get("include_domain_reviewers") else {})
-        audit[s["id"]] = dom.resolve_refset(merged, cfg)
+        audit[s["id"]] = close_mod.resolve_signoff_candidates(
+            cfg,
+            candidate_refset=s.get("candidate_refset") or {},
+            default_reviewers=default_reviewers,
+            use_default_reviewers=bool(s.get("use_default_reviewers")),
+            domain_refset=domain_refset,
+            include_domain_reviewers=bool(s.get("include_domain_reviewers")),
+        )
     return audit
 
 
@@ -8032,6 +8003,11 @@ def cmd_gateway(args: argparse.Namespace) -> int:
                 outcome=args.outcome,
                 reason=args.reason,
             )
+        elif action == "canary-verify":
+            result = gateway.SpendLedger().verify_dashboard_canary(
+                args.attempt_id,
+                observed_delta_micro_eur=args.dashboard_delta_micro_eur,
+            )
         elif action == "hold":
             result = gateway.SpendLedger().place_hold(reason=args.reason)
         elif action == "clear-hold":
@@ -8045,6 +8021,8 @@ def cmd_gateway(args: argparse.Namespace) -> int:
         return 2
     print(json.dumps(result, indent=2, sort_keys=True))
     if action == "status" and not result.get("ready"):
+        return 2
+    if action == "canary-verify" and not result.get("accepted"):
         return 2
     return 0
 
@@ -9918,6 +9896,8 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         backend_profile=backend_profile,
         profile_env=profile_env,
     )
+    if backend_profile == "ovh-qwen":
+        Path(child_env["CLAUDE_CONFIG_DIR"]).mkdir(parents=True, exist_ok=True)
     launch = wrapper_run.preflight_launch_runtime(
         argv, args.cli, launch_cwd, child_env)
     if launch.blocked:
@@ -13021,6 +13001,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gw_reconcile.add_argument("--reason", required=True)
     gw_reconcile.set_defaults(func=cmd_gateway)
+    gw_canary = gwsub.add_parser(
+        "canary-verify",
+        help="Compare one settled attempt with the operator-observed dashboard delta.",
+    )
+    gw_canary.add_argument("attempt_id")
+    gw_canary.add_argument(
+        "--dashboard-delta-eur",
+        dest="dashboard_delta_micro_eur",
+        type=_micro_eur_arg,
+        required=True,
+    )
+    gw_canary.set_defaults(func=cmd_gateway)
     gw_hold = gwsub.add_parser("hold", help="Durably block new provider transport.")
     gw_hold.add_argument("--reason", required=True)
     gw_hold.set_defaults(func=cmd_gateway)
