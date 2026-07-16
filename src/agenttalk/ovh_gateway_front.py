@@ -227,24 +227,48 @@ class GatewayFront:
             do_HEAD = _reject_default
 
             def do_POST(self) -> None:
-                if self.path != PUBLIC_ROUTE:
+                request_line = self.requestline.split(" ")
+                if (
+                    len(request_line) != 3
+                    or request_line[0] != "POST"
+                    or request_line[1] != PUBLIC_ROUTE
+                    or self.path != PUBLIC_ROUTE
+                ):
                     self._reject_default()
                     return
-                if self.headers.get("Host") != front.config.public_host_header:
+                host_values = self.headers.get_all("Host") or []
+                if len(host_values) != 1 or host_values[0] != front.config.public_host_header:
                     self._stable_error(400, CONFIG_ERROR_CODE)
                     return
-                if "Origin" in self.headers:
+                if self.headers.get_all("Origin"):
                     self._stable_error(403, CONFIG_ERROR_CODE)
                     return
-                if not token_matches(self.headers.get("Authorization"), front.config.public_token):
+                if self.headers.get_all("Transfer-Encoding"):
+                    self._stable_error(400, CONFIG_ERROR_CODE)
+                    return
+                authorization_values = self.headers.get_all("Authorization") or []
+                if len(authorization_values) != 1:
+                    self._stable_error(400, CONFIG_ERROR_CODE)
+                    return
+                if not token_matches(authorization_values[0], front.config.public_token):
                     self._stable_error(401, CONFIG_ERROR_CODE)
                     return
-                raw_length = self.headers.get("Content-Length")
-                try:
-                    length = int(raw_length or "")
-                except ValueError:
+                content_type_values = self.headers.get_all("Content-Type") or []
+                if len(content_type_values) > 1:
+                    self._stable_error(400, CONFIG_ERROR_CODE)
+                    return
+                length_values = self.headers.get_all("Content-Length") or []
+                if not length_values:
                     self._stable_error(411, CONFIG_ERROR_CODE)
                     return
+                if len(length_values) != 1:
+                    self._stable_error(400, CONFIG_ERROR_CODE)
+                    return
+                raw_length = length_values[0]
+                if not raw_length or any(char < "0" or char > "9" for char in raw_length):
+                    self._stable_error(411, CONFIG_ERROR_CODE)
+                    return
+                length = int(raw_length)
                 if length <= 0 or length > front.config.max_request_bytes:
                     self._stable_error(413, CONFIG_ERROR_CODE)
                     return

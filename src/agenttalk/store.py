@@ -1643,16 +1643,6 @@ class Store:
             )
         return out
 
-    @staticmethod
-    def _agent_matches_refset(cfg: dict, agent: str, refset: dict) -> bool:
-        if agent in (refset.get("agents") or []):
-            return True
-        role = (cfg.get("roles") or {}).get(agent)
-        if role in (refset.get("roles") or []):
-            return True
-        groups = cfg.get("groups") or {}
-        return any(agent in (groups.get(group) or []) for group in (refset.get("groups") or []))
-
     def _assert_external_worker_authority_safe(self, cfg: dict) -> None:
         """Prevent accidental authority assignment at roster mutation time.
 
@@ -1678,6 +1668,7 @@ class Store:
                 )
 
         from agenttalk import close as _close
+        from agenttalk import domains as _domains
 
         policy, error = _close.load_signoff_policy(self)
         if error:
@@ -1694,7 +1685,7 @@ class Store:
                 if signoff_set["use_default_reviewers"]:
                     refsets.append(policy["defaults"]["reviewers"])
         for agent in sorted(external):
-            if any(self._agent_matches_refset(cfg, agent, refset) for refset in refsets):
+            if any(agent in _domains.resolve_refset(refset, cfg) for refset in refsets):
                 raise ValueError(
                     f"external-worker {agent!r} cannot be a signoff candidate"
                 )

@@ -70,6 +70,14 @@ def test_doctor_ovh_qwen_gateway_is_allowlisted_and_checks_ambient_keys(
             "price_policy_hash": "a" * 64,
             "committed_micro_eur": 123,
             "unresolved_count": 0,
+            "ledger": {
+                "opening_micro_eur": 580_000,
+                "opening_evidence": (
+                    "OVH AI Endpoints dashboard, observed 2026-07-16 morning"
+                ),
+                "opening_observed_at": "2026-07-16T08:00:00.000000Z",
+                "opening_period": "2026-07",
+            },
         },
     )
     monkeypatch.delenv("OVH_KEY", raising=False)
@@ -85,7 +93,10 @@ def test_doctor_ovh_qwen_gateway_is_allowlisted_and_checks_ambient_keys(
         "price_policy_hash",
         "committed_micro_eur",
         "unresolved_count",
+        "ledger",
     }
+    assert check.data["ledger"]["opening_micro_eur"] == 580_000
+    assert "OVH AI Endpoints dashboard" in check.data["ledger"]["opening_evidence"]
 
     monkeypatch.setenv("OVH_KEY", "must-not-be-reported")
     check = doctor._check_ovh_qwen_gateway(store)

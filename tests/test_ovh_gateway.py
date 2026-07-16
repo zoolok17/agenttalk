@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from agenttalk.ovh_gateway import (
+    EXTERNAL_CEILING_MICRO_EUR,
     INPUT_RATE_MICRO_EUR,
     MAX_CONTEXT_TOKENS,
     MAX_OUTPUT_TOKENS,
@@ -33,6 +34,9 @@ from agenttalk.ovh_gateway import (
 )
 
 
+TEST_OPENING_EVIDENCE = "test dashboard, observed 2026-07-15T12:00:00Z"
+
+
 class Clock:
     def __init__(self, value: datetime) -> None:
         self.value = value
@@ -48,7 +52,11 @@ def make_ledger(tmp_path, clock: Clock | None = None) -> SpendLedger:
         tmp_path / "install.json",
         now=clock,
     )
-    ledger.initialize(generation="a" * 32)
+    ledger.initialize(
+        opening_micro_eur=0,
+        opening_evidence=TEST_OPENING_EVIDENCE,
+        generation="a" * 32,
+    )
     return ledger
 
 
@@ -62,6 +70,7 @@ def test_exact_price_policy_and_charge_fixture() -> None:
     assert MAX_OUTPUT_TOKENS == 4_096
     assert TRIAL_CUTOFF_MICRO_EUR == 25_000_000
     assert SOFT_STOP_MICRO_EUR == 20_000_000
+    assert EXTERNAL_CEILING_MICRO_EUR == 100_000_000
     assert settlement_cost_micro_eur(1_000, 100) == 1_135
     assert reservation_cost_micro_eur() == 244_237
     assert len(price_policy_hash()) == 64
@@ -86,10 +95,17 @@ def test_initialize_is_explicit_and_partial_or_missing_state_fails_closed(tmp_pa
     ledger = SpendLedger(tmp_path / "ledger.sqlite3", tmp_path / "install.json")
     with pytest.raises(LedgerBlocked, match="not initialized"):
         ledger.status()
-    marker = ledger.initialize(generation="b" * 32)
+    marker = ledger.initialize(
+        opening_micro_eur=0,
+        opening_evidence=TEST_OPENING_EVIDENCE,
+        generation="b" * 32,
+    )
     assert marker["price_policy_hash"] == price_policy_hash()
     with pytest.raises(LedgerBlocked, match="requires both"):
-        ledger.initialize()
+        ledger.initialize(
+            opening_micro_eur=0,
+            opening_evidence=TEST_OPENING_EVIDENCE,
+        )
 
     (tmp_path / "install.json").unlink()
     with pytest.raises(LedgerBlocked, match="partial"):
@@ -106,7 +122,11 @@ def test_initialize_durability_failure_never_creates_complete_install(tmp_path) 
         durability_barrier=fail_barrier,
     )
     with pytest.raises(OSError, match="flush failure"):
-        ledger.initialize(generation="a" * 32)
+        ledger.initialize(
+            opening_micro_eur=0,
+            opening_evidence=TEST_OPENING_EVIDENCE,
+            generation="a" * 32,
+        )
     assert ledger.installation_state() == "absent"
 
 
@@ -119,6 +139,79 @@ def test_corrupt_marker_or_database_fails_closed(tmp_path) -> None:
     ledger = make_ledger(tmp_path / "other")
     ledger.db_path.write_bytes(b"not sqlite")
     with pytest.raises(LedgerBlocked):
+        ledger.status()
+
+
+def test_opening_balance_is_bound_seeded_and_surfaced(tmp_path) -> None:
+    clock = Clock(datetime(2026, 7, 16, 8, 0, tzinfo=timezone.utc))
+    ledger = SpendLedger(
+        tmp_path / "ledger.sqlite3",
+        tmp_path / "install.json",
+        now=clock,
+    )
+    evidence = "OVH AI Endpoints dashboard, observed 2026-07-16 morning"
+
+    marker = ledger.initialize(
+        opening_micro_eur=580_000,
+        opening_evidence=evidence,
+        generation="b" * 32,
+    )
+
+    assert marker["opening_micro_eur"] == 580_000
+    status = ledger.status()
+    assert status["opening_micro_eur"] == 580_000
+    assert status["opening_evidence"] == evidence
+    assert status["opening_observed_at"] == "2026-07-16T08:00:00.000000Z"
+    assert status["opening_period"] == "2026-07"
+    assert status["current_committed_micro_eur"] == 580_000
+    assert status["current_trial_committed_micro_eur"] == 0
+    assert status["external_ceiling_micro_eur"] == 100_000_000
+
+    ledger.reserve("1" * 32)
+    ledger.settle(
+        "1" * 32,
+        model=MODEL_ALIAS,
+        input_tokens=1_000,
+        output_tokens=100,
+    )
+    status = ledger.status()
+    assert status["current_committed_micro_eur"] == 581_135
+    assert status["current_trial_committed_micro_eur"] == 1_135
+
+
+def test_opening_balance_external_envelope_blocks_init_and_readiness(tmp_path) -> None:
+    unsafe_opening = (
+        EXTERNAL_CEILING_MICRO_EUR
+        - TRIAL_CUTOFF_MICRO_EUR
+        - reservation_cost_micro_eur()
+        + 1
+    )
+    ledger = SpendLedger(tmp_path / "ledger.sqlite3", tmp_path / "install.json")
+    with pytest.raises(PolicyBlocked, match="external account ceiling"):
+        ledger.initialize(
+            opening_micro_eur=unsafe_opening,
+            opening_evidence=TEST_OPENING_EVIDENCE,
+        )
+    assert ledger.installation_state() == "absent"
+
+    ledger.initialize(
+        opening_micro_eur=0,
+        opening_evidence=TEST_OPENING_EVIDENCE,
+        generation="a" * 32,
+    )
+    marker = json.loads(ledger.marker_path.read_text(encoding="utf-8"))
+    marker["opening_micro_eur"] = unsafe_opening
+    ledger.marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    with sqlite3.connect(ledger.db_path) as conn:
+        conn.execute(
+            "UPDATE metadata SET value=? WHERE key='opening_micro_eur'",
+            (str(unsafe_opening),),
+        )
+        conn.execute(
+            "UPDATE periods SET committed_micro_eur=? WHERE period='2026-07'",
+            (unsafe_opening,),
+        )
+    with pytest.raises(LedgerBlocked, match="opening balance envelope"):
         ledger.status()
 
 
@@ -177,6 +270,25 @@ def test_unresolved_attempt_blocks_restart_until_explicit_reconcile(tmp_path) ->
     )
     assert result["total_actual_micro_eur"] == 244_237
     restarted.reserve("2" * 32)
+
+
+def test_reconcile_never_accepts_a_caller_supplied_actual_cost(tmp_path) -> None:
+    ledger = make_ledger(tmp_path)
+    ledger.reserve("1" * 32)
+
+    with pytest.raises(ValueError, match="no-send or charge-reserve"):
+        ledger.reconcile(
+            "1" * 32,
+            outcome="charge-actual",
+            reason="caller supplied dashboard value",
+        )
+
+    result = ledger.reconcile(
+        "1" * 32,
+        outcome="charge-reserve",
+        reason="provider disposition remains ambiguous",
+    )
+    assert result["total_actual_micro_eur"] == reservation_cost_micro_eur()
 
 
 def test_process_exit_after_durable_reserve_retains_global_restart_hold(tmp_path) -> None:

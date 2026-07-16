@@ -75,6 +75,7 @@ class FakeUpstream:
                         "path": self.path,
                         "authorization": self.headers.get("Authorization"),
                         "host": self.headers.get("Host"),
+                        "headers": dict(self.headers.items()),
                         "body": json.loads(body),
                     }
                 )
@@ -105,7 +106,11 @@ class FakeUpstream:
 class RunningFront:
     def __init__(self, tmp_path, upstream: FakeUpstream) -> None:
         self.ledger = SpendLedger(tmp_path / "ledger.sqlite3", tmp_path / "install.json")
-        self.ledger.initialize(generation="a" * 32)
+        self.ledger.initialize(
+            opening_micro_eur=0,
+            opening_evidence="fake front fixture, observed 2026-07-16",
+            generation="a" * 32,
+        )
         public_port = _listen_port()
         self.config = FrontConfig(
             public_token="front-secret",
@@ -156,6 +161,19 @@ class RunningFront:
             return response.status, response.read()
         finally:
             conn.close()
+
+    def raw_request(self, request: bytes) -> tuple[int, bytes]:
+        with socket.create_connection(
+            ("127.0.0.1", self.config.public_port), timeout=5
+        ) as connection:
+            connection.sendall(request)
+            connection.shutdown(socket.SHUT_WR)
+            chunks: list[bytes] = []
+            while chunk := connection.recv(16 * 1024):
+                chunks.append(chunk)
+        response = b"".join(chunks)
+        status = int(response.split(b" ", 2)[1])
+        return status, response
 
 
 def test_stream_usage_accepts_complete_sse_and_json() -> None:
@@ -215,10 +233,72 @@ def test_front_is_exact_default_deny(tmp_path, method, path, headers, expected) 
         assert front.ledger.status()["unresolved"] == []
 
 
+@pytest.mark.parametrize(
+    "raw_request",
+    [
+        (
+            b"POST /v1/messages HTTP/1.1\r\n"
+            b"Host: {HOST}\r\nHost: {HOST}\r\n"
+            b"Authorization: Bearer front-secret\r\nContent-Length: 2\r\n\r\n{}"
+        ),
+        (
+            b"POST /v1/messages HTTP/1.1\r\nHost: {HOST}\r\n"
+            b"Authorization: Bearer front-secret\r\n"
+            b"Authorization: Bearer front-secret\r\nContent-Length: 2\r\n\r\n{}"
+        ),
+        (
+            b"POST /v1/messages HTTP/1.1\r\nHost: {HOST}\r\n"
+            b"Authorization: Bearer front-secret\r\n"
+            b"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}"
+        ),
+        (
+            b"POST /v1/messages HTTP/1.1\r\nHost: {HOST}\r\n"
+            b"Authorization: Bearer front-secret\r\n"
+            b"Content-Type: application/json\r\nContent-Type: application/json\r\n"
+            b"Content-Length: 2\r\n\r\n{}"
+        ),
+        (
+            b"POST /v1/messages HTTP/1.1\r\nHost: {HOST}\r\n"
+            b"Authorization: Bearer front-secret\r\nTransfer-Encoding: chunked\r\n"
+            b"Content-Length: 2\r\n\r\n{}"
+        ),
+    ],
+)
+def test_front_rejects_duplicate_or_ambiguous_request_framing(
+    tmp_path, raw_request
+) -> None:
+    with FakeUpstream() as upstream, RunningFront(tmp_path, upstream) as front:
+        raw_request = raw_request.replace(
+            b"{HOST}", front.config.public_host_header.encode("ascii")
+        )
+        status, response = front.raw_request(raw_request)
+
+        assert status == 400
+        assert CONFIG_ERROR_CODE.encode() in response
+        assert upstream.requests == []
+        assert front.ledger.status()["unresolved"] == []
+
+
+def test_front_rejects_absolute_form_request_target(tmp_path) -> None:
+    with FakeUpstream() as upstream, RunningFront(tmp_path, upstream) as front:
+        host = front.config.public_host_header.encode("ascii")
+        request = (
+            b"POST http://" + host + b"/v1/messages HTTP/1.1\r\n"
+            b"Host: " + host + b"\r\nAuthorization: Bearer front-secret\r\n"
+            b"Content-Length: 2\r\n\r\n{}"
+        )
+        status, response = front.raw_request(request)
+
+        assert status == 404
+        assert CONFIG_ERROR_CODE.encode() in response
+        assert upstream.requests == []
+        assert front.ledger.status()["unresolved"] == []
+
+
 def test_success_reserves_before_one_internal_attempt_then_settles(tmp_path) -> None:
     with FakeUpstream() as upstream, RunningFront(tmp_path, upstream) as front:
         assert front.front.internal_liveliness() is True
-        status, body = front.request()
+        status, body = front.request(headers={"X-Front-Only": "must-not-forward"})
         assert status == 200
         assert b"message_stop" in body
         assert len(upstream.requests) == 1
@@ -227,6 +307,15 @@ def test_success_reserves_before_one_internal_attempt_then_settles(tmp_path) -> 
         assert request["authorization"] == "Bearer internal-secret"
         assert request["host"] == f"127.0.0.1:{upstream.port}"
         assert request["body"]["model"] == MODEL_ALIAS
+        downstream_headers = {name.casefold() for name in request["headers"]}
+        assert "x-front-only" not in downstream_headers
+        assert downstream_headers <= {
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+        }
         ledger = front.ledger.status()
         assert ledger["unresolved"] == []
         assert ledger["current_committed_micro_eur"] == settlement_cost_micro_eur(100, 10)
@@ -367,7 +456,11 @@ class _FakeHandler:
 
 def _direct_front(tmp_path, connection: _FakeConnection) -> GatewayFront:
     ledger = SpendLedger(tmp_path / "ledger.sqlite3", tmp_path / "install.json")
-    ledger.initialize(generation="a" * 32)
+    ledger.initialize(
+        opening_micro_eur=0,
+        opening_evidence="fake front fixture, observed 2026-07-16",
+        generation="a" * 32,
+    )
     return GatewayFront(
         FrontConfig(public_token="front", internal_token="internal"),
         ledger,

@@ -296,6 +296,8 @@ def initialize_install(
     root: str | os.PathLike[str],
     *,
     litellm_executable: str | os.PathLike[str],
+    opening_micro_eur: int,
+    opening_evidence: str,
     api_base: str = DEFAULT_API_BASE,
     ledger: SpendLedger | None = None,
     front_token_path: Path | None = None,
@@ -321,7 +323,10 @@ def initialize_install(
             "refusing partial or replacement gateway initialization: " + ", ".join(existing)
         )
     ledger = ledger or SpendLedger()
-    marker = ledger.initialize()
+    marker = ledger.initialize(
+        opening_micro_eur=opening_micro_eur,
+        opening_evidence=opening_evidence,
+    )
     _durable_write_bytes(
         config_path,
         render_litellm_config(api_base=api_base).encode("utf-8"),
@@ -345,6 +350,8 @@ def initialize_install(
         "initialized": True,
         "ledger_generation": marker["generation"],
         "price_policy_hash": marker["price_policy_hash"],
+        "opening_micro_eur": marker["opening_micro_eur"],
+        "opening_observed_at": marker["opening_observed_at"],
         "config_path": str(config_path),
         "config_sha256": config_hash,
         "litellm_executable": str(executable),

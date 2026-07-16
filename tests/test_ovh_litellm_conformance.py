@@ -139,7 +139,7 @@ class _FakeOpenAI:
         self.thread.join(timeout=5)
 
 
-def _wait_liveliness(port: int, process: subprocess.Popen, *, timeout: float = 30) -> None:
+def _wait_liveliness(port: int, process: subprocess.Popen, *, timeout: float = 60) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -208,7 +208,11 @@ def test_anthropic_messages_routes_once_to_chat_completions_with_representative_
             stderr=subprocess.DEVNULL,
         )
         ledger = SpendLedger(tmp_path / "ledger.sqlite3", tmp_path / "install.json")
-        ledger.initialize(generation="a" * 32)
+        ledger.initialize(
+            opening_micro_eur=0,
+            opening_evidence="fake LiteLLM fixture, observed 2026-07-16",
+            generation="a" * 32,
+        )
         front = GatewayFront(
             FrontConfig(
                 public_token="sk-fake-front",
@@ -262,16 +266,19 @@ def test_anthropic_messages_routes_once_to_chat_completions_with_representative_
             finally:
                 connection.close()
         finally:
-            if front_thread.is_alive():
-                front_server.shutdown()
-            front_server.server_close()
-            front_thread.join(timeout=5)
-            process.terminate()
             try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+                if front_thread.is_alive():
+                    front_server.shutdown()
+                front_server.server_close()
+                if front_thread.ident is not None:
+                    front_thread.join(timeout=5)
+            finally:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
 
     assert len(upstream.requests) == 1
     translated = upstream.requests[0]

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import sys
 
+import pytest
+
 from agenttalk import cli
 from agenttalk import ovh_gateway
 from agenttalk import ovh_gateway_service
@@ -28,11 +30,16 @@ def test_gateway_cli_initializes_once_and_controls_manual_hold(
         "init",
         "--litellm-executable",
         str(executable),
+        "--opening-eur",
+        "0.58",
+        "--opening-evidence",
+        "OVH AI Endpoints dashboard, observed 2026-07-16 morning",
     ])
 
     assert rc == 0
     initialized = json.loads(capsys.readouterr().out)
     assert initialized["initialized"] is True
+    assert initialized["opening_micro_eur"] == 580_000
     assert "atgw-" not in json.dumps(initialized)
 
     assert cli.main([
@@ -59,6 +66,30 @@ def test_gateway_cli_initializes_once_and_controls_manual_hold(
     cleared = json.loads(capsys.readouterr().out)
     assert cleared["held"] is False
     assert ledger.status()["service_hold"] is None
+
+
+def test_gateway_cli_rejects_caller_supplied_actual_reconciliation(
+    tmp_path,
+    capsys,
+) -> None:
+    root = tmp_path / "project"
+    Store(root).init(["lead"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main([
+            "--root",
+            str(root),
+            "gateway",
+            "reconcile",
+            "1" * 32,
+            "--outcome",
+            "charge-actual",
+            "--reason",
+            "caller supplied value",
+        ])
+
+    assert exc_info.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
 
 
 def test_gateway_status_not_ready_uses_operational_error_exit(tmp_path, monkeypatch) -> None:

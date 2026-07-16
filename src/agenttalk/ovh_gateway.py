@@ -38,6 +38,7 @@ MAX_CONTEXT_TOKENS = 262_144
 MAX_OUTPUT_TOKENS = 4_096
 TRIAL_CUTOFF_MICRO_EUR = 25_000_000
 SOFT_STOP_MICRO_EUR = 20_000_000
+EXTERNAL_CEILING_MICRO_EUR = 100_000_000
 LEDGER_SCHEMA_VERSION = 1
 INSTALL_MARKER_SCHEMA_VERSION = 1
 BACKEND_PROFILE = "ovh-qwen"
@@ -49,6 +50,7 @@ INTERNAL_PORT = 4001
 MAX_REQUEST_BYTES = 128 * 1024
 DEFAULT_LOCAL_DIRNAME = "agenttalk-ovh"
 DEFAULT_SPEND_DIRNAME = "agenttalk-ovh-spend"
+MAX_OPENING_EVIDENCE_LENGTH = 512
 
 _ATTEMPT_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _PERIOD_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])$")
@@ -125,6 +127,7 @@ def price_policy() -> dict:
         },
         "trial_cutoff_micro_eur": TRIAL_CUTOFF_MICRO_EUR,
         "soft_stop_micro_eur": SOFT_STOP_MICRO_EUR,
+        "external_ceiling_micro_eur": EXTERNAL_CEILING_MICRO_EUR,
     }
 
 
@@ -336,12 +339,61 @@ class SpendLedger:
             return "absent"
         return "partial"
 
-    def initialize(self, *, generation: str | None = None) -> dict:
+    @staticmethod
+    def _opening_evidence(value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("opening_evidence must be a string")
+        normalized = value.strip()
+        if (
+            not normalized
+            or len(normalized) > MAX_OPENING_EVIDENCE_LENGTH
+            or "\r" in normalized
+            or "\n" in normalized
+            or any(ord(char) < 32 for char in normalized)
+        ):
+            raise ValueError(
+                "opening_evidence must be a non-empty single line of at most "
+                f"{MAX_OPENING_EVIDENCE_LENGTH} characters"
+            )
+        return normalized
+
+    @staticmethod
+    def _opening_amount(value: object) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError("opening_micro_eur must be a non-negative integer")
+        return value
+
+    @staticmethod
+    def _assert_external_envelope(opening_micro_eur: int) -> None:
+        projected = (
+            opening_micro_eur
+            + TRIAL_CUTOFF_MICRO_EUR
+            + reservation_cost_micro_eur()
+        )
+        if projected > EXTERNAL_CEILING_MICRO_EUR:
+            raise PolicyBlocked(
+                "opening balance plus trial cutoff and one reservation exceeds "
+                "the external account ceiling"
+            )
+
+    def initialize(
+        self,
+        *,
+        opening_micro_eur: int,
+        opening_evidence: str,
+        generation: str | None = None,
+    ) -> dict:
         if self.installation_state() != "absent":
             raise LedgerBlocked(
                 "ledger initialization requires both database and install marker to be absent"
             )
+        opening_micro_eur = self._opening_amount(opening_micro_eur)
+        opening_evidence = self._opening_evidence(opening_evidence)
+        self._assert_external_envelope(opening_micro_eur)
         now = self.now().astimezone(timezone.utc)
+        observed_at = _iso_utc(now)
+        opening_period = _period(now)
+        evidence_hash = hashlib.sha256(opening_evidence.encode("utf-8")).hexdigest()
         generation = generation or uuid.uuid4().hex
         if not _ATTEMPT_ID_RE.fullmatch(generation):
             raise ValueError("generation must be 32 lowercase hexadecimal characters")
@@ -359,9 +411,14 @@ class SpendLedger:
                     "currency": POLICY_CURRENCY,
                     "trial_cutoff_micro_eur": str(TRIAL_CUTOFF_MICRO_EUR),
                     "soft_stop_micro_eur": str(SOFT_STOP_MICRO_EUR),
-                    "initialized_at": _iso_utc(now),
-                    "last_accepted_utc": _iso_utc(now),
-                    "last_accepted_period": _period(now),
+                    "external_ceiling_micro_eur": str(EXTERNAL_CEILING_MICRO_EUR),
+                    "opening_micro_eur": str(opening_micro_eur),
+                    "opening_evidence": opening_evidence,
+                    "opening_observed_at": observed_at,
+                    "opening_period": opening_period,
+                    "initialized_at": observed_at,
+                    "last_accepted_utc": observed_at,
+                    "last_accepted_period": opening_period,
                     "service_hold": "",
                 }
                 conn.execute("BEGIN IMMEDIATE")
@@ -369,8 +426,8 @@ class SpendLedger:
                     "INSERT INTO metadata(key, value) VALUES (?, ?)", values.items()
                 )
                 conn.execute(
-                    "INSERT INTO periods(period, committed_micro_eur) VALUES (?, 0)",
-                    (_period(now),),
+                    "INSERT INTO periods(period, committed_micro_eur) VALUES (?, ?)",
+                    (opening_period, opening_micro_eur),
                 )
                 conn.commit()
             finally:
@@ -382,7 +439,11 @@ class SpendLedger:
                 "ledger_schema_version": LEDGER_SCHEMA_VERSION,
                 "generation": generation,
                 "price_policy_hash": price_policy_hash(),
-                "initialized_at": _iso_utc(now),
+                "opening_micro_eur": opening_micro_eur,
+                "opening_evidence_sha256": evidence_hash,
+                "opening_observed_at": observed_at,
+                "opening_period": opening_period,
+                "initialized_at": observed_at,
             }
             _durable_write_json(self.marker_path, marker)
             return marker
@@ -456,6 +517,22 @@ class SpendLedger:
         generation = marker.get("generation")
         if not isinstance(generation, str) or not _ATTEMPT_ID_RE.fullmatch(generation):
             raise LedgerBlocked("ledger install marker generation is invalid")
+        opening_micro_eur = marker.get("opening_micro_eur")
+        if (
+            not isinstance(opening_micro_eur, int)
+            or isinstance(opening_micro_eur, bool)
+            or opening_micro_eur < 0
+        ):
+            raise LedgerBlocked("ledger install marker opening balance is invalid")
+        evidence_hash = marker.get("opening_evidence_sha256")
+        if (
+            not isinstance(evidence_hash, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", evidence_hash)
+        ):
+            raise LedgerBlocked("ledger install marker opening evidence hash is invalid")
+        _parse_utc(marker.get("opening_observed_at"))
+        if not _PERIOD_RE.fullmatch(str(marker.get("opening_period") or "")):
+            raise LedgerBlocked("ledger install marker opening period is invalid")
         return marker
 
     @contextlib.contextmanager
@@ -499,6 +576,7 @@ class SpendLedger:
             "currency": POLICY_CURRENCY,
             "trial_cutoff_micro_eur": str(TRIAL_CUTOFF_MICRO_EUR),
             "soft_stop_micro_eur": str(SOFT_STOP_MICRO_EUR),
+            "external_ceiling_micro_eur": str(EXTERNAL_CEILING_MICRO_EUR),
         }
         for key, value in expected.items():
             if metadata.get(key) != value:
@@ -507,6 +585,37 @@ class SpendLedger:
         _parse_utc(metadata.get("last_accepted_utc"))
         if not _PERIOD_RE.fullmatch(metadata.get("last_accepted_period", "")):
             raise LedgerBlocked("ledger last accepted period is invalid")
+        raw_opening = metadata.get("opening_micro_eur")
+        try:
+            opening_micro_eur = int(raw_opening or "")
+        except ValueError as exc:
+            raise LedgerBlocked("ledger opening balance is invalid") from exc
+        if str(opening_micro_eur) != raw_opening or opening_micro_eur < 0:
+            raise LedgerBlocked("ledger opening balance is invalid")
+        try:
+            opening_evidence = self._opening_evidence(metadata.get("opening_evidence"))
+            self._assert_external_envelope(opening_micro_eur)
+        except (ValueError, PolicyBlocked) as exc:
+            raise LedgerBlocked("ledger opening balance envelope is invalid") from exc
+        observed_at = metadata.get("opening_observed_at")
+        observed = _parse_utc(observed_at)
+        opening_period = metadata.get("opening_period", "")
+        if not _PERIOD_RE.fullmatch(opening_period) or opening_period != _period(observed):
+            raise LedgerBlocked("ledger opening period is invalid")
+        if (
+            marker.get("opening_micro_eur") != opening_micro_eur
+            or marker.get("opening_observed_at") != observed_at
+            or marker.get("opening_period") != opening_period
+            or marker.get("opening_evidence_sha256")
+            != hashlib.sha256(opening_evidence.encode("utf-8")).hexdigest()
+        ):
+            raise LedgerBlocked("ledger opening balance does not match the install marker")
+        opening_row = conn.execute(
+            "SELECT committed_micro_eur FROM periods WHERE period=?",
+            (opening_period,),
+        ).fetchone()
+        if opening_row is None or int(opening_row[0]) < opening_micro_eur:
+            raise LedgerBlocked("ledger opening balance is not represented in its period")
         return metadata
 
     @staticmethod
@@ -607,7 +716,12 @@ class SpendLedger:
                     raise LedgerBlocked("admission period is missing")
                 unresolved_total = sum(int(item["reserved_micro_eur"]) for item in unresolved)
                 projected = int(row[0]) + unresolved_total + reserve
-                if projected > TRIAL_CUTOFF_MICRO_EUR:
+                opening_allowance = (
+                    int(metadata["opening_micro_eur"])
+                    if period == metadata["opening_period"]
+                    else 0
+                )
+                if projected > opening_allowance + TRIAL_CUTOFF_MICRO_EUR:
                     raise PolicyBlocked("trial spend cutoff would be exceeded")
                 try:
                     conn.execute(
@@ -751,20 +865,13 @@ class SpendLedger:
         *,
         outcome: str,
         reason: str,
-        actual_micro_eur: int | None = None,
         now: datetime | None = None,
     ) -> dict:
         self._validate_attempt_id(attempt_id)
-        if outcome not in {"no-send", "charge-actual", "charge-reserve"}:
-            raise ValueError("outcome must be no-send, charge-actual, or charge-reserve")
+        if outcome not in {"no-send", "charge-reserve"}:
+            raise ValueError("outcome must be no-send or charge-reserve")
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("a reconciliation reason is required")
-        if outcome == "charge-actual" and (
-            not isinstance(actual_micro_eur, int)
-            or isinstance(actual_micro_eur, bool)
-            or actual_micro_eur < 0
-        ):
-            raise ValueError("charge-actual requires non-negative actual_micro_eur")
         timestamp = _iso_utc((now or self.now()).astimezone(timezone.utc))
         with self._connect() as conn:
             self._begin(conn)
@@ -781,10 +888,8 @@ class SpendLedger:
                     if already:
                         raise LedgerBlocked("no-send cannot erase an already recorded charge")
                     desired = 0
-                elif outcome == "charge-reserve":
-                    desired = max(already, int(row["reserved_micro_eur"]))
                 else:
-                    desired = max(already, int(actual_micro_eur or 0))
+                    desired = max(already, int(row["reserved_micro_eur"]))
                 incremental = max(0, desired - already)
                 if incremental:
                     conn.execute(
@@ -892,6 +997,10 @@ class SpendLedger:
                 (row for row in periods if row["period"] == current_period),
                 {"committed_micro_eur": 0},
             )
+            opening_micro_eur = int(metadata["opening_micro_eur"])
+            current_opening = (
+                opening_micro_eur if current_period == metadata["opening_period"] else 0
+            )
             return {
                 "schema_version": LEDGER_SCHEMA_VERSION,
                 "generation": metadata["generation"],
@@ -899,8 +1008,17 @@ class SpendLedger:
                 "currency": metadata["currency"],
                 "trial_cutoff_micro_eur": TRIAL_CUTOFF_MICRO_EUR,
                 "soft_stop_micro_eur": SOFT_STOP_MICRO_EUR,
+                "external_ceiling_micro_eur": EXTERNAL_CEILING_MICRO_EUR,
+                "opening_micro_eur": opening_micro_eur,
+                "opening_evidence": metadata["opening_evidence"],
+                "opening_observed_at": metadata["opening_observed_at"],
+                "opening_period": metadata["opening_period"],
                 "current_period": current_period,
                 "current_committed_micro_eur": int(current["committed_micro_eur"]),
+                "current_trial_committed_micro_eur": max(
+                    0,
+                    int(current["committed_micro_eur"]) - current_opening,
+                ),
                 "periods": periods,
                 "unresolved": unresolved,
                 "service_hold": metadata.get("service_hold") or None,

@@ -17,6 +17,7 @@ import time
 import uuid
 import webbrowser
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, DecimalException
 from pathlib import Path
 
 from agenttalk import __version__
@@ -116,6 +117,21 @@ def _finite_float_arg(value: str) -> float:
     if not math.isfinite(parsed):
         raise argparse.ArgumentTypeError("must be a finite number")
     return parsed
+
+
+def _micro_eur_arg(value: str) -> int:
+    if len(value) > 64:
+        raise argparse.ArgumentTypeError("must be a non-negative EUR amount")
+    try:
+        parsed = Decimal(value)
+        micro_eur = parsed * Decimal(1_000_000)
+    except (DecimalException, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative EUR amount") from exc
+    if not parsed.is_finite() or parsed < 0 or micro_eur != micro_eur.to_integral_value():
+        raise argparse.ArgumentTypeError(
+            "must be a non-negative EUR amount with at most six decimal places"
+        )
+    return int(micro_eur)
 
 
 def _parse_meta(items: list[str] | None) -> dict:
@@ -7998,6 +8014,8 @@ def cmd_gateway(args: argparse.Namespace) -> int:
             result = service.initialize_install(
                 store.root,
                 litellm_executable=args.litellm_executable,
+                opening_micro_eur=args.opening_micro_eur,
+                opening_evidence=args.opening_evidence,
             )
         elif action == "task-install":
             service.load_install_manifest(store.root)
@@ -8013,7 +8031,6 @@ def cmd_gateway(args: argparse.Namespace) -> int:
                 args.attempt_id,
                 outcome=args.outcome,
                 reason=args.reason,
-                actual_micro_eur=args.actual_micro_eur,
             )
         elif action == "hold":
             result = gateway.SpendLedger().place_hold(reason=args.reason)
@@ -12970,6 +12987,18 @@ def build_parser() -> argparse.ArgumentParser:
     gwsub = pgw.add_subparsers(dest="gateway_action", required=True)
     gw_init = gwsub.add_parser("init", help="One-time ledger/config/token initialization.")
     gw_init.add_argument("--litellm-executable", required=True)
+    gw_init.add_argument(
+        "--opening-eur",
+        dest="opening_micro_eur",
+        type=_micro_eur_arg,
+        required=True,
+        help="Current OVH month-to-date spend in EUR (up to six decimal places).",
+    )
+    gw_init.add_argument(
+        "--opening-evidence",
+        required=True,
+        help="Short source and observed-at description for the opening balance.",
+    )
     gw_init.set_defaults(func=cmd_gateway)
     gw_task = gwsub.add_parser("task-install", help="Install or verify the project task.")
     gw_task.set_defaults(func=cmd_gateway)
@@ -12987,11 +13016,10 @@ def build_parser() -> argparse.ArgumentParser:
     gw_reconcile.add_argument("attempt_id")
     gw_reconcile.add_argument(
         "--outcome",
-        choices=("no-send", "charge-actual", "charge-reserve"),
+        choices=("no-send", "charge-reserve"),
         required=True,
     )
     gw_reconcile.add_argument("--reason", required=True)
-    gw_reconcile.add_argument("--actual-micro-eur", type=int)
     gw_reconcile.set_defaults(func=cmd_gateway)
     gw_hold = gwsub.add_parser("hold", help="Durably block new provider transport.")
     gw_hold.add_argument("--reason", required=True)

@@ -158,11 +158,15 @@ def test_one_time_install_writes_nonsecret_config_and_tokens_outside_project(tmp
     result = initialize_install(
         tmp_path / "project",
         litellm_executable=executable,
+        opening_micro_eur=580_000,
+        opening_evidence="test dashboard, observed 2026-07-16",
         ledger=ledger,
         front_token_path=front_token,
         internal_token_path=internal_token,
     )
     assert result["price_policy_hash"] == price_policy_hash()
+    assert result["opening_micro_eur"] == 580_000
+    assert result["opening_observed_at"]
     config = litellm_config_path(tmp_path / "project").read_text(encoding="utf-8")
     assert "use_chat_completions_url_for_anthropic_messages: true" in config
     assert "store: false" in config
@@ -174,6 +178,8 @@ def test_one_time_install_writes_nonsecret_config_and_tokens_outside_project(tmp
         initialize_install(
             tmp_path / "project",
             litellm_executable=executable,
+            opening_micro_eur=580_000,
+            opening_evidence="test dashboard, observed 2026-07-16",
             ledger=ledger,
             front_token_path=front_token,
             internal_token_path=internal_token,
@@ -208,6 +214,8 @@ def test_runner_uses_env_only_secrets_and_pinned_single_worker_argv(
     initialize_install(
         root,
         litellm_executable=executable,
+        opening_micro_eur=0,
+        opening_evidence="test dashboard, observed 2026-07-16",
         ledger=ledger,
         front_token_path=front_token,
         internal_token_path=internal_token,
@@ -356,6 +364,8 @@ def test_status_requires_attested_runtime_front_and_internal_liveliness(
     initialize_install(
         root,
         litellm_executable=executable,
+        opening_micro_eur=580_000,
+        opening_evidence="test dashboard, observed 2026-07-16",
         ledger=ledger,
         front_token_path=front_token,
         internal_token_path=internal_token,
@@ -399,6 +409,11 @@ def test_status_requires_attested_runtime_front_and_internal_liveliness(
     )
 
     assert status["ready"] is True
+    assert status["ledger"]["opening_micro_eur"] == 580_000
+    assert status["ledger"]["current_committed_micro_eur"] == 580_000
+    assert status["ledger"]["opening_evidence"] == (
+        "test dashboard, observed 2026-07-16"
+    )
     encoded = str(status)
     assert "atgw-" not in encoded
     assert "provider-key" not in encoded
@@ -423,6 +438,8 @@ def test_start_waits_for_attested_readiness(tmp_path, monkeypatch) -> None:
     initialize_install(
         root,
         litellm_executable=executable,
+        opening_micro_eur=0,
+        opening_evidence="test dashboard, observed 2026-07-16",
         ledger=ledger,
         front_token_path=tmp_path / "secrets" / "front.txt",
         internal_token_path=tmp_path / "secrets" / "internal.txt",
@@ -458,6 +475,8 @@ def test_start_is_idempotent_when_attested_service_is_already_ready(
     initialize_install(
         root,
         litellm_executable=executable,
+        opening_micro_eur=0,
+        opening_evidence="test dashboard, observed 2026-07-16",
         ledger=ledger,
         front_token_path=tmp_path / "secrets" / "front.txt",
         internal_token_path=tmp_path / "secrets" / "internal.txt",

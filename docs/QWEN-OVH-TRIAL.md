@@ -19,6 +19,9 @@ hostile same-user process.
 - Maximum output: 4096 tokens; maximum input context: 262144 tokens.
 - Maximum one-attempt reservation: EUR 0.244237.
 - Trial cutoff: EUR 25; operator soft stop: EUR 20.
+- External account ceiling: EUR 100. Initialization and readiness require the
+  operator-observed opening balance plus the EUR 25 trial cutoff plus one
+  maximum reservation to remain within this ceiling.
 - Provider attempts: one. LiteLLM, router, and front retries are disabled.
 
 The policy hash is persisted in the install marker, ledger, config manifest,
@@ -60,12 +63,16 @@ or AgentTalk messages.
 3. Initialize the ledger, config, tokens, and install manifest once:
 
    ```powershell
-   agenttalk gateway init --litellm-executable C:\path\to\litellm.exe
+   agenttalk gateway init --litellm-executable C:\path\to\litellm.exe `
+     --opening-eur 0.58 `
+     --opening-evidence "OVH AI Endpoints dashboard, observed 2026-07-16 morning"
    ```
 
    Initialization is explicit and one-time. Service startup never creates or
    resets a missing ledger. A partial, corrupt, deleted, rolled-back, or
-   policy-mismatched ledger blocks startup.
+   policy-mismatched ledger blocks startup. The first billing period is seeded
+   with the operator-provided month-to-date opening balance; status and doctor
+   surface its amount, evidence, observation timestamp, and period.
 
 4. Install the project-scoped current-user Scheduled Task, then start it:
 
@@ -143,9 +150,13 @@ Inspect the attempt and reconcile only from provider/dashboard evidence:
 ```powershell
 agenttalk gateway status
 agenttalk gateway reconcile ATTEMPT_ID --outcome no-send --reason "provider confirms no request"
-agenttalk gateway reconcile ATTEMPT_ID --outcome charge-actual --actual-micro-eur 1234 --reason "OVH dashboard evidence"
 agenttalk gateway reconcile ATTEMPT_ID --outcome charge-reserve --reason "charge remains uncertain"
 ```
+
+`no-send` requires recorded provider evidence and cannot erase an already
+recorded charge. `charge-reserve` commits the full conservative reservation.
+The reconciliation surface never accepts a caller-supplied actual cost; valid
+terminal usage settles automatically from the completed provider response.
 
 Use a service hold when the live canary or dashboard does not match the pinned
 price policy:
