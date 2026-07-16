@@ -48,10 +48,12 @@ Both ports are bound to literal IPv4 `127.0.0.1`; neither uses `localhost`,
 `0.0.0.0`, or `::`.
 
 `store: false` is forced in the generated single-deployment config. Telemetry
-is disabled, there is no spend/success callback, and the managed runner sends
-LiteLLM stdout and stderr to `DEVNULL` rather than retaining its access or error
-output. Stable gateway errors do not include raw upstream bodies,
-Authorization values, the internal URL, or tokens.
+is disabled and there is no spend/success callback. The managed runner combines
+LiteLLM stdout and stderr into a redacted rotating log at
+`%LOCALAPPDATA%\agenttalk-ovh\gateway\litellm.log`. The current log and two
+backups are each capped at 1 MiB. Stable gateway errors and retained diagnostics
+do not include raw upstream bodies, Authorization values, the internal URL, or
+known key/token values.
 
 ## One-Time Morning Setup
 
@@ -88,10 +90,21 @@ or AgentTalk messages.
    ```
 
 The task name is derived from canonical project identity. Installation is
-idempotent for an exact match and refuses a foreign or mismatched task. Startup
-verifies the task, manifest, config hash, ledger, runtime process identity,
-both binds, a no-secret negative-auth public-front probe, and internal
-liveliness before reporting ready.
+idempotent for an exact match and refuses a foreign or mismatched task. The
+executable, arguments, and working directory must round-trip exactly; the
+current-user principal is compared by resolved Windows SID because Task
+Scheduler normalizes account names to SIDs. The Scheduled Task is required for
+operational and worker readiness; direct `gateway run` is not a supported
+worker launch mode. Startup allows LiteLLM up to 120 seconds to become live on
+a cold boot, but fails immediately if the child exits. It then verifies the
+manifest, config hash, ledger, runtime process identity, both binds, a no-secret
+negative-auth public-front probe, and internal liveliness before reporting
+ready.
+
+The non-secret LiteLLM config, task identity, install manifest, and runtime
+marker intentionally live in the project's gitignored `.agenttalk/gateway`
+directory. The provider key, gateway tokens, spend ledger, and bounded child
+log remain under `%LOCALAPPDATA%\agenttalk-ovh`.
 Status and doctor use only the local liveliness route; they do not call OVH or
 spend money.
 

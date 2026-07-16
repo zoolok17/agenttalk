@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import socket
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -83,6 +85,41 @@ def test_task_xml_pins_one_least_privilege_action_and_bounded_restart(tmp_path) 
     assert f"<Count>{MAX_TASK_RESTARTS}</Count>" in xml
     assert "OVH_KEY" not in xml
     assert "api_key" not in xml
+
+
+def test_task_xml_matches_sid_normalized_scheduler_fixture(tmp_path, monkeypatch) -> None:
+    identity = expected_task_identity(
+        tmp_path,
+        execute=tmp_path / "python.exe",
+        principal="DOMAIN\\operator",
+    )
+    sid = "S-1-5-21-111-222-333-1001"
+    scheduler_xml = render_task_xml(identity).replace(
+        "<UserId>DOMAIN\\operator</UserId>",
+        f"<UserId>{sid}</UserId>",
+    )
+    monkeypatch.setattr(
+        service,
+        "_resolve_principal_sid",
+        lambda principal: sid if principal in {identity.principal, sid} else None,
+        raising=False,
+    )
+
+    assert task_xml_matches(scheduler_xml, identity)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows account SID lookup")
+def test_current_windows_principal_round_trips_as_scheduler_sid(tmp_path) -> None:
+    identity = expected_task_identity(tmp_path)
+    sid = service._resolve_principal_sid(identity.principal)
+    assert sid is not None
+    assert sid.startswith("S-1-")
+    scheduler_xml = render_task_xml(identity).replace(
+        f"<UserId>{identity.principal}</UserId>",
+        f"<UserId>{sid}</UserId>",
+    )
+
+    assert task_xml_matches(scheduler_xml, identity)
 
 
 def test_install_is_idempotent_and_refuses_foreign_task(tmp_path) -> None:
@@ -226,6 +263,9 @@ def test_runner_uses_env_only_secrets_and_pinned_single_worker_argv(
     class FakeProcess:
         pid = os.getpid()
 
+        def __init__(self, output: str) -> None:
+            self.stdout = io.StringIO(output)
+
         def poll(self):
             return None
 
@@ -241,7 +281,15 @@ def test_runner_uses_env_only_secrets_and_pinned_single_worker_argv(
     def fake_popen(argv, **kwargs):
         captured["argv"] = list(argv)
         captured["env"] = dict(kwargs["env"])
-        return FakeProcess()
+        captured["stdout"] = kwargs["stdout"]
+        captured["stderr"] = kwargs["stderr"]
+        output = (
+            "oversized diagnostic " + "x" * 2_048 + "\n"
+            + "bounded startup diagnostic\n" * 80
+            + f"raw provider {kwargs['env']['OVH_KEY']}\n"
+            f"Authorization: Bearer {kwargs['env']['LITELLM_MASTER_KEY']}\n"
+        )
+        return FakeProcess(output)
 
     class FakeServer:
         def serve_forever(self, **_kwargs) -> None:
@@ -266,6 +314,9 @@ def test_runner_uses_env_only_secrets_and_pinned_single_worker_argv(
     monkeypatch.setattr(service, "exclusive_bind_probe", lambda _host, _port: None)
     monkeypatch.setattr(service, "_wait_liveliness", lambda _front, _process: None)
     monkeypatch.setattr(service, "GatewayFront", FakeFront)
+    monkeypatch.setattr(service, "LITELLM_LOG_MAX_BYTES", 256)
+    monkeypatch.setattr(service, "LITELLM_LOG_BACKUP_COUNT", 2)
+    child_log = tmp_path / "local" / "agenttalk-ovh" / "gateway" / "litellm.log"
 
     rc = run_service(
         root,
@@ -273,6 +324,7 @@ def test_runner_uses_env_only_secrets_and_pinned_single_worker_argv(
         key_path=key,
         front_token_path=front_token,
         internal_token_path=internal_token,
+        child_log_path=child_log,
         popen=fake_popen,
     )
 
@@ -286,7 +338,61 @@ def test_runner_uses_env_only_secrets_and_pinned_single_worker_argv(
     env = captured["env"]
     assert env["OVH_KEY"] == "provider-secret"
     assert env["LITELLM_MASTER_KEY"].startswith("atgw-")
+    assert captured["stdout"] is subprocess.PIPE
+    assert captured["stderr"] is subprocess.STDOUT
+    logs = sorted(child_log.parent.glob("litellm.log*"))
+    assert child_log in logs
+    assert child_log.with_suffix(".log.1") in logs
+    assert len(logs) <= 3
+    assert all(path.stat().st_size <= 256 for path in logs)
+    logged = "".join(path.read_text(encoding="utf-8") for path in logs)
+    assert "provider-secret" not in logged
+    assert env["LITELLM_MASTER_KEY"] not in logged
+    assert "[REDACTED]" in logged
     assert not runtime_marker_path(root).exists()
+
+
+def test_litellm_readiness_allows_cold_start_beyond_thirty_seconds(
+    monkeypatch,
+) -> None:
+    now = [0.0]
+
+    class Process:
+        @staticmethod
+        def poll():
+            return None
+
+    class Front:
+        calls = 0
+
+        def internal_liveliness(self) -> bool:
+            self.calls += 1
+            return self.calls == 3
+
+    front = Front()
+    monkeypatch.setattr(service.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(service.time, "sleep", lambda _seconds: now.__setitem__(0, now[0] + 31))
+
+    service._wait_liveliness(front, Process())
+
+    assert service.LITELLM_READINESS_TIMEOUT_SECONDS == 120.0
+    assert front.calls == 3
+    assert now[0] == 62.0
+
+
+def test_litellm_readiness_fails_immediately_when_process_exits() -> None:
+    class Process:
+        @staticmethod
+        def poll():
+            return 1
+
+    class Front:
+        @staticmethod
+        def internal_liveliness() -> bool:
+            raise AssertionError("liveliness probe ran after process exit")
+
+    with pytest.raises(GatewayConfigError, match="exited before readiness"):
+        service._wait_liveliness(Front(), Process())
 
 
 def test_operator_stop_uses_gateway_kill_switch_before_bounded_task_end(tmp_path) -> None:

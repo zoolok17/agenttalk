@@ -7,6 +7,8 @@ import hashlib
 import html
 import http.client
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import socket
 import subprocess  # nosec B404 - fixed schtasks/LiteLLM argv lists; shell is never used
@@ -31,6 +33,7 @@ from .ovh_gateway import (
     default_front_token_path,
     default_internal_token_path,
     default_key_path,
+    default_secret_dir,
     generate_token,
     price_policy_hash,
     read_secret_file,
@@ -38,12 +41,17 @@ from .ovh_gateway import (
     write_secret_file,
 )
 from .ovh_gateway_front import CONFIG_ERROR_CODE, PUBLIC_ROUTE, FrontConfig, GatewayFront
+from .redaction import redact_diagnostic_text
 
 
 TASK_SCHEMA_VERSION = 1
 RUNTIME_SCHEMA_VERSION = 1
 DEFAULT_API_BASE = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
 STOP_TIMEOUT_SECONDS = 30.0
+LITELLM_READINESS_TIMEOUT_SECONDS = 120.0
+LITELLM_LOG_MAX_BYTES = 1024 * 1024
+LITELLM_LOG_BACKUP_COUNT = 2
+LITELLM_LOG_RECORD_MAX_BYTES = 64 * 1024
 MAX_TASK_RESTARTS = 3
 TASK_RESTART_INTERVAL = "PT1M"
 TASK_PREFIX = "agenttalk-qwen-gateway"
@@ -98,6 +106,10 @@ def litellm_config_path(root: str | os.PathLike[str]) -> Path:
 
 def install_manifest_path(root: str | os.PathLike[str]) -> Path:
     return gateway_state_dir(root) / "install-manifest.json"
+
+
+def default_litellm_log_path() -> Path:
+    return default_secret_dir() / "gateway" / "litellm.log"
 
 
 def _task_arguments(root: Path) -> str:
@@ -187,17 +199,105 @@ def _task_xml_action(xml_text: str) -> tuple[str, str, str, str]:
     return text("Command"), text("Arguments"), text("WorkingDirectory"), principals[0].text or ""
 
 
+def _canonical_sid(value: str) -> str | None:
+    parts = value.strip().split("-")
+    if len(parts) < 4 or parts[0].casefold() != "s" or any(not part.isdecimal() for part in parts[1:]):
+        return None
+    numbers = [int(part) for part in parts[1:]]
+    revision, authority, *subauthorities = numbers
+    if (
+        revision > 0xFF
+        or authority > 0xFFFFFFFFFFFF
+        or len(subauthorities) > 15
+        or any(part > 0xFFFFFFFF for part in subauthorities)
+    ):
+        return None
+    return "S-" + "-".join(str(part) for part in numbers)
+
+
+def _binary_sid_to_string(value: bytes) -> str | None:
+    if len(value) < 8:
+        return None
+    revision = value[0]
+    count = value[1]
+    required = 8 + (count * 4)
+    if count > 15 or len(value) < required:
+        return None
+    authority = int.from_bytes(value[2:8], "big")
+    subauthorities = [
+        int.from_bytes(value[offset : offset + 4], "little")
+        for offset in range(8, required, 4)
+    ]
+    return "S-" + "-".join(str(part) for part in (revision, authority, *subauthorities))
+
+
+def _resolve_principal_sid(principal: str) -> str | None:
+    canonical = _canonical_sid(principal)
+    if canonical is not None:
+        return canonical
+    if os.name != "nt":
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    lookup_account_name = ctypes.WinDLL("advapi32", use_last_error=True).LookupAccountNameW
+    lookup_account_name.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    lookup_account_name.restype = wintypes.BOOL
+    sid_size = wintypes.DWORD()
+    domain_size = wintypes.DWORD()
+    sid_type = wintypes.DWORD()
+    lookup_account_name(
+        None,
+        principal,
+        None,
+        ctypes.byref(sid_size),
+        None,
+        ctypes.byref(domain_size),
+        ctypes.byref(sid_type),
+    )
+    if ctypes.get_last_error() != 122 or sid_size.value == 0:
+        return None
+    sid = ctypes.create_string_buffer(sid_size.value)
+    domain = ctypes.create_unicode_buffer(max(1, domain_size.value))
+    if not lookup_account_name(
+        None,
+        principal,
+        sid,
+        ctypes.byref(sid_size),
+        domain,
+        ctypes.byref(domain_size),
+        ctypes.byref(sid_type),
+    ):
+        return None
+    return _binary_sid_to_string(sid.raw[: sid_size.value])
+
+
 def task_xml_matches(xml_text: str, identity: TaskIdentity) -> bool:
     try:
         action = _task_xml_action(xml_text)
     except GatewayConfigError:
         return False
-    return action == (
+    if action[:3] != (
         identity.execute,
         identity.arguments,
         identity.working_directory,
-        identity.principal,
-    )
+    ):
+        return False
+    actual_principal = action[3]
+    if actual_principal == identity.principal:
+        return True
+    actual_sid = _resolve_principal_sid(actual_principal)
+    expected_sid = _resolve_principal_sid(identity.principal)
+    return actual_sid is not None and actual_sid == expected_sid
 
 
 def exclusive_bind_probe(host: str, port: int) -> None:
@@ -509,7 +609,11 @@ def _runtime_projection(root: Path, manifest: dict, *, front_token_sha256: str) 
     }
 
 
-def _wait_liveliness(front: GatewayFront, process: subprocess.Popen, timeout: float = 30.0) -> None:
+def _wait_liveliness(
+    front: GatewayFront,
+    process: subprocess.Popen,
+    timeout: float = LITELLM_READINESS_TIMEOUT_SECONDS,
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -518,6 +622,59 @@ def _wait_liveliness(front: GatewayFront, process: subprocess.Popen, timeout: fl
             return
         time.sleep(0.25)
     raise GatewayConfigError("LiteLLM readiness timed out")
+
+
+def _open_litellm_log(path: Path) -> RotatingFileHandler:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        path,
+        maxBytes=LITELLM_LOG_MAX_BYTES,
+        backupCount=LITELLM_LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o600)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    return handler
+
+
+def _redact_litellm_output(value: object, secrets: tuple[str, ...]) -> str:
+    text = str(value or "").rstrip("\r\n")
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    clean = redact_diagnostic_text(text)
+    budget = min(LITELLM_LOG_RECORD_MAX_BYTES, max(64, LITELLM_LOG_MAX_BYTES // 2))
+    encoded = clean.encode("utf-8", "replace")
+    if len(encoded) <= budget:
+        return clean
+    marker = b" [truncated]"
+    prefix = encoded[: max(0, budget - len(marker))].decode("utf-8", "ignore")
+    return prefix + marker.decode("ascii")
+
+
+def _pump_litellm_output(
+    stream,
+    handler: RotatingFileHandler,
+    secrets: tuple[str, ...],
+) -> None:
+    try:
+        for line in stream:
+            clean = _redact_litellm_output(line, secrets)
+            if not clean:
+                continue
+            record = logging.LogRecord(
+                "agenttalk.ovh_gateway.litellm",
+                logging.INFO,
+                __file__,
+                0,
+                clean,
+                (),
+                None,
+            )
+            handler.handle(record)
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            stream.close()
 
 
 def _public_front_attested(timeout_seconds: float = 5.0) -> bool:
@@ -563,6 +720,7 @@ def run_service(
     key_path: Path | None = None,
     front_token_path: Path | None = None,
     internal_token_path: Path | None = None,
+    child_log_path: Path | None = None,
     popen=subprocess.Popen,
 ) -> int:
     """Run LiteLLM plus the public front. Called only by the managed task."""
@@ -599,21 +757,37 @@ def run_service(
         "--num_workers",
         "1",
     ]
-    process = popen(
-        argv,
-        cwd=str(root),
-        env=_safe_gateway_environment(ovh_key, internal_token),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    front = GatewayFront(
-        FrontConfig(public_token=front_token, internal_token=internal_token),
-        ledger,
-    )
+    log_handler = _open_litellm_log(Path(child_log_path or default_litellm_log_path()))
+    process = None
+    pump_thread = None
     server = None
     monitor_stop = threading.Event()
     try:
+        process = popen(
+            argv,
+            cwd=str(root),
+            env=_safe_gateway_environment(ovh_key, internal_token),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        if process.stdout is None:
+            raise GatewayConfigError("LiteLLM diagnostic pipe is unavailable")
+        pump_thread = threading.Thread(
+            target=_pump_litellm_output,
+            args=(process.stdout, log_handler, (ovh_key, front_token, internal_token)),
+            daemon=True,
+            name="agenttalk-litellm-log",
+        )
+        pump_thread.start()
+        front = GatewayFront(
+            FrontConfig(public_token=front_token, internal_token=internal_token),
+            ledger,
+        )
         _wait_liveliness(front, process)
         server = front.make_server()
         _durable_write_json(
@@ -650,13 +824,16 @@ def run_service(
         monitor_stop.set()
         if server is not None:
             server.server_close()
-        if process.poll() is None:
+        if process is not None and process.poll() is None:
             process.terminate()
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+        if pump_thread is not None:
+            pump_thread.join(timeout=5)
+        log_handler.close()
         with contextlib.suppress(FileNotFoundError):
             runtime_marker_path(root).unlink()
 
