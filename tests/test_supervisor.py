@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -2594,6 +2595,190 @@ def _checkout_runtime_env(base: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def _live_supervisor_config(*agents: str) -> dict:
+    return {
+        "agents": {
+            name: {"auto_restart": True, "cli": "claude"}
+            for name in agents
+        },
+        "poll_seconds": 2,
+        "backoff": {
+            "base_seconds": 30,
+            "cap_seconds": 900,
+            "reset_after_seconds": 180,
+        },
+        "suspect_warn_interval_seconds": 300,
+        "launch_grace_seconds": 120,
+    }
+
+
+def _wait_for_live_supervisor(
+    proc: subprocess.Popen,
+    log_path: Path,
+    predicate,
+    *,
+    timeout: float = 30,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if predicate():
+                return
+        except (OSError, json.JSONDecodeError):
+            pass
+        rc = proc.poll()
+        if rc is not None:
+            log = log_path.read_text(encoding="utf-8", errors="replace")
+            pytest.fail(f"live supervisor exited {rc} before condition; log={log!r}")
+        time.sleep(0.05)
+    log = log_path.read_text(encoding="utf-8", errors="replace")
+    pytest.fail(f"timed out waiting for live supervisor; log={log!r}")
+
+
+def _stop_live_supervisor(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def _state_has_agent(state_path: Path, agent: str) -> bool:
+    if not state_path.exists():
+        return False
+    state = json.loads(state_path.read_text(encoding="utf-8-sig"))
+    return isinstance(state.get("agents", {}).get(agent), dict)
+
+
+def _log_contains(log_path: Path, text: str) -> bool:
+    if not log_path.exists():
+        return False
+    return text in log_path.read_text(encoding="utf-8", errors="replace")
+
+
+def _log_occurrences(log_path: Path, text: str) -> int:
+    if not log_path.exists():
+        return 0
+    return log_path.read_text(encoding="utf-8", errors="replace").count(text)
+
+
+def _replace_text_when_unlocked(path: Path, text: str, *, timeout: float = 5) -> None:
+    staged = path.with_name(path.name + ".test-next")
+    staged.write_text(text, encoding="utf-8")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.replace(staged, path)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+def _start_live_generated_supervisor(
+    tmp_path: Path,
+    shell: str,
+) -> tuple[Store, subprocess.Popen, object, Path]:
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(_live_supervisor_config("lead")),
+        encoding="utf-8",
+    )
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    _select_test_powershell(tmp_path, shell)
+    log_path = tmp_path / "live-supervisor.log"
+    log_handle = log_path.open("w", encoding="utf-8")
+    proc = subprocess.Popen(
+        [shell, "-NoProfile", "-File", str(store.dir / "supervisor.ps1")],
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=str(tmp_path),
+        env=_checkout_runtime_env(),
+    )
+    return store, proc, log_handle, log_path
+
+
+def test_generated_ps1_survives_malformed_config_poll_with_last_good(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    store, proc, log_handle, log_path = _start_live_generated_supervisor(
+        tmp_path,
+        shell,
+    )
+    state_path = store.dir / "supervisor-state.json"
+    warning = "supervisor.json refresh failed; keeping last-good config"
+    try:
+        _wait_for_live_supervisor(
+            proc,
+            log_path,
+            lambda: _state_has_agent(state_path, "lead")
+            and _log_contains(log_path, "supervisor: lead:"),
+        )
+        time.sleep(0.25)
+        _replace_text_when_unlocked(
+            state_path,
+            json.dumps({"agents": {}}),
+        )
+        (store.dir / "supervisor.json").write_text("{", encoding="utf-8")
+
+        _wait_for_live_supervisor(
+            proc,
+            log_path,
+            lambda: _log_occurrences(log_path, warning) >= 2
+            and _state_has_agent(state_path, "lead"),
+        )
+        assert proc.poll() is None
+    finally:
+        _stop_live_supervisor(proc)
+        log_handle.close()
+
+
+def test_generated_ps1_hot_adds_agent_across_live_polls(tmp_path: Path) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    store, proc, log_handle, log_path = _start_live_generated_supervisor(
+        tmp_path,
+        shell,
+    )
+    state_path = store.dir / "supervisor-state.json"
+    try:
+        _wait_for_live_supervisor(
+            proc,
+            log_path,
+            lambda: _state_has_agent(state_path, "lead")
+            and _log_contains(log_path, "supervisor: lead:"),
+        )
+        store.add_agent("hot-added", role="lead")
+        config_path = store.dir / "supervisor.json"
+        _replace_text_when_unlocked(
+            config_path,
+            json.dumps(_live_supervisor_config("lead", "hot-added")),
+        )
+
+        _wait_for_live_supervisor(
+            proc,
+            log_path,
+            lambda: _state_has_agent(state_path, "hot-added")
+            and _log_contains(log_path, "supervisor: hot-added:"),
+        )
+        assert proc.poll() is None
+        state = json.loads(state_path.read_text(encoding="utf-8-sig"))
+        assert state["agents"]["hot-added"]["pid_alive"] is False
+    finally:
+        _stop_live_supervisor(proc)
+        log_handle.close()
+
+
 def test_ps_state_helpers_recover_backup_and_refuse_two_corrupt_copies(tmp_path: Path) -> None:
     shell = _pick_powershell()
     if not shell:
@@ -4551,11 +4736,16 @@ def test_ps_template_routes_dynamic_agent_state_writes_through_helper() -> None:
 def test_ps_template_refreshes_config_before_each_poll() -> None:
     ps = sup.PS_TEMPLATE
     loop = ps[ps.index("do {"):ps.index("} while (-not $Once)")]
-    refresh = "$cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json"
+    refresh = "$nextCfg = Read-SupervisorConfig"
     if refresh not in loop:
         pytest.fail("poll uses stale supervisor config for hot-added agents")
     if loop.index(refresh) > loop.index("$state = Load-State"):
         pytest.fail("supervisor config must refresh before poll state initialization")
+    before_state = loop[:loop.index("$state = Load-State")]
+    if "try {" not in before_state or "catch {" not in before_state:
+        pytest.fail("per-poll config refresh is not guarded")
+    if "keeping last-good config" not in before_state:
+        pytest.fail("config refresh failure does not preserve last-good behavior")
 
 
 def test_process_ownership_stop_tree_closed_set_pin() -> None:

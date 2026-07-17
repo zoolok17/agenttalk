@@ -5005,7 +5005,22 @@ if ($DryRun) {
 }
 
 try {
-$cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+function Read-SupervisorConfig {
+  $value = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+  if (($null -eq $value) -or
+      (($value -isnot [System.Management.Automation.PSCustomObject]) -and
+       ($value -isnot [hashtable]))) {
+    throw "supervisor config must be a JSON object"
+  }
+  $agents = $value.PSObject.Properties['agents']
+  if (($null -eq $agents) -or ($null -eq $agents.Value) -or
+      (($agents.Value -isnot [System.Management.Automation.PSCustomObject]) -and
+       ($agents.Value -isnot [hashtable]))) {
+    throw "supervisor config agents must be a JSON object"
+  }
+  return $value
+}
+$cfg = Read-SupervisorConfig
 # Baked at `supervise --init`: the Python that runs the bus + whether this is a
 # source checkout (prepend <root>/src to PYTHONPATH) vs a pip install.
 $AgenttalkPython = '__AGENTTALK_PYTHON__'
@@ -5533,7 +5548,12 @@ function Launch-Spec($name, $spec, $codexHome) {
 $lastLogged = @{}
 $pollNum = 0
 do {
-  $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+  try {
+    $nextCfg = Read-SupervisorConfig
+    $cfg = $nextCfg
+  } catch {
+    Write-Warning "supervisor: supervisor.json refresh failed; keeping last-good config"
+  }
   $state = Load-State
   if (-not $state.agents) { $state | Add-Member agents ([pscustomobject]@{}) -Force }
   # 1) capture the process snapshot (the executor's only OS-liveness source) +
