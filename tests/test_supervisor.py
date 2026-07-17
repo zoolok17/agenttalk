@@ -854,10 +854,20 @@ def test_supervise_record_launch_creates_missing_state_with_atomic_codec(
 def test_ps_state_helpers_are_atomic_backed_up_and_fail_closed() -> None:
     ps = sup.PS_TEMPLATE
     block = ps[ps.index("# region state-helpers"):ps.index("# endregion state-helpers")]
+    poll_loop = ps[ps.index("$pollNum = 0\ndo {"):ps.index("} while (-not $Once)")]
     assert "$StateBackupPath" in ps
     assert "[System.IO.FileStream]" in block
     assert ".Flush($true)" in block
     assert "[System.IO.File]::Replace" in block
+    assert "[System.IO.File]::Move" in block
+    assert "function Invoke-StateFileSwapWithRetry" in block
+    assert "Test-IsIOException $_.Exception" in block
+    assert "for ($attempt = 1; $attempt -le 8; $attempt++)" in block
+    assert "$delayMs = [Math]::Min(250, $delayMs * 2)" in block
+    assert "function Save-StateForPoll" in block
+    assert "state write failed this poll; will retry next poll" in block
+    assert poll_loop.count("Save-StateForPoll $state") == 3
+    assert "Save-State $state" not in poll_loop
     assert "function Test-StateObject" in block
     assert "throw" in block
     assert "Set-Content $StatePath" not in ps
@@ -2777,6 +2787,282 @@ def test_generated_ps1_hot_adds_agent_across_live_polls(tmp_path: Path) -> None:
     finally:
         _stop_live_supervisor(proc)
         log_handle.close()
+
+
+_STATE_WRITE_LOCK_CSHARP = r"""
+using System;
+using System.IO;
+using System.Threading;
+
+public static class AgenttalkStateWriteLock
+{
+    private static bool RetryObserved(string path)
+    {
+        try
+        {
+            return File.Exists(path) && new FileInfo(path).Length > 0;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
+
+    private static void WaitForRetry(string retryPath)
+    {
+        DateTime deadline = DateTime.UtcNow.AddSeconds(5);
+        while (DateTime.UtcNow < deadline && !RetryObserved(retryPath))
+        {
+            Thread.Sleep(1);
+        }
+    }
+
+    public static Thread LockExistingUntilRetry(
+        string path, string readyPath, string retryPath)
+    {
+        Thread thread = new Thread(() =>
+        {
+            using (FileStream stream = new FileStream(
+                path, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                File.WriteAllText(readyPath, "ready");
+                WaitForRetry(retryPath);
+            }
+        });
+        thread.IsBackground = true;
+        thread.Start();
+        return thread;
+    }
+
+    public static Thread LockExistingForMilliseconds(
+        string path, string readyPath, int milliseconds)
+    {
+        Thread thread = new Thread(() =>
+        {
+            using (FileStream stream = new FileStream(
+                path, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                File.WriteAllText(readyPath, "ready");
+                Thread.Sleep(milliseconds);
+            }
+        });
+        thread.IsBackground = true;
+        thread.Start();
+        return thread;
+    }
+
+    public static Thread LockNextTempUntilRetry(
+        string directory, string readyPath, string retryPath)
+    {
+        Thread thread = new Thread(() =>
+        {
+            DateTime deadline = DateTime.UtcNow.AddSeconds(5);
+            FileStream stream = null;
+            while (DateTime.UtcNow < deadline && stream == null)
+            {
+                foreach (string candidate in Directory.GetFiles(directory, ".at-*.tmp"))
+                {
+                    try
+                    {
+                        stream = new FileStream(
+                            candidate, FileMode.Open, FileAccess.Read, FileShare.None);
+                        break;
+                    }
+                    catch (IOException)
+                    {
+                    }
+                }
+                if (stream == null)
+                {
+                    Thread.Sleep(1);
+                }
+            }
+            if (stream == null)
+            {
+                File.WriteAllText(readyPath, "timeout");
+                return;
+            }
+            using (stream)
+            {
+                File.WriteAllText(readyPath, "ready");
+                WaitForRetry(retryPath);
+            }
+        });
+        thread.IsBackground = true;
+        thread.Start();
+        return thread;
+    }
+}
+""".strip()
+
+
+def _state_write_contention_harness_prefix(
+    *,
+    state_path: Path,
+    ready_path: Path,
+    retry_path: Path,
+) -> list[str]:
+    ps = sup.PS_TEMPLATE
+    helpers = ps[ps.index("# region state-helpers"):ps.index("# endregion state-helpers")]
+    return [
+        "$ErrorActionPreference = 'Stop'",
+        f"$StatePath = {_pslit(str(state_path))}",
+        "$StateBackupPath = \"$StatePath.bak\"",
+        "$KillSwitchPath = Join-Path (Split-Path -Parent $StatePath) 'supervisor.kill'",
+        f"$ReadyPath = {_pslit(str(ready_path))}",
+        f"$RetryPath = {_pslit(str(retry_path))}",
+        "function Actions-Enabled { return $true }",
+        "Add-Type -TypeDefinition @'",
+        _STATE_WRITE_LOCK_CSHARP,
+        "'@",
+        "function Start-Sleep {",
+        "  param([int]$Milliseconds)",
+        "  [IO.File]::AppendAllText($RetryPath, \"$Milliseconds`n\")",
+        "  Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds $Milliseconds",
+        "}",
+        helpers,
+    ]
+
+
+@pytest.mark.parametrize("swap_path", ["replace", "move"])
+def test_ps_state_atomic_swap_retries_windows_sharing_violation(
+    tmp_path: Path,
+    swap_path: str,
+) -> None:
+    if os.name != "nt":
+        return
+    shell = _pick_powershell()
+    if not shell:
+        return
+    state_path = tmp_path / "supervisor-state.json"
+    ready_path = tmp_path / "lock-ready.txt"
+    retry_path = tmp_path / "retry-observed.txt"
+    result_path = tmp_path / "state-swap-result.json"
+    if swap_path == "replace":
+        state_path.write_text(
+            json.dumps({"agents": {"worker": {"pid": 101}}}),
+            encoding="utf-8",
+        )
+
+    harness = _state_write_contention_harness_prefix(
+        state_path=state_path,
+        ready_path=ready_path,
+        retry_path=retry_path,
+    )
+    if swap_path == "replace":
+        harness += [
+            "$locker = [AgenttalkStateWriteLock]::LockExistingUntilRetry(",
+            "  $StatePath, $ReadyPath, $RetryPath)",
+            "while (-not (Microsoft.PowerShell.Management\\Test-Path "
+            "-LiteralPath $ReadyPath)) {",
+            "  Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds 1",
+            "}",
+        ]
+    else:
+        harness += [
+            "$locker = [AgenttalkStateWriteLock]::LockNextTempUntilRetry(",
+            "  (Split-Path -Parent $StatePath), $ReadyPath, $RetryPath)",
+            "$script:MoveGateWaited = $false",
+            "function Test-Path {",
+            "  param([string]$LiteralPath)",
+            "  $exists = Microsoft.PowerShell.Management\\Test-Path "
+            "-LiteralPath $LiteralPath",
+            "  if (-not $script:MoveGateWaited -and $LiteralPath -eq $StatePath "
+            "-and -not $exists) {",
+            "    while (-not (Microsoft.PowerShell.Management\\Test-Path "
+            "-LiteralPath $ReadyPath)) {",
+            "      Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds 1",
+            "    }",
+            "    if ([IO.File]::ReadAllText($ReadyPath) -ne 'ready') {",
+            "      throw 'temp lock did not become ready'",
+            "    }",
+            "    $script:MoveGateWaited = $true",
+            "  }",
+            "  return $exists",
+            "}",
+        ]
+    harness += [
+        "$next = [pscustomobject]@{ agents = [pscustomobject]@{ worker = "
+        "[pscustomobject]@{ pid = 202 } } }",
+        "Write-StateFileAtomic $StatePath $next",
+        "$null = $locker.Join(5000)",
+        "$retryCount = @(Get-Content -LiteralPath $RetryPath).Count",
+        "$saved = Read-StateFile $StatePath",
+        "@{ pid = $saved.agents.worker.pid; retries = $retryCount } | "
+        f"ConvertTo-Json | Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ]
+    script = tmp_path / f"state-swap-{swap_path}.ps1"
+    script.write_text("\n".join(harness), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload["pid"] == 202
+    assert payload["retries"] >= 1
+
+
+def test_ps_poll_state_save_warns_and_survives_persistent_contention(
+    tmp_path: Path,
+) -> None:
+    if os.name != "nt":
+        return
+    shell = _pick_powershell()
+    if not shell:
+        return
+    state_path = tmp_path / "supervisor-state.json"
+    state_path.write_text(
+        json.dumps({"agents": {"worker": {"pid": 101}}}),
+        encoding="utf-8",
+    )
+    ready_path = tmp_path / "persistent-lock-ready.txt"
+    retry_path = tmp_path / "persistent-retries.txt"
+    result_path = tmp_path / "poll-save-result.json"
+    harness = _state_write_contention_harness_prefix(
+        state_path=state_path,
+        ready_path=ready_path,
+        retry_path=retry_path,
+    )
+    harness += [
+        "$locker = [AgenttalkStateWriteLock]::LockExistingForMilliseconds(",
+        "  $StatePath, $ReadyPath, 2500)",
+        "while (-not (Microsoft.PowerShell.Management\\Test-Path "
+        "-LiteralPath $ReadyPath)) {",
+        "  Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds 1",
+        "}",
+        "$next = [pscustomobject]@{ agents = [pscustomobject]@{ worker = "
+        "[pscustomobject]@{ pid = 202 } } }",
+        "$results = @()",
+        "for ($poll = 0; $poll -lt 2; $poll++) {",
+        "  $results += [bool](Save-StateForPoll $next)",
+        "}",
+        "$primary = Read-StateFile $StatePath",
+        "@{ polls = $results.Count; saved = @($results | Where-Object { $_ }).Count; "
+        "pid = $primary.agents.worker.pid } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ]
+    script = tmp_path / "poll-save-contention.ps1"
+    script.write_text("\n".join(harness), encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    combined = f"{result.stdout}{result.stderr}"
+    assert result.returncode == 0, combined
+    assert combined.count(
+        "supervisor: state write failed this poll; will retry next poll"
+    ) >= 2
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload == {"polls": 2, "saved": 0, "pid": 101}
 
 
 def test_ps_state_helpers_recover_backup_and_refuse_two_corrupt_copies(tmp_path: Path) -> None:

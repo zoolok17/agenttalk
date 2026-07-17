@@ -5054,6 +5054,39 @@ function Read-StateFile([string]$path) {
   } catch { }
   return $null
 }
+function Test-IsIOException($exception) {
+  $current = $exception
+  while ($null -ne $current) {
+    if ($current -is [System.IO.IOException]) { return $true }
+    $current = $current.InnerException
+  }
+  return $false
+}
+function Invoke-StateFileSwapWithRetry([string]$tmp, [string]$path) {
+  $delayMs = 5
+  for ($attempt = 1; $attempt -le 8; $attempt++) {
+    $replaced = $null
+    try {
+      if (Test-Path -LiteralPath $path) {
+        $replacedName = ".at-replaced-{0}-{1}.bak" -f $PID, ([Guid]::NewGuid().ToString('N'))
+        $replaced = [System.IO.Path]::Combine(
+          [System.IO.Path]::GetDirectoryName($path), $replacedName)
+        [System.IO.File]::Replace($tmp, $path, $replaced)
+      } else {
+        [System.IO.File]::Move($tmp, $path)
+      }
+      return
+    } catch {
+      if (-not (Test-IsIOException $_.Exception) -or $attempt -ge 8) { throw }
+      Start-Sleep -Milliseconds $delayMs
+      $delayMs = [Math]::Min(250, $delayMs * 2)
+    } finally {
+      if ($null -ne $replaced -and (Test-Path -LiteralPath $replaced)) {
+        Remove-Item -LiteralPath $replaced -Force
+      }
+    }
+  }
+}
 function Write-StateFileAtomic([string]$path, $state) {
   if (-not (Test-StateObject $state)) { throw "supervisor state must be a JSON object" }
   $json = $state | ConvertTo-Json -Depth 8
@@ -5070,21 +5103,10 @@ function Write-StateFileAtomic([string]$path, $state) {
   } finally {
     $stream.Dispose()
   }
-  $replaced = $null
   try {
-    if (Test-Path -LiteralPath $path) {
-      $replacedName = ".at-replaced-{0}-{1}.bak" -f $PID, ([Guid]::NewGuid().ToString('N'))
-      $replaced = [System.IO.Path]::Combine(
-        [System.IO.Path]::GetDirectoryName($path), $replacedName)
-      [System.IO.File]::Replace($tmp, $path, $replaced)
-    } else {
-      [System.IO.File]::Move($tmp, $path)
-    }
+    Invoke-StateFileSwapWithRetry $tmp $path
   } finally {
     if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
-    if ($null -ne $replaced -and (Test-Path -LiteralPath $replaced)) {
-      Remove-Item -LiteralPath $replaced -Force
-    }
   }
 }
 function Set-AgentState($state, $name, $value) {
@@ -5119,6 +5141,16 @@ function Save-State($state) {
     throw "supervisor state backup is invalid"
   }
   Write-StateFileAtomic $StatePath $state
+}
+function Save-StateForPoll($state) {
+  try {
+    Save-State $state
+    return $true
+  } catch {
+    if (-not (Test-IsIOException $_.Exception)) { throw }
+    Write-Warning "supervisor: state write failed this poll; will retry next poll"
+    return $false
+  }
 }
 # endregion state-helpers
 function Pid-Alive($procId) {
@@ -5572,7 +5604,7 @@ do {
     }
     $st | Add-Member pid_alive (Pid-Alive $st.pid) -Force
   }
-  Save-State $state
+  Save-StateForPoll $state | Out-Null
   # 2) ask Python for the safe action plan (it interprets the snapshot)
   # MUST be a UTC epoch: heartbeats are stamped in UTC (...Z), and the Python
   # plan compares now-vs-heartbeat for staleness. `Get-Date -UFormat %s` on
@@ -5663,7 +5695,7 @@ do {
           if ($res) { Get-ProcSnapshot $postLaunchPath | Out-Null }
           Set-AgentState $state $name $p.next_state    # planner fields pass brain/managed/launching/etc through
           if ($res) {
-            Save-State $state
+            Save-StateForPoll $state | Out-Null
             # Record the LAUNCHER pid + start (anti-reuse) + open grace via Python
             # (authoritative: claude pins the minted id; codex resumes by --last).
             $extra = @(); if ($res.session_id) { $extra += @('--session-id', $res.session_id) }
@@ -5775,7 +5807,7 @@ do {
   if (-not $Quiet -and -not $DryRun -and $total -gt 0 -and ($pollNum % 10 -eq 0)) {
     Write-Host ("supervisor: poll {0} - {1}/{2} agents healthy" -f $pollNum, $healthy, $total)
   }
-  if (-not $DryRun) { Save-State $state }
+  if (-not $DryRun) { Save-StateForPoll $state | Out-Null }
   if (-not $Once) { Start-Sleep -Seconds ([int]$cfg.poll_seconds) }
 } while (-not $Once)
 } finally {
