@@ -851,22 +851,122 @@ def test_supervise_record_launch_creates_missing_state_with_atomic_codec(
     state = sup.load_supervisor_state(state_file)
     assert state["agents"]["worker"]["launcher_pid"] == 777
 
+
+def test_record_launch_authoritatively_persists_launch_clock_and_grace(
+    tmp_path: Path,
+) -> None:
+    store = _team(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({
+            "agents": {"worker": {"auto_restart": True, "cli": "claude"}},
+            "launch_grace_seconds": 75,
+        }),
+        encoding="utf-8",
+    )
+    state_file = store.dir / "supervisor-state.json"
+    state_file.write_text(
+        json.dumps({"agents": {"worker": {"last_launch_epoch": NOW - 100}}}),
+        encoding="utf-8",
+    )
+
+    rc = _run([
+        "supervise", "--record-launch", "--for", "worker", "--cli", "claude",
+        "--pid", "777", "--state-file", str(state_file), "--now", str(NOW),
+    ], tmp_path)
+
+    assert rc == 0
+    persisted = sup.load_supervisor_state(state_file)["agents"]["worker"]
+    assert persisted["last_launch_epoch"] == NOW
+    assert persisted["launch_grace_until"] == NOW + 75
+
+
+@pytest.mark.parametrize("winerror", [5, 32, 33])
+def test_supervisor_state_writer_retries_retryable_windows_replace_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    winerror: int,
+) -> None:
+    state_file = tmp_path / "supervisor-state.json"
+    real_replace = os.replace
+    attempts = 0
+
+    def contended_replace(source: str, destination: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            error = PermissionError("state file is in use")
+            error.winerror = winerror
+            raise error
+        real_replace(source, destination)
+
+    monkeypatch.setattr(sup.os, "replace", contended_replace)
+
+    sup.save_supervisor_state(
+        state_file,
+        {"agents": {"worker": {"launcher_pid": 777}}},
+    )
+
+    assert attempts == 3
+    assert sup.load_supervisor_state(state_file)["agents"]["worker"]["launcher_pid"] == 777
+
+
+def test_supervisor_state_writer_does_not_retry_permanent_io_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    def disk_full_replace(source: str, destination: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise OSError(28, "disk full", destination)
+
+    monkeypatch.setattr(sup.os, "replace", disk_full_replace)
+
+    with pytest.raises(OSError, match="disk full"):
+        sup.save_supervisor_state(
+            tmp_path / "supervisor-state.json",
+            {"agents": {"worker": {}}},
+        )
+
+    assert attempts == 1
+
+
 def test_ps_state_helpers_are_atomic_backed_up_and_fail_closed() -> None:
     ps = sup.PS_TEMPLATE
     block = ps[ps.index("# region state-helpers"):ps.index("# endregion state-helpers")]
-    poll_loop = ps[ps.index("$pollNum = 0\ndo {"):ps.index("} while (-not $Once)")]
+    mutations = ps[
+        ps.index("# region checked-mutations"):
+        ps.index("# endregion checked-mutations")
+    ]
+    poll_loop = ps[ps.index("$pollNum = 0\n:supervisorPoll do {"):ps.index("} while (-not $Once)")]
     assert "$StateBackupPath" in ps
     assert "[System.IO.FileStream]" in block
     assert ".Flush($true)" in block
     assert "[System.IO.File]::Replace" in block
     assert "[System.IO.File]::Move" in block
     assert "function Invoke-StateFileSwapWithRetry" in block
-    assert "Test-IsIOException $_.Exception" in block
+    assert "Test-IsRetryableStateWriteException $_.Exception" in block
     assert "for ($attempt = 1; $attempt -le 8; $attempt++)" in block
     assert "$delayMs = [Math]::Min(250, $delayMs * 2)" in block
     assert "function Save-StateForPoll" in block
     assert "state write failed this poll; will retry next poll" in block
     assert poll_loop.count("Save-StateForPoll $state") == 3
+    assert poll_loop.count("if (-not (Save-StateForPoll $state))") == 3
+    assert poll_loop.count("continue supervisorPoll") >= 3
+    assert "$LASTEXITCODE" in mutations
+    assert poll_loop.count(
+        'Invoke-CheckedSupervisorMutation ("record-launch {0}"'
+    ) == 1
+    assert poll_loop.count(
+        'Invoke-CheckedSupervisorMutation ("record-ephemeral-launch {0}"'
+    ) == 1
+    assert poll_loop.count(
+        'Invoke-CheckedSupervisorMutation ("archive-launch-request {0}"'
+    ) == 4
+    assert "& $AgenttalkCmd --root $Root supervise --record-launch" not in poll_loop
+    assert "& $AgenttalkCmd --root $Root supervise --record-ephemeral-launch" not in poll_loop
+    assert "& $AgenttalkCmd --root $Root supervise --archive-launch-request" not in poll_loop
     assert "Save-State $state" not in poll_loop
     assert "function Test-StateObject" in block
     assert "throw" in block
@@ -2107,7 +2207,7 @@ def test_ps_template_seeds_preflights_and_drops_baked_python_for_agent() -> None
     # does (src on a checkout) so it tests the agent's REAL import env and does
     # not fail closed on a checkout where agenttalk is not globally installed.
     pf = ps[ps.index("function Preflight"):]
-    pf = pf[:pf.index("\ndo {")]                            # the Preflight body
+    pf = pf[:pf.index("\n:supervisorPoll do {")]             # before the poll body
     ci = pf.index("$plan.cli -eq 'codex'")
     codex_branch = pf[ci:pf.index("} else {", ci)]          # from codex to the codex/claude divider
     assert "'src') + ';' + $env:PYTHONPATH" in codex_branch
@@ -2789,6 +2889,69 @@ def test_generated_ps1_hot_adds_agent_across_live_polls(tmp_path: Path) -> None:
         log_handle.close()
 
 
+def test_generated_ps1_holds_poll_when_preplan_state_save_is_contended(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    store = _team(tmp_path)
+    config = {
+        "agents": {
+            "worker": {
+                "activity_hook": True,
+                "auto_restart": True,
+                "cli": "claude",
+            },
+        },
+        "backoff": {
+            "base_seconds": 30,
+            "cap_seconds": 900,
+            "reset_after_seconds": 180,
+        },
+        "launch_grace_seconds": 120,
+        "poll_seconds": 1,
+    }
+    (store.dir / "supervisor.json").write_text(
+        json.dumps(config),
+        encoding="utf-8",
+    )
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    _select_test_powershell(tmp_path, shell)
+    state_path = store.dir / "supervisor-state.json"
+    initial = {"agents": {"worker": _ready(backoff_next_epoch=0)}}
+    state_path.write_text(json.dumps(initial), encoding="utf-8")
+    wrapper = tmp_path / "run-supervisor-with-state-lock.ps1"
+    wrapper.write_text(
+        "\n".join([
+            "$ErrorActionPreference = 'Stop'",
+            f"$StatePath = {_pslit(str(state_path))}",
+            f"$Supervisor = {_pslit(str(store.dir / 'supervisor.ps1'))}",
+            "$lock = [IO.FileStream]::new($StatePath, [IO.FileMode]::Open, "
+            "[IO.FileAccess]::Read, [IO.FileShare]::Read)",
+            "try { & $Supervisor -Once } finally { $lock.Dispose() }",
+        ]),
+        encoding="utf-8-sig",
+    )
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(wrapper)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(tmp_path),
+        env=_checkout_runtime_env(),
+    )
+
+    combined = f"{result.stdout}{result.stderr}"
+    assert result.returncode == 0, combined
+    assert "state write failed this poll; will retry next poll" in combined
+    assert "supervisor: worker:" not in combined
+    persisted = sup.load_supervisor_state(state_path)["agents"]["worker"]
+    assert persisted["backoff_next_epoch"] == 0
+    assert persisted.get("launching") is False
+
+
 _STATE_WRITE_LOCK_CSHARP = r"""
 using System;
 using System.IO;
@@ -3063,6 +3226,159 @@ def test_ps_poll_state_save_warns_and_survives_persistent_contention(
     ) >= 2
     payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
     assert payload == {"polls": 2, "saved": 0, "pid": 101}
+
+
+def test_ps_poll_state_save_only_softens_sharing_and_lock_violations(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[ps.index("# region state-helpers"):ps.index("# endregion state-helpers")]
+    result_path = tmp_path / "poll-save-error-classification.json"
+    state_path = tmp_path / "supervisor-state.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$StatePath = {_pslit(str(state_path))}",
+        "$StateBackupPath = \"$StatePath.bak\"",
+        "$KillSwitchPath = Join-Path (Split-Path -Parent $StatePath) 'supervisor.kill'",
+        "function Actions-Enabled { return $true }",
+        helpers,
+        "$script:Failure = ''",
+        "function Save-State($state) {",
+        "  switch ($script:Failure) {",
+        "    'sharing' { throw [IO.IOException]::new('sharing', -2147024864) }",
+        "    'lock' { throw [IO.IOException]::new('lock', -2147024863) }",
+        "    'disk_full' { throw [IO.IOException]::new('disk full', -2147024784) }",
+        "    'unauthorized' { throw [UnauthorizedAccessException]::new('denied') }",
+        "  }",
+        "}",
+        "$next = [pscustomobject]@{ agents = [pscustomobject]@{} }",
+        "$script:Failure = 'sharing'",
+        "$sharingSoft = -not [bool](Save-StateForPoll $next)",
+        "$script:Failure = 'lock'",
+        "$lockSoft = -not [bool](Save-StateForPoll $next)",
+        "$script:Failure = 'disk_full'",
+        "$diskFullPropagated = $false",
+        "try { Save-StateForPoll $next | Out-Null } catch { $diskFullPropagated = $true }",
+        "$script:Failure = 'unauthorized'",
+        "$unauthorizedPropagated = $false",
+        "try { Save-StateForPoll $next | Out-Null } catch { $unauthorizedPropagated = $true }",
+        "@{ sharing_soft = $sharingSoft; lock_soft = $lockSoft; "
+        "disk_full_propagated = $diskFullPropagated; "
+        "unauthorized_propagated = $unauthorizedPropagated } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ])
+    script = tmp_path / "poll-save-error-classification.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    assert json.loads(result_path.read_text(encoding="utf-8-sig")) == {
+        "sharing_soft": True,
+        "lock_soft": True,
+        "disk_full_propagated": True,
+        "unauthorized_propagated": True,
+    }
+
+
+def test_spawned_launch_is_not_acknowledged_when_record_launch_cannot_commit(
+    tmp_path: Path,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    store = _team(tmp_path)
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({
+            "agents": {"worker": {"auto_restart": True, "cli": "claude"}},
+            "launch_grace_seconds": 120,
+        }),
+        encoding="utf-8",
+    )
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    state_path = store.dir / "supervisor-state.json"
+    state_path.write_text(
+        json.dumps({
+            "agents": {
+                "worker": {
+                    "launcher_pid": 111,
+                    "last_launch_epoch": NOW - 100,
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    store.write_restart_request("worker", _auth_marker("record-launch-race"))
+    marker_path = store.state_dir / "worker.restart-request"
+    child_script = tmp_path / "record-launch-child.py"
+    child_script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    result_path = tmp_path / "record-launch-contention-result.json"
+    generated = (store.dir / "supervisor.ps1").read_text(encoding="utf-8-sig")
+    mutation_helpers = generated[
+        generated.index("# region checked-mutations"):
+        generated.index("# endregion checked-mutations")
+    ]
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        f"$AgenttalkCmd = {_pslit(str(store.dir / 'bin' / 'agenttalk.cmd'))}",
+        f"$Root = {_pslit(str(tmp_path))}",
+        f"$StatePath = {_pslit(str(state_path))}",
+        f"$MarkerPath = {_pslit(str(marker_path))}",
+        f"$ChildScript = {_pslit(str(child_script))}",
+        f"$ResultPath = {_pslit(str(result_path))}",
+        f"$Python = {_pslit(sys.executable)}",
+        mutation_helpers,
+        "$child = Start-Process -FilePath $Python "
+        "-ArgumentList ('\"{0}\"' -f $ChildScript) -PassThru",
+        "$lock = [IO.FileStream]::new($StatePath, [IO.FileMode]::Open, "
+        "[IO.FileAccess]::Read, [IO.FileShare]::Read)",
+        "try {",
+        "  $recordArgs = @('--root', $Root, 'supervise', '--record-launch', "
+        "'--for', 'worker', '--cli', 'claude', '--pid', [string]$child.Id, "
+        f"'--now', '{NOW}', '--state-file', $StatePath)",
+        "  $recorded = Invoke-CheckedSupervisorMutation "
+        "'record-launch worker' $recordArgs",
+        "  if ($recorded) {",
+        "    & $AgenttalkCmd --root $Root supervise --clear-restart --for worker "
+        "--request-id record-launch-race | Out-Null",
+        "  }",
+        "} finally {",
+        "  $lock.Dispose()",
+        "  Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue",
+        "}",
+        "@{ recorded = [bool]$recorded; marker_present = (Test-Path $MarkerPath) } | "
+        "ConvertTo-Json | Set-Content $ResultPath -Encoding utf8",
+    ])
+    script = tmp_path / "record-launch-contention.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(tmp_path),
+        env=_checkout_runtime_env(),
+    )
+
+    combined = f"{result.stdout}{result.stderr}"
+    assert result.returncode == 0, combined
+    assert "record-launch worker failed" in combined
+    assert json.loads(result_path.read_text(encoding="utf-8-sig")) == {
+        "recorded": False,
+        "marker_present": True,
+    }
+    persisted = sup.load_supervisor_state(state_path)["agents"]["worker"]
+    assert persisted["launcher_pid"] == 111
+    assert persisted["last_launch_epoch"] == NOW - 100
 
 
 def test_ps_state_helpers_recover_backup_and_refuse_two_corrupt_copies(tmp_path: Path) -> None:

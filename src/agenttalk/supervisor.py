@@ -35,6 +35,7 @@ import re
 import shlex
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
@@ -155,6 +156,17 @@ class SupervisorPersistenceError(ValueError):
     """Supervisor state/config cannot be trusted as a complete JSON object."""
 
 
+_STATE_SWAP_RETRY_DELAYS_SECONDS = (0.005, 0.01, 0.02, 0.04, 0.08, 0.16, 0.25)
+_RETRYABLE_WINDOWS_STATE_SWAP_ERRORS = frozenset({5, 32, 33})
+
+
+def _is_retryable_supervisor_swap_error(error: OSError) -> bool:
+    # CPython's MoveFileEx wrapper can surface a delete-sharing conflict as
+    # WinError 5; Win32 also exposes the explicit sharing/lock codes 32/33.
+    # A persistent 5 still raises after the same bounded retry budget.
+    return getattr(error, "winerror", None) in _RETRYABLE_WINDOWS_STATE_SWAP_ERRORS
+
+
 def supervisor_state_backup_path(path: Path) -> Path:
     return Path(f"{path}.bak")
 
@@ -227,7 +239,17 @@ def _atomic_write_supervisor_json(path: Path, value: dict, *, source: str) -> No
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(tmp_name, path)
+        for attempt in range(len(_STATE_SWAP_RETRY_DELAYS_SECONDS) + 1):
+            try:
+                os.replace(tmp_name, path)
+                break
+            except OSError as error:
+                if (
+                    attempt >= len(_STATE_SWAP_RETRY_DELAYS_SECONDS)
+                    or not _is_retryable_supervisor_swap_error(error)
+                ):
+                    raise
+                time.sleep(_STATE_SWAP_RETRY_DELAYS_SECONDS[attempt])
         _fsync_supervisor_directory(path.parent)
     except Exception:
         try:
@@ -4393,10 +4415,9 @@ def record_launch(state: dict, agent: str, *, cli: str, pid: int | None,
     )
     entry["managed_pids"] = launch_children
     entry["provenance_diagnostics"] = {k: v for k, v in diagnostics.items() if v}
-    if now_epoch is not None:
-        entry["last_launch_epoch"] = now_epoch
-        if grace_seconds is not None:
-            entry["launch_grace_until"] = now_epoch + float(grace_seconds)
+    entry["last_launch_epoch"] = now
+    if grace_seconds is not None:
+        entry["launch_grace_until"] = now + float(grace_seconds)
     # legacy back-compat (non-forking pid_alive path + old tests)
     entry["pid"] = pid
     entry["pid_alive"] = True
@@ -5054,10 +5075,13 @@ function Read-StateFile([string]$path) {
   } catch { }
   return $null
 }
-function Test-IsIOException($exception) {
+function Test-IsRetryableStateWriteException($exception) {
   $current = $exception
   while ($null -ne $current) {
-    if ($current -is [System.IO.IOException]) { return $true }
+    if ($current -is [System.IO.IOException]) {
+      $win32 = $current.HResult -band 0xFFFF
+      if ($win32 -in @(32, 33)) { return $true }
+    }
     $current = $current.InnerException
   }
   return $false
@@ -5077,7 +5101,7 @@ function Invoke-StateFileSwapWithRetry([string]$tmp, [string]$path) {
       }
       return
     } catch {
-      if (-not (Test-IsIOException $_.Exception) -or $attempt -ge 8) { throw }
+      if (-not (Test-IsRetryableStateWriteException $_.Exception) -or $attempt -ge 8) { throw }
       Start-Sleep -Milliseconds $delayMs
       $delayMs = [Math]::Min(250, $delayMs * 2)
     } finally {
@@ -5147,7 +5171,7 @@ function Save-StateForPoll($state) {
     Save-State $state
     return $true
   } catch {
-    if (-not (Test-IsIOException $_.Exception)) { throw }
+    if (-not (Test-IsRetryableStateWriteException $_.Exception)) { throw }
     Write-Warning "supervisor: state write failed this poll; will retry next poll"
     return $false
   }
@@ -5458,6 +5482,21 @@ function Preflight($name, $plan, $file, $codexHome) {
   }
 }
 # endregion exec-helpers
+# region checked-mutations
+function Invoke-CheckedSupervisorMutation(
+  [string]$description,
+  [object[]]$arguments
+) {
+  & $AgenttalkCmd @arguments | Out-Null
+  $exitCode = $LASTEXITCODE
+  if ($exitCode -eq 0) { return $true }
+  Write-Warning ("supervisor: {0} failed (exit {1}); holding this poll" -f $description, $exitCode)
+  return $false
+}
+function Wait-ForNextPoll($config) {
+  if (-not $Once) { Start-Sleep -Seconds ([int]$config.poll_seconds) }
+}
+# endregion checked-mutations
 function Launch($name, $plan, $codexHome) {
   if (-not (Assert-ActionsEnabled ("launch {0}" -f $name))) { return $null }
   $a = $cfg.agents.$name
@@ -5579,7 +5618,7 @@ function Launch-Spec($name, $spec, $codexHome) {
 # $Quiet suppresses the log; -DryRun prints every agent every run (one-shot).
 $lastLogged = @{}
 $pollNum = 0
-do {
+:supervisorPoll do {
   try {
     $nextCfg = Read-SupervisorConfig
     $cfg = $nextCfg
@@ -5604,7 +5643,10 @@ do {
     }
     $st | Add-Member pid_alive (Pid-Alive $st.pid) -Force
   }
-  Save-StateForPoll $state | Out-Null
+  if (-not (Save-StateForPoll $state)) {
+    Wait-ForNextPoll $cfg
+    continue supervisorPoll
+  }
   # 2) ask Python for the safe action plan (it interprets the snapshot)
   # MUST be a UTC epoch: heartbeats are stamped in UTC (...Z), and the Python
   # plan compares now-vs-heartbeat for staleness. `Get-Date -UFormat %s` on
@@ -5695,7 +5737,10 @@ do {
           if ($res) { Get-ProcSnapshot $postLaunchPath | Out-Null }
           Set-AgentState $state $name $p.next_state    # planner fields pass brain/managed/launching/etc through
           if ($res) {
-            Save-StateForPoll $state | Out-Null
+            if (-not (Save-StateForPoll $state)) {
+              Wait-ForNextPoll $cfg
+              continue supervisorPoll
+            }
             # Record the LAUNCHER pid + start (anti-reuse) + open grace via Python
             # (authoritative: claude pins the minted id; codex resumes by --last).
             $extra = @(); if ($res.session_id) { $extra += @('--session-id', $res.session_id) }
@@ -5706,7 +5751,14 @@ do {
               $extra += @('--launcher-nonce-missing-reason', $res.launcher_nonce_missing_reason)
             }
             if (-not (Assert-ActionsEnabled ("record-launch {0}" -f $name))) { continue }
-            & $AgenttalkCmd --root $Root supervise --record-launch --for $name --cli $p.cli --pid $res.pid @extra --pre-snapshot-file $preLaunchPath --post-snapshot-file $postLaunchPath --now $now --state-file $StatePath | Out-Null
+            $recordArgs = @('--root', $Root, 'supervise', '--record-launch',
+              '--for', $name, '--cli', $p.cli, '--pid', [string]$res.pid) + $extra + @(
+              '--pre-snapshot-file', $preLaunchPath, '--post-snapshot-file', $postLaunchPath,
+              '--now', [string]$now, '--state-file', $StatePath)
+            if (-not (Invoke-CheckedSupervisorMutation ("record-launch {0}" -f $name) $recordArgs)) {
+              Wait-ForNextPoll $cfg
+              continue supervisorPoll
+            }
             $state = Load-State
             # Manual restart markers clear on a later readiness-seen plan tick, not on PID return.
             if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }
@@ -5735,7 +5787,13 @@ do {
       'ephemeral_deny' {
         Write-Warning ("supervisor: launch-request {0}: DENIED - {1}" -f $rid, $p.reason)
         if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
-        & $AgenttalkCmd --root $Root supervise --archive-launch-request --request-id $rid --terminal-state denied --reason $p.reason --state-file $StatePath --now $now | Out-Null
+        $archiveArgs = @('--root', $Root, 'supervise', '--archive-launch-request',
+          '--request-id', $rid, '--terminal-state', 'denied', '--reason', $p.reason,
+          '--state-file', $StatePath, '--now', [string]$now)
+        if (-not (Invoke-CheckedSupervisorMutation ("archive-launch-request {0}" -f $rid) $archiveArgs)) {
+          Wait-ForNextPoll $cfg
+          continue supervisorPoll
+        }
         $state = Load-State
       }
       'ephemeral_launch' {
@@ -5751,7 +5809,13 @@ do {
           $homeEnv = Seed-CodexHome $prep.agent $prep.windows_sandbox
           if (-not $homeEnv) {
             if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
-            & $AgenttalkCmd --root $Root supervise --archive-launch-request --request-id $rid --terminal-state failed --reason "codex home seed failed" --state-file $StatePath --now $now | Out-Null
+            $archiveArgs = @('--root', $Root, 'supervise', '--archive-launch-request',
+              '--request-id', $rid, '--terminal-state', 'failed', '--reason',
+              'codex home seed failed', '--state-file', $StatePath, '--now', [string]$now)
+            if (-not (Invoke-CheckedSupervisorMutation ("archive-launch-request {0}" -f $rid) $archiveArgs)) {
+              Wait-ForNextPoll $cfg
+              continue supervisorPoll
+            }
             $state = Load-State
             continue
           }
@@ -5769,11 +5833,25 @@ do {
             $extra += @('--launcher-nonce-missing-reason', $res.launcher_nonce_missing_reason)
           }
           if (-not (Assert-ActionsEnabled ("record-ephemeral-launch {0}" -f $rid))) { continue }
-          & $AgenttalkCmd --root $Root supervise --record-ephemeral-launch --request-id $rid --pid $res.pid @extra --pre-snapshot-file $preLaunchPath --post-snapshot-file $postLaunchPath --timeout-seconds $prep.timeout_seconds --state-file $StatePath --now $now | Out-Null
+          $recordArgs = @('--root', $Root, 'supervise', '--record-ephemeral-launch',
+            '--request-id', $rid, '--pid', [string]$res.pid) + $extra + @(
+            '--pre-snapshot-file', $preLaunchPath, '--post-snapshot-file', $postLaunchPath,
+            '--timeout-seconds', [string]$prep.timeout_seconds, '--state-file', $StatePath,
+            '--now', [string]$now)
+          if (-not (Invoke-CheckedSupervisorMutation ("record-ephemeral-launch {0}" -f $rid) $recordArgs)) {
+            Wait-ForNextPoll $cfg
+            continue supervisorPoll
+          }
           $state = Load-State
         } else {
           if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
-          & $AgenttalkCmd --root $Root supervise --archive-launch-request --request-id $rid --terminal-state failed --reason "launch returned no pid" --state-file $StatePath --now $now | Out-Null
+          $archiveArgs = @('--root', $Root, 'supervise', '--archive-launch-request',
+            '--request-id', $rid, '--terminal-state', 'failed', '--reason',
+            'launch returned no pid', '--state-file', $StatePath, '--now', [string]$now)
+          if (-not (Invoke-CheckedSupervisorMutation ("archive-launch-request {0}" -f $rid) $archiveArgs)) {
+            Wait-ForNextPoll $cfg
+            continue supervisorPoll
+          }
           $state = Load-State
         }
       }
@@ -5789,7 +5867,14 @@ do {
         $completionJson = '{}'
         if ($p.completion) { $completionJson = ($p.completion | ConvertTo-Json -Compress -Depth 8) }
         if (-not (Assert-ActionsEnabled ("archive-launch-request {0}" -f $rid))) { continue }
-        & $AgenttalkCmd --root $Root supervise --archive-launch-request --request-id $rid --terminal-state $p.terminal_state --reason $p.reason --completion-json $completionJson --state-file $StatePath --now $now | Out-Null
+        $archiveArgs = @('--root', $Root, 'supervise', '--archive-launch-request',
+          '--request-id', $rid, '--terminal-state', $p.terminal_state, '--reason', $p.reason,
+          '--completion-json', $completionJson, '--state-file', $StatePath,
+          '--now', [string]$now)
+        if (-not (Invoke-CheckedSupervisorMutation ("archive-launch-request {0}" -f $rid) $archiveArgs)) {
+          Wait-ForNextPoll $cfg
+          continue supervisorPoll
+        }
         $state = Load-State
       }
       'ephemeral_janitor' {
@@ -5807,8 +5892,13 @@ do {
   if (-not $Quiet -and -not $DryRun -and $total -gt 0 -and ($pollNum % 10 -eq 0)) {
     Write-Host ("supervisor: poll {0} - {1}/{2} agents healthy" -f $pollNum, $healthy, $total)
   }
-  if (-not $DryRun) { Save-StateForPoll $state | Out-Null }
-  if (-not $Once) { Start-Sleep -Seconds ([int]$cfg.poll_seconds) }
+  if (-not $DryRun) {
+    if (-not (Save-StateForPoll $state)) {
+      Wait-ForNextPoll $cfg
+      continue supervisorPoll
+    }
+  }
+  Wait-ForNextPoll $cfg
 } while (-not $Once)
 } finally {
   if ($InstanceToken) {
