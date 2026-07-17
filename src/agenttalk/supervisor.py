@@ -5072,6 +5072,9 @@ function Write-StateFileAtomic([string]$path, $state) {
     }
   }
 }
+function Set-AgentState($state, $name, $value) {
+  $state.agents | Add-Member -NotePropertyName $name -NotePropertyValue $value -Force
+}
 function Load-State {
   $primaryExists = Test-Path -LiteralPath $StatePath
   $backupExists = Test-Path -LiteralPath $StateBackupPath
@@ -5530,6 +5533,7 @@ function Launch-Spec($name, $spec, $codexHome) {
 $lastLogged = @{}
 $pollNum = 0
 do {
+  $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
   $state = Load-State
   if (-not $state.agents) { $state | Add-Member agents ([pscustomobject]@{}) -Force }
   # 1) capture the process snapshot (the executor's only OS-liveness source) +
@@ -5541,7 +5545,11 @@ do {
     $snapshotArgs = @('--snapshot-file', $SnapPath)
   }
   foreach ($name in $cfg.agents.PSObject.Properties.Name) {
-    $st = $state.agents.$name; if (-not $st) { $st = [pscustomobject]@{}; $state.agents | Add-Member $name $st -Force }
+    $st = $state.agents.$name
+    if (-not $st) {
+      $st = [pscustomobject]@{}
+      Set-AgentState $state $name $st
+    }
     $st | Add-Member pid_alive (Pid-Alive $st.pid) -Force
   }
   Save-State $state
@@ -5601,7 +5609,7 @@ do {
           $why = if ($barrier -and $barrier.reason) { $barrier.reason } else { 'launch_barrier_unavailable' }
           $n = if ($barrier -and $barrier.survivor_count) { [int]$barrier.survivor_count } else { 0 }
           Write-Warning ("supervisor: {0}: launch barrier held ({1}; survivors={2}) - skipping relaunch this tick" -f $name, $why, $n)
-          if ($p.barrier_state) { $state.agents.$name = $p.barrier_state } else { $state.agents.$name = $p.next_state }
+          if ($p.barrier_state) { Set-AgentState $state $name $p.barrier_state } else { Set-AgentState $state $name $p.next_state }
           continue
         }
         # SEED the agent for UNATTENDED launch (blocker #2). Codex: a per-agent
@@ -5626,14 +5634,14 @@ do {
         if ($seedOk -and -not (Preflight $name $p $file $homeEnv)) { $seedOk = $false }
         if (-not $seedOk) {
           Write-Warning ("supervisor: {0}: seed/preflight failed - skipping relaunch this tick (fail closed)" -f $name)
-          $state.agents.$name = $p.next_state
+          Set-AgentState $state $name $p.next_state
         } else {
           $preLaunchPath = Join-Path $PSScriptRoot ("supervisor-prelaunch-{0}.json" -f $name)
           $postLaunchPath = Join-Path $PSScriptRoot ("supervisor-postlaunch-{0}.json" -f $name)
           Get-ProcSnapshot $preLaunchPath | Out-Null
           $res = Launch $name $p $homeEnv
           if ($res) { Get-ProcSnapshot $postLaunchPath | Out-Null }
-          $state.agents.$name = $p.next_state    # planner fields pass brain/managed/launching/etc through
+          Set-AgentState $state $name $p.next_state    # planner fields pass brain/managed/launching/etc through
           if ($res) {
             Save-State $state
             # Record the LAUNCHER pid + start (anti-reuse) + open grace via Python
@@ -5655,16 +5663,16 @@ do {
           }
         }
       }
-      'clear_marker' { if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; $state.agents.$name = $p.next_state }
-      'refuse_protected' { Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason); if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; $state.agents.$name = $p.next_state }
+      'clear_marker' { if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; Set-AgentState $state $name $p.next_state }
+      'refuse_protected' { Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason); if ($p.clear_marker -and (Assert-ActionsEnabled ("clear-restart {0}" -f $name))) { & $AgenttalkCmd --root $Root supervise --clear-restart --for $name --request-id $p.clear_marker | Out-Null }; Set-AgentState $state $name $p.next_state }
       { $_ -in 'warn_only','suspect_warn','snapshot_unavailable','readiness_gave_up' } {
         Write-Warning ("supervisor: {0}: {1}" -f $name, $p.reason)
         if ($p.notify -and $cfg.notify_sender -and $cfg.notify_to -and (Assert-ActionsEnabled ("notify {0}" -f $name))) {
           & $AgenttalkCmd --root $Root send --from $cfg.notify_sender --to $cfg.notify_to --kind note -m ("supervisor: {0}: {1}" -f $name, $p.reason) --quiet | Out-Null
         }
-        $state.agents.$name = $p.next_state
+        Set-AgentState $state $name $p.next_state
       }
-      default { $state.agents.$name = $p.next_state }
+      default { Set-AgentState $state $name $p.next_state }
     }
   }
   foreach ($rid in $plan.launch_requests.PSObject.Properties.Name) {

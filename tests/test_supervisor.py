@@ -2638,6 +2638,42 @@ def test_ps_state_helpers_recover_backup_and_refuse_two_corrupt_copies(tmp_path:
     assert payload == {"recoveredPid": 101, "failedClosed": True}
 
 
+def test_ps_set_agent_state_adds_new_agent_to_fresh_and_reloaded_state(
+    tmp_path: Path,
+) -> None:
+    """The poll must create state for an agent added after the supervisor starts."""
+    shell = _pick_powershell()
+    if not shell:
+        return
+    ps = sup.PS_TEMPLATE
+    helpers = ps[ps.index("# region state-helpers"):ps.index("# endregion state-helpers")]
+    result_path = tmp_path / "set-agent-state-result.json"
+    harness = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        "$fresh = [pscustomobject]@{ agents = [pscustomobject]@{} }",
+        "$reloaded = '{\"agents\":{}}' | ConvertFrom-Json",
+        helpers,
+        "Set-AgentState $fresh 'new-agent' ([pscustomobject]@{ state = 'FRESH' })",
+        "Set-AgentState $reloaded 'new-agent' ([pscustomobject]@{ state = 'RELOADED' })",
+        "@{ fresh = $fresh.agents.'new-agent'.state; "
+        "reloaded = $reloaded.agents.'new-agent'.state } | ConvertTo-Json | "
+        f"Set-Content {_pslit(str(result_path))} -Encoding utf8",
+    ])
+    script = tmp_path / "set-agent-state-test.ps1"
+    script.write_text(harness, encoding="utf-8-sig")
+
+    result = subprocess.run(
+        [shell, "-NoProfile", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+    payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
+    assert payload == {"fresh": "FRESH", "reloaded": "RELOADED"}
+
+
 def _replace_proc_start(ps1: Path, body: str) -> None:
     text = ps1.read_text(encoding="utf-8-sig")
     start = text.index("function Proc-Start($procId) {")
@@ -4495,10 +4531,31 @@ def test_ps_template_rechecks_launch_barrier_after_stop_tree_before_launch() -> 
     assert block.index("Stop-Tree $p.kill_targets") < block.index("--launch-barrier")
     assert "Get-ProcSnapshot $barrierPath" in block
     assert "Write-Warning" in block
-    assert "$state.agents.$name = $p.barrier_state" in block
+    if "Set-AgentState $state $name $p.barrier_state" not in block:
+        pytest.fail("launch-barrier state update bypasses Set-AgentState")
     assert "continue" in block
     launch_idx = ps.index("$res = Launch $name", block_end)
     assert block_end < launch_idx
+
+
+def test_ps_template_routes_dynamic_agent_state_writes_through_helper() -> None:
+    ps = sup.PS_TEMPLATE
+    if "function Set-AgentState($state, $name, $value)" not in ps:
+        pytest.fail("generated supervisor has no Set-AgentState helper")
+    if "$state.agents.$name =" in ps:
+        pytest.fail("generated supervisor still dot-assigns dynamic agent state")
+    if ps.count("$state.agents | Add-Member") != 1:
+        pytest.fail("agent-state properties must be created only by Set-AgentState")
+
+
+def test_ps_template_refreshes_config_before_each_poll() -> None:
+    ps = sup.PS_TEMPLATE
+    loop = ps[ps.index("do {"):ps.index("} while (-not $Once)")]
+    refresh = "$cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json"
+    if refresh not in loop:
+        pytest.fail("poll uses stale supervisor config for hot-added agents")
+    if loop.index(refresh) > loop.index("$state = Load-State"):
+        pytest.fail("supervisor config must refresh before poll state initialization")
 
 
 def test_process_ownership_stop_tree_closed_set_pin() -> None:
