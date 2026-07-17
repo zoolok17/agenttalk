@@ -954,6 +954,12 @@ def test_ps_state_helpers_are_atomic_backed_up_and_fail_closed() -> None:
     assert poll_loop.count("Save-StateForPoll $state") == 3
     assert poll_loop.count("if (-not (Save-StateForPoll $state))") == 3
     assert poll_loop.count("continue supervisorPoll") >= 3
+    reserve = "Set-AgentState $state $name $p.next_state\n          if (-not (Save-StateForPoll $state))"
+    launch_index = poll_loop.index("$res = Launch $name $p $homeEnv")
+    record_index = poll_loop.index("$recordArgs = @('--root', $Root, 'supervise', '--record-launch'")
+    assert reserve in poll_loop
+    assert poll_loop.index(reserve) < launch_index
+    assert "Save-StateForPoll $state" not in poll_loop[launch_index:record_index]
     assert "$LASTEXITCODE" in mutations
     assert poll_loop.count(
         'Invoke-CheckedSupervisorMutation ("record-launch {0}"'
@@ -3379,6 +3385,232 @@ def test_spawned_launch_is_not_acknowledged_when_record_launch_cannot_commit(
     persisted = sup.load_supervisor_state(state_path)["agents"]["worker"]
     assert persisted["launcher_pid"] == 111
     assert persisted["last_launch_epoch"] == NOW - 100
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["legacy-direct", "wrapped"])
+def test_generated_ps1_two_polls_do_not_duplicate_launch_after_postspawn_contention(
+    tmp_path: Path,
+    wrapped: bool,
+) -> None:
+    shell = _pick_powershell()
+    if not shell:
+        return
+    store = _team(tmp_path)
+    store.set_role("lead", "lead")
+    store.set_operator_facing("lead")
+    state_path = store.dir / "supervisor-state.json"
+    launch_log = tmp_path / "postspawn-launches.txt"
+    lock_ready = tmp_path / "postspawn-lock-ready.txt"
+    stop_path = tmp_path / "postspawn-stop.txt"
+    fake_modules = tmp_path / "fake-launch-modules"
+    fake_modules.mkdir()
+    child_source = "\n".join([
+        "import os",
+        "import time",
+        "from pathlib import Path",
+        "launch_log = Path(os.environ['AGENTTALK_TEST_LAUNCH_LOG'])",
+        "with launch_log.open('a', encoding='utf-8') as stream:",
+        "    stream.write(f'{os.getpid()}\\n')",
+        "stop = Path(os.environ['AGENTTALK_TEST_STOP'])",
+        "while not stop.exists():",
+        "    time.sleep(0.02)",
+        "",
+    ])
+    (fake_modules / "legacy_agent.py").write_text(child_source, encoding="utf-8")
+    fake_agenttalk = fake_modules / "agenttalk"
+    fake_agenttalk.mkdir()
+    (fake_agenttalk / "__init__.py").write_text("", encoding="utf-8")
+    (fake_agenttalk / "__main__.py").write_text(child_source, encoding="utf-8")
+
+    if wrapped:
+        launch_args = [
+            "-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for", "worker",
+            "--cli", "claude", "--loop", "--", sys.executable,
+        ]
+    else:
+        launch_args = ["-m", "legacy_agent", "{SESSION_ARGS}"]
+    config = {
+        "agents": {
+            "worker": {
+                "auto_restart": True,
+                "cli": "claude",
+                "wrapped": wrapped,
+                "cwd": str(tmp_path),
+                "env": {
+                    "AGENTTALK_TEST_LAUNCH_LOG": str(launch_log),
+                    "AGENTTALK_TEST_STOP": str(stop_path),
+                    "PYTHONPATH": str(fake_modules),
+                },
+                "launch": {
+                    "windows_file": sys.executable,
+                    "windows_args": launch_args,
+                },
+            },
+        },
+        "backoff": {
+            "base_seconds": 30,
+            "cap_seconds": 900,
+            "reset_after_seconds": 180,
+        },
+        "launch_grace_seconds": 120,
+        "poll_seconds": 1,
+    }
+    (store.dir / "supervisor.json").write_text(json.dumps(config), encoding="utf-8")
+    assert _run(["supervise", "--init"], tmp_path) == 0
+    _select_test_powershell(tmp_path, shell)
+    state_path.write_text(
+        json.dumps({
+            "agents": {
+                "worker": {
+                    "backoff_next_epoch": 0,
+                    "launching": False,
+                    "last_launch_epoch": 0,
+                    "readiness_seen": True,
+                    "resume_available": True,
+                    "session_id": "abc",
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    store.write_restart_request("worker", _auth_marker("rr-postspawn"))
+
+    supervisor_path = store.dir / "supervisor.ps1"
+    runner_script = tmp_path / "run-supervisor-with-postspawn-lock.ps1"
+    runner_script.write_text(
+        "\n".join([
+            "param(",
+            "  [Parameter(Mandatory=$true)][string]$SupervisorPath,",
+            "  [Parameter(Mandatory=$true)][string]$TestStatePath,",
+            "  [Parameter(Mandatory=$true)][string]$LaunchLogPath,",
+            "  [Parameter(Mandatory=$true)][string]$LockReadyPath,",
+            "  [switch]$InjectStateLock",
+            ")",
+            "$ErrorActionPreference = 'Stop'",
+            "$script:InjectedStateLock = $null",
+            "function Start-Process {",
+            "  [CmdletBinding()]",
+            "  param(",
+            "    [Parameter(Mandatory=$true)][string]$FilePath,",
+            "    [string[]]$ArgumentList,",
+            "    [string]$WorkingDirectory,",
+            "    [System.Diagnostics.ProcessWindowStyle]$WindowStyle,",
+            "    [switch]$PassThru",
+            "  )",
+            "  $startArgs = @{",
+            "    FilePath = $FilePath",
+            "    WorkingDirectory = $WorkingDirectory",
+            "    WindowStyle = $WindowStyle",
+            "    PassThru = [bool]$PassThru",
+            "  }",
+            "  if ($PSBoundParameters.ContainsKey('ArgumentList')) {",
+            "    $startArgs.ArgumentList = $ArgumentList",
+            "  }",
+            "  $proc = Microsoft.PowerShell.Management\\Start-Process @startArgs",
+            "  if ($InjectStateLock) {",
+            "    $script:InjectedStateLock = [IO.FileStream]::new(",
+            "      $TestStatePath, [IO.FileMode]::Open, [IO.FileAccess]::Read,",
+            "      [IO.FileShare]::Read)",
+            "    [IO.File]::WriteAllText($LockReadyPath, 'ready')",
+            "  }",
+            "  $deadline = [DateTime]::UtcNow.AddSeconds(15)",
+            "  $logged = $false",
+            "  do {",
+            "    if (Test-Path -LiteralPath $LaunchLogPath) {",
+            "      $logged = [IO.File]::ReadAllLines($LaunchLogPath) -contains [string]$proc.Id",
+            "    }",
+            "    if (-not $logged) {",
+            "      Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds 10",
+            "    }",
+            "  } until ($logged -or [DateTime]::UtcNow -ge $deadline)",
+            "  if (-not $logged) { throw \"launched pid $($proc.Id) was not logged\" }",
+            "  return $proc",
+            "}",
+            "try {",
+            "  . $SupervisorPath -Once",
+            "} finally {",
+            "  if ($null -ne $script:InjectedStateLock) {",
+            "    $script:InjectedStateLock.Dispose()",
+            "  }",
+            "}",
+        ]),
+        encoding="utf-8-sig",
+    )
+    command = [
+        shell, "-NoProfile", "-File", str(runner_script),
+        "-SupervisorPath", str(supervisor_path),
+        "-TestStatePath", str(state_path),
+        "-LaunchLogPath", str(launch_log),
+        "-LockReadyPath", str(lock_ready),
+    ]
+    env = _checkout_runtime_env()
+    launched_pids: list[int] = []
+    try:
+        first = subprocess.run(
+            [*command, "-InjectStateLock"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=str(tmp_path),
+            env=env,
+        )
+        first_output = f"{first.stdout}{first.stderr}"
+        assert first.returncode == 0, first_output
+        assert lock_ready.read_text(encoding="utf-8") == "ready"
+        assert (
+            "state write failed this poll" in first_output
+            or "record-launch worker failed" in first_output
+        ), first_output
+        first_pids = [
+            int(line)
+            for line in launch_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(first_pids) == 1
+        reserved = sup.load_supervisor_state(state_path)["agents"]["worker"]
+
+        second = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=str(tmp_path),
+            env=env,
+        )
+        assert second.returncode == 0, f"{second.stdout}{second.stderr}"
+        launched_pids = [
+            int(line)
+            for line in launch_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        persisted = sup.load_supervisor_state(state_path)["agents"]["worker"]
+        assert len(launched_pids) == 1
+        assert "record-launch worker failed" in first_output
+        assert reserved["launching"] is True
+        assert "rr-postspawn" in reserved["consumed_rids"]
+        assert reserved["pending_restart_request_id"] == "rr-postspawn"
+        assert reserved.get("launcher_pid") is None
+        assert persisted["launching"] is True
+        assert "rr-postspawn" in persisted["consumed_rids"]
+    finally:
+        stop_path.write_text("stop", encoding="utf-8")
+        if launch_log.exists():
+            launched_pids = [
+                int(line)
+                for line in launch_log.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        for pid in set(launched_pids):
+            subprocess.run(
+                [
+                    shell, "-NoProfile", "-Command",
+                    f"Wait-Process -Id {pid} -Timeout 5 -ErrorAction SilentlyContinue; "
+                    f"Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
 
 
 def test_ps_state_helpers_recover_backup_and_refuse_two_corrupt_copies(tmp_path: Path) -> None:

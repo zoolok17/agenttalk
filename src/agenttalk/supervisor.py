@@ -5730,17 +5730,21 @@ $pollNum = 0
           Write-Warning ("supervisor: {0}: seed/preflight failed - skipping relaunch this tick (fail closed)" -f $name)
           Set-AgentState $state $name $p.next_state
         } else {
+          # Reserve the relaunch before Start-Process.  The planner state carries
+          # launching/grace and consumes a manual restart id, so a failed
+          # post-spawn PID record cannot make the next poll launch a second
+          # legacy-direct process from the old state.
+          Set-AgentState $state $name $p.next_state
+          if (-not (Save-StateForPoll $state)) {
+            Wait-ForNextPoll $cfg
+            continue supervisorPoll
+          }
           $preLaunchPath = Join-Path $PSScriptRoot ("supervisor-prelaunch-{0}.json" -f $name)
           $postLaunchPath = Join-Path $PSScriptRoot ("supervisor-postlaunch-{0}.json" -f $name)
           Get-ProcSnapshot $preLaunchPath | Out-Null
           $res = Launch $name $p $homeEnv
           if ($res) { Get-ProcSnapshot $postLaunchPath | Out-Null }
-          Set-AgentState $state $name $p.next_state    # planner fields pass brain/managed/launching/etc through
           if ($res) {
-            if (-not (Save-StateForPoll $state)) {
-              Wait-ForNextPoll $cfg
-              continue supervisorPoll
-            }
             # Record the LAUNCHER pid + start (anti-reuse) + open grace via Python
             # (authoritative: claude pins the minted id; codex resumes by --last).
             $extra = @(); if ($res.session_id) { $extra += @('--session-id', $res.session_id) }
