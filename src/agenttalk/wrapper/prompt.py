@@ -64,7 +64,8 @@ _DEFAULT_RULES = (
     "- question with meta.consult=true: ATTACK the draft, do not endorse; reply "
     "kind=message echoing request_id + consult=true + round, ending with agree / "
     "disagree / qualified-agree; do not start your own consult.\n"
-    "- question (plain): answer on the thread. A broadcast question that does not "
+    "- ordinary tracked question owing a plain answer: answer on the thread. A "
+    "broadcast question that does not "
     "concern your role: reply --na (never placeholder-ack, never go silent).\n"
     "- review-result / proposal-response: a verdict on something YOU sent - act on "
     "it (proceed / revise), do not reply only to ack.\n"
@@ -75,8 +76,8 @@ _DEFAULT_RULES = (
     "`& \"$env:AGENTTALK_PY\" -m agenttalk send`, "
     "`& \"$env:AGENTTALK_PY\" -m agenttalk escalate`, proposal-response / review-result via "
     "`& \"$env:AGENTTALK_PY\" -m agenttalk reply --kind ...`, and "
-    "`& \"$env:AGENTTALK_PY\" -m agenttalk composing --to-request <id>` to mark a long draft "
-    "in flight (repeat ~every 2 min).\n"
+    "`& \"$env:AGENTTALK_PY\" -m agenttalk composing --to-request <id>` only when "
+    "the wrapper supplied a durable continuation. A composing marker is not an answer.\n"
     "\n"
     "You are HEADLESS: there is no human at your console. If you need a human "
     "decision, DO NOT ask your own window - run "
@@ -121,6 +122,18 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
     out.append("```")
     if lessons:
         out += ["== LESSONS TO CHECK ==", lessons]
+    owed = record.get("owed_action")
+    if isinstance(owed, dict):
+        out += [
+            "== OWED ACTION TRANSPORT ==",
+            "This ordinary tracked question is commit-gated. Write the answer as UTF-8 "
+            "bytes to the exact draft_path with your structured Write/Edit tool. Then run "
+            "the fixed argv operation shown below. Do not put answer text in a shell "
+            "command, do not use -m, and do not substitute another inbound anchor.",
+            "```json",
+            json.dumps(owed, ensure_ascii=False, indent=2, sort_keys=True),
+            "```",
+        ]
     out += ["== HOW TO HANDLE ==", rules]
     return "\n".join(out)
 

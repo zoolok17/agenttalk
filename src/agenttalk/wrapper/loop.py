@@ -47,6 +47,9 @@ class DriveOutcome:
     failure_class: str | None = None
     summary: str = ""
     child_output_tail: dict | None = None
+    bus_action_attempted: bool = False
+    bus_action_infra: bool = False
+    bus_action_rejected: bool = False
 
 
 def _as_outcome(ret: object) -> DriveOutcome:
@@ -215,6 +218,7 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              capacity_refresh: Callable[[], None] | None = None,
              capacity_interval_seconds: float = 60.0,
              wrapper_generation: str | None = None,
+             commit_gate=None,
              now_iso: Callable[[], str] = _iso_now) -> int:
     """Run the wrapper listen loop. ``drive(record)`` handles ONE turn (injected).
     Returns the number of turns driven. ``max_turns`` / ``max_polls`` / ``max_wall``
@@ -254,7 +258,10 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
     interval-gated and failure-isolated; exceptions are swallowed so capacity
     cannot undo the just-completed liveness/cursor boundary."""
     stamp = heartbeat if heartbeat is not None else (lambda: store.write_heartbeat(agent))
-    wait_token = (wrapper_generation or uuid.uuid4().hex) if manage_waiting else None
+    gate_generation = getattr(commit_gate, "fence", None)
+    wait_token = (
+        wrapper_generation or gate_generation or uuid.uuid4().hex
+    ) if manage_waiting else None
     try:
         if wait_token is not None:
             store.write_waiting(agent, {
@@ -273,7 +280,8 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
                 idle_interval=idle_interval, max_idle_interval=max_idle_interval,
                 heartbeat_interval=heartbeat_interval, clock=clock, sleep=sleep,
                 max_turns=max_turns, max_polls=max_polls, max_wall=max_wall,
-                stamp=stamp, on_health_idle=on_health_idle)
+                stamp=stamp, on_health_idle=on_health_idle,
+                commit_gate=commit_gate)
         return _run_continuous(
             store, agent, drive, idle_interval=idle_interval,
             max_idle_interval=max_idle_interval, heartbeat_interval=heartbeat_interval,
@@ -286,6 +294,7 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
             pre_commit=pre_commit, cadence=cadence, on_health_idle=on_health_idle,
             capacity_refresh=capacity_refresh,
             capacity_interval_seconds=capacity_interval_seconds,
+            commit_gate=commit_gate,
             now_iso=now_iso)
     finally:
         if wait_token is not None:
@@ -309,6 +318,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     on_health_idle: Callable[[], None] | None,
                     capacity_refresh: Callable[[], None] | None,
                     capacity_interval_seconds: float,
+                    commit_gate,
                     now_iso: Callable[[], str]) -> int:
     turns = 0
 
@@ -322,9 +332,21 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         if pre_commit is not None:
             pre_commit()
 
-    def _commit(rec: dict) -> None:
+    def _commit(rec: dict, gate_resolution=None) -> bool:
         _guard_advance()
+        if (
+            commit_gate is not None
+            and gate_resolution is not None
+            and gate_resolution.ledger_revision is not None
+        ):
+            finalized = commit_gate.finalize(
+                rec,
+                gate_resolution,
+                expected_revision=gate_resolution.ledger_revision,
+            )
+            return finalized.allows_legacy_commit or finalized.terminal
         recv_api.commit(store, agent, rec)
+        return True
 
     polls = 0
     last_hb: float | None = None
@@ -379,8 +401,36 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         _guard_advance()                      # dead-letter ADVANCES the cursor - verify
         #                                       lease ownership first (lead-loop), else a
         #                                       lost-lease controller could dispose unguarded
-        store.dead_letter(agent, record, reason=reason, failure_class=failure_class,
-                          at=now_iso(), child_output_tail=child_output_tail)
+        if commit_gate is not None and legacy_gate_resolution is not None:
+            authority = commit_gate.validate_no_admission_authority(
+                record,
+                legacy_gate_resolution,
+                side_effect=lambda: store.dead_letter(
+                    agent,
+                    record,
+                    reason=reason,
+                    failure_class=failure_class,
+                    at=now_iso(),
+                    child_output_tail=child_output_tail,
+                ),
+            )
+            if not authority.allows_legacy_commit:
+                stamp()
+                if on_health_idle is not None:
+                    on_health_idle()
+                last_hb = clock()
+                sleep(fail_sleep)
+                fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                return
+        else:
+            store.dead_letter(
+                agent,
+                record,
+                reason=reason,
+                failure_class=failure_class,
+                at=now_iso(),
+                child_output_tail=child_output_tail,
+            )
         stamp()                               # DL is progress (bypasses drive's stamp)
         if on_health_idle is not None:
             on_health_idle()
@@ -475,6 +525,334 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             _commit(record)
             continue
 
+        legacy_gate_resolution = None
+        if commit_gate is not None:
+            from .obligations import GateError, ResolverState
+
+            resolution = commit_gate.admit_or_finalize(record)
+            if resolution.allows_legacy_commit:
+                legacy_gate_resolution = resolution
+            if not resolution.allows_legacy_commit:
+                if resolution.state in {
+                    ResolverState.BLOCKED,
+                    ResolverState.BLOCKED_POLICY,
+                    ResolverState.BLOCKED_COMPLIANCE,
+                    ResolverState.INDETERMINATE,
+                    ResolverState.IN_PROGRESS,
+                    ResolverState.DEFERRED,
+                }:
+                    stamp()
+                    if on_health_idle is not None:
+                        on_health_idle()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+                if resolution.terminal:
+                    _guard_advance()
+                    finalized = commit_gate.finalize(
+                        record,
+                        resolution,
+                        expected_revision=resolution.ledger_revision,
+                    )
+                    if finalized.state == ResolverState.INDETERMINATE:
+                        if (
+                            resolution.key is not None
+                            and finalized.reason == "finalization CAS contention exhausted"
+                        ):
+                            commit_gate.settle_retry_exhaustion(
+                                record,
+                                resolution.key,
+                                category="finalization",
+                                reason="finalization CAS contention exhausted",
+                            )
+                        sleep(fail_sleep)
+                        fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                        continue
+                    if resolution.key is not None and resolution.compliance_success:
+                        commit_gate.mark_satisfied(resolution.key)
+                    stamp()
+                    last_hb = clock()
+                    fail_sleep = idle_interval
+                    continue
+                if resolution.state != ResolverState.OWED_UNSATISFIED:
+                    stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+
+                key = resolution.key
+                if key is None:
+                    stamp()
+                    sleep(fail_sleep)
+                    continue
+                captured = commit_gate.captured_operation(key)
+                if captured is not None:
+                    may_retry = commit_gate.record_retry_barrier(
+                        key,
+                        category="operation_infra",
+                        expected_revision=resolution.scoped_revision,
+                    )
+                    if may_retry:
+                        if commit_gate.retry_captured_operation(captured, record):
+                            commit_gate.mark_captured_operation_succeeded(captured)
+                        else:
+                            commit_gate.complete_retry_barrier(
+                                key, category="operation_infra")
+                    else:
+                        latest = commit_gate.resolve(record)
+                        should_settle = latest.terminal or latest.state in {
+                            ResolverState.BLOCKED,
+                            ResolverState.BLOCKED_POLICY,
+                            ResolverState.BLOCKED_COMPLIANCE,
+                        } or commit_gate.retry_bound_exhausted(
+                            key,
+                            category="operation_infra",
+                        )
+                        if not should_settle:
+                            stamp()
+                            sleep(fail_sleep)
+                            fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                            continue
+                        _guard_advance()
+                        commit_gate.settle_retry_exhaustion(
+                            record,
+                            key,
+                            category="operation_infra",
+                            reason="captured bus operation exhausted its durable retry bound",
+                            permit=captured,
+                        )
+                        commit_gate.cleanup_permit(captured)
+                        stamp()
+                        continue
+                    resolution = commit_gate.resolve(record)
+                    if resolution.terminal:
+                        _guard_advance()
+                        finalized = commit_gate.finalize(record, resolution)
+                        if finalized.state != ResolverState.INDETERMINATE:
+                            if resolution.compliance_success:
+                                commit_gate.mark_satisfied(key)
+                            commit_gate.cleanup_permit(captured)
+                            stamp()
+                            turns += 1
+                            if max_turns is not None and turns >= max_turns:
+                                return turns
+                        else:
+                            if finalized.reason == "finalization CAS contention exhausted":
+                                commit_gate.settle_retry_exhaustion(
+                                    record,
+                                    key,
+                                    category="finalization",
+                                    reason="finalization CAS contention exhausted",
+                                )
+                    else:
+                        sleep(fail_sleep)
+                        fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+
+                purpose = commit_gate.next_dispatch_purpose(key)
+                if purpose is None:
+                    if commit_gate.dispatch_exhausted(key):
+                        _guard_advance()
+                        commit_gate.fail_delivery_or_block(
+                            record,
+                            key,
+                            reason=(
+                                "agent computed but did not emit the owed reply "
+                                "(model/prompt-compliance gap)"
+                            ),
+                            expected_revision=resolution.scoped_revision,
+                        )
+                        stamp()
+                        fail_sleep = idle_interval
+                    else:
+                        stamp()
+                        sleep(fail_sleep)
+                        fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+                try:
+                    permit = commit_gate.reserve_dispatch(resolution, purpose=purpose)
+                except GateError:
+                    stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+                try:
+                    dispatch_record = commit_gate.dispatch_record(record, permit)
+                except GateError:
+                    stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+                outcome = _as_outcome(drive(dispatch_record))
+                action_infra = (
+                    outcome.bus_action_infra or outcome.failure_class == CLASS_INFRA
+                )
+                resolution = commit_gate.resolve(record)
+                post_budget_composing = resolution.reason == "post_budget_composing"
+                action_rejected = outcome.bus_action_rejected or (
+                    resolution.state == ResolverState.OWED_UNSATISFIED
+                    and outcome.bus_action_attempted
+                    and not action_infra
+                )
+                commit_gate.mark_dispatch_result(
+                    permit,
+                    action_attempted=outcome.bus_action_attempted,
+                    action_rejected=action_rejected,
+                    action_infra=action_infra,
+                )
+                if post_budget_composing:
+                    resolution = commit_gate.resolve(record)
+                    action_infra = commit_gate.captured_operation(key) is not None
+                if (
+                    resolution.state == ResolverState.OWED_UNSATISFIED
+                    and outcome.bus_action_attempted
+                    and not action_infra
+                ):
+                    commit_gate.mark_unsatisfied_attempt(
+                        permit,
+                        reason="attempted action did not legally terminate this obligation",
+                    )
+                if resolution.terminal:
+                    _guard_advance()
+                    finalized = commit_gate.finalize(record, resolution)
+                    if finalized.state != ResolverState.INDETERMINATE:
+                        if resolution.compliance_success:
+                            commit_gate.mark_satisfied(key)
+                        commit_gate.cleanup_permit(permit)
+                        stamp()
+                        last_hb = clock()
+                        fail_sleep = idle_interval
+                        turns += 1
+                        if max_turns is not None and turns >= max_turns:
+                            return turns
+                        continue
+                    if finalized.reason == "finalization CAS contention exhausted":
+                        commit_gate.settle_retry_exhaustion(
+                            record,
+                            key,
+                            category="finalization",
+                            reason="finalization CAS contention exhausted",
+                        )
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+                if action_infra:
+                    may_retry = commit_gate.record_retry_barrier(
+                        key,
+                        category="operation_infra",
+                        expected_revision=resolution.scoped_revision,
+                    )
+                    if may_retry:
+                        if commit_gate.retry_captured_operation(permit, record):
+                            commit_gate.mark_captured_operation_succeeded(permit)
+                            resolution = commit_gate.resolve(record)
+                            if resolution.terminal:
+                                _guard_advance()
+                                finalized = commit_gate.finalize(record, resolution)
+                                if finalized.state != ResolverState.INDETERMINATE:
+                                    if resolution.compliance_success:
+                                        commit_gate.mark_satisfied(key)
+                                    commit_gate.cleanup_permit(permit)
+                                    stamp()
+                                    turns += 1
+                                    if max_turns is not None and turns >= max_turns:
+                                        return turns
+                                    continue
+                                if (
+                                    finalized.reason
+                                    == "finalization CAS contention exhausted"
+                                ):
+                                    settled = commit_gate.settle_retry_exhaustion(
+                                        record,
+                                        key,
+                                        category="finalization",
+                                        reason="finalization CAS contention exhausted",
+                                    )
+                                    if settled.terminal:
+                                        commit_gate.cleanup_permit(permit)
+                                sleep(fail_sleep)
+                                fail_sleep = min(
+                                    max_idle_interval,
+                                    fail_sleep * 2.0,
+                                )
+                                continue
+                        else:
+                            commit_gate.complete_retry_barrier(
+                                key, category="operation_infra")
+                    else:
+                        latest = commit_gate.resolve(record)
+                        should_settle = latest.terminal or latest.state in {
+                            ResolverState.BLOCKED,
+                            ResolverState.BLOCKED_POLICY,
+                            ResolverState.BLOCKED_COMPLIANCE,
+                        } or commit_gate.retry_bound_exhausted(
+                            key,
+                            category="operation_infra",
+                        )
+                        if not should_settle:
+                            stamp()
+                            sleep(fail_sleep)
+                            fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                            continue
+                        _guard_advance()
+                        commit_gate.settle_retry_exhaustion(
+                            record,
+                            key,
+                            category="operation_infra",
+                            reason="captured bus operation exhausted its durable retry bound",
+                            permit=permit,
+                        )
+                        commit_gate.cleanup_permit(permit)
+                        stamp()
+                        continue
+                if commit_gate.dispatch_exhausted(key) and not action_infra:
+                    _guard_advance()
+                    commit_gate.fail_delivery_or_block(
+                        record,
+                        key,
+                        reason=(
+                            "agent computed but did not emit the owed reply "
+                            "(model/prompt-compliance gap)"
+                        ),
+                        expected_revision=resolution.scoped_revision,
+                    )
+                    commit_gate.cleanup_permit(permit)
+                    stamp()
+                    fail_sleep = idle_interval
+                    continue
+                sleep(fail_sleep)
+                fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
+
+        if (
+            commit_gate is not None
+            and legacy_gate_resolution is not None
+            and legacy_gate_resolution.reason in {
+                "no_admission_finalization_pending",
+                "no_admission_disposition_pending",
+            }
+        ):
+            _guard_advance()
+            finalized = commit_gate.finalize(
+                record,
+                legacy_gate_resolution,
+                expected_revision=legacy_gate_resolution.ledger_revision,
+            )
+            if finalized.allows_legacy_commit:
+                store.clear_attempt(agent, record.get("id"))
+                store.gc_attempts_below(agent, store.cursor(agent))
+                stamp()
+                last_hb = clock()
+                fail_sleep = idle_interval
+                turns += 1
+                if max_turns is not None and turns >= max_turns:
+                    return turns
+                continue
+            stamp()
+            sleep(fail_sleep)
+            fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+            continue
+
         # ---- dead-letter: bound the at-least-once retry of a POISON head message ----
         head_id = record.get("id")
         # A stale in_progress on this head means the process crashed mid-turn last run ->
@@ -524,13 +902,88 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 # auto-dead-letter and NEVER freeze - fall through to drive AGAIN (a real outage,
                 # incl. a stale-kill mid-outage, must keep retrying until it clears).
 
+        if commit_gate is not None and legacy_gate_resolution is not None:
+            authorized = commit_gate.authorize_no_admission_drive(
+                record,
+                legacy_gate_resolution,
+            )
+            if authorized.terminal:
+                _guard_advance()
+                finalized = commit_gate.finalize(
+                    record,
+                    authorized,
+                    expected_revision=authorized.ledger_revision,
+                )
+                if finalized.terminal:
+                    store.clear_attempt(agent, record.get("id"))
+                    store.gc_attempts_below(agent, store.cursor(agent))
+                    stamp()
+                    fail_sleep = idle_interval
+                    continue
+                stamp()
+                sleep(fail_sleep)
+                fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
+            if not authorized.allows_legacy_commit:
+                stamp()
+                sleep(fail_sleep)
+                fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
+            legacy_gate_resolution = authorized
+
         # WRITE-AHEAD: count + mark in_progress BEFORE drive() so a crash mid-turn
         # still costs a durable attempt on relaunch. EXACTLY one attempt per drive().
         store.record_attempt_start(agent, record, attempt_id=uuid.uuid4().hex[:12],
                                    at=now_iso())
         outcome = _as_outcome(drive(record))
         if outcome.ok:
-            _commit(record)                             # guards lease ownership first
+            finalization_resolution = legacy_gate_resolution
+            retained_success = False
+            if (
+                commit_gate is not None
+                and legacy_gate_resolution is not None
+                and legacy_gate_resolution.ledger_revision is not None
+            ):
+                finalization_resolution = commit_gate.record_no_admission_success(
+                    record,
+                    legacy_gate_resolution,
+                )
+                retained_success = (
+                    finalization_resolution.reason
+                    == "no_admission_finalization_pending"
+                )
+                if not (
+                    finalization_resolution.allows_legacy_commit
+                    or finalization_resolution.terminal
+                ):
+                    store.record_attempt_result(
+                        agent,
+                        head_id,
+                        failure_class=CLASS_AMBIGUOUS,
+                        summary="commit-gate no-admission success retention miss",
+                        at=now_iso(),
+                    )
+                    stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+            if not _commit(record, finalization_resolution):
+                if retained_success:
+                    store.clear_attempt(agent, head_id)
+                    stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+                store.record_attempt_result(
+                    agent,
+                    head_id,
+                    failure_class=CLASS_AMBIGUOUS,
+                    summary="commit-gate no-admission CAS miss",
+                    at=now_iso(),
+                )
+                sleep(fail_sleep)
+                fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
             store.clear_attempt(agent, head_id)
             store.gc_attempts_below(agent, store.cursor(agent))
             last_hb = clock()                           # drive already stamped on success
@@ -592,7 +1045,8 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                   sleep: Callable[[float], None], max_turns: int | None,
                   max_polls: int | None, max_wall: float | None,
                   stamp: Callable[[], None] | None = None,
-                  on_health_idle: Callable[[], None] | None = None) -> int:
+                  on_health_idle: Callable[[], None] | None = None,
+                  commit_gate=None) -> int:
     """SCOPED one-shot loop for an ephemeral reviewer (see run_loop). Receives only
     messages on ``rid`` so unrelated traffic neither starves it nor is consumed from
     the global inbox; bounded so it always terminates."""
@@ -631,18 +1085,273 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
             cur_sleep = min(max_idle_interval, cur_sleep * 2.0)
             continue
         cur_sleep = idle_interval
-        if is_terminal_control(record):
+        if is_terminal_control(record) and commit_gate is None:
             # scoped record on a rescinded/closed thread: consume + stop (terminal).
             recv_api.commit(store, agent, record)
             return turns
+        legacy_gate_resolution = None
+        if commit_gate is not None:
+            from .obligations import GateError, ResolverState
+
+            resolution = commit_gate.admit_or_finalize(record)
+            if resolution.allows_legacy_commit:
+                legacy_gate_resolution = resolution
+            if not resolution.allows_legacy_commit:
+                if resolution.terminal:
+                    finalized = commit_gate.finalize(
+                        record,
+                        resolution,
+                        expected_revision=resolution.ledger_revision,
+                    )
+                    if finalized.state != ResolverState.INDETERMINATE:
+                        if resolution.key is not None and resolution.compliance_success:
+                            commit_gate.mark_satisfied(resolution.key)
+                        return turns
+                    if (
+                        resolution.key is not None
+                        and finalized.reason == "finalization CAS contention exhausted"
+                    ):
+                        commit_gate.settle_retry_exhaustion(
+                            record,
+                            resolution.key,
+                            category="finalization",
+                            reason="finalization CAS contention exhausted",
+                        )
+                if resolution.state != ResolverState.OWED_UNSATISFIED:
+                    _stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+                key = resolution.key
+                if key is None:
+                    _stamp()
+                    sleep(fail_sleep)
+                    continue
+                captured = commit_gate.captured_operation(key)
+                if captured is not None:
+                    may_retry = commit_gate.record_retry_barrier(
+                        key,
+                        category="operation_infra",
+                        expected_revision=resolution.scoped_revision,
+                    )
+                    if not may_retry:
+                        latest = commit_gate.resolve(record)
+                        should_settle = latest.terminal or latest.state in {
+                            ResolverState.BLOCKED,
+                            ResolverState.BLOCKED_POLICY,
+                            ResolverState.BLOCKED_COMPLIANCE,
+                        } or commit_gate.retry_bound_exhausted(
+                            key,
+                            category="operation_infra",
+                        )
+                        if not should_settle:
+                            _stamp()
+                            sleep(fail_sleep)
+                            fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                            continue
+                        commit_gate.settle_retry_exhaustion(
+                            record,
+                            key,
+                            category="operation_infra",
+                            reason="captured bus operation exhausted its durable retry bound",
+                            permit=captured,
+                        )
+                        commit_gate.cleanup_permit(captured)
+                        return turns
+                    if commit_gate.retry_captured_operation(captured, record):
+                        commit_gate.mark_captured_operation_succeeded(captured)
+                    else:
+                        commit_gate.complete_retry_barrier(
+                            key, category="operation_infra")
+                    resolved = commit_gate.resolve(record)
+                    if resolved.terminal:
+                        finalized = commit_gate.finalize(record, resolved)
+                        if finalized.state != ResolverState.INDETERMINATE:
+                            if resolved.compliance_success:
+                                commit_gate.mark_satisfied(key)
+                            commit_gate.cleanup_permit(captured)
+                            turns += 1
+                            return turns
+                        if finalized.reason == "finalization CAS contention exhausted":
+                            commit_gate.settle_retry_exhaustion(
+                                record,
+                                key,
+                                category="finalization",
+                                reason="finalization CAS contention exhausted",
+                            )
+                    _stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+                purpose = commit_gate.next_dispatch_purpose(key)
+                if purpose is None:
+                    if commit_gate.dispatch_exhausted(key):
+                        commit_gate.fail_delivery_or_block(
+                            record,
+                            key,
+                            reason=(
+                                "agent computed but did not emit the owed reply "
+                                "(model/prompt-compliance gap)"
+                            ),
+                            expected_revision=resolution.scoped_revision,
+                        )
+                        return turns
+                    _stamp()
+                    sleep(fail_sleep)
+                    continue
+                try:
+                    permit = commit_gate.reserve_dispatch(resolution, purpose=purpose)
+                except GateError:
+                    _stamp()
+                    sleep(fail_sleep)
+                    continue
+                try:
+                    dispatch_record = commit_gate.dispatch_record(record, permit)
+                except GateError:
+                    _stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+                outcome = _as_outcome(drive(dispatch_record))
+                action_infra = (
+                    outcome.bus_action_infra or outcome.failure_class == CLASS_INFRA
+                )
+                resolved = commit_gate.resolve(record)
+                post_budget_composing = resolved.reason == "post_budget_composing"
+                action_rejected = outcome.bus_action_rejected or (
+                    resolved.state == ResolverState.OWED_UNSATISFIED
+                    and outcome.bus_action_attempted
+                    and not action_infra
+                )
+                commit_gate.mark_dispatch_result(
+                    permit,
+                    action_attempted=outcome.bus_action_attempted,
+                    action_rejected=action_rejected,
+                    action_infra=action_infra,
+                )
+                if post_budget_composing:
+                    resolved = commit_gate.resolve(record)
+                    action_infra = commit_gate.captured_operation(key) is not None
+                if (
+                    resolved.state == ResolverState.OWED_UNSATISFIED
+                    and outcome.bus_action_attempted
+                    and not action_infra
+                ):
+                    commit_gate.mark_unsatisfied_attempt(
+                        permit,
+                        reason="attempted action did not legally terminate this obligation",
+                    )
+                if resolved.terminal:
+                    finalized = commit_gate.finalize(record, resolved)
+                    if finalized.state != ResolverState.INDETERMINATE:
+                        if resolved.compliance_success:
+                            commit_gate.mark_satisfied(key)
+                        commit_gate.cleanup_permit(permit)
+                        turns += 1
+                        return turns
+                    if finalized.reason == "finalization CAS contention exhausted":
+                        commit_gate.settle_retry_exhaustion(
+                            record,
+                            key,
+                            category="finalization",
+                            reason="finalization CAS contention exhausted",
+                        )
+                    _stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+                if action_infra:
+                    _stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+                if commit_gate.dispatch_exhausted(key) and not action_infra:
+                    commit_gate.fail_delivery_or_block(
+                        record,
+                        key,
+                        reason=(
+                            "agent computed but did not emit the owed reply "
+                            "(model/prompt-compliance gap)"
+                        ),
+                        expected_revision=resolved.scoped_revision,
+                    )
+                    commit_gate.cleanup_permit(permit)
+                    return turns
+                sleep(fail_sleep)
+                fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
+        if (
+            commit_gate is not None
+            and legacy_gate_resolution is not None
+            and legacy_gate_resolution.reason in {
+                "no_admission_finalization_pending",
+                "no_admission_disposition_pending",
+            }
+        ):
+            finalized = commit_gate.finalize(
+                record,
+                legacy_gate_resolution,
+                expected_revision=legacy_gate_resolution.ledger_revision,
+            )
+            if finalized.allows_legacy_commit:
+                turns += 1
+                return turns
+            _stamp()
+            sleep(fail_sleep)
+            fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+            continue
         # A scoped record carries ``rid`` by construction - it is the work this ephemeral
         # reviewer was spawned for. Normalize ONCE, then commit/thread-seen/turns++ ONLY when
         # ok - drive() returns a DriveOutcome (frozen dataclass, no __bool__ -> always truthy),
         # so a bare ``if drive(record):`` would treat a FAILED turn as success and mark the
         # scoped request seen (lead 4th-verify P1 #1; mirrors _run_continuous's _as_outcome).
+        if commit_gate is not None and legacy_gate_resolution is not None:
+            authorized = commit_gate.authorize_no_admission_drive(
+                record,
+                legacy_gate_resolution,
+            )
+            if authorized.terminal:
+                finalized = commit_gate.finalize(
+                    record,
+                    authorized,
+                    expected_revision=authorized.ledger_revision,
+                )
+                if finalized.terminal:
+                    return turns
+                _stamp()
+                sleep(fail_sleep)
+                fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
+            if not authorized.allows_legacy_commit:
+                _stamp()
+                sleep(fail_sleep)
+                fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
+            legacy_gate_resolution = authorized
         outcome = _as_outcome(drive(record))
         if outcome.ok:
-            recv_api.commit(store, agent, record)       # SCOPED: thread-seen only
+            if legacy_gate_resolution is not None and legacy_gate_resolution.ledger_revision is not None:
+                retained = commit_gate.record_no_admission_success(
+                    record,
+                    legacy_gate_resolution,
+                )
+                if not (retained.allows_legacy_commit or retained.terminal):
+                    _stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+                finalized = commit_gate.finalize(
+                    record,
+                    retained,
+                    expected_revision=retained.ledger_revision,
+                )
+                if not (finalized.allows_legacy_commit or finalized.terminal):
+                    _stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+            else:
+                recv_api.commit(store, agent, record)   # SCOPED: thread-seen only
             last_hb = clock()
             fail_sleep = idle_interval
             turns += 1
