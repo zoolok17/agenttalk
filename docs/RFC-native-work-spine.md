@@ -98,7 +98,9 @@ so any file this feature writes needs a validate-on-read guard, not a
 trust-the-write assumption. Second, `_jsonl.append_record` explicitly
 does **not** serialize writers; its docstring says "the caller owns
 inter-process serialization," and `onboarding.append_event` wraps it in
-`store._config_lock()`. Work events follow that same pattern.
+`store._config_lock()`. Work events need the same serialization, but
+reach it through an injected factory rather than that private call — see
+The Lock Boundary.
 
 There is no `trust_tier` symbol anywhere in the repo today. That
 vocabulary is genuinely new, which is exactly why it must be defined as a
@@ -308,6 +310,35 @@ Rules:
 
 - `work_id` is opaque, stable, and validated by the same character class
   as existing IDs. It is never reused, including after abandonment.
+  `new_work_id()` mints one, matching `knowledge.new_note_id()`
+  (`knowledge.py:173`) and `onboarding.new_run_id()`
+  (`onboarding.py:100`); a caller-supplied id is accepted for tests and
+  recovery, validated identically. Create **refuses** when an item file
+  already exists for that id — and a *corrupt* existing file also
+  refuses, because per the corrupt-item rule it blocks rather than
+  reading as absent.
+- **Minimum create shape.** Required at create: `schema_version`,
+  `work_id`, `title`, `created_at`, `created_by`, `domain_id`,
+  `registry_hash_at_bind`, `item_seq`, `ledger_head`, `pending_op`,
+  `terminal` (null), and the empty collections `artifact_ids`,
+  `note_ids`, `review_request_ids`. `registry_hash_at_bind` is required
+  *because* `domain_id` is — a witness written later would witness the
+  wrong registry version.
+- Nullable or empty at create: `owner` (null is exactly what
+  distinguishes `draft` from `open`), `lane_id` and `lane_generation`
+  (both null, and they move together — never one without the other),
+  `base_ref` / `base_sha` / `target_ref`, `gate_scope`, `close_id`,
+  `delivery_artifact_path`, `policy_hash_at_open`, and `scope_globs`
+  (`[]`, for which the `domains.check_paths` subset test passes
+  trivially). `policy_hash_at_open` is null when no policy exists at
+  `base_sha`, and recorded at create when one does — same witness rule as
+  above.
+- A nullable `base_sha` is **required by internal consistency**, not
+  granted for convenience: Safety Invariant #19 asserts that a fresh
+  draft with no lane and an unresolvable revision renders
+  `draft · UNKNOWN` rather than `blocked`. If `base_sha` were mandatory
+  at create, that case would be unconstructible and the invariant could
+  not be written.
 - `schema_version` is an integer and is checked **exact-match
   fail-closed** — see Schema Versioning. A record whose version this
   build does not recognize is not upgraded, not guessed at, and not
@@ -438,9 +469,10 @@ corruption HOLD.
 ## Event Model
 
 `.agenttalk/work/events/<work_id>.jsonl`, append-only, one JSON record
-per line, appended through `_jsonl.append_record` **inside**
-`store._config_lock()` — the `onboarding.append_event` pattern, because
-`append_record` does not serialize writers on its own.
+per line, appended through `_jsonl.append_record` **inside the injected
+lock context** (see The Lock Boundary) — the `onboarding.append_event`
+serialization pattern, because `append_record` does not serialize writers
+on its own.
 
 ```json
 {
@@ -513,6 +545,41 @@ Rules:
   so `assigned` had no owner, `lane_bound` no lane, and `reopened` no
   authority rule. The classification test passed anyway, because it
   tested field classification rather than per-type completeness.
+- **The canonical event hash is defined exactly**, because "a canonical
+  hash" is not a specification an implementer can write twice the same
+  way. It is `"sha256:" + sha256(blob).hexdigest()` — full 64 hex, never
+  truncated (the examples in this document abbreviate for readability
+  only) — where `blob` is
+
+  ```python
+  json.dumps(event, ensure_ascii=False, sort_keys=True,
+             separators=(",", ":")).encode("utf-8")
+  ```
+
+  over **every** bound field, which is the complete list above including
+  all per-type payload fields. The `"sha256:"` prefix is presentational
+  and added after the digest, so the hashed bytes match the helper below
+  exactly.
+- That encoding is `knowledge._canonical_hash` (`knowledge.py:178-182`)
+  byte for byte, and it is **not this document's local preference**: the
+  platform architect has ratified it **repo-wide** for new modules and
+  for any provenance, integrity, or security hash — compact separators,
+  no `default`, raising on a non-serializable value. This RFC cites that
+  ruling; it does not make it.
+- The reason it was ratified is worth keeping next to the rule. The repo
+  carried **two** divergent conventions: `close._stable_hash`
+  (`close.py:565-568`) omits `separators` (emitting `", "` / `": "`
+  spacing) and passes `default=str`. `default=str` **silently coerces**
+  non-JSON types, so two distinct payloads can stringify identically —
+  unacceptable for a provenance hash, where a collision is a forgery
+  surface. `knowledge`'s version has no `default` and therefore **raises**,
+  which is the fail-closed behaviour a bound event hash needs.
+- `close._stable_hash` is now **tracked on the primary side** to be
+  brought into line or explicitly justified. Recorded so a later reader
+  who finds the divergence still present does not conclude this RFC chose
+  arbitrarily between two equal options. The divergence is a **latent**
+  hazard rather than a live exploit — no current caller is known to feed
+  it a non-serializable value — and that under-claim is deliberate.
 - `op_id` is **unique across the ledger**. A replayed event re-encoded
   with a fresh `op_id` still fails against `ledger_head`, and one
   re-encoded with the original `op_id` is rejected as a duplicate.
@@ -520,8 +587,10 @@ Rules:
   curation-mutable partition **and** the per-type required payload above,
   failing when a new type or field is added to neither.
 - **`seq` orders the ledger; timestamps never do.** `seq` is a
-  gap-free monotonic integer per `work_id`, and `prev_hash` chains each
-  record to its predecessor's canonical hash. `event_id` retains a
+  gap-free monotonic integer per `work_id` **starting at 1**, and
+  `prev_hash` chains each record to its predecessor's canonical hash
+  (`null` for the first record, which has no predecessor). `event_id`
+  retains a
   timestamp prefix for human readability and is *never* a sort key.
   Anything in a projection that reaches for "the latest" means highest
   valid `seq`, not newest `ts`.
@@ -544,10 +613,48 @@ Rules:
   (`_jsonl.py:23-29`, `:66-74`). `O_APPEND` makes each individual
   `os.write` atomic; it does not make one logical record atomic. Two
   unserialized writers can therefore both observe the same unterminated
-  tail, or interleave chunks of two payloads. Work holds
-  `store._config_lock()` across tail inspection, `seq` allocation, the
-  append, and the `fsync` — the `onboarding.append_event` pattern,
-  applied deliberately rather than by imitation.
+  tail, or interleave chunks of two payloads. Work holds the injected
+  lock across tail inspection, `seq` allocation, the append, and the
+  `fsync` — the `onboarding.append_event` pattern, applied deliberately
+  rather than by imitation.
+
+**The Lock Boundary.** `work_store` takes a **lock-context factory** and
+**raises when none is supplied**. It never calls a private `Store`
+method itself. Two things force this shape:
+
+- The ownership boundary. At the time of writing there is no public lock
+  accessor — `Store._config_lock` (`store.py:1430`) and
+  `Store._exclusive_lock` (`store.py:1283`) are both private, while this
+  team's work package permits `store` only through its public API.
+  `onboarding.py` and `knowledge.py` do call the private one, but they
+  are primary-team modules already in-tree; a new module owned by this
+  team is a different question. Injection keeps the private call on the
+  primary team's side of the boundary: the single coordinated `cli.py`
+  dispatch line supplies the factory.
+- **Raise, never default.** A missing factory must be a hard error, not
+  a fall-back to unlocked. An unlocked read-modify-write is precisely
+  the C1(2) lost-update fail-open this document exists to prevent, and a
+  convenience default would reintroduce the bug as an ergonomic. The
+  factory is also what makes the locking unit-testable with a fake.
+
+**Migration note.** The architect has granted a thin, additive,
+behaviour-free public `Store.config_lock()` delegating to
+`_config_lock()` — same lock, same semantics, public name. The contract
+moves in two steps and only in this order:
+
+- **Now:** dependency injection with raise-if-unsupplied, exactly as
+  above. This stands until the alias has landed **and CI is green on
+  it** — not merely merged.
+- **Then:** `work_store` may call `store.config_lock()` directly and the
+  injection workaround may be dropped, one line at the dispatch point.
+
+**The raise-if-absent rule survives the migration.** Its reason was
+never the ownership boundary — that is what injection solved. Its reason
+is that an unlocked read-modify-write is a lost-update fail-open, and
+that is just as true through a public accessor as a private one. Anyone
+reading the alias landing as permission to default to unlocked has
+inverted the rule: the boundary problem goes away, the concurrency
+problem does not.
 - Events are evidence of what happened, not authority over what is true.
   A `state_asserted` event records that an actor claimed a state; the
   projection still derives status from records. An event cannot assert an
@@ -574,27 +681,64 @@ append, in this order:
 
 | # | Write | Item image |
 |---|---|---|
-| I0 | (pre-existing) | settled: `pending_op` null, `ledger_head` = current tail |
+| I0 | (pre-existing) | settled: `pending_op` null, `ledger_head` = current tail. **Absent on a create** — the item does not exist yet, so a create begins at I1. |
 | I1 | item write 1 | `pending_op` = `{op_id, intended_type}`, `ledger_head` **unchanged** |
 | — | ledger append | the event, under the per-ledger lock |
 | I2 | item write 2 | `pending_op` null, `ledger_head` **advanced** to the new tail |
 
 `ledger_head` advances only in I2, together with clearing `pending_op`,
 so those two facts move as a unit and the settled relation is restored
-atomically from a reader's perspective. Recovery is idempotent by
+atomically from a reader's perspective.
+
+**Genesis is pinned exactly**, since the empty ledger has no tail to
+name. A create writes `item_seq: 1` with
+`ledger_head: {"seq": 0, "hash": null}` at I1, appends the `created`
+event with `seq: 1` and `prev_hash: null`, then writes `item_seq: 2`
+with `ledger_head: {"seq": 1, "hash": "<event hash>"}` at I2. `seq` is
+1-based, so `0` is unambiguous as the empty-ledger sentinel rather than a
+placeholder: it is the honest description of a ledger with no records,
+and the settled relation reads true against it. Recovery is idempotent by
 `op_id`: re-appending an event whose `op_id` already exists is a no-op.
 
-Classification keys on **`pending_op` and `ledger_head`** — never on
-`item_seq`, which is a record version and is not commensurate with ledger
-`seq`:
+**Physical checkpoints and observable states are two different axes, and
+conflating them produces false test evidence.** A checkpoint is a place
+the process can die; a state is what a later reader finds. Only *some*
+states are reachable by abrupt death from a compliant writer — the rest
+require corruption or an out-of-protocol writer, and constructing those
+is different evidence from killing a process at a boundary. Claiming
+"six kill points, all exercised by process death" would be false on its
+face, which is the referenced-versus-executed distinction ASSURANCE.md
+turns on, applied to this document's own test plan.
 
-| Crash point | Observed | Outcome |
+There are **four physical checkpoints** where a compliant writer can die:
+
+| Checkpoint | Dies | Resulting state |
+|---|---|---|
+| K0 | before I1 | (f) — nothing published |
+| K1 | after I1, before the append | (a) |
+| K2 | after the append, before I2 | (b) |
+| K3 | after I2, before `create` returns | settled and complete; recovery must be a **byte-for-byte no-op** |
+
+K3 is the checkpoint an earlier draft omitted entirely. Durable
+completion has to survive caller death: the mutation is finished on disk,
+the caller never learned it, and a recovery pass must change nothing.
+K0 and K3 both observe a settled item, and they are still distinct
+checkpoints — one where nothing exists, one where everything does.
+
+Classification of the observable state keys on **`pending_op` and
+`ledger_head`** — never on `item_seq`, which is a record version and is
+not commensurate with ledger `seq`. Rows (a), (b) and (f) are the
+death-reachable states above; rows (c), (d) and (e) are **fault states**
+reachable only by corruption or an out-of-protocol writer, marked as
+such:
+
+| Observable state | Observed | Outcome |
 |---|---|---|
 | (a) after I1, before append | `pending_op` set; no matching `op_id` in ledger | Recovery re-appends the event from `pending_op` exactly once, then publishes I2. If the payload cannot be reconstructed, `work_ledger_gap`; the state is not audited and does not count for GO. |
 | (b) after append, before I2 | `pending_op` set; matching `op_id` **present**; `ledger_head` stale | Recovery publishes I2 only — clears `pending_op`, advances `ledger_head`. No re-append. This is the distinct case an earlier draft muddled by calling it "case (a) with the event present," which contradicted (a)'s own definition of *no matching event*. |
-| (c) ledger tail ahead of `ledger_head`, `pending_op` null | an event exists that no item image commits | `work_ledger_ahead`; HOLD. Not applied — replaying history onto the state-authoritative record is the silent rebinding this design forbids. |
-| (d) `ledger_head` names a tail the ledger does not have | head/tail mismatch | `work_ledger_head_mismatch`; HOLD. Covers a rewritten or truncated tail whose internal `prev_hash` chain still verifies. |
-| (e) orphan `op_id` with no item | event references an unknown `work_id` | `work_ledger_orphan`; never materializes an item. Unreachable through the normal path, so it means a hand-edited or externally-written ledger. |
+| (c) **FAULT** — ledger tail ahead of `ledger_head`, `pending_op` null | an event exists that no item image commits | `work_ledger_ahead`; HOLD. Not applied — replaying history onto the state-authoritative record is the silent rebinding this design forbids. Not death-reachable: `pending_op` is null only at I0 and I2, and I2 advances `ledger_head` with it, so this needs an out-of-protocol append or a stale item rewrite. |
+| (d) **FAULT** — `ledger_head` names a tail the ledger does not have | head/tail mismatch | `work_ledger_head_mismatch`; HOLD. Covers a rewritten or truncated tail whose internal `prev_hash` chain still verifies. Not death-reachable: `ledger_head` advances only at I2, after the append is durable, so the named tail always existed — reaching this requires later truncation or rewriting. |
+| (e) **FAULT** — orphan `op_id` with no item | event references an unknown `work_id` | `work_ledger_orphan`; never materializes an item. Not death-reachable: the item is written at I1 before any append, so an event always has an item — this means a hand-edited or externally-written ledger. |
 | (f) neither published | settled relation holds | Clean no-op. Nothing happened. |
 
 Rules:
@@ -2097,12 +2241,21 @@ a named test in D1–D4's acceptance set.
     are satisfied; satisfying only the broader one still holds.
 11. **Tiers do not collapse.** *Test:* `work show --json` reports the
     per-artifact tier; no field reduces the set to a single boolean.
-12. **Crash recovery converges.** *Test:* inject process death at each of
-    the **six** kill points in the Crash And Recovery Protocol; assert
-    every replay reaches the same state or the same named HOLD, and that
-    re-running recovery is a no-op. Additionally assert `work check`
-    **before** recovery holds with `work_recovery_required` for rows (a)
-    and (b) — convergence-after is not the same property as safe-before.
+12. **Crash recovery converges — and the evidence is labelled by how it
+    was produced.** *Test, part 1 (process death):* inject abrupt death
+    at each of the **four physical checkpoints** K0–K3; assert every
+    replay reaches the same state or the same named HOLD, that re-running
+    recovery is a no-op, and that K3 specifically leaves the store
+    **byte-for-byte unchanged**. *Test, part 2 (constructed fault
+    states):* build states (c), (d) and (e) directly — they are **not
+    reachable by killing a compliant writer** — and assert their named
+    HOLDs. Report the two parts as **distinct evidence**: "six states
+    covered, three by process death and three by constructed faults" is
+    true; "six kill points, all tested by process death" is false, and
+    the difference is exactly the referenced-versus-executed line this
+    project gates on. Additionally assert `work check` **before**
+    recovery holds with `work_recovery_required` for rows (a) and (b) —
+    convergence-after is not the same property as safe-before.
 13. **The ledger is one record per append under contention.** *Test:*
     monkeypatch `os.write` to return short writes, barrier two writers on
     one ledger, and assert two parseable records with distinct `seq` and
@@ -2331,8 +2484,14 @@ the reason this document exists.
 Implement:
 
 - `work.py` + `work_store.py`: per-item records, the append-only event
-  ledger under `store._config_lock()`, per-item locking for every
-  read-modify-write.
+  ledger under the **injected lock context** (never a private `Store`
+  method — see The Lock Boundary and its migration note, which supersedes
+  injection once `Store.config_lock()` lands and CI is green), per-item
+  locking for every read-modify-write, and a hard raise when no lock
+  factory is supplied — a rule that survives that migration.
+- The genesis encoding, the canonical event-hash definition, and the
+  minimum create shape exactly as specified — these are on-disk contract,
+  so guessing any of them costs a migration later.
 - The crash protocol in full: `item_seq` as `expected_version`,
   `pending_op` / `op_id`, ledger `seq` + `prev_hash`, `ledger_head`
   validated on **every item read**, and idempotent recovery as a separate
@@ -2508,8 +2667,10 @@ choice and this document made one:
   the runner stays deferred behind roadmap §7's Hard HOLD.
 - **The item is authoritative for state, the ledger for history, and a
   `GO` needs both** — with `pending_op` + `op_id` + `seq` + `prev_hash`
-  making every one of the six crash points converge idempotently, with
-  `work_recovery_required` covering a check run before recovery.
+  making all six observable crash states converge idempotently — three
+  reached by death at the four physical checkpoints, three constructed as
+  fault states — with `work_recovery_required` covering a check run
+  before recovery.
 - **`seq` orders everything; timestamps order nothing**, and an
   implausible producer timestamp disqualifies the artifact rather than
   merely being noted.
@@ -2657,7 +2818,7 @@ being there.
 | 20 | ID-REBASE-FORCE-PUSH | FOLD (in full) | Artifact Schema → the **exact-key join is authoritative** (`(base_sha, head_sha)` mismatch = not current); ordinary head move is a `stale_reason`, content-identical rebase is the named caution `rebased_identical_diff`; caution is **insufficient for release-blocking** (re-execution required) and may be accepted for non-blocking; rebinding stays an explicit event. *Revision history — dispositioned three times:* first a partial decline on D-6 grounds; codex-dev contested and I conceded; then claude-rev and codex-sec independently overturned it again with a sharper refutation, which is the one now in the doc. **D-6's analogy fails on its own terms** — it rejects HEAD-relative staleness because unrelated commits would empty the knowledge layer, but work evidence binds one `base..head` pair and unrelated commits do not move it, so the noise problem never arises. Decisive: a test result is a property of base+patch, not of the patch. My cost-asymmetry argument was true but secondary. |
 | 21 | ID-DUPLICATE-LANE-CLAIM | FOLD | Lifecycle → "**A lane may be claimed by at most one non-terminal work item**", serialized on `(lane_id, lane_generation)`, with `work_lane_conflict` holding *every* claimant rather than picking the older. |
 | 22 | ID-LANE-DISAPPEARS/REUSED | FOLD | Work Item Schema → `lane_generation`; Lifecycle → live-lane-with-matching-generation for non-terminal items, delivery artifact for terminal ones; `work_lane_generation_mismatch`. |
-| 23 | CRASH-ITEM/EVENT-TRANSACTION | FOLD | New **Crash And Recovery Protocol**: item authoritative for identity/state, ledger for history, `GO` requires both; write order with `pending_op`; all **six** kill points (a)–(f) given stated outcomes across three published item images; recovery idempotent by `op_id`; `work_recovery_required` covers a check run before recovery. |
+| 23 | CRASH-ITEM/EVENT-TRANSACTION | FOLD | New **Crash And Recovery Protocol**: item authoritative for identity/state, ledger for history, `GO` requires both; write order with `pending_op`; all **six** observable states (a)–(f) given stated outcomes across three published item images; recovery idempotent by `op_id`; `work_recovery_required` covers a check run before recovery. *Amended (D2 gap-fill 5):* physical checkpoints and observable states are separated — four death-reachable checkpoints K0–K3 (K3 = post-I2, added) versus three constructed fault states (c)/(d)/(e), so test evidence cannot claim process-death coverage it does not have. |
 | 24 | CRASH-TORN-ITEM/LEDGER | FOLD | Event Model → a `seq` gap or broken `prev_hash` raises `work_event_chain_broken` and "transitions after the break are not applied". Draft surfaced malformed lines but would have read past them to a later `ready`. |
 | 25 | CRASH-CONCURRENT-JSONL | FOLD | Event Model → lock spans tail inspection, `seq` allocation, append, and fsync, citing `_jsonl.py:23-29` / `:66-74`. **Verified and strengthened:** `_write_all` really is a `while remaining:` loop over `os.write`, *and* `append_record` does a separate `lseek`+`read` tail probe with a possible standalone delimiter write — two race windows, not one. |
 | 26 | CRASH-ARTIFACT-PAIR | FOLD | Artifact Schema → **Torn Reads And The JSON/Log Pair**: log written and hash-validated first, metadata published last as the commit marker; all seven states (a)–(g) tabulated; both files revalidated on every consumption. |
