@@ -375,7 +375,8 @@ Rules:
   event ledger. Every non-terminal state is derived.
 - **`closed` is not a `terminal` value.** Work writes only `delivered`
   and `abandoned`; `closed` is driven by `close.py` and work only reads
-  it, so `terminal == "closed"` had **no producer** and was unreachable.
+  it, so `closed` as a `terminal.type` had **no producer** and was
+  unreachable.
   An unreachable enum member inside a disjunction is worse than merely
   dead: it makes the disjunction read as though it has two ways to be
   satisfied when it has one. Catching that needs a **reachability**
@@ -1093,10 +1094,28 @@ Rules:
   execution or transport adapter; no such adapter exists in these phases,
   so nothing can produce `evidence_source == "automation_ci"` honestly and
   no `producer_class == "automation"` resolution rule exists either.
-  **The consequence, stated plainly: no release-blocking work item can
+  **The consequence, scoped precisely: under the default floor — or any
+  floor at `automation_ci` or above — no release-blocking work item can
   reach `GO` in D1–D5.** `release_min_tier` defaults to `automation_ci`,
   that floor cannot be met, and `work_artifact_insufficient_tier` holds
   every release-blocking requirement.
+- **That is not an absolute, and stating it as one would be false.**
+  `release_min_tier` is a *default*, not a hard floor: a project policy
+  may set it lower, which the roadmap explicitly permits ("unless project
+  policy intentionally allows otherwise"). A base rule carrying
+  `release_min_tier: "local_agent"` with every baseline row green
+  therefore *can* reach `GO` in D1–D5. Forbidding that would put this
+  document in conflict with its own north star, which is the wrong end to
+  fix.
+- **A lowered release floor must be VISIBLE, never silent.** Whenever a
+  release-blocking requirement is satisfied under a floor below
+  `automation_ci`, the projection raises the caution flag
+  `release_floor_lowered`, naming the matched glob and the tier accepted.
+  An operator reading `GO` can then see *that* the floor was lowered and
+  *by which rule*. A policy that quietly accepts `local_agent` for a
+  release-blocking requirement is exactly the "operators read green as
+  correctness" false-trust failure the roadmap names in §8 — invisible is
+  the defect; lowered-and-visible is a legitimate project choice.
 - That is intended, not a defect. A release gate satisfiable without any
   adapter capable of producing release-grade evidence would be a false GO
   by construction — the exact failure this document exists to prevent. It
@@ -1271,9 +1290,9 @@ order, and the first matching rule wins:
 
 | Derived state | Condition |
 |---|---|
-| `abandoned` | `terminal == "abandoned"` |
+| `abandoned` | `terminal.type == "abandoned"` |
 | `closed` | the linked close is published |
-| `delivered` | `terminal == "delivered"`, or the linked lane has a committed delivery artifact |
+| `delivered` | `terminal.type == "delivered"`, or the linked lane has a committed delivery artifact |
 | `changes_requested` | a review-result bound to the **current revision** is `rejected` |
 | `review` | a linked review thread **for the current revision** is open and unanswered |
 | `active` | a lane is bound, or any artifact exists |
@@ -1681,15 +1700,19 @@ Rules:
 | A review-result bound to the current revision exists and is approved | `work_review_missing` |
 | `gate_check.required_gates` is non-empty and every one is green | `work_release_gates_vacuous` |
 
-**In D1–D5 a release-blocking item cannot reach `GO` at all**, even with
-every row above satisfied. `release_min_tier` defaults to
-`automation_ci`, no adapter capable of producing that tier exists in
+**Under the default floor, a release-blocking item cannot reach `GO` in
+D1–D5** even with every row above satisfied: `release_min_tier` defaults
+to `automation_ci`, no adapter capable of producing that tier exists in
 these phases, and `work_artifact_insufficient_tier` therefore holds. The
 baseline above is the set of requirements a release will have to meet
-*once release-grade evidence is producible*; until then the release path
-is closed by construction. That is deliberate — see Evidence Tiers — and
-it is stated here so nobody implements against this table expecting a
-reachable GO.
+*once release-grade evidence is producible*.
+
+That is deliberate, and it is **not** absolute. A project policy may set
+`release_min_tier` below `automation_ci` — the roadmap permits it — and
+such an item *can* reach `GO` in D1–D5. When it does, the projection
+raises `release_floor_lowered` naming the rule and the accepted tier, so
+the lowered floor is visible to whoever reads the `GO` rather than
+inferred from the policy file. See Evidence Tiers.
 
 Rules:
 
@@ -1848,7 +1871,7 @@ Roadmap §7 makes "records can disagree with no single projection
 explaining the conflict" a Hard HOLD. The projection therefore has an
 explicit contradiction pass:
 
-- If the item's `terminal` says `delivered` but no committed lane
+- If the item's `terminal.type` is `delivered` but no committed lane
   delivery artifact exists, that is `work_contradiction`, not a silent
   preference for either record.
 - If a close is published **at a revision the linked records do not
@@ -1937,6 +1960,7 @@ Those live in the **view**, not the verdict:
   "artifacts": [{"artifact_id": "a-3f91c2", "check_name": "pytest", "trust_tier": "local_agent",
                  "current": false, "caution_flags": ["rebased_identical_diff"]}],
   "history": [{"kind": "review", "revision": "H3", "status": "rejected", "applies_to_current": false}],
+  "cautions": [{"flag": "release_floor_lowered", "glob": "src/**", "accepted_tier": "local_agent"}],
   "source_errors": [{"source": "gates", "error": "gates.json unreadable"}],
   "ledger_problems": 0
 }
@@ -1957,12 +1981,23 @@ Rules:
   exist.** A legacy rendering that emits `record_state` alone could show
   `delivered` while omitting a HOLD, which is the no-collapse rule
   defeated by the compatibility hatch. The legacy shape is therefore
-  `{work_id, record_state, verdict, ok, has_unknown}` — flattened, but
-  never single-axis and never dropping the epistemic flag. If a consumer
+  `{work_id, record_state, verdict, ok, has_unknown, cautions}` —
+  flattened, but never single-axis, never dropping the epistemic flag,
+  and never dropping `cautions`. `release_floor_lowered` in particular
+  must survive the legacy rendering: a hatch that shows `GO` while
+  discarding the fact that the release floor was lowered would recreate
+  the false-trust failure through the compatibility path. If a consumer
   needs less than that, it does not get a work view.
 - The envelope carries the **snapshot content token** both axes were
   resolved from, so a reader can tell that the pair is internally
   consistent rather than composed from two reads.
+- **`cautions` is item-level and survives a `GO`.** Per-artifact
+  `caution_flags` describe one artifact; `release_floor_lowered` is a
+  fact about a *requirement* and belongs to neither an artifact nor a
+  hold — a satisfied requirement produces no hold, so a caution attached
+  only to holds would vanish exactly when the floor was lowered and the
+  item passed. That is the case it exists to make visible, so it rides
+  the envelope independently of the verdict.
 
 ## Policy Boundary
 
@@ -2288,8 +2323,10 @@ a named test in D1–D4's acceptance set.
 
 1. **No hidden contradiction.** Given records that disagree, `work check`
    returns `HOLD` with `work_contradiction` naming both sources.
-   *Test:* construct an item with `terminal: "delivered"` and no lane
-   delivery artifact; assert the code and that neither record is
+   *Test:* construct an item with
+   `terminal: {"type": "delivered", "event_id": "we-1"}` — both keys
+   required, or the fixture is schema-invalid and tests nothing — and no
+   lane delivery artifact; assert the code and that neither record is
    silently preferred.
 2. **Artifacts are immutable.** Writing an artifact to an existing
    `artifact_id` fails. *Test:* attempt a second write; assert refusal
@@ -2897,7 +2934,7 @@ being there.
 | 5 | HH-LOCAL-RELEASE | ADDRESSED | Policy Boundary — "Absent `release_min_tier` defaults to `automation_ci` … the default is the strict one, so forgetting to write it fails closed." Plus Safety Invariants #5. |
 | 6 | HH-SELF-JUDGING-POLICY | FOLD | Policy Boundary → union of base and candidate; stricter candidate rules apply immediately with no waiver; **relaxation holds with no escape in D1–D5**, because the authenticated waiver it would require does not exist. Draft evaluated base-only and bound one hash. |
 | 7 | HH-RUNNER-EXECUTION | ADDRESSED | Artifact Schema — "`command` is a structured argv list, never a shell string. D1 defines the field; D1–D4 do not execute it." The runner is deferred behind roadmap §7's Hard HOLD, so the attack surface does not exist in scope. |
-| 8 | HH-FAILURE-NORMALIZATION | FOLD | Work Check → closed outcome enum (`pass`/`fail`/`skipped`/`timeout`/`malformed`/`adapter_error`/`unavailable`/`missing`), "**Only `pass` satisfies** … no `else` branch". Draft lumped these into one code. |
+| 8 | HH-FAILURE-NORMALIZATION | FOLD | Work Check → closed outcome enum, all **ten** members (`pass`/`fail`/`skipped`/`waived`/`unknown`/`timeout`/`malformed`/`adapter_error`/`unavailable`/`missing`), "**Only `pass` satisfies** … no `else` branch", with out-of-enum values normalizing to `malformed`. Draft lumped these into one code. |
 | 9 | HH-DESTRUCTIVE-CLEANUP | FOLD | Lifecycle → "**Work never deletes a worktree.**" The draft was silent on cleanup, which is worse than wrong — an implementer would have invented one. |
 | 10 | HH-TIER-DISPLAY | ADDRESSED | Safety Invariants #11 "Tiers do not collapse" with its test; dashboard itself is out of scope (Q2, `web.py` outside the boundary). |
 | 11 | HH-PLATFORM-CLAIM | FOLD | Evidence Tiers → platform claims need executed target-platform evidence; skipped stays UNKNOWN; expressed via distinct opaque `check_name`s. Draft had the mechanism but never stated the claim rule. |
