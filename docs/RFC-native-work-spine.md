@@ -378,11 +378,15 @@ Rules:
   in the same locked transaction as the event itself. `prev_hash` chains
   each record to its predecessor, which commits every event *except the
   last one* — the tail's `actor`, `ts`, `type`, and payload could be
-  rewritten without breaking any chain link, and a replayed transition
-  re-encoded with a fresh `seq` / `event_id` / `op_id` would be rejected
-  by nothing. Committing the head on the item closes both: the tail is
-  covered by a record outside the ledger, and a replay changes the head
-  hash. The honest limit: this is unkeyed, so it detects rewriting, not a
+  rewritten without breaking any chain link. Committing the head on the
+  item closes that: the tail is covered by a record outside the ledger.
+  **`ledger_head` is validated on every item read** — the same
+  every-consumption rule the artifact pair carries — because a head
+  checked once at recovery is a cache, and a cache is not authority.
+  It does **not** reject a semantic replay: a replay appended by a
+  legitimate writer advances `ledger_head` too, and only the three named
+  per-type preconditions reject the replays that are decidable at all.
+  The honest limit: this is unkeyed, so it detects rewriting, not a
   writer who updates both files coherently — the same trusted-team
   boundary as `content_hash`, and explicitly weaker than the HMAC token
   `lanes.py` uses for delivery artifacts.
@@ -611,16 +615,25 @@ Rules:
   `work_ledger_head_mismatch` requires a head naming an absent tail. Left
   uncoded, an implementation driven by the HOLD table would have no
   branch and return GO on an item mid-transaction.
-- **`ledger_head` commits a tail; it does not by itself reject a semantic
-  replay.** A replay appended through a legitimate writer can also
-  advance `ledger_head`, and a hash commitment cannot distinguish that
-  from an honest new event. What rejects it is the per-type transition
-  preconditions: an `assigned` event whose `from` owner does not match
-  the current item, a `lane_bound` for an already-bound lane, a
-  `delivered` on a terminal item, or a duplicate `op_id`. Safety
-  Invariant #22 tests the tail-rewrite case that `ledger_head` *does*
-  catch; the replay case is caught by preconditions, and neither claim
-  should be made on the other's behalf.
+- **`ledger_head` commits a tail; it does not reject a semantic replay,
+  and neither does anything else in general.** A replay appended through
+  a legitimate writer also advances `ledger_head`, and a hash commitment
+  cannot distinguish it from an honest new event. Three named
+  preconditions reject the replays that are *decidable against the
+  specified schema*, and only those: a **duplicate `op_id`**, a
+  `lane_bound` for an **already-bound lane**, and a `delivered` on an
+  **already-terminal item**. Each is checkable from the current item plus
+  the closed per-type payload.
+- **Everything else is not rejectable and this document does not claim it
+  is.** An earlier draft named "an `assigned` event whose `from` owner
+  does not match the current item" — but the closed `assigned` payload is
+  `owner` alone, with no `from_owner`, so that check cannot be written
+  against this schema. More fundamentally, a genuine re-assignment back
+  to a previous owner is *indistinguishable* from a replay of the
+  original assignment; `ledger_head` commits both equally. Adding
+  pre-state bindings to every event type would make it decidable, and
+  that is deliberately not in D1–D5. Safety Invariant #22 states exactly
+  this narrowed guarantee, and the two now specify the same thing.
 - **Recovery never runs inside `work check`.** It is a separate explicit
   command. A verdict function that repaired state would make the answer
   depend on how many times it had been called (see Work Check purity).
@@ -913,6 +926,17 @@ Rules:
   as written. An artifact that arrives claiming
   `producer: "github-actions"` gets whatever tier its actual origin
   earns.
+- **Registration caps an operator-context attach at `local_agent`.** The
+  recompute above resolves `producer_class` from the invoking context, so
+  an operator running `work artifact attach` would otherwise resolve
+  `operator` and map straight through the `local_operator` row — which is
+  the generic version of the laundering path removed from assurance
+  ingestion, reachable by any operator attaching any agent's output.
+  Until a runtime adapter binds actor, command, and inputs *at execution
+  start*, a generic attach **cannot emit `local_operator` regardless of
+  who invokes it**. Removing the assurance-specific route while leaving
+  the generic one open would have withdrawn the claim without withdrawing
+  the capability.
 - A **platform claim** is evidence like any other: "this works on Linux"
   requires an executed artifact whose producer ran on Linux at the
   current revision. A skipped platform is `UNKNOWN`, never pass. Because
@@ -1390,12 +1414,47 @@ and `work_close_missing` could fire only when a close *existed* but was
 unpublished. The guard was disabled by the condition it existed to
 catch; omission moved up one level instead of being closed.
 
-So: an item is treated as release-blocking unless a **positive,
-present record** proves otherwise — a linked close whose `scope` is
-outside `close.RELEASE_CLASS_SCOPES`, or a policy in which no matched
-rule is release-scoped. Absence proves nothing and never exempts. An item
-with no close and no policy is release-blocking by default and fails the
-baseline, which is the intended and safe answer.
+So: an item is treated as release-blocking unless **every** applicable
+classification record positively proves otherwise. Two signals classify
+an item — the linked close's `scope`, and the `release_scoped` flag on
+each policy rule matched to a changed path — and they are combined by a
+**total truth table**, never by a disjunction:
+
+| Close signal | Policy signal | Result |
+|---|---|---|
+| `scope` ∈ `RELEASE_CLASS_SCOPES` | anything | **release-blocking** |
+| any | any matched rule `release_scoped: true` | **release-blocking** |
+| `scope` release · policy all `false` | — | **release-blocking** (conflict) |
+| `scope` non-release · any rule `release_scoped: true` | — | **release-blocking** (conflict) |
+| `scope` non-release | every matched rule explicitly `release_scoped: false`, every changed path matched | **exempt** |
+| absent / no `close_id` | anything | **release-blocking** |
+| any | any matched rule with `release_scoped` **absent** | **release-blocking** |
+| any | any changed path matched by no rule | **release-blocking** |
+| `scope` missing or unparseable | anything | **release-blocking** |
+
+Rules:
+
+- **Any present release signal wins.** One release-class close makes the
+  item release-blocking no matter what the policy says.
+- **Disagreement is release-blocking, never exempt.** Both directions of
+  conflict resolve the same way, because a contradiction between two
+  classification records is not evidence of exemption — it is evidence
+  that the classification is unreliable, and `work_release_class_conflict`
+  reports it so an operator can repair the records rather than have work
+  pick a side.
+- **Absence is never proof.** An earlier draft exempted on
+  *(non-release close)* **OR** *(no matched release-scoped rule)* while
+  defaulting a missing `release_scoped` to `false` — so a release-class
+  close plus one legacy rule `{glob: "src/**", checks: ["pytest"]}` with
+  no `release_scoped` key made the second disjunct true and skipped the
+  entire baseline, *despite the authoritative close being release-class*.
+  An omitted field had been defaulted into proof. `release_scoped` is now
+  three-valued for classification: `true`, `false`, or **absent =
+  unknown**, and unknown never exempts.
+- Exemption therefore requires all four: at least one applicable
+  classification record exists, no release signal is present, every
+  matched rule is *explicitly* `release_scoped: false`, and no
+  classification is absent, unmatched, or unparseable.
 
 | Requirement | Hold when absent |
 |---|---|
@@ -1509,6 +1568,7 @@ Rules:
 | `work_release_gates_vacuous` | `required_gates` is empty for a release-blocking item |
 | `work_waiver_backed_gate` | a required gate is green only via an active waiver |
 | `work_recovery_required` | `pending_op` is set and recovery has not run (crash states (a) and (b)) |
+| `work_release_class_conflict` | the close and policy release signals disagree (item is release-blocking) |
 | `work_independence_unverifiable` | `min_independent_roots > 1` cannot be satisfied by claimed roots |
 | `work_ledger_orphan` | an event references a `work_id` with no item record |
 | `work_version_conflict` | a mutation's `expected_version` no longer matches `item_seq` |
@@ -1542,7 +1602,7 @@ Rules:
 | `work_review_rejected` | the current terminal review-result is `rejected` |
 | `work_gate_hold` | `check_gates` reported a blocker for the item's scope |
 | `work_gate_stale` | the gate result was recorded against a different revision or policy hash |
-| `work_close_hold` | the linked close's `compute_verdict` reported a hold |
+| `work_close_hold` | the linked close's stored `final.verdict` is not `GO` (a malformed or absent `final` is `work_bundle_invalid`, not a pass) |
 | `work_close_stale` | the close was evaluated at a revision or policy that is no longer current |
 | `work_policy_missing` | policy is required by the item but absent |
 | `work_policy_invalid` | policy fails shape validation |
@@ -1626,8 +1686,12 @@ Three cases pin the semantics:
 
 ### The View Envelope
 
-`compute_verdict` returns exactly `{verdict, holds, ok}`, pinned to
-`close` and `lanes`. That shape deliberately cannot carry history — and
+`compute_verdict` returns `{verdict, holds, ok}` with `close`/`lanes`'
+outer keys preserved, extended additively by a per-hold `class` and a
+top-level `has_unknown` (see Work Check). Both extensions appear in the
+envelope's nested verdict and in the legacy shape below — a projection
+that dropped them would hide the established/unknown distinction the
+evaluator computes. That shape deliberately cannot carry history — and
 the sections above promise history in several places: the H1 facts in
 case A, the H3 dissent in case C, `ledger_problems`, bounded
 `source_error` rows, a bounded error record per corrupt `work_id`, and
@@ -1640,7 +1704,8 @@ Those live in the **view**, not the verdict:
   "schema": "work-view-v1",
   "work_id": "w-0007",
   "record_state": "active",
-  "verdict": {"verdict": "HOLD", "holds": [{"code": "work_artifact_stale", "detail": "…"}], "ok": false},
+  "verdict": {"verdict": "HOLD", "ok": false, "has_unknown": false,
+              "holds": [{"code": "work_artifact_stale", "class": "established", "detail": "…"}]},
   "revision": {"base_sha": "e0e8f7b4…", "head_sha": "b8e1c3a7…", "resolved_at_head": true},
   "artifacts": [{"artifact_id": "a-3f91c2", "check_name": "pytest", "trust_tier": "local_agent",
                  "current": false, "caution_flags": ["rebased_identical_diff"]}],
@@ -1665,9 +1730,9 @@ Rules:
   exist.** A legacy rendering that emits `record_state` alone could show
   `delivered` while omitting a HOLD, which is the no-collapse rule
   defeated by the compatibility hatch. The legacy shape is therefore
-  `{work_id, record_state, verdict, ok}` — flattened, but never
-  single-axis. If a consumer needs less than that, it does not get a
-  work view.
+  `{work_id, record_state, verdict, ok, has_unknown}` — flattened, but
+  never single-axis and never dropping the epistemic flag. If a consumer
+  needs less than that, it does not get a work view.
 - The envelope carries the **snapshot content token** both axes were
   resolved from, so a reader can tell that the pair is internally
   consistent rather than composed from two reads.
@@ -1744,12 +1809,15 @@ Rules:
   Source-Of-Truth Boundaries.
 - `required_review: true` on a matched entry is what makes a review
   required work-side, and it is the predicate `work_review_missing`
-  fires on outside the release baseline. `release_scoped: true` marks an
-  entry as covering release requirements, and is the positive record The
-  Release Baseline reads when deciding whether a policy proves an item
-  non-release. Both default to `false` when absent — but absence never
-  *exempts* an item from the baseline, it only fails to prove the
-  exemption.
+  fires on outside the release baseline. It defaults to `false` when
+  absent.
+- `release_scoped` is **three-valued for classification**: `true`,
+  `false`, or **absent = unknown**. It does *not* default to `false`. An
+  absent flag cannot prove an item non-release, because a legacy policy
+  written before the field existed would then silently exempt every item
+  it matched. For every other purpose (which requirements apply) an
+  absent flag behaves as not-release-scoped; only the *exemption* reading
+  treats it as unknown, and only exemption needs proof.
 - `min_tier` applies always; `release_min_tier` applies when the item is
   release-blocking per The Release Baseline. Absent `release_min_tier` defaults to
   `automation_ci`, per the roadmap's trailing rule — the default is the
@@ -2008,7 +2076,7 @@ a named test in D1–D4's acceptance set.
    `trust_tier` cannot satisfy a required check. *Test:* one omission per
    field, seven assertions.
 5. **Local agent evidence never greens a release blocker.** *Test:* a
-   `local_agent` artifact against a `release_blocking` item with default
+   `local_agent` artifact against a release-blocking item with default
    policy yields `work_artifact_insufficient_tier`.
 6. **Branch policy cannot judge itself.** *Test:* a branch that relaxes
    `code-policy.json` still evaluates under the base policy and raises
@@ -2061,7 +2129,7 @@ a named test in D1–D4's acceptance set.
     permanent HOLD. Asserts the two axes are independent and the
     projection is total.
 20. **No waiver satisfies a release blocker.** *Test:* `gate waive` an
-    active waiver over a required check on a `release_blocking` item;
+    active waiver over a required check on a release-blocking item;
     assert `work_waiver_not_authoritative` and that the verdict stays
     non-GO.
 21. **Lineage cannot mint independence.** *Test:* two artifacts derived
@@ -2116,6 +2184,20 @@ a named test in D1–D4's acceptance set.
 30. **The axes cannot disagree.** *Test:* assert
     `changes_requested · GO` is unreachable, and that both axes carry the
     same snapshot token.
+31. **A generic operator attach cannot reach `local_operator`.** *Test:*
+    an operator invokes `work artifact attach` on an agent-produced
+    output; assert the registered tier is `local_agent`, that no path
+    emits `local_operator` in D1–D5, and that a `local_operator` floor
+    stays unsatisfied.
+32. **Release classification is total and conflict fails closed.**
+    *Test:* the full truth table — a release-class close with an
+    all-`false` policy, a non-release close with a `release_scoped: true`
+    rule (both yield release-blocking plus
+    `work_release_class_conflict`), a legacy rule with `release_scoped`
+    **absent** alongside a release-class close (release-blocking, not
+    exempt), a changed path matched by no rule (release-blocking), and
+    the only exempting case: a non-release close with every matched rule
+    explicitly `release_scoped: false` and every path matched.
 
 ## Threat Model And Honest Limits
 
@@ -2248,8 +2330,9 @@ Implement:
   ledger under `store._config_lock()`, per-item locking for every
   read-modify-write.
 - The crash protocol in full: `item_seq` as `expected_version`,
-  `pending_op` / `op_id`, ledger `seq` + `prev_hash`, and idempotent
-  recovery as a separate command. This lands in D2 rather than later
+  `pending_op` / `op_id`, ledger `seq` + `prev_hash`, `ledger_head`
+  validated on **every item read**, and idempotent recovery as a separate
+  command. This lands in D2 rather than later
   because retrofitting a chain onto an existing ledger means rewriting
   history, which the append-only rule forbids.
 - `work create|list|show|status|assign|start|deliver|abandon`.
@@ -2283,7 +2366,10 @@ Implement:
 
 Do NOT implement: command execution. D3 records an argv that a producer
 claims it ran; it never runs one. Also no redaction scanning — ship
-`not_scanned` honestly.
+`not_scanned` honestly. **And no `local_operator` emission from any
+path**: the tier mapping table is the eventual rule, not a D3 capability,
+so a generic attach caps at `local_agent` whoever invokes it. Emitting
+`local_operator` requires the runtime adapter, which is not in D3.
 
 ### Phase D4: Pure Work Check
 
@@ -2347,7 +2433,18 @@ needs it — not during it.
    in Evidence Tiers covers the part that does. This decision is forced
    by whichever phase first introduces an attestation producer, and it
    blocks that phase.
-7. **What is the bounded clock skew, and against which clock?** The
+7. **The close-provenance envelope — BLOCKS D4.** `record["final"]`
+   stores blocker *names* only (`close.py:1083-1091`), so work cannot see
+   that a close's GO rested on a waived gate, an `ack.override`, a
+   `signoff_overrides` skip, or a remediation resolved through a
+   non-required waived gate. `work check` lands in **D4**, so unless a
+   bound envelope (pre-publish gate rows + override markers + exact
+   scope/revision binding) exists first, D4 ships with that route
+   admittedly invisible. This is a scheduled blocker, not a note: D4 may
+   not ship until it is resolved or an operator explicitly accepts the
+   residual. It needs `close.py` changes outside this team's boundary, so
+   it is filed through the operator.
+8. **What is the bounded clock skew, and against which clock?** The
    `work_implausible_timestamp` rule needs a concrete bound. Decided at
    D3 with the first real producer, because picking a number now without
    measuring agent-host clock spread would be arbitrary.
@@ -2379,9 +2476,13 @@ choice and this document made one:
 - **`local_operator` is likewise unreachable in D1–D5**, because the only
   path to it would be an operator attaching an agent's output, which is
   confirmation rather than execution.
-- **Work check adapts `check_gates`'s different return shape** rather
-  than assuming all three verdict producers match; only `close` and
-  `lanes` share the `{verdict, holds, ok}` shape.
+- **Work check adapts each source's actual return shape** rather than
+  assuming the verdict producers match. `close.compute_verdict` and
+  `lanes.compute_verdict` share `{verdict, holds, ok}`, but work consumes
+  a *published* close through its stored `record["final"]`
+  (`verdict`, `gate_verdict`, `blockers`, `by`, `at`, plus the close's
+  `scope` and `revision`) — a different shape again, and the only one
+  reachable for a published close.
 - **Lane isolation uses the artifact-side vocabulary**
   (`verified` / `advisory_unisolated` / `unverified`) and requires
   `verified`, matching the existing hard reject in
@@ -2403,7 +2504,8 @@ choice and this document made one:
   the runner stays deferred behind roadmap §7's Hard HOLD.
 - **The item is authoritative for state, the ledger for history, and a
   `GO` needs both** — with `pending_op` + `op_id` + `seq` + `prev_hash`
-  making every one of the five crash points converge idempotently.
+  making every one of the six crash points converge idempotently, with
+  `work_recovery_required` covering a check run before recovery.
 - **`seq` orders everything; timestamps order nothing**, and an
   implausible producer timestamp disqualifies the artifact rather than
   merely being noted.
@@ -2425,9 +2527,14 @@ choice and this document made one:
   an empty `source_errors` proves nothing.
 - **A release-blocking item needs a non-vacuous baseline** (policy, path
   coverage, published close, bound review, non-empty green gates), and
-  waiver-backed gates and closes are rejected rather than inherited.
-  Omission must not become the silent waiver.
-- **`release_blocking` is derived, not an author-set field.**
+  waiver-backed **gates** are rejected rather than inherited — while a
+  waiver-backed **close** is admittedly **undetectable** with the fields
+  `record["final"]` carries, which is a scheduled D6 blocker on D4 rather
+  than a closed route. Omission must not become the silent waiver.
+- **Release classification is derived by a total truth table**, never
+  stored and never disjunctive: any present release signal wins,
+  disagreement is release-blocking, and an absent `release_scoped` is
+  unknown rather than false.
 - **Tier re-resolution may only weaken**; the bound tier caps the
   effective tier, and producer retirement is a caution, never a demotion.
 - **`item_seq` is a record version, not a ledger position.** Crash
@@ -2551,7 +2658,7 @@ being there.
 | 26 | CRASH-ARTIFACT-PAIR | FOLD | Artifact Schema → **Torn Reads And The JSON/Log Pair**: log written and hash-validated first, metadata published last as the commit marker; all seven states (a)–(g) tabulated; both files revalidated on every consumption. |
 | 27 | CONTRADICTION-SEMANTICS | FOLD | Contradictions → cases A, B, C spelled out, with "most recent" and "most pessimistic" each rejected by name and reason (clock control; permanent poisoning of later valid revisions). |
 | 28 | TIER-ASSURANCE-INGEST | FOLD | Assurance Ingestion → the artifact's actual field list, confirmed against `assurance.py:2164-2189`, carries no work bindings; tier comes from the ingestion path, never from `profile` / attestation / path / producer string / `CI=true`. |
-| 29 | TIER-WAIVER-LAUNDERING | FOLD (amended) | Execution Tiers → a waiver never mutates evidence, and **no waiver satisfies a release-blocking requirement in D1–D5 at all**. *Amended after codex-sec:* the first fold asserted a typed waiver "scoped to one requirement at one head and policy hash" — a record that does not exist. `gates.waive_gate` (`gates.py:143-181`) stores `{operator, date, reason, scope, expires}` with `operator` as unauthenticated free text and no work/check/head/policy binding, `_gate_verdict` (`:311-317`) makes any active waiver non-blocking, and ASSURANCE.md:109-114 forbids treating that path as operator authority. The required record is now specified as a target for the hardening, and until it lands there is no waiver escape. |
+| 29 | TIER-WAIVER-LAUNDERING | FOLD (partial — close route open) | Execution Tiers → a waiver never mutates evidence, and no waiver satisfies a release-blocking requirement **through a direct work-side gate**. The **close** route is NOT closed: `record["final"]` carries blocker names only, so a waiver-backed close is undetectable; there is no `work_waiver_backed_close` code, and D6 item 7 blocks D4 on a close-provenance envelope. *Amended after codex-sec:* the first fold asserted a typed waiver "scoped to one requirement at one head and policy hash" — a record that does not exist. `gates.waive_gate` (`gates.py:143-181`) stores `{operator, date, reason, scope, expires}` with `operator` as unauthenticated free text and no work/check/head/policy binding, `_gate_verdict` (`:311-317`) makes any active waiver non-blocking, and ASSURANCE.md:109-114 forbids treating that path as operator authority. The required record is now specified as a target for the hardening, and until it lands there is no waiver escape. |
 | 30 | TIER-REREGISTRATION | FOLD (amended twice) | Execution Lineage → `root_execution_id` derived from **execution identity** (command, cwd, base, head, policy hash, producer, started_at), explicitly not captured output, with `work_artifact_execution_conflict` on a tier/origin change. `content_hash` alone cannot do this: the record hashes its own `artifact_id`, so two registrations of one run hash differently by construction. *Round 2:* codex-sec showed the replacement is still **self-asserted** — every input is a producer claim, so a sibling adapter can mint a fresh root with a plausible `started_at`. `min_independent_roots > 1` is therefore unsatisfiable by claimed roots in D1–D5 (`work_independence_unverifiable`); it needs a launch-time nonce that does not exist. |
 | 31 | TIER-FAKE-CORROBORATION | FOLD | Execution Lineage → "**Corroboration counts distinct `root_execution_id` values, not records**"; `derived_from` lineage; a derived artifact "can never corroborate its own ancestor." |
 | 32 | TIER-CONTAINER/SIGNER-SPOOF | DEFER | D6 gate item 6, forced by whichever phase first introduces an attestation producer. Partly covered now: Evidence Tiers makes `producer`/`producer_class`/`trust_tier` untrusted input recomputed at registration, and `external_attested` has **no producer in D1–D5**, so the transitive-container surface does not yet exist. The attestation-scope model is what remains. |
