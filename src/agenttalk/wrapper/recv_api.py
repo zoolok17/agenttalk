@@ -75,24 +75,6 @@ def _terminal_state(store, agent: str, rid: str) -> tuple[bool, bool]:
     return (False, False)
 
 
-def _requester_terminal(store, agent: str, rid: str) -> dict | None:
-    from .obligations import requester_terminal_for
-
-    return requester_terminal_for(store, rid, agent)
-
-
-def _requester_broadcast_state(store, agent: str, rid: str) -> str | None:
-    from .obligations import requester_broadcast_policy_state
-
-    return requester_broadcast_policy_state(store, rid, agent)
-
-
-def _delivery_failed(terminal: dict | None) -> dict | None:
-    if terminal is None or terminal.get("state") != "delivery_failed":
-        return None
-    return terminal
-
-
 def records(store, agent: str, *, scoped_request_id: str | None = None,
             since: str | None = None, include_control: bool = False) -> list[dict]:
     """All currently-unread messages for ``agent`` as structured records (oldest
@@ -115,18 +97,10 @@ def records(store, agent: str, *, scoped_request_id: str | None = None,
         msgs = [m for m in msgs if m.kind not in CONTROL_KINDS]
     msgs = [m for m in msgs if m.meta.get("request_id") == rid]
     closed, superseded = _terminal_state(store, agent, rid)
-    terminal = _requester_terminal(store, agent, rid)
-    broadcast_state = _requester_broadcast_state(store, agent, rid)
-    if broadcast_state in {"open", "blocked"} and terminal is None:
-        closed = superseded
-    failed = _delivery_failed(terminal)
-    closed = closed or terminal is not None
     out = []
     for m in msgs:
         scoped = {"request_id": rid, "seen_before": seen, "seen_after": m.id,
-                  "closed": closed, "superseded": superseded,
-                  "delivery_terminal": terminal,
-                  "delivery_failed": failed}
+                  "closed": closed, "superseded": superseded}
         # cursor before==after: scoped recv NEVER moves the global cursor.
         out.append(to_record(m, mode=SCOPED, cursor_before=gcur, cursor_after=gcur,
                              scoped=scoped))
@@ -151,23 +125,11 @@ def poll(store, agent: str, *, scoped_request_id: str | None = None,
     }
     if scoped_request_id is not None:
         closed, superseded = _terminal_state(store, agent, scoped_request_id)
-        terminal = _requester_terminal(store, agent, scoped_request_id)
-        broadcast_state = _requester_broadcast_state(
-            store,
-            agent,
-            scoped_request_id,
-        )
-        if broadcast_state in {"open", "blocked"} and terminal is None:
-            closed = superseded
-        failed = _delivery_failed(terminal)
-        closed = closed or terminal is not None
         env["scoped"] = {
             "request_id": scoped_request_id,
             "seen": store.thread_seen(agent, scoped_request_id),
             "closed": closed,
             "superseded": superseded,
-            "delivery_terminal": terminal,
-            "delivery_failed": failed,
         }
     return env
 

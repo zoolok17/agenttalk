@@ -1690,8 +1690,6 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                "retryable": False, "rc": None, "error": None, "terminal_text": "",
                "config_blocked": False, "config_blocked_text": "", "bus_failure": None,
                "setup_failure": None,
-               "bus_action_attempted": False, "bus_action_infra": False,
-               "bus_action_rejected": False,
                "structured_errors": [], "child_output_tail": None,
                "lesson_exposure_error": None}
         child_output_lines: list[dict[str, str]] = []
@@ -1761,9 +1759,6 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                             # be classed poison (lead verify P1).
                             sig["terminal_text"] = ev.text or sig["terminal_text"]
                     elif ev.type == EventType.TOOL_FINISHED:
-                        verb = _bus_command_verb(ev.tool)
-                        if verb in _REQUIRED_BUS_WRITE_VERBS:
-                            sig["bus_action_attempted"] = True
                         bus = classify_bus_execution(ev.tool, ev.text, ev.exit_code, ev.raw)
                         if bus["kind"] == BUS_KIND_CONFIG_BLOCKED:
                             sig["config_blocked"] = True
@@ -1773,10 +1768,6 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                             BUS_KIND_UNKNOWN_FAILURE,
                         ):
                             sig["bus_failure"] = bus
-                            if bus["kind"] == BUS_KIND_SEMANTIC_FAILURE:
-                                sig["bus_action_rejected"] = True
-                            else:
-                                sig["bus_action_infra"] = True
                         setup_failure = classify_setup_execution(
                             ev.tool, ev.text, ev.exit_code, ev.raw)
                         if setup_failure is not None:
@@ -1944,12 +1935,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 persist(session_state)
             if health_writer.state != health_model.STATE_DEGRADED_OUTPUT:
                 health_writer.idle(reason_code="turn_completed")
-            return DriveOutcome(
-                ok=True,
-                bus_action_attempted=bool(sig.get("bus_action_attempted")),
-                bus_action_infra=bool(sig.get("bus_action_infra")),
-                bus_action_rejected=bool(sig.get("bus_action_rejected")),
-            )
+            return DriveOutcome(ok=True)
         # the turn FAILED (no completed boundary / nonzero exit / spawn error, after
         # any resume->fresh retry): undo any heartbeat its streaming progress stamped,
         # so a failed attempt leaves NO fresh heartbeat - AND reset the engine throttle
@@ -1976,10 +1962,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             else:
                 store.write_heartbeat(agent)
         return DriveOutcome(ok=False, failure_class=failure_class, summary=summary,
-                            child_output_tail=sig.get("child_output_tail"),
-                            bus_action_attempted=bool(sig.get("bus_action_attempted")),
-                            bus_action_infra=bool(sig.get("bus_action_infra")),
-                            bus_action_rejected=bool(sig.get("bus_action_rejected")))
+                            child_output_tail=sig.get("child_output_tail"))
 
     return drive
 
