@@ -128,6 +128,8 @@ def _operation_idempotency(
         broadcast_id=meta.get("broadcast_id"),
         origin_request_id=meta.get("origin_request_id"),
         origin_inbound_id=meta.get("origin_inbound_id"),
+        origin_obligation_key_digest=meta.get("origin_obligation_key_digest"),
+        expected_roster_revision=meta.get("expected_roster_revision"),
     )
     meta["operation_nonce"] = nonce
     meta["operation_digest"] = digest
@@ -8178,6 +8180,13 @@ def cmd_commit_gate(args: argparse.Namespace) -> int:
             print(f"  reason: {status['reason']}")
         if status.get("breaker"):
             print(f"  breaker: {json.dumps(status['breaker'], sort_keys=True)}")
+        if status.get("legacy_broadcast"):
+            legacy = status["legacy_broadcast"]
+            print(
+                "  legacy-broadcast: "
+                f"enforcement={legacy.get('enforcement')} "
+                f"unenforced_total={legacy.get('unenforced_total')}"
+            )
     return 0
 
 

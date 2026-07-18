@@ -24,7 +24,7 @@ from typing import Callable
 
 from agenttalk import threads
 from agenttalk._atomic import write_text as _atomic_write_text
-from agenttalk.store import PROC_DEAD, Message, _process_liveness
+from agenttalk.store import CONTROL_KINDS, PROC_DEAD, Message, _process_liveness
 
 POLICY_ENV = "AGENTTALK_COMMIT_GATE_POLICY"
 POLICY_SCHEMA_VERSION = 1
@@ -122,28 +122,50 @@ class PolicySnapshot:
     generation: str
     grade: str | None = None
     reason: str = ""
+    agent: str | None = None
 
     @classmethod
-    def inactive(cls, reason: str = "no policy configured") -> "PolicySnapshot":
-        return cls(ResolverState.NOT_OWED, "inactive", reason=reason)
+    def inactive(
+        cls,
+        reason: str = "no policy configured",
+        *,
+        agent: str | None = None,
+    ) -> "PolicySnapshot":
+        return cls(ResolverState.NOT_OWED, "inactive", reason=reason, agent=agent)
 
     @classmethod
     def from_mapping(cls, raw: object, agent: str) -> "PolicySnapshot":
         if not isinstance(raw, dict) or raw.get("schema_version") != POLICY_SCHEMA_VERSION:
-            return cls(ResolverState.BLOCKED_POLICY, "unreadable", reason="policy schema invalid")
+            return cls(
+                ResolverState.BLOCKED_POLICY,
+                "unreadable",
+                reason="policy schema invalid",
+                agent=agent,
+            )
         agents = raw.get("agents")
         if not isinstance(agents, dict):
-            return cls(ResolverState.BLOCKED_POLICY, "unreadable", reason="policy agents invalid")
+            return cls(
+                ResolverState.BLOCKED_POLICY,
+                "unreadable",
+                reason="policy agents invalid",
+                agent=agent,
+            )
         canonical = json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         generation = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         entry = agents.get(agent)
         if entry is None:
-            return cls(ResolverState.NOT_OWED, generation, reason="agent has no configured grade")
+            return cls(
+                ResolverState.NOT_OWED,
+                generation,
+                reason="agent has no configured grade",
+                agent=agent,
+            )
         if not isinstance(entry, dict) or not isinstance(entry.get("grade"), str):
             return cls(
                 ResolverState.BLOCKED_POLICY,
                 generation,
                 reason="configured grade is invalid",
+                agent=agent,
             )
         grade = entry.get("grade")
         if grade not in {DETECTION_GRADE, SECURITY_GRADE}:
@@ -151,6 +173,7 @@ class PolicySnapshot:
                 ResolverState.BLOCKED_POLICY,
                 generation,
                 reason="configured grade is unsupported",
+                agent=agent,
             )
         enabled = entry.get("enabled", True)
         if enabled is not True and enabled is not False:
@@ -158,6 +181,7 @@ class PolicySnapshot:
                 ResolverState.BLOCKED_POLICY,
                 generation,
                 reason="configured enabled flag is invalid",
+                agent=agent,
             )
         if enabled is False:
             return cls(
@@ -165,6 +189,7 @@ class PolicySnapshot:
                 generation,
                 grade,
                 "operator disabled gate",
+                agent,
             )
         if grade == SECURITY_GRADE:
             return cls(
@@ -172,8 +197,15 @@ class PolicySnapshot:
                 generation,
                 SECURITY_GRADE,
                 "security-grade prerequisites are not available in this build",
+                agent,
             )
-        return cls(ResolverState.ACTIVE, generation, DETECTION_GRADE, "policy ready")
+        return cls(
+            ResolverState.ACTIVE,
+            generation,
+            DETECTION_GRADE,
+            "policy ready",
+            agent,
+        )
 
     @classmethod
     def from_path(cls, path: Path, agent: str) -> "PolicySnapshot":
@@ -184,6 +216,7 @@ class PolicySnapshot:
                 ResolverState.BLOCKED_POLICY,
                 "unreadable",
                 reason=f"operator policy unreadable: {type(exc).__name__}",
+                agent=agent,
             )
         return cls.from_mapping(raw, agent)
 
@@ -191,7 +224,7 @@ class PolicySnapshot:
     def from_environment(cls, agent: str) -> "PolicySnapshot":
         configured = os.environ.get(POLICY_ENV)
         if not configured:
-            return cls.inactive()
+            return cls.inactive(agent=agent)
         return cls.from_path(Path(configured).expanduser().resolve(), agent)
 
 
@@ -351,6 +384,58 @@ def _true(meta: dict, name: str) -> bool | None:
     return None
 
 
+def _broadcast_descriptor(meta: object, *, requester: object = None) -> dict | None:
+    if not isinstance(meta, dict) or not isinstance(meta.get("broadcast_id"), str):
+        return None
+    broadcast_id = meta["broadcast_id"]
+    members = meta.get("membership_snapshot")
+    policy = meta.get("response_policy")
+    quorum = meta.get("response_quorum")
+    if (
+        not isinstance(members, list)
+        or not members
+        or any(not isinstance(member, str) or not member for member in members)
+        or len(set(members)) != len(members)
+        or not isinstance(requester, str)
+        or not requester
+        or meta.get("request_id") != broadcast_id
+        or policy not in {"each", "any", "quorum"}
+        or meta.get("broadcast_policy_version") != 1
+        or (
+            policy == "quorum"
+            and (
+                not isinstance(quorum, int)
+                or isinstance(quorum, bool)
+                or quorum < 1
+                or quorum > len(members)
+            )
+        )
+    ):
+        return None
+    return {
+        "broadcast_id": broadcast_id,
+        "requester": requester,
+        "membership_snapshot": list(members),
+        "response_policy": policy,
+        "response_quorum": quorum if policy == "quorum" else None,
+        "broadcast_policy_version": 1,
+    }
+
+
+def _broadcast_descriptor_digest(descriptor: dict) -> str:
+    return hashlib.sha256(_canonical(descriptor).encode("utf-8")).hexdigest()
+
+
+def _valid_hex_digest(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64 or value != value.lower():
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
 def _canonical(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -366,6 +451,8 @@ def operation_payload_digest(
     broadcast_id: str | None = None,
     origin_request_id: str | None = None,
     origin_inbound_id: str | None = None,
+    origin_obligation_key_digest: str | None = None,
+    expected_roster_revision: str | None = None,
 ) -> str:
     payload = {
         "operation": operation,
@@ -378,6 +465,10 @@ def operation_payload_digest(
         "origin_request_id": origin_request_id,
         "origin_inbound_id": origin_inbound_id,
     }
+    if origin_obligation_key_digest is not None:
+        payload["origin_obligation_key_digest"] = origin_obligation_key_digest
+    if expected_roster_revision is not None:
+        payload["expected_roster_revision"] = expected_roster_revision
     return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
 
 
@@ -395,6 +486,8 @@ def _message_operation_valid(message: Message, *, operation: str, nonce: str) ->
         broadcast_id=meta.get("broadcast_id"),
         origin_request_id=meta.get("origin_request_id"),
         origin_inbound_id=meta.get("origin_inbound_id"),
+        origin_obligation_key_digest=meta.get("origin_obligation_key_digest"),
+        expected_roster_revision=meta.get("expected_roster_revision"),
     )
     return meta.get("operation_digest") == expected
 
@@ -435,6 +528,7 @@ def _new_ledger() -> dict:
         "dispatch_nonces": {},
         "breakers": {},
         "delivery_index": {},
+        "broadcasts": {},
         "cursor_dispositions": {},
         "telemetry": {},
     }
@@ -444,10 +538,12 @@ def _validate_ledger(raw: object) -> dict:
     if not isinstance(raw, dict) or raw.get("schema_version") != LEDGER_SCHEMA_VERSION:
         raise LedgerUnreadable("obligation ledger schema invalid")
     raw.setdefault("dispatch_nonces", {})
+    raw.setdefault("broadcasts", {})
     required = (
         "store_epoch", "append_sequence", "revision", "messages", "transitions",
         "scoped_revisions", "obligations", "inbound_index", "breakers",
-        "no_admission_claims", "dispatch_nonces", "delivery_index", "telemetry",
+        "no_admission_claims", "dispatch_nonces", "delivery_index", "broadcasts",
+        "telemetry",
         "cursor_dispositions",
     )
     if not isinstance(raw.get("store_epoch"), str):
@@ -456,7 +552,8 @@ def _validate_ledger(raw: object) -> dict:
         raise LedgerUnreadable("obligation ledger fields missing")
     if not all(isinstance(raw.get(name), dict) for name in (
         "messages", "scoped_revisions", "obligations", "inbound_index",
-        "no_admission_claims", "dispatch_nonces", "breakers", "delivery_index", "telemetry",
+        "no_admission_claims", "dispatch_nonces", "breakers", "delivery_index",
+        "broadcasts", "telemetry",
         "cursor_dispositions",
     )):
         raise LedgerUnreadable("obligation ledger maps invalid")
@@ -669,6 +766,7 @@ class DetectionCommitGate:
         invalid_records: list[tuple[str, str]] | None = None,
     ) -> dict:
         """Normalize validated bus records into the monotonic canonical journal."""
+        messages = self.store.publication_ordered_messages(messages)
         with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
             ledger = self._load()
             changed = False
@@ -701,13 +799,39 @@ class DetectionCommitGate:
                         "timestamp": message.ts,
                     },
                 )
-                ledger["messages"][message.id] = {
+                operation_nonce = meta.get("operation_nonce")
+                operation_digest = meta.get("operation_digest")
+                operation_payload_valid = bool(
+                    isinstance(operation_nonce, str)
+                    and isinstance(operation_digest, str)
+                    and operation_digest == operation_payload_digest(
+                        operation=(
+                            "composing" if message.kind == "composing" else "terminal"
+                        ),
+                        body=message.body,
+                        kind=message.kind,
+                        recipient=message.recipient,
+                        in_reply_to=meta.get("in_reply_to"),
+                        request_id=meta.get("request_id"),
+                        broadcast_id=meta.get("broadcast_id"),
+                        origin_request_id=meta.get("origin_request_id"),
+                        origin_inbound_id=meta.get("origin_inbound_id"),
+                        origin_obligation_key_digest=meta.get(
+                            "origin_obligation_key_digest"
+                        ),
+                        expected_roster_revision=meta.get(
+                            "expected_roster_revision"
+                        ),
+                    )
+                )
+                message_row = {
                     "sequence": event["sequence"],
                     "correlation_id": rid,
                     "kind": message.kind,
                     "sender": message.sender,
                     "recipient": message.recipient,
                     "in_reply_to": meta.get("in_reply_to"),
+                    "request_id": meta.get("request_id"),
                     "broadcast_id": meta.get("broadcast_id"),
                     "membership_snapshot": meta.get("membership_snapshot"),
                     "response_policy": meta.get("response_policy"),
@@ -715,33 +839,198 @@ class DetectionCommitGate:
                     "broadcast_policy_version": meta.get("broadcast_policy_version"),
                     "roster_revision": meta.get("roster_revision"),
                     "authorized_liaisons": meta.get("authorized_liaisons"),
+                    "operation_nonce": operation_nonce,
+                    "operation_payload_valid": operation_payload_valid,
                 }
+                ledger["messages"][message.id] = message_row
                 revisions = ledger["scoped_revisions"]
                 for inbound_id in set(related_inbounds):
                     revisions[inbound_id] = int(revisions.get(inbound_id, 0)) + 1
+
+                descriptor = (
+                    _broadcast_descriptor(meta, requester=message.sender)
+                    if message.kind == "question" and meta.get("broadcast_id")
+                    else None
+                )
+                if descriptor is not None:
+                    bid = descriptor["broadcast_id"]
+                    digest = _broadcast_descriptor_digest(descriptor)
+                    aggregate = ledger["broadcasts"].get(bid)
+                    if not isinstance(aggregate, dict):
+                        aggregate = {
+                            "state": "open",
+                            "generation": 1,
+                            "descriptor": descriptor,
+                            "descriptor_digest": digest,
+                            "member_inbounds": {},
+                            "winning_ids": [],
+                            "affected_member_keys": [],
+                            "history": [],
+                        }
+                        ledger["broadcasts"][bid] = aggregate
+                    if aggregate.get("descriptor_digest") != digest:
+                        if aggregate.get("state") != "blocked":
+                            aggregate["state"] = "blocked"
+                            aggregate["blocked_reason"] = (
+                                "immutable broadcast policy copies conflict"
+                            )
+                            self._append(
+                                ledger,
+                                "BROADCAST_POLICY_CONFLICT",
+                                scope=message.id,
+                                source_id=message.id,
+                                data={
+                                    "broadcast_id": bid,
+                                    "expected_descriptor_digest": aggregate.get(
+                                        "descriptor_digest"
+                                    ),
+                                    "observed_descriptor_digest": digest,
+                                },
+                            )
+                    else:
+                        prior_for_member = aggregate.get("member_inbounds", {}).get(
+                            message.recipient,
+                        )
+                        if (
+                            aggregate.get("state") == "policy_satisfied"
+                            and isinstance(prior_for_member, list)
+                            and prior_for_member
+                        ):
+                            history = list(aggregate.get("history") or [])
+                            history.append({
+                                name: value
+                                for name, value in aggregate.items()
+                                if name != "history"
+                            })
+                            aggregate = {
+                                "state": "open",
+                                "generation": int(
+                                    aggregate.get("generation", 1)
+                                ) + 1,
+                                "descriptor": descriptor,
+                                "descriptor_digest": digest,
+                                "member_inbounds": {},
+                                "winning_ids": [],
+                                "affected_member_keys": [],
+                                "history": history,
+                            }
+                            ledger["broadcasts"][bid] = aggregate
+                        member_inbounds = aggregate.setdefault("member_inbounds", {})
+                        member_inbounds.setdefault(message.recipient, []).append(message.id)
+                        message_row["broadcast_generation"] = int(
+                            aggregate.get("generation", 1)
+                        )
+                        if aggregate.get("state") == "policy_satisfied":
+                            self._append(
+                                ledger,
+                                "BROADCAST_POLICY_SATISFIED",
+                                scope=message.id,
+                                source_id=(aggregate.get("winning_ids") or [None])[-1],
+                                data={
+                                    "aggregate": False,
+                                    "broadcast_id": bid,
+                                    "inbound_id": message.id,
+                                    "winning_ids": list(
+                                        aggregate.get("winning_ids") or []
+                                    ),
+                                    "winning_classes": list(
+                                        aggregate.get("winning_classes") or []
+                                    ),
+                                    "policy": descriptor["response_policy"],
+                                    "broadcast_policy_version": 1,
+                                    "broadcast_generation": aggregate.get(
+                                        "generation", 1
+                                    ),
+                                    "transaction_id": aggregate.get("transaction_id"),
+                                    "prospective": True,
+                                },
+                            )
                 if isinstance(anchor, str) and anchor:
+                    anchor_row = ledger["messages"].get(anchor)
                     key_id = ledger["inbound_index"].get(anchor)
                     admission = ledger["obligations"].get(key_id) if key_id else None
-                    if isinstance(admission, dict) and admission.get("state") != "open":
+                    anchor_descriptor = (
+                        _broadcast_descriptor(
+                            anchor_row,
+                            requester=anchor_row.get("sender"),
+                        )
+                        if isinstance(anchor_row, dict)
+                        else None
+                    )
+                    current_aggregate = (
+                        ledger["broadcasts"].get(anchor_descriptor["broadcast_id"])
+                        if anchor_descriptor is not None
+                        else None
+                    )
+                    anchor_generation = anchor_row.get("broadcast_generation") if isinstance(
+                        anchor_row, dict
+                    ) else None
+                    aggregate_candidates = (
+                        [current_aggregate]
+                        + list(current_aggregate.get("history") or [])
+                        if isinstance(current_aggregate, dict)
+                        else []
+                    )
+                    aggregate = next((
+                        candidate for candidate in aggregate_candidates
+                        if isinstance(candidate, dict)
+                        and int(candidate.get("generation", 1))
+                        == int(anchor_generation or 1)
+                    ), None)
+                    prospective_policy_close = any(
+                        candidate.get("transition") == "BROADCAST_POLICY_SATISFIED"
+                        and isinstance(candidate.get("data"), dict)
+                        and candidate["data"].get("aggregate") is False
+                        and candidate["data"].get("inbound_id") == anchor
+                        and int(candidate.get("sequence", 0)) < int(event["sequence"])
+                        for candidate in ledger["transitions"]
+                    )
+                    closed_by_policy = bool(
+                        isinstance(aggregate, dict)
+                        and aggregate.get("state") == "policy_satisfied"
+                        and int(event["sequence"])
+                        > int(aggregate.get("aggregate_sequence", 0))
+                        and (
+                            isinstance(admission, dict)
+                            and admission.get("state") == "broadcast_policy_satisfied"
+                            or not isinstance(admission, dict)
+                            and prospective_policy_close
+                        )
+                    )
+                    exact_late_response = bool(
+                        anchor_descriptor is not None
+                        and _correlation(meta) == anchor_descriptor["broadcast_id"]
+                        and message.kind not in CONTROL_KINDS
+                        and message.sender == anchor_row.get("recipient")
+                        and message.recipient == anchor_row.get("sender")
+                        and closed_by_policy
+                        and message.id not in (aggregate.get("winning_ids") or [])
+                    )
+                    if exact_late_response:
                         self._append(
                             ledger,
                             "LATE_RESPONSE",
                             scope=anchor,
                             source_id=message.id,
                             key_digest=key_id,
-                            data={"closed_state": admission.get("state")},
+                            data={
+                                "broadcast_id": anchor_descriptor["broadcast_id"],
+                                "closed_state": (
+                                    admission.get("state")
+                                    if isinstance(admission, dict)
+                                    else "prospective_policy_satisfied"
+                                ),
+                                "transaction_id": aggregate.get("transaction_id"),
+                            },
                         )
                 if (
                     message.kind == "question"
                     and meta.get("broadcast_id")
-                    and not (
-                        isinstance(meta.get("membership_snapshot"), list)
-                        and meta.get("response_policy") in {"each", "any", "quorum"}
-                    )
+                    and descriptor is None
                 ):
                     telemetry = ledger["telemetry"]
-                    telemetry["legacy_broadcast_records"] = int(
-                        telemetry.get("legacy_broadcast_records", 0)
+                    telemetry["legacy_broadcast_unenforced_total"] = int(
+                        telemetry.get("legacy_broadcast_unenforced_total", 0)
                     ) + 1
                 changed = True
             seen_invalid = ledger["telemetry"].setdefault("invalid_records", {})
@@ -768,7 +1057,7 @@ class DetectionCommitGate:
 
     def _validated_messages(self) -> tuple[list[Message], dict]:
         try:
-            messages = self.store.valid_messages()
+            messages = self.store.publication_ordered_messages()
             invalid_records = self.store.list_invalid_messages()
         except (OSError, ValueError, TimeoutError, RuntimeError) as exc:
             observed_at = self.now()
@@ -902,19 +1191,30 @@ class DetectionCommitGate:
             return ResolverState.NOT_OWED, "not addressed to this wrapper", rid
         bid = meta.get("broadcast_id")
         if bid:
-            members = meta.get("membership_snapshot")
-            policy = meta.get("response_policy")
-            if not isinstance(members, list) or self.agent not in members or policy not in {
-                "each", "any", "quorum",
-            }:
-                return ResolverState.NOT_OWED, "legacy broadcast log-only", rid
-            if meta.get("broadcast_policy_version") != 1:
-                return ResolverState.CLASSIFICATION_UNKNOWN, "broadcast policy version unsupported", rid
-            quorum = meta.get("response_quorum")
-            if policy == "quorum" and (
-                not isinstance(quorum, int) or quorum < 1 or quorum > len(members)
+            descriptor = _broadcast_descriptor(meta, requester=record.get("from"))
+            if descriptor is None:
+                return (
+                    ResolverState.CLASSIFICATION_UNKNOWN,
+                    "legacy broadcast is not enforcement-eligible",
+                    rid,
+                )
+            if self.agent not in descriptor["membership_snapshot"]:
+                return (
+                    ResolverState.CLASSIFICATION_UNKNOWN,
+                    "broadcast recipient is absent from frozen membership",
+                    rid,
+                )
+        transfer_from = meta.get("transfer_from_key_digest")
+        transfer_generation = meta.get("transfer_policy_generation")
+        if transfer_from is not None or transfer_generation is not None:
+            if not _valid_hex_digest(transfer_from) or not _valid_hex_digest(
+                transfer_generation
             ):
-                return ResolverState.CLASSIFICATION_UNKNOWN, "broadcast quorum invalid", rid
+                return (
+                    ResolverState.CLASSIFICATION_UNKNOWN,
+                    "transfer destination marker is invalid",
+                    rid,
+                )
         obligation_class = (
             "human_escalation" if _true(meta, "escalation_required") is True else "answer"
         )
@@ -947,6 +1247,20 @@ class DetectionCommitGate:
         ):
             return Resolution(ResolverState.CLASSIFICATION_UNKNOWN, "validated inbound mismatch")
         key = self._key_from(admission["key"]) if admission is not None else None
+        inbound_descriptor = _broadcast_descriptor(
+            inbound.meta,
+            requester=inbound.sender,
+        )
+        aggregate_blocked_reason: str | None = None
+        if inbound_descriptor is not None:
+            aggregate = ledger["broadcasts"].get(
+                inbound_descriptor["broadcast_id"],
+            )
+            if isinstance(aggregate, dict) and aggregate.get("state") == "blocked":
+                aggregate_blocked_reason = str(
+                    aggregate.get("blocked_reason")
+                    or "immutable broadcast policy is blocked"
+                )
         obligation_class = (
             str(admission.get("obligation_class"))
             if admission is not None
@@ -973,6 +1287,24 @@ class DetectionCommitGate:
                     or "cursor projection retry bound exhausted"
                 ),
                 key,
+            )
+        transfer_blocked_state = (
+            admission.get("transfer_blocked_state")
+            if admission is not None
+            else None
+        )
+        if (
+            admission is not None
+            and admission.get("state") == "open"
+            and isinstance(admission.get("broadcast_policy_close_pending"), dict)
+        ):
+            return Resolution(
+                ResolverState.OWED_UNSATISFIED,
+                "reserved dispatch owns pending broadcast policy close",
+                key,
+                scoped_revision=int(
+                    ledger["scoped_revisions"].get(inbound.id, 0)
+                ),
             )
         inbound_sequence = int(ledger["messages"].get(inbound.id, {}).get("sequence", 0))
         watermark = int(admission.get("watermark_sequence", 0)) if admission else inbound_sequence
@@ -1037,9 +1369,27 @@ class DetectionCommitGate:
                 and message.sender == inbound.sender
                 and _correlation(meta) == rid
             ):
+                supersedes = meta.get("supersedes")
+                if supersedes is not None:
+                    try:
+                        superseded_key = self._key_from(supersedes)
+                    except (TypeError, ValueError):
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "authorized exact-key supersession is uninterpretable",
+                            key,
+                            message.id,
+                            scope_revision,
+                        )
+                    if key is None or superseded_key != key:
+                        continue
                 return Resolution(
                     ResolverState.SUPERSEDED,
-                    "requester rescinded",
+                    (
+                        "requester superseded exact generation"
+                        if supersedes is not None
+                        else "requester rescinded all visible generations"
+                    ),
                     key,
                     message.id,
                     scope_revision,
@@ -1124,6 +1474,27 @@ class DetectionCommitGate:
                 key,
                 blocked_event.get("source_id"),
                 scope_revision,
+            )
+        if aggregate_blocked_reason is not None:
+            return Resolution(
+                ResolverState.BLOCKED,
+                aggregate_blocked_reason,
+                key,
+                scoped_revision=scope_revision,
+            )
+        if isinstance(transfer_blocked_state, str):
+            try:
+                transfer_state = ResolverState(transfer_blocked_state)
+            except ValueError:
+                transfer_state = ResolverState.BLOCKED
+            return Resolution(
+                transfer_state,
+                str(
+                    admission.get("transfer_blocked_reason")
+                    or "transfer destination validation is blocked"
+                ),
+                key,
+                scoped_revision=scope_revision,
             )
         if composing is not None and admission is not None:
             first = _epoch(admission.get("first_deferred_at"))
@@ -1351,6 +1722,8 @@ class DetectionCommitGate:
                 and intent.get("broadcast_id") is None
                 and intent.get("origin_request_id") == key.correlation_id
                 and intent.get("origin_inbound_id") == key.inbound_id
+                and intent.get("origin_obligation_key_digest") == key.digest
+                and _valid_hex_digest(intent.get("expected_roster_revision"))
             )
         broadcast_id = admission.get("broadcast_id")
         return bool(
@@ -1534,6 +1907,10 @@ class DetectionCommitGate:
             broadcast_id=intent.get("broadcast_id"),
             origin_request_id=intent.get("origin_request_id"),
             origin_inbound_id=intent.get("origin_inbound_id"),
+            origin_obligation_key_digest=intent.get(
+                "origin_obligation_key_digest"
+            ),
+            expected_roster_revision=intent.get("expected_roster_revision"),
         )
         marker = self.store.read_operation_intent(self.agent, nonce)
         payload = body.encode("utf-8")
@@ -1779,6 +2156,12 @@ class DetectionCommitGate:
             admission = ledger["obligations"].get(existing_id)
             if not isinstance(admission, dict):
                 return Resolution(ResolverState.INDETERMINATE, "admission index torn")
+            existing_key = self._key_from(admission["key"])
+            if self._reconcile_landed_pending_broadcast_close(existing_key):
+                ledger = self._load()
+                admission = ledger["obligations"].get(existing_id)
+                if not isinstance(admission, dict):
+                    return Resolution(ResolverState.INDETERMINATE, "admission index torn")
             replayed = self._resolve_replay(record, messages, ledger, admission=admission)
             if replayed.terminal:
                 breaker = ledger["breakers"].get(self.agent, {})
@@ -1806,6 +2189,121 @@ class DetectionCommitGate:
             ):
                 return self._persist_unsatisfied_attempts(classified)
             return classified
+        inbound_meta = inbound.meta if isinstance(inbound.meta, dict) else {}
+        if _valid_hex_digest(inbound_meta.get("transfer_from_key_digest")):
+            # Publishing the immutable target and committing the source transfer are
+            # separate operations.  The first ledger CAS wins: either the source has
+            # already admitted this target, or this wrapper aborts the orphan target
+            # without invoking the model.  A crash-before-transfer therefore cannot
+            # leave the destination queue parked on an INDETERMINATE head forever.
+            replay_revision = int(
+                ledger["scoped_revisions"].get(inbound.id, 0)
+            )
+            with self.store._exclusive_lock(
+                self.path.with_suffix(".lock"), timeout=10.0,
+            ):
+                current = self._load()
+                if int(current["scoped_revisions"].get(inbound.id, 0)) != (
+                    replay_revision
+                ):
+                    return Resolution(
+                        ResolverState.INDETERMINATE,
+                        "transfer-target abort CAS miss",
+                    )
+                if inbound.id in current["inbound_index"]:
+                    return Resolution(
+                        ResolverState.INDETERMINATE,
+                        "atomic source transfer won before target abort",
+                    )
+                claim = current["no_admission_claims"].get(inbound.id)
+                if isinstance(claim, dict):
+                    if claim.get("state") == "blocked":
+                        return Resolution(
+                            ResolverState.BLOCKED,
+                            str(
+                                claim.get("blocked_reason")
+                                or "transfer-target finalization blocked"
+                            ),
+                        )
+                    if (
+                        claim.get("resolution") != ResolverState.NOT_OWED.value
+                        or claim.get("state")
+                        not in {"open", "finalization_pending", "finalized"}
+                    ):
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "transfer-target abort conflicts with prior claim",
+                        )
+                    if (
+                        claim.get("state") in {"open", "finalization_pending"}
+                        and claim.get("fence") != self.fence
+                    ):
+                        if not self._can_reassign_no_admission_claim(claim):
+                            return Resolution(
+                                ResolverState.INDETERMINATE,
+                                "prior transfer-target abort owner is still authoritative",
+                            )
+                        previous_fence = claim.get("fence")
+                        claim["fence"] = self.fence
+                        claim["owner_pid"] = os.getpid()
+                        self._append(
+                            current,
+                            "NO_ADMISSION_CLAIM_REASSIGNED",
+                            scope=inbound.id,
+                            source_id=inbound.id,
+                            data={
+                                "previous_fence": previous_fence,
+                                "fence": self.fence,
+                                "reason": "transfer_target_abort",
+                            },
+                        )
+                        self._write(current)
+                else:
+                    claim = {
+                        "fence": self.fence,
+                        "owner_pid": os.getpid(),
+                        "state": "open",
+                        "resolution": ResolverState.NOT_OWED.value,
+                        "finalization_misses": 0,
+                        "finalization_first_at": None,
+                        "cursor_projection_misses": 0,
+                        "cursor_projection_first_at": None,
+                        "cursor_projection_inflight": False,
+                        "cursor_projection_reserved_at": None,
+                        "transfer_from_key_digest": inbound_meta.get(
+                            "transfer_from_key_digest"
+                        ),
+                    }
+                    current["no_admission_claims"][inbound.id] = claim
+                    self._append(
+                        current,
+                        "TRANSFER_TARGET_ABORTED",
+                        scope=inbound.id,
+                        source_id=inbound.id,
+                        data={
+                            "inbound_id": inbound.id,
+                            "transfer_from_key_digest": inbound_meta.get(
+                                "transfer_from_key_digest"
+                            ),
+                            "transfer_policy_generation": inbound_meta.get(
+                                "transfer_policy_generation"
+                            ),
+                        },
+                    )
+                    self._write(current)
+                scoped_revision = int(
+                    current["scoped_revisions"].get(inbound.id, 0)
+                )
+            return Resolution(
+                ResolverState.NOT_OWED,
+                (
+                    "no_admission_disposition_pending"
+                    if claim.get("state") == "finalized"
+                    else "no_admission_finalization_pending"
+                ),
+                scoped_revision=scoped_revision,
+                ledger_revision=scoped_revision,
+            )
         before = self._resolve_replay(record, messages, ledger, admission=None)
         if before.state in TERMINAL_STATES:
             with self.store._exclusive_lock(
@@ -1960,6 +2458,10 @@ class DetectionCommitGate:
                 "broadcast_policy_version": (inbound.meta or {}).get(
                     "broadcast_policy_version"
                 ),
+                "broadcast_generation": current["messages"].get(
+                    inbound.id,
+                    {},
+                ).get("broadcast_generation"),
             }
             current["obligations"][key.digest] = admission
             current["inbound_index"][inbound.id] = key.digest
@@ -1992,6 +2494,12 @@ class DetectionCommitGate:
         admission = ledger["obligations"].get(key_id)
         if not isinstance(admission, dict):
             return Resolution(ResolverState.INDETERMINATE, "admission missing")
+        key = self._key_from(admission["key"])
+        if self._reconcile_landed_pending_broadcast_close(key):
+            ledger = self._load()
+            admission = ledger["obligations"].get(key_id)
+            if not isinstance(admission, dict):
+                return Resolution(ResolverState.INDETERMINATE, "admission missing")
         replayed = self._resolve_replay(record, messages, ledger, admission=admission)
         if replayed.terminal:
             breaker = ledger["breakers"].get(self.agent, {})
@@ -2075,6 +2583,8 @@ class DetectionCommitGate:
             raise DispatchRefused("obligation is no longer open")
         if admission.get("fence") != self.fence or not self._live_dispatch_fence_owned():
             raise DispatchRefused("wrapper fence changed")
+        if isinstance(admission.get("transfer_blocked_state"), str):
+            raise DispatchRefused("transfer destination validation is blocked")
         current_policy = self._current_policy()
         activation = admission.get("activation_generation")
         readiness = admission.get("readiness_generation")
@@ -2212,6 +2722,10 @@ class DetectionCommitGate:
                     raise DispatchRefused("dispatch nonce index is torn")
                 permit = self._permit_from_reservation(key.digest, nonce, existing)
             else:
+                if isinstance(admission.get("broadcast_policy_close_pending"), dict):
+                    raise DispatchRefused(
+                        "broadcast policy is satisfied; only the reserved call may finish"
+                    )
                 if (
                     int(ledger["scoped_revisions"].get(key.inbound_id, 0))
                     != resolution.scoped_revision
@@ -2367,6 +2881,14 @@ class DetectionCommitGate:
                     for row in reservations.values()
                 ):
                     return None
+                if isinstance(admission.get("broadcast_policy_close_pending"), dict):
+                    self._complete_pending_broadcast_close_locked(
+                        ledger,
+                        admission,
+                        key,
+                    )
+                    self._write(ledger)
+                    return None
                 if any(
                     isinstance(row, dict) and row.get("state") == "action_infra"
                     for row in reservations.values()
@@ -2402,82 +2924,101 @@ class DetectionCommitGate:
         """Durably arm one permit, then add wrapper-owned transport facts."""
         decorated = dict(record)
         executable = self._pinned_executable()
-        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
-            ledger = self._load(create=False)
-            admission = ledger["obligations"].get(permit.key_digest)
-            if not isinstance(admission, dict):
-                raise DispatchRefused("dispatch admission disappeared")
-            key = self._key_from(admission["key"])
-            current_revision = int(
-                ledger["scoped_revisions"].get(key.inbound_id, 0),
-            )
-            self._validate_dispatch_authority(
-                ledger,
-                admission,
-                key,
-                Resolution(
-                    ResolverState.OWED_UNSATISFIED,
-                    "dispatch permit revalidation",
-                    key,
-                    scoped_revision=current_revision,
-                    activation_generation=str(admission.get("activation_generation")),
-                    readiness_generation=str(admission.get("readiness_generation")),
-                ),
-            )
-            reservation = admission.get("reservations", {}).get(permit.nonce)
-            if (
-                not isinstance(reservation, dict)
-                or reservation.get("state") != "reserved"
-                or reservation.get("purpose") != permit.purpose
-                or reservation.get("composing_nonce") != permit.composing_nonce
-                or reservation.get("budgets_digest") != permit.budgets_digest
-                or Path(str(reservation.get("draft_path", ""))) != permit.draft_path
-                or int(reservation.get("paid_dispatches_total", 0))
-                != permit.paid_dispatches_total
+        with self.store._config_lock(timeout=10.0):
+            cfg = self.store.load_config()
+            roster = _roster_snapshot(cfg)
+            recipient = cfg.get("operator_facing")
+            if not isinstance(recipient, str) or recipient not in roster[
+                "authorized_liaisons"
+            ]:
+                candidates = [
+                    candidate for candidate in roster["authorized_liaisons"]
+                    if candidate != self.agent
+                ]
+                recipient = candidates[0] if len(candidates) == 1 else None
+            with self.store._exclusive_lock(
+                self.path.with_suffix(".lock"), timeout=10.0
             ):
-                raise DispatchRefused(
-                    "dispatch permit draft path or authority does not match its reservation",
+                ledger = self._load(create=False)
+                admission = ledger["obligations"].get(permit.key_digest)
+                if not isinstance(admission, dict):
+                    raise DispatchRefused("dispatch admission disappeared")
+                key = self._key_from(admission["key"])
+                current_revision = int(
+                    ledger["scoped_revisions"].get(key.inbound_id, 0),
                 )
-            obligation_class = admission.get("obligation_class")
-            record_meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
-            if obligation_class == "human_escalation":
-                recipient = self.store.operator_facing() or self.store.sole_lead()
-                if not isinstance(recipient, str) or recipient == self.agent:
-                    raise DispatchRefused("human escalation has no external operator target")
-                operation_intent = {
-                    "operation": "terminal",
-                    "kind": "question",
-                    "recipient": recipient,
-                    "in_reply_to": record.get("id"),
-                    "request_id": f"esc-{permit.nonce[:12]}",
-                    "broadcast_id": None,
-                    "origin_request_id": record.get("correlation_id"),
-                    "origin_inbound_id": record.get("id"),
-                }
-            else:
-                operation_intent = {
-                    "operation": "terminal",
-                    "kind": "message",
-                    "recipient": key.requester,
-                    "in_reply_to": record.get("id"),
-                    "request_id": record_meta.get("request_id"),
-                    "broadcast_id": record_meta.get("broadcast_id"),
-                    "origin_request_id": None,
-                    "origin_inbound_id": None,
-                }
-            reservation["state"] = "dispatching"
-            reservation["dispatch_started_at"] = self.now()
-            reservation["dispatch_fence"] = self.fence
-            reservation["dispatch_owner_pid"] = os.getpid()
-            reservation["operation_intent"] = operation_intent
-            self._append(
-                ledger,
-                "DISPATCH_ATTEMPT_STARTED",
-                key_digest=permit.key_digest,
-                data={"nonce": permit.nonce, "purpose": permit.purpose},
-            )
-            self._write(ledger)
-            requested_budgets = dict(reservation["budgets"])
+                self._validate_dispatch_authority(
+                    ledger,
+                    admission,
+                    key,
+                    Resolution(
+                        ResolverState.OWED_UNSATISFIED,
+                        "dispatch permit revalidation",
+                        key,
+                        scoped_revision=current_revision,
+                        activation_generation=str(admission.get("activation_generation")),
+                        readiness_generation=str(admission.get("readiness_generation")),
+                    ),
+                )
+                reservation = admission.get("reservations", {}).get(permit.nonce)
+                if (
+                    not isinstance(reservation, dict)
+                    or reservation.get("state") != "reserved"
+                    or reservation.get("purpose") != permit.purpose
+                    or reservation.get("composing_nonce") != permit.composing_nonce
+                    or reservation.get("budgets_digest") != permit.budgets_digest
+                    or Path(str(reservation.get("draft_path", ""))) != permit.draft_path
+                    or int(reservation.get("paid_dispatches_total", 0))
+                    != permit.paid_dispatches_total
+                ):
+                    raise DispatchRefused(
+                        "dispatch permit draft path or authority does not match its reservation",
+                    )
+                obligation_class = admission.get("obligation_class")
+                record_meta = (
+                    record.get("meta") if isinstance(record.get("meta"), dict) else {}
+                )
+                if obligation_class == "human_escalation":
+                    if not isinstance(recipient, str) or recipient == self.agent:
+                        raise DispatchRefused(
+                            "human escalation has no external operator target"
+                        )
+                    operation_intent = {
+                        "operation": "terminal",
+                        "kind": "question",
+                        "recipient": recipient,
+                        "in_reply_to": record.get("id"),
+                        "request_id": f"esc-{permit.nonce[:12]}",
+                        "broadcast_id": None,
+                        "origin_request_id": record.get("correlation_id"),
+                        "origin_inbound_id": record.get("id"),
+                        "origin_obligation_key_digest": key.digest,
+                        "expected_roster_revision": roster["revision"],
+                    }
+                else:
+                    operation_intent = {
+                        "operation": "terminal",
+                        "kind": "message",
+                        "recipient": key.requester,
+                        "in_reply_to": record.get("id"),
+                        "request_id": record_meta.get("request_id"),
+                        "broadcast_id": record_meta.get("broadcast_id"),
+                        "origin_request_id": None,
+                        "origin_inbound_id": None,
+                    }
+                reservation["state"] = "dispatching"
+                reservation["dispatch_started_at"] = self.now()
+                reservation["dispatch_fence"] = self.fence
+                reservation["dispatch_owner_pid"] = os.getpid()
+                reservation["operation_intent"] = operation_intent
+                self._append(
+                    ledger,
+                    "DISPATCH_ATTEMPT_STARTED",
+                    key_digest=permit.key_digest,
+                    data={"nonce": permit.nonce, "purpose": permit.purpose},
+                )
+                self._write(ledger)
+                requested_budgets = dict(reservation["budgets"])
         if obligation_class == "human_escalation":
             argv = [
                 executable,
@@ -2494,6 +3035,16 @@ class DetectionCommitGate:
                 str(record.get("id")),
                 "--meta",
                 f"request_id={operation_intent['request_id']}",
+                "--meta",
+                (
+                    "expected_roster_revision="
+                    f"{operation_intent['expected_roster_revision']}"
+                ),
+                "--meta",
+                (
+                    "origin_obligation_key_digest="
+                    f"{operation_intent['origin_obligation_key_digest']}"
+                ),
                 "--operation-nonce",
                 permit.nonce,
                 "--file",
@@ -2813,6 +3364,13 @@ class DetectionCommitGate:
                 if not action_attempted:
                     admission["owed_action_missing_seen"] = True
             self._append(ledger, transition, key_digest=permit.key_digest)
+            if isinstance(admission.get("broadcast_policy_close_pending"), dict):
+                key = self._key_from(admission["key"])
+                self._complete_pending_broadcast_close_locked(
+                    ledger,
+                    admission,
+                    key,
+                )
             self._write(ledger)
 
     def mark_unsatisfied_attempt(self, permit: DispatchPermit, *, reason: str) -> None:
@@ -2847,7 +3405,7 @@ class DetectionCommitGate:
         except LedgerUnreadable:
             return None
         admission = ledger["obligations"].get(key.digest)
-        if not isinstance(admission, dict):
+        if not isinstance(admission, dict) or admission.get("state") != "open":
             return None
         for nonce, row in admission.get("reservations", {}).items():
             if (
@@ -2953,6 +3511,16 @@ class DetectionCommitGate:
                 str(operation_intent["origin_inbound_id"]),
                 "--meta",
                 f"request_id={operation_intent['request_id']}",
+                "--meta",
+                (
+                    "expected_roster_revision="
+                    f"{operation_intent['expected_roster_revision']}"
+                ),
+                "--meta",
+                (
+                    "origin_obligation_key_digest="
+                    f"{operation_intent['origin_obligation_key_digest']}"
+                ),
                 "--operation-nonce",
                 permit.nonce,
                 "--file",
@@ -3356,6 +3924,10 @@ class DetectionCommitGate:
                 broadcast_id=intent.get("broadcast_id"),
                 origin_request_id=intent.get("origin_request_id"),
                 origin_inbound_id=intent.get("origin_inbound_id"),
+                origin_obligation_key_digest=intent.get(
+                    "origin_obligation_key_digest"
+                ),
+                expected_roster_revision=intent.get("expected_roster_revision"),
             )
             if not isinstance(marker, dict):
                 return block_locked(
@@ -3761,6 +4333,14 @@ class DetectionCommitGate:
             raise GateError("nonterminal resolution cannot finalize")
         projection_block: str | None = None
         key = resolution.key
+        if key is not None and any((
+            key.responder != self.agent,
+            record.get("id") != key.inbound_id,
+            record.get("to") != key.responder,
+            record.get("from") != key.requester,
+            record.get("correlation_id") != key.correlation_id,
+        )):
+            raise GateError("finalizer record does not match the exact inbound key")
         inbound_id = str(key.inbound_id if key is not None else record.get("id"))
         key_digest = key.digest if key is not None else None
         with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
@@ -3780,6 +4360,10 @@ class DetectionCommitGate:
                     if resolution.state == ResolverState.DELIVERY_EXHAUSTED
                     else "operator_resolved"
                     if resolution.state == ResolverState.OPERATOR_RESOLVED
+                    else "transferred"
+                    if resolution.state == ResolverState.TRANSFERRED
+                    else "broadcast_policy_satisfied"
+                    if resolution.state == ResolverState.BROADCAST_POLICY_SATISFIED
                     else "finalized"
                 )
                 disposition = ledger["cursor_dispositions"].get(self.agent)
@@ -3815,13 +4399,23 @@ class DetectionCommitGate:
                         return Resolution(ResolverState.BLOCKED, reason, key)
                     write_required = False
                 else:
-                    if admission.get("state") != "open":
+                    policy_or_transfer_preclosed = bool(
+                        resolution.state in {
+                            ResolverState.TRANSFERRED,
+                            ResolverState.BROADCAST_POLICY_SATISFIED,
+                        }
+                        and admission.get("state") == persisted_admission_state
+                        and admission.get("terminal_state") == resolution.state.value
+                    )
+                    if admission.get("state") != "open" and not policy_or_transfer_preclosed:
                         return Resolution(
                             ResolverState.INDETERMINATE,
                             "finalized cursor disposition is torn",
                             key,
                         )
-                    if int(ledger["scoped_revisions"].get(key.inbound_id, 0)) != (
+                    if not policy_or_transfer_preclosed and int(
+                        ledger["scoped_revisions"].get(key.inbound_id, 0)
+                    ) != (
                         resolution.scoped_revision
                     ):
                         exhausted = self._record_finalization_miss_locked(
@@ -3843,7 +4437,8 @@ class DetectionCommitGate:
                     admission["state"] = persisted_admission_state
                     admission["finalization_retry_inflight"] = False
                     admission["terminal_state"] = resolution.state.value
-                    admission["terminal_evidence_id"] = resolution.evidence_id
+                    if not policy_or_transfer_preclosed:
+                        admission["terminal_evidence_id"] = resolution.evidence_id
                     admission["finalized_at"] = self.now()
                     self._append(
                         ledger,
@@ -3855,7 +4450,11 @@ class DetectionCommitGate:
                     if resolution.compliance_success:
                         self._reset_compliance_streak_locked(ledger, key)
                     if resolution.state == ResolverState.SATISFIED:
-                        self._apply_broadcast_policy_locked(ledger, key, admission)
+                        self._apply_broadcast_policy_locked(
+                            ledger,
+                            broadcast_id=admission.get("broadcast_id"),
+                            broadcast_generation=admission.get("broadcast_generation"),
+                        )
                 owner = admission
             else:
                 claim = ledger["no_admission_claims"].get(record.get("id"))
@@ -3934,6 +4533,14 @@ class DetectionCommitGate:
                     )
                     claim["state"] = "finalized"
                     claim["finalized_at"] = self.now()
+                    claim["terminal_evidence_id"] = resolution.evidence_id
+                    if resolution.state == ResolverState.SATISFIED:
+                        indexed = ledger["messages"].get(record.get("id"), {})
+                        self._apply_broadcast_policy_locked(
+                            ledger,
+                            broadcast_id=indexed.get("broadcast_id"),
+                            broadcast_generation=indexed.get("broadcast_generation"),
+                        )
                 owner = claim
             if write_required:
                 disposition_state = (
@@ -4034,76 +4641,526 @@ class DetectionCommitGate:
             pass
         return resolution
 
+    def _broadcast_qualifying_answers_locked(
+        self,
+        ledger: dict,
+        aggregate: dict,
+    ) -> list[tuple[int, str, str, str]]:
+        """Return canonical answer evidence for the current aggregate generation."""
+        descriptor = aggregate.get("descriptor")
+        if not isinstance(descriptor, dict):
+            return []
+        bid = descriptor.get("broadcast_id")
+        requester = descriptor.get("requester")
+        members = descriptor.get("membership_snapshot")
+        if (
+            not isinstance(bid, str)
+            or not isinstance(requester, str)
+            or not isinstance(members, list)
+        ):
+            return []
+        generation = int(aggregate.get("generation", 1))
+        qualifying: list[tuple[int, str, str, str]] = []
+        for member, inbound_ids in aggregate.get("member_inbounds", {}).items():
+            if member not in members or not isinstance(inbound_ids, list):
+                continue
+            for inbound_id in inbound_ids:
+                inbound_row = ledger["messages"].get(inbound_id)
+                if not isinstance(inbound_id, str) or not isinstance(inbound_row, dict):
+                    continue
+                if any((
+                    int(inbound_row.get("broadcast_generation", 1)) != generation,
+                    inbound_row.get("kind") != "question",
+                    inbound_row.get("sender") != requester,
+                    inbound_row.get("recipient") != member,
+                    inbound_row.get("correlation_id") != bid,
+                    inbound_row.get("request_id") != bid,
+                    inbound_row.get("broadcast_id") != bid,
+                )):
+                    continue
+                key_id = ledger["inbound_index"].get(inbound_id)
+                admission = ledger["obligations"].get(key_id) if key_id else None
+                reservations: dict = {}
+                if isinstance(admission, dict):
+                    try:
+                        key = self._key_from(admission.get("key"))
+                    except (TypeError, ValueError):
+                        continue
+                    if any((
+                        key.inbound_id != inbound_id,
+                        key.correlation_id != bid,
+                        key.requester != requester,
+                        key.responder != member,
+                        admission.get("obligation_class") != "answer",
+                        int(admission.get("broadcast_generation") or 1) != generation,
+                    )):
+                        continue
+                    reservations = admission.get("reservations", {})
+                    if not isinstance(reservations, dict):
+                        continue
+                else:
+                    claim = ledger["no_admission_claims"].get(inbound_id)
+                    evidence_id = (
+                        claim.get("terminal_evidence_id")
+                        if isinstance(claim, dict)
+                        and claim.get("resolution") == ResolverState.SATISFIED.value
+                        and claim.get("state") in {"finalization_pending", "finalized"}
+                        else None
+                    )
+                    evidence = ledger["messages"].get(evidence_id)
+                    if not isinstance(evidence, dict) or any((
+                        int(evidence.get("sequence", 0))
+                        <= int(inbound_row.get("sequence", 0)),
+                        evidence.get("in_reply_to") != inbound_id,
+                        evidence.get("correlation_id") != bid,
+                        evidence.get("sender") != member,
+                        evidence.get("recipient") != requester,
+                        evidence.get("kind") in CONTROL_KINDS,
+                    )):
+                        continue
+                    qualifying.append((
+                        int(evidence["sequence"]),
+                        str(evidence_id),
+                        str(member),
+                        inbound_id,
+                    ))
+                    continue
+
+                for message_id, message_row in ledger["messages"].items():
+                    if not isinstance(message_row, dict):
+                        continue
+                    nonce = message_row.get("operation_nonce")
+                    if not (
+                        int(message_row.get("sequence", 0))
+                        > int(inbound_row.get("sequence", 0))
+                        and message_row.get("in_reply_to") == inbound_id
+                        and message_row.get("correlation_id") == bid
+                        and message_row.get("sender") == member
+                        and message_row.get("recipient") == requester
+                        and message_row.get("kind") not in CONTROL_KINDS
+                        and message_row.get("operation_payload_valid") is True
+                        and isinstance(nonce, str)
+                        and isinstance(reservations.get(nonce), dict)
+                    ):
+                        continue
+                    qualifying.append((
+                        int(message_row["sequence"]),
+                        message_id,
+                        str(member),
+                        inbound_id,
+                    ))
+                    break
+        return sorted(qualifying, key=lambda item: (item[0], item[1]))
+
     def _apply_broadcast_policy_locked(
         self,
         ledger: dict,
-        winning_key: ObligationKey,
-        winning_admission: dict,
+        *,
+        broadcast_id: object,
+        broadcast_generation: object,
     ) -> None:
-        bid = winning_admission.get("broadcast_id")
-        policy = winning_admission.get("response_policy")
-        members = winning_admission.get("membership_snapshot")
-        if not isinstance(bid, str) or policy == "each" or not isinstance(members, list):
+        bid = broadcast_id
+        if not isinstance(bid, str):
             return
-        threshold = 1 if policy == "any" else winning_admission.get("response_quorum")
+        aggregate = ledger["broadcasts"].get(bid)
+        if not isinstance(aggregate, dict) or aggregate.get("state") != "open":
+            return
+        if int(broadcast_generation or 1) != int(aggregate.get("generation", 1)):
+            return
+        descriptor = aggregate.get("descriptor")
+        if not isinstance(descriptor, dict):
+            return
+        policy = descriptor.get("response_policy")
+        members = descriptor.get("membership_snapshot")
+        requester = descriptor.get("requester")
+        if (
+            policy not in {"each", "any", "quorum"}
+            or not isinstance(members, list)
+            or not isinstance(requester, str)
+        ):
+            return
+        qualifying = self._broadcast_qualifying_answers_locked(ledger, aggregate)
+        threshold = (
+            len(members)
+            if policy == "each"
+            else 1
+            if policy == "any"
+            else descriptor.get("response_quorum")
+        )
         if not isinstance(threshold, int) or threshold < 1:
             return
-        winners = [
-            (key_id, row)
-            for key_id, row in ledger["obligations"].items()
-            if isinstance(row, dict)
-            and row.get("broadcast_id") == bid
-            and row.get("terminal_state") == ResolverState.SATISFIED.value
-            and isinstance(row.get("terminal_evidence_id"), str)
-        ]
-        if len(winners) < threshold:
-            return
-        winners.sort(key=lambda item: int(
-            ledger["messages"].get(item[1]["terminal_evidence_id"], {}).get(
-                "sequence", 0
-            )
-        ))
-        winning_ids = [row["terminal_evidence_id"] for _, row in winners[:threshold]]
-        for inbound_id, message_row in ledger["messages"].items():
-            if not isinstance(message_row, dict):
+        earliest_by_member: dict[str, tuple[int, str, str, str]] = {}
+        for candidate in qualifying:
+            earliest_by_member.setdefault(candidate[2], candidate)
+        ordered = sorted(earliest_by_member.values(), key=lambda item: item[0])
+        if policy == "each":
+            if set(earliest_by_member) != set(members):
+                return
+            winners = ordered
+        else:
+            if len(ordered) < threshold:
+                return
+            winners = ordered[:threshold]
+        winning_ids = [candidate[1] for candidate in winners]
+        winning_inbounds = {candidate[3] for candidate in winners}
+        transaction_id = hashlib.sha256(_canonical({
+            "broadcast_descriptor_digest": aggregate.get("descriptor_digest"),
+            "winning_ids": winning_ids,
+        }).encode("utf-8")).hexdigest()
+
+        affected: list[dict] = []
+        close_candidates: list[tuple[str, str | None, dict | None, str]] = []
+        pending_candidates: list[tuple[dict, dict]] = []
+        conflict: tuple[str, str | None, str] | None = None
+        current_generation = int(aggregate.get("generation", 1))
+        for member, inbound_ids in sorted(aggregate.get("member_inbounds", {}).items()):
+            if member not in members or not isinstance(inbound_ids, list):
                 continue
-            if (
-                message_row.get("kind") != "question"
-                or message_row.get("broadcast_id") != bid
-                or message_row.get("recipient") not in members
-            ):
-                continue
-            key_id = ledger["inbound_index"].get(inbound_id)
-            admission = ledger["obligations"].get(key_id) if key_id else None
-            if key_id == winning_key.digest:
-                continue
-            if isinstance(admission, dict):
-                if admission.get("state") != "open":
+            for inbound_id in inbound_ids:
+                inbound_row = ledger["messages"].get(inbound_id)
+                if (
+                    not isinstance(inbound_id, str)
+                    or not isinstance(inbound_row, dict)
+                    or int(inbound_row.get("broadcast_generation", 1))
+                    != current_generation
+                ):
                     continue
-                admission["state"] = "broadcast_policy_satisfied"
-                admission["terminal_state"] = (
-                    ResolverState.BROADCAST_POLICY_SATISFIED.value
-                )
-            elif any(
-                event.get("transition") == "BROADCAST_POLICY_SATISFIED"
-                and isinstance(event.get("data"), dict)
-                and event["data"].get("inbound_id") == inbound_id
-                for event in ledger["transitions"]
-            ):
-                continue
+                if inbound_id in winning_inbounds:
+                    continue
+                key_id = ledger["inbound_index"].get(inbound_id)
+                admission = ledger["obligations"].get(key_id) if key_id else None
+                outcome = "prospective_policy_close"
+                if isinstance(admission, dict):
+                    if admission.get("state") != "open":
+                        continue
+                    try:
+                        affected_key = self._key_from(admission.get("key"))
+                    except (TypeError, ValueError):
+                        conflict = conflict or (
+                            inbound_id,
+                            key_id,
+                            "broadcast admission key is invalid",
+                        )
+                        continue
+                    if any((
+                        affected_key.inbound_id != inbound_id,
+                        affected_key.correlation_id != bid,
+                        affected_key.requester != requester,
+                        affected_key.responder != member,
+                        int(admission.get("broadcast_generation") or 1)
+                        != current_generation,
+                    )):
+                        conflict = conflict or (
+                            inbound_id,
+                            key_id,
+                            "broadcast admission identity conflicts with frozen policy",
+                        )
+                        continue
+                    reservations = admission.get("reservations", {})
+                    if not isinstance(reservations, dict):
+                        conflict = conflict or (
+                            inbound_id,
+                            key_id,
+                            "broadcast admission reservations are invalid",
+                        )
+                        continue
+                    armed = any(
+                        isinstance(row, dict)
+                        and row.get("state") in {"reserved", "dispatching", "action_infra"}
+                        for row in reservations.values()
+                    )
+                    if armed:
+                        outcome = "reservation_won"
+                    else:
+                        outcome = "policy_close"
+                affected.append({
+                    "member": member,
+                    "inbound_id": inbound_id,
+                    "key_digest": key_id,
+                    "scoped_revision": int(
+                        ledger["scoped_revisions"].get(inbound_id, 0)
+                    ),
+                    "outcome": outcome,
+                })
+                if outcome == "reservation_won" and isinstance(admission, dict):
+                    pending_candidates.append((admission, {
+                        "transaction_id": transaction_id,
+                        "winning_ids": list(winning_ids),
+                        "winning_classes": ["answer"] * len(winning_ids),
+                        "broadcast_id": bid,
+                        "broadcast_generation": current_generation,
+                        "policy": policy,
+                    }))
+                else:
+                    close_candidates.append((inbound_id, key_id, admission, member))
+
+        if conflict is not None:
+            conflict_inbound, conflict_key, conflict_reason = conflict
+            aggregate["state"] = "blocked"
+            aggregate["blocked_reason"] = conflict_reason
             self._append(
+                ledger,
+                "BROADCAST_POLICY_CONFLICT",
+                scope=conflict_inbound,
+                key_digest=conflict_key,
+                data={"broadcast_id": bid, "reason": conflict_reason},
+            )
+            return
+
+        aggregate_event = self._append(
+            ledger,
+            "BROADCAST_POLICY_SATISFIED",
+            source_id=winning_ids[-1],
+            data={
+                "aggregate": True,
+                "broadcast_id": bid,
+                "broadcast_policy_version": descriptor["broadcast_policy_version"],
+                "broadcast_generation": aggregate.get("generation", 1),
+                "policy": policy,
+                "response_quorum": descriptor.get("response_quorum"),
+                "winning_ids": winning_ids,
+                "winning_classes": ["answer"] * len(winning_ids),
+                "affected_member_keys": affected,
+                "transaction_id": transaction_id,
+                "descriptor_digest": aggregate.get("descriptor_digest"),
+            },
+        )
+        aggregate.update({
+            "state": "policy_satisfied",
+            "winning_ids": winning_ids,
+            "winning_classes": ["answer"] * len(winning_ids),
+            "affected_member_keys": affected,
+            "transaction_id": transaction_id,
+            "aggregate_sequence": aggregate_event["sequence"],
+        })
+        ledger["delivery_index"].setdefault(bid, []).append({
+            "kind": "BROADCAST_POLICY_SATISFIED",
+            "sequence": aggregate_event["sequence"],
+            "key_digest": (
+                ledger["inbound_index"].get(winners[-1][3])
+                if winners
+                else None
+            ),
+            "inbound_id": winners[-1][3],
+            "question_generation": None,
+            "delivery_generation": None,
+            "requester": requester,
+            "responder": "*",
+            "state": ResolverState.BROADCAST_POLICY_SATISFIED.value,
+            "aggregate": True,
+            "broadcast_id": bid,
+            "response_policy": policy,
+            "response_quorum": descriptor.get("response_quorum"),
+            "broadcast_policy_version": descriptor["broadcast_policy_version"],
+            "broadcast_generation": aggregate.get("generation", 1),
+            "winning_ids": winning_ids,
+            "transaction_id": transaction_id,
+        })
+        for admission, pending in pending_candidates:
+            admission["broadcast_policy_close_pending"] = pending
+        for inbound_id, key_id, admission, _member in close_candidates:
+            member_event = self._append(
                 ledger,
                 "BROADCAST_POLICY_SATISFIED",
                 scope=inbound_id,
                 source_id=winning_ids[-1],
                 key_digest=key_id,
                 data={
+                    "aggregate": False,
                     "broadcast_id": bid,
                     "inbound_id": inbound_id,
                     "winning_ids": winning_ids,
+                    "winning_classes": ["answer"] * len(winning_ids),
                     "policy": policy,
+                    "broadcast_policy_version": descriptor["broadcast_policy_version"],
+                    "broadcast_generation": aggregate.get("generation", 1),
+                    "transaction_id": transaction_id,
                 },
             )
+            if isinstance(admission, dict):
+                admission["state"] = "broadcast_policy_satisfied"
+                admission["terminal_state"] = (
+                    ResolverState.BROADCAST_POLICY_SATISFIED.value
+                )
+                admission["terminal_evidence_id"] = str(member_event["sequence"])
+
+    def _complete_pending_broadcast_close_locked(
+        self,
+        ledger: dict,
+        admission: dict,
+        key: ObligationKey,
+    ) -> None:
+        """Close a nonwinning member after its already-reserved call is classified."""
+        pending = admission.get("broadcast_policy_close_pending")
+        if not isinstance(pending, dict) or admission.get("state") != "open":
+            return
+        bid = pending.get("broadcast_id")
+        winning_ids = pending.get("winning_ids")
+        aggregate = ledger["broadcasts"].get(bid) if isinstance(bid, str) else None
+        descriptor = aggregate.get("descriptor") if isinstance(aggregate, dict) else None
+        pending_generation = pending.get("broadcast_generation")
+        transaction_id = pending.get("transaction_id")
+        descriptor_digest = (
+            aggregate.get("descriptor_digest")
+            if isinstance(aggregate, dict)
+            else None
+        )
+        expected_transaction_id = (
+            hashlib.sha256(_canonical({
+                "broadcast_descriptor_digest": descriptor_digest,
+                "winning_ids": winning_ids,
+            }).encode("utf-8")).hexdigest()
+            if isinstance(winning_ids, list)
+            else None
+        )
+        affected = (
+            aggregate.get("affected_member_keys")
+            if isinstance(aggregate, dict)
+            else None
+        )
+        inbound_row = ledger["messages"].get(key.inbound_id)
+        exact_affected = [
+            row for row in affected
+            if isinstance(row, dict)
+            and row.get("member") == key.responder
+            and row.get("inbound_id") == key.inbound_id
+            and row.get("key_digest") == key.digest
+            and row.get("outcome") == "reservation_won"
+        ] if isinstance(affected, list) else []
+        proof_valid = bool(
+            isinstance(bid, str)
+            and isinstance(winning_ids, list)
+            and winning_ids
+            and all(isinstance(message_id, str) for message_id in winning_ids)
+            and isinstance(pending_generation, int)
+            and isinstance(transaction_id, str)
+            and transaction_id
+            and isinstance(aggregate, dict)
+            and aggregate.get("state") == "policy_satisfied"
+            and aggregate.get("generation") == pending_generation
+            and aggregate.get("transaction_id") == transaction_id
+            and transaction_id == expected_transaction_id
+            and aggregate.get("winning_ids") == winning_ids
+            and aggregate.get("winning_classes") == pending.get("winning_classes")
+            and isinstance(descriptor, dict)
+            and descriptor_digest == _broadcast_descriptor_digest(descriptor)
+            and descriptor.get("broadcast_id") == bid
+            and descriptor.get("requester") == key.requester
+            and isinstance(descriptor.get("membership_snapshot"), list)
+            and key.responder in descriptor["membership_snapshot"]
+            and descriptor.get("response_policy") == pending.get("policy")
+            and key.correlation_id == bid
+            and admission.get("broadcast_id") == bid
+            and admission.get("broadcast_generation") == pending_generation
+            and ledger["inbound_index"].get(key.inbound_id) == key.digest
+            and ledger["obligations"].get(key.digest) is admission
+            and isinstance(inbound_row, dict)
+            and inbound_row.get("sender") == key.requester
+            and inbound_row.get("recipient") == key.responder
+            and inbound_row.get("correlation_id") == bid
+            and inbound_row.get("request_id") == bid
+            and inbound_row.get("broadcast_id") == bid
+            and inbound_row.get("broadcast_generation") == pending_generation
+            and len(exact_affected) == 1
+        )
+        if not proof_valid:
+            admission["state"] = "blocked"
+            admission["blocked_reason"] = (
+                "pending broadcast close does not match the policy-satisfied aggregate"
+            )
+            self._append(
+                ledger,
+                "OBLIGATION_BLOCKED",
+                scope=key.inbound_id,
+                key_digest=key.digest,
+                data={"reason": admission["blocked_reason"]},
+            )
+            admission.pop("broadcast_policy_close_pending", None)
+            return
+        member_event = self._append(
+            ledger,
+            "BROADCAST_POLICY_SATISFIED",
+            scope=key.inbound_id,
+            source_id=winning_ids[-1],
+            key_digest=key.digest,
+            data={
+                "aggregate": False,
+                "broadcast_id": bid,
+                "inbound_id": key.inbound_id,
+                "winning_ids": list(winning_ids),
+                "winning_classes": list(pending.get("winning_classes") or []),
+                "policy": pending.get("policy"),
+                "broadcast_policy_version": 1,
+                "broadcast_generation": pending.get("broadcast_generation"),
+                "transaction_id": transaction_id,
+                "reservation_won": True,
+            },
+        )
+        admission["state"] = "broadcast_policy_satisfied"
+        admission["terminal_state"] = ResolverState.BROADCAST_POLICY_SATISFIED.value
+        admission["terminal_evidence_id"] = str(member_event["sequence"])
+        admission.pop("broadcast_policy_close_pending", None)
+
+        aggregate_sequence = int(aggregate.get("aggregate_sequence", 0))
+        already_late = {
+            event.get("source_id")
+            for event in ledger["transitions"]
+            if event.get("transition") == "LATE_RESPONSE"
+            and event.get("key_digest") == key.digest
+        }
+        for message_id, row in ledger["messages"].items():
+            if not isinstance(row, dict) or any((
+                int(row.get("sequence", 0)) <= aggregate_sequence,
+                row.get("in_reply_to") != key.inbound_id,
+                row.get("correlation_id") != bid,
+                row.get("sender") != key.responder,
+                row.get("recipient") != key.requester,
+                row.get("kind") in CONTROL_KINDS,
+                message_id in winning_ids,
+                message_id in already_late,
+            )):
+                continue
+            self._append(
+                ledger,
+                "LATE_RESPONSE",
+                scope=key.inbound_id,
+                source_id=message_id,
+                key_digest=key.digest,
+                data={
+                    "broadcast_id": bid,
+                    "closed_state": "broadcast_policy_satisfied",
+                    "transaction_id": transaction_id,
+                },
+            )
+
+    def _reconcile_landed_pending_broadcast_close(
+        self,
+        key: ObligationKey,
+    ) -> bool:
+        """Make a landed reserved response informational before replay can classify it."""
+        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
+            ledger = self._load()
+            admission = ledger["obligations"].get(key.digest)
+            if (
+                not isinstance(admission, dict)
+                or not isinstance(admission.get("broadcast_policy_close_pending"), dict)
+            ):
+                return False
+            aggregate = ledger["broadcasts"].get(admission.get("broadcast_id"))
+            if not isinstance(aggregate, dict):
+                return False
+            landed = any(
+                candidate[3] == key.inbound_id
+                for candidate in self._broadcast_qualifying_answers_locked(
+                    ledger,
+                    aggregate,
+                )
+            )
+            if not landed:
+                return False
+            self._complete_pending_broadcast_close_locked(ledger, admission, key)
+            self._write(ledger)
+            return True
 
     @staticmethod
     def _delivery_transaction_intact(
@@ -4494,8 +5551,26 @@ class DetectionCommitGate:
         ]
         if not failures:
             return None
+        aggregate_state = ledger["broadcasts"].get(request_id)
+        current_broadcast_generation = (
+            int(aggregate_state.get("generation", 1))
+            if isinstance(aggregate_state, dict)
+            else None
+        )
+        policy_terminals = [
+            row for row in failures
+            if row.get("state") == ResolverState.BROADCAST_POLICY_SATISFIED.value
+            and row.get("aggregate") is True
+            and (
+                current_broadcast_generation is None
+                or int(row.get("broadcast_generation", 1))
+                == current_broadcast_generation
+            )
+        ]
+        if policy_terminals:
+            return dict(policy_terminals[-1])
         try:
-            messages = self.store.valid_messages()
+            messages = self.store.publication_ordered_messages()
         except (OSError, ValueError, TimeoutError, RuntimeError):
             return None
         canonical_order = {
@@ -4532,51 +5607,58 @@ class DetectionCommitGate:
         broadcast = [
             (key, admission) for key, admission in admissions
             if admission.get("broadcast_id") == request_id
+            and (
+                current_broadcast_generation is None
+                or int(admission.get("broadcast_generation") or 1)
+                == current_broadcast_generation
+            )
         ]
-        if broadcast:
-            latest_by_responder: dict[str, tuple[ObligationKey, dict]] = {}
-            for key, admission in broadcast:
-                prior = latest_by_responder.get(key.responder)
-                if prior is None or (
-                    key.question_generation,
-                    key.delivery_generation,
-                ) > (
-                    prior[0].question_generation,
-                    prior[0].delivery_generation,
-                ):
-                    latest_by_responder[key.responder] = (key, admission)
-            active = list(latest_by_responder.values())
-            pinned = active[0][1]
-            policy = pinned.get("response_policy")
-            members = pinned.get("membership_snapshot")
+        if broadcast and isinstance(aggregate_state, dict):
+            descriptor = aggregate_state.get("descriptor")
+            if not isinstance(descriptor, dict) or descriptor.get("requester") != requester:
+                return None
+            policy = descriptor.get("response_policy")
+            members = descriptor.get("membership_snapshot")
             threshold = (
                 1
                 if policy == "any"
-                else pinned.get("response_quorum")
+                else descriptor.get("response_quorum")
                 if policy == "quorum"
                 else len(members)
                 if policy == "each" and isinstance(members, list)
                 else None
             )
             if isinstance(threshold, int) and threshold > 0:
-                satisfied = sum(
-                    admission.get("terminal_state") == ResolverState.SATISFIED.value
-                    for _key, admission in active
+                qualifying = self._broadcast_qualifying_answers_locked(
+                    ledger,
+                    aggregate_state,
                 )
-                still_open = sum(
-                    admission.get("state") == "open" for _key, admission in active
-                )
+                satisfied_members = {candidate[2] for candidate in qualifying}
+                possible_members: set[str] = set()
                 if isinstance(members, list):
-                    still_open += len(set(members) - set(latest_by_responder))
+                    by_responder: dict[str, list[dict]] = {}
+                    for key, admission in broadcast:
+                        by_responder.setdefault(key.responder, []).append(admission)
+                    for member in members:
+                        if member in satisfied_members:
+                            continue
+                        member_rows = by_responder.get(member, [])
+                        if not member_rows or any(
+                            row.get("state") == "open" for row in member_rows
+                        ):
+                            possible_members.add(member)
                 # DELIVERY_FAILED is not a qualifying default answer.  The aggregate
                 # waiter stays live while the immutable policy can still be met.
-                if satisfied >= threshold or satisfied + still_open >= threshold:
+                if (
+                    len(satisfied_members) >= threshold
+                    or len(satisfied_members | possible_members) >= threshold
+                ):
                     return None
                 result = dict(failures[-1])
                 result.update({
                     "aggregate": True,
                     "response_policy": policy,
-                    "response_quorum": pinned.get("response_quorum"),
+                    "response_quorum": descriptor.get("response_quorum"),
                 })
                 return result
         if admissions:
@@ -4598,6 +5680,24 @@ class DetectionCommitGate:
                     return dict(row)
             return None
         return dict(failures[-1])
+
+    def broadcast_status(self, request_id: str, requester: str) -> str | None:
+        """Return the normative v1 aggregate state for requester wait projection."""
+        try:
+            ledger = self._load(create=False)
+        except (LedgerUnreadable, OSError, ValueError, TimeoutError, RuntimeError):
+            return None
+        aggregate = ledger["broadcasts"].get(request_id)
+        if not isinstance(aggregate, dict):
+            return None
+        descriptor = aggregate.get("descriptor")
+        if not isinstance(descriptor, dict):
+            return None
+        return (
+            str(aggregate.get("state"))
+            if descriptor.get("requester") == requester
+            else None
+        )
 
     def schedule_continuation(self, key: ObligationKey, *, producer_token: str) -> str:
         with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
@@ -4645,13 +5745,38 @@ class DetectionCommitGate:
     ) -> Resolution:
         if not reason.strip():
             raise ValueError("operator resolution requires an audit reason")
+        if any((
+            key.responder != self.agent,
+            record.get("id") != key.inbound_id,
+            record.get("from") != key.requester,
+            record.get("to") != key.responder,
+            record.get("correlation_id") != key.correlation_id,
+        )):
+            raise GateError(
+                "operator resolution record does not match the exact inbound key"
+            )
+        resolution: Resolution
         with self.store._config_lock(timeout=10.0):
             roster = _roster_snapshot(self.store.load_config())
             if roster["revision"] != expected_roster_revision:
                 raise StaleRevision("roster changed before operator resolution")
             if actor not in roster["authorized_liaisons"]:
                 raise PermissionError("actor is not an event-time authorized liaison or lead")
-            with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
+            with ExitStack() as locks:
+                locks.enter_context(self.store._message_publication_lock())
+                messages, _ = self._validated_messages()
+                canonical = self._record_message(record, messages)
+                if canonical is None or any((
+                    canonical.sender != key.requester,
+                    canonical.recipient != key.responder,
+                    _correlation(canonical.meta) != key.correlation_id,
+                )):
+                    raise GateError("operator resolution canonical inbound mismatch")
+                locks.enter_context(
+                    self.store._exclusive_lock(
+                        self.path.with_suffix(".lock"), timeout=10.0
+                    )
+                )
                 ledger = self._load()
                 admission = ledger["obligations"].get(key.digest)
                 if not isinstance(admission, dict) or admission.get("state") not in {
@@ -4659,166 +5784,509 @@ class DetectionCommitGate:
                     "delivery_failed",
                 }:
                     raise GateError("operator resolution target is not recoverable")
-                admission["state"] = "operator_resolved"
-                admission["terminal_state"] = ResolverState.OPERATOR_RESOLVED.value
-                event = self._append(
+                replayed = self._resolve_replay(
+                    record,
+                    messages,
                     ledger,
-                    "OPERATOR_RESOLUTION",
+                    admission=admission,
+                )
+                if replayed.terminal and replayed.state != ResolverState.DELIVERY_EXHAUSTED:
+                    resolution = replayed
+                elif replayed.state in {
+                    ResolverState.BLOCKED,
+                    ResolverState.BLOCKED_POLICY,
+                    ResolverState.BLOCKED_COMPLIANCE,
+                    ResolverState.INDETERMINATE,
+                }:
+                    return replayed
+                else:
+                    admission["state"] = "operator_resolved"
+                    admission["terminal_state"] = ResolverState.OPERATOR_RESOLVED.value
+                    event = self._append(
+                        ledger,
+                        "OPERATOR_RESOLUTION",
+                        scope=key.inbound_id,
+                        source_id=actor,
+                        key_digest=key.digest,
+                        data={
+                            "actor": actor,
+                            "reason": reason.strip(),
+                            "roster_revision": expected_roster_revision,
+                        },
+                    )
+                    ledger["delivery_index"].setdefault(key.correlation_id, []).append({
+                        "kind": "OPERATOR_RESOLUTION",
+                        "sequence": event["sequence"],
+                        "key_digest": key.digest,
+                        "inbound_id": key.inbound_id,
+                        "question_generation": key.question_generation,
+                        "delivery_generation": key.delivery_generation,
+                        "requester": key.requester,
+                        "responder": key.responder,
+                        "state": "operator_resolved",
+                        "reason": reason.strip(),
+                        "actor": actor,
+                        "roster_revision": expected_roster_revision,
+                        "broadcast_id": admission.get("broadcast_id"),
+                    })
+                    ledger["cursor_dispositions"][self.agent] = {
+                        "inbound_id": record.get("id"),
+                        "mode": record.get("mode", "global"),
+                        "state": ResolverState.OPERATOR_RESOLVED.value,
+                        "at": self.now(),
+                    }
+                    self._write(ledger)
+                    scoped_revision = int(
+                        ledger["scoped_revisions"].get(key.inbound_id, 0)
+                    )
+                    resolution = Resolution(
+                        ResolverState.OPERATOR_RESOLVED,
+                        reason.strip(),
+                        key,
+                        evidence_id=str(event["sequence"]),
+                        scoped_revision=scoped_revision,
+                        ledger_revision=scoped_revision,
+                    )
+        return self.finalize(
+            record,
+            resolution,
+            expected_revision=resolution.scoped_revision,
+        )
+
+    def transfer(
+        self,
+        record: dict,
+        key: ObligationKey,
+        *,
+        destination: str,
+        new_inbound_id: str,
+        destination_policy: PolicySnapshot,
+        actor: str,
+        expected_roster_revision: str,
+        expected_revision: int,
+    ) -> Resolution:
+        """Close the source and create one fenced destination generation atomically."""
+        if any((
+            key.responder != self.agent,
+            record.get("id") != key.inbound_id,
+            record.get("from") != key.requester,
+            record.get("to") != key.responder,
+            record.get("correlation_id") != key.correlation_id,
+        )):
+            raise GateError("transfer record does not match the exact inbound key")
+        resolution: Resolution
+        with self.store._config_lock(timeout=10.0):
+            cfg = self.store.load_config()
+            roster = _roster_snapshot(cfg)
+            if roster["revision"] != expected_roster_revision:
+                raise StaleRevision("roster changed before transfer")
+            if actor not in roster["authorized_liaisons"]:
+                raise PermissionError("transfer actor is not an authorized liaison or lead")
+            if destination not in (cfg.get("agents") or []):
+                raise ValueError("transfer destination is not active")
+            current_policy = self._current_policy()
+            destination_policy_block_state = (
+                destination_policy.status
+                if destination_policy.status in {
+                    ResolverState.BLOCKED,
+                    ResolverState.BLOCKED_POLICY,
+                    ResolverState.BLOCKED_COMPLIANCE,
+                }
+                else None
+            )
+            destination_policy_block_reason = (
+                destination_policy.reason
+                or "transfer destination policy is unreadable"
+            )
+            if destination_policy_block_state is None and (
+                current_policy.status != ResolverState.ACTIVE
+                or current_policy.generation != destination_policy.generation
+                or destination_policy.status != ResolverState.ACTIVE
+                or destination_policy.agent != destination
+                or destination_policy.grade != DETECTION_GRADE
+                or not _valid_hex_digest(destination_policy.generation)
+            ):
+                raise GateError(
+                    "transfer destination policy is not detection-grade active"
+                )
+            if (
+                destination_policy_block_state is not None
+                and destination_policy.agent not in {None, destination}
+            ):
+                raise GateError("transfer destination policy is bound to another agent")
+            with ExitStack() as locks:
+                locks.enter_context(self.store._message_publication_lock())
+                messages, projected = self._validated_messages()
+                canonical_source = self._record_message(record, messages)
+                source_meta = (
+                    canonical_source.meta
+                    if canonical_source is not None
+                    and isinstance(canonical_source.meta, dict)
+                    else {}
+                )
+                if canonical_source is None or any((
+                    canonical_source.id != record.get("id"),
+                    canonical_source.ts != record.get("ts"),
+                    canonical_source.sender != record.get("from"),
+                    canonical_source.recipient != record.get("to"),
+                    canonical_source.kind != record.get("kind"),
+                    canonical_source.subject != record.get("subject"),
+                    canonical_source.body != record.get("body"),
+                    source_meta != record.get("meta"),
+                    _correlation(source_meta) != key.correlation_id,
+                )):
+                    raise GateError("transfer canonical source record mismatch")
+                projected_source = projected["obligations"].get(key.digest)
+                if (
+                    isinstance(projected_source, dict)
+                    and self._key_from(projected_source.get("key")) == key
+                ):
+                    published_source = self._resolve_replay(
+                        record,
+                        messages,
+                        projected,
+                        admission=projected_source,
+                    )
+                    if (
+                        published_source.terminal
+                        and published_source.state
+                        != ResolverState.DELIVERY_EXHAUSTED
+                    ):
+                        return self.finalize(
+                            record,
+                            published_source,
+                            expected_revision=published_source.scoped_revision,
+                        )
+                next_inbound = next(
+                    (message for message in messages if message.id == new_inbound_id),
+                    None,
+                )
+                meta = (
+                    next_inbound.meta
+                    if next_inbound is not None and isinstance(next_inbound.meta, dict)
+                    else {}
+                )
+                if (
+                    next_inbound is None
+                    or next_inbound.kind != "question"
+                    or next_inbound.sender != key.requester
+                    or next_inbound.recipient != destination
+                    or _correlation(meta) != key.correlation_id
+                    or _true(meta, "consult") is not False
+                    or meta.get("transfer_from_key_digest") != key.digest
+                    or meta.get("transfer_policy_generation")
+                    != destination_policy.generation
+                    or (
+                        _true(meta, "escalation_required") is True
+                        if key.obligation_class == "answer"
+                        else _true(meta, "escalation_required") is not True
+                    )
+                ):
+                    raise ValueError(
+                        "transfer destination inbound is missing or semantically unadmittable"
+                    )
+                source_descriptor = _broadcast_descriptor(
+                    source_meta,
+                    requester=canonical_source.sender,
+                )
+                target_descriptor = _broadcast_descriptor(
+                    meta,
+                    requester=next_inbound.sender,
+                )
+                if (
+                    (source_descriptor is None) != (target_descriptor is None)
+                    or source_descriptor is not None
+                    and source_descriptor != target_descriptor
+                    or target_descriptor is not None
+                    and destination not in target_descriptor["membership_snapshot"]
+                ):
+                    raise ValueError("transfer destination changed frozen broadcast policy")
+                locks.enter_context(
+                    self.store._exclusive_lock(
+                        self.path.with_suffix(".lock"), timeout=10.0
+                    )
+                )
+                ledger = self._load()
+                old = ledger["obligations"].get(key.digest)
+                if not isinstance(old, dict) or self._key_from(old.get("key")) != key:
+                    raise GateError("transfer source admission is missing or mismatched")
+                if old.get("state") not in {"open", "delivery_failed"}:
+                    raise GateError("transfer source is not recoverable")
+                if int(ledger["scoped_revisions"].get(key.inbound_id, 0)) != (
+                    expected_revision
+                ):
+                    raise StaleRevision("transfer source scoped revision changed")
+                if old.get("state") == "open" and (
+                    old.get("fence") != self.fence
+                    or not self._live_dispatch_fence_owned()
+                    or not self._dispatch_head_is_current(old, key)
+                ):
+                    raise GateError("transfer source wrapper no longer owns the exact head")
+                old.pop("transfer_blocked_state", None)
+                old.pop("transfer_blocked_reason", None)
+                source_replay = self._resolve_replay(
+                    record,
+                    messages,
+                    ledger,
+                    admission=old,
+                )
+                if (
+                    source_replay.terminal
+                    and source_replay.state != ResolverState.DELIVERY_EXHAUSTED
+                ):
+                    return source_replay
+                if destination_policy_block_state is not None:
+                    old["transfer_blocked_state"] = destination_policy_block_state.value
+                    old["transfer_blocked_reason"] = destination_policy_block_reason
+                    self._append(
+                        ledger,
+                        "TRANSFER_DESTINATION_BLOCKED",
+                        scope=key.inbound_id,
+                        key_digest=key.digest,
+                        data={
+                            "state": destination_policy_block_state.value,
+                            "reason": destination_policy_block_reason,
+                        },
+                    )
+                    self._write(ledger)
+                    return Resolution(
+                        destination_policy_block_state,
+                        destination_policy_block_reason,
+                        key,
+                        scoped_revision=int(
+                            ledger["scoped_revisions"].get(key.inbound_id, 0)
+                        ),
+                    )
+                if target_descriptor is not None:
+                    aggregate = ledger["broadcasts"].get(
+                        target_descriptor["broadcast_id"]
+                    )
+                    if (
+                        isinstance(aggregate, dict)
+                        and aggregate.get("state") == "blocked"
+                    ):
+                        reason = "transfer destination broadcast aggregate is blocked"
+                        old["transfer_blocked_state"] = ResolverState.BLOCKED.value
+                        old["transfer_blocked_reason"] = reason
+                        self._append(
+                            ledger,
+                            "TRANSFER_DESTINATION_BLOCKED",
+                            scope=key.inbound_id,
+                            key_digest=key.digest,
+                            data={"state": ResolverState.BLOCKED.value, "reason": reason},
+                        )
+                        self._write(ledger)
+                        scoped_revision = int(
+                            ledger["scoped_revisions"].get(key.inbound_id, 0)
+                        )
+                        return Resolution(
+                            ResolverState.BLOCKED,
+                            reason,
+                            key,
+                            scoped_revision=scoped_revision,
+                            ledger_revision=scoped_revision,
+                        )
+                destination_breaker = ledger["breakers"].get(destination, {})
+                if isinstance(destination_breaker, dict) and (
+                    destination_breaker.get("tripped") is True
+                    or destination_breaker.get("config_blocked") is True
+                ):
+                    reason = "transfer destination compliance breaker is tripped"
+                    old["transfer_blocked_state"] = (
+                        ResolverState.BLOCKED_COMPLIANCE.value
+                    )
+                    old["transfer_blocked_reason"] = reason
+                    self._append(
+                        ledger,
+                        "TRANSFER_DESTINATION_BLOCKED",
+                        scope=key.inbound_id,
+                        key_digest=key.digest,
+                        data={
+                            "state": ResolverState.BLOCKED_COMPLIANCE.value,
+                            "reason": reason,
+                        },
+                    )
+                    self._write(ledger)
+                    scoped_revision = int(
+                        ledger["scoped_revisions"].get(key.inbound_id, 0)
+                    )
+                    return Resolution(
+                        ResolverState.BLOCKED_COMPLIANCE,
+                        reason,
+                        key,
+                        scoped_revision=scoped_revision,
+                        ledger_revision=scoped_revision,
+                    )
+                if source_replay.state in {
+                    ResolverState.BLOCKED,
+                    ResolverState.BLOCKED_POLICY,
+                    ResolverState.BLOCKED_COMPLIANCE,
+                    ResolverState.INDETERMINATE,
+                }:
+                    raise GateError(
+                        f"transfer source replay is {source_replay.state.value}"
+                    )
+                if (
+                    new_inbound_id in ledger["inbound_index"]
+                    or new_inbound_id in ledger["no_admission_claims"]
+                ):
+                    raise StaleRevision("transfer destination was already claimed")
+                indexed = ledger["messages"].get(new_inbound_id)
+                if not isinstance(indexed, dict):
+                    raise GateError("transfer destination is absent from canonical replay")
+                target_record = {
+                    "id": next_inbound.id,
+                    "ts": next_inbound.ts,
+                    "from": next_inbound.sender,
+                    "to": next_inbound.recipient,
+                    "kind": next_inbound.kind,
+                    "subject": next_inbound.subject,
+                    "body": next_inbound.body,
+                    "meta": dict(meta),
+                    "request_id": meta.get("request_id"),
+                    "broadcast_id": meta.get("broadcast_id"),
+                    "correlation_id": _correlation(meta),
+                    "mode": "global",
+                }
+                destination_gate = DetectionCommitGate(
+                    self.store,
+                    destination,
+                    destination_policy,
+                    fence="transfer-pre-admission-validation",
+                    now=self.now,
+                )
+                prospective = destination_gate._resolve_replay(
+                    target_record,
+                    messages,
+                    ledger,
+                    admission=None,
+                )
+                if prospective.state in TERMINAL_STATES:
+                    raise GateError(
+                        "transfer destination already terminal before admission"
+                    )
+                if prospective.state != ResolverState.OWED_UNSATISFIED:
+                    raise GateError(
+                        "transfer destination replay is not safely admissible"
+                    )
+
+                next_key = ObligationKey(
+                    store_epoch=key.store_epoch,
+                    inbound_id=new_inbound_id,
+                    correlation_id=key.correlation_id,
+                    requester=key.requester,
+                    responder=destination,
+                    question_generation=key.question_generation,
+                    delivery_generation=key.delivery_generation + 1,
+                    obligation_class=key.obligation_class,
+                    reducer_version=key.reducer_version,
+                    participant_capabilities_digest=key.participant_capabilities_digest,
+                )
+                next_admission = {
+                    "key": next_key.to_dict(),
+                    "correlation_id": key.correlation_id,
+                    "obligation_class": key.obligation_class,
+                    "state": "open",
+                    "watermark_sequence": ledger["append_sequence"],
+                    "scoped_revision": int(
+                        ledger["scoped_revisions"].get(new_inbound_id, 0)
+                    ),
+                    "activation_generation": destination_policy.generation,
+                    "readiness_generation": destination_policy.generation,
+                    "fence": "unclaimed",
+                    "owner_pid": None,
+                    "delivery_mode": old.get("delivery_mode", "global"),
+                    "scoped_request_id": old.get("scoped_request_id"),
+                    "paid_dispatches_total": 0,
+                    "paid_initial_dispatches_total": 0,
+                    "paid_recoveries_total": 0,
+                    "paid_continuations_total": 0,
+                    "continuation_used": False,
+                    "recovery_used": False,
+                    "first_dispatch_classified": False,
+                    "last_exhaustion_class": None,
+                    "reservations": {},
+                    "operation_infra_attempts": 0,
+                    "operation_infra_first_at": None,
+                    "operation_infra_retry_inflight": False,
+                    "finalization_misses": 0,
+                    "finalization_first_at": None,
+                    "finalization_retry_inflight": False,
+                    "cursor_projection_misses": 0,
+                    "cursor_projection_first_at": None,
+                    "cursor_projection_inflight": False,
+                    "cursor_projection_reserved_at": None,
+                    "owed_action_missing_seen": False,
+                    "created_at": self.now(),
+                    "broadcast_id": meta.get("broadcast_id"),
+                    "membership_snapshot": meta.get("membership_snapshot"),
+                    "response_policy": meta.get("response_policy"),
+                    "response_quorum": meta.get("response_quorum"),
+                    "broadcast_policy_version": meta.get("broadcast_policy_version"),
+                    "broadcast_generation": indexed.get("broadcast_generation"),
+                    "exhausted": False,
+                    "exhausted_at": None,
+                    "delivery_failure_reason": None,
+                    "delivery_failure_sequence": None,
+                    "delivery_failure_incident_sequence": None,
+                    "dead_letter_reference": None,
+                }
+                transaction_id = uuid.uuid4().hex
+                ledger["obligations"][next_key.digest] = next_admission
+                ledger["inbound_index"][new_inbound_id] = next_key.digest
+                self._append(
+                    ledger,
+                    "OBLIGATION_ADMITTED",
+                    scope=new_inbound_id,
+                    source_id=new_inbound_id,
+                    key_digest=next_key.digest,
+                    data={
+                        "key": next_key.to_dict(),
+                        "transfer_from": key.digest,
+                        "transaction_id": transaction_id,
+                        "destination_policy_generation": destination_policy.generation,
+                    },
+                )
+                transfer_event = self._append(
+                    ledger,
+                    "TRANSFERRED",
                     scope=key.inbound_id,
                     source_id=actor,
                     key_digest=key.digest,
                     data={
-                        "actor": actor,
-                        "reason": reason.strip(),
+                        "destination": destination,
+                        "new_key": next_key.to_dict(),
+                        "transaction_id": transaction_id,
                         "roster_revision": expected_roster_revision,
                     },
                 )
-                ledger["delivery_index"].setdefault(key.correlation_id, []).append({
-                    "kind": "OPERATOR_RESOLUTION",
-                    "sequence": event["sequence"],
-                    "key_digest": key.digest,
-                    "inbound_id": key.inbound_id,
-                    "question_generation": key.question_generation,
-                    "delivery_generation": key.delivery_generation,
-                    "requester": key.requester,
-                    "responder": key.responder,
-                    "state": "operator_resolved",
-                    "reason": reason.strip(),
-                    "actor": actor,
-                    "roster_revision": expected_roster_revision,
-                    "broadcast_id": admission.get("broadcast_id"),
-                })
+                old["state"] = "transferred"
+                old["terminal_state"] = ResolverState.TRANSFERRED.value
+                old["terminal_evidence_id"] = str(transfer_event["sequence"])
+                old["transferred_at"] = self.now()
                 ledger["cursor_dispositions"][self.agent] = {
                     "inbound_id": record.get("id"),
                     "mode": record.get("mode", "global"),
-                    "state": ResolverState.OPERATOR_RESOLVED.value,
+                    "state": ResolverState.TRANSFERRED.value,
                     "at": self.now(),
                 }
                 self._write(ledger)
-        scoped_revision = int(ledger["scoped_revisions"].get(key.inbound_id, 0))
-        return self.finalize(
-            record,
-            Resolution(
-                ResolverState.OPERATOR_RESOLVED,
-                reason.strip(),
-                key,
-                evidence_id=str(event["sequence"]),
-                scoped_revision=scoped_revision,
-                ledger_revision=scoped_revision,
-            ),
-            expected_revision=scoped_revision,
-        )
-
-    def transfer(self, key: ObligationKey, *, destination: str, new_inbound_id: str) -> None:
-        """Atomically validate destination, close old delivery, and create the next."""
-        if destination not in self.store.load_config().get("agents", []):
-            raise ValueError("transfer destination is not active")
-        messages, _ = self._validated_messages()
-        next_inbound = next(
-            (message for message in messages if message.id == new_inbound_id),
-            None,
-        )
-        if (
-            next_inbound is None
-            or next_inbound.kind != "question"
-            or next_inbound.sender != key.requester
-            or next_inbound.recipient != destination
-            or _correlation(next_inbound.meta) != key.correlation_id
-        ):
-            raise ValueError("transfer destination inbound is missing or unadmittable")
-        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
-            ledger = self._load()
-            old = ledger["obligations"].get(key.digest)
-            if not isinstance(old, dict) or old.get("state") not in {
-                "open",
-                "delivery_failed",
-            }:
-                raise GateError("transfer source is not recoverable")
-            next_key = ObligationKey(
-                store_epoch=key.store_epoch,
-                inbound_id=new_inbound_id,
-                correlation_id=key.correlation_id,
-                requester=key.requester,
-                responder=destination,
-                question_generation=key.question_generation,
-                delivery_generation=key.delivery_generation + 1,
-                obligation_class=key.obligation_class,
-                reducer_version=key.reducer_version,
-                participant_capabilities_digest=key.participant_capabilities_digest,
-            )
-            next_admission = dict(old)
-            next_admission.update({
-                "key": next_key.to_dict(),
-                "state": "open",
-                "fence": "unclaimed",
-                "paid_dispatches_total": 0,
-                "paid_initial_dispatches_total": 0,
-                "paid_recoveries_total": 0,
-                "paid_continuations_total": 0,
-                "reservations": {},
-                "continuation_used": False,
-                "recovery_used": False,
-                "first_dispatch_classified": False,
-                "last_exhaustion_class": None,
-                "operation_infra_attempts": 0,
-                "operation_infra_first_at": None,
-                "operation_infra_retry_inflight": False,
-                "finalization_misses": 0,
-                "finalization_first_at": None,
-                "finalization_retry_inflight": False,
-                "cursor_projection_misses": 0,
-                "cursor_projection_first_at": None,
-                "cursor_projection_inflight": False,
-                "cursor_projection_reserved_at": None,
-                "owed_action_missing_seen": False,
-                "exhausted": False,
-                "exhausted_at": None,
-                "delivery_failure_reason": None,
-                "delivery_failure_sequence": None,
-                "delivery_failure_incident_sequence": None,
-                "dead_letter_reference": None,
-            })
-            old["state"] = "transferred"
-            ledger["obligations"][next_key.digest] = next_admission
-            ledger["inbound_index"][new_inbound_id] = next_key.digest
-            self._append(
-                ledger,
-                "TRANSFERRED",
-                scope=key.inbound_id,
-                key_digest=key.digest,
-                data={"destination": destination, "new_key": next_key.to_dict()},
-            )
-            self._append(
-                ledger,
-                "OBLIGATION_ADMITTED",
-                scope=new_inbound_id,
-                source_id=new_inbound_id,
-                key_digest=next_key.digest,
-                data={"key": next_key.to_dict(), "transfer_from": key.digest},
-            )
-            self._write(ledger)
+                scoped_revision = int(
+                    ledger["scoped_revisions"].get(key.inbound_id, 0)
+                )
+                resolution = Resolution(
+                    ResolverState.TRANSFERRED,
+                    "transferred",
+                    key,
+                    str(transfer_event["sequence"]),
+                    scoped_revision,
+                )
+        return self.finalize(record, resolution, expected_revision=scoped_revision)
 
     def close_broadcast_members(self, winning_key: ObligationKey,
                                 remaining: list[ObligationKey], *, winning_ids: list[str]) -> None:
-        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
-            ledger = self._load()
-            # DELIVERY_FAILED is intentionally not an answer winner.
-            winner = ledger["obligations"].get(winning_key.digest)
-            if not isinstance(winner, dict) or winner.get("terminal_state") != "satisfied":
-                raise GateError("broadcast winner is not an answer terminal")
-            for key in remaining:
-                admission = ledger["obligations"].get(key.digest)
-                if not isinstance(admission, dict) or admission.get("state") != "open":
-                    continue
-                admission["state"] = "broadcast_policy_satisfied"
-                self._append(
-                    ledger,
-                    "BROADCAST_POLICY_SATISFIED",
-                    scope=key.inbound_id,
-                    key_digest=key.digest,
-                    data={"winning_ids": list(winning_ids)},
-                )
-            self._write(ledger)
+        del winning_key, remaining, winning_ids
+        raise GateError("direct broadcast closure is forbidden; use canonical replay")
 
     def status(self) -> dict:
         result = {
@@ -4858,6 +6326,10 @@ class DetectionCommitGate:
             result["append_sequence"] = 0
             result["breaker"] = {}
             result["open_obligations"] = 0
+            result["legacy_broadcast"] = {
+                "enforcement": "none",
+                "unenforced_total": 0,
+            }
             return result
         try:
             ledger = self._load(create=False)
@@ -4869,6 +6341,12 @@ class DetectionCommitGate:
             return result
         result["store_epoch"] = ledger["store_epoch"]
         result["append_sequence"] = ledger["append_sequence"]
+        result["legacy_broadcast"] = {
+            "enforcement": "none",
+            "unenforced_total": int(
+                ledger["telemetry"].get("legacy_broadcast_unenforced_total", 0)
+            ),
+        }
         breaker = ledger["breakers"].get(self.agent, {})
         result["breaker"] = breaker
         if isinstance(breaker, dict) and breaker.get("tripped") is True:
@@ -4895,7 +6373,13 @@ def note_bus_message(store, message: Message) -> None:
     )
     if not gate.path.exists():
         return
-    gate._index_messages([message])
+    # Re-read the immutable publication stream so a prior failed eager hook is
+    # repaired before the newest message.  Indexing only ``message`` could invert
+    # canonical winner order when the earlier projection was delayed or missed.
+    gate._index_messages(
+        store.publication_ordered_messages(),
+        invalid_records=store.list_invalid_messages(),
+    )
 
 
 def note_manual_close(store, agent: str, request_id: str) -> None:
@@ -4903,7 +6387,7 @@ def note_manual_close(store, agent: str, request_id: str) -> None:
     gate = DetectionCommitGate(
         store, agent, PolicySnapshot.inactive("append service"), fence="append-service",
     )
-    messages = store.valid_messages()
+    messages = store.publication_ordered_messages()
     inbounds = [
         message for message in messages
         if message.kind == "question"
@@ -4958,6 +6442,20 @@ def requester_terminal_for(store, request_id: str, requester: str) -> dict | Non
         fence="read-only",
     )
     return gate.delivery_status(request_id, requester)
+
+
+def requester_broadcast_policy_state(
+    store,
+    request_id: str,
+    requester: str,
+) -> str | None:
+    gate = DetectionCommitGate(
+        store,
+        requester,
+        PolicySnapshot.inactive("broadcast state read"),
+        fence="read-only",
+    )
+    return gate.broadcast_status(request_id, requester)
 
 
 def delivery_failed_for(store, request_id: str, requester: str) -> dict | None:

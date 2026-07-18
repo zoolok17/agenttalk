@@ -78,6 +78,7 @@ _LOCK_PID_PREFIX_RE = re.compile(rb'"pid"\s*:\s*([0-9]+)')
 _LOCK_GENERATION_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 
 _AWAIT_SCHEMA_VERSION = 1
+_MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION = 1
 _AWAIT_ID_RE = re.compile(r"\A[A-Za-z0-9_.:-]{1,128}\Z")
 _AWAIT_PATH_TOKEN_RE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
 _AWAIT_SOURCES = frozenset({"send", "reply"})
@@ -1485,6 +1486,160 @@ class Store:
             what="message publication",
         )
 
+    @property
+    def _message_publication_order_path(self) -> Path:
+        return self.state_dir / "message-publication-order.json"
+
+    @property
+    def _message_publication_order_anchor_path(self) -> Path:
+        return self.state_dir / "message-publication-order.anchor.json"
+
+    @staticmethod
+    def _message_publication_order_chain(
+        messages: dict[str, int],
+        *,
+        through: int | None = None,
+    ) -> str:
+        limit = len(messages) if through is None else through
+        by_sequence = {sequence: message_id for message_id, sequence in messages.items()}
+        digest = hashlib.sha256(b"agenttalk-message-publication-order-v1").hexdigest()
+        for sequence in range(1, limit + 1):
+            message_id = by_sequence.get(sequence)
+            if not isinstance(message_id, str):
+                raise ValueError("message publication order sequence is incomplete")
+            digest = hashlib.sha256(
+                f"{digest}:{sequence}:{message_id}".encode("utf-8")
+            ).hexdigest()
+        return digest
+
+    @classmethod
+    def _validate_message_publication_order(cls, raw: object) -> dict:
+        if (
+            not isinstance(raw, dict)
+            or raw.get("schema_version") != _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION
+            or not isinstance(raw.get("append_sequence"), int)
+            or isinstance(raw.get("append_sequence"), bool)
+            or int(raw["append_sequence"]) < 0
+            or not isinstance(raw.get("messages"), dict)
+        ):
+            raise ValueError("message publication order sidecar is invalid")
+        append_sequence = int(raw["append_sequence"])
+        messages = raw["messages"]
+        if any(
+            not isinstance(message_id, str)
+            or _ID_RE.fullmatch(message_id) is None
+            or not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or sequence < 1
+            for message_id, sequence in messages.items()
+        ):
+            raise ValueError("message publication order entry is invalid")
+        sequences = set(messages.values())
+        if (
+            len(messages) != append_sequence
+            or sequences != set(range(1, append_sequence + 1))
+        ):
+            raise ValueError("message publication order sequence is non-contiguous")
+        return raw
+
+    @staticmethod
+    def _validate_message_publication_order_anchor(raw: object) -> dict:
+        if (
+            not isinstance(raw, dict)
+            or raw.get("schema_version") != _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION
+            or not isinstance(raw.get("append_sequence"), int)
+            or isinstance(raw.get("append_sequence"), bool)
+            or int(raw["append_sequence"]) < 0
+            or re.fullmatch(r"[0-9a-f]{64}", str(raw.get("chain_digest", "")))
+            is None
+        ):
+            raise ValueError("message publication order anchor is invalid")
+        return raw
+
+    def _read_message_publication_order(self) -> dict | None:
+        order_path = self._message_publication_order_path
+        anchor_path = self._message_publication_order_anchor_path
+        if not order_path.exists():
+            if anchor_path.exists():
+                raise ValueError(
+                    "message publication order sidecar is missing while its anchor exists"
+                )
+            return None
+        try:
+            raw_order = json.loads(order_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("message publication order sidecar is unreadable") from exc
+        order = self._validate_message_publication_order(raw_order)
+        if not anchor_path.exists():
+            return order
+        try:
+            raw_anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("message publication order anchor is unreadable") from exc
+        anchor = self._validate_message_publication_order_anchor(raw_anchor)
+        anchor_sequence = int(anchor["append_sequence"])
+        if anchor_sequence > int(order["append_sequence"]):
+            raise ValueError("message publication order sidecar rolled back")
+        prefix_digest = self._message_publication_order_chain(
+            order["messages"],
+            through=anchor_sequence,
+        )
+        if prefix_digest != anchor["chain_digest"]:
+            raise ValueError("message publication order sidecar changed below its anchor")
+        return order
+
+    def _reserve_message_publication_sequence(
+        self,
+        message_id: str,
+        existing_messages: list[Message],
+    ) -> int:
+        """Durably reserve physical append order before publishing message bytes."""
+        order = self._read_message_publication_order()
+        if order is None:
+            ordered_legacy = sorted(existing_messages, key=lambda message: message.id)
+            messages = {
+                message.id: sequence
+                for sequence, message in enumerate(ordered_legacy, start=1)
+            }
+            order = {
+                "schema_version": _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION,
+                "append_sequence": len(messages),
+                "messages": messages,
+            }
+        else:
+            messages = dict(order["messages"])
+            missing = [
+                message.id for message in existing_messages if message.id not in messages
+            ]
+            if missing:
+                raise ValueError(
+                    "validated message is missing durable publication order: "
+                    f"{missing[0]}"
+                )
+        if message_id in messages:
+            raise ValueError("message id already has a durable publication order")
+        sequence = int(order["append_sequence"]) + 1
+        messages[message_id] = sequence
+        updated = {
+            "schema_version": _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION,
+            "append_sequence": sequence,
+            "messages": messages,
+        }
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(
+            self._message_publication_order_path,
+            json.dumps(updated, indent=2, ensure_ascii=False),
+        )
+        _atomic_write_text(
+            self._message_publication_order_anchor_path,
+            json.dumps({
+                "schema_version": _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION,
+                "append_sequence": sequence,
+                "chain_digest": self._message_publication_order_chain(messages),
+            }, indent=2, ensure_ascii=False),
+        )
+        return sequence
+
     @staticmethod
     def _cfg_dict(cfg: dict, key: str) -> dict:
         """Return cfg[key] as a dict, coercing absent/null to a fresh {}.
@@ -2570,7 +2725,12 @@ class Store:
                 ).encode("utf-8")
             ).hexdigest()
             expected_revision = meta.get("expected_roster_revision")
-            if expected_revision is not None and expected_revision != roster_revision:
+            if not isinstance(expected_revision, str) or not expected_revision:
+                raise ValueError(
+                    "origin-correlated authorized transition requires an expected "
+                    "roster revision"
+                )
+            if expected_revision != roster_revision:
                 raise ValueError("roster revision changed before authorized transition append")
             if recipient not in authorized:
                 raise ValueError(
@@ -2633,6 +2793,10 @@ class Store:
                     recipient=recipient,
                     allow_reserved_sender=_allow_reserved_sender,
                 )
+                self._reserve_message_publication_sequence(
+                    msg.id,
+                    self.valid_messages(),
+                )
                 try:
                     os.replace(pending, path)
                     _fsync_directory(path.parent)
@@ -2641,21 +2805,22 @@ class Store:
                     # that block rename. Preserve the established direct-write
                     # fallback there; ordinary Windows/POSIX stays pre-staged.
                     _atomic_write_text(path, payload)
+                # Keep publication order and the monotonic owed-action projection
+                # under one ordering mutex.  A delayed eager hook must not let a
+                # later canonical message acquire an earlier reducer sequence.
+                try:
+                    from agenttalk.wrapper.obligations import note_bus_message
+
+                    note_bus_message(self, msg)
+                except (OSError, ValueError, RuntimeError):
+                    # The immutable message is authoritative. A later replay repairs
+                    # a missed projection in canonical publication order.
+                    pass
         finally:
             try:
                 _unlink_if_same_file(pending, pending_identity)
             except OSError:
                 pass
-        # Detection-grade wrapped-turn enforcement keeps a store-owned monotonic
-        # append journal.  Publication above remains the source record; this eager
-        # index is recoverable because admission replays and indexes any missed
-        # validated record before making a decision.
-        try:
-            from agenttalk.wrapper.obligations import note_bus_message
-
-            note_bus_message(self, msg)
-        except (OSError, ValueError, RuntimeError):
-            pass
         request_id = (msg.meta or {}).get("request_id")
         if isinstance(request_id, str) and request_id and kind not in CONTROL_KINDS:
             # Observational cleanup only. The validated thread remains the
@@ -2683,7 +2848,7 @@ class Store:
         recipient: str,
         meta: dict,
     ) -> dict:
-        return {
+        identity = {
             "operation": operation,
             "kind": kind,
             "recipient": recipient,
@@ -2693,6 +2858,13 @@ class Store:
             "origin_request_id": meta.get("origin_request_id"),
             "origin_inbound_id": meta.get("origin_inbound_id"),
         }
+        origin_key = meta.get("origin_obligation_key_digest")
+        roster_revision = meta.get("expected_roster_revision")
+        if origin_key is not None:
+            identity["origin_obligation_key_digest"] = origin_key
+        if roster_revision is not None:
+            identity["expected_roster_revision"] = roster_revision
+        return identity
 
     @staticmethod
     def _operation_intent_digest(intent: dict) -> str:
@@ -3566,6 +3738,29 @@ class Store:
         it. Sorted by id (chronological).
         """
         return self._validated_messages()
+
+    def publication_ordered_messages(
+        self,
+        messages: list[Message] | None = None,
+    ) -> list[Message]:
+        """Return validated messages in the durable physical publication order.
+
+        Legacy stores have no sidecar, so their established id order is the only
+        available bootstrap authority. The first subsequent send freezes that
+        order under the publication lock before reserving its own sequence.
+        """
+        messages = self.valid_messages() if messages is None else list(messages)
+        order = self._read_message_publication_order()
+        if order is None:
+            return messages
+        sequences = order["messages"]
+        missing = [message.id for message in messages if message.id not in sequences]
+        if missing:
+            raise ValueError(
+                "validated message is missing durable publication order: "
+                f"{missing[0]}"
+            )
+        return sorted(messages, key=lambda message: sequences[message.id])
 
     def _validated_messages(self, *, since_id: str | None = None) -> list[Message]:
         """Shared trust gate behind ``messages_for`` and ``valid_messages``.

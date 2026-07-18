@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -13,7 +14,7 @@ import pytest
 
 from agenttalk import cli, doctor, signing, threads
 from agenttalk.store import Store
-from agenttalk.wrapper import loop, recv_api
+from agenttalk.wrapper import loop, obligations, recv_api
 from agenttalk.wrapper.obligations import (
     COMPLIANCE_BREAKER_TRIP,
     DETECTION_GRADE,
@@ -105,6 +106,8 @@ def _record_captured_intent(
         broadcast_id=intent.get("broadcast_id"),
         origin_request_id=intent.get("origin_request_id"),
         origin_inbound_id=intent.get("origin_inbound_id"),
+        origin_obligation_key_digest=intent.get("origin_obligation_key_digest"),
+        expected_roster_revision=intent.get("expected_roster_revision"),
     )
     store.record_operation_intent(
         sender="beta",
@@ -171,6 +174,7 @@ def _broadcast_question(
     quorum: int | None = None,
 ):
     meta = {
+        "request_id": broadcast_id,
         "broadcast_id": broadcast_id,
         "membership_snapshot": members,
         "response_policy": policy,
@@ -1483,6 +1487,51 @@ def test_durable_retry_barrier_records_missing_outcome_before_restart_retry(
     )
 
 
+def test_captured_retry_rejects_draft_reparse_before_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-reparse-draft")
+    gate = _gate(store)
+    record = _record(store)
+    admitted = gate.admit_or_finalize(record)
+    assert admitted.key is not None
+    permit = gate.reserve_dispatch(admitted, purpose="initial")
+    gate.dispatch_record(record, permit)
+    permit.draft_path.write_text("captured answer", encoding="utf-8")
+    _record_captured_intent(store, gate, permit)
+    gate.mark_dispatch_result(permit, action_attempted=True, action_infra=True)
+    current = gate.resolve(record)
+    assert gate.record_retry_barrier(
+        admitted.key,
+        category="operation_infra",
+        expected_revision=current.scoped_revision,
+    ) is True
+    original_is_symlink = Path.is_symlink
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda candidate: (
+            candidate == permit.draft_path or original_is_symlink(candidate)
+        ),
+    )
+    invoked = False
+
+    def unexpected_subprocess(*_args, **_kwargs):
+        nonlocal invoked
+        invoked = True
+        raise AssertionError("unsafe reparse draft reached subprocess")
+
+    monkeypatch.setattr(
+        "agenttalk.wrapper.obligations.subprocess.run",
+        unexpected_subprocess,
+    )
+
+    assert gate.retry_captured_operation(permit, record) is False
+    assert invoked is False
+
+
 def test_captured_escalation_retry_reuses_persisted_target_and_request_id(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1926,25 +1975,39 @@ def test_breaker_hold_projection_failure_heals_on_terminal_replay(
 def test_transfer_validates_destination_before_closing_source(tmp_path: Path) -> None:
     store = _store(tmp_path)
     _question(store)
-    gate = _gate(store)
-    admitted = gate.admit_or_finalize(_record(store))
+    destination_policy = _policy("gamma", "beta")
+    gate = _gate(store, policy_agents=("beta", "gamma"))
+    record = _record(store)
+    admitted = gate.admit_or_finalize(record)
     assert admitted.key is not None
+    roster = gate.roster_snapshot()
 
     with pytest.raises(ValueError):
-        gate.transfer(admitted.key, destination="missing", new_inbound_id="next-1")
+        gate.transfer(
+            record,
+            admitted.key,
+            destination="missing",
+            new_inbound_id="next-1",
+            destination_policy=destination_policy,
+            actor="lead",
+            expected_roster_revision=roster["revision"],
+            expected_revision=admitted.scoped_revision,
+        )
     assert _ledger(gate)["obligations"][admitted.key.digest]["state"] == "open"
 
-    transferred = store.send(
-        sender="alpha",
-        recipient="gamma",
-        kind="question",
-        body="What is 19 * 21?",
-        meta={"request_id": "q-1"},
+    transferred = _transfer_question(
+        store, admitted.key, "gamma", destination_policy,
     )
+    current = gate.resolve(record)
     gate.transfer(
+        record,
         admitted.key,
         destination="gamma",
         new_inbound_id=transferred.id,
+        destination_policy=destination_policy,
+        actor="lead",
+        expected_roster_revision=roster["revision"],
+        expected_revision=current.scoped_revision,
     )
     ledger = _ledger(gate)
     assert ledger["obligations"][admitted.key.digest]["state"] == "transferred"
@@ -3175,17 +3238,26 @@ def test_operator_resolution_cas_rejects_revoke_then_accepts_current_authority(
 def test_transferred_admission_is_claimed_by_destination_wrapper(tmp_path: Path) -> None:
     store = _store(tmp_path)
     _question(store)
+    destination_policy = _policy("gamma", "beta")
     source = _gate(store, policy_agents=("beta", "gamma"))
-    admitted = source.admit_or_finalize(_record(store))
+    record = _record(store)
+    admitted = source.admit_or_finalize(record)
     assert admitted.key is not None
-    inbound = store.send(
-        sender="alpha",
-        recipient="gamma",
-        kind="question",
-        body="transferred question",
-        meta={"request_id": "q-1"},
+    inbound = _transfer_question(
+        store, admitted.key, "gamma", destination_policy,
     )
-    source.transfer(admitted.key, destination="gamma", new_inbound_id=inbound.id)
+    current = source.resolve(record)
+    roster = source.roster_snapshot()
+    source.transfer(
+        record,
+        admitted.key,
+        destination="gamma",
+        new_inbound_id=inbound.id,
+        destination_policy=destination_policy,
+        actor="lead",
+        expected_roster_revision=roster["revision"],
+        expected_revision=current.scoped_revision,
+    )
     destination = _gate(
         store,
         agent="gamma",
@@ -3354,17 +3426,26 @@ def test_transfer_and_policy_close_win_against_stale_dispatch_reservations(
 ) -> None:
     store = _store(tmp_path)
     _question(store)
+    destination_policy = _policy("gamma", "beta")
     source = _gate(store, policy_agents=("beta", "gamma"))
-    stale = source.admit_or_finalize(_record(store))
+    record = _record(store)
+    stale = source.admit_or_finalize(record)
     assert stale.key is not None
-    transferred = store.send(
-        sender="alpha",
-        recipient="gamma",
-        kind="question",
-        body="transfer target",
-        meta={"request_id": "q-1"},
+    transferred = _transfer_question(
+        store, stale.key, "gamma", destination_policy,
     )
-    source.transfer(stale.key, destination="gamma", new_inbound_id=transferred.id)
+    current = source.resolve(record)
+    roster = source.roster_snapshot()
+    source.transfer(
+        record,
+        stale.key,
+        destination="gamma",
+        new_inbound_id=transferred.id,
+        destination_policy=destination_policy,
+        actor="lead",
+        expected_roster_revision=roster["revision"],
+        expected_revision=current.scoped_revision,
+    )
     with pytest.raises(DispatchRefused):
         source.reserve_dispatch(stale, purpose="initial")
 
@@ -3405,8 +3486,9 @@ def test_transfer_is_pre_admission_fenced_and_commits_one_complete_transaction(
 ) -> None:
     store = _store(tmp_path)
     _question(store, "q-transfer-atomic")
-    policy = _policy("beta", "gamma")
-    source = DetectionCommitGate(store, "beta", policy, fence="wrapper-1")
+    source_policy = _policy("beta", "gamma")
+    destination_policy = _policy("gamma", "beta")
+    source = DetectionCommitGate(store, "beta", source_policy, fence="wrapper-1")
     store.write_waiting("beta", {
         "mode": "wrapper-loop", "wrapper_generation": "wrapper-1",
         "wait_token": "wrapper-1", "pid": os.getpid(),
@@ -3414,16 +3496,15 @@ def test_transfer_is_pre_admission_fenced_and_commits_one_complete_transaction(
     record = _record(store)
     admitted = source.admit_or_finalize(record)
     assert admitted.key is not None
-    target = _transfer_question(store, admitted.key, "gamma", policy)
+    target = _transfer_question(
+        store, admitted.key, "gamma", destination_policy,
+    )
     destination = _gate(
         store,
         agent="gamma",
         fence="wrapper-gamma",
         policy_agents=("gamma", "beta"),
     )
-
-    held = destination.admit_or_finalize(_record(store, agent="gamma"))
-    assert held.state == ResolverState.INDETERMINATE
     assert target.id not in _ledger(source)["inbound_index"]
 
     current = source.resolve(record)
@@ -3433,7 +3514,7 @@ def test_transfer_is_pre_admission_fenced_and_commits_one_complete_transaction(
         admitted.key,
         destination="gamma",
         new_inbound_id=target.id,
-        destination_policy=policy,
+        destination_policy=destination_policy,
         actor="lead",
         expected_roster_revision=roster["revision"],
         expected_revision=current.scoped_revision,
@@ -3454,8 +3535,8 @@ def test_transfer_is_pre_admission_fenced_and_commits_one_complete_transaction(
     assert ledger["obligations"][admitted.key.digest]["state"] == "transferred"
     assert next_admission["state"] == "open"
     assert next_admission["fence"] == "unclaimed"
-    assert next_admission["activation_generation"] == policy.generation
-    assert next_admission["readiness_generation"] == policy.generation
+    assert next_admission["activation_generation"] == destination_policy.generation
+    assert next_admission["readiness_generation"] == destination_policy.generation
     assert next_admission["paid_dispatches_total"] == 0
     assert next_admission.get("terminal_state") is None
     assert [row["transition"] for row in transaction[-2:]] == [
@@ -3478,8 +3559,9 @@ def test_transfer_crash_or_stale_roster_leaves_source_open_and_target_unadmitted
 ) -> None:
     store = _store(tmp_path)
     _question(store, "q-transfer-crash")
-    policy = _policy("beta", "gamma")
-    source = DetectionCommitGate(store, "beta", policy, fence="wrapper-1")
+    source_policy = _policy("beta", "gamma")
+    destination_policy = _policy("gamma", "beta")
+    source = DetectionCommitGate(store, "beta", source_policy, fence="wrapper-1")
     store.write_waiting("beta", {
         "mode": "wrapper-loop", "wrapper_generation": "wrapper-1",
         "wait_token": "wrapper-1", "pid": os.getpid(),
@@ -3487,7 +3569,9 @@ def test_transfer_crash_or_stale_roster_leaves_source_open_and_target_unadmitted
     record = _record(store)
     admitted = source.admit_or_finalize(record)
     assert admitted.key is not None
-    target = _transfer_question(store, admitted.key, "gamma", policy)
+    target = _transfer_question(
+        store, admitted.key, "gamma", destination_policy,
+    )
     current = source.resolve(record)
     stale_roster = source.roster_snapshot()
     store.set_operator_facing("gamma")
@@ -3498,7 +3582,7 @@ def test_transfer_crash_or_stale_roster_leaves_source_open_and_target_unadmitted
             admitted.key,
             destination="gamma",
             new_inbound_id=target.id,
-            destination_policy=policy,
+            destination_policy=destination_policy,
             actor="lead",
             expected_roster_revision=stale_roster["revision"],
             expected_revision=current.scoped_revision,
@@ -3520,7 +3604,7 @@ def test_transfer_crash_or_stale_roster_leaves_source_open_and_target_unadmitted
             admitted.key,
             destination="gamma",
             new_inbound_id=target.id,
-            destination_policy=policy,
+            destination_policy=destination_policy,
             actor="gamma",
             expected_roster_revision=roster["revision"],
             expected_revision=current.scoped_revision,
@@ -3531,12 +3615,61 @@ def test_transfer_crash_or_stale_roster_leaves_source_open_and_target_unadmitted
     assert target.id not in after["inbound_index"]
 
 
+def test_transfer_rejects_destination_outside_frozen_broadcast_membership(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path, ["alpha", "beta", "gamma", "delta", "lead"])
+    members = ["beta", "gamma"]
+    _broadcast_question(
+        store,
+        "beta",
+        broadcast_id="b-transfer-membership",
+        members=members,
+        policy="each",
+    )
+    destination_policy = _policy("delta", "beta", "gamma")
+    source = _gate(store, policy_agents=("beta", "gamma", "delta"))
+    record = _record(store)
+    admitted = source.admit_or_finalize(record)
+    assert admitted.key is not None
+    target = store.send(
+        sender="alpha",
+        recipient="delta",
+        kind="question",
+        body="invalid transferred broadcast slot",
+        meta={
+            "broadcast_id": "b-transfer-membership",
+            "membership_snapshot": members,
+            "response_policy": "each",
+            "broadcast_policy_version": 1,
+            "consult": False,
+            "transfer_from_key_digest": admitted.key.digest,
+            "transfer_policy_generation": destination_policy.generation,
+        },
+    )
+    current = source.resolve(record)
+    roster = source.roster_snapshot()
+
+    with pytest.raises(ValueError, match="frozen broadcast policy"):
+        source.transfer(
+            record,
+            admitted.key,
+            destination="delta",
+            new_inbound_id=target.id,
+            destination_policy=destination_policy,
+            actor="lead",
+            expected_roster_revision=roster["revision"],
+            expected_revision=current.scoped_revision,
+        )
+    assert _ledger(source)["obligations"][admitted.key.digest]["state"] == "open"
+
+
 @pytest.mark.parametrize(
     "destination_policy,consult",
     [
         (PolicySnapshot(ResolverState.BLOCKED_POLICY, "unreadable"), False),
         (PolicySnapshot(ResolverState.INACTIVE, "disabled", DETECTION_GRADE), False),
-        (_policy("beta", "gamma"), {"unsupported": True}),
+        (_policy("gamma", "beta"), {"unsupported": True}),
     ],
 )
 def test_transfer_rejects_unadmittable_destination_before_source_close(
@@ -3565,7 +3698,395 @@ def test_transfer_rejects_unadmittable_destination_before_source_close(
     current = source.resolve(record)
     roster = source.roster_snapshot()
 
-    with pytest.raises((GateError, ValueError)):
+    if destination_policy.status == ResolverState.BLOCKED_POLICY:
+        result = source.transfer(
+            record,
+            admitted.key,
+            destination="gamma",
+            new_inbound_id=target.id,
+            destination_policy=destination_policy,
+            actor="lead",
+            expected_roster_revision=roster["revision"],
+            expected_revision=current.scoped_revision,
+        )
+        assert result.state == ResolverState.BLOCKED_POLICY
+    else:
+        with pytest.raises((GateError, ValueError)):
+            source.transfer(
+                record,
+                admitted.key,
+                destination="gamma",
+                new_inbound_id=target.id,
+                destination_policy=destination_policy,
+                actor="lead",
+                expected_roster_revision=roster["revision"],
+                expected_revision=current.scoped_revision,
+            )
+    ledger = _ledger(source)
+    assert ledger["obligations"][admitted.key.digest]["state"] == "open"
+    assert target.id not in ledger["inbound_index"]
+
+
+def test_transfer_rejects_forged_source_record_before_mutating_either_assignment(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-transfer-source-forgery")
+    destination_policy = _policy("gamma", "beta")
+    source = _gate(store, policy_agents=("beta", "gamma"))
+    record = _record(store)
+    admitted = source.admit_or_finalize(record)
+    assert admitted.key is not None
+    target = _transfer_question(store, admitted.key, "gamma", destination_policy)
+    forged = {**record, "meta": {**record["meta"], "forged": True}}
+    current = source.resolve(record)
+    roster = source.roster_snapshot()
+
+    with pytest.raises(GateError, match="canonical source"):
+        source.transfer(
+            forged,
+            admitted.key,
+            destination="gamma",
+            new_inbound_id=target.id,
+            destination_policy=destination_policy,
+            actor="lead",
+            expected_roster_revision=roster["revision"],
+            expected_revision=current.scoped_revision,
+        )
+
+    ledger = _ledger(source)
+    assert ledger["obligations"][admitted.key.digest]["state"] == "open"
+    assert target.id not in ledger["inbound_index"]
+
+
+def test_transfer_rejects_active_policy_snapshot_bound_to_another_agent(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-transfer-policy-binding")
+    source = _gate(store, policy_agents=("beta", "gamma"))
+    record = _record(store)
+    admitted = source.admit_or_finalize(record)
+    assert admitted.key is not None
+    wrong_agent_policy = _policy("beta", "gamma")
+    target = _transfer_question(store, admitted.key, "gamma", wrong_agent_policy)
+    current = source.resolve(record)
+    roster = source.roster_snapshot()
+
+    with pytest.raises(GateError, match="destination policy"):
+        source.transfer(
+            record,
+            admitted.key,
+            destination="gamma",
+            new_inbound_id=target.id,
+            destination_policy=wrong_agent_policy,
+            actor="lead",
+            expected_roster_revision=roster["revision"],
+            expected_revision=current.scoped_revision,
+        )
+
+    ledger = _ledger(source)
+    assert ledger["obligations"][admitted.key.digest]["state"] == "open"
+    assert target.id not in ledger["inbound_index"]
+
+
+def test_unreadable_transfer_destination_policy_holds_source_visibly_blocked(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-transfer-policy-block")
+    source = _gate(store, policy_agents=("beta", "gamma"))
+    record = _record(store)
+    admitted = source.admit_or_finalize(record)
+    assert admitted.key is not None
+    blocked_policy = PolicySnapshot(
+        ResolverState.BLOCKED_POLICY,
+        "unreadable",
+        reason="destination policy unreadable",
+        agent="gamma",
+    )
+    target = _transfer_question(store, admitted.key, "gamma", blocked_policy)
+    roster = source.roster_snapshot()
+    result = source.transfer(
+        record,
+        admitted.key,
+        destination="gamma",
+        new_inbound_id=target.id,
+        destination_policy=blocked_policy,
+        actor="lead",
+        expected_roster_revision=roster["revision"],
+        expected_revision=source.resolve(record).scoped_revision,
+    )
+
+    row = _ledger(source)["obligations"][admitted.key.digest]
+    assert result.state == ResolverState.BLOCKED_POLICY
+    assert source.resolve(record).state == ResolverState.BLOCKED_POLICY
+    assert row["state"] == "open"
+    assert row["transfer_blocked_state"] == ResolverState.BLOCKED_POLICY.value
+    assert store.cursor("beta") == ""
+    with pytest.raises(DispatchRefused):
+        source.reserve_dispatch(admitted, purpose="initial")
+
+
+def test_retired_source_wrapper_cannot_persist_transfer_destination_block(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-transfer-policy-block-owner")
+    source = _gate(store, policy_agents=("beta", "gamma"))
+    record = _record(store)
+    admitted = source.admit_or_finalize(record)
+    assert admitted.key is not None
+    blocked_policy = PolicySnapshot(
+        ResolverState.BLOCKED_POLICY,
+        "unreadable",
+        reason="destination policy unreadable",
+        agent="gamma",
+    )
+    target = _transfer_question(store, admitted.key, "gamma", blocked_policy)
+    current = source.resolve(record)
+    retired = DetectionCommitGate(
+        store,
+        "beta",
+        source.policy,
+        fence="retired-wrapper",
+    )
+
+    with pytest.raises(GateError, match="no longer owns"):
+        retired.transfer(
+            record,
+            admitted.key,
+            destination="gamma",
+            new_inbound_id=target.id,
+            destination_policy=blocked_policy,
+            actor="lead",
+            expected_roster_revision=source.roster_snapshot()["revision"],
+            expected_revision=current.scoped_revision,
+        )
+
+    row = _ledger(source)["obligations"][admitted.key.digest]
+    assert row["state"] == "open"
+    assert row.get("transfer_blocked_state") is None
+    assert source.resolve(record).state == ResolverState.OWED_UNSATISFIED
+
+
+def test_transfer_replays_source_and_preserves_answer_that_won_publication_race(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-transfer-source-answer-race")
+    destination_policy = _policy("gamma", "beta")
+    source = _gate(store, policy_agents=("beta", "gamma"))
+    record = _record(store)
+    admitted = source.admit_or_finalize(record)
+    assert admitted.key is not None
+    target = _transfer_question(store, admitted.key, "gamma", destination_policy)
+    _answer_reserved(tmp_path, source, record, body="answer won before transfer")
+    current = source.resolve(record)
+    assert current.state == ResolverState.SATISFIED
+    roster = source.roster_snapshot()
+
+    result = source.transfer(
+        record,
+        admitted.key,
+        destination="gamma",
+        new_inbound_id=target.id,
+        destination_policy=destination_policy,
+        actor="lead",
+        expected_roster_revision=roster["revision"],
+        expected_revision=current.scoped_revision,
+    )
+
+    ledger = _ledger(source)
+    assert result.state == ResolverState.SATISFIED
+    assert ledger["obligations"][admitted.key.digest]["state"] == "finalized"
+    assert target.id not in ledger["inbound_index"]
+    assert not any(
+        row["transition"] == "TRANSFERRED"
+        and row.get("key_digest") == admitted.key.digest
+        for row in ledger["transitions"]
+    )
+
+
+def test_landed_source_terminal_precedes_blocked_broadcast_aggregate(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    members = ["beta", "gamma"]
+    _broadcast_question(
+        store,
+        "beta",
+        broadcast_id="b-transfer-terminal-precedence",
+        members=members,
+        policy="each",
+    )
+    destination_policy = _policy("gamma", "beta")
+    source = _gate(store, policy_agents=("beta", "gamma"))
+    record = _record(store)
+    admitted = source.admit_or_finalize(record)
+    assert admitted.key is not None
+    target = store.send(
+        sender="alpha",
+        recipient="gamma",
+        kind="question",
+        body="transferred broadcast target",
+        meta={
+            "request_id": "b-transfer-terminal-precedence",
+            "broadcast_id": "b-transfer-terminal-precedence",
+            "membership_snapshot": members,
+            "response_policy": "each",
+            "broadcast_policy_version": 1,
+            "consult": False,
+            "transfer_from_key_digest": admitted.key.digest,
+            "transfer_policy_generation": destination_policy.generation,
+        },
+    )
+    _answer_reserved(tmp_path, source, record, body="canonical terminal wins")
+    ledger = _ledger(source)
+    aggregate = ledger["broadcasts"]["b-transfer-terminal-precedence"]
+    aggregate["state"] = "blocked"
+    aggregate["blocked_reason"] = "conflict observed after terminal"
+    source._write(ledger)
+
+    replayed = source.resolve(record)
+    assert replayed.state == ResolverState.SATISFIED
+    result = source.transfer(
+        record,
+        admitted.key,
+        destination="gamma",
+        new_inbound_id=target.id,
+        destination_policy=destination_policy,
+        actor="lead",
+        expected_roster_revision=source.roster_snapshot()["revision"],
+        expected_revision=replayed.scoped_revision,
+    )
+
+    after = _ledger(source)
+    source_row = after["obligations"][admitted.key.digest]
+    assert result.state == ResolverState.SATISFIED
+    assert source_row["state"] == "finalized"
+    assert source_row.get("transfer_blocked_state") is None
+    assert target.id not in after["inbound_index"]
+
+
+def test_transfer_rejects_destination_with_tripped_compliance_breaker(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-transfer-destination-breaker")
+    destination_policy = _policy("gamma", "beta")
+    source = _gate(store, policy_agents=("beta", "gamma"))
+    record = _record(store)
+    admitted = source.admit_or_finalize(record)
+    assert admitted.key is not None
+    target = _transfer_question(store, admitted.key, "gamma", destination_policy)
+    ledger = _ledger(source)
+    ledger["breakers"]["gamma"] = {"tripped": True, "config_blocked": True}
+    source._write(ledger)
+    current = source.resolve(record)
+    roster = source.roster_snapshot()
+
+    blocked = source.transfer(
+        record,
+        admitted.key,
+        destination="gamma",
+        new_inbound_id=target.id,
+        destination_policy=destination_policy,
+        actor="lead",
+        expected_roster_revision=roster["revision"],
+        expected_revision=current.scoped_revision,
+    )
+
+    after = _ledger(source)
+    assert blocked.state == ResolverState.BLOCKED_COMPLIANCE
+    assert source.resolve(record).state == ResolverState.BLOCKED_COMPLIANCE
+    assert after["obligations"][admitted.key.digest]["state"] == "open"
+    assert target.id not in after["inbound_index"]
+
+
+def test_transfer_rejects_destination_in_blocked_broadcast_aggregate(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    members = ["beta", "gamma"]
+    _broadcast_question(
+        store,
+        "beta",
+        broadcast_id="b-transfer-blocked",
+        members=members,
+        policy="each",
+    )
+    destination_policy = _policy("gamma", "beta")
+    source = _gate(store, policy_agents=("beta", "gamma"))
+    record = _record(store)
+    admitted = source.admit_or_finalize(record)
+    assert admitted.key is not None
+    target = store.send(
+        sender="alpha",
+        recipient="gamma",
+        kind="question",
+        body="transferred broadcast target",
+        meta={
+            "request_id": "b-transfer-blocked",
+            "broadcast_id": "b-transfer-blocked",
+            "membership_snapshot": members,
+            "response_policy": "each",
+            "broadcast_policy_version": 1,
+            "consult": False,
+            "transfer_from_key_digest": admitted.key.digest,
+            "transfer_policy_generation": destination_policy.generation,
+        },
+    )
+    source.resolve(record)
+    ledger = _ledger(source)
+    ledger["broadcasts"]["b-transfer-blocked"]["state"] = "blocked"
+    ledger["broadcasts"]["b-transfer-blocked"]["blocked_reason"] = "test conflict"
+    source._write(ledger)
+    current = source.resolve(record)
+    roster = source.roster_snapshot()
+
+    blocked = source.transfer(
+        record,
+        admitted.key,
+        destination="gamma",
+        new_inbound_id=target.id,
+        destination_policy=destination_policy,
+        actor="lead",
+        expected_roster_revision=roster["revision"],
+        expected_revision=current.scoped_revision,
+    )
+
+    after = _ledger(source)
+    assert blocked.state == ResolverState.BLOCKED
+    assert source.resolve(record).state == ResolverState.BLOCKED
+    assert after["obligations"][admitted.key.digest]["state"] == "open"
+    assert target.id not in after["inbound_index"]
+
+
+def test_transfer_rejects_target_with_prospective_terminal_answer(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-transfer-target-preanswered")
+    destination_policy = _policy("gamma", "beta")
+    source = _gate(store, policy_agents=("beta", "gamma"))
+    record = _record(store)
+    admitted = source.admit_or_finalize(record)
+    assert admitted.key is not None
+    target = _transfer_question(store, admitted.key, "gamma", destination_policy)
+    store.send(
+        sender="gamma",
+        recipient="alpha",
+        body="already answered before assignment",
+        meta={
+            "request_id": admitted.key.correlation_id,
+            "in_reply_to": target.id,
+        },
+    )
+    current = source.resolve(record)
+    roster = source.roster_snapshot()
+
+    with pytest.raises(GateError, match="already terminal"):
         source.transfer(
             record,
             admitted.key,
@@ -3576,9 +4097,67 @@ def test_transfer_rejects_unadmittable_destination_before_source_close(
             expected_roster_revision=roster["revision"],
             expected_revision=current.scoped_revision,
         )
+
     ledger = _ledger(source)
     assert ledger["obligations"][admitted.key.digest]["state"] == "open"
     assert target.id not in ledger["inbound_index"]
+
+
+def test_uncommitted_transfer_target_abort_wins_cas_and_unblocks_destination_queue(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-transfer-abort")
+    destination_policy = _policy("gamma", "beta")
+    source = _gate(store, policy_agents=("beta", "gamma"))
+    source_record = _record(store)
+    admitted = source.admit_or_finalize(source_record)
+    assert admitted.key is not None
+    target = _transfer_question(store, admitted.key, "gamma", destination_policy)
+    next_message = store.send(
+        sender="alpha",
+        recipient="gamma",
+        kind="question",
+        body="next live destination work",
+        meta={"request_id": "q-after-aborted-transfer"},
+    )
+    destination = _gate(
+        store,
+        agent="gamma",
+        fence="wrapper-gamma",
+        policy_agents=("gamma", "beta"),
+    )
+    target_record = _record(store, agent="gamma")
+
+    aborted = destination.admit_or_finalize(target_record)
+    assert aborted.state == ResolverState.NOT_OWED
+    assert aborted.reason == "no_admission_finalization_pending"
+    finalized = destination.finalize(
+        target_record,
+        aborted,
+        expected_revision=aborted.ledger_revision,
+    )
+    assert finalized.state == ResolverState.NOT_OWED
+    assert store.cursor("gamma") == target.id
+    assert _record(store, agent="gamma")["id"] == next_message.id
+
+    current = source.resolve(source_record)
+    roster = source.roster_snapshot()
+    with pytest.raises(StaleRevision, match="already claimed"):
+        source.transfer(
+            source_record,
+            admitted.key,
+            destination="gamma",
+            new_inbound_id=target.id,
+            destination_policy=destination_policy,
+            actor="lead",
+            expected_roster_revision=roster["revision"],
+            expected_revision=current.scoped_revision,
+        )
+
+    claim = _ledger(destination)["no_admission_claims"][target.id]
+    assert claim["state"] == "finalized"
+    assert claim["resolution"] == ResolverState.NOT_OWED.value
 
 
 def test_human_escalation_pins_roster_revision_and_repoint_rejects_append(
@@ -3605,6 +4184,58 @@ def test_human_escalation_pins_roster_revision_and_repoint_rejects_append(
         (message.meta or {}).get("origin_inbound_id") == record["id"]
         for message in store.valid_messages()
     )
+
+
+def test_legacy_operation_digest_and_intent_replay_remain_compatible(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    body = "399"
+    nonce = "a" * 32
+    legacy_intent = {
+        "operation": "terminal",
+        "kind": "message",
+        "recipient": "alpha",
+        "in_reply_to": "legacy-inbound",
+        "request_id": "q-legacy-operation",
+        "broadcast_id": None,
+        "origin_request_id": None,
+        "origin_inbound_id": None,
+    }
+    legacy_payload = {**legacy_intent, "body": body}
+    expected = hashlib.sha256(
+        json.dumps(
+            legacy_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    digest = operation_payload_digest(body=body, **legacy_intent)
+    store.record_operation_intent(
+        sender="beta",
+        operation_nonce=nonce,
+        operation_digest=expected,
+        body=body,
+        operation_intent=legacy_intent,
+    )
+    message, created = store.send_operation(
+        sender="beta",
+        recipient="alpha",
+        body=body,
+        kind="message",
+        meta={
+            "in_reply_to": "legacy-inbound",
+            "request_id": "q-legacy-operation",
+        },
+        operation_nonce=nonce,
+        operation_digest=expected,
+    )
+
+    assert digest == expected
+    assert created is True
+    assert (message.meta or {})["operation_digest"] == expected
 
 
 def test_operator_resolution_rejects_record_key_mismatch_without_cursor_move(
@@ -3706,6 +4337,126 @@ def test_quorum_pins_earliest_canonical_qualifying_events_and_exact_transaction(
     assert gamma.resolve(gamma_record).state == ResolverState.SATISFIED
 
 
+def test_missed_eager_projection_repairs_in_publication_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-projection-order")
+    gate = _gate(store)
+    record = _record(store)
+    gate.admit_or_finalize(record)
+    original = obligations.note_bus_message
+    missed = False
+
+    def miss_first_projection(current_store, message):
+        nonlocal missed
+        if message.body == "first canonical response" and not missed:
+            missed = True
+            raise OSError("injected eager projection miss")
+        return original(current_store, message)
+
+    monkeypatch.setattr(obligations, "note_bus_message", miss_first_projection)
+    message_ids = iter([
+        "20990101-000000-000002-AAAA",
+        "20990101-000000-000001-BBBB",
+    ])
+    monkeypatch.setattr("agenttalk.store._new_id", lambda: next(message_ids))
+    first = store.send(
+        sender="beta",
+        recipient="alpha",
+        body="first canonical response",
+        meta={"request_id": "q-projection-order", "in_reply_to": record["id"]},
+    )
+    second = store.send(
+        sender="beta",
+        recipient="alpha",
+        body="second canonical response",
+        meta={"request_id": "q-projection-order", "in_reply_to": record["id"]},
+    )
+    ledger = _ledger(gate)
+
+    assert missed is True
+    assert first.id > second.id  # Cross-process IDs need not follow commit order.
+    assert ledger["messages"][first.id]["sequence"] < (
+        ledger["messages"][second.id]["sequence"]
+    )
+
+
+@pytest.mark.parametrize("damage", ["rollback", "reorder", "duplicate"])
+def test_publication_order_sidecar_damage_fails_closed(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    store = _store(tmp_path)
+    first = _question(store, "q-publication-anchor-a")
+    order_path = store.state_dir / "message-publication-order.json"
+    first_order = order_path.read_text(encoding="utf-8")
+    second = _question(store, "q-publication-anchor-b")
+    if damage == "rollback":
+        order_path.write_text(first_order, encoding="utf-8")
+        error = "rolled back"
+    elif damage == "reorder":
+        order = json.loads(order_path.read_text(encoding="utf-8"))
+        order["messages"][first.id], order["messages"][second.id] = (
+            order["messages"][second.id],
+            order["messages"][first.id],
+        )
+        order_path.write_text(json.dumps(order), encoding="utf-8")
+        error = "changed below its anchor"
+    else:
+        order = json.loads(order_path.read_text(encoding="utf-8"))
+        order["messages"]["20990101-000000-000003-CCCC"] = 1
+        order_path.write_text(json.dumps(order), encoding="utf-8")
+        error = "sequence is non-contiguous"
+    published_before = len(store.valid_messages())
+
+    with pytest.raises(ValueError, match=error):
+        store.publication_ordered_messages()
+    with pytest.raises(ValueError, match=error):
+        _question(store, "q-publication-anchor-c")
+
+    assert len(store.valid_messages()) == published_before
+
+
+def test_prepublish_order_reservation_gap_does_not_block_later_send(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    real_replace = os.replace
+    failed = False
+
+    def fail_first_message_publish(source, destination) -> None:
+        nonlocal failed
+        if (
+            not failed
+            and Path(source).name.endswith(".pending")
+            and Path(destination).parent == store.messages_dir
+        ):
+            failed = True
+            raise OSError("injected failure after order reservation")
+        real_replace(source, destination)
+
+    monkeypatch.setattr("agenttalk.store.os.replace", fail_first_message_publish)
+    with pytest.raises(OSError, match="after order reservation"):
+        _question(store, "q-publication-gap-lost")
+    landed = _question(store, "q-publication-gap-landed")
+    order = json.loads(
+        (store.state_dir / "message-publication-order.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert failed is True
+    assert order["append_sequence"] == 2
+    assert sorted(order["messages"].values()) == [1, 2]
+    assert order["messages"][landed.id] == 2
+    assert [message.id for message in store.publication_ordered_messages()] == [
+        landed.id
+    ]
+
+
 def test_broadcast_policy_conflict_and_manual_close_do_not_qualify(
     tmp_path: Path,
 ) -> None:
@@ -3751,6 +4502,50 @@ def test_broadcast_policy_conflict_and_manual_close_do_not_qualify(
     assert gamma_open.key is not None
 
 
+def test_manual_close_never_suppresses_impossible_broadcast_delivery_failure(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    members = ["beta", "gamma"]
+    for member in members:
+        _broadcast_question(
+            store,
+            member,
+            broadcast_id="b-manual-failure",
+            members=members,
+            policy="any",
+        )
+    beta = _gate(store, policy_agents=("beta", "gamma"))
+    gamma = _gate(
+        store,
+        agent="gamma",
+        fence="wrapper-gamma",
+        policy_agents=("gamma", "beta"),
+    )
+    beta_record = _record(store)
+    gamma_record = _record(store, agent="gamma")
+    beta.admit_or_finalize(beta_record)
+    gamma_open = gamma.admit_or_finalize(gamma_record)
+    assert gamma_open.key is not None
+    note_manual_close(store, "beta", "b-manual-failure")
+    beta.finalize(beta_record, beta.resolve(beta_record))
+    gamma.delivery_failed(
+        gamma_record,
+        gamma_open.key,
+        reason="remaining answer slot failed",
+        expected_revision=gamma.resolve(gamma_record).scoped_revision,
+    )
+
+    scoped = recv_api.poll(
+        store,
+        "alpha",
+        scoped_request_id="b-manual-failure",
+    )["scoped"]
+    assert scoped["closed"] is True
+    assert scoped["delivery_terminal"]["state"] == "delivery_failed"
+    assert scoped["delivery_terminal"]["aggregate"] is True
+
+
 def test_any_threshold_closes_requester_and_late_member_without_model_call(
     tmp_path: Path,
 ) -> None:
@@ -3780,7 +4575,11 @@ def test_any_threshold_closes_requester_and_late_member_without_model_call(
     gamma_record = _record(store, agent="gamma")
     policy_closed = gamma.admit_or_finalize(gamma_record)
     assert policy_closed.state == ResolverState.BROADCAST_POLICY_SATISFIED
-    gamma.finalize(gamma_record, policy_closed)
+    gamma.finalize(
+        gamma_record,
+        policy_closed,
+        expected_revision=policy_closed.ledger_revision,
+    )
     assert store.cursor("gamma") == gamma_inbound.id
     assert gamma.next_dispatch_purpose(policy_closed.key) is None if policy_closed.key else True
 
@@ -3815,7 +4614,11 @@ def test_broadcast_policy_close_and_dispatch_reservation_have_one_cas_winner(
     assert cli.main([
         "--root", str(tmp_path), *dispatched["owed_action"]["argv"][3:], "--quiet",
     ]) == 0
-    assert gamma.resolve(gamma_record).state == ResolverState.SATISFIED
+    assert gamma.resolve(gamma_record).state == (
+        ResolverState.BROADCAST_POLICY_SATISFIED
+    )
+    assert gamma_open.key is not None
+    assert gamma.next_dispatch_purpose(gamma_open.key) is None
     aggregates = [
         row for row in _ledger(gamma)["transitions"]
         if row["transition"] == "BROADCAST_POLICY_SATISFIED"
@@ -3823,6 +4626,309 @@ def test_broadcast_policy_close_and_dispatch_reservation_have_one_cas_winner(
     ]
     assert len(aggregates) == 1
     assert len(aggregates[0]["data"]["winning_ids"]) == 1
+
+
+def test_reserved_nonwinner_closes_after_first_result_without_recovery(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    members = ["beta", "gamma"]
+    for member in members:
+        _broadcast_question(
+            store,
+            member,
+            broadcast_id="b-reserved-result",
+            members=members,
+            policy="any",
+        )
+    beta = _gate(store, policy_agents=("beta", "gamma"))
+    gamma = _gate(
+        store,
+        agent="gamma",
+        fence="wrapper-gamma",
+        policy_agents=("gamma", "beta"),
+    )
+    gamma_record = _record(store, agent="gamma")
+    gamma_open = gamma.admit_or_finalize(gamma_record)
+    assert gamma_open.key is not None
+    permit = gamma.reserve_dispatch(gamma_open, purpose="initial")
+    gamma.dispatch_record(gamma_record, permit)
+
+    beta_record = _record(store)
+    _answer_reserved(tmp_path, beta, beta_record)
+    beta.finalize(beta_record, beta.resolve(beta_record))
+    gamma.mark_dispatch_result(permit, action_attempted=False)
+
+    assert gamma.resolve(gamma_record).state == (
+        ResolverState.BROADCAST_POLICY_SATISFIED
+    )
+    assert gamma.next_dispatch_purpose(gamma_open.key) is None
+    with pytest.raises(DispatchRefused):
+        gamma.reserve_dispatch(gamma_open, purpose="recovery")
+
+
+def test_pre_admission_broadcast_answer_atomically_closes_aggregate(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    members = ["beta", "gamma"]
+    beta_inbound = _broadcast_question(
+        store,
+        "beta",
+        broadcast_id="b-pre-admission-answer",
+        members=members,
+        policy="any",
+    )
+    _broadcast_question(
+        store,
+        "gamma",
+        broadcast_id="b-pre-admission-answer",
+        members=members,
+        policy="any",
+    )
+    response = store.send(
+        sender="beta",
+        recipient="alpha",
+        body="answer before wrapper admission",
+        meta={
+            "request_id": "b-pre-admission-answer",
+            "in_reply_to": beta_inbound.id,
+        },
+    )
+    beta = _gate(store, policy_agents=("beta", "gamma"))
+    record = _record(store)
+    terminal = beta.admit_or_finalize(record)
+
+    assert terminal.state == ResolverState.SATISFIED
+    assert terminal.key is None
+    beta.finalize(record, terminal, expected_revision=terminal.scoped_revision)
+    ledger = _ledger(beta)
+    aggregate = ledger["broadcasts"]["b-pre-admission-answer"]
+    assert aggregate["state"] == "policy_satisfied"
+    assert aggregate["winning_ids"] == [response.id]
+    assert recv_api.poll(
+        store,
+        "alpha",
+        scoped_request_id="b-pre-admission-answer",
+    )["scoped"]["closed"] is True
+
+
+def test_policy_close_covers_every_open_member_inbound_generation(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    members = ["beta", "gamma"]
+    first = _broadcast_question(
+        store,
+        "beta",
+        broadcast_id="b-all-open-generations",
+        members=members,
+        policy="any",
+    )
+    second = _broadcast_question(
+        store,
+        "beta",
+        broadcast_id="b-all-open-generations",
+        members=members,
+        policy="any",
+    )
+    _broadcast_question(
+        store,
+        "gamma",
+        broadcast_id="b-all-open-generations",
+        members=members,
+        policy="any",
+    )
+    beta = _gate(store, policy_agents=("beta", "gamma"))
+    first_record = _record(store)
+    first_open = beta.admit_or_finalize(first_record)
+    assert first_open.key is not None
+    store.advance_cursor("beta", first.id)
+    second_record = _record(store)
+    second_open = beta.admit_or_finalize(second_record)
+    assert second_open.key is not None and second_record["id"] == second.id
+    gamma = _gate(
+        store,
+        agent="gamma",
+        fence="wrapper-gamma",
+        policy_agents=("gamma", "beta"),
+    )
+    gamma_record = _record(store, agent="gamma")
+    _answer_reserved(tmp_path, gamma, gamma_record)
+    gamma.finalize(gamma_record, gamma.resolve(gamma_record))
+    obligations = _ledger(beta)["obligations"]
+
+    assert obligations[first_open.key.digest]["state"] == (
+        "broadcast_policy_satisfied"
+    )
+    assert obligations[second_open.key.digest]["state"] == (
+        "broadcast_policy_satisfied"
+    )
+
+
+def test_broadcast_policy_validation_failure_never_leaks_pending_close(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    members = ["beta", "gamma", "lead"]
+    for member in members:
+        _broadcast_question(
+            store,
+            member,
+            broadcast_id="b-invalid-later-member",
+            members=members,
+            policy="any",
+        )
+    beta = _gate(store, policy_agents=("beta", "gamma", "lead"))
+    beta_record = _record(store)
+    beta_open = beta.admit_or_finalize(beta_record)
+    assert beta_open.key is not None
+    beta.reserve_dispatch(beta_open, purpose="initial")
+    gamma = _gate(
+        store,
+        agent="gamma",
+        fence="wrapper-gamma",
+        policy_agents=("gamma", "beta", "lead"),
+    )
+    gamma_open = gamma.admit_or_finalize(_record(store, agent="gamma"))
+    assert gamma_open.key is not None
+    ledger = _ledger(gamma)
+    ledger["obligations"][gamma_open.key.digest]["key"]["requester"] = "delta"
+    gamma._write(ledger)  # noqa: SLF001 - later-member validation failure injection
+
+    lead = _gate(
+        store,
+        agent="lead",
+        fence="wrapper-lead",
+        policy_agents=("lead", "beta", "gamma"),
+    )
+    lead_record = _record(store, agent="lead")
+    _answer_reserved(tmp_path, lead, lead_record)
+    lead.finalize(lead_record, lead.resolve(lead_record))
+
+    persisted = _ledger(beta)
+    beta_admission = persisted["obligations"][beta_open.key.digest]
+    assert persisted["broadcasts"]["b-invalid-later-member"]["state"] == "blocked"
+    assert beta_admission["state"] == "open"
+    assert "broadcast_policy_close_pending" not in beta_admission
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["aggregate_state", "generation", "transaction", "identity"],
+)
+def test_pending_broadcast_close_requires_exact_aggregate_proof(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    store = _store(tmp_path)
+    members = ["beta", "gamma"]
+    beta_inbound = _broadcast_question(
+        store,
+        "beta",
+        broadcast_id="b-pending-proof",
+        members=members,
+        policy="any",
+    )
+    gamma_inbound = _broadcast_question(
+        store,
+        "gamma",
+        broadcast_id="b-pending-proof",
+        members=members,
+        policy="any",
+    )
+    gamma = _gate(
+        store,
+        agent="gamma",
+        fence="wrapper-gamma",
+        policy_agents=("gamma", "beta"),
+    )
+    gamma_record = _record(store, agent="gamma")
+    gamma_open = gamma.admit_or_finalize(gamma_record)
+    assert gamma_open.key is not None
+    permit = gamma.reserve_dispatch(gamma_open, purpose="initial")
+    gamma.dispatch_record(gamma_record, permit)
+    beta = _gate(store, policy_agents=("beta", "gamma"))
+    beta_record = _record(store)
+    assert beta_record["id"] == beta_inbound.id
+    _answer_reserved(tmp_path, beta, beta_record)
+    beta.finalize(beta_record, beta.resolve(beta_record))
+
+    ledger = _ledger(gamma)
+    aggregate = ledger["broadcasts"]["b-pending-proof"]
+    admission = ledger["obligations"][gamma_open.key.digest]
+    assert aggregate["state"] == "policy_satisfied"
+    assert isinstance(admission.get("broadcast_policy_close_pending"), dict)
+    if corruption == "aggregate_state":
+        aggregate["state"] = "blocked"
+    elif corruption == "generation":
+        admission["broadcast_policy_close_pending"]["broadcast_generation"] += 1
+    elif corruption == "transaction":
+        admission["broadcast_policy_close_pending"]["transaction_id"] = "stale"
+    else:
+        affected = next(
+            row for row in aggregate["affected_member_keys"]
+            if row["inbound_id"] == gamma_inbound.id
+        )
+        affected["member"] = "delta"
+    gamma._write(ledger)  # noqa: SLF001 - corrupt/stale pending-proof injection
+
+    gamma.mark_dispatch_result(permit, action_attempted=False)
+
+    persisted = _ledger(gamma)
+    admission = persisted["obligations"][gamma_open.key.digest]
+    assert admission["state"] == "blocked"
+    assert admission.get("terminal_state") != (
+        ResolverState.BROADCAST_POLICY_SATISFIED.value
+    )
+    assert "broadcast_policy_close_pending" not in admission
+    assert not any(
+        row["transition"] == "BROADCAST_POLICY_SATISFIED"
+        and row.get("scope") == gamma_inbound.id
+        for row in persisted["transitions"]
+    )
+
+
+def test_broadcast_identity_collision_between_requesters_fails_closed(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path, ["alpha", "beta", "gamma", "delta", "lead"])
+    members = ["beta", "gamma"]
+    _broadcast_question(
+        store,
+        "beta",
+        broadcast_id="b-requester-collision",
+        members=members,
+        policy="any",
+    )
+    store.send(
+        sender="delta",
+        recipient="gamma",
+        kind="question",
+        body="different requester reuses broadcast id",
+        meta={
+            "request_id": "b-requester-collision",
+            "broadcast_id": "b-requester-collision",
+            "membership_snapshot": members,
+            "response_policy": "any",
+            "broadcast_policy_version": 1,
+        },
+    )
+    beta = _gate(store, policy_agents=("beta", "gamma"))
+    gamma = _gate(
+        store,
+        agent="gamma",
+        fence="wrapper-gamma",
+        policy_agents=("gamma", "beta"),
+    )
+
+    assert beta.admit_or_finalize(_record(store)).state == ResolverState.BLOCKED
+    assert gamma.admit_or_finalize(
+        _record(store, agent="gamma")
+    ).state == ResolverState.BLOCKED
+    aggregate = _ledger(beta)["broadcasts"]["b-requester-collision"]
+    assert aggregate["state"] == "blocked"
+    assert aggregate["descriptor"]["requester"] == "alpha"
 
 
 def test_late_response_requires_exact_closed_member_actor_and_anchor(
@@ -3941,18 +5047,57 @@ def test_legacy_broadcast_is_classification_unknown_with_public_telemetry(
         meta=meta,
     )
     gate = _gate(store)
+    record = _record(store)
 
-    resolution = gate.admit_or_finalize(_record(store))
-    replayed = gate.admit_or_finalize(_record(store))
+    resolution = gate.admit_or_finalize(record)
+    replayed = gate.admit_or_finalize(record)
+    finalized = gate.finalize(
+        record,
+        replayed,
+        expected_revision=replayed.scoped_revision,
+    )
     status = gate.status()
+    doctor_check = doctor._check_detection_commit_gate(store)  # noqa: SLF001
 
     assert resolution.state == ResolverState.CLASSIFICATION_UNKNOWN
     assert replayed.state == ResolverState.CLASSIFICATION_UNKNOWN
+    assert finalized.state == ResolverState.CLASSIFICATION_UNKNOWN
+    assert store.cursor("beta") == record["id"]
     assert _ledger(gate)["telemetry"]["legacy_broadcast_unenforced_total"] == 1
     assert status["legacy_broadcast"] == {
         "enforcement": "none",
         "unenforced_total": 1,
     }
+    assert doctor_check.status == "warn"
+    assert "legacy_unenforced=1" in doctor_check.details
+
+
+def test_conflicting_request_and_broadcast_identity_is_not_enforcement_eligible(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    inbound = store.send(
+        sender="alpha",
+        recipient="beta",
+        kind="question",
+        body="split identity",
+        meta={
+            "request_id": "q-split",
+            "broadcast_id": "b-split",
+            "membership_snapshot": ["beta"],
+            "response_policy": "any",
+            "broadcast_policy_version": 1,
+        },
+    )
+    gate = _gate(store)
+    record = _record(store)
+    result = gate.admit_or_finalize(record)
+
+    assert record["id"] == inbound.id
+    assert result.state == ResolverState.CLASSIFICATION_UNKNOWN
+    assert result.key is None
+    assert "legacy broadcast" in result.reason
+    assert "b-split" not in _ledger(gate)["broadcasts"]
 
 
 def test_blocked_policy_never_dispatches_or_advances_cursor(tmp_path: Path) -> None:
@@ -3972,6 +5117,96 @@ def test_blocked_policy_never_dispatches_or_advances_cursor(tmp_path: Path) -> N
     assert blocked.key is None
     assert store.cursor("beta") == before
     assert inbound.id not in _ledger(gate).get("inbound_index", {}) if gate.path.exists() else True
+
+
+def test_exact_key_supersession_closes_only_named_generation_and_malformed_blocks(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    first = _question(store, "q-exact-supersede")
+    gate = _gate(store)
+    first_record = _record(store)
+    first_open = gate.admit_or_finalize(first_record)
+    assert first_open.key is not None
+    store.advance_cursor("beta", first.id)
+    second = _question(store, "q-exact-supersede")
+    second_record = _record(store)
+    second_open = gate.admit_or_finalize(second_record)
+    assert second_open.key is not None
+    store.send(
+        sender="alpha",
+        recipient="beta",
+        kind="rescind",
+        body="supersede first generation only",
+        meta={
+            "request_id": "q-exact-supersede",
+            "target_msg_id": first.id,
+            "supersedes": first_open.key.to_dict(),
+        },
+    )
+
+    assert gate.resolve(first_record).state == ResolverState.SUPERSEDED
+    assert gate.resolve(second_record).state == ResolverState.OWED_UNSATISFIED
+
+    store.send(
+        sender="alpha",
+        recipient="beta",
+        kind="rescind",
+        body="malformed exact transition",
+        meta={
+            "request_id": "q-exact-supersede",
+            "target_msg_id": second.id,
+            "supersedes": {"inbound_id": second.id},
+        },
+    )
+    malformed = gate.resolve(second_record)
+    assert malformed.state == ResolverState.INDETERMINATE
+    assert "uninterpretable" in malformed.reason
+
+
+def test_reused_broadcast_id_starts_fresh_generation_without_old_winner_leak(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    members = ["beta", "gamma"]
+    for member in members:
+        _broadcast_question(
+            store,
+            member,
+            broadcast_id="b-reused-generation",
+            members=members,
+            policy="any",
+        )
+    beta = _gate(store, policy_agents=("beta", "gamma"))
+    first_record = _record(store)
+    _answer_reserved(tmp_path, beta, first_record)
+    beta.finalize(first_record, beta.resolve(first_record))
+    assert recv_api.poll(
+        store,
+        "alpha",
+        scoped_request_id="b-reused-generation",
+    )["scoped"]["closed"] is True
+
+    second = _broadcast_question(
+        store,
+        "beta",
+        broadcast_id="b-reused-generation",
+        members=members,
+        policy="any",
+    )
+    second_record = _record(store)
+    second_open = beta.admit_or_finalize(second_record)
+    aggregate = _ledger(beta)["broadcasts"]["b-reused-generation"]
+
+    assert second_open.state == ResolverState.OWED_UNSATISFIED
+    assert second_open.key is not None and second_open.key.inbound_id == second.id
+    assert aggregate["state"] == "open"
+    assert aggregate["generation"] == 2
+    assert recv_api.poll(
+        store,
+        "alpha",
+        scoped_request_id="b-reused-generation",
+    )["scoped"]["closed"] is False
 
 
 @pytest.mark.parametrize(
@@ -5858,7 +7093,8 @@ def test_reassignment_after_failed_delivery_gets_fresh_generation_and_budget(
 ) -> None:
     store = _store(tmp_path)
     _question(store, "q-reassigned-recovery")
-    source = _gate(store)
+    destination_policy = _policy("gamma", "beta")
+    source = _gate(store, policy_agents=("beta", "gamma"))
     record = _record(store)
     admitted = source.admit_or_finalize(record)
     assert admitted.key is not None
@@ -5871,18 +7107,21 @@ def test_reassignment_after_failed_delivery_gets_fresh_generation_and_budget(
     old_spend = _ledger(source)["obligations"][admitted.key.digest][
         "paid_dispatches_total"
     ]
-    next_inbound = store.send(
-        sender="alpha",
-        recipient="gamma",
-        kind="question",
-        body="reassign the unanswered request",
-        meta={"request_id": "q-reassigned-recovery"},
+    next_inbound = _transfer_question(
+        store, admitted.key, "gamma", destination_policy,
     )
+    current = source.resolve(record)
+    roster = source.roster_snapshot()
 
     source.transfer(
+        record,
         admitted.key,
         destination="gamma",
         new_inbound_id=next_inbound.id,
+        destination_policy=destination_policy,
+        actor="lead",
+        expected_roster_revision=roster["revision"],
+        expected_revision=current.scoped_revision,
     )
 
     ledger = _ledger(source)

@@ -198,6 +198,7 @@ def _check_detection_commit_gate(store: Store) -> Check:
     rows: list[dict] = []
     has_error = False
     has_warn = False
+    has_legacy_broadcast = False
     for agent in roster:
         configured = process_path or supervisor_paths.get(agent)
         policy = (
@@ -211,7 +212,20 @@ def _check_detection_commit_gate(store: Store) -> Check:
         rows.append(status)
         has_error = has_error or policy.status == ResolverState.BLOCKED_POLICY
         has_warn = has_warn or status.get("breaker", {}).get("tripped") is True
-    details = "; ".join(f"{row['agent']}={row['status']}" for row in rows)
+        legacy = status.get("legacy_broadcast", {})
+        has_legacy_broadcast = has_legacy_broadcast or int(
+            legacy.get("unenforced_total", 0)
+        ) > 0
+    has_warn = has_warn or has_legacy_broadcast
+    details = "; ".join(
+        f"{row['agent']}={row['status']}"
+        + (
+            f" legacy_unenforced={row['legacy_broadcast']['unenforced_total']}"
+            if int(row.get("legacy_broadcast", {}).get("unenforced_total", 0)) > 0
+            else ""
+        )
+        for row in rows
+    )
     return Check(
         name="wrapped_commit_gate",
         status="error" if has_error else ("warn" if has_warn else "ok"),
@@ -220,7 +234,14 @@ def _check_detection_commit_gate(store: Store) -> Check:
             f"repair the operator-owned {POLICY_ENV} snapshot before dispatch"
             if has_error else (
                 "audit and reset the tripped compliance breaker before paid dispatch"
-                if has_warn else ""
+                if any(
+                    row.get("breaker", {}).get("tripped") is True for row in rows
+                )
+                else (
+                    "audit legacy broadcast records; they were logged without "
+                    "owed-action enforcement"
+                    if has_legacy_broadcast else ""
+                )
             )
         ),
         data={"agents": rows, "security_grade": False},

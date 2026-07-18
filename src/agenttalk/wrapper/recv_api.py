@@ -81,6 +81,12 @@ def _requester_terminal(store, agent: str, rid: str) -> dict | None:
     return requester_terminal_for(store, rid, agent)
 
 
+def _requester_broadcast_state(store, agent: str, rid: str) -> str | None:
+    from .obligations import requester_broadcast_policy_state
+
+    return requester_broadcast_policy_state(store, rid, agent)
+
+
 def _delivery_failed(terminal: dict | None) -> dict | None:
     if terminal is None or terminal.get("state") != "delivery_failed":
         return None
@@ -110,6 +116,9 @@ def records(store, agent: str, *, scoped_request_id: str | None = None,
     msgs = [m for m in msgs if m.meta.get("request_id") == rid]
     closed, superseded = _terminal_state(store, agent, rid)
     terminal = _requester_terminal(store, agent, rid)
+    broadcast_state = _requester_broadcast_state(store, agent, rid)
+    if broadcast_state in {"open", "blocked"} and terminal is None:
+        closed = superseded
     failed = _delivery_failed(terminal)
     closed = closed or terminal is not None
     out = []
@@ -143,6 +152,13 @@ def poll(store, agent: str, *, scoped_request_id: str | None = None,
     if scoped_request_id is not None:
         closed, superseded = _terminal_state(store, agent, scoped_request_id)
         terminal = _requester_terminal(store, agent, scoped_request_id)
+        broadcast_state = _requester_broadcast_state(
+            store,
+            agent,
+            scoped_request_id,
+        )
+        if broadcast_state in {"open", "blocked"} and terminal is None:
+            closed = superseded
         failed = _delivery_failed(terminal)
         closed = closed or terminal is not None
         env["scoped"] = {
