@@ -7430,6 +7430,21 @@ def _print_rescinded(store: Store, rid: str, row) -> None:
             print(f"  reason: {row.rescind_reason}")
 
 
+def _print_requester_terminal(terminal: dict) -> int:
+    state = terminal.get("state")
+    if state == "delivery_failed":
+        print("AGENTTALK :: DELIVERY FAILED")
+        code = 4
+    elif state == "operator_resolved":
+        print("AGENTTALK :: OPERATOR RESOLVED")
+        code = 7
+    else:
+        print("AGENTTALK :: REQUESTER TERMINAL")
+        code = 7
+    print(json.dumps(terminal, ensure_ascii=False, sort_keys=True))
+    return code
+
+
 def _scoped_wait(store: Store, agent: str, args: argparse.Namespace, wait_token: str) -> int:
     """Block until a message on ONE thread (request_id) arrives — ignoring
     unrelated traffic — and return only that match.
@@ -7443,13 +7458,11 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace, wait_token:
     """
     rid = args.to_request
     kind_filter = getattr(args, "kind", None)
-    from .wrapper.obligations import delivery_failed_for
+    from .wrapper.obligations import requester_terminal_for
 
-    failed = delivery_failed_for(store, rid, agent)
-    if failed is not None:
-        print("AGENTTALK :: DELIVERY FAILED")
-        print(json.dumps(failed, ensure_ascii=False, sort_keys=True))
-        return 4
+    terminal = requester_terminal_for(store, rid, agent)
+    if terminal is not None:
+        return _print_requester_terminal(terminal)
     # Rescind wake (#12): a superseded request must never be waited on.
     # Checked at entry (the rescind may predate this wait entirely) and
     # re-evaluated when a rescind on this rid arrives mid-wait. Exit 3 —
@@ -7494,11 +7507,9 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace, wait_token:
             if _wait_was_superseded(store, agent, wait_token):
                 _print_wait_superseded(agent, rid=rid)
                 return 6
-            failed = delivery_failed_for(store, rid, agent)
-            if failed is not None:
-                print("AGENTTALK :: DELIVERY FAILED")
-                print(json.dumps(failed, ensure_ascii=False, sort_keys=True))
-                return 4
+            terminal = requester_terminal_for(store, rid, agent)
+            if terminal is not None:
+                return _print_requester_terminal(terminal)
             # Floor delivery at BOTH the per-thread seen pointer AND the
             # global cursor: a message already consumed globally (a `drain`
             # or plain `wait` advanced the cursor past it) must NOT be

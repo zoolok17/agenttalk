@@ -1407,14 +1407,19 @@ def test_durable_retry_barrier_records_missing_outcome_before_restart_retry(
         action_attempted=True,
         action_infra=True,
     )
+    current = gate.resolve(record)
 
     def crash_after_barrier(*_args, **_kwargs):
         admission = _ledger(gate)["obligations"][admitted.key.digest]
-        assert admission["operation_infra_attempts"] == 1
+        assert admission["operation_infra_attempts"] == 2
         assert admission["operation_infra_retry_inflight"] is True
         raise RuntimeError("captured retry crash")
 
-    assert gate.record_retry_barrier(admitted.key, category="operation_infra") is True
+    assert gate.record_retry_barrier(
+        admitted.key,
+        category="operation_infra",
+        expected_revision=current.scoped_revision,
+    ) is True
     monkeypatch.setattr(
         "agenttalk.wrapper.obligations.subprocess.run",
         crash_after_barrier,
@@ -1425,10 +1430,11 @@ def test_durable_retry_barrier_records_missing_outcome_before_restart_retry(
     assert restarted.record_retry_barrier(
         admitted.key,
         category="operation_infra",
+        expected_revision=current.scoped_revision,
     ) is True
     admission = _ledger(restarted)["obligations"][admitted.key.digest]
 
-    assert admission["operation_infra_attempts"] == 2
+    assert admission["operation_infra_attempts"] == 3
     assert admission["operation_infra_first_at"]
     transitions = _ledger(restarted)["transitions"]
     missing_index = next(
@@ -1444,12 +1450,13 @@ def test_durable_retry_barrier_records_missing_outcome_before_restart_retry(
     assert restarted.record_retry_barrier(
         admitted.key,
         category="operation_infra",
+        expected_revision=current.scoped_revision,
     ) is True
     assert (
         _ledger(restarted)["obligations"][admitted.key.digest][
             "operation_infra_attempts"
         ]
-        == 3
+        == 4
     )
 
 
@@ -1468,7 +1475,12 @@ def test_captured_escalation_retry_reuses_persisted_target_and_request_id(
     permit.draft_path.write_text("captured operator request", encoding="utf-8")
     _record_captured_intent(store, gate, permit)
     gate.mark_dispatch_result(permit, action_attempted=True, action_infra=True)
-    assert gate.record_retry_barrier(admitted.key, category="operation_infra") is True
+    current = gate.resolve(record)
+    assert gate.record_retry_barrier(
+        admitted.key,
+        category="operation_infra",
+        expected_revision=current.scoped_revision,
+    ) is True
     store.set_operator_facing("gamma")
     observed: list[str] = []
 
@@ -1542,6 +1554,8 @@ def test_draft_capture_survives_new_generation_without_second_model_call(
     assert restarted.next_dispatch_purpose(admitted.key) is None
     admission = _ledger(restarted)["obligations"][admitted.key.digest]
     assert admission["paid_dispatches_total"] == 1
+    assert admission["operation_infra_attempts"] == 1
+    assert admission["operation_infra_first_at"]
     assert admission["reservations"][permit.nonce]["operation_payload_digest"]
     assert any(
         row["transition"] == "OPERATION_INTENT_RECOVERED"
@@ -1563,13 +1577,14 @@ def test_delivery_failed_indexes_requester_and_disposition_before_cursor_project
         raise OSError("crash barrier")
 
     monkeypatch.setattr(gate, "_advance_record_cursor", crash_projection)
-    with pytest.raises(OSError, match="crash barrier"):
-        gate.delivery_failed(
-            _record(store),
-            admitted.key,
-            reason="test failure",
-            expected_revision=admitted.scoped_revision,
-        )
+    failed = gate.delivery_failed(
+        _record(store),
+        admitted.key,
+        reason="test failure",
+        expected_revision=admitted.scoped_revision,
+    )
+    assert failed.state == ResolverState.INDETERMINATE
+    assert failed.reason == "cursor projection failed: OSError"
 
     ledger = _ledger(gate)
     assert ledger["delivery_index"]["q-1"][0]["state"] == "delivery_failed"
@@ -1581,6 +1596,10 @@ def test_delivery_failed_indexes_requester_and_disposition_before_cursor_project
     assert terminal.state == ResolverState.DELIVERY_EXHAUSTED
     restarted.finalize(_record(store), terminal)
     assert store.cursor("beta") == inbound.id
+    assert restarted.delivery_status("q-1", "alpha")["state"] == "delivery_failed"
+    assert _ledger(restarted)["obligations"][admitted.key.digest]["state"] == (
+        "delivery_failed"
+    )
 
 
 def test_delivery_failed_is_idempotent_for_one_exact_key(tmp_path: Path) -> None:
@@ -1749,13 +1768,13 @@ def test_breaker_trip_persists_config_block_before_cursor_projection(
         lambda _record: (_ for _ in ()).throw(RuntimeError("cursor crash")),
     )
 
-    with pytest.raises(RuntimeError, match="cursor crash"):
-        gate.delivery_failed(
-            record,
-            admitted.key,
-            reason="third compliance exhaustion",
-            expected_revision=current.scoped_revision,
-        )
+    failed = gate.delivery_failed(
+        record,
+        admitted.key,
+        reason="third compliance exhaustion",
+        expected_revision=current.scoped_revision,
+    )
+    assert failed.state == ResolverState.INDETERMINATE
 
     assert store.cursor("beta") != inbound.id
     assert _ledger(gate)["breakers"]["beta"]["tripped"] is True
@@ -2152,6 +2171,9 @@ def test_alternating_global_projection_errors_exhaust_by_elapsed_time_only(
     assert health["fingerprint"] == {
         "error_class": "DifferentError", "path": "other-path",
     }
+    assert health["incident"]["kind"] == "PROOF_REPLAY_INCIDENT"
+    assert health["incident"]["authority"] == "elapsed_time"
+    assert health["incident_id"] == health["incident"]["incident_id"]
     assert store.cursor("beta") == ""
 
 
@@ -2359,8 +2381,8 @@ def test_successful_finalization_resets_compliance_streak_before_cursor_projecti
         lambda _record: (_ for _ in ()).throw(RuntimeError("cursor crash")),
     )
 
-    with pytest.raises(RuntimeError, match="cursor crash"):
-        gate.finalize(record, terminal)
+    finalized = gate.finalize(record, terminal)
+    assert finalized.state == ResolverState.INDETERMINATE
 
     breaker = _ledger(gate)["breakers"]["beta"]
     assert breaker["owed_action_cap_exhaustions_consecutive"] == 0
@@ -2570,12 +2592,12 @@ def test_finalized_no_admission_disposition_replays_cursor_after_crash(
         "_advance_record_cursor",
         lambda _record: (_ for _ in ()).throw(RuntimeError("crash barrier")),
     )
-    with pytest.raises(RuntimeError, match="crash barrier"):
-        owner.finalize(
-            record,
-            terminal,
-            expected_revision=terminal.ledger_revision,
-        )
+    finalized = owner.finalize(
+        record,
+        terminal,
+        expected_revision=terminal.ledger_revision,
+    )
+    assert finalized.state == ResolverState.INDETERMINATE
     assert store.cursor("beta") == ""
 
     restarted = _gate(store, fence="wrapper-2")
@@ -3390,13 +3412,25 @@ def test_nonpaid_retry_bounds_persist_across_cycles(
     gate = _gate(store)
     admitted = gate.admit_or_finalize(_record(store))
     assert admitted.key is not None
-    for _index in range(limit - 1):
-        assert gate.record_retry_barrier(admitted.key, category=category) is True
+    for _index in range(limit):
+        assert gate.record_retry_barrier(
+            admitted.key,
+            category=category,
+            expected_revision=admitted.scoped_revision,
+        ) is True
         gate.complete_retry_barrier(admitted.key, category=category)
-    assert gate.record_retry_barrier(admitted.key, category=category) is False
+    assert gate.record_retry_barrier(
+        admitted.key,
+        category=category,
+        expected_revision=admitted.scoped_revision,
+    ) is False
     restarted = _gate(store, fence="wrapper-1")
 
-    assert restarted.record_retry_barrier(admitted.key, category=category) is False
+    assert restarted.record_retry_barrier(
+        admitted.key,
+        category=category,
+        expected_revision=admitted.scoped_revision,
+    ) is False
     assert _ledger(restarted)["obligations"][admitted.key.digest][counter] == limit
 
 
@@ -3415,8 +3449,8 @@ def test_terminal_append_before_cursor_crash_replays_without_model_call(
         "_advance_record_cursor",
         lambda _record: (_ for _ in ()).throw(RuntimeError("crash barrier")),
     )
-    with pytest.raises(RuntimeError, match="crash barrier"):
-        gate.finalize(record, terminal)
+    finalized = gate.finalize(record, terminal)
+    assert finalized.state == ResolverState.INDETERMINATE
     assert store.cursor("beta") == ""
     calls = 0
 
@@ -3438,6 +3472,135 @@ def test_terminal_append_before_cursor_crash_replays_without_model_call(
 
     assert calls == 0
     assert store.cursor("beta") == inbound.id
+
+
+def test_cursor_projection_reservation_reconciles_crash_before_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-projection-crash-barrier")
+    owner = _gate(store, fence="wrapper-1")
+    record = _record(store)
+    _answer_reserved(tmp_path, owner, record)
+    terminal = owner.resolve(record)
+    monkeypatch.setattr(
+        owner,
+        "_advance_record_cursor",
+        lambda _record: (_ for _ in ()).throw(SystemExit("hard crash")),
+    )
+
+    with pytest.raises(SystemExit, match="hard crash"):
+        owner.finalize(record, terminal)
+
+    admission = _ledger(owner)["obligations"][terminal.key.digest]
+    assert admission["cursor_projection_inflight"] is True
+    assert admission["cursor_projection_misses"] == 0
+
+    restarted = _gate(store, fence="wrapper-1")
+    monkeypatch.setattr(
+        restarted,
+        "_advance_record_cursor",
+        lambda _record: (_ for _ in ()).throw(OSError("retry failed")),
+    )
+    retried = restarted.finalize(record, restarted.resolve(record))
+
+    assert retried.state == ResolverState.INDETERMINATE
+    admission = _ledger(restarted)["obligations"][terminal.key.digest]
+    assert admission["cursor_projection_inflight"] is False
+    assert admission["cursor_projection_misses"] == 2
+    assert sum(
+        row["transition"] == "CURSOR_FINALIZED"
+        for row in _ledger(restarted)["transitions"]
+    ) == 1
+
+
+def test_cursor_projection_elapsed_bound_starts_at_crashed_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-projection-elapsed-crash")
+    owner = _gate(
+        store,
+        fence="wrapper-1",
+        now=lambda: "2026-01-01T00:00:00Z",
+    )
+    record = _record(store)
+    _answer_reserved(tmp_path, owner, record)
+    terminal = owner.resolve(record)
+    monkeypatch.setattr(
+        owner,
+        "_advance_record_cursor",
+        lambda _record: (_ for _ in ()).throw(SystemExit("hard crash")),
+    )
+    with pytest.raises(SystemExit, match="hard crash"):
+        owner.finalize(record, terminal)
+    admission = _ledger(owner)["obligations"][terminal.key.digest]
+    assert admission["cursor_projection_reserved_at"] == "2026-01-01T00:00:00Z"
+
+    restarted = _gate(
+        store,
+        fence="wrapper-1",
+        now=lambda: "2026-01-01T00:15:01Z",
+    )
+    attempted = False
+
+    def project(_record: dict) -> None:
+        nonlocal attempted
+        attempted = True
+
+    monkeypatch.setattr(restarted, "_advance_record_cursor", project)
+    result = restarted.finalize(record, restarted.resolve(record))
+
+    assert result.state == ResolverState.INDETERMINATE
+    assert result.reason == "cursor projection retry bound exhausted"
+    assert attempted is False
+    admission = _ledger(restarted)["obligations"][terminal.key.digest]
+    assert admission["cursor_projection_misses"] == 1
+    assert admission["cursor_projection_first_at"] == "2026-01-01T00:00:00Z"
+    assert admission["cursor_projection_blocked"] is True
+    assert restarted.resolve(record).state == ResolverState.BLOCKED
+
+
+def test_persistent_cursor_projection_failure_blocks_after_durable_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-projection-bound")
+    owner = _gate(store, fence="wrapper-1")
+    record = _record(store)
+    _answer_reserved(tmp_path, owner, record)
+    key = owner.resolve(record).key
+    assert key is not None
+
+    for _attempt in range(12):
+        restarted = _gate(store, fence="wrapper-1")
+        monkeypatch.setattr(
+            restarted,
+            "_advance_record_cursor",
+            lambda _record: (_ for _ in ()).throw(OSError("persistent failure")),
+        )
+        result = restarted.finalize(record, restarted.resolve(record))
+        assert result.state == ResolverState.INDETERMINATE
+
+    ledger = _ledger(restarted)
+    admission = ledger["obligations"][key.digest]
+    assert admission["cursor_projection_misses"] == 12
+    assert admission["cursor_projection_blocked"] is True
+    assert admission["cursor_projection_inflight"] is False
+    assert store.cursor("beta") == ""
+    assert restarted.resolve(record).state == ResolverState.BLOCKED
+    assert restarted.status()["status"] == "BLOCKED"
+    assert sum(
+        row["transition"] == "CURSOR_FINALIZED"
+        for row in ledger["transitions"]
+    ) == 1
+    assert sum(
+        row["transition"] == "CURSOR_PROJECTION_BLOCKED"
+        for row in ledger["transitions"]
+    ) == 1
 
 
 def test_unwritable_disposition_never_advances_cursor(
@@ -3519,16 +3682,15 @@ def test_at_cap_failed_delivery_transaction_is_complete_before_cursor_projection
         lambda _record: (_ for _ in ()).throw(OSError("cursor projection crash")),
     )
 
-    with pytest.raises(OSError, match="cursor projection crash"):
-        loop.run_loop(
-            store,
-            "beta",
-            drive,
-            commit_gate=gate,
-            clock=lambda: 0.0,
-            sleep=lambda _delay: None,
-            max_polls=4,
-        )
+    loop.run_loop(
+        store,
+        "beta",
+        drive,
+        commit_gate=gate,
+        clock=lambda: 0.0,
+        sleep=lambda _delay: None,
+        max_polls=4,
+    )
 
     ledger = _ledger(gate)
     key_digest = ledger["inbound_index"][inbound.id]
@@ -3792,3 +3954,1368 @@ def test_explicit_reask_after_failed_delivery_gets_fresh_budget_without_reopenin
     )
     assert after_reservation[old.key.digest]["state"] == "delivery_failed"
     assert any(message.id == old_inbound.id for message in store.valid_messages())
+    assert restarted.delivery_status("q-new-delivery", "alpha") is None
+
+
+def _captured_infra_attempt(
+    store: Store,
+    gate: DetectionCommitGate,
+    *,
+    rid: str | None = None,
+):
+    record = _record(store, rid)
+    admitted = gate.admit_or_finalize(record)
+    assert admitted.key is not None
+    permit = gate.reserve_dispatch(admitted, purpose="initial")
+    dispatched = gate.dispatch_record(record, permit)
+    permit.draft_path.write_text("captured answer", encoding="utf-8")
+    _record_captured_intent(store, gate, permit)
+    gate.mark_dispatch_result(
+        permit,
+        action_attempted=True,
+        action_infra=True,
+    )
+    return record, admitted, permit, dispatched
+
+
+def _race_scoped_revision(store: Store, sequence: int, *, rid: str = "q-1") -> None:
+    store.send(
+        sender="gamma",
+        recipient="alpha",
+        kind="note",
+        body=f"correlated revision race {sequence}",
+        meta={"request_id": rid},
+    )
+
+
+def _consume_operation_retry_budget(
+    gate: DetectionCommitGate,
+    admitted,
+    *,
+    already_executed: int = 1,
+) -> int:
+    executions = already_executed
+    current = gate.resolve(_record(gate.store))
+    while executions < 16:
+        assert gate.record_retry_barrier(
+            admitted.key,
+            category="operation_infra",
+            expected_revision=current.scoped_revision,
+        ) is True
+        executions += 1
+        gate.complete_retry_barrier(admitted.key, category="operation_infra")
+    return executions
+
+
+def test_finalization_cas_miss_is_durable_when_finalize_returns_and_after_restart(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store)
+    gate = _gate(store, now=lambda: "2026-01-01T00:00:00Z")
+    record = _record(store)
+    _answer_reserved(tmp_path, gate, record)
+    terminal = gate.resolve(record)
+    _race_scoped_revision(store, 1)
+
+    missed = gate.finalize(record, terminal)
+    admission = _ledger(gate)["obligations"][terminal.key.digest]
+
+    assert missed.state == ResolverState.INDETERMINATE
+    assert admission["finalization_misses"] == 1
+    assert admission["finalization_first_at"] == "2026-01-01T00:00:00Z"
+    assert store.cursor("beta") != inbound.id
+
+    restarted = _gate(
+        store,
+        fence="wrapper-1",
+        now=lambda: "2026-01-01T00:00:01Z",
+    )
+    persisted = _ledger(restarted)["obligations"][terminal.key.digest]
+    assert persisted["finalization_misses"] == 1
+    assert persisted["finalization_first_at"] == "2026-01-01T00:00:00Z"
+
+
+def test_three_finalization_misses_back_off_indeterminate_without_model_spend(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store)
+    gate = _gate(store)
+    record = _record(store)
+    _answer_reserved(tmp_path, gate, record)
+    results = []
+
+    for sequence in range(1, 4):
+        terminal = gate.resolve(record)
+        _race_scoped_revision(store, sequence)
+        results.append(gate.finalize(record, terminal).state)
+        gate = _gate(store, fence="wrapper-1")
+
+    admission = _ledger(gate)["obligations"][terminal.key.digest]
+    assert results == [ResolverState.INDETERMINATE] * 3
+    assert admission["finalization_misses"] == 3
+    assert admission["paid_dispatches_total"] == 1
+    assert admission["state"] == "open"
+    assert store.cursor("beta") == ""
+
+
+def test_twelfth_finalization_miss_replays_latest_terminal_and_finalizes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store)
+    gate = _gate(store)
+    record = _record(store)
+    _answer_reserved(tmp_path, gate, record)
+
+    for sequence in range(1, 12):
+        terminal = gate.resolve(record)
+        _race_scoped_revision(store, sequence)
+        assert gate.finalize(record, terminal).state == ResolverState.INDETERMINATE
+
+    original_finalize = gate.finalize
+    raced = False
+
+    def race_twelfth_finalize(current_record, resolution, **kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            _race_scoped_revision(store, 12)
+        return original_finalize(current_record, resolution, **kwargs)
+
+    monkeypatch.setattr(gate, "finalize", race_twelfth_finalize)
+    model_calls = 0
+
+    def drive(_record: dict) -> bool:
+        nonlocal model_calls
+        model_calls += 1
+        return True
+
+    loop.run_loop(
+        store,
+        "beta",
+        drive,
+        commit_gate=gate,
+        clock=lambda: 0.0,
+        sleep=lambda _delay: None,
+        max_polls=2,
+    )
+
+    admission = _ledger(gate)["obligations"][terminal.key.digest]
+    assert raced is True
+    assert admission["finalization_misses"] == 12
+    assert admission["state"] == "finalized"
+    assert admission["terminal_state"] == ResolverState.SATISFIED.value
+    assert store.cursor("beta") == inbound.id
+    assert model_calls == 0
+
+
+def test_no_admission_finalization_bound_is_visible_across_restart(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store)
+    record = _record(store)
+    policy = PolicySnapshot.from_mapping({"schema_version": 1, "agents": {}}, "beta")
+    outcomes = []
+
+    for sequence in range(1, 13):
+        gate = DetectionCommitGate(
+            store,
+            "beta",
+            policy,
+            fence="wrapper-1",
+            now=lambda: "2026-01-01T00:00:00Z",
+        )
+        resolution = gate.admit_or_finalize(record)
+        _race_scoped_revision(store, sequence)
+        outcomes.append(gate.finalize(
+            record,
+            resolution,
+            expected_revision=resolution.ledger_revision,
+        ).state)
+
+    assert outcomes[:11] == [ResolverState.INDETERMINATE] * 11
+    assert outcomes[11] == ResolverState.BLOCKED
+    claim = _ledger(gate)["no_admission_claims"][record["id"]]
+    assert claim["finalization_misses"] == 12
+    assert claim["finalization_first_at"] == "2026-01-01T00:00:00Z"
+
+    restarted = DetectionCommitGate(
+        store,
+        "beta",
+        policy,
+        fence="wrapper-1",
+        now=lambda: "2026-01-01T00:00:01Z",
+    )
+    assert restarted.admit_or_finalize(record).state == ResolverState.BLOCKED
+    assert store.cursor("beta") == ""
+
+
+def test_operation_infra_clock_starts_at_initial_captured_failure_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store)
+    gate = _gate(store, now=lambda: "2026-01-01T00:00:00Z")
+    _record_, admitted, _permit, _dispatched = _captured_infra_attempt(store, gate)
+    admission = _ledger(gate)["obligations"][admitted.key.digest]
+
+    assert admission["operation_infra_attempts"] == 1
+    assert admission["operation_infra_first_at"] == "2026-01-01T00:00:00Z"
+
+    restarted = _gate(
+        store,
+        fence="wrapper-1",
+        now=lambda: "2026-01-01T00:14:59Z",
+    )
+    persisted = _ledger(restarted)["obligations"][admitted.key.digest]
+    assert persisted["operation_infra_attempts"] == 1
+    assert persisted["operation_infra_first_at"] == "2026-01-01T00:00:00Z"
+
+
+def test_operation_retry_barrier_allows_exactly_sixteen_executions(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store)
+    gate = _gate(store)
+    _record_, admitted, _permit, _dispatched = _captured_infra_attempt(store, gate)
+
+    executions = _consume_operation_retry_budget(gate, admitted)
+    current = gate.resolve(_record(store))
+
+    assert executions == 16
+    assert gate.record_retry_barrier(
+        admitted.key,
+        category="operation_infra",
+        expected_revision=current.scoped_revision,
+    ) is False
+    admission = _ledger(gate)["obligations"][admitted.key.digest]
+    assert admission["operation_infra_attempts"] == 16
+
+
+def test_stale_terminal_refuses_operation_retry_before_execution(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store)
+    gate = _gate(store)
+    record, admitted, _permit, dispatched = _captured_infra_attempt(store, gate)
+    stale = gate.resolve(record)
+    before = _ledger(gate)["obligations"][admitted.key.digest][
+        "operation_infra_attempts"
+    ]
+    assert cli.main([
+        "--root", str(tmp_path), *dispatched["owed_action"]["argv"][3:], "--quiet",
+    ]) == 0
+
+    allowed = gate.record_retry_barrier(
+        admitted.key,
+        category="operation_infra",
+        expected_revision=stale.scoped_revision,
+    )
+
+    assert allowed is False
+    assert gate.resolve(record).state == ResolverState.SATISFIED
+    assert _ledger(gate)["obligations"][admitted.key.digest][
+        "operation_infra_attempts"
+    ] == before
+
+
+def test_operation_cap_fresh_replay_lets_concurrent_terminal_win(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store)
+    gate = _gate(store)
+    record, admitted, _permit, dispatched = _captured_infra_attempt(store, gate)
+    assert _consume_operation_retry_budget(gate, admitted) == 16
+    original_captured = gate.captured_operation
+    published = False
+
+    def publish_before_cap_check(key):
+        nonlocal published
+        captured = original_captured(key)
+        if not published:
+            published = True
+            assert cli.main([
+                "--root",
+                str(tmp_path),
+                *dispatched["owed_action"]["argv"][3:],
+                "--quiet",
+            ]) == 0
+        return captured
+
+    monkeypatch.setattr(gate, "captured_operation", publish_before_cap_check)
+    model_calls = 0
+
+    def drive(_record: dict) -> bool:
+        nonlocal model_calls
+        model_calls += 1
+        return True
+
+    loop.run_loop(
+        store,
+        "beta",
+        drive,
+        commit_gate=gate,
+        clock=lambda: 0.0,
+        sleep=lambda _delay: None,
+        max_polls=2,
+    )
+
+    assert published is True
+    assert model_calls == 0
+    assert store.cursor("beta") == inbound.id
+    assert gate.resolve(record).state == ResolverState.SATISFIED
+    assert gate.delivery_status("q-1", "alpha") is None
+
+
+def test_unlocalizable_operation_exhaustion_is_durably_blocked_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store)
+    gate = _gate(store)
+    record, admitted, permit, _dispatched = _captured_infra_attempt(store, gate)
+    assert _consume_operation_retry_budget(gate, admitted) == 16
+    original_captured = gate.captured_operation
+
+    def fail_replay_after_initial_resolution(key):
+        captured = original_captured(key)
+
+        def unreadable_replay():
+            raise LedgerUnreadable("global projection unavailable at exhaustion")
+
+        monkeypatch.setattr(gate, "_validated_messages", unreadable_replay)
+        return captured
+
+    monkeypatch.setattr(gate, "captured_operation", fail_replay_after_initial_resolution)
+    model_calls = 0
+
+    def drive(_record: dict) -> bool:
+        nonlocal model_calls
+        model_calls += 1
+        return True
+
+    loop.run_loop(
+        store,
+        "beta",
+        drive,
+        commit_gate=gate,
+        clock=lambda: 0.0,
+        sleep=lambda _delay: None,
+        max_polls=1,
+    )
+
+    assert model_calls == 0
+    assert store.cursor("beta") != inbound.id
+    assert gate.delivery_status("q-1", "alpha") is None
+
+    restarted = _gate(store, fence="wrapper-1")
+    assert restarted.resolve(record).state == ResolverState.BLOCKED
+    admission = _ledger(restarted)["obligations"][admitted.key.digest]
+    assert admission["state"] == "blocked"
+
+
+def test_operation_infra_elapsed_ceiling_survives_restart_without_another_attempt(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store)
+    gate = _gate(store, now=lambda: "2026-01-01T00:00:00Z")
+    record, admitted, permit, _dispatched = _captured_infra_attempt(store, gate)
+
+    restarted = _gate(
+        store,
+        fence="wrapper-1",
+        now=lambda: "2026-01-01T00:15:01Z",
+    )
+    current = restarted.resolve(record)
+    assert restarted.record_retry_barrier(
+        admitted.key,
+        category="operation_infra",
+        expected_revision=current.scoped_revision,
+    ) is False
+    admission = _ledger(restarted)["obligations"][admitted.key.digest]
+
+    assert admission["operation_infra_attempts"] == 1
+    assert admission["operation_infra_first_at"] == "2026-01-01T00:00:00Z"
+    settled = restarted.settle_retry_exhaustion(
+        record,
+        admitted.key,
+        category="operation_infra",
+        reason="operation elapsed ceiling exhausted",
+        permit=permit,
+    )
+    assert settled.state == ResolverState.BLOCKED
+    assert restarted.delivery_status("q-1", "alpha") is None
+
+
+@pytest.mark.parametrize("only_request_id", [None, "q-loop-infra-bound"])
+def test_loop_operation_infra_bound_requires_proven_head_local_failure(
+    tmp_path: Path,
+    only_request_id: str | None,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store, "q-loop-infra-bound")
+    gate = _gate(store)
+    record, admitted, _permit, _dispatched = _captured_infra_attempt(
+        store,
+        gate,
+        rid=only_request_id,
+    )
+    ledger = _ledger(gate)
+    admission = ledger["obligations"][admitted.key.digest]
+    admission["operation_infra_attempts"] = 16
+    gate._write(ledger)  # noqa: SLF001 - inject the durable cross-restart cap
+
+    turns = loop.run_loop(
+        store,
+        "beta",
+        lambda _record: pytest.fail("model was called after operation cap"),
+        commit_gate=gate,
+        only_request_id=only_request_id,
+        clock=lambda: 0.0,
+        sleep=lambda _delay: None,
+        max_polls=1,
+    )
+
+    assert turns == 0
+    assert store.cursor("beta") == ""
+    assert any(message.id == inbound.id for message in store.valid_messages())
+    assert gate.delivery_status("q-loop-infra-bound", "alpha") is None
+    admission = _ledger(gate)["obligations"][admitted.key.digest]
+    assert admission["state"] == "blocked"
+    assert "not proven" in admission["blocked_reason"]
+    assert gate.resolve(record).state == ResolverState.BLOCKED
+
+
+def test_finalization_elapsed_ceiling_survives_restart_and_replays_terminal(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store)
+    gate = _gate(store, now=lambda: "2026-01-01T00:00:00Z")
+    record = _record(store)
+    _answer_reserved(tmp_path, gate, record)
+    first = gate.resolve(record)
+    _race_scoped_revision(store, 1)
+    assert gate.finalize(record, first).state == ResolverState.INDETERMINATE
+
+    restarted = _gate(
+        store,
+        fence="wrapper-1",
+        now=lambda: "2026-01-01T00:15:01Z",
+    )
+    latest = restarted.resolve(record)
+    _race_scoped_revision(store, 2)
+    exhausted = restarted.finalize(record, latest)
+
+    assert exhausted.state == ResolverState.INDETERMINATE
+    assert exhausted.reason == "finalization CAS contention exhausted"
+    admission = _ledger(restarted)["obligations"][latest.key.digest]
+    assert admission["finalization_misses"] == 2
+    assert admission["finalization_first_at"] == "2026-01-01T00:00:00Z"
+    settled = restarted.settle_retry_exhaustion(
+        record,
+        latest.key,
+        category="finalization",
+        reason="finalization elapsed ceiling exhausted",
+    )
+    assert settled.state == ResolverState.SATISFIED
+    assert store.cursor("beta") == inbound.id
+
+
+def test_unwritable_failed_delivery_becomes_visible_blocked_without_cursor_advance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    _question(store)
+    gate = _gate(store)
+    record = _record(store)
+    admitted = gate.admit_or_finalize(record)
+    assert admitted.key is not None
+    monkeypatch.setattr(
+        gate,
+        "_write",
+        lambda _ledger: (_ for _ in ()).throw(OSError("disposition unavailable")),
+    )
+
+    blocked = gate.fail_delivery_or_block(
+        record,
+        admitted.key,
+        reason="cannot persist failed delivery",
+        expected_revision=admitted.scoped_revision,
+    )
+
+    assert blocked.state == ResolverState.BLOCKED
+    assert store.cursor("beta") == ""
+    health = json.loads(gate.proof_health_path.read_text(encoding="utf-8"))
+    assert health["state"] == "blocked"
+    assert health["disposition_block"] is True
+    restarted = _gate(store, fence="wrapper-1")
+    assert restarted.admit_or_finalize(record).state == ResolverState.BLOCKED
+    assert restarted.status()["status"] == "BLOCKED"
+
+
+def test_head_local_failed_delivery_does_not_dispose_an_unrelated_head(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    first = _question(store, "q-local")
+    second = _question(store, "q-unrelated")
+    gate = _gate(store)
+    record, admitted, permit, _dispatched = _captured_infra_attempt(store, gate)
+    permit.draft_path.write_text("tampered after durable capture", encoding="utf-8")
+    current = gate.resolve(record)
+
+    result = gate.fail_head_local_corruption_or_block(
+        record,
+        admitted.key,
+        permit,
+        reason="captured operation proof is corrupt",
+        expected_revision=current.scoped_revision,
+    )
+
+    assert result.state == ResolverState.DELIVERY_EXHAUSTED
+    assert gate.delivery_status("q-local", "alpha") is not None
+    assert gate.delivery_status("q-unrelated", "alpha") is None
+    assert any(message.id == first.id for message in store.valid_messages())
+    assert any(message.id == second.id for message in store.valid_messages())
+    proof = _ledger(gate)["obligations"][admitted.key.digest][
+        "head_local_proof_failure"
+    ]
+    assert proof["kind"] == "HEAD_LOCAL_PROOF_FAILURE"
+    assert proof["inbound_id"] == first.id
+    assert proof["operation_nonce"] == permit.nonce
+    assert proof["expected_payload_sha256"] != proof["observed_payload_sha256"]
+    assert _record(store)["id"] == second.id
+
+
+def test_unreadable_head_local_artifact_blocks_instead_of_failed_delivery(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-unproven-local")
+    gate = _gate(store)
+    record, admitted, permit, _dispatched = _captured_infra_attempt(store, gate)
+    permit.draft_path.unlink()
+    current = gate.resolve(record)
+
+    result = gate.fail_head_local_corruption_or_block(
+        record,
+        admitted.key,
+        permit,
+        reason="unreadable local artifact",
+        expected_revision=current.scoped_revision,
+    )
+
+    assert result.state == ResolverState.BLOCKED
+    assert store.cursor("beta") == ""
+    assert gate.delivery_status("q-unproven-local", "alpha") is None
+    admission = _ledger(gate)["obligations"][admitted.key.digest]
+    assert admission["state"] == "blocked"
+    assert "unreadable" in admission["blocked_reason"]
+
+
+@pytest.mark.parametrize("tamper", ["marker", "reservation"])
+def test_disagreeing_durable_operation_proofs_cannot_authorize_failed_delivery(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-untrusted-local-proof")
+    gate = _gate(store)
+    record, admitted, permit, _dispatched = _captured_infra_attempt(store, gate)
+    if tamper == "marker":
+        marker_path = store._operation_intent_path(  # noqa: SLF001 - corruption injection
+            "beta",
+            permit.nonce,
+        )
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["operation_digest"] = "0" * 64
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    else:
+        ledger = _ledger(gate)
+        ledger["obligations"][admitted.key.digest]["reservations"][permit.nonce][
+            "operation_payload_digest"
+        ] = "0" * 64
+        gate._write(ledger)  # noqa: SLF001 - corruption injection
+    current = gate.resolve(record)
+
+    result = gate.fail_head_local_corruption_or_block(
+        record,
+        admitted.key,
+        permit,
+        reason="untrusted durable proof",
+        expected_revision=current.scoped_revision,
+    )
+
+    assert result.state == ResolverState.BLOCKED
+    assert store.cursor("beta") == ""
+    assert gate.delivery_status("q-untrusted-local-proof", "alpha") is None
+    admission = _ledger(gate)["obligations"][admitted.key.digest]
+    assert admission["state"] == "blocked"
+    assert "proofs disagree" in admission["blocked_reason"]
+    assert not any(
+        row["transition"] == "DELIVERY_FAILED"
+        for row in _ledger(gate)["transitions"]
+    )
+
+
+def test_terminal_append_and_finalizer_concurrency_has_no_deadlock_or_stale_commit(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store)
+    gate = _gate(store)
+    record = _record(store)
+    _answer_reserved(tmp_path, gate, record)
+    terminal = gate.resolve(record)
+    start = threading.Barrier(2)
+    results: list[ResolverState] = []
+    failures: list[BaseException] = []
+
+    def append_evidence() -> None:
+        try:
+            start.wait(timeout=5)
+            store.send(
+                sender="gamma",
+                recipient="alpha",
+                kind="note",
+                body="concurrent correlated evidence",
+                meta={"request_id": "q-1"},
+            )
+        except BaseException as exc:  # pragma: no cover - assertion captures thread errors
+            failures.append(exc)
+
+    def finalize_terminal() -> None:
+        try:
+            start.wait(timeout=5)
+            results.append(gate.finalize(record, terminal).state)
+        except BaseException as exc:  # pragma: no cover - assertion captures thread errors
+            failures.append(exc)
+
+    threads_ = [
+        threading.Thread(target=append_evidence),
+        threading.Thread(target=finalize_terminal),
+    ]
+    for worker in threads_:
+        worker.start()
+    for worker in threads_:
+        worker.join(timeout=10)
+
+    assert not failures
+    assert all(not worker.is_alive() for worker in threads_)
+    assert results[0] in {ResolverState.SATISFIED, ResolverState.INDETERMINATE}
+    if results[0] == ResolverState.INDETERMINATE:
+        latest = gate.resolve(record)
+        assert gate.finalize(record, latest).state == ResolverState.SATISFIED
+    assert store.cursor("beta") == inbound.id
+    assert sum(
+        row["transition"] == "CURSOR_FINALIZED"
+        for row in _ledger(gate)["transitions"]
+    ) == 1
+
+
+def test_identical_proof_error_fingerprint_emits_one_elapsed_authority(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    gate = _gate(store, now=lambda: "2026-01-01T00:00:00Z")
+    first = gate.record_proof_failure(error_class="OSError", path="ledger.json")
+    restarted = _gate(
+        store,
+        fence="wrapper-1",
+        now=lambda: "2026-01-01T00:15:01Z",
+    )
+    exhausted = restarted.record_proof_failure(
+        error_class="OSError",
+        path="ledger.json",
+    )
+    again = restarted.record_proof_failure(
+        error_class="OSError",
+        path="ledger.json",
+    )
+
+    assert exhausted["exhausted"] is True
+    assert exhausted["fingerprint"] == first["fingerprint"]
+    assert exhausted["first_failure_at"] == first["first_failure_at"]
+    assert again["alerted_at"] == exhausted["alerted_at"]
+    assert again["incident_id"] == exhausted["incident_id"]
+    assert again["incident"] == exhausted["incident"]
+
+
+def test_stale_nonterminal_retry_revision_does_not_exhaust_operation_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    _question(store)
+    gate = _gate(store)
+    record, admitted, permit, _dispatched = _captured_infra_attempt(store, gate)
+    original_captured = gate.captured_operation
+    raced = False
+
+    def race_before_barrier(key):
+        nonlocal raced
+        captured = original_captured(key)
+        if not raced:
+            raced = True
+            _race_scoped_revision(store, 1)
+        return captured
+
+    monkeypatch.setattr(gate, "captured_operation", race_before_barrier)
+    monkeypatch.setattr(
+        gate,
+        "retry_captured_operation",
+        lambda *_args, **_kwargs: pytest.fail("stale retry executed"),
+    )
+
+    turns = loop.run_loop(
+        store,
+        "beta",
+        lambda _record: pytest.fail("model was called"),
+        commit_gate=gate,
+        clock=lambda: 0.0,
+        sleep=lambda _delay: None,
+        max_polls=1,
+    )
+
+    admission = _ledger(gate)["obligations"][admitted.key.digest]
+    assert raced is True
+    assert turns == 0
+    assert admission["operation_infra_attempts"] == 1
+    assert admission["state"] == "open"
+    assert permit.draft_path.exists()
+    assert gate.retry_bound_exhausted(
+        admitted.key,
+        category="operation_infra",
+    ) is False
+    assert gate.delivery_status("q-1", "alpha") is None
+
+
+def test_immediate_operation_retry_does_not_claim_turn_on_finalization_cas_miss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    _question(store)
+    gate = _gate(store)
+    permits: list[object] = []
+    dispatched_records: list[dict] = []
+    original_reserve = gate.reserve_dispatch
+    original_finalize = gate.finalize
+
+    def reserve(*args, **kwargs):
+        permit = original_reserve(*args, **kwargs)
+        permits.append(permit)
+        return permit
+
+    def drive(dispatch_record: dict) -> loop.DriveOutcome:
+        dispatched_records.append(dispatch_record)
+        permit = permits[-1]
+        permit.draft_path.write_text("captured answer", encoding="utf-8")
+        _record_captured_intent(store, gate, permit)
+        return loop.DriveOutcome(
+            ok=False,
+            failure_class=loop.CLASS_INFRA,
+            bus_action_attempted=True,
+            bus_action_infra=True,
+        )
+
+    def publish_retry(_permit, _record) -> bool:
+        argv = dispatched_records[-1]["owed_action"]["argv"]
+        assert cli.main(["--root", str(tmp_path), *argv[3:], "--quiet"]) == 0
+        return True
+
+    raced = False
+
+    def race_finalize(current_record, resolution, **kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            _race_scoped_revision(store, 1)
+        return original_finalize(current_record, resolution, **kwargs)
+
+    monkeypatch.setattr(gate, "reserve_dispatch", reserve)
+    monkeypatch.setattr(gate, "retry_captured_operation", publish_retry)
+    monkeypatch.setattr(gate, "finalize", race_finalize)
+
+    turns = loop.run_loop(
+        store,
+        "beta",
+        drive,
+        commit_gate=gate,
+        clock=lambda: 0.0,
+        sleep=lambda _delay: None,
+        max_polls=1,
+    )
+
+    admission = _ledger(gate)["obligations"][permits[0].key_digest]
+    assert raced is True
+    assert turns == 0
+    assert admission["finalization_misses"] == 1
+    assert admission["state"] == "open"
+    assert permits[0].draft_path.exists()
+
+
+@pytest.mark.parametrize("only_request_id", [None, "q-no-key-retry"])
+def test_no_admission_finalization_contention_never_redrives_successful_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    only_request_id: str | None,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store, "q-no-key-retry")
+    store.write_waiting("beta", {
+        "mode": "wrapper-loop",
+        "wrapper_generation": "wrapper-1",
+        "wait_token": "wrapper-1",
+        "pid": os.getpid(),
+    })
+    policy = PolicySnapshot.from_mapping({
+        "schema_version": 1,
+        "agents": {"beta": {"grade": DETECTION_GRADE, "enabled": False}},
+    }, "beta")
+    gate = DetectionCommitGate(store, "beta", policy, fence="wrapper-1")
+    original_finalize = gate.finalize
+    finalize_calls = 0
+    drive_calls = 0
+
+    def race_each_finalize(current_record, resolution, **kwargs):
+        nonlocal finalize_calls
+        finalize_calls += 1
+        _race_scoped_revision(
+            store,
+            finalize_calls,
+            rid="q-no-key-retry",
+        )
+        return original_finalize(current_record, resolution, **kwargs)
+
+    def drive(_record: dict) -> bool:
+        nonlocal drive_calls
+        drive_calls += 1
+        return True
+
+    monkeypatch.setattr(gate, "finalize", race_each_finalize)
+
+    turns = loop.run_loop(
+        store,
+        "beta",
+        drive,
+        commit_gate=gate,
+        only_request_id=only_request_id,
+        clock=lambda: 0.0,
+        sleep=lambda _delay: None,
+        max_polls=3,
+    )
+
+    claim = _ledger(gate)["no_admission_claims"][inbound.id]
+    assert turns == 0
+    assert drive_calls == 1
+    assert finalize_calls == 3
+    assert claim["state"] == "finalization_pending"
+    assert claim["finalization_misses"] == 3
+    assert claim["drive_succeeded_at"]
+    assert store.cursor("beta") == ""
+
+
+def test_no_admission_disposition_crash_replays_without_redriving_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store, "q-no-key-projection")
+    store.write_waiting("beta", {
+        "mode": "wrapper-loop",
+        "wrapper_generation": "wrapper-1",
+        "wait_token": "wrapper-1",
+        "pid": os.getpid(),
+    })
+    policy = PolicySnapshot.from_mapping({
+        "schema_version": 1,
+        "agents": {"beta": {"grade": DETECTION_GRADE, "enabled": False}},
+    }, "beta")
+    owner = DetectionCommitGate(store, "beta", policy, fence="wrapper-1")
+    record = _record(store)
+    resolution = owner.admit_or_finalize(record)
+    retained = owner.record_no_admission_success(record, resolution)
+    monkeypatch.setattr(
+        owner,
+        "_advance_record_cursor",
+        lambda _record: (_ for _ in ()).throw(OSError("projection crash")),
+    )
+    finalized = owner.finalize(
+        record,
+        retained,
+        expected_revision=retained.ledger_revision,
+    )
+    assert finalized.state == ResolverState.INDETERMINATE
+    assert store.cursor("beta") == ""
+
+    restarted = DetectionCommitGate(
+        store,
+        "beta",
+        policy,
+        fence="wrapper-1",
+    )
+    turns = loop.run_loop(
+        store,
+        "beta",
+        lambda _record: pytest.fail("model was redriven"),
+        commit_gate=restarted,
+        clock=lambda: 0.0,
+        sleep=lambda _delay: None,
+        max_polls=1,
+    )
+
+    assert turns == 1
+    assert store.cursor("beta") == inbound.id
+
+
+@pytest.mark.parametrize("only_request_id", [None, "q-no-key-append"])
+def test_no_admission_success_survives_correlated_append_during_drive(
+    tmp_path: Path,
+    only_request_id: str | None,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store, "q-no-key-append")
+    store.write_waiting("beta", {
+        "mode": "wrapper-loop",
+        "wrapper_generation": "wrapper-1",
+        "wait_token": "wrapper-1",
+        "pid": os.getpid(),
+    })
+    policy = PolicySnapshot.from_mapping({
+        "schema_version": 1,
+        "agents": {"beta": {"grade": DETECTION_GRADE, "enabled": False}},
+    }, "beta")
+    gate = DetectionCommitGate(store, "beta", policy, fence="wrapper-1")
+    drive_calls = 0
+
+    def drive(_record: dict) -> bool:
+        nonlocal drive_calls
+        drive_calls += 1
+        store.send(
+            sender="gamma",
+            recipient="alpha",
+            kind="note",
+            body="concurrent correlated append",
+            meta={"request_id": "q-no-key-append"},
+        )
+        return True
+
+    turns = loop.run_loop(
+        store,
+        "beta",
+        drive,
+        commit_gate=gate,
+        only_request_id=only_request_id,
+        clock=lambda: 0.0,
+        sleep=lambda _delay: None,
+        max_polls=2,
+    )
+
+    assert turns == 1
+    assert drive_calls == 1
+    claim = _ledger(gate)["no_admission_claims"][inbound.id]
+    assert claim["state"] == "finalized"
+    if only_request_id is None:
+        assert store.cursor("beta") == inbound.id
+    else:
+        assert store.cursor("beta") == ""
+        assert store.thread_seen("beta", only_request_id) == inbound.id
+
+
+def test_exhaustion_second_terminal_race_never_synthesizes_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store)
+    gate = _gate(store)
+    record = _record(store)
+    _answer_reserved(tmp_path, gate, record)
+
+    for sequence in range(1, 13):
+        terminal = gate.resolve(record)
+        _race_scoped_revision(store, sequence)
+        missed = gate.finalize(record, terminal)
+        assert missed.state == ResolverState.INDETERMINATE
+    assert missed.reason == "finalization CAS contention exhausted"
+
+    original_finalize = gate.finalize
+    raced = False
+
+    def race_settlement_finalize(current_record, resolution, **kwargs):
+        nonlocal raced
+        if not raced:
+            raced = True
+            _race_scoped_revision(store, 13)
+        return original_finalize(current_record, resolution, **kwargs)
+
+    monkeypatch.setattr(gate, "finalize", race_settlement_finalize)
+    settled = gate.settle_retry_exhaustion(
+        record,
+        terminal.key,
+        category="finalization",
+        reason="finalization bound exhausted",
+    )
+
+    assert raced is True
+    assert settled.state == ResolverState.SATISFIED
+    assert not any(
+        row["transition"] == "OBLIGATION_BLOCKED"
+        for row in _ledger(gate)["transitions"]
+    )
+    restarted = _gate(store, fence="wrapper-1")
+    latest = restarted.resolve(record)
+    assert latest.state == ResolverState.SATISFIED
+    assert restarted.finalize(record, latest).state == ResolverState.SATISFIED
+    assert store.cursor("beta") == inbound.id
+
+
+@pytest.mark.parametrize(
+    ("new_responder", "masked"),
+    [("beta", True), ("gamma", False)],
+)
+def test_explicit_reask_masks_failed_delivery_before_new_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    new_responder: str,
+    masked: bool,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-pre-admission-reask")
+    gate = _gate(store)
+    record = _record(store)
+    admitted = gate.admit_or_finalize(record)
+    assert admitted.key is not None
+    gate.delivery_failed(
+        record,
+        admitted.key,
+        reason="old generation exhausted",
+        expected_revision=admitted.scoped_revision,
+    )
+    old = dict(_ledger(gate)["obligations"][admitted.key.digest])
+
+    monkeypatch.setattr(
+        "agenttalk.wrapper.obligations.note_bus_message",
+        lambda _store, _message: None,
+    )
+    new_inbound = store.send(
+        sender="alpha",
+        recipient=new_responder,
+        kind="question",
+        body="retry the unanswered request",
+        meta={"request_id": "q-pre-admission-reask"},
+    )
+
+    assert new_inbound.id not in _ledger(gate)["messages"]
+    status = gate.delivery_status("q-pre-admission-reask", "alpha")
+    assert (status is None) is masked
+    scoped = recv_api.poll(
+        store,
+        "alpha",
+        scoped_request_id="q-pre-admission-reask",
+    )["scoped"]
+    assert scoped["closed"] is (not masked)
+    assert (scoped["delivery_failed"] is None) is masked
+    assert _ledger(gate)["obligations"][admitted.key.digest] == old
+
+
+@pytest.mark.parametrize(
+    "replacement_meta",
+    [
+        {"request_id": "q-invalid-reask", "consult": True},
+        {
+            "broadcast_id": "q-invalid-reask",
+            "broadcast_policy_version": 1,
+        },
+    ],
+)
+def test_non_owed_or_malformed_reask_cannot_mask_failed_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_meta: dict,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-invalid-reask")
+    gate = _gate(store)
+    record = _record(store)
+    admitted = gate.admit_or_finalize(record)
+    assert admitted.key is not None
+    gate.delivery_failed(
+        record,
+        admitted.key,
+        reason="old assignment exhausted",
+        expected_revision=admitted.scoped_revision,
+    )
+    monkeypatch.setattr(
+        "agenttalk.wrapper.obligations.note_bus_message",
+        lambda _store, _message: None,
+    )
+
+    store.send(
+        sender="alpha",
+        recipient="beta",
+        kind="question",
+        body="not an admissible replacement",
+        meta=replacement_meta,
+    )
+
+    status = gate.delivery_status("q-invalid-reask", "alpha")
+    assert status is not None
+    assert status["state"] == "delivery_failed"
+    scoped = recv_api.poll(
+        store,
+        "alpha",
+        scoped_request_id="q-invalid-reask",
+    )["scoped"]
+    assert scoped["closed"] is True
+    assert scoped["delivery_failed"] == status
+
+
+@pytest.mark.parametrize(
+    "tear",
+    ["requester_index", "cursor_disposition", "operation_reference"],
+)
+def test_torn_failed_delivery_transaction_blocks_without_advancing_cursor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tear: str,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-torn-delivery")
+    gate = _gate(store)
+    record = _record(store)
+    admitted = gate.admit_or_finalize(record)
+    assert admitted.key is not None
+    permit = gate.reserve_dispatch(admitted, purpose="initial")
+    gate.dispatch_record(record, permit)
+    gate.mark_dispatch_result(permit, action_attempted=False)
+    current = gate.resolve(record)
+    monkeypatch.setattr(gate, "_advance_record_cursor", lambda _record: None)
+    gate.delivery_failed(
+        record,
+        admitted.key,
+        reason="delivery exhausted",
+        expected_revision=current.scoped_revision,
+    )
+    ledger = _ledger(gate)
+    if tear == "requester_index":
+        del ledger["delivery_index"]["q-torn-delivery"]
+    elif tear == "cursor_disposition":
+        del ledger["cursor_dispositions"]["beta"]
+    else:
+        ledger["obligations"][admitted.key.digest]["dead_letter_reference"][
+            "operation_nonces"
+        ] = []
+    gate._write(ledger)  # noqa: SLF001 - deterministic torn-transaction injection
+
+    restarted = _gate(store, fence="wrapper-1")
+    blocked = restarted.delivery_failed(
+        record,
+        admitted.key,
+        reason="idempotent projection recovery",
+        expected_revision=restarted.resolve(record).scoped_revision,
+    )
+
+    assert blocked.state == ResolverState.BLOCKED
+    assert store.cursor("beta") == ""
+    admission = _ledger(restarted)["obligations"][admitted.key.digest]
+    assert admission["state"] == "blocked"
+    assert "structurally torn" in admission["blocked_reason"]
+    assert restarted.resolve(record).state == ResolverState.BLOCKED
+
+
+def test_corrupt_config_during_failed_disposition_becomes_visible_blocked(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store)
+    gate = _gate(store)
+    record = _record(store)
+    admitted = gate.admit_or_finalize(record)
+    assert admitted.key is not None
+    store.config_path.write_text("{", encoding="utf-8")
+
+    blocked = gate.fail_delivery_or_block(
+        record,
+        admitted.key,
+        reason="configuration unreadable during disposition",
+        expected_revision=admitted.scoped_revision,
+    )
+
+    assert blocked.state == ResolverState.BLOCKED
+    assert store.cursor("beta") == ""
+    admission = _ledger(gate)["obligations"][admitted.key.digest]
+    assert admission["state"] == "blocked"
+    assert gate.resolve(record).state == ResolverState.BLOCKED
+
+
+def test_canonical_terminal_with_missed_eager_hook_wins_failed_disposition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-terminal-wins")
+    gate = _gate(store)
+    record = _record(store)
+    admitted = gate.admit_or_finalize(record)
+    assert admitted.key is not None
+    permit = gate.reserve_dispatch(admitted, purpose="initial")
+    dispatched = gate.dispatch_record(record, permit)
+    permit.draft_path.write_text("canonical answer", encoding="utf-8")
+    monkeypatch.setattr(
+        "agenttalk.wrapper.obligations.note_bus_message",
+        lambda _store, _message: None,
+    )
+    assert cli.main([
+        "--root",
+        str(tmp_path),
+        *dispatched["owed_action"]["argv"][3:],
+        "--quiet",
+    ]) == 0
+
+    result = gate.fail_delivery_or_block(
+        record,
+        admitted.key,
+        reason="stale compliance decision",
+        expected_revision=admitted.scoped_revision,
+    )
+
+    assert result.state == ResolverState.SATISFIED
+    assert gate.resolve(record).state == ResolverState.SATISFIED
+    assert gate.delivery_status("q-terminal-wins", "alpha") is None
+    assert store.cursor("beta") == record["id"]
+    assert not any(
+        row["transition"] in {"DELIVERY_FAILED", "OBLIGATION_BLOCKED"}
+        for row in _ledger(gate)["transitions"]
+    )
+
+
+def test_operator_resolution_recovers_failed_delivery_without_resetting_old_budget(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-operator-recovery")
+    gate = _gate(store)
+    record = _record(store)
+    admitted = gate.admit_or_finalize(record)
+    assert admitted.key is not None
+    permit = gate.reserve_dispatch(admitted, purpose="initial")
+    gate.dispatch_record(record, permit)
+    gate.mark_dispatch_result(permit, action_attempted=False)
+    current = gate.resolve(record)
+    gate.delivery_failed(
+        record,
+        admitted.key,
+        reason="assignment exhausted",
+        expected_revision=current.scoped_revision,
+    )
+    spent = dict(_ledger(gate)["obligations"][admitted.key.digest])
+    roster = gate.roster_snapshot()
+
+    resolved = gate.operator_resolve(
+        record,
+        admitted.key,
+        actor="lead",
+        expected_roster_revision=roster["revision"],
+        reason="operator accepted the unresolved conversation",
+    )
+
+    recovered = _ledger(gate)["obligations"][admitted.key.digest]
+    assert resolved.state == ResolverState.OPERATOR_RESOLVED
+    assert recovered["state"] == "operator_resolved"
+    assert recovered["exhausted"] is True
+    assert recovered["paid_dispatches_total"] == spent["paid_dispatches_total"]
+    terminal = gate.delivery_status("q-operator-recovery", "alpha")
+    assert terminal is not None
+    assert terminal["state"] == "operator_resolved"
+    assert terminal["actor"] == "lead"
+    assert terminal["reason"] == "operator accepted the unresolved conversation"
+    scoped = recv_api.poll(
+        store,
+        "alpha",
+        scoped_request_id="q-operator-recovery",
+    )["scoped"]
+    assert scoped["closed"] is True
+    assert scoped["delivery_failed"] is None
+    assert scoped["delivery_terminal"] == terminal
+
+    rc = cli.main([
+        "--root",
+        str(tmp_path),
+        "wait",
+        "--for",
+        "alpha",
+        "--to-request",
+        "q-operator-recovery",
+        "--timeout",
+        "1",
+        "--interval",
+        "0.1",
+    ])
+    output = capsys.readouterr().out
+    assert rc == 7
+    assert "OPERATOR RESOLVED" in output
+    assert "DELIVERY FAILED" not in output
+    assert '"state": "operator_resolved"' in output
+
+
+def test_reassignment_after_failed_delivery_gets_fresh_generation_and_budget(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-reassigned-recovery")
+    source = _gate(store)
+    record = _record(store)
+    admitted = source.admit_or_finalize(record)
+    assert admitted.key is not None
+    source.delivery_failed(
+        record,
+        admitted.key,
+        reason="source assignment exhausted",
+        expected_revision=admitted.scoped_revision,
+    )
+    old_spend = _ledger(source)["obligations"][admitted.key.digest][
+        "paid_dispatches_total"
+    ]
+    next_inbound = store.send(
+        sender="alpha",
+        recipient="gamma",
+        kind="question",
+        body="reassign the unanswered request",
+        meta={"request_id": "q-reassigned-recovery"},
+    )
+
+    source.transfer(
+        admitted.key,
+        destination="gamma",
+        new_inbound_id=next_inbound.id,
+    )
+
+    ledger = _ledger(source)
+    old = ledger["obligations"][admitted.key.digest]
+    next_digest = ledger["inbound_index"][next_inbound.id]
+    reassigned = ledger["obligations"][next_digest]
+    assert old["state"] == "transferred"
+    assert old["exhausted"] is True
+    assert old["paid_dispatches_total"] == old_spend
+    assert reassigned["state"] == "open"
+    assert reassigned["exhausted"] is False
+    assert reassigned["paid_dispatches_total"] == 0
+    assert reassigned["key"]["delivery_generation"] == (
+        admitted.key.delivery_generation + 1
+    )
+    assert source.delivery_status("q-reassigned-recovery", "alpha") is None
