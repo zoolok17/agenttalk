@@ -1,11 +1,13 @@
 # agenttalk - Product Roadmap & Feasibility
 
-**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-07-12
+**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-07-18
 **Audience:** maintainers, operators, and agents deciding what to build next.
 **Horizon:** pragmatic next 2-3 quarters + a labeled "later" tier.
-**Current shipped baseline:** v0.74.1 (2026-07-12). `CHANGELOG.md` remains the release-history source of truth.
+**Current shipped baseline:** v0.74.1 (2026-07-12); runtime hardening has continued since (supervisor crash/durability fixes). `CHANGELOG.md` remains the release-history source of truth.
 
-Companion docs: `docs/DESIGN.md` (why / architecture) · `docs/ASSURANCE.md` (per-release GOOD/ROBUST/SECURE attestation) · `docs/ISSUES.md` (living work tracker + known limitations) · `docs/DASHBOARD-CONTROL-PLANE-ROADMAP.md` (dashboard control-plane design history) · `CHANGELOG.md`.
+**Platform requirement:** agenttalk must run on **Windows, macOS, and Linux**. The Python core (bus/store/CLI/wrapper) is already cross-platform and CI-tested on all three (Windows/macOS/Ubuntu × Python 3.10–3.13). The **supervisor is the open platform gap** — it currently requires PowerShell Core 7+ and Windows-only `Win32_Process`; a POSIX supervisor path is an unbuilt follow-up (see §6 cross-cutting and §8).
+
+Companion docs: `docs/DESIGN.md` (why / architecture) · `docs/ASSURANCE.md` (per-release GOOD/ROBUST/SECURE attestation) · `docs/ISSUES.md` (living work tracker + known limitations) · `docs/TEST-COVERAGE-REPORT.md` (test inventory, coverage, and tooling recommendations) · `docs/DASHBOARD-CONTROL-PLANE-ROADMAP.md` (dashboard control-plane design history) · `CHANGELOG.md`.
 
 ---
 
@@ -52,7 +54,7 @@ The healthy shape is still a thin substrate plus pluggable products with hard bo
 | **E. Assurance & Release Governance** | gates, closes, specialist sign-off, release ledger, scan evidence | Strong primitives; needs work-item consumption |
 | **F. Knowledge & Codebase Memory** | domains, durable pointer-notes, lessons, onboarding digests, onboarding evidence ledgers, anchor-relative staleness | Primitives exist; codebase-comprehension product just started |
 | **G. Operator Control Plane** | local console, read views, action-gated intent queue, lead-chat, attention/capacity/liveness, onboarding progress | Useful local console; needs Work view |
-| **H. Execution Runtime** | supervisor, wrapper, session continuity, dead-letter, managed lead-loop, isolated lane worktrees | Powerful but high-maintenance; runtime ergonomics remain active |
+| **H. Execution Runtime** | supervisor, wrapper, session continuity, dead-letter, managed lead-loop, isolated lane worktrees | Powerful but high-maintenance; runtime ergonomics remain active. **Cross-platform gap:** wrapper/core run on all 3 OSes; the supervisor is PowerShell-Core + Windows-`Win32_Process`-bound — POSIX path pending. |
 | **I. Delivery Workflows** | greenfield product build, existing-project change, legacy adoption, release preparation | Mostly dogfooded practice, not yet productized |
 
 Key boundary:
@@ -210,6 +212,15 @@ Legacy adoption remains a flagship workflow, but it is no longer the whole roadm
 16. **CI adapters.** GitHub Actions first: ingest run ids, workflow refs, commit SHA, conclusion, logs/artifacts as evidence. Other providers later.
 17. **Repeatable beta packaging.** Golden-path walkthroughs for one greenfield app and one existing-project change, with sample policies and artifact schemas.
 
+### Cross-cutting - runtime, platform & test hardening
+
+These are foundational, not tied to one quarter — the delivery spine above rides on a runtime that must be portable and provably robust. Prioritize the cross-platform supervisor and the crash-test harness near Q1 (they gate the "runs anywhere, self-heals" promise).
+
+- **P1. Cross-platform supervisor.** Close the platform gap so the supervisor runs on Windows, macOS, and Linux — either a POSIX supervisor with parity to `supervisor.ps1` (liveness/heartbeat-staleness, claim/marker, restart/backoff, reserve-before-spawn, config last-good, fail-closed), or make the generated script pwsh-Core-portable by abstracting the Windows-only `Win32_Process` snapshot (`ps`/`Get-Process` on POSIX). Design-first (choose the approach). This is what makes "runs on all three" true for the whole stack, not just the core.
+- **P2. Supervisor crash-simulation test harness.** A configurable fake agent the real supervisor launches, failing every realistic way (crash-on-start, crash-after-N, hang, wedge = alive-heartbeat-but-no-work, crash-loop, bad/stale/future heartbeat, pid-reuse, record-launch-fail), driven through poll cycles asserting the invariants we have been fixing by hand (daemon never crashes, correct restart/backoff/reset, liveness classification, no double-launch, hot-add survival, config-corruption tolerance, fail-closed on permanent I/O). This session's three supervisor bugs were caught by review/production, not tests — this closes that class. Must run on each target OS (a Linux-only matrix false-greens the Windows/macOS supervisor).
+- **P3. Test-quality tooling.** Adopt property-based testing (Hypothesis) for the bus protocol / resolver state machine / enforcement invariants, and mutation testing (`mutmut`/`cosmic-ray`) to measure whether tests actually catch bugs. Add `pytest-xdist` (parallel) and `pytest-randomly` (order-independence); pin the multi-version matrix via `tox`/`nox`. See `docs/TEST-COVERAGE-REPORT.md`.
+- **P4. CI honesty for platform coverage.** Ensure the matrix runs the platform-specific supervisor/pwsh path on **each** OS (real pwsh tranche is skipped off-Windows today → false-green risk). Consider a fake-model-gateway container to exercise backend-failure modes (429/timeout/malformed) without paid model calls, ahead of the Qwen enforcement canary.
+
 ### Later - explicitly not scheduled
 
 Hosted multi-tenant SaaS · enterprise auth / cryptographic human identity · remote cloud runners · semantic/vector index over large codebases · automatic architecture inference claiming completeness · automatic large refactors without human-curated characterization · multi-repo program management · skill/method marketplace · broad merge/release automation before gate semantics are proven.
@@ -230,6 +241,7 @@ Do not ship broad workflow claims if any of these are true:
 - Timeout, malformed output, parser failure, or adapter failure can normalize to pass.
 - Worktree cleanup can delete dirty, unmerged, unmanaged, or user-created files.
 - Dashboard collapses evidence tiers into one misleading green status.
+- Cross-platform support is claimed while the supervisor runs (or is tested) on only one OS, or while the real-pwsh/supervisor test tranche is silently skipped on a target platform's CI.
 
 ---
 
@@ -241,6 +253,8 @@ Do not ship broad workflow claims if any of these are true:
 - **Policy drift:** a branch changes the rules that judge itself. Mitigation: policy hash binding, base-policy evaluation, explicit waiver for policy changes.
 - **Evidence rot:** artifacts point at old SHAs or missing logs. Mitigation: stale-at-head detection and content-addressed artifact references.
 - **Maintenance overload:** provider CLI, CI, and scanner formats change. Mitigation: adapter boundaries and generic artifact schema first.
+- **Platform portability:** the supervisor is Windows/PowerShell/`Win32_Process`-bound while the product must run on Windows, macOS, and Linux. Mitigation: a POSIX (or pwsh-Core-portable) supervisor path, and a CI matrix that exercises the supervisor on every target OS.
+- **Runtime test coverage is behavioral, not line-measurable, and thin on failure paths:** the supervisor's logic is a PowerShell template `coverage.py` can't see, so line-% understates it; this session's supervisor bugs reached production because the crash/liveness matrix was under-tested. Mitigation: the crash-simulation harness (P2) + property/mutation testing (P3), measuring behavioral coverage rather than lines.
 
 ---
 
