@@ -78,6 +78,7 @@ _LOCK_PID_PREFIX_RE = re.compile(rb'"pid"\s*:\s*([0-9]+)')
 _LOCK_GENERATION_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 
 _AWAIT_SCHEMA_VERSION = 1
+_MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION = 1
 _AWAIT_ID_RE = re.compile(r"\A[A-Za-z0-9_.:-]{1,128}\Z")
 _AWAIT_PATH_TOKEN_RE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
 _AWAIT_SOURCES = frozenset({"send", "reply"})
@@ -1471,6 +1472,174 @@ class Store:
             what="retirement/message publication",
         )
 
+    def _message_publication_lock(
+        self,
+        *,
+        timeout: float = 10.0,
+        poll: float = 0.005,
+    ):
+        """Linearize every canonical message publication with dispatch replay."""
+        return self._lock_generation_guard(
+            self.dir / "message-publication",
+            deadline=time.monotonic() + timeout,
+            poll=poll,
+            what="message publication",
+        )
+
+    @property
+    def _message_publication_order_path(self) -> Path:
+        return self.state_dir / "message-publication-order.json"
+
+    @property
+    def _message_publication_order_anchor_path(self) -> Path:
+        return self.state_dir / "message-publication-order.anchor.json"
+
+    @staticmethod
+    def _message_publication_order_chain(
+        messages: dict[str, int],
+        *,
+        through: int | None = None,
+    ) -> str:
+        limit = len(messages) if through is None else through
+        by_sequence = {sequence: message_id for message_id, sequence in messages.items()}
+        digest = hashlib.sha256(b"agenttalk-message-publication-order-v1").hexdigest()
+        for sequence in range(1, limit + 1):
+            message_id = by_sequence.get(sequence)
+            if not isinstance(message_id, str):
+                raise ValueError("message publication order sequence is incomplete")
+            digest = hashlib.sha256(
+                f"{digest}:{sequence}:{message_id}".encode("utf-8")
+            ).hexdigest()
+        return digest
+
+    @classmethod
+    def _validate_message_publication_order(cls, raw: object) -> dict:
+        if (
+            not isinstance(raw, dict)
+            or raw.get("schema_version") != _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION
+            or not isinstance(raw.get("append_sequence"), int)
+            or isinstance(raw.get("append_sequence"), bool)
+            or int(raw["append_sequence"]) < 0
+            or not isinstance(raw.get("messages"), dict)
+        ):
+            raise ValueError("message publication order sidecar is invalid")
+        append_sequence = int(raw["append_sequence"])
+        messages = raw["messages"]
+        if any(
+            not isinstance(message_id, str)
+            or _ID_RE.fullmatch(message_id) is None
+            or not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or sequence < 1
+            for message_id, sequence in messages.items()
+        ):
+            raise ValueError("message publication order entry is invalid")
+        sequences = set(messages.values())
+        if (
+            len(messages) != append_sequence
+            or sequences != set(range(1, append_sequence + 1))
+        ):
+            raise ValueError("message publication order sequence is non-contiguous")
+        return raw
+
+    @staticmethod
+    def _validate_message_publication_order_anchor(raw: object) -> dict:
+        if (
+            not isinstance(raw, dict)
+            or raw.get("schema_version") != _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION
+            or not isinstance(raw.get("append_sequence"), int)
+            or isinstance(raw.get("append_sequence"), bool)
+            or int(raw["append_sequence"]) < 0
+            or re.fullmatch(r"[0-9a-f]{64}", str(raw.get("chain_digest", "")))
+            is None
+        ):
+            raise ValueError("message publication order anchor is invalid")
+        return raw
+
+    def _read_message_publication_order(self) -> dict | None:
+        order_path = self._message_publication_order_path
+        anchor_path = self._message_publication_order_anchor_path
+        if not order_path.exists():
+            if anchor_path.exists():
+                raise ValueError(
+                    "message publication order sidecar is missing while its anchor exists"
+                )
+            return None
+        try:
+            raw_order = json.loads(order_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("message publication order sidecar is unreadable") from exc
+        order = self._validate_message_publication_order(raw_order)
+        if not anchor_path.exists():
+            return order
+        try:
+            raw_anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("message publication order anchor is unreadable") from exc
+        anchor = self._validate_message_publication_order_anchor(raw_anchor)
+        anchor_sequence = int(anchor["append_sequence"])
+        if anchor_sequence > int(order["append_sequence"]):
+            raise ValueError("message publication order sidecar rolled back")
+        prefix_digest = self._message_publication_order_chain(
+            order["messages"],
+            through=anchor_sequence,
+        )
+        if prefix_digest != anchor["chain_digest"]:
+            raise ValueError("message publication order sidecar changed below its anchor")
+        return order
+
+    def _reserve_message_publication_sequence(
+        self,
+        message_id: str,
+        existing_messages: list[Message],
+    ) -> int:
+        """Durably reserve physical append order before publishing message bytes."""
+        order = self._read_message_publication_order()
+        if order is None:
+            ordered_legacy = sorted(existing_messages, key=lambda message: message.id)
+            messages = {
+                message.id: sequence
+                for sequence, message in enumerate(ordered_legacy, start=1)
+            }
+            order = {
+                "schema_version": _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION,
+                "append_sequence": len(messages),
+                "messages": messages,
+            }
+        else:
+            messages = dict(order["messages"])
+            missing = [
+                message.id for message in existing_messages if message.id not in messages
+            ]
+            if missing:
+                raise ValueError(
+                    "validated message is missing durable publication order: "
+                    f"{missing[0]}"
+                )
+        if message_id in messages:
+            raise ValueError("message id already has a durable publication order")
+        sequence = int(order["append_sequence"]) + 1
+        messages[message_id] = sequence
+        updated = {
+            "schema_version": _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION,
+            "append_sequence": sequence,
+            "messages": messages,
+        }
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(
+            self._message_publication_order_path,
+            json.dumps(updated, indent=2, ensure_ascii=False),
+        )
+        _atomic_write_text(
+            self._message_publication_order_anchor_path,
+            json.dumps({
+                "schema_version": _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION,
+                "append_sequence": sequence,
+                "chain_digest": self._message_publication_order_chain(messages),
+            }, indent=2, ensure_ascii=False),
+        )
+        return sequence
+
     @staticmethod
     def _cfg_dict(cfg: dict, key: str) -> dict:
         """Return cfg[key] as a dict, coercing absent/null to a fresh {}.
@@ -2484,6 +2653,24 @@ class Store:
     ) -> Message:
         if not self.initialized():
             raise FileNotFoundError("agenttalk not initialized; run `agenttalk init`.")
+        supplied_meta = dict(meta or {})
+        authority_sensitive = bool(
+            supplied_meta.get("origin_request_id")
+            and supplied_meta.get("origin_inbound_id")
+        )
+        if authority_sensitive and not _config_locked:
+            with self._config_lock():
+                return self.send(
+                    sender=sender,
+                    recipient=recipient,
+                    body=body,
+                    kind=kind,
+                    subject=subject,
+                    meta=supplied_meta,
+                    sign=sign,
+                    _allow_reserved_sender=_allow_reserved_sender,
+                    _config_locked=True,
+                )
         config_before = os.stat(self.config_path)
         cfg = self.load_config()
         config_after = os.stat(self.config_path)
@@ -2512,7 +2699,46 @@ class Store:
         # yet); a pre-0.16.0 client never ran this code, so the key is absent.
         # A caller that already supplied `epoch_at_send` wins (broadcast
         # snapshots one epoch for the whole fan-out — B3).
-        meta = dict(meta or {})
+        meta = supplied_meta
+        if authority_sensitive:
+            roster = list(cfg.get("agents") or [])
+            roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
+            authorized = {
+                name for name in roster
+                if isinstance(roles.get(name), str)
+                and roles[name].casefold() == "lead"
+            }
+            liaison = cfg.get("operator_facing")
+            if isinstance(liaison, str) and liaison in roster:
+                authorized.add(liaison)
+            roster_payload = {
+                "agents": roster,
+                "roles": {name: roles[name] for name in sorted(roles)},
+                "operator_facing": liaison if isinstance(liaison, str) else None,
+            }
+            roster_revision = hashlib.sha256(
+                json.dumps(
+                    roster_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            expected_revision = meta.get("expected_roster_revision")
+            if not isinstance(expected_revision, str) or not expected_revision:
+                raise ValueError(
+                    "origin-correlated authorized transition requires an expected "
+                    "roster revision"
+                )
+            if expected_revision != roster_revision:
+                raise ValueError("roster revision changed before authorized transition append")
+            if recipient not in authorized:
+                raise ValueError(
+                    "origin-correlated escalation target is not an event-time "
+                    "authorized liaison or lead"
+                )
+            meta["roster_revision"] = roster_revision
+            meta["authorized_liaisons"] = sorted(authorized)
         _gates.validate_response_status(kind, meta)
         if kind in OPENER_KINDS and "epoch_at_send" not in meta:
             meta["epoch_at_send"] = self.current_epoch()
@@ -2552,11 +2778,12 @@ class Store:
                 if _config_locked
                 else self._retirement_lock()
             )
-            with lock:
+            with lock, self._message_publication_lock():
                 # Durable payload preparation is deliberately OUTSIDE this lock,
                 # so unrelated sends do not serialize their write+fsync cost.
-                # Retirement and final publication share only this persistent,
-                # narrow mutex. Revalidate immediately before the O(1) commit.
+                # Retirement and dispatch replay share persistent, narrow
+                # mutexes with final publication. Revalidate immediately before
+                # the O(1) commit.
                 current_revision = _file_revision(os.stat(self.config_path))
                 if config_revision is None or current_revision != config_revision:
                     cfg = self.load_config()
@@ -2566,6 +2793,10 @@ class Store:
                     recipient=recipient,
                     allow_reserved_sender=_allow_reserved_sender,
                 )
+                self._reserve_message_publication_sequence(
+                    msg.id,
+                    self.valid_messages(),
+                )
                 try:
                     os.replace(pending, path)
                     _fsync_directory(path.parent)
@@ -2574,6 +2805,17 @@ class Store:
                     # that block rename. Preserve the established direct-write
                     # fallback there; ordinary Windows/POSIX stays pre-staged.
                     _atomic_write_text(path, payload)
+                # Keep publication order and the monotonic owed-action projection
+                # under one ordering mutex.  A delayed eager hook must not let a
+                # later canonical message acquire an earlier reducer sequence.
+                try:
+                    from agenttalk.wrapper.obligations import note_bus_message
+
+                    note_bus_message(self, msg)
+                except (OSError, ValueError, RuntimeError):
+                    # The immutable message is authoritative. A later replay repairs
+                    # a missed projection in canonical publication order.
+                    pass
         finally:
             try:
                 _unlink_if_same_file(pending, pending_identity)
@@ -2591,6 +2833,253 @@ class Store:
             except Exception as exc:  # noqa: BLE001 - observational cleanup only
                 _ = exc
         return msg
+
+    def _operation_intent_path(self, sender: str, operation_nonce: str) -> Path:
+        name = validate_agent_name(sender)
+        if re.fullmatch(r"[0-9a-f]{32}", operation_nonce) is None:
+            raise ValueError("operation nonce must be exactly 32 lowercase hexadecimal characters")
+        return self.state_dir / "operation-intents" / f"{name}.{operation_nonce}.json"
+
+    @staticmethod
+    def _operation_intent_identity(
+        *,
+        operation: str,
+        kind: str,
+        recipient: str,
+        meta: dict,
+    ) -> dict:
+        identity = {
+            "operation": operation,
+            "kind": kind,
+            "recipient": recipient,
+            "in_reply_to": meta.get("in_reply_to"),
+            "request_id": meta.get("request_id"),
+            "broadcast_id": meta.get("broadcast_id"),
+            "origin_request_id": meta.get("origin_request_id"),
+            "origin_inbound_id": meta.get("origin_inbound_id"),
+        }
+        origin_key = meta.get("origin_obligation_key_digest")
+        roster_revision = meta.get("expected_roster_revision")
+        if origin_key is not None:
+            identity["origin_obligation_key_digest"] = origin_key
+        if roster_revision is not None:
+            identity["expected_roster_revision"] = roster_revision
+        return identity
+
+    @staticmethod
+    def _operation_intent_digest(intent: dict) -> str:
+        canonical = json.dumps(
+            intent,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _operation_digest_for_intent(cls, intent: dict, body: str) -> str:
+        return cls._operation_intent_digest({**intent, "body": body})
+
+    def read_operation_intent(self, sender: str, operation_nonce: str) -> dict | None:
+        """Read one atomically prepared wrapper-operation identity."""
+        path = self._operation_intent_path(sender, operation_nonce)
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(value, dict)
+            or value.get("sender") != sender
+            or value.get("operation_nonce") != operation_nonce
+            or re.fullmatch(r"[0-9a-f]{64}", str(value.get("operation_digest", "")))
+            is None
+            or re.fullmatch(r"[0-9a-f]{64}", str(value.get("payload_sha256", "")))
+            is None
+            or (
+                "intent_digest" in value
+                and re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(value.get("intent_digest", "")),
+                )
+                is None
+            )
+            or not isinstance(value.get("payload_size"), int)
+            or value.get("state") not in {"prepared", "published"}
+        ):
+            return None
+        return value
+
+    def _record_operation_intent_locked(
+        self,
+        *,
+        sender: str,
+        operation_nonce: str,
+        operation_digest: str,
+        body: str,
+        intent_digest: str | None = None,
+    ) -> tuple[Path, dict]:
+        if re.fullmatch(r"[0-9a-f]{64}", operation_digest) is None:
+            raise ValueError(
+                "operation digest must be exactly 64 lowercase hexadecimal characters"
+            )
+        path = self._operation_intent_path(sender, operation_nonce)
+        payload = body.encode("utf-8")
+        identity = {
+            "sender": sender,
+            "operation_nonce": operation_nonce,
+            "operation_digest": operation_digest,
+            "payload_sha256": hashlib.sha256(payload).hexdigest(),
+            "payload_size": len(payload),
+        }
+        if intent_digest is not None:
+            if re.fullmatch(r"[0-9a-f]{64}", intent_digest) is None:
+                raise ValueError(
+                    "operation intent digest must be exactly 64 lowercase hexadecimal characters"
+                )
+            identity["intent_digest"] = intent_digest
+        existing = self.read_operation_intent(sender, operation_nonce)
+        if isinstance(existing, dict):
+            base_identity = {
+                name: value
+                for name, value in identity.items()
+                if name != "intent_digest"
+            }
+            if any(existing.get(name) != value for name, value in base_identity.items()):
+                raise ValueError("operation nonce was already used with a different payload")
+            if intent_digest is not None:
+                existing_intent = existing.get("intent_digest")
+                if existing_intent not in {None, intent_digest}:
+                    raise ValueError(
+                        "operation nonce was already used with a different intent"
+                    )
+                if existing_intent is None:
+                    existing["intent_digest"] = intent_digest
+                    _atomic_write_text(
+                        path,
+                        json.dumps(existing, indent=2, ensure_ascii=False),
+                    )
+            return path, existing
+        if path.exists():
+            raise ValueError("operation intent marker is unreadable")
+        intent = {**identity, "state": "prepared", "prepared_at": _now_iso()}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(path, json.dumps(intent, indent=2, ensure_ascii=False))
+        return path, intent
+
+    def record_operation_intent(
+        self,
+        *,
+        sender: str,
+        operation_nonce: str,
+        operation_digest: str,
+        body: str,
+        operation_intent: dict | None = None,
+    ) -> dict:
+        """Durably mark a complete captured payload before canonical append."""
+        intent_digest = None
+        if operation_intent is not None:
+            if not isinstance(operation_intent, dict):
+                raise ValueError("operation intent must be a mapping")
+            if self._operation_digest_for_intent(operation_intent, body) != operation_digest:
+                raise ValueError("operation intent does not match the operation digest")
+            intent_digest = self._operation_intent_digest(operation_intent)
+        lock = self.state_dir / "operation-publication.lock"
+        with self._exclusive_lock(
+            lock,
+            timeout=10.0,
+            what="wrapper operation publication",
+        ):
+            _path, intent = self._record_operation_intent_locked(
+                sender=sender,
+                operation_nonce=operation_nonce,
+                operation_digest=operation_digest,
+                body=body,
+                intent_digest=intent_digest,
+            )
+            return dict(intent)
+
+    def send_operation(
+        self,
+        *,
+        sender: str,
+        recipient: str,
+        body: str,
+        kind: str,
+        subject: str = "",
+        meta: dict,
+        operation_nonce: str,
+        operation_digest: str,
+    ) -> tuple[Message, bool]:
+        """Atomically dedupe one canonical wrapper operation publication."""
+        if re.fullmatch(r"[0-9a-f]{32}", operation_nonce) is None:
+            raise ValueError("operation nonce must be exactly 32 lowercase hexadecimal characters")
+        if re.fullmatch(r"[0-9a-f]{64}", operation_digest) is None:
+            raise ValueError("operation digest must be exactly 64 lowercase hexadecimal characters")
+        supplied = dict(meta)
+        if supplied.get("operation_nonce") not in {None, operation_nonce}:
+            raise ValueError("operation nonce metadata conflicts with publication request")
+        if supplied.get("operation_digest") not in {None, operation_digest}:
+            raise ValueError("operation digest metadata conflicts with publication request")
+        supplied["operation_nonce"] = operation_nonce
+        supplied["operation_digest"] = operation_digest
+        operation_intent = self._operation_intent_identity(
+            operation="composing" if kind == "composing" else "terminal",
+            kind=kind,
+            recipient=recipient,
+            meta=supplied,
+        )
+        if self._operation_digest_for_intent(operation_intent, body) != operation_digest:
+            raise ValueError("operation intent does not match the operation digest")
+        intent_digest = self._operation_intent_digest(operation_intent)
+        lock = self.state_dir / "operation-publication.lock"
+        with self._exclusive_lock(
+            lock,
+            timeout=10.0,
+            what="wrapper operation publication",
+        ):
+            intent_path, intent = self._record_operation_intent_locked(
+                sender=sender,
+                operation_nonce=operation_nonce,
+                operation_digest=operation_digest,
+                body=body,
+                intent_digest=intent_digest,
+            )
+            for existing in self.valid_messages():
+                existing_meta = existing.meta or {}
+                if (
+                    existing.sender != sender
+                    or existing_meta.get("operation_nonce") != operation_nonce
+                ):
+                    continue
+                if existing_meta.get("operation_digest") == operation_digest:
+                    if intent.get("state") != "published" or intent.get(
+                        "message_id"
+                    ) != existing.id:
+                        intent["state"] = "published"
+                        intent["message_id"] = existing.id
+                        intent["published_at"] = _now_iso()
+                        _atomic_write_text(
+                            intent_path,
+                            json.dumps(intent, indent=2, ensure_ascii=False),
+                        )
+                    return existing, False
+                raise ValueError("operation nonce was already used with a different payload")
+            message = self.send(
+                sender=sender,
+                recipient=recipient,
+                body=body,
+                kind=kind,
+                subject=subject,
+                meta=supplied,
+            )
+            intent["state"] = "published"
+            intent["message_id"] = message.id
+            intent["published_at"] = _now_iso()
+            _atomic_write_text(
+                intent_path,
+                json.dumps(intent, indent=2, ensure_ascii=False),
+            )
+            return message, True
 
     def send_operator_answer_atomic(
         self,
@@ -3249,6 +3738,29 @@ class Store:
         it. Sorted by id (chronological).
         """
         return self._validated_messages()
+
+    def publication_ordered_messages(
+        self,
+        messages: list[Message] | None = None,
+    ) -> list[Message]:
+        """Return validated messages in the durable physical publication order.
+
+        Legacy stores have no sidecar, so their established id order is the only
+        available bootstrap authority. The first subsequent send freezes that
+        order under the publication lock before reserving its own sequence.
+        """
+        messages = self.valid_messages() if messages is None else list(messages)
+        order = self._read_message_publication_order()
+        if order is None:
+            return messages
+        sequences = order["messages"]
+        missing = [message.id for message in messages if message.id not in sequences]
+        if missing:
+            raise ValueError(
+                "validated message is missing durable publication order: "
+                f"{missing[0]}"
+            )
+        return sorted(messages, key=lambda message: sequences[message.id])
 
     def _validated_messages(self, *, since_id: str | None = None) -> list[Message]:
         """Shared trust gate behind ``messages_for`` and ``valid_messages``.
@@ -5731,6 +6243,12 @@ class Store:
         entry["closed_reason"] = reason
         data[request_id] = entry
         self._write_threadstate(agent, data)
+        try:
+            from agenttalk.wrapper.obligations import note_manual_close
+
+            note_manual_close(self, agent, request_id)
+        except (OSError, ValueError, RuntimeError):
+            pass
 
     def thread_closed(self, agent: str, request_id: str) -> bool:
         """True iff ``agent`` has explicitly closed this thread.

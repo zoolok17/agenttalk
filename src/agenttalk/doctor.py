@@ -151,6 +151,7 @@ def run(project_root: Path | None = None) -> Report:
         holds = _check_config_blocked_holds(store)
         if holds is not None:  # additive: absent unless a valid config-blocked hold exists
             report.checks.append(holds)
+        report.checks.append(_check_detection_commit_gate(store))
         kn_check = _check_knowledge(store)
         if kn_check is not None:  # additive: absent unless a knowledge store exists
             report.checks.append(kn_check)
@@ -167,6 +168,84 @@ def run(project_root: Path | None = None) -> Report:
         if lead_check is not None:  # additive: absent unless a lead-loop concern exists
             report.checks.append(lead_check)
     return report
+
+
+def _check_detection_commit_gate(store: Store) -> Check:
+    """Report the operator launch-policy snapshot and durable breaker state."""
+    from agenttalk.wrapper.obligations import (
+        POLICY_ENV,
+        DetectionCommitGate,
+        PolicySnapshot,
+        ResolverState,
+    )
+
+    roster = store.load_config().get("agents", []) or []
+    supervisor_paths: dict[str, str] = {}
+    supervisor_path = store.dir / "supervisor.json"
+    if supervisor_path.exists():
+        try:
+            supervisor = json.loads(supervisor_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            supervisor = None
+        entries = supervisor.get("agents") if isinstance(supervisor, dict) else None
+        if isinstance(entries, dict):
+            for name, entry in entries.items():
+                env = entry.get("env") if isinstance(entry, dict) else None
+                value = env.get(POLICY_ENV) if isinstance(env, dict) else None
+                if isinstance(value, str) and value:
+                    supervisor_paths[str(name)] = value
+    process_path = os.environ.get(POLICY_ENV)
+    rows: list[dict] = []
+    has_error = False
+    has_warn = False
+    has_legacy_broadcast = False
+    for agent in roster:
+        configured = process_path or supervisor_paths.get(agent)
+        policy = (
+            PolicySnapshot.from_path(Path(configured).expanduser().resolve(), agent)
+            if configured
+            else PolicySnapshot.inactive()
+        )
+        gate = DetectionCommitGate(store, agent, policy, fence="doctor-read-only")
+        status = gate.status()
+        status["policy_path"] = configured
+        rows.append(status)
+        has_error = has_error or policy.status == ResolverState.BLOCKED_POLICY
+        has_warn = has_warn or status.get("breaker", {}).get("tripped") is True
+        legacy = status.get("legacy_broadcast", {})
+        has_legacy_broadcast = has_legacy_broadcast or int(
+            legacy.get("unenforced_total", 0)
+        ) > 0
+    has_warn = has_warn or has_legacy_broadcast
+    details = "; ".join(
+        f"{row['agent']}={row['status']}"
+        + (
+            f" legacy_unenforced={row['legacy_broadcast']['unenforced_total']}"
+            if int(row.get("legacy_broadcast", {}).get("unenforced_total", 0)) > 0
+            else ""
+        )
+        for row in rows
+    )
+    return Check(
+        name="wrapped_commit_gate",
+        status="error" if has_error else ("warn" if has_warn else "ok"),
+        details=details or "no active agents",
+        fix=(
+            f"repair the operator-owned {POLICY_ENV} snapshot before dispatch"
+            if has_error else (
+                "audit and reset the tripped compliance breaker before paid dispatch"
+                if any(
+                    row.get("breaker", {}).get("tripped") is True for row in rows
+                )
+                else (
+                    "audit legacy broadcast records; they were logged without "
+                    "owed-action enforcement"
+                    if has_legacy_broadcast else ""
+                )
+            )
+        ),
+        data={"agents": rows, "security_grade": False},
+    )
 
 
 def _check_powershell_host(store: Store) -> Check:
