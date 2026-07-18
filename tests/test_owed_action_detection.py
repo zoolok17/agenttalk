@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agenttalk import cli, doctor, signing
+from agenttalk import cli, doctor, signing, threads
 from agenttalk.store import Store
 from agenttalk.wrapper import loop, recv_api
 from agenttalk.wrapper.obligations import (
@@ -3497,3 +3497,298 @@ def test_global_ledger_corruption_blocks_without_dispatch_or_queue_drain(
     assert json.loads(gate.path.read_text(encoding="utf-8"))["store_epoch"]
     health = json.loads(gate.proof_health_path.read_text(encoding="utf-8"))
     assert health["last_rebuild_succeeded"] is True
+
+
+def test_at_cap_failed_delivery_transaction_is_complete_before_cursor_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store, "q-atomic-failure")
+    gate = _gate(store)
+    calls = 0
+
+    def drive(_record: dict) -> loop.DriveOutcome:
+        nonlocal calls
+        calls += 1
+        return loop.DriveOutcome(ok=True)
+
+    monkeypatch.setattr(
+        gate,
+        "_advance_record_cursor",
+        lambda _record: (_ for _ in ()).throw(OSError("cursor projection crash")),
+    )
+
+    with pytest.raises(OSError, match="cursor projection crash"):
+        loop.run_loop(
+            store,
+            "beta",
+            drive,
+            commit_gate=gate,
+            clock=lambda: 0.0,
+            sleep=lambda _delay: None,
+            max_polls=4,
+        )
+
+    ledger = _ledger(gate)
+    key_digest = ledger["inbound_index"][inbound.id]
+    admission = ledger["obligations"][key_digest]
+    incident = [
+        row for row in ledger["transitions"]
+        if row["transition"] == "COMPLIANCE_INCIDENT"
+        and row.get("key_digest") == key_digest
+    ]
+    failed = [
+        row for row in ledger["transitions"]
+        if row["transition"] == "DELIVERY_FAILED"
+        and row.get("key_digest") == key_digest
+    ]
+
+    assert calls == 2
+    assert len(incident) == len(failed) == 1
+    assert admission["state"] == "delivery_failed"
+    assert admission["paid_dispatches_total"] == 2
+    assert admission["delivery_failure_sequence"] == failed[0]["sequence"]
+    assert ledger["breakers"]["beta"][
+        "owed_action_cap_exhaustions_consecutive"
+    ] == 1
+    indexed = ledger["delivery_index"]["q-atomic-failure"]
+    assert len(indexed) == 1
+    assert indexed[0]["key_digest"] == key_digest
+    assert indexed[0]["incident_sequence"] == incident[0]["sequence"]
+    assert ledger["cursor_dispositions"]["beta"] == {
+        "inbound_id": inbound.id,
+        "mode": "global",
+        "state": "delivery_failed",
+        "at": ledger["cursor_dispositions"]["beta"]["at"],
+    }
+
+    stack: list[object] = [ledger]
+    dead_letter_references: list[dict] = []
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            if value.get("kind") == "dead_letter_reference":
+                dead_letter_references.append(value)
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    assert len(dead_letter_references) == 1
+    reference = json.dumps(dead_letter_references[0], sort_keys=True)
+    assert inbound.id in reference
+    assert key_digest in reference
+    assert str(incident[0]["sequence"]) in reference
+    assert str(failed[0]["sequence"]) in reference
+    for nonce in admission["reservations"]:
+        assert nonce in reference
+
+    assert store.cursor("beta") == ""
+    assert any(message.id == inbound.id for message in store.valid_messages())
+
+
+def test_blocked_pairwise_waiter_wakes_from_transactional_delivery_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _store(tmp_path)
+    _question(store, "q-blocked-waiter")
+    gate = _gate(store)
+    marker_written = threading.Event()
+    original_write_marker = cli._write_waiting_marker  # noqa: SLF001
+
+    def write_marker_then_signal(*args, **kwargs):
+        result = original_write_marker(*args, **kwargs)
+        marker_written.set()
+        return result
+
+    monkeypatch.setattr(cli, "_write_waiting_marker", write_marker_then_signal)
+    wait_results: list[int] = []
+
+    def wait_for_failure() -> None:
+        wait_results.append(cli.main([
+            "--root",
+            str(tmp_path),
+            "wait",
+            "--for",
+            "alpha",
+            "--to-request",
+            "q-blocked-waiter",
+            "--timeout",
+            "2",
+            "--interval",
+            "0.1",
+        ]))
+
+    waiter = threading.Thread(target=wait_for_failure)
+    waiter.start()
+    assert marker_written.wait(timeout=5)
+    assert wait_results == []
+
+    calls = 0
+
+    def drive(_record: dict) -> loop.DriveOutcome:
+        nonlocal calls
+        calls += 1
+        return loop.DriveOutcome(ok=True)
+
+    loop.run_loop(
+        store,
+        "beta",
+        drive,
+        commit_gate=gate,
+        clock=lambda: 0.0,
+        sleep=lambda _delay: None,
+        max_polls=4,
+    )
+    waiter.join(timeout=5)
+
+    assert not waiter.is_alive()
+    assert calls == 2
+    assert wait_results == [4]
+    output = capsys.readouterr().out
+    assert "AGENTTALK :: DELIVERY FAILED" in output
+    payload = json.loads(next(
+        line for line in reversed(output.splitlines()) if line.startswith("{")
+    ))
+    assert payload["state"] == "delivery_failed"
+    assert payload["delivery_generation"] == 1
+    assert isinstance(payload["incident_sequence"], int)
+
+
+def test_failed_broadcast_member_does_not_terminalize_pinned_quorum_recv(
+    tmp_path: Path,
+) -> None:
+    members = ["beta", "gamma", "lead"]
+    store = _store(tmp_path, ["alpha", *members])
+    for member in members:
+        _broadcast_question(
+            store,
+            member,
+            broadcast_id="b-pinned-quorum",
+            members=members,
+            policy="quorum",
+            quorum=2,
+        )
+    beta = _gate(store, policy_agents=tuple(members))
+    gamma = _gate(
+        store,
+        agent="gamma",
+        fence="wrapper-gamma",
+        policy_agents=("gamma", "beta", "lead"),
+    )
+    beta_record = _record(store)
+    gamma_record = _record(store, agent="gamma")
+    beta_open = beta.admit_or_finalize(beta_record)
+    assert beta_open.key is not None
+    beta.delivery_failed(
+        beta_record,
+        beta_open.key,
+        reason="one member exhausted",
+        expected_revision=beta_open.scoped_revision,
+    )
+
+    before_answer = recv_api.poll(
+        store,
+        "alpha",
+        scoped_request_id="b-pinned-quorum",
+    )
+    assert before_answer["scoped"]["closed"] is False
+    assert before_answer["scoped"]["delivery_failed"] is None
+
+    _answer_reserved(tmp_path, gamma, gamma_record, body="one qualifying answer")
+    gamma.finalize(gamma_record, gamma.resolve(gamma_record))
+    after_one_answer = recv_api.poll(
+        store,
+        "alpha",
+        scoped_request_id="b-pinned-quorum",
+    )
+
+    assert after_one_answer["scoped"]["closed"] is False
+    assert after_one_answer["scoped"]["delivery_failed"] is None
+
+
+def test_failed_delivery_replay_exhausts_assignment_but_leaves_conversation_unanswered(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store, "q-unanswered")
+    gate = _gate(store)
+    record = _record(store)
+    admitted = gate.admit_or_finalize(record)
+    assert admitted.key is not None
+    gate.delivery_failed(
+        record,
+        admitted.key,
+        reason="delivery exhausted",
+        expected_revision=admitted.scoped_revision,
+    )
+
+    replayed = gate.resolve(record)
+    requester_threads = threads.derive_threads(
+        store.valid_messages(),
+        agent="alpha",
+        cursor="",
+    )
+    requester_thread = next(
+        row for row in requester_threads if row.request_id == "q-unanswered"
+    )
+
+    assert replayed.state == ResolverState.DELIVERY_EXHAUSTED
+    assert replayed.key == admitted.key
+    assert gate.delivery_status("q-unanswered", "alpha")["state"] == "delivery_failed"
+    assert requester_thread.state == "open-outbound"
+    assert any(message.id == inbound.id for message in store.valid_messages())
+
+
+def test_explicit_reask_after_failed_delivery_gets_fresh_budget_without_reopening_old(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    old_inbound = _question(store, "q-new-delivery")
+    gate = _gate(store)
+    old_record = _record(store)
+    old = gate.admit_or_finalize(old_record)
+    assert old.key is not None
+    old_permit = gate.reserve_dispatch(old, purpose="initial")
+    gate.dispatch_record(old_record, old_permit)
+    gate.mark_dispatch_result(old_permit, action_attempted=False)
+    old_current = gate.resolve(old_record)
+    gate.delivery_failed(
+        old_record,
+        old.key,
+        reason="old delivery exhausted",
+        expected_revision=old_current.scoped_revision,
+    )
+    old_before_reask = dict(_ledger(gate)["obligations"][old.key.digest])
+
+    new_inbound = _question(store, "q-new-delivery")
+    restarted = _gate(store, fence="wrapper-2")
+    new_record = _record(store)
+    assert new_record["id"] == new_inbound.id
+    new = restarted.admit_or_finalize(new_record)
+    assert new.key is not None
+
+    assert new.key.digest != old.key.digest
+    assert (
+        new.key.question_generation,
+        new.key.delivery_generation,
+    ) != (
+        old.key.question_generation,
+        old.key.delivery_generation,
+    )
+    ledger = _ledger(restarted)
+    assert ledger["obligations"][old.key.digest] == old_before_reask
+    assert ledger["obligations"][old.key.digest]["state"] == "delivery_failed"
+    assert ledger["obligations"][new.key.digest]["state"] == "open"
+    assert ledger["obligations"][new.key.digest]["paid_dispatches_total"] == 0
+
+    new_permit = restarted.reserve_dispatch(new, purpose="initial")
+    after_reservation = _ledger(restarted)["obligations"]
+    assert new_permit.paid_dispatches_total == 1
+    assert after_reservation[new.key.digest]["paid_dispatches_total"] == 1
+    assert after_reservation[old.key.digest]["paid_dispatches_total"] == (
+        old_before_reask["paid_dispatches_total"]
+    )
+    assert after_reservation[old.key.digest]["state"] == "delivery_failed"
+    assert any(message.id == old_inbound.id for message in store.valid_messages())
