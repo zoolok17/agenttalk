@@ -368,11 +368,20 @@ Rules:
   the moment it is written and would invite exactly the evidence-rot the
   roadmap warns about (§8).
 - There is no `status`. Status is projected.
-- `terminal` is `null` for a live item, or one of `delivered`,
-  `closed`, `abandoned` with the event id that made it terminal. This is
-  the only lifecycle fact stored on the item, and it is stored only
-  because "this item is finished" must survive a corrupt event ledger.
-  Every non-terminal state is derived.
+- `terminal` is `null` for a live item, or exactly
+  `{"type": "delivered" | "abandoned", "event_id": "we-..."}` — two keys,
+  both required. It is the only lifecycle fact stored on the item, and it
+  is stored only because "this item is finished" must survive a corrupt
+  event ledger. Every non-terminal state is derived.
+- **`closed` is not a `terminal` value.** Work writes only `delivered`
+  and `abandoned`; `closed` is driven by `close.py` and work only reads
+  it, so `terminal == "closed"` had **no producer** and was unreachable.
+  An unreachable enum member inside a disjunction is worse than merely
+  dead: it makes the disjunction read as though it has two ways to be
+  satisfied when it has one. Catching that needs a **reachability**
+  question — "which producer writes this value?" — which is a different
+  check from consistency, and it is why the member survived five review
+  rounds.
 - `item_seq` is a **record version**, not a ledger position. It counts
   durable *item writes* and serves only as the `expected_version` for
   optimistic concurrency: a mutation states the `item_seq` it read, and a
@@ -505,9 +514,12 @@ Rules:
   `ts`, `actor`, `type`, `from_state`, `to_state`, **plus every per-type
   payload field**: `title`, `domain_id`, `owner`, `lane_id`,
   `lane_generation`, `artifact_id`, `head_sha`, `request_id`,
-  `reviewed_head_sha`, `asserted_state`, `delivery_artifact_path`,
-  `reason`, `supersedes_event_id`. A later event can never rewrite these
-  on an earlier event.
+  `asserted_state`, `delivery_artifact_path`, `reason`,
+  `supersedes_event_id`. A later event can never rewrite these on an
+  earlier event. (`reviewed_head_sha` is deliberately **not** here: no
+  event carries it. It exists only as `meta.reviewed_head_sha` on a bus
+  `review-result`, which is a different namespace — see The Review
+  Binding Contract.)
   An earlier draft declared the bound set before the per-type schemas
   existed and then added those schemas without extending it, classifying
   only `artifact_id` and `head_sha`. The construction test could not then
@@ -530,15 +542,13 @@ Rules:
   |---|---|---|
   | `created` | `title`, `domain_id` | any rostered agent |
   | `assigned` | `owner` | owner or lead |
-  | `started` | — | owner |
   | `lane_bound` | `lane_id`, `lane_generation` | owner |
   | `artifact_attached` | `artifact_id`, `head_sha` | producer or owner |
-  | `review_requested` | `request_id` | owner |
-  | `review_recorded` | `request_id`, `reviewed_head_sha` | owner |
+  | `review_requested` | `request_id` | owner — producer lands in **increment 3**, see below |
   | `state_asserted` | `asserted_state` | any rostered agent (advisory) |
   | `delivered` | `delivery_artifact_path` | owner or lead |
   | `abandoned` | `reason` | owner or lead |
-  | `reopened` | `reason`, `supersedes_event_id` | lead only |
+  | `reopened` | `reason`, `supersedes_event_id` | lead only — **no producer in D1–D5, see below** |
 
   An earlier draft named the types and classified their fields as bound
   xor curation-mutable, but never said what each type must *contain* —
@@ -580,6 +590,39 @@ Rules:
   arbitrarily between two equal options. The divergence is a **latent**
   hazard rather than a live exploit — no current caller is known to feed
   it a non-serializable value — and that under-claim is deliberate.
+- **Three types have no producer in D1–D5, and each is disclosed rather
+  than left for a reader to assume:**
+  - `reopened` — there is **no `work reopen` command** in any phase, so
+    **once an item is `delivered` or `abandoned` it is permanently
+    terminal**. A command was deliberately *not* added to make this
+    member reachable: reopening un-terminates a delivered item, which is
+    a real authority surface deserving its own design and its own review,
+    not a command invented to discharge a vocabulary entry.
+  - Resolving the tension a reader would otherwise have to settle
+    themselves: `terminal` is justified as the fact that must survive a
+    corrupt event ledger, which makes **finality load-bearing**, while
+    `reopened` advertises reversibility. **Finality is the D1–D5
+    contract.** A future reopen capability must *reconcile* with the
+    survives-a-corrupt-ledger justification — explaining what a reopened
+    item's durable record means — rather than simply relaxing it.
+  - `review_requested` — its producer is the **link mutation that stores
+    a `request_id`**, which lands in **increment 3** with the other link
+    mutations. Named rather than disclosed, because it has a producer;
+    it is merely not built yet.
+- **There is deliberately no `review_recorded` event type**, and the
+  reason matters more than the absence. Review state is **not ledger
+  state**: the Source-Of-Truth table makes bus messages plus
+  `threads.derive_threads` authoritative for reviews, and every
+  `work_review_*` code evaluates those messages live at verdict time. A
+  work-side `review_recorded` event would **fork that truth** — a second
+  record of review history alongside the bus, which is the
+  duplicated-truth failure the boundary section exists to prevent.
+  An earlier draft carried the type and merely disclosed it as
+  unwritable. That was the weaker choice: a disclosure says "do not write
+  this" while leaving the entry in the vocabulary, and this document's
+  defect history is things that *read* as covered but are not. Removal
+  makes it unwritable rather than discouraged. Recorded so nobody adds it
+  back in D3 to "complete" the vocabulary.
 - `op_id` is **unique across the ledger**. A replayed event re-encoded
   with a fresh `op_id` still fails against `ledger_head`, and one
   re-encoded with the original `op_id` is rejected as a duplicate.
@@ -1044,6 +1087,22 @@ Rules:
   request only once the D6 attestation-scope decision lands. Until then
   `external_attested` is a work-side tier that no producer emits, and
   `work check` treats it as unreachable rather than pretending it works.
+- **`automation_ci` is also unreachable in D1–D5**, and this is the
+  disclosure that matters most, because it is the tier the release
+  baseline actually depends on. Origin tier is assigned only by a trusted
+  execution or transport adapter; no such adapter exists in these phases,
+  so nothing can produce `evidence_source == "automation_ci"` honestly and
+  no `producer_class == "automation"` resolution rule exists either.
+  **The consequence, stated plainly: no release-blocking work item can
+  reach `GO` in D1–D5.** `release_min_tier` defaults to `automation_ci`,
+  that floor cannot be met, and `work_artifact_insufficient_tier` holds
+  every release-blocking requirement.
+- That is intended, not a defect. A release gate satisfiable without any
+  adapter capable of producing release-grade evidence would be a false GO
+  by construction — the exact failure this document exists to prevent. It
+  is written here rather than left to be discovered because a reader who
+  sees a defined tier floor reasonably concludes the floor is satisfiable,
+  and being surprised by this in D4 is worse than being surprised now.
 - `producer_class` ∈ `{agent, operator, automation, external}` is
   resolved from the roster and the invoking context at write time, not
   from a self-declared field in the artifact. An artifact that claims
@@ -1213,7 +1272,7 @@ order, and the first matching rule wins:
 | Derived state | Condition |
 |---|---|
 | `abandoned` | `terminal == "abandoned"` |
-| `closed` | `terminal == "closed"`, or the linked close is published |
+| `closed` | the linked close is published |
 | `delivered` | `terminal == "delivered"`, or the linked lane has a committed delivery artifact |
 | `changes_requested` | a review-result bound to the **current revision** is `rejected` |
 | `review` | a linked review thread **for the current revision** is open and unanswered |
@@ -1242,12 +1301,19 @@ Rules:
   Contradiction case C reappearing in the state ladder — and in the first
   draft case C survived only because the `closed` row happened to match
   first, which is luck of table position rather than a mechanism.
-- Who may drive each transition: the **owner** may assign, start, bind a
-  lane, attach artifacts, and request review. Any rostered agent may
-  attach an artifact naming itself as producer. Only the item owner or a
-  lead may `deliver` or `abandon`. `closed` is driven by `close.py`, not
-  by work — work reads it. No prose in any message body drives any
-  transition (DESIGN.md principle 1).
+- Who may drive each transition: the **owner** may assign, bind a lane,
+  attach artifacts, and request review. Any rostered agent may attach an
+  artifact naming itself as producer. Only the item owner or a lead may
+  `deliver` or `abandon`. `closed` is driven by `close.py`, not by work —
+  work reads it. No prose in any message body drives any transition
+  (DESIGN.md principle 1).
+- **Where this prose and the event table's Who-may-drive column differ,
+  the event table governs**, because that column is what the construction
+  test pins. Two consequences worth stating rather than leaving to be
+  derived: on an **unowned** item "the owner may assign" is vacuous, so
+  `assigned` falls to the **lead** by elimination; and a target agent
+  **cannot self-assign**, because they are neither owner nor lead and the
+  column is a closed rule.
 - Terminal states are recorded on the item because they must survive a
   corrupt ledger; every other state is recomputed and nothing about it is
   persisted.
@@ -1269,6 +1335,10 @@ Rules:
 - **A lane may be claimed by at most one non-terminal work item.**
   Binding is serialized on `(lane_id, lane_generation)`, so a second
   concurrent `work start` against the same lane loses at mutation time.
+  `work start` **is** the lane-claiming command and emits `lane_bound`;
+  there is no separate `started` event, because an event that mutates
+  nothing and maps to no state transition audits only that someone typed
+  a command.
   The projection independently detects cardinality greater than one — a
   state only reachable through corrupt or hand-written records — and
   holds *every* claimant with `work_lane_conflict` until reconciled,
@@ -1610,6 +1680,16 @@ Rules:
 | A linked close exists and is published | `work_close_missing` |
 | A review-result bound to the current revision exists and is approved | `work_review_missing` |
 | `gate_check.required_gates` is non-empty and every one is green | `work_release_gates_vacuous` |
+
+**In D1–D5 a release-blocking item cannot reach `GO` at all**, even with
+every row above satisfied. `release_min_tier` defaults to
+`automation_ci`, no adapter capable of producing that tier exists in
+these phases, and `work_artifact_insufficient_tier` therefore holds. The
+baseline above is the set of requirements a release will have to meet
+*once release-grade evidence is producible*; until then the release path
+is closed by construction. That is deliberate — see Evidence Tiers — and
+it is stated here so nobody implements against this table expecting a
+reachable GO.
 
 Rules:
 
@@ -2498,9 +2578,13 @@ Implement:
   command. This lands in D2 rather than later
   because retrofitting a chain onto an existing ledger means rewriting
   history, which the append-only rule forbids.
-- `work create|list|show|status|assign|start|deliver|abandon`.
-- The derived-state projection table, with terminal states on the item.
-- Links to lanes, domains, threads, gates, closes, onboarding, notes.
+- `work create|list|show|status|assign|start|deliver|abandon`, where
+  `start` binds the lane and emits `lane_bound`.
+- The derived-state projection table, with `terminal` on the item as
+  `{"type": "delivered"|"abandoned", "event_id"}` — `closed` is derived
+  from the linked close, never stored.
+- The lane link (bound by `start`, validated at bind time against lanes'
+  public read API) and the domain link (bound at create).
 - Fail-safe per-item reads, corrupt-item mutation refusal, and the
   one-corrupt-item-does-not-brick-work test.
 
@@ -2508,6 +2592,16 @@ Do NOT implement: artifacts, policy, tiers, or `work check`. `work
 status` in D2 projects lifecycle state only and reports `UNKNOWN` for
 anything requiring evidence, rather than a provisional verdict that would
 have to be un-taught later.
+
+**Also NOT in increment 2: link mutation** for `close_id`, `gate_scope`,
+`onboarding_run_id`, and `note_ids`. Those fields stay `null`/`[]` from
+create, and there is deliberately **no event type that writes them** yet.
+They move to increment 3, alongside the projection that consumes them —
+a link writer with no reader cannot be meaningfully exercised, and
+building the writer next to its consumer is how a wrong shape gets found
+while it is still cheap to change. Increment 3 inherits this rather than
+rediscovering it: adding the event type is an **RFC amendment**, not an
+implementation choice.
 
 ### Phase D3: Evidence Registry MVP
 
