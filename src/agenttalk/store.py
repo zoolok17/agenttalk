@@ -1432,6 +1432,17 @@ class Store:
                                     poll=poll, what="config lock (another agent may be "
                                     "mid roster-admin)")
 
+    def config_lock(self, *, timeout: float = 10.0, poll: float = 0.05):
+        """Public alias for the config read-modify-write lock.
+
+        Additive and behaviour-free: delegates to ``_config_lock`` so a
+        boundary-respecting external module (e.g. the Native Work & Evidence
+        spine) can run its read-modify-write / JSONL append under the same
+        exclusive lock without reaching across the module boundary into a
+        private helper. An unlocked RMW is a lost-update fail-open.
+        """
+        return self._config_lock(timeout=timeout, poll=poll)
+
     def _supervisor_lifecycle_lock(self, *, timeout: float = 10.0,
                                    poll: float = 0.05):
         """Serialize supervisor claim/release, host selection, and refresh.
