@@ -103,14 +103,18 @@ Evidence tiers (do NOT collapse all green into one dot):
 
 `agenttalk work ...` needs one entry in `cli.py` (the forbidden-to-edit file). Handle it with a **single minimal dispatch hook**: add exactly one subparser + one line `from agenttalk import work; return work.main(args)` and put ALL logic in your own module. Coordinate that one-line insertion with the primary architect (via the operator) so it lands cleanly — it is the only `cli.py` touch you should need.
 
+**Tier note (per `docs/ASSURANCE.md`):** the `agenttalk work` CLI surface and the `.agenttalk/work/` + `.agenttalk/artifacts/` JSON schemas are **public contracts** — a public-contract change is **Tier 2 minimum** on its own (`ASSURANCE.md:79-82`). The feature as a whole is **Tier 3** (see §7). Treat the tier as settled here, not re-litigated per deliverable.
+
 ---
 
 ## 7. Process & quality bar (same standard as the primary team)
 
-- **Design-first:** D1 RFC reviewed (adversarial, cross-family) before any build.
+- **Tier: this feature is Tier 3** (per `docs/ASSURANCE.md:72-78`) — it is simultaneously a gate/authority surface, a provenance + persistent-state contract, and its core design problem is fail-open/fail-closed semantics. `ASSURANCE.md:63` ("uncertainty rounds UP") points the same way.
+- **Reviewer floor = a HARD FLOOR OF 3** independent reviewers (`ASSURANCE.md:93-96`): ≥2 model families, distinct predeclared lenses, **no designer/builder/lead counted**, and ephemeral evidence-only reviews may add counters but do NOT satisfy the minimum. This floor applies to **the D1 RFC design panel** (D1 *is* the Tier-3 design review), not only to the final code diff. (Corrects an earlier "≥2" statement in this doc — GitHub #29.)
+- **Design-first:** D1 RFC reviewed (adversarial, cross-family, ≥3 per above) before any build.
 - **Small committed increments:** one logical unit per turn, failing-first evidence, commit, post SHA + which acceptance rows are green, STOP. (This is what keeps agent sessions from context-bloating and crashing — do NOT build a whole deliverable in one turn.)
 - **Dual-version gate:** ruff + bandit + pytest on **Python 3.10 AND 3.14**, direct interpreter (see §8 gotchas), before calling anything done.
-- **Adversarial review before merge:** ≥2 cross-family reviewers on the final SHA + your lead gate + CI. HOLD until then.
+- **Adversarial review before merge:** the Tier-3 floor of 3 cross-family reviewers on the final SHA + your lead gate + CI. HOLD until then.
 - **Failing-first is mandatory:** every new acceptance test must fail against unimplemented/broken code, or it's tautological.
 
 ---
