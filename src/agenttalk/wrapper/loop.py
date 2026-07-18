@@ -344,7 +344,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 gate_resolution,
                 expected_revision=gate_resolution.ledger_revision,
             )
-            return finalized.allows_legacy_commit
+            return finalized.allows_legacy_commit or finalized.terminal
         recv_api.commit(store, agent, rec)
         return True
 
@@ -405,6 +405,14 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             authority = commit_gate.validate_no_admission_authority(
                 record,
                 legacy_gate_resolution,
+                side_effect=lambda: store.dead_letter(
+                    agent,
+                    record,
+                    reason=reason,
+                    failure_class=failure_class,
+                    at=now_iso(),
+                    child_output_tail=child_output_tail,
+                ),
             )
             if not authority.allows_legacy_commit:
                 stamp()
@@ -414,8 +422,15 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 sleep(fail_sleep)
                 fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                 return
-        store.dead_letter(agent, record, reason=reason, failure_class=failure_class,
-                          at=now_iso(), child_output_tail=child_output_tail)
+        else:
+            store.dead_letter(
+                agent,
+                record,
+                reason=reason,
+                failure_class=failure_class,
+                at=now_iso(),
+                child_output_tail=child_output_tail,
+            )
         stamp()                               # DL is progress (bypasses drive's stamp)
         if on_health_idle is not None:
             on_health_idle()
@@ -892,6 +907,23 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 record,
                 legacy_gate_resolution,
             )
+            if authorized.terminal:
+                _guard_advance()
+                finalized = commit_gate.finalize(
+                    record,
+                    authorized,
+                    expected_revision=authorized.ledger_revision,
+                )
+                if finalized.terminal:
+                    store.clear_attempt(agent, record.get("id"))
+                    store.gc_attempts_below(agent, store.cursor(agent))
+                    stamp()
+                    fail_sleep = idle_interval
+                    continue
+                stamp()
+                sleep(fail_sleep)
+                fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
             if not authorized.allows_legacy_commit:
                 stamp()
                 sleep(fail_sleep)
@@ -907,7 +939,11 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         if outcome.ok:
             finalization_resolution = legacy_gate_resolution
             retained_success = False
-            if commit_gate is not None and legacy_gate_resolution is not None:
+            if (
+                commit_gate is not None
+                and legacy_gate_resolution is not None
+                and legacy_gate_resolution.ledger_revision is not None
+            ):
                 finalization_resolution = commit_gate.record_no_admission_success(
                     record,
                     legacy_gate_resolution,
@@ -916,7 +952,10 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     finalization_resolution.reason
                     == "no_admission_finalization_pending"
                 )
-                if not finalization_resolution.allows_legacy_commit:
+                if not (
+                    finalization_resolution.allows_legacy_commit
+                    or finalization_resolution.terminal
+                ):
                     store.record_attempt_result(
                         agent,
                         head_id,
@@ -1046,7 +1085,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
             cur_sleep = min(max_idle_interval, cur_sleep * 2.0)
             continue
         cur_sleep = idle_interval
-        if is_terminal_control(record):
+        if is_terminal_control(record) and commit_gate is None:
             # scoped record on a rescinded/closed thread: consume + stop (terminal).
             recv_api.commit(store, agent, record)
             return turns
@@ -1271,6 +1310,18 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                 record,
                 legacy_gate_resolution,
             )
+            if authorized.terminal:
+                finalized = commit_gate.finalize(
+                    record,
+                    authorized,
+                    expected_revision=authorized.ledger_revision,
+                )
+                if finalized.terminal:
+                    return turns
+                _stamp()
+                sleep(fail_sleep)
+                fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
             if not authorized.allows_legacy_commit:
                 _stamp()
                 sleep(fail_sleep)
@@ -1284,7 +1335,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                     record,
                     legacy_gate_resolution,
                 )
-                if not retained.allows_legacy_commit:
+                if not (retained.allows_legacy_commit or retained.terminal):
                     _stamp()
                     sleep(fail_sleep)
                     fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
@@ -1294,7 +1345,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                     retained,
                     expected_revision=retained.ledger_revision,
                 )
-                if not finalized.allows_legacy_commit:
+                if not (finalized.allows_legacy_commit or finalized.terminal):
                     _stamp()
                     sleep(fail_sleep)
                     fail_sleep = min(max_idle_interval, fail_sleep * 2.0)

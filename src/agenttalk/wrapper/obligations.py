@@ -684,9 +684,8 @@ class DetectionCommitGate:
             and policy.grade != SECURITY_GRADE
         )
 
-    @classmethod
-    def _durable_no_admission_disposition_matches(
-        cls,
+    @staticmethod
+    def _exact_no_admission_disposition_matches(
         claim: dict,
         disposition: object,
         record: dict,
@@ -699,7 +698,6 @@ class DetectionCommitGate:
         )
         return (
             claim.get("state") == "finalized"
-            and cls._claim_has_no_legacy_work(claim)
             and claim.get("resolution") == resolution.state.value
             and claim.get("terminal_evidence_id") == resolution.evidence_id
             and isinstance(disposition, dict)
@@ -707,6 +705,538 @@ class DetectionCommitGate:
             and disposition.get("mode") == record.get("mode", "global")
             and disposition.get("state") == disposition_state
         )
+
+    @classmethod
+    def _durable_no_admission_disposition_matches(
+        cls,
+        claim: dict,
+        disposition: object,
+        record: dict,
+        resolution: Resolution,
+    ) -> bool:
+        return (
+            cls._claim_has_no_legacy_work(claim)
+            and cls._exact_no_admission_disposition_matches(
+                claim,
+                disposition,
+                record,
+                resolution,
+            )
+        )
+
+    def _replay_pinned_terminal_transition(
+        self,
+        record: dict,
+        messages: list[Message],
+        ledger: dict,
+        *,
+        transition: str,
+        state: ResolverState,
+        evidence_id: object,
+    ) -> Resolution:
+        """Replay the immutable prefix that established an exact terminal winner."""
+        inbound_id = record.get("id")
+        candidates = [
+            event
+            for event in ledger["transitions"]
+            if isinstance(event, dict)
+            and event.get("transition") == transition
+            and isinstance(event.get("data"), dict)
+            and event["data"].get("inbound_id") == inbound_id
+            and event["data"].get("state") == state.value
+            and (evidence_id is None or event.get("source_id") == evidence_id)
+        ]
+        if len(candidates) != 1:
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "pinned terminal authority is ambiguous",
+            )
+        authority = candidates[0]
+        cutoff = int(authority.get("sequence", 0))
+        prefix_rows = {
+            message_id: row
+            for message_id, row in ledger["messages"].items()
+            if int(row.get("sequence", 0)) < cutoff
+        }
+        prefix_ledger = {
+            **ledger,
+            "messages": prefix_rows,
+            "transitions": [
+                event
+                for event in ledger["transitions"]
+                if int(event.get("sequence", 0)) < cutoff
+            ],
+        }
+        prefix_messages = [
+            message for message in messages if message.id in prefix_rows
+        ]
+        replayed = self._resolve_replay(
+            record,
+            prefix_messages,
+            prefix_ledger,
+            admission=None,
+        )
+        if (
+            replayed.state != state
+            or not isinstance(replayed.evidence_id, str)
+            or authority.get("source_id") != replayed.evidence_id
+        ):
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "pinned terminal authority conflicts with replay",
+            )
+        return replayed
+
+    def _recognized_zero_work_terminal_authority(
+        self,
+        record: dict,
+        messages: list[Message],
+        ledger: dict,
+        claim: object,
+    ) -> Resolution | None:
+        """Return exact authority for a durably recognized zero-work terminal.
+
+        Policy controls whether new work may start.  It cannot revoke a terminal
+        that canonical replay and the no-admission journal have already agreed
+        upon.  This predicate intentionally excludes ordinary semantic claims
+        and every claim that has authorized or retained legacy work.
+        """
+        if not isinstance(claim, dict) or not self._claim_has_no_legacy_work(claim):
+            return None
+        try:
+            state = ResolverState(str(claim.get("resolution")))
+        except ValueError:
+            return (
+                Resolution(
+                    ResolverState.INDETERMINATE,
+                    "zero-work terminal authority resolution is invalid",
+                )
+                if claim.get("claim_kind") in {
+                    "pre_admission_terminal",
+                    "transfer_target_abort",
+                }
+                else None
+            )
+        inbound_id = record.get("id")
+        claim_kind: str
+        if state in TERMINAL_STATES:
+            persisted_evidence = claim.get("terminal_evidence_id")
+            replayed = self._replay_pinned_terminal_transition(
+                record,
+                messages,
+                ledger,
+                transition="PRE_ADMISSION_TERMINAL_NORMALIZED",
+                state=state,
+                evidence_id=persisted_evidence,
+            )
+            if replayed.state == ResolverState.INDETERMINATE:
+                return replayed
+            recognized = True
+            claim_kind = "pre_admission_terminal"
+        elif state == ResolverState.NOT_OWED:
+            inbound_message = next(
+                (message for message in messages if message.id == inbound_id),
+                None,
+            )
+            inbound_meta = (
+                inbound_message.meta
+                if isinstance(inbound_message, Message)
+                and isinstance(inbound_message.meta, dict)
+                else {}
+            )
+            transfer_digest = claim.get("transfer_from_key_digest")
+            transfer_events = [
+                event
+                for event in ledger["transitions"]
+                if isinstance(event, dict)
+                and event.get("transition") == "TRANSFER_TARGET_ABORTED"
+                and event.get("source_id") == inbound_id
+            ]
+            if not (
+                claim.get("claim_kind") == "transfer_target_abort"
+                or _valid_hex_digest(transfer_digest)
+                or transfer_events
+            ):
+                return None
+            recognized = bool(
+                _valid_hex_digest(transfer_digest)
+                and inbound_meta.get("transfer_from_key_digest") == transfer_digest
+                and any(
+                    isinstance(event.get("data"), dict)
+                    and event["data"].get("inbound_id") == inbound_id
+                    and event["data"].get("transfer_from_key_digest")
+                    == transfer_digest
+                    for event in transfer_events
+                )
+            )
+            replayed = Resolution(
+                ResolverState.NOT_OWED,
+                "transfer_target_abort_authority",
+            )
+            claim_kind = "transfer_target_abort"
+        else:
+            return None
+        if claim.get("state") not in {"open", "finalized"}:
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "zero-work terminal authority has an invalid state",
+            )
+        persisted_evidence = claim.get("terminal_evidence_id")
+        if persisted_evidence is not None and persisted_evidence != replayed.evidence_id:
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "zero-work terminal authority evidence is torn",
+            )
+        if claim.get("claim_kind") not in {None, claim_kind} or not recognized:
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "zero-work terminal lacks durable recognition authority",
+            )
+        legacy_transition = any(
+            isinstance(event, dict)
+            and event.get("transition") in {
+                "PRE_ADMISSION_DRIVE_AUTHORIZED",
+                "PRE_ADMISSION_SUCCESS_RETAINED",
+            }
+            and event.get("source_id") == inbound_id
+            for event in ledger["transitions"]
+        )
+        if legacy_transition:
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "zero-work terminal conflicts with legacy authority",
+            )
+        if claim.get("state") == "finalized" and not (
+            self._exact_no_admission_disposition_matches(
+                claim,
+                ledger["cursor_dispositions"].get(self.agent),
+                record,
+                replayed,
+            )
+        ):
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "finalized no-admission disposition is torn",
+            )
+        return replayed
+
+    def _rebind_zero_work_terminal_authority_locked(
+        self,
+        ledger: dict,
+        claim: dict,
+        record: dict,
+        resolution: Resolution,
+        policy: PolicySnapshot,
+    ) -> bool:
+        """Bind exact terminal authority to current readable policy and owner."""
+        previous = {
+            "policy_status": claim.get("policy_status"),
+            "policy_generation": claim.get("policy_generation"),
+            "fence": claim.get("fence"),
+            "claim_kind": claim.get("claim_kind"),
+            "terminal_evidence_id": claim.get("terminal_evidence_id"),
+        }
+        claim["policy_status"] = policy.status.value
+        claim["policy_generation"] = policy.generation
+        claim["claim_kind"] = (
+            "pre_admission_terminal"
+            if resolution.state in TERMINAL_STATES
+            else "transfer_target_abort"
+        )
+        claim["terminal_evidence_id"] = resolution.evidence_id
+        if claim.get("state") == "open":
+            claim["fence"] = self.fence
+            claim["owner_pid"] = os.getpid()
+        current = {
+            "policy_status": claim.get("policy_status"),
+            "policy_generation": claim.get("policy_generation"),
+            "fence": claim.get("fence"),
+            "claim_kind": claim.get("claim_kind"),
+            "terminal_evidence_id": claim.get("terminal_evidence_id"),
+        }
+        if current == previous:
+            return False
+        self._append(
+            ledger,
+            "ZERO_WORK_TERMINAL_AUTHORITY_REBOUND",
+            scope=str(record.get("id")),
+            source_id=resolution.evidence_id,
+            data={
+                "previous_policy_status": previous["policy_status"],
+                "previous_policy_generation": previous["policy_generation"],
+                "policy_status": policy.status.value,
+                "policy_generation": policy.generation,
+                "previous_fence": previous["fence"],
+                "fence": claim.get("fence"),
+            },
+        )
+        return True
+
+    def _authorized_legacy_terminal_replay(
+        self,
+        record: dict,
+        messages: list[Message],
+        ledger: dict,
+        claim: object,
+        policy: PolicySnapshot,
+    ) -> Resolution | None:
+        """Recognize an exact terminal landed after durable legacy authorization."""
+        if not isinstance(claim, dict) or not (
+            claim.get("state") == "open"
+            and claim.get("drive_started_at")
+            and not claim.get("drive_succeeded_at")
+            and claim.get("claim_kind") is None
+        ):
+            return None
+        try:
+            claim_state = ResolverState(str(claim.get("resolution")))
+        except ValueError:
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "authorized legacy claim resolution is invalid",
+            )
+        if not Resolution(claim_state, "").allows_legacy_commit:
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "authorized legacy claim is not a no-admission claim",
+            )
+        try:
+            attempts = int(claim.get("drive_attempts", 0))
+        except (TypeError, ValueError):
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "authorized legacy drive attempt count is invalid",
+            )
+        authorizations = [
+            event
+            for event in ledger["transitions"]
+            if isinstance(event, dict)
+            and event.get("transition") == "PRE_ADMISSION_DRIVE_AUTHORIZED"
+            and event.get("source_id") == record.get("id")
+            and isinstance(event.get("data"), dict)
+        ]
+        try:
+            authorized_attempts = {
+                int(event["data"].get("attempt", 0)) for event in authorizations
+            }
+        except (TypeError, ValueError):
+            authorized_attempts = set()
+        if (
+            attempts < 1
+            or len(authorizations) != attempts
+            or authorized_attempts != set(range(1, attempts + 1))
+        ):
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "authorized legacy terminal lacks exact drive authority",
+            )
+        if any(
+            event["data"].get("policy_generation") != claim.get("policy_generation")
+            for event in authorizations
+        ):
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "authorized legacy drive policy authority is torn",
+            )
+        replayed = self._resolve_replay(record, messages, ledger, admission=None)
+        if replayed.state not in TERMINAL_STATES:
+            return None
+        if not self._claim_matches_policy(claim, policy):
+            return self._policy_authority_failure(
+                policy,
+                reason="legacy terminal policy changed after work started",
+            )
+        if not isinstance(replayed.evidence_id, str):
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "authorized legacy terminal evidence is invalid",
+            )
+        return replayed
+
+    def _retain_same_generation_legacy_terminal_locked(
+        self,
+        ledger: dict,
+        claim: dict,
+        record: dict,
+        replayed: Resolution,
+        policy: PolicySnapshot,
+    ) -> None:
+        """Linearize an exact same-policy terminal before cursor finalization."""
+        claim["state"] = "finalization_pending"
+        claim["drive_succeeded_at"] = self.now()
+        claim["resolution"] = replayed.state.value
+        claim["claim_kind"] = "same_generation_legacy_terminal"
+        claim["terminal_evidence_id"] = replayed.evidence_id
+        self._append(
+            ledger,
+            "LEGACY_DRIVE_TERMINAL_RETAINED",
+            scope=str(record.get("id")),
+            source_id=replayed.evidence_id,
+            data={
+                "inbound_id": record.get("id"),
+                "state": replayed.state.value,
+                "policy_generation": policy.generation,
+                "authorization_attempt": int(claim.get("drive_attempts", 0)),
+            },
+        )
+
+    def _recover_authorized_legacy_terminal(
+        self,
+        record: dict,
+    ) -> Resolution | None:
+        """Recover a terminal landed after authorization but before retention."""
+        inbound_id = record.get("id")
+        if not isinstance(inbound_id, str):
+            return None
+        with ExitStack() as locks:
+            locks.enter_context(self.store._message_publication_lock())
+            try:
+                messages, _ = self._validated_messages()
+            except LedgerUnreadable as exc:
+                return Resolution(ResolverState.BLOCKED, str(exc))
+            observed_policy = self._current_policy()
+            if self._policy_blocks_durable_terminal_projection(observed_policy):
+                return Resolution(observed_policy.status, observed_policy.reason)
+            locks.enter_context(
+                self.store._exclusive_lock(
+                    self.path.with_suffix(".lock"), timeout=10.0,
+                )
+            )
+            policy_block = self._revalidate_admission_policy(observed_policy)
+            if policy_block is not None:
+                return policy_block
+            ledger = self._load()
+            claim = ledger["no_admission_claims"].get(inbound_id)
+            replayed = self._authorized_legacy_terminal_replay(
+                record,
+                messages,
+                ledger,
+                claim,
+                observed_policy,
+            )
+            if replayed is None or replayed.state not in TERMINAL_STATES:
+                return replayed
+            if not isinstance(claim, dict):
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "authorized legacy terminal claim disappeared",
+                )
+            if claim.get("fence") != self.fence:
+                if not self._can_reassign_no_admission_claim(claim):
+                    return Resolution(
+                        ResolverState.INDETERMINATE,
+                        "prior authorized legacy owner is still authoritative",
+                    )
+                previous_fence = claim.get("fence")
+                claim["fence"] = self.fence
+                claim["owner_pid"] = os.getpid()
+                self._append(
+                    ledger,
+                    "NO_ADMISSION_CLAIM_REASSIGNED",
+                    scope=inbound_id,
+                    source_id=replayed.evidence_id,
+                    data={
+                        "previous_fence": previous_fence,
+                        "fence": self.fence,
+                        "reason": "authorized_legacy_terminal",
+                    },
+                )
+            self._retain_same_generation_legacy_terminal_locked(
+                ledger,
+                claim,
+                record,
+                replayed,
+                observed_policy,
+            )
+            self._write(ledger)
+            policy_block = self._revalidate_admission_policy(observed_policy)
+            if policy_block is not None:
+                return policy_block
+            revision = int(ledger["scoped_revisions"].get(inbound_id, 0))
+        return Resolution(
+            replayed.state,
+            "no_admission_finalization_pending",
+            evidence_id=replayed.evidence_id,
+            scoped_revision=revision,
+            ledger_revision=revision,
+            activation_generation=observed_policy.generation,
+            readiness_generation=observed_policy.generation,
+        )
+
+    def _recognized_same_generation_legacy_terminal(
+        self,
+        record: dict,
+        messages: list[Message],
+        ledger: dict,
+        claim: object,
+        policy: PolicySnapshot,
+    ) -> Resolution | None:
+        """Recover a terminal produced by already-authorized same-policy work."""
+        if not isinstance(claim, dict) or claim.get("claim_kind") != (
+            "same_generation_legacy_terminal"
+        ):
+            return None
+        if not self._claim_matches_policy(claim, policy):
+            return self._policy_authority_failure(
+                policy,
+                reason="legacy terminal policy changed after work started",
+            )
+        if claim.get("state") not in {"finalization_pending", "finalized"} or not (
+            claim.get("drive_started_at") and claim.get("drive_succeeded_at")
+        ):
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "legacy terminal retention state is torn",
+            )
+        try:
+            state = ResolverState(str(claim.get("resolution")))
+        except ValueError:
+            state = ResolverState.INDETERMINATE
+        evidence_id = claim.get("terminal_evidence_id")
+        if state not in TERMINAL_STATES or not isinstance(evidence_id, str):
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "legacy terminal retention evidence is invalid",
+            )
+        retained = [
+            event
+            for event in ledger["transitions"]
+            if isinstance(event, dict)
+            and event.get("transition") == "LEGACY_DRIVE_TERMINAL_RETAINED"
+            and event.get("source_id") == evidence_id
+            and isinstance(event.get("data"), dict)
+            and event["data"].get("inbound_id") == record.get("id")
+            and event["data"].get("state") == state.value
+            and event["data"].get("policy_generation") == policy.generation
+        ]
+        if len(retained) != 1:
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "legacy terminal retention authority is ambiguous",
+            )
+        replayed = self._replay_pinned_terminal_transition(
+            record,
+            messages,
+            ledger,
+            transition="LEGACY_DRIVE_TERMINAL_RETAINED",
+            state=state,
+            evidence_id=evidence_id,
+        )
+        if replayed.state == ResolverState.INDETERMINATE:
+            return replayed
+        if claim.get("state") == "finalized" and not (
+            self._exact_no_admission_disposition_matches(
+                claim,
+                ledger["cursor_dispositions"].get(self.agent),
+                record,
+                replayed,
+            )
+        ):
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "finalized legacy terminal disposition is torn",
+            )
+        return replayed
 
     def _recover_durable_no_admission_disposition(
         self,
@@ -720,6 +1250,183 @@ class DetectionCommitGate:
             return Resolution(policy.status, policy.reason)
         inbound_id = record.get("id")
         claim = ledger["no_admission_claims"].get(inbound_id)
+        recognized = self._recognized_zero_work_terminal_authority(
+            record,
+            messages,
+            ledger,
+            claim,
+        )
+        if recognized is not None:
+            if recognized.state == ResolverState.INDETERMINATE:
+                return recognized
+            replay_revision = int(ledger["scoped_revisions"].get(inbound_id, 0))
+            with self.store._exclusive_lock(
+                self.path.with_suffix(".lock"), timeout=10.0,
+            ):
+                current_policy = self._current_policy()
+                if self._policy_blocks_durable_terminal_projection(current_policy):
+                    return Resolution(current_policy.status, current_policy.reason)
+                current = self._load()
+                if int(current["scoped_revisions"].get(inbound_id, 0)) != (
+                    replay_revision
+                ):
+                    return Resolution(
+                        ResolverState.INDETERMINATE,
+                        "zero-work terminal authority CAS miss",
+                    )
+                current_claim = current["no_admission_claims"].get(inbound_id)
+                current_authority = self._recognized_zero_work_terminal_authority(
+                    record,
+                    messages,
+                    current,
+                    current_claim,
+                )
+                if current_authority is None or (
+                    current_authority.state == ResolverState.INDETERMINATE
+                ):
+                    return current_authority or Resolution(
+                        ResolverState.INDETERMINATE,
+                        "zero-work terminal authority disappeared",
+                    )
+                if (
+                    isinstance(current_claim, dict)
+                    and current_claim.get("state") == "open"
+                    and current_claim.get("fence") != self.fence
+                    and not self._can_reassign_no_admission_claim(current_claim)
+                ):
+                    return Resolution(
+                        ResolverState.INDETERMINATE,
+                        "prior no-admission claim owner is still authoritative",
+                    )
+                if not isinstance(current_claim, dict):
+                    return Resolution(
+                        ResolverState.INDETERMINATE,
+                        "zero-work terminal authority claim disappeared",
+                    )
+                if self._rebind_zero_work_terminal_authority_locked(
+                    current,
+                    current_claim,
+                    record,
+                    current_authority,
+                    current_policy,
+                ):
+                    self._write(current)
+                revision = int(current["scoped_revisions"].get(inbound_id, 0))
+            return Resolution(
+                current_authority.state,
+                (
+                    "no_admission_disposition_pending"
+                    if current_claim.get("state") == "finalized"
+                    else "no_admission_finalization_pending"
+                    if current_authority.state == ResolverState.NOT_OWED
+                    else current_authority.reason
+                ),
+                evidence_id=current_authority.evidence_id,
+                scoped_revision=revision,
+                ledger_revision=revision,
+                activation_generation=current_policy.generation,
+                readiness_generation=current_policy.generation,
+            )
+        authorized_terminal = self._authorized_legacy_terminal_replay(
+            record,
+            messages,
+            ledger,
+            claim,
+            policy,
+        )
+        if authorized_terminal is not None:
+            if authorized_terminal.state not in TERMINAL_STATES:
+                return authorized_terminal
+            recovered_terminal = self._recover_authorized_legacy_terminal(record)
+            if recovered_terminal is not None:
+                return recovered_terminal
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "authorized legacy terminal disappeared during recovery",
+            )
+        legacy_terminal = self._recognized_same_generation_legacy_terminal(
+            record,
+            messages,
+            ledger,
+            claim,
+            policy,
+        )
+        if legacy_terminal is not None:
+            if legacy_terminal.state not in TERMINAL_STATES:
+                return legacy_terminal
+            replay_revision = int(ledger["scoped_revisions"].get(inbound_id, 0))
+            with self.store._exclusive_lock(
+                self.path.with_suffix(".lock"), timeout=10.0,
+            ):
+                current_policy = self._current_policy()
+                if self._policy_blocks_durable_terminal_projection(current_policy):
+                    return Resolution(current_policy.status, current_policy.reason)
+                current = self._load()
+                if int(current["scoped_revisions"].get(inbound_id, 0)) != (
+                    replay_revision
+                ):
+                    return Resolution(
+                        ResolverState.INDETERMINATE,
+                        "legacy terminal recovery CAS miss",
+                    )
+                current_claim = current["no_admission_claims"].get(inbound_id)
+                current_terminal = self._recognized_same_generation_legacy_terminal(
+                    record,
+                    messages,
+                    current,
+                    current_claim,
+                    current_policy,
+                )
+                if current_terminal is None or current_terminal.state not in (
+                    TERMINAL_STATES
+                ):
+                    return current_terminal or Resolution(
+                        ResolverState.INDETERMINATE,
+                        "legacy terminal retention disappeared",
+                    )
+                if not isinstance(current_claim, dict):
+                    return Resolution(
+                        ResolverState.INDETERMINATE,
+                        "legacy terminal claim disappeared",
+                    )
+                if (
+                    current_claim.get("state") == "finalization_pending"
+                    and current_claim.get("fence") != self.fence
+                ):
+                    if not self._can_reassign_no_admission_claim(current_claim):
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "prior legacy terminal owner is still authoritative",
+                        )
+                    previous_fence = current_claim.get("fence")
+                    current_claim["fence"] = self.fence
+                    current_claim["owner_pid"] = os.getpid()
+                    self._append(
+                        current,
+                        "NO_ADMISSION_CLAIM_REASSIGNED",
+                        scope=str(inbound_id),
+                        source_id=current_terminal.evidence_id,
+                        data={
+                            "previous_fence": previous_fence,
+                            "fence": self.fence,
+                            "reason": "same_generation_legacy_terminal",
+                        },
+                    )
+                    self._write(current)
+                revision = int(current["scoped_revisions"].get(inbound_id, 0))
+            return Resolution(
+                current_terminal.state,
+                (
+                    "no_admission_disposition_pending"
+                    if current_claim.get("state") == "finalized"
+                    else "no_admission_finalization_pending"
+                ),
+                evidence_id=current_terminal.evidence_id,
+                scoped_revision=revision,
+                ledger_revision=revision,
+                activation_generation=current_policy.generation,
+                readiness_generation=current_policy.generation,
+            )
         if not isinstance(claim, dict) or claim.get("state") != "finalized":
             return None
         if not self._claim_has_no_legacy_work(claim):
@@ -2227,6 +2934,149 @@ class DetectionCommitGate:
             self._write(ledger)
             return ledger, admission
 
+    def _normalize_pre_admission_terminal(
+        self,
+        record: dict,
+        inbound: Message,
+        replayed: Resolution,
+        observed_policy: PolicySnapshot,
+    ) -> Resolution:
+        """Durably recognize exact zero-work terminal authority before projection."""
+        if replayed.state not in TERMINAL_STATES or not isinstance(
+            replayed.evidence_id,
+            str,
+        ):
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "pre-admission terminal replay is invalid",
+            )
+        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
+            policy_block = self._revalidate_admission_policy(observed_policy)
+            if policy_block is not None:
+                return policy_block
+            current = self._load()
+            if int(current["scoped_revisions"].get(inbound.id, 0)) != (
+                replayed.scoped_revision
+            ):
+                return Resolution(ResolverState.INDETERMINATE, "normalization CAS miss")
+            if inbound.id in current["inbound_index"]:
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "concurrent admission won before terminal normalization",
+                )
+            claim = current["no_admission_claims"].get(inbound.id)
+            if isinstance(claim, dict):
+                if claim.get("state") == "blocked":
+                    return Resolution(
+                        ResolverState.BLOCKED,
+                        str(claim.get("blocked_reason") or "finalization blocked"),
+                    )
+                semantic_claim = bool(
+                    self._claim_is_untouched(claim)
+                    and claim.get("claim_kind") is None
+                )
+                if semantic_claim:
+                    if claim.get("fence") != self.fence:
+                        if not self._can_reassign_no_admission_claim(claim):
+                            return Resolution(
+                                ResolverState.INDETERMINATE,
+                                "prior no-admission claim owner is still authoritative",
+                            )
+                        previous_fence = claim.get("fence")
+                        claim["fence"] = self.fence
+                        claim["owner_pid"] = os.getpid()
+                        self._append(
+                            current,
+                            "NO_ADMISSION_CLAIM_REASSIGNED",
+                            scope=inbound.id,
+                            source_id=replayed.evidence_id,
+                            data={
+                                "previous_fence": previous_fence,
+                                "fence": self.fence,
+                                "reason": "terminal_normalization",
+                            },
+                        )
+                    claim["resolution"] = replayed.state.value
+                    claim["claim_kind"] = "pre_admission_terminal"
+                    claim["terminal_evidence_id"] = replayed.evidence_id
+                    claim["policy_status"] = observed_policy.status.value
+                    claim["policy_generation"] = observed_policy.generation
+                    self._append(
+                        current,
+                        "PRE_ADMISSION_TERMINAL_NORMALIZED",
+                        scope=inbound.id,
+                        source_id=replayed.evidence_id,
+                        data={"inbound_id": inbound.id, "state": replayed.state.value},
+                    )
+                    self._write(current)
+                elif not self._claim_matches_policy(claim, observed_policy):
+                    return self._policy_authority_failure(
+                        observed_policy,
+                        reason="terminal normalization policy changed",
+                    )
+                if claim.get("resolution") != replayed.state.value or claim.get(
+                    "state"
+                ) not in {"open", "finalized"}:
+                    return Resolution(
+                        ResolverState.INDETERMINATE,
+                        "no-admission claim conflicts with terminal replay",
+                    )
+                if claim.get("state") == "open" and claim.get("fence") != self.fence:
+                    if not self._can_reassign_no_admission_claim(claim):
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "prior no-admission claim owner is still authoritative",
+                        )
+                    previous_fence = claim.get("fence")
+                    claim["fence"] = self.fence
+                    claim["owner_pid"] = os.getpid()
+                    self._append(
+                        current,
+                        "NO_ADMISSION_CLAIM_REASSIGNED",
+                        scope=inbound.id,
+                        source_id=replayed.evidence_id,
+                        data={
+                            "previous_fence": previous_fence,
+                            "fence": self.fence,
+                        },
+                    )
+                    self._write(current)
+            else:
+                current["no_admission_claims"][inbound.id] = {
+                    "fence": self.fence,
+                    "owner_pid": os.getpid(),
+                    "state": "open",
+                    "resolution": replayed.state.value,
+                    "claim_kind": "pre_admission_terminal",
+                    "terminal_evidence_id": replayed.evidence_id,
+                    "policy_status": observed_policy.status.value,
+                    "policy_generation": observed_policy.generation,
+                    "finalization_misses": 0,
+                    "finalization_first_at": None,
+                    "cursor_projection_misses": 0,
+                    "cursor_projection_first_at": None,
+                    "cursor_projection_inflight": False,
+                    "cursor_projection_reserved_at": None,
+                }
+                self._append(
+                    current,
+                    "PRE_ADMISSION_TERMINAL_NORMALIZED",
+                    scope=inbound.id,
+                    source_id=replayed.evidence_id,
+                    data={"inbound_id": inbound.id, "state": replayed.state.value},
+                )
+                self._write(current)
+            scoped_revision = int(current["scoped_revisions"].get(inbound.id, 0))
+        return Resolution(
+            replayed.state,
+            replayed.reason,
+            evidence_id=replayed.evidence_id,
+            scoped_revision=scoped_revision,
+            ledger_revision=scoped_revision,
+            activation_generation=observed_policy.generation,
+            readiness_generation=observed_policy.generation,
+        )
+
     def admit_or_finalize(self, record: dict) -> Resolution:
         observed_policy = self._current_policy()
         eligibility, detail, rid = self._eligibility(
@@ -2251,7 +3101,7 @@ class DetectionCommitGate:
             if (
                 eligibility in blocked_states
                 and not readable_policy_block
-            ) or observed_policy.generation == "inactive":
+            ):
                 return Resolution(
                     eligibility,
                     detail,
@@ -2276,7 +3126,27 @@ class DetectionCommitGate:
             )
             if recovered is not None:
                 return recovered
+            replayed_terminal = self._resolve_replay(
+                record,
+                messages,
+                ledger,
+                admission=None,
+            )
+            if replayed_terminal.state in TERMINAL_STATES:
+                return self._normalize_pre_admission_terminal(
+                    record,
+                    inbound,
+                    replayed_terminal,
+                    observed_policy,
+                )
             if eligibility in blocked_states:
+                return Resolution(
+                    eligibility,
+                    detail,
+                    activation_generation=observed_policy.generation,
+                    readiness_generation=observed_policy.generation,
+                )
+            if observed_policy.generation == "inactive":
                 return Resolution(
                     eligibility,
                     detail,
@@ -2562,6 +3432,7 @@ class DetectionCommitGate:
                         "owner_pid": os.getpid(),
                         "state": "open",
                         "resolution": ResolverState.NOT_OWED.value,
+                        "claim_kind": "transfer_target_abort",
                         "policy_status": observed_policy.status.value,
                         "policy_generation": observed_policy.generation,
                         "finalization_misses": 0,
@@ -2608,91 +3479,11 @@ class DetectionCommitGate:
             )
         before = self._resolve_replay(record, messages, ledger, admission=None)
         if before.state in TERMINAL_STATES:
-            with self.store._exclusive_lock(
-                self.path.with_suffix(".lock"), timeout=10.0,
-            ):
-                policy_block = self._revalidate_admission_policy(observed_policy)
-                if policy_block is not None:
-                    return policy_block
-                current = self._load()
-                if int(current["scoped_revisions"].get(inbound.id, 0)) != before.scoped_revision:
-                    return Resolution(ResolverState.INDETERMINATE, "normalization CAS miss")
-                if inbound.id in current["inbound_index"]:
-                    return Resolution(
-                        ResolverState.INDETERMINATE,
-                        "concurrent admission won before terminal normalization",
-                    )
-                claim = current["no_admission_claims"].get(inbound.id)
-                if isinstance(claim, dict):
-                    if not self._claim_matches_policy(claim, observed_policy):
-                        return self._policy_authority_failure(
-                            observed_policy,
-                            reason="terminal normalization policy changed",
-                        )
-                    if claim.get("state") == "blocked":
-                        return Resolution(
-                            ResolverState.BLOCKED,
-                            str(claim.get("blocked_reason") or "finalization blocked"),
-                        )
-                    if claim.get("resolution") != before.state.value or claim.get(
-                        "state"
-                    ) not in {"open", "finalized"}:
-                        return Resolution(
-                            ResolverState.INDETERMINATE,
-                            "no-admission claim conflicts with terminal replay",
-                        )
-                    if claim.get("state") == "open" and claim.get("fence") != self.fence:
-                        if not self._can_reassign_no_admission_claim(claim):
-                            return Resolution(
-                                ResolverState.INDETERMINATE,
-                                "prior no-admission claim owner is still authoritative",
-                            )
-                        previous_fence = claim.get("fence")
-                        claim["fence"] = self.fence
-                        claim["owner_pid"] = os.getpid()
-                        self._append(
-                            current,
-                            "NO_ADMISSION_CLAIM_REASSIGNED",
-                            scope=inbound.id,
-                            source_id=before.evidence_id,
-                            data={
-                                "previous_fence": previous_fence,
-                                "fence": self.fence,
-                            },
-                        )
-                        self._write(current)
-                else:
-                    current["no_admission_claims"][inbound.id] = {
-                        "fence": self.fence,
-                        "owner_pid": os.getpid(),
-                        "state": "open",
-                        "resolution": before.state.value,
-                        "policy_status": observed_policy.status.value,
-                        "policy_generation": observed_policy.generation,
-                        "finalization_misses": 0,
-                        "finalization_first_at": None,
-                        "cursor_projection_misses": 0,
-                        "cursor_projection_first_at": None,
-                        "cursor_projection_inflight": False,
-                        "cursor_projection_reserved_at": None,
-                    }
-                    self._append(
-                        current,
-                        "PRE_ADMISSION_TERMINAL_NORMALIZED",
-                        scope=inbound.id,
-                        source_id=before.evidence_id,
-                        data={"inbound_id": inbound.id, "state": before.state.value},
-                    )
-                    self._write(current)
-                scoped_revision = int(current["scoped_revisions"].get(inbound.id, 0))
-            return Resolution(
-                before.state,
-                before.reason,
-                evidence_id=before.evidence_id,
-                scoped_revision=scoped_revision,
-                ledger_revision=scoped_revision,
-                activation_generation=observed_policy.generation,
-                readiness_generation=observed_policy.generation,
+            return self._normalize_pre_admission_terminal(
+                record,
+                inbound,
+                before,
+                observed_policy,
             )
         if before.state not in {ResolverState.OWED_UNSATISFIED}:
             return before
@@ -4622,73 +5413,140 @@ class DetectionCommitGate:
         self,
         record: dict,
         resolution: Resolution,
+        *,
+        side_effect: Callable[[], None] | None = None,
     ) -> Resolution:
-        """Confirm current policy still permits a no-admission side effect."""
+        """Confirm authority and optionally linearize its side effect with replay."""
         if not resolution.allows_legacy_commit:
             raise GateError("only no-admission resolutions have legacy authority")
-        current_policy = self._current_policy()
-        eligibility, detail, _ = self._eligibility(
-            record,
-            policy=current_policy,
-        )
-        if eligibility in {
-            ResolverState.BLOCKED,
-            ResolverState.BLOCKED_POLICY,
-            ResolverState.BLOCKED_COMPLIANCE,
-        }:
-            return Resolution(eligibility, detail)
-        if (
-            eligibility != resolution.state
-            or current_policy.generation != resolution.activation_generation
-        ):
-            return self._policy_authority_failure(
-                current_policy,
-                reason="no-admission policy changed before legacy side effect",
-            )
-        if resolution.ledger_revision is None:
-            return Resolution(
-                resolution.state,
-                resolution.reason,
-                scoped_revision=resolution.scoped_revision,
-                activation_generation=current_policy.generation,
-                readiness_generation=current_policy.generation,
-            )
         inbound_id = record.get("id")
         if not isinstance(inbound_id, str):
             raise GateError("no-admission authority requires an exact inbound")
-        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
-            policy_block = self._revalidate_admission_policy(current_policy)
-            if policy_block is not None:
-                return policy_block
-            ledger = self._load()
-            claim = ledger["no_admission_claims"].get(inbound_id)
-            if not isinstance(claim, dict):
+        terminal_replay: Resolution | None = None
+        terminal_has_started_work = False
+        with self.store._message_publication_lock():
+            try:
+                messages, _ = self._validated_messages()
+            except LedgerUnreadable as exc:
+                return Resolution(ResolverState.BLOCKED, str(exc))
+            inbound = self._record_message(record, messages)
+            if inbound is None:
                 return Resolution(
                     ResolverState.INDETERMINATE,
-                    "no-admission authority claim missing",
+                    "no-admission authority inbound is absent from validated replay",
                 )
-            if (
-                not self._claim_matches_policy(claim, current_policy)
-                or claim.get("policy_generation") != resolution.activation_generation
+            current_policy = self._current_policy()
+            if self._policy_blocks_durable_terminal_projection(current_policy):
+                return Resolution(current_policy.status, current_policy.reason)
+            eligibility, detail, _ = self._eligibility(
+                record,
+                policy=current_policy,
+            )
+            with self.store._exclusive_lock(
+                self.path.with_suffix(".lock"), timeout=10.0,
             ):
-                return self._policy_authority_failure(
+                policy_block = self._revalidate_admission_policy(current_policy)
+                if policy_block is not None:
+                    return policy_block
+                ledger = self._load()
+                replayed = self._resolve_replay(
+                    record,
+                    messages,
+                    ledger,
+                    admission=None,
+                )
+                if replayed.state in TERMINAL_STATES:
+                    terminal_replay = replayed
+                    terminal_claim = ledger["no_admission_claims"].get(inbound_id)
+                    terminal_has_started_work = bool(
+                        isinstance(terminal_claim, dict)
+                        and terminal_claim.get("drive_started_at")
+                    )
+                else:
+                    if eligibility in {
+                        ResolverState.BLOCKED,
+                        ResolverState.BLOCKED_POLICY,
+                        ResolverState.BLOCKED_COMPLIANCE,
+                    }:
+                        return Resolution(eligibility, detail)
+                    if (
+                        eligibility != resolution.state
+                        or current_policy.generation
+                        != resolution.activation_generation
+                    ):
+                        return self._policy_authority_failure(
+                            current_policy,
+                            reason=(
+                                "no-admission policy changed before legacy side effect"
+                            ),
+                        )
+                    if resolution.ledger_revision is None:
+                        policy_block = self._revalidate_admission_policy(
+                            current_policy,
+                        )
+                        if policy_block is not None:
+                            return policy_block
+                        if side_effect is not None:
+                            side_effect()
+                        return Resolution(
+                            resolution.state,
+                            resolution.reason,
+                            scoped_revision=resolution.scoped_revision,
+                            activation_generation=current_policy.generation,
+                            readiness_generation=current_policy.generation,
+                        )
+                    claim = ledger["no_admission_claims"].get(inbound_id)
+                    if not isinstance(claim, dict):
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "no-admission authority claim missing",
+                        )
+                    if (
+                        not self._claim_matches_policy(claim, current_policy)
+                        or claim.get("policy_generation")
+                        != resolution.activation_generation
+                    ):
+                        return self._policy_authority_failure(
+                            current_policy,
+                            reason="no-admission side-effect policy changed",
+                        )
+                    if claim.get("resolution") != resolution.state.value:
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "no-admission authority conflicts with replay",
+                        )
+                    if (
+                        claim.get("state") != "open"
+                        or claim.get("fence") != self.fence
+                    ):
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "no-admission authority is not open for this fence",
+                        )
+                    if int(ledger["scoped_revisions"].get(inbound_id, 0)) != (
+                        resolution.ledger_revision
+                    ):
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "no-admission authority scoped CAS miss",
+                        )
+                    policy_block = self._revalidate_admission_policy(current_policy)
+                    if policy_block is not None:
+                        return policy_block
+                    revision = int(
+                        ledger["scoped_revisions"].get(inbound_id, 0)
+                    )
+                    if side_effect is not None:
+                        side_effect()
+            if terminal_replay is not None and not terminal_has_started_work:
+                return self._normalize_pre_admission_terminal(
+                    record,
+                    inbound,
+                    terminal_replay,
                     current_policy,
-                    reason="no-admission side-effect policy changed",
                 )
-            if claim.get("resolution") != resolution.state.value:
-                return Resolution(
-                    ResolverState.INDETERMINATE,
-                    "no-admission authority conflicts with replay",
-                )
-            if claim.get("state") != "open" or claim.get("fence") != self.fence:
-                return Resolution(
-                    ResolverState.INDETERMINATE,
-                    "no-admission authority is not open for this fence",
-                )
-            policy_block = self._revalidate_admission_policy(current_policy)
-            if policy_block is not None:
-                return policy_block
-            revision = int(ledger["scoped_revisions"].get(inbound_id, 0))
+        if terminal_replay is not None:
+            return self.admit_or_finalize(record)
         return Resolution(
             resolution.state,
             resolution.reason,
@@ -4703,85 +5561,148 @@ class DetectionCommitGate:
         record: dict,
         resolution: Resolution,
     ) -> Resolution:
-        """Recheck and durably pin policy authority immediately before legacy work."""
+        """Replay, then durably pin policy authority immediately before legacy work."""
         if not resolution.allows_legacy_commit:
             raise GateError("only no-admission resolutions authorize legacy work")
-        current_policy = self._current_policy()
-        eligibility, detail, _ = self._eligibility(
-            record,
-            policy=current_policy,
-        )
-        if eligibility in {
-            ResolverState.BLOCKED,
-            ResolverState.BLOCKED_POLICY,
-            ResolverState.BLOCKED_COMPLIANCE,
-        }:
-            return Resolution(eligibility, detail)
-        if (
-            eligibility != resolution.state
-            or current_policy.generation != resolution.activation_generation
-        ):
-            return self._policy_authority_failure(
-                current_policy,
-                reason="no-admission policy changed before legacy drive",
-            )
-        if resolution.ledger_revision is None:
-            return Resolution(
-                resolution.state,
-                resolution.reason,
-                scoped_revision=resolution.scoped_revision,
-                activation_generation=current_policy.generation,
-                readiness_generation=current_policy.generation,
-            )
         inbound_id = record.get("id")
         if not isinstance(inbound_id, str):
             raise GateError("no-admission drive requires an exact inbound")
-        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
-            policy_block = self._revalidate_admission_policy(current_policy)
-            if policy_block is not None:
-                return policy_block
-            ledger = self._load()
-            claim = ledger["no_admission_claims"].get(inbound_id)
-            if not isinstance(claim, dict):
+        terminal_replay: Resolution | None = None
+        terminal_has_started_work = False
+        with self.store._message_publication_lock():
+            try:
+                messages, _ = self._validated_messages()
+            except LedgerUnreadable as exc:
+                return Resolution(ResolverState.BLOCKED, str(exc))
+            inbound = self._record_message(record, messages)
+            if inbound is None:
                 return Resolution(
                     ResolverState.INDETERMINATE,
-                    "no-admission drive claim missing",
+                    "no-admission drive inbound is absent from validated replay",
                 )
-            if (
-                not self._claim_matches_policy(claim, current_policy)
-                or claim.get("policy_generation") != resolution.activation_generation
-            ):
-                return self._policy_authority_failure(
-                    current_policy,
-                    reason="no-admission drive claim policy changed",
-                )
-            if claim.get("resolution") != resolution.state.value:
-                return Resolution(
-                    ResolverState.INDETERMINATE,
-                    "no-admission drive claim conflicts with replay",
-                )
-            if claim.get("state") != "open" or claim.get("fence") != self.fence:
-                return Resolution(
-                    ResolverState.INDETERMINATE,
-                    "no-admission drive claim is not open for this fence",
-                )
-            claim["drive_started_at"] = claim.get("drive_started_at") or self.now()
-            claim["drive_attempts"] = int(claim.get("drive_attempts", 0)) + 1
-            self._append(
-                ledger,
-                "PRE_ADMISSION_DRIVE_AUTHORIZED",
-                scope=inbound_id,
-                source_id=inbound_id,
-                data={
-                    "attempt": claim["drive_attempts"],
-                    "policy_generation": current_policy.generation,
-                },
+            current_policy = self._current_policy()
+            if self._policy_blocks_durable_terminal_projection(current_policy):
+                return Resolution(current_policy.status, current_policy.reason)
+            eligibility, detail, _ = self._eligibility(
+                record,
+                policy=current_policy,
             )
-            self._write(ledger)
-            policy_block = self._revalidate_admission_policy(current_policy)
-            if policy_block is not None:
-                return policy_block
-            revision = int(ledger["scoped_revisions"].get(inbound_id, 0))
+            with self.store._exclusive_lock(
+                self.path.with_suffix(".lock"), timeout=10.0,
+            ):
+                policy_block = self._revalidate_admission_policy(current_policy)
+                if policy_block is not None:
+                    return policy_block
+                ledger = self._load()
+                replayed = self._resolve_replay(
+                    record,
+                    messages,
+                    ledger,
+                    admission=None,
+                )
+                if replayed.state in TERMINAL_STATES:
+                    terminal_replay = replayed
+                    terminal_claim = ledger["no_admission_claims"].get(inbound_id)
+                    terminal_has_started_work = bool(
+                        isinstance(terminal_claim, dict)
+                        and terminal_claim.get("drive_started_at")
+                    )
+                else:
+                    if eligibility in {
+                        ResolverState.BLOCKED,
+                        ResolverState.BLOCKED_POLICY,
+                        ResolverState.BLOCKED_COMPLIANCE,
+                    }:
+                        return Resolution(eligibility, detail)
+                    if (
+                        eligibility != resolution.state
+                        or current_policy.generation
+                        != resolution.activation_generation
+                    ):
+                        return self._policy_authority_failure(
+                            current_policy,
+                            reason="no-admission policy changed before legacy drive",
+                        )
+                    if resolution.ledger_revision is None:
+                        policy_block = self._revalidate_admission_policy(
+                            current_policy,
+                        )
+                        if policy_block is not None:
+                            return policy_block
+                        return Resolution(
+                            resolution.state,
+                            resolution.reason,
+                            scoped_revision=resolution.scoped_revision,
+                            activation_generation=current_policy.generation,
+                            readiness_generation=current_policy.generation,
+                        )
+                    claim = ledger["no_admission_claims"].get(inbound_id)
+                    if not isinstance(claim, dict):
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "no-admission drive claim missing",
+                        )
+                    if (
+                        not self._claim_matches_policy(claim, current_policy)
+                        or claim.get("policy_generation")
+                        != resolution.activation_generation
+                    ):
+                        return self._policy_authority_failure(
+                            current_policy,
+                            reason="no-admission drive claim policy changed",
+                        )
+                    if claim.get("resolution") != resolution.state.value:
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "no-admission drive claim conflicts with replay",
+                        )
+                    if (
+                        claim.get("state") != "open"
+                        or claim.get("fence") != self.fence
+                    ):
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "no-admission drive claim is not open for this fence",
+                        )
+                    if int(ledger["scoped_revisions"].get(inbound_id, 0)) != (
+                        resolution.ledger_revision
+                    ):
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "no-admission drive scoped CAS miss",
+                        )
+                    claim["drive_started_at"] = (
+                        claim.get("drive_started_at") or self.now()
+                    )
+                    claim["drive_attempts"] = int(
+                        claim.get("drive_attempts", 0)
+                    ) + 1
+                    self._append(
+                        ledger,
+                        "PRE_ADMISSION_DRIVE_AUTHORIZED",
+                        scope=inbound_id,
+                        source_id=inbound_id,
+                        data={
+                            "attempt": claim["drive_attempts"],
+                            "policy_generation": current_policy.generation,
+                        },
+                    )
+                    self._write(ledger)
+                    policy_block = self._revalidate_admission_policy(current_policy)
+                    if policy_block is not None:
+                        return policy_block
+                    revision = int(
+                        ledger["scoped_revisions"].get(inbound_id, 0)
+                    )
+            if terminal_replay is not None and not terminal_has_started_work:
+                return self._normalize_pre_admission_terminal(
+                    record,
+                    inbound,
+                    terminal_replay,
+                    current_policy,
+                )
+        if terminal_replay is not None:
+            return self.admit_or_finalize(record)
         return Resolution(
             resolution.state,
             resolution.reason,
@@ -4886,7 +5807,32 @@ class DetectionCommitGate:
                 admission=None,
             )
             if replayed.terminal:
-                return replayed
+                if claim.get("state") != "open" or claim.get("fence") != self.fence:
+                    return Resolution(
+                        ResolverState.INDETERMINATE,
+                        "legacy terminal retention fence mismatch",
+                    )
+                self._retain_same_generation_legacy_terminal_locked(
+                    ledger,
+                    claim,
+                    record,
+                    replayed,
+                    current_policy,
+                )
+                self._write(ledger)
+                policy_block = self._revalidate_admission_policy(current_policy)
+                if policy_block is not None:
+                    return policy_block
+                revision = int(ledger["scoped_revisions"].get(inbound_id, 0))
+                return Resolution(
+                    replayed.state,
+                    "no_admission_finalization_pending",
+                    evidence_id=replayed.evidence_id,
+                    scoped_revision=revision,
+                    ledger_revision=revision,
+                    activation_generation=current_policy.generation,
+                    readiness_generation=current_policy.generation,
+                )
             if claim.get("state") != "open" or claim.get("fence") != self.fence:
                 return Resolution(
                     ResolverState.INDETERMINATE,
@@ -4929,6 +5875,7 @@ class DetectionCommitGate:
         durable_zero_work_terminal = False
         key = resolution.key
         no_admission_policy: PolicySnapshot | None = None
+        no_admission_messages: list[Message] | None = None
         if key is not None and any((
             key.responder != self.agent,
             record.get("id") != key.inbound_id,
@@ -4939,6 +5886,11 @@ class DetectionCommitGate:
             raise GateError("finalizer record does not match the exact inbound key")
         inbound_id = str(key.inbound_id if key is not None else record.get("id"))
         key_digest = key.digest if key is not None else None
+        if key is None:
+            try:
+                no_admission_messages, _ = self._validated_messages()
+            except LedgerUnreadable as exc:
+                return Resolution(ResolverState.BLOCKED, str(exc))
         with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
             ledger = self._load()
             write_required = True
@@ -5063,6 +6015,27 @@ class DetectionCommitGate:
                 no_admission_policy = current_policy
                 if self._policy_blocks_durable_terminal_projection(current_policy):
                     return Resolution(current_policy.status, current_policy.reason)
+                terminal_authority = self._recognized_zero_work_terminal_authority(
+                    record,
+                    no_admission_messages or [],
+                    ledger,
+                    claim,
+                )
+                if (
+                    terminal_authority is not None
+                    and terminal_authority.state == ResolverState.INDETERMINATE
+                ):
+                    return terminal_authority
+                terminal_immune = bool(
+                    terminal_authority is not None
+                    and terminal_authority.state == resolution.state
+                    and terminal_authority.evidence_id == resolution.evidence_id
+                )
+                if terminal_authority is not None and not terminal_immune:
+                    return Resolution(
+                        ResolverState.INDETERMINATE,
+                        "no-admission finalizer terminal authority changed",
+                    )
                 if claim.get("resolution") != resolution.state.value:
                     return Resolution(
                         ResolverState.INDETERMINATE,
@@ -5090,7 +6063,9 @@ class DetectionCommitGate:
                             ResolverState.INDETERMINATE,
                             "no-admission finalized disposition is torn",
                         )
-                    if not self._claim_has_no_legacy_work(claim) and (
+                    if not terminal_immune and not self._claim_has_no_legacy_work(
+                        claim
+                    ) and (
                         not self._claim_matches_policy(claim, current_policy)
                         or resolution.activation_generation
                         not in {None, current_policy.generation}
@@ -5099,9 +6074,19 @@ class DetectionCommitGate:
                             current_policy,
                             reason="no-admission policy changed before finalization",
                         )
-                    write_required = False
+                    write_required = (
+                        self._rebind_zero_work_terminal_authority_locked(
+                            ledger,
+                            claim,
+                            record,
+                            terminal_authority,
+                            current_policy,
+                        )
+                        if terminal_immune and terminal_authority is not None
+                        else False
+                    )
                 else:
-                    if (
+                    if not terminal_immune and (
                         not self._claim_matches_policy(claim, current_policy)
                         or resolution.activation_generation
                         not in {None, current_policy.generation}
@@ -5113,7 +6098,13 @@ class DetectionCommitGate:
                     if claim.get("state") not in {
                         "open",
                         "finalization_pending",
-                    } or claim.get("fence") != self.fence:
+                    } or (
+                        claim.get("fence") != self.fence
+                        and (
+                            not terminal_immune
+                            or not self._can_reassign_no_admission_claim(claim)
+                        )
+                    ):
                         return Resolution(
                             ResolverState.INDETERMINATE,
                             "no-admission finalizer fence mismatch",
@@ -5148,6 +6139,14 @@ class DetectionCommitGate:
                         return Resolution(
                             ResolverState.INDETERMINATE,
                             "no-admission finalizer CAS miss",
+                        )
+                    if terminal_immune and terminal_authority is not None:
+                        self._rebind_zero_work_terminal_authority_locked(
+                            ledger,
+                            claim,
+                            record,
+                            terminal_authority,
+                            current_policy,
                         )
                     self._append(
                         ledger,
@@ -5196,6 +6195,30 @@ class DetectionCommitGate:
                 )
                 if policy_block is not None:
                     return policy_block
+                rebound_policy = self._current_policy()
+                if self._policy_blocks_durable_terminal_projection(rebound_policy):
+                    return Resolution(rebound_policy.status, rebound_policy.reason)
+                recognized = self._recognized_zero_work_terminal_authority(
+                    record,
+                    no_admission_messages or [],
+                    ledger,
+                    owner,
+                )
+                if (
+                    recognized is not None
+                    and recognized.state == ResolverState.INDETERMINATE
+                ):
+                    return recognized
+                if recognized is not None:
+                    no_admission_policy = rebound_policy
+                    if self._rebind_zero_work_terminal_authority_locked(
+                        ledger,
+                        owner,
+                        record,
+                        recognized,
+                        rebound_policy,
+                    ):
+                        self._write(ledger)
             if self._cursor_projection_is_complete(record):
                 projection_was_inflight = owner.get("cursor_projection_inflight") is True
                 self._clear_cursor_projection_reservation_locked(owner)
@@ -5212,7 +6235,6 @@ class DetectionCommitGate:
             self._write(ledger)
             if (
                 no_admission_policy is not None
-                and not durable_zero_work_terminal
                 and projection_block is None
             ):
                 policy_block = self._revalidate_no_admission_projection_policy(
@@ -5230,7 +6252,7 @@ class DetectionCommitGate:
         # Its write-ahead reservation makes a crash an accounted miss before any
         # subsequent retry, while the exact disposition makes the side effect
         # idempotent and prevents duplicate terminal transitions.
-        if no_admission_policy is not None and not durable_zero_work_terminal:
+        if no_admission_policy is not None:
             policy_block = self._revalidate_no_admission_projection_policy(
                 no_admission_policy,
                 owner,
