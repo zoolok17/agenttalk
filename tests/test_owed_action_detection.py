@@ -89,6 +89,24 @@ def _ledger(gate: DetectionCommitGate) -> dict:
     return json.loads(gate.path.read_text(encoding="utf-8"))
 
 
+def _symlink_or_skip_windows(
+    link: Path,
+    target: Path,
+    *,
+    target_is_directory: bool = False,
+) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except NotImplementedError as exc:
+        if os.name != "nt":
+            raise
+        pytest.skip(f"Windows file symlinks are unavailable: {exc}")
+    except OSError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 1314:
+            raise
+        pytest.skip(f"Windows file symlink privilege is unavailable: {exc}")
+
+
 def _record_captured_intent(
     store: Store,
     gate: DetectionCommitGate,
@@ -1108,6 +1126,56 @@ def test_dispatch_record_rejects_a_tampered_permit_draft_path(tmp_path: Path) ->
     admission = _ledger(gate)["obligations"][permit.key_digest]
     assert admission["reservations"][permit.nonce]["state"] == "reserved"
     assert not tampered.draft_path.exists()
+
+
+def test_dispatch_record_pins_regular_python_symlink_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = Path(os.sys.executable).resolve(strict=True)
+    launcher = tmp_path / f"python-link{target.suffix}"
+    _symlink_or_skip_windows(launcher, target)
+    monkeypatch.setenv("AGENTTALK_PY", str(launcher))
+    store = _store(tmp_path / "store")
+    _question(store)
+    gate = _gate(store)
+    record = _record(store)
+    admitted = gate.admit_or_finalize(record)
+    permit = gate.reserve_dispatch(admitted, purpose="initial")
+
+    dispatched = gate.dispatch_record(record, permit)
+
+    assert dispatched["owed_action"]["argv"][0] == str(target)
+    assert dispatched["owed_action"]["composing_argv"][0] == str(target)
+
+
+@pytest.mark.parametrize(
+    ("target_kind", "error"),
+    [
+        ("dangling", "unavailable"),
+        ("directory", "regular file"),
+        ("loop", "unavailable"),
+    ],
+)
+def test_pinned_executable_rejects_symlink_without_regular_file_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_kind: str,
+    error: str,
+) -> None:
+    launcher = tmp_path / "python-link"
+    target = launcher if target_kind == "loop" else tmp_path / "target"
+    if target_kind == "directory":
+        target.mkdir()
+    _symlink_or_skip_windows(
+        launcher,
+        target,
+        target_is_directory=target_kind == "directory",
+    )
+    monkeypatch.setenv("AGENTTALK_PY", str(launcher))
+
+    with pytest.raises(DispatchRefused, match=error):
+        DetectionCommitGate._pinned_executable()  # noqa: SLF001 - path policy boundary
 
 
 def test_scheduled_continuation_excludes_recovery_before_second_launch(
