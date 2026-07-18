@@ -629,6 +629,59 @@ class DetectionCommitGate:
     def _current_policy(self) -> PolicySnapshot:
         return self.policy_loader() if self.policy_loader is not None else self.policy
 
+    def _revalidate_admission_policy(
+        self,
+        observed: PolicySnapshot,
+    ) -> Resolution | None:
+        """Fail closed if policy changed after admission classification."""
+        current = self._current_policy()
+        if (
+            current.status == observed.status
+            and current.generation == observed.generation
+            and current.grade == observed.grade
+            and current.agent == observed.agent
+        ):
+            return None
+        if current.status in {
+            ResolverState.BLOCKED,
+            ResolverState.BLOCKED_POLICY,
+            ResolverState.BLOCKED_COMPLIANCE,
+        }:
+            return Resolution(current.status, current.reason)
+        return Resolution(
+            ResolverState.BLOCKED_POLICY,
+            "operator policy changed during admission; retry classification",
+        )
+
+    @staticmethod
+    def _claim_matches_policy(claim: dict, policy: PolicySnapshot) -> bool:
+        return (
+            claim.get("policy_status") == policy.status.value
+            and claim.get("policy_generation") == policy.generation
+        )
+
+    @staticmethod
+    def _claim_is_untouched(claim: dict) -> bool:
+        return (
+            claim.get("state") == "open"
+            and not claim.get("drive_started_at")
+            and not claim.get("drive_succeeded_at")
+        )
+
+    def _policy_authority_failure(
+        self,
+        policy: PolicySnapshot,
+        *,
+        reason: str,
+    ) -> Resolution:
+        if policy.status in {
+            ResolverState.BLOCKED,
+            ResolverState.BLOCKED_POLICY,
+            ResolverState.BLOCKED_COMPLIANCE,
+        }:
+            return Resolution(policy.status, policy.reason)
+        return Resolution(ResolverState.BLOCKED_POLICY, reason)
+
     def _load(self, *, create: bool = True) -> dict:
         if not self.path.exists():
             if self.epoch_anchor_path.exists():
@@ -1155,7 +1208,13 @@ class DetectionCommitGate:
         except OSError:
             pass
 
-    def _eligibility(self, record: dict) -> tuple[ResolverState, str, str | None]:
+    def _eligibility(
+        self,
+        record: dict,
+        *,
+        policy: PolicySnapshot | None = None,
+    ) -> tuple[ResolverState, str, str | None]:
+        policy = policy or self._current_policy()
         try:
             health = json.loads(self.proof_health_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, json.JSONDecodeError):
@@ -1166,16 +1225,16 @@ class DetectionCommitGate:
                 str(health.get("reason") or "failed-delivery disposition unavailable"),
                 _correlation(record.get("meta")),
             )
-        if self.policy.status in {
+        if policy.status in {
             ResolverState.BLOCKED,
             ResolverState.BLOCKED_POLICY,
             ResolverState.BLOCKED_COMPLIANCE,
         }:
-            return self.policy.status, self.policy.reason, None
-        if self.policy.status == ResolverState.INACTIVE:
-            return ResolverState.INACTIVE, self.policy.reason, None
-        if self.policy.status != ResolverState.ACTIVE:
-            return ResolverState.NOT_OWED, self.policy.reason, None
+            return policy.status, policy.reason, None
+        if policy.status == ResolverState.INACTIVE:
+            return ResolverState.INACTIVE, policy.reason, None
+        if policy.status != ResolverState.ACTIVE:
+            return ResolverState.NOT_OWED, policy.reason, None
         if record.get("kind") != "question":
             return ResolverState.NOT_OWED, "kind is detection log-only", None
         meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
@@ -1994,7 +2053,12 @@ class DetectionCommitGate:
                     key,
                 )
             if previous_fence == "unclaimed":
-                if admission.get("activation_generation") != self.policy.generation:
+                policy = self._current_policy()
+                if (
+                    policy.status != ResolverState.ACTIVE
+                    or admission.get("activation_generation") != policy.generation
+                    or admission.get("readiness_generation") != policy.generation
+                ):
                     return Resolution(
                         ResolverState.BLOCKED_POLICY,
                         "transfer policy generation changed before claim",
@@ -2030,14 +2094,23 @@ class DetectionCommitGate:
             return ledger, admission
 
     def admit_or_finalize(self, record: dict) -> Resolution:
-        eligibility, detail, rid = self._eligibility(record)
+        observed_policy = self._current_policy()
+        eligibility, detail, rid = self._eligibility(
+            record,
+            policy=observed_policy,
+        )
         if eligibility != ResolverState.ACTIVE:
             if eligibility in {
                 ResolverState.BLOCKED,
                 ResolverState.BLOCKED_POLICY,
                 ResolverState.BLOCKED_COMPLIANCE,
-            } or self.policy.generation == "inactive":
-                return Resolution(eligibility, detail)
+            } or observed_policy.generation == "inactive":
+                return Resolution(
+                    eligibility,
+                    detail,
+                    activation_generation=observed_policy.generation,
+                    readiness_generation=observed_policy.generation,
+                )
             try:
                 messages, ledger = self._validated_messages()
             except LedgerUnreadable as exc:
@@ -2059,6 +2132,9 @@ class DetectionCommitGate:
                 name = "semantic_noneligible_heads"
                 transition = "SEMANTICALLY_NOT_OWED"
             with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
+                policy_block = self._revalidate_admission_policy(observed_policy)
+                if policy_block is not None:
+                    return policy_block
                 current = self._load()
                 if int(current["scoped_revisions"].get(inbound.id, 0)) != replay_revision:
                     return Resolution(
@@ -2071,6 +2147,29 @@ class DetectionCommitGate:
                         "concurrent admission won before no-admission claim",
                     )
                 claim = current["no_admission_claims"].get(inbound.id)
+                if isinstance(claim, dict):
+                    if not self._claim_matches_policy(claim, observed_policy):
+                        if not self._claim_is_untouched(claim):
+                            return self._policy_authority_failure(
+                                observed_policy,
+                                reason=(
+                                    "no-admission claim policy changed after legacy "
+                                    "work started"
+                                ),
+                            )
+                        previous_generation = claim.get("policy_generation")
+                        del current["no_admission_claims"][inbound.id]
+                        self._append(
+                            current,
+                            "NO_ADMISSION_CLAIM_POLICY_SUPERSEDED",
+                            scope=inbound.id,
+                            source_id=inbound.id,
+                            data={
+                                "previous_generation": previous_generation,
+                                "policy_generation": observed_policy.generation,
+                            },
+                        )
+                        claim = None
                 if isinstance(claim, dict):
                     if claim.get("state") == "blocked":
                         return Resolution(
@@ -2106,7 +2205,7 @@ class DetectionCommitGate:
                             },
                         )
                         self._write(current)
-                else:
+                if not isinstance(claim, dict):
                     current_telemetry = current["telemetry"]
                     current_telemetry[name] = int(current_telemetry.get(name, 0)) + 1
                     self._append(
@@ -2116,11 +2215,13 @@ class DetectionCommitGate:
                         source_id=inbound.id,
                         data={"reason": detail},
                     )
-                    current["no_admission_claims"][inbound.id] = {
+                    claim = {
                         "fence": self.fence,
                         "owner_pid": os.getpid(),
                         "state": "open",
                         "resolution": eligibility.value,
+                        "policy_status": observed_policy.status.value,
+                        "policy_generation": observed_policy.generation,
                         "finalization_misses": 0,
                         "finalization_first_at": None,
                         "cursor_projection_misses": 0,
@@ -2128,7 +2229,24 @@ class DetectionCommitGate:
                         "cursor_projection_inflight": False,
                         "cursor_projection_reserved_at": None,
                     }
+                    current["no_admission_claims"][inbound.id] = claim
                     self._write(current)
+                policy_block = self._revalidate_admission_policy(observed_policy)
+                if policy_block is not None:
+                    if self._claim_is_untouched(claim) and self._claim_matches_policy(
+                        claim,
+                        observed_policy,
+                    ):
+                        del current["no_admission_claims"][inbound.id]
+                        self._append(
+                            current,
+                            "NO_ADMISSION_CLAIM_POLICY_INVALIDATED",
+                            scope=inbound.id,
+                            source_id=inbound.id,
+                            data={"policy_generation": observed_policy.generation},
+                        )
+                        self._write(current)
+                    return policy_block
                 scope_revision = int(current["scoped_revisions"].get(inbound.id, 0))
             return Resolution(
                 eligibility,
@@ -2143,6 +2261,8 @@ class DetectionCommitGate:
                 ),
                 scoped_revision=scope_revision,
                 ledger_revision=scope_revision,
+                activation_generation=observed_policy.generation,
+                readiness_generation=observed_policy.generation,
             )
         try:
             messages, ledger = self._validated_messages()
@@ -2202,6 +2322,9 @@ class DetectionCommitGate:
             with self.store._exclusive_lock(
                 self.path.with_suffix(".lock"), timeout=10.0,
             ):
+                policy_block = self._revalidate_admission_policy(observed_policy)
+                if policy_block is not None:
+                    return policy_block
                 current = self._load()
                 if int(current["scoped_revisions"].get(inbound.id, 0)) != (
                     replay_revision
@@ -2217,6 +2340,11 @@ class DetectionCommitGate:
                     )
                 claim = current["no_admission_claims"].get(inbound.id)
                 if isinstance(claim, dict):
+                    if not self._claim_matches_policy(claim, observed_policy):
+                        return self._policy_authority_failure(
+                            observed_policy,
+                            reason="transfer-target claim policy changed",
+                        )
                     if claim.get("state") == "blocked":
                         return Resolution(
                             ResolverState.BLOCKED,
@@ -2264,6 +2392,8 @@ class DetectionCommitGate:
                         "owner_pid": os.getpid(),
                         "state": "open",
                         "resolution": ResolverState.NOT_OWED.value,
+                        "policy_status": observed_policy.status.value,
+                        "policy_generation": observed_policy.generation,
                         "finalization_misses": 0,
                         "finalization_first_at": None,
                         "cursor_projection_misses": 0,
@@ -2303,12 +2433,17 @@ class DetectionCommitGate:
                 ),
                 scoped_revision=scoped_revision,
                 ledger_revision=scoped_revision,
+                activation_generation=observed_policy.generation,
+                readiness_generation=observed_policy.generation,
             )
         before = self._resolve_replay(record, messages, ledger, admission=None)
         if before.state in TERMINAL_STATES:
             with self.store._exclusive_lock(
                 self.path.with_suffix(".lock"), timeout=10.0,
             ):
+                policy_block = self._revalidate_admission_policy(observed_policy)
+                if policy_block is not None:
+                    return policy_block
                 current = self._load()
                 if int(current["scoped_revisions"].get(inbound.id, 0)) != before.scoped_revision:
                     return Resolution(ResolverState.INDETERMINATE, "normalization CAS miss")
@@ -2319,6 +2454,11 @@ class DetectionCommitGate:
                     )
                 claim = current["no_admission_claims"].get(inbound.id)
                 if isinstance(claim, dict):
+                    if not self._claim_matches_policy(claim, observed_policy):
+                        return self._policy_authority_failure(
+                            observed_policy,
+                            reason="terminal normalization policy changed",
+                        )
                     if claim.get("state") == "blocked":
                         return Resolution(
                             ResolverState.BLOCKED,
@@ -2357,6 +2497,8 @@ class DetectionCommitGate:
                         "owner_pid": os.getpid(),
                         "state": "open",
                         "resolution": before.state.value,
+                        "policy_status": observed_policy.status.value,
+                        "policy_generation": observed_policy.generation,
                         "finalization_misses": 0,
                         "finalization_first_at": None,
                         "cursor_projection_misses": 0,
@@ -2379,20 +2521,51 @@ class DetectionCommitGate:
                 evidence_id=before.evidence_id,
                 scoped_revision=scoped_revision,
                 ledger_revision=scoped_revision,
+                activation_generation=observed_policy.generation,
+                readiness_generation=observed_policy.generation,
             )
         if before.state not in {ResolverState.OWED_UNSATISFIED}:
             return before
         with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
+            policy_block = self._revalidate_admission_policy(observed_policy)
+            if policy_block is not None:
+                return policy_block
             current = self._load()
             if int(current["scoped_revisions"].get(inbound.id, 0)) != before.scoped_revision:
                 return Resolution(ResolverState.INDETERMINATE, "admission CAS miss")
             if inbound.id in current["inbound_index"]:
                 return Resolution(ResolverState.INDETERMINATE, "concurrent admission won")
-            if inbound.id in current["no_admission_claims"]:
-                return Resolution(
-                    ResolverState.INDETERMINATE,
-                    "concurrent no-admission finalizer won",
-                )
+            claim = current["no_admission_claims"].get(inbound.id)
+            if isinstance(claim, dict):
+                previous_generation = claim.get("policy_generation")
+                if (
+                    isinstance(previous_generation, str)
+                    and not self._claim_matches_policy(claim, observed_policy)
+                    and self._claim_is_untouched(claim)
+                ):
+                    del current["no_admission_claims"][inbound.id]
+                    self._append(
+                        current,
+                        "NO_ADMISSION_CLAIM_POLICY_SUPERSEDED",
+                        scope=inbound.id,
+                        source_id=inbound.id,
+                        data={
+                            "previous_generation": previous_generation,
+                            "policy_generation": observed_policy.generation,
+                        },
+                    )
+                elif not self._claim_matches_policy(claim, observed_policy):
+                    return self._policy_authority_failure(
+                        observed_policy,
+                        reason=(
+                            "no-admission claim policy changed after legacy work started"
+                        ),
+                    )
+                else:
+                    return Resolution(
+                        ResolverState.INDETERMINATE,
+                        "concurrent no-admission finalizer won",
+                    )
             breaker = current["breakers"].get(self.agent, {})
             if breaker.get("tripped") is True or breaker.get("config_blocked") is True:
                 return Resolution(
@@ -2420,8 +2593,8 @@ class DetectionCommitGate:
                 "state": "open",
                 "watermark_sequence": current["append_sequence"],
                 "scoped_revision": int(current["scoped_revisions"].get(inbound.id, 0)),
-                "activation_generation": self.policy.generation,
-                "readiness_generation": self.policy.generation,
+                "activation_generation": observed_policy.generation,
+                "readiness_generation": observed_policy.generation,
                 "fence": self.fence,
                 "owner_pid": os.getpid(),
                 "delivery_mode": record.get("mode", "global"),
@@ -2479,8 +2652,8 @@ class DetectionCommitGate:
             "obligation admitted",
             key,
             scoped_revision=int(current["scoped_revisions"].get(inbound.id, 0)),
-            activation_generation=self.policy.generation,
-            readiness_generation=self.policy.generation,
+            activation_generation=observed_policy.generation,
+            readiness_generation=observed_policy.generation,
         )
 
     def resolve(self, record: dict) -> Resolution:
@@ -4222,6 +4395,179 @@ class DetectionCommitGate:
         )
         return None
 
+    def validate_no_admission_authority(
+        self,
+        record: dict,
+        resolution: Resolution,
+    ) -> Resolution:
+        """Confirm current policy still permits a no-admission side effect."""
+        if not resolution.allows_legacy_commit:
+            raise GateError("only no-admission resolutions have legacy authority")
+        current_policy = self._current_policy()
+        eligibility, detail, _ = self._eligibility(
+            record,
+            policy=current_policy,
+        )
+        if eligibility in {
+            ResolverState.BLOCKED,
+            ResolverState.BLOCKED_POLICY,
+            ResolverState.BLOCKED_COMPLIANCE,
+        }:
+            return Resolution(eligibility, detail)
+        if (
+            eligibility != resolution.state
+            or current_policy.generation != resolution.activation_generation
+        ):
+            return self._policy_authority_failure(
+                current_policy,
+                reason="no-admission policy changed before legacy side effect",
+            )
+        if resolution.ledger_revision is None:
+            return Resolution(
+                resolution.state,
+                resolution.reason,
+                scoped_revision=resolution.scoped_revision,
+                activation_generation=current_policy.generation,
+                readiness_generation=current_policy.generation,
+            )
+        inbound_id = record.get("id")
+        if not isinstance(inbound_id, str):
+            raise GateError("no-admission authority requires an exact inbound")
+        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
+            policy_block = self._revalidate_admission_policy(current_policy)
+            if policy_block is not None:
+                return policy_block
+            ledger = self._load()
+            claim = ledger["no_admission_claims"].get(inbound_id)
+            if not isinstance(claim, dict):
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "no-admission authority claim missing",
+                )
+            if (
+                not self._claim_matches_policy(claim, current_policy)
+                or claim.get("policy_generation") != resolution.activation_generation
+            ):
+                return self._policy_authority_failure(
+                    current_policy,
+                    reason="no-admission side-effect policy changed",
+                )
+            if claim.get("resolution") != resolution.state.value:
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "no-admission authority conflicts with replay",
+                )
+            if claim.get("state") != "open" or claim.get("fence") != self.fence:
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "no-admission authority is not open for this fence",
+                )
+            policy_block = self._revalidate_admission_policy(current_policy)
+            if policy_block is not None:
+                return policy_block
+            revision = int(ledger["scoped_revisions"].get(inbound_id, 0))
+        return Resolution(
+            resolution.state,
+            resolution.reason,
+            scoped_revision=revision,
+            ledger_revision=revision,
+            activation_generation=current_policy.generation,
+            readiness_generation=current_policy.generation,
+        )
+
+    def authorize_no_admission_drive(
+        self,
+        record: dict,
+        resolution: Resolution,
+    ) -> Resolution:
+        """Recheck and durably pin policy authority immediately before legacy work."""
+        if not resolution.allows_legacy_commit:
+            raise GateError("only no-admission resolutions authorize legacy work")
+        current_policy = self._current_policy()
+        eligibility, detail, _ = self._eligibility(
+            record,
+            policy=current_policy,
+        )
+        if eligibility in {
+            ResolverState.BLOCKED,
+            ResolverState.BLOCKED_POLICY,
+            ResolverState.BLOCKED_COMPLIANCE,
+        }:
+            return Resolution(eligibility, detail)
+        if (
+            eligibility != resolution.state
+            or current_policy.generation != resolution.activation_generation
+        ):
+            return self._policy_authority_failure(
+                current_policy,
+                reason="no-admission policy changed before legacy drive",
+            )
+        if resolution.ledger_revision is None:
+            return Resolution(
+                resolution.state,
+                resolution.reason,
+                scoped_revision=resolution.scoped_revision,
+                activation_generation=current_policy.generation,
+                readiness_generation=current_policy.generation,
+            )
+        inbound_id = record.get("id")
+        if not isinstance(inbound_id, str):
+            raise GateError("no-admission drive requires an exact inbound")
+        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
+            policy_block = self._revalidate_admission_policy(current_policy)
+            if policy_block is not None:
+                return policy_block
+            ledger = self._load()
+            claim = ledger["no_admission_claims"].get(inbound_id)
+            if not isinstance(claim, dict):
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "no-admission drive claim missing",
+                )
+            if (
+                not self._claim_matches_policy(claim, current_policy)
+                or claim.get("policy_generation") != resolution.activation_generation
+            ):
+                return self._policy_authority_failure(
+                    current_policy,
+                    reason="no-admission drive claim policy changed",
+                )
+            if claim.get("resolution") != resolution.state.value:
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "no-admission drive claim conflicts with replay",
+                )
+            if claim.get("state") != "open" or claim.get("fence") != self.fence:
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "no-admission drive claim is not open for this fence",
+                )
+            claim["drive_started_at"] = claim.get("drive_started_at") or self.now()
+            claim["drive_attempts"] = int(claim.get("drive_attempts", 0)) + 1
+            self._append(
+                ledger,
+                "PRE_ADMISSION_DRIVE_AUTHORIZED",
+                scope=inbound_id,
+                source_id=inbound_id,
+                data={
+                    "attempt": claim["drive_attempts"],
+                    "policy_generation": current_policy.generation,
+                },
+            )
+            self._write(ledger)
+            policy_block = self._revalidate_admission_policy(current_policy)
+            if policy_block is not None:
+                return policy_block
+            revision = int(ledger["scoped_revisions"].get(inbound_id, 0))
+        return Resolution(
+            resolution.state,
+            resolution.reason,
+            scoped_revision=revision,
+            ledger_revision=revision,
+            activation_generation=current_policy.generation,
+            readiness_generation=current_policy.generation,
+        )
+
     def record_no_admission_success(
         self,
         record: dict,
@@ -4244,7 +4590,16 @@ class DetectionCommitGate:
                 messages, _ = self._validated_messages()
             except LedgerUnreadable as exc:
                 return Resolution(ResolverState.BLOCKED, str(exc))
-            current_eligibility, detail, _ = self._eligibility(record)
+            current_policy = self._current_policy()
+            current_eligibility, detail, _ = self._eligibility(
+                record,
+                policy=current_policy,
+            )
+            if current_policy.generation != resolution.activation_generation:
+                return self._policy_authority_failure(
+                    current_policy,
+                    reason="no-admission policy changed during legacy drive",
+                )
             if current_eligibility != resolution.state:
                 if current_eligibility in {
                     ResolverState.BLOCKED,
@@ -4268,6 +4623,14 @@ class DetectionCommitGate:
                     ResolverState.INDETERMINATE,
                     "no-admission success claim missing",
                 )
+            if (
+                not self._claim_matches_policy(claim, current_policy)
+                or claim.get("policy_generation") != resolution.activation_generation
+            ):
+                return self._policy_authority_failure(
+                    current_policy,
+                    reason="no-admission claim policy changed during legacy drive",
+                )
             if claim.get("resolution") != resolution.state.value:
                 return Resolution(
                     ResolverState.INDETERMINATE,
@@ -4290,6 +4653,8 @@ class DetectionCommitGate:
                     ledger_revision=int(
                         ledger["scoped_revisions"].get(inbound_id, 0)
                     ),
+                    activation_generation=current_policy.generation,
+                    readiness_generation=current_policy.generation,
                 )
             replayed = self._resolve_replay(
                 record,
@@ -4314,12 +4679,17 @@ class DetectionCommitGate:
                 data={"state": resolution.state.value},
             )
             self._write(ledger)
+            policy_block = self._revalidate_admission_policy(current_policy)
+            if policy_block is not None:
+                return policy_block
             revision = int(ledger["scoped_revisions"].get(inbound_id, 0))
         return Resolution(
             resolution.state,
             "no_admission_finalization_pending",
             scoped_revision=revision,
             ledger_revision=revision,
+            activation_generation=current_policy.generation,
+            readiness_generation=current_policy.generation,
         )
 
     def finalize(
@@ -4333,6 +4703,7 @@ class DetectionCommitGate:
             raise GateError("nonterminal resolution cannot finalize")
         projection_block: str | None = None
         key = resolution.key
+        no_admission_policy: PolicySnapshot | None = None
         if key is not None and any((
             key.responder != self.agent,
             record.get("id") != key.inbound_id,
@@ -4463,6 +4834,17 @@ class DetectionCommitGate:
                         ResolverState.INDETERMINATE,
                         "no-admission finalizer claim missing",
                     )
+                current_policy = self._current_policy()
+                if (
+                    not self._claim_matches_policy(claim, current_policy)
+                    or resolution.activation_generation
+                    not in {None, current_policy.generation}
+                ):
+                    return self._policy_authority_failure(
+                        current_policy,
+                        reason="no-admission policy changed before finalization",
+                    )
+                no_admission_policy = current_policy
                 if claim.get("resolution") != resolution.state.value:
                     return Resolution(
                         ResolverState.INDETERMINATE,
@@ -4560,6 +4942,12 @@ class DetectionCommitGate:
                 owner["cursor_projection_reserved_at"] = None
                 if write_required or projection_was_inflight:
                     self._write(ledger)
+                if no_admission_policy is not None:
+                    policy_block = self._revalidate_admission_policy(
+                        no_admission_policy,
+                    )
+                    if policy_block is not None:
+                        return policy_block
                 return resolution
             projection_block = self._reserve_cursor_projection_locked(
                 ledger,
@@ -4568,6 +4956,12 @@ class DetectionCommitGate:
                 key_digest=key_digest,
             )
             self._write(ledger)
+            if no_admission_policy is not None:
+                policy_block = self._revalidate_admission_policy(
+                    no_admission_policy,
+                )
+                if policy_block is not None:
+                    return policy_block
         if projection_block is not None:
             self._record_disposition_block(reason=projection_block)
             return Resolution(ResolverState.INDETERMINATE, projection_block, key)
@@ -4575,6 +4969,10 @@ class DetectionCommitGate:
         # Its write-ahead reservation makes a crash an accounted miss before any
         # subsequent retry, while the exact disposition makes the side effect
         # idempotent and prevents duplicate terminal transitions.
+        if no_admission_policy is not None:
+            policy_block = self._revalidate_admission_policy(no_admission_policy)
+            if policy_block is not None:
+                return policy_block
         try:
             self._advance_record_cursor(record)
         except (OSError, TimeoutError, ValueError, RuntimeError) as exc:
@@ -6289,16 +6687,17 @@ class DetectionCommitGate:
         raise GateError("direct broadcast closure is forbidden; use canonical replay")
 
     def status(self) -> dict:
+        policy = self._current_policy()
         result = {
             "agent": self.agent,
-            "grade": self.policy.grade,
-            "policy_generation": self.policy.generation,
+            "grade": policy.grade,
+            "policy_generation": policy.generation,
             "status": (
                 "ACTIVE (detection-grade)"
-                if self.policy.status == ResolverState.ACTIVE
-                else self.policy.status.value.upper()
+                if policy.status == ResolverState.ACTIVE
+                else policy.status.value.upper()
             ),
-            "reason": self.policy.reason,
+            "reason": policy.reason,
             "security_grade": False,
         }
         if self.proof_health_path.exists():
@@ -6312,7 +6711,7 @@ class DetectionCommitGate:
                 proof_health = {"state": "blocked", "unreadable": True}
             result["proof_health"] = proof_health
             if (
-                self.policy.status == ResolverState.ACTIVE
+                policy.status == ResolverState.ACTIVE
                 and proof_health.get("state") == "blocked"
             ):
                 result["status"] = ResolverState.BLOCKED.value.upper()
@@ -6334,7 +6733,7 @@ class DetectionCommitGate:
         try:
             ledger = self._load(create=False)
         except LedgerUnreadable as exc:
-            if self.policy.status == ResolverState.ACTIVE:
+            if policy.status == ResolverState.ACTIVE:
                 result["status"] = ResolverState.BLOCKED.value.upper()
                 result["reason"] = str(exc)
             result["ledger_error"] = str(exc)
@@ -6349,7 +6748,11 @@ class DetectionCommitGate:
         }
         breaker = ledger["breakers"].get(self.agent, {})
         result["breaker"] = breaker
-        if isinstance(breaker, dict) and breaker.get("tripped") is True:
+        if (
+            policy.status == ResolverState.ACTIVE
+            and isinstance(breaker, dict)
+            and breaker.get("tripped") is True
+        ):
             result["status"] = ResolverState.BLOCKED_COMPLIANCE.value.upper()
             result["reason"] = "owed_action_compliance_breaker"
             self._project_compliance_breaker_hold()

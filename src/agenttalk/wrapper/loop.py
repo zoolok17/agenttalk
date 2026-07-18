@@ -401,6 +401,19 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         _guard_advance()                      # dead-letter ADVANCES the cursor - verify
         #                                       lease ownership first (lead-loop), else a
         #                                       lost-lease controller could dispose unguarded
+        if commit_gate is not None and legacy_gate_resolution is not None:
+            authority = commit_gate.validate_no_admission_authority(
+                record,
+                legacy_gate_resolution,
+            )
+            if not authority.allows_legacy_commit:
+                stamp()
+                if on_health_idle is not None:
+                    on_health_idle()
+                last_hb = clock()
+                sleep(fail_sleep)
+                fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                return
         store.dead_letter(agent, record, reason=reason, failure_class=failure_class,
                           at=now_iso(), child_output_tail=child_output_tail)
         stamp()                               # DL is progress (bypasses drive's stamp)
@@ -874,6 +887,18 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 # auto-dead-letter and NEVER freeze - fall through to drive AGAIN (a real outage,
                 # incl. a stale-kill mid-outage, must keep retrying until it clears).
 
+        if commit_gate is not None and legacy_gate_resolution is not None:
+            authorized = commit_gate.authorize_no_admission_drive(
+                record,
+                legacy_gate_resolution,
+            )
+            if not authorized.allows_legacy_commit:
+                stamp()
+                sleep(fail_sleep)
+                fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
+            legacy_gate_resolution = authorized
+
         # WRITE-AHEAD: count + mark in_progress BEFORE drive() so a crash mid-turn
         # still costs a durable attempt on relaunch. EXACTLY one attempt per drive().
         store.record_attempt_start(agent, record, attempt_id=uuid.uuid4().hex[:12],
@@ -1241,6 +1266,17 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
         # ok - drive() returns a DriveOutcome (frozen dataclass, no __bool__ -> always truthy),
         # so a bare ``if drive(record):`` would treat a FAILED turn as success and mark the
         # scoped request seen (lead 4th-verify P1 #1; mirrors _run_continuous's _as_outcome).
+        if commit_gate is not None and legacy_gate_resolution is not None:
+            authorized = commit_gate.authorize_no_admission_drive(
+                record,
+                legacy_gate_resolution,
+            )
+            if not authorized.allows_legacy_commit:
+                _stamp()
+                sleep(fail_sleep)
+                fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                continue
+            legacy_gate_resolution = authorized
         outcome = _as_outcome(drive(record))
         if outcome.ok:
             if legacy_gate_resolution is not None and legacy_gate_resolution.ledger_revision is not None:
