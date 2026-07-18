@@ -1,0 +1,2108 @@
+# RFC: native work and evidence spine
+
+Status: draft
+Date: 2026-07-18
+Related: `docs/ROADMAP.md` §4 / §6 Q1 3–7 / §7 / §8, `docs/ISSUES.md`
+(P1 PLANNED 2026-07-08; C1, C2, C5), `docs/DESIGN.md` D-5, D-11, D-13, D-16,
+`docs/WORK-PACKAGE-native-work-spine.md`
+
+## Summary
+
+agenttalk already owns every primitive a delivery record needs — domains,
+lanes, gates, closes, review threads, knowledge, onboarding — and binds
+none of them together. `agenttalk work` should be that binding and
+nothing more. It is a **link-and-project** layer: it stores the
+associations between existing records and derives a verdict over them.
+It never stores a second copy of a truth another module owns.
+
+Recommended D1–D4 scope:
+
+1. Per-item work records at `.agenttalk/work/items/<work_id>.json` with an
+   append-only event ledger at `.agenttalk/work/events/<work_id>.jsonl`.
+   One corrupt item blocks that item and nothing else.
+2. Write-once evidence artifacts at `.agenttalk/artifacts/<artifact_id>.json`
+   (+ `.log`), each bound to the exact inputs that produced it. Corrections
+   create a new artifact; nothing is ever mutated in place.
+3. A derived `trust_tier` that is a **mapping over** the four evidence
+   vocabularies this repo already has, not a fifth parallel one.
+4. A pure `work.compute_verdict` returning `GO` / `HOLD` / `UNKNOWN` with
+   stable string HOLD codes, matching the `close` / `lanes` verdict shape.
+5. An optional `.agenttalk/code-policy.json` whose required checks are
+   matched by glob with **all-matching** semantics (D-11), evaluated
+   against the merge-base policy so a branch cannot rewrite the rules that
+   judge it.
+
+Recommended later scope:
+
+1. Assurance ingestion as a read-only evidence source (D5).
+2. CI adapters, a generic quality runner, and the dashboard Work view —
+   each blocked until the schema and check semantics are proven.
+
+Important constraint, stated up front: this design produces
+**coordination evidence, not proof**. Everything under `.agenttalk/` is
+writable by any process running as the same OS user, so a hostile local
+writer can forge a work item, an event, or an artifact. Per DESIGN.md
+principle 4, the spine makes the right thing easy and the wrong thing
+visible; it is not an authorization boundary. Every claim below about
+"binding" and "immutability" means *machine-checkable for a trusted
+team*, and the Threat Model section says exactly where that stops.
+
+## Current Model
+
+What already exists, and who owns what. Getting this list right is the
+whole point — every duplicated field here would be a future
+contradiction.
+
+- **`domains.py`** owns path/area ownership: one unified registry
+  (`.agenttalk/domains.json`) shared by lanes and knowledge (D-5), with
+  `registry_hash`, `normalize_repo_path`, `glob_matches`, and
+  `check_paths`. It survives `reset`.
+- **`lanes.py`** owns worktree isolation and delivery. Active
+  coordination state is `.agenttalk/state/lanes.json` — **cleared by
+  `reset`** — while the durable committed delivery artifact lives at
+  `.agenttalk/lane-deliveries/` and survives. `compute_verdict` is pure
+  and returns `{"verdict", "holds": [{code, detail}], "ok"}` with 15
+  stable string HOLD codes. Delivery artifacts carry
+  `isolation_status` ∈ `{verified, advisory_unisolated, unverified}` plus
+  an HMAC integrity token.
+- **`gates.py`** owns assurance gate state (`.agenttalk/gates.json`):
+  `VALID_STATUSES` = `{red, green, unknown, skipped, waived}`,
+  `VALID_SEVERITIES` = `{blocker, warn, info}`,
+  `VALID_EVIDENCE_SOURCES` = `{automation_ci, local_command,
+  manual_review, operator_waiver}`, and the subset
+  `BLOCKER_GREEN_SOURCES` = `{automation_ci, operator_waiver}`.
+  `check_gates` returns a **different** shape from close/lanes —
+  `{schema_version, verdict, required_gates, blockers, gates}` — a fact
+  the Work Check section handles explicitly rather than papering over.
+- **`close.py`** owns milestone/release closes under `.agenttalk/closes/`:
+  sign-off policy, lens acks, counters, and a pure `compute_verdict`
+  with 16 stable HOLD codes. Its docstring records the pure-core
+  discipline this RFC copies: the CLI resolves all I/O into a
+  `signoff_eval` bundle and the pure function only counts.
+- **`knowledge.py`** owns durable team memory and the staleness
+  vocabulary this RFC reuses: 13 hard `STALE_*` reasons and 6
+  `CAUTION_*` flags, folded by a pure `compute_staleness` into
+  `{stale_reasons, caution_flags, hard_stale}`. Authority is
+  `AUTH_*` ∈ `{uncurated, verified, lead_override, retracted}`.
+- **`onboarding.py`** owns comprehension runs, with
+  `CLAIM_SOURCES` = `{code, docs, test, command, human, ci, runtime}` and
+  `CONFIDENCE_LEVELS` = `{low, medium, high}`.
+- **`assurance.py`** owns scan execution and per-dimension attestation
+  `{"GOOD": …, "ROBUST": …, "SECURE": …, "reasons": [...]}` where each
+  dimension is `good` / `unknown` / `not_assessed`.
+
+Two facts about the current code shape the design more than anything in
+the roadmap. First, `_atomic.write_text` is temp+fsync+`os.replace` with
+a **latched Windows sandbox-direct fallback that is not crash-atomic** —
+so any file this feature writes needs a validate-on-read guard, not a
+trust-the-write assumption. Second, `_jsonl.append_record` explicitly
+does **not** serialize writers; its docstring says "the caller owns
+inter-process serialization," and `onboarding.append_event` wraps it in
+`store._config_lock()`. Work events follow that same pattern.
+
+There is no `trust_tier` symbol anywhere in the repo today. That
+vocabulary is genuinely new, which is exactly why it must be defined as a
+projection over the four above rather than a fifth competing one.
+
+## Goals
+
+- Bind domain, lane, work item, quality evidence, review evidence, gate
+  state, and close state into one durable record that can be inspected
+  and checked as a unit.
+- Make status a **projection** over typed records. A projection that
+  cannot reconcile its sources reports the disagreement; it never picks a
+  side and never renders blank-or-green.
+- Bind every piece of evidence to the exact inputs that produced it, so
+  "the tests passed" is always answerable with "at which revision, under
+  which policy, run by whom, at what tier."
+- Fail closed everywhere a verdict is computed: absent, corrupt,
+  torn, mis-scoped, skipped, and unknown all block a blocking
+  requirement. None of them read as pass.
+- Keep the core domain-neutral. Core validates shape, IDs, references,
+  freshness, hashes, transitions, and HOLD codes; the project owns which
+  checks are required and which tools produce them.
+- Stay additive. Existing stores must load unchanged, and a store that
+  has never run `work` must behave exactly as it does today.
+
+## Non-Goals
+
+Quoted verbatim from `docs/ISSUES.md` (P1 PLANNED, 2026-07-08), whose
+deferral list is this section:
+
+> Defer arbitrary third-party command execution, CI adapters, merge
+> automation, and broad dashboard actions until the schema and check
+> semantics are proven.
+
+Additionally, out of scope for D1–D5:
+
+- Do not build a project-management state machine. The lifecycle in this
+  RFC is deliberately narrow and adds no priorities, sprints, estimates,
+  dependencies, or assignees beyond a single owner.
+- Do not duplicate lane, gate, close, domain, or knowledge truth into the
+  work record. Work stores references and derives; it does not mirror.
+- Do not let `work` mutate any record another module owns. It reads
+  lanes, gates, closes, domains, threads, and onboarding through their
+  public read APIs and writes only under `.agenttalk/work/` and
+  `.agenttalk/artifacts/`.
+- Do not add a new message kind. Review binding rides existing
+  `review-request` / `review-result` threads, which old clients already
+  understand.
+- Do not treat `assurance.py` as authority. It is a producer whose output
+  is ingested read-only, and roadmap §6 item 7 forbids the alternative.
+- Do not claim malicious-peer safety from any hash or binding described
+  here.
+
+## Source-Of-Truth Boundaries
+
+For each primitive, exactly one of: work **links** it (stores a reference
+and reads through the owner), work **projects** it (derives a display
+value that is recomputed every read and never persisted as authority), or
+work **owns** it (work is the only writer).
+
+| Primitive | Relationship | What work persists | Who remains authoritative |
+|---|---|---|---|
+| Domain / path scope | links | `domain_id`, `registry_hash_at_bind` | `domains.json` |
+| Lane / worktree | links | `lane_id`, `delivery_artifact_path` | `lanes.py` + the durable delivery artifact |
+| Gate state | links | `gate_scope` | `gates.json` via `check_gates` |
+| Close | links | `close_id` | `.agenttalk/closes/` |
+| Review | links | `request_id` of the review thread | bus messages + `threads.derive_threads` |
+| Onboarding run | links | `run_id` | `.agenttalk/onboarding/` |
+| Knowledge notes | links | `note_id[]` | `knowledge/notes.jsonl` |
+| Project policy | links | `policy_hash_at_open` (witness) | `.agenttalk/code-policy.json` at the merge base |
+| Review lenses | links | nothing | `close.py` `required_lenses` / `lens_acks` |
+| Requirement satisfaction | **owns** | satisfaction records (matched glob) | work — but as a cache, never authority |
+| Work item identity, owner, base/head refs, links | **owns** | the item record | work |
+| Work events | **owns** | the append-only ledger | work |
+| Evidence artifacts | **owns** | write-once artifact records | work |
+| Lifecycle status | **projects** | nothing | derived per read |
+| Verdict (`GO`/`HOLD`/`UNKNOWN`) | **projects** | nothing | derived per read |
+| Trust tier of an artifact | owns, derived-then-bound | `trust_tier` on the artifact | derived at write, revalidated at verdict |
+
+Rules:
+
+- A field that appears in this table as *links* is stored as an
+  identifier only. Work never copies the linked record's contents,
+  because a copy is a contradiction waiting to happen (roadmap §8,
+  "state-machine drift").
+- Work persists **three drift witnesses**, and each is disclosed here
+  with the rule that reads it. A witness is a record of *which version of
+  someone else's truth we bound against*, used only to detect drift; none
+  is ever read as the current answer. An undisclosed witness is just a
+  copy, and a witness with no drift rule is dead weight:
+
+  | Witness | Witnesses | Drift rule |
+  |---|---|---|
+  | `registry_hash_at_bind` | `domains.json` | `work_domain_scope_drift` |
+  | `lane_generation` | `lanes.json` | `work_lane_generation_mismatch` |
+  | `policy_hash_at_open` | `code-policy.json` | `work_policy_changed_since_open` |
+
+  `isolation_status` on an *artifact* is a fourth copy of lanes-owned
+  truth, disclosed in Evidence Tiers: it is frozen at artifact-write time
+  by design, because an artifact is an immutable record of the conditions
+  under which a check ran.
+- `work_policy_changed_since_open` is what anchors `policy_hash_at_open`.
+  An earlier draft carried that field with nothing reading it, which
+  invites a later phase to invent a meaning for it. It is distinct from
+  `work_policy_hash_drift` (artifact-side: the policy moved since the
+  *artifact* was produced) — this one says the rules moved since the item
+  was opened, which an owner needs to know even when every artifact is
+  current.
+- Status and verdict are never persisted. `work show` recomputes both on
+  every read. There is no `status` field in the item schema, and adding
+  one later is a schema break, not an optimization.
+- `trust_tier` is derived at artifact-write time, bound into the
+  immutable artifact, and **revalidated against a re-resolved
+  `producer_class`** when a verdict consumes it. The re-resolution is
+  what makes revalidation meaningful: every other tier input
+  (`evidence_source`, `exit_code`, binding completeness) is immutable on
+  a write-once record, so recomputing over those alone is a tautology
+  that returns the same value by construction and could only ever fire on
+  tampering `content_hash` already catches. `producer_class` is the one
+  input that genuinely moves — an agent retires, or its roster
+  classification changes — and freezing it would make the real drift
+  invisible. If the re-resolved tier is weaker than the bound one, the
+  artifact does not count and the verdict emits
+  `work_artifact_tier_drift`.
+- This is the C2 lesson (`ISSUES.md`:874–884) only *because* of that
+  re-resolution: C2's bypass was a persisted approval whose underlying
+  inputs could change while the approval stood. A revalidation over
+  frozen inputs would not have been that lesson at all, and citing C2 for
+  it would have been borrowing authority the mechanism did not earn.
+  What it additionally catches is version skew — a store written by a
+  build whose derivation table differs from this one.
+- Every source read in a projection is independently guarded, so a
+  failing source becomes a bounded `source_error` row naming the source
+  and the error rather than an empty list. That guarding *pattern* is
+  D-16's (DESIGN.md:618-620, "a bounded `source_error` row, never a blank
+  queue"); the additional rule that **a failed source can never yield
+  green** is this RFC's own, not D-16's. D-16 governs the operator
+  attention queue's completeness, not gate greenness, and citing it for
+  the stronger proposition would have dressed a new rule in borrowed
+  authority.
+
+## Work Item Schema
+
+`.agenttalk/work/items/<work_id>.json`, one file per item, written with
+`_atomic.write_text` under a per-item lock:
+
+```json
+{
+  "schema_version": 1,
+  "work_id": "w-0007",
+  "title": "Harden lane delivery readback",
+  "created_at": "2026-07-18T09:14:02.113400Z",
+  "created_by": "claude-lead",
+  "owner": "codex-dev-2",
+  "domain_id": "core-lanes",
+  "registry_hash_at_bind": "9f2c1b7e4a",
+  "scope_globs": ["src/agenttalk/lanes.py", "tests/test_lanes*.py"],
+  "base_ref": "master",
+  "base_sha": "e0e8f7b4c19a2d6f8b3e5107c9a4d2f6b8e1c3a7",
+  "target_ref": "master",
+  "lane_id": "lane-lanes-hardening",
+  "lane_generation": 3,
+  "delivery_artifact_path": null,
+  "item_seq": 12,
+  "pending_op": null,
+  "ledger_head": {"seq": 12, "hash": "sha256:b41f7c09de2a8653"},
+  "close_id": null,
+  "gate_scope": "feature",
+  "review_request_ids": ["q-de4534c8b3c4"],
+  "onboarding_run_id": null,
+  "note_ids": [],
+  "artifact_ids": ["a-3f91c2", "a-77b0de"],
+  "policy_hash_at_open": "3b1f0c9d22",
+  "release_blocking": true,
+  "terminal": null
+}
+```
+
+Rules:
+
+- `work_id` is opaque, stable, and validated by the same character class
+  as existing IDs. It is never reused, including after abandonment.
+- `schema_version` is an integer and is checked **exact-match
+  fail-closed** — see Schema Versioning. A record whose version this
+  build does not recognize is not upgraded, not guessed at, and not
+  skipped; it blocks that item.
+- `owner` is a single agent name validated against the roster's known
+  agents (active or retired), so an item owned by a retired identity
+  still reads. Retired ownership surfaces as a caution, not a silent
+  reassignment.
+- `base_sha` is a full 40-character SHA, never an abbreviation and never
+  a symbolic ref. `base_ref` and `target_ref` are advisory labels; the
+  SHA is what evidence binds to.
+- `scope_globs` are normalized through `domains.normalize_repo_path` /
+  `normalize_glob`, which already reject NUL, absolute, drive-relative,
+  UNC, and `..`-escape paths. Work adds no second path normalizer.
+- **`scope_globs` must be a subset of the bound domain's paths, checked
+  against `domains.check_paths` at bind time and revalidated at verdict
+  time.** A mismatch raises `work_scope_outside_domain`. Without this the
+  domain link is decorative: an item could bind `domain_id: "core-lanes"`
+  with a perfectly fresh registry hash while its `scope_globs` covered
+  `src/agenttalk/gates.py`, and no hold would fire —
+  `work_domain_scope_drift` only detects that the *registry* moved, never
+  that the item's scope ever agreed with it. That is work silently
+  re-owning path scope while the boundary table calls it a link, and it
+  bypasses the domain's approver model.
+- There is no `head_sha` in the item. Head is resolved live from the
+  linked lane or the repo at read time, because a persisted head is stale
+  the moment it is written and would invite exactly the evidence-rot the
+  roadmap warns about (§8).
+- There is no `status`. Status is projected.
+- `terminal` is `null` for a live item, or one of `delivered`,
+  `closed`, `abandoned` with the event id that made it terminal. This is
+  the only lifecycle fact stored on the item, and it is stored only
+  because "this item is finished" must survive a corrupt event ledger.
+  Every non-terminal state is derived.
+- `item_seq` is a monotonic integer incremented on every durable item
+  write. It is the `expected_version` for optimistic concurrency: a
+  mutation states the `item_seq` it read, and a write whose expected
+  value no longer matches is refused as a version conflict rather than
+  applied. This closes the C1(2) lost-update analogue at the record
+  level, not only at the lock level.
+- `pending_op` is `null` on a settled item, or `{op_id, intended_type}`
+  while a mutation is in flight. It is written durably *before* the
+  matching event is appended and cleared after, so an interrupted
+  transaction is always visible on read. See Crash And Recovery Protocol.
+- `lane_generation` pins the lane's immutable generation at bind time. A
+  lane whose ID matches but whose generation does not is a *different*
+  lane that reused the name, and it raises
+  `work_lane_generation_mismatch` rather than reading as the bound one.
+- `delivery_artifact_path` points at the validated immutable lane
+  delivery artifact once one exists. It is what lets a terminal item stay
+  readable after its lane is cleaned up, and the Source-Of-Truth table
+  names it, so the schema carries it rather than leaving the table and
+  the schema disagreeing about what work stores.
+- `ledger_head` is `{seq, hash}` of the **current** last event, written
+  in the same locked transaction as the event itself. `prev_hash` chains
+  each record to its predecessor, which commits every event *except the
+  last one* — the tail's `actor`, `ts`, `type`, and payload could be
+  rewritten without breaking any chain link, and a replayed transition
+  re-encoded with a fresh `seq` / `event_id` / `op_id` would be rejected
+  by nothing. Committing the head on the item closes both: the tail is
+  covered by a record outside the ledger, and a replay changes the head
+  hash. The honest limit: this is unkeyed, so it detects rewriting, not a
+  writer who updates both files coherently — the same trusted-team
+  boundary as `content_hash`, and explicitly weaker than the HMAC token
+  `lanes.py` uses for delivery artifacts.
+- `release_blocking` records whether this item's evidence is subject to
+  the release-blocking tier rule. It is an input to the verdict, not a
+  verdict.
+- Reading an item is fail-safe per item. A malformed
+  `items/<work_id>.json` yields a bounded error record for that
+  `work_id`; `work list` still returns every other item. This is the
+  roadmap's "one corrupt item must not brick all work," and it is
+  asserted by a test that writes literal garbage into one item file.
+
+### Corrupt Items Block Their Own Mutation
+
+This is C1 (`ISSUES.md`:864–873) restated for work. In `gates.py`, `set`
+and `waive` silently overwrote a corrupt `gates.json`, discarding the
+corruption HOLD.
+
+- A work item that fails to load blocks every mutation of **that item**.
+  `work assign`, `work start`, `work deliver`, and `work abandon` all
+  refuse with a non-zero exit and a repair hint.
+- The corrupt file is never overwritten, never repaired implicitly, and
+  never replaced by a fresh record under the same `work_id`. Recovery is
+  an explicit operator action that moves the file aside.
+- Every read-modify-write of a work item holds a per-item cross-process
+  lock for the whole sequence — load, validate, decide, write the item,
+  append the event, fsync — not just the write. An unlocked RMW was C1's
+  second fail-open. The lock is backed by `item_seq` as an
+  `expected_version`, so a writer that somehow proceeds without the lock
+  still loses cleanly to a version conflict instead of silently
+  overwriting.
+- The artifact analogue holds too: an `artifact_id` whose existing JSON
+  is **unreadable** is never repaired in place and never reused. A
+  registration against a corrupt existing artifact refuses; it does not
+  treat the unreadable file as absent and write over it. That was C1(1)
+  in a different costume.
+- The honest limit: the lock is a coordination lock, not a security
+  boundary (DESIGN.md principle 4). It prevents concurrent honest writers
+  from losing an update; it does not stop a writer who ignores it.
+
+## Event Model
+
+`.agenttalk/work/events/<work_id>.jsonl`, append-only, one JSON record
+per line, appended through `_jsonl.append_record` **inside**
+`store._config_lock()` — the `onboarding.append_event` pattern, because
+`append_record` does not serialize writers on its own.
+
+```json
+{
+  "schema_version": 1,
+  "event_id": "we-20260718-091402-113400-KQ3x",
+  "work_id": "w-0007",
+  "seq": 12,
+  "prev_hash": "sha256:7c1a0e93bb42f508",
+  "op_id": "op-4a91c07e",
+  "ts": "2026-07-18T09:14:02.113400Z",
+  "actor": "codex-dev-2",
+  "type": "artifact_attached",
+  "artifact_id": "a-3f91c2",
+  "head_sha": "b8e1c3a70f2d4916ac53b7e08d1f6a2c94e7d305",
+  "note": "ruff + pytest on 3.10"
+}
+```
+
+Rules:
+
+- Every persisted event field is classified **bound** xor
+  **curation-mutable**, and both sets are pinned by a construction test
+  that fails when a new field is added to neither set. This is the
+  provenance discipline from the v0.76.1 knowledge work
+  (`ISSUES.md`:84–89): the integrity boundary is complete-by-construction,
+  not a hand-maintained list that drifts.
+- **Bound** (immutable, folded into the event's identity):
+  `schema_version`, `event_id`, `work_id`, `seq`, `prev_hash`, `op_id`,
+  `ts`, `actor`, `type`, `artifact_id`, `head_sha`, `from_state`,
+  `to_state`. A later event can never rewrite these on an earlier event.
+- **Curation-mutable** (a later authorized event may supersede the
+  projected value): `note`, `labels`. Nothing that feeds a verdict is
+  curation-mutable, which is the point — a forged curation event must not
+  be able to move a gate.
+- `actor` and `ts` are bound specifically because forging attribution and
+  creation time was a reproduced attack in the knowledge work, where it
+  had poisoned `roster --expertise` and the dashboard.
+- Event types are a small closed vocabulary, and **each carries a
+  required payload** — a type with a missing or extra payload field is a
+  malformed line, not a tolerated variant:
+
+  | `type` | Required payload | Who may drive |
+  |---|---|---|
+  | `created` | `title`, `domain_id` | any rostered agent |
+  | `assigned` | `owner` | owner or lead |
+  | `started` | — | owner |
+  | `lane_bound` | `lane_id`, `lane_generation` | owner |
+  | `artifact_attached` | `artifact_id`, `head_sha` | producer or owner |
+  | `review_requested` | `request_id` | owner |
+  | `review_recorded` | `request_id`, `reviewed_head_sha` | owner |
+  | `state_asserted` | `asserted_state` | any rostered agent (advisory) |
+  | `delivered` | `delivery_artifact_path` | owner or lead |
+  | `abandoned` | `reason` | owner or lead |
+  | `reopened` | `reason`, `supersedes_event_id` | lead only |
+
+  An earlier draft named the types and classified their fields as bound
+  xor curation-mutable, but never said what each type must *contain* —
+  so `assigned` had no owner, `lane_bound` no lane, and `reopened` no
+  authority rule. The classification test passed anyway, because it
+  tested field classification rather than per-type completeness.
+- `op_id` is **unique across the ledger**. A replayed event re-encoded
+  with a fresh `op_id` still fails against `ledger_head`, and one
+  re-encoded with the original `op_id` is rejected as a duplicate.
+- The construction test is extended accordingly: it pins the bound xor
+  curation-mutable partition **and** the per-type required payload above,
+  failing when a new type or field is added to neither.
+- **`seq` orders the ledger; timestamps never do.** `seq` is a
+  gap-free monotonic integer per `work_id`, and `prev_hash` chains each
+  record to its predecessor's canonical hash. `event_id` retains a
+  timestamp prefix for human readability and is *never* a sort key.
+  Anything in a projection that reaches for "the latest" means highest
+  valid `seq`, not newest `ts`.
+- A malformed physical line is **isolated**, surfaced, and skipped, and
+  later valid records are retained — the existing JSONL reader contract
+  (DESIGN.md principle 3). It is never silently dropped: the projection
+  carries a `ledger_problems` count, and a non-zero count blocks a
+  `GO` verdict rather than degrading quietly.
+- Skipping a bad line preserves it for diagnostics but must **not** let
+  later records take effect across the hole. A `seq` gap or a broken
+  `prev_hash` link raises `work_event_chain_broken`, and transitions
+  after the break are not applied. Reading past a torn transition to find
+  a later `ready` is precisely the fail-open this rule exists to stop.
+- **The per-ledger lock spans the whole append**, not just the write
+  call. `_jsonl.append_record` is not one-record-atomic on its own and
+  its docstring says the caller owns serialization: internally it
+  `lseek`s to inspect the trailing byte, may issue a *separate*
+  `_write_all(fd, b"\n")` to repair a missing delimiter, and then writes
+  the payload through a `while remaining:` loop over `os.write`
+  (`_jsonl.py:23-29`, `:66-74`). `O_APPEND` makes each individual
+  `os.write` atomic; it does not make one logical record atomic. Two
+  unserialized writers can therefore both observe the same unterminated
+  tail, or interleave chunks of two payloads. Work holds
+  `store._config_lock()` across tail inspection, `seq` allocation, the
+  append, and the `fsync` — the `onboarding.append_event` pattern,
+  applied deliberately rather than by imitation.
+- Events are evidence of what happened, not authority over what is true.
+  A `state_asserted` event records that an actor claimed a state; the
+  projection still derives status from records. An event cannot assert an
+  item into `ready`.
+
+### Crash And Recovery Protocol
+
+Two files cannot be updated atomically together, so the design names
+which side is authoritative **per question** and makes the other
+reconstructible. Guessing at recovery time is what produces split-brain.
+
+- **The item is authoritative for identity and current state** — what
+  this item is, who owns it, what it is bound to, whether it is terminal.
+- **The ledger is authoritative for history** — how it got there, who
+  acted, and in what order.
+- **A `GO` requires both to agree.** The item answers "what," the ledger
+  answers "how we got here," and a divergence between them is non-GO in
+  either direction. The item being authoritative for state does *not*
+  mean an unaudited state advances; it means the item wins the question
+  of what state we are in, while the ledger's silence still blocks.
+
+Write order is always: set `pending_op` on the item, durably write the
+item, append the event, clear `pending_op`. Recovery is idempotent by
+`op_id` — re-appending an event whose `op_id` already exists in the
+ledger is a no-op, never a duplicate.
+
+| Crash point | Observed | Outcome |
+|---|---|---|
+| (a) item published, no event | `pending_op` set, no matching `op_id` | Recovery re-appends the event from `pending_op` exactly once. If the payload cannot be reconstructed, `work_ledger_gap` and the state does not count as audited. |
+| (b) event published, no item | orphan `op_id` with no item | `work_ledger_orphan`; never materializes an item, because the item is identity-authoritative. Unreachable through the normal path (item is written first), so it means a hand-edited or externally-written ledger. |
+| (c) item updated, no event | `pending_op` set on an advanced item | Same as (a): re-append by `op_id` if provable, else `work_ledger_gap`. The advanced state is **not** accepted for `GO` while unaudited. |
+| (d) event appended, item stale | ledger `seq` ahead of `item_seq` | `work_ledger_ahead`; HOLD. The transition is not applied to the item, because replaying history onto an authoritative-for-state record would be exactly the silent rebinding this design forbids. |
+| (e) neither published | no `pending_op`, no orphan | Clean no-op. Nothing happened. |
+
+Rules:
+
+- Every outcome above is deterministic and converges to the same answer
+  on repeated reads. Two agents recovering the same interrupted
+  transaction reach the same state or the same named HOLD; neither
+  invents a third.
+- `pending_op` is cleared by a second item write, which can itself crash.
+  That leaves `pending_op` set with the event already appended — case (a)
+  with the event present, which recovery resolves idempotently by
+  observing the `op_id` and clearing. The protocol converges rather than
+  looping.
+- **Recovery never runs inside `work check`.** It is a separate explicit
+  command. A verdict function that repaired state would make the answer
+  depend on how many times it had been called (see Work Check purity).
+- The honest limit: this converges for *crashes*. It does not defend
+  against a writer who edits both files to agree on a false history,
+  which is the same trusted-team boundary as everything else here.
+
+## Artifact Schema
+
+`.agenttalk/artifacts/<artifact_id>.json`, write-once, with an optional
+bounded `.log` sibling:
+
+```json
+{
+  "schema_version": 1,
+  "artifact_id": "a-3f91c2",
+  "work_id": "w-0007",
+  "created_at": "2026-07-18T09:31:44.902113Z",
+  "ingested_at": "2026-07-18T09:31:45.010882Z",
+  "root_execution_id": "x-6b20f4de91c7",
+  "derived_from": null,
+  "supersedes": null,
+  "producer": "codex-dev-2",
+  "producer_class": "agent",
+  "check_name": "pytest",
+  "covered_globs": ["src/agenttalk/**", "tests/**"],
+  "command": ["py", "-3.10", "-m", "pytest", "-q"],
+  "cwd": "worktrees/lane-lanes-hardening",
+  "exit_code": 0,
+  "started_at": "2026-07-18T09:29:02.441077Z",
+  "ended_at": "2026-07-18T09:31:44.180255Z",
+  "base_sha": "e0e8f7b4c19a2d6f8b3e5107c9a4d2f6b8e1c3a7",
+  "head_sha": "b8e1c3a70f2d4916ac53b7e08d1f6a2c94e7d305",
+  "diff_hash": "sha256:41d9a0c6f38b2e57",
+  "policy_hash": "3b1f0c9d22",
+  "evidence_source": "local_command",
+  "isolation_status": "verified",
+  "trust_tier": "local_agent",
+  "log_path": "a-3f91c2.log",
+  "log_bytes": 65536,
+  "log_hash": "sha256:0b7e14c2aa9f6d30",
+  "log_truncated": true,
+  "redaction_status": "not_scanned",
+  "content_hash": "sha256:9c2f77b104ae3d81"
+}
+```
+
+Rules:
+
+- An artifact is written once and never modified. There is no update
+  path, no status field to flip, and no in-place correction. A wrong
+  artifact is superseded by a new artifact carrying `supersedes:
+  "<old_id>"`; both remain readable, and the verdict considers only
+  artifacts that bind to the current revision.
+- Write-once is enforced with **create-if-absent** under the artifact
+  lock. Re-registering an existing `artifact_id` is idempotent **only**
+  when the incoming content is byte-identical; any difference is a
+  collision that refuses and leaves the original bytes untouched. A
+  correction that reuses an ID is refused, not merged — reusing an ID is
+  how "write once" quietly becomes "write whenever," and every gate
+  already holding that ID would silently observe new evidence.
+- The honest limit: this is not filesystem immutability. A process with
+  write access can overwrite the file, which is why `content_hash` exists
+  and why validation is on-read.
+- `content_hash` is computed over the canonical serialization of every
+  field except itself, so a tampered or torn artifact fails validation on
+  read. It detects accidental corruption and casual edits; it does not
+  detect an attacker who recomputes it (no secret is involved). Lane
+  delivery artifacts already use an HMAC integrity token for the stronger
+  property; work artifacts deliberately do not claim it.
+- The **exact input binding** is `work_id`, `base_sha`, `head_sha`,
+  `diff_hash`, `policy_hash`, `command`, `cwd`, `exit_code`,
+  `started_at`/`ended_at`, `producer`, and `trust_tier` — the roadmap §4
+  list in full. An artifact missing any of these does not count as
+  evidence for a blocking requirement; it is `referenced` at best.
+- **A missing binding field is never backfilled from current state.**
+  An importer that fills an absent `base_sha`, `head_sha`, `diff_hash`,
+  or `policy_hash` from the item's present values manufactures the exact
+  provenance the binding exists to prove, and turns a stale or foreign
+  artifact into a current one. Absence raises
+  `work_artifact_binding_missing`; mismatch raises `work_artifact_stale`.
+  Neither is repaired.
+- `ingested_at` is when work recorded the artifact and is distinct from
+  the producer-reported `started_at`/`ended_at`. Only `ingested_at` is
+  observed locally; the other two are producer claims.
+- `covered_globs` declares **what the check actually exercised**,
+  normalized through `domains.normalize_glob`. Without it there is no way
+  to express "a `src/ui/**` artifact," and therefore no way to detect
+  that a `src/payments/**` requirement was answered with unrelated
+  evidence — `work_artifact_wrong_scope` would be unimplementable and
+  its test untestable. A requirement is satisfied only when the
+  requirement's glob is covered by the artifact's `covered_globs`.
+  The honest limit: `covered_globs` is a producer claim like any other
+  field. It makes a *mismatch* detectable; it cannot prove the check
+  really exercised those paths.
+- **The exact-key join is authoritative: an artifact whose
+  `(base_sha, head_sha)` differs from the resolved current revision is
+  NOT CURRENT**, and a not-current artifact never satisfies a
+  requirement. Evidence binds to an exact commit (roadmap §4: "Evidence
+  binds to exact inputs … base SHA, head SHA"; §7 makes unbound evidence
+  a Hard HOLD), and `automation_ci` is "automation on exact
+  commit/policy" — a CI run attested H1, and no local reasoning converts
+  that into an attestation of H2.
+- Not-current is not automatically *hard* stale. The
+  `{stale_reasons, caution_flags, hard_stale}` shape carries the
+  distinction: an ordinary head move is a `stale_reason`, while a
+  **content-identical rebase** raises the named caution flag
+  `rebased_identical_diff`. Neither satisfies a requirement; the flag
+  exists so an operator can tell "this needs a re-run" from "this needs
+  a rethink."
+- `diff_hash` is over the normalized `base_sha..head_sha` diff, which
+  makes it a **diagnostic, never a satisfier**. Equal patch content does
+  not prove an equal base tree: a rebase onto a different base yields the
+  same diff and a different resulting tree, along with different
+  dependency resolution and build inputs. `diff_hash` equality tells an
+  operator that a cheap revalidation is likely to pass; it does not
+  perform that revalidation.
+- The caution/blocking split is explicit. For a **release-blocking**
+  requirement a caution is **insufficient**: re-execution at the new
+  `(base_sha, head_sha)` pair is required, with no exception. For a
+  **non-blocking** requirement, project policy may accept the caution.
+  A test result is a property of base *plus* patch, not of the patch: if
+  the new base moved a dependency pin, a default, or a signature, the
+  identical diff can fail where it passed — ordinary merge skew. That is
+  why the caution is a prompt to re-run rather than a substitute for it.
+- Project policy **may** permit diff-equivalent reuse, and only in this
+  narrow shape: a new artifact bound to H2 is produced by a verifier that
+  positively establishes the equivalence, and its `trust_tier` is no
+  stronger than that verifier's own tier. That is new evidence about H2,
+  not old evidence stretched over it. Reuse is available for non-release
+  claims only; a release-blocking `automation_ci` requirement stays stale
+  until CI attests H2, because the whole content of that tier is *which
+  commit the automation ran on*.
+- An earlier draft justified diff-equivalent reuse by analogy to D-6's
+  anchor-relative knowledge staleness. **The analogy fails on its own
+  terms**, which is a cleaner refutation than the cost argument that
+  first replaced it. D-6 rejects HEAD-relative staleness because it would
+  empty the knowledge layer on every *unrelated* commit — a rationale
+  that requires the anchor to be evaluated against a continuously
+  advancing shared HEAD. Work evidence is not HEAD-relative in that
+  sense: it binds one specific `base_sha..head_sha` pair for one item,
+  and unrelated commits to master do not move it. The noise problem D-6
+  solves does not arise here, so its conclusion cannot be imported.
+- The underlying difference: a knowledge note's claim is scoped to an
+  **anchor**, while a test artifact's claim is scoped to a **build**.
+  Anchor-relative freshness is sound for the former and unsound for the
+  latter. The cost asymmetry points the same way — a false-stale artifact
+  costs one re-run, a false-fresh one costs a false GO — but the scope
+  argument is the decisive one.
+- `command` is a structured argv list, never a shell string. D1 defines
+  the field; D1–D4 do not execute it. Recording what an agent says it ran
+  is not the same as running it, and the runner is deliberately deferred
+  (roadmap §7: "a runner accepts shell strings by default" is a Hard
+  HOLD).
+- `log_truncated` being `true` is not a failure, but a truncated log
+  cannot be the sole basis for a blocking requirement being satisfied,
+  because the truncation may have removed the failure.
+- `redaction_status` ∈ `{not_scanned, scanned_clean, scanned_redacted}`.
+  D3 ships `not_scanned` honestly rather than claiming a scan that does
+  not exist.
+- **Existence is never advancement.** C5 (`ISSUES.md`:914–917) records
+  the *fix* — `lane deliver` "reads back + shape/verdict-validates the
+  delivery artifact before clearing the lane (a HOLD/wrong-schema
+  artifact can no longer clear it)". The pre-fix behaviour is implied by
+  that text rather than stated in it, so this RFC asserts the rule on its
+  own account and cites C5 as the precedent for the remedy. A work item advances only after the artifact is read back and
+  shape-validated *and* verdict-validated: schema version exact-match,
+  `content_hash` recomputed, required binding fields present, `work_id`
+  matching, and `head_sha` matching the current revision. A file that
+  exists but fails any of those blocks; it does not advance and it does
+  not read as absent.
+
+### Torn Reads And The JSON/Log Pair
+
+`_atomic.write_text` falls back to a direct non-atomic write once the
+Windows sandbox latch trips, and its own docstring says "a reader can
+catch a half-write." An artifact is also *two* files, which are not
+group-atomic. Both are first-class outcomes, not exceptions.
+
+**Write order is log first, metadata last.** The `.log` is written and
+hash-validated before the `.json` exists, and publishing the `.json` is
+the commit marker that makes the artifact real. A crash therefore leaves
+either nothing or an unreferenced log, never a metadata record pointing
+at a log that was never finished.
+
+| State | Outcome |
+|---|---|
+| (a) `.log` only | Orphan. Surfaced, never evidence. Cleanable. |
+| (b) `.json` only, log declared | `work_artifact_log_missing` |
+| (c) torn `.log` | `log_hash`/`log_bytes` mismatch → `work_artifact_log_hash` |
+| (d) torn `.json` | `work_artifact_unreadable`. Never reconstructed by guessing from the log. |
+| (e) both valid, no attach event | Valid orphan; not counted. An idempotent attach may adopt it. |
+| (f) event references an artifact whose pair is not valid | `work_artifact_unreadable` — a broken reference is non-GO |
+| (g) ID exists with different bytes | Immutable collision; refuse, never overwrite |
+
+Rules:
+
+- Both files are validated on **every** consumption, not once at
+  registration. A hash checked only at attach time is a cache, and a
+  cache is not authority.
+- `UNKNOWN` never satisfies a blocking requirement and never crashes the
+  projection. Both halves matter: crashing would make one bad artifact
+  brick `work check`, and passing would be the fail-open C1 was about.
+
+## Evidence Tiers And Trust Tier
+
+The roadmap tier table, reproduced in full including its trailing default
+rule:
+
+| Tier | Meaning | Default gate role |
+|---|---|---|
+| `referenced` | prose claim or linked output only | Never satisfies required gates |
+| `local_agent` | local command run by an agent | Useful pre-review evidence |
+| `local_operator` | local command run/confirmed by operator | Strong local evidence, still not CI |
+| `automation_ci` | configured automation on exact commit/policy | Default release-authoritative tier |
+| `external_attested` | signed/attested third-party evidence | Later, strongest tier |
+
+> Release-blocking gates should require `automation_ci`,
+> `external_attested`, or an explicit operator waiver unless project
+> policy intentionally allows otherwise.
+
+`trust_tier` is **derived**, by a pure total function, from vocabularies
+that already exist. It is not a new independent assertion a producer gets
+to make about itself:
+
+| Derived `trust_tier` | Derived from |
+|---|---|
+| `referenced` | no `evidence_source`, or `manual_review`, or any missing binding field, or `exit_code` absent |
+| `local_agent` | `gates` `evidence_source == "local_command"` and `producer_class == "agent"` |
+| `local_operator` | `evidence_source == "local_command"` and `producer_class == "operator"` |
+| `automation_ci` | `evidence_source == "automation_ci"` |
+| `external_attested` | `evidence_source == "external_attested"` (new; no producer emits it in D1–D5) |
+
+Rules:
+
+- The tier ladder maps onto `gates.BLOCKER_GREEN_SOURCES` rather than
+  competing with it. That set is `{automation_ci, operator_waiver}`
+  today, which is already the repo's answer to "what may green a
+  blocker," and it agrees with the roadmap rule on two of three terms.
+  `external_attested` is the third term and has no `gates.py`
+  counterpart yet.
+- Because `gates.py` is outside this team's ownership boundary, adding
+  `external_attested` to `VALID_EVIDENCE_SOURCES` /
+  `BLOCKER_GREEN_SOURCES` is filed as a request to the primary team, not
+  an edit. Until it lands, `external_attested` is a work-side tier that
+  no producer emits, and `work check` treats it as unreachable rather
+  than pretending it works.
+- `producer_class` ∈ `{agent, operator, automation, external}` is
+  resolved from the roster and the invoking context at write time, not
+  from a self-declared field in the artifact. An artifact that claims
+  `producer_class: "operator"` while being written by a rostered agent is
+  a validation failure, not an upgrade. The honest limit: a local writer
+  who bypasses the CLI can write any value, which is why the tier is
+  revalidated at verdict time and why this is trusted-team correctness
+  rather than an authority boundary.
+- **Operator waiver is not a tier.** It is a separate gate-side decision
+  that already exists (`gates.waive_gate`, `operator_waiver`). Work reads
+  a waiver through `check_gates`; it does not implement a second waiver
+  mechanism, because two waiver paths would be two authorities.
+- `isolation_status` on the artifact records the linked lane's isolation
+  at write time, using the **artifact-side** lane vocabulary
+  `{verified, advisory_unisolated, unverified}` — the values `lanes.py`
+  actually writes. Only `verified` counts toward a release-blocking
+  requirement. This matches the existing hard reject in
+  `lanes.validate_delivery_artifact(..., require_isolation=True)`, which
+  raises on every non-`verified` status, so work is not inventing a
+  stricter rule than the close path already enforces.
+- **`producer`, `producer_class`, and `trust_tier` in an incoming
+  artifact are untrusted input.** They are recomputed at registration
+  from the invoking context and rejected on disagreement, never accepted
+  as written. An artifact that arrives claiming
+  `producer: "github-actions"` gets whatever tier its actual origin
+  earns.
+- A **platform claim** is evidence like any other: "this works on Linux"
+  requires an executed artifact whose producer ran on Linux at the
+  current revision. A skipped platform is `UNKNOWN`, never pass. Because
+  `check_name` is an opaque string, platform-scoped requirements are
+  expressed as distinct check names (`pytest-linux`, `pytest-windows`)
+  rather than a platform axis in the schema — the roadmap's own
+  cross-platform Hard HOLD is exactly this failure, where a silently
+  skipped tranche read as support.
+
+### Execution Lineage And Independent Corroboration
+
+`content_hash` proves an artifact record is intact. It says nothing about
+whether two records came from the *same run*, because the record includes
+its own `artifact_id` and two registrations of one execution hash
+differently. Independence therefore needs its own identity:
+
+- `root_execution_id` is derived from the **execution's identity**:
+  `command`, `cwd`, `base_sha`, `head_sha`, `policy_hash`, `producer`,
+  and `started_at`. It is deliberately **not** derived from the captured
+  output. Output was the obvious choice and it is wrong: a JUnit XML and
+  a console log of one pytest process are different bytes, so an
+  output-derived root would hand two representations of one run two
+  different identities — exactly the corroboration the field exists to
+  prevent. An adapter that truncates or reformats output must not thereby
+  mint a new execution.
+- Registering a second artifact with an existing `root_execution_id` and
+  a **different** `trust_tier` or origin is refused as
+  `work_artifact_execution_conflict`. Re-importing one local log under a
+  new ID with `producer_class: "automation"` does not launder it into CI
+  evidence; it collides with its own earlier registration.
+- `derived_from` names the parent artifact when one record is a
+  reformatting or aggregation of another. Its rules are normative, not
+  descriptive:
+  - a descendant **inherits its ancestor's `root_execution_id`
+    verbatim** — it does not compute its own;
+  - a `derived_from` whose parent's root disagrees with the child's
+    declared root is rejected as `work_artifact_lineage_invalid`;
+  - lineage is walked **transitively** to a single root, and a cycle or
+    a missing parent is `work_artifact_lineage_invalid`, never a
+    silently-accepted new root;
+  - a derived artifact may support a *different* claim, but it can never
+    corroborate its own ancestor or any sibling sharing that root.
+- **Corroboration counts distinct transitive roots, not records.** A
+  policy asking for two independent checks is not satisfied by two
+  adapters over one process. `required_checks` entries may declare
+  `min_independent_roots` (default 1); the independence count is the size
+  of the set of distinct transitive `root_execution_id` values among
+  satisfying artifacts, and it is computed, not asserted.
+- The honest limit: a producer that lies about `started_at` or `command`
+  mints a distinct root, and nothing here detects that. This makes
+  accidental double-counting and adapter-shaped laundering
+  machine-detectable; it is not a defence against a writer constructing
+  false executions.
+- An **operator waiver never mutates evidence.** It never changes an
+  artifact's tier, never turns a non-`pass` outcome green, and is not
+  transferable to a second requirement that happens to match the same
+  glob. The underlying artifact keeps its original tier, verbatim.
+- **No waiver satisfies a release-blocking work requirement in D1–D5,
+  because no waiver record capable of doing so exists yet.**
+  `gates.waive_gate` (`gates.py:143-181`) stores only
+  `{operator, date, reason, scope, expires}` where `operator` is
+  unauthenticated free text; it records no `work_id`, no check or glob
+  identity, no head SHA, and no policy hash. `_gate_verdict`
+  (`gates.py:311-317`) then makes *any* active waiver non-blocking.
+  ASSURANCE.md:109-114 is explicit that this path "MUST NOT be treated as
+  operator authority until it is hardened to consume + validate a typed
+  operator-answer reference," and that "a lead may not self-waive an open
+  REVISE/P0/P1." Work honours that prohibition rather than routing around
+  it: a gates waiver is *displayed* on the requirement it names and never
+  satisfies one.
+- The waiver record work would need, specified here so the hardening has
+  a target and D4 does not improvise one: an authenticated
+  operator-answer reference (server-derived actor, never caller-asserted),
+  the exact `work_id`, the requirement's `check_name` and matched glob,
+  `head_sha`, both base and candidate `policy_hash`, a reason, an expiry,
+  an explicit non-transitivity marker, and a no-self-waive rule against
+  the finding's owner. Until such a record exists and is validated, the
+  honest state is that release-blocking requirements have **no** waiver
+  escape — which is stricter than the roadmap's tier table anticipated,
+  and deliberately so, because the roadmap describes the intended end
+  state while ASSURANCE.md describes what is trustworthy today.
+- **Operator confirmation is not operator execution.** An operator
+  reviewing an agent-produced artifact produces a separate typed
+  acknowledgement referencing the immutable lower-tier artifact. It never
+  rewrites `producer_class` to `operator`. `local_operator` requires
+  evidence the operator *ran* the command under the bound inputs;
+  clicking confirm on someone else's output is not that, and treating it
+  as such would make the strongest local tier the easiest one to obtain.
+- The honest limit: every one of these rules is enforced against records
+  a local writer could fabricate wholesale. They stop accidental
+  double-counting and casual laundering, which is the realistic failure;
+  they do not stop a determined forger.
+
+## Lifecycle State Machine
+
+The roadmap lifecycle, unchanged and deliberately narrow:
+
+```text
+draft -> open -> active -> review -> blocked -> ready -> delivered -> closed
+                                  \                         \
+                                   -> changes_requested      -> abandoned
+```
+
+Every state except the terminal ones is **derived**. The projection
+answers "what state is this item in" by evaluating records in a fixed
+order, and the first matching rule wins:
+
+| Derived state | Condition |
+|---|---|
+| `abandoned` | `terminal == "abandoned"` |
+| `closed` | `terminal == "closed"`, or the linked close is published |
+| `delivered` | `terminal == "delivered"`, or the linked lane has a committed delivery artifact |
+| `changes_requested` | a review-result bound to the **current revision** is `rejected` |
+| `review` | a linked review thread is open and unanswered |
+| `active` | a lane is bound, or any artifact exists |
+| `open` | an owner is assigned |
+| `draft` | otherwise |
+
+Rules:
+
+- **`record_state` is a pure function of records. It never reads the
+  verdict.** An earlier draft put `blocked` and `ready` in this ladder,
+  which made `record_state = f(verdict)` while the contradiction pass
+  made `verdict = g(record_state)` — a circular definition with no fixed
+  point, no evaluation order, and no convergence. It also put `blocked`
+  above every record-shaped row, so once `work check` existed a fresh
+  draft with no resolvable revision would derive `UNKNOWN` and render
+  `blocked`, and `changes_requested` became unreachable. The two are
+  **orthogonal axes**, and interleaving them was the single most serious
+  defect in the first draft.
+- Ordering is fixed and total, so two readers of the same records always
+  derive the same state. It is written as a table, not as nested
+  conditionals, so a reviewer can check exhaustiveness by reading it.
+- `changes_requested` carries a **revision qualifier**. A rejection bound
+  to H3 does not describe an item now at H4; it is history. Without that
+  qualifier a stale rejection would poison every later revision, which is
+  Contradiction case C reappearing in the state ladder — and in the first
+  draft case C survived only because the `closed` row happened to match
+  first, which is luck of table position rather than a mechanism.
+- Who may drive each transition: the **owner** may assign, start, bind a
+  lane, attach artifacts, and request review. Any rostered agent may
+  attach an artifact naming itself as producer. Only the item owner or a
+  lead may `deliver` or `abandon`. `closed` is driven by `close.py`, not
+  by work — work reads it. No prose in any message body drives any
+  transition (DESIGN.md principle 1).
+- Terminal states are recorded on the item because they must survive a
+  corrupt ledger; every other state is recomputed and nothing about it is
+  persisted.
+- "Current" and "latest" in this table never mean newest timestamp. For
+  the ledger it means highest valid `seq`. **For bus records there is no
+  ordering authority at all, so work never orders them.**
+  `threads.derive_threads` sorts by message id (`threads.py:596`), and
+  `store._new_id` is monotonic only *within one process* — its own
+  docstring says "for any single writer" (`store.py:6085-6094`). Across
+  two agents, id order is producer-clock order wearing a different name.
+  Delegating "the current review" to thread derivation would be a
+  clock-ordering bug committed while believing it had been avoided.
+- Work therefore resolves review state by **revision binding, not
+  recency**: a review-result counts only if it is bound to the current
+  revision, and two conflicting bound results at the same revision are
+  `work_contradiction` — surfaced, never ordered. This is the one place
+  where "we cannot order these" is the honest answer, and picking the
+  newest would be inventing an authority the bus does not have.
+- **A lane may be claimed by at most one non-terminal work item.**
+  Binding is serialized on `(lane_id, lane_generation)`, so a second
+  concurrent `work start` against the same lane loses at mutation time.
+  The projection independently detects cardinality greater than one — a
+  state only reachable through corrupt or hand-written records — and
+  holds *every* claimant with `work_lane_conflict` until reconciled,
+  rather than picking the older one.
+- A non-terminal item requires a live lane whose generation matches
+  `lane_generation` and whose head matches the bound revision. A
+  terminal item may instead reference a validated immutable delivery
+  artifact, which is what lets a delivered item stay readable after its
+  lane is cleaned up. A lane that vanished raises `work_lane_missing`; a
+  lane whose ID was reused raises `work_lane_generation_mismatch`.
+  Neither is inferred to mean the work completed.
+- **Work never deletes a worktree.** `work abandon` and `work deliver`
+  record intent and may *request* lane cleanup; `lanes.py` remains the
+  sole authority on whether cleanup is safe, and it refuses on dirty,
+  unmerged, unmanaged, or user-created content. Roadmap §7 makes
+  "worktree cleanup can delete dirty, unmerged, unmanaged, or
+  user-created files" a Hard HOLD, and the cheapest way to never violate
+  it is to own no deletion path at all.
+- The honest limit: "who may drive" is enforced against the roster, which
+  is trusted-team routing metadata, not authenticated identity. Per the
+  identity RFC, roles and groups remain routing metadata until a real
+  per-agent signing model exists.
+
+### Two Axes, Never Collapsed
+
+`work status` reports a **pair**: the record state above, and the gate
+verdict from Work Check. Neither is derived from the other, and neither
+may hide the other.
+
+| | `GO` | `HOLD` | `UNKNOWN` |
+|---|---|---|---|
+| `draft` / `open` | draft, GO | draft, HOLD(n) | draft, UNKNOWN(n) |
+| `active` / `review` | **ready** | **blocked**(n) | active, UNKNOWN(n) |
+| `changes_requested` | changes_requested, GO | changes_requested, HOLD(n) | … |
+| `delivered` / `closed` / `abandoned` | terminal — verdict shown, never masked | | |
+
+Rules:
+
+- `ready` and `blocked` are **presentation compositions**, not rungs.
+  They are the names for (`active`-or-`review`, `GO`) and
+  (`active`-or-`review`, `HOLD`) respectively, kept because the roadmap's
+  lifecycle vocabulary uses them. They are not states a record can be in.
+- **No single-token rendering may drop either axis.** A UI that must show
+  one token shows the record state and the verdict together
+  (`active · HOLD(3)`), never a bare `blocked`. Collapsing to one token
+  is how a fresh draft would read as blocked and how a rejected review
+  would vanish behind a HOLD.
+- A `draft` item with an unresolvable revision is `draft, UNKNOWN` — an
+  honest "we have not started, so we cannot tell you it is deliverable."
+  It is not `blocked`, because nothing is blocking; nothing has begun.
+- Terminal items still report a verdict. A `delivered` item whose
+  evidence has since gone stale reads `delivered · HOLD(1)`, which is
+  exactly the contradiction an operator needs to see rather than a green
+  `delivered`.
+
+## Work Check
+
+`work.compute_verdict` is pure. The CLI resolves every piece of I/O —
+git, lanes, gates, closes, threads, artifacts, policy — into a resolved
+bundle and passes it in. This is the `close.compute_verdict` /
+`_build_signoff_eval` split, copied deliberately, and it is what makes
+the verdict unit-testable against dicts with no live repo:
+
+```python
+def compute_verdict(item: dict, *, artifacts: list[dict], lane_eval: dict | None,
+                    gate_check: dict, close_eval: dict | None, review_eval: dict,
+                    policy_eval: dict, revision: dict,
+                    source_errors: list[dict]) -> dict[str, Any]:
+```
+
+The return matches `close` and `lanes` exactly:
+
+```json
+{
+  "verdict": "HOLD",
+  "holds": [
+    {"code": "work_artifact_stale", "detail": "a-3f91c2 binds head b8e1c3a7, current head is 4d92f10c"},
+    {"code": "work_required_check_missing", "detail": "policy glob 'src/agenttalk/**' requires 'bandit'; no artifact found"}
+  ],
+  "ok": false
+}
+```
+
+Rules:
+
+- `verdict` ∈ `{GO, HOLD, UNKNOWN}`; `holds` is a list of
+  `{code, detail}`; `ok` is `true` **only** for `GO`. `UNKNOWN` is not a
+  third outcome between pass and fail — it is non-advancing exactly like
+  `HOLD`, and it exists only so an operator can tell "we established a
+  problem" from "we could not establish anything." Any consumer reading
+  `ok` gets the safe answer without knowing about `UNKNOWN`.
+- `UNKNOWN` wins over `GO` and loses to `HOLD`. If any source is
+  unreadable and no positive hold exists, the verdict is `UNKNOWN`; if a
+  real hold exists, that is more actionable and the verdict is `HOLD`
+  with the unknown-source holds included in the list.
+- HOLD codes are **stable plain strings**, not enums, matching
+  `close.py:68` ("STABLE hold codes (the public verdict contract - tests
+  assert each one)"). Every code below gets a test that asserts the exact
+  literal.
+- `gate_check` is `check_gates`'s output, whose shape
+  (`{schema_version, verdict, required_gates, blockers, gates}`) does
+  **not** match the close/lanes verdict shape. The CLI adapts it: each
+  entry in `blockers` becomes one `work_gate_hold` entry carrying the
+  gate name and reason. Work does not attempt to unify the two shapes,
+  and it does not read `gate_check["holds"]`, which does not exist.
+- `source_errors` is a required parameter, not an optional one, so a
+  caller cannot forget to pass failures and accidentally get a clean
+  verdict. Each entry produces a hold; a projection with a failed source
+  is never green (D-16).
+- **Requirements are derived first, evidence is matched second.** The
+  evaluator computes the required check set from the changed paths and
+  the applicable policy *before* looking at any artifact, then asks
+  whether each requirement is satisfied. Filtering artifacts first and
+  concluding from an empty list is how `all([])` returns true and a
+  wrong-scope artifact reads as no-requirement — the C1(3) shape. A
+  requirement with no matching evidence stays unsatisfied; it never
+  disappears.
+- A **present but wrong-scope** artifact is `work_artifact_wrong_scope`
+  *and* leaves its requirement unsatisfied. Two holds, not one, because
+  "you ran the wrong thing" and "you did not run the right thing" are
+  different repairs.
+- Each required check resolves to exactly one outcome from a closed
+  enum: `pass`, `fail`, `skipped`, `timeout`, `malformed`,
+  `adapter_error`, `unavailable`, `missing`. **Only `pass` satisfies.**
+  Every other value is a distinct, stable, non-GO outcome with its own
+  detail. There is no `else` branch and no "no findings means green" —
+  an empty parse result is `malformed`, not `pass`.
+- **Facts are joined on an exact key**, never on `work_id` alone. An
+  artifact, review, gate result, or close counts toward the current
+  verdict only when it matches on `(work_id, base_sha, head_sha,
+  diff_hash, policy_hash, lane_id + lane_generation)` as applicable to
+  that source. A record that matches loosely is *historical*, and
+  historical records are reported as history rather than silently
+  applied to the current revision.
+- **The revision is resolved at check time**, not read from a field. The
+  CLI resolves the authoritative head from the bound lane or target ref,
+  requires it to equal the artifact's bound `head_sha`, and requires that
+  SHA to still be reachable. A force-push that leaves the bound commit
+  unreachable is `work_revision_unreachable`, and rebinding to the new
+  head is an explicit event, never automatic.
+- **Nothing is inferred from an unresolvable revision.** A null or
+  garbage `base_sha`, an unreachable object, a git failure, or a diff
+  that cannot be computed yields `work_revision_unresolvable` — never
+  "no changed paths, therefore no requirements." An empty requirement set
+  from a failed diff is the same vacuous-truth bug as `all([])`, reached
+  by a different road.
+- **Timestamps never order anything and never establish freshness.**
+  Ordering is by `seq` and the existing thread derivation. A producer
+  timestamp beyond a bounded skew, or an interval where `ended_at`
+  precedes `started_at`, raises `work_implausible_timestamp` and the
+  artifact does not count. Only `ingested_at` is locally observed;
+  producer times are claims.
+- **The evaluator writes nothing.** `compute_verdict` performs no I/O,
+  stamps no `last_checked`, refreshes no cache, and reads no ambient
+  clock or git state — every such value arrives in `revision`. Calling
+  it twice with the same snapshot returns the same verdict and leaves
+  `.agenttalk/` byte-identical. Recovery from an interrupted transaction
+  is a separate command, so no repeat invocation of `work check` can turn
+  a HOLD into a GO.
+
+### The Review Binding Contract
+
+A `review-result` message today carries **no lens and no revision**.
+`gates.validate_review_result_evidence` is the only validator, it fires
+only for `status == "approved"` (`gates.py:270`), and the fields it
+requires are `risk_class`, `release_blocker`, `tests_referenced`,
+`tests_executed`, `residual_risk`, `evidence`-or-`artifacts`, and
+`na_reason` (`gates.py:269-296`). There is no `head_sha`, no `base_sha`,
+no `diff_hash`, and no `lens`. `reviewed_ref` exists only as skill
+policy and is validated by nothing.
+
+Two consequences the draft has to state rather than assume:
+
+- **Staleness is not computable for an unbound review.** A message with
+  no revision cannot be compared against the current one. Work does not
+  pretend otherwise: an unbound review-result raises
+  `work_review_unbound` and cannot satisfy a blocking review
+  requirement. It remains visible as `referenced` evidence.
+- **A new meta contract is unavoidable**, and specifying it here is the
+  point — the alternative is D4 inventing one under time pressure. Work
+  reads two additive meta keys on an existing `review-result`:
+  `meta.work_id` and `meta.reviewed_head_sha`. No new message kind, so
+  old clients are unaffected and the Non-Goal holds; but "no new kind"
+  is not the same as "no new contract," and pretending otherwise would
+  have hidden a real schema decision inside an implementation phase.
+
+Rules:
+
+- Work **validates** these two keys on ingestion and never writes them;
+  the reviewing agent supplies them. A `reviewed_head_sha` that is not
+  a full 40-character SHA is unbound, not coerced.
+- `work_review_stale` applies only to a *bound* review whose
+  `reviewed_head_sha` is no longer current. Unbound and stale are
+  different failures with different repairs — one needs a re-review, the
+  other needs the reviewer to say what they reviewed.
+- Lens identity is **not** read from the message, because nothing on the
+  message names a lens. It comes from close's `--lens` argument and
+  lives in close's `lens_acks`. Work links that; it does not parse it.
+
+### HOLD Codes
+
+| Code | Raised when |
+|---|---|
+| `work_malformed_item` | the item record fails to load or fails schema validation |
+| `work_unknown_schema_version` | `schema_version` is not exactly the supported version |
+| `work_ledger_problem` | one or more event lines are malformed |
+| `work_event_chain_broken` | a `seq` gap or `prev_hash` mismatch; later transitions are not applied |
+| `work_ledger_gap` | an item mutation has no corresponding event and cannot be reconstructed |
+| `work_ledger_ahead` | the ledger's `seq` is ahead of `item_seq` |
+| `work_ledger_orphan` | an event references a `work_id` with no item record |
+| `work_version_conflict` | a mutation's `expected_version` no longer matches `item_seq` |
+| `work_artifact_unreadable` | an artifact is torn, unparseable, or fails `content_hash` |
+| `work_artifact_binding_missing` | a required binding field is absent (never backfilled) |
+| `work_artifact_stale` | an artifact binds a `head_sha`/`diff_hash` that is not the current revision |
+| `work_artifact_wrong_scope` | an artifact is present but scoped to paths the requirement does not cover |
+| `work_artifact_log_missing` | metadata declares a log that is absent |
+| `work_artifact_log_hash` | the log's hash or size disagrees with the metadata |
+| `work_artifact_tier_drift` | the recomputed `trust_tier` disagrees with the bound one |
+| `work_artifact_execution_conflict` | a second artifact claims an existing `root_execution_id` at a different tier or origin |
+| `work_artifact_lineage_invalid` | a `derived_from` chain has a root mismatch, a cycle, or a missing parent |
+| `work_independence_insufficient` | fewer distinct transitive roots than the requirement's `min_independent_roots` |
+| `work_requirement_expired` | a satisfying artifact is older than the requirement's `max_age` |
+| `work_artifact_insufficient_tier` | the best artifact for a release-blocking requirement is below `automation_ci` (no waiver escape exists — see Evidence Tiers) |
+| `work_waiver_not_authoritative` | a gates waiver is present on a required check but cannot satisfy it (unauthenticated `operator` field, no work/head/policy binding) |
+| `work_implausible_timestamp` | a producer timestamp is beyond bounded skew or the interval is impossible |
+| `work_required_check_missing` | a policy-required check has no artifact at all |
+| `work_required_check_not_green` | a required check resolves to any closed-enum outcome other than `pass` (the outcome is named in the detail) |
+| `work_revision_dirty` | the working tree or lane has uncommitted changes |
+| `work_revision_unreachable` | the bound `head_sha` is no longer reachable (force-push, gc) |
+| `work_revision_unresolvable` | base/head cannot be resolved, or the diff cannot be computed |
+| `work_lane_isolation_unverified` | the linked lane's `isolation_status` is not `verified` |
+| `work_lane_missing` | the item references a lane that no longer exists |
+| `work_lane_generation_mismatch` | the lane ID matches but the generation does not |
+| `work_lane_conflict` | more than one non-terminal item claims the same lane |
+| `work_review_missing` | a required review has no terminal review-result |
+| `work_review_unbound` | a review-result carries no `reviewed_head_sha`, so its currency cannot be established |
+| `work_review_stale` | a *bound* review-result's `reviewed_head_sha` is no longer current |
+| `work_review_conflict` | two bound review-results disagree at the same revision (never ordered by recency) |
+| `work_review_rejected` | the current terminal review-result is `rejected` |
+| `work_gate_hold` | `check_gates` reported a blocker for the item's scope |
+| `work_gate_stale` | the gate result was recorded against a different revision or policy hash |
+| `work_close_hold` | the linked close's `compute_verdict` reported a hold |
+| `work_close_stale` | the close was evaluated at a revision or policy that is no longer current |
+| `work_policy_missing` | policy is required by the item but absent |
+| `work_policy_invalid` | policy fails shape validation |
+| `work_policy_changed_in_branch` | the branch relaxes `code-policy.json` (no authoritative waiver exists in D1–D5, so this does not clear) |
+| `work_policy_hash_drift` | the policy hash now differs from the one artifacts were produced under |
+| `work_policy_changed_since_open` | the policy moved since `policy_hash_at_open` |
+| `work_domain_scope_drift` | `registry_hash_at_bind` no longer matches the current registry |
+| `work_scope_outside_domain` | `scope_globs` is not a subset of the bound domain's paths |
+| `work_out_of_scope_change` | the diff touches paths outside `scope_globs` |
+| `work_source_error` | a source read failed and its result could not be established |
+| `work_contradiction` | two records disagree irreconcilably (see below) |
+
+### Contradictions Are Surfaced, Never Resolved
+
+Roadmap §7 makes "records can disagree with no single projection
+explaining the conflict" a Hard HOLD. The projection therefore has an
+explicit contradiction pass:
+
+- If the item's `terminal` says `delivered` but no committed lane
+  delivery artifact exists, that is `work_contradiction`, not a silent
+  preference for either record.
+- If a close is published but `work check` holds, that is
+  `work_contradiction`.
+- **`state_asserted` events are advisory and are never a contradiction
+  source.** An actor's recorded belief about the state is evidence that
+  they believed it, nothing more. An item whose records legitimately
+  advance past its last assertion is *normal*, not contradictory — an
+  earlier draft treated that disagreement as a hold, which combined with
+  a verdict-derived state to make such an item a permanent HOLD by
+  construction.
+- Contradictions compare **records to records**, never a record to the
+  verdict and never a record to the derived state. The evaluation order
+  is fixed and one-directional: resolve sources → compute per-source
+  holds → run the contradiction pass over records and those holds →
+  return. Nothing downstream feeds back upstream, which is what makes
+  the function total and its repeat-invocation determinism (Safety
+  Invariant #15) actually true rather than merely claimed.
+- A contradiction is always `HOLD`, never `UNKNOWN`. We established that
+  the records conflict; that is knowledge, not absence of it.
+
+Two tempting reducers are both wrong, and the design rejects both by
+name. **"Most recent wins"** is wrong because clocks are producer-
+controlled and a non-authoritative record must not override the owner of
+a field — it is the same mistake as ordering the ledger by timestamp.
+**"Most pessimistic wins"** is wrong because a stale historical failure,
+or an expected earlier HOLD, would permanently poison every later valid
+revision; a project whose gate went red at H1 could never go green at
+H7. The correct reducer is exact-key applicability plus per-field source
+ownership: a record applies to the current verdict only if it joins on
+the key, and within that set each field is answered by the module that
+owns it.
+
+Three cases pin the semantics:
+
+- **A — stale approvals under a dirty head.** Item says ready at H2, the
+  lane is dirty at H2, and gate, close, and review are all green at H1.
+  Render H2 as `HOLD` with `work_revision_dirty` plus
+  `work_gate_stale` / `work_close_stale` / `work_review_stale`. The H1
+  facts remain visible as history; they simply do not apply to H2.
+- **B — an unbacked delivery claim.** Item claims delivered at H3, the
+  lane has no validated delivery artifact and is dirty, gate is green at
+  H3, close holds at H3. Render `work_contradiction` and non-GO. Do not
+  silently demote the item to active, and do not bless the delivery
+  because the gate happens to be green — either would be picking a side.
+- **C — historical dissent must not poison a valid present.** Item and
+  lane are closed at H4 under policy P2; the gate has an old blocker at
+  H3/P1 and green at H4/P2; close and review are valid at H4/P2; and an
+  H3 `changes_requested` message carries a *later* timestamp than
+  everything at H4. Render closed and current at H4, with the H3 dissent
+  shown as history. The future-dated H3 record does not apply to H4,
+  because applicability is by key, not by clock. Note this is enforced by
+  the exact-key join and the `changes_requested` revision qualifier — not
+  by the `closed` row happening to match first, which is where an earlier
+  draft's case C actually survived.
+
+### The View Envelope
+
+`compute_verdict` returns exactly `{verdict, holds, ok}`, pinned to
+`close` and `lanes`. That shape deliberately cannot carry history — and
+the sections above promise history in several places: the H1 facts in
+case A, the H3 dissent in case C, `ledger_problems`, bounded
+`source_error` rows, a bounded error record per corrupt `work_id`, and
+per-artifact tiers for Safety Invariant #11.
+
+Those live in the **view**, not the verdict:
+
+```json
+{
+  "schema": "work-view-v1",
+  "work_id": "w-0007",
+  "record_state": "active",
+  "verdict": {"verdict": "HOLD", "holds": [{"code": "work_artifact_stale", "detail": "…"}], "ok": false},
+  "revision": {"base_sha": "e0e8f7b4…", "head_sha": "b8e1c3a7…", "resolved_at_head": true},
+  "artifacts": [{"artifact_id": "a-3f91c2", "check_name": "pytest", "trust_tier": "local_agent",
+                 "current": false, "caution_flags": ["rebased_identical_diff"]}],
+  "history": [{"kind": "review", "revision": "H3", "status": "rejected", "applies_to_current": false}],
+  "source_errors": [{"source": "gates", "error": "gates.json unreadable"}],
+  "ledger_problems": 0
+}
+```
+
+Rules:
+
+- The verdict object inside the envelope is byte-identical to what
+  `compute_verdict` returns. The view wraps it; it never rewrites it, and
+  no consumer needs to reconstruct one from the other.
+- Every history row carries `applies_to_current`. A row that does not
+  apply is shown as history and is **never** an input to the verdict —
+  which is what makes "surface the disagreement, don't pick a side"
+  implementable rather than merely asserted.
+- `record_state` and `verdict` both appear, per Two Axes, Never
+  Collapsed. There is no field that reduces them to one token.
+
+## Policy Boundary
+
+Optional `.agenttalk/code-policy.json`. Absent policy means no
+project-required checks — it does not mean everything passes, because
+gates, close, lane isolation, and review requirements still apply.
+
+```json
+{
+  "schema_version": 1,
+  "policy_id": "agenttalk-core",
+  "required_checks": [
+    {
+      "glob": "src/agenttalk/**",
+      "checks": ["ruff", "bandit", "pytest"],
+      "min_tier": "local_agent",
+      "release_min_tier": "automation_ci"
+    },
+    {
+      "glob": "src/agenttalk/supervisor.py",
+      "checks": ["pytest", "supervisor-crash-matrix"],
+      "min_tier": "local_operator",
+      "release_min_tier": "automation_ci"
+    }
+  ],
+  "require_close_lenses": true,
+  "waiver": {"allowed_by": ["operator"], "requires_reason": true}
+}
+```
+
+Rules:
+
+- Matching is by glob through `domains.glob_matches`, and **every**
+  matching entry must be satisfied independently. There is no
+  first-match, no most-specific-wins, no longest-prefix, and no prefix
+  arm. All four are the same bug wearing different hats: each picks one
+  winner, and a permissive nested rule that wins erases a broad
+  security requirement. This is D-11 verbatim — picking a winner
+  "imposes a total order on a partial order and was twice proven
+  unsound."
+- Longest-prefix deserves its own refusal because it *looks* principled.
+  It is not even well-defined here: globs are sets, and sets overlap
+  without nesting. `src/**/secret/*.py` and `src/api/**` intersect while
+  neither contains the other, so there is no longer one, and wildcards,
+  ties, and case/path normalization each produce further incomparable
+  pairs. Requirements **compose** — a path in two rules owes both — which
+  removes the ordering question rather than answering it.
+- Duplicate normalized globs are rejected at validation, matching the
+  lane registry's rule, so "which of these two identical entries won" can
+  never be asked.
+- A change to `src/agenttalk/supervisor.py` therefore satisfies both
+  example entries, including the stricter `local_operator` floor and the
+  union of both check lists.
+- The **matched glob** is persisted on the artifact's satisfaction
+  record, never the raw path. C2 persisted the path and let a broad
+  approval clear a nested one; persisting the glob is what makes
+  revalidation meaningful.
+- Persisted satisfaction is **revalidated at verdict time** across six
+  dimensions, not two: the matched **rule identity** (glob), the current
+  **policy** and **registry**, the artifact's **revision**, its **tier**
+  floor, and the producing **actor**'s re-resolved classification.
+  Requirement **expiry** is the sixth — a `required_checks` entry may
+  declare `max_age`, after which a satisfying artifact is stale even at
+  an unchanged revision, for checks whose result decays with the outside
+  world (dependency audits, licence scans). A check satisfied under an
+  older policy, by a since-retired producer, or beyond its declared age
+  does not stay satisfied by inertia.
+- `min_tier` applies always; `release_min_tier` applies when the item is
+  `release_blocking`. Absent `release_min_tier` defaults to
+  `automation_ci`, per the roadmap's trailing rule — the default is the
+  strict one, so forgetting to write it fails closed.
+- `policy_hash` is computed over the canonical serialization and bound
+  into every artifact. If policy changes, artifacts produced under the
+  old hash stop counting for required checks and `work_policy_hash_drift`
+  is raised.
+- **Base-policy evaluation**: required checks are resolved from the
+  policy at the item's `base_sha`, not from the working tree. A branch
+  that edits `code-policy.json` cannot thereby change the rules that
+  judge it (roadmap §8, "policy drift"). If the branch modifies the
+  policy file at all, `work_policy_changed_in_branch` holds until an
+  operator waiver is recorded — the roadmap's named mitigation, which is
+  "explicit waiver for policy changes," not "detect and allow."
+- The evaluated requirement set is the **union** of the base policy and
+  the candidate policy. A branch may freely make itself *stricter* — an
+  added requirement takes effect immediately, with no waiver, because
+  raising your own bar needs no permission. Only **relaxation** (a
+  removed requirement, a lowered tier floor, a widened waiver rule) needs
+  an operator waiver binding **both** the base and candidate policy
+  hashes so it cannot be reused after either side moves. That waiver is
+  the same record specified in Evidence Tiers, and it does not exist yet
+  — so in D1–D5 a policy relaxation simply holds. Fail-closed with no
+  escape is the honest state; an escape routed through the current
+  unauthenticated `gate waive` would be worse than none.
+- Both hashes are recorded on the verdict. "The policy changed" and
+  "which direction it changed" are different facts, and a reviewer needs
+  the second one to judge the waiver.
+- Core validates policy **shape** only. It does not know what `ruff`,
+  `bandit`, or `supervisor-crash-matrix` are, and it never executes them
+  in D1–D5. A check name is an opaque string that an artifact's
+  `check_name` must match exactly.
+- **Work does not own review lenses; `close.py` does.** An earlier draft
+  put a bare `required_lenses` string list here, which would have been a
+  second and weaker authority on a question close already answers with a
+  full authorization model: `required_lenses` entries carry
+  `{id, allowed_agents, allowed_roles, allowed_groups, required}`
+  (`close.py:126`), acks land in `lens_acks` (`:130`), authorization is
+  checked against agent/role/group refsets (`:390-403`), staleness
+  compares `ack["revision"]` to the close revision (`:209-222`), and the
+  verdict emits `missing_lens` / `unauthorized_lens_ack` /
+  `stale_lens_ack` (`:72-74`). A bare string list would have reported
+  lens coverage satisfied for an ack `close.compute_verdict` rejects as
+  unauthorized — exactly the duplicated-truth failure Source-Of-Truth
+  Boundaries forbids. `require_close_lenses` is therefore a boolean that
+  defers to the linked close; `work check` reads close's verdict and
+  never recomputes lens coverage.
+
+### Satisfaction Records
+
+When a requirement is satisfied, work persists a satisfaction record
+under the item so the matched glob is auditable. It is data, never
+authority — the verdict recomputes matching every time (see
+"revalidated at verdict time"):
+
+```json
+{
+  "schema_version": 1,
+  "requirement_glob": "src/agenttalk/**",
+  "check_name": "pytest",
+  "artifact_id": "a-3f91c2",
+  "root_execution_id": "x-6b20f4de91c7",
+  "policy_hash_base": "3b1f0c9d22",
+  "policy_hash_candidate": "3b1f0c9d22",
+  "head_sha": "b8e1c3a70f2d4916ac53b7e08d1f6a2c94e7d305",
+  "recorded_at": "2026-07-18T09:31:45.112094Z"
+}
+```
+
+Rules:
+
+- `requirement_glob` is the **normalized glob**, never the raw path.
+  Persisting the path was C2's bug: it let a broad approval clear a
+  nested entry with different approvers.
+- A satisfaction record is a cache of a past evaluation, not a licence.
+  If the current policy produces a requirement this record does not
+  match — or the artifact behind it fails revalidation — the requirement
+  is unsatisfied regardless of what the record says.
+- It exists for audit and diagnosis: "why did this pass last time" is a
+  question an operator will ask, and reconstructing it from scratch is
+  worse than recording it.
+- The honest limit: base-policy evaluation reads the policy from git at
+  `base_sha`, so it depends on git being available and the base being
+  reachable. When it is not, the result is `UNKNOWN` with
+  `work_source_error`, never a fallback to the working-tree policy.
+  Falling back would silently reintroduce the exact bypass.
+
+## Reset And Durability Semantics
+
+`Store.reset` deletes `messages/` and `state/` and preserves everything
+else. `.agenttalk/work/` and `.agenttalk/artifacts/` are **top-level**,
+so both **survive reset** by construction.
+
+Rules:
+
+- This placement is deliberate. A work item is a durable delivery record;
+  losing it on a session reset would destroy exactly the history the
+  feature exists to keep. It sits with `domains.json`, `knowledge/`,
+  `closes/`, `gates.json`, `lane-deliveries/`, and `control-audit/` on
+  the preserved side of the load-bearing durability boundary
+  (DESIGN.md §3).
+- Because they survive, the durability-boundary assertion in the
+  end-to-end regression test must be extended to name `work/` and
+  `artifacts/` in the preserved set. The boundary is only load-bearing
+  because a test pins it.
+- `cli.py` already warns on `reset` that active lane coordination state
+  is cleared while delivery artifacts under `.agenttalk/lane-deliveries/`
+  are not touched. That warning needs extending: work items and evidence
+  artifacts also survive, so an operator resetting a bus to "start clean"
+  will still see the prior work records. Surviving is correct; surviving
+  *silently* would be surprising in the same way lane artifacts were.
+- **Name hazard, called out so nobody conflates them:**
+  `.agenttalk/state/work-heartbeat/` already exists and is **entirely
+  unrelated** to this feature. It holds per-agent wrapper liveness
+  diagnostics written by `store.write_work_heartbeat_status`, it is
+  explicitly "NOT a supervisor input in v1," and because it lives under
+  `state/` it **is** cleared by reset. The two directories share four
+  letters and nothing else. This RFC's storage is `work/` (durable
+  delivery records) and `state/work-heartbeat/` is liveness telemetry;
+  no code should read one expecting the other.
+- A reset that clears `state/lanes.json` while work items survive leaves
+  items referencing lanes that no longer exist. That is not corruption —
+  it is exactly the contradiction the projection must surface, and it
+  raises `work_lane_missing` rather than silently unbinding.
+
+## Failure Modes And Fail-Closed Behavior
+
+Every row is a case where an earlier version of this codebase, or an
+obvious naive implementation, would have returned green.
+
+| Condition | Result | Never |
+|---|---|---|
+| Item file corrupt | `HOLD` `work_malformed_item`; mutations refused | overwritten or recreated |
+| Item file absent | command exits non-zero, "unknown work id" | treated as an empty valid item |
+| Unknown `schema_version` | `HOLD` `work_unknown_schema_version` | upgraded, guessed, or skipped |
+| Event line malformed | line isolated + surfaced; `HOLD` `work_ledger_problem` | silently dropped |
+| Artifact torn / bad hash | `UNKNOWN` `work_artifact_unreadable` | crash, or treated as pass |
+| Artifact absent for a required check | `HOLD` `work_required_check_missing` | absence read as pass |
+| Artifact present, wrong `head_sha` | `HOLD` `work_artifact_stale` | accepted because it exists |
+| Artifact present, wrong scope/glob | `HOLD` | dropped as if absent |
+| Required check `skipped` / `waived` / `unknown` | `HOLD` `work_required_check_not_green` | counted as green |
+| Blocking requirement, tier below floor | `HOLD` `work_artifact_insufficient_tier` | promoted because it is the best available |
+| Gate source read fails | `HOLD` `work_source_error` | empty gate list read as no blockers |
+| Policy unreadable at `base_sha` | `UNKNOWN` `work_source_error` | fallback to working-tree policy |
+| Policy invalid | `HOLD` `work_policy_invalid` | ignored as if absent |
+| Two records disagree | `HOLD` `work_contradiction` | one side silently preferred |
+| Concurrent mutation | serialized under a per-item lock + `expected_version` | last-writer-wins |
+| Crash between item and event | `HOLD` `work_ledger_gap` / `work_ledger_ahead`, or idempotent replay by `op_id` | the advanced state accepted unaudited |
+| Event chain gap | `HOLD` `work_event_chain_broken`; later transitions not applied | reading past the hole to a later `ready` |
+| Log present, metadata absent | orphan; surfaced | counted as evidence |
+| Metadata present, log torn/absent | `HOLD` `work_artifact_log_hash` / `work_artifact_log_missing` | metadata trusted alone |
+| Same run registered twice at a higher tier | `HOLD` `work_artifact_execution_conflict` | two independent corroborators |
+| Future-dated or impossible timestamp | `HOLD` `work_implausible_timestamp` | fresh forever, or ordering the ledger |
+| Bound commit unreachable after force-push | `HOLD` `work_revision_unreachable` | evidence silently rebound to the new head |
+| Diff cannot be computed | `UNKNOWN` `work_revision_unresolvable` | "no changed paths" read as no requirements |
+| Gates waiver on a required check | displayed; `work_waiver_not_authoritative` for a release blocker | treated as operator authority (ASSURANCE.md:109-114 forbids it) |
+
+The unifying rule, stated once: **absence, corruption, staleness,
+skipping, waiving without authority, and unknown are all non-green for a
+blocking requirement.** C1's four fail-opens were four different ways of
+violating that one sentence, and each row above is a test.
+
+## Assurance Ingestion
+
+D5 makes `assurance.py` artifacts readable by `work check` without making
+assurance an authority. Roadmap §6 item 7 requires exactly this
+separation.
+
+Rules:
+
+- Ingestion is **read-only**. Work never writes into
+  `.agenttalk/assurance/`, never triggers a scan, and never modifies an
+  assurance artifact.
+- `assurance.py` writes its artifact with plain `Path.write_text`
+  (`assurance.py:711`), **not** `_atomic.write_text`. A reader can
+  therefore catch a torn file. Ingestion treats an unparseable assurance
+  artifact as `UNKNOWN` with `work_source_error`. It never crashes, and
+  absence is never pass.
+- The attestation shape is `{"GOOD": …, "ROBUST": …, "SECURE": …,
+  "reasons": [...]}` — keys uppercase, values lowercase. The value
+  vocabulary is `good` / `unknown` / **`not_assessed`**; the third value
+  is reachable for `ROBUST` and must be handled explicitly rather than
+  falling into an `else` that means good.
+- **`good` does not map to `satisfied`.** An assurance attestation is
+  ingested as an artifact at tier `local_agent` **at most**, carrying the
+  attestation and its `reasons` as detail. It is pre-review evidence.
+  Mapping `good` → satisfied would silently turn a scan producer into a
+  release authority, which is the thing the roadmap forbids.
+- **There is no ingestion path to `local_operator`, and D1–D5 defines
+  none.** An operator importing or confirming a scan an agent ran is not
+  evidence that the operator ran it, and nothing in the assurance record
+  distinguishes those two cases. `local_operator` requires a runtime
+  adapter that binds actor, command, and exact inputs *when execution
+  begins*; no such adapter exists here. An earlier draft allowed
+  "`local_operator` when operator-run" on ingestion, which would have let
+  an agent scan acquire the operator tier by passing through operator
+  hands and satisfy a `local_operator` floor.
+- **The assurance artifact does not carry work's bindings.** Its record
+  has `schema_version`, `artifact_type`, `run_id`, `generated_at`,
+  `profile`, `root`, `scanner`, `attestation`, `verdict_summary`, and
+  `residual_risk`, plus `git_sha` / `git_dirty` / `changed_from` /
+  `changed_to` on the scan result — and **no** `work_id`, `base_sha`,
+  `diff_hash`, work `policy_hash`, verified producer, or trust tier.
+  **Missing bindings stay missing.** Ingestion does not supply them from
+  the ingesting context — an earlier draft said it did while also
+  forbidding backfill, and both cannot hold; supplying a binding *is*
+  backfilling it, whatever the source is called. An ingested assurance
+  artifact is therefore `referenced` and raises
+  `work_artifact_binding_missing` against any blocking requirement, and
+  it becomes `local_agent` only if the producing run itself recorded the
+  work bindings at execution time.
+- **Tier comes from the ingestion path, never from the artifact's
+  content.** A `profile: "release"` field, a `GOOD` attestation, a file
+  sitting under a CI-looking directory, a producer string containing
+  "github", or a `CI=true` environment variable are all *claims*. None of
+  them promotes an ingested scan to `automation_ci`. Origin tier is
+  assigned only by a trusted execution or transport adapter, and no such
+  adapter exists in D1–D5, so every ingested assurance artifact is
+  `local_agent` or `local_operator`.
+- `unknown` and `not_assessed` are non-green for a blocking requirement,
+  and their `reasons` strings are surfaced verbatim in the hold detail so
+  an operator sees *why* — the reasons are already formatted as
+  `"SECURE: missing executed security, deps evidence"` and carry more
+  information than a boolean.
+- The honest limit: assurance's own attestation is fail-honest per
+  dimension, which is a strength, but it attests a **scan run**, not the
+  correctness of the code. Work reports it as one evidence input among
+  several and never as a verdict.
+
+## Safety Invariants
+
+Roadmap §7's Hard HOLDs, restated as assertions a test can make. Each is
+a named test in D1–D4's acceptance set.
+
+1. **No hidden contradiction.** Given records that disagree, `work check`
+   returns `HOLD` with `work_contradiction` naming both sources.
+   *Test:* construct an item with `terminal: "delivered"` and no lane
+   delivery artifact; assert the code and that neither record is
+   silently preferred.
+2. **Artifacts are immutable.** Writing an artifact to an existing
+   `artifact_id` fails. *Test:* attempt a second write; assert refusal
+   and that the original bytes are unchanged.
+3. **Prose never gates.** No message body content is an input to
+   `compute_verdict`. *Test:* a review-result whose body says "approved"
+   but whose `meta.status` is `rejected` yields
+   `work_review_rejected`.
+4. **Evidence binds exactly.** An artifact missing any of `work_id`,
+   `base_sha`, `head_sha`, `diff_hash`, `policy_hash`, `producer`,
+   `trust_tier` cannot satisfy a required check. *Test:* one omission per
+   field, seven assertions.
+5. **Local agent evidence never greens a release blocker.** *Test:* a
+   `local_agent` artifact against a `release_blocking` item with default
+   policy yields `work_artifact_insufficient_tier`.
+6. **Branch policy cannot judge itself.** *Test:* a branch that relaxes
+   `code-policy.json` still evaluates under the base policy and raises
+   `work_policy_changed_in_branch`.
+7. **Failure never normalizes to pass.** *Test:* torn artifact, absent
+   artifact, non-zero exit, `skipped` status, and unreadable source each
+   assert non-green.
+8. **One corrupt item does not brick work.** *Test:* garbage in one item
+   file; `work list` returns every other item and a bounded error row for
+   the corrupt one.
+9. **Corrupt state is never overwritten.** *Test:* mutate a corrupt item;
+   assert refusal and byte-identical file contents afterward.
+10. **All matching policy entries must be satisfied.** *Test:* a path
+    matching two globs with different required checks holds until both
+    are satisfied; satisfying only the broader one still holds.
+11. **Tiers do not collapse.** *Test:* `work show --json` reports the
+    per-artifact tier; no field reduces the set to a single boolean.
+12. **Crash recovery converges.** *Test:* inject process death at each of
+    the five kill points in the Crash And Recovery Protocol; assert every
+    replay reaches the same state or the same named HOLD, and that
+    re-running recovery is a no-op.
+13. **The ledger is one record per append under contention.** *Test:*
+    monkeypatch `os.write` to return short writes, barrier two writers on
+    one ledger, and assert two parseable records with distinct `seq` and
+    an intact `prev_hash` chain — no interleaving, no duplicate `seq`.
+14. **One execution corroborates once.** *Test:* register two artifacts
+    derived from a single run; assert the independence count is 1 and
+    that a policy requiring two independent checks still holds.
+15. **`work check` is inert.** *Test:* hash `.agenttalk/` before and
+    after; call the evaluator twice on the same snapshot; assert
+    identical verdicts and byte-identical state.
+16. **Requirements survive wrong-scope evidence.** *Test:* a change under
+    `src/payments/**` with only an artifact whose `covered_globs` is
+    `["src/ui/**"]` yields both `work_artifact_wrong_scope` and
+    `work_required_check_missing` — never a vacuous pass from an empty
+    filtered list.
+17. **Bus records are never ordered by id.** *Test:* two conflicting
+    bound review-results at one revision, authored so the *rejecting*
+    one has the lower message id; assert `work_review_conflict` and that
+    swapping the ids does not change the verdict.
+18. **An unbound review cannot satisfy.** *Test:* an approved
+    review-result with no `reviewed_head_sha` yields
+    `work_review_unbound` and leaves the requirement unsatisfied.
+19. **Record state never reads the verdict.** *Test:* a fresh `draft`
+    item with no lane and an unresolvable revision renders
+    `draft` + `UNKNOWN`, **not** `blocked`; and an item whose records
+    advance past its last `state_asserted` event does not become a
+    permanent HOLD. Asserts the two axes are independent and the
+    projection is total.
+20. **No waiver satisfies a release blocker.** *Test:* `gate waive` an
+    active waiver over a required check on a `release_blocking` item;
+    assert `work_waiver_not_authoritative` and that the verdict stays
+    non-GO.
+21. **Lineage cannot mint independence.** *Test:* two artifacts derived
+    from one root — one reformatted, one truncated — yield independence
+    count 1; a `derived_from` cycle and a root mismatch each yield
+    `work_artifact_lineage_invalid`.
+22. **The ledger tail is committed.** *Test:* rewrite the last event's
+    `actor` in place; assert the chain still verifies internally but
+    `ledger_head` mismatches and the verdict holds. Replay a transition
+    with a fresh `seq`/`event_id`/`op_id`; assert rejection.
+23. **Imported assurance never reaches `local_operator`.** *Test:*
+    ingest an agent-produced assurance artifact through an operator
+    context; assert the tier is `referenced` (bindings absent) and that
+    a `local_operator` floor stays unsatisfied.
+
+## Threat Model And Honest Limits
+
+### What This Design Establishes
+
+For a trusted team, on records written through the CLI: which revision
+evidence was produced against, under which policy, by whom, at what
+tier, and whether any of that has drifted from the current revision.
+It makes stale, absent, mis-scoped, corrupt, and insufficient-tier
+evidence machine-detectable rather than a matter of memory.
+
+### What It Does Not Establish
+
+- **Not a defense against a local writer.** Everything under
+  `.agenttalk/` is writable by the same OS user. A hostile writer can
+  author a work item, append events, and write artifacts with any
+  content, including a recomputed `content_hash`. `content_hash` detects
+  accidental corruption and casual edits, not a determined forger.
+- **Not proof a command ran.** D1–D4 record a `command` that a producer
+  claims to have executed. Nothing verifies execution. This is why
+  `local_agent` cannot green a release blocker, and it is the honest
+  reason the tier ladder exists at all.
+- **Not proof the code is correct.** Every surface must say "evidence
+  current and policy satisfied," never "code correct" — roadmap §8's
+  named mitigation for the false-trust risk. A `GO` means the recorded
+  evidence is current and sufficient under policy; it means nothing about
+  whether the tests were good tests.
+- **Not atomic with the action that follows.** Like `check --epoch` in
+  the identity RFC, a `GO` can be invalidated by a commit landing
+  immediately after the check. Consumers re-check immediately before an
+  irreversible action and treat the residual race as they already do.
+- **Not a same-user authorization boundary.** Per-item locks are
+  coordination gates producing auditable evidence (DESIGN.md principle
+  4). They prevent honest concurrent writers from losing updates.
+- **Roster-based authority is routing metadata.** "Only the owner or a
+  lead may deliver" is enforced against config that a local writer can
+  edit. Real per-agent authority awaits the signing model the identity
+  RFC scopes.
+
+## Schema Versioning
+
+This repo has no repo-wide versioning ADR, and its two existing
+precedents disagree: `assurance.py:794` raises on
+`schema_version != SCHEMA_VERSION` (exact-match fail-closed), while the
+knowledge work shipped a versioned `knowledge-view-v1` envelope with an
+`--output-schema legacy` escape.
+
+**Decision: split by direction, because the two precedents are answers to
+different questions.**
+
+- **Persisted records we own — exact-match fail-closed.** Work items,
+  events, and artifacts carry an integer `schema_version` that must equal
+  the supported version exactly. An unrecognized version raises
+  `work_unknown_schema_version` and blocks that record. These records are
+  *verdict inputs*: a record this build cannot fully interpret must not
+  be allowed to vote, and best-effort partial parsing of a safety input
+  is how fail-opens are born. Following `assurance.py`.
+- **Output projections — versioned envelope with a legacy escape.**
+  `work show --json` and `work check --json` emit a `work-view-v1`
+  envelope, with the same `--output-schema legacy` escape hatch the
+  knowledge view established. These are *consumer surfaces*: a dashboard
+  or script breaking on an additive field is a real cost, and a misread
+  here causes display drift, not a false GO.
+
+Rules:
+
+- Forward compatibility is bought by making new **persisted** fields
+  additive within a version, and bumping the version only when a field
+  changes meaning. A field that changes meaning without a version bump is
+  the failure this rule exists to prevent.
+- An unknown version is never "upgraded in place." Migration, if ever
+  needed, is an explicit operator command that writes new records and
+  leaves the old ones readable.
+- The honest cost of exact-match: a store written by a newer agenttalk
+  blocks on an older one, rather than degrading. That is the intended
+  trade for a verdict input, and it is stated here so nobody
+  "fixes" it later by loosening the check.
+
+## Migration And Compatibility
+
+Migration is read-first and additive, matching the identity RFC's
+discipline.
+
+1. A store with no `.agenttalk/work/` or `.agenttalk/artifacts/`
+   directory behaves exactly as today. Nothing is created until the first
+   `work create`.
+2. No existing file is modified by this feature. `gates.json`,
+   `domains.json`, `closes/`, `lanes.json`, and the message store are
+   read-only inputs.
+3. `.agenttalk/code-policy.json` is optional. Its absence means no
+   project-required checks, and every other requirement still applies.
+4. No new message kind. Review binding uses existing `review-request` /
+   `review-result` threads, so old clients neither break nor need
+   upgrading.
+5. New JSON fields are ignored by older readers as ordinary data. Work's
+   own readers reject unknown *versions*, not unknown *fields*.
+6. The single `cli.py` touch is one subparser plus one dispatch line, per
+   the work package's low-collision rule. All logic lives in the new
+   modules. That insertion is coordinated with the primary team rather
+   than merged unilaterally.
+7. Two changes outside this team's namespace are **requests, not edits**:
+   extending the reset warning in `cli.py`, and adding
+   `external_attested` to `gates.VALID_EVIDENCE_SOURCES` /
+   `BLOCKER_GREEN_SOURCES`. Both are filed through the operator.
+
+## Recommended Phases
+
+### Phase D1: This RFC
+
+Implement: nothing. D1 is the design gate.
+
+Do NOT implement: any module, CLI surface, or storage directory before
+this RFC is review-clean. Design-first is the work package's §7 rule and
+the reason this document exists.
+
+### Phase D2: Work Item MVP
+
+Implement:
+
+- `work.py` + `work_store.py`: per-item records, the append-only event
+  ledger under `store._config_lock()`, per-item locking for every
+  read-modify-write.
+- The crash protocol in full: `item_seq` as `expected_version`,
+  `pending_op` / `op_id`, ledger `seq` + `prev_hash`, and idempotent
+  recovery as a separate command. This lands in D2 rather than later
+  because retrofitting a chain onto an existing ledger means rewriting
+  history, which the append-only rule forbids.
+- `work create|list|show|status|assign|start|deliver|abandon`.
+- The derived-state projection table, with terminal states on the item.
+- Links to lanes, domains, threads, gates, closes, onboarding, notes.
+- Fail-safe per-item reads, corrupt-item mutation refusal, and the
+  one-corrupt-item-does-not-brick-work test.
+
+Do NOT implement: artifacts, policy, tiers, or `work check`. `work
+status` in D2 projects lifecycle state only and reports `UNKNOWN` for
+anything requiring evidence, rather than a provisional verdict that would
+have to be un-taught later.
+
+### Phase D3: Evidence Registry MVP
+
+Implement:
+
+- `evidence.py`: write-once artifacts with create-if-absent,
+  `content_hash`, exact input binding, bounded logs with `log_hash` /
+  `log_truncated`, `redaction_status`.
+- The log-first / metadata-last pair protocol and its seven-state
+  validation on every consumption.
+- `root_execution_id`, `derived_from`, and independence counting.
+- Derived `trust_tier` with the mapping table, plus revalidation.
+- Stale-at-head detection reusing the knowledge staleness **shape**
+  (`{stale_reasons, caution_flags, hard_stale}`) — the data structure
+  only, not D-6's anchor-relative rule. A head mismatch is a hard stale
+  for evidence, where it would be a caution for a knowledge note.
+- `work artifact attach|list|show`, and readback validation before any
+  advancement (C5).
+
+Do NOT implement: command execution. D3 records an argv that a producer
+claims it ran; it never runs one. Also no redaction scanning — ship
+`not_scanned` honestly.
+
+### Phase D4: Pure Work Check
+
+Implement:
+
+- `work_check.py`: `compute_verdict` as a pure function over resolved
+  bundles, with the CLI owning all I/O.
+- The full HOLD-code table, one literal-asserting test per code.
+- `GO` / `HOLD` / `UNKNOWN` with `ok` true only for `GO`.
+- The contradiction pass and `source_errors`.
+- Policy loading, glob matching with all-matching semantics, policy-hash
+  binding, and base-policy evaluation.
+
+Do NOT implement: assurance ingestion, CI adapters, merge automation, or
+any dashboard surface.
+
+### Phase D5: Assurance Ingestion (Stretch)
+
+Implement: read-only ingestion of assurance artifacts as `local_agent` /
+`local_operator` evidence, torn-file tolerance yielding `UNKNOWN`, and
+verbatim `reasons` in hold details.
+
+Do NOT implement: any mapping from `good` to satisfied, any write into
+the assurance namespace, and any scan triggering.
+
+### Phase D6 Gate: Deferred Decisions
+
+These are deliberately **not** answered by this RFC. They are scheduled
+here rather than left floating, and each is decided before the phase that
+needs it — not during it.
+
+1. **Does `external_attested` need a `gates.py` counterpart before D3
+   ships, or can it stay work-side-only?** Decide with the primary team
+   when the `gates.py` request is filed. Until then no producer emits it.
+2. **Does `work check` need its own scope, or does it always inherit the
+   item's `gate_scope`?** Decide at D4, when the first multi-scope item
+   exists. Guessing now would likely produce the mis-scoped-gate class
+   C1 already paid for.
+3. **What is the retention policy for artifacts and logs?** Write-once
+   plus survive-reset means unbounded growth. Decide at D3 alongside log
+   caps; a `work gc` that deletes evidence is itself a safety surface and
+   deserves its own review.
+4. **Should `work` expose a merge-base helper, or require callers to
+   supply `base_sha`?** Decide at D4 with the base-policy evaluation
+   implementation, since both need the same git access.
+5. **Does the dashboard Work view need a projection contract frozen in
+   this RFC?** Deferred to Q2 by the work package (`web.py` is outside
+   the ownership boundary). The `work-view-v1` envelope is designed to be
+   that contract when the time comes.
+6. **What exactly does an external attestation attest?** Signing or
+   uploading an artifact proves custody of a blob, not that the check
+   ran. A container's tier must not become transitive to the claims
+   inside it, so `external_attested` needs an attestation-scope model
+   naming which claims are verified — blob existence, execution, inputs,
+   or result. Deferred because `external_attested` has **no producer in
+   D1–D5**, so the surface does not exist yet; the untrusted-fields rule
+   in Evidence Tiers covers the part that does. This decision is forced
+   by whichever phase first introduces an attestation producer, and it
+   blocks that phase.
+7. **What is the bounded clock skew, and against which clock?** The
+   `work_implausible_timestamp` rule needs a concrete bound. Decided at
+   D3 with the first real producer, because picking a number now without
+   measuring agent-host clock spread would be arbitrary.
+
+## Acceptance Criteria For The RFC
+
+This RFC is ready to drive implementation when reviewers agree on the
+contested points — the ones where the source documents left a genuine
+choice and this document made one:
+
+- **Storage placement.** `.agenttalk/work/` and `.agenttalk/artifacts/`
+  are top-level and therefore survive `reset`; the durability-boundary
+  test and the `reset` warning are extended accordingly; and
+  `state/work-heartbeat/` is unrelated liveness telemetry that reset
+  still clears.
+- **Schema versioning is split by direction.** Exact-match fail-closed
+  for persisted verdict inputs, versioned envelope with a legacy escape
+  for output projections — rather than one rule everywhere.
+- **`UNKNOWN` is non-advancing.** `ok` is true only for `GO`, and
+  `UNKNOWN` loses to `HOLD` when both apply.
+- **`trust_tier` is derived, not asserted**, mapping onto
+  `gates.BLOCKER_GREEN_SOURCES` rather than competing with it, and
+  revalidated at verdict time rather than trusted from persistence.
+- **`external_attested` has no producer in D1–D5** and its `gates.py`
+  extension is a request to the primary team, not an edit.
+- **Work check adapts `check_gates`'s different return shape** rather
+  than assuming all three verdict producers match; only `close` and
+  `lanes` share the `{verdict, holds, ok}` shape.
+- **Lane isolation uses the artifact-side vocabulary**
+  (`verified` / `advisory_unisolated` / `unverified`) and requires
+  `verified`, matching the existing hard reject in
+  `validate_delivery_artifact(..., require_isolation=True)`.
+- **Policy is evaluated at the merge base**, and a branch that edits
+  `code-policy.json` holds until an operator waiver — detection alone is
+  not the mitigation.
+- **All matching policy globs must be satisfied** (D-11), with the
+  matched glob persisted rather than the raw path.
+- **Status and verdict are never persisted**, and contradictions are
+  always `HOLD` with both sources named, never resolved by preference.
+- **Terminal states are the one persisted lifecycle fact**, justified by
+  needing to survive a corrupt ledger.
+- **Every persisted event field is bound xor curation-mutable**, pinned
+  by a construction test, with nothing verdict-bearing in the mutable
+  set.
+- **D1–D5 execute no commands.** `command` is recorded, never run, and
+  the runner stays deferred behind roadmap §7's Hard HOLD.
+- **The item is authoritative for state, the ledger for history, and a
+  `GO` needs both** — with `pending_op` + `op_id` + `seq` + `prev_hash`
+  making every one of the five crash points converge idempotently.
+- **`seq` orders everything; timestamps order nothing**, and an
+  implausible producer timestamp disqualifies the artifact rather than
+  merely being noted.
+- **Independence is counted by `root_execution_id`, not by record**, so
+  two adapters over one process corroborate once.
+- **Policy is the union of base and candidate**: a branch may make itself
+  stricter without a waiver, and only relaxation needs one, bound to both
+  hashes.
+- **Work owns no deletion path.** Cleanup is requested from `lanes.py`,
+  which remains the sole authority on whether it is safe.
+- **Record state and gate verdict are orthogonal axes**, neither derived
+  from the other, neither allowed to mask the other, and `ready` /
+  `blocked` are presentation compositions rather than ladder rungs.
+- **No waiver satisfies a release-blocking requirement in D1–D5**,
+  because `gates.waive_gate` stores unauthenticated free text with no
+  work/head/policy binding and ASSURANCE.md:109-114 forbids treating it
+  as operator authority. The waiver record work *would* need is
+  specified so the hardening has a target.
+- **Independence is counted by distinct transitive `root_execution_id`**,
+  with descendants inheriting their ancestor's root, and roots derived
+  from execution identity rather than captured output.
+- **`ledger_head` on the item commits the ledger tail**, which
+  `prev_hash` alone cannot.
+- **Imported assurance is capped at `referenced`/`local_agent`.** There
+  is no ingestion path to `local_operator`, and missing bindings stay
+  missing rather than being supplied from ingesting context.
+- **Work never orders bus records.** Review state resolves by revision
+  binding; same-revision disagreement is `work_review_conflict`. Message
+  ids are not a cross-process clock, so no projection may treat them as
+  one.
+- **An unbound review cannot satisfy a blocking requirement.** Work reads
+  additive `meta.work_id` + `meta.reviewed_head_sha` on existing
+  `review-result` messages — a new meta contract, not a new message kind,
+  and named here rather than left for D4 to invent.
+- **Review lenses stay in `close.py`.** `code-policy.json` carries a
+  `require_close_lenses` boolean, not a competing lens list.
+- **A head mismatch is a hard stale for evidence**, `diff_hash` is a
+  diagnostic rather than a satisfier, and diff-equivalent reuse is
+  available only as a new H2-bound artifact tiered no stronger than its
+  verifier — never for a release-blocking `automation_ci` requirement.
+  This is deliberately stricter than D-6's rule for knowledge notes.
+
+Once ratified, the safest first build is D2 exactly as scoped, with the
+corrupt-item and one-item-does-not-brick-work tests written **failing
+first** against the unimplemented module — the work package's §7 rule,
+and the only thing that makes an acceptance test non-tautological.
+
+## Pre-Mortem Traceability (codex-dev, 2026-07-18)
+
+Dispositions for all 34 findings in the independent adversarial
+pre-mortem. Counts: **6 ADDRESSED · 27 FOLD · 1 DEFER · 0 REJECT.**
+
+**Amended three times on 2026-07-18, every time by cross-family review.**
+(3) Panel round 1 (`claude-rev` REJECTED, `codex-sec` NEEDS-INFO,
+`codex-rev` NEEDS-INFO on artifact drift) found 11 P0s. The two
+structural ones are recorded against the rows they touch: the derived
+state table was **circular** with the contradiction pass
+(`record_state = f(verdict)` while `verdict = g(record_state)`), and
+`blocked` sat above every record-shaped row so a fresh draft would have
+rendered `blocked` once `work check` existed. Record state and gate
+verdict are now orthogonal axes. Findings with no pre-mortem number —
+the waiver authority gap, execution lineage, assurance ingestion tiers,
+the review binding envelope, the unhashed ledger tail, and ten P1/P2
+items — are folded into the body.
+
+**Amended twice before that, both times by cross-family review.**
+(1) Finding 20 was originally a partial decline; codex-dev contested it
+with source citations, the decline was wrong, and the RFC was narrowed.
+(2) claude-rev then found that the finding-18 fix was *itself* a
+clock-ordering bug — it delegated bus ordering to thread derivation,
+which is producer-clock ordering across processes. Both rows record the
+reversal in place. A traceability matrix that quietly rewrites its own
+history is worth less than one that shows where it was corrected, and
+"my fix for the ordering bug contained the ordering bug" is precisely
+the kind of thing a reviewer should be able to see.
+
+Findings raised by claude-rev's review (`rq-6d0c9c2b3410`) that were not
+in the codex-dev pre-mortem are folded into the body rather than
+numbered here: the review binding contract, `covered_globs` on
+artifacts, the satisfaction-record schema, and dropping
+`required_lenses` in favour of close's model.
+
+An `ADDRESSED` row means the cited sentence already carried the normative
+force before the fold-in pass. Where the pre-mortem's phrasing was
+sharper than the draft's, the row is `FOLD` even if the draft gestured at
+the idea — a reviewer having to infer an invariant is the same as it not
+being there.
+
+| Finding | ID | Disposition | RFC section / rationale |
+|---|---|---|---|
+| 1 | HH-CONTRADICTION | FOLD | Work Check → "Facts are joined on an exact key"; Contradictions → per-field ownership + cases A/B/C. Added `work_gate_stale` / `work_close_stale`; the draft had one blanket contradiction code and no join key. |
+| 2 | HH-ARTIFACT-MUTATION | FOLD | Artifact Schema → create-if-absent, "idempotent **only** when the incoming content is byte-identical", `supersedes` field. Draft said "refusing to write when the target path exists" with no idempotency or supersede link. |
+| 3 | HH-UNTYPED-AUTHORITY | ADDRESSED | Safety Invariants #3 "Prose never gates" — "No message body content is an input to `compute_verdict`", with the test that a body saying "approved" under `meta.status: rejected` yields `work_review_rejected`. Plus Evidence Tiers: `referenced` never satisfies. |
+| 4 | HH-INCOMPLETE-BINDING | FOLD | Artifact Schema → "**A missing binding field is never backfilled from current state**"; added `ingested_at` as the one locally-observed time. Draft required the fields but never forbade backfilling them. |
+| 5 | HH-LOCAL-RELEASE | ADDRESSED | Policy Boundary — "Absent `release_min_tier` defaults to `automation_ci` … the default is the strict one, so forgetting to write it fails closed." Plus Safety Invariants #5. |
+| 6 | HH-SELF-JUDGING-POLICY | FOLD | Policy Boundary → union of base and candidate; stricter candidate rules apply with no waiver, relaxation needs one bound to **both** hashes. Draft evaluated base-only and bound one hash. |
+| 7 | HH-RUNNER-EXECUTION | ADDRESSED | Artifact Schema — "`command` is a structured argv list, never a shell string. D1 defines the field; D1–D4 do not execute it." The runner is deferred behind roadmap §7's Hard HOLD, so the attack surface does not exist in scope. |
+| 8 | HH-FAILURE-NORMALIZATION | FOLD | Work Check → closed outcome enum (`pass`/`fail`/`skipped`/`timeout`/`malformed`/`adapter_error`/`unavailable`/`missing`), "**Only `pass` satisfies** … no `else` branch". Draft lumped these into one code. |
+| 9 | HH-DESTRUCTIVE-CLEANUP | FOLD | Lifecycle → "**Work never deletes a worktree.**" The draft was silent on cleanup, which is worse than wrong — an implementer would have invented one. |
+| 10 | HH-TIER-DISPLAY | ADDRESSED | Safety Invariants #11 "Tiers do not collapse" with its test; dashboard itself is out of scope (Q2, `web.py` outside the boundary). |
+| 11 | HH-PLATFORM-CLAIM | FOLD | Evidence Tiers → platform claims need executed target-platform evidence; skipped stays UNKNOWN; expressed via distinct opaque `check_name`s. Draft had the mechanism but never stated the claim rule. |
+| 12 | GATE-ANALOG-CORRUPT-OVERWRITE | FOLD | Corrupt Items Block Their Own Mutation (item side was already there) **+** new artifact-analogue clause: an unreadable existing artifact is "never repaired in place and never reused." |
+| 13 | GATE-ANALOG-LOST-UPDATE | FOLD | Work Item Schema → `item_seq` as `expected_version`; Corrupt Items → lock spans the full protocol including the event append. Draft had the lock but no version, so an unlocked writer still won. |
+| 14 | GATE-ANALOG-SCOPE-DROP | FOLD | Work Check → "**Requirements are derived first, evidence is matched second**", naming the `all([])` vacuous-truth trap; wrong-scope emits two holds. |
+| 15 | GATE-ANALOG-SKIPPED-BLOCKER | ADDRESSED | HOLD table `work_required_check_not_green` covers `skipped`/`waived`/`unknown`; Failure Modes row "Required check `skipped`/`waived`/`unknown` → HOLD, never counted as green". Waiver-vs-green distinctness folded under #29. |
+| 16 | GLOB-WINNER-BYPASS | FOLD | Policy Boundary → longest-prefix now refused **by name**, with the reason globs are not totally orderable (`src/**/secret/*.py` vs `src/api/**` intersect without nesting) and duplicate-normalized-glob rejection. |
+| 17 | GLOB-STALE-SATISFACTION | ADDRESSED | Policy Boundary — "Persisted satisfaction is **revalidated at verdict time** … does not stay satisfied by inertia", plus requirements-first derivation, so a newly-added nested rule surfaces as unsatisfied. |
+| 18 | TIME-FUTURE | FOLD (amended twice) | Event Model → "**`seq` orders the ledger; timestamps never do**"; Work Check → `work_implausible_timestamp`. The original draft's lifecycle table said "latest", which was the bug. *The first fix was itself incomplete:* it delegated bus-record ordering to `threads.derive_threads`, which sorts by message id (`threads.py:596`) where `_new_id` is monotonic only within one process (`store.py:6085-6094`) — producer-clock ordering under another name. claude-rev caught it. Work now orders bus records **not at all**, resolving review state by revision binding and emitting `work_review_conflict` for same-revision disagreement. |
+| 19 | ID-NULL-UNRESOLVABLE | FOLD | Work Check → `work_revision_unresolvable`; "An empty requirement set from a failed diff is the same vacuous-truth bug as `all([])`, reached by a different road." |
+| 20 | ID-REBASE-FORCE-PUSH | FOLD (in full) | Artifact Schema → the **exact-key join is authoritative** (`(base_sha, head_sha)` mismatch = not current); ordinary head move is a `stale_reason`, content-identical rebase is the named caution `rebased_identical_diff`; caution is **insufficient for release-blocking** (re-execution required) and may be accepted for non-blocking; rebinding stays an explicit event. *Revision history — dispositioned three times:* first a partial decline on D-6 grounds; codex-dev contested and I conceded; then claude-rev and codex-sec independently overturned it again with a sharper refutation, which is the one now in the doc. **D-6's analogy fails on its own terms** — it rejects HEAD-relative staleness because unrelated commits would empty the knowledge layer, but work evidence binds one `base..head` pair and unrelated commits do not move it, so the noise problem never arises. Decisive: a test result is a property of base+patch, not of the patch. My cost-asymmetry argument was true but secondary. |
+| 21 | ID-DUPLICATE-LANE-CLAIM | FOLD | Lifecycle → "**A lane may be claimed by at most one non-terminal work item**", serialized on `(lane_id, lane_generation)`, with `work_lane_conflict` holding *every* claimant rather than picking the older. |
+| 22 | ID-LANE-DISAPPEARS/REUSED | FOLD | Work Item Schema → `lane_generation`; Lifecycle → live-lane-with-matching-generation for non-terminal items, delivery artifact for terminal ones; `work_lane_generation_mismatch`. |
+| 23 | CRASH-ITEM/EVENT-TRANSACTION | FOLD | New **Crash And Recovery Protocol**: item authoritative for identity/state, ledger for history, `GO` requires both; write order with `pending_op`; all five kill points (a)–(e) given stated outcomes; recovery idempotent by `op_id`. |
+| 24 | CRASH-TORN-ITEM/LEDGER | FOLD | Event Model → a `seq` gap or broken `prev_hash` raises `work_event_chain_broken` and "transitions after the break are not applied". Draft surfaced malformed lines but would have read past them to a later `ready`. |
+| 25 | CRASH-CONCURRENT-JSONL | FOLD | Event Model → lock spans tail inspection, `seq` allocation, append, and fsync, citing `_jsonl.py:23-29` / `:66-74`. **Verified and strengthened:** `_write_all` really is a `while remaining:` loop over `os.write`, *and* `append_record` does a separate `lseek`+`read` tail probe with a possible standalone delimiter write — two race windows, not one. |
+| 26 | CRASH-ARTIFACT-PAIR | FOLD | Artifact Schema → **Torn Reads And The JSON/Log Pair**: log written and hash-validated first, metadata published last as the commit marker; all seven states (a)–(g) tabulated; both files revalidated on every consumption. |
+| 27 | CONTRADICTION-SEMANTICS | FOLD | Contradictions → cases A, B, C spelled out, with "most recent" and "most pessimistic" each rejected by name and reason (clock control; permanent poisoning of later valid revisions). |
+| 28 | TIER-ASSURANCE-INGEST | FOLD | Assurance Ingestion → the artifact's actual field list, confirmed against `assurance.py:2164-2189`, carries no work bindings; tier comes from the ingestion path, never from `profile` / attestation / path / producer string / `CI=true`. |
+| 29 | TIER-WAIVER-LAUNDERING | FOLD (amended) | Execution Tiers → a waiver never mutates evidence, and **no waiver satisfies a release-blocking requirement in D1–D5 at all**. *Amended after codex-sec:* the first fold asserted a typed waiver "scoped to one requirement at one head and policy hash" — a record that does not exist. `gates.waive_gate` (`gates.py:143-181`) stores `{operator, date, reason, scope, expires}` with `operator` as unauthenticated free text and no work/check/head/policy binding, `_gate_verdict` (`:311-317`) makes any active waiver non-blocking, and ASSURANCE.md:109-114 forbids treating that path as operator authority. The required record is now specified as a target for the hardening, and until it lands there is no waiver escape. |
+| 30 | TIER-REREGISTRATION | FOLD | Execution Lineage → `root_execution_id` derived from content and exact inputs (not a fresh ID at registration), with `work_artifact_execution_conflict` on a tier/origin change. The lead is right that `content_hash` alone cannot do this: the record hashes its own `artifact_id`, so two registrations of one run hash differently by construction. |
+| 31 | TIER-FAKE-CORROBORATION | FOLD | Execution Lineage → "**Corroboration counts distinct `root_execution_id` values, not records**"; `derived_from` lineage; a derived artifact "can never corroborate its own ancestor." |
+| 32 | TIER-CONTAINER/SIGNER-SPOOF | DEFER | D6 gate item 6, forced by whichever phase first introduces an attestation producer. Partly covered now: Evidence Tiers makes `producer`/`producer_class`/`trust_tier` untrusted input recomputed at registration, and `external_attested` has **no producer in D1–D5**, so the transitive-container surface does not yet exist. The attestation-scope model is what remains. |
+| 33 | TIER-OPERATOR-CONFIRMATION | FOLD | Execution Lineage → "**Operator confirmation is not operator execution**"; confirmation is a separate typed acknowledgement, never a `producer_class` rewrite. |
+| 34 | PURE-CHECK | FOLD | Work Check → "**The evaluator writes nothing**" — no `last_checked`, no cache, no ambient clock or git read; recovery is a separate command "so no repeat invocation of `work check` can turn a HOLD into a GO." Safety Invariant #15 pins it with a before/after hash. |
+
+The pre-mortem's closing note is accepted in full: `_atomic`'s latched
+Windows direct path is explicitly non-crash-atomic and
+`_jsonl.append_record` explicitly delegates serialization to callers, so
+this RFC cannot cite either helper as satisfying findings 23–26. The
+Crash And Recovery Protocol, the ledger lock span, and the artifact pair
+ordering are the additional protocol those findings demanded.
