@@ -15,6 +15,7 @@ import os
 # Dispatch argv uses a pinned interpreter and never invokes a shell.
 import subprocess  # nosec B404
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -1076,14 +1077,33 @@ class DetectionCommitGate:
             continuation = admission.get("durable_continuation")
             owner = admission.get("producer_token")
             live = isinstance(owner, str) and self.producer_alive(owner)
-            if first is not None and now is not None and now - first <= MAX_DEFERRAL_SECONDS:
-                if live or isinstance(continuation, dict):
+            if first is not None and now is not None:
+                if now - first <= MAX_DEFERRAL_SECONDS:
+                    if live or isinstance(continuation, dict):
+                        return Resolution(
+                            ResolverState.IN_PROGRESS,
+                            "authenticated producer active or continuation scheduled",
+                            key,
+                            composing.id,
+                            scope_revision,
+                        )
+                else:
                     return Resolution(
-                        ResolverState.IN_PROGRESS,
-                        "authenticated producer active or continuation scheduled",
+                        ResolverState.OWED_UNSATISFIED,
+                        "post_budget_composing",
                         key,
                         composing.id,
                         scope_revision,
+                        activation_generation=(
+                            str(admission.get("activation_generation"))
+                            if admission.get("activation_generation") is not None
+                            else None
+                        ),
+                        readiness_generation=(
+                            str(admission.get("readiness_generation"))
+                            if admission.get("readiness_generation") is not None
+                            else None
+                        ),
                     )
         return Resolution(
             ResolverState.OWED_UNSATISFIED,
@@ -1097,6 +1117,279 @@ class DetectionCommitGate:
                 str(admission.get("readiness_generation")) if admission else None
             ),
         )
+
+    def _persist_post_budget_composing(self, resolution: Resolution) -> Resolution:
+        """Durably classify an expired composing marker before another dispatch."""
+        if (
+            resolution.state != ResolverState.OWED_UNSATISFIED
+            or resolution.reason != "post_budget_composing"
+            or resolution.key is None
+            or not isinstance(resolution.evidence_id, str)
+        ):
+            return resolution
+        key = resolution.key
+        with ExitStack() as locks:
+            # Canonical publication and this projection/classification share an
+            # ordering domain. If a bus record already landed but its eager
+            # projection hook failed or is waiting, replay it before the CAS.
+            locks.enter_context(self.store._message_publication_lock())
+            try:
+                self._validated_messages()
+            except LedgerUnreadable as exc:
+                return Resolution(ResolverState.BLOCKED, str(exc), key)
+            locks.enter_context(
+                self.store._exclusive_lock(
+                    self.path.with_suffix(".lock"),
+                    timeout=10.0,
+                ),
+            )
+            ledger = self._load()
+            admission = ledger["obligations"].get(key.digest)
+            if (
+                not isinstance(admission, dict)
+                or admission.get("state") != "open"
+                or admission.get("fence") != self.fence
+                or not self._live_dispatch_fence_owned()
+            ):
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "post-budget composing owner changed before classification",
+                    key,
+                )
+            breaker = ledger["breakers"].get(self.agent, {})
+            if breaker.get("tripped") is True or breaker.get("config_blocked") is True:
+                return Resolution(
+                    ResolverState.BLOCKED_COMPLIANCE,
+                    "compliance breaker tripped",
+                    key,
+                )
+            if (
+                int(ledger["scoped_revisions"].get(key.inbound_id, 0))
+                != resolution.scoped_revision
+            ):
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "post-budget composing classification CAS miss",
+                    key,
+                )
+            evidence_id = admission.get("post_budget_composing_evidence_id")
+            if evidence_id is not None and not isinstance(evidence_id, str):
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "post-budget composing evidence is invalid",
+                    key,
+                )
+            changed = False
+            if evidence_id is None:
+                evidence_id = resolution.evidence_id
+                admission["post_budget_composing_evidence_id"] = evidence_id
+                self._append(
+                    ledger,
+                    "OWED_ACTION_MISSING",
+                    source_id=evidence_id,
+                    key_digest=key.digest,
+                    data={"evidence": "post_budget_composing"},
+                )
+                changed = True
+            else:
+                evidence = [
+                    event
+                    for event in ledger["transitions"]
+                    if event.get("transition") == "OWED_ACTION_MISSING"
+                    and event.get("source_id") == evidence_id
+                    and event.get("key_digest") == key.digest
+                    and isinstance(event.get("data"), dict)
+                    and event["data"].get("evidence") == "post_budget_composing"
+                ]
+                if len(evidence) != 1:
+                    return Resolution(
+                        ResolverState.INDETERMINATE,
+                        "post-budget composing evidence transition is invalid",
+                        key,
+                    )
+            captured_rows = [
+                (nonce, row)
+                for nonce, row in admission.get("reservations", {}).items()
+                if isinstance(row, dict) and row.get("state") == "action_infra"
+            ]
+            if any(
+                not self._historical_capture_valid(key, admission, nonce, row)
+                for nonce, row in captured_rows
+            ):
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "captured infrastructure evidence is invalid",
+                    key,
+                )
+            captured_infra = bool(captured_rows)
+            required = {
+                "owed_action_missing_seen": True,
+                "first_dispatch_classified": True,
+                "last_exhaustion_class": (
+                    "infrastructure" if captured_infra else "compliance"
+                ),
+            }
+            for field, value in required.items():
+                if admission.get(field) != value:
+                    admission[field] = value
+                    changed = True
+            if changed:
+                self._write(ledger)
+            return Resolution(
+                ResolverState.OWED_UNSATISFIED,
+                "post_budget_composing",
+                key,
+                evidence_id,
+                int(ledger["scoped_revisions"].get(key.inbound_id, 0)),
+                ledger_revision=int(ledger["revision"]),
+                activation_generation=(
+                    str(admission.get("activation_generation"))
+                    if admission.get("activation_generation") is not None
+                    else None
+                ),
+                readiness_generation=(
+                    str(admission.get("readiness_generation"))
+                    if admission.get("readiness_generation") is not None
+                    else None
+                ),
+            )
+
+    def _historical_capture_valid(
+        self,
+        key: ObligationKey,
+        admission: dict,
+        nonce: str,
+        row: dict,
+    ) -> bool:
+        """Validate durable capture identity without requiring the mutable draft."""
+        digest = row.get("operation_payload_digest")
+        intent = row.get("operation_intent")
+        if (
+            not self._valid_dispatch_nonce(nonce)
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or digest != digest.lower()
+            or not isinstance(intent, dict)
+        ):
+            return False
+        try:
+            int(digest, 16)
+        except ValueError:
+            return False
+        marker = self.store.read_operation_intent(self.agent, nonce)
+        if (
+            not isinstance(marker, dict)
+            or marker.get("operation_digest") != digest
+            or marker.get("intent_digest")
+            != self.store._operation_intent_digest(intent)
+        ):
+            return False
+        if intent.get("operation") != "terminal" or intent.get(
+            "in_reply_to",
+        ) != key.inbound_id:
+            return False
+        if admission.get("obligation_class") == "human_escalation":
+            return bool(
+                intent.get("kind") == "question"
+                and isinstance(intent.get("recipient"), str)
+                and intent.get("recipient") not in {"", self.agent}
+                and intent.get("request_id") == f"esc-{nonce[:12]}"
+                and intent.get("broadcast_id") is None
+                and intent.get("origin_request_id") == key.correlation_id
+                and intent.get("origin_inbound_id") == key.inbound_id
+            )
+        broadcast_id = admission.get("broadcast_id")
+        return bool(
+            intent.get("kind") == "message"
+            and intent.get("recipient") == key.requester
+            and intent.get("request_id")
+            == (None if isinstance(broadcast_id, str) else key.correlation_id)
+            and intent.get("broadcast_id")
+            == (broadcast_id if isinstance(broadcast_id, str) else None)
+            and intent.get("origin_request_id") is None
+            and intent.get("origin_inbound_id") is None
+        )
+
+    def _persist_unsatisfied_attempts(self, resolution: Resolution) -> Resolution:
+        """Recover split result/classification writes before a corrected retry."""
+        if resolution.state != ResolverState.OWED_UNSATISFIED or resolution.key is None:
+            return resolution
+        key = resolution.key
+        with ExitStack() as locks:
+            locks.enter_context(self.store._message_publication_lock())
+            try:
+                self._validated_messages()
+            except LedgerUnreadable as exc:
+                return Resolution(ResolverState.BLOCKED, str(exc), key)
+            locks.enter_context(
+                self.store._exclusive_lock(
+                    self.path.with_suffix(".lock"),
+                    timeout=10.0,
+                ),
+            )
+            ledger = self._load()
+            admission = ledger["obligations"].get(key.digest)
+            if (
+                not isinstance(admission, dict)
+                or admission.get("state") != "open"
+                or admission.get("fence") != self.fence
+                or not self._live_dispatch_fence_owned()
+            ):
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "unsatisfied attempt owner changed before classification",
+                    key,
+                )
+            breaker = ledger["breakers"].get(self.agent, {})
+            if breaker.get("tripped") is True or breaker.get("config_blocked") is True:
+                return Resolution(
+                    ResolverState.BLOCKED_COMPLIANCE,
+                    "compliance breaker tripped",
+                    key,
+                )
+            if (
+                int(ledger["scoped_revisions"].get(key.inbound_id, 0))
+                != resolution.scoped_revision
+            ):
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "unsatisfied attempt classification CAS miss",
+                    key,
+                )
+            pending = [
+                (nonce, row)
+                for nonce, row in admission.get("reservations", {}).items()
+                if isinstance(row, dict)
+                and row.get("state") == "completed"
+                and row.get("action_attempted") is True
+            ]
+            if not pending:
+                return resolution
+            reason = "replay remained unsatisfied after attempted action"
+            for nonce, row in pending:
+                row["state"] = "action_rejected"
+                row["rejection_reason"] = reason
+                self._append(
+                    ledger,
+                    "ACTION_REJECTED",
+                    key_digest=key.digest,
+                    data={"nonce": nonce, "reason": reason},
+                )
+            admission["owed_action_missing_seen"] = True
+            admission["first_dispatch_classified"] = True
+            admission["last_exhaustion_class"] = "compliance"
+            self._write(ledger)
+            return Resolution(
+                resolution.state,
+                resolution.reason,
+                key,
+                resolution.evidence_id,
+                int(ledger["scoped_revisions"].get(key.inbound_id, 0)),
+                ledger_revision=int(ledger["revision"]),
+                compliance_success=resolution.compliance_success,
+                activation_generation=resolution.activation_generation,
+                readiness_generation=resolution.readiness_generation,
+            )
 
     def _can_reassign_fenced_owner(self, owner: dict) -> bool:
         """Require current wrapper ownership and a stale prior owner before takeover."""
@@ -1193,6 +1486,8 @@ class DetectionCommitGate:
         if (
             not isinstance(marker, dict)
             or marker.get("operation_digest") != digest
+            or marker.get("intent_digest")
+            != self.store._operation_intent_digest(intent)
             or marker.get("payload_sha256") != hashlib.sha256(payload).hexdigest()
             or marker.get("payload_size") != len(payload)
         ):
@@ -1413,7 +1708,21 @@ class DetectionCommitGate:
                 if isinstance(claimed, Resolution):
                     return claimed
                 ledger, admission = claimed
-            return self._resolve_replay(record, messages, ledger, admission=admission)
+                replayed = self._resolve_replay(
+                    record,
+                    messages,
+                    ledger,
+                    admission=admission,
+                )
+            classified = self._persist_post_budget_composing(replayed)
+            if any(
+                isinstance(row, dict)
+                and row.get("state") == "completed"
+                and row.get("action_attempted") is True
+                for row in admission.get("reservations", {}).values()
+            ):
+                return self._persist_unsatisfied_attempts(classified)
+            return classified
         before = self._resolve_replay(record, messages, ledger, admission=None)
         if before.state in TERMINAL_STATES:
             with self.store._exclusive_lock(
@@ -1615,7 +1924,15 @@ class DetectionCommitGate:
                 "compliance breaker tripped",
                 self._key_from(admission["key"]),
             )
-        return replayed
+        classified = self._persist_post_budget_composing(replayed)
+        if any(
+            isinstance(row, dict)
+            and row.get("state") == "completed"
+            and row.get("action_attempted") is True
+            for row in admission.get("reservations", {}).values()
+        ):
+            return self._persist_unsatisfied_attempts(classified)
+        return classified
 
     def _live_dispatch_fence_owned(self) -> bool:
         generation = self.store.wrapper_wait_generation(self.agent)
@@ -1737,7 +2054,18 @@ class DetectionCommitGate:
         )
         key = resolution.key
         permit: DispatchPermit
-        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
+        with ExitStack() as locks:
+            # Hold final message publication across replay synchronization and
+            # reservation CAS. A canonically published terminal can never be
+            # hidden merely because its eager projection hook failed or waited.
+            locks.enter_context(self.store._message_publication_lock())
+            self._validated_messages()
+            locks.enter_context(
+                self.store._exclusive_lock(
+                    self.path.with_suffix(".lock"),
+                    timeout=10.0,
+                ),
+            )
             ledger = self._load()
             admission = ledger["obligations"].get(key.digest)
             admission = self._validate_dispatch_authority(
@@ -1818,6 +2146,15 @@ class DetectionCommitGate:
                     if total != 1 or admission.get("first_dispatch_classified") is not True:
                         raise DispatchRefused(
                             "extra dispatch requires one durably classified first attempt",
+                        )
+                    if any(
+                        isinstance(row, dict)
+                        and row.get("state") == "completed"
+                        and row.get("action_attempted") is True
+                        for row in admission.get("reservations", {}).values()
+                    ):
+                        raise DispatchRefused(
+                            "corrected retry requires durable rejection classification",
                         )
                 scheduled = admission.get("durable_continuation")
                 if purpose == "recovery" and (
@@ -1941,6 +2278,13 @@ class DetectionCommitGate:
                 if total == 0:
                     return "initial"
                 if total != 1 or admission.get("first_dispatch_classified") is not True:
+                    return None
+                if any(
+                    isinstance(row, dict)
+                    and row.get("state") == "completed"
+                    and row.get("action_attempted") is True
+                    for row in reservations.values()
+                ):
                     return None
                 continuation = admission.get("durable_continuation")
                 if (
@@ -2355,6 +2699,7 @@ class DetectionCommitGate:
                     reservation["state"] = "uncaptured_infra"
             elif action_rejected:
                 transition = "ACTION_REJECTED"
+                reservation["state"] = "action_rejected"
                 admission["owed_action_missing_seen"] = True
                 admission["last_exhaustion_class"] = "compliance"
             else:
@@ -2375,8 +2720,10 @@ class DetectionCommitGate:
             ) else None
             if not isinstance(admission, dict) or not isinstance(row, dict):
                 raise GateError("dispatch reservation disappeared")
-            if row.get("state") == "action_infra":
+            if row.get("state") == "action_rejected":
                 return
+            if row.get("state") != "completed":
+                raise GateError("unsatisfied action is not durably classified")
             admission["owed_action_missing_seen"] = True
             admission["last_exhaustion_class"] = "compliance"
             row["state"] = "action_rejected"

@@ -645,13 +645,22 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 action_infra = (
                     outcome.bus_action_infra or outcome.failure_class == CLASS_INFRA
                 )
+                resolution = commit_gate.resolve(record)
+                post_budget_composing = resolution.reason == "post_budget_composing"
+                action_rejected = outcome.bus_action_rejected or (
+                    resolution.state == ResolverState.OWED_UNSATISFIED
+                    and outcome.bus_action_attempted
+                    and not action_infra
+                )
                 commit_gate.mark_dispatch_result(
                     permit,
                     action_attempted=outcome.bus_action_attempted,
-                    action_rejected=outcome.bus_action_rejected,
+                    action_rejected=action_rejected,
                     action_infra=action_infra,
                 )
-                resolution = commit_gate.resolve(record)
+                if post_budget_composing:
+                    resolution = commit_gate.resolve(record)
+                    action_infra = commit_gate.captured_operation(key) is not None
                 if (
                     resolution.state == ResolverState.OWED_UNSATISFIED
                     and outcome.bus_action_attempted
@@ -1023,13 +1032,22 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                 action_infra = (
                     outcome.bus_action_infra or outcome.failure_class == CLASS_INFRA
                 )
+                resolved = commit_gate.resolve(record)
+                post_budget_composing = resolved.reason == "post_budget_composing"
+                action_rejected = outcome.bus_action_rejected or (
+                    resolved.state == ResolverState.OWED_UNSATISFIED
+                    and outcome.bus_action_attempted
+                    and not action_infra
+                )
                 commit_gate.mark_dispatch_result(
                     permit,
                     action_attempted=outcome.bus_action_attempted,
-                    action_rejected=outcome.bus_action_rejected,
+                    action_rejected=action_rejected,
                     action_infra=action_infra,
                 )
-                resolved = commit_gate.resolve(record)
+                if post_budget_composing:
+                    resolved = commit_gate.resolve(record)
+                    action_infra = commit_gate.captured_operation(key) is not None
                 if (
                     resolved.state == ResolverState.OWED_UNSATISFIED
                     and outcome.bus_action_attempted

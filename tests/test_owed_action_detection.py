@@ -20,6 +20,7 @@ from agenttalk.wrapper.obligations import (
     DispatchRefused,
     DetectionCommitGate,
     GateError,
+    LedgerUnreadable,
     PolicySnapshot,
     ResolverState,
     StaleRevision,
@@ -109,6 +110,7 @@ def _record_captured_intent(
         operation_nonce=permit.nonce,
         operation_digest=digest,
         body=body,
+        operation_intent=intent,
     )
     return digest
 
@@ -773,6 +775,294 @@ def test_reservation_precedes_drive_and_second_dispatch_is_xor(tmp_path: Path) -
 
     with pytest.raises(DispatchRefused):
         gate.reserve_dispatch(gate.resolve(_record(store)), purpose="continuation")
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+def test_action_rejected_gets_one_corrected_retry_within_paid_cap(
+    tmp_path: Path,
+    scoped: bool,
+) -> None:
+    store = _store(tmp_path)
+    _question(store)
+    gate = _gate(store)
+    purposes: list[str] = []
+
+    def drive(record: dict) -> loop.DriveOutcome:
+        purposes.append(record["owed_action"]["purpose"])
+        if len(purposes) == 1:
+            return loop.DriveOutcome(
+                ok=False,
+                failure_class=loop.CLASS_AMBIGUOUS,
+                summary="deterministic schema rejection",
+                bus_action_attempted=True,
+                bus_action_rejected=True,
+            )
+        Path(record["owed_action"]["draft_path"]).write_text(
+            "399",
+            encoding="utf-8",
+        )
+        assert cli.main([
+            "--root",
+            str(tmp_path),
+            *record["owed_action"]["argv"][3:],
+            "--quiet",
+        ]) == 0
+        return loop.DriveOutcome(ok=True, bus_action_attempted=True)
+
+    turns = loop.run_loop(
+        store,
+        "beta",
+        drive,
+        only_request_id="q-1" if scoped else None,
+        commit_gate=gate,
+        clock=lambda: 0.0,
+        sleep=lambda _delay: None,
+        max_turns=1,
+        max_polls=4,
+    )
+
+    admission = next(iter(_ledger(gate)["obligations"].values()))
+    transitions = _ledger(gate)["transitions"]
+    rejected = [
+        index
+        for index, row in enumerate(transitions)
+        if row["transition"] == "ACTION_REJECTED"
+    ]
+    recovery = next(
+        index
+        for index, row in enumerate(transitions)
+        if row["transition"] == "DISPATCH_RESERVED"
+        and row["data"].get("purpose") == "recovery"
+    )
+    first_nonce = next(iter(admission["reservations"]))
+
+    assert turns == 1
+    assert purposes == ["initial", "recovery"]
+    assert admission["paid_dispatches_total"] == 2
+    assert admission["paid_recoveries_total"] == 1
+    assert admission["reservations"][first_nonce]["state"] == "action_rejected"
+    assert len(rejected) == 1
+    assert rejected[0] < recovery
+
+
+def test_wrong_class_retry_waits_for_durable_rejection_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store, escalation_required=True)
+    owner = _gate(store, fence="wrapper-1")
+    record = _record(store)
+    admitted = owner.admit_or_finalize(record)
+    assert admitted.key is not None
+    first = owner.reserve_dispatch(admitted, purpose="initial")
+    owner.dispatch_record(record, first)
+    first.draft_path.write_text("I answered instead", encoding="utf-8")
+    assert cli.main([
+        "--root",
+        str(tmp_path),
+        "reply",
+        "--from",
+        "beta",
+        "--to-id",
+        inbound.id,
+        "--operation-nonce",
+        first.nonce,
+        "--file",
+        str(first.draft_path),
+        "--quiet",
+    ]) == 0
+    # Model the old split-write crash point: the side effect/result is durable,
+    # but its replay-proven wrong class has not yet been classified.
+    owner.mark_dispatch_result(first, action_attempted=True)
+    monkeypatch.setattr(
+        "agenttalk.wrapper.obligations._process_liveness",
+        lambda _pid: "dead",
+    )
+
+    restarted = _gate(store, fence="wrapper-2")
+    purposes: list[str] = []
+
+    def corrected_drive(recovery_record: dict) -> loop.DriveOutcome:
+        owed = recovery_record["owed_action"]
+        purposes.append(owed["purpose"])
+        Path(owed["draft_path"]).write_text(
+            "Operator decision needed",
+            encoding="utf-8",
+        )
+        assert cli.main([
+            "--root",
+            str(tmp_path),
+            *owed["argv"][3:],
+            "--quiet",
+        ]) == 0
+        return loop.DriveOutcome(ok=True, bus_action_attempted=True)
+
+    assert loop.run_loop(
+        store,
+        "beta",
+        corrected_drive,
+        commit_gate=restarted,
+        clock=lambda: 0.0,
+        sleep=lambda _delay: None,
+        max_turns=1,
+        max_polls=2,
+    ) == 1
+
+    ledger = _ledger(restarted)
+    admission = ledger["obligations"][admitted.key.digest]
+    rejection = next(
+        index
+        for index, row in enumerate(ledger["transitions"])
+        if row["transition"] == "ACTION_REJECTED"
+    )
+    recovery = next(
+        index
+        for index, row in enumerate(ledger["transitions"])
+        if row["transition"] == "DISPATCH_RESERVED"
+        and row["data"].get("purpose") == "recovery"
+    )
+    assert purposes == ["recovery"]
+    assert admission["paid_dispatches_total"] == 2
+    assert admission["reservations"][first.nonce]["state"] == "action_rejected"
+    assert rejection < recovery
+
+
+def test_unsatisfied_attempt_revalidation_failure_returns_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    _question(store)
+    gate = _gate(store)
+    record = _record(store)
+    admitted = gate.admit_or_finalize(record)
+    assert admitted.key is not None
+    first = gate.reserve_dispatch(admitted, purpose="initial")
+    gate.dispatch_record(record, first)
+    gate.mark_dispatch_result(first, action_attempted=True)
+    original = gate._validated_messages
+    reads = 0
+
+    def fail_second_read():
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise LedgerUnreadable("injected second replay failure")
+        return original()
+
+    monkeypatch.setattr(gate, "_validated_messages", fail_second_read)
+
+    blocked = gate.resolve(record)
+
+    assert blocked.state == ResolverState.BLOCKED
+    assert "injected second replay failure" in blocked.reason
+    assert _ledger(gate)["obligations"][admitted.key.digest][
+        "paid_dispatches_total"
+    ] == 1
+
+
+@pytest.mark.parametrize(
+    ("first_class", "second_class", "second_purpose", "expected_states"),
+    [
+        ("missing", "infrastructure", "recovery", ("completed", "uncaptured_infra")),
+        ("infrastructure", "rejected", "continuation", ("uncaptured_infra", "action_rejected")),
+        ("rejected", "ambiguous", "recovery", ("action_rejected", "completed")),
+        ("ambiguous", "missing", "continuation", ("completed", "completed")),
+        ("wrong_class", "wrong_class", "recovery", ("action_rejected", "action_rejected")),
+    ],
+)
+def test_all_class_mixes_never_reserve_a_third_paid_dispatch(
+    tmp_path: Path,
+    first_class: str,
+    second_class: str,
+    second_purpose: str,
+    expected_states: tuple[str, str],
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(
+        store,
+        escalation_required="wrong_class" in {first_class, second_class},
+    )
+    gate = _gate(store)
+    record = _record(store)
+    admitted = gate.admit_or_finalize(record)
+    assert admitted.key is not None
+
+    def classify(permit, classification: str) -> None:
+        if classification == "infrastructure":
+            gate.mark_dispatch_result(
+                permit,
+                action_attempted=True,
+                action_infra=True,
+            )
+        elif classification == "rejected":
+            gate.mark_dispatch_result(
+                permit,
+                action_attempted=True,
+                action_rejected=True,
+            )
+        elif classification == "wrong_class":
+            permit.draft_path.write_text("I answered instead", encoding="utf-8")
+            assert cli.main([
+                "--root",
+                str(tmp_path),
+                "reply",
+                "--from",
+                "beta",
+                "--to-id",
+                inbound.id,
+                "--operation-nonce",
+                permit.nonce,
+                "--file",
+                str(permit.draft_path),
+                "--quiet",
+            ]) == 0
+            gate.mark_dispatch_result(permit, action_attempted=True)
+            assert gate.resolve(record).state == ResolverState.OWED_UNSATISFIED
+            gate.mark_unsatisfied_attempt(
+                permit,
+                reason="answered instead of escalating",
+            )
+        elif classification == "ambiguous":
+            # Ambiguous/no-authoritative-evidence and explicit missing both
+            # reach the gate as non-proof; the wrapper's failure class only
+            # affects diagnostics outside the paid reservation ledger.
+            gate.mark_dispatch_result(permit, action_attempted=False)
+        else:
+            gate.mark_dispatch_result(permit, action_attempted=False)
+
+    first = gate.reserve_dispatch(admitted, purpose="initial")
+    gate.dispatch_record(record, first)
+    classify(first, first_class)
+    if second_purpose == "continuation":
+        gate.schedule_continuation(admitted.key, producer_token="producer-1")
+    second = gate.reserve_dispatch(gate.resolve(record), purpose=second_purpose)
+    gate.dispatch_record(record, second)
+    classify(second, second_class)
+
+    with pytest.raises(DispatchRefused, match="paid dispatch budget exhausted"):
+        gate.reserve_dispatch(
+            gate.resolve(record),
+            purpose="continuation" if second_purpose == "recovery" else "recovery",
+            nonce="f" * 32,
+        )
+
+    ledger = _ledger(gate)
+    admission = ledger["obligations"][admitted.key.digest]
+    assert admission["paid_dispatches_total"] == 2
+    assert admission["paid_initial_dispatches_total"] == 1
+    assert admission["paid_recoveries_total"] == (second_purpose == "recovery")
+    assert admission["paid_continuations_total"] == (second_purpose == "continuation")
+    assert admission["reservations"][first.nonce]["state"] == expected_states[0]
+    assert admission["reservations"][second.nonce]["state"] == expected_states[1]
+    assert sum(
+        row["transition"] == "ACTION_REJECTED"
+        for row in ledger["transitions"]
+    ) == sum(
+        classification in {"rejected", "wrong_class"}
+        for classification in (first_class, second_class)
+    )
 
 
 def test_dispatch_record_rejects_a_tampered_permit_draft_path(tmp_path: Path) -> None:
@@ -2484,6 +2774,245 @@ def test_composing_without_live_producer_or_continuation_does_not_park(
     assert gate.resolve(record).state == ResolverState.OWED_UNSATISFIED
 
 
+def test_post_budget_composing_is_durably_missing_and_cannot_escape_paid_cap(
+    tmp_path: Path,
+) -> None:
+    current = {"value": "2026-01-01T00:00:00Z"}
+    store = _store(tmp_path)
+    _question(store)
+    gate = _gate(
+        store,
+        now=lambda: current["value"],
+        producer_alive=lambda _token: True,
+    )
+    record = _record(store)
+    admitted = gate.admit_or_finalize(record)
+    assert admitted.key is not None
+    first = gate.reserve_dispatch(admitted, purpose="initial")
+    dispatched = gate.dispatch_record(record, first)
+    gate.schedule_continuation(admitted.key, producer_token="producer-1")
+    assert cli.main([
+        "--root",
+        str(tmp_path),
+        *dispatched["owed_action"]["composing_argv"][3:],
+        "--quiet",
+    ]) == 0
+    current["value"] = "2026-01-01T01:00:00Z"
+    assert gate.resolve(record).state == ResolverState.IN_PROGRESS
+    current["value"] = "2026-01-01T01:00:00.001Z"
+
+    expired = gate.resolve(record)
+    replayed = gate.resolve(record)
+
+    ledger = _ledger(gate)
+    admission = ledger["obligations"][admitted.key.digest]
+    evidence_id = admission.get("post_budget_composing_evidence_id")
+    assert expired.state == ResolverState.OWED_UNSATISFIED
+    assert expired.reason == "post_budget_composing"
+    assert expired.evidence_id == evidence_id
+    assert replayed.evidence_id == evidence_id
+    assert admission["owed_action_missing_seen"] is True
+    assert admission["first_dispatch_classified"] is True
+    assert admission["last_exhaustion_class"] == "compliance"
+    assert sum(
+        row["transition"] == "OWED_ACTION_MISSING"
+        and row.get("source_id") == evidence_id
+        and row["data"].get("evidence") == "post_budget_composing"
+        for row in ledger["transitions"]
+    ) == 1
+
+    gate.mark_dispatch_result(
+        first,
+        action_attempted=True,
+        action_infra=True,
+    )
+    assert _ledger(gate)["obligations"][admitted.key.digest][
+        "last_exhaustion_class"
+    ] == "infrastructure"
+    reasserted = gate.resolve(record)
+    assert reasserted.reason == "post_budget_composing"
+    assert _ledger(gate)["obligations"][admitted.key.digest][
+        "last_exhaustion_class"
+    ] == "compliance"
+    second = gate.reserve_dispatch(expired, purpose="continuation")
+    gate.dispatch_record(record, second)
+    gate.mark_dispatch_result(second, action_attempted=False)
+    with pytest.raises(DispatchRefused, match="paid dispatch budget exhausted"):
+        gate.reserve_dispatch(
+            gate.resolve(record),
+            purpose="recovery",
+            nonce="e" * 32,
+        )
+    assert _ledger(gate)["obligations"][admitted.key.digest][
+        "paid_dispatches_total"
+    ] == 2
+
+
+def test_post_budget_composing_outranks_child_infra_in_loop(tmp_path: Path) -> None:
+    current = {"value": "2026-01-01T00:00:00Z"}
+    store = _store(tmp_path)
+    _question(store)
+    gate = _gate(
+        store,
+        now=lambda: current["value"],
+        producer_alive=lambda _token: True,
+    )
+    admitted = gate.admit_or_finalize(_record(store))
+    assert admitted.key is not None
+
+    def drive(record: dict) -> loop.DriveOutcome:
+        gate.schedule_continuation(admitted.key, producer_token="producer-1")
+        assert cli.main([
+            "--root",
+            str(tmp_path),
+            *record["owed_action"]["composing_argv"][3:],
+            "--quiet",
+        ]) == 0
+        current["value"] = "2026-01-01T01:00:00.001Z"
+        return loop.DriveOutcome(
+            ok=False,
+            failure_class=loop.CLASS_INFRA,
+            bus_action_infra=True,
+        )
+
+    assert loop.run_loop(
+        store,
+        "beta",
+        drive,
+        commit_gate=gate,
+        clock=lambda: 0.0,
+        sleep=lambda _delay: None,
+        max_polls=1,
+    ) == 0
+
+    ledger = _ledger(gate)
+    admission = ledger["obligations"][admitted.key.digest]
+    first = next(iter(admission["reservations"].values()))
+    assert first["state"] == "uncaptured_infra"
+    assert admission["last_exhaustion_class"] == "compliance"
+    assert not any(
+        row["transition"] == "OPERATION_RETRY_RECORDED"
+        for row in ledger["transitions"]
+    )
+
+
+def test_post_budget_composing_preserves_captured_operation_infra(
+    tmp_path: Path,
+) -> None:
+    current = {"value": "2026-01-01T00:00:00Z"}
+    store = _store(tmp_path)
+    _question(store, escalation_required=True)
+    gate = _gate(
+        store,
+        now=lambda: current["value"],
+        producer_alive=lambda _token: True,
+    )
+    record = _record(store)
+    admitted = gate.admit_or_finalize(record)
+    assert admitted.key is not None
+    first = gate.reserve_dispatch(admitted, purpose="initial")
+    dispatched = gate.dispatch_record(record, first)
+    gate.schedule_continuation(admitted.key, producer_token="producer-1")
+    assert cli.main([
+        "--root",
+        str(tmp_path),
+        *dispatched["owed_action"]["composing_argv"][3:],
+        "--quiet",
+    ]) == 0
+    current["value"] = "2026-01-01T01:00:00.001Z"
+    assert gate.resolve(record).reason == "post_budget_composing"
+    first.draft_path.write_text("399", encoding="utf-8")
+    captured_digest = _record_captured_intent(store, gate, first)
+    gate.mark_dispatch_result(
+        first,
+        action_attempted=True,
+        action_infra=True,
+    )
+
+    replayed = gate.resolve(record)
+    ledger = _ledger(gate)
+    admission = ledger["obligations"][admitted.key.digest]
+    row = admission["reservations"][first.nonce]
+    captured = gate.captured_operation(admitted.key)
+
+    assert replayed.reason == "post_budget_composing"
+    assert admission["last_exhaustion_class"] == "infrastructure"
+    assert row["state"] == "action_infra"
+    assert row["operation_payload_digest"] == captured_digest
+    assert captured is not None
+    assert captured.nonce == first.nonce
+
+    first.draft_path.unlink()
+    after_loss = gate.resolve(record)
+    admission_after_loss = _ledger(gate)["obligations"][admitted.key.digest]
+    assert after_loss.reason == "post_budget_composing"
+    assert admission_after_loss["last_exhaustion_class"] == "infrastructure"
+
+    corrupt = _ledger(gate)
+    corrupt_row = corrupt["obligations"][admitted.key.digest]["reservations"][
+        first.nonce
+    ]
+    corrupt_row["operation_intent"]["recipient"] = "gamma"
+    gate.path.write_text(json.dumps(corrupt), encoding="utf-8")
+
+    invalid = gate.resolve(record)
+    assert invalid.state == ResolverState.INDETERMINATE
+    assert "captured infrastructure evidence" in invalid.reason
+
+
+@pytest.mark.parametrize("escalation_required", [False, True])
+def test_canonical_terminal_blocks_stale_post_budget_reservation_when_hook_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    escalation_required: bool,
+) -> None:
+    current = {"value": "2026-01-01T00:00:00Z"}
+    store = _store(tmp_path)
+    _question(store, escalation_required=escalation_required)
+    gate = _gate(
+        store,
+        now=lambda: current["value"],
+        producer_alive=lambda _token: True,
+    )
+    record = _record(store)
+    admitted = gate.admit_or_finalize(record)
+    assert admitted.key is not None
+    first = gate.reserve_dispatch(admitted, purpose="initial")
+    dispatched = gate.dispatch_record(record, first)
+    gate.schedule_continuation(admitted.key, producer_token="producer-1")
+    assert cli.main([
+        "--root",
+        str(tmp_path),
+        *dispatched["owed_action"]["composing_argv"][3:],
+        "--quiet",
+    ]) == 0
+    current["value"] = "2026-01-01T01:00:00.001Z"
+    stale = gate.resolve(record)
+    gate.mark_dispatch_result(first, action_attempted=False)
+
+    def fail_eager_index(_store, _message) -> None:
+        raise OSError("injected projection hook failure")
+
+    monkeypatch.setattr(
+        "agenttalk.wrapper.obligations.note_bus_message",
+        fail_eager_index,
+    )
+    first.draft_path.write_text("399", encoding="utf-8")
+    assert cli.main([
+        "--root",
+        str(tmp_path),
+        *dispatched["owed_action"]["argv"][3:],
+        "--quiet",
+    ]) == 0
+
+    with pytest.raises((DispatchRefused, StaleRevision)):
+        gate.reserve_dispatch(stale, purpose="continuation")
+
+    admission = _ledger(gate)["obligations"][admitted.key.digest]
+    assert admission["paid_dispatches_total"] == 1
+    assert gate.resolve(record).state == ResolverState.SATISFIED
+
+
 def test_wrong_class_answer_does_not_satisfy_required_escalation(tmp_path: Path) -> None:
     store = _store(tmp_path)
     inbound = _question(store, escalation_required=True)
@@ -2492,6 +3021,9 @@ def test_wrong_class_answer_does_not_satisfy_required_escalation(tmp_path: Path)
     admitted = gate.admit_or_finalize(record)
     assert admitted.key is not None
     permit = gate.reserve_dispatch(admitted, purpose="initial")
+    with pytest.raises(GateError, match="durably classified"):
+        gate.mark_unsatisfied_attempt(permit, reason="answered instead of escalating")
+    gate.dispatch_record(record, permit)
     permit.draft_path.write_text("I answered instead", encoding="utf-8")
     assert cli.main([
         "--root",
@@ -2508,6 +3040,11 @@ def test_wrong_class_answer_does_not_satisfy_required_escalation(tmp_path: Path)
         "--quiet",
     ]) == 0
     unresolved = gate.resolve(record)
+    gate.mark_dispatch_result(
+        permit,
+        action_attempted=True,
+        action_rejected=unresolved.state == ResolverState.OWED_UNSATISFIED,
+    )
     gate.mark_unsatisfied_attempt(permit, reason="answered instead of escalating")
 
     assert unresolved.state == ResolverState.OWED_UNSATISFIED

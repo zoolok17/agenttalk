@@ -1471,6 +1471,20 @@ class Store:
             what="retirement/message publication",
         )
 
+    def _message_publication_lock(
+        self,
+        *,
+        timeout: float = 10.0,
+        poll: float = 0.005,
+    ):
+        """Linearize every canonical message publication with dispatch replay."""
+        return self._lock_generation_guard(
+            self.dir / "message-publication",
+            deadline=time.monotonic() + timeout,
+            poll=poll,
+            what="message publication",
+        )
+
     @staticmethod
     def _cfg_dict(cfg: dict, key: str) -> dict:
         """Return cfg[key] as a dict, coercing absent/null to a fresh {}.
@@ -2604,11 +2618,12 @@ class Store:
                 if _config_locked
                 else self._retirement_lock()
             )
-            with lock:
+            with lock, self._message_publication_lock():
                 # Durable payload preparation is deliberately OUTSIDE this lock,
                 # so unrelated sends do not serialize their write+fsync cost.
-                # Retirement and final publication share only this persistent,
-                # narrow mutex. Revalidate immediately before the O(1) commit.
+                # Retirement and dispatch replay share persistent, narrow
+                # mutexes with final publication. Revalidate immediately before
+                # the O(1) commit.
                 current_revision = _file_revision(os.stat(self.config_path))
                 if config_revision is None or current_revision != config_revision:
                     cfg = self.load_config()
@@ -2660,6 +2675,39 @@ class Store:
             raise ValueError("operation nonce must be exactly 32 lowercase hexadecimal characters")
         return self.state_dir / "operation-intents" / f"{name}.{operation_nonce}.json"
 
+    @staticmethod
+    def _operation_intent_identity(
+        *,
+        operation: str,
+        kind: str,
+        recipient: str,
+        meta: dict,
+    ) -> dict:
+        return {
+            "operation": operation,
+            "kind": kind,
+            "recipient": recipient,
+            "in_reply_to": meta.get("in_reply_to"),
+            "request_id": meta.get("request_id"),
+            "broadcast_id": meta.get("broadcast_id"),
+            "origin_request_id": meta.get("origin_request_id"),
+            "origin_inbound_id": meta.get("origin_inbound_id"),
+        }
+
+    @staticmethod
+    def _operation_intent_digest(intent: dict) -> str:
+        canonical = json.dumps(
+            intent,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _operation_digest_for_intent(cls, intent: dict, body: str) -> str:
+        return cls._operation_intent_digest({**intent, "body": body})
+
     def read_operation_intent(self, sender: str, operation_nonce: str) -> dict | None:
         """Read one atomically prepared wrapper-operation identity."""
         path = self._operation_intent_path(sender, operation_nonce)
@@ -2675,6 +2723,14 @@ class Store:
             is None
             or re.fullmatch(r"[0-9a-f]{64}", str(value.get("payload_sha256", "")))
             is None
+            or (
+                "intent_digest" in value
+                and re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(value.get("intent_digest", "")),
+                )
+                is None
+            )
             or not isinstance(value.get("payload_size"), int)
             or value.get("state") not in {"prepared", "published"}
         ):
@@ -2688,6 +2744,7 @@ class Store:
         operation_nonce: str,
         operation_digest: str,
         body: str,
+        intent_digest: str | None = None,
     ) -> tuple[Path, dict]:
         if re.fullmatch(r"[0-9a-f]{64}", operation_digest) is None:
             raise ValueError(
@@ -2702,10 +2759,33 @@ class Store:
             "payload_sha256": hashlib.sha256(payload).hexdigest(),
             "payload_size": len(payload),
         }
+        if intent_digest is not None:
+            if re.fullmatch(r"[0-9a-f]{64}", intent_digest) is None:
+                raise ValueError(
+                    "operation intent digest must be exactly 64 lowercase hexadecimal characters"
+                )
+            identity["intent_digest"] = intent_digest
         existing = self.read_operation_intent(sender, operation_nonce)
         if isinstance(existing, dict):
-            if any(existing.get(name) != value for name, value in identity.items()):
+            base_identity = {
+                name: value
+                for name, value in identity.items()
+                if name != "intent_digest"
+            }
+            if any(existing.get(name) != value for name, value in base_identity.items()):
                 raise ValueError("operation nonce was already used with a different payload")
+            if intent_digest is not None:
+                existing_intent = existing.get("intent_digest")
+                if existing_intent not in {None, intent_digest}:
+                    raise ValueError(
+                        "operation nonce was already used with a different intent"
+                    )
+                if existing_intent is None:
+                    existing["intent_digest"] = intent_digest
+                    _atomic_write_text(
+                        path,
+                        json.dumps(existing, indent=2, ensure_ascii=False),
+                    )
             return path, existing
         if path.exists():
             raise ValueError("operation intent marker is unreadable")
@@ -2721,8 +2801,16 @@ class Store:
         operation_nonce: str,
         operation_digest: str,
         body: str,
+        operation_intent: dict | None = None,
     ) -> dict:
         """Durably mark a complete captured payload before canonical append."""
+        intent_digest = None
+        if operation_intent is not None:
+            if not isinstance(operation_intent, dict):
+                raise ValueError("operation intent must be a mapping")
+            if self._operation_digest_for_intent(operation_intent, body) != operation_digest:
+                raise ValueError("operation intent does not match the operation digest")
+            intent_digest = self._operation_intent_digest(operation_intent)
         lock = self.state_dir / "operation-publication.lock"
         with self._exclusive_lock(
             lock,
@@ -2734,6 +2822,7 @@ class Store:
                 operation_nonce=operation_nonce,
                 operation_digest=operation_digest,
                 body=body,
+                intent_digest=intent_digest,
             )
             return dict(intent)
 
@@ -2761,6 +2850,15 @@ class Store:
             raise ValueError("operation digest metadata conflicts with publication request")
         supplied["operation_nonce"] = operation_nonce
         supplied["operation_digest"] = operation_digest
+        operation_intent = self._operation_intent_identity(
+            operation="composing" if kind == "composing" else "terminal",
+            kind=kind,
+            recipient=recipient,
+            meta=supplied,
+        )
+        if self._operation_digest_for_intent(operation_intent, body) != operation_digest:
+            raise ValueError("operation intent does not match the operation digest")
+        intent_digest = self._operation_intent_digest(operation_intent)
         lock = self.state_dir / "operation-publication.lock"
         with self._exclusive_lock(
             lock,
@@ -2772,6 +2870,7 @@ class Store:
                 operation_nonce=operation_nonce,
                 operation_digest=operation_digest,
                 body=body,
+                intent_digest=intent_digest,
             )
             for existing in self.valid_messages():
                 existing_meta = existing.meta or {}
