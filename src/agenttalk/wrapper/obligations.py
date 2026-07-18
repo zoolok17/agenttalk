@@ -4235,10 +4235,12 @@ class DetectionCommitGate:
             raise DispatchRefused("AGENTTALK_PY must name an absolute executable")
         try:
             resolved = executable.resolve(strict=True)
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             raise DispatchRefused("AGENTTALK_PY executable is unavailable") from exc
-        if executable.is_symlink() or not resolved.is_file():
-            raise DispatchRefused("AGENTTALK_PY must name a regular non-symlink file")
+        # POSIX Python launchers are commonly symlinks. Returning the canonical
+        # regular-file path keeps dispatch argv stable if the launcher is retargeted.
+        if not resolved.is_file():
+            raise DispatchRefused("AGENTTALK_PY must resolve to a regular file")
         return str(resolved)
 
     def dispatch_exhausted(self, key: ObligationKey) -> bool:
