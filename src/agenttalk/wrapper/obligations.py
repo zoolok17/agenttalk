@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 # Dispatch argv uses a pinned interpreter and never invokes a shell.
 import subprocess  # nosec B404
@@ -46,6 +47,10 @@ PARTICIPANT_CAPABILITIES_DIGEST = hashlib.sha256(
 ).hexdigest()
 MAX_PAID_DISPATCHES_TOTAL = 2
 COMPLIANCE_BREAKER_TRIP = 3
+MAX_DISPATCH_TOKEN_CEILING = 262_144
+MAX_DISPATCH_WALL_TIME_SECONDS = 3_600.0
+MAX_DISPATCH_RESERVED_COST = 100.0
+MAX_CONCURRENT_PAID_DISPATCHES = 1
 MAX_OPERATION_INFRA_ATTEMPTS = 16
 MAX_OPERATION_INFRA_SECONDS = 900.0
 MAX_FINALIZATION_MISSES = 12
@@ -83,6 +88,14 @@ TERMINAL_STATES = frozenset({
     ResolverState.OPERATOR_RESOLVED,
     ResolverState.BROADCAST_POLICY_SATISFIED,
     ResolverState.DELIVERY_EXHAUSTED,
+})
+CLOSED_ADMISSION_STATES = frozenset({
+    "blocked",
+    "broadcast_policy_satisfied",
+    "delivery_failed",
+    "finalized",
+    "operator_resolved",
+    "transferred",
 })
 
 
@@ -223,6 +236,8 @@ class Resolution:
     scoped_revision: int = 0
     ledger_revision: int | None = None
     compliance_success: bool = False
+    activation_generation: str | None = None
+    readiness_generation: str | None = None
 
     @property
     def terminal(self) -> bool:
@@ -245,6 +260,56 @@ class DispatchPermit:
     purpose: str
     paid_dispatches_total: int
     draft_path: Path
+    budgets_digest: str = ""
+
+
+DEFAULT_DISPATCH_BUDGETS = {
+    "token_ceiling": MAX_DISPATCH_TOKEN_CEILING,
+    "wall_time_seconds": MAX_DISPATCH_WALL_TIME_SECONDS,
+    "reserved_cost": MAX_DISPATCH_RESERVED_COST,
+    "concurrency": MAX_CONCURRENT_PAID_DISPATCHES,
+}
+
+
+def _dispatch_budgets(raw: object) -> dict:
+    value = DEFAULT_DISPATCH_BUDGETS if raw is None else raw
+    if not isinstance(value, dict) or set(value) != set(DEFAULT_DISPATCH_BUDGETS):
+        raise DispatchRefused("dispatch budgets are incomplete")
+    token_ceiling = value.get("token_ceiling")
+    wall_time_seconds = value.get("wall_time_seconds")
+    reserved_cost = value.get("reserved_cost")
+    concurrency = value.get("concurrency")
+    if (
+        not isinstance(token_ceiling, int)
+        or isinstance(token_ceiling, bool)
+        or token_ceiling < 1
+        or token_ceiling > MAX_DISPATCH_TOKEN_CEILING
+    ):
+        raise DispatchRefused("dispatch token ceiling exceeds the v1 budget")
+    if (
+        not isinstance(wall_time_seconds, (int, float))
+        or isinstance(wall_time_seconds, bool)
+        or not math.isfinite(float(wall_time_seconds))
+        or float(wall_time_seconds) <= 0
+        or float(wall_time_seconds) > MAX_DISPATCH_WALL_TIME_SECONDS
+    ):
+        raise DispatchRefused("dispatch wall-time ceiling exceeds the v1 budget")
+    if (
+        not isinstance(reserved_cost, (int, float))
+        or isinstance(reserved_cost, bool)
+        or not math.isfinite(float(reserved_cost))
+        or float(reserved_cost) < 0
+        or float(reserved_cost) > MAX_DISPATCH_RESERVED_COST
+    ):
+        raise DispatchRefused("dispatch reserved-cost ceiling exceeds the v1 budget")
+    if concurrency != MAX_CONCURRENT_PAID_DISPATCHES:
+        raise DispatchRefused("dispatch concurrency budget exhausted")
+    return {
+        "token_ceiling": token_ceiling,
+        "wall_time_seconds": float(wall_time_seconds),
+        "reserved_cost": float(reserved_cost),
+        "concurrency": concurrency,
+    }
 
 
 def _now_iso() -> str:
@@ -366,6 +431,7 @@ def _new_ledger() -> dict:
         "obligations": {},
         "inbound_index": {},
         "no_admission_claims": {},
+        "dispatch_nonces": {},
         "breakers": {},
         "delivery_index": {},
         "cursor_dispositions": {},
@@ -376,10 +442,11 @@ def _new_ledger() -> dict:
 def _validate_ledger(raw: object) -> dict:
     if not isinstance(raw, dict) or raw.get("schema_version") != LEDGER_SCHEMA_VERSION:
         raise LedgerUnreadable("obligation ledger schema invalid")
+    raw.setdefault("dispatch_nonces", {})
     required = (
         "store_epoch", "append_sequence", "revision", "messages", "transitions",
         "scoped_revisions", "obligations", "inbound_index", "breakers",
-        "no_admission_claims", "delivery_index", "telemetry",
+        "no_admission_claims", "dispatch_nonces", "delivery_index", "telemetry",
         "cursor_dispositions",
     )
     if not isinstance(raw.get("store_epoch"), str):
@@ -388,7 +455,7 @@ def _validate_ledger(raw: object) -> dict:
         raise LedgerUnreadable("obligation ledger fields missing")
     if not all(isinstance(raw.get(name), dict) for name in (
         "messages", "scoped_revisions", "obligations", "inbound_index",
-        "no_admission_claims", "breakers", "delivery_index", "telemetry",
+        "no_admission_claims", "dispatch_nonces", "breakers", "delivery_index", "telemetry",
         "cursor_dispositions",
     )):
         raise LedgerUnreadable("obligation ledger maps invalid")
@@ -434,6 +501,8 @@ class DetectionCommitGate:
         fence: str,
         now: Callable[[], str] = _now_iso,
         producer_alive: Callable[[str], bool] | None = None,
+        policy_loader: Callable[[], PolicySnapshot] | None = None,
+        dispatch_budgets: dict | None = None,
     ) -> None:
         self.store = store
         self.agent = agent
@@ -441,6 +510,8 @@ class DetectionCommitGate:
         self.fence = fence
         self.now = now
         self.producer_alive = producer_alive or (lambda _token: False)
+        self.policy_loader = policy_loader
+        self.dispatch_budgets = _dispatch_budgets(dispatch_budgets)
         self.path = store.state_dir / "owed-action" / "ledger.json"
         self.checkpoint_path = store.state_dir / "owed-action" / "ledger.checkpoint.json"
         self.epoch_anchor_path = store.state_dir / "owed-action" / "epoch-anchor.json"
@@ -449,7 +520,16 @@ class DetectionCommitGate:
 
     @classmethod
     def from_environment(cls, store, agent: str, *, fence: str) -> "DetectionCommitGate":
-        return cls(store, agent, PolicySnapshot.from_environment(agent), fence=fence)
+        return cls(
+            store,
+            agent,
+            PolicySnapshot.from_environment(agent),
+            fence=fence,
+            policy_loader=lambda: PolicySnapshot.from_environment(agent),
+        )
+
+    def _current_policy(self) -> PolicySnapshot:
+        return self.policy_loader() if self.policy_loader is not None else self.policy
 
     def _load(self, *, create: bool = True) -> dict:
         if not self.path.exists():
@@ -1010,9 +1090,15 @@ class DetectionCommitGate:
             "replay leaves next move with responder",
             key,
             scoped_revision=scope_revision,
+            activation_generation=(
+                str(admission.get("activation_generation")) if admission else None
+            ),
+            readiness_generation=(
+                str(admission.get("readiness_generation")) if admission else None
+            ),
         )
 
-    def _can_reassign_no_admission_claim(self, claim: dict) -> bool:
+    def _can_reassign_fenced_owner(self, owner: dict) -> bool:
         """Require current wrapper ownership and a stale prior owner before takeover."""
         if self.store.wrapper_wait_generation(self.agent) != self.fence:
             return False
@@ -1022,7 +1108,192 @@ class DetectionCommitGate:
                 isinstance(lease, dict)
                 and lease.get("wrapper_generation") == self.fence
             )
-        return _process_liveness(claim.get("owner_pid")) == PROC_DEAD
+        return _process_liveness(owner.get("owner_pid")) == PROC_DEAD
+
+    def _can_reassign_no_admission_claim(self, claim: dict) -> bool:
+        return self._can_reassign_fenced_owner(claim)
+
+    def _reconcile_closed_dispatch_slots_locked(self, ledger: dict) -> bool:
+        """Release only terminal slots whose dispatch can no longer be authoritative."""
+        changed = False
+        for key_digest, admission in ledger["obligations"].items():
+            if (
+                not isinstance(admission, dict)
+                or admission.get("state") not in CLOSED_ADMISSION_STATES
+                or self._key_from(admission.get("key")).responder != self.agent
+            ):
+                continue
+            for nonce, row in admission.get("reservations", {}).items():
+                if not isinstance(row, dict):
+                    continue
+                prior_state = row.get("state")
+                if prior_state == "reserved":
+                    # No external model side effect was armed. A concurrent
+                    # dispatch_record will revalidate the now-closed admission
+                    # and fail, so this intent cannot consume capacity forever.
+                    pass
+                elif prior_state == "dispatching":
+                    dispatch_fence = row.get("dispatch_fence")
+                    if (
+                        not isinstance(dispatch_fence, str)
+                        or dispatch_fence == self.fence
+                        or _process_liveness(row.get("dispatch_owner_pid"))
+                        != PROC_DEAD
+                        or not self._can_reassign_fenced_owner(admission)
+                    ):
+                        # A live or unprovably-dead owner remains fail-closed and
+                        # continues to consume the agent-wide concurrency slot.
+                        continue
+                else:
+                    continue
+                row["state"] = "cancelled_terminal"
+                row["cancelled_at"] = self.now()
+                self._append(
+                    ledger,
+                    "TERMINAL_DISPATCH_RECONCILED",
+                    key_digest=str(key_digest),
+                    data={
+                        "nonce": nonce,
+                        "prior_state": prior_state,
+                        "terminal_state": admission.get("terminal_state"),
+                    },
+                )
+                changed = True
+        return changed
+
+    def _captured_payload_digest(self, row: dict, nonce: str) -> str | None:
+        intent = row.get("operation_intent")
+        draft = Path(str(row.get("draft_path", "")))
+        if not isinstance(intent, dict):
+            return None
+        try:
+            resolved = draft.resolve(strict=True)
+            root = self.drafts.resolve(strict=True)
+            resolved.relative_to(root)
+            if draft.is_symlink() or resolved.stat().st_size > 1024 * 1024:
+                return None
+            body = resolved.read_text(encoding="utf-8")
+        except (OSError, UnicodeError, ValueError):
+            return None
+        if not body:
+            return None
+        digest = operation_payload_digest(
+            operation=str(intent.get("operation", "")),
+            body=body,
+            kind=str(intent.get("kind", "")),
+            recipient=str(intent.get("recipient", "")),
+            in_reply_to=intent.get("in_reply_to"),
+            request_id=intent.get("request_id"),
+            broadcast_id=intent.get("broadcast_id"),
+            origin_request_id=intent.get("origin_request_id"),
+            origin_inbound_id=intent.get("origin_inbound_id"),
+        )
+        marker = self.store.read_operation_intent(self.agent, nonce)
+        payload = body.encode("utf-8")
+        if (
+            not isinstance(marker, dict)
+            or marker.get("operation_digest") != digest
+            or marker.get("payload_sha256") != hashlib.sha256(payload).hexdigest()
+            or marker.get("payload_size") != len(payload)
+        ):
+            return None
+        return digest
+
+    def _recover_captured_dispatches_locked(
+        self,
+        ledger: dict,
+        admission: dict,
+        key: ObligationKey,
+        *,
+        previous_fence: str,
+    ) -> None:
+        """Recover a durable draft only after the prior wrapper is proven dead."""
+        for nonce, row in admission.get("reservations", {}).items():
+            if (
+                not isinstance(row, dict)
+                or row.get("state") != "dispatching"
+                or row.get("dispatch_fence") != previous_fence
+            ):
+                continue
+            digest = self._captured_payload_digest(row, str(nonce))
+            if digest is None:
+                continue
+            row["state"] = "action_infra"
+            row["operation_payload_digest"] = digest
+            row["captured_at"] = self.now()
+            admission["first_dispatch_classified"] = True
+            admission["last_exhaustion_class"] = "infrastructure"
+            self._append(
+                ledger,
+                "OPERATION_INTENT_RECOVERED",
+                key_digest=key.digest,
+                data={"nonce": nonce, "payload_digest": digest},
+            )
+
+    def _claim_open_admission(
+        self,
+        key_digest: str,
+        inbound_id: str,
+    ) -> tuple[dict, dict] | Resolution:
+        """Fence an open admission to this live wrapper or fail closed."""
+        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
+            ledger = self._load()
+            admission = ledger["obligations"].get(key_digest)
+            if not isinstance(admission, dict):
+                return Resolution(ResolverState.INDETERMINATE, "admission disappeared")
+            if admission.get("state") != "open":
+                return ledger, admission
+            key = self._key_from(admission["key"])
+            if key.inbound_id != inbound_id or key.responder != self.agent:
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "admission ownership does not match exact inbound",
+                    key,
+                )
+            previous_fence = admission.get("fence")
+            if previous_fence == self.fence:
+                return ledger, admission
+            if self.store.wrapper_wait_generation(self.agent) != self.fence:
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "replacement wrapper does not own the waiting generation",
+                    key,
+                )
+            if previous_fence == "unclaimed":
+                if admission.get("activation_generation") != self.policy.generation:
+                    return Resolution(
+                        ResolverState.BLOCKED_POLICY,
+                        "transfer policy generation changed before claim",
+                        key,
+                    )
+                transition = "DELIVERY_CLAIMED"
+            else:
+                if not isinstance(previous_fence, str) or not self._can_reassign_fenced_owner(
+                    admission,
+                ):
+                    return Resolution(
+                        ResolverState.INDETERMINATE,
+                        "prior admission owner is still authoritative",
+                        key,
+                    )
+                transition = "DELIVERY_CLAIM_REASSIGNED"
+            admission["fence"] = self.fence
+            admission["owner_pid"] = os.getpid()
+            self._recover_captured_dispatches_locked(
+                ledger,
+                admission,
+                key,
+                previous_fence=str(previous_fence),
+            )
+            self._append(
+                ledger,
+                transition,
+                scope=inbound_id,
+                key_digest=key.digest,
+                data={"previous_fence": previous_fence, "fence": self.fence},
+            )
+            self._write(ledger)
+            return ledger, admission
 
     def admit_or_finalize(self, record: dict) -> Resolution:
         eligibility, detail, rid = self._eligibility(record)
@@ -1130,51 +1401,18 @@ class DetectionCommitGate:
             admission = ledger["obligations"].get(existing_id)
             if not isinstance(admission, dict):
                 return Resolution(ResolverState.INDETERMINATE, "admission index torn")
-            existing_key = self._key_from(admission["key"])
-            if admission.get("fence") == "unclaimed":
-                if existing_key.responder != self.agent:
-                    return Resolution(
-                        ResolverState.INDETERMINATE,
-                        "transferred admission responder mismatch",
-                    )
-                with self.store._exclusive_lock(
-                    self.path.with_suffix(".lock"), timeout=10.0,
-                ):
-                    current = self._load()
-                    claimed = current["obligations"].get(existing_id)
-                    if not isinstance(claimed, dict):
-                        return Resolution(
-                            ResolverState.INDETERMINATE,
-                            "transferred admission disappeared",
-                        )
-                    if claimed.get("fence") == "unclaimed":
-                        if claimed.get("state") != "open":
-                            return Resolution(
-                                ResolverState.INDETERMINATE,
-                                "transferred admission is no longer open",
-                            )
-                        if claimed.get("activation_generation") != self.policy.generation:
-                            return Resolution(
-                                ResolverState.BLOCKED_POLICY,
-                                "transfer policy generation changed before claim",
-                                existing_key,
-                            )
-                        claimed["fence"] = self.fence
-                        self._append(
-                            current,
-                            "DELIVERY_CLAIMED",
-                            scope=inbound.id,
-                            key_digest=existing_key.digest,
-                            data={"fence": self.fence},
-                        )
-                        self._write(current)
-                    elif claimed.get("fence") != self.fence:
-                        return Resolution(
-                            ResolverState.INDETERMINATE,
-                            "transferred admission claimed by another wrapper",
-                        )
-                    ledger = current
-                    admission = claimed
+            replayed = self._resolve_replay(record, messages, ledger, admission=admission)
+            if replayed.terminal:
+                breaker = ledger["breakers"].get(self.agent, {})
+                if isinstance(breaker, dict) and breaker.get("tripped") is True:
+                    self._project_compliance_breaker_hold()
+                    self._reconcile_compliance_breaker_alert()
+                return replayed
+            if admission.get("state") == "open" and admission.get("fence") != self.fence:
+                claimed = self._claim_open_admission(existing_id, inbound.id)
+                if isinstance(claimed, Resolution):
+                    return claimed
+                ledger, admission = claimed
             return self._resolve_replay(record, messages, ledger, admission=admission)
         before = self._resolve_replay(record, messages, ledger, admission=None)
         if before.state in TERMINAL_STATES:
@@ -1254,6 +1492,12 @@ class DetectionCommitGate:
                     ResolverState.INDETERMINATE,
                     "concurrent no-admission finalizer won",
                 )
+            breaker = current["breakers"].get(self.agent, {})
+            if breaker.get("tripped") is True or breaker.get("config_blocked") is True:
+                return Resolution(
+                    ResolverState.BLOCKED_COMPLIANCE,
+                    "compliance breaker tripped",
+                )
             question_generation = 1 + sum(
                 1 for value in current["obligations"].values()
                 if isinstance(value, dict) and value.get("correlation_id") == rid
@@ -1278,9 +1522,21 @@ class DetectionCommitGate:
                 "activation_generation": self.policy.generation,
                 "readiness_generation": self.policy.generation,
                 "fence": self.fence,
+                "owner_pid": os.getpid(),
+                "delivery_mode": record.get("mode", "global"),
+                "scoped_request_id": (
+                    record.get("scoped", {}).get("request_id")
+                    if isinstance(record.get("scoped"), dict)
+                    else None
+                ),
                 "paid_dispatches_total": 0,
+                "paid_initial_dispatches_total": 0,
+                "paid_recoveries_total": 0,
+                "paid_continuations_total": 0,
                 "continuation_used": False,
                 "recovery_used": False,
+                "first_dispatch_classified": False,
+                "last_exhaustion_class": None,
                 "reservations": {},
                 "operation_infra_attempts": 0,
                 "operation_infra_first_at": None,
@@ -1314,6 +1570,8 @@ class DetectionCommitGate:
             "obligation admitted",
             key,
             scoped_revision=int(current["scoped_revisions"].get(inbound.id, 0)),
+            activation_generation=self.policy.generation,
+            readiness_generation=self.policy.generation,
         )
 
     def resolve(self, record: dict) -> Resolution:
@@ -1327,6 +1585,21 @@ class DetectionCommitGate:
         admission = ledger["obligations"].get(key_id)
         if not isinstance(admission, dict):
             return Resolution(ResolverState.INDETERMINATE, "admission missing")
+        replayed = self._resolve_replay(record, messages, ledger, admission=admission)
+        if replayed.terminal:
+            breaker = ledger["breakers"].get(self.agent, {})
+            if isinstance(breaker, dict) and breaker.get("tripped") is True:
+                self._project_compliance_breaker_hold()
+                self._reconcile_compliance_breaker_alert()
+            return replayed
+        if admission.get("state") == "open" and admission.get("fence") != self.fence:
+            claimed = self._claim_open_admission(key_id, str(record.get("id", "")))
+            if isinstance(claimed, Resolution):
+                return claimed
+            ledger, admission = claimed
+            replayed = self._resolve_replay(record, messages, ledger, admission=admission)
+            if replayed.terminal:
+                return replayed
         if admission.get("state") == "blocked":
             return Resolution(
                 ResolverState.BLOCKED,
@@ -1335,104 +1608,434 @@ class DetectionCommitGate:
             )
         breaker = ledger["breakers"].get(self.agent, {})
         if breaker.get("tripped") is True:
+            self._project_compliance_breaker_hold()
+            self._reconcile_compliance_breaker_alert()
             return Resolution(
                 ResolverState.BLOCKED_COMPLIANCE,
                 "compliance breaker tripped",
                 self._key_from(admission["key"]),
             )
-        return self._resolve_replay(record, messages, ledger, admission=admission)
+        return replayed
 
-    def reserve_dispatch(self, resolution: Resolution, *, purpose: str) -> DispatchPermit:
+    def _live_dispatch_fence_owned(self) -> bool:
+        generation = self.store.wrapper_wait_generation(self.agent)
+        if generation != self.fence:
+            return False
+        if self.store.is_managed_lead_loop(self.agent):
+            lease = self.store.read_lead_loop_lease(self.agent)
+            return bool(
+                isinstance(lease, dict)
+                and lease.get("wrapper_generation") == self.fence
+            )
+        marker = self.store.read_waiting(self.agent)
+        return bool(
+            isinstance(marker, dict)
+            and marker.get("mode") == "wrapper-loop"
+            and marker.get("pid") == os.getpid()
+        )
+
+    def _dispatch_head_is_current(self, admission: dict, key: ObligationKey) -> bool:
+        from agenttalk.wrapper import recv_api
+
+        scoped_request_id = (
+            admission.get("scoped_request_id")
+            if admission.get("delivery_mode") == "scoped"
+            else None
+        )
+        head = recv_api.next_record(
+            self.store,
+            self.agent,
+            scoped_request_id=scoped_request_id,
+        )
+        return bool(isinstance(head, dict) and head.get("id") == key.inbound_id)
+
+    def _validate_dispatch_authority(
+        self,
+        ledger: dict,
+        admission: dict | None,
+        key: ObligationKey,
+        resolution: Resolution,
+    ) -> dict:
+        if not isinstance(admission, dict) or admission.get("state") != "open":
+            raise DispatchRefused("obligation is no longer open")
+        if admission.get("fence") != self.fence or not self._live_dispatch_fence_owned():
+            raise DispatchRefused("wrapper fence changed")
+        current_policy = self._current_policy()
+        activation = admission.get("activation_generation")
+        readiness = admission.get("readiness_generation")
+        if (
+            current_policy.status != ResolverState.ACTIVE
+            or activation != current_policy.generation
+            or readiness != current_policy.generation
+            or resolution.activation_generation not in {None, activation}
+            or resolution.readiness_generation not in {None, readiness}
+        ):
+            raise DispatchRefused("activation or readiness generation changed")
+        if not self._dispatch_head_is_current(admission, key):
+            raise DispatchRefused("wrapper no longer owns the exact cursor head")
+        breaker = ledger["breakers"].get(self.agent, {})
+        if breaker.get("tripped") is True or breaker.get("config_blocked") is True:
+            raise DispatchRefused("compliance breaker is tripped")
+        return admission
+
+    @staticmethod
+    def _dispatch_request_digest(
+        key: ObligationKey,
+        purpose: str,
+        budgets: dict,
+        activation_generation: object,
+        readiness_generation: object,
+    ) -> str:
+        return hashlib.sha256(_canonical({
+            "key_digest": key.digest,
+            "purpose": purpose,
+            "budgets": budgets,
+            "activation_generation": activation_generation,
+            "readiness_generation": readiness_generation,
+        }).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _valid_dispatch_nonce(value: object) -> bool:
+        if not isinstance(value, str) or len(value) != 32:
+            return False
+        try:
+            int(value, 16)
+        except ValueError:
+            return False
+        return value == value.lower()
+
+    @staticmethod
+    def _permit_from_reservation(
+        key_digest: str,
+        nonce: str,
+        row: dict,
+    ) -> DispatchPermit:
+        return DispatchPermit(
+            key_digest,
+            nonce,
+            str(row.get("composing_nonce", "")),
+            str(row.get("purpose", "")),
+            int(row.get("paid_dispatches_total", 0)),
+            Path(str(row.get("draft_path", ""))),
+            str(row.get("budgets_digest", "")),
+        )
+
+    def reserve_dispatch(
+        self,
+        resolution: Resolution,
+        *,
+        purpose: str,
+        nonce: str | None = None,
+        budgets: dict | None = None,
+    ) -> DispatchPermit:
         if resolution.key is None or resolution.state != ResolverState.OWED_UNSATISFIED:
             raise DispatchRefused("dispatch requires an open unsatisfied obligation")
         if purpose not in {"initial", "recovery", "continuation"}:
             raise ValueError("invalid dispatch purpose")
+        requested_budgets = _dispatch_budgets(
+            self.dispatch_budgets if budgets is None else budgets,
+        )
         key = resolution.key
+        permit: DispatchPermit
         with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
             ledger = self._load()
             admission = ledger["obligations"].get(key.digest)
-            if not isinstance(admission, dict) or admission.get("state") != "open":
-                raise DispatchRefused("obligation is no longer open")
-            if admission.get("fence") != self.fence:
-                raise DispatchRefused("wrapper fence changed")
-            if admission.get("activation_generation") != self.policy.generation:
-                raise DispatchRefused("activation generation changed")
-            if self.policy.status != ResolverState.ACTIVE:
-                raise DispatchRefused("commit gate is not ready")
-            if int(ledger["scoped_revisions"].get(key.inbound_id, 0)) != resolution.scoped_revision:
-                raise StaleRevision("scoped replay revision changed before dispatch")
-            breaker = ledger["breakers"].get(self.agent, {})
-            if breaker.get("tripped") is True:
-                raise DispatchRefused("compliance breaker is tripped")
-            total = int(admission.get("paid_dispatches_total", 0))
-            if total >= MAX_PAID_DISPATCHES_TOTAL:
-                raise DispatchRefused("paid dispatch budget exhausted")
-            if purpose == "initial" and total != 0:
-                raise DispatchRefused("initial dispatch already reserved")
-            if purpose == "recovery" and admission.get("continuation_used"):
-                raise DispatchRefused("second dispatch already used by continuation")
-            if purpose == "continuation" and admission.get("recovery_used"):
-                raise DispatchRefused("second dispatch already used by recovery")
-            if purpose != "initial" and total != 1:
-                raise DispatchRefused("extra dispatch is only the second dispatch")
-            nonce = uuid.uuid4().hex
-            composing_nonce = uuid.uuid4().hex
-            self.drafts.mkdir(parents=True, exist_ok=True)
-            draft = self.drafts / f"{key.inbound_id}.{nonce}.txt"
-            admission["paid_dispatches_total"] = total + 1
-            admission[f"{purpose}_used"] = True
-            admission["reservations"][nonce] = {
-                "purpose": purpose,
-                "state": "reserved",
-                "at": self.now(),
-                "scoped_revision": resolution.scoped_revision,
-                "draft_path": str(draft),
-                "composing_nonce": composing_nonce,
-            }
-            self._append(
+            admission = self._validate_dispatch_authority(
                 ledger,
-                "DISPATCH_RESERVED",
-                scope=key.inbound_id,
-                key_digest=key.digest,
-                data={"nonce": nonce, "purpose": purpose, "total": total + 1},
+                admission,
+                key,
+                resolution,
             )
-            self._write(ledger)
-        return DispatchPermit(
-            key.digest,
-            nonce,
-            composing_nonce,
-            purpose,
-            total + 1,
-            draft,
-        )
+            total = int(admission.get("paid_dispatches_total", 0))
+            if nonce is None:
+                pending = [
+                    (stored_nonce, row)
+                    for stored_nonce, row in admission.get("reservations", {}).items()
+                    if isinstance(row, dict)
+                    and row.get("purpose") == purpose
+                    and row.get("state") == "reserved"
+                ]
+                if len(pending) == 1:
+                    nonce = pending[0][0]
+                else:
+                    nonce = hashlib.sha256(
+                        f"{key.digest}:{purpose}:{total + 1}".encode("utf-8"),
+                    ).hexdigest()[:32]
+            if not self._valid_dispatch_nonce(nonce):
+                raise DispatchRefused("dispatch nonce is invalid")
+            request_digest = self._dispatch_request_digest(
+                key,
+                purpose,
+                requested_budgets,
+                admission.get("activation_generation"),
+                admission.get("readiness_generation"),
+            )
+            nonce_index = ledger["dispatch_nonces"].get(nonce)
+            if isinstance(nonce_index, dict):
+                if nonce_index.get("request_digest") != request_digest:
+                    self._append(
+                        ledger,
+                        "ACTION_REJECTED",
+                        key_digest=key.digest,
+                        data={"reason": "dispatch_nonce_reused_for_different_request"},
+                    )
+                    self._write(ledger)
+                    raise DispatchRefused("dispatch nonce was reused for another request")
+                existing = admission.get("reservations", {}).get(nonce)
+                if not isinstance(existing, dict):
+                    raise DispatchRefused("dispatch nonce index is torn")
+                permit = self._permit_from_reservation(key.digest, nonce, existing)
+            else:
+                if (
+                    int(ledger["scoped_revisions"].get(key.inbound_id, 0))
+                    != resolution.scoped_revision
+                ):
+                    raise StaleRevision("scoped replay revision changed before dispatch")
+                if self._reconcile_closed_dispatch_slots_locked(ledger):
+                    # Persist capacity recovery before any subsequent refusal or
+                    # new reservation. A crash cannot resurrect a leaked slot.
+                    self._write(ledger)
+                active = 0
+                for candidate in ledger["obligations"].values():
+                    if not isinstance(candidate, dict):
+                        continue
+                    candidate_key = self._key_from(candidate.get("key"))
+                    if candidate_key.responder != self.agent:
+                        continue
+                    active += sum(
+                        1
+                        for row in candidate.get("reservations", {}).values()
+                        if isinstance(row, dict)
+                        and row.get("state") in {"reserved", "dispatching"}
+                    )
+                if active >= requested_budgets["concurrency"]:
+                    raise DispatchRefused("dispatch concurrency budget exhausted")
+                if total >= MAX_PAID_DISPATCHES_TOTAL:
+                    raise DispatchRefused("paid dispatch budget exhausted")
+                if purpose == "initial" and total != 0:
+                    raise DispatchRefused("initial dispatch already reserved")
+                if purpose != "initial":
+                    if total != 1 or admission.get("first_dispatch_classified") is not True:
+                        raise DispatchRefused(
+                            "extra dispatch requires one durably classified first attempt",
+                        )
+                scheduled = admission.get("durable_continuation")
+                if purpose == "recovery" and (
+                    admission.get("continuation_used")
+                    or isinstance(scheduled, dict) and scheduled.get("state") == "scheduled"
+                ):
+                    raise DispatchRefused("second dispatch is assigned to continuation")
+                if purpose == "continuation" and (
+                    admission.get("recovery_used")
+                    or not isinstance(scheduled, dict)
+                    or scheduled.get("state") != "scheduled"
+                ):
+                    raise DispatchRefused("second dispatch is not a scheduled continuation")
+                composing_nonce = hashlib.sha256(
+                    f"{nonce}:composing".encode("utf-8"),
+                ).hexdigest()[:32]
+                draft = self.drafts / f"{key.inbound_id}.{nonce}.txt"
+                admission["paid_dispatches_total"] = total + 1
+                subtype = {
+                    "initial": "paid_initial_dispatches_total",
+                    "recovery": "paid_recoveries_total",
+                    "continuation": "paid_continuations_total",
+                }[purpose]
+                admission[subtype] = int(admission.get(subtype, 0)) + 1
+                if purpose != "initial":
+                    admission[f"{purpose}_used"] = True
+                if purpose == "continuation":
+                    scheduled["state"] = "reserved"
+                    scheduled["dispatch_nonce"] = nonce
+                budgets_digest = hashlib.sha256(
+                    _canonical(requested_budgets).encode("utf-8"),
+                ).hexdigest()
+                reservation = {
+                    "purpose": purpose,
+                    "state": "reserved",
+                    "at": self.now(),
+                    "scoped_revision": resolution.scoped_revision,
+                    "draft_path": str(draft),
+                    "composing_nonce": composing_nonce,
+                    "paid_dispatches_total": total + 1,
+                    "budgets": requested_budgets,
+                    "budgets_digest": budgets_digest,
+                    "request_digest": request_digest,
+                    "reserved_fence": self.fence,
+                }
+                admission["reservations"][nonce] = reservation
+                ledger["dispatch_nonces"][nonce] = {
+                    "key_digest": key.digest,
+                    "request_digest": request_digest,
+                }
+                self._append(
+                    ledger,
+                    "DISPATCH_RESERVED",
+                    scope=key.inbound_id,
+                    key_digest=key.digest,
+                    data={
+                        "nonce": nonce,
+                        "purpose": purpose,
+                        "total": total + 1,
+                        "budgets_digest": budgets_digest,
+                    },
+                )
+                self._write(ledger)
+                permit = self._permit_from_reservation(key.digest, nonce, reservation)
+        permit.draft_path.parent.mkdir(parents=True, exist_ok=True)
+        return permit
 
     def next_dispatch_purpose(self, key: ObligationKey) -> str | None:
         try:
-            ledger = self._load(create=False)
+            with self.store._exclusive_lock(
+                self.path.with_suffix(".lock"),
+                timeout=10.0,
+            ):
+                ledger = self._load(create=False)
+                admission = ledger["obligations"].get(key.digest)
+                if not isinstance(admission, dict) or admission.get("state") != "open":
+                    return None
+                if admission.get("fence") != self.fence or not self._live_dispatch_fence_owned():
+                    return None
+                reservations = admission.get("reservations", {})
+                pending = [
+                    row
+                    for row in reservations.values()
+                    if isinstance(row, dict) and row.get("state") == "reserved"
+                ]
+                if len(pending) == 1:
+                    return str(pending[0].get("purpose"))
+                changed = False
+                for nonce, row in reservations.items():
+                    if not isinstance(row, dict) or row.get("state") != "dispatching":
+                        continue
+                    if row.get("dispatch_fence") == self.fence:
+                        continue
+                    if not isinstance(row.get("dispatch_fence"), str):
+                        return None
+                    row["state"] = "dispatch_result_missing"
+                    row["result_missing_at"] = self.now()
+                    admission["first_dispatch_classified"] = True
+                    admission["owed_action_missing_seen"] = True
+                    admission["last_exhaustion_class"] = "infrastructure"
+                    self._append(
+                        ledger,
+                        "DISPATCH_RESULT_MISSING",
+                        key_digest=key.digest,
+                        data={"nonce": nonce, "purpose": row.get("purpose")},
+                    )
+                    changed = True
+                if changed:
+                    self._write(ledger)
+                if any(
+                    isinstance(row, dict) and row.get("state") == "dispatching"
+                    for row in reservations.values()
+                ):
+                    return None
+                if any(
+                    isinstance(row, dict) and row.get("state") == "action_infra"
+                    for row in reservations.values()
+                ):
+                    return None
+                total = int(admission.get("paid_dispatches_total", 0))
+                if total == 0:
+                    return "initial"
+                if total != 1 or admission.get("first_dispatch_classified") is not True:
+                    return None
+                continuation = admission.get("durable_continuation")
+                if (
+                    isinstance(continuation, dict)
+                    and continuation.get("state") == "scheduled"
+                ):
+                    return "continuation"
+                if not admission.get("continuation_used") and not admission.get(
+                    "recovery_used",
+                ):
+                    return "recovery"
+                return None
         except LedgerUnreadable:
             return None
-        admission = ledger["obligations"].get(key.digest)
-        if not isinstance(admission, dict):
-            return None
-        if any(
-            isinstance(row, dict) and row.get("state") == "action_infra"
-            for row in admission.get("reservations", {}).values()
-        ):
-            return None
-        total = int(admission.get("paid_dispatches_total", 0))
-        if total == 0:
-            return "initial"
-        if total == 1 and not admission.get("continuation_used"):
-            return "recovery"
-        return None
 
     def dispatch_record(self, record: dict, permit: DispatchPermit) -> dict:
-        """Add wrapper-owned transport facts without changing inbound protocol data."""
+        """Durably arm one permit, then add wrapper-owned transport facts."""
         decorated = dict(record)
         executable = self._pinned_executable()
-        ledger = self._load(create=False)
-        admission = ledger["obligations"].get(permit.key_digest, {})
-        obligation_class = admission.get("obligation_class")
+        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
+            ledger = self._load(create=False)
+            admission = ledger["obligations"].get(permit.key_digest)
+            if not isinstance(admission, dict):
+                raise DispatchRefused("dispatch admission disappeared")
+            key = self._key_from(admission["key"])
+            current_revision = int(
+                ledger["scoped_revisions"].get(key.inbound_id, 0),
+            )
+            self._validate_dispatch_authority(
+                ledger,
+                admission,
+                key,
+                Resolution(
+                    ResolverState.OWED_UNSATISFIED,
+                    "dispatch permit revalidation",
+                    key,
+                    scoped_revision=current_revision,
+                    activation_generation=str(admission.get("activation_generation")),
+                    readiness_generation=str(admission.get("readiness_generation")),
+                ),
+            )
+            reservation = admission.get("reservations", {}).get(permit.nonce)
+            if (
+                not isinstance(reservation, dict)
+                or reservation.get("state") != "reserved"
+                or reservation.get("purpose") != permit.purpose
+                or reservation.get("composing_nonce") != permit.composing_nonce
+                or reservation.get("budgets_digest") != permit.budgets_digest
+                or Path(str(reservation.get("draft_path", ""))) != permit.draft_path
+                or int(reservation.get("paid_dispatches_total", 0))
+                != permit.paid_dispatches_total
+            ):
+                raise DispatchRefused(
+                    "dispatch permit draft path or authority does not match its reservation",
+                )
+            obligation_class = admission.get("obligation_class")
+            record_meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+            if obligation_class == "human_escalation":
+                recipient = self.store.operator_facing() or self.store.sole_lead()
+                if not isinstance(recipient, str) or recipient == self.agent:
+                    raise DispatchRefused("human escalation has no external operator target")
+                operation_intent = {
+                    "operation": "terminal",
+                    "kind": "question",
+                    "recipient": recipient,
+                    "in_reply_to": record.get("id"),
+                    "request_id": f"esc-{permit.nonce[:12]}",
+                    "broadcast_id": None,
+                    "origin_request_id": record.get("correlation_id"),
+                    "origin_inbound_id": record.get("id"),
+                }
+            else:
+                operation_intent = {
+                    "operation": "terminal",
+                    "kind": "message",
+                    "recipient": key.requester,
+                    "in_reply_to": record.get("id"),
+                    "request_id": record_meta.get("request_id"),
+                    "broadcast_id": record_meta.get("broadcast_id"),
+                    "origin_request_id": None,
+                    "origin_inbound_id": None,
+                }
+            reservation["state"] = "dispatching"
+            reservation["dispatch_started_at"] = self.now()
+            reservation["dispatch_fence"] = self.fence
+            reservation["dispatch_owner_pid"] = os.getpid()
+            reservation["operation_intent"] = operation_intent
+            self._append(
+                ledger,
+                "DISPATCH_ATTEMPT_STARTED",
+                key_digest=permit.key_digest,
+                data={"nonce": permit.nonce, "purpose": permit.purpose},
+            )
+            self._write(ledger)
+            requested_budgets = dict(reservation["budgets"])
         if obligation_class == "human_escalation":
             argv = [
                 executable,
@@ -1441,10 +2044,14 @@ class DetectionCommitGate:
                 "escalate",
                 "--from",
                 self.agent,
+                "--to",
+                str(operation_intent["recipient"]),
                 "--origin-request",
                 str(record.get("correlation_id")),
                 "--origin-id",
                 str(record.get("id")),
+                "--meta",
+                f"request_id={operation_intent['request_id']}",
                 "--operation-nonce",
                 permit.nonce,
                 "--file",
@@ -1472,6 +2079,7 @@ class DetectionCommitGate:
             "terminal_operation_nonce": permit.nonce,
             "composing_operation_nonce": permit.composing_nonce,
             "purpose": permit.purpose,
+            "budgets": requested_budgets,
             "exact_inbound_id": record.get("id"),
             "draft_path": str(permit.draft_path),
             "argv": argv,
@@ -1518,18 +2126,172 @@ class DetectionCommitGate:
             >= MAX_PAID_DISPATCHES_TOTAL
         )
 
+    def _breaker_state(self, ledger: dict) -> dict:
+        breaker = ledger["breakers"].setdefault(self.agent, {
+            "generation": 0,
+            "owed_action_cap_exhaustions_consecutive": 0,
+            "proof_infra_exhaustions_consecutive": 0,
+            "compliance_exhaustion_references": [],
+            "tripped": False,
+            "config_blocked": False,
+            "config_blocked_reason": None,
+            "alerted_generation": None,
+            "alerts": {},
+        })
+        breaker.setdefault("alerts", {})
+        return breaker
+
+    def _project_compliance_breaker_hold(self) -> None:
+        self.store.write_config_blocked_hold(
+            self.agent,
+            summary="owed_action_compliance_breaker",
+        )
+
+    def _clear_compliance_breaker_hold(self) -> None:
+        hold = self.store.read_config_blocked_hold(self.agent)
+        if (
+            isinstance(hold, dict)
+            and hold.get("summary") == "owed_action_compliance_breaker"
+        ):
+            self.store.clear_config_blocked_hold(self.agent)
+
+    def _reconcile_compliance_breaker_alert(self) -> bool:
+        """Publish and acknowledge one durable alert outbox row idempotently."""
+        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
+            ledger = self._load(create=False)
+            breaker = ledger["breakers"].get(self.agent)
+            if not isinstance(breaker, dict) or breaker.get("tripped") is not True:
+                return False
+            generation = int(breaker.get("generation", 0))
+            alerts = breaker.get("alerts")
+            alert = alerts.get(str(generation)) if isinstance(alerts, dict) else None
+            if not isinstance(alert, dict):
+                return False
+            if alert.get("state") == "delivered":
+                return True
+            nonce = str(alert.get("nonce", ""))
+            body = str(alert.get("body", ""))
+            request_id = str(alert.get("request_id", ""))
+            pinned_target = alert.get("recipient")
+        candidate = None
+        if not isinstance(pinned_target, str) or not pinned_target:
+            candidate = self.store.operator_facing() or self.store.sole_lead()
+
+        # Route the outbox row once, before publication. A crash after the bus
+        # append must retry the same nonce *and* the same operation identity,
+        # even if liaison routing changes before the next wrapper generation.
+        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
+            ledger = self._load(create=False)
+            breaker = ledger["breakers"].get(self.agent)
+            if not isinstance(breaker, dict) or breaker.get("tripped") is not True:
+                return False
+            alerts = breaker.get("alerts")
+            current = alerts.get(str(generation)) if isinstance(alerts, dict) else None
+            if not isinstance(current, dict) or current.get("nonce") != nonce:
+                return False
+            if current.get("state") == "delivered":
+                return True
+            target = current.get("recipient")
+            if not isinstance(target, str) or not target:
+                target = candidate
+            if not isinstance(target, str) or not target or target == self.agent:
+                return False
+            digest = operation_payload_digest(
+                operation="terminal",
+                body=body,
+                kind="question",
+                recipient=target,
+                request_id=request_id,
+            )
+            stored_digest = current.get("operation_digest")
+            if isinstance(stored_digest, str) and stored_digest != digest:
+                return False
+            if current.get("recipient") != target or stored_digest != digest:
+                current["recipient"] = target
+                current["operation_digest"] = digest
+                self._append(
+                    ledger,
+                    "COMPLIANCE_BREAKER_ALERT_ROUTED",
+                    data={
+                        "agent": self.agent,
+                        "generation": generation,
+                        "recipient": target,
+                        "operation_digest": digest,
+                    },
+                )
+                self._write(ledger)
+        meta = {
+            "needs_operator": "true",
+            "request_id": request_id,
+            "compliance_breaker_alert_generation": generation,
+            "compliance_breaker_agent": self.agent,
+        }
+        try:
+            message, _published = self.store.send_operation(
+                sender=self.agent,
+                recipient=target,
+                body=body,
+                kind="question",
+                subject=f"owed-action compliance breaker: {self.agent}",
+                meta=meta,
+                operation_nonce=nonce,
+                operation_digest=digest,
+            )
+        except (OSError, TimeoutError, ValueError):
+            return False
+        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
+            ledger = self._load(create=False)
+            breaker = ledger["breakers"].get(self.agent)
+            alerts = breaker.get("alerts") if isinstance(breaker, dict) else None
+            current = alerts.get(str(generation)) if isinstance(alerts, dict) else None
+            if not isinstance(current, dict) or current.get("nonce") != nonce:
+                return False
+            if current.get("state") != "delivered":
+                current["state"] = "delivered"
+                current["message_id"] = message.id
+                current["delivered_at"] = self.now()
+                current["recipient"] = target
+                current["operation_digest"] = digest
+                breaker["alerted_generation"] = generation
+                self._append(
+                    ledger,
+                    "COMPLIANCE_BREAKER_ALERT",
+                    data={
+                        "agent": self.agent,
+                        "generation": generation,
+                        "message_id": message.id,
+                    },
+                )
+                self._write(ledger)
+            return True
+
+    def _reset_compliance_streak_locked(
+        self,
+        ledger: dict,
+        key: ObligationKey,
+    ) -> bool:
+        breaker = ledger["breakers"].get(self.agent)
+        if not isinstance(breaker, dict) or breaker.get("tripped") is True:
+            return False
+        if (
+            int(breaker.get("owed_action_cap_exhaustions_consecutive", 0)) == 0
+            and not breaker.get("compliance_exhaustion_references")
+        ):
+            return False
+        breaker["owed_action_cap_exhaustions_consecutive"] = 0
+        breaker["compliance_exhaustion_references"] = []
+        self._append(
+            ledger,
+            "COMPLIANCE_STREAK_RESET",
+            key_digest=key.digest,
+        )
+        return True
+
     def mark_satisfied(self, key: ObligationKey) -> None:
         """A successful delivery resets only the compliance-dominant streak."""
         with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
             ledger = self._load()
-            breaker = ledger["breakers"].get(self.agent)
-            if isinstance(breaker, dict) and breaker.get("tripped") is not True:
-                breaker["owed_action_cap_exhaustions_consecutive"] = 0
-                self._append(
-                    ledger,
-                    "COMPLIANCE_STREAK_RESET",
-                    key_digest=key.digest,
-                )
+            if self._reset_compliance_streak_locked(ledger, key):
                 self._write(ledger)
 
     def reset_compliance_breaker(self, *, actor: str, reason: str) -> None:
@@ -1539,18 +2301,27 @@ class DetectionCommitGate:
             raise ValueError("breaker reset requires an audit reason")
         with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
             ledger = self._load()
-            breaker = ledger["breakers"].setdefault(self.agent, {})
+            breaker = self._breaker_state(ledger)
+            breaker["generation"] = int(breaker.get("generation", 0)) + 1
             breaker["tripped"] = False
+            breaker["config_blocked"] = False
+            breaker["config_blocked_reason"] = None
             breaker["owed_action_cap_exhaustions_consecutive"] = 0
+            breaker["compliance_exhaustion_references"] = []
             breaker["reset_at"] = self.now()
             breaker["reset_by"] = actor
             self._append(
                 ledger,
                 "COMPLIANCE_BREAKER_RESET",
-                data={"agent": self.agent, "actor": actor, "reason": reason.strip()},
+                data={
+                    "agent": self.agent,
+                    "actor": actor,
+                    "reason": reason.strip(),
+                    "generation": breaker["generation"],
+                },
             )
             self._write(ledger)
-        self.store.clear_config_blocked_hold(self.agent)
+        self._clear_compliance_breaker_hold()
 
     def mark_dispatch_result(
         self,
@@ -1568,16 +2339,27 @@ class DetectionCommitGate:
             reservation = admission["reservations"].get(permit.nonce)
             if not isinstance(reservation, dict):
                 raise GateError("dispatch reservation disappeared")
+            if reservation.get("state") != "dispatching":
+                raise GateError("dispatch result has no durable attempt barrier")
             reservation["state"] = "completed"
             reservation["action_attempted"] = action_attempted
+            admission["first_dispatch_classified"] = True
             if action_infra:
                 transition = "ACTION_ATTEMPT_INFRA"
-                reservation["state"] = "action_infra"
+                admission["last_exhaustion_class"] = "infrastructure"
+                payload_digest = self._captured_payload_digest(reservation, permit.nonce)
+                if payload_digest is not None:
+                    reservation["state"] = "action_infra"
+                    reservation["operation_payload_digest"] = payload_digest
+                else:
+                    reservation["state"] = "uncaptured_infra"
             elif action_rejected:
                 transition = "ACTION_REJECTED"
                 admission["owed_action_missing_seen"] = True
+                admission["last_exhaustion_class"] = "compliance"
             else:
                 transition = "ACTION_ATTEMPTED" if action_attempted else "OWED_ACTION_MISSING"
+                admission["last_exhaustion_class"] = "compliance"
                 if not action_attempted:
                     admission["owed_action_missing_seen"] = True
             self._append(ledger, transition, key_digest=permit.key_digest)
@@ -1596,6 +2378,7 @@ class DetectionCommitGate:
             if row.get("state") == "action_infra":
                 return
             admission["owed_action_missing_seen"] = True
+            admission["last_exhaustion_class"] = "compliance"
             row["state"] = "action_rejected"
             row["rejection_reason"] = reason
             self._append(
@@ -1615,7 +2398,11 @@ class DetectionCommitGate:
         if not isinstance(admission, dict):
             return None
         for nonce, row in admission.get("reservations", {}).items():
-            if not isinstance(row, dict) or row.get("state") != "action_infra":
+            if (
+                not isinstance(row, dict)
+                or row.get("state") != "action_infra"
+                or not isinstance(row.get("operation_payload_digest"), str)
+            ):
                 continue
             return DispatchPermit(
                 key.digest,
@@ -1624,6 +2411,7 @@ class DetectionCommitGate:
                 row.get("purpose", "recovery"),
                 int(admission.get("paid_dispatches_total", 0)),
                 Path(row["draft_path"]),
+                str(row.get("budgets_digest", "")),
             )
         return None
 
@@ -1632,7 +2420,11 @@ class DetectionCommitGate:
             ledger = self._load()
             admission = ledger["obligations"].get(permit.key_digest)
             row = admission.get("reservations", {}).get(permit.nonce) if isinstance(admission, dict) else None
-            if not isinstance(row, dict):
+            if (
+                not isinstance(row, dict)
+                or row.get("state") != "action_infra"
+                or admission.get("operation_infra_retry_inflight") is not True
+            ):
                 raise GateError("captured operation disappeared")
             row["state"] = "completed"
             admission["operation_infra_retry_inflight"] = False
@@ -1648,7 +2440,39 @@ class DetectionCommitGate:
 
     def retry_captured_operation(self, permit: DispatchPermit, record: dict) -> bool:
         """Retry the fixed file-based reply operation without another model call."""
-        draft = permit.draft_path
+        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
+            ledger = self._load(create=False)
+            admission = ledger["obligations"].get(permit.key_digest)
+            if not isinstance(admission, dict):
+                raise DispatchRefused("captured operation admission disappeared")
+            key = self._key_from(admission["key"])
+            self._validate_dispatch_authority(
+                ledger,
+                admission,
+                key,
+                Resolution(
+                    ResolverState.OWED_UNSATISFIED,
+                    "captured operation revalidation",
+                    key,
+                    activation_generation=str(admission.get("activation_generation")),
+                    readiness_generation=str(admission.get("readiness_generation")),
+                ),
+            )
+            row = admission.get("reservations", {}).get(permit.nonce)
+            if (
+                not isinstance(row, dict)
+                or row.get("state") != "action_infra"
+                or row.get("budgets_digest") != permit.budgets_digest
+                or admission.get("operation_infra_retry_inflight") is not True
+                or not isinstance(row.get("operation_payload_digest"), str)
+                or Path(str(row.get("draft_path", ""))) != permit.draft_path
+                or not isinstance(row.get("operation_intent"), dict)
+            ):
+                raise DispatchRefused("captured operation retry is not durably reserved")
+            expected_payload_digest = row["operation_payload_digest"]
+            operation_intent = dict(row["operation_intent"])
+            obligation_class = admission.get("obligation_class")
+        draft = Path(str(row["draft_path"]))
         try:
             resolved = draft.resolve(strict=True)
             root = self.drafts.resolve(strict=True)
@@ -1658,10 +2482,10 @@ class DetectionCommitGate:
             resolved.read_text(encoding="utf-8")
         except (OSError, UnicodeError, ValueError):
             return False
+        if self._captured_payload_digest(row, permit.nonce) != expected_payload_digest:
+            return False
         executable = self._pinned_executable()
-        ledger = self._load(create=False)
-        admission = ledger["obligations"].get(permit.key_digest, {})
-        if admission.get("obligation_class") == "human_escalation":
+        if obligation_class == "human_escalation":
             argv = [
                 executable,
                 "-m",
@@ -1669,10 +2493,14 @@ class DetectionCommitGate:
                 "escalate",
                 "--from",
                 self.agent,
+                "--to",
+                str(operation_intent["recipient"]),
                 "--origin-request",
-                str(record.get("correlation_id")),
+                str(operation_intent["origin_request_id"]),
                 "--origin-id",
-                str(record.get("id")),
+                str(operation_intent["origin_inbound_id"]),
+                "--meta",
+                f"request_id={operation_intent['request_id']}",
                 "--operation-nonce",
                 permit.nonce,
                 "--file",
@@ -1687,7 +2515,7 @@ class DetectionCommitGate:
                 "--from",
                 self.agent,
                 "--to-id",
-                str(record.get("id")),
+                str(operation_intent["in_reply_to"]),
                 "--operation-nonce",
                 permit.nonce,
                 "--file",
@@ -1725,11 +2553,38 @@ class DetectionCommitGate:
             count_name = f"{category}_attempts" if category == "operation_infra" else "finalization_misses"
             first_name = f"{category}_first_at"
             inflight_name = f"{category}_retry_inflight"
-            if completed_attempt:
+            count = int(admission.get(count_name, 0))
+            now_text = self.now()
+            first = _epoch(admission.get(first_name))
+            now = _epoch(now_text)
+            elapsed = 0.0 if first is None or now is None else now - first
+            limit = (
+                MAX_OPERATION_INFRA_ATTEMPTS
+                if category == "operation_infra"
+                else MAX_FINALIZATION_MISSES
+            )
+            elapsed_limit = (
+                MAX_OPERATION_INFRA_SECONDS
+                if category == "operation_infra"
+                else MAX_FINALIZATION_SECONDS
+            )
+            if count >= limit or elapsed >= elapsed_limit:
+                return False
+            if admission.get(inflight_name) and not completed_attempt:
+                self._append(
+                    ledger,
+                    "OPERATION_RETRY_OUTCOME_MISSING"
+                    if category == "operation_infra"
+                    else "FINALIZATION_RETRY_OUTCOME_MISSING",
+                    key_digest=key.digest,
+                    data={"prior_count": int(admission.get(count_name, 0))},
+                )
+                admission[inflight_name] = False
+            elif completed_attempt:
                 admission[inflight_name] = False
             if not admission.get(inflight_name):
-                admission[count_name] = int(admission.get(count_name, 0)) + 1
-                admission[first_name] = admission.get(first_name) or self.now()
+                admission[count_name] = count + 1
+                admission[first_name] = admission.get(first_name) or now_text
                 admission[inflight_name] = True
                 self._append(
                     ledger,
@@ -1739,13 +2594,11 @@ class DetectionCommitGate:
                     key_digest=key.digest,
                     data={"count": admission[count_name]},
                 )
+                allowed = admission[count_name] < limit and elapsed < elapsed_limit
+                if not allowed:
+                    admission[inflight_name] = False
                 self._write(ledger)
-            first = _epoch(admission[first_name])
-            now = _epoch(self.now())
-            elapsed = 0.0 if first is None or now is None else now - first
-            if category == "operation_infra":
-                return admission[count_name] < MAX_OPERATION_INFRA_ATTEMPTS and elapsed < MAX_OPERATION_INFRA_SECONDS
-            return admission[count_name] < MAX_FINALIZATION_MISSES and elapsed < MAX_FINALIZATION_SECONDS
+            return admission[count_name] < limit and elapsed < elapsed_limit
 
     def complete_retry_barrier(self, key: ObligationKey, *, category: str) -> None:
         if category not in {"operation_infra", "finalization"}:
@@ -1825,6 +2678,8 @@ class DetectionCommitGate:
                     key_digest=key.digest,
                     data={"state": resolution.state.value},
                 )
+                if resolution.compliance_success:
+                    self._reset_compliance_streak_locked(ledger, key)
                 if resolution.state == ResolverState.SATISFIED:
                     self._apply_broadcast_policy_locked(ledger, key, admission)
             else:
@@ -1962,90 +2817,168 @@ class DetectionCommitGate:
                 },
             )
 
-    def delivery_failed(self, record: dict, key: ObligationKey, *, reason: str) -> Resolution:
+    def delivery_failed(
+        self,
+        record: dict,
+        key: ObligationKey,
+        *,
+        reason: str,
+        expected_revision: int,
+    ) -> Resolution:
         """Atomically index requester release and dispose the responder assignment."""
+        if record.get("id") != key.inbound_id:
+            raise GateError("delivery failure does not match the exact inbound")
         with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
             ledger = self._load()
+            if ledger["inbound_index"].get(key.inbound_id) != key.digest:
+                raise GateError("delivery failure admission index is stale")
             admission = ledger["obligations"].get(key.digest)
             if not isinstance(admission, dict):
                 raise GateError("delivery admission missing")
-            admission["state"] = "delivery_failed"
-            event = self._append(
-                ledger,
-                "DELIVERY_FAILED",
-                scope=key.inbound_id,
-                key_digest=key.digest,
-                data={
-                    "reason": reason,
+            if self._key_from(admission.get("key")) != key:
+                raise GateError("delivery failure key does not match persisted admission")
+            if admission.get("state") == "delivery_failed":
+                canonical_reason = str(admission.get("delivery_failure_reason") or reason)
+            else:
+                if admission.get("state") != "open":
+                    raise GateError("delivery admission is no longer open")
+                if admission.get("fence") != self.fence or not self._live_dispatch_fence_owned():
+                    raise GateError("delivery failure wrapper fence changed")
+                if int(ledger["scoped_revisions"].get(key.inbound_id, 0)) != (
+                    expected_revision
+                ):
+                    raise StaleRevision("delivery failure scoped revision changed")
+                if not self._dispatch_head_is_current(admission, key):
+                    raise StaleRevision("delivery failure no longer owns the exact cursor head")
+                canonical_reason = reason
+                admission["state"] = "delivery_failed"
+                admission["delivery_failure_reason"] = canonical_reason
+                event = self._append(
+                    ledger,
+                    "DELIVERY_FAILED",
+                    scope=key.inbound_id,
+                    key_digest=key.digest,
+                    data={
+                        "reason": canonical_reason,
+                        "requester": key.requester,
+                        "responder": key.responder,
+                        "correlation_id": key.correlation_id,
+                    },
+                )
+                admission["delivery_failure_sequence"] = event["sequence"]
+                ledger["delivery_index"].setdefault(key.correlation_id, []).append({
+                    "sequence": event["sequence"],
+                    "key_digest": key.digest,
+                    "inbound_id": key.inbound_id,
+                    "delivery_generation": key.delivery_generation,
                     "requester": key.requester,
                     "responder": key.responder,
-                    "correlation_id": key.correlation_id,
-                },
-            )
-            ledger["delivery_index"].setdefault(key.correlation_id, []).append({
-                "sequence": event["sequence"],
-                "requester": key.requester,
-                "responder": key.responder,
-                "state": "delivery_failed",
-                "reason": reason,
-            })
-            ledger["cursor_dispositions"][self.agent] = {
-                "inbound_id": record.get("id"),
-                "mode": record.get("mode", "global"),
-                "state": "delivery_failed",
-                "at": self.now(),
-            }
-            breaker_tripped = self._apply_compliance_exhaustion(ledger, key, admission)
-            self._write(ledger)
-        self._advance_record_cursor(record)
+                    "state": "delivery_failed",
+                    "reason": canonical_reason,
+                })
+                ledger["cursor_dispositions"][self.agent] = {
+                    "inbound_id": record.get("id"),
+                    "mode": record.get("mode", "global"),
+                    "state": "delivery_failed",
+                    "at": self.now(),
+                }
+                self._apply_delivery_exhaustion(
+                    ledger,
+                    key,
+                    admission,
+                    event,
+                )
+                self._write(ledger)
+            breaker = ledger["breakers"].get(self.agent, {})
+            breaker_tripped = isinstance(breaker, dict) and breaker.get("tripped") is True
+            scoped_revision = int(ledger["scoped_revisions"].get(key.inbound_id, 0))
         if breaker_tripped:
-            self.store.write_config_blocked_hold(
-                self.agent,
-                summary=(
-                    "owed-action compliance breaker tripped after "
-                    f"{COMPLIANCE_BREAKER_TRIP} consecutive compliance-dominant exhaustions"
-                ),
-            )
+            self._project_compliance_breaker_hold()
+            self._reconcile_compliance_breaker_alert()
+        self._advance_record_cursor(record)
         return Resolution(
             ResolverState.DELIVERY_EXHAUSTED,
-            reason,
+            canonical_reason,
             key,
-            scoped_revision=int(ledger["scoped_revisions"].get(key.inbound_id, 0)),
+            scoped_revision=scoped_revision,
         )
 
-    def _apply_compliance_exhaustion(self, ledger: dict, key: ObligationKey,
-                                     admission: dict) -> bool:
-        if not admission.get("owed_action_missing_seen"):
+    def _apply_delivery_exhaustion(
+        self,
+        ledger: dict,
+        key: ObligationKey,
+        admission: dict,
+        event: dict,
+    ) -> bool:
+        breaker = self._breaker_state(ledger)
+        if admission.get("last_exhaustion_class") != "compliance":
+            breaker["proof_infra_exhaustions_consecutive"] = int(
+                breaker.get("proof_infra_exhaustions_consecutive", 0),
+            ) + 1
+            self._append(
+                ledger,
+                "PROOF_INFRA_EXHAUSTION_RECORDED",
+                key_digest=key.digest,
+                data={
+                    "count": breaker["proof_infra_exhaustions_consecutive"],
+                    "delivery_sequence": event.get("sequence"),
+                },
+            )
             return False
-        breaker = ledger["breakers"].setdefault(self.agent, {
-            "generation": 0,
-            "owed_action_cap_exhaustions_consecutive": 0,
-            "tripped": False,
-            "alerted_generation": None,
-        })
         breaker["owed_action_cap_exhaustions_consecutive"] = int(
             breaker.get("owed_action_cap_exhaustions_consecutive", 0)) + 1
+        references = breaker.setdefault("compliance_exhaustion_references", [])
+        if not isinstance(references, list):
+            raise LedgerUnreadable("compliance exhaustion references are invalid")
+        references.append({
+            "key_digest": key.digest,
+            "delivery_sequence": event.get("sequence"),
+        })
         if breaker["owed_action_cap_exhaustions_consecutive"] < COMPLIANCE_BREAKER_TRIP:
             return False
         newly_tripped = False
         if breaker.get("tripped") is not True:
             breaker["generation"] = int(breaker.get("generation", 0)) + 1
             breaker["tripped"] = True
+            breaker["config_blocked"] = True
+            breaker["config_blocked_reason"] = "owed_action_compliance_breaker"
             newly_tripped = True
             breaker["tripped_at"] = self.now()
+            generation = int(breaker["generation"])
+            alert_nonce = uuid.uuid4().hex
+            alert_request_id = f"esc-owed-breaker-{self.agent}-{generation}"
+            alert_body = (
+                f"Owed-action compliance breaker tripped for {self.agent} "
+                f"at generation {generation}. Paid dispatch is halted. "
+                f"Exhaustion references: {_canonical(references[-COMPLIANCE_BREAKER_TRIP:])}"
+            )
+            breaker.setdefault("alerts", {})[str(generation)] = {
+                "state": "pending",
+                "nonce": alert_nonce,
+                "request_id": alert_request_id,
+                "body": alert_body,
+                "exhaustion_references": list(references[-COMPLIANCE_BREAKER_TRIP:]),
+                "queued_at": self.now(),
+            }
             self._append(
                 ledger,
                 "COMPLIANCE_BREAKER_TRIPPED",
                 key_digest=key.digest,
-                data={"agent": self.agent, "generation": breaker["generation"]},
+                data={
+                    "agent": self.agent,
+                    "generation": breaker["generation"],
+                    "exhaustion_references": list(references[-COMPLIANCE_BREAKER_TRIP:]),
+                },
             )
-        if breaker.get("alerted_generation") != breaker["generation"]:
-            breaker["alerted_generation"] = breaker["generation"]
             self._append(
                 ledger,
-                "COMPLIANCE_BREAKER_ALERT",
+                "COMPLIANCE_BREAKER_ALERT_QUEUED",
                 key_digest=key.digest,
-                data={"agent": self.agent, "generation": breaker["generation"]},
+                data={
+                    "agent": self.agent,
+                    "generation": generation,
+                    "nonce": alert_nonce,
+                },
             )
         return newly_tripped
 
@@ -2061,14 +2994,21 @@ class DetectionCommitGate:
         return None
 
     def schedule_continuation(self, key: ObligationKey, *, producer_token: str) -> str:
-        operation_nonce = uuid.uuid4().hex
         with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
             ledger = self._load()
             admission = ledger["obligations"].get(key.digest)
-            if not isinstance(admission, dict):
+            if not isinstance(admission, dict) or admission.get("state") != "open":
                 raise GateError("continuation admission missing")
+            if int(admission.get("paid_dispatches_total", 0)) != 1:
+                raise DispatchRefused("continuation requires exactly one paid dispatch")
             if admission.get("recovery_used") or admission.get("continuation_used"):
                 raise DispatchRefused("extra dispatch budget already assigned")
+            existing = admission.get("durable_continuation")
+            if isinstance(existing, dict) and existing.get("state") == "scheduled":
+                if admission.get("producer_token") != producer_token:
+                    raise DispatchRefused("continuation is already owned by another producer")
+                return str(existing["operation_nonce"])
+            operation_nonce = uuid.uuid4().hex
             admission["producer_token"] = producer_token
             admission["first_deferred_at"] = admission.get("first_deferred_at") or self.now()
             admission["durable_continuation"] = {
@@ -2077,7 +3017,7 @@ class DetectionCommitGate:
             }
             self._append(
                 ledger,
-                "DEFERRED",
+                "CONTINUATION_SCHEDULED",
                 scope=key.inbound_id,
                 key_digest=key.digest,
                 data={"operation_nonce": operation_nonce},
@@ -2180,7 +3120,14 @@ class DetectionCommitGate:
                 "state": "open",
                 "fence": "unclaimed",
                 "paid_dispatches_total": 0,
+                "paid_initial_dispatches_total": 0,
+                "paid_recoveries_total": 0,
+                "paid_continuations_total": 0,
                 "reservations": {},
+                "continuation_used": False,
+                "recovery_used": False,
+                "first_dispatch_classified": False,
+                "last_exhaustion_class": None,
                 "operation_infra_attempts": 0,
                 "operation_infra_first_at": None,
                 "operation_infra_retry_inflight": False,
@@ -2280,7 +3227,15 @@ class DetectionCommitGate:
             return result
         result["store_epoch"] = ledger["store_epoch"]
         result["append_sequence"] = ledger["append_sequence"]
-        result["breaker"] = ledger["breakers"].get(self.agent, {})
+        breaker = ledger["breakers"].get(self.agent, {})
+        result["breaker"] = breaker
+        if isinstance(breaker, dict) and breaker.get("tripped") is True:
+            result["status"] = ResolverState.BLOCKED_COMPLIANCE.value.upper()
+            result["reason"] = "owed_action_compliance_breaker"
+            self._project_compliance_breaker_hold()
+            self._reconcile_compliance_breaker_alert()
+        elif isinstance(breaker, dict) and breaker.get("config_blocked") is False:
+            self._clear_compliance_breaker_hold()
         result["open_obligations"] = sum(
             1 for row in ledger["obligations"].values()
             if isinstance(row, dict) and row.get("state") == "open"

@@ -111,6 +111,7 @@ def _operation_idempotency(
     nonce: str | None,
 ) -> tuple[object | None, str | None]:
     """Bind one wrapper operation nonce to one canonical semantic payload."""
+    _ = store, sender
     if nonce is None:
         return None, None
     if _OPERATION_NONCE_RE.fullmatch(nonce) is None:
@@ -128,13 +129,6 @@ def _operation_idempotency(
         origin_request_id=meta.get("origin_request_id"),
         origin_inbound_id=meta.get("origin_inbound_id"),
     )
-    for message in store.valid_messages():
-        existing_meta = message.meta or {}
-        if message.sender != sender or existing_meta.get("operation_nonce") != nonce:
-            continue
-        if existing_meta.get("operation_digest") == digest:
-            return message, None
-        return None, "operation nonce was already used with a different payload"
     meta["operation_nonce"] = nonce
     meta["operation_digest"] = digest
     return None, None
@@ -1631,6 +1625,7 @@ def cmd_composing(args: argparse.Namespace) -> int:
         meta["request_id"] = rid
     else:
         recipient = _resolve_peer(args.recipient, cfg, sender)
+    operation_nonce = getattr(args, "operation_nonce", None)
     existing, operation_error = _operation_idempotency(
         store,
         sender=sender,
@@ -1639,7 +1634,7 @@ def cmd_composing(args: argparse.Namespace) -> int:
         kind="composing",
         operation="composing",
         meta=meta,
-        nonce=getattr(args, "operation_nonce", None),
+        nonce=operation_nonce,
     )
     if operation_error is not None:
         sys.stderr.write(f"agenttalk composing: {operation_error}.\n")
@@ -1648,17 +1643,36 @@ def cmd_composing(args: argparse.Namespace) -> int:
         if not args.quiet:
             print(f"(composing operation already recorded: id={existing.id})")
         return 0
-    msg = store.send(
-        sender=sender,
-        recipient=recipient,
-        body=body,
-        kind="composing",
-        subject=args.subject or "composing",
-        meta=meta,
-    )
+    try:
+        if operation_nonce is not None:
+            msg, published = store.send_operation(
+                sender=sender,
+                recipient=recipient,
+                body=body,
+                kind="composing",
+                subject=args.subject or "composing",
+                meta=meta,
+                operation_nonce=operation_nonce,
+                operation_digest=str(meta["operation_digest"]),
+            )
+        else:
+            msg = store.send(
+                sender=sender,
+                recipient=recipient,
+                body=body,
+                kind="composing",
+                subject=args.subject or "composing",
+                meta=meta,
+            )
+            published = True
+    except ValueError as exc:
+        sys.stderr.write(f"agenttalk composing: {exc}.\n")
+        return 2
     if rid:
         store.write_composing_intent(sender, rid, recipient)  # best-effort
-    if not args.quiet:
+    if not published and not args.quiet:
+        print(f"(composing operation already recorded: id={msg.id})")
+    elif not args.quiet:
         print(f"(composing ping sent: {sender} -> {recipient}; id={msg.id})")
     return 0
 
@@ -5778,6 +5792,7 @@ def cmd_escalate(args: argparse.Namespace) -> int:
         meta["attention"] = att_block
     if "request_id" not in meta:
         meta["request_id"] = "esc-" + uuid.uuid4().hex[:12]
+    operation_nonce = getattr(args, "operation_nonce", None)
     existing, operation_error = _operation_idempotency(
         store,
         sender=sender,
@@ -5786,7 +5801,7 @@ def cmd_escalate(args: argparse.Namespace) -> int:
         kind="question",
         operation="terminal",
         meta=meta,
-        nonce=getattr(args, "operation_nonce", None),
+        nonce=operation_nonce,
     )
     if operation_error is not None:
         sys.stderr.write(f"agenttalk escalate: {operation_error}.\n")
@@ -5796,14 +5811,36 @@ def cmd_escalate(args: argparse.Namespace) -> int:
             print(f"(escalation operation already recorded: id={existing.id})")
         print(f"request_id={(existing.meta or {}).get('request_id', meta['request_id'])}")
         return 0
-    msg = store.send(
-        sender=sender,
-        recipient=target,
-        body=body,
-        kind="question",
-        subject=args.subject or "operator input needed",
-        meta=meta,
-    )
+    try:
+        if operation_nonce is not None:
+            msg, published = store.send_operation(
+                sender=sender,
+                recipient=target,
+                body=body,
+                kind="question",
+                subject=args.subject or "operator input needed",
+                meta=meta,
+                operation_nonce=operation_nonce,
+                operation_digest=str(meta["operation_digest"]),
+            )
+        else:
+            msg = store.send(
+                sender=sender,
+                recipient=target,
+                body=body,
+                kind="question",
+                subject=args.subject or "operator input needed",
+                meta=meta,
+            )
+            published = True
+    except ValueError as exc:
+        sys.stderr.write(f"agenttalk escalate: {exc}.\n")
+        return 2
+    if not published:
+        if not args.quiet:
+            print(f"(escalation operation already recorded: id={msg.id})")
+        print(f"request_id={(msg.meta or {}).get('request_id', meta['request_id'])}")
+        return 0
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: ESCALATE  {sender} -> {target}"))
     # Always print the machine-parseable correlation line: the caller's
@@ -8532,6 +8569,7 @@ def cmd_reply(args: argparse.Namespace) -> int:
     ):
         meta["broadcast_id"] = anchor.meta["broadcast_id"]
     _maybe_autogen_request_id(kind, meta, quiet=args.quiet)
+    operation_nonce = getattr(args, "operation_nonce", None)
     existing, operation_error = _operation_idempotency(
         store,
         sender=sender,
@@ -8540,7 +8578,7 @@ def cmd_reply(args: argparse.Namespace) -> int:
         kind=kind,
         operation="terminal",
         meta=meta,
-        nonce=getattr(args, "operation_nonce", None),
+        nonce=operation_nonce,
     )
     if operation_error is not None:
         sys.stderr.write(f"agenttalk reply: {operation_error}.\n")
@@ -8569,14 +8607,35 @@ def cmd_reply(args: argparse.Namespace) -> int:
         return 0
     gate_mod.validate_response_status(kind, meta)
     gate_mod.validate_review_result_evidence(kind, meta)
-    msg = store.send(
-        sender=sender,
-        recipient=anchor.sender,
-        body=body,
-        kind=kind,
-        subject=args.subject or "",
-        meta=meta,
-    )
+    try:
+        if operation_nonce is not None:
+            msg, published = store.send_operation(
+                sender=sender,
+                recipient=anchor.sender,
+                body=body,
+                kind=kind,
+                subject=args.subject or "",
+                meta=meta,
+                operation_nonce=operation_nonce,
+                operation_digest=str(meta["operation_digest"]),
+            )
+        else:
+            msg = store.send(
+                sender=sender,
+                recipient=anchor.sender,
+                body=body,
+                kind=kind,
+                subject=args.subject or "",
+                meta=meta,
+            )
+            published = True
+    except ValueError as exc:
+        sys.stderr.write(f"agenttalk reply: {exc}.\n")
+        return 2
+    if not published:
+        if not args.quiet:
+            print(f"(reply operation already recorded: id={msg.id})")
+        return 0
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: REPLY  {msg.sender} -> {msg.recipient}"))
     _register_await_reply(store, await_record, quiet=args.quiet)

@@ -2654,6 +2654,162 @@ class Store:
                 _ = exc
         return msg
 
+    def _operation_intent_path(self, sender: str, operation_nonce: str) -> Path:
+        name = validate_agent_name(sender)
+        if re.fullmatch(r"[0-9a-f]{32}", operation_nonce) is None:
+            raise ValueError("operation nonce must be exactly 32 lowercase hexadecimal characters")
+        return self.state_dir / "operation-intents" / f"{name}.{operation_nonce}.json"
+
+    def read_operation_intent(self, sender: str, operation_nonce: str) -> dict | None:
+        """Read one atomically prepared wrapper-operation identity."""
+        path = self._operation_intent_path(sender, operation_nonce)
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(value, dict)
+            or value.get("sender") != sender
+            or value.get("operation_nonce") != operation_nonce
+            or re.fullmatch(r"[0-9a-f]{64}", str(value.get("operation_digest", "")))
+            is None
+            or re.fullmatch(r"[0-9a-f]{64}", str(value.get("payload_sha256", "")))
+            is None
+            or not isinstance(value.get("payload_size"), int)
+            or value.get("state") not in {"prepared", "published"}
+        ):
+            return None
+        return value
+
+    def _record_operation_intent_locked(
+        self,
+        *,
+        sender: str,
+        operation_nonce: str,
+        operation_digest: str,
+        body: str,
+    ) -> tuple[Path, dict]:
+        if re.fullmatch(r"[0-9a-f]{64}", operation_digest) is None:
+            raise ValueError(
+                "operation digest must be exactly 64 lowercase hexadecimal characters"
+            )
+        path = self._operation_intent_path(sender, operation_nonce)
+        payload = body.encode("utf-8")
+        identity = {
+            "sender": sender,
+            "operation_nonce": operation_nonce,
+            "operation_digest": operation_digest,
+            "payload_sha256": hashlib.sha256(payload).hexdigest(),
+            "payload_size": len(payload),
+        }
+        existing = self.read_operation_intent(sender, operation_nonce)
+        if isinstance(existing, dict):
+            if any(existing.get(name) != value for name, value in identity.items()):
+                raise ValueError("operation nonce was already used with a different payload")
+            return path, existing
+        if path.exists():
+            raise ValueError("operation intent marker is unreadable")
+        intent = {**identity, "state": "prepared", "prepared_at": _now_iso()}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(path, json.dumps(intent, indent=2, ensure_ascii=False))
+        return path, intent
+
+    def record_operation_intent(
+        self,
+        *,
+        sender: str,
+        operation_nonce: str,
+        operation_digest: str,
+        body: str,
+    ) -> dict:
+        """Durably mark a complete captured payload before canonical append."""
+        lock = self.state_dir / "operation-publication.lock"
+        with self._exclusive_lock(
+            lock,
+            timeout=10.0,
+            what="wrapper operation publication",
+        ):
+            _path, intent = self._record_operation_intent_locked(
+                sender=sender,
+                operation_nonce=operation_nonce,
+                operation_digest=operation_digest,
+                body=body,
+            )
+            return dict(intent)
+
+    def send_operation(
+        self,
+        *,
+        sender: str,
+        recipient: str,
+        body: str,
+        kind: str,
+        subject: str = "",
+        meta: dict,
+        operation_nonce: str,
+        operation_digest: str,
+    ) -> tuple[Message, bool]:
+        """Atomically dedupe one canonical wrapper operation publication."""
+        if re.fullmatch(r"[0-9a-f]{32}", operation_nonce) is None:
+            raise ValueError("operation nonce must be exactly 32 lowercase hexadecimal characters")
+        if re.fullmatch(r"[0-9a-f]{64}", operation_digest) is None:
+            raise ValueError("operation digest must be exactly 64 lowercase hexadecimal characters")
+        supplied = dict(meta)
+        if supplied.get("operation_nonce") not in {None, operation_nonce}:
+            raise ValueError("operation nonce metadata conflicts with publication request")
+        if supplied.get("operation_digest") not in {None, operation_digest}:
+            raise ValueError("operation digest metadata conflicts with publication request")
+        supplied["operation_nonce"] = operation_nonce
+        supplied["operation_digest"] = operation_digest
+        lock = self.state_dir / "operation-publication.lock"
+        with self._exclusive_lock(
+            lock,
+            timeout=10.0,
+            what="wrapper operation publication",
+        ):
+            intent_path, intent = self._record_operation_intent_locked(
+                sender=sender,
+                operation_nonce=operation_nonce,
+                operation_digest=operation_digest,
+                body=body,
+            )
+            for existing in self.valid_messages():
+                existing_meta = existing.meta or {}
+                if (
+                    existing.sender != sender
+                    or existing_meta.get("operation_nonce") != operation_nonce
+                ):
+                    continue
+                if existing_meta.get("operation_digest") == operation_digest:
+                    if intent.get("state") != "published" or intent.get(
+                        "message_id"
+                    ) != existing.id:
+                        intent["state"] = "published"
+                        intent["message_id"] = existing.id
+                        intent["published_at"] = _now_iso()
+                        _atomic_write_text(
+                            intent_path,
+                            json.dumps(intent, indent=2, ensure_ascii=False),
+                        )
+                    return existing, False
+                raise ValueError("operation nonce was already used with a different payload")
+            message = self.send(
+                sender=sender,
+                recipient=recipient,
+                body=body,
+                kind=kind,
+                subject=subject,
+                meta=supplied,
+            )
+            intent["state"] = "published"
+            intent["message_id"] = message.id
+            intent["published_at"] = _now_iso()
+            _atomic_write_text(
+                intent_path,
+                json.dumps(intent, indent=2, ensure_ascii=False),
+            )
+            return message, True
+
     def send_operator_answer_atomic(
         self,
         *,

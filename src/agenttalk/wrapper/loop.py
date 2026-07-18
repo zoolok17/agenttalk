@@ -258,7 +258,10 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
     interval-gated and failure-isolated; exceptions are swallowed so capacity
     cannot undo the just-completed liveness/cursor boundary."""
     stamp = heartbeat if heartbeat is not None else (lambda: store.write_heartbeat(agent))
-    wait_token = (wrapper_generation or uuid.uuid4().hex) if manage_waiting else None
+    gate_generation = getattr(commit_gate, "fence", None)
+    wait_token = (
+        wrapper_generation or gate_generation or uuid.uuid4().hex
+    ) if manage_waiting else None
     try:
         if wait_token is not None:
             store.write_waiting(agent, {
@@ -571,6 +574,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             record,
                             key,
                             reason="captured bus operation exhausted its durable retry bound",
+                            expected_revision=resolution.scoped_revision,
                         )
                         commit_gate.cleanup_permit(captured)
                         stamp()
@@ -614,6 +618,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                 "agent computed but did not emit the owed reply "
                                 "(model/prompt-compliance gap)"
                             ),
+                            expected_revision=resolution.scoped_revision,
                         )
                         stamp()
                         fail_sleep = idle_interval
@@ -629,7 +634,14 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     sleep(fail_sleep)
                     fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                     continue
-                outcome = _as_outcome(drive(commit_gate.dispatch_record(record, permit)))
+                try:
+                    dispatch_record = commit_gate.dispatch_record(record, permit)
+                except GateError:
+                    stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+                outcome = _as_outcome(drive(dispatch_record))
                 action_infra = (
                     outcome.bus_action_infra or outcome.failure_class == CLASS_INFRA
                 )
@@ -703,6 +715,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             record,
                             key,
                             reason="captured bus operation exhausted its durable retry bound",
+                            expected_revision=resolution.scoped_revision,
                         )
                         commit_gate.cleanup_permit(permit)
                         stamp()
@@ -716,6 +729,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             "agent computed but did not emit the owed reply "
                             "(model/prompt-compliance gap)"
                         ),
+                        expected_revision=resolution.scoped_revision,
                     )
                     commit_gate.cleanup_permit(permit)
                     stamp()
@@ -944,6 +958,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                             record,
                             key,
                             reason="captured bus operation exhausted its durable retry bound",
+                            expected_revision=resolution.scoped_revision,
                         )
                         commit_gate.cleanup_permit(captured)
                         return turns
@@ -985,6 +1000,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                                 "agent computed but did not emit the owed reply "
                                 "(model/prompt-compliance gap)"
                             ),
+                            expected_revision=resolution.scoped_revision,
                         )
                         return turns
                     _stamp()
@@ -996,7 +1012,14 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                     _stamp()
                     sleep(fail_sleep)
                     continue
-                outcome = _as_outcome(drive(commit_gate.dispatch_record(record, permit)))
+                try:
+                    dispatch_record = commit_gate.dispatch_record(record, permit)
+                except GateError:
+                    _stamp()
+                    sleep(fail_sleep)
+                    fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                    continue
+                outcome = _as_outcome(drive(dispatch_record))
                 action_infra = (
                     outcome.bus_action_infra or outcome.failure_class == CLASS_INFRA
                 )
@@ -1051,6 +1074,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                             "agent computed but did not emit the owed reply "
                             "(model/prompt-compliance gap)"
                         ),
+                        expected_revision=resolved.scoped_revision,
                     )
                     commit_gate.cleanup_permit(permit)
                     return turns
