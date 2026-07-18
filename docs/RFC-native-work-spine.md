@@ -1013,8 +1013,11 @@ differently. Independence therefore needs its own identity:
   artifact's tier, never turns a non-`pass` outcome green, and is not
   transferable to a second requirement that happens to match the same
   glob. The underlying artifact keeps its original tier, verbatim.
-- **No waiver satisfies a release-blocking work requirement in D1–D5,
-  because no waiver record capable of doing so exists yet.**
+- **No waiver satisfies a release-blocking work requirement through a
+  direct work-side gate in D1–D5, because no waiver record capable of
+  doing so exists yet.** (The waiver-backed *close* route is a separate
+  matter and is **not** closed — see The Release Baseline's honest limit
+  and D6 item 7.)
   `gates.waive_gate` (`gates.py:143-181`) stores only
   `{operator, date, reason, scope, expires}` where `operator` is
   unauthenticated free text; it records no `work_id`, no check or glob
@@ -2128,10 +2131,11 @@ a named test in D1–D4's acceptance set.
     advance past its last `state_asserted` event does not become a
     permanent HOLD. Asserts the two axes are independent and the
     projection is total.
-20. **No waiver satisfies a release blocker.** *Test:* `gate waive` an
-    active waiver over a required check on a release-blocking item;
-    assert `work_waiver_not_authoritative` and that the verdict stays
-    non-GO.
+20. **No waiver satisfies a release blocker through a direct work-side
+    gate.** *Test:* `gate waive` an active waiver over a required check
+    on a release-blocking item; assert `work_waiver_not_authoritative`
+    and that the verdict stays non-GO. Scoped deliberately: the
+    waiver-backed close route is undetectable and is not asserted here.
 21. **Lineage cannot mint independence.** *Test:* two artifacts derived
     from one root — one reformatted, one truncated — yield independence
     count 1; a `derived_from` cycle and a root mismatch each yield
@@ -2541,11 +2545,12 @@ choice and this document made one:
   classification keys on `pending_op` + `ledger_head`.
 - **Claimed execution roots cannot satisfy independence**; that needs a
   launch-time nonce which does not exist in D1–D5.
-- **No waiver satisfies a release-blocking requirement in D1–D5**,
-  because `gates.waive_gate` stores unauthenticated free text with no
-  work/head/policy binding and ASSURANCE.md:109-114 forbids treating it
-  as operator authority. The waiver record work *would* need is
-  specified so the hardening has a target.
+- **No waiver satisfies a release-blocking requirement through a direct
+  work-side gate in D1–D5**, because `gates.waive_gate` stores
+  unauthenticated free text with no work/head/policy binding and
+  ASSURANCE.md:109-114 forbids treating it as operator authority. The
+  waiver record work *would* need is specified so the hardening has a
+  target. The waiver-backed **close** route remains open and blocks D4.
 - **Independence is counted by distinct transitive `root_execution_id`**,
   with descendants inheriting their ancestor's root, and roots derived
   from execution identity rather than captured output.
@@ -2658,7 +2663,7 @@ being there.
 | 26 | CRASH-ARTIFACT-PAIR | FOLD | Artifact Schema → **Torn Reads And The JSON/Log Pair**: log written and hash-validated first, metadata published last as the commit marker; all seven states (a)–(g) tabulated; both files revalidated on every consumption. |
 | 27 | CONTRADICTION-SEMANTICS | FOLD | Contradictions → cases A, B, C spelled out, with "most recent" and "most pessimistic" each rejected by name and reason (clock control; permanent poisoning of later valid revisions). |
 | 28 | TIER-ASSURANCE-INGEST | FOLD | Assurance Ingestion → the artifact's actual field list, confirmed against `assurance.py:2164-2189`, carries no work bindings; tier comes from the ingestion path, never from `profile` / attestation / path / producer string / `CI=true`. |
-| 29 | TIER-WAIVER-LAUNDERING | FOLD (partial — close route open) | Execution Tiers → a waiver never mutates evidence, and no waiver satisfies a release-blocking requirement **through a direct work-side gate**. The **close** route is NOT closed: `record["final"]` carries blocker names only, so a waiver-backed close is undetectable; there is no `work_waiver_backed_close` code, and D6 item 7 blocks D4 on a close-provenance envelope. *Amended after codex-sec:* the first fold asserted a typed waiver "scoped to one requirement at one head and policy hash" — a record that does not exist. `gates.waive_gate` (`gates.py:143-181`) stores `{operator, date, reason, scope, expires}` with `operator` as unauthenticated free text and no work/check/head/policy binding, `_gate_verdict` (`:311-317`) makes any active waiver non-blocking, and ASSURANCE.md:109-114 forbids treating that path as operator authority. The required record is now specified as a target for the hardening, and until it lands there is no waiver escape. |
+| 29 | TIER-WAIVER-LAUNDERING | FOLD (partial — close route open) | Execution Tiers → a waiver never mutates evidence, and no waiver satisfies a release-blocking requirement **through a direct work-side gate**. The **close** route is NOT closed: `record["final"]` carries blocker names only, so a waiver-backed close is undetectable; there is no `work_waiver_backed_close` code, and D6 item 7 blocks D4 on a close-provenance envelope. *Amended after codex-sec:* the first fold asserted a typed waiver "scoped to one requirement at one head and policy hash" — a record that does not exist. `gates.waive_gate` (`gates.py:143-181`) stores `{operator, date, reason, scope, expires}` with `operator` as unauthenticated free text and no work/check/head/policy binding, `_gate_verdict` (`:311-317`) makes any active waiver non-blocking, and ASSURANCE.md:109-114 forbids treating that path as operator authority. The required record is now specified as a target for the hardening, and until it lands the close route remains open and blocks D4. |
 | 30 | TIER-REREGISTRATION | FOLD (amended twice) | Execution Lineage → `root_execution_id` derived from **execution identity** (command, cwd, base, head, policy hash, producer, started_at), explicitly not captured output, with `work_artifact_execution_conflict` on a tier/origin change. `content_hash` alone cannot do this: the record hashes its own `artifact_id`, so two registrations of one run hash differently by construction. *Round 2:* codex-sec showed the replacement is still **self-asserted** — every input is a producer claim, so a sibling adapter can mint a fresh root with a plausible `started_at`. `min_independent_roots > 1` is therefore unsatisfiable by claimed roots in D1–D5 (`work_independence_unverifiable`); it needs a launch-time nonce that does not exist. |
 | 31 | TIER-FAKE-CORROBORATION | FOLD | Execution Lineage → "**Corroboration counts distinct `root_execution_id` values, not records**"; `derived_from` lineage; a derived artifact "can never corroborate its own ancestor." |
 | 32 | TIER-CONTAINER/SIGNER-SPOOF | DEFER | D6 gate item 6, forced by whichever phase first introduces an attestation producer. Partly covered now: Evidence Tiers makes `producer`/`producer_class`/`trust_tier` untrusted input recomputed at registration, and `external_attested` has **no producer in D1–D5**, so the transitive-container surface does not yet exist. The attestation-scope model is what remains. |
