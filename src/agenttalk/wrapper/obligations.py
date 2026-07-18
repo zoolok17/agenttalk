@@ -22,7 +22,7 @@ from typing import Callable
 
 from agenttalk import threads
 from agenttalk._atomic import write_text as _atomic_write_text
-from agenttalk.store import Message
+from agenttalk.store import PROC_DEAD, Message, _process_liveness
 
 POLICY_ENV = "AGENTTALK_COMMIT_GATE_POLICY"
 POLICY_SCHEMA_VERSION = 1
@@ -57,6 +57,7 @@ PROOF_UNREADABLE_SECONDS = 900.0
 class ResolverState(str, Enum):
     NOT_OWED = "not_owed"
     CLASSIFICATION_UNKNOWN = "classification_unknown"
+    INACTIVE = "inactive"
     ACTIVE = "active"
     BLOCKED = "blocked"
     BLOCKED_POLICY = "blocked_policy"
@@ -130,21 +131,34 @@ class PolicySnapshot:
                 generation,
                 reason="configured grade is invalid",
             )
-        if entry.get("grade") == SECURITY_GRADE:
+        grade = entry.get("grade")
+        if grade not in {DETECTION_GRADE, SECURITY_GRADE}:
+            return cls(
+                ResolverState.BLOCKED_POLICY,
+                generation,
+                reason="configured grade is unsupported",
+            )
+        enabled = entry.get("enabled", True)
+        if enabled is not True and enabled is not False:
+            return cls(
+                ResolverState.BLOCKED_POLICY,
+                generation,
+                reason="configured enabled flag is invalid",
+            )
+        if enabled is False:
+            return cls(
+                ResolverState.INACTIVE,
+                generation,
+                grade,
+                "operator disabled gate",
+            )
+        if grade == SECURITY_GRADE:
             return cls(
                 ResolverState.BLOCKED,
                 generation,
                 SECURITY_GRADE,
                 "security-grade prerequisites are not available in this build",
             )
-        if entry.get("grade") != DETECTION_GRADE:
-            return cls(
-                ResolverState.BLOCKED_POLICY,
-                generation,
-                reason="configured grade is unsupported",
-            )
-        if entry.get("enabled", True) is not True:
-            return cls(ResolverState.NOT_OWED, generation, reason="operator disabled gate")
         return cls(ResolverState.ACTIVE, generation, DETECTION_GRADE, "policy ready")
 
     @classmethod
@@ -216,7 +230,11 @@ class Resolution:
 
     @property
     def allows_legacy_commit(self) -> bool:
-        return self.state in {ResolverState.NOT_OWED, ResolverState.CLASSIFICATION_UNKNOWN}
+        return self.state in {
+            ResolverState.NOT_OWED,
+            ResolverState.CLASSIFICATION_UNKNOWN,
+            ResolverState.INACTIVE,
+        }
 
 
 @dataclass(frozen=True)
@@ -481,8 +499,14 @@ class DetectionCommitGate:
             # apparent failure.
             pass
 
-    def _record_projection_rebuild(self, *, success: bool, detail: str) -> None:
-        now_text = self.now()
+    def _record_projection_rebuild(
+        self,
+        *,
+        success: bool,
+        detail: str,
+        observed_at: str,
+    ) -> None:
+        now_text = observed_at
         lock = self.proof_health_path.with_suffix(".lock")
         with self.store._exclusive_lock(lock, timeout=10.0):
             try:
@@ -503,7 +527,7 @@ class DetectionCommitGate:
                 json.dumps(health, indent=2, ensure_ascii=False),
             )
 
-    def _try_rebuild_projection(self) -> bool:
+    def _try_rebuild_projection(self, *, observed_at: str) -> bool:
         """Restore a byte-corrupt projection only from an epoch-matched checkpoint."""
         try:
             with self.store._exclusive_lock(
@@ -525,9 +549,17 @@ class DetectionCommitGate:
                     json.dumps(checkpoint, indent=2, ensure_ascii=False),
                 )
         except (OSError, ValueError, json.JSONDecodeError, LedgerUnreadable) as exc:
-            self._record_projection_rebuild(success=False, detail=str(exc))
+            self._record_projection_rebuild(
+                success=False,
+                detail=str(exc),
+                observed_at=observed_at,
+            )
             return False
-        self._record_projection_rebuild(success=True, detail="checkpoint restored")
+        self._record_projection_rebuild(
+            success=True,
+            detail="checkpoint restored",
+            observed_at=observed_at,
+        )
         return True
 
     def _append(self, ledger: dict, transition: str, *, scope: str | None = None,
@@ -658,22 +690,47 @@ class DetectionCommitGate:
             messages = self.store.valid_messages()
             invalid_records = self.store.list_invalid_messages()
         except (OSError, ValueError, TimeoutError, RuntimeError) as exc:
-            raise LedgerUnreadable("validated bus replay unavailable") from exc
+            observed_at = self.now()
+            failure = LedgerUnreadable("validated bus replay unavailable")
+            self.record_proof_failure(
+                error_class=type(failure).__name__,
+                path=str(self.path),
+                observed_at=observed_at,
+            )
+            raise failure from exc
         try:
             ledger = self._index_messages(messages, invalid_records=invalid_records)
         except (OSError, ValueError, TimeoutError, RuntimeError) as exc:
+            observed_at = self.now()
             if isinstance(exc, LedgerUnreadable):
-                if self._try_rebuild_projection():
-                    raise LedgerUnreadable(
+                if self._try_rebuild_projection(observed_at=observed_at):
+                    failure = LedgerUnreadable(
                         "canonical projection rebuilt; fail-closed replay required"
-                    ) from exc
+                    )
+                else:
+                    failure = exc
+            else:
+                failure = LedgerUnreadable("canonical append service unavailable")
+            self.record_proof_failure(
+                error_class=type(failure).__name__,
+                path=str(self.path),
+                observed_at=observed_at,
+            )
+            if failure is exc:
                 raise
-            raise LedgerUnreadable("canonical append service unavailable") from exc
+            raise failure from exc
+        self.clear_proof_failure()
         return messages, ledger
 
-    def record_proof_failure(self, *, error_class: str, path: str) -> dict:
+    def record_proof_failure(
+        self,
+        *,
+        error_class: str,
+        path: str,
+        observed_at: str | None = None,
+    ) -> dict:
         """Persist continuous unreadability; elapsed time alone exhausts it."""
-        now_text = self.now()
+        now_text = observed_at or self.now()
         lock = self.proof_health_path.with_suffix(".lock")
         with self.store._exclusive_lock(lock, timeout=10.0):
             try:
@@ -721,6 +778,8 @@ class DetectionCommitGate:
             ResolverState.BLOCKED_COMPLIANCE,
         }:
             return self.policy.status, self.policy.reason, None
+        if self.policy.status == ResolverState.INACTIVE:
+            return ResolverState.INACTIVE, self.policy.reason, None
         if self.policy.status != ResolverState.ACTIVE:
             return ResolverState.NOT_OWED, self.policy.reason, None
         if record.get("kind") != "question":
@@ -783,6 +842,15 @@ class DetectionCommitGate:
         ):
             return Resolution(ResolverState.CLASSIFICATION_UNKNOWN, "validated inbound mismatch")
         key = self._key_from(admission["key"]) if admission is not None else None
+        obligation_class = (
+            str(admission.get("obligation_class"))
+            if admission is not None
+            else (
+                "human_escalation"
+                if _true(inbound.meta or {}, "escalation_required") is True
+                else "answer"
+            )
+        )
         if key is not None and (
             key.reducer_version != REDUCER_VERSION
             or key.participant_capabilities_digest != PARTICIPANT_CAPABILITIES_DIGEST
@@ -810,7 +878,10 @@ class DetectionCommitGate:
             prospective = key is None and data.get("inbound_id") == inbound.id
             if not (exact_key or prospective):
                 continue
-            state = transition_states.get(event.get("transition"))
+            transition = event.get("transition")
+            if key is None and transition == "DELIVERY_FAILED":
+                continue
+            state = transition_states.get(transition)
             if state is not None:
                 return Resolution(
                     state,
@@ -837,7 +908,11 @@ class DetectionCommitGate:
             meta = message.meta or {}
             # Existing requester rescinds are intentionally rid-scoped and close every
             # open generation existing when the rescind is appended.
-            if message.kind == "rescind" and message.sender == inbound.sender:
+            if (
+                message.kind == "rescind"
+                and message.sender == inbound.sender
+                and _correlation(meta) == rid
+            ):
                 return Resolution(
                     ResolverState.SUPERSEDED,
                     "requester rescinded",
@@ -845,9 +920,10 @@ class DetectionCommitGate:
                     message.id,
                     scope_revision,
                 )
-            exact = meta.get("in_reply_to") == inbound.id
-            if admission is not None and (sequence <= watermark or not exact):
+            if admission is not None and sequence <= watermark:
                 continue
+            exact = meta.get("in_reply_to") == inbound.id
+            exact_correlation = _correlation(meta) == rid
             terminal_nonce = meta.get("operation_nonce")
             reservations = admission.get("reservations", {}) if admission else {}
             terminal_token_valid = bool(
@@ -860,7 +936,12 @@ class DetectionCommitGate:
                     nonce=terminal_nonce,
                 )
             )
-            if message.kind == "composing" and message.sender == self.agent:
+            if (
+                message.kind == "composing"
+                and message.sender == self.agent
+                and exact
+                and exact_correlation
+            ):
                 composing_token = meta.get("operation_nonce")
                 composing_token_valid = any(
                     isinstance(row, dict)
@@ -874,7 +955,7 @@ class DetectionCommitGate:
                 if composing_token_valid:
                     composing = message
                 continue
-            if admission and admission.get("obligation_class") == "human_escalation":
+            if obligation_class == "human_escalation":
                 if (
                     message.kind == "question"
                     and message.sender == self.agent
@@ -892,6 +973,8 @@ class DetectionCommitGate:
                         scope_revision,
                         compliance_success=True,
                     )
+                continue
+            if not exact or not exact_correlation:
                 continue
             if not terminal_token_valid:
                 continue
@@ -929,6 +1012,18 @@ class DetectionCommitGate:
             scoped_revision=scope_revision,
         )
 
+    def _can_reassign_no_admission_claim(self, claim: dict) -> bool:
+        """Require current wrapper ownership and a stale prior owner before takeover."""
+        if self.store.wrapper_wait_generation(self.agent) != self.fence:
+            return False
+        if self.store.is_managed_lead_loop(self.agent):
+            lease = self.store.read_lead_loop_lease(self.agent)
+            return bool(
+                isinstance(lease, dict)
+                and lease.get("wrapper_generation") == self.fence
+            )
+        return _process_liveness(claim.get("owner_pid")) == PROC_DEAD
+
     def admit_or_finalize(self, record: dict) -> Resolution:
         eligibility, detail, rid = self._eligibility(record)
         if eligibility != ResolverState.ACTIVE:
@@ -941,10 +1036,6 @@ class DetectionCommitGate:
             try:
                 messages, ledger = self._validated_messages()
             except LedgerUnreadable as exc:
-                self.record_proof_failure(
-                    error_class=type(exc).__name__,
-                    path=str(self.path),
-                )
                 return Resolution(ResolverState.BLOCKED, str(exc))
             inbound = self._record_message(record, messages)
             if inbound is None:
@@ -952,36 +1043,74 @@ class DetectionCommitGate:
                     ResolverState.INDETERMINATE,
                     "non-admission head absent from validated replay",
                 )
-            name = (
-                "classification_unknown_heads"
-                if eligibility == ResolverState.CLASSIFICATION_UNKNOWN
-                else "semantic_noneligible_heads"
-            )
+            replay_revision = int(ledger["scoped_revisions"].get(inbound.id, 0))
+            if eligibility == ResolverState.CLASSIFICATION_UNKNOWN:
+                name = "classification_unknown_heads"
+                transition = "CLASSIFICATION_UNKNOWN"
+            elif eligibility == ResolverState.INACTIVE:
+                name = "inactive_policy_heads"
+                transition = "POLICY_INACTIVE"
+            else:
+                name = "semantic_noneligible_heads"
+                transition = "SEMANTICALLY_NOT_OWED"
             with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
                 current = self._load()
-                claim = current["no_admission_claims"].get(inbound.id)
-                if isinstance(claim, dict) and claim.get("fence") != self.fence:
+                if int(current["scoped_revisions"].get(inbound.id, 0)) != replay_revision:
                     return Resolution(
                         ResolverState.INDETERMINATE,
-                        "no-admission head claimed by another wrapper",
+                        "no-admission claim CAS miss",
                     )
-                current_telemetry = current["telemetry"]
-                current_telemetry[name] = int(current_telemetry.get(name, 0)) + 1
-                self._append(
-                    current,
-                    "CLASSIFICATION_UNKNOWN"
-                    if eligibility == ResolverState.CLASSIFICATION_UNKNOWN
-                    else "SEMANTICALLY_NOT_OWED",
-                    scope=inbound.id,
-                    source_id=inbound.id,
-                    data={"reason": detail},
-                )
-                current["no_admission_claims"][inbound.id] = {
-                    "fence": self.fence,
-                    "state": "open",
-                    "resolution": eligibility.value,
-                }
-                self._write(current)
+                if inbound.id in current["inbound_index"]:
+                    return Resolution(
+                        ResolverState.INDETERMINATE,
+                        "concurrent admission won before no-admission claim",
+                    )
+                claim = current["no_admission_claims"].get(inbound.id)
+                if isinstance(claim, dict):
+                    if claim.get("resolution") != eligibility.value or claim.get(
+                        "state"
+                    ) not in {"open", "finalized"}:
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "no-admission claim conflicts with replay",
+                        )
+                    if claim.get("state") == "open" and claim.get("fence") != self.fence:
+                        if not self._can_reassign_no_admission_claim(claim):
+                            return Resolution(
+                                ResolverState.INDETERMINATE,
+                                "prior no-admission claim owner is still authoritative",
+                            )
+                        previous_fence = claim.get("fence")
+                        claim["fence"] = self.fence
+                        claim["owner_pid"] = os.getpid()
+                        self._append(
+                            current,
+                            "NO_ADMISSION_CLAIM_REASSIGNED",
+                            scope=inbound.id,
+                            source_id=inbound.id,
+                            data={
+                                "previous_fence": previous_fence,
+                                "fence": self.fence,
+                            },
+                        )
+                        self._write(current)
+                else:
+                    current_telemetry = current["telemetry"]
+                    current_telemetry[name] = int(current_telemetry.get(name, 0)) + 1
+                    self._append(
+                        current,
+                        transition,
+                        scope=inbound.id,
+                        source_id=inbound.id,
+                        data={"reason": detail},
+                    )
+                    current["no_admission_claims"][inbound.id] = {
+                        "fence": self.fence,
+                        "owner_pid": os.getpid(),
+                        "state": "open",
+                        "resolution": eligibility.value,
+                    }
+                    self._write(current)
                 scope_revision = int(current["scoped_revisions"].get(inbound.id, 0))
             return Resolution(
                 eligibility,
@@ -992,12 +1121,7 @@ class DetectionCommitGate:
         try:
             messages, ledger = self._validated_messages()
         except LedgerUnreadable as exc:
-            self.record_proof_failure(
-                error_class=type(exc).__name__,
-                path=str(self.path),
-            )
             return Resolution(ResolverState.BLOCKED, str(exc))
-        self.clear_proof_failure()
         inbound = self._record_message(record, messages)
         if inbound is None:
             return Resolution(ResolverState.INDETERMINATE, "inbound absent from validated replay")
@@ -1066,24 +1190,49 @@ class DetectionCommitGate:
                         "concurrent admission won before terminal normalization",
                     )
                 claim = current["no_admission_claims"].get(inbound.id)
-                if isinstance(claim, dict) and claim.get("fence") != self.fence:
-                    return Resolution(
-                        ResolverState.INDETERMINATE,
-                        "no-admission head claimed by another wrapper",
+                if isinstance(claim, dict):
+                    if claim.get("resolution") != before.state.value or claim.get(
+                        "state"
+                    ) not in {"open", "finalized"}:
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "no-admission claim conflicts with terminal replay",
+                        )
+                    if claim.get("state") == "open" and claim.get("fence") != self.fence:
+                        if not self._can_reassign_no_admission_claim(claim):
+                            return Resolution(
+                                ResolverState.INDETERMINATE,
+                                "prior no-admission claim owner is still authoritative",
+                            )
+                        previous_fence = claim.get("fence")
+                        claim["fence"] = self.fence
+                        claim["owner_pid"] = os.getpid()
+                        self._append(
+                            current,
+                            "NO_ADMISSION_CLAIM_REASSIGNED",
+                            scope=inbound.id,
+                            source_id=before.evidence_id,
+                            data={
+                                "previous_fence": previous_fence,
+                                "fence": self.fence,
+                            },
+                        )
+                        self._write(current)
+                else:
+                    current["no_admission_claims"][inbound.id] = {
+                        "fence": self.fence,
+                        "owner_pid": os.getpid(),
+                        "state": "open",
+                        "resolution": before.state.value,
+                    }
+                    self._append(
+                        current,
+                        "PRE_ADMISSION_TERMINAL_NORMALIZED",
+                        scope=inbound.id,
+                        source_id=before.evidence_id,
+                        data={"inbound_id": inbound.id, "state": before.state.value},
                     )
-                current["no_admission_claims"][inbound.id] = {
-                    "fence": self.fence,
-                    "state": "open",
-                    "resolution": before.state.value,
-                }
-                self._append(
-                    current,
-                    "PRE_ADMISSION_TERMINAL_NORMALIZED",
-                    scope=inbound.id,
-                    source_id=before.evidence_id,
-                    data={"inbound_id": inbound.id, "state": before.state.value},
-                )
-                self._write(current)
+                    self._write(current)
                 scoped_revision = int(current["scoped_revisions"].get(inbound.id, 0))
             return Resolution(
                 before.state,
@@ -1171,12 +1320,7 @@ class DetectionCommitGate:
         try:
             messages, ledger = self._validated_messages()
         except LedgerUnreadable as exc:
-            self.record_proof_failure(
-                error_class=type(exc).__name__,
-                path=str(self.path),
-            )
             return Resolution(ResolverState.BLOCKED, str(exc))
-        self.clear_proof_failure()
         key_id = ledger["inbound_index"].get(record.get("id"))
         if not key_id:
             return self.admit_or_finalize(record)
@@ -1662,6 +1806,7 @@ class DetectionCommitGate:
         with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
             ledger = self._load()
             key = resolution.key
+            write_required = True
             if key is not None:
                 admission = ledger["obligations"].get(key.digest)
                 if not isinstance(admission, dict):
@@ -1684,41 +1829,62 @@ class DetectionCommitGate:
                     self._apply_broadcast_policy_locked(ledger, key, admission)
             else:
                 claim = ledger["no_admission_claims"].get(record.get("id"))
-                if not isinstance(claim, dict) or claim.get("fence") != self.fence:
+                if not isinstance(claim, dict):
                     return Resolution(
                         ResolverState.INDETERMINATE,
-                        "no-admission finalizer fence mismatch",
+                        "no-admission finalizer claim missing",
                     )
-                if claim.get("state") != "open":
+                if claim.get("resolution") != resolution.state.value:
                     return Resolution(
                         ResolverState.INDETERMINATE,
-                        "no-admission head is no longer open",
+                        "no-admission finalizer replay mismatch",
                     )
-                if (
-                    expected_revision is not None
-                    and int(ledger["scoped_revisions"].get(record.get("id"), 0))
-                    != expected_revision
-                ):
-                    return Resolution(
-                        ResolverState.INDETERMINATE,
-                        "no-admission finalizer CAS miss",
+                if claim.get("state") == "finalized":
+                    disposition = ledger["cursor_dispositions"].get(self.agent)
+                    if not isinstance(disposition, dict) or any((
+                        disposition.get("inbound_id") != record.get("id"),
+                        disposition.get("state") != resolution.state.value,
+                    )):
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "no-admission finalized disposition is torn",
+                        )
+                    write_required = False
+                else:
+                    if claim.get("state") != "open" or claim.get("fence") != self.fence:
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "no-admission finalizer fence mismatch",
+                        )
+                    if expected_revision is None:
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "no-admission finalizer requires a scoped revision",
+                        )
+                    if int(ledger["scoped_revisions"].get(record.get("id"), 0)) != (
+                        expected_revision
+                    ):
+                        return Resolution(
+                            ResolverState.INDETERMINATE,
+                            "no-admission finalizer CAS miss",
+                        )
+                    self._append(
+                        ledger,
+                        "PRE_ADMISSION_FINALIZED",
+                        scope=record.get("id"),
+                        source_id=resolution.evidence_id,
+                        data={"state": resolution.state.value},
                     )
-                self._append(
-                    ledger,
-                    "PRE_ADMISSION_FINALIZED",
-                    scope=record.get("id"),
-                    source_id=resolution.evidence_id,
-                    data={"state": resolution.state.value},
-                )
-                claim["state"] = "finalized"
-                claim["finalized_at"] = self.now()
-            ledger["cursor_dispositions"][self.agent] = {
-                "inbound_id": record.get("id"),
-                "mode": record.get("mode", "global"),
-                "state": resolution.state.value,
-                "at": self.now(),
-            }
-            self._write(ledger)
+                    claim["state"] = "finalized"
+                    claim["finalized_at"] = self.now()
+            if write_required:
+                ledger["cursor_dispositions"][self.agent] = {
+                    "inbound_id": record.get("id"),
+                    "mode": record.get("mode", "global"),
+                    "state": resolution.state.value,
+                    "at": self.now(),
+                }
+                self._write(ledger)
         # The physical cursor is a projection of the authoritative disposition.
         # A crash here replays this idempotently; the reverse ordering could lose
         # a message with no canonical terminal.
@@ -2080,11 +2246,24 @@ class DetectionCommitGate:
         }
         if self.proof_health_path.exists():
             try:
-                result["proof_health"] = json.loads(
+                proof_health = json.loads(
                     self.proof_health_path.read_text(encoding="utf-8")
                 )
+                if not isinstance(proof_health, dict):
+                    raise ValueError("proof health is not an object")
             except (OSError, ValueError, json.JSONDecodeError):
-                result["proof_health"] = {"state": "blocked", "unreadable": True}
+                proof_health = {"state": "blocked", "unreadable": True}
+            result["proof_health"] = proof_health
+            if (
+                self.policy.status == ResolverState.ACTIVE
+                and proof_health.get("state") == "blocked"
+            ):
+                result["status"] = ResolverState.BLOCKED.value.upper()
+                result["reason"] = (
+                    "canonical replay proof health is unreadable"
+                    if proof_health.get("unreadable") is True
+                    else "canonical replay proof is blocked pending a successful replay"
+                )
         if not self.path.exists() and not self.epoch_anchor_path.exists():
             result["store_epoch"] = None
             result["append_sequence"] = 0

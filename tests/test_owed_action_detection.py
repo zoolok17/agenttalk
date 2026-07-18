@@ -137,6 +137,48 @@ def test_readable_policy_reports_detection_grade() -> None:
     assert len(snapshot.generation) == 64
 
 
+def test_operator_disabled_policy_is_inactive_and_audited(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store)
+    policy = PolicySnapshot.from_mapping({
+        "schema_version": 1,
+        "agents": {"beta": {"grade": DETECTION_GRADE, "enabled": False}},
+    }, "beta")
+    gate = DetectionCommitGate(store, "beta", policy, fence="wrapper-1")
+    record = _record(store)
+
+    resolution = gate.admit_or_finalize(record)
+
+    assert policy.status == ResolverState.INACTIVE
+    assert resolution.state == ResolverState.INACTIVE
+    assert resolution.allows_legacy_commit is True
+    assert any(
+        row["transition"] == "POLICY_INACTIVE"
+        for row in _ledger(gate)["transitions"]
+    )
+    assert gate.finalize(
+        record,
+        resolution,
+        expected_revision=resolution.ledger_revision,
+    ).state == ResolverState.INACTIVE
+    assert store.cursor("beta") == inbound.id
+    assert gate.status()["status"] == "INACTIVE"
+    assert PolicySnapshot.from_mapping({
+        "schema_version": 1,
+        "agents": {"beta": {"grade": "security", "enabled": False}},
+    }, "beta").status == ResolverState.INACTIVE
+
+
+@pytest.mark.parametrize("enabled", [None, 0, "false"])
+def test_malformed_enabled_policy_fails_closed(enabled: object) -> None:
+    snapshot = PolicySnapshot.from_mapping({
+        "schema_version": 1,
+        "agents": {"beta": {"grade": DETECTION_GRADE, "enabled": enabled}},
+    }, "beta")
+
+    assert snapshot.status == ResolverState.BLOCKED_POLICY
+
+
 def test_admission_allocates_epoch_monotonic_sequence_and_replay_visible_key(
     tmp_path: Path,
 ) -> None:
@@ -203,6 +245,73 @@ def test_pre_admission_manual_close_and_legacy_rescind_are_terminal(tmp_path: Pa
         recv_api.records(store, "beta")[-2]
     )
     assert rescinded.state == ResolverState.SUPERSEDED
+
+
+def test_pre_admission_answer_cannot_satisfy_required_escalation(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store, escalation_required=True)
+    store.send(
+        sender="beta",
+        recipient="alpha",
+        body="answered instead of escalating",
+        meta={"request_id": "q-1", "in_reply_to": inbound.id},
+    )
+
+    resolution = _gate(store).admit_or_finalize(_record(store))
+
+    assert resolution.state == ResolverState.OWED_UNSATISFIED
+    assert resolution.key is not None
+    assert resolution.key.obligation_class == "human_escalation"
+
+
+def test_pre_admission_human_escalation_normalizes_without_key(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store, escalation_required=True)
+    gate = _gate(store)
+    roster = gate.roster_snapshot()
+    escalation = store.send(
+        sender="beta",
+        recipient="lead",
+        kind="question",
+        body="operator decision needed",
+        meta={
+            "request_id": "esc-1",
+            "origin_request_id": "q-1",
+            "origin_inbound_id": inbound.id,
+            "in_reply_to": inbound.id,
+            "expected_roster_revision": roster["revision"],
+        },
+    )
+    record = _record(store)
+
+    resolution = gate.admit_or_finalize(record)
+
+    assert resolution.state == ResolverState.SATISFIED
+    assert resolution.key is None
+    assert resolution.evidence_id == escalation.id
+    gate.finalize(record, resolution, expected_revision=resolution.ledger_revision)
+    assert store.cursor("beta") == inbound.id
+
+
+def test_pre_admission_delivery_failed_cannot_terminalize(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store)
+    gate = _gate(store)
+    gate._validated_messages()  # noqa: SLF001 - inject a forbidden canonical transition
+    with store._exclusive_lock(gate.path.with_suffix(".lock"), timeout=10.0):
+        ledger = gate._load()  # noqa: SLF001 - crash-boundary fixture
+        gate._append(  # noqa: SLF001 - crash-boundary fixture
+            ledger,
+            "DELIVERY_FAILED",
+            scope=inbound.id,
+            data={"inbound_id": inbound.id},
+        )
+        gate._write(ledger)  # noqa: SLF001 - crash-boundary fixture
+
+    resolution = gate.admit_or_finalize(_record(store))
+
+    assert resolution.state == ResolverState.OWED_UNSATISFIED
+    assert resolution.key is not None
 
 
 def test_dispatch_reservation_is_scoped_revision_cas_linearization(tmp_path: Path) -> None:
@@ -603,6 +712,46 @@ def test_prior_generation_answer_does_not_satisfy_same_rid_reask(tmp_path: Path)
     assert resolution.key is not None and resolution.key.inbound_id == second.id
 
 
+def test_delayed_prior_generation_answer_does_not_satisfy_same_rid_reask(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    first = _question(store, "reused")
+    store.advance_cursor("beta", first.id)
+    second = _question(store, "reused")
+    store.send(
+        sender="beta",
+        recipient="alpha",
+        body="delayed old answer",
+        meta={"request_id": "reused", "in_reply_to": first.id},
+    )
+
+    resolution = _gate(store).admit_or_finalize(_record(store))
+
+    assert resolution.state == ResolverState.OWED_UNSATISFIED
+    assert resolution.key is not None and resolution.key.inbound_id == second.id
+
+
+def test_pre_admission_answer_requires_exact_correlation(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store)
+    store.send(
+        sender="beta",
+        recipient="alpha",
+        body="wrong correlation",
+        meta={
+            "request_id": "q-other",
+            "origin_request_id": "q-1",
+            "in_reply_to": inbound.id,
+        },
+    )
+
+    resolution = _gate(store).admit_or_finalize(_record(store))
+
+    assert resolution.state == ResolverState.OWED_UNSATISFIED
+    assert resolution.key is not None
+
+
 def test_pre_admission_finalize_ignores_unrelated_revision(tmp_path: Path) -> None:
     store = _store(tmp_path)
     inbound = _question(store)
@@ -653,6 +802,33 @@ def test_pre_admission_finalize_rejects_correlated_revision_race(tmp_path: Path)
     assert store.cursor("beta") == ""
 
 
+def test_semantic_no_admission_claim_rejects_correlated_revision_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    _question(store, consult=True)
+    gate = _gate(store)
+    original = gate._validated_messages  # noqa: SLF001 - deterministic CAS race
+
+    def replay_then_race():
+        messages, ledger = original()
+        store.send(
+            sender="gamma",
+            recipient="beta",
+            body="correlated concurrent append",
+            meta={"request_id": "q-1"},
+        )
+        return messages, ledger
+
+    monkeypatch.setattr(gate, "_validated_messages", replay_then_race)
+
+    resolution = gate.admit_or_finalize(_record(store))
+
+    assert resolution.state == ResolverState.INDETERMINATE
+    assert not _ledger(gate)["no_admission_claims"]
+
+
 def test_alternating_global_projection_errors_exhaust_by_elapsed_time_only(
     tmp_path: Path,
 ) -> None:
@@ -665,9 +841,18 @@ def test_alternating_global_projection_errors_exhaust_by_elapsed_time_only(
     gate = _gate(store, now=lambda: next(times))
 
     assert gate.resolve(_record(store)).state == ResolverState.BLOCKED
+    first_health = json.loads(gate.proof_health_path.read_text(encoding="utf-8"))
+    assert first_health["first_failure_at"] == "2026-01-01T00:00:00Z"
+    assert first_health["last_failure_at"] == "2026-01-01T00:00:00Z"
+    assert first_health["last_rebuild_at"] == "2026-01-01T00:00:00Z"
+    assert first_health["elapsed_seconds"] == 0
+    assert first_health.get("exhausted") is not True
     health = gate.record_proof_failure(error_class="DifferentError", path="other-path")
 
     assert health["exhausted"] is True
+    assert health["first_failure_at"] == first_health["first_failure_at"]
+    assert health["last_failure_at"] == "2026-01-01T00:15:01Z"
+    assert health["failures"] == 2
     assert health["elapsed_seconds"] >= 900
     assert health["fingerprint"] == {
         "error_class": "DifferentError", "path": "other-path",
@@ -826,6 +1011,7 @@ def test_no_admission_finalizer_is_revision_and_fence_guarded(tmp_path: Path) ->
     resolution = owner.admit_or_finalize(record)
     contender = DetectionCommitGate(store, "beta", policy, fence="wrapper-2")
 
+    unfenced = owner.finalize(record, resolution)
     rejected = contender.finalize(
         record,
         resolution,
@@ -837,8 +1023,116 @@ def test_no_admission_finalizer_is_revision_and_fence_guarded(tmp_path: Path) ->
         expected_revision=resolution.ledger_revision,
     )
 
+    assert unfenced.state == ResolverState.INDETERMINATE
     assert rejected.state == ResolverState.INDETERMINATE
     assert finalized.state == ResolverState.NOT_OWED
+
+
+def test_open_no_admission_claim_is_recoverable_by_new_wrapper_fence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store)
+    store.send(
+        sender="beta",
+        recipient="alpha",
+        body="399",
+        meta={"request_id": "q-1", "in_reply_to": inbound.id},
+    )
+    record = _record(store)
+    first = _gate(store, fence="wrapper-1").admit_or_finalize(record)
+    store.write_waiting("beta", {
+        "mode": "wrapper-loop",
+        "wrapper_generation": "wrapper-2",
+    })
+    monkeypatch.setattr(
+        "agenttalk.wrapper.obligations._process_liveness",
+        lambda _pid: "dead",
+    )
+
+    restarted = _gate(store, fence="wrapper-2")
+    recovered = restarted.admit_or_finalize(record)
+
+    assert first.state == ResolverState.SATISFIED
+    assert recovered.state == ResolverState.SATISFIED
+    assert _ledger(restarted)["no_admission_claims"][inbound.id]["fence"] == "wrapper-2"
+    restarted.finalize(
+        record,
+        recovered,
+        expected_revision=recovered.ledger_revision,
+    )
+    assert store.cursor("beta") == inbound.id
+
+
+def test_live_no_admission_claim_owner_cannot_be_displaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store)
+    store.send(
+        sender="beta",
+        recipient="alpha",
+        body="399",
+        meta={"request_id": "q-1", "in_reply_to": inbound.id},
+    )
+    record = _record(store)
+    _gate(store, fence="wrapper-1").admit_or_finalize(record)
+    store.write_waiting("beta", {
+        "mode": "wrapper-loop",
+        "wrapper_generation": "wrapper-2",
+    })
+    monkeypatch.setattr(
+        "agenttalk.wrapper.obligations._process_liveness",
+        lambda _pid: "alive",
+    )
+
+    resolution = _gate(store, fence="wrapper-2").admit_or_finalize(record)
+
+    assert resolution.state == ResolverState.INDETERMINATE
+    assert _ledger(_gate(store))["no_admission_claims"][inbound.id]["fence"] == (
+        "wrapper-1"
+    )
+
+
+def test_finalized_no_admission_disposition_replays_cursor_after_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    inbound = _question(store)
+    store.send(
+        sender="beta",
+        recipient="alpha",
+        body="399",
+        meta={"request_id": "q-1", "in_reply_to": inbound.id},
+    )
+    record = _record(store)
+    owner = _gate(store, fence="wrapper-1")
+    terminal = owner.admit_or_finalize(record)
+    monkeypatch.setattr(
+        owner,
+        "_advance_record_cursor",
+        lambda _record: (_ for _ in ()).throw(RuntimeError("crash barrier")),
+    )
+    with pytest.raises(RuntimeError, match="crash barrier"):
+        owner.finalize(
+            record,
+            terminal,
+            expected_revision=terminal.ledger_revision,
+        )
+    assert store.cursor("beta") == ""
+
+    restarted = _gate(store, fence="wrapper-2")
+    recovered = restarted.admit_or_finalize(record)
+    restarted.finalize(
+        record,
+        recovered,
+        expected_revision=recovered.ledger_revision,
+    )
+
+    assert store.cursor("beta") == inbound.id
 
 
 def test_sidecar_only_close_is_not_replay_proof(tmp_path: Path) -> None:
@@ -867,8 +1161,26 @@ def test_epoch_anchor_detects_append_counter_rollback(tmp_path: Path) -> None:
     resolution = gate.resolve(_record(store))
 
     assert resolution.state == ResolverState.BLOCKED
-    assert gate.status()["status"] == "BLOCKED"
+    blocked = gate.status()
+    assert blocked["status"] == "BLOCKED"
+    assert blocked["proof_health"]["state"] == "blocked"
     assert store.cursor("beta") == ""
+
+    assert gate.resolve(_record(store)).state == ResolverState.OWED_UNSATISFIED
+    assert gate.status()["status"] == "ACTIVE (detection-grade)"
+
+
+def test_unreadable_proof_health_is_visible_as_blocked(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _question(store)
+    gate = _gate(store)
+    gate.admit_or_finalize(_record(store))
+    gate.proof_health_path.write_text("{", encoding="utf-8")
+
+    status = gate.status()
+
+    assert status["status"] == "BLOCKED"
+    assert status["proof_health"] == {"state": "blocked", "unreadable": True}
 
 
 def test_operation_nonce_is_idempotent_and_payload_bound(tmp_path: Path) -> None:
