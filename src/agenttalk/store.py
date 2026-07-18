@@ -2484,6 +2484,24 @@ class Store:
     ) -> Message:
         if not self.initialized():
             raise FileNotFoundError("agenttalk not initialized; run `agenttalk init`.")
+        supplied_meta = dict(meta or {})
+        authority_sensitive = bool(
+            supplied_meta.get("origin_request_id")
+            and supplied_meta.get("origin_inbound_id")
+        )
+        if authority_sensitive and not _config_locked:
+            with self._config_lock():
+                return self.send(
+                    sender=sender,
+                    recipient=recipient,
+                    body=body,
+                    kind=kind,
+                    subject=subject,
+                    meta=supplied_meta,
+                    sign=sign,
+                    _allow_reserved_sender=_allow_reserved_sender,
+                    _config_locked=True,
+                )
         config_before = os.stat(self.config_path)
         cfg = self.load_config()
         config_after = os.stat(self.config_path)
@@ -2512,7 +2530,41 @@ class Store:
         # yet); a pre-0.16.0 client never ran this code, so the key is absent.
         # A caller that already supplied `epoch_at_send` wins (broadcast
         # snapshots one epoch for the whole fan-out — B3).
-        meta = dict(meta or {})
+        meta = supplied_meta
+        if authority_sensitive:
+            roster = list(cfg.get("agents") or [])
+            roles = cfg.get("roles") if isinstance(cfg.get("roles"), dict) else {}
+            authorized = {
+                name for name in roster
+                if isinstance(roles.get(name), str)
+                and roles[name].casefold() == "lead"
+            }
+            liaison = cfg.get("operator_facing")
+            if isinstance(liaison, str) and liaison in roster:
+                authorized.add(liaison)
+            roster_payload = {
+                "agents": roster,
+                "roles": {name: roles[name] for name in sorted(roles)},
+                "operator_facing": liaison if isinstance(liaison, str) else None,
+            }
+            roster_revision = hashlib.sha256(
+                json.dumps(
+                    roster_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            expected_revision = meta.get("expected_roster_revision")
+            if expected_revision is not None and expected_revision != roster_revision:
+                raise ValueError("roster revision changed before authorized transition append")
+            if recipient not in authorized:
+                raise ValueError(
+                    "origin-correlated escalation target is not an event-time "
+                    "authorized liaison or lead"
+                )
+            meta["roster_revision"] = roster_revision
+            meta["authorized_liaisons"] = sorted(authorized)
         _gates.validate_response_status(kind, meta)
         if kind in OPENER_KINDS and "epoch_at_send" not in meta:
             meta["epoch_at_send"] = self.current_epoch()
@@ -2579,6 +2631,16 @@ class Store:
                 _unlink_if_same_file(pending, pending_identity)
             except OSError:
                 pass
+        # Detection-grade wrapped-turn enforcement keeps a store-owned monotonic
+        # append journal.  Publication above remains the source record; this eager
+        # index is recoverable because admission replays and indexes any missed
+        # validated record before making a decision.
+        try:
+            from agenttalk.wrapper.obligations import note_bus_message
+
+            note_bus_message(self, msg)
+        except (OSError, ValueError, RuntimeError):
+            pass
         request_id = (msg.meta or {}).get("request_id")
         if isinstance(request_id, str) and request_id and kind not in CONTROL_KINDS:
             # Observational cleanup only. The validated thread remains the
@@ -5731,6 +5793,12 @@ class Store:
         entry["closed_reason"] = reason
         data[request_id] = entry
         self._write_threadstate(agent, data)
+        try:
+            from agenttalk.wrapper.obligations import note_manual_close
+
+            note_manual_close(self, agent, request_id)
+        except (OSError, ValueError, RuntimeError):
+            pass
 
     def thread_closed(self, agent: str, request_id: str) -> bool:
         """True iff ``agent`` has explicitly closed this thread.

@@ -75,6 +75,12 @@ def _terminal_state(store, agent: str, rid: str) -> tuple[bool, bool]:
     return (False, False)
 
 
+def _delivery_failed(store, agent: str, rid: str) -> dict | None:
+    from .obligations import delivery_failed_for
+
+    return delivery_failed_for(store, rid, agent)
+
+
 def records(store, agent: str, *, scoped_request_id: str | None = None,
             since: str | None = None, include_control: bool = False) -> list[dict]:
     """All currently-unread messages for ``agent`` as structured records (oldest
@@ -97,10 +103,13 @@ def records(store, agent: str, *, scoped_request_id: str | None = None,
         msgs = [m for m in msgs if m.kind not in CONTROL_KINDS]
     msgs = [m for m in msgs if m.meta.get("request_id") == rid]
     closed, superseded = _terminal_state(store, agent, rid)
+    failed = _delivery_failed(store, agent, rid)
+    closed = closed or failed is not None
     out = []
     for m in msgs:
         scoped = {"request_id": rid, "seen_before": seen, "seen_after": m.id,
-                  "closed": closed, "superseded": superseded}
+                  "closed": closed, "superseded": superseded,
+                  "delivery_failed": failed}
         # cursor before==after: scoped recv NEVER moves the global cursor.
         out.append(to_record(m, mode=SCOPED, cursor_before=gcur, cursor_after=gcur,
                              scoped=scoped))
@@ -125,11 +134,14 @@ def poll(store, agent: str, *, scoped_request_id: str | None = None,
     }
     if scoped_request_id is not None:
         closed, superseded = _terminal_state(store, agent, scoped_request_id)
+        failed = _delivery_failed(store, agent, scoped_request_id)
+        closed = closed or failed is not None
         env["scoped"] = {
             "request_id": scoped_request_id,
             "seen": store.thread_seen(agent, scoped_request_id),
             "closed": closed,
             "superseded": superseded,
+            "delivery_failed": failed,
         }
     return env
 

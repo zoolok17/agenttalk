@@ -60,6 +60,7 @@ from agenttalk import supervisor_lifecycle as supervisor_lifecycle
 # from holding a waiter forever. 30 min was picked to comfortably cover
 # long substantive review cycles without being effectively infinite.
 _COMPOSING_MAX_EXTEND_SECONDS = 1800.0
+_OPERATION_NONCE_RE = re.compile(r"[0-9a-f]{32}")
 
 
 # --------------------------------------------------------------------- utils
@@ -96,6 +97,47 @@ def _read_body(args: argparse.Namespace) -> str:
         if data:
             return data
     return ""
+
+
+def _operation_idempotency(
+    store: Store,
+    *,
+    sender: str,
+    recipient: str,
+    body: str,
+    kind: str,
+    operation: str,
+    meta: dict,
+    nonce: str | None,
+) -> tuple[object | None, str | None]:
+    """Bind one wrapper operation nonce to one canonical semantic payload."""
+    if nonce is None:
+        return None, None
+    if _OPERATION_NONCE_RE.fullmatch(nonce) is None:
+        return None, "operation nonce must be exactly 32 lowercase hexadecimal characters"
+    from agenttalk.wrapper.obligations import operation_payload_digest
+
+    digest = operation_payload_digest(
+        operation=operation,
+        body=body,
+        kind=kind,
+        recipient=recipient,
+        in_reply_to=meta.get("in_reply_to"),
+        request_id=meta.get("request_id"),
+        broadcast_id=meta.get("broadcast_id"),
+        origin_request_id=meta.get("origin_request_id"),
+        origin_inbound_id=meta.get("origin_inbound_id"),
+    )
+    for message in store.valid_messages():
+        existing_meta = message.meta or {}
+        if message.sender != sender or existing_meta.get("operation_nonce") != nonce:
+            continue
+        if existing_meta.get("operation_digest") == digest:
+            return message, None
+        return None, "operation nonce was already used with a different payload"
+    meta["operation_nonce"] = nonce
+    meta["operation_digest"] = digest
+    return None, None
 
 
 def _json_scrub_nonfinite(value):
@@ -1589,6 +1631,23 @@ def cmd_composing(args: argparse.Namespace) -> int:
         meta["request_id"] = rid
     else:
         recipient = _resolve_peer(args.recipient, cfg, sender)
+    existing, operation_error = _operation_idempotency(
+        store,
+        sender=sender,
+        recipient=recipient,
+        body=body,
+        kind="composing",
+        operation="composing",
+        meta=meta,
+        nonce=getattr(args, "operation_nonce", None),
+    )
+    if operation_error is not None:
+        sys.stderr.write(f"agenttalk composing: {operation_error}.\n")
+        return 2
+    if existing is not None:
+        if not args.quiet:
+            print(f"(composing operation already recorded: id={existing.id})")
+        return 0
     msg = store.send(
         sender=sender,
         recipient=recipient,
@@ -5693,6 +5752,17 @@ def cmd_escalate(args: argparse.Namespace) -> int:
         return 2
     meta = _parse_meta(args.meta)
     meta["needs_operator"] = "true"  # force-set: the bucket discriminator
+    origin_request = getattr(args, "origin_request", None)
+    origin_id = getattr(args, "origin_id", None)
+    if bool(origin_request) != bool(origin_id):
+        sys.stderr.write(
+            "agenttalk escalate: --origin-request and --origin-id must be supplied together.\n"
+        )
+        return 2
+    if origin_request:
+        meta["origin_request_id"] = origin_request
+        meta["origin_inbound_id"] = origin_id
+        meta["in_reply_to"] = origin_id
     # Typed attention enrichment (0.56.0): escalate OWNS meta.attention - build it ONLY from
     # the typed flags (a caller --meta attention=... is not a supported typed input). Strict
     # CLI validation: a malformed typed block exits 2 BEFORE any write (gate 4); the reader
@@ -5708,6 +5778,24 @@ def cmd_escalate(args: argparse.Namespace) -> int:
         meta["attention"] = att_block
     if "request_id" not in meta:
         meta["request_id"] = "esc-" + uuid.uuid4().hex[:12]
+    existing, operation_error = _operation_idempotency(
+        store,
+        sender=sender,
+        recipient=target,
+        body=body,
+        kind="question",
+        operation="terminal",
+        meta=meta,
+        nonce=getattr(args, "operation_nonce", None),
+    )
+    if operation_error is not None:
+        sys.stderr.write(f"agenttalk escalate: {operation_error}.\n")
+        return 2
+    if existing is not None:
+        if not args.quiet:
+            print(f"(escalation operation already recorded: id={existing.id})")
+        print(f"request_id={(existing.meta or {}).get('request_id', meta['request_id'])}")
+        return 0
     msg = store.send(
         sender=sender,
         recipient=target,
@@ -6333,7 +6421,9 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     resume = getattr(args, "resume", None)
     if resume:
         if (args.message or getattr(args, "file", None) or args.subject
-                or args.kind != "message" or args.meta):
+                or args.kind != "message" or args.meta
+                or getattr(args, "response_policy", None)
+                or getattr(args, "response_quorum", None) is not None):
             sys.stderr.write(
                 "agenttalk broadcast: --resume re-sends the ORIGINAL frozen "
                 "copies - it takes no body/subject/kind/meta overrides.\n")
@@ -6498,6 +6588,28 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         )
         return 2
     bid = supplied_bid or supplied_rid or ("b-" + uuid.uuid4().hex[:12])
+    response_policy = getattr(args, "response_policy", None)
+    response_quorum = getattr(args, "response_quorum", None)
+    if args.kind == "question":
+        response_policy = response_policy or "each"
+        if response_policy == "quorum":
+            if response_quorum is None or not 1 <= response_quorum <= len(recipients):
+                sys.stderr.write(
+                    "agenttalk broadcast: --response-policy quorum requires "
+                    "--response-quorum N within the frozen audience size.\n"
+                )
+                return 2
+        elif response_quorum is not None:
+            sys.stderr.write(
+                "agenttalk broadcast: --response-quorum is valid only with "
+                "--response-policy quorum.\n"
+            )
+            return 2
+    elif response_policy is not None or response_quorum is not None:
+        sys.stderr.write(
+            "agenttalk broadcast: response policy applies only to --kind question.\n"
+        )
+        return 2
     audience_label = "all" if args.all else target
     sent: list = []
     # Delivery accounting (#16, 0.15.0): every copy freezes the fan-out
@@ -6528,6 +6640,12 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
             meta["audience_role"] = target
         meta["audience_resolved"] = ",".join(recipients)
         meta["batch_total"] = str(len(recipients))
+        if args.kind == "question":
+            meta["broadcast_policy_version"] = 1
+            meta["membership_snapshot"] = list(recipients)
+            meta["response_policy"] = response_policy
+            if response_policy == "quorum":
+                meta["response_quorum"] = response_quorum
         if args.kind in OPENER_KINDS:
             # one epoch for the whole batch (B3); pre-set so send() does not
             # recompute current_epoch() per copy.
@@ -7288,6 +7406,13 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace, wait_token:
     """
     rid = args.to_request
     kind_filter = getattr(args, "kind", None)
+    from .wrapper.obligations import delivery_failed_for
+
+    failed = delivery_failed_for(store, rid, agent)
+    if failed is not None:
+        print("AGENTTALK :: DELIVERY FAILED")
+        print(json.dumps(failed, ensure_ascii=False, sort_keys=True))
+        return 4
     # Rescind wake (#12): a superseded request must never be waited on.
     # Checked at entry (the rescind may predate this wait entirely) and
     # re-evaluated when a rescind on this rid arrives mid-wait. Exit 3 —
@@ -7332,6 +7457,11 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace, wait_token:
             if _wait_was_superseded(store, agent, wait_token):
                 _print_wait_superseded(agent, rid=rid)
                 return 6
+            failed = delivery_failed_for(store, rid, agent)
+            if failed is not None:
+                print("AGENTTALK :: DELIVERY FAILED")
+                print(json.dumps(failed, ensure_ascii=False, sort_keys=True))
+                return 4
             # Floor delivery at BOTH the per-thread seen pointer AND the
             # global cursor: a message already consumed globally (a `drain`
             # or plain `wait` advanced the cursor past it) must NOT be
@@ -7972,6 +8102,37 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_commit_gate(args: argparse.Namespace) -> int:
+    """Inspect or explicitly reset the detection-grade compliance breaker."""
+    from .wrapper.obligations import DetectionCommitGate
+
+    store = _get_store(args)
+    roster = store.load_config().get("agents") or []
+    agent = _resolve_self(args.agent, roster=roster)
+    gate = DetectionCommitGate.from_environment(
+        store,
+        agent,
+        fence="operator-cli",
+    )
+    if args.gate_action == "reset":
+        actor = _resolve_self(args.sender, roster=roster)
+        try:
+            gate.reset_compliance_breaker(actor=actor, reason=args.reason)
+        except (PermissionError, ValueError) as exc:
+            sys.stderr.write(f"agenttalk commit-gate reset: {exc}\n")
+            return 2
+    status = gate.status()
+    if args.json:
+        print(json.dumps(status, indent=2))
+    else:
+        print(f"commit-gate {agent}: {status['status']}")
+        if status.get("reason"):
+            print(f"  reason: {status['reason']}")
+        if status.get("breaker"):
+            print(f"  breaker: {json.dumps(status['breaker'], sort_keys=True)}")
+    return 0
+
+
 def _render_doctor_human(report) -> None:
     # Root is the FIRST line (0.14.0, #13) — same contract as whoami: the
     # wrong-root footgun must be diagnosable from line one.
@@ -8344,6 +8505,9 @@ def cmd_reply(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk reply: empty body (use -m TEXT, --file PATH, pipe stdin, or --allow-empty)\n")
             return 2
     meta = _parse_meta(args.meta)
+    # Exact immutable anchor for generation-safe replay.  The correlation id
+    # identifies the conversation; in_reply_to identifies this delivery.
+    meta["in_reply_to"] = anchor.id
     if na:
         meta["response"] = "not-applicable"  # the display discriminator
     # Auto-echo request_id for correlation. Explicit --meta wins.
@@ -8360,7 +8524,31 @@ def cmd_reply(args: argparse.Namespace) -> int:
         and "request_id" in (anchor.meta or {})
     ):
         meta["request_id"] = anchor.meta["request_id"]
+    if (
+        kind not in ("review-request", "proposal")
+        and "request_id" not in meta
+        and "broadcast_id" not in meta
+        and "broadcast_id" in (anchor.meta or {})
+    ):
+        meta["broadcast_id"] = anchor.meta["broadcast_id"]
     _maybe_autogen_request_id(kind, meta, quiet=args.quiet)
+    existing, operation_error = _operation_idempotency(
+        store,
+        sender=sender,
+        recipient=anchor.sender,
+        body=body,
+        kind=kind,
+        operation="terminal",
+        meta=meta,
+        nonce=getattr(args, "operation_nonce", None),
+    )
+    if operation_error is not None:
+        sys.stderr.write(f"agenttalk reply: {operation_error}.\n")
+        return 2
+    if existing is not None:
+        if not args.quiet:
+            print(f"(reply operation already recorded: id={existing.id})")
+        return 0
     await_record = _prepare_await_reply(
         store,
         sender=sender,
@@ -9614,6 +9802,13 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
 
         cadence_hook = _cadence
     try:
+        from .wrapper.obligations import DetectionCommitGate
+
+        commit_gate = DetectionCommitGate.from_environment(
+            store,
+            agent,
+            fence=wrapper_generation,
+        )
         turns = wloop.run_loop(
             store, agent, drive,
             max_turns=1 if one_shot_request_id else None,
@@ -9632,6 +9827,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             on_health_idle=health_writer.idle,
             capacity_refresh=capacity_refresh,
             wrapper_generation=wrapper_generation,
+            commit_gate=commit_gate,
         )
     except _LeadLoopLeaseLost:
         # LOST the lease mid-run (stolen / torn / force-released): the ownership gate /
@@ -11320,6 +11516,8 @@ def build_parser() -> argparse.ArgumentParser:
                             "reply-in-flight marker that `threads`/`sync` "
                             "show as '(reply in flight)'. Validates the id "
                             "is a live thread of yours.")
+    pcomp.add_argument("--operation-nonce", dest="operation_nonce",
+                       help=argparse.SUPPRESS)
     pcomp.add_argument("--subject",
                        help="One-line summary (default: 'composing')")
     pcomp.add_argument("--meta", action="append",
@@ -11937,6 +12135,12 @@ def build_parser() -> argparse.ArgumentParser:
     pesc.add_argument("--subject",
                       help="One-line summary (default: 'operator input needed')")
     pesc.add_argument("--meta", action="append", help="key=value (repeatable)")
+    pesc.add_argument("--origin-request",
+                      help="Original enforced request id (requires --origin-id).")
+    pesc.add_argument("--origin-id",
+                      help="Exact original inbound id (requires --origin-request).")
+    pesc.add_argument("--operation-nonce", dest="operation_nonce",
+                      help=argparse.SUPPRESS)
     pesc.add_argument("-m", "--message",
                       help="The operator question (else --file or stdin). Required.")
     pesc.add_argument("--file", help="Read body from this file path ('-' = stdin)")
@@ -12072,6 +12276,16 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Broadcast kind (default: message). Use `question` "
                           "when you want everyone to respond.")
     pbc.add_argument("--subject", help="One-line summary.")
+    pbc.add_argument(
+        "--response-policy",
+        choices=["each", "any", "quorum"],
+        help="Question completion policy (default: each).",
+    )
+    pbc.add_argument(
+        "--response-quorum",
+        type=int,
+        help="Required answer count for --response-policy quorum.",
+    )
     pbc.add_argument("--meta", action="append", help="key=value (repeatable).")
     pbc.add_argument("-m", "--message", help="Body text (else --file or stdin).")
     pbc.add_argument("--file", help="Read body from this file path ('-' = stdin).")
@@ -12290,6 +12504,22 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Second operator-facing acknowledgement required before a "
                           "freshly heartbeating protected agent is killed.")
     prr.set_defaults(func=cmd_request_restart)
+
+    pcg = sub.add_parser(
+        "commit-gate",
+        help="Inspect detection-grade commit enforcement or audit-reset its breaker.",
+    )
+    pcg.add_argument("--for", dest="agent", required=True, help="Wrapped agent name.")
+    pcg.add_argument("--json", action="store_true")
+    pcg_sub = pcg.add_subparsers(dest="gate_action")
+    pcg_status = pcg_sub.add_parser("status", help="Show activation and breaker state.")
+    pcg_status.set_defaults(func=cmd_commit_gate)
+    pcg_reset = pcg_sub.add_parser("reset", help="Authenticated, audited breaker reset.")
+    pcg_reset.add_argument("--from", dest="sender", required=True,
+                           help="Operator-facing liaison or sole lead.")
+    pcg_reset.add_argument("--reason", required=True, help="Audit reason for reset.")
+    pcg_reset.set_defaults(func=cmd_commit_gate)
+    pcg.set_defaults(func=cmd_commit_gate, gate_action="status")
 
     prl = sub.add_parser(
         "request-launch",
@@ -12666,6 +12896,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="key=value (repeatable); request_id is auto-echoed if not set")
     prpl.add_argument("-m", "--message", help="Body text (else --file or stdin)")
     prpl.add_argument("--file", help="Read body from this file path ('-' = stdin)")
+    prpl.add_argument("--operation-nonce", dest="operation_nonce",
+                      help=argparse.SUPPRESS)
     prpl.add_argument("--allow-empty", action="store_true")
     prpl.add_argument(
         "--await-reply",
