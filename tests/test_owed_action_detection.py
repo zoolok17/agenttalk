@@ -24,6 +24,7 @@ from agenttalk.wrapper.obligations import (
     LedgerUnreadable,
     PolicySnapshot,
     ResolverState,
+    SECURITY_GRADE,
     StaleRevision,
     note_manual_close,
     operation_payload_digest,
@@ -4160,6 +4161,94 @@ def test_uncommitted_transfer_target_abort_wins_cas_and_unblocks_destination_que
     assert claim["resolution"] == ResolverState.NOT_OWED.value
 
 
+def test_finalized_transfer_target_abort_projects_across_policy_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    policy_path = tmp_path / "operator-policy.json"
+    initial_agents = {
+        "beta": {"grade": DETECTION_GRADE},
+        "gamma": {"grade": DETECTION_GRADE},
+    }
+    policy_path.write_text(
+        json.dumps({"schema_version": 1, "agents": initial_agents}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTTALK_COMMIT_GATE_POLICY", str(policy_path))
+    _question(store, "q-transfer-abort-policy-drift")
+    destination_policy = PolicySnapshot.from_path(policy_path, "gamma")
+    source = _gate(store, policy_agents=("beta", "gamma"))
+    source_record = _record(store)
+    admitted = source.admit_or_finalize(source_record)
+    assert admitted.key is not None
+    target = _transfer_question(store, admitted.key, "gamma", destination_policy)
+    destination = DetectionCommitGate.from_environment(
+        store,
+        "gamma",
+        fence="wrapper-gamma-1",
+    )
+    target_record = _record(store, agent="gamma")
+    aborted = destination.admit_or_finalize(target_record)
+    original_write = destination._write
+    drifted = False
+
+    def drift_after_terminal_ledger_write(ledger: dict) -> None:
+        nonlocal drifted
+        original_write(ledger)
+        claim = ledger["no_admission_claims"].get(target.id)
+        disposition = ledger["cursor_dispositions"].get("gamma")
+        if (
+            not drifted
+            and isinstance(claim, dict)
+            and claim.get("state") == "finalized"
+            and isinstance(disposition, dict)
+            and disposition.get("inbound_id") == target.id
+        ):
+            drifted = True
+            policy_path.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "agents": {
+                        **initial_agents,
+                        "lead": {"grade": DETECTION_GRADE},
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr(destination, "_write", drift_after_terminal_ledger_write)
+    monkeypatch.setattr(
+        destination,
+        "_advance_record_cursor",
+        lambda _record: (_ for _ in ()).throw(RuntimeError("crash barrier")),
+    )
+
+    destination.finalize(
+        target_record,
+        aborted,
+        expected_revision=aborted.ledger_revision,
+    )
+
+    assert drifted is True
+    assert store.cursor("gamma") == ""
+    restarted = DetectionCommitGate.from_environment(
+        store,
+        "gamma",
+        fence="wrapper-gamma-2",
+    )
+    recovered = restarted.admit_or_finalize(target_record)
+    assert recovered.state == ResolverState.NOT_OWED
+    assert recovered.reason == "no_admission_disposition_pending"
+    projected = restarted.finalize(
+        target_record,
+        recovered,
+        expected_revision=recovered.ledger_revision,
+    )
+    assert projected.state == ResolverState.NOT_OWED
+    assert store.cursor("gamma") == target.id
+
+
 def test_human_escalation_pins_roster_revision_and_repoint_rejects_append(
     tmp_path: Path,
 ) -> None:
@@ -5476,6 +5565,14 @@ def test_no_admission_drive_reservation_blocks_policy_change_during_write(
     assert activated is True
     assert blocked.state == ResolverState.BLOCKED_POLICY
     assert claim["drive_started_at"]
+    assert not claim.get("drive_succeeded_at")
+    assert store.cursor("beta") != inbound.id
+    restarted = DetectionCommitGate.from_environment(
+        store,
+        "beta",
+        fence="wrapper-2",
+    )
+    assert restarted.admit_or_finalize(record).state == ResolverState.BLOCKED_POLICY
     assert store.cursor("beta") != inbound.id
 
 
@@ -5744,6 +5841,270 @@ def test_no_admission_finalizer_blocks_activation_after_legacy_success(
     replayed = restarted.admit_or_finalize(record)
     assert replayed.state == ResolverState.BLOCKED_POLICY
     assert store.cursor("beta") != inbound.id
+
+
+@pytest.mark.parametrize(
+    "updated_agents",
+    [
+        {"gamma": {"grade": DETECTION_GRADE}},
+        {
+            "beta": {"grade": DETECTION_GRADE},
+            "gamma": {"grade": DETECTION_GRADE},
+        },
+        {"beta": {"grade": SECURITY_GRADE}},
+    ],
+    ids=["active-to-no-grade", "unrelated-agent-edit", "active-to-security"],
+)
+def test_finalized_pre_admission_terminal_projects_across_readable_policy_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    updated_agents: dict[str, dict[str, str]],
+) -> None:
+    store = _store(tmp_path)
+    policy_path = tmp_path / "operator-policy.json"
+    policy_path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "agents": {"beta": {"grade": DETECTION_GRADE}},
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTTALK_COMMIT_GATE_POLICY", str(policy_path))
+    gate = DetectionCommitGate.from_environment(
+        store,
+        "beta",
+        fence="wrapper-1",
+    )
+    inbound = _question(store, "q-terminal-policy-drift")
+    answer = store.send(
+        sender="beta",
+        recipient="alpha",
+        body="399",
+        meta={
+            "request_id": "q-terminal-policy-drift",
+            "in_reply_to": inbound.id,
+        },
+    )
+    record = _record(store)
+    terminal = gate.admit_or_finalize(record)
+    original_write = gate._write
+    drifted = False
+
+    def drift_after_terminal_ledger_write(ledger: dict) -> None:
+        nonlocal drifted
+        original_write(ledger)
+        claim = ledger["no_admission_claims"].get(inbound.id)
+        disposition = ledger["cursor_dispositions"].get("beta")
+        if (
+            not drifted
+            and isinstance(claim, dict)
+            and claim.get("state") == "finalized"
+            and isinstance(disposition, dict)
+            and disposition.get("inbound_id") == inbound.id
+        ):
+            drifted = True
+            policy_path.write_text(
+                json.dumps({"schema_version": 1, "agents": updated_agents}),
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr(gate, "_write", drift_after_terminal_ledger_write)
+    monkeypatch.setattr(
+        gate,
+        "_advance_record_cursor",
+        lambda _record: (_ for _ in ()).throw(RuntimeError("crash barrier")),
+    )
+
+    gate.finalize(
+        record,
+        terminal,
+        expected_revision=terminal.ledger_revision,
+    )
+
+    claim = _ledger(gate)["no_admission_claims"][inbound.id]
+    assert drifted is True
+    assert claim["state"] == "finalized"
+    assert not claim.get("drive_started_at")
+    assert not claim.get("drive_succeeded_at")
+    assert store.cursor("beta") == ""
+
+    restarted = DetectionCommitGate.from_environment(
+        store,
+        "beta",
+        fence="wrapper-2",
+    )
+    replayed = restarted.admit_or_finalize(record)
+
+    assert replayed.state == ResolverState.SATISFIED
+    assert replayed.evidence_id == answer.id
+    projected = restarted.finalize(
+        record,
+        replayed,
+        expected_revision=replayed.ledger_revision,
+    )
+    assert projected.state == ResolverState.SATISFIED
+    assert store.cursor("beta") == inbound.id
+
+
+def test_finalized_pre_admission_terminal_waits_for_readable_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    policy_path = tmp_path / "operator-policy.json"
+    policy_path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "agents": {"beta": {"grade": DETECTION_GRADE}},
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTTALK_COMMIT_GATE_POLICY", str(policy_path))
+    gate = DetectionCommitGate.from_environment(
+        store,
+        "beta",
+        fence="wrapper-1",
+    )
+    inbound = _question(store, "q-terminal-corrupt-policy")
+    store.send(
+        sender="beta",
+        recipient="alpha",
+        body="399",
+        meta={
+            "request_id": "q-terminal-corrupt-policy",
+            "in_reply_to": inbound.id,
+        },
+    )
+    record = _record(store)
+    terminal = gate.admit_or_finalize(record)
+    original_write = gate._write
+    corrupted = False
+
+    def corrupt_after_terminal_ledger_write(ledger: dict) -> None:
+        nonlocal corrupted
+        original_write(ledger)
+        claim = ledger["no_admission_claims"].get(inbound.id)
+        disposition = ledger["cursor_dispositions"].get("beta")
+        if (
+            not corrupted
+            and isinstance(claim, dict)
+            and claim.get("state") == "finalized"
+            and isinstance(disposition, dict)
+            and disposition.get("inbound_id") == inbound.id
+        ):
+            corrupted = True
+            policy_path.write_text("{", encoding="utf-8")
+
+    monkeypatch.setattr(gate, "_write", corrupt_after_terminal_ledger_write)
+    blocked = gate.finalize(
+        record,
+        terminal,
+        expected_revision=terminal.ledger_revision,
+    )
+
+    assert corrupted is True
+    assert blocked.state == ResolverState.BLOCKED_POLICY
+    assert store.cursor("beta") == ""
+    claim = _ledger(gate)["no_admission_claims"][inbound.id]
+    assert claim["cursor_projection_misses"] == 0
+
+    restarted = DetectionCommitGate.from_environment(
+        store,
+        "beta",
+        fence="wrapper-2",
+    )
+    assert restarted.admit_or_finalize(record).state == ResolverState.BLOCKED_POLICY
+    policy_path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "agents": {
+                "beta": {"grade": DETECTION_GRADE},
+                "gamma": {"grade": DETECTION_GRADE},
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    recovered = restarted.admit_or_finalize(record)
+    assert recovered.state == ResolverState.SATISFIED
+    projected = restarted.finalize(
+        record,
+        recovered,
+        expected_revision=recovered.ledger_revision,
+    )
+    assert projected.state == ResolverState.SATISFIED
+    assert store.cursor("beta") == inbound.id
+    assert _ledger(restarted)["no_admission_claims"][inbound.id][
+        "cursor_projection_misses"
+    ] == 0
+
+
+def test_finalized_legacy_drive_remains_blocked_across_policy_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    policy_path = tmp_path / "operator-policy.json"
+    policy_path.write_text(
+        json.dumps({"schema_version": 1, "agents": {}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTTALK_COMMIT_GATE_POLICY", str(policy_path))
+    gate = DetectionCommitGate.from_environment(
+        store,
+        "beta",
+        fence="wrapper-1",
+    )
+    inbound = _question(store, "q-finalized-legacy-policy-drift")
+    record = _record(store)
+    resolution = gate.admit_or_finalize(record)
+    authorized = gate.authorize_no_admission_drive(record, resolution)
+    retained = gate.record_no_admission_success(record, authorized)
+    original_write = gate._write
+    drifted = False
+
+    def drift_after_terminal_ledger_write(ledger: dict) -> None:
+        nonlocal drifted
+        original_write(ledger)
+        claim = ledger["no_admission_claims"].get(inbound.id)
+        disposition = ledger["cursor_dispositions"].get("beta")
+        if (
+            not drifted
+            and isinstance(claim, dict)
+            and claim.get("state") == "finalized"
+            and isinstance(disposition, dict)
+            and disposition.get("inbound_id") == inbound.id
+        ):
+            drifted = True
+            policy_path.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "agents": {"beta": {"grade": DETECTION_GRADE}},
+                }),
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr(gate, "_write", drift_after_terminal_ledger_write)
+    blocked = gate.finalize(
+        record,
+        retained,
+        expected_revision=retained.ledger_revision,
+    )
+
+    claim = _ledger(gate)["no_admission_claims"][inbound.id]
+    assert drifted is True
+    assert blocked.state == ResolverState.BLOCKED_POLICY
+    assert claim["state"] == "finalized"
+    assert claim["drive_started_at"]
+    assert claim["drive_succeeded_at"]
+    assert store.cursor("beta") == ""
+    restarted = DetectionCommitGate.from_environment(
+        store,
+        "beta",
+        fence="wrapper-2",
+    )
+    assert restarted.admit_or_finalize(record).state == ResolverState.BLOCKED_POLICY
+    assert store.cursor("beta") == ""
 
 
 @pytest.mark.parametrize("scoped", [False, True], ids=["continuous", "scoped"])

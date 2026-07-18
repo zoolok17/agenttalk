@@ -668,6 +668,140 @@ class DetectionCommitGate:
             and not claim.get("drive_succeeded_at")
         )
 
+    @staticmethod
+    def _claim_has_no_legacy_work(claim: dict) -> bool:
+        return not claim.get("drive_started_at") and not claim.get(
+            "drive_succeeded_at"
+        )
+
+    @staticmethod
+    def _policy_blocks_durable_terminal_projection(policy: PolicySnapshot) -> bool:
+        return policy.status in {
+            ResolverState.BLOCKED_POLICY,
+            ResolverState.BLOCKED_COMPLIANCE,
+        } or (
+            policy.status == ResolverState.BLOCKED
+            and policy.grade != SECURITY_GRADE
+        )
+
+    @classmethod
+    def _durable_no_admission_disposition_matches(
+        cls,
+        claim: dict,
+        disposition: object,
+        record: dict,
+        resolution: Resolution,
+    ) -> bool:
+        disposition_state = (
+            "delivery_failed"
+            if resolution.state == ResolverState.DELIVERY_EXHAUSTED
+            else resolution.state.value
+        )
+        return (
+            claim.get("state") == "finalized"
+            and cls._claim_has_no_legacy_work(claim)
+            and claim.get("resolution") == resolution.state.value
+            and claim.get("terminal_evidence_id") == resolution.evidence_id
+            and isinstance(disposition, dict)
+            and disposition.get("inbound_id") == record.get("id")
+            and disposition.get("mode") == record.get("mode", "global")
+            and disposition.get("state") == disposition_state
+        )
+
+    def _recover_durable_no_admission_disposition(
+        self,
+        record: dict,
+        messages: list[Message],
+        ledger: dict,
+        policy: PolicySnapshot,
+    ) -> Resolution | None:
+        """Replay a zero-work terminal whose durable disposition already won."""
+        if self._policy_blocks_durable_terminal_projection(policy):
+            return Resolution(policy.status, policy.reason)
+        inbound_id = record.get("id")
+        claim = ledger["no_admission_claims"].get(inbound_id)
+        if not isinstance(claim, dict) or claim.get("state") != "finalized":
+            return None
+        if not self._claim_has_no_legacy_work(claim):
+            return None
+        try:
+            state = ResolverState(str(claim.get("resolution")))
+        except ValueError:
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "finalized no-admission resolution is invalid",
+            )
+        evidence_id = claim.get("terminal_evidence_id")
+        if evidence_id is not None and not isinstance(evidence_id, str):
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "finalized no-admission evidence is invalid",
+            )
+        resolution: Resolution
+        if state in TERMINAL_STATES:
+            replayed = self._resolve_replay(record, messages, ledger, admission=None)
+            if replayed.state != state or replayed.evidence_id != evidence_id:
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "finalized no-admission terminal conflicts with replay",
+                )
+            resolution = replayed
+        elif state in {
+            ResolverState.NOT_OWED,
+            ResolverState.CLASSIFICATION_UNKNOWN,
+            ResolverState.INACTIVE,
+        }:
+            inbound_message = next(
+                (message for message in messages if message.id == inbound_id),
+                None,
+            )
+            inbound_meta = (
+                inbound_message.meta
+                if isinstance(inbound_message, Message)
+                and isinstance(inbound_message.meta, dict)
+                else {}
+            )
+            transfer_digest = claim.get("transfer_from_key_digest")
+            if not (
+                state == ResolverState.NOT_OWED
+                and _valid_hex_digest(transfer_digest)
+                and inbound_meta.get("transfer_from_key_digest") == transfer_digest
+            ):
+                return Resolution(
+                    ResolverState.INDETERMINATE,
+                    "finalized no-admission legacy claim lacks zero-work authority",
+                )
+            resolution = Resolution(
+                state,
+                "no_admission_disposition_pending",
+                evidence_id=evidence_id,
+            )
+        else:
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "finalized no-admission state is not terminal",
+            )
+        if not self._durable_no_admission_disposition_matches(
+            claim,
+            ledger["cursor_dispositions"].get(self.agent),
+            record,
+            resolution,
+        ):
+            return Resolution(
+                ResolverState.INDETERMINATE,
+                "finalized no-admission disposition is torn",
+            )
+        revision = int(ledger["scoped_revisions"].get(inbound_id, 0))
+        return Resolution(
+            resolution.state,
+            resolution.reason,
+            evidence_id=resolution.evidence_id,
+            scoped_revision=revision,
+            ledger_revision=revision,
+            activation_generation=policy.generation,
+            readiness_generation=policy.generation,
+        )
+
     def _policy_authority_failure(
         self,
         policy: PolicySnapshot,
@@ -2100,11 +2234,24 @@ class DetectionCommitGate:
             policy=observed_policy,
         )
         if eligibility != ResolverState.ACTIVE:
-            if eligibility in {
+            blocked_states = {
                 ResolverState.BLOCKED,
                 ResolverState.BLOCKED_POLICY,
                 ResolverState.BLOCKED_COMPLIANCE,
-            } or observed_policy.generation == "inactive":
+            }
+            readable_policy_block = (
+                eligibility == ResolverState.BLOCKED
+                and observed_policy.status == ResolverState.BLOCKED
+                and detail == observed_policy.reason
+                and rid is None
+                and not self._policy_blocks_durable_terminal_projection(
+                    observed_policy
+                )
+            )
+            if (
+                eligibility in blocked_states
+                and not readable_policy_block
+            ) or observed_policy.generation == "inactive":
                 return Resolution(
                     eligibility,
                     detail,
@@ -2120,6 +2267,21 @@ class DetectionCommitGate:
                 return Resolution(
                     ResolverState.INDETERMINATE,
                     "non-admission head absent from validated replay",
+                )
+            recovered = self._recover_durable_no_admission_disposition(
+                record,
+                messages,
+                ledger,
+                observed_policy,
+            )
+            if recovered is not None:
+                return recovered
+            if eligibility in blocked_states:
+                return Resolution(
+                    eligibility,
+                    detail,
+                    activation_generation=observed_policy.generation,
+                    readiness_generation=observed_policy.generation,
                 )
             replay_revision = int(ledger["scoped_revisions"].get(inbound.id, 0))
             if eligibility == ResolverState.CLASSIFICATION_UNKNOWN:
@@ -2271,6 +2433,14 @@ class DetectionCommitGate:
         inbound = self._record_message(record, messages)
         if inbound is None:
             return Resolution(ResolverState.INDETERMINATE, "inbound absent from validated replay")
+        recovered = self._recover_durable_no_admission_disposition(
+            record,
+            messages,
+            ledger,
+            observed_policy,
+        )
+        if recovered is not None:
+            return recovered
         existing_id = ledger["inbound_index"].get(inbound.id)
         if existing_id:
             admission = ledger["obligations"].get(existing_id)
@@ -4395,6 +4565,59 @@ class DetectionCommitGate:
         )
         return None
 
+    @staticmethod
+    def _clear_cursor_projection_reservation_locked(owner: dict) -> None:
+        owner["cursor_projection_inflight"] = False
+        owner["cursor_projection_reserved_at"] = None
+
+    def _revalidate_no_admission_projection_policy(
+        self,
+        observed: PolicySnapshot,
+        claim: dict,
+    ) -> Resolution | None:
+        """Gate pending projection, without un-winning a zero-work terminal."""
+        current = self._current_policy()
+        if self._policy_blocks_durable_terminal_projection(current):
+            return Resolution(current.status, current.reason)
+        if claim.get("state") == "finalized" and self._claim_has_no_legacy_work(claim):
+            return None
+        if (
+            current.status == observed.status
+            and current.generation == observed.generation
+            and current.grade == observed.grade
+            and current.agent == observed.agent
+        ):
+            return None
+        return Resolution(
+            ResolverState.BLOCKED_POLICY,
+            "operator policy changed before legacy cursor projection",
+        )
+
+    def _defer_cursor_projection_for_policy(
+        self,
+        record: dict,
+        *,
+        key_digest: str | None,
+        reserved_at: object,
+    ) -> None:
+        """Cancel our reservation when policy, rather than the cursor write, blocks."""
+        if not isinstance(reserved_at, str):
+            return
+        with self.store._exclusive_lock(self.path.with_suffix(".lock"), timeout=10.0):
+            ledger = self._load()
+            owner = (
+                ledger["obligations"].get(key_digest)
+                if key_digest is not None
+                else ledger["no_admission_claims"].get(record.get("id"))
+            )
+            if (
+                isinstance(owner, dict)
+                and owner.get("cursor_projection_inflight") is True
+                and owner.get("cursor_projection_reserved_at") == reserved_at
+            ):
+                self._clear_cursor_projection_reservation_locked(owner)
+                self._write(ledger)
+
     def validate_no_admission_authority(
         self,
         record: dict,
@@ -4702,6 +4925,8 @@ class DetectionCommitGate:
         if not (resolution.terminal or resolution.allows_legacy_commit):
             raise GateError("nonterminal resolution cannot finalize")
         projection_block: str | None = None
+        projection_reserved_at: object = None
+        durable_zero_work_terminal = False
         key = resolution.key
         no_admission_policy: PolicySnapshot | None = None
         if key is not None and any((
@@ -4835,16 +5060,9 @@ class DetectionCommitGate:
                         "no-admission finalizer claim missing",
                     )
                 current_policy = self._current_policy()
-                if (
-                    not self._claim_matches_policy(claim, current_policy)
-                    or resolution.activation_generation
-                    not in {None, current_policy.generation}
-                ):
-                    return self._policy_authority_failure(
-                        current_policy,
-                        reason="no-admission policy changed before finalization",
-                    )
                 no_admission_policy = current_policy
+                if self._policy_blocks_durable_terminal_projection(current_policy):
+                    return Resolution(current_policy.status, current_policy.reason)
                 if claim.get("resolution") != resolution.state.value:
                     return Resolution(
                         ResolverState.INDETERMINATE,
@@ -4857,16 +5075,41 @@ class DetectionCommitGate:
                     )
                 if claim.get("state") == "finalized":
                     disposition = ledger["cursor_dispositions"].get(self.agent)
+                    disposition_state = (
+                        "delivery_failed"
+                        if resolution.state == ResolverState.DELIVERY_EXHAUSTED
+                        else resolution.state.value
+                    )
                     if not isinstance(disposition, dict) or any((
                         disposition.get("inbound_id") != record.get("id"),
-                        disposition.get("state") != resolution.state.value,
+                        disposition.get("mode") != record.get("mode", "global"),
+                        disposition.get("state") != disposition_state,
+                        claim.get("terminal_evidence_id") != resolution.evidence_id,
                     )):
                         return Resolution(
                             ResolverState.INDETERMINATE,
                             "no-admission finalized disposition is torn",
                         )
+                    if not self._claim_has_no_legacy_work(claim) and (
+                        not self._claim_matches_policy(claim, current_policy)
+                        or resolution.activation_generation
+                        not in {None, current_policy.generation}
+                    ):
+                        return self._policy_authority_failure(
+                            current_policy,
+                            reason="no-admission policy changed before finalization",
+                        )
                     write_required = False
                 else:
+                    if (
+                        not self._claim_matches_policy(claim, current_policy)
+                        or resolution.activation_generation
+                        not in {None, current_policy.generation}
+                    ):
+                        return self._policy_authority_failure(
+                            current_policy,
+                            reason="no-admission policy changed before finalization",
+                        )
                     if claim.get("state") not in {
                         "open",
                         "finalization_pending",
@@ -4936,18 +5179,28 @@ class DetectionCommitGate:
                     "state": disposition_state,
                     "at": self.now(),
                 }
+            durable_zero_work_terminal = (
+                no_admission_policy is not None
+                and owner.get("state") == "finalized"
+                and self._claim_has_no_legacy_work(owner)
+            )
+            if durable_zero_work_terminal and write_required:
+                # The terminal and its exact disposition become authoritative before
+                # policy is checked for the pending physical projection.  A crash or
+                # unreadable policy here therefore leaves no false cursor attempt.
+                self._write(ledger)
+                write_required = False
+                policy_block = self._revalidate_no_admission_projection_policy(
+                    no_admission_policy,
+                    owner,
+                )
+                if policy_block is not None:
+                    return policy_block
             if self._cursor_projection_is_complete(record):
                 projection_was_inflight = owner.get("cursor_projection_inflight") is True
-                owner["cursor_projection_inflight"] = False
-                owner["cursor_projection_reserved_at"] = None
+                self._clear_cursor_projection_reservation_locked(owner)
                 if write_required or projection_was_inflight:
                     self._write(ledger)
-                if no_admission_policy is not None:
-                    policy_block = self._revalidate_admission_policy(
-                        no_admission_policy,
-                    )
-                    if policy_block is not None:
-                        return policy_block
                 return resolution
             projection_block = self._reserve_cursor_projection_locked(
                 ledger,
@@ -4955,12 +5208,20 @@ class DetectionCommitGate:
                 inbound_id=inbound_id,
                 key_digest=key_digest,
             )
+            projection_reserved_at = owner.get("cursor_projection_reserved_at")
             self._write(ledger)
-            if no_admission_policy is not None:
-                policy_block = self._revalidate_admission_policy(
+            if (
+                no_admission_policy is not None
+                and not durable_zero_work_terminal
+                and projection_block is None
+            ):
+                policy_block = self._revalidate_no_admission_projection_policy(
                     no_admission_policy,
+                    owner,
                 )
                 if policy_block is not None:
+                    self._clear_cursor_projection_reservation_locked(owner)
+                    self._write(ledger)
                     return policy_block
         if projection_block is not None:
             self._record_disposition_block(reason=projection_block)
@@ -4969,9 +5230,17 @@ class DetectionCommitGate:
         # Its write-ahead reservation makes a crash an accounted miss before any
         # subsequent retry, while the exact disposition makes the side effect
         # idempotent and prevents duplicate terminal transitions.
-        if no_admission_policy is not None:
-            policy_block = self._revalidate_admission_policy(no_admission_policy)
+        if no_admission_policy is not None and not durable_zero_work_terminal:
+            policy_block = self._revalidate_no_admission_projection_policy(
+                no_admission_policy,
+                owner,
+            )
             if policy_block is not None:
+                self._defer_cursor_projection_for_policy(
+                    record,
+                    key_digest=key_digest,
+                    reserved_at=projection_reserved_at,
+                )
                 return policy_block
         try:
             self._advance_record_cursor(record)
