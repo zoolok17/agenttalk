@@ -55,8 +55,10 @@ contradiction.
 
 - **`domains.py`** owns path/area ownership: one unified registry
   (`.agenttalk/domains.json`) shared by lanes and knowledge (D-5), with
-  `registry_hash`, `normalize_repo_path`, `glob_matches`, and
-  `check_paths`. It survives `reset`.
+  `registry_hash`, `normalize_repo_path`, `normalize_glob`,
+  `glob_matches`, `check_path`, and `check_paths`. It survives `reset`.
+  Note that `check_path`/`check_paths` classify **concrete paths** — see
+  the containment rule for why they cannot decide glob containment.
 - **`lanes.py`** owns worktree isolation and delivery. Active
   coordination state is `.agenttalk/state/lanes.json` — **cleared by
   `reset`** — while the durable committed delivery artifact lives at
@@ -329,8 +331,9 @@ Rules:
   (both null, and they move together — never one without the other),
   `base_ref` / `base_sha` / `target_ref`, `gate_scope`, `close_id`,
   `delivery_artifact_path`, `policy_hash_at_open`, and `scope_globs`
-  (`[]`, for which the `domains.check_paths` subset test passes
-  trivially). `policy_hash_at_open` is null when no policy exists at
+  (`[]`, for which the containment test passes vacuously — there is no
+  glob to prove, which is why the separate non-empty invariant below
+  exists). `policy_hash_at_open` is null when no policy exists at
   `base_sha`, and recorded at create when one does — same witness rule as
   above.
 - A nullable `base_sha` is **required by internal consistency**, not
@@ -353,9 +356,9 @@ Rules:
 - `scope_globs` are normalized through `domains.normalize_repo_path` /
   `normalize_glob`, which already reject NUL, absolute, drive-relative,
   UNC, and `..`-escape paths. Work adds no second path normalizer.
-- **`scope_globs` must be a subset of the bound domain's paths, checked
-  against `domains.check_paths` at bind time and revalidated at verdict
-  time.** A mismatch raises `work_scope_outside_domain`. Without this the
+- **`scope_globs` must be a subset of the bound domain's paths**, checked
+  at bind time and revalidated at verdict time. A mismatch raises
+  `work_scope_outside_domain`. Without this the
   domain link is decorative: an item could bind `domain_id: "core-lanes"`
   with a perfectly fresh registry hash while its `scope_globs` covered
   `src/agenttalk/gates.py`, and no hold would fire —
@@ -363,6 +366,127 @@ Rules:
   that the item's scope ever agreed with it. That is work silently
   re-owning path scope while the boundary table calls it a link, and it
   bypasses the domain's approver model.
+
+**The containment rule, stated exactly — a GLOB-SUBSET proof, never a
+point-membership call.** `domains.check_path` classifies one **concrete
+path** and `check_paths` classifies a list of them; both answer "is this
+file in the domain?" Passing a *glob* to either
+asks whether the literal string `src/**` is in the domain, which is a
+different question with a different answer: a domain glob `src/*` matches
+the literal segment `**`, so `src/**` is **accepted** while its own member
+`src/deep/file.py` lies outside the domain. A concrete-path classifier
+cannot serve as a subset proof, and using one is the
+**descriptor-validated-as-instance** defect: running the checker built
+for a *member* of a set against a *descriptor* of that set.
+
+The rule is **conservative single-glob containment, and it fails closed**:
+
+- A scope glob `G` is accepted only when **one** domain glob `D` provably
+  covers it. Coverage by two domain globs jointly — where neither alone
+  covers `G` — is **rejected**, even though such a `G` may be a genuine
+  subset. This is deliberately approximate in the **safe** direction: it
+  rejects some legal scopes and accepts no illegal one.
+- Both sides are compared **segment-wise on normalized globs**, never as
+  string prefixes. Both are normalized with `domains.normalize_glob`
+  under the **registry's own casefold setting** (`default_casefold_paths`),
+  so containment is decided in the same space the matcher matches in.
+  Segment-wise is what makes `src/a` correctly fail to cover `src/ab` —
+  the C2 lesson that a prefix match is not a containment proof, applied
+  to the domain boundary.
+- `covers(D, G)` over segment lists, exhaustively:
+  - `D` empty → covered **iff** `G` is empty.
+  - `D[0] == "**"` → covered if `covers(D[1:], G)` **or**
+    (`G` non-empty and `covers(D, G[1:])`). This mirrors the matcher's
+    own zero-or-more recursion, and is sound at descriptor level because
+    `**` absorbs any run of concrete segments however `G` expands.
+  - `G` empty (and `D` is not) → **not** covered.
+  - `D[0] == "*"` → covers any single `G` segment **except `**`**, then
+    `covers(D[1:], G[1:])`. `*` and `**` are both wildcards but not the
+    same wildcard: `*` spans exactly one segment and `**` spans any
+    number, so `*` cannot cover `**`. **This is the repro**, and the
+    concrete-path checker gets it wrong in exactly this spot.
+  - otherwise → covered only if `D[0]` and `G[0]` are the **identical
+    string**, then `covers(D[1:], G[1:])`.
+- The final clause is deliberately identity, not matching. A `D` segment
+  of `a*` does **not** cover a `G` segment of `ab` even though it matches
+  it, and `[ab]` does not cover `a`. Both are real subsets that this rule
+  rejects — the disclosed cost of failing closed. An authority boundary
+  that guesses is not a boundary.
+
+Why conservative rather than exact: full glob-language containment over a
+*union* of domain globs is where a subset proof is hardest and where a
+mistake fails **open**, and this document has twice rejected schemes that
+combined overlapping globs — D-11 refused first-match, most-specific and
+longest-prefix because picking among overlapping globs "imposes a total
+order on a partial order" and was twice proven unsound. Requiring a single
+covering glob removes the combining question entirely. The cost is a
+legal-but-unprovable scope must be narrowed or the domain widened; the
+cost of the alternative is an unsound acceptance on an approver boundary.
+
+**Required cases. These are normative — an implementation that does not
+decide all of them this way does not implement this rule.**
+
+| # | domain `owned_globs` | `scope_globs` | required | why |
+|---|---|---|---|---|
+| 1 | `src/*` | `src/a.py` | **accept** | `*` covers a literal |
+| 2 | `src/*` | `src/*` | **accept** | `*` covers `*` |
+| 3 | `src/*` | `src/**` | **REJECT** | one-segment vs recursive. The member `src/deep/a.py` is outside the domain. A concrete-path checker **accepts** this — `*` matches the literal segment `**`. This is the descriptor-validated-as-instance repro. |
+| 4 | `src/**` | `src/a/b.py` | **accept** | `**` absorbs any suffix |
+| 5 | `src/**` | `src/**` | **accept** | `**` absorbs `**` |
+| 6 | `src/a/**` | `src/ab/**` | **REJECT** | sibling-prefix. `src/ab` is not `src/a`; a string-prefix test accepts this and is wrong. |
+| 7 | `src/a` | `src/ab` | **REJECT** | sibling-prefix, no wildcard |
+| 8 | `src/**` + `docs/**` | `src/**/*.py` where a member is `docs/x.py` | n/a — unreachable | see below |
+| 9 | `src/*` + `src/**/t.py` | `src/**/t.py` | **accept** | a single domain glob covers it; the union is never consulted |
+| 10 | `src/a/*` + `src/*/b.py` | `src/a/b.py` | **accept** | glob 2 alone covers it |
+| 11 | `pkg/*/mod.py` + `pkg/a/**` | `pkg/a/mod.py` | **accept** | either glob alone covers it |
+| 12 | `src/a/*` + `src/*/b` | `src/a/b` | **accept** | glob 1 covers it |
+| 13 | `src/**/t.py` | `src/a/t.py` | **accept** | mid-pattern `**` absorbs zero-or-more, not only a suffix |
+| 14 | `src/*` | `src/a*` | **accept** | `a*` spans exactly one segment, and `*` covers any single segment |
+| 15 | `src/a*` | `src/ab` | **REJECT** | disclosed conservative rejection: a real subset the identity clause refuses, because `D` carries a metacharacter that is not a bare `*` |
+| 16 | `src/**` | `src/**/*` | **accept** | `**` absorbs the trailing `*` by consuming zero further segments — an implementation whose `**` is suffix-only gets this wrong |
+| 17 | `src/**/*.py` | `src/a/b.py` | **REJECT** | disclosed conservative rejection: a real subset, refused because `*.py` is a metacharacter segment that is not a bare `*` |
+
+Case 8 is listed to be struck explicitly: it cannot arise, because the
+rule proves each scope glob against a **single** domain glob and never
+against a union, so no scope glob can be accepted on the strength of two
+domain globs whose members differ. Cases 9–12 exist to pin the other
+side of that — requiring a single *covering* glob does not mean requiring
+a single *domain* glob; the domain may own many, and the rule asks
+whether **some one of them** covers `G`.
+
+The one case that must be tested and cannot be read off the table:
+**a descriptor is accepted but a member is not**. Under this rule that
+combination must be **unreachable**, and case 3 is the proof obligation —
+run the concrete-path checker over the members of every accepted
+`scope_glob` and no member may fall outside the domain. If an
+implementation can produce an accepted descriptor with an outside member,
+the containment rule is unsound and the finding is a P0, not a tuning
+question.
+
+**What this rule does NOT establish, disclosed because the
+circular-validation sweep fires on it.** `covers` takes two arguments,
+and only one of them is externally sourced. The scope glob comes from the
+item; the domain glob comes from `domains.json`, which is external and
+approver-governed — but **which** domain is consulted comes from the
+item's own `domain_id`. So containment proves "this scope is inside the
+domain this item claims", not "this item is entitled to that domain". An
+agent free to bind any `domain_id` can satisfy containment by choosing a
+permissive domain, and no rule in this document stops it. That is a
+**domain-binding authority** question, it is genuinely open, and naming
+it here is deliberate: a reader who sees a containment check and a
+registry hash could otherwise conclude the domain boundary is enforced
+end to end, when what is enforced is internal consistency with a
+self-selected authority. Closing it means constraining who may bind a
+`domain_id` to what, which is its own design with its own review — it is
+**Open Question #9 and it gates D6**. Implementing this containment rule
+correctly does not close it and must not be reported as closing it.
+
+Two properties hold and are worth asserting directly, because an
+implementation can pass the table and still violate them:
+**reflexivity** — `covers(X, X)` is true for every normalized glob `X`,
+so a scope glob identical to a domain glob is never rejected; and
+**one-sidedness** — `covers` is not symmetric, and an implementation
+that ever compares the two arguments in either order has lost the rule.
 - **A lane-bound item must have a non-empty `scope_globs`, checked on
   EVERY read and every verdict.** Violation raises
   `work_scope_empty`. This is a *read-time* invariant and it is
@@ -615,8 +739,8 @@ Rules:
   arbitrarily between two equal options. The divergence is a **latent**
   hazard rather than a live exploit — no current caller is known to feed
   it a non-serializable value — and that under-claim is deliberate.
-- **Three types have no producer in D1–D5, and each is disclosed rather
-  than left for a reader to assume:**
+- **Two types are unreachable in a D2 tree, for DIFFERENT reasons, and
+  both are called out so a reader does not have to guess which:**
   - `reopened` — there is **no `work reopen` command** in any phase, so
     **once an item is `delivered` or `abandoned` it is permanently
     terminal**. A command was deliberately *not* added to make this
@@ -790,8 +914,8 @@ There are **four physical checkpoints** where a compliant writer can die:
 K3 is the checkpoint an earlier draft omitted entirely. Durable
 completion has to survive caller death: the mutation is finished on disk,
 the caller never learned it, and a recovery pass must change nothing.
-K0 and K3 both observe a settled item, and they are still distinct
-checkpoints — one where nothing exists, one where everything does.
+K0 and K3 both require recovery to change nothing, and they are still
+distinct checkpoints — one where nothing exists, one where everything does.
 
 Classification of the observable state keys on **`pending_op` and
 `ledger_head`** — never on `item_seq`, which is a record version and is
@@ -2032,7 +2156,7 @@ Rules:
 | `work_policy_hash_drift` | the policy hash now differs from the one artifacts were produced under |
 | `work_policy_changed_since_open` | the policy moved since `policy_hash_at_open` |
 | `work_domain_scope_drift` | `registry_hash_at_bind` no longer matches the current registry |
-| `work_scope_outside_domain` | `scope_globs` is not a subset of the bound domain's paths |
+| `work_scope_outside_domain` | a `scope_globs` entry is not provably covered by a **single** domain glob under the `covers` predicate (conservative and fail-closed — an entry this cannot prove is rejected, so the code also fires on legal-but-unprovable scopes) |
 | `work_scope_empty` | a lane-bound item has an empty `scope_globs` (read-time state check; the `work start` precondition guards the mutation, this guards corrupt / out-of-protocol / hand-edited state) |
 | `work_out_of_scope_change` | the diff touches paths outside `scope_globs` |
 | `work_source_error` | a source read failed and its result could not be established |
@@ -2481,7 +2605,7 @@ obvious naive implementation, would have returned green.
 | Artifact present, wrong scope/glob | `HOLD` | dropped as if absent |
 | Required check `skipped` / `waived` / `unknown` | `HOLD` `work_required_check_not_green` | counted as green |
 | Blocking requirement, tier below floor | `HOLD` `work_artifact_insufficient_tier` | promoted because it is the best available |
-| Gate source read fails | `HOLD` `work_source_error` | empty gate list read as no blockers |
+| Gate source read fails | `UNKNOWN` `work_source_error` | empty gate list read as no blockers |
 | Policy unreadable at `base_sha` | `UNKNOWN` `work_source_error` | fallback to working-tree policy |
 | Policy invalid | `HOLD` `work_policy_invalid` | ignored as if absent |
 | Two records disagree | `HOLD` `work_contradiction` | one side silently preferred |
@@ -2804,7 +2928,16 @@ a named test in D1–D4's acceptance set.
     `base_ref` and `target_ref`. A `start` that binds only the lane
     passes every other invariant while leaving the item permanently
     revision-unresolvable.
-
+40. **An accepted scope glob has no member outside the domain.** *Test:*
+    for every accepted `scope_globs` entry, expand a member set and run
+    `domains.check_path` over each member; assert **none** falls outside
+    the bound domain. Then pin the specific inversion: domain `src/*`,
+    scope `src/**`. Assert the containment predicate **rejects** it, and
+    assert separately that feeding the same pair to a concrete-path
+    checker **accepts** it — the second assertion is what stops a later
+    "simplification" back to `check_paths` from looking harmless. This is
+    the descriptor-validated-as-instance defect, and it is invisible to
+    any test that only ever passes concrete paths.
 ## Threat Model And Honest Limits
 
 ### What This Design Establishes
@@ -2964,6 +3097,13 @@ Implement:
   `start` refusal above is the mutation guard; this is the read-time half,
   and implementing only the first leaves corrupt, hand-edited, and
   out-of-protocol items reading as fine.
+- **The `covers` glob-containment predicate and its required-case table**,
+  raising `work_scope_outside_domain` at every point `scope_globs` is
+  written (create, `start`) and again on every item read. It is a
+  **glob-subset proof and must not delegate to `domains.check_paths`**,
+  which classifies a concrete path and therefore accepts `src/**` under a
+  domain of `src/*`. All seventeen required cases are D2 tests; the
+  descriptor-accepted-member-rejected obligation is one of them.
 - **`deliver`'s precondition**: a bound lane, and
   `validate_delivery_artifact(..., require_isolation=True)` called with a
   `head_sha` resolved live from the lane — never read from the artifact.
@@ -3107,6 +3247,52 @@ needs it — not during it.
    `work_implausible_timestamp` rule needs a concrete bound. Decided at
    D3 with the first real producer, because picking a number now without
    measuring agent-host clock spread would be arbitrary.
+9. **Who is entitled to bind a given `domain_id`?** **Open, and NOT
+   closed by the containment rule.** `covers` proves that an item's
+   `scope_globs` sit inside the domain the item *claims*; nothing proves
+   the item was entitled to claim it. An agent free to write any
+   `domain_id` satisfies containment trivially by naming a permissive
+   domain, so the rule can be implemented perfectly and the domain
+   boundary still not be enforced end to end. The containment section
+   discloses this at its topical site; this entry exists because a
+   disclosure a reader is never required to visit is not a gate.
+
+   **What would close it:** a binding-time entitlement check, run when
+   `domain_id` is written (create) and revalidated at verdict time like
+   every other domain-derived fact — resolve the domain entry's own
+   refsets through the public API (`domains.load_registry` +
+   `domains.resolve_refset`) and require the binding actor to appear in
+   them. Two details make it answerable rather than merely alarming.
+   First, `owners` is a **required** refset on every domain entry while
+   `curators` and `reviewers` are optional, so `owners` is the only
+   basis guaranteed to exist — an entitlement set drawn from an optional
+   refset would be empty for some domains and would fail closed against
+   legitimate work. Second, the check must resolve refsets **at bind
+   time and again at verdict time**, because roster membership moves;
+   `registry_hash_at_bind` already witnesses registry drift but says
+   nothing about whether the actor is still entitled.
+
+   **Why it is not decided here:** entitlement is an authority surface,
+   and this document's standing position is that authority surfaces get
+   their own design and their own review rather than a rule invented to
+   discharge a gap found in an adjacent one — the same reason there is
+   no `work reopen` command. It also reaches into how the roster and the
+   domain registry relate, which is not work's to settle alone.
+
+   **The exposure window opens at D2, not at D6, and this entry would
+   mislead if it did not say so.** Every other question in this list is
+   scheduled before the phase that *needs* it, and nothing is exposed in
+   the meantime. This one inverts that: `domain_id` is bound at **create**,
+   which ships in D2, so from the moment D2 lands there are items in the
+   store whose domain binding was never checked for entitlement. Deciding
+   it at D6 does not defer the exposure, it defers the *fix* — and any
+   answer will have to say what happens to items already bound under no
+   rule, which is a migration question the answer must carry.
+
+   **Consequence if it stays open past D6:** the domain link is
+   enforceable against *drift* and *scope*, and unenforceable against
+   *entitlement*. Any surface that renders a bound domain as an
+   authority claim would be overstating it.
 
 ## Acceptance Criteria For The RFC
 
@@ -3167,6 +3353,15 @@ a pre-mortem it never appeared in.
   not the mitigation.
 - **All matching policy globs must be satisfied** (D-11), with the
   matched glob persisted rather than the raw path.
+- **Scope containment is conservative-approximate and fails CLOSED**, and
+  a scope glob must be covered by a **single** domain glob rather than by
+  the union of several. The alternative — an exact subset decision over
+  the union — accepts more legal scopes, and is rejected because the
+  place it would be wrong is an approver boundary where the error fails
+  *open*. The disclosed cost is real: some genuine subsets are rejected
+  and must be narrowed or the domain widened. Reviewers should agree the
+  trade is right, since it is the one choice here a reasonable person
+  could make the other way.
 - **Status and verdict are never persisted**, and contradictions are
   always `HOLD` with both sources named, never resolved by preference.
 - **Terminal states are the one persisted lifecycle fact**, justified by
