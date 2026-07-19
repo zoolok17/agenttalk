@@ -434,12 +434,60 @@ The rule is **conservative single-glob containment, and it fails closed**:
   overflow the stack on every read, which is a strictly worse failure
   than the unguarded state the read-time check was added to prevent. A
   read-time invariant that can hang is not a safety property.
-- **A segment-count bound is required, and exceeding it is a HOLD, not a
-  crash.** `domains.normalize_glob` accepts arbitrarily many segments, so
-  the bound must be enforced by work rather than assumed from the
-  normalizer. Exceeding it raises `work_scope_glob_too_complex` — a
-  bounded, named refusal. Unbounded input meeting a bounded evaluator is
-  how a correctness rule becomes an availability defect.
+- **The bound is a MAXIMUM STATE BUDGET with exact values, it covers BOTH
+  operands, and it is checked BEFORE any evaluation.** A budget rather
+  than a segment cap alone, because states are the quantity that actually
+  bounds the work; a segment cap is a proxy for it and a proxy admits the
+  aggregate case, where every glob is individually in-bound and the pair
+  count is not.
+
+  | constant | value | what it bounds |
+  |---|---|---|
+  | `MAX_GLOB_SEGMENTS` | **64** | segments in ONE normalized glob, either operand |
+  | `MAX_CONTAINMENT_STATES` | **1048576** (2^20) | total `(D,G)` subproblem states across ONE containment evaluation |
+
+  CHECK ORDER — every step precedes any call to `covers`, so an
+  implementation **cannot discover the bound by exceeding it**:
+  1. Normalize both operands.
+  2. Any `scope_globs` entry with more than `MAX_GLOB_SEGMENTS` segments
+     → `work_scope_glob_too_complex`.
+  3. Any `owned_globs` entry with more than `MAX_GLOB_SEGMENTS` segments
+     → `work_domain_glob_too_complex`.
+  4. Predicted aggregate `Σ over pairs (len(D)+1)·(len(G)+1)` exceeds
+     `MAX_CONTAINMENT_STATES` → `work_containment_budget_exceeded`.
+  5. Only now evaluate.
+
+  Step 4 is computable from **segment counts alone**, in time linear in
+  the number of globs and without evaluating any of them — so the guard
+  is strictly cheaper than the work it guards, which is what makes
+  checking first possible rather than merely desirable.
+
+- **The bound is TWO-SIDED because `D` is not ours.** `covers` costs
+  `(len(D)+1)·(len(G)+1)` per pair and `D` comes from `owned_globs`.
+  Verified against the frozen source: `domains._validate_glob_list` and
+  `_normalize_repoish` (`domains.py:330-370`) cap **neither list
+  cardinality nor segment count** — the only length limits in that module
+  are on role names and ids. A scope-only cap is therefore bypassed
+  entirely by a short, in-bound scope glob evaluated against a very long
+  domain glob, or against many of them, and the unbounded work still runs
+  on every read.
+
+  Work does not own `domains.py` and **cannot impose a schema change on
+  it**, so the domain side gets a defined fail-closed refusal rather than
+  a validation rule: `work_domain_glob_too_complex`, class **blocking**.
+  Blocking rather than `unknown` deliberately — the module answered, and
+  the answer is a definite observed condition, not a failure to observe.
+  It is not the item's fault, and the verdict is not an allocation of
+  fault: an unprovable containment is a rejection, whichever side made it
+  unprovable. Fixing it means fixing the registry, and the code says so.
+
+- **Three distinct codes, because there are three distinct remedies.**
+  `work_scope_glob_too_complex` → narrow the scope glob.
+  `work_domain_glob_too_complex` → fix the domain registry.
+  `work_containment_budget_exceeded` → reduce glob counts; every glob was
+  individually legal and only the product was not. Collapsing these to one
+  code would name the condition without naming what to do about it, and
+  the aggregate case in particular is invisible from either per-glob cap.
 - The correctness table above does NOT exercise any of this. **A
   correctness table and a termination guarantee are different
   obligations**, and a table that is right in every row says nothing
@@ -556,12 +604,39 @@ silent passage, and this one is no different.
 
 Consequences that follow and are required with it:
 
-- **Every D2/D3 surface that renders a bound domain must mark entitlement
-  explicitly UNVERIFIED.** A rendering that shows `domain_id` alone reads
-  as an authority association, which is exactly the false claim. This is
-  the same rule as `cautions` never being droppable from the default
-  human path — a mitigation absent from the surface an operator actually
-  reads is not a mitigation.
+- **`domain_id` NEVER appears as a bare scalar in any projection.** The
+  marker is not an additional field a surface must remember to include —
+  the domain renders as a single object that carries both, so a rendering
+  that shows the domain without the entitlement state is not
+  *non-conforming*, it is *unconstructible*. The canonical shape is
+
+  ```json
+  "domain": {"domain_id": "core-lanes", "entitlement": "unverified"}
+  ```
+
+  with `entitlement` ∈ `{"unverified", "verified"}` and **no third value
+  and no absent case** — an omitted `entitlement` is a malformed view,
+  not a default.
+
+  Stating it as "every surface must mark it" was the defect. That phrasing
+  is satisfied by ONE surface: a construction that emits the marker in
+  `work show --json` while `list`, the legacy shape, or the default human
+  output render the bound domain alone passes the rule as written, passes
+  SI #41 as written, and still presents the forged authority association
+  on every pre-D4 surface an operator actually reads. Binding the marker
+  to the id structurally removes the per-surface obligation that was being
+  discharged unevenly.
+
+  Exact locations, all three normative:
+  - **`work-view-v1`**: `view["domain"]`, sibling to `record_state`.
+  - **Legacy shape**: `domain`, carrying the identical object. The legacy
+    escape can render a domain, so it can forge the association; this is
+    the same reasoning that keeps `cautions` in the legacy shape.
+  - **Default non-`--json` human output**: the domain is written
+    `core-lanes · entitlement UNVERIFIED` and never as a bare name. This
+    is where the analogous `cautions` rule earns its keep — a mitigation
+    absent from the surface an operator actually reads is not a
+    mitigation.
 - **Migration is fail-closed.** Items bound before the amendment that
   closes Open Question #9 carry no entitlement evidence, and they are
   treated as unverified rather than grandfathered. Grandfathering would
@@ -2270,7 +2345,9 @@ Rules:
 | `work_domain_scope_drift` | `registry_hash_at_bind` no longer matches the current registry |
 | `work_scope_outside_domain` | a `scope_globs` entry is not provably covered by a **single** domain glob under the `covers` predicate (conservative and fail-closed — an entry this cannot prove is rejected, so the code also fires on legal-but-unprovable scopes) |
 | `work_scope_empty` | a lane-bound item has an empty `scope_globs` (read-time state check; the `work start` precondition guards the mutation, this guards corrupt / out-of-protocol / hand-edited state) |
-| `work_scope_glob_too_complex` | a `scope_globs` entry exceeds the segment-count bound; a bounded refusal rather than an unbounded evaluation |
+| `work_scope_glob_too_complex` | a `scope_globs` entry exceeds `MAX_GLOB_SEGMENTS` (64); remedy is to narrow the scope glob |
+| `work_domain_glob_too_complex` | an `owned_globs` entry exceeds `MAX_GLOB_SEGMENTS` (64) — class `blocking`, since the module answered and the answer is a definite condition; remedy is to fix the domain registry, which work does not own |
+| `work_containment_budget_exceeded` | the predicted aggregate `(D,G)` state count exceeds `MAX_CONTAINMENT_STATES` (2^20) with every glob individually in-bound; remedy is to reduce glob counts |
 | `work_domain_entitlement_unverified` | the actor's entitlement to the bound `domain_id` has not been verified — class `unknown`, blocks GO from D4 onward. Unverifiable is not passable; see the containment rule and Open Question #9 |
 | `work_out_of_scope_change` | the diff touches paths outside `scope_globs` |
 | `work_source_error` | a source read failed and its result could not be established |
@@ -2377,6 +2454,7 @@ Those live in the **view**, not the verdict:
   "schema": "work-view-v1",
   "work_id": "w-0007",
   "record_state": "active",
+  "domain": {"domain_id": "core-lanes", "entitlement": "unverified"},
   "verdict": {"verdict": "HOLD", "ok": false, "has_unknown": false,
               "holds": [{"code": "work_artifact_stale", "class": "established", "detail": "…"}],
               "cautions": [{"flag": "release_floor_lowered", "glob": "src/**",
@@ -2405,9 +2483,13 @@ Rules:
   exist.** A legacy rendering that emits `record_state` alone could show
   `delivered` while omitting a HOLD, which is the no-collapse rule
   defeated by the compatibility hatch. The legacy shape is therefore
-  `{work_id, record_state, verdict, ok, has_unknown, cautions}` —
+  `{work_id, record_state, verdict, ok, has_unknown, cautions, domain}` —
   flattened, but never single-axis, never dropping the epistemic flag,
-  and never dropping `cautions`. `release_floor_lowered` in particular
+  never dropping `cautions`, and never dropping the `domain` object.
+  `domain` carries `{domain_id, entitlement}` intact: flattening it to a
+  bare `domain_id` through the compatibility hatch would forge exactly the
+  authority association the entitlement rule exists to prevent, by the
+  same route the hatch would otherwise drop a `cautions` entry. `release_floor_lowered` in particular
   must survive the legacy rendering: a hatch that shows `GO` while
   discarding the fact that the release floor was lowered would recreate
   the false-trust failure through the compatibility path. If a consumer
@@ -2722,7 +2804,9 @@ obvious naive implementation, would have returned green.
 | Gate source read fails | `UNKNOWN` `work_source_error` | empty gate list read as no blockers |
 | Policy unreadable at `base_sha` | `UNKNOWN` `work_source_error` | fallback to working-tree policy |
 | Policy invalid | `HOLD` `work_policy_invalid` | ignored as if absent |
-| Scope glob exceeds the segment bound | `HOLD` `work_scope_glob_too_complex` | unbounded evaluation; hang or stack overflow on every read |
+| Scope glob exceeds `MAX_GLOB_SEGMENTS` | `HOLD` `work_scope_glob_too_complex` | unbounded evaluation; hang or stack overflow on every read |
+| DOMAIN glob exceeds `MAX_GLOB_SEGMENTS` | `HOLD` `work_domain_glob_too_complex` | a scope-only cap bypassed entirely by the operand work does not own |
+| Aggregate state budget exceeded, every glob in-bound | `HOLD` `work_containment_budget_exceeded` | per-glob caps pass and the product still runs unbounded |
 | Entitlement to the bound domain unverified | `UNKNOWN` `work_domain_entitlement_unverified` | unverifiable read as permitted, advancing a forged authority association |
 | Two records disagree | `HOLD` `work_contradiction` | one side silently preferred |
 | Concurrent mutation | serialized under a per-item lock + `expected_version` | last-writer-wins |
@@ -3062,12 +3146,28 @@ a named test in D1–D4's acceptance set.
     `work_domain_entitlement_unverified` **specifically**, with class
     `unknown`. The specificity is the whole test: every containment and
     drift check passes on this input by construction, so a weaker
-    assertion would be satisfied by nothing at all. Assert separately
-    that a D2/D3 rendering of this item marks entitlement UNVERIFIED
-    rather than displaying the domain alone. Under the disposition this
-    replaces, this input returned `GO` — a rostered actor binding a
-    domain they do not own and carrying a forged authority association
-    through every gate.
+    assertion would be satisfied by nothing at all.
+
+    Then assert the rendering **PATH-EXACTLY, on every surface that can
+    name a domain** — not "a rendering", which one conforming surface
+    satisfies while every other still forges the association:
+      - `work show --json` → `view["domain"]["entitlement"] == "unverified"`
+      - `work check --json` → same path, same value
+      - `work list --json` → same path on every listed row
+      - `--output-schema legacy` → `domain` present, carrying
+        `{domain_id, entitlement}`, **not** flattened to a bare id
+      - default non-`--json` output of `show`, `check` and `list` → the
+        entitlement state is rendered adjacent to the domain name
+    Assert additionally that **no projection emits `domain_id` as a bare
+    scalar anywhere in its output**. That assertion is the one that
+    survives a surface being added later; the list above is exhaustive
+    only as of this amendment.
+
+    Under the disposition this replaces, this input returned `GO` — a
+    rostered actor binding a domain they do not own, carrying a forged
+    authority association through every gate. Under the *intermediate*
+    fix it returned non-`GO` at D4 while every pre-D4 surface still
+    displayed the bare domain, which is the construction codex-sec built.
 42. **The containment predicate cannot be made to hang.** *Test:* evaluate
     `covers` on `D = **/…/**/x` against `G = **/…/**/y` at 14 segments —
     shape-valid input and a legitimate `false`. Assert it returns, and
@@ -3076,11 +3176,29 @@ a named test in D1–D4's acceptance set.
     rather than timing is the point: a timing assertion passes on a fast
     machine against an exponential implementation, and the naive
     recurrence costs 222,981,434 calls on this exact input where the
-    memoized form costs 240 states. Assert separately that a glob
-    exceeding the segment bound raises `work_scope_glob_too_complex`
-    rather than being evaluated. **A correctness table and a termination
-    guarantee are different obligations** — all 17 semantic rows pass
-    against an implementation that hangs on this input.
+    memoized form costs 240 states.
+
+    Then assert the budget with **just-under / at / over fixtures on both
+    operands**, which the previous wording could not express because it
+    named no value:
+      - scope glob at 64 segments → accepted; at 65 →
+        `work_scope_glob_too_complex`
+      - domain glob at 64 segments → accepted; at 65 →
+        `work_domain_glob_too_complex`
+      - glob counts whose predicted aggregate is 1048576 → accepted; at
+        1048577 → `work_containment_budget_exceeded`, **with every
+        individual glob inside the per-glob cap**, which is the case no
+        per-glob assertion can reach
+    Assert in every over case that the hold is raised **without evaluating
+    any pair** — instrument the state counter and assert it is zero. A
+    bound discovered by exceeding it is not a bound, and an
+    implementation that evaluates first and refuses afterwards passes
+    every assertion about the returned code while doing the unbounded
+    work the code exists to prevent.
+
+    **A correctness table and a termination guarantee are different
+    obligations** — all 17 semantic rows pass against an implementation
+    that hangs on this input.
 
 ## Threat Model And Honest Limits
 
@@ -3142,10 +3260,15 @@ different questions.**
   `work show --json` and `work check --json` emit a `work-view-v1`
   envelope, with the same `--output-schema legacy` escape hatch the
   knowledge view established. The **default non-`--json` human output is
-  also a projection** and is bound by the same no-drop rules: two axes
-  plus any `cautions`. Naming only the `--json` surfaces here is what let
+  also a projection** and is bound by the same no-drop rules: two axes,
+  any `cautions`, **and the `domain` object with its `entitlement`
+  state**. Naming only the `--json` surfaces here is what let
   an earlier draft add a mitigation to the machine paths and leave the
-  human path conforming without it. These are *consumer surfaces*: a dashboard
+  human path conforming without it. The no-drop set is **three** things,
+  not two-plus-cautions: an earlier version of this clause listed only the
+  axes and `cautions`, which left the entitlement marker outside the
+  projection contract entirely — so a conforming projection could omit it
+  while the topical rule said it was mandatory. These are *consumer surfaces*: a dashboard
   or script breaking on an additive field is a real cost, and a misread
   here causes display drift, not a false GO.
 
@@ -3249,14 +3372,27 @@ Implement:
   domain of `src/*`. All seventeen required cases are D2 tests; the
   descriptor-accepted-member-rejected obligation is one of them, and the
   three rows marked DISCRIMINATING are not optional.
-- **`covers` MUST be memoized or iterative over `(D-index, G-index)`**,
-  with a segment-count bound raising `work_scope_glob_too_complex`. The
-  naive recurrence is exponential on shape-valid input and the predicate
-  runs on every read, so an implementation that transcribes the five
-  clauses literally ships a hang. The three asserted properties —
-  reflexivity, one-sidedness, order-independence — are D2 tests
-  alongside the table, because an implementation can pass all seventeen
-  rows and violate any of them.
+- **`covers` MUST be memoized or iterative over `(D-index, G-index)`.**
+  The naive recurrence is exponential on shape-valid input and the
+  predicate runs on every read, so an implementation that transcribes the
+  five clauses literally ships a hang. The three asserted properties —
+  reflexivity, one-sidedness, order-independence — are D2 tests alongside
+  the table, because an implementation can pass all seventeen rows and
+  violate any of them.
+- **The state budget and its check order**, with `MAX_GLOB_SEGMENTS` = 64
+  and `MAX_CONTAINMENT_STATES` = 2^20, enforced on **both** operands
+  before any evaluation: `work_scope_glob_too_complex`,
+  `work_domain_glob_too_complex`, `work_containment_budget_exceeded`.
+  The domain side is not optional — `domains.py` caps neither glob length
+  nor list size and work cannot change it.
+- **The entitlement marker RENDERS in D2, on every surface.** `domain`
+  is emitted as `{domain_id, entitlement}` — never a bare `domain_id` —
+  in `work-view-v1` at `view["domain"]`, in the legacy shape, and in the
+  **default non-`--json` human output** of `show`, `check` and `list`.
+  D2 is where these surfaces are built, so D2 is where the obligation
+  binds; D4 only adds the GO-blocking hold. An item is renderable in D2
+  long before it is checkable in D4, and the pre-D4 window is exactly
+  when a bare domain would be read as an authority association.
 - **`deliver`'s precondition**: a bound lane, and
   `validate_delivery_artifact(..., require_isolation=True)` called with a
   `head_sha` resolved live from the lane — never read from the artifact.
@@ -3460,6 +3596,48 @@ needs it — not during it.
    grandfathered, because grandfathering would convert a disclosed gap
    into a permanent silent exemption for precisely the population created
    while the gap was open.
+
+## Obligation → Phase Map
+
+Every normative MUST introduced by an amendment gets a row here, naming the
+phase that builds it and the phase-list line that carries it. One row per
+**obligation**, not per rule: a rule with two phase consequences produces
+two rows, and carrying one of them leaves a visibly empty cell rather than
+an unasked question.
+
+The point is that it is **count-checkable by someone who is not the author**
+— N obligations, N phase assignments, N cited lines — so a reviewer can
+falsify it without re-deriving the author's reasoning. "I ran the
+propagation sweep" is a description of a process; this is an artifact.
+
+It does not replace the consumer-propagation sweep, it reports it. If the
+phase list was never visited at all, every third cell is empty and the
+table shows that immediately.
+
+| obligation | phase | phase-list line |
+|---|---|---|
+| `covers` is memoized/iterative over `(D-index, G-index)` | D2 | Phase D2 → "`covers` MUST be memoized or iterative" |
+| 17 required cases, incl. 3 DISCRIMINATING rows | D2 | Phase D2 → "All seventeen required cases are D2 tests" |
+| reflexivity, one-sidedness, order-independence tested | D2 | Phase D2 → "The three asserted properties" |
+| state budget enforced on the SCOPE operand | D2 | Phase D2 → "The state budget and its check order" |
+| state budget enforced on the DOMAIN operand | D2 | Phase D2 → same line, "The domain side is not optional" |
+| aggregate budget checked BEFORE any evaluation | D2 | Phase D2 → same line, check order |
+| `domain` renders as `{domain_id, entitlement}` in `work-view-v1` | D2 | Phase D2 → "The entitlement marker RENDERS in D2" |
+| same object in the LEGACY shape | D2 | Phase D2 → same line |
+| same state in DEFAULT HUMAN output of `show`/`check`/`list` | D2 | Phase D2 → same line |
+| unverified entitlement blocks GO | **D4** | Phase D4 → "`work_domain_entitlement_unverified` as a GO-blocking `UNKNOWN`" |
+| entitlement VERIFICATION is not built | D4 | Phase D4 → "Do **not** implement entitlement VERIFICATION" |
+| migration treats pre-existing bindings as unverified | **UNASSIGNED** | — see below |
+
+**The last row is the table working.** Building it surfaced an obligation
+with no phase: the fail-closed migration rule is conditioned on "the
+amendment that closes Open Question #9", and that amendment is unscheduled,
+so nothing in D1–D5 builds it. This is disclosed rather than resolved —
+assigning it a phase would mean scheduling the entitlement-granting design,
+which is not this amendment's to schedule. A reader must not conclude the
+migration rule is built; it is specified and unscheduled, and those are
+different states. It was invisible until the table forced a phase column
+next to it.
 
 ## Acceptance Criteria For The RFC
 
