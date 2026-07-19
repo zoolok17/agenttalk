@@ -299,6 +299,67 @@ backlog is what production is actually asking for.
 
 ---
 
+## Substrate v2 — from-scratch reflection (2026-07-20, 5-voice consensus)
+
+A "what would you do differently from scratch?" question (operator → Fable)
+was put to the team: two Codex agents, two Claude agents, plus Fable and the
+lead — 4 vendors/roles, answered independently. They converged hard on FIVE
+pillars. **This records a DIRECTION; it is design-first (RFC), NOT a committed
+rewrite.** The system works and is load-bearing; this is where *new* substrate
+investment points, and where to stop deepening the old model.
+
+**Consensus pillars (ranked):**
+1. **Fact plane vs. message plane.** `obligations.py` (8,161 lines — larger than
+   the store) is a hand-built event-sourcing/transaction engine that exists only
+   because state-bearing facts ride a cursor-consumed chat carrier. Separate
+   them: chat stays ephemeral, cursor-consumed, per-file JSON (KEEP); facts
+   become typed, append-only records with ONE declared reduce contract. Already
+   in motion via the Native Work & Evidence Spine (#27) + close-provenance (#31).
+2. **Immutable signed event log — NOT a synced SQLite file.** The synced folder
+   holds immutable, never-overwritten, writer-partitioned, content-addressed,
+   signed records; each machine builds a DISPOSABLE local SQLite projection (WAL
+   local, never synced), rebuildable from the log. Two hosts produce DISJOINT
+   writes the sync merges by convergence — the property #37/#44 chase reactively.
+   (Corrects the naive "one bus.db"; survives no-atomic-rename + no-cross-host-
+   lock by construction.)
+3. **Identity signed-at-write, a founding primitive.** Every record signed by its
+   author; id binds author; roster is itself a signed record. Removes the
+   read-time fail-open surface + the detection-vs-security-grade retrofit tax.
+   (Overlaps identity-authz RFC #19.)
+4. **Headless models as untrusted workers.** A typed turn protocol
+   (TurnEnvelope → ActionIntent → receipt); the host validates + commits bus
+   actions; the model never holds the bus key, never shells `agenttalk`, never
+   picks its own `--from`. Fixes the Qwen print-not-run / dontAsk-transport
+   failure. Interactive wrapping = optional UX, never authority. → fold into
+   agent-lifecycle RFC #36.
+5. **One committed SHA-bound hermetic gate** (`agenttalk dev-gate`): pins env,
+   verifies a clean SHA, runs source AND built-wheel modes, emits machine-
+   readable evidence; CI invokes the same manifest. Near-term, no-regret. → #50.
+
+**Hard honesty limit (the team's addition, not in the Fable answer):** a synced
+folder CANNOT provide consensus or exactly-once. Linearization or a single
+external effect (spend, launch, privileged approval) MUST route through one named
+coordinator or block offline. Tail-deletion is unprovable to a fresh replica
+without a peer/external witness. This is the real boundary of the whole approach
+— and it is exactly the OVH €-cap / paid-dispatch case (why spend runs
+single-owner, reserve-before-transport).
+
+**KEEP (unanimous):** human-readable per-file JSON (legibility =
+reproduce-don't-believe); the typed review-result gate + adversarial multi-round
+review (it CAUGHT the fail-opens); the #37/#44 invariants (fail-closed,
+reserve-before-effect, heal-only-unpinned-tail); single-consumer delivery +
+one-message turns; local-first / no-server.
+
+**Sequencing (lead decision, 2026-07-20):** NOT a big-bang rewrite (second-system
+trap on a working system). (a) **Hermetic gate NOW** (#50) — valuable under any
+substrate. (b) **Substrate-v2 RFC** to scope pillars 1–3 design-first (absorbs
+#19) — #51. (c) Headless → RFC #36. (d) cli.py command-registry (#42) as the
+typed-core enabler. (e) Continue incremental fact-plane (#27/#31). (f) HOLD
+net-new features that deepen the old `obligations.py` model; keep shipping cheap
+hardening.
+
+---
+
 ## Operational notes (lessons from build + production)
 
 ### Fleet upgrade discipline (new, 2026-06-05)
