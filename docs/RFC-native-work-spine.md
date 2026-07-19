@@ -3150,18 +3150,34 @@ a named test in D1–D4's acceptance set.
 
     Then assert the rendering **PATH-EXACTLY, on every surface that can
     name a domain** — not "a rendering", which one conforming surface
-    satisfies while every other still forges the association:
+    satisfies while every other still forges the association. **The
+    assertions are assigned per phase, not pooled**, because the surfaces
+    are built in different phases and a pooled test cannot be written by
+    either builder alone:
+
+    *D2 — the producer and the surfaces D2 has:*
       - `work show --json` → `view["domain"]["entitlement"] == "unverified"`
-      - `work check --json` → same path, same value
       - `work list --json` → same path on every listed row
+      - `work status` projection → same
       - `--output-schema legacy` → `domain` present, carrying
         `{domain_id, entitlement}`, **not** flattened to a bare id
-      - default non-`--json` output of `show`, `check` and `list` → the
+      - default non-`--json` output of `show`, `list`, `status` → the
         entitlement state is rendered adjacent to the domain name
-    Assert additionally that **no projection emits `domain_id` as a bare
-    scalar anywhere in its output**. That assertion is the one that
-    survives a surface being added later; the list above is exhaustive
-    only as of this amendment.
+
+    *D4 — `work check`, which D2 forbids and therefore cannot test:*
+      - `work check --json` → `view["domain"]["entitlement"]`, same value
+      - `work check` legacy and default human output → same rule
+      - and that `check` consumes the D2 producer rather than
+        constructing its own representation
+
+    Assert additionally, **in D2, as its own test and not as the
+    conjunction of the surfaces above**, that **no projection emits
+    `domain_id` as a bare scalar anywhere in its output**. The
+    surface-by-surface assertions are exhaustive only as of this
+    amendment; this one is what a surface added later must also satisfy.
+    Writing it as "all the listed surfaces pass" would rebuild the
+    distributive shape this amendment exists to remove — three instances
+    that a fourth surface is not bound by.
 
     Under the disposition this replaces, this input returned `GO` — a
     rostered actor binding a domain they do not own, carrying a forged
@@ -3385,14 +3401,24 @@ Implement:
   `work_domain_glob_too_complex`, `work_containment_budget_exceeded`.
   The domain side is not optional — `domains.py` caps neither glob length
   nor list size and work cannot change it.
-- **The entitlement marker RENDERS in D2, on every surface.** `domain`
-  is emitted as `{domain_id, entitlement}` — never a bare `domain_id` —
-  in `work-view-v1` at `view["domain"]`, in the legacy shape, and in the
-  **default non-`--json` human output** of `show`, `check` and `list`.
-  D2 is where these surfaces are built, so D2 is where the obligation
-  binds; D4 only adds the GO-blocking hold. An item is renderable in D2
-  long before it is checkable in D4, and the pre-D4 window is exactly
-  when a bare domain would be read as an authority association.
+- **The domain object PRODUCER, and the renderers for the surfaces D2
+  actually has.** D2 builds the single reusable `{domain_id,
+  entitlement}` representation and binds it in `work-view-v1` at
+  `view["domain"]`, in the legacy shape, and in the **default
+  non-`--json` human output** — for `show`, `list`, and the D2 `status`
+  projection. **`work check` is NOT among them**: D2 forbids it below,
+  and its rendering is D4's, listed there.
+  D2 owns the producer because D2 builds the first surfaces that can name
+  a domain, and the pre-D4 window is exactly when a bare domain would be
+  read as an authority association.
+- **The no-bare-scalar invariant is a D2 obligation in its own right, and
+  it is NOT the sum of the surfaces above.** `domain_id` must be
+  unemittable as a bare scalar from any projection, including one added
+  later by someone who never reads this amendment. Implementing the three
+  named surfaces satisfies the three named surfaces; it does not
+  establish the invariant, and a fourth surface added afterwards is
+  exactly the case the invariant exists for. Enforce it at the producer —
+  there is one representation and no code path that emits the id alone.
 - **`deliver`'s precondition**: a bound lane, and
   `validate_delivery_artifact(..., require_isolation=True)` called with a
   `head_sha` resolved live from the lane — never read from the artifact.
@@ -3463,6 +3489,19 @@ Implement:
   present as `[]` when empty. Deriving it without rendering it on the
   default path leaves the mitigation on the surfaces an operator does not
   read.
+- **`work check`'s domain rendering, and SI #41's check-specific
+  assertions.** D4 builds `work check`, so D4 binds its `--json`, legacy
+  and default-human renderings to the D2 `{domain_id, entitlement}`
+  producer — it does not re-implement the object, and it does not emit a
+  bare `domain_id`. The path-exact assertions for `work check --json` and
+  for `check`'s human output live here, not pooled with D2's.
+  This split exists because an earlier draft assigned the whole rendering
+  obligation, `check` included, to D2 — which forbids `work check`. A D4
+  builder following the phase plan would legitimately have found no D2
+  check consumer to extend and built `work check` with an unbound
+  renderer, recreating the forged-authority display while the obligation
+  map read green. **An absent obligation is an open question; a
+  misassigned one is an answered question with the wrong answer.**
 - **`work_domain_entitlement_unverified` as a GO-blocking `UNKNOWN`.** D4
   is the first phase that emits a verdict and is therefore where this
   binds — not D6. Until Open Question #9 lands a granting mechanism,
@@ -3614,30 +3653,63 @@ It does not replace the consumer-propagation sweep, it reports it. If the
 phase list was never visited at all, every third cell is empty and the
 table shows that immediately.
 
-| obligation | phase | phase-list line |
-|---|---|---|
-| `covers` is memoized/iterative over `(D-index, G-index)` | D2 | Phase D2 → "`covers` MUST be memoized or iterative" |
-| 17 required cases, incl. 3 DISCRIMINATING rows | D2 | Phase D2 → "All seventeen required cases are D2 tests" |
-| reflexivity, one-sidedness, order-independence tested | D2 | Phase D2 → "The three asserted properties" |
-| state budget enforced on the SCOPE operand | D2 | Phase D2 → "The state budget and its check order" |
-| state budget enforced on the DOMAIN operand | D2 | Phase D2 → same line, "The domain side is not optional" |
-| aggregate budget checked BEFORE any evaluation | D2 | Phase D2 → same line, check order |
-| `domain` renders as `{domain_id, entitlement}` in `work-view-v1` | D2 | Phase D2 → "The entitlement marker RENDERS in D2" |
-| same object in the LEGACY shape | D2 | Phase D2 → same line |
-| same state in DEFAULT HUMAN output of `show`/`check`/`list` | D2 | Phase D2 → same line |
-| unverified entitlement blocks GO | **D4** | Phase D4 → "`work_domain_entitlement_unverified` as a GO-blocking `UNKNOWN`" |
-| entitlement VERIFICATION is not built | D4 | Phase D4 → "Do **not** implement entitlement VERIFICATION" |
-| migration treats pre-existing bindings as unverified | **UNASSIGNED** | — see below |
+**Test for whether a row carries an obligation:** *would this row go empty
+if the obligation were dropped from the document?* A row that cannot go
+empty is describing the plan rather than checking it. Rows 7 and 14 below
+are the ones this test was written against — a universal invariant and its
+enumerated instances are DIFFERENT obligations, and a map that lists only
+the instances re-creates, one layer up, the distributive shape the
+amendment removed from the spec.
 
-**The last row is the table working.** Building it surfaced an obligation
-with no phase: the fail-closed migration rule is conditioned on "the
-amendment that closes Open Question #9", and that amendment is unscheduled,
-so nothing in D1–D5 builds it. This is disclosed rather than resolved —
-assigning it a phase would mean scheduling the entitlement-granting design,
-which is not this amendment's to schedule. A reader must not conclude the
-migration rule is built; it is specified and unscheduled, and those are
-different states. It was invisible until the table forced a phase column
-next to it.
+**The map is EXHAUSTIVE over the obligations introduced or changed by
+amendment #14.** It does not attempt to cover pre-existing obligations from
+earlier amendments; that is a bounded claim and it is the whole claim.
+
+| # | obligation | phase | phase-list line |
+|---|---|---|---|
+| 1 | `covers` is memoized/iterative over `(D-index, G-index)` | D2 | Phase D2 → "`covers` MUST be memoized or iterative" |
+| 2 | 17 required cases, incl. the 3 DISCRIMINATING rows | D2 | Phase D2 → "All seventeen required cases are D2 tests" |
+| 3 | reflexivity, one-sidedness, order-independence tested | D2 | Phase D2 → "The three asserted properties" |
+| 4 | containment applied at BIND/WRITE — create and `start` | D2 | Phase D2 → "raising `work_scope_outside_domain` at every point `scope_globs` is written" |
+| 5 | containment RE-APPLIED on every read/verdict | D2 | Phase D2 → same line, "and again on every item read" |
+| 6 | SI #40's anti-simplification assertion — that a concrete-path checker ACCEPTS `src/*` vs `src/**` | D2 | Phase D2 → "must not delegate to `domains.check_paths`" |
+| 7 | **`domain_id` is unemittable as a bare scalar from ANY projection**, including one added later | D2 | Phase D2 → "The no-bare-scalar invariant is a D2 obligation in its own right" |
+| 8 | the single reusable `{domain_id, entitlement}` producer | D2 | Phase D2 → "The domain object PRODUCER" |
+| 9 | `view["domain"]` in `work-view-v1` for `show`/`list`/`status` | D2 | Phase D2 → same line |
+| 10 | `domain` in the LEGACY shape, object intact | D2 | Phase D2 → same line |
+| 11 | entitlement state in DEFAULT HUMAN output of `show`/`list`/`status` | D2 | Phase D2 → same line |
+| 12 | state budget enforced on the SCOPE operand | D2 | Phase D2 → "The state budget and its check order" |
+| 13 | state budget enforced on the DOMAIN operand | D2 | Phase D2 → same line, "The domain side is not optional" |
+| 14 | aggregate budget checked BEFORE any evaluation | D2 | Phase D2 → same line, check order |
+| 15 | **`work check`'s domain rendering**, bound to the D2 producer — `--json`, legacy, human | **D4** | Phase D4 → "`work check`'s domain rendering" |
+| 16 | SI #41's check-specific path-exact assertions | **D4** | Phase D4 → same line |
+| 17 | unverified entitlement blocks GO | **D4** | Phase D4 → "`work_domain_entitlement_unverified` as a GO-blocking `UNKNOWN`" |
+| 18 | entitlement VERIFICATION is not built | D4 | Phase D4 → "Do **not** implement entitlement VERIFICATION" |
+| 19 | migration treats pre-existing bindings as unverified | **UNASSIGNED** | — see below |
+
+**Nineteen rows.** An earlier version of this map claimed thirteen and
+listed twelve, which is a count nobody could check against a table that did
+not number its rows; the rows are numbered now so the claim and the artifact
+are comparable without recounting.
+
+**Row 19 is the map working, and so is the 15/16 split.** Two audits, two
+real findings:
+
+- **Row 19** surfaced an obligation with no phase. The fail-closed migration
+  rule is conditioned on "the amendment that closes Open Question #9", which
+  is unscheduled, so nothing in D1–D5 builds it. Disclosed rather than
+  resolved: assigning a phase means scheduling the entitlement-granting
+  design, which is not this amendment's to schedule. Specified-and-
+  unscheduled and built are different states, and a reader must not read one
+  as the other.
+- **Rows 15 and 16** exist because an earlier version assigned `work check`
+  rendering to D2 — a phase whose own text forbids `work check`. The map did
+  not merely mis-describe the plan; it pointed at a real hole in the phase
+  assignment, through which a D4 builder would have found no D2 check
+  consumer to extend and shipped an unbound renderer with the map reading
+  green. The plan was corrected first and these rows follow from the
+  correction, because fixing the rows to match the old plan would have
+  suppressed the finding rather than recorded it.
 
 ## Acceptance Criteria For The RFC
 
