@@ -381,6 +381,12 @@ Rules:
   the original `GO` stayed conforming. **A mutation-time guard and a
   read-time check are different consumers of the same rule** — moving a
   rule from one to the other is not propagating it to both.
+- **The phase list is a read-time consumer too**, and it is the one most
+  often missed: a builder reads it to decide what to implement, so a rule
+  absent from it is a rule that does not get built, however precisely the
+  normative sections state it. This clause itself was first propagated to
+  the normative rule, the HOLD table and the invariant — and not to the
+  phase list, in the very amendment that introduced the parity rule.
 - There is no `head_sha` in the item. Head is resolved live from the
   linked lane or the repo at read time, because a persisted head is stale
   the moment it is written and would invite exactly the evidence-rot the
@@ -2953,6 +2959,11 @@ Implement:
   permitted `scope_globs` update; and it **refuses** on an empty
   `scope_globs`. A `start` implemented as lane-binding only leaves
   `base_sha` null and reopens the gap this contract exists to close.
+- **The shared item-read validator surfaces `work_scope_empty`** on
+  `list` / `show` / `status`, **and blocks mutation of that state**. The
+  `start` refusal above is the mutation guard; this is the read-time half,
+  and implementing only the first leaves corrupt, hand-edited, and
+  out-of-protocol items reading as fine.
 - **`deliver`'s precondition**: a bound lane, and
   `validate_delivery_artifact(..., require_isolation=True)` called with a
   `head_sha` resolved live from the lane — never read from the artifact.
