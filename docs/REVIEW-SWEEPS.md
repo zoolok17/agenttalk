@@ -141,6 +141,29 @@ changed shape. Reachability asks about *writers* of a value.
 
 **Will not catch:** a value with a real producer that produces it wrongly.
 
+**RECURSE UNTIL IT GROUNDS.** For every named outcome, ask which input state
+produces it — **and then ask whether any producer can emit that input state.**
+One hop is not enough. Asking "which input state produces
+`work_link_unresolvable`?" found that the projection's input vocabulary had no
+tag for it. Asking the same question of the tag itself — "which producer emits
+`not_found`?" — found that no linked module can distinguish a missing record
+from an unreadable one, so nothing could ever populate it. The first hop finds
+a schema gap; the second finds that filling the schema would have shipped a
+branch no conforming producer could reach. **The sweep terminates only at
+something a real module actually returns.**
+
+**ENUMERATE THE NEIGHBOUR'S PUBLIC IDENTITY SURFACE.** When binding to another
+module's record, do not bind the identifier you already had in hand — go and
+list what the module exposes for identity. `close_id` was bound and
+`close_instance_id` was not, for six amendments, while `close.replace_close`
+*required* `expected_instance_id` from its own callers. The owning module
+treated the instance as mandatory and work linked past it. The diagnosis:
+**we bound what the neighbouring module ADVERTISED, not what it EXPOSED** —
+`lanes` put generation in the shape work already read, so it got bound;
+`close`'s instance id is public and documented as immutable, and nothing in the
+shape we happened to read prompted anyone to look. That is the reachability
+question asked of the wrong surface.
+
 **Instances:** `automation_ci` unreachable by design and disclosed rather than
 removed; `reopened` having no producer in D1–D5; and the sharpest one — the
 class value `blocking`, which had **no producer anywhere** because it was not a
@@ -304,6 +327,27 @@ Sweeps are checks. Checks are artifacts. Artifacts can be wrong.
 An absence result has two causes — the thing is not there, or you did not look
 where it is — and **nothing at the call site distinguishes them.**
 
+**VERIFY INTEGRITY BY DIFF, NOT BY COUNTING.** "Occurrence counts can coincide
+while content differs; a diff cannot." Counting tokens proves a number matches;
+diffing the whole universe proves **nothing was touched**, which is the actual
+property being claimed. Filter the diff for the tokens you care about and
+assert **zero deletions and zero modifications** — that is a strictly stronger
+claim than "the count is still 9".
+
+**REPORT NON-DISCREPANCIES EXPLICITLY.** When two correct probes disagree in
+shape, say so before anyone reads it as a conflict. `memoized` → 4 and
+`memoiz` → 5 differ only because the second catches "memoization"; stating that
+costs one line and prevents a round spent reconciling two correct numbers.
+
+**A near-miss worth the space.** A containment check once ran against a blob
+that had not been written to the object store. Git returned `fatal: bad
+object`, the grep saw empty output, and the count came back **0** — which reads
+exactly like a clean result. It was caught only because the error text shared
+the output stream; piped, it would have been reported as a passing check that
+never ran. That is this very failure arriving *inside the verification of a fix
+for a different instance of itself*, and it is the strongest argument in this
+file for leading with a control rather than trusting a zero.
+
 **Defence: a positive control, run in the SAME QUERY SHAPE.** Same command,
 same parser, same field path, against something known to be present. Only then
 trust the empty result. A control run a different way controls for the wrong
@@ -365,6 +409,32 @@ never what a real defect distribution looks like.
 This is the single most useful diagnostic in this document, because it detects
 a broken probe **from its output alone**, without needing a control.
 
+### THE PARTITION TEST IS NOT ABOUT PROBES
+
+It generalises to **any set of outcomes you have a theory about**. If the
+outcomes split cleanly on a property your theory does not mention, **the theory
+is wrong and the property is the answer.**
+
+Invented for a backtick-escaping bug in a PowerShell matcher; within hours it
+settled a question about coordination protocol. Three bus threads leaked their
+obligations and three did not. The standing theory was a structural conflict
+between two protocols requiring a mechanical bridge. The actual split: **every
+leak used `send`, every close used `reply`** — three and three, no exceptions,
+partitioned on a property the structural theory never mentioned. There was no
+conflict to bridge; a reply *is* its own message, and the rule had been misread
+as constraining the verb when it constrained bundling.
+
+**And the error that let it stand: explaining the failures instead of
+discriminating them from the successes.** A story that accounts for every
+failure and never touches a success is **unfalsifiable by construction** — the
+passing cases were never given a chance to refute it. Always compute the split.
+
+**Before building a bridge, check that the conflict is real.** A mechanical
+bridge would have worked here, and would have permanently encoded a conflict
+that does not exist, making every future delivery two operations instead of
+one. When a habit fails at a suspiciously regular rate, look for a rule you are
+applying in a stricter form than it was written.
+
 ### How it complements the positive control
 
 They answer different questions and you want both:
@@ -419,6 +489,14 @@ They are listed separately because they are all different — which is the point
    subject, or vice versa.
 6. **Metacharacter in the matcher** — the tool's own syntax silently eating part
    of the pattern.
+7. **Searching for the PAYLOAD instead of the NEIGHBOUR.** Verifying an
+   *insertion anchor* by searching for the content that is about to be
+   inserted. Worse than the other six: they produce noise, this one **inverts
+   the signal**. It is guaranteed to fail on every correct plan and to succeed
+   only where the work has already been done, so a clean result means the
+   opposite of what it appears to mean.
+   *Rule:* for an insertion anchor, the thing you are looking for is the
+   neighbour you will insert next to — never the payload.
 
 The unifying diagnosis: **the probe's model of the artifact was wrong, and the
 probe cannot tell.** Mechanisms 1–3 assume LAYOUT; layout is not structure. A
@@ -486,6 +564,16 @@ newly authored claim wearing a label that says *do not read this*.
 **FORENSICS**
 - `git hash-object -w` makes a reported fingerprint retrievable so a divergence
   can be diffed. It does **not** narrow the check-to-act window.
+- **`-w` makes an object RETRIEVABLE. A ref makes it DURABLE. The gap between
+  them is one `gc` away.** An unreferenced loose object survives until the next
+  prune (default two weeks) and not one moment longer. Anything you may need to
+  *prove something with later* gets a tag; `-w` is for the current cycle only.
+
+  This was settled by an experiment nobody designed. Three blobs preserved on
+  the same day: two were tagged and are still present; the third had only `-w`
+  and has been collected. The risk was flagged when it was stored and it
+  arrived exactly as described. It cost nothing only because the lost blob's
+  content happened to be derivable from a surviving one — luck, not design.
 
 **Keeping a forensic tool in the prevention column is how you end up with a
 well-documented recurring failure.**
@@ -522,6 +610,28 @@ alone**: no clone, no network, no correct repository state, no access to the
 artifact at all. **A wrong-length hash is not a typo. It is a value that was
 never measured.**
 
+**DEFENCE 3 — build the message body from a LITERAL string.** The related rule
+"never inline prose into a shell command, write it to a file" is **not
+sufficient**, and following it exactly still fails. The corruption happens
+while *building* the content, if the construct that builds it interpolates:
+a PowerShell double-quoted here-string (`@"..."@`) treats **backtick** as an
+escape, so ``​`reopened`​`` becomes a carriage return followed by `eopened`, and
+a mangled redirect can create a **file literally named `$null`** in the repo
+root. Use the literal form — `@'...'@` in PowerShell, single quotes in bash.
+
+The hazard is not "inlining in the command". It is **any interpolating string
+layer between your prose and the artifact**, wherever it sits. Observed four
+times in one day across two shells and two agents, which makes it a property
+of the medium.
+
+And the loss is **selective in the worst direction**: prose survives, code
+literals vanish. The reader gets fluent sentences with holes exactly where the
+identifiers were, and fluent text does not read as damaged.
+
+*Corollary:* check `git status` **after** sending, not only before. A shell
+that eats your backticks will also happily create a file from a mangled
+redirect, and that file lands in the working tree where it can be committed.
+
 **Why the guards bounded this anyway.** The three freeze guards do not detect
 fabrication, and do not need to. They ask one question — *does the artifact in
 front of me match the number in the message?* — and stale, mislabelled and
@@ -557,6 +667,17 @@ message, not the document. See *Placement of absence claims* for why.
   something no reader can check; numbering converts it into a presence claim.
 - The universe names the **AMENDMENT PARENT**, not the previous review revision.
 - It travels **COMPLETE** in every dispatch, at every hop.
+- **THE ROW TEST DETECTS SUBTRACTION, NOT ABSENCE — and this is its
+  structural limit.** It asks what happens if an obligation is DROPPED. It
+  cannot see a required thing that was **never introduced**, because there is
+  no row to go empty for something that was never a row. Three defects passed
+  it for exactly this reason: a missing typed carrier for an outcome the
+  document specified downstream, a completeness rule whose violation is an
+  OMISSION rather than a deletion, and an obligation with no phase line at all.
+  In every case the surrounding rows described real obligations and stayed
+  full. **Pair the row test with the recursion under sweep 3** — for every
+  named outcome, which input state produces it, and can anything emit that
+  input state.
 - **Row test:** *would this row go empty if the obligation were dropped?* A row
   that cannot go empty is describing the plan rather than checking it.
 
@@ -568,6 +689,57 @@ between an artifact and a description: "I ran the sweep" is a description.
 **Its own findings, in one amendment:** a `work check` obligation assigned to a
 phase that forbids `work check`; a migration obligation with no phase at all;
 and a 21-vs-22 row discrepancy that only a complete enumeration could expose.
+
+## Escalation triggers: make them checkable without the subject's cooperation
+
+When a repeated error raises the question of whether to reset or escalate,
+**state the trigger rather than applying it silently** — and construct it so
+someone other than the subject can evaluate it.
+
+Two shapes, from a real instance:
+
+- **Checkable by the observer.** "A typed coordinate appearing again after the
+  mechanical fix." The observer does not need the subject's assurance that they
+  are interpolating from command output — the shape check plus resolution shows
+  it. This is the same substitution the rest of this document argues for:
+  replace a claim about someone's care with an artifact anyone can test.
+- **NOT self-certifiable.** "A substantive claim turning out to be unsourced."
+  The subject cannot certify this one, because *not knowing* is the failure
+  mode — an unsourced claim feels exactly like a sourced one from the inside.
+
+For the second shape, the construction that works: the subject runs the audit,
+reports what it finds **including marginal cases**, and shows the output. Then
+**a clean report with no output shown is itself the trigger.** That converts an
+uncheckable property into a checkable artifact — the observer is not watching
+for the subject to be wrong, which they cannot see, but for **output to be
+absent**, which they can.
+
+The same instance produced the marginal-case rule: surface the borderline item
+rather than judging it. *Measured* versus *inferred-from-measurements* is the
+seam that coordinate failures come through — a value interpolated between two
+real endpoints has the SHAPE of a measurement and carries the AUTHORITY of the
+real values it sits between, and it is the thing nobody re-derives. Whether a
+marginal item clears the threshold is the observer's call, and they can only
+make it on items they are told about.
+
+## Trust-on-first-use is safe only for populations that were never at risk
+
+Retrofitting a TOFU scheme onto a security control **blesses whatever state
+exists at first observation**. If the substitution has already happened, TOFU
+permanently certifies the substituted value — so it defeats the guard for
+**exactly the population the guard exists to protect**, while appearing to
+protect everyone.
+
+Encountered as a migration option for an ABA guard: bind the identity seen at
+first read after upgrade. It looks like the cheap middle path between blocking
+everything and grandfathering everything, and it is the one option that is
+actively harmful. Recorded because it will look attractive again.
+
+The general form: **a control that begins trusting at the moment it is
+installed cannot distinguish a clean subject from a compromised one.** It is
+sound only where you can independently establish that nothing was at risk
+before installation — which, if you could establish it, would usually mean you
+did not need the control.
 
 ## Wrapped-agent constraints
 
