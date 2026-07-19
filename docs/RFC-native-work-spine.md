@@ -1095,15 +1095,24 @@ Rules:
   so nothing can produce `evidence_source == "automation_ci"` honestly and
   no `producer_class == "automation"` resolution rule exists either.
 - **The consequence, stated exhaustively from the bottom of the ladder:
-  in D1–D5 only a `release_min_tier` at or below `local_agent` admits a
-  `GO`; every higher floor is unmeetable.** `local_agent` is the sole
-  producible tier — `local_operator`, `automation_ci`, and
-  `external_attested` are each unreachable in these phases, and
-  `referenced` never satisfies a requirement on its own though a floor
-  set there is cleared by a `local_agent` artifact. Since
-  `release_min_tier` defaults to `automation_ci`, the default is
-  unmeetable and `work_artifact_insufficient_tier` holds every
-  release-blocking requirement.
+  in D1–D5 a `GO` requires that EVERY release-scoped rule matching a
+  changed path sit at or below `local_agent`; any higher floor on any
+  matching rule is unmeetable.** Phrased over all matching rules, not
+  over "a" floor, because policy is D-11 all-matching: **the strictest
+  matching floor governs**. A `src/**` rule at `local_agent` beside a
+  `src/payments/**` rule at `automation_ci` holds every change under
+  `src/payments/`, even though the first rule alone would have admitted
+  it — the same composition that makes a `supervisor.py` change owe both
+  example entries.
+- `local_agent` is the sole producible **satisfying** tier — not the sole
+  producible tier, since `referenced` is producible too (from manual or
+  missing-binding evidence) but never satisfies a requirement on its own,
+  though a floor set at `referenced` is cleared by a `local_agent`
+  artifact. `local_operator`, `automation_ci`, and `external_attested`
+  are each unreachable in these phases. Since `release_min_tier` defaults
+  to `automation_ci`, the default is unmeetable and
+  `work_artifact_insufficient_tier` holds every release-blocking
+  requirement.
 - Stated from the bottom deliberately. Enumerating downward from the top
   ("the default, or anything at `automation_ci` or above") is true but
   stops one rung short: a policy author who reads that the default is
@@ -1473,7 +1482,11 @@ def compute_verdict(item: dict, *, artifacts: list[dict], lane_eval: dict | None
                     source_manifest: dict, source_errors: list[dict]) -> dict[str, Any]:
 ```
 
-The return matches `close` and `lanes` exactly:
+The return **shares the core `close`/`lanes` keys — `verdict`, `holds`,
+`ok` — and extends them** with a per-hold `class`, a top-level
+`has_unknown`, and a top-level `cautions`. `close` and `lanes` return
+none of those three, so "matches exactly" would be false and would tell
+an implementer to drop the extensions:
 
 ```json
 {
@@ -1722,11 +1735,15 @@ Rules:
 | A review-result bound to the current revision exists and is approved | `work_review_missing` |
 | `gate_check.required_gates` is non-empty and every one is green | `work_release_gates_vacuous` |
 
-**In D1–D5 only a `release_min_tier` at or below `local_agent` admits a
-`GO`; every higher floor is unmeetable** — including the default, which
-is `automation_ci`. So an item satisfying every row above still holds
-unless its policy lowered the floor to `local_agent` or below, because
-`local_agent` is the only producible tier in these phases. The baseline
+**In D1–D5 a `GO` requires EVERY release-scoped rule matching a changed
+path to sit at or below `local_agent`; any higher floor on any matching
+rule is unmeetable** — including the default, which is `automation_ci`.
+Phrased over all matching rules because policy is D-11 all-matching and
+**the strictest matching floor governs**: a permissive `src/**` rule does
+not rescue a change that also matches a stricter nested rule. So an item
+satisfying every row above still holds unless *all* its matching
+release-scoped rules were lowered to `local_agent` or below, since
+`local_agent` is the only producible satisfying tier in these phases. The baseline
 above is the set of requirements a release will have to meet *once
 release-grade evidence is producible*.
 
@@ -1960,18 +1977,23 @@ Three cases pin the semantics:
 ### The View Envelope
 
 `compute_verdict` returns `{verdict, holds, ok}` with `close`/`lanes`'
-outer keys preserved, extended additively by a per-hold `class`, a
-top-level `has_unknown`, and a top-level **`cautions`** (see Work Check).
-All three appear in the envelope's nested verdict, in the legacy shape,
-and in the default human rendering — a projection that dropped them would
-hide the established/unknown distinction or the lowered-floor fact the
-evaluator computes.
+outer keys preserved, extended additively by a per-hold `class` and two
+keys at the top level **of the result** — `has_unknown` and `cautions`.
+"Top level of the result" is not the top level of the envelope: in
+`work-view-v1` both live inside `view["verdict"]`, which is byte-identical
+to the compute result. All three extensions appear there, in the legacy
+shape, and in the default human rendering — a projection that dropped
+them would hide the established/unknown distinction or the lowered-floor
+fact the evaluator computes.
+
 **`cautions` is returned by `compute_verdict` itself, not derived by the
 view builder.** The floor comparison that produces `release_floor_lowered`
 happens inside requirement evaluation; making the view builder re-derive
 it would duplicate verdict logic in a second place, and a direct
 `compute_verdict` consumer — which exists — would otherwise never see a
-caution at all. One producer, every consumer. That shape deliberately cannot carry history — and
+caution at all. One producer, one location, every consumer.
+
+That result shape deliberately cannot carry history — and
 the sections above promise history in several places: the H1 facts in
 case A, the H3 dissent in case C, `ledger_problems`, bounded
 `source_error` rows, a bounded error record per corrupt `work_id`, and
@@ -1985,12 +2007,13 @@ Those live in the **view**, not the verdict:
   "work_id": "w-0007",
   "record_state": "active",
   "verdict": {"verdict": "HOLD", "ok": false, "has_unknown": false,
-              "holds": [{"code": "work_artifact_stale", "class": "established", "detail": "…"}]},
+              "holds": [{"code": "work_artifact_stale", "class": "established", "detail": "…"}],
+              "cautions": [{"flag": "release_floor_lowered", "glob": "src/**",
+                            "accepted_tier": "local_agent"}]},
   "revision": {"base_sha": "e0e8f7b4…", "head_sha": "b8e1c3a7…", "resolved_at_head": true},
   "artifacts": [{"artifact_id": "a-3f91c2", "check_name": "pytest", "trust_tier": "local_agent",
                  "current": false, "caution_flags": ["rebased_identical_diff"]}],
   "history": [{"kind": "review", "revision": "H3", "status": "rejected", "applies_to_current": false}],
-  "cautions": [{"flag": "release_floor_lowered", "glob": "src/**", "accepted_tier": "local_agent"}],
   "source_errors": [{"source": "gates", "error": "gates.json unreadable"}],
   "ledger_problems": 0
 }
@@ -2021,13 +2044,21 @@ Rules:
 - The envelope carries the **snapshot content token** both axes were
   resolved from, so a reader can tell that the pair is internally
   consistent rather than composed from two reads.
+- **`cautions` has exactly ONE canonical location: inside the verdict
+  result**, i.e. `view["verdict"]["cautions"]`. It is not duplicated at
+  the envelope root. An earlier draft put it at the root while the rules
+  said the nested verdict is byte-identical to the compute result — two
+  canonical locations, so a builder following the example emitted a
+  verdict with no cautions while a builder following the rule broke
+  anything written against the example. In the flattened legacy shape it
+  is top-level, because that shape has no nesting to be inside of.
 - **`cautions` is item-level and survives a `GO`.** Per-artifact
   `caution_flags` describe one artifact; `release_floor_lowered` is a
   fact about a *requirement* and belongs to neither an artifact nor a
   hold — a satisfied requirement produces no hold, so a caution attached
   only to holds would vanish exactly when the floor was lowered and the
   item passed. That is the case it exists to make visible, so it rides
-  the result independently of the verdict.
+  the result independently of the verdict value.
 - **`cautions` is always present, as `[]` when empty**, in every JSON
   surface. An optional field cannot be tested for wrongful omission: a
   consumer cannot distinguish "no cautions" from "the producer forgot to
@@ -2049,7 +2080,7 @@ gates, close, lane isolation, and review requirements still apply.
       "glob": "src/agenttalk/**",
       "checks": ["ruff", "bandit", "pytest"],
       "min_tier": "local_agent",
-      "release_min_tier": "automation_ci",
+      "release_min_tier": "local_agent",
       "required_review": true,
       "release_scoped": true
     },
@@ -2057,7 +2088,8 @@ gates, close, lane isolation, and review requirements still apply.
       "glob": "src/agenttalk/supervisor.py",
       "checks": ["pytest", "supervisor-crash-matrix"],
       "min_tier": "local_operator",
-      "release_min_tier": "automation_ci"
+      "release_min_tier": "automation_ci",
+      "release_scoped": true
     }
   ],
   "require_close_lenses": true,
@@ -2088,6 +2120,13 @@ Rules:
 - A change to `src/agenttalk/supervisor.py` therefore satisfies both
   example entries, including the stricter `local_operator` floor and the
   union of both check lists.
+- The two example entries carry **different** `release_min_tier` values
+  (`local_agent` and `automation_ci`) so the example *demonstrates*
+  composition rather than merely asserting it: a change under
+  `src/agenttalk/` alone meets a satisfiable floor, while a change to
+  `supervisor.py` matches both rules and is governed by the stricter
+  `automation_ci` — unmeetable in D1–D5, so it holds. An example whose
+  entries agree cannot exhibit the rule it illustrates.
 - The **matched glob** is persisted on the artifact's satisfaction
   record, never the raw path. C2 persisted the path and let a broad
   approval clear a nested one; persisting the glob is what makes
@@ -2146,6 +2185,22 @@ Rules:
 - Both hashes are recorded on the verdict. "The policy changed" and
   "which direction it changed" are different facts, and a reviewer needs
   the second one to judge the waiver.
+- **Every rule's `checks` must be a non-empty list of valid check names.
+  An empty list is `work_policy_invalid`.** Without this, omission-as-
+  silent-waiver returns one level down: a rule
+  `{glob: "src/**", checks: [], release_scoped: true}` *satisfies* the
+  baseline's every-changed-path-matches-a-release-scoped-rule
+  requirement while providing nothing to satisfy — so no artifact
+  requirement exists, no tier comparison can fire,
+  `work_artifact_insufficient_tier` cannot raise, and the item reaches
+  `GO` under an unmeetable default floor.
+- The general form, stated because this is the second place it has
+  appeared: **a coverage requirement satisfied by a container says
+  nothing about that container's contents.** Any rule of the form "every
+  X must match some Y" needs Y's own non-vacuity stated separately, or
+  the match is satisfiable by an empty Y. We closed this at the item
+  level (no policy, no close, no review) and it came back in a child
+  collection.
 - Core validates policy **shape** only. It does not know what `ruff`,
   `bandit`, or `supervisor-crash-matrix` are, and it never executes them
   in D1–D5. A check name is an opaque string that an artifact's
@@ -2502,13 +2557,25 @@ a named test in D1–D4's acceptance set.
     release-blocking item whose base-policy rule sets
     `release_min_tier: "local_agent"`, one exact-bound passing
     `local_agent` artifact, every baseline row green — a legitimate `GO`.
-    Assert `release_floor_lowered` (naming the glob and accepted tier)
-    appears in **all three**: the `work-view-v1` envelope, the
-    `--output-schema legacy` shape, and the **default human output of
-    `work check` without `--json`**. Separately assert that an item with
-    no lowered floor emits `cautions: []` rather than omitting the key,
-    so a dropped caution is distinguishable from an absent one.
-33. **Release classification is total and conflict fails closed.**
+    Assert `release_floor_lowered` (naming the glob and accepted tier) at
+    the **exact path** on each surface, not merely that it appears
+    somewhere: `view["verdict"]["cautions"]` in `work-view-v1`, the
+    top-level `cautions` in the flattened `--output-schema legacy` shape,
+    and the rendered flag in the **default human output of `work check`
+    without `--json`**. Path-exact, because "appears in the envelope"
+    passes for two different locations and that ambiguity is what this
+    invariant exists to pin. Separately assert
+    `view["verdict"]["cautions"] == []` for an item with no lowered
+    floor, rather than the key being absent, so a dropped caution is
+    distinguishable from an absent one.
+33. **An empty `checks` list cannot launder a release.** *Test:* base
+    policy `{glob: "src/**", checks: [], release_scoped: true,
+    release_min_tier: "automation_ci"}`, a release close, a bound
+    approved review, non-empty green gates — every baseline row passes on
+    coverage. Assert `work_policy_invalid` rather than `GO`: the empty
+    list must be rejected at validation, because once it is accepted
+    there is no requirement left for any tier check to fire against.
+34. **Release classification is total and conflict fails closed.**
     *Test:* the full truth table — a release-class close with an
     all-`false` policy, a non-release close with a `release_scoped: true`
     rule (both yield release-blocking plus
