@@ -4655,7 +4655,11 @@ def test_publication_order_sidecar_damage_fails_closed(
     second = _question(store, "q-publication-anchor-b")
     if damage == "rollback":
         order_path.write_text(first_order, encoding="utf-8")
-        error = "rolled back"
+        # #37: the sidecar is rolled back below its (higher) anchor, i.e. the
+        # durable order lost committed history. Reading the anchor first now names
+        # this cause precisely ("anchor is ahead of its sidecar") instead of the
+        # old generic "rolled back"; still fail-closed, just a clearer message.
+        error = "anchor is ahead of its sidecar"
     elif damage == "reorder":
         order = json.loads(order_path.read_text(encoding="utf-8"))
         order["messages"][first.id], order["messages"][second.id] = (

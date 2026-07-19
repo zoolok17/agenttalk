@@ -27,7 +27,12 @@ from agenttalk import signing as _signing
 from agenttalk import supervisor as sup
 from agenttalk import powershell_host as psh
 from agenttalk import supervisor_lifecycle
-from agenttalk.store import Store, find_root, find_stores_upward
+from agenttalk.store import (
+    STORE_SCHEMA_CAPABILITIES,
+    Store,
+    find_root,
+    find_stores_upward,
+)
 
 
 _TASK_QUERY_SENTINEL = "AGENTTALK_TASK_QUERY_V1:"
@@ -62,6 +67,13 @@ class Report:
     agenttalk_version: str
     python_version: str
     project_root: str
+    # #37 Fix 2: discriminate the RUNNING code when two writers report the same
+    # --version. module_path distinguishes a PYTHONPATH=src checkout from an
+    # installed wheel; schema_capabilities names what the running store supports,
+    # so a capability-deficient writer (the one that can corrupt the store's
+    # ordering invariant) is visible by comparing agents' `doctor` output.
+    agenttalk_module_path: str = ""
+    store_schema_capabilities: list[str] = field(default_factory=list)
     checks: list[Check] = field(default_factory=list)
 
     @property
@@ -78,6 +90,8 @@ class Report:
             # by reading exactly one key, on both output surfaces.
             "project_root": self.project_root,
             "agenttalk_version": self.agenttalk_version,
+            "agenttalk_module_path": self.agenttalk_module_path,
+            "store_schema_capabilities": self.store_schema_capabilities,
             "python_version": self.python_version,
             "overall": self.overall,
             "checks": [
@@ -97,10 +111,13 @@ def run(project_root: Path | None = None) -> Report:
     """
     root = (project_root or find_root()).resolve()
     py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    import agenttalk as _agenttalk_pkg
     report = Report(
         agenttalk_version=__version__,
         python_version=py,
         project_root=str(root),
+        agenttalk_module_path=str(Path(_agenttalk_pkg.__file__).resolve().parent),
+        store_schema_capabilities=list(STORE_SCHEMA_CAPABILITIES),
     )
 
     store = Store(root)
