@@ -169,6 +169,7 @@ def run(project_root: Path | None = None) -> Report:
         if holds is not None:  # additive: absent unless a valid config-blocked hold exists
             report.checks.append(holds)
         report.checks.append(_check_detection_commit_gate(store))
+        report.checks.append(_check_publication_order(store))
         kn_check = _check_knowledge(store)
         if kn_check is not None:  # additive: absent unless a knowledge store exists
             report.checks.append(kn_check)
@@ -185,6 +186,46 @@ def run(project_root: Path | None = None) -> Report:
         if lead_check is not None:  # additive: absent unless a lead-loop concern exists
             report.checks.append(lead_check)
     return report
+
+
+def _check_publication_order(store: Store) -> Check:
+    """Surface the publication-order sidecar's integrity state (#37).
+
+    Serves the diagnostics the self-heal relies on: an absent tamper-anchor is a
+    WARN (transient after a crash; the next send re-anchors), and a genuine
+    corruption (digest mismatch / anchor-ahead / lone anchor) is an ERROR naming
+    the cause — so an operator sees the state that a shared `--version` hides,
+    rather than discovering it as a comms outage.
+    """
+    name = "publication order"
+    order_path = store.state_dir / "message-publication-order.json"
+    anchor_path = store.state_dir / "message-publication-order.anchor.json"
+    if not order_path.exists():
+        if anchor_path.exists():
+            return Check(
+                name=name, status="error",
+                details="sidecar is missing while its tamper-anchor exists "
+                        "(the durable order file was lost or removed)",
+                fix="investigate; do not delete the anchor to work around this",
+            )
+        return Check(name=name, status="ok",
+                     details="no durable order yet (legacy or empty store)")
+    try:
+        store._read_message_publication_order()
+    except ValueError as exc:
+        return Check(
+            name=name, status="error",
+            details=f"integrity check failed: {exc}",
+            fix="investigate before writing; do not delete the sidecar/anchor blindly",
+        )
+    if not anchor_path.exists():
+        return Check(
+            name=name, status="warn",
+            details="sidecar present but its tamper-evidence anchor is absent "
+                    "(expected transiently after a crash; the next send re-anchors)",
+            fix="run any send to re-anchor, or investigate if this persists",
+        )
+    return Check(name=name, status="ok", details="durable order and anchor present")
 
 
 def _check_detection_commit_gate(store: Store) -> Check:

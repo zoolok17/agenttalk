@@ -216,3 +216,39 @@ def test_doctor_reports_module_path_and_capabilities(store_root: Path) -> None:
     assert data["agenttalk_module_path"].replace("\\", "/").endswith("agenttalk")
     assert "message-publication-order/v1" in data["store_schema_capabilities"]
     assert "message-publication-order/v1" in STORE_SCHEMA_CAPABILITIES
+
+
+def _pub_order_check(report) -> object:
+    return next(c for c in report.checks if c.name == "publication order")
+
+
+def test_doctor_warns_on_absent_anchor(store: Store, store_root: Path) -> None:
+    _send(store, 2)
+    _anchor_path(store).unlink()
+    check = _pub_order_check(doctor.run(store_root))
+    assert check.status == "warn"
+    assert "anchor is absent" in check.details
+
+
+def test_doctor_errors_on_corrupt_order(store: Store, store_root: Path) -> None:
+    _send(store, 3)
+    anchor = _read_anchor(store)
+    anchor["append_sequence"] = int(anchor["append_sequence"]) + 1  # anchor ahead
+    _anchor_path(store).write_text(json.dumps(anchor), encoding="utf-8")
+    check = _pub_order_check(doctor.run(store_root))
+    assert check.status == "error"
+    assert "integrity check failed" in check.details
+
+
+def test_doctor_errors_on_lone_anchor(store: Store, store_root: Path) -> None:
+    _send(store, 2)
+    _order_path(store).unlink()   # sidecar gone, anchor remains
+    check = _pub_order_check(doctor.run(store_root))
+    assert check.status == "error"
+    assert "missing while its tamper-anchor exists" in check.details
+
+
+def test_doctor_ok_on_healthy_order(store: Store, store_root: Path) -> None:
+    _send(store, 2)
+    check = _pub_order_check(doctor.run(store_root))
+    assert check.status == "ok"
