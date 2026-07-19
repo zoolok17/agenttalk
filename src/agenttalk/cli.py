@@ -8196,6 +8196,13 @@ def _render_doctor_human(report) -> None:
     print(f"root: {report.project_root}")
     print("agenttalk doctor")
     print(f"  agenttalk version  {report.agenttalk_version}")
+    # #37 Fix 2: the running module path + capabilities discriminate two writers
+    # that report the same version (src checkout vs installed wheel) — compare
+    # these across agents to spot a store-corrupting version skew.
+    if report.agenttalk_module_path:
+        print(f"  module path        {report.agenttalk_module_path}")
+    if report.store_schema_capabilities:
+        print(f"  store schema caps  {', '.join(report.store_schema_capabilities)}")
     print(f"  python version     {report.python_version}")
     print()
     badge = {"ok": "ok  ", "warn": "warn", "error": "FAIL"}

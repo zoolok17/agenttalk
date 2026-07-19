@@ -20,6 +20,7 @@ import contextlib
 import errno
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -47,7 +48,16 @@ if os.name == "nt":
 else:
     import fcntl
 
+logger = logging.getLogger(__name__)
+
 DIRNAME = ".agenttalk"
+
+# Capability tokens the RUNNING store code supports. Surfaced by `doctor` so two
+# writers reporting the same --version (e.g. a PYTHONPATH=src build and an
+# installed wheel) are still discriminable — a writer lacking a token here is one
+# that can leave the store in a state a token-bearing writer must repair (#37).
+STORE_SCHEMA_CAPABILITIES = ("message-publication-order/v1",)
+
 _ID_ALPHABET = string.ascii_letters + string.digits
 # Canonical generated-message-id shape, built FROM _ID_ALPHABET so the
 # validator can never drift from `_new_id` (which emits
@@ -1568,43 +1578,128 @@ class Store:
         return raw
 
     def _read_message_publication_order(self) -> dict | None:
+        """Read + verify the publication-order sidecar (or None for a legacy store).
+
+        Reads the ANCHOR before the sidecar. ``append_sequence`` is monotonic
+        (append-only; the pinned prefix is never rewritten), so anchor-first makes
+        ``anchor_seq <= sidecar_seq`` hold for any concurrent writer's two-file
+        update — a LOCK-FREE reader can never observe the anchor ahead of the
+        sidecar merely from a race (#37 HIGH: the old sidecar-first read raised a
+        false ``rolled back`` tamper on every busy send, which silently degraded
+        owed-action/terminal projection). A bounded re-read rides out the torn
+        two-file window; only a DURABLE anchor-ahead-of-sidecar survives, and that
+        means the sidecar lost committed history (genuine corruption) → fail loud.
+        Under the publication lock (write path) there is no concurrent writer, so
+        the first attempt is always consistent and the retry never sleeps.
+        """
         order_path = self._message_publication_order_path
         anchor_path = self._message_publication_order_anchor_path
-        if not order_path.exists():
-            if anchor_path.exists():
+        attempts = 4
+        for attempt in range(attempts):
+            last = attempt == attempts - 1
+            if not order_path.exists():
+                if not anchor_path.exists():
+                    return None
+                # A lone anchor: transient (mid two-file write) or the sidecar was
+                # lost/removed. Retry to clear the race, then fail loud with cause.
+                if not last:
+                    time.sleep(0.01 * (attempt + 1))
+                    continue
                 raise ValueError(
-                    "message publication order sidecar is missing while its anchor exists"
+                    "message publication order sidecar is missing while its anchor "
+                    "exists (the durable order file was lost or removed; the anchor "
+                    "cannot be satisfied) — investigate; do not delete the anchor "
+                    "to work around this"
                 )
-            return None
-        try:
-            raw_order = json.loads(order_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError("message publication order sidecar is unreadable") from exc
-        order = self._validate_message_publication_order(raw_order)
-        if not anchor_path.exists():
+            # Anchor FIRST (see docstring), then the sidecar.
+            anchor = None
+            if anchor_path.exists():
+                try:
+                    raw_anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        "message publication order anchor is unreadable"
+                    ) from exc
+                anchor = self._validate_message_publication_order_anchor(raw_anchor)
+            try:
+                raw_order = json.loads(order_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    "message publication order sidecar is unreadable"
+                ) from exc
+            order = self._validate_message_publication_order(raw_order)
+            if anchor is None:
+                # Sidecar present, anchor absent: contiguity-validated but not
+                # tamper-pinned (a crash during first-bootstrap wrote the sidecar
+                # at :1640 before the anchor at :1644, or the anchor was removed).
+                # Serve it — failing loud would wedge a benign crash-recovery — and
+                # let the next write re-anchor it (`_reserve...` always rewrites the
+                # anchor). #37 MED fold.
+                return order
+            anchor_sequence = int(anchor["append_sequence"])
+            order_sequence = int(order["append_sequence"])
+            if anchor_sequence > order_sequence:
+                # Anchor ahead of the sidecar: a torn lock-free read (retry clears
+                # it) or, if durable, the sidecar lost committed history.
+                if not last:
+                    time.sleep(0.01 * (attempt + 1))
+                    continue
+                raise ValueError(
+                    "message publication order anchor is ahead of its sidecar "
+                    "(the durable order lost committed history — corruption, not a "
+                    "recoverable version-skew); investigate before writing"
+                )
+            prefix_digest = self._message_publication_order_chain(
+                order["messages"],
+                through=anchor_sequence,
+            )
+            if prefix_digest != anchor["chain_digest"]:
+                raise ValueError(
+                    "message publication order sidecar changed below its anchor "
+                    "(chain digest mismatch — the pinned order was modified or "
+                    "corrupted; this is NOT a recoverable version-skew) — "
+                    "investigate before writing; do not delete the sidecar blindly"
+                )
             return order
-        try:
-            raw_anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError("message publication order anchor is unreadable") from exc
-        anchor = self._validate_message_publication_order_anchor(raw_anchor)
-        anchor_sequence = int(anchor["append_sequence"])
-        if anchor_sequence > int(order["append_sequence"]):
-            raise ValueError("message publication order sidecar rolled back")
-        prefix_digest = self._message_publication_order_chain(
-            order["messages"],
-            through=anchor_sequence,
-        )
-        if prefix_digest != anchor["chain_digest"]:
-            raise ValueError("message publication order sidecar changed below its anchor")
-        return order
+        return None  # unreachable: the loop returns or raises on the last attempt
+
+    @classmethod
+    def _extend_order_with_orphans(
+        cls, order: dict, orphan_ids: list[str]
+    ) -> dict:
+        """Return a NEW order dict with ``orphan_ids`` appended at the tail in
+        deterministic id-order — the SAME rule the initial bootstrap uses
+        (`sorted(..., key=id)`). Existing entries are never rewritten, so the
+        anchored prefix is preserved: healing can neither reorder nor mask
+        committed history, only assign fresh tail sequences to messages already
+        validly on disk (#37). Inter-orphan order is best-effort under cross-writer
+        clock skew (ids are timestamp-prefixed); consumers of publication order
+        must already tolerate out-of-causal-order delivery."""
+        messages = dict(order["messages"])
+        sequence = int(order["append_sequence"])
+        for orphan_id in sorted(orphan_ids):
+            if orphan_id in messages:
+                continue
+            sequence += 1
+            messages[orphan_id] = sequence
+        return {
+            "schema_version": _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION,
+            "append_sequence": sequence,
+            "messages": messages,
+        }
 
     def _reserve_message_publication_sequence(
         self,
         message_id: str,
         existing_messages: list[Message],
     ) -> int:
-        """Durably reserve physical append order before publishing message bytes."""
+        """Durably reserve physical append order before publishing message bytes.
+
+        Runs under the publication lock. Self-heals a version-skew store (an older
+        or bypassing writer appended message files without an order entry) instead
+        of wedging every send (#37); also re-anchors an anchor-absent sidecar,
+        because the tail unconditionally rewrites both files below.
+        """
         order = self._read_message_publication_order()
         if order is None:
             ordered_legacy = sorted(existing_messages, key=lambda message: message.id)
@@ -1623,9 +1718,17 @@ class Store:
                 message.id for message in existing_messages if message.id not in messages
             ]
             if missing:
-                raise ValueError(
-                    "validated message is missing durable publication order: "
-                    f"{missing[0]}"
+                # Version-skew / bypassed-writer self-heal: fold the orphans onto
+                # the tail in id-order rather than raising on every send. The
+                # anchored prefix is untouched (see _extend_order_with_orphans).
+                order = self._extend_order_with_orphans(order, missing)
+                messages = dict(order["messages"])
+                logger.warning(
+                    "agenttalk store: healed %d orphan message(s) with no "
+                    "publication-order entry (cause undetermined: version skew or "
+                    "a writer that bypassed _reserve_message_publication_sequence) "
+                    "— upgrade/inspect all writers sharing this store; first=%s",
+                    len(missing), sorted(missing)[0],
                 )
         if message_id in messages:
             raise ValueError("message id already has a durable publication order")
@@ -3767,10 +3870,11 @@ class Store:
         sequences = order["messages"]
         missing = [message.id for message in messages if message.id not in sequences]
         if missing:
-            raise ValueError(
-                "validated message is missing durable publication order: "
-                f"{missing[0]}"
-            )
+            # Read-time heal, IN-MEMORY only (a read path must not write): fold the
+            # orphans onto the tail in id-order — identical to what the next write
+            # will persist, so a read before and after the write agree — instead of
+            # wedging every ordered read under version skew (#37).
+            sequences = self._extend_order_with_orphans(order, missing)["messages"]
         return sorted(messages, key=lambda message: sequences[message.id])
 
     def _validated_messages(self, *, since_id: str | None = None) -> list[Message]:
