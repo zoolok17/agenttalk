@@ -212,16 +212,40 @@ This is the only sweep of the six that assumes the answer to "did we check?" is
 YES and asks a further question. Every checklist is phrased as did-we-check;
 every instance below passed a real check, honestly performed.
 
-### Two species, with different defences — both must be run
+### Three species, with different defences — all must be run
 
 - **WRONG IDENTITY.** The check touched a different object than the claim.
   *Defence:* name the object, and label its TYPE.
-- **WRONG TIME.** The check touched the right object, but the object moved
-  between the check and the action it authorised.
+- **WRONG TIME — the object moved.** The check touched the right object, but
+  it changed between the check and the action it authorised.
   *Defence:* re-check AFTER the action, or remove the concurrency.
   > You can aim correctly and still miss, if the thing moves.
+- **WRONG TIME — the WORLD moved.** The object did not change at all. Its
+  *description* went stale, because everything around it changed.
+  *Defence:* re-derive a preserved artifact against the CURRENT world before
+  use. **Its name is not evidence.**
 
-A sweep naming only the first species passes the second cleanly. The general
+The third is the most dangerous of the three, and the reason is the timescale.
+The first two have a window measured in minutes. This one has a window measured
+in the **lifetime of a label** — and the label is usually accurate when written,
+which is what makes it trustworthy right up until it is not.
+
+Worked instance: a blob was tagged `draft/amendment-15-links` at the moment an
+amendment was split in two. The tag was created by one agent, used by both, and
+verified three times — it resolves, it recovers the expected line count, its
+hash matches. Every one of those checks confirmed the object was **INTACT**.
+None asked what it **CONTAINED**, because the name answered that and the name
+was true at save time. Seven review rounds later the blob still held the
+*pre-review* form of content that had since been ratified in a much-changed
+state. Applying it as a "mechanical rebase" — the phrase both agents kept using,
+accurate when coined — would have silently reverted every P0 and P1 from those
+seven rounds while looking like a routine port of held work.
+
+**Integrity checks confirm an object has not changed. They say nothing about
+whether it is still the right object.** A checksum cannot detect that the world
+moved.
+
+A sweep naming only the first species passes the other two cleanly. The general
 form: *a check separated from the action it authorises is only as good as the
 interval between them; for anything under concurrent write the interval must be
 zero or the check must be REPEATED AFTER the action.* **Verify-then-act is
@@ -341,6 +365,45 @@ never what a real defect distribution looks like.
 This is the single most useful diagnostic in this document, because it detects
 a broken probe **from its output alone**, without needing a control.
 
+### How it complements the positive control
+
+They answer different questions and you want both:
+
+- A **positive control** tells you your probe **CAN** fail — it is a
+  precondition check, run before you trust an empty result, and it costs a
+  second query.
+- The **partition diagnostic** tells you your probe **DID** fail, from the
+  shape of the results, with no second run at all.
+
+The control is prophylactic and the diagnostic is forensic. A control you
+forgot to run leaves you with nothing; the partition signal is still sitting in
+the output you already have.
+
+### This document could not verify itself on the first attempt
+
+Written down because it argues the case better than any paragraph here can.
+
+A coverage check was run over the finished text of this file, for every item it
+was required to contain. It reported **two missing**. Both were present. The
+three diagnoses cost three of the six mechanisms enumerated above:
+
+- **#1 line-wrap** — the search key contained a newline; the phrase wraps.
+- **#3 structural blindness** — the wrapped line carries a blockquote `>`
+  marker, so whitespace-flattening alone still failed.
+- **#6 metacharacter / variant** — the probe searched `wrong-IDENTITY`; the
+  text says `WRONG IDENTITY`. Hyphen versus space.
+
+Zero real gaps. Three probe failures, on a coverage check of the document that
+lists those exact mechanisms, run by the person who listed them.
+
+What caught it was the partition diagnostic, on its first independent use:
+every "missing" item was a search key typed by hand, every resolved item was
+one that had been copied. That is a property of the probe, not of the document.
+
+**The lesson is not that the author was careless.** It is that knowing all six
+mechanisms, having just written them down, does not make you immune to them —
+which is the entire argument for a sweep over a rule you have read.
+
 ## Six distinct probe failure mechanisms, one day
 
 They are listed separately because they are all different — which is the point.
@@ -426,6 +489,46 @@ newly authored claim wearing a label that says *do not read this*.
 
 **Keeping a forensic tool in the prevention column is how you end up with a
 well-documented recurring failure.**
+
+## Coordinates: fabrication, and the two checks that catch it
+
+There is a failure worse than a stale or mislabelled value: **a value with no
+referent at all.** Not a real number pointed at the wrong object — a number
+produced by the part of composing that fills a slot because the slot is there.
+
+Observed twice in consecutive messages, the second inside the message
+correcting the first, two lines below a sentence promising not to do it.
+
+**DEFENCE 1 — never type a hash.** Every coordinate in a message must be
+**interpolated from command output in the same invocation that sends the
+message**. If prose reaches a coordinate slot, stop and measure; do not
+continue the sentence. This matters because the dispositional version does not
+work: "I will be careful" failed *inside the message that said it*. An
+assurance occupying the space where the handling should be is the same defect
+this document describes elsewhere — the fix has to remove the failure mode, not
+resolve to avoid it.
+
+**DEFENCE 2 — CHECK THE SHAPE BEFORE THE VALUE.**
+
+| kind | length |
+|---|---|
+| git object id | 40 hex |
+| sha256 | 64 hex |
+
+The invented value failed the shape of the field it sat in — 40 hex characters
+in a sha256 slot. So a coordinate can be rejected as **impossible** before
+anyone tries to resolve it, and unlike resolution this works **on a message
+alone**: no clone, no network, no correct repository state, no access to the
+artifact at all. **A wrong-length hash is not a typo. It is a value that was
+never measured.**
+
+**Why the guards bounded this anyway.** The three freeze guards do not detect
+fabrication, and do not need to. They ask one question — *does the artifact in
+front of me match the number in the message?* — and stale, mislabelled and
+invented values all fail it identically. The verifier never needs to know which
+way a value is wrong, or to model how the sender might err. **That is the
+argument for verification over trustworthiness**, and it is why a fabricated
+coordinate costs a round-trip rather than a corrupted freeze.
 
 **Label object TYPES, every time.** `RFC BLOB`, `PARENT COMMIT`, `AMENDMENT
 PARENT COMMIT` — never a bare hash and never a bare `base`. On this project a
