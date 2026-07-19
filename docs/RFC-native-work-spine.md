@@ -169,9 +169,9 @@ work **owns** it (work is the only writer).
 | Lane / worktree | links | `lane_id`, `delivery_artifact_path` | `lanes.py` + the durable delivery artifact |
 | Gate state | links | `gate_scope` | `gates.json` via `check_gates` |
 | Close | links | `close_id` | `.agenttalk/closes/` |
-| Review | links | `request_id` of the review thread | bus messages + `threads.derive_threads` |
-| Onboarding run | links | `run_id` | `.agenttalk/onboarding/` |
-| Knowledge notes | links | `note_id[]` | `knowledge/notes.jsonl` |
+| Review | links | `review_request_ids` | bus messages + `threads.derive_threads` |
+| Onboarding run | links | `onboarding_run_id` | `.agenttalk/onboarding/` |
+| Knowledge notes | links | `note_ids` | `knowledge/notes.jsonl` |
 | Project policy | links | `policy_hash_at_open` (witness) | `.agenttalk/code-policy.json` at the merge base |
 | Review lenses | links | nothing | `close.py` `required_lenses` / `lens_acks` |
 | Requirement satisfaction | **owns** | satisfaction records (matched glob) | work — but as a cache, never authority |
@@ -188,6 +188,17 @@ Rules:
   identifier only. Work never copies the linked record's contents,
   because a copy is a contradiction waiting to happen (roadmap §8,
   "state-machine drift").
+- **Every *links* field is resolved through the owning module's PUBLIC
+  read API, at BOTH mutation time and read/verdict time.** Validating an
+  identifier's *shape* is not validating the link: a well-formed
+  `close_id` naming no close is precisely the dangling reference this
+  table exists to prevent. Mutation-time validation alone leaves the
+  read side unguarded against corruption, out-of-protocol writes, and
+  hand edits — the same writer/reader parity gap that `work_scope_empty`
+  exists to close, and the reason a mutation guard is never a substitute
+  for a read-time check. The two failure outcomes are distinct and are
+  kept distinct: `work_link_unresolvable` when the module answers that no
+  such record exists, `work_source_error` when the module cannot answer.
 - Work persists **three drift witnesses**, and each is disclosed here
   with the rule that reads it. A witness is a record of *which version of
   someone else's truth we bound against*, used only to detect drift; none
@@ -861,6 +872,7 @@ Rules:
   `ts`, `actor`, `type`, `from_state`, `to_state`, **plus every per-type
   payload field**: `title`, `domain_id`, `owner`, `lane_id`,
   `lane_generation`, `artifact_id`, `head_sha`, `request_id`,
+  `close_id`, `gate_scope`, `onboarding_run_id`, `note_id`,
   `asserted_state`, `delivery_artifact_path`, `reason`,
   `supersedes_event_id`. A later event can never rewrite these on an
   earlier event. (`reviewed_head_sha` is deliberately **not** here: no
@@ -891,7 +903,11 @@ Rules:
   | `assigned` | `owner` | owner or lead |
   | `lane_bound` | `lane_id`, `lane_generation` | owner |
   | `artifact_attached` | `artifact_id`, `head_sha` | producer or owner |
-  | `review_requested` | `request_id` | owner — producer lands in **increment 3**, see below |
+  | `review_requested` | `request_id` | owner |
+  | `close_linked` | `close_id` | owner or lead |
+  | `gate_scope_set` | `gate_scope` | owner or lead |
+  | `onboarding_linked` | `onboarding_run_id` | owner |
+  | `note_linked` | `note_id` | owner |
   | `state_asserted` | `asserted_state` | any rostered agent (advisory) |
   | `delivered` | `delivery_artifact_path` | owner or lead |
   | `abandoned` | `reason` | owner or lead |
@@ -902,6 +918,53 @@ Rules:
   so `assigned` had no owner, `lane_bound` no lane, and `reopened` no
   authority rule. The classification test passed anyway, because it
   tested field classification rather than per-type completeness.
+- **Link writers are four CLOSED types, not one generic `linked` event.**
+  A generic type carrying `{link_type, link_id}` was considered and
+  rejected: it re-opens the closed vocabulary from the inside. `link_type`
+  becomes an unvalidated discriminator inside a table whose entire
+  discipline is required-payload-per-type; per-type authority (owner
+  versus owner-or-lead) cannot be expressed without a second table that
+  would itself drift; and the reachability sweep goes blind, because
+  every link kind shares one producer and a dead one is no longer
+  visible. Four rows cost less than any of those.
+- **Cardinality is a property of the ITEM FIELD, not of the event
+  payload.** Every link event carries **exactly one** id — the payload
+  fields `close_id`, `gate_scope`, `onboarding_run_id`, `note_id`,
+  `request_id` are all singular, and an event that carried a list would
+  be un-attributable when half its entries were bad. What differs is the
+  item field each one feeds:
+  - `close_id`, `gate_scope`, `onboarding_run_id` are **scalar item
+    fields**. A later valid event **rebinds** them, and the effective
+    value is the one carried by the **highest valid ledger `seq`** —
+    never the newest `ts`, because this document does not order by
+    producer clock. Rebinding is auditable precisely because the earlier
+    event stays in the ledger.
+  - `note_ids` and `review_request_ids` are **collection item fields**,
+    fed by `note_linked` and `review_requested` respectively. Events
+    **append**, and an id already present is a **no-op rather than a
+    duplicate entry**.
+  The singular/plural spelling is the tell: a payload key is singular
+  (`note_id`), the item field it feeds is plural (`note_ids`), and an
+  implementation that names them alike has lost the distinction.
+  **"Highest valid `seq`" is subject-sourced, and that is permitted only
+  under the narrow exemption already stated for self-referential
+  digests**: `valid` means chain-verified against the item's own
+  `prev_hash` links, which detects corruption and orders events, and
+  which **never licenses an advancement on its own**. A rebind decides
+  *which* link id is current; it never decides that the linked record
+  says anything good. That still comes from the linked module.
+- **There is no unlink in D2.** Removal is a capability nobody has asked
+  for, and every capability is a surface. A link bound in error is
+  corrected by rebinding a scalar; a collection entry stays, with the
+  history showing when it arrived.
+- **Every link validates through the linked module's PUBLIC read API at
+  BOTH mutation time and read/verdict time.** Identifier-shape validation
+  is not the boundary: a syntactically valid `close_id` naming no close
+  is exactly the dangling link the boundary table exists to prevent.
+  Mutation-time validation alone is the writer/read parity gap — the
+  state is reachable by corruption, out-of-protocol write, or hand edit,
+  none of which pass through the mutation. A link that cannot be resolved
+  at read time raises `work_link_unresolvable`.
 - **The canonical event hash is defined exactly**, because "a canonical
   hash" is not a specification an implementer can write twice the same
   way. It is `"sha256:" + sha256(blob).hexdigest()` — full 64 hex, never
@@ -937,8 +1000,8 @@ Rules:
   arbitrarily between two equal options. The divergence is a **latent**
   hazard rather than a live exploit — no current caller is known to feed
   it a non-serializable value — and that under-claim is deliberate.
-- **Two types are unreachable in a D2 tree, for DIFFERENT reasons, and
-  both are called out so a reader does not have to guess which:**
+- **Exactly ONE type has no producer anywhere in D1–D5, and it is
+  disclosed rather than left for a reader to assume:**
   - `reopened` — there is **no `work reopen` command** in any phase, so
     **once an item is `delivered` or `abandoned` it is permanently
     terminal**. A command was deliberately *not* added to make this
@@ -952,10 +1015,14 @@ Rules:
     contract.** A future reopen capability must *reconcile* with the
     survives-a-corrupt-ledger justification — explaining what a reopened
     item's durable record means — rather than simply relaxing it.
-  - `review_requested` — its producer is the **link mutation that stores
-    a `request_id`**, which lands in **increment 3** with the other link
-    mutations. Named rather than disclosed, because it has a producer;
-    it is merely not built yet.
+- **FIVE types have a producer that is specified here and BUILT in
+  increment 3**: `review_requested`, `close_linked`, `gate_scope_set`,
+  `onboarding_linked` and `note_linked` — the link mutations. These are
+  *named*, not disclosed, and the distinction is the whole point of the
+  reachability sweep: a member with no producer at all is a claim the
+  document cannot cash, while a member whose producer is designed and
+  scheduled is simply not built yet. A reader who finds these unreachable
+  in an increment-2 tree is looking at the plan working, not at a defect.
 - **There is deliberately no `review_recorded` event type**, and the
   reason matters more than the absence. Review state is **not ledger
   state**: the Source-Of-Truth table makes bus messages plus
@@ -1717,7 +1784,7 @@ order, and the first matching rule wins:
 | Derived state | Condition |
 |---|---|
 | `abandoned` | `terminal.type == "abandoned"` |
-| `closed` | the linked close is published |
+| `closed` | the linked close **resolved**, and is published |
 | `delivered` | `terminal.type == "delivered"`, or the linked lane has a committed delivery artifact |
 | `changes_requested` | a review-result bound to the **current revision** is `rejected` |
 | `review` | a linked review thread **for the current revision** is open and unanswered |
@@ -1727,6 +1794,15 @@ order, and the first matching rule wins:
 
 Rules:
 
+- **Every row that names a linked record requires that link to have
+  RESOLVED.** A link that did not resolve — unreadable, or naming nothing
+  — makes its row **not match**, and evaluation continues down the
+  ladder; it never matches on a maybe. So an item whose `close_id` cannot
+  be read falls through to `active` (or `open` with no lane bound) and
+  reports the failure on the **verdict** axis, never by moving state. The
+  ladder is first-match-wins, which is exactly why this must be stated:
+  a row that matched on an unresolved link would silently outrank every
+  row below it, and an outage would present as a settled `closed`.
 - **`record_state` is a pure function of records. It never reads the
   verdict.** An earlier draft put `blocked` and `ready` in this ladder,
   which made `record_state = f(verdict)` while the contradiction pass
@@ -1885,6 +1961,33 @@ Rules:
   (`changes_requested`), and emit one envelope whose two halves refute
   each other. Two correct answers to two different questions, composed
   into one wrong document.
+- **The projection takes an ALREADY-RESOLVED snapshot as its input and
+  performs no I/O of its own.** Its input is the item record, its event
+  ledger, and a **resolved link map** — one entry per link the item
+  carries, each already fetched through the linked module's public read
+  API and each tagged `resolved` (the value) or `unreadable` (the reason).
+  Its output is the `record_state` **plus a list of bounded projection
+  problems**, which the caller folds into the verdict's `holds`. The
+  projection never fetches, never retries, and never decides that a link
+  is fine because it could not check.
+  The signature is the enforcement: a pure function that cannot read
+  cannot resolve two axes from two snapshots, and cannot turn a slow or
+  broken source into a state transition. "Bounded" means the problem list
+  is drawn from the closed HOLD vocabulary — the projection reports
+  `work_link_unresolvable`, it does not compose prose.
+- **A link-source failure MUST NOT move `record_state`.** An unreadable
+  close, gate scope, onboarding run, or note is a failure to *observe*,
+  and record state is a function of what the item's own records say —
+  not of what a neighbouring module was able to answer this second. So an
+  item whose `close_id` cannot be read stays where its own records put
+  it, falling through to `active` (or `open` if no lane is bound), while
+  the **verdict** carries the failure as `work_source_error` with
+  epistemic class `unknown`. The rendering is **`active · UNKNOWN(1)`**.
+  The alternative — letting an unreadable source push the item to
+  `closed` or to `blocked` — makes an outage indistinguishable from a
+  fact, in the exact direction where it reads as more settled than it is.
+  This is the same asymmetry as `has_unknown`: not knowing is its own
+  answer and is never rounded to either neighbour.
 - **`changes_requested · GO` is impossible by construction.**
   `changes_requested` derives from a rejected review bound to the current
   revision, and that same record raises `work_review_rejected`. If a
@@ -2362,6 +2465,7 @@ Rules:
 | `work_domain_entitlement_unverified` | the actor's entitlement to the bound `domain_id` has not been verified — class `unknown`, blocks GO from D4 onward. Unverifiable is not passable; see the containment rule and Open Question #9 |
 | `work_out_of_scope_change` | the diff touches paths outside `scope_globs` |
 | `work_source_error` | a source read failed and its result could not be established |
+| `work_link_unresolvable` | a link names an id the linked module reports does not exist — class `established`, since the module answered and "no such record" is a determination |
 | `work_contradiction` | two records disagree irreconcilably (see below) |
 
 ### Contradictions Are Surfaced, Never Resolved
@@ -2819,6 +2923,8 @@ obvious naive implementation, would have returned green.
 | DOMAIN glob exceeds `MAX_GLOB_SEGMENTS` | `HOLD` `work_domain_glob_too_complex` | a scope-only cap bypassed entirely by the operand work does not own |
 | Aggregate state budget exceeded, every glob in-bound | `HOLD` `work_containment_budget_exceeded` | per-glob caps pass and the product still runs unbounded |
 | Entitlement to the bound domain unverified | `UNKNOWN` `work_domain_entitlement_unverified` | unverifiable read as permitted, advancing a forged authority association |
+| A linked record cannot be READ | `UNKNOWN` `work_source_error`; `record_state` **unchanged** | an outage moving the item's state |
+| A linked record DOES NOT EXIST | `HOLD` `work_link_unresolvable`; `record_state` **unchanged** | a dangling link read as an outage, or as absent |
 | Two records disagree | `HOLD` `work_contradiction` | one side silently preferred |
 | Concurrent mutation | serialized under a per-item lock + `expected_version` | last-writer-wins |
 | Crash between item and event | `HOLD` `work_ledger_gap` / `work_ledger_ahead`, or idempotent replay by `op_id` | the advanced state accepted unaudited |
@@ -3243,6 +3349,19 @@ a named test in D1–D4's acceptance set.
     obligations** — all 17 semantic rows pass against an implementation
     that hangs on this input.
 
+43. **A link failure never moves the record state, and the two link
+    outcomes are distinguishable.** *Test:* build an item whose `close_id`
+    names a close whose read **fails**. Assert `record_state` is exactly what
+    the item's own records give — `active` for a lane-bound item — and **not**
+    `closed`, and that the verdict carries `work_source_error` with class
+    `unknown`. Then repeat with a `close_id` the module reports **does not
+    exist** and assert `work_link_unresolvable` with class **`established`**.
+    Asserting only "non-GO" passes on either code and would let an outage and
+    a dangling link collapse into one answer — which is the whole reason they
+    are separate codes. Assert the classes, not the code literals: a dangling
+    link is a determination and competes as a `HOLD`, while an unreadable
+    source is an absence of one and must not.
+
 ## Threat Model And Honest Limits
 
 ### What This Design Establishes
@@ -3510,14 +3629,23 @@ anything requiring evidence, rather than a provisional verdict that would
 have to be un-taught later.
 
 **Also NOT in increment 2: link mutation** for `close_id`, `gate_scope`,
-`onboarding_run_id`, and `note_ids`. Those fields stay `null`/`[]` from
-create, and there is deliberately **no event type that writes them** yet.
-They move to increment 3, alongside the projection that consumes them —
-a link writer with no reader cannot be meaningfully exercised, and
-building the writer next to its consumer is how a wrong shape gets found
-while it is still cheap to change. Increment 3 inherits this rather than
-rediscovering it: adding the event type is an **RFC amendment**, not an
-implementation choice.
+`onboarding_run_id`, `note_ids`, and `review_request_ids`. Those fields stay
+`null`/`[]` from create. They move to **increment 3**, alongside the
+projection that consumes them — a link writer with no reader cannot be
+meaningfully exercised, and building the writer next to its consumer is how a
+wrong shape gets found while it is still cheap to change.
+
+**Increment 3 implements link mutation.** The event types (`close_linked`,
+`gate_scope_set`, `onboarding_linked`, `note_linked`, `review_requested`),
+their required payloads and their per-type authority are specified in the
+Event Model and are **not** an implementation choice; the mutation semantics
+— scalar rebind by highest valid ledger `seq`, collection append-and-dedupe,
+no unlink — are fixed there too. Increment 3 also implements the
+**resolved-link-map projection input** and the two link outcomes:
+`work_link_unresolvable` (the module answered "no such record", class
+`established`) and `work_source_error` (the module could not answer, class
+`unknown`). **Neither may move `record_state`**; an item with an unreadable
+close renders `active · UNKNOWN(1)`.
 
 ### Phase D3: Evidence Registry MVP
 
@@ -3793,6 +3921,11 @@ a pre-mortem it never appeared in.
   Reviewers should agree that a disclosed blockage beats a silent pass
   here, because it is the one place this document knowingly trades
   throughput for soundness.
+- **Link mutation is four CLOSED event types, not one generic `linked`.**
+  The generic form is more economical and was rejected: a `link_type`
+  discriminator re-opens the closed vocabulary from inside, defeats per-type
+  required payloads and per-type authority, and blinds the reachability sweep
+  by giving every link kind one shared producer.
 - **Scope containment is conservative-approximate and fails CLOSED**, and
   a scope glob must be covered by a **single** domain glob rather than by
   the union of several. The alternative — an exact subset decision over
