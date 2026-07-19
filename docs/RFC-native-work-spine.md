@@ -3442,8 +3442,28 @@ Implement:
 
   **What it does NOT cover, stated because the previous phrasing hid
   it:** a surface that bypasses the builder entirely and hand-assembles
-  output is not caught by the builder. Nothing automatic catches that;
-  it is a code-review obligation, and naming it is the honest bound.
+  output is not caught by the builder. **No automated check catches every
+  bypass — but one catches the likely case and MUST be run:** a source
+  sweep over **work's projection surfaces** asserting that nothing other
+  than the view builder constructs a mapping with a `domain_id` key. Same
+  shape as the standing private-API sweep.
+
+  The sweep is **scoped to work's surfaces deliberately, not blanket.**
+  `domain_id` mappings are already built for unrelated reasons in
+  `knowledge.py`, `lanes.py`, `lesson_context.py`, `web.py` **and
+  `cli.py`** — a blanket rule fires on five innocent modules the first
+  time it runs, and a check that cries wolf on its first run is a check
+  nobody keeps. `cli.py` needs naming separately: it is both an existing
+  innocent constructor and the eventual home of work's CLI surfaces, so
+  the scope is work's projection code inside it, not the file.
+
+  What remains uncovered after the sweep is a hand-assembled projection
+  that never names `domain_id` as a literal key. That is a code-review
+  obligation, and it is a much smaller residual than "nothing automatic
+  catches this" implied. **An over-conceded limit is fail-safe — it
+  licenses nothing — but it forecloses a cheap mitigation, because a team
+  told nothing can be automated will not build the check that mostly can.**
+
   "No future projection can emit a bare scalar" was a universal over
   arbitrary future code — untestable, and therefore a comment with the
   grammar of a rule. The mechanism is assertable; the aspiration was not.
@@ -3510,6 +3530,20 @@ Implement:
 - The full HOLD-code table, one literal-asserting test per code.
 - `GO` / `HOLD` / `UNKNOWN` with `ok` true only for `GO`.
 - The contradiction pass and `source_errors`.
+- **A failed source produces `work_source_error` with `class: "unknown"`,
+  and the envelope reads `UNKNOWN` when no established hold competes.**
+  Tested on the gates source specifically: make `check_gates` fail, assert
+  the hold's **class** is `unknown` and the top-level verdict is `UNKNOWN`
+  — not merely that the code is present.
+  The class assertion is the whole test, because **codes are not
+  intrinsically `HOLD` or `UNKNOWN` in this design; the class carries
+  that**. A test that asserts only "`work_source_error` appears" passes
+  identically whether the source failure is treated as a definite blocker
+  or as an absence of knowledge, which are different answers to the
+  question an operator is asking. Amendment #14 moved this disposition
+  from `HOLD` to `UNKNOWN`, and without a class-level assertion that move
+  is silently revertible: the code table, its literal-code test, and this
+  phase line would all be unchanged by a revert.
 - Policy loading, glob matching with all-matching semantics, policy-hash
   binding, and base-policy evaluation.
 - **Caution derivation AND rendering.** `compute_verdict` derives
