@@ -173,7 +173,7 @@ work **owns** it (work is the only writer).
 | Project policy | links | `policy_hash_at_open` (witness) | `.agenttalk/code-policy.json` at the merge base |
 | Review lenses | links | nothing | `close.py` `required_lenses` / `lens_acks` |
 | Requirement satisfaction | **owns** | satisfaction records (matched glob) | work — but as a cache, never authority |
-| Work item identity, owner, base/head refs, links | **owns** | the item record | work |
+| Work item identity, owner, base/target refs, links | **owns** | the item record | work |
 | Work events | **owns** | the append-only ledger | work |
 | Evidence artifacts | **owns** | write-once artifact records | work |
 | Lifecycle status | **projects** | nothing | derived per read |
@@ -993,6 +993,23 @@ Rules:
   matching, and `head_sha` matching the current revision. A file that
   exists but fails any of those blocks; it does not advance and it does
   not read as absent.
+- **A validator's inputs must come from a source independent of the thing
+  being validated.** Where the rule above says *read the artifact back*,
+  this one says *get the EXPECTATION from somewhere else*. They look like
+  one lesson and are not: an implementation can satisfy C5 completely —
+  reading the artifact, recomputing its hash, checking every field — and
+  still be circular, if the value it checks those fields *against* was
+  taken from the artifact itself.
+- The species has a name and a tell. **Circular validation**: the
+  expectation and the subject share a source. The tell is that a
+  validator takes an argument, so the question *"where did this argument
+  come from?"* is always worth asking — and if the answer is "from the
+  thing being validated," the check is circular however thorough it
+  looks. It runs, it passes, and it establishes nothing, which is worse
+  than an absent check because an absent check does not produce evidence.
+  `work deliver` is the first instance (see Lifecycle); D3 ingestion will
+  meet it again wherever an artifact carries a field a validator might be
+  tempted to compare it to.
 
 ### Torn Reads And The JSON/Log Pair
 
@@ -1395,6 +1412,23 @@ Rules:
   state only reachable through corrupt or hand-written records — and
   holds *every* claimant with `work_lane_conflict` until reconciled,
   rather than picking the older one.
+- **`work start` also writes the bound revision**, without which the next
+  rule has no referent. It takes caller-supplied `base_ref`, `base_sha`,
+  and `target_ref`, resolves `base_sha` to a full 40-character SHA, and
+  **validates** it against the lane through lanes' public read API. It
+  does **not** snapshot lane fields into the item.
+  **Validating against a linked record is not copying it.** Work stores
+  only what work owns — the item's own revision binding — and reads the
+  lane to check the two agree. `registry_hash_at_bind` is the same
+  pattern: a value work owns, checked against a linked source, recorded
+  as a witness rather than a duplicate. Caching lane state into the item
+  would create the second source of truth the Source-Of-Truth boundary
+  exists to prevent, however helpful it looks.
+- `scope_globs` may be set at create or at start, but note the
+  consequence rather than leaving it to be discovered: an **empty**
+  `scope_globs` puts every changed path outside scope, so
+  `work_out_of_scope_change` holds until it is non-empty. Fail-closed and
+  correct — and it means no item reaches `GO` with an empty scope.
 - A non-terminal item requires a live lane whose generation matches
   `lane_generation` and whose head matches the bound revision. A
   terminal item may instead reference a validated immutable delivery
@@ -1402,6 +1436,17 @@ Rules:
   lane is cleaned up. A lane that vanished raises `work_lane_missing`; a
   lane whose ID was reused raises `work_lane_generation_mismatch`.
   Neither is inferred to mean the work completed.
+- **`work deliver` validates against an independently resolved head.** It
+  requires an already-bound lane, calls
+  `lanes.validate_delivery_artifact(..., require_isolation=True)`, and
+  passes a `head_sha` **resolved live from the lane at mutation time**
+  through lanes' public read API — **never** read from the artifact under
+  validation. That resolved head must match the item's bound revision.
+  As codex-dev put it: *"Reading `delivered_head` from the artifact and
+  passing it back would validate shape but not bind it to the current
+  work revision."* Passing an artifact's own field into its validator
+  asks whether the artifact agrees with **itself**, which every
+  well-formed artifact answers yes to — including a stale one.
 - **Work never deletes a worktree.** `work abandon` and `work deliver`
   record intent and may *request* lane cleanup; `lanes.py` remains the
   sole authority on whether cleanup is safe, and it refuses on dirty,
@@ -2651,6 +2696,18 @@ a named test in D1–D4's acceptance set.
     exempt), a changed path matched by no rule (release-blocking), and
     the only exempting case: a non-release close with every matched rule
     explicitly `release_scoped: false` and every path matched.
+37. **Delivery validation is not circular.** *Test:* a bound lane whose
+    **live head is H2**, and a committed delivery artifact whose
+    `delivered_head` is **H1**. Call `work deliver`. Assert the mutation
+    **refuses specifically because the resolved live head does not match
+    the artifact's bound head** — not merely that some later verdict is
+    non-GO. The distinction is the whole invariant: an implementation
+    that passes the artifact's own `delivered_head` into
+    `validate_delivery_artifact` produces a *passing* validation here,
+    and would satisfy a weaker "assert non-GO" assertion by holding for
+    an unrelated reason while leaving the circular path wide open. That
+    is the same defect as asserting a caution "appears in" the envelope
+    rather than at an exact path.
 
 ## Threat Model And Honest Limits
 
