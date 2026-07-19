@@ -1095,15 +1095,25 @@ Rules:
   so nothing can produce `evidence_source == "automation_ci"` honestly and
   no `producer_class == "automation"` resolution rule exists either.
 - **The consequence, stated exhaustively from the bottom of the ladder:
-  in D1–D5 a `GO` requires that EVERY release-scoped rule matching a
-  changed path sit at or below `local_agent`; any higher floor on any
-  matching rule is unmeetable.** Phrased over all matching rules, not
-  over "a" floor, because policy is D-11 all-matching: **the strictest
-  matching floor governs**. A `src/**` rule at `local_agent` beside a
-  `src/payments/**` rule at `automation_ci` holds every change under
-  `src/payments/`, even though the first rule alone would have admitted
-  it — the same composition that makes a `supervisor.py` change owe both
-  example entries.
+  in D1–D5 a `GO` requires that EVERY rule matching a changed path sit at
+  or below `local_agent`; any higher floor on any matching rule is
+  unmeetable.** Phrased over all matching rules, not over "a" floor,
+  because policy is D-11 all-matching: **the strictest matching floor
+  governs**. A `src/**` rule at `local_agent` beside a `src/payments/**`
+  rule at `automation_ci` holds every change under `src/payments/`, even
+  though the first rule alone would have admitted it — the same
+  composition that makes a `supervisor.py` change owe both example
+  entries.
+- **Every MATCHING rule, not every release-scoped one.** Once the item is
+  release-blocking, a matching rule's `release_min_tier` binds regardless
+  of that rule's own `release_scoped` value — including a legacy rule
+  where the flag is absent. An earlier draft quantified over
+  "every release-scoped rule," which silently dropped a stricter floor
+  out of the maximum: a `src/**` rule at `local_agent` with
+  `release_scoped: true` beside a `src/payments/**` rule at
+  `automation_ci` with the flag *absent* would have excluded the second,
+  seen every included floor at `local_agent`, and returned `GO` — with
+  `release_floor_lowered` attached as false reassurance.
 - `local_agent` is the sole producible **satisfying** tier — not the sole
   producible tier, since `referenced` is producible too (from manual or
   missing-binding evidence) but never satisfies a requirement on its own,
@@ -1735,15 +1745,21 @@ Rules:
 | A review-result bound to the current revision exists and is approved | `work_review_missing` |
 | `gate_check.required_gates` is non-empty and every one is green | `work_release_gates_vacuous` |
 
-**In D1–D5 a `GO` requires EVERY release-scoped rule matching a changed
-path to sit at or below `local_agent`; any higher floor on any matching
-rule is unmeetable** — including the default, which is `automation_ci`.
-Phrased over all matching rules because policy is D-11 all-matching and
-**the strictest matching floor governs**: a permissive `src/**` rule does
-not rescue a change that also matches a stricter nested rule. So an item
-satisfying every row above still holds unless *all* its matching
-release-scoped rules were lowered to `local_agent` or below, since
-`local_agent` is the only producible satisfying tier in these phases. The baseline
+**In D1–D5 a `GO` requires EVERY rule matching a changed path to sit at
+or below `local_agent`; any higher floor on any matching rule is
+unmeetable** — including the default, which is `automation_ci`. Phrased
+over all matching rules because policy is D-11 all-matching and **the
+strictest matching floor governs**: a permissive `src/**` rule does not
+rescue a change that also matches a stricter nested rule. So an item
+satisfying every row above still holds unless *all* its matching rules
+were lowered to `local_agent` or below, since `local_agent` is the only
+producible satisfying tier in these phases.
+
+The effective floor is **`max` over every matching rule of
+(`release_min_tier` or the `automation_ci` default)** — matching rules,
+not release-scoped ones. A rule's `release_scoped` value governs
+classification and coverage; it does **not** gate whether that rule's
+floor participates once the item is already release-blocking. The baseline
 above is the set of requirements a release will have to meet *once
 release-grade evidence is producible*.
 
@@ -2147,14 +2163,29 @@ Rules:
   required work-side, and it is the predicate `work_review_missing`
   fires on outside the release baseline. It defaults to `false` when
   absent.
-- `release_scoped` is **three-valued for classification**: `true`,
-  `false`, or **absent = unknown**. It does *not* default to `false`. An
-  absent flag cannot prove an item non-release, because a legacy policy
-  written before the field existed would then silently exempt every item
-  it matched. For every other purpose (which requirements apply) an
-  absent flag behaves as not-release-scoped; only the *exemption* reading
-  treats it as unknown, and only exemption needs proof.
-- `min_tier` applies always; `release_min_tier` applies when the item is
+- `release_scoped` is **three-valued**: `true`, `false`, or **absent =
+  unknown**. It does *not* default to `false`. Because the same field is
+  read by more than one rule, **every reader is enumerated here with the
+  reading it takes.** A site that does not appear in this table is a
+  defect regardless of which reading it picks — ambiguity about *which*
+  reading applies is what produced a live fail-open once already.
+
+  | Reader | Reading of an ABSENT flag | Direction |
+  |---|---|---|
+  | **Classification / exemption** (the truth table) | **unknown** — never exempts | fail-closed |
+  | **Release-path coverage** (`work_uncovered_release_path`) | not release-scoped — provides no coverage, so a path covered only by absent-flag rules fails coverage | fail-closed |
+  | **Requirement applicability** (which checks apply) | not release-scoped | — |
+  | **Floor composition** (`max` over matching rules) | **irrelevant — the flag is not read at all**; every matching rule's floor binds once the item is release-blocking | fail-closed |
+
+  The exemption reading treats absence as unknown because only exemption
+  needs *proof*. The composition reader ignores the flag entirely,
+  because gating a floor on it lets a legacy rule drop its own stricter
+  requirement out of the maximum. Both are fail-closed; they differ
+  because they are answering different questions, and the table exists so
+  a fifth reader cannot be added without declaring which question it
+  asks.
+- `min_tier` applies always; `release_min_tier` applies — for **every**
+  matching rule, whatever its `release_scoped` value — when the item is
   release-blocking per The Release Baseline. Absent `release_min_tier` defaults to
   `automation_ci`, per the roadmap's trailing rule — the default is the
   strict one, so forgetting to write it fails closed.
@@ -2575,7 +2606,19 @@ a named test in D1–D4's acceptance set.
     coverage. Assert `work_policy_invalid` rather than `GO`: the empty
     list must be rejected at validation, because once it is accepted
     there is no requirement left for any tier check to fire against.
-34. **Release classification is total and conflict fails closed.**
+34. **A stricter floor on a legacy rule still binds.** *Test:* changed
+    path `src/payments/pay.py`; rule A
+    `{glob: "src/**", checks: ["pytest"], release_min_tier: "local_agent",
+    release_scoped: true}`; rule B
+    `{glob: "src/payments/**", checks: ["sast"],
+    release_min_tier: "automation_ci"}` with `release_scoped` **absent**;
+    release-class close, bound approved review, green gates, and
+    exact-bound passing `local_agent` artifacts for *both* checks. Assert
+    `work_artifact_insufficient_tier` — B's floor participates in the
+    maximum despite its absent flag — and specifically assert the verdict
+    is **not** `GO`-with-`release_floor_lowered`, which is what a
+    release-scoped-only quantifier produces.
+35. **Release classification is total and conflict fails closed.**
     *Test:* the full truth table — a release-class close with an
     all-`false` policy, a non-release close with a `release_scoped: true`
     rule (both yield release-blocking plus
@@ -2955,6 +2998,13 @@ choice and this document made one:
   stored and never disjunctive: any present release signal wins,
   disagreement is release-blocking, and an absent `release_scoped` is
   unknown rather than false.
+- **The release floor composes over EVERY matching rule**, not every
+  release-scoped one: once an item is release-blocking, each matching
+  rule's `release_min_tier` (or the `automation_ci` default) enters the
+  maximum whatever that rule's `release_scoped` value. Every reader of
+  `release_scoped` is enumerated in Policy Boundary with the reading it
+  takes, because the same field answering different questions is what
+  produced a fail-open once already.
 - **Tier re-resolution may only weaken**; the bound tier caps the
   effective tier, and producer retirement is a caution, never a demotion.
 - **`item_seq` is a record version, not a ledger position.** Crash
