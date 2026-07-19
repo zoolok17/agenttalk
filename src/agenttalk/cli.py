@@ -11323,6 +11323,74 @@ def cmd_end(args: argparse.Namespace) -> int:
     return 0
 
 
+def _dev_gate_forward_argv(args: argparse.Namespace) -> list[str]:
+    argv = ["--profile", args.profile]
+    if args.ci_leg:
+        argv.extend(["--ci-leg", args.ci_leg])
+    if args.aggregate:
+        argv.extend(["--aggregate", str(Path(args.aggregate).resolve())])
+    if args.evidence:
+        argv.extend(["--evidence", str(Path(args.evidence).resolve())])
+    if args.temp_root:
+        argv.extend(["--temp-root", str(Path(args.temp_root).resolve())])
+    for mapping in args.python:
+        argv.extend(["--python", mapping])
+    return argv
+
+
+def cmd_dev_gate(args: argparse.Namespace) -> int:
+    """Run the committed, SHA-bound repository development gate."""
+
+    from agenttalk import dev_gate as dev_gate_mod
+
+    if args.root:
+        sys.stderr.write("agenttalk dev-gate: BLOCK [candidate_root_override_forbidden] use the Git worktree CWD\n")
+        return 2
+    try:
+        root = dev_gate_mod.discover_repo_root()
+        forward_argv = _dev_gate_forward_argv(args)
+        reentered = dev_gate_mod.reenter_candidate_source(root, forward_argv)
+        if reentered is not None:
+            return reentered
+        if args.aggregate is not None:
+            if args.python:
+                raise dev_gate_mod.GateBlock(
+                    "aggregate_argument_invalid", "--python is not valid with --aggregate"
+                )
+            result = dev_gate_mod.execute_aggregate(
+                root=root,
+                input_root=Path(args.aggregate),
+                profile=args.profile,
+                evidence_path=Path(args.evidence) if args.evidence else None,
+                temp_base=Path(args.temp_root) if args.temp_root else None,
+            )
+        else:
+            result = dev_gate_mod.execute_gate(
+                root=root,
+                profile=args.profile,
+                ci_leg=args.ci_leg,
+                evidence_path=Path(args.evidence) if args.evidence else None,
+                temp_base=Path(args.temp_root) if args.temp_root else None,
+                python_overrides=dev_gate_mod.parse_python_overrides(args.python),
+            )
+    except dev_gate_mod.GateBlock as exc:
+        sys.stderr.write(f"agenttalk dev-gate: BLOCK [{exc.code}] {exc.detail}\n")
+        return 2
+    print(
+        json.dumps(
+            {
+                "verdict": result.artifact["verdict"],
+                "complete": result.artifact["complete"],
+                "evidence": str(result.evidence_path),
+                "evidence_sha256": result.evidence_sha256,
+                "candidate_sha": result.artifact["subject"]["candidate_sha"],
+            },
+            sort_keys=True,
+        )
+    )
+    return result.exit_code
+
+
 # --------------------------------------------------------------------- parser
 
 def build_parser() -> argparse.ArgumentParser:
@@ -11338,6 +11406,37 @@ def build_parser() -> argparse.ArgumentParser:
                         "store fails loudly — it never falls back to the walk.")
     p.add_argument("--supervisor-launch-nonce", help=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    pdev = sub.add_parser(
+        "dev-gate",
+        help="Run the committed hermetic source+wheel development gate and emit SHA-bound JSON evidence.",
+    )
+    pdev.add_argument("--profile", choices=["release"], default="release")
+    dev_scope = pdev.add_mutually_exclusive_group()
+    dev_scope.add_argument("--ci-leg", help="Emit incomplete evidence for one declared <os>/<python> CI leg.")
+    dev_scope.add_argument(
+        "--aggregate",
+        type=Path,
+        help="Aggregate a directory of exact CI-leg JSON artifacts into authoritative evidence.",
+    )
+    pdev.add_argument(
+        "--evidence",
+        type=Path,
+        help="Output JSON path; must be outside the candidate worktree and any AgentTalk store.",
+    )
+    pdev.add_argument(
+        "--temp-root",
+        type=Path,
+        help="External temp parent for isolated source, wheel, logs, and pytest basetemps.",
+    )
+    pdev.add_argument(
+        "--python",
+        action="append",
+        default=[],
+        metavar="MINOR=ABSOLUTE_EXE",
+        help="Bind a required Python minor to a direct interpreter (repeatable).",
+    )
+    pdev.set_defaults(func=cmd_dev_gate)
 
     pi = sub.add_parser("init", help="Initialize a fresh .agenttalk/ store in the current dir.")
     pi.add_argument("--agents", default="claude,codex", help="Comma-separated agent names (default: claude,codex)")

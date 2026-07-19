@@ -19,6 +19,16 @@ security = [
     "bandit>=1.7",
     "pip-audit>=2.7",
 ]
+gate = [
+    "pytest>=8.0",
+    "build>=1.2",
+    "hatchling>=1.25",
+    "ruff>=0.6",
+    "bandit>=1.7",
+    "pip-audit>=2.7",
+    "semgrep>=1.80",
+    "zizmor>=1.20",
+]
 
 [tool.ruff]
 # 120 is generous-but-not-permissive; lets multi-line user-facing
@@ -57,6 +67,7 @@ include = [
     "/.gitleaks.toml",
     "/.gitleaksignore",
     "/.semgrep",
+    "/dev-gate.json",
     "/CHANGELOG.md",
     "/README.md",
     "/ROADMAP.md",
