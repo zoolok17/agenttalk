@@ -3647,6 +3647,26 @@ no unlink — are fixed there too. Increment 3 also implements the
 `unknown`). **Neither may move `record_state`**; an item with an unreadable
 close renders `active · UNKNOWN(1)`.
 
+Three obligations increment 3 must carry that no earlier phase line does:
+
+- **Every *links* field is resolved through the owning module's PUBLIC read
+  API at BOTH mutation time and read/verdict time.** The read-time half is
+  the one that needs saying: a mutation guard is not a read guard, and the
+  dangling-link state is reachable by corruption, out-of-protocol write and
+  hand edit, none of which pass through the mutation. This is the same
+  writer/reader parity the `work_scope_empty` pair exists for.
+- **The derived-state ladder's link rows require the link to have RESOLVED.**
+  The ladder is FIRST-MATCH-WINS, so a row that matched on an unresolved link
+  would silently outrank every row below it — an unreadable close would
+  present as a settled `closed`, which is an outage wearing a terminal state.
+  An unresolved link makes its row not match and evaluation continues.
+- **The bound-xor-curation-mutable construction test covers the four link
+  payload fields** (`close_id`, `gate_scope`, `onboarding_run_id`,
+  `note_id`). Without it these are curation-mutable in practice and a forged
+  curation event can move a link. **This carrier closes a PRE-EXISTING gap**:
+  the partition rule predates amendment #15 and has never had a phase line —
+  #15 does not create the gap, it enlarges the population exposed by it.
+
 ### Phase D3: Evidence Registry MVP
 
 Implement:
