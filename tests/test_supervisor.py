@@ -2092,6 +2092,119 @@ def test_supervise_bootstrap_check_accepts_wrapped_claude_and_codex(
     assert ("Ramanujan", "claude") in by_agent_cli
 
 
+def test_supervise_bootstrap_check_accepts_constrained_ovh_qwen_profile(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _team(tmp_path, "Polaris,qwen-dev-1")
+    s.set_role("Polaris", "lead")
+    s.set_operator_facing("Polaris")
+    s.set_trust_class("qwen-dev-1", "external-worker")
+    for name in ("Polaris", "qwen-dev-1"):
+        s.write_heartbeat(name)
+    qwen = _wrapped_supervisor_agent("qwen-dev-1", "claude")
+    qwen.pop("env")
+    qwen.update({
+        "backend_profile": "ovh-qwen",
+        "model": "Qwen3.5-397B-A17B",
+        "trust_class": "external-worker",
+    })
+    _write_supervisor_config(s, {"qwen-dev-1": qwen})
+    monkeypatch.delenv("OVH_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    profile = next(
+        check for check in payload["checks"]
+        if check["id"] == "supervisor_ovh_qwen_profile"
+    )
+    assert profile["status"] == "ok"
+
+
+def test_supervise_bootstrap_check_rejects_uncapped_qwen_lead_loop(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _team(tmp_path, "Polaris,qwen-dev-1")
+    s.set_role("Polaris", "lead")
+    s.set_operator_facing("Polaris")
+    s.set_trust_class("qwen-dev-1", "external-worker")
+    for name in ("Polaris", "qwen-dev-1"):
+        s.write_heartbeat(name)
+    qwen = _wrapped_supervisor_agent("qwen-dev-1", "claude")
+    qwen.pop("env")
+    qwen["launch"]["windows_args"].insert(
+        qwen["launch"]["windows_args"].index("--"), "--lead-loop"
+    )
+    qwen.update({
+        "backend_profile": "ovh-qwen",
+        "model": "Qwen3.5-397B-A17B",
+        "trust_class": "external-worker",
+    })
+    _write_supervisor_config(s, {"qwen-dev-1": qwen})
+    monkeypatch.delenv("OVH_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    profile = next(
+        check
+        for check in payload["checks"]
+        if check["id"] == "supervisor_ovh_qwen_profile"
+    )
+    assert profile["status"] == "error"
+    assert "lead-loop is unsupported" in profile["detail"]
+
+
+def test_supervise_bootstrap_check_rejects_ambient_provider_key_for_qwen(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _team(tmp_path, "Polaris,qwen-dev-1")
+    s.set_role("Polaris", "lead")
+    s.set_operator_facing("Polaris")
+    s.set_trust_class("qwen-dev-1", "external-worker")
+    for name in ("Polaris", "qwen-dev-1"):
+        s.write_heartbeat(name)
+    qwen = _wrapped_supervisor_agent("qwen-dev-1", "claude")
+    qwen.pop("env")
+    qwen.update({
+        "backend_profile": "ovh-qwen",
+        "model": "Qwen3.5-397B-A17B",
+        "trust_class": "external-worker",
+    })
+    _write_supervisor_config(s, {"qwen-dev-1": qwen})
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-reach-qwen")
+
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    profile = next(
+        check for check in payload["checks"]
+        if check["id"] == "supervisor_ovh_qwen_profile"
+    )
+    assert profile["status"] == "error"
+    assert "ambient provider keys" in profile["detail"]
+
+
+def test_supervisor_template_checks_qwen_secrets_before_agent_env() -> None:
+    ps = sup.PS_TEMPLATE
+    profile_check = ps.index("backend_profile -eq 'ovh-qwen'")
+    agent_env = ps.index("if ($a.env)")
+    assert profile_check < agent_env
+    assert "OVH_KEY" in ps[profile_check:agent_env]
+    assert "ANTHROPIC_API_KEY" in ps[profile_check:agent_env]
+
+
 def test_supervise_bootstrap_check_warns_on_roster_only_placeholders(
     tmp_path: Path, capsys: pytest.CaptureFixture,
 ) -> None:

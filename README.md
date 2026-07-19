@@ -49,6 +49,8 @@ For operator-facing procedures and examples, use
 - [docs/ASSURANCE.md](docs/ASSURANCE.md) - release attestation and gate
   evidence.
 - [docs/ISSUES.md](docs/ISSUES.md) - living tracker.
+- [docs/QWEN-OVH-TRIAL.md](docs/QWEN-OVH-TRIAL.md) - operator runbook for
+  the watched, cooperative Qwen-on-OVH trial.
 - [CHANGELOG.md](CHANGELOG.md) - release history.
 - [SECURITY.md](SECURITY.md) - security posture and trust model.
 
