@@ -363,6 +363,24 @@ Rules:
   that the item's scope ever agreed with it. That is work silently
   re-owning path scope while the boundary table calls it a link, and it
   bypasses the domain's approver model.
+- **A lane-bound item must have a non-empty `scope_globs`, checked on
+  EVERY read and every verdict.** Violation raises
+  `work_scope_empty`. This is a *read-time* invariant and it is
+  deliberately separate from the `work start` precondition: the
+  precondition guards the mutation, this guards the state. An item can
+  reach empty-scope-while-lane-bound through corruption, an
+  out-of-protocol write, or a hand edit — none of which pass through
+  `start` — and such an item is still **shape-valid**, because the item
+  schema permits an empty `scope_globs` at create for a draft that has
+  not begun.
+- Both layers are required and neither substitutes for the other. An
+  earlier draft moved the empty-scope rule from a consequence to a
+  mutation precondition and stopped there, which looked complete and left
+  the read side unguarded: no named code could produce the non-`GO` the
+  invariant demanded, so an implementer would have had to invent one and
+  the original `GO` stayed conforming. **A mutation-time guard and a
+  read-time check are different consumers of the same rule** — moving a
+  rule from one to the other is not propagating it to both.
 - There is no `head_sha` in the item. Head is resolved live from the
   linked lane or the repo at read time, because a persisted head is stale
   the moment it is written and would invite exactly the evidence-rot the
@@ -2009,6 +2027,7 @@ Rules:
 | `work_policy_changed_since_open` | the policy moved since `policy_hash_at_open` |
 | `work_domain_scope_drift` | `registry_hash_at_bind` no longer matches the current registry |
 | `work_scope_outside_domain` | `scope_globs` is not a subset of the bound domain's paths |
+| `work_scope_empty` | a lane-bound item has an empty `scope_globs` (read-time state check; the `work start` precondition guards the mutation, this guards corrupt / out-of-protocol / hand-edited state) |
 | `work_out_of_scope_change` | the diff touches paths outside `scope_globs` |
 | `work_source_error` | a source read failed and its result could not be established |
 | `work_contradiction` | two records disagree irreconcilably (see below) |
@@ -2763,9 +2782,16 @@ a named test in D1–D4's acceptance set.
     a lane whose live head **equals** its base so revision resolution
     **succeeds with zero changed paths**, a valid non-release close
     exempting the release baseline, and every other source at exact `GO`.
-    Assert non-`GO`. Under the old consequence-based rule this input
-    returned `GO`, because a predicate over "paths outside scope" has
-    nothing to fire on when there are no paths at all.
+    Assert **`work_scope_empty` specifically** — not merely non-`GO`. The
+    specificity is the point: this state is reachable only by bypassing
+    `start` (corruption, an out-of-protocol write, a hand edit), so the
+    mutation guard cannot produce it and a weaker assertion would be
+    satisfied by any unrelated hold while the read side stayed unguarded.
+    Under the old consequence-based rule this input returned `GO`,
+    because a predicate over "paths outside scope" has nothing to fire on
+    when there are no paths at all — and under a mutation-guard-only fix
+    it still returned `GO`, because no named code existed to produce the
+    non-`GO` the invariant demanded.
 39. **`start` leaves a bound revision.** *Test:* after a successful
     `work start`, assert the item carries a **full 40-character**
     `base_sha` equal to the linked lane's authoritative base, plus
@@ -3075,7 +3101,22 @@ needs it — not during it.
 
 This RFC is ready to drive implementation when reviewers agree on the
 contested points — the ones where the source documents left a genuine
-choice and this document made one:
+choice and this document made one.
+
+**Slot definition, stated so the consumer-propagation sweep can apply it
+without a judgement call.** A rule earns a bullet here when it records a
+**contested choice among genuine alternatives** — not merely because it
+is load-bearing, normative, or new. A derived generalisation nobody
+disputed has **no slot**, and its absence is correct rather than a gap.
+Absence and omission look identical to a grep, so the sweep must ask
+*"does this surface have a slot for this rule?"* before asking *"is it
+filled?"* — otherwise every non-topical surface manufactures a finding
+whenever a rule arrives that its index has no key for. The same test
+applies to the traceability matrix from the other direction: it is
+indexed by pre-mortem finding-id and records **where a finding came
+from**, so adding a row for a build-derived rule would not improve
+coverage — it would **forge provenance** by asserting the rule came from
+a pre-mortem it never appeared in.
 
 - **Storage placement.** `.agenttalk/work/` and `.agenttalk/artifacts/`
   are top-level and therefore survive `reset`; the durability-boundary
@@ -3201,12 +3242,18 @@ choice and this document made one:
   available only as a new H2-bound artifact tiered no stronger than its
   verifier — never for a release-blocking `automation_ci` requirement.
   This is deliberately stricter than D-6's rule for knowledge notes.
-- **A validator's semantic expectation must come from a source
-  independent of the subject.** A self-referential digest is legitimate
-  only within a corruption-detection claim and never licenses advancement
-  alone — it must compose with at least one independently-sourced check.
-  This is what makes `work deliver` resolve its `head_sha` live from the
-  lane rather than reading it off the artifact under validation.
+- **A self-referential validator is exempted by CLAIM SCOPE, not by
+  CATEGORY.** The contested choice: a digest that reads its own subject
+  could have been exempted as a *kind of check* ("integrity checks are
+  fine"), or only for as long as its *claim* stays narrow. This document
+  chose claim scope — a self-referential digest is legitimate only within
+  a corruption-detection claim and never licenses advancement alone,
+  which is why `work deliver` resolves its `head_sha` live from the lane
+  rather than reading it off the artifact. Category exemption was
+  rejected because categories can be *claimed*: a future reader relabels
+  a check "an integrity check" and inherits the exemption. The
+  circularity is not an exception to the rule; it is the reason the
+  guarantee is narrow.
 
 Once ratified, the safest first build is D2 exactly as scoped, with the
 corrupt-item and one-item-does-not-brick-work tests written **failing
