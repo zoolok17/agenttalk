@@ -474,12 +474,23 @@ The rule is **conservative single-glob containment, and it fails closed**:
 
   Work does not own `domains.py` and **cannot impose a schema change on
   it**, so the domain side gets a defined fail-closed refusal rather than
-  a validation rule: `work_domain_glob_too_complex`, class **blocking**.
-  Blocking rather than `unknown` deliberately — the module answered, and
-  the answer is a definite observed condition, not a failure to observe.
-  It is not the item's fault, and the verdict is not an allocation of
-  fault: an unprovable containment is a rejection, whichever side made it
-  unprovable. Fixing it means fixing the registry, and the code says so.
+  a validation rule: `work_domain_glob_too_complex`.
+
+- **All three complexity codes are `class: "established"`, and the class is
+  stated here because a code without one is unimplementable.** The
+  vocabulary is `{established, unknown}` and nothing else; there is no
+  third value. `established` rather than `unknown` for all three, for one
+  shared reason: each is a **definite measurement**, not a failure to
+  measure. A glob has more than `MAX_GLOB_SEGMENTS` segments or it does
+  not; the predicted aggregate exceeds `MAX_CONTAINMENT_STATES` or it does
+  not. Both are computed from segment counts the evaluator already holds.
+  `unknown` is for the case where a question could not be answered, and
+  here every question was answered — the answer was just a refusal.
+
+  For the domain-side code specifically: it is not the item's fault, and
+  the class is not an allocation of fault. An unprovable containment is a
+  rejection whichever side made it unprovable, and `established` records
+  that we know exactly why. Fixing it means fixing the registry.
 
 - **Three distinct codes, because there are three distinct remedies.**
   `work_scope_glob_too_complex` → narrow the scope glob.
@@ -2345,9 +2356,9 @@ Rules:
 | `work_domain_scope_drift` | `registry_hash_at_bind` no longer matches the current registry |
 | `work_scope_outside_domain` | a `scope_globs` entry is not provably covered by a **single** domain glob under the `covers` predicate (conservative and fail-closed — an entry this cannot prove is rejected, so the code also fires on legal-but-unprovable scopes) |
 | `work_scope_empty` | a lane-bound item has an empty `scope_globs` (read-time state check; the `work start` precondition guards the mutation, this guards corrupt / out-of-protocol / hand-edited state) |
-| `work_scope_glob_too_complex` | a `scope_globs` entry exceeds `MAX_GLOB_SEGMENTS` (64); remedy is to narrow the scope glob |
-| `work_domain_glob_too_complex` | an `owned_globs` entry exceeds `MAX_GLOB_SEGMENTS` (64) — class `blocking`, since the module answered and the answer is a definite condition; remedy is to fix the domain registry, which work does not own |
-| `work_containment_budget_exceeded` | the predicted aggregate `(D,G)` state count exceeds `MAX_CONTAINMENT_STATES` (2^20) with every glob individually in-bound; remedy is to reduce glob counts |
+| `work_scope_glob_too_complex` | a `scope_globs` entry exceeds `MAX_GLOB_SEGMENTS` (64) — class `established`; remedy is to narrow the scope glob |
+| `work_domain_glob_too_complex` | an `owned_globs` entry exceeds `MAX_GLOB_SEGMENTS` (64) — class `established`, since the module answered and the answer is a definite measurement; remedy is to fix the domain registry, which work does not own |
+| `work_containment_budget_exceeded` | the predicted aggregate `(D,G)` state count exceeds `MAX_CONTAINMENT_STATES` (2^20) with every glob individually in-bound — class `established`; remedy is to reduce glob counts |
 | `work_domain_entitlement_unverified` | the actor's entitlement to the bound `domain_id` has not been verified — class `unknown`, blocks GO from D4 onward. Unverifiable is not passable; see the containment rule and Open Question #9 |
 | `work_out_of_scope_change` | the diff touches paths outside `scope_globs` |
 | `work_source_error` | a source read failed and its result could not be established |
@@ -3213,6 +3224,14 @@ a named test in D1–D4's acceptance set.
         1048577 → `work_containment_budget_exceeded`, **with every
         individual glob inside the per-glob cap**, which is the case no
         per-glob assertion can reach
+    Assert in every over case that the hold is raised with
+    **`class: "established"`** — the class, not merely the code literal.
+    All three complexity codes are `established`, and a test asserting only
+    that the code appears passes identically against an implementation that
+    emits them as `unknown`, which would make a definite measured refusal
+    read as an unanswered question and let `UNKNOWN` lose to any competing
+    established hold rather than standing on its own.
+
     Assert in every over case that the hold is raised **without evaluating
     any pair** — instrument the state counter and assert it is zero. A
     bound discovered by exceeding it is not a bound, and an
@@ -3408,7 +3427,11 @@ Implement:
   before any evaluation: `work_scope_glob_too_complex`,
   `work_domain_glob_too_complex`, `work_containment_budget_exceeded`.
   The domain side is not optional — `domains.py` caps neither glob length
-  nor list size and work cannot change it.
+  nor list size and work cannot change it. **All three carry
+  `class: "established"`**, and the D2 tests assert the class rather than
+  the code literal: a code-presence test cannot distinguish a definite
+  refusal from an unanswered question, and the two behave differently at
+  the top level.
 - **The domain object PRODUCER, and the renderers for the surfaces D2
   actually has.** D2 builds the single reusable `{domain_id,
   entitlement}` representation and binds it in `work-view-v1` at
