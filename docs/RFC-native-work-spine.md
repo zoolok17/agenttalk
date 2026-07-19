@@ -199,6 +199,64 @@ Rules:
   for a read-time check. The two failure outcomes are distinct and are
   kept distinct: `work_link_unresolvable` when the module answers that no
   such record exists, `work_source_error` when the module cannot answer.
+- **A `close_id` alone is not an identity. `close_instance_id` is bound with
+  it, and a read-time mismatch FAILS CLOSED.** `close.replace_close`
+  atomically substitutes a new, independently identified close under the SAME
+  `close_id`, minting a fresh `instance_id`. Binding the id alone admits an
+  **ABA substitution**: link close `rel` at instance A, force-replace it with
+  instance B, and the next read silently resolves B with no `close_linked`
+  event emitted, an unchanged and still-valid work ledger, and the item's
+  record state and verdict provenance moved behind it.
+
+  So `close_instance_id` is bound at mutation, folded into the event hash
+  alongside `close_id`, carried in the item projection, and compared on every
+  read. A mismatch raises `work_close_instance_mismatch`, class
+  `established` — the module answered and the answer is a different close.
+
+  **GENERATION changes within the same instance stay live.** A close being
+  amended is not a different close wearing the same name: the instance is the
+  identity, the generation is its version. Binding the generation would
+  re-break the drift-witness rule, which detects movement rather than
+  forbidding it.
+
+  This closes a gap the owning module had already closed for itself.
+  `close.replace_close` **requires** `expected_instance_id` from its callers
+  — close.py treats the instance as mandatory for its own update path. Work
+  was the caller that linked past a guard its owner considers compulsory. The
+  asymmetry is worth naming: `lane_generation` was bound from the start
+  because lanes put generation in the shape work already read. **We bound
+  what the neighbouring module ADVERTISED, not what it EXPOSED.**
+
+- **The other three link types are NOT exposed to this class, for three
+  DIFFERENT reasons.** Stated separately because a single "the others are
+  fine" would be unfalsifiable, and each of these is refutable on its own
+  terms:
+  - **`gate_scope` — binding an instance would be a CATEGORY ERROR, not
+    merely unnecessary.** A scope is a SELECTOR naming a standing query over
+    live gate state (`check_gates(root, *, scope=…)`), not a reference to an
+    immutable record; `gates.py` mints no identifiers at all. There is no A
+    to be replaced by B, only the current answer. Binding it would **freeze a
+    value the design requires to be live** — a new defect introduced by
+    over-applying a fix. Nobody should "complete the pattern" here.
+  - **`note_ids` — knowledge notes are append-only immutable events.** A
+    `note_id` names an event that cannot be replaced under the same id;
+    retraction is its own event, so a retracted note is the SAME note in a
+    new authorization state — a generation change, not an instance change.
+  - **`onboarding_run_id` — uuid4-minted per run, recorded through events,
+    with no replace-under-same-id path.** Stated as the weaker claim: no such
+    path was found, which is less than the module documenting immutability.
+
+- **An item carrying a bound close with NO recorded instance is unverifiable
+  and non-GO** — `work_close_instance_mismatch`, fail closed. There is **no
+  grandfathering and no operator escape**, and the rule costs nothing today:
+  **the population it governs is empty.** `close_linked` is introduced by
+  this amendment and no link-writing producer exists in the store, so no item
+  can have been bound before it. The rule is stated anyway because it must
+  hold the moment anything hand-writes or corrupts an item into that state —
+  the out-of-protocol case every read-time invariant here exists for — and
+  because the emptiness is a fact about today that stops being true the
+  moment increment 3 ships. **A rule left unwritten because it has no
+  subjects is a rule nobody adds when it acquires some.**
 - Work persists **three drift witnesses**, and each is disclosed here
   with the rule that reads it. A witness is a record of *which version of
   someone else's truth we bound against*, used only to detect drift; none
@@ -1795,8 +1853,8 @@ order, and the first matching rule wins:
 Rules:
 
 - **Every row that names a linked record requires that link to have
-  RESOLVED.** A link that did not resolve — unreadable, or naming nothing
-  — makes its row **not match**, and evaluation continues down the
+  RESOLVED.** A link whose resolver result is `not_found` or `unreadable` —
+  the two non-`resolved` tags — makes its row **not match**, and evaluation continues down the
   ladder; it never matches on a maybe. So an item whose `close_id` cannot
   be read falls through to `active` (or `open` with no lane bound) and
   reports the failure on the **verdict** axis, never by moving state. The
@@ -1965,7 +2023,71 @@ Rules:
   performs no I/O of its own.** Its input is the item record, its event
   ledger, and a **resolved link map** — one entry per link the item
   carries, each already fetched through the linked module's public read
-  API and each tagged `resolved` (the value) or `unreadable` (the reason).
+  API, and each carrying a **closed three-way resolver result** that is
+  **bound to the id it answers for** — a result that does not name its
+  requested id can be silently misfiled against another link:
+
+  | tag | payload | the module… |
+  |---|---|---|
+  | `resolved` | the requested id + the record | returned it |
+  | `not_found` | the requested id | determined no such record exists |
+  | `unreadable` | the requested id + the reason | could not answer |
+
+  **Three tags, not two.** `not_found` and `unreadable` answer different
+  questions and carry different classes downstream — a determination versus
+  the absence of one. A two-tag input makes `work_link_unresolvable`
+  **unreachable by construction**: `resolved` has no value to carry, tagging
+  it `unreadable` assigns the wrong class, and omitting the entry violates
+  one-entry-per-link and erases the problem entirely.
+
+  Each tag maps to exactly one ladder behaviour and one verdict outcome, and
+  the mapping is total:
+
+  | tag | ladder row naming this link | hold | class |
+  |---|---|---|---|
+  | `resolved` | may match | — | — |
+  | `not_found` | does **not** match | `work_link_unresolvable` | `established` |
+  | `unreadable` | does **not** match | `work_source_error` | `unknown` |
+
+  Both failure tags suppress the ladder row identically — that is the
+  outage-wearing-`closed` defence and it does not depend on which failure
+  occurred. The **verdict** is where they diverge, and it must: `unknown`
+  invites "retry later", `established` demands repair.
+
+  **A resolver MUST emit `not_found` when the linked module can distinguish a
+  missing record from an unreadable one, and MUST emit `unreadable` when it
+  cannot.** The degradation is one-directional and fail-safe by construction:
+  `unreadable` maps to `unknown`, which is non-advancing, so a degraded
+  resolver over-reports outages and can never advance an item it should have
+  blocked.
+
+  **DISCLOSED LIMIT — and what a reader would otherwise wrongly conclude.**
+  As of this amendment **no linked module can make the distinction**.
+  `close.load_close` raises one `CloseError` for missing, unreadable and
+  malformed alike — its own docstring says so — and `knowledge`, `onboarding`
+  and `gates` expose no not-found type at all. So a reader could otherwise
+  conclude that `work_link_unresolvable` will appear whenever a link dangles.
+  **It will not.** Until the upstream not-found subclasses land, every
+  dangling link presents as `work_source_error`, class `unknown`.
+  An implementer who finds `not_found` never firing has implemented this
+  **correctly**. The fix is the upstream subclass — **never** a workaround
+  that infers not-found by matching an exception's message text. A
+  verdict-bearing class assignment must not rest on a substring of a
+  human-readable string, which is not a contract and changes without notice.
+  **The map's key set is VALIDATED against the item's links BEFORE
+  projection, and a mismatch is a named non-GO problem rather than a silent
+  pass.** `keys(resolved_links)` must equal exactly the links the item
+  carries, **including every member of the collection fields**. Missing,
+  extra or mismatched entries raise `work_link_map_incomplete`, class
+  `established`, and the projection does not run.
+
+  This rule is security-critical and its violation is SILENT without the
+  check: omitting the entry for a dangling or unreadable link removes that
+  link's problem from the projection entirely, and the item then projects as
+  though the link were fine — which is precisely the failure the
+  resolved-link-map design exists to prevent. An incomplete map is
+  indistinguishable from a healthy one at every downstream surface.
+
   Its output is the `record_state` **plus a list of bounded projection
   problems**, which the caller folds into the verdict's `holds`. The
   projection never fetches, never retries, and never decides that a link
@@ -2466,6 +2588,8 @@ Rules:
 | `work_out_of_scope_change` | the diff touches paths outside `scope_globs` |
 | `work_source_error` | a source read failed and its result could not be established |
 | `work_link_unresolvable` | a link names an id the linked module reports does not exist — class `established`, since the module answered and "no such record" is a determination |
+| `work_close_instance_mismatch` | the bound `close_instance_id` does not match the resolved close, or no instance is bound — class `established`; an ABA substitution under a reused `close_id` |
+| `work_link_map_incomplete` | `keys(resolved_links)` does not equal the links the item carries, including collection members — class `established`; checked BEFORE projection |
 | `work_contradiction` | two records disagree irreconcilably (see below) |
 
 ### Contradictions Are Surfaced, Never Resolved
@@ -3349,18 +3473,43 @@ a named test in D1–D4's acceptance set.
     obligations** — all 17 semantic rows pass against an implementation
     that hangs on this input.
 
-43. **A link failure never moves the record state, and the two link
-    outcomes are distinguishable.** *Test:* build an item whose `close_id`
-    names a close whose read **fails**. Assert `record_state` is exactly what
-    the item's own records give — `active` for a lane-bound item — and **not**
-    `closed`, and that the verdict carries `work_source_error` with class
-    `unknown`. Then repeat with a `close_id` the module reports **does not
-    exist** and assert `work_link_unresolvable` with class **`established`**.
-    Asserting only "non-GO" passes on either code and would let an outage and
-    a dangling link collapse into one answer — which is the whole reason they
-    are separate codes. Assert the classes, not the code literals: a dangling
-    link is a determination and competes as a `HOLD`, while an unreadable
-    source is an absence of one and must not.
+43. **A link failure never moves the record state, the two link outcomes are
+    distinguishable, and an incomplete map cannot pass.** *Test:* call the
+    projection directly with a **constructed resolved link map**, one case per
+    tag. This tests the PROJECTION — a pure function over the map it is
+    handed — not the resolver and not the filesystem. The earlier wording
+    described real-world conditions the projection never sees, which would
+    have made the test either unwritable or a resolver test wearing a
+    projection label.
+      - entry tagged `unreadable` → assert `record_state` is what the item's
+        own records give (`active` for a lane-bound item) and **not**
+        `closed`, and that the verdict carries `work_source_error` with class
+        `unknown`.
+      - entry tagged `not_found` → assert the same `record_state`, and
+        `work_link_unresolvable` with class **`established`**.
+      - entry tagged `resolved` with a published close → assert `closed` IS
+        reachable, so suppression is specific to failure and the test can fail
+        in both directions.
+      - a map MISSING an entry for a link the item carries, and one with an
+        EXTRA key → assert `work_link_map_incomplete` and that the projection
+        did not run. Omission is the silent failure; it must be tested
+        separately from the supplied-failure cases, which is why the earlier
+        version could not have caught it.
+      - a bound `close_instance_id` differing from the resolved close's
+        instance → assert `work_close_instance_mismatch`, class
+        `established`. Then the same with NO bound instance → same code, same
+        class, fail closed.
+    Assert the CLASSES, not the code literals: asserting only "non-GO" passes
+    on any of them and collapses an outage, a dangling link, an incomplete map
+    and an ABA substitution into one answer.
+
+    **Constructing the map is what makes the `not_found` case testable at
+    all.** No resolver can currently emit that tag, so a test driven from the
+    world could not reach it. The pure-function boundary is what keeps the
+    obligation verifiable ahead of its producers — the objection "you are
+    testing a state that cannot occur" is answered by: it cannot occur YET,
+    and this test is what makes the eventual producer verifiable rather than
+    trusted.
 
 ## Threat Model And Honest Limits
 
@@ -3646,6 +3795,20 @@ no unlink — are fixed there too. Increment 3 also implements the
 `established`) and `work_source_error` (the module could not answer, class
 `unknown`). **Neither may move `record_state`**; an item with an unreadable
 close renders `active · UNKNOWN(1)`.
+
+Increment 3 also carries, and each needs its own test:
+
+- **The closed three-way resolver result** — `resolved` / `not_found` /
+  `unreadable` — each bound to the id it answers for, with the total mapping
+  to ladder non-match and to hold+class, and the fail-safe degradation rule.
+  Both failure tags suppress the ladder row; only the verdict distinguishes
+  them.
+- **Key-set validation of the resolved link map BEFORE projection**, covering
+  collection members, raising `work_link_map_incomplete`. Omission is the
+  silent failure mode and needs its own assertion.
+- **`close_instance_id` bound with `close_id`**, in the event hash and the
+  item projection, compared on every read, `work_close_instance_mismatch` on
+  mismatch or absence. Generation changes within an instance stay live.
 
 Three obligations increment 3 must carry that no earlier phase line does:
 
