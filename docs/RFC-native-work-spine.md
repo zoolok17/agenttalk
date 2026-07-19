@@ -412,6 +412,38 @@ The rule is **conservative single-glob containment, and it fails closed**:
   it, and `[ab]` does not cover `a`. Both are real subsets that this rule
   rejects — the disclosed cost of failing closed. An authority boundary
   that guesses is not a boundary.
+- **Evaluation MUST be memoized or iterative over `(D-index, G-index)`,
+  and the naive recurrence is FORBIDDEN.** Written as stated above, the
+  `**` clause branches twice into overlapping subproblems, and the cost
+  is exponential in segment count on shape-VALID input. Measured on
+  `D = **/…/**/x` against `G = **/…/**/y`, which is legitimate input and
+  a legitimate `false`:
+
+  | segments | naive calls | memoized states |
+  |---|---|---|
+  | 4 | 335 | 30 |
+  | 8 | 68,067 | 90 |
+  | 12 | 14,857,999 | 182 |
+  | 14 | 222,981,434 | 240 |
+  | 40 | — | 1,722 |
+
+  The subproblem space is bounded by `(len(D)+1) × (len(G)+1)`, so
+  memoizing on the index pair makes it quadratic and the change is small.
+  This is normative because `covers` runs at create, at `start`, and on
+  **every read** — an item whose globs trigger the blowup would hang or
+  overflow the stack on every read, which is a strictly worse failure
+  than the unguarded state the read-time check was added to prevent. A
+  read-time invariant that can hang is not a safety property.
+- **A segment-count bound is required, and exceeding it is a HOLD, not a
+  crash.** `domains.normalize_glob` accepts arbitrarily many segments, so
+  the bound must be enforced by work rather than assumed from the
+  normalizer. Exceeding it raises `work_scope_glob_too_complex` — a
+  bounded, named refusal. Unbounded input meeting a bounded evaluator is
+  how a correctness rule becomes an availability defect.
+- The correctness table above does NOT exercise any of this. **A
+  correctness table and a termination guarantee are different
+  obligations**, and a table that is right in every row says nothing
+  about whether the predicate returns at all.
 
 Why conservative rather than exact: full glob-language containment over a
 *union* of domain globs is where a subset proof is hardest and where a
@@ -435,9 +467,9 @@ decide all of them this way does not implement this rule.**
 | 5 | `src/**` | `src/**` | **accept** | `**` absorbs `**` |
 | 6 | `src/a/**` | `src/ab/**` | **REJECT** | sibling-prefix. `src/ab` is not `src/a`; a string-prefix test accepts this and is wrong. |
 | 7 | `src/a` | `src/ab` | **REJECT** | sibling-prefix, no wildcard |
-| 8 | `src/**` + `docs/**` | `src/**/*.py` where a member is `docs/x.py` | n/a — unreachable | see below |
-| 9 | `src/*` + `src/**/t.py` | `src/**/t.py` | **accept** | a single domain glob covers it; the union is never consulted |
-| 10 | `src/a/*` + `src/*/b.py` | `src/a/b.py` | **accept** | glob 2 alone covers it |
+| 8 | `src/a/**` + `src/b/**` | `src/[ab]/**` | **REJECT** | **the no-union witness.** Every member of `src/[ab]/**` lies in the UNION of the two domain globs, yet neither glob ALONE covers the descriptor — `[ab]` is not identical to `a` or to `b`. An implementation that unions the domain globs before comparing ACCEPTS this and is wrong. **DISCRIMINATING.** |
+| 9 | `src/*` + `src/**/t.py` | `src/**/t.py` | **accept** | a single domain glob covers it; the union is never consulted. Glob 1 does not cover, so **DISCRIMINATING** against first-glob-only. Order is normative here: the covering glob is listed SECOND. |
+| 10 | `src/x/*` + `src/*/b.py` | `src/a/b.py` | **accept** | glob 2 alone covers it; glob 1 genuinely does NOT (`x` is not `a`), so a first-glob-only implementation fails this row. **DISCRIMINATING.** |
 | 11 | `pkg/*/mod.py` + `pkg/a/**` | `pkg/a/mod.py` | **accept** | either glob alone covers it |
 | 12 | `src/a/*` + `src/*/b` | `src/a/b` | **accept** | glob 1 covers it |
 | 13 | `src/**/t.py` | `src/a/t.py` | **accept** | mid-pattern `**` absorbs zero-or-more, not only a suffix |
@@ -446,13 +478,34 @@ decide all of them this way does not implement this rule.**
 | 16 | `src/**` | `src/**/*` | **accept** | `**` absorbs the trailing `*` by consuming zero further segments — an implementation whose `**` is suffix-only gets this wrong |
 | 17 | `src/**/*.py` | `src/a/b.py` | **REJECT** | disclosed conservative rejection: a real subset, refused because `*.py` is a metacharacter segment that is not a bare `*` |
 
-Case 8 is listed to be struck explicitly: it cannot arise, because the
-rule proves each scope glob against a **single** domain glob and never
-against a union, so no scope glob can be accepted on the strength of two
-domain globs whose members differ. Cases 9–12 exist to pin the other
-side of that — requiring a single *covering* glob does not mean requiring
-a single *domain* glob; the domain may own many, and the rule asks
-whether **some one of them** covers `G`.
+Case 8 is the **rejecting** witness for the no-union rule, and cases 9–12
+are the accepting witnesses for its other side. Together they pin the
+distinction the whole rule turns on: requiring a single *covering* glob
+does not mean requiring a single *domain* glob. The domain may own many,
+and the rule asks whether **some one of them** covers `G` — never whether
+their union does. Case 8 is the only row where a union-based
+implementation and this rule disagree, which is why it must be a real
+executable row and not a note.
+
+An earlier draft made case 8 a prose aside marked "n/a — unreachable",
+supplying `src/**` + `docs/**` against `src/**/*.py` with the premise that
+`docs/x.py` was a member. That premise is false — the scope's first
+segment is literally `src` — and the row as written EVALUATES: `src/**`
+covers it, so the predicate returns **accept**, not "unreachable". The
+consequence was worse than a dead row. Because D2 declares all rows
+normative tests, case 8 was unwritable as a test, and it was the ONLY row
+meant to pin the no-union choice — so the table had no rejecting
+discriminator at all for the authority-bearing choice the amendment
+exists to make. Found independently by both Codex lenses, which proposed
+the identical replacement now in the table.
+
+**Three rows are marked DISCRIMINATING (8, 9, 10) and the marking is
+load-bearing.** Each is the row that fails against a specific wrong
+implementation — 8 against a union-based one, 9 and 10 against a
+first-glob-only one. A later editor who deletes or "simplifies" one is
+removing a witness, not a duplicate, and the marking exists so that is
+visible at the point of editing rather than discoverable afterwards by
+whoever finds the resulting green suite.
 
 The one case that must be tested and cannot be read off the table:
 **a descriptor is accepted but a member is not**. Under this rule that
@@ -476,17 +529,76 @@ permissive domain, and no rule in this document stops it. That is a
 it here is deliberate: a reader who sees a containment check and a
 registry hash could otherwise conclude the domain boundary is enforced
 end to end, when what is enforced is internal consistency with a
-self-selected authority. Closing it means constraining who may bind a
-`domain_id` to what, which is its own design with its own review — it is
-**Open Question #9 and it gates D6**. Implementing this containment rule
-correctly does not close it and must not be reported as closing it.
+self-selected authority.
 
-Two properties hold and are worth asserting directly, because an
+**Therefore an unverified entitlement claim CANNOT REACH GO.** This is
+normative and it binds from **D4**, the first phase that emits a verdict —
+not D6. A bound `domain_id` whose entitlement has not been verified
+raises **`work_domain_entitlement_unverified`** with epistemic class
+`unknown`, and `UNKNOWN` is non-advancing everywhere in this document.
+
+The distinction that makes this buildable, and that an earlier draft
+collapsed:
+
+- **Verifying entitlement is NOT buildable in D1–D5.** There is no
+  authenticated identity to check an actor against; roster membership is
+  routing metadata, which the Threat Model already says in terms. That
+  argument is correct and it is why Open Question #9 stays open.
+- **Refusing to ADVANCE on an unverified claim IS trivially buildable.**
+  It requires no identity at all — only that the absence of a
+  verification be reported as an absence. That is one hold code.
+
+Collapsing the second into the first is the error: "we cannot verify this"
+became "this may proceed", which is a fail-open, sited in the one place
+the document had just finished admitting it could verify nothing. Every
+other unverifiable fact in this design produces `UNKNOWN` rather than
+silent passage, and this one is no different.
+
+Consequences that follow and are required with it:
+
+- **Every D2/D3 surface that renders a bound domain must mark entitlement
+  explicitly UNVERIFIED.** A rendering that shows `domain_id` alone reads
+  as an authority association, which is exactly the false claim. This is
+  the same rule as `cautions` never being droppable from the default
+  human path — a mitigation absent from the surface an operator actually
+  reads is not a mitigation.
+- **Migration is fail-closed.** Items bound before the amendment that
+  closes Open Question #9 carry no entitlement evidence, and they are
+  treated as unverified rather than grandfathered. Grandfathering would
+  convert a disclosed gap into a permanent silent exemption for exactly
+  the population created while the gap was open.
+
+Open Question #9 survives, and its question narrows: it asks **who GRANTS
+entitlement and how**, no longer whether an unverified claim may advance.
+That is answered here, and the answer is no.
+
+Implementing this containment rule correctly does not close #9 and must
+not be reported as closing it.
+
+Three properties hold and are worth asserting directly, because an
 implementation can pass the table and still violate them:
 **reflexivity** — `covers(X, X)` is true for every normalized glob `X`,
-so a scope glob identical to a domain glob is never rejected; and
+so a scope glob identical to a domain glob is never rejected;
 **one-sidedness** — `covers` is not symmetric, and an implementation
-that ever compares the two arguments in either order has lost the rule.
+that ever compares the two arguments in either order has lost the rule;
+and **order-independence** — the verdict must not depend on the order of
+`owned_globs`. The rule is "some one of them covers `G`", which is a
+existential over the whole list; an implementation that short-circuits on
+the first glob, or whose result changes when the registry lists the same
+globs in a different order, is wrong. This is asserted as a property
+rather than left to the table because the table cannot carry it: a
+discriminating row only discriminates when the covering glob is not
+listed first, so the rows' power depends on a fixture ordering that a
+transcriber is free to reverse. Case 9 pins one ordering explicitly; the
+property covers the rest.
+
+**Order-independence must itself be TESTED, not merely stated.** Every row
+marked DISCRIMINATING is evaluated in **both** orderings of `owned_globs`
+and must yield the identical verdict in each. Stating a property and
+testing it are different obligations — the same distinction that separates
+the correctness table from the termination guarantee, and the reason
+reflexivity and one-sidedness are asserted rather than left to be inferred
+from rows. A property with no test is a comment.
 - **A lane-bound item must have a non-empty `scope_globs`, checked on
   EVERY read and every verdict.** Violation raises
   `work_scope_empty`. This is a *read-time* invariant and it is
@@ -2158,6 +2270,8 @@ Rules:
 | `work_domain_scope_drift` | `registry_hash_at_bind` no longer matches the current registry |
 | `work_scope_outside_domain` | a `scope_globs` entry is not provably covered by a **single** domain glob under the `covers` predicate (conservative and fail-closed — an entry this cannot prove is rejected, so the code also fires on legal-but-unprovable scopes) |
 | `work_scope_empty` | a lane-bound item has an empty `scope_globs` (read-time state check; the `work start` precondition guards the mutation, this guards corrupt / out-of-protocol / hand-edited state) |
+| `work_scope_glob_too_complex` | a `scope_globs` entry exceeds the segment-count bound; a bounded refusal rather than an unbounded evaluation |
+| `work_domain_entitlement_unverified` | the actor's entitlement to the bound `domain_id` has not been verified — class `unknown`, blocks GO from D4 onward. Unverifiable is not passable; see the containment rule and Open Question #9 |
 | `work_out_of_scope_change` | the diff touches paths outside `scope_globs` |
 | `work_source_error` | a source read failed and its result could not be established |
 | `work_contradiction` | two records disagree irreconcilably (see below) |
@@ -2608,6 +2722,8 @@ obvious naive implementation, would have returned green.
 | Gate source read fails | `UNKNOWN` `work_source_error` | empty gate list read as no blockers |
 | Policy unreadable at `base_sha` | `UNKNOWN` `work_source_error` | fallback to working-tree policy |
 | Policy invalid | `HOLD` `work_policy_invalid` | ignored as if absent |
+| Scope glob exceeds the segment bound | `HOLD` `work_scope_glob_too_complex` | unbounded evaluation; hang or stack overflow on every read |
+| Entitlement to the bound domain unverified | `UNKNOWN` `work_domain_entitlement_unverified` | unverifiable read as permitted, advancing a forged authority association |
 | Two records disagree | `HOLD` `work_contradiction` | one side silently preferred |
 | Concurrent mutation | serialized under a per-item lock + `expected_version` | last-writer-wins |
 | Crash between item and event | `HOLD` `work_ledger_gap` / `work_ledger_ahead`, or idempotent replay by `op_id` | the advanced state accepted unaudited |
@@ -2938,6 +3054,34 @@ a named test in D1–D4's acceptance set.
     "simplification" back to `check_paths` from looking harmless. This is
     the descriptor-validated-as-instance defect, and it is invisible to
     any test that only ever passes concrete paths.
+41. **An unverified entitlement claim cannot reach GO.** *Test:* build an
+    item whose `domain_id` names a domain the binding actor is NOT in the
+    `owners` refset of, give it a scope the containment rule ACCEPTS, a
+    fresh `registry_hash_at_bind`, and every other source at exact `GO`.
+    Assert the verdict is **not** `GO` and carries
+    `work_domain_entitlement_unverified` **specifically**, with class
+    `unknown`. The specificity is the whole test: every containment and
+    drift check passes on this input by construction, so a weaker
+    assertion would be satisfied by nothing at all. Assert separately
+    that a D2/D3 rendering of this item marks entitlement UNVERIFIED
+    rather than displaying the domain alone. Under the disposition this
+    replaces, this input returned `GO` — a rostered actor binding a
+    domain they do not own and carrying a forged authority association
+    through every gate.
+42. **The containment predicate cannot be made to hang.** *Test:* evaluate
+    `covers` on `D = **/…/**/x` against `G = **/…/**/y` at 14 segments —
+    shape-valid input and a legitimate `false`. Assert it returns, and
+    assert the number of distinct `(D-index, G-index)` subproblems
+    evaluated is bounded by `(len(D)+1) × (len(G)+1)`. Counting states
+    rather than timing is the point: a timing assertion passes on a fast
+    machine against an exponential implementation, and the naive
+    recurrence costs 222,981,434 calls on this exact input where the
+    memoized form costs 240 states. Assert separately that a glob
+    exceeding the segment bound raises `work_scope_glob_too_complex`
+    rather than being evaluated. **A correctness table and a termination
+    guarantee are different obligations** — all 17 semantic rows pass
+    against an implementation that hangs on this input.
+
 ## Threat Model And Honest Limits
 
 ### What This Design Establishes
@@ -3103,7 +3247,16 @@ Implement:
   **glob-subset proof and must not delegate to `domains.check_paths`**,
   which classifies a concrete path and therefore accepts `src/**` under a
   domain of `src/*`. All seventeen required cases are D2 tests; the
-  descriptor-accepted-member-rejected obligation is one of them.
+  descriptor-accepted-member-rejected obligation is one of them, and the
+  three rows marked DISCRIMINATING are not optional.
+- **`covers` MUST be memoized or iterative over `(D-index, G-index)`**,
+  with a segment-count bound raising `work_scope_glob_too_complex`. The
+  naive recurrence is exponential on shape-valid input and the predicate
+  runs on every read, so an implementation that transcribes the five
+  clauses literally ships a hang. The three asserted properties —
+  reflexivity, one-sidedness, order-independence — are D2 tests
+  alongside the table, because an implementation can pass all seventeen
+  rows and violate any of them.
 - **`deliver`'s precondition**: a bound lane, and
   `validate_delivery_artifact(..., require_isolation=True)` called with a
   `head_sha` resolved live from the lane — never read from the artifact.
@@ -3174,9 +3327,17 @@ Implement:
   present as `[]` when empty. Deriving it without rendering it on the
   default path leaves the mitigation on the surfaces an operator does not
   read.
+- **`work_domain_entitlement_unverified` as a GO-blocking `UNKNOWN`.** D4
+  is the first phase that emits a verdict and is therefore where this
+  binds — not D6. Until Open Question #9 lands a granting mechanism,
+  **no item reaches GO on this hold**, and that is intended rather than a
+  regression to be tuned away. An implementer who finds every item
+  blocked here has implemented it correctly; the fix is the granting
+  mechanism, never a waiver of the hold.
 
 Do NOT implement: assurance ingestion, CI adapters, merge automation, or
-any dashboard surface.
+any dashboard surface. Do **not** implement entitlement VERIFICATION —
+D4 reports the absence, it does not resolve it.
 
 ### Phase D5: Assurance Ingestion (Stretch)
 
@@ -3247,52 +3408,58 @@ needs it — not during it.
    `work_implausible_timestamp` rule needs a concrete bound. Decided at
    D3 with the first real producer, because picking a number now without
    measuring agent-host clock spread would be arbitrary.
-9. **Who is entitled to bind a given `domain_id`?** **Open, and NOT
-   closed by the containment rule.** `covers` proves that an item's
-   `scope_globs` sit inside the domain the item *claims*; nothing proves
-   the item was entitled to claim it. An agent free to write any
-   `domain_id` satisfies containment trivially by naming a permissive
-   domain, so the rule can be implemented perfectly and the domain
-   boundary still not be enforced end to end. The containment section
-   discloses this at its topical site; this entry exists because a
-   disclosure a reader is never required to visit is not a gate.
+9. **Who GRANTS entitlement to bind a given `domain_id`, and how?**
+   **Narrowed by amendment #14.** The question this entry once asked —
+   *may an item carrying an unverified entitlement claim advance?* — is
+   **no longer open. The answer is NO**, stated normatively in the
+   containment rule: an unverified claim raises
+   `work_domain_entitlement_unverified`, class `unknown`, blocking GO
+   from D4 onward. What remains open is strictly the granting mechanism.
 
-   **What would close it:** a binding-time entitlement check, run when
-   `domain_id` is written (create) and revalidated at verdict time like
+   **Why the split matters, since an earlier draft of this entry got it
+   wrong.** Two different things were folded into one deferral:
+   *verifying* entitlement, which needs an authenticated identity this
+   design does not have in D1–D5; and *refusing to advance* on an
+   unverified claim, which needs no identity at all — only that an
+   absence be reported as an absence. The first is genuinely blocked on
+   work outside this document. The second was buildable all along, and
+   deferring it to D6 meant a rostered actor could bind a domain they do
+   not own, pass containment, pass drift, and reach exact GO carrying a
+   forged authority association. Found by two independent lenses with the
+   same construction.
+
+   **What would close what remains:** a binding-time entitlement check,
+   run when `domain_id` is written and revalidated at verdict time like
    every other domain-derived fact — resolve the domain entry's own
    refsets through the public API (`domains.load_registry` +
    `domains.resolve_refset`) and require the binding actor to appear in
    them. Two details make it answerable rather than merely alarming.
    First, `owners` is a **required** refset on every domain entry while
-   `curators` and `reviewers` are optional, so `owners` is the only
-   basis guaranteed to exist — an entitlement set drawn from an optional
-   refset would be empty for some domains and would fail closed against
-   legitimate work. Second, the check must resolve refsets **at bind
-   time and again at verdict time**, because roster membership moves;
-   `registry_hash_at_bind` already witnesses registry drift but says
-   nothing about whether the actor is still entitled.
+   `curators` and `reviewers` are optional, so `owners` is the only basis
+   guaranteed to exist — an entitlement set drawn from an optional refset
+   would be empty for some domains and would fail closed against
+   legitimate work. Second, the check must resolve refsets **at bind time
+   and again at verdict time**, because roster membership moves;
+   `registry_hash_at_bind` witnesses registry drift but says nothing
+   about whether the actor is still entitled.
 
-   **Why it is not decided here:** entitlement is an authority surface,
-   and this document's standing position is that authority surfaces get
-   their own design and their own review rather than a rule invented to
-   discharge a gap found in an adjacent one — the same reason there is
-   no `work reopen` command. It also reaches into how the roster and the
-   domain registry relate, which is not work's to settle alone.
+   **Why the granting mechanism is not decided here:** it is an authority
+   surface, and this document's standing position is that authority
+   surfaces get their own design and their own review rather than a rule
+   invented to discharge a gap found in an adjacent one — the same reason
+   there is no `work reopen` command. It also reaches into how the roster
+   and the domain registry relate, which is not work's to settle alone.
 
-   **The exposure window opens at D2, not at D6, and this entry would
-   mislead if it did not say so.** Every other question in this list is
-   scheduled before the phase that *needs* it, and nothing is exposed in
-   the meantime. This one inverts that: `domain_id` is bound at **create**,
-   which ships in D2, so from the moment D2 lands there are items in the
-   store whose domain binding was never checked for entitlement. Deciding
-   it at D6 does not defer the exposure, it defers the *fix* — and any
-   answer will have to say what happens to items already bound under no
-   rule, which is a migration question the answer must carry.
-
-   **Consequence if it stays open past D6:** the domain link is
-   enforceable against *drift* and *scope*, and unenforceable against
-   *entitlement*. Any surface that renders a bound domain as an
-   authority claim would be overstating it.
+   **Exposure while it stays open, stated plainly:** items are bound from
+   D2 and no entitlement evidence exists for any of them, so from D4
+   every such item reads `UNKNOWN` on this hold and none can reach GO
+   until the granting mechanism lands. That is the intended cost. It is
+   the difference between a disclosed blockage and a silent pass, and
+   this design takes the blockage. Migration is fail-closed: items bound
+   before the closing amendment are treated as unverified, never
+   grandfathered, because grandfathering would convert a disclosed gap
+   into a permanent silent exemption for precisely the population created
+   while the gap was open.
 
 ## Acceptance Criteria For The RFC
 
@@ -3353,6 +3520,16 @@ a pre-mortem it never appeared in.
   not the mitigation.
 - **All matching policy globs must be satisfied** (D-11), with the
   matched glob persisted rather than the raw path.
+- **An unverified entitlement claim is non-advancing, and the cost is
+  accepted.** Verifying entitlement needs an authenticated identity D1–D5
+  does not have; refusing to ADVANCE on an unverified claim needs no
+  identity at all. Separating those is the contested choice — the
+  alternative, deferring both to D6, lets a rostered actor bind a domain
+  they do not own and reach exact GO. The accepted cost is real and
+  large: **no item reaches GO on this hold until Open Question #9 lands.**
+  Reviewers should agree that a disclosed blockage beats a silent pass
+  here, because it is the one place this document knowingly trades
+  throughput for soundness.
 - **Scope containment is conservative-approximate and fails CLOSED**, and
   a scope glob must be covered by a **single** domain glob rather than by
   the union of several. The alternative — an exact subset decision over
