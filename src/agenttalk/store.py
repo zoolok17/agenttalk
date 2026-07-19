@@ -3877,6 +3877,169 @@ class Store:
             sequences = self._extend_order_with_orphans(order, missing)["messages"]
         return sorted(messages, key=lambda message: sequences[message.id])
 
+    @staticmethod
+    def _stable_scan_problem_reason(reason: str) -> str:
+        """Map platform/version-specific scan details to a stable reason code."""
+        if reason.startswith("cannot read file:"):
+            return "message_file_unreadable"
+        if reason.startswith("invalid JSON:"):
+            return "message_json_invalid"
+        if reason.startswith("filename stem "):
+            return "message_filename_mismatch"
+        return "message_schema_invalid"
+
+    def _validated_message_snapshot(
+        self,
+        *,
+        since_id: str | None = None,
+        collect_problems: bool,
+    ) -> tuple[
+        list[Message],
+        list[dict[str, str | None]],
+        set[str],
+    ]:
+        """Run the shared full validation gate over one canonical disk walk.
+
+        The third result is the set of canonical ``.json`` stems observed by
+        that same walk.  The public completeness snapshot uses it to distinguish
+        a present-but-rejected message from a publication-ordered message whose
+        file is absent.
+
+        ``collect_problems=False`` is the delivery hot path.  In particular, it
+        preserves the historical fail-closed early return when no usable roster
+        exists, without touching the message directory.
+        """
+        try:
+            cfg = self.load_config()
+            # D3 (#19): validate history against the KNOWN roster (active ∪
+            # retired) so a retired identity's past messages stay valid.
+            roster = self._known_roster(cfg)
+        except (ValueError, OSError, FileNotFoundError):
+            roster = []
+        if not roster and not collect_problems:
+            # Preserve _validated_messages' existing no-roster fast fail-closed
+            # behavior.  The diagnostic API still scans so it can explain why
+            # every otherwise-parseable file was rejected.
+            return [], [], set()
+
+        require_sig = bool(roster) and self.signing_enforced()
+        project_id = self.project_id() if require_sig else None
+        key: bytes | None = None
+        if require_sig:
+            try:
+                key = _signing.load_key(project_id)
+            except (FileNotFoundError, OSError, ValueError):
+                key = None  # key vanished between check and load — refuse
+
+        scanned, scan_failures = self._scan_messages_with_paths(
+            since_id=since_id,
+        )
+        present_stems = {
+            path.stem for _, path in scanned
+        } | {
+            path.stem for path, _, _ in scan_failures
+        }
+        problems: list[dict[str, str | None]] = []
+
+        def reject(ident: str | None, path: Path, reason: str) -> None:
+            if collect_problems:
+                problems.append(
+                    {"id": ident, "path": str(path), "reason": reason}
+                )
+
+        for path, ident, reason in scan_failures:
+            reject(ident, path, self._stable_scan_problem_reason(reason))
+
+        out: list[Message] = []
+        for message, path in scanned:
+            if not roster:
+                reject(message.id, path, "message_roster_unavailable")
+                continue
+            try:
+                message.validate(roster)
+            except ValueError:
+                reject(message.id, path, "message_roster_invalid")
+                continue
+            if require_sig:
+                if key is None:
+                    reject(message.id, path, "message_signature_key_unavailable")
+                    continue
+                try:
+                    _signing.verify_message(
+                        message.to_dict(), key, expected_key_id=project_id,
+                    )
+                except ValueError:
+                    reject(message.id, path, "message_signature_invalid")
+                    continue
+            out.append(message)
+
+        # Restore the documented "sorted by id (chronological)" contract:
+        # _scan_messages_with_paths yields raw filesystem-iteration (filename)
+        # order, which equals id order ONLY because stem==id is now enforced
+        # above. Sort explicitly so delivery, cursor advance, and thread
+        # replay are correct even if that invariant is ever relaxed (review H1).
+        out.sort(key=lambda message: message.id)
+        # Defensive dedupe by id: stem==id + unique filenames make duplicate
+        # ids structurally impossible today, but double-delivery would be a
+        # silent correctness bug if that ever changed, so guard it cheaply.
+        deduped: list[Message] = []
+        seen_ids: set[str] = set()
+        for message in out:
+            if message.id in seen_ids:
+                continue
+            seen_ids.add(message.id)
+            deduped.append(message)
+        return deduped, problems, present_stems
+
+    def validated_messages_with_problems(
+        self,
+        *,
+        since_id: str | None = None,
+    ) -> tuple[list[Message], list[dict[str, str | None]]]:
+        """Return one full-validation snapshot as ``(valid, problems)``.
+
+        One canonical directory traversal applies schema, known-roster, and
+        (when enforced) signature validation.  ``problems`` also includes a
+        ``publication_ordered_message_absent`` entry for every durable order id
+        whose canonical message file is absent.  That reverse-history gap is
+        reported but never auto-healed.
+
+        Problem dictionaries have exactly ``id``, ``path``, and ``reason``.
+        Reasons are stable machine-readable codes; paths use the host platform's
+        native representation.  ``since_id`` is an exclusive incremental slice,
+        so completeness/integrity consumers should leave it as ``None``.
+        """
+        # send() durably reserves an order entry immediately before publishing
+        # its file under this lock.  Covering BOTH the traversal and order read
+        # prevents that legitimate interval from looking like deleted history.
+        # Retirement uses the same outer lock ordering, so roster removal cannot
+        # race the gate and manufacture a mixed-roster snapshot.
+        with self._retirement_lock(), self._message_publication_lock():
+            valid, problems, present_stems = self._validated_message_snapshot(
+                since_id=since_id,
+                collect_problems=True,
+            )
+            order = self._read_message_publication_order()
+            if order is None:
+                return valid, problems
+            ordered_ids = sorted(
+                order["messages"],
+                key=order["messages"].__getitem__,
+            )
+            for message_id in ordered_ids:
+                if since_id is not None and message_id <= since_id:
+                    continue
+                if message_id in present_stems:
+                    continue
+                problems.append(
+                    {
+                        "id": message_id,
+                        "path": str(self.messages_dir / f"{message_id}.json"),
+                        "reason": "publication_ordered_message_absent",
+                    }
+                )
+            return valid, problems
+
     def _validated_messages(self, *, since_id: str | None = None) -> list[Message]:
         """Shared trust gate behind ``messages_for`` and ``valid_messages``.
 
@@ -3890,63 +4053,11 @@ class Store:
         ``valid_messages`` MUST keep the default ``None`` (full log) —
         epoch / thread / rescind derivation reads the whole history.
         """
-        try:
-            cfg = self.load_config()
-            # D3 (#19): validate history against the KNOWN roster (active ∪
-            # retired) so a retired identity's past messages stay valid.
-            roster = self._known_roster(cfg)
-        except (ValueError, OSError, FileNotFoundError):
-            roster = []
-        if not roster:
-            # Fail CLOSED: a missing/corrupt roster (load_config raised, or an
-            # empty agents list) means there are no valid senders/recipients,
-            # so deliver NOTHING — rather than fall through to Message.validate's
-            # empty-roster fail-open and deliver forged/off-roster messages
-            # (review L). CLI delivery commands already abort earlier on a
-            # corrupt config; this makes the store-level contract explicit.
-            return []
-        require_sig = self.signing_enforced()
-        project_id = self.project_id() if require_sig else None
-        key: bytes | None = None
-        if require_sig:
-            try:
-                key = _signing.load_key(project_id)
-            except (FileNotFoundError, OSError, ValueError):
-                key = None  # key vanished between check and load — refuse
-        valid, _ = self._scan_messages(since_id=since_id)
-        out: list[Message] = []
-        for m in valid:
-            try:
-                m.validate(roster)
-            except ValueError:
-                continue
-            if require_sig:
-                if key is None:
-                    continue  # policy on but no key — refuse everything
-                try:
-                    _signing.verify_message(
-                        m.to_dict(), key, expected_key_id=project_id,
-                    )
-                except ValueError:
-                    continue
-            out.append(m)
-        # Restore the documented "sorted by id (chronological)" contract:
-        # _scan_messages_with_paths yields raw filesystem-iteration (filename)
-        # order, which equals id order ONLY because stem==id is now enforced
-        # above. Sort explicitly so delivery, cursor advance, and thread
-        # replay are correct even if that invariant is ever relaxed (review H1).
-        out.sort(key=lambda m: m.id)
-        # Defensive dedupe by id: stem==id + unique filenames make duplicate
-        # ids structurally impossible today, but double-delivery would be a
-        # silent correctness bug if that ever changed, so guard it cheaply.
-        deduped: list[Message] = []
-        seen_ids: set[str] = set()
-        for m in out:
-            if m.id in seen_ids:
-                continue
-            seen_ids.add(m.id)
-            deduped.append(m)
-        return deduped
+        valid, _, _ = self._validated_message_snapshot(
+            since_id=since_id,
+            collect_problems=False,
+        )
+        return valid
 
     def current_epoch(self) -> str | None:
         """The global epoch id = the message id of the latest validated global
