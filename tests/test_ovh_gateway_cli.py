@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 
 import pytest
@@ -12,6 +13,9 @@ from agenttalk.ovh_gateway import SpendLedger, default_install_marker_path, defa
 from agenttalk.ovh_gateway import MODEL_ALIAS
 from agenttalk.wrapper import run as wrapper_run
 from agenttalk.store import Store
+
+
+TEST_CHILD_CAP_ISSUER = "atgw-" + "i" * 43
 
 
 def _make_qwen_wrap_store(tmp_path) -> Store:
@@ -148,6 +152,48 @@ def test_gateway_cli_rejects_caller_supplied_actual_reconciliation(
     assert "invalid choice" in capsys.readouterr().err
 
 
+def test_gateway_cli_atomically_installs_child_caps_on_existing_ledger(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "project"
+    Store(root).init(["lead"])
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    ledger = SpendLedger(default_ledger_path(), default_install_marker_path())
+    ledger.initialize(
+        opening_micro_eur=0,
+        opening_evidence="test dashboard, observed 2026-07-16",
+        generation="a" * 32,
+        child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    with sqlite3.connect(ledger.db_path) as conn:
+        conn.execute("DROP TABLE child_attempts")
+        conn.execute("DROP TABLE child_capabilities")
+        conn.execute("DROP TABLE child_turns")
+        conn.execute(
+            "DELETE FROM metadata WHERE key IN (?, ?, ?)",
+            (
+                "child_cap_schema_version",
+                "child_cap_policy_hash",
+                "child_cap_issuer_sha256",
+            ),
+        )
+        conn.execute("UPDATE metadata SET value='1' WHERE key='schema_version'")
+    marker = json.loads(ledger.marker_path.read_text(encoding="utf-8"))
+    marker["ledger_schema_version"] = 1
+    ledger.marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    ovh_gateway.write_secret_file(
+        ovh_gateway.default_front_token_path(), TEST_CHILD_CAP_ISSUER
+    )
+
+    assert cli.main(["--root", str(root), "gateway", "cap-install"]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["installed"] is True
+    assert ledger.status()["child_cap_ready"] is True
+
+
 def test_gateway_status_not_ready_uses_operational_error_exit(tmp_path, monkeypatch) -> None:
     root = tmp_path / "project"
     Store(root).init(["lead"])
@@ -195,6 +241,34 @@ def test_qwen_wrap_requires_authenticated_gateway_readiness_before_token_read(
     assert "internal_liveliness_failed" in hold["summary"]
 
 
+def test_qwen_wrap_rejects_uncapped_lead_loop_cadence(
+    tmp_path,
+    capsys,
+) -> None:
+    store = _make_qwen_wrap_store(tmp_path)
+    store.set_managed_lead_loop("qwen-dev-1")
+
+    rc = cli.main([
+        "--root",
+        str(tmp_path),
+        "wrap",
+        "--for",
+        "qwen-dev-1",
+        "--cli",
+        "claude",
+        "--loop",
+        "--lead-loop",
+        "--",
+        sys.executable,
+        "-c",
+        "pass",
+    ])
+
+    assert rc == 2
+    assert "does not support --lead-loop" in capsys.readouterr().err
+    assert store.read_lead_loop_lease("qwen-dev-1") is None
+
+
 @pytest.mark.parametrize(
     ("canary_state", "expected_reason"),
     [
@@ -215,6 +289,7 @@ def test_qwen_wrap_worker_spend_preflight_blocks_unaccepted_canary_before_token_
         opening_micro_eur=0,
         opening_evidence="test dashboard, observed 2026-07-16",
         generation="a" * 32,
+        child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
     )
     if canary_state != "absent":
         ledger.reserve("1" * 32)
@@ -271,6 +346,7 @@ def test_qwen_wrap_worker_spend_preflight_allows_accepted_canary(
         opening_micro_eur=0,
         opening_evidence="test dashboard, observed 2026-07-16",
         generation="a" * 32,
+        child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
     )
     ledger.reserve("1" * 32)
     ledger.settle(

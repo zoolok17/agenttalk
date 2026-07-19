@@ -40,8 +40,12 @@ TRIAL_CUTOFF_MICRO_EUR = 25_000_000
 SOFT_STOP_MICRO_EUR = 20_000_000
 EXTERNAL_CEILING_MICRO_EUR = 100_000_000
 CANARY_TOLERANCE_BPS = 1_000
-LEDGER_SCHEMA_VERSION = 1
+LEDGER_SCHEMA_VERSION = 2
 INSTALL_MARKER_SCHEMA_VERSION = 1
+CHILD_CAP_SCHEMA_VERSION = 1
+CHILD_TURN_MAX_CALLS = 8
+CHILD_TURN_MAX_MICRO_EUR = 500_000
+CHILD_TURN_MAX_SECONDS = 300
 BACKEND_PROFILE = "ovh-qwen"
 EXTERNAL_WORKER = "external-worker"
 PUBLIC_HOST = "127.0.0.1"
@@ -57,6 +61,13 @@ _ATTEMPT_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _PERIOD_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])$")
 _TERMINAL_ATTEMPT_STATES = frozenset({"settled", "reconciled"})
 _UNRESOLVED_ATTEMPT_STATES = frozenset({"reserved", "uncertain"})
+_FRONT_TOKEN_RE = re.compile(r"^atgw-[A-Za-z0-9_-]{43}$")
+_CHILD_CAPABILITY_RE = re.compile(r"^atgw-child-[A-Za-z0-9_-]{43}$")
+_CHILD_CAP_TABLES = (
+    "child_turns",
+    "child_capabilities",
+    "child_attempts",
+)
 
 
 class GatewayError(RuntimeError):
@@ -81,6 +92,14 @@ class LedgerHold(LedgerError):
 
 class PolicyBlocked(LedgerError):
     """The configured trial cutoff refuses a new reservation."""
+
+
+class ChildTurnCapBlocked(LedgerBlocked):
+    """A request lacks a valid durable child-turn capability."""
+
+
+class ChildTurnCapExceeded(ChildTurnCapBlocked):
+    """A durable child-turn budget has reached a hard gateway ceiling."""
 
 
 def _ceil_cost(tokens: int, rate_micro_eur: int) -> int:
@@ -139,6 +158,24 @@ def price_policy() -> dict:
 def price_policy_hash() -> str:
     encoded = json.dumps(
         price_policy(), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def child_cap_policy() -> dict:
+    """Canonical separately-versioned child-turn admission policy."""
+    return {
+        "schema_version": CHILD_CAP_SCHEMA_VERSION,
+        "max_calls": CHILD_TURN_MAX_CALLS,
+        "max_micro_eur": CHILD_TURN_MAX_MICRO_EUR,
+        "max_seconds": CHILD_TURN_MAX_SECONDS,
+        "reservation_micro_eur": reservation_cost_micro_eur(),
+    }
+
+
+def child_cap_policy_hash() -> str:
+    encoded = json.dumps(
+        child_cap_policy(), sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -310,6 +347,14 @@ class Reservation:
     admitted_at: str
 
 
+@dataclass(frozen=True)
+class ChildTurnCredential:
+    token: str
+    agent: str
+    message_id: str
+    expires_at: str
+
+
 class SpendLedger:
     """Fail-closed monthly accounting with durable unresolved reservations."""
 
@@ -387,6 +432,7 @@ class SpendLedger:
         opening_micro_eur: int,
         opening_evidence: str,
         generation: str | None = None,
+        child_cap_issuer_token: str | None = None,
     ) -> dict:
         if self.installation_state() != "absent":
             raise LedgerBlocked(
@@ -394,6 +440,7 @@ class SpendLedger:
             )
         opening_micro_eur = self._opening_amount(opening_micro_eur)
         opening_evidence = self._opening_evidence(opening_evidence)
+        issuer_hash = self._child_cap_issuer_hash(child_cap_issuer_token)
         self._assert_external_envelope(opening_micro_eur)
         now = self.now().astimezone(timezone.utc)
         observed_at = _iso_utc(now)
@@ -425,6 +472,9 @@ class SpendLedger:
                     "last_accepted_utc": observed_at,
                     "last_accepted_period": opening_period,
                     "service_hold": "",
+                    "child_cap_schema_version": str(CHILD_CAP_SCHEMA_VERSION),
+                    "child_cap_policy_hash": child_cap_policy_hash(),
+                    "child_cap_issuer_sha256": issuer_hash,
                 }
                 conn.execute("BEGIN IMMEDIATE")
                 conn.executemany(
@@ -509,8 +559,48 @@ class SpendLedger:
             );
             """
         )
+        SpendLedger._create_child_cap_schema(conn)
 
-    def _marker(self) -> dict:
+    @staticmethod
+    def _create_child_cap_schema(conn: sqlite3.Connection) -> None:
+        statements = (
+            """CREATE TABLE child_turns (
+                agent TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (
+                    state IN ('open', 'capped', 'expired')
+                ),
+                max_calls INTEGER NOT NULL CHECK (max_calls > 0),
+                max_micro_eur INTEGER NOT NULL CHECK (max_micro_eur > 0),
+                opened_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(agent, message_id)
+            )""",
+            """CREATE TABLE child_capabilities (
+                token_sha256 TEXT PRIMARY KEY,
+                agent TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                issued_at TEXT NOT NULL,
+                FOREIGN KEY(agent, message_id)
+                    REFERENCES child_turns(agent, message_id)
+            )""",
+            """CREATE TABLE child_attempts (
+                attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+                agent TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+                FOREIGN KEY(agent, message_id)
+                    REFERENCES child_turns(agent, message_id),
+                UNIQUE(agent, message_id, ordinal)
+            )""",
+        )
+        for statement in statements:
+            conn.execute(statement)
+
+    def _marker(self, *, ledger_schema_version: int | None = None) -> dict:
         state = self.installation_state()
         if state == "absent":
             raise LedgerBlocked("ledger is not initialized; run explicit ledger init")
@@ -519,7 +609,11 @@ class SpendLedger:
         marker = _strict_json_object(self.marker_path)
         expected = {
             "schema_version": INSTALL_MARKER_SCHEMA_VERSION,
-            "ledger_schema_version": LEDGER_SCHEMA_VERSION,
+            "ledger_schema_version": (
+                LEDGER_SCHEMA_VERSION
+                if ledger_schema_version is None
+                else ledger_schema_version
+            ),
             "price_policy_hash": price_policy_hash(),
         }
         for key, value in expected.items():
@@ -572,7 +666,13 @@ class SpendLedger:
     def _metadata(conn: sqlite3.Connection) -> dict[str, str]:
         return {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM metadata")}
 
-    def _verify_metadata(self, conn: sqlite3.Connection, marker: dict) -> dict[str, str]:
+    def _verify_metadata(
+        self,
+        conn: sqlite3.Connection,
+        marker: dict,
+        *,
+        ledger_schema_version: int | None = None,
+    ) -> dict[str, str]:
         try:
             integrity = conn.execute("PRAGMA quick_check(1)").fetchone()
         except sqlite3.Error as exc:
@@ -581,7 +681,11 @@ class SpendLedger:
             raise LedgerBlocked("ledger integrity check is not ok")
         metadata = self._metadata(conn)
         expected = {
-            "schema_version": str(LEDGER_SCHEMA_VERSION),
+            "schema_version": str(
+                LEDGER_SCHEMA_VERSION
+                if ledger_schema_version is None
+                else ledger_schema_version
+            ),
             "generation": marker["generation"],
             "price_policy_hash": price_policy_hash(),
             "currency": POLICY_CURRENCY,
@@ -682,6 +786,224 @@ class SpendLedger:
         return metadata
 
     @staticmethod
+    def _child_cap_table_names(conn: sqlite3.Connection) -> set[str]:
+        return {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'child_%'"
+            )
+        }
+
+    def _child_cap_feature_state(
+        self,
+        conn: sqlite3.Connection,
+        metadata: dict[str, str] | None = None,
+    ) -> str:
+        metadata = metadata or self._metadata(conn)
+        schema_value = metadata.get("child_cap_schema_version")
+        policy_value = metadata.get("child_cap_policy_hash")
+        issuer_value = metadata.get("child_cap_issuer_sha256")
+        tables = self._child_cap_table_names(conn)
+        expected_tables = set(_CHILD_CAP_TABLES)
+        if (
+            schema_value is None
+            and policy_value is None
+            and issuer_value is None
+            and not (tables & expected_tables)
+        ):
+            return "absent"
+        if schema_value != str(CHILD_CAP_SCHEMA_VERSION):
+            raise LedgerBlocked("child cap schema version is missing or mismatched")
+        if policy_value != child_cap_policy_hash():
+            raise LedgerBlocked("child cap policy hash is missing or mismatched")
+        if not isinstance(issuer_value, str) or not re.fullmatch(
+            r"[a-f0-9]{64}", issuer_value
+        ):
+            raise LedgerBlocked("child cap issuer authority is missing or invalid")
+        if not expected_tables <= tables:
+            raise LedgerBlocked("child cap schema is partial")
+        expected_columns = {
+            "child_turns": (
+                "agent",
+                "message_id",
+                "request_id",
+                "state",
+                "max_calls",
+                "max_micro_eur",
+                "opened_at",
+                "expires_at",
+                "updated_at",
+                "reason",
+            ),
+            "child_capabilities": (
+                "token_sha256",
+                "agent",
+                "message_id",
+                "issued_at",
+            ),
+            "child_attempts": (
+                "attempt_id",
+                "agent",
+                "message_id",
+                "ordinal",
+            ),
+        }
+        for table, expected in expected_columns.items():
+            observed = tuple(
+                str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")
+            )
+            if observed != expected:
+                raise LedgerBlocked(f"child cap table {table} has an unexpected shape")
+        invalid_turn = conn.execute(
+            """
+            SELECT 1 FROM child_turns
+            WHERE state NOT IN ('open', 'capped', 'expired')
+               OR max_calls != ? OR max_micro_eur != ?
+            LIMIT 1
+            """,
+            (CHILD_TURN_MAX_CALLS, CHILD_TURN_MAX_MICRO_EUR),
+        ).fetchone()
+        if invalid_turn is not None:
+            raise LedgerBlocked("child cap turn policy binding is invalid")
+        for row in conn.execute(
+            "SELECT opened_at, expires_at, updated_at FROM child_turns"
+        ):
+            opened = _parse_utc(row["opened_at"])
+            expires = _parse_utc(row["expires_at"])
+            _parse_utc(row["updated_at"])
+            if expires - opened != timedelta(seconds=CHILD_TURN_MAX_SECONDS):
+                raise LedgerBlocked("child cap turn expiry binding is invalid")
+        for row in conn.execute(
+            "SELECT token_sha256, issued_at FROM child_capabilities"
+        ):
+            if not re.fullmatch(r"[a-f0-9]{64}", str(row["token_sha256"])):
+                raise LedgerBlocked("child cap capability hash is invalid")
+            _parse_utc(row["issued_at"])
+        return "ready"
+
+    def install_child_caps(self, *, issuer_token: str | None = None) -> dict:
+        """Migrate a v1 ledger to the downgrade-fenced child-cap schema."""
+        issuer_hash = self._child_cap_issuer_hash(issuer_token)
+        if self.installation_state() != "complete":
+            raise LedgerBlocked(
+                "child cap install requires a complete existing ledger"
+            )
+        raw_marker = _strict_json_object(self.marker_path)
+        marker_version = raw_marker.get("ledger_schema_version")
+        if marker_version == LEDGER_SCHEMA_VERSION:
+            with self._connect() as conn:
+                metadata = self._verify_metadata(conn, self._marker())
+                if self._child_cap_feature_state(conn, metadata) != "ready":
+                    raise LedgerBlocked(
+                        "current ledger schema is missing the child cap feature"
+                    )
+                if not hmac.compare_digest(
+                    metadata["child_cap_issuer_sha256"], issuer_hash
+                ):
+                    raise ChildTurnCapBlocked(
+                        "child turn issuer credential is invalid"
+                    )
+            return {
+                "installed": False,
+                "schema_version": CHILD_CAP_SCHEMA_VERSION,
+                "policy_hash": child_cap_policy_hash(),
+            }
+        if marker_version != 1:
+            raise LedgerBlocked("child cap install requires ledger schema v1 or v2")
+
+        # Commit the database version first. During the small marker-update
+        # window, old code sees metadata v2 and new code sees marker v1, so both
+        # fail closed. A retry recognizes that transitional pair and finishes
+        # the durable marker projection.
+        marker = self._marker(ledger_schema_version=1)
+        try:
+            conn = sqlite3.connect(
+                f"{self.db_path.as_uri()}?mode=rw",
+                uri=True,
+                timeout=self.busy_timeout_seconds,
+            )
+        except sqlite3.Error as exc:
+            raise LedgerBlocked("ledger database cannot be opened") from exc
+        conn.row_factory = sqlite3.Row
+        try:
+            self._configure(conn)
+            conn.execute(
+                f"PRAGMA busy_timeout={int(self.busy_timeout_seconds * 1000)}"
+            )
+            self._begin(conn)
+            try:
+                raw_metadata = self._metadata(conn)
+                database_version = raw_metadata.get("schema_version")
+                if database_version == "1":
+                    metadata = self._verify_metadata(
+                        conn, marker, ledger_schema_version=1
+                    )
+                    if self._unresolved(conn):
+                        raise LedgerHold(
+                            "child cap install requires all provider attempts reconciled"
+                        )
+                    state = self._child_cap_feature_state(conn, metadata)
+                    if state == "absent":
+                        self._create_child_cap_schema(conn)
+                        conn.executemany(
+                            "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                            (
+                                (
+                                    "child_cap_schema_version",
+                                    str(CHILD_CAP_SCHEMA_VERSION),
+                                ),
+                                ("child_cap_policy_hash", child_cap_policy_hash()),
+                                ("child_cap_issuer_sha256", issuer_hash),
+                            ),
+                        )
+                    else:
+                        if not hmac.compare_digest(
+                            metadata["child_cap_issuer_sha256"], issuer_hash
+                        ):
+                            raise ChildTurnCapBlocked(
+                                "child turn issuer credential is invalid"
+                            )
+                    conn.execute(
+                        "UPDATE metadata SET value=? WHERE key='schema_version'",
+                        (str(LEDGER_SCHEMA_VERSION),),
+                    )
+                elif database_version == str(LEDGER_SCHEMA_VERSION):
+                    metadata = self._verify_metadata(
+                        conn, marker, ledger_schema_version=LEDGER_SCHEMA_VERSION
+                    )
+                    if self._child_cap_feature_state(conn, metadata) != "ready":
+                        raise LedgerBlocked(
+                            "migrated ledger is missing the child cap feature"
+                        )
+                    if not hmac.compare_digest(
+                        metadata["child_cap_issuer_sha256"], issuer_hash
+                    ):
+                        raise ChildTurnCapBlocked(
+                            "child turn issuer credential is invalid"
+                        )
+                else:
+                    raise LedgerBlocked(
+                        "ledger schema cannot be migrated to the child cap feature"
+                    )
+                self._commit(conn)
+            except Exception:
+                self._rollback(conn)
+                raise
+        except sqlite3.Error as exc:
+            raise LedgerBlocked("ledger database operation failed") from exc
+        finally:
+            conn.close()
+
+        migrated_marker = dict(marker)
+        migrated_marker["ledger_schema_version"] = LEDGER_SCHEMA_VERSION
+        _durable_write_json(self.marker_path, migrated_marker)
+        return {
+            "installed": True,
+            "schema_version": CHILD_CAP_SCHEMA_VERSION,
+            "policy_hash": child_cap_policy_hash(),
+        }
+
+    @staticmethod
     def _begin(conn: sqlite3.Connection) -> None:
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -717,9 +1039,201 @@ class SpendLedger:
         )
 
     @staticmethod
+    def _validate_child_cap_clock(
+        conn: sqlite3.Connection, current: datetime
+    ) -> None:
+        observations = [
+            _parse_utc(row[0])
+            for row in conn.execute("SELECT updated_at FROM child_turns")
+        ]
+        if observations and current < max(observations):
+            raise LedgerHold(
+                "child turn clock rollback detected; explicit reconciliation is required"
+            )
+
+    def _observe_child_attempt_clock(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        attempt_id: str,
+        current: datetime,
+        timestamp: str,
+    ) -> None:
+        self._validate_child_cap_clock(conn, current)
+        child = conn.execute(
+            """
+            SELECT agent, message_id FROM child_attempts WHERE attempt_id=?
+            """,
+            (attempt_id,),
+        ).fetchone()
+        if child is not None:
+            conn.execute(
+                """
+                UPDATE child_turns SET updated_at=?
+                WHERE agent=? AND message_id=?
+                """,
+                (timestamp, child["agent"], child["message_id"]),
+            )
+
+    @staticmethod
     def _validate_attempt_id(attempt_id: str) -> None:
         if not isinstance(attempt_id, str) or not _ATTEMPT_ID_RE.fullmatch(attempt_id):
             raise ValueError("attempt_id must be 32 lowercase hexadecimal characters")
+
+    @staticmethod
+    def _validate_child_scope(value: object, *, name: str, limit: int) -> str:
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > limit
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        ):
+            raise ValueError(f"{name} must be a non-empty printable string of at most {limit} characters")
+        return value
+
+    @staticmethod
+    def _capability_hash(capability: object) -> str:
+        if not isinstance(capability, str) or not _CHILD_CAPABILITY_RE.fullmatch(capability):
+            raise ChildTurnCapBlocked("child turn capability is missing or malformed")
+        return hashlib.sha256(capability.encode("ascii")).hexdigest()
+
+    @staticmethod
+    def _child_cap_issuer_hash(issuer_token: object) -> str:
+        if not isinstance(issuer_token, str) or not _FRONT_TOKEN_RE.fullmatch(
+            issuer_token
+        ):
+            raise ChildTurnCapBlocked(
+                "child turn issuer credential is missing or malformed"
+            )
+        return hashlib.sha256(issuer_token.encode("ascii")).hexdigest()
+
+    def verify_child_cap_issuer(self, issuer_token: str | None) -> None:
+        """Fail closed unless the current front token owns child-cap minting."""
+        issuer_hash = self._child_cap_issuer_hash(issuer_token)
+        with self._connect() as conn:
+            metadata = self._verify_metadata(conn, self._marker())
+            if self._child_cap_feature_state(conn, metadata) != "ready":
+                raise ChildTurnCapBlocked("child turn cap feature is not installed")
+            if not hmac.compare_digest(
+                metadata["child_cap_issuer_sha256"], issuer_hash
+            ):
+                raise ChildTurnCapBlocked(
+                    "front token does not match the child turn issuer authority"
+                )
+
+    def open_child_turn(
+        self,
+        *,
+        agent: str,
+        message_id: str,
+        request_id: str = "",
+        issuer_token: str | None = None,
+        now: datetime | None = None,
+    ) -> ChildTurnCredential:
+        """Issue an opaque capability bound to one durable wrapper message."""
+        agent = self._validate_child_scope(agent, name="agent", limit=128)
+        message_id = self._validate_child_scope(
+            message_id, name="message_id", limit=256
+        )
+        if request_id:
+            request_id = self._validate_child_scope(
+                request_id, name="request_id", limit=256
+            )
+        elif not isinstance(request_id, str):
+            raise ValueError("request_id must be a string")
+        current = (now or self.now()).astimezone(timezone.utc)
+        issuer_hash = self._child_cap_issuer_hash(issuer_token)
+        timestamp = _iso_utc(current)
+        expires_at = _iso_utc(current + timedelta(seconds=CHILD_TURN_MAX_SECONDS))
+        token = "atgw-child-" + secrets.token_urlsafe(32)
+        token_hash = self._capability_hash(token)
+        with self._connect() as conn:
+            self._begin(conn)
+            try:
+                marker = self._marker()
+                metadata = self._verify_metadata(conn, marker)
+                if self._child_cap_feature_state(conn, metadata) != "ready":
+                    raise ChildTurnCapBlocked("child turn cap feature is not installed")
+                if not hmac.compare_digest(
+                    metadata["child_cap_issuer_sha256"], issuer_hash
+                ):
+                    raise ChildTurnCapBlocked("child turn issuer credential is invalid")
+                self._validate_child_cap_clock(conn, current)
+                self._validate_clock(metadata, current)
+                row = conn.execute(
+                    "SELECT * FROM child_turns WHERE agent=? AND message_id=?",
+                    (agent, message_id),
+                ).fetchone()
+                if row is None:
+                    conn.execute(
+                        """
+                        INSERT INTO child_turns(
+                            agent, message_id, request_id, state, max_calls,
+                            max_micro_eur, opened_at, expires_at, updated_at
+                        ) VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            agent,
+                            message_id,
+                            request_id,
+                            CHILD_TURN_MAX_CALLS,
+                            CHILD_TURN_MAX_MICRO_EUR,
+                            timestamp,
+                            expires_at,
+                            timestamp,
+                        ),
+                    )
+                else:
+                    if row["request_id"] != request_id:
+                        raise ChildTurnCapBlocked(
+                            "child turn request binding changed for an immutable message"
+                        )
+                    latest_observation = _parse_utc(row["updated_at"])
+                    if current < latest_observation:
+                        raise LedgerHold(
+                            "child turn clock rollback detected; explicit reconciliation "
+                            "is required"
+                        )
+                    expiry = _parse_utc(row["expires_at"])
+                    if row["state"] != "open" or current >= expiry:
+                        if row["state"] == "open":
+                            conn.execute(
+                                """
+                                UPDATE child_turns
+                                SET state='expired', reason='wall-time ceiling exceeded',
+                                    updated_at=?
+                                WHERE agent=? AND message_id=?
+                                """,
+                                (timestamp, agent, message_id),
+                            )
+                            self._commit(conn)
+                        raise ChildTurnCapExceeded(
+                            str(row["reason"] or "child turn wall-time ceiling exceeded")
+                        )
+                    expires_at = row["expires_at"]
+                    conn.execute(
+                        """
+                        UPDATE child_turns SET updated_at=?
+                        WHERE agent=? AND message_id=?
+                        """,
+                        (timestamp, agent, message_id),
+                    )
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO child_capabilities(
+                            token_sha256, agent, message_id, issued_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (token_hash, agent, message_id, timestamp),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise LedgerBlocked("child turn capability collision") from exc
+                self._commit(conn)
+            except Exception:
+                self._rollback(conn)
+                raise
+        return ChildTurnCredential(token, agent, message_id, expires_at)
 
     def _advance_period_if_valid(
         self,
@@ -751,6 +1265,81 @@ class SpendLedger:
             raise LedgerHold("billing period skipped or moved backward; explicit advance required")
         return admitted_period
 
+    def _reserve_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        attempt_id: str,
+        model: str,
+        current: datetime,
+        timestamp: str,
+        reserve: int,
+        metadata: dict[str, str],
+        child_scope: tuple[str, str, int] | None = None,
+    ) -> Reservation:
+        if metadata.get("service_hold"):
+            raise LedgerHold("gateway has a durable accounting hold")
+        unresolved = self._unresolved(conn)
+        if unresolved:
+            raise LedgerHold("an unresolved provider attempt blocks new transport")
+        period = self._advance_period_if_valid(conn, metadata, current)
+        row = conn.execute(
+            "SELECT committed_micro_eur FROM periods WHERE period=?", (period,)
+        ).fetchone()
+        if row is None:
+            raise LedgerBlocked("admission period is missing")
+        unresolved_total = sum(int(item["reserved_micro_eur"]) for item in unresolved)
+        projected = int(row[0]) + unresolved_total + reserve
+        opening_allowance = (
+            int(metadata["opening_micro_eur"])
+            if period == metadata["opening_period"]
+            else 0
+        )
+        if projected > opening_allowance + TRIAL_CUTOFF_MICRO_EUR:
+            raise PolicyBlocked("trial spend cutoff would be exceeded")
+        cumulative_row = conn.execute(
+            "SELECT COALESCE(SUM(committed_micro_eur), 0) FROM periods"
+        ).fetchone()
+        cumulative_projected = int(cumulative_row[0]) + unresolved_total + reserve
+        if cumulative_projected > EXTERNAL_CEILING_MICRO_EUR:
+            raise PolicyBlocked("external ceiling would be exceeded")
+        try:
+            conn.execute(
+                """
+                INSERT INTO attempts(
+                    attempt_id, period, model, policy_hash, reserved_micro_eur,
+                    state, admitted_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?)
+                """,
+                (
+                    attempt_id,
+                    period,
+                    model,
+                    price_policy_hash(),
+                    reserve,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            if child_scope is not None:
+                child_agent, child_message_id, ordinal = child_scope
+                conn.execute(
+                    """
+                    INSERT INTO child_attempts(attempt_id, agent, message_id, ordinal)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (attempt_id, child_agent, child_message_id, ordinal),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise LedgerBlocked("attempt_id or child turn ordinal already exists") from exc
+        conn.execute(
+            "UPDATE metadata SET value=? WHERE key='last_accepted_utc'", (timestamp,)
+        )
+        conn.execute(
+            "UPDATE metadata SET value=? WHERE key='last_accepted_period'", (period,)
+        )
+        return Reservation(attempt_id, period, reserve, timestamp)
+
     def reserve(
         self,
         attempt_id: str,
@@ -769,68 +1358,135 @@ class SpendLedger:
             try:
                 marker = self._marker()
                 metadata = self._verify_metadata(conn, marker)
-                if metadata.get("service_hold"):
-                    raise LedgerHold("gateway has a durable accounting hold")
-                unresolved = self._unresolved(conn)
-                if unresolved:
-                    raise LedgerHold("an unresolved provider attempt blocks new transport")
-                period = self._advance_period_if_valid(conn, metadata, current)
-                row = conn.execute(
-                    "SELECT committed_micro_eur FROM periods WHERE period=?", (period,)
-                ).fetchone()
-                if row is None:
-                    raise LedgerBlocked("admission period is missing")
-                unresolved_total = sum(int(item["reserved_micro_eur"]) for item in unresolved)
-                projected = int(row[0]) + unresolved_total + reserve
-                opening_allowance = (
-                    int(metadata["opening_micro_eur"])
-                    if period == metadata["opening_period"]
-                    else 0
-                )
-                if projected > opening_allowance + TRIAL_CUTOFF_MICRO_EUR:
-                    raise PolicyBlocked("trial spend cutoff would be exceeded")
-                cumulative_row = conn.execute(
-                    "SELECT COALESCE(SUM(committed_micro_eur), 0) FROM periods"
-                ).fetchone()
-                # The opening balance is seeded into the opening period, so the
-                # SUM already includes it. Adding metadata.opening_micro_eur
-                # again would double-count the operator-observed balance.
-                cumulative_projected = (
-                    int(cumulative_row[0]) + unresolved_total + reserve
-                )
-                if cumulative_projected > EXTERNAL_CEILING_MICRO_EUR:
-                    raise PolicyBlocked("external ceiling would be exceeded")
-                try:
-                    conn.execute(
-                        """
-                        INSERT INTO attempts(
-                            attempt_id, period, model, policy_hash, reserved_micro_eur,
-                            state, admitted_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?)
-                        """,
-                        (
-                            attempt_id,
-                            period,
-                            model,
-                            price_policy_hash(),
-                            reserve,
-                            timestamp,
-                            timestamp,
-                        ),
-                    )
-                except sqlite3.IntegrityError as exc:
-                    raise LedgerBlocked("attempt_id already exists") from exc
-                conn.execute(
-                    "UPDATE metadata SET value=? WHERE key='last_accepted_utc'", (timestamp,)
-                )
-                conn.execute(
-                    "UPDATE metadata SET value=? WHERE key='last_accepted_period'", (period,)
+                reservation = self._reserve_locked(
+                    conn,
+                    attempt_id=attempt_id,
+                    model=model,
+                    current=current,
+                    timestamp=timestamp,
+                    reserve=reserve,
+                    metadata=metadata,
                 )
                 self._commit(conn)
-                return Reservation(attempt_id, period, reserve, timestamp)
+                return reservation
             except Exception:
                 self._rollback(conn)
                 raise
+
+    def reserve_for_child(
+        self,
+        attempt_id: str,
+        *,
+        capability: str,
+        model: str = MODEL_ALIAS,
+        now: datetime | None = None,
+    ) -> Reservation:
+        """Atomically consume a child-turn slot and reserve provider exposure."""
+        self._validate_attempt_id(attempt_id)
+        capability_hash = self._capability_hash(capability)
+        if model != MODEL_ALIAS:
+            raise PolicyBlocked("model alias is not allowed by the price policy")
+        current = (now or self.now()).astimezone(timezone.utc)
+        timestamp = _iso_utc(current)
+        reserve = reservation_cost_micro_eur()
+        denial: str | None = None
+        reservation: Reservation | None = None
+        with self._connect() as conn:
+            self._begin(conn)
+            try:
+                marker = self._marker()
+                metadata = self._verify_metadata(conn, marker)
+                if self._child_cap_feature_state(conn, metadata) != "ready":
+                    raise ChildTurnCapBlocked("child turn cap feature is not installed")
+                self._validate_child_cap_clock(conn, current)
+                row = conn.execute(
+                    """
+                    SELECT turn.*
+                    FROM child_capabilities AS capability
+                    JOIN child_turns AS turn
+                      ON turn.agent=capability.agent
+                     AND turn.message_id=capability.message_id
+                    WHERE capability.token_sha256=?
+                    """,
+                    (capability_hash,),
+                ).fetchone()
+                if row is None:
+                    raise ChildTurnCapBlocked("child turn capability is unknown")
+                opened = _parse_utc(row["opened_at"])
+                latest_observation = _parse_utc(row["updated_at"])
+                expiry = _parse_utc(row["expires_at"])
+                if current < opened or current < latest_observation:
+                    raise LedgerHold(
+                        "child turn clock rollback detected; explicit reconciliation is required"
+                    )
+                if row["state"] != "open":
+                    denial = str(row["reason"] or "child turn is no longer open")
+                elif current >= expiry:
+                    denial = "child turn wall-time ceiling exceeded"
+                counts = conn.execute(
+                    """
+                    SELECT COUNT(*) AS attempt_count,
+                           COALESCE(SUM(
+                               CASE
+                                   WHEN attempt.actual_micro_eur IS NOT NULL
+                                   THEN attempt.actual_micro_eur
+                                   ELSE attempt.reserved_micro_eur
+                               END
+                           ), 0) AS exposure_micro_eur
+                    FROM child_attempts AS child
+                    JOIN attempts AS attempt ON attempt.attempt_id=child.attempt_id
+                    WHERE child.agent=? AND child.message_id=?
+                    """,
+                    (row["agent"], row["message_id"]),
+                ).fetchone()
+                attempt_count = int(counts["attempt_count"])
+                exposure = int(counts["exposure_micro_eur"])
+                if denial is None and attempt_count >= int(row["max_calls"]):
+                    denial = "child turn call ceiling exceeded"
+                if denial is None and exposure + reserve > int(row["max_micro_eur"]):
+                    denial = "child turn cost ceiling exceeded"
+                if denial is not None:
+                    state = "expired" if current >= expiry else "capped"
+                    conn.execute(
+                        """
+                        UPDATE child_turns
+                        SET state=?, reason=?, updated_at=?
+                        WHERE agent=? AND message_id=?
+                        """,
+                        (state, denial, timestamp, row["agent"], row["message_id"]),
+                    )
+                    self._commit(conn)
+                else:
+                    conn.execute(
+                        """
+                        UPDATE child_turns SET updated_at=?
+                        WHERE agent=? AND message_id=?
+                        """,
+                        (timestamp, row["agent"], row["message_id"]),
+                    )
+                    reservation = self._reserve_locked(
+                        conn,
+                        attempt_id=attempt_id,
+                        model=model,
+                        current=current,
+                        timestamp=timestamp,
+                        reserve=reserve,
+                        metadata=metadata,
+                        child_scope=(
+                            str(row["agent"]),
+                            str(row["message_id"]),
+                            attempt_count + 1,
+                        ),
+                    )
+                    self._commit(conn)
+            except Exception:
+                self._rollback(conn)
+                raise
+        if denial is not None:
+            raise ChildTurnCapExceeded(denial)
+        if reservation is None:
+            raise LedgerBlocked("child turn reservation did not reach a terminal state")
+        return reservation
 
     def mark_uncertain(self, attempt_id: str, *, reason: str, now: datetime | None = None) -> None:
         self._validate_attempt_id(attempt_id)
@@ -848,6 +1504,12 @@ class SpendLedger:
                     raise LedgerBlocked("attempt does not exist")
                 if row["state"] in _TERMINAL_ATTEMPT_STATES:
                     return
+                self._observe_child_attempt_clock(
+                    conn,
+                    attempt_id=attempt_id,
+                    current=current,
+                    timestamp=timestamp,
+                )
                 conn.execute(
                     """
                     UPDATE attempts SET state='uncertain', reason=?, updated_at=?
@@ -899,6 +1561,12 @@ class SpendLedger:
                 marker = self._marker()
                 metadata = self._verify_metadata(conn, marker)
                 self._validate_clock(metadata, current)
+                self._observe_child_attempt_clock(
+                    conn,
+                    attempt_id=attempt_id,
+                    current=current,
+                    timestamp=timestamp,
+                )
                 over_limit = (
                     input_tokens > MAX_CONTEXT_TOKENS
                     or output_tokens > MAX_OUTPUT_TOKENS
@@ -949,7 +1617,8 @@ class SpendLedger:
             raise ValueError("outcome must be no-send or charge-reserve")
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("a reconciliation reason is required")
-        timestamp = _iso_utc((now or self.now()).astimezone(timezone.utc))
+        current = (now or self.now()).astimezone(timezone.utc)
+        timestamp = _iso_utc(current)
         with self._connect() as conn:
             self._begin(conn)
             try:
@@ -960,6 +1629,12 @@ class SpendLedger:
                     raise LedgerBlocked("attempt does not exist")
                 if row["state"] not in _UNRESOLVED_ATTEMPT_STATES:
                     raise LedgerBlocked("attempt is not unresolved")
+                self._observe_child_attempt_clock(
+                    conn,
+                    attempt_id=attempt_id,
+                    current=current,
+                    timestamp=timestamp,
+                )
                 already = int(row["actual_micro_eur"] or 0)
                 if outcome == "no-send":
                     if already:
@@ -1020,7 +1695,8 @@ class SpendLedger:
     def place_hold(self, *, reason: str, now: datetime | None = None) -> dict:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("a hold reason is required")
-        timestamp = _iso_utc((now or self.now()).astimezone(timezone.utc))
+        current = (now or self.now()).astimezone(timezone.utc)
+        timestamp = _iso_utc(current)
         value = "manual: " + reason.strip()[:500]
         with self._connect() as conn:
             self._begin(conn)
@@ -1039,7 +1715,8 @@ class SpendLedger:
     def clear_hold(self, *, reason: str, now: datetime | None = None) -> dict:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("a clear-hold reason is required")
-        timestamp = _iso_utc((now or self.now()).astimezone(timezone.utc))
+        current = (now or self.now()).astimezone(timezone.utc)
+        timestamp = _iso_utc(current)
         with self._connect() as conn:
             self._begin(conn)
             try:
@@ -1077,7 +1754,8 @@ class SpendLedger:
             or observed_delta_micro_eur < 0
         ):
             raise ValueError("observed dashboard delta must be non-negative micro-EUR")
-        timestamp = _iso_utc((now or self.now()).astimezone(timezone.utc))
+        current = (now or self.now()).astimezone(timezone.utc)
+        timestamp = _iso_utc(current)
         with self._connect() as conn:
             self._begin(conn)
             try:
@@ -1096,6 +1774,12 @@ class SpendLedger:
                     raise LedgerBlocked(
                         "dashboard canary requires a positive policy-matched settled attempt"
                     )
+                self._observe_child_attempt_clock(
+                    conn,
+                    attempt_id=attempt_id,
+                    current=current,
+                    timestamp=timestamp,
+                )
                 tolerance = max(
                     1,
                     (
@@ -1144,7 +1828,11 @@ class SpendLedger:
         with self._connect() as conn:
             marker = self._marker()
             metadata = self._verify_metadata(conn, marker)
-            self._validate_clock(metadata, self.now().astimezone(timezone.utc))
+            current = self.now().astimezone(timezone.utc)
+            self._validate_clock(metadata, current)
+            child_cap_state = self._child_cap_feature_state(conn, metadata)
+            if child_cap_state == "ready":
+                self._validate_child_cap_clock(conn, current)
             periods = [dict(row) for row in conn.execute("SELECT * FROM periods ORDER BY period")]
             unresolved = [dict(row) for row in self._unresolved(conn)]
             current_period = metadata["last_accepted_period"]
@@ -1180,6 +1868,36 @@ class SpendLedger:
                 worker_spend_errors.append("dashboard_canary_absent")
             elif dashboard_canary["status"] != "accepted":
                 worker_spend_errors.append("dashboard_canary_mismatch")
+            if child_cap_state != "ready":
+                worker_spend_errors.append("child_cap_unavailable")
+            active_child_turns = []
+            if child_cap_state == "ready":
+                active_child_turns = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT turn.agent, turn.message_id, turn.request_id,
+                               turn.state, turn.opened_at, turn.expires_at,
+                               turn.reason,
+                               COUNT(child.attempt_id) AS attempt_count,
+                               COALESCE(SUM(
+                                   CASE
+                                       WHEN attempt.actual_micro_eur IS NOT NULL
+                                       THEN attempt.actual_micro_eur
+                                       ELSE attempt.reserved_micro_eur
+                                   END
+                               ), 0) AS exposure_micro_eur
+                        FROM child_turns AS turn
+                        LEFT JOIN child_attempts AS child
+                          ON child.agent=turn.agent
+                         AND child.message_id=turn.message_id
+                        LEFT JOIN attempts AS attempt
+                          ON attempt.attempt_id=child.attempt_id
+                        GROUP BY turn.agent, turn.message_id
+                        ORDER BY turn.opened_at, turn.agent, turn.message_id
+                        """
+                    )
+                ]
             return {
                 "schema_version": LEDGER_SCHEMA_VERSION,
                 "generation": metadata["generation"],
@@ -1202,6 +1920,17 @@ class SpendLedger:
                 "unresolved": unresolved,
                 "service_hold": metadata.get("service_hold") or None,
                 "dashboard_canary": dashboard_canary,
+                "child_cap_ready": child_cap_state == "ready",
+                "child_cap_schema_version": (
+                    CHILD_CAP_SCHEMA_VERSION if child_cap_state == "ready" else None
+                ),
+                "child_cap_policy_hash": (
+                    child_cap_policy_hash() if child_cap_state == "ready" else None
+                ),
+                "child_turn_max_calls": CHILD_TURN_MAX_CALLS,
+                "child_turn_max_micro_eur": CHILD_TURN_MAX_MICRO_EUR,
+                "child_turn_max_seconds": CHILD_TURN_MAX_SECONDS,
+                "active_child_turns": active_child_turns,
                 "ready": accounting_ready,
                 "worker_spend_ready": not worker_spend_errors,
                 "worker_spend_errors": worker_spend_errors,
@@ -1243,6 +1972,13 @@ def token_matches(header: str | None, expected: str) -> bool:
     if not isinstance(header, str) or not header.startswith("Bearer "):
         return False
     return hmac.compare_digest(header[7:], expected)
+
+
+def child_capability_from_header(header: str | None) -> str | None:
+    if not isinstance(header, str) or not header.startswith("Bearer "):
+        return None
+    token = header[7:]
+    return token if _CHILD_CAPABILITY_RE.fullmatch(token) else None
 
 
 def render_litellm_config(*, api_base: str) -> str:

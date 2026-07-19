@@ -21,6 +21,9 @@ from agenttalk.ovh_gateway import (
 from agenttalk.ovh_gateway_front import FrontConfig, GatewayFront
 
 
+TEST_CHILD_CAP_ISSUER = "atgw-" + "i" * 43
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
@@ -212,6 +215,13 @@ def test_anthropic_messages_routes_once_to_chat_completions_with_representative_
             opening_micro_eur=0,
             opening_evidence="fake LiteLLM fixture, observed 2026-07-16",
             generation="a" * 32,
+            child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
+        )
+        credential = ledger.open_child_turn(
+            agent="qwen-dev-1",
+            message_id="litellm-conformance-message",
+            request_id="q-litellm-conformance",
+            issuer_token=TEST_CHILD_CAP_ISSUER,
         )
         front = GatewayFront(
             FrontConfig(
@@ -256,7 +266,7 @@ def test_anthropic_messages_routes_once_to_chat_completions_with_representative_
                     "/v1/messages",
                     body=request,
                     headers={
-                        "Authorization": "Bearer sk-fake-front",
+                        "Authorization": f"Bearer {credential.token}",
                         "Content-Type": "application/json",
                         "Host": f"127.0.0.1:{public_port}",
                     },

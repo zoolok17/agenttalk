@@ -3498,6 +3498,16 @@ def bootstrap_check(store: Store, *, now_epoch: float,
                     errors.append("supervisor and roster trust_class must be external-worker")
                 if cfg_agent.get("env"):
                     errors.append("literal per-agent env is forbidden")
+                profile_launch = cfg_agent.get("launch")
+                profile_args = (
+                    profile_launch.get("windows_args")
+                    if isinstance(profile_launch, dict)
+                    else None
+                )
+                if isinstance(profile_args, list) and "--lead-loop" in profile_args:
+                    errors.append(
+                        "lead-loop is unsupported because cadence has no immutable budget scope"
+                    )
                 ambient = [
                     key for key in ("OVH_KEY", "ANTHROPIC_API_KEY") if os.environ.get(key)
                 ]

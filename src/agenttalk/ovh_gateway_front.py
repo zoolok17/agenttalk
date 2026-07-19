@@ -21,12 +21,14 @@ from .ovh_gateway import (
     MODEL_ALIAS,
     PUBLIC_HOST,
     PUBLIC_PORT,
+    ChildTurnCapBlocked,
+    ChildTurnCapExceeded,
     GatewayConfigError,
     LedgerBlocked,
     LedgerHold,
     PolicyBlocked,
     SpendLedger,
-    token_matches,
+    child_capability_from_header,
 )
 
 
@@ -37,6 +39,7 @@ LEDGER_BLOCKED_CODE = "ATGW_LEDGER_BLOCKED"
 CONFIG_ERROR_CODE = "ATGW_CONFIG_ERROR"
 INFRA_ERROR_CODE = "ATGW_INFRA_UNAVAILABLE"
 BUSY_CODE = "ATGW_INFRA_BUSY"
+CHILD_TURN_CAP_EXCEEDED_CODE = "ATGW_CHILD_TURN_CAP_EXCEEDED"
 FORBIDDEN_REQUEST_KEYS = frozenset({
     "api_base",
     "api_key",
@@ -250,7 +253,8 @@ class GatewayFront:
                 if len(authorization_values) != 1:
                     self._stable_error(400, CONFIG_ERROR_CODE)
                     return
-                if not token_matches(authorization_values[0], front.config.public_token):
+                capability = child_capability_from_header(authorization_values[0])
+                if capability is None:
                     self._stable_error(401, CONFIG_ERROR_CODE)
                     return
                 content_type_values = self.headers.get_all("Content-Type") or []
@@ -305,7 +309,7 @@ class GatewayFront:
                     self._stable_error(429, BUSY_CODE)
                     return
                 try:
-                    front._proxy(self, body)
+                    front._proxy(self, body, capability=capability)
                 finally:
                     front._permit.release()
 
@@ -319,11 +323,23 @@ class GatewayFront:
             # explanatory update cannot be committed.
             return
 
-    def _proxy(self, handler: BaseHTTPRequestHandler, body: bytes) -> None:
+    def _proxy(
+        self,
+        handler: BaseHTTPRequestHandler,
+        body: bytes,
+        *,
+        capability: str,
+    ) -> None:
         attempt_id = uuid.uuid4().hex
         public_response_started = False
         try:
-            self.ledger.reserve(attempt_id)
+            self.ledger.reserve_for_child(attempt_id, capability=capability)
+        except ChildTurnCapExceeded:
+            handler._stable_error(403, CHILD_TURN_CAP_EXCEEDED_CODE)  # type: ignore[attr-defined]
+            return
+        except ChildTurnCapBlocked:
+            handler._stable_error(403, CHILD_TURN_CAP_EXCEEDED_CODE)  # type: ignore[attr-defined]
+            return
         except PolicyBlocked:
             handler._stable_error(429, POLICY_BLOCKED_CODE)  # type: ignore[attr-defined]
             return

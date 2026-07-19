@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from agenttalk import ovh_gateway as gateway
 from agenttalk.ovh_gateway import (
     CANARY_TOLERANCE_BPS,
     EXTERNAL_CEILING_MICRO_EUR,
@@ -36,6 +37,7 @@ from agenttalk.ovh_gateway import (
 
 
 TEST_OPENING_EVIDENCE = "test dashboard, observed 2026-07-15T12:00:00Z"
+TEST_CHILD_CAP_ISSUER = "atgw-" + "i" * 43
 
 
 class Clock:
@@ -57,8 +59,31 @@ def make_ledger(tmp_path, clock: Clock | None = None) -> SpendLedger:
         opening_micro_eur=0,
         opening_evidence=TEST_OPENING_EVIDENCE,
         generation="a" * 32,
+        child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
     )
     return ledger
+
+
+def downgrade_to_v1_without_child_caps(ledger: SpendLedger) -> None:
+    """Build the exact pre-cap ledger shape exercised by the migration."""
+    with sqlite3.connect(ledger.db_path) as conn:
+        conn.execute("DROP TABLE child_attempts")
+        conn.execute("DROP TABLE child_capabilities")
+        conn.execute("DROP TABLE child_turns")
+        conn.execute(
+            "DELETE FROM metadata WHERE key IN (?, ?, ?)",
+            (
+                "child_cap_schema_version",
+                "child_cap_policy_hash",
+                "child_cap_issuer_sha256",
+            ),
+        )
+        conn.execute(
+            "UPDATE metadata SET value='1' WHERE key='schema_version'"
+        )
+    marker = json.loads(ledger.marker_path.read_text(encoding="utf-8"))
+    marker["ledger_schema_version"] = 1
+    ledger.marker_path.write_text(json.dumps(marker), encoding="utf-8")
 
 
 def test_exact_price_policy_and_charge_fixture() -> None:
@@ -76,6 +101,14 @@ def test_exact_price_policy_and_charge_fixture() -> None:
     assert settlement_cost_micro_eur(1_000, 100) == 960
     assert reservation_cost_micro_eur() == 206_439
     assert len(price_policy_hash()) == 64
+    assert gateway.child_cap_policy() == {
+        "schema_version": 1,
+        "max_calls": 8,
+        "max_micro_eur": 500_000,
+        "max_seconds": 300,
+        "reservation_micro_eur": 206_439,
+    }
+    assert len(gateway.child_cap_policy_hash()) == 64
 
 
 def test_litellm_config_is_single_model_callback_free_and_chat_completions() -> None:
@@ -101,12 +134,14 @@ def test_initialize_is_explicit_and_partial_or_missing_state_fails_closed(tmp_pa
         opening_micro_eur=0,
         opening_evidence=TEST_OPENING_EVIDENCE,
         generation="b" * 32,
+        child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
     )
     assert marker["price_policy_hash"] == price_policy_hash()
     with pytest.raises(LedgerBlocked, match="requires both"):
         ledger.initialize(
             opening_micro_eur=0,
             opening_evidence=TEST_OPENING_EVIDENCE,
+            child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
         )
 
     (tmp_path / "install.json").unlink()
@@ -128,6 +163,7 @@ def test_initialize_durability_failure_never_creates_complete_install(tmp_path) 
             opening_micro_eur=0,
             opening_evidence=TEST_OPENING_EVIDENCE,
             generation="a" * 32,
+            child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
         )
     assert ledger.installation_state() == "absent"
 
@@ -138,6 +174,7 @@ def test_initialize_removes_temporary_persist_journal(tmp_path) -> None:
         opening_micro_eur=0,
         opening_evidence=TEST_OPENING_EVIDENCE,
         generation="a" * 32,
+        child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
     )
 
     assert not [
@@ -172,6 +209,7 @@ def test_opening_balance_is_bound_seeded_and_surfaced(tmp_path) -> None:
         opening_micro_eur=580_000,
         opening_evidence=evidence,
         generation="b" * 32,
+        child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
     )
 
     assert marker["opening_micro_eur"] == 580_000
@@ -208,6 +246,7 @@ def test_opening_balance_external_envelope_blocks_init_and_readiness(tmp_path) -
         ledger.initialize(
             opening_micro_eur=unsafe_opening,
             opening_evidence=TEST_OPENING_EVIDENCE,
+            child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
         )
     assert ledger.installation_state() == "absent"
 
@@ -215,6 +254,7 @@ def test_opening_balance_external_envelope_blocks_init_and_readiness(tmp_path) -
         opening_micro_eur=0,
         opening_evidence=TEST_OPENING_EVIDENCE,
         generation="a" * 32,
+        child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
     )
     marker = json.loads(ledger.marker_path.read_text(encoding="utf-8"))
     marker["opening_micro_eur"] = unsafe_opening
@@ -249,6 +289,415 @@ def test_reserve_then_settle_commits_exact_actual(tmp_path) -> None:
     assert status["ready"] is True
     assert status["current_committed_micro_eur"] == 960
     assert status["unresolved"] == []
+
+
+def test_child_turn_call_cap_is_durable_and_fail_closed(tmp_path) -> None:
+    ledger = make_ledger(tmp_path)
+    credential = ledger.open_child_turn(
+        agent="qwen-dev-1",
+        message_id="20260719-120000-000000-test",
+        request_id="q-child-cap",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    assert credential.expires_at == "2026-07-15T12:05:00.000000Z"
+
+    for ordinal in range(gateway.CHILD_TURN_MAX_CALLS):
+        attempt_id = f"{ordinal + 1:032x}"
+        ledger.reserve_for_child(attempt_id, capability=credential.token)
+        ledger.settle(
+            attempt_id,
+            model=MODEL_ALIAS,
+            input_tokens=1_000,
+            output_tokens=100,
+        )
+
+    restarted = SpendLedger(ledger.db_path, ledger.marker_path, now=ledger.now)
+    replay = restarted.open_child_turn(
+        agent="qwen-dev-1",
+        message_id="20260719-120000-000000-test",
+        request_id="q-child-cap",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    with pytest.raises(gateway.ChildTurnCapExceeded, match="call ceiling"):
+        restarted.reserve_for_child("f" * 32, capability=replay.token)
+
+    status = restarted.status()
+    assert status["child_cap_ready"] is True
+    assert status["active_child_turns"][0]["attempt_count"] == (
+        gateway.CHILD_TURN_MAX_CALLS
+    )
+    assert all(row["attempt_id"] != "f" * 32 for row in status["unresolved"])
+
+
+def test_child_turn_mint_requires_non_inherited_controller_issuer(tmp_path) -> None:
+    ledger = make_ledger(tmp_path)
+    untrusted_child = SpendLedger(ledger.db_path, ledger.marker_path, now=ledger.now)
+
+    with pytest.raises(gateway.ChildTurnCapBlocked, match="issuer"):
+        untrusted_child.open_child_turn(
+            agent="qwen-dev-1",
+            message_id="invented-fresh-scope",
+            request_id="q-bypass",
+        )
+    with pytest.raises(gateway.ChildTurnCapBlocked, match="issuer"):
+        untrusted_child.open_child_turn(
+            agent="qwen-dev-1",
+            message_id="invented-fresh-scope",
+            request_id="q-bypass",
+            issuer_token="atgw-" + "x" * 43,
+        )
+
+    with sqlite3.connect(ledger.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM child_turns").fetchone()[0] == 0
+
+
+def test_child_turn_cost_cap_and_scope_isolation(tmp_path) -> None:
+    ledger = make_ledger(tmp_path)
+    first = ledger.open_child_turn(
+        agent="qwen-dev-1",
+        message_id="message-a",
+        request_id="same-request",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    for ordinal in range(2):
+        attempt_id = f"{ordinal + 1:032x}"
+        ledger.reserve_for_child(attempt_id, capability=first.token)
+        ledger.settle(
+            attempt_id,
+            model=MODEL_ALIAS,
+            input_tokens=MAX_CONTEXT_TOKENS,
+            output_tokens=MAX_OUTPUT_TOKENS,
+        )
+    with pytest.raises(gateway.ChildTurnCapExceeded, match="cost ceiling"):
+        ledger.reserve_for_child("3" * 32, capability=first.token)
+
+    # A different immutable inbound message gets an independent bucket even when
+    # request_id repeats; another child is independent too.
+    second_message = ledger.open_child_turn(
+        agent="qwen-dev-1",
+        message_id="message-b",
+        request_id="same-request",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    other_child = ledger.open_child_turn(
+        agent="qwen-review-1",
+        message_id="message-a",
+        request_id="same-request",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    ledger.reserve_for_child("4" * 32, capability=second_message.token)
+    ledger.settle(
+        "4" * 32,
+        model=MODEL_ALIAS,
+        input_tokens=1_000,
+        output_tokens=100,
+    )
+    ledger.reserve_for_child("5" * 32, capability=other_child.token)
+
+
+def test_child_turn_expiry_and_forged_capability_block_before_reserve(tmp_path) -> None:
+    clock = Clock(datetime(2026, 7, 15, 12, tzinfo=timezone.utc))
+    ledger = make_ledger(tmp_path, clock)
+    credential = ledger.open_child_turn(
+        agent="qwen-dev-1",
+        message_id="message-a",
+        request_id="q-expiry",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+
+    with pytest.raises(gateway.ChildTurnCapBlocked, match="capability"):
+        ledger.reserve_for_child("1" * 32, capability="atgw-child-forged")
+    assert ledger.status()["unresolved"] == []
+
+    clock.value += timedelta(seconds=gateway.CHILD_TURN_MAX_SECONDS + 1)
+    with pytest.raises(gateway.ChildTurnCapExceeded, match="wall-time"):
+        ledger.reserve_for_child("2" * 32, capability=credential.token)
+    assert ledger.status()["unresolved"] == []
+
+
+def test_child_turn_clock_rollback_cannot_extend_wall_time(tmp_path) -> None:
+    clock = Clock(datetime(2026, 7, 15, 12, tzinfo=timezone.utc))
+    ledger = make_ledger(tmp_path, clock)
+    clock.value += timedelta(hours=1)
+    credential = ledger.open_child_turn(
+        agent="qwen-dev-1",
+        message_id="message-clock-rollback",
+        request_id="q-clock-rollback",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+
+    # This is still later than the ledger initialization clock, but earlier than
+    # the durable turn opening. It must not extend the turn's wall-time budget.
+    clock.value -= timedelta(minutes=59)
+    with pytest.raises(LedgerHold, match="clock rollback"):
+        ledger.reserve_for_child("1" * 32, capability=credential.token)
+
+    with sqlite3.connect(ledger.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM child_attempts").fetchone()[0] == 0
+
+
+def test_child_turn_clock_rollback_after_capability_reissue_blocks_reserve(
+    tmp_path,
+) -> None:
+    clock = Clock(datetime(2026, 7, 15, 12, tzinfo=timezone.utc))
+    ledger = make_ledger(tmp_path, clock)
+    ledger.open_child_turn(
+        agent="qwen-dev-1",
+        message_id="message-reissued-clock",
+        request_id="q-reissued-clock",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    clock.value += timedelta(minutes=4)
+    replay = ledger.open_child_turn(
+        agent="qwen-dev-1",
+        message_id="message-reissued-clock",
+        request_id="q-reissued-clock",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+
+    clock.value -= timedelta(minutes=3)
+    with pytest.raises(LedgerHold, match="clock rollback"):
+        ledger.reserve_for_child("1" * 32, capability=replay.token)
+    with sqlite3.connect(ledger.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM child_attempts").fetchone()[0] == 0
+
+
+def test_child_turn_clock_rollback_after_settlement_blocks_more_transport(
+    tmp_path,
+) -> None:
+    clock = Clock(datetime(2026, 7, 15, 12, tzinfo=timezone.utc))
+    ledger = make_ledger(tmp_path, clock)
+    credential = ledger.open_child_turn(
+        agent="qwen-dev-1",
+        message_id="message-settlement-clock",
+        request_id="q-settlement-clock",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    ledger.reserve_for_child("1" * 32, capability=credential.token)
+    clock.value += timedelta(minutes=4)
+    ledger.settle(
+        "1" * 32,
+        model=MODEL_ALIAS,
+        input_tokens=1_000,
+        output_tokens=100,
+    )
+
+    clock.value -= timedelta(minutes=3)
+    with pytest.raises(LedgerHold, match="clock rollback"):
+        ledger.reserve_for_child("2" * 32, capability=credential.token)
+    with sqlite3.connect(ledger.db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE attempt_id=?", ("2" * 32,)
+        ).fetchone()[0] == 0
+
+
+def test_child_cap_install_migrates_old_ledger_atomically_under_hold(tmp_path) -> None:
+    ledger = make_ledger(tmp_path)
+    ledger.place_hold(reason="install cap before any more paid work")
+    downgrade_to_v1_without_child_caps(ledger)
+
+    with pytest.raises(LedgerBlocked, match="marker ledger_schema_version mismatch"):
+        ledger.status()
+    installed = ledger.install_child_caps(issuer_token=TEST_CHILD_CAP_ISSUER)
+    repeated = ledger.install_child_caps(issuer_token=TEST_CHILD_CAP_ISSUER)
+
+    assert installed["installed"] is True
+    assert repeated["installed"] is False
+    after = ledger.status()
+    assert after["child_cap_ready"] is True
+    assert after["service_hold"] == "manual: install cap before any more paid work"
+    assert after["worker_spend_ready"] is False
+
+
+def test_child_cap_migration_fences_old_static_token_ledger_code(
+    tmp_path, monkeypatch
+) -> None:
+    ledger = make_ledger(tmp_path)
+    ledger.place_hold(reason="migration fence")
+    downgrade_to_v1_without_child_caps(ledger)
+
+    assert ledger.install_child_caps(
+        issuer_token=TEST_CHILD_CAP_ISSUER
+    )["installed"] is True
+    marker = json.loads(ledger.marker_path.read_text(encoding="utf-8"))
+    assert marker["ledger_schema_version"] == 2
+    with sqlite3.connect(ledger.db_path) as conn:
+        assert conn.execute(
+            "SELECT value FROM metadata WHERE key='schema_version'"
+        ).fetchone()[0] == "2"
+
+    # The pre-cap front calls the old ledger's reserve() directly. Its v1
+    # marker/schema authority must reject this migrated install before reserve.
+    monkeypatch.setattr(gateway, "LEDGER_SCHEMA_VERSION", 1)
+    old_ledger = SpendLedger(ledger.db_path, ledger.marker_path, now=ledger.now)
+    with pytest.raises(LedgerBlocked, match="marker ledger_schema_version mismatch"):
+        old_ledger.reserve("f" * 32)
+    with sqlite3.connect(ledger.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+
+
+def test_child_cap_migration_refuses_unresolved_attempt_without_partial_upgrade(
+    tmp_path,
+) -> None:
+    ledger = make_ledger(tmp_path)
+    ledger.reserve("a" * 32)
+    downgrade_to_v1_without_child_caps(ledger)
+
+    with pytest.raises(LedgerHold, match="all provider attempts reconciled"):
+        ledger.install_child_caps(issuer_token=TEST_CHILD_CAP_ISSUER)
+
+    marker = json.loads(ledger.marker_path.read_text(encoding="utf-8"))
+    assert marker["ledger_schema_version"] == 1
+    with sqlite3.connect(ledger.db_path) as conn:
+        assert conn.execute(
+            "SELECT value FROM metadata WHERE key='schema_version'"
+        ).fetchone()[0] == "1"
+        child_tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'child_%'"
+        ).fetchall()
+        assert child_tables == []
+
+
+def test_child_cap_migration_recovers_after_marker_projection_failure(
+    tmp_path, monkeypatch
+) -> None:
+    ledger = make_ledger(tmp_path)
+    ledger.place_hold(reason="migration recovery")
+    downgrade_to_v1_without_child_caps(ledger)
+    durable_write = gateway._durable_write_json
+
+    def fail_marker_projection(_path, _value) -> None:
+        raise OSError("injected marker projection failure")
+
+    monkeypatch.setattr(gateway, "_durable_write_json", fail_marker_projection)
+    with pytest.raises(OSError, match="projection failure"):
+        ledger.install_child_caps(issuer_token=TEST_CHILD_CAP_ISSUER)
+
+    marker = json.loads(ledger.marker_path.read_text(encoding="utf-8"))
+    assert marker["ledger_schema_version"] == 1
+    with sqlite3.connect(ledger.db_path) as conn:
+        assert conn.execute(
+            "SELECT value FROM metadata WHERE key='schema_version'"
+        ).fetchone()[0] == "2"
+    with pytest.raises(LedgerBlocked, match="marker ledger_schema_version mismatch"):
+        ledger.status()
+
+    monkeypatch.setattr(gateway, "_durable_write_json", durable_write)
+    assert ledger.install_child_caps(
+        issuer_token=TEST_CHILD_CAP_ISSUER
+    )["installed"] is True
+    assert ledger.status()["child_cap_ready"] is True
+
+
+def test_partial_child_cap_schema_fails_closed(tmp_path) -> None:
+    ledger = make_ledger(tmp_path)
+    with sqlite3.connect(ledger.db_path) as conn:
+        conn.execute("DROP TABLE child_attempts")
+
+    with pytest.raises(LedgerBlocked, match="partial"):
+        ledger.status()
+
+
+def test_child_capability_is_hash_only_and_global_rejection_consumes_no_slot(
+    tmp_path,
+) -> None:
+    ledger = make_ledger(tmp_path)
+    credential = ledger.open_child_turn(
+        agent="qwen-dev-1",
+        message_id="message-a",
+        request_id="q-atomic",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    assert credential.token.encode("ascii") not in ledger.db_path.read_bytes()
+    with sqlite3.connect(ledger.db_path) as conn:
+        conn.execute(
+            "UPDATE periods SET committed_micro_eur=? WHERE period='2026-07'",
+            (TRIAL_CUTOFF_MICRO_EUR,),
+        )
+
+    with pytest.raises(PolicyBlocked, match="trial spend cutoff"):
+        ledger.reserve_for_child("1" * 32, capability=credential.token)
+
+    with sqlite3.connect(ledger.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM child_attempts").fetchone()[0] == 0
+        conn.execute(
+            "UPDATE periods SET committed_micro_eur=0 WHERE period='2026-07'"
+        )
+    ledger.reserve_for_child("2" * 32, capability=credential.token)
+    with sqlite3.connect(ledger.db_path) as conn:
+        assert conn.execute(
+            "SELECT ordinal FROM child_attempts WHERE attempt_id=?", ("2" * 32,)
+        ).fetchone()[0] == 1
+
+
+def test_child_turn_last_slot_race_never_exceeds_ceiling(
+    tmp_path, monkeypatch
+) -> None:
+    ledger = make_ledger(tmp_path)
+    credential = ledger.open_child_turn(
+        agent="qwen-dev-1",
+        message_id="message-race",
+        request_id="q-race",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    for ordinal in range(gateway.CHILD_TURN_MAX_CALLS - 1):
+        attempt_id = f"{ordinal + 1:032x}"
+        ledger.reserve_for_child(attempt_id, capability=credential.token)
+        ledger.settle(
+            attempt_id,
+            model=MODEL_ALIAS,
+            input_tokens=1_000,
+            output_tokens=100,
+        )
+
+    # Isolate the child-cap CAS from the separate single-unresolved-attempt
+    # safety gate, so the losing writer must observe the durable call ceiling.
+    monkeypatch.setattr(
+        SpendLedger, "_unresolved", staticmethod(lambda _conn: [])
+    )
+
+    barrier = threading.Barrier(2)
+    results: list[tuple[str, str]] = []
+
+    def reserve_last(attempt_id: str) -> None:
+        contender = SpendLedger(ledger.db_path, ledger.marker_path, now=ledger.now)
+        barrier.wait(timeout=5)
+        try:
+            contender.reserve_for_child(attempt_id, capability=credential.token)
+        except gateway.ChildTurnCapExceeded:
+            results.append(("blocked", attempt_id))
+        else:
+            results.append(("reserved", attempt_id))
+
+    workers = [
+        threading.Thread(target=reserve_last, args=("a" * 32,)),
+        threading.Thread(target=reserve_last, args=("b" * 32,)),
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert sorted(state for state, _attempt_id in results) == ["blocked", "reserved"]
+    blocked_id = next(
+        attempt_id for state, attempt_id in results if state == "blocked"
+    )
+    with sqlite3.connect(ledger.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM child_attempts").fetchone()[0] == (
+            gateway.CHILD_TURN_MAX_CALLS
+        )
+        assert conn.execute(
+            "SELECT COALESCE(MAX(ordinal), 0) FROM child_attempts"
+        ).fetchone()[0] == gateway.CHILD_TURN_MAX_CALLS
+        assert conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE attempt_id=?", (blocked_id,)
+        ).fetchone()[0] == 0
+        turn = conn.execute(
+            "SELECT state, reason FROM child_turns WHERE message_id='message-race'"
+        ).fetchone()
+        assert turn == ("capped", "child turn call ceiling exceeded")
 
 
 def test_sqlite_full_commit_is_the_reservation_durability_authority(tmp_path) -> None:

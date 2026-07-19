@@ -2008,6 +2008,44 @@ def test_supervise_bootstrap_check_accepts_constrained_ovh_qwen_profile(
     assert profile["status"] == "ok"
 
 
+def test_supervise_bootstrap_check_rejects_uncapped_qwen_lead_loop(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _team(tmp_path, "Polaris,qwen-dev-1")
+    s.set_role("Polaris", "lead")
+    s.set_operator_facing("Polaris")
+    s.set_trust_class("qwen-dev-1", "external-worker")
+    for name in ("Polaris", "qwen-dev-1"):
+        s.write_heartbeat(name)
+    qwen = _wrapped_supervisor_agent("qwen-dev-1", "claude")
+    qwen.pop("env")
+    qwen["launch"]["windows_args"].insert(
+        qwen["launch"]["windows_args"].index("--"), "--lead-loop"
+    )
+    qwen.update({
+        "backend_profile": "ovh-qwen",
+        "model": "Qwen3.5-397B-A17B",
+        "trust_class": "external-worker",
+    })
+    _write_supervisor_config(s, {"qwen-dev-1": qwen})
+    monkeypatch.delenv("OVH_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    rc = _run(["supervise", "--bootstrap-check"], tmp_path)
+
+    assert rc == 2
+    payload = json.loads(capsys.readouterr().out)
+    profile = next(
+        check
+        for check in payload["checks"]
+        if check["id"] == "supervisor_ovh_qwen_profile"
+    )
+    assert profile["status"] == "error"
+    assert "lead-loop is unsupported" in profile["detail"]
+
+
 def test_supervise_bootstrap_check_rejects_ambient_provider_key_for_qwen(
     tmp_path: Path,
     capsys: pytest.CaptureFixture,

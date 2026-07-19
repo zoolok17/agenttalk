@@ -8003,6 +8003,13 @@ def cmd_gateway(args: argparse.Namespace) -> int:
                 outcome=args.outcome,
                 reason=args.reason,
             )
+        elif action == "cap-install":
+            issuer_token = gateway.read_secret_file(
+                gateway.default_front_token_path()
+            )
+            result = gateway.SpendLedger().install_child_caps(
+                issuer_token=issuer_token
+            )
         elif action == "canary-verify":
             result = gateway.SpendLedger().verify_dashboard_canary(
                 args.attempt_id,
@@ -9816,6 +9823,12 @@ def cmd_wrap(args: argparse.Namespace) -> int:
             return 2
         backend_profile = raw_profile
         if backend_profile == "ovh-qwen":
+            if lead_loop:
+                sys.stderr.write(
+                    "agenttalk wrap: ovh-qwen does not support --lead-loop; "
+                    "cadence turns have no immutable inbound budget scope\n"
+                )
+                return 2
             from agenttalk.ovh_gateway import (
                 EXTERNAL_WORKER,
                 GatewayConfigError,
@@ -13030,6 +13043,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gw_reconcile.add_argument("--reason", required=True)
     gw_reconcile.set_defaults(func=cmd_gateway)
+    gw_cap_install = gwsub.add_parser(
+        "cap-install",
+        help="Durably install or verify fail-closed per-child turn caps.",
+    )
+    gw_cap_install.set_defaults(func=cmd_gateway)
     gw_canary = gwsub.add_parser(
         "canary-verify",
         help="Compare one settled attempt with the operator-observed dashboard delta.",

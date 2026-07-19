@@ -30,6 +30,7 @@ from .ovh_gateway import (
     SpendLedger,
     _durable_write_bytes,
     _durable_write_json,
+    child_cap_policy_hash,
     default_front_token_path,
     default_internal_token_path,
     default_key_path,
@@ -45,7 +46,7 @@ from .redaction import redact_diagnostic_text
 
 
 TASK_SCHEMA_VERSION = 1
-RUNTIME_SCHEMA_VERSION = 1
+RUNTIME_SCHEMA_VERSION = 2
 DEFAULT_API_BASE = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
 STOP_TIMEOUT_SECONDS = 30.0
 LITELLM_READINESS_TIMEOUT_SECONDS = 120.0
@@ -422,10 +423,12 @@ def initialize_install(
         raise GatewayConfigError(
             "refusing partial or replacement gateway initialization: " + ", ".join(existing)
         )
+    front_token = generate_token()
     ledger = ledger or SpendLedger()
     marker = ledger.initialize(
         opening_micro_eur=opening_micro_eur,
         opening_evidence=opening_evidence,
+        child_cap_issuer_token=front_token,
     )
     _durable_write_bytes(
         config_path,
@@ -444,7 +447,7 @@ def initialize_install(
             "internal_bind": f"{INTERNAL_HOST}:{INTERNAL_PORT}",
         },
     )
-    write_secret_file(front_path, generate_token())
+    write_secret_file(front_path, front_token)
     write_secret_file(internal_path, generate_token())
     return {
         "initialized": True,
@@ -577,6 +580,7 @@ def _runtime_projection(root: Path, manifest: dict, *, front_token_sha256: str) 
         "schema_version": RUNTIME_SCHEMA_VERSION,
         "task_name": project_task_name(root),
         "price_policy_hash": price_policy_hash(),
+        "child_cap_policy_hash": child_cap_policy_hash(),
         "config_sha256": manifest["litellm_config_sha256"],
         "public_bind": f"{PUBLIC_HOST}:{PUBLIC_PORT}",
         "internal_bind": f"{INTERNAL_HOST}:{INTERNAL_PORT}",
@@ -602,6 +606,7 @@ def _runtime_projection(root: Path, manifest: dict, *, front_token_sha256: str) 
             "litellm_start",
             "task_name",
             "price_policy_hash",
+            "child_cap_policy_hash",
             "config_sha256",
             "public_bind",
             "internal_bind",
@@ -728,12 +733,14 @@ def run_service(
     if not actions_enabled(root):
         raise GatewayConfigError("gateway.kill is present; actions are disabled")
     ledger = ledger or SpendLedger()
-    if not ledger.status()["ready"]:
-        raise LedgerBlocked("ledger has an unresolved reservation or service hold")
+    ledger_status = ledger.status()
+    if not ledger_status["ready"] or not ledger_status["child_cap_ready"]:
+        raise LedgerBlocked("ledger or child turn cap is not ready")
     exclusive_bind_probe(PUBLIC_HOST, PUBLIC_PORT)
     exclusive_bind_probe(INTERNAL_HOST, INTERNAL_PORT)
     ovh_key = read_secret_file(key_path or default_key_path())
     front_token = read_secret_file(front_token_path or default_front_token_path())
+    ledger.verify_child_cap_issuer(front_token)
     internal_token = read_secret_file(internal_token_path or default_internal_token_path())
     manifest = load_install_manifest(root)
     configured_executable = str(Path(manifest["litellm_executable"]).resolve())
@@ -800,6 +807,7 @@ def run_service(
                 "litellm_start": _process_start_token(int(process.pid)),
                 "task_name": project_task_name(root),
                 "price_policy_hash": price_policy_hash(),
+                "child_cap_policy_hash": child_cap_policy_hash(),
                 "config_sha256": manifest["litellm_config_sha256"],
                 "public_bind": f"{PUBLIC_HOST}:{PUBLIC_PORT}",
                 "internal_bind": f"{INTERNAL_HOST}:{INTERNAL_PORT}",
@@ -884,8 +892,9 @@ def start_task(
     root = canonical_project_root(root)
     load_install_manifest(root)
     ledger = ledger or SpendLedger()
-    if not ledger.status()["ready"]:
-        raise LedgerBlocked("gateway ledger is not ready")
+    ledger_status = ledger.status()
+    if not ledger_status["ready"] or not ledger_status["child_cap_ready"]:
+        raise LedgerBlocked("gateway ledger or child turn cap is not ready")
     identity = expected_task_identity(root)
     existing = commands.query_xml(identity.task_name)
     if existing is None:
@@ -893,6 +902,10 @@ def start_task(
     if not task_xml_matches(existing, identity):
         raise GatewayConfigError("refusing to start a foreign or mismatched gateway task")
     current = gateway_status(root, commands=commands, ledger=ledger)
+    if {"child_cap_issuer_mismatch", "front_token_unavailable"} & set(
+        current["errors"]
+    ):
+        raise LedgerBlocked("front token cannot authorize child turn issuance")
     if current["ready"]:
         return {"started": False, "ready": True, "task_name": identity.task_name}
     kill_switch_path(root).unlink(missing_ok=True)
@@ -928,6 +941,7 @@ def gateway_status(
         "project_root": str(root),
         "task_name": project_task_name(root),
         "price_policy_hash": price_policy_hash(),
+        "child_cap_policy_hash": child_cap_policy_hash(),
         "ambient_provider_keys_absent": not any(
             os.environ.get(key) for key in ("OVH_KEY", "ANTHROPIC_API_KEY")
         ),
@@ -976,8 +990,14 @@ def gateway_status(
     try:
         front_token = read_secret_file(front_token_path or default_front_token_path())
         front_token_hash = hashlib.sha256(front_token.encode("utf-8")).hexdigest()
+        ledger.verify_child_cap_issuer(front_token)
     except GatewayConfigError:
         result["errors"].append("front_token_unavailable")
+    except (LedgerBlocked, LedgerHold):
+        result["errors"].append("child_cap_issuer_mismatch")
+        result["worker_spend_ready"] = False
+        if "child_cap_issuer_mismatch" not in result["worker_spend_errors"]:
+            result["worker_spend_errors"].append("child_cap_issuer_mismatch")
     if (
         runtime_marker_path(root).is_file()
         and manifest is not None

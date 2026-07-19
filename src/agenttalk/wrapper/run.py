@@ -56,6 +56,10 @@ WRAPPER_GENERATION_ENV = "AGENTTALK_WRAPPER_GENERATION"
 INBOUND_REQUEST_ID_ENV = "AGENTTALK_INBOUND_REQUEST_ID"
 _BENIGN_PIPE_TEARDOWN_ERRNOS = {errno.EINVAL, errno.EPIPE}
 
+
+class _GatewayChildCapUnavailable(RuntimeError):
+    """The wrapper could not durably issue a scoped paid-child credential."""
+
 # Legacy infra-like text markers. These are low-confidence hints only; they deliberately
 # no longer classify known_global_infra without a structured CLI status/rate-limit fact.
 # NOTE: bare "blocked" is DELIBERATELY excluded - it would shadow the content-policy
@@ -443,6 +447,7 @@ def _child_env(
     inbound_request_id: str | None = None,
     backend_profile: str | None = None,
     profile_env: dict[str, str] | None = None,
+    gateway_capability: str | None = None,
 ) -> dict[str, str]:
     workspace = Path(workspace_root).resolve() if workspace_root else _workspace_root()
     if backend_profile == "ovh-qwen":
@@ -476,8 +481,19 @@ def _child_env(
         if injected.get("ANTHROPIC_MODEL") not in {None, "Qwen3.5-397B-A17B"}:
             raise ValueError("ovh-qwen requires the pinned model alias")
         injected["ANTHROPIC_MODEL"] = "Qwen3.5-397B-A17B"
+        # The front token is a controller-only mint credential. It must not
+        # reach executable preflight or the model child. A paid child receives
+        # only the scoped capability minted immediately before its spawn.
+        injected.pop("ANTHROPIC_AUTH_TOKEN")
+        if gateway_capability is not None:
+            from agenttalk.ovh_gateway import child_capability_from_header
+
+            if child_capability_from_header(f"Bearer {gateway_capability}") is None:
+                raise ValueError("ovh-qwen child turn capability is malformed")
+            injected["ANTHROPIC_AUTH_TOKEN"] = gateway_capability
         # Never inherit provider credentials or an ambient Claude token. The
-        # front token is the only Anthropic credential injected below.
+        # controller starts with the issuer token; the real paid child gets
+        # only its message-scoped capability instead.
         for key in list(env):
             if key.casefold() in {
                 "anthropic_api_key",
@@ -1557,6 +1573,8 @@ def _classify_drive_failure(
 
     if backend_profile == "ovh-qwen":
         text = _ovh_qwen_failure_text(sig)
+        if "atgw_child_turn_cap_exceeded" in text:
+            return CLASS_CONFIG_BLOCKED, "OVH child turn budget exhausted"
         if "atgw_policy_blocked" in text or "atgw_ledger_blocked" in text:
             return CLASS_CONFIG_BLOCKED, "OVH trial policy or accounting hold"
         if "atgw_config_error" in text or "status code: 422" in text or "http 422" in text:
@@ -1752,6 +1770,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         min_interval=min_interval,
     )
     active_parent_request_id: str | None = None
+    active_message_id: str | None = None
     if spawn is not None:
         spawner = spawn                     # tests inject their own (argv, stdin) spawner
     else:
@@ -1769,12 +1788,35 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             # Bind the per-turn watchdog onto the real spawner. When turn_watchdog is None
             # or disabled, _ProcStream starts no thread (zero overhead, behavior unchanged).
             # Same for a disabled/invalid work_heartbeat config.
+            gateway_capability = None
+            if backend_profile == "ovh-qwen":
+                from agenttalk.ovh_gateway import GatewayError, SpendLedger
+
+                if not active_message_id:
+                    raise _GatewayChildCapUnavailable(
+                        "immutable inbound message id is unavailable"
+                    )
+                try:
+                    gateway_capability = SpendLedger().open_child_turn(
+                        agent=agent,
+                        message_id=active_message_id,
+                        request_id=active_parent_request_id or "",
+                        issuer_token=str(
+                            (profile_env or {}).get("ANTHROPIC_AUTH_TOKEN") or ""
+                        ),
+                    ).token
+                except (GatewayError, OSError, ValueError) as exc:
+                    raise _GatewayChildCapUnavailable(
+                        "durable child turn capability unavailable: "
+                        f"{type(exc).__name__}"
+                    ) from exc
             child_env = _child_env(
                 store.root,
                 wrapper_generation=wrapper_generation,
                 inbound_request_id=active_parent_request_id,
                 backend_profile=backend_profile,
                 profile_env=profile_env,
+                gateway_capability=gateway_capability,
             )
             return _ProcStream(argv, stdin_text, watchdog=turn_watchdog,
                                watchdog_snapshot_fn=watchdog_snapshot_fn,
@@ -1885,6 +1927,13 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                             sig["setup_failure"] = setup_failure
                     health_writer.event(ev)
                     engine.process(ev, clock())
+        except _GatewayChildCapUnavailable as e:
+            _capture_child_output("stderr", f"{type(e).__name__}: {e}")
+            _finalize_child_output()
+            sig["config_blocked"] = True
+            sig["config_blocked_text"] = str(e)
+            sig["error"] = str(e)
+            return sig
         except OSError as e:
             _capture_child_output("stderr", f"{type(e).__name__}: {e}")
             _finalize_child_output()
@@ -1920,10 +1969,12 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         return _classify_drive_failure(sig, backend_profile=backend_profile)
 
     def drive(record: dict) -> DriveOutcome:
-        nonlocal active_parent_request_id
+        nonlocal active_message_id, active_parent_request_id
         meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
         parent = meta.get("request_id")
         active_parent_request_id = parent if isinstance(parent, str) and parent else None
+        message_id = record.get("id")
+        active_message_id = message_id if isinstance(message_id, str) and message_id else None
         lesson_selection = _lesson_context.select_for_record(store, record)
         lesson_prompt = _lesson_context.render_prompt_section(lesson_selection)
         lesson_turn_id = f"turn-{uuid.uuid4().hex[:12]}"

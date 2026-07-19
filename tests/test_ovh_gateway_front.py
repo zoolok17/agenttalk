@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from agenttalk import ovh_gateway as gateway
 from agenttalk.ovh_gateway import MODEL_ALIAS, SpendLedger, settlement_cost_micro_eur
 from agenttalk.ovh_gateway_front import (
     CONFIG_ERROR_CODE,
@@ -19,6 +20,9 @@ from agenttalk.ovh_gateway_front import (
     GatewayFront,
     StreamUsage,
 )
+
+
+TEST_CHILD_CAP_ISSUER = "atgw-" + "i" * 43
 
 
 def _listen_port() -> int:
@@ -110,6 +114,13 @@ class RunningFront:
             opening_micro_eur=0,
             opening_evidence="fake front fixture, observed 2026-07-16",
             generation="a" * 32,
+            child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
+        )
+        self.credential = self.ledger.open_child_turn(
+            agent="qwen-dev-1",
+            message_id="front-fixture-message",
+            request_id="q-front-fixture",
+            issuer_token=TEST_CHILD_CAP_ISSUER,
         )
         public_port = _listen_port()
         self.config = FrontConfig(
@@ -150,7 +161,7 @@ class RunningFront:
         encoded = json.dumps(body).encode("utf-8") if isinstance(body, dict) else body
         request_headers = {
             "Host": self.config.public_host_header,
-            "Authorization": "Bearer front-secret",
+            "Authorization": f"Bearer {self.credential.token}",
             "Content-Type": "application/json",
         }
         request_headers.update(headers or {})
@@ -271,6 +282,9 @@ def test_front_rejects_duplicate_or_ambiguous_request_framing(
         raw_request = raw_request.replace(
             b"{HOST}", front.config.public_host_header.encode("ascii")
         )
+        raw_request = raw_request.replace(
+            b"front-secret", front.credential.token.encode("ascii")
+        )
         status, response = front.raw_request(raw_request)
 
         assert status == 400
@@ -319,6 +333,44 @@ def test_success_reserves_before_one_internal_attempt_then_settles(tmp_path) -> 
         ledger = front.ledger.status()
         assert ledger["unresolved"] == []
         assert ledger["current_committed_micro_eur"] == settlement_cost_micro_eur(100, 10)
+
+
+def test_static_front_token_is_not_a_paid_transport_bypass(tmp_path) -> None:
+    with FakeUpstream() as upstream, RunningFront(tmp_path, upstream) as front:
+        status, body = front.request(
+            headers={"Authorization": "Bearer front-secret"},
+        )
+
+        assert status == 401
+        assert CONFIG_ERROR_CODE.encode() in body
+        assert upstream.requests == []
+        assert front.ledger.status()["unresolved"] == []
+
+
+def test_forged_well_formed_child_capability_never_reaches_provider(tmp_path) -> None:
+    with FakeUpstream() as upstream, RunningFront(tmp_path, upstream) as front:
+        status, body = front.request(
+            headers={"Authorization": "Bearer atgw-child-" + "z" * 43},
+        )
+
+        assert status == 403
+        assert b"ATGW_CHILD_TURN_CAP_EXCEEDED" in body
+        assert upstream.requests == []
+        assert front.ledger.status()["unresolved"] == []
+
+
+def test_front_refuses_ninth_child_call_without_provider_transport(tmp_path) -> None:
+    with FakeUpstream() as upstream, RunningFront(tmp_path, upstream) as front:
+        for _ in range(gateway.CHILD_TURN_MAX_CALLS):
+            status, _ = front.request()
+            assert status == 200
+
+        status, body = front.request()
+
+        assert status == 403
+        assert b"ATGW_CHILD_TURN_CAP_EXCEEDED" in body
+        assert len(upstream.requests) == gateway.CHILD_TURN_MAX_CALLS
+        assert front.ledger.status()["unresolved"] == []
 
 
 @pytest.mark.parametrize("upstream_status", [429, 500])
@@ -460,12 +512,22 @@ def _direct_front(tmp_path, connection: _FakeConnection) -> GatewayFront:
         opening_micro_eur=0,
         opening_evidence="fake front fixture, observed 2026-07-16",
         generation="a" * 32,
+        child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
     )
     return GatewayFront(
         FrontConfig(public_token="front", internal_token="internal"),
         ledger,
         connection_factory=lambda *_args, **_kwargs: connection,
     )
+
+
+def _direct_capability(front: GatewayFront) -> str:
+    return front.ledger.open_child_turn(
+        agent="qwen-dev-1",
+        message_id="direct-front-message",
+        request_id="q-direct-front",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    ).token
 
 
 @pytest.mark.parametrize(
@@ -480,7 +542,7 @@ def test_internal_transport_failure_retains_reservation_and_returns_stable_infra
     front = _direct_front(tmp_path, connection)
     handler = _FakeHandler()
 
-    front._proxy(handler, b"{}")
+    front._proxy(handler, b"{}", capability=_direct_capability(front))
 
     assert connection.request_count == 1
     assert handler.status == 502
@@ -500,7 +562,7 @@ def test_client_disconnect_retains_reservation_after_one_internal_attempt(tmp_pa
     front = _direct_front(tmp_path, connection)
     handler = _FakeHandler(disconnect=True)
 
-    front._proxy(handler, b"{}")
+    front._proxy(handler, b"{}", capability=_direct_capability(front))
 
     assert connection.request_count == 1
     assert front.ledger.status()["unresolved"][0]["state"] == "uncertain"

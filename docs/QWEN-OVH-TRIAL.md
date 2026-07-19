@@ -20,6 +20,9 @@ hostile same-user process.
   4.32/M output tokens.
 - Maximum output: 4096 tokens; maximum input context: 262144 tokens.
 - Maximum one-attempt reservation: EUR 0.206439.
+- Maximum one wrapped child turn: 8 provider calls, EUR 0.50 of settled or
+  reserved exposure, and 300 seconds from its first durable opening. The first
+  reached ceiling closes that turn; later calls are refused before transport.
 - Trial cutoff: EUR 25; operator soft stop: EUR 20.
 - External account ceiling: EUR 100. Initialization and readiness require the
   operator-observed opening balance plus the EUR 25 trial cutoff plus one
@@ -34,8 +37,11 @@ or transport.
 
 ## Boundaries
 
-The public front accepts only an authenticated exact `POST /v1/messages` with
-the literal `Host: 127.0.0.1:4000`. It rejects missing or different Host,
+The public front accepts only an exact `POST /v1/messages` carrying a valid
+message-scoped child capability and the literal `Host: 127.0.0.1:4000`. The
+installation's front token authorizes capability issuance by the trusted
+wrapper controller; it does not authorize paid requests. The front rejects a
+static front token, a missing or different Host,
 every Origin header, every other path or method, excess body size, excess token
 limits, and concurrent work. The front never forwards `/health`, models,
 Chat Completions, admin, UI, docs, config, or key routes.
@@ -138,7 +144,11 @@ Claude executable tail:
 
 Do not add an `env` object to this entry. The profile constructs the child
 environment from an empty map, passes only the named safe OS and `AGENTTALK_*`
-variables, and injects the loopback URL and front token. It excludes ambient
+variables, and injects the loopback URL. Immediately before each real model
+spawn, the trusted wrapper binds the immutable inbound message ID to a durable
+turn and replaces the controller-only front token with that turn's opaque
+capability. Executable preflight and the model child never receive the issuer
+token. The profile excludes ambient
 `ANTHROPIC_API_KEY`, `OVH_KEY`, and `ANTHROPIC_AUTH_TOKEN`. Every non-Qwen
 profile retains its prior environment behavior.
 
@@ -156,12 +166,28 @@ supervisor environment. A failed readiness check creates the normal durable
 
 ## Spend and Failure Semantics
 
-Before the single provider transport, SQLite `BEGIN IMMEDIATE` durably records
-a unique attempt reservation. SQLite `synchronous=FULL` commit is the sole
+Before every provider transport, SQLite `BEGIN IMMEDIATE` durably records
+a unique attempt reservation and consumes the next slot in the same child-turn
+transaction. A reservation rejected by the call, cost, or wall-time ceiling
+does not create a provider attempt. Replaying or restarting the same immutable
+message reuses its original durable turn bucket. SQLite `synchronous=FULL`
+commit is the sole
 transaction durability authority; there is no fallible second flush after a
 committed terminal transition. Admission counts committed spend plus every
 unresolved reservation. The concurrency permit remains held through settlement
 or durable hold.
+
+`ovh-qwen` does not support `wrap --lead-loop`. Cadence turns have no immutable
+inbound message scope, so the wrapper and supervisor bootstrap check reject
+that combination instead of launching an uncapped child.
+
+For an existing schema-v1 trial ledger, keep a manual hold in place, reconcile
+every unresolved attempt, and run `agenttalk gateway cap-install` from the
+cap-aware build before enabling worker spend. The migration binds the current
+front token as the issuer, advances both the ledger and install marker to
+schema v2, and is retryable if marker projection fails after the database
+commit. Schema-v1 gateway code rejects the migrated ledger, which prevents a
+rollback to static-token paid admission.
 
 A complete response with exact-model, present, positive integer token usage is
 settled to the original UTC admission period. Missing or invalid usage,

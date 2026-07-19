@@ -10,7 +10,14 @@ from pathlib import Path
 import pytest
 
 from agenttalk import ovh_gateway_service as service
-from agenttalk.ovh_gateway import GatewayConfigError, MODEL_ALIAS, SpendLedger, price_policy_hash
+from agenttalk.ovh_gateway import (
+    GatewayConfigError,
+    LedgerBlocked,
+    MODEL_ALIAS,
+    SpendLedger,
+    child_cap_policy_hash,
+    price_policy_hash,
+)
 from agenttalk.ovh_gateway_service import (
     MAX_TASK_RESTARTS,
     TaskCommands,
@@ -480,24 +487,23 @@ def test_status_requires_attested_runtime_front_and_internal_liveliness(
     install_task(root, commands=commands)
     manifest = service.load_install_manifest(root)
     start = service._process_start_token(os.getpid())
-    service._durable_write_json(
-        runtime_marker_path(root),
-        {
-            "schema_version": 1,
-            "runner_pid": os.getpid(),
-            "runner_start": start,
-            "litellm_pid": os.getpid(),
-            "litellm_start": start,
-            "task_name": project_task_name(root),
-            "price_policy_hash": price_policy_hash(),
-            "config_sha256": manifest["litellm_config_sha256"],
-            "public_bind": "127.0.0.1:4000",
-            "internal_bind": "127.0.0.1:4001",
-            "front_token_sha256": hashlib.sha256(
-                front_token.read_text(encoding="utf-8").strip().encode("utf-8")
-            ).hexdigest(),
-        },
-    )
+    runtime = {
+        "schema_version": service.RUNTIME_SCHEMA_VERSION,
+        "runner_pid": os.getpid(),
+        "runner_start": start,
+        "litellm_pid": os.getpid(),
+        "litellm_start": start,
+        "task_name": project_task_name(root),
+        "price_policy_hash": price_policy_hash(),
+        "child_cap_policy_hash": child_cap_policy_hash(),
+        "config_sha256": manifest["litellm_config_sha256"],
+        "public_bind": "127.0.0.1:4000",
+        "internal_bind": "127.0.0.1:4001",
+        "front_token_sha256": hashlib.sha256(
+            front_token.read_text(encoding="utf-8").strip().encode("utf-8")
+        ).hexdigest(),
+    }
+    service._durable_write_json(runtime_marker_path(root), runtime)
     monkeypatch.setattr(
         service,
         "exclusive_bind_probe",
@@ -546,7 +552,8 @@ def test_status_requires_attested_runtime_front_and_internal_liveliness(
     assert accepted["worker_spend_ready"] is True
     assert accepted["worker_spend_errors"] == []
 
-    front_token.write_text("replacement-token\n", encoding="utf-8")
+    replacement_token = service.generate_token()
+    front_token.write_text(replacement_token + "\n", encoding="utf-8")
     replaced = gateway_status(
         root,
         commands=commands,
@@ -555,7 +562,72 @@ def test_status_requires_attested_runtime_front_and_internal_liveliness(
         internal_token_path=internal_token,
     )
     assert replaced["ready"] is False
+    assert "child_cap_issuer_mismatch" in replaced["errors"]
     assert "runtime_marker_invalid" in replaced["errors"]
+
+    runtime["front_token_sha256"] = hashlib.sha256(
+        replacement_token.encode("utf-8")
+    ).hexdigest()
+    service._durable_write_json(runtime_marker_path(root), runtime)
+    clean_restart = gateway_status(
+        root,
+        commands=commands,
+        ledger=ledger,
+        front_token_path=front_token,
+        internal_token_path=internal_token,
+    )
+    assert clean_restart["runtime_marker_present"] is True
+    assert clean_restart["ready"] is False
+    assert clean_restart["worker_spend_ready"] is False
+    assert "child_cap_issuer_mismatch" in clean_restart["errors"]
+    assert "child_cap_issuer_mismatch" in clean_restart["worker_spend_errors"]
+
+
+def test_runner_refuses_replaced_front_token_before_child_spawn(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "project"
+    ledger = SpendLedger(
+        tmp_path / "spend" / "ledger.sqlite3",
+        tmp_path / "spend" / "install.json",
+    )
+    executable = tmp_path / "litellm.exe"
+    executable.write_bytes(b"fake")
+    key = tmp_path / "secrets" / "provider.txt"
+    front_token = tmp_path / "secrets" / "front.txt"
+    internal_token = tmp_path / "secrets" / "internal.txt"
+    initialize_install(
+        root,
+        litellm_executable=executable,
+        opening_micro_eur=0,
+        opening_evidence="test dashboard, observed 2026-07-16",
+        ledger=ledger,
+        front_token_path=front_token,
+        internal_token_path=internal_token,
+    )
+    key.write_text("provider-secret\n", encoding="utf-8")
+    front_token.write_text(service.generate_token() + "\n", encoding="utf-8")
+    spawned = False
+
+    def fake_popen(*_args, **_kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("provider child must not spawn")
+
+    monkeypatch.setattr(service, "exclusive_bind_probe", lambda _host, _port: None)
+
+    with pytest.raises(LedgerBlocked, match="front token"):
+        run_service(
+            root,
+            ledger=ledger,
+            key_path=key,
+            front_token_path=front_token,
+            internal_token_path=internal_token,
+            popen=fake_popen,
+        )
+
+    assert spawned is False
 
 
 def test_start_waits_for_attested_readiness(tmp_path, monkeypatch) -> None:
@@ -590,6 +662,43 @@ def test_start_waits_for_attested_readiness(tmp_path, monkeypatch) -> None:
 
     assert result["ready"] is True
     assert commands.started == [project_task_name(root)]
+
+
+def test_start_refuses_child_cap_issuer_mismatch_before_task_start(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "project"
+    ledger = SpendLedger(
+        tmp_path / "spend" / "ledger.sqlite3",
+        tmp_path / "spend" / "install.json",
+    )
+    executable = tmp_path / "litellm.exe"
+    executable.write_bytes(b"fake")
+    initialize_install(
+        root,
+        litellm_executable=executable,
+        opening_micro_eur=0,
+        opening_evidence="test dashboard, observed 2026-07-16",
+        ledger=ledger,
+        front_token_path=tmp_path / "secrets" / "front.txt",
+        internal_token_path=tmp_path / "secrets" / "internal.txt",
+    )
+    commands = FakeCommands()
+    install_task(root, commands=commands)
+    monkeypatch.setattr(
+        service,
+        "gateway_status",
+        lambda *_args, **_kwargs: {
+            "ready": False,
+            "errors": ["child_cap_issuer_mismatch"],
+        },
+    )
+
+    with pytest.raises(LedgerBlocked, match="front token"):
+        start_task(root, commands=commands, ledger=ledger)
+
+    assert commands.started == []
 
 
 def test_start_is_idempotent_when_attested_service_is_already_ready(
