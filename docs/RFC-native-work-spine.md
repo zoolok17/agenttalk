@@ -1094,11 +1094,25 @@ Rules:
   execution or transport adapter; no such adapter exists in these phases,
   so nothing can produce `evidence_source == "automation_ci"` honestly and
   no `producer_class == "automation"` resolution rule exists either.
-  **The consequence, scoped precisely: under the default floor — or any
-  floor at `automation_ci` or above — no release-blocking work item can
-  reach `GO` in D1–D5.** `release_min_tier` defaults to `automation_ci`,
-  that floor cannot be met, and `work_artifact_insufficient_tier` holds
-  every release-blocking requirement.
+- **The consequence, stated exhaustively from the bottom of the ladder:
+  in D1–D5 only a `release_min_tier` at or below `local_agent` admits a
+  `GO`; every higher floor is unmeetable.** `local_agent` is the sole
+  producible tier — `local_operator`, `automation_ci`, and
+  `external_attested` are each unreachable in these phases, and
+  `referenced` never satisfies a requirement on its own though a floor
+  set there is cleared by a `local_agent` artifact. Since
+  `release_min_tier` defaults to `automation_ci`, the default is
+  unmeetable and `work_artifact_insufficient_tier` holds every
+  release-blocking requirement.
+- Stated from the bottom deliberately. Enumerating downward from the top
+  ("the default, or anything at `automation_ci` or above") is true but
+  stops one rung short: a policy author who reads that the default is
+  unmeetable will most naturally lower it by **one** rung, to
+  `local_operator`, and hit a hold from a floor the disclosure never
+  mentioned. A disclosure whose entire purpose is to say what happens
+  when you lower the floor has to cover the likeliest lowering. The
+  bottom-up form is also exhaustive, shorter, and lines up exactly with
+  when `release_floor_lowered` fires.
 - **That is not an absolute, and stating it as one would be false.**
   `release_min_tier` is a *default*, not a hard floor: a project policy
   may set it lower, which the roadmap explicitly permits ("unless project
@@ -1429,6 +1443,13 @@ Rules:
   (`active · HOLD(3)`), never a bare `blocked`. Collapsing to one token
   is how a fresh draft would read as blocked and how a rejected review
   would vanish behind a HOLD.
+- **No rendering may drop `cautions` either, including the DEFAULT HUMAN
+  output.** `work check` and `work status` without `--json` display any
+  cautions alongside the pair — `active · GO · release_floor_lowered(src/**, local_agent)`
+  or an equivalent that names the flag. A caution carried only on the
+  `--json` paths is a mitigation that survives everywhere except the
+  surface an operator actually reads, which is where the false-trust
+  failure it exists to prevent actually happens.
 - A `draft` item with an unresolvable revision is `draft, UNKNOWN` — an
   honest "we have not started, so we cannot tell you it is deliverable."
   It is not `blocked`, because nothing is blocking; nothing has begun.
@@ -1464,7 +1485,8 @@ The return matches `close` and `lanes` exactly:
      "detail": "a-77b0de failed content_hash; cannot establish its result"}
   ],
   "ok": false,
-  "has_unknown": true
+  "has_unknown": true,
+  "cautions": []
 }
 ```
 
@@ -1700,12 +1722,13 @@ Rules:
 | A review-result bound to the current revision exists and is approved | `work_review_missing` |
 | `gate_check.required_gates` is non-empty and every one is green | `work_release_gates_vacuous` |
 
-**Under the default floor, a release-blocking item cannot reach `GO` in
-D1–D5** even with every row above satisfied: `release_min_tier` defaults
-to `automation_ci`, no adapter capable of producing that tier exists in
-these phases, and `work_artifact_insufficient_tier` therefore holds. The
-baseline above is the set of requirements a release will have to meet
-*once release-grade evidence is producible*.
+**In D1–D5 only a `release_min_tier` at or below `local_agent` admits a
+`GO`; every higher floor is unmeetable** — including the default, which
+is `automation_ci`. So an item satisfying every row above still holds
+unless its policy lowered the floor to `local_agent` or below, because
+`local_agent` is the only producible tier in these phases. The baseline
+above is the set of requirements a release will have to meet *once
+release-grade evidence is producible*.
 
 That is deliberate, and it is **not** absolute. A project policy may set
 `release_min_tier` below `automation_ci` — the roadmap permits it — and
@@ -1937,11 +1960,18 @@ Three cases pin the semantics:
 ### The View Envelope
 
 `compute_verdict` returns `{verdict, holds, ok}` with `close`/`lanes`'
-outer keys preserved, extended additively by a per-hold `class` and a
-top-level `has_unknown` (see Work Check). Both extensions appear in the
-envelope's nested verdict and in the legacy shape below — a projection
-that dropped them would hide the established/unknown distinction the
-evaluator computes. That shape deliberately cannot carry history — and
+outer keys preserved, extended additively by a per-hold `class`, a
+top-level `has_unknown`, and a top-level **`cautions`** (see Work Check).
+All three appear in the envelope's nested verdict, in the legacy shape,
+and in the default human rendering — a projection that dropped them would
+hide the established/unknown distinction or the lowered-floor fact the
+evaluator computes.
+**`cautions` is returned by `compute_verdict` itself, not derived by the
+view builder.** The floor comparison that produces `release_floor_lowered`
+happens inside requirement evaluation; making the view builder re-derive
+it would duplicate verdict logic in a second place, and a direct
+`compute_verdict` consumer — which exists — would otherwise never see a
+caution at all. One producer, every consumer. That shape deliberately cannot carry history — and
 the sections above promise history in several places: the H1 facts in
 case A, the H3 dissent in case C, `ledger_problems`, bounded
 `source_error` rows, a bounded error record per corrupt `work_id`, and
@@ -1997,7 +2027,12 @@ Rules:
   hold — a satisfied requirement produces no hold, so a caution attached
   only to holds would vanish exactly when the floor was lowered and the
   item passed. That is the case it exists to make visible, so it rides
-  the envelope independently of the verdict.
+  the result independently of the verdict.
+- **`cautions` is always present, as `[]` when empty**, in every JSON
+  surface. An optional field cannot be tested for wrongful omission: a
+  consumer cannot distinguish "no cautions" from "the producer forgot to
+  emit them," and neither can a test. Present-and-empty makes omission a
+  detectable defect rather than an indistinguishable one.
 
 ## Policy Boundary
 
@@ -2463,7 +2498,17 @@ a named test in D1–D4's acceptance set.
     output; assert the registered tier is `local_agent`, that no path
     emits `local_operator` in D1–D5, and that a `local_operator` floor
     stays unsatisfied.
-32. **Release classification is total and conflict fails closed.**
+32. **A lowered release floor is visible on every surface.** *Test:* a
+    release-blocking item whose base-policy rule sets
+    `release_min_tier: "local_agent"`, one exact-bound passing
+    `local_agent` artifact, every baseline row green — a legitimate `GO`.
+    Assert `release_floor_lowered` (naming the glob and accepted tier)
+    appears in **all three**: the `work-view-v1` envelope, the
+    `--output-schema legacy` shape, and the **default human output of
+    `work check` without `--json`**. Separately assert that an item with
+    no lowered floor emits `cautions: []` rather than omitting the key,
+    so a dropped caution is distinguishable from an absent one.
+33. **Release classification is total and conflict fails closed.**
     *Test:* the full truth table — a release-class close with an
     all-`false` policy, a non-release close with a `release_scoped: true`
     rule (both yield release-blocking plus
@@ -2532,7 +2577,11 @@ different questions.**
 - **Output projections — versioned envelope with a legacy escape.**
   `work show --json` and `work check --json` emit a `work-view-v1`
   envelope, with the same `--output-schema legacy` escape hatch the
-  knowledge view established. These are *consumer surfaces*: a dashboard
+  knowledge view established. The **default non-`--json` human output is
+  also a projection** and is bound by the same no-drop rules: two axes
+  plus any `cautions`. Naming only the `--json` surfaces here is what let
+  an earlier draft add a mitigation to the machine paths and leave the
+  human path conforming without it. These are *consumer surfaces*: a dashboard
   or script breaking on an additive field is a real cost, and a misread
   here causes display drift, not a false GO.
 
@@ -2676,6 +2725,14 @@ Implement:
 - The contradiction pass and `source_errors`.
 - Policy loading, glob matching with all-matching semantics, policy-hash
   binding, and base-policy evaluation.
+- **Caution derivation AND rendering.** `compute_verdict` derives
+  `release_floor_lowered` whenever a release-blocking requirement is
+  satisfied under a floor below `automation_ci`, naming the matched glob
+  and accepted tier. Every surface renders it: `work-view-v1`, the legacy
+  shape, and the **default non-`--json` human output**. The JSON field is
+  present as `[]` when empty. Deriving it without rendering it on the
+  default path leaves the mitigation on the surfaces an operator does not
+  read.
 
 Do NOT implement: assurance ingestion, CI adapters, merge automation, or
 any dashboard surface.
