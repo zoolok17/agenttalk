@@ -198,6 +198,7 @@ def resume_failure_is_session_attributable(failure_class: str | None,
     broken_terms = (
         "no session",
         "session not found",
+        "no conversation found with session id",
         "invalid session",
         "expired session",
         "broken session",

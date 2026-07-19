@@ -2314,6 +2314,54 @@ def test_make_drive_claude_resume_gives_up_after_two_then_fresh_session(tmp_path
     assert state.fresh_session_success_reason == "fresh_session_success"
 
 
+def test_make_drive_claude_missing_conversation_rotates_to_fresh_session(tmp_path) -> None:
+    calls = []
+
+    def spawn(argv, stdin):
+        calls.append(list(argv))
+        if "--resume" in argv:
+            return [json.dumps({
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "errors": ["No conversation found with session ID: stale-session"],
+            })]
+        return _claude_ok_lines()
+
+    state = session.SessionState(
+        cli="claude",
+        claude_session_id="stale-session",
+        turns=8,
+        resume_available=True,
+    )
+    drive = run.make_drive(
+        _store(tmp_path),
+        "beta",
+        "claude",
+        state,
+        ["claude"],
+        spawn=spawn,
+        clock=lambda: 0.0,
+        render=False,
+    )
+
+    first = drive(_claude_rec())
+    assert first.ok is False
+    assert state.resume_failure_count == 1
+    assert state.claude_session_id == "stale-session"
+
+    second = drive(_claude_rec())
+    assert second.ok is False and "resume_unavailable" in second.summary
+    assert state.claude_session_id != "stale-session"
+
+    third = drive(_claude_rec())
+    assert third.ok is True
+    assert "--resume" in calls[0]
+    assert "--resume" in calls[1]
+    assert "--session-id" in calls[2]
+    assert "--resume" not in calls[2]
+
+
 def test_make_drive_claude_prompt_too_long_on_resume_is_not_message_poison(tmp_path) -> None:
     # Resume-scoped session pressure never classifies the message as poison on the
     # first failed resume; it must go through the B4 resume ledger.

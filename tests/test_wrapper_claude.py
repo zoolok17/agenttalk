@@ -95,6 +95,18 @@ def test_claude_adapter_error_and_ratelimit() -> None:
     assert claude_adapter.map_event("not a dict") == []
 
 
+def test_claude_adapter_preserves_result_errors_array() -> None:
+    err = claude_adapter.map_event({
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": True,
+        "errors": ["No conversation found with session ID: stale-session"],
+    })
+
+    assert err[0].type == ET.ADAPTER_ERROR
+    assert err[0].text == "No conversation found with session ID: stale-session"
+
+
 # --------------------------------------------------------- is_progress channel rule
 
 def test_text_delta_does_not_stamp_thinking_delta_does() -> None:
