@@ -2166,24 +2166,39 @@ Rules:
 - `release_scoped` is **three-valued**: `true`, `false`, or **absent =
   unknown**. It does *not* default to `false`. Because the same field is
   read by more than one rule, **every reader is enumerated here with the
-  reading it takes.** A site that does not appear in this table is a
-  defect regardless of which reading it picks — ambiguity about *which*
-  reading applies is what produced a live fail-open once already.
+  reading it takes.** A site that does not appear below is a defect
+  regardless of which reading it picks — ambiguity about *which* reading
+  applies is what produced a live fail-open once already.
+
+  **There are exactly TWO readers.**
 
   | Reader | Reading of an ABSENT flag | Direction |
   |---|---|---|
   | **Classification / exemption** (the truth table) | **unknown** — never exempts | fail-closed |
   | **Release-path coverage** (`work_uncovered_release_path`) | not release-scoped — provides no coverage, so a path covered only by absent-flag rules fails coverage | fail-closed |
-  | **Requirement applicability** (which checks apply) | not release-scoped | — |
-  | **Floor composition** (`max` over matching rules) | **irrelevant — the flag is not read at all**; every matching rule's floor binds once the item is release-blocking | fail-closed |
 
-  The exemption reading treats absence as unknown because only exemption
-  needs *proof*. The composition reader ignores the flag entirely,
-  because gating a floor on it lets a legacy rule drop its own stricter
-  requirement out of the maximum. Both are fail-closed; they differ
-  because they are answering different questions, and the table exists so
-  a fifth reader cannot be added without declaring which question it
-  asks.
+  **Two things deliberately DO NOT read it**, listed because an
+  implementer inventing a branch here is the failure mode this table
+  exists to prevent:
+
+  | Not a reader | Rule |
+  |---|---|
+  | **Requirement applicability** (`checks`, `min_tier`) | Every matching rule's `checks` and `min_tier` apply, **whatever the flag says or omits**. D-11 all-matching governs; the flag is not consulted. A branch reading "a non-release-scoped rule's checks do not count for release purposes" would silently drop a legacy rule's required check — `sast` present in policy, absent from the requirement set, `GO` with no `sast` artifact. |
+  | **Floor composition** (`max` over matching rules) | Every matching rule's `release_min_tier` enters the maximum once the ITEM is release-blocking. Gated by the item's derived classification, never by the rule's flag. |
+
+  The count is two rather than three or four because the fix to
+  requirement applicability turned it from a reader into a non-reader,
+  and a table that pads its count to look complete is worse than a
+  shorter honest one. The exemption reading treats absence as unknown
+  because only exemption needs *proof*; coverage takes the restrictive
+  reading, which is safe **structurally rather than by enumeration** —
+  treating a rule as not-release-scoped can only shrink the coverage set,
+  and a smaller coverage set can only leave more paths uncovered, so
+  there is no input where the restrictive reading admits a path the
+  permissive one would have held. Both readers and both non-readers are
+  fail-closed; they differ because they answer different questions, and
+  this listing exists so a third reader cannot appear without declaring
+  which question it asks.
 - `min_tier` applies always; `release_min_tier` applies — for **every**
   matching rule, whatever its `release_scoped` value — when the item is
   release-blocking per The Release Baseline. Absent `release_min_tier` defaults to
@@ -2618,7 +2633,16 @@ a named test in D1–D4's acceptance set.
     maximum despite its absent flag — and specifically assert the verdict
     is **not** `GO`-with-`release_floor_lowered`, which is what a
     release-scoped-only quantifier produces.
-35. **Release classification is total and conflict fails closed.**
+35. **A legacy rule's CHECK stays required.** *Test:* changed path
+    `src/payments/pay.py`; a matching rule
+    `{glob: "src/payments/**", checks: ["sast"]}` with `release_scoped`
+    **absent**; a release-class close and every other baseline row green;
+    **no `sast` artifact at all**. Assert `work_required_check_missing`.
+    Distinct from SI #34, which asserts an absent-flag rule's stricter
+    *floor* participates — this asserts its *check* is required in the
+    first place, which is the branch an implementer would drop if they
+    read the flag as gating applicability.
+36. **Release classification is total and conflict fails closed.**
     *Test:* the full truth table — a release-class close with an
     all-`false` policy, a non-release close with a `release_scoped: true`
     rule (both yield release-blocking plus
