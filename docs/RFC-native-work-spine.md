@@ -993,15 +993,16 @@ Rules:
   matching, and `head_sha` matching the current revision. A file that
   exists but fails any of those blocks; it does not advance and it does
   not read as absent.
-- **A validator's inputs must come from a source independent of the thing
-  being validated.** Where the rule above says *read the artifact back*,
-  this one says *get the EXPECTATION from somewhere else*. They look like
-  one lesson and are not: an implementation can satisfy C5 completely —
-  reading the artifact, recomputing its hash, checking every field — and
-  still be circular, if the value it checks those fields *against* was
-  taken from the artifact itself.
+- **A validator's SEMANTIC EXPECTATION must come from a source
+  independent of the thing being validated.** Where the rule above says
+  *read the artifact back*, this one says *get the EXPECTATION from
+  somewhere else*. They look like one lesson and are not: an
+  implementation can satisfy C5 completely — reading the artifact,
+  recomputing its hash, checking every field — and still be circular, if
+  the value it checks those fields *against* was taken from the artifact
+  itself.
 - The species has a name and a tell. **Circular validation**: the
-  expectation and the subject share a source. The tell is that a
+  semantic expectation and the subject share a source. The tell is that a
   validator takes an argument, so the question *"where did this argument
   come from?"* is always worth asking — and if the answer is "from the
   thing being validated," the check is circular however thorough it
@@ -1010,6 +1011,35 @@ Rules:
   `work deliver` is the first instance (see Lifecycle); D3 ingestion will
   meet it again wherever an artifact carries a field a validator might be
   tempted to compare it to.
+- **A self-referential DIGEST is not an exception to this rule — it is
+  the reason its own guarantee is narrow.** `content_hash` recomputation
+  necessarily takes its expectation from the subject's own bytes, and a
+  digest that did not read its own subject would check nothing. It is
+  legitimate **only while its claim stays internal-consistency /
+  corruption-detection**, and it can **never license advancement on its
+  own**: it must compose with at least one independently-sourced check.
+  The moment such a digest is treated as an external-authority or
+  anti-forgery expectation, it becomes circular in the full sense — which
+  is why this document says elsewhere that `content_hash` detects
+  accidental corruption and casual edits but not a forger who recomputes
+  it. **The circularity is not an exception to the rule; it is the REASON
+  the guarantee is narrow.**
+- The document already gets this right in *practice*, and this clause
+  makes the stated rule match the implemented mechanism rather than
+  changing behaviour: C5's advancement rule above pairs the recomputed
+  `content_hash` with independently-sourced checks — `work_id` matching
+  the item and `head_sha` matching the **current revision**, neither of
+  which comes from the artifact's own authority. The digest contributes
+  "these bytes are intact"; the independent checks contribute "and they
+  are about *this* work at *this* revision." Only the conjunction
+  advances anything.
+- **Qualifying to *semantic* expectations is load-bearing, not
+  pedantry.** Unqualified, the rule condemns `content_hash` itself — the
+  document would be asserting that its own corruption guard "establishes
+  nothing." A reader resolving that contradiction has two natural exits
+  and both are wrong: delete the integrity check as circular, or conclude
+  the rule is unreliable and stop applying it. The second is worse,
+  because it discredits a rule that caught a real fail-open.
 
 ### Torn Reads And The JSON/Log Pair
 
@@ -1424,11 +1454,28 @@ Rules:
   as a witness rather than a duplicate. Caching lane state into the item
   would create the second source of truth the Source-Of-Truth boundary
   exists to prevent, however helpful it looks.
-- `scope_globs` may be set at create or at start, but note the
-  consequence rather than leaving it to be discovered: an **empty**
-  `scope_globs` puts every changed path outside scope, so
-  `work_out_of_scope_change` holds until it is non-empty. Fail-closed and
-  correct — and it means no item reaches `GO` with an empty scope.
+- **`work start` REFUSES on an empty `scope_globs`.** It is a
+  precondition of the mutation, not a downstream consequence.
+  `scope_globs` may be set at create or supplied at start, but start does
+  not proceed without a non-empty, domain-valid set.
+  An earlier draft made this a consequence instead — "an empty scope puts
+  every changed path outside scope, so `work_out_of_scope_change` holds"
+  — and that clause had **its own vacuous case**. `work_out_of_scope_change`
+  fires on "the diff touches paths outside `scope_globs`"; with a
+  successfully resolved diff containing **zero changed paths** there is no
+  offending path, the predicate never fires, and an item with an empty
+  scope reaches `GO` against the clause's own promise. Refusing at the
+  mutation fails closed without depending on a downstream predicate
+  firing at all.
+- The general form, now at its **fourth** level: **a predicate over a set
+  is vacuous when the set is empty**, so any "X must not appear" rule
+  needs its empty-X case stated. Omission-as-waiver has appeared at the
+  item (no policy/close/review), at classification (absent
+  `release_scoped` defaulting into proof), in a child collection
+  (`checks: []`), and now in an empty **diff**. Each fix was correct at
+  its own level and the pattern moved down one. The durable counter is
+  not another instance-fix but the habit: when writing "no X may…", ask
+  what the rule says when there are no X at all.
 - A non-terminal item requires a live lane whose generation matches
   `lane_generation` and whose head matches the bound revision. A
   terminal item may instead reference a validated immutable delivery
@@ -2708,6 +2755,23 @@ a named test in D1–D4's acceptance set.
     an unrelated reason while leaving the circular path wide open. That
     is the same defect as asserting a caution "appears in" the envelope
     rather than at an exact path.
+38. **An empty scope cannot pass through an empty diff.** *Test:* call
+    `work start` with `scope_globs: []`. Assert the mutation **refuses
+    specifically because `scope_globs` is empty** — not merely that some
+    later verdict is non-GO. Then, to pin the hole the precondition
+    closes, construct the state directly: an item with `scope_globs: []`,
+    a lane whose live head **equals** its base so revision resolution
+    **succeeds with zero changed paths**, a valid non-release close
+    exempting the release baseline, and every other source at exact `GO`.
+    Assert non-`GO`. Under the old consequence-based rule this input
+    returned `GO`, because a predicate over "paths outside scope" has
+    nothing to fire on when there are no paths at all.
+39. **`start` leaves a bound revision.** *Test:* after a successful
+    `work start`, assert the item carries a **full 40-character**
+    `base_sha` equal to the linked lane's authoritative base, plus
+    `base_ref` and `target_ref`. A `start` that binds only the lane
+    passes every other invariant while leaving the item permanently
+    revision-unresolvable.
 
 ## Threat Model And Honest Limits
 
@@ -2855,8 +2919,17 @@ Implement:
   command. This lands in D2 rather than later
   because retrofitting a chain onto an existing ledger means rewriting
   history, which the append-only rule forbids.
-- `work create|list|show|status|assign|start|deliver|abandon`, where
-  `start` binds the lane and emits `lane_bound`.
+- `work create|list|show|status|assign|start|deliver|abandon`.
+- **`start`'s full contract**, not the lane link alone: it emits
+  `lane_bound`; it **writes and validates** `base_ref`, a full
+  40-character `base_sha`, and `target_ref` from caller-supplied values,
+  checked against the lane through lanes' public read API; it accepts the
+  permitted `scope_globs` update; and it **refuses** on an empty
+  `scope_globs`. A `start` implemented as lane-binding only leaves
+  `base_sha` null and reopens the gap this contract exists to close.
+- **`deliver`'s precondition**: a bound lane, and
+  `validate_delivery_artifact(..., require_isolation=True)` called with a
+  `head_sha` resolved live from the lane — never read from the artifact.
 - The derived-state projection table, with `terminal` on the item as
   `{"type": "delivered"|"abandoned", "event_id"}` — `closed` is derived
   from the linked close, never stored.
@@ -2958,9 +3031,16 @@ needs it — not during it.
    plus survive-reset means unbounded growth. Decide at D3 alongside log
    caps; a `work gc` that deletes evidence is itself a safety surface and
    deserves its own review.
-4. **Should `work` expose a merge-base helper, or require callers to
-   supply `base_sha`?** Decide at D4 with the base-policy evaluation
-   implementation, since both need the same git access.
+4. **RETIRED — decided in amendment #10.** `work start` requires
+   **caller-supplied** `base_ref`/`base_sha`/`target_ref`, validated
+   against the lane; D2 owns that binding contract and it is not
+   reopenable. What remains open is strictly narrower and cannot disturb
+   it: **may `work` offer a merge-base *convenience helper* that computes
+   a candidate `base_sha` for a caller to then supply?** That is a D4
+   ergonomics question about a helper, not about where the authority
+   lives. Left as an open question in its original form, it directly
+   contradicted the amendment and would have licensed a lane-only
+   `start`.
 5. **Does the dashboard Work view need a projection contract frozen in
    this RFC?** Deferred to Q2 by the work package (`web.py` is outside
    the ownership boundary). The `work-view-v1` envelope is designed to be
@@ -3121,6 +3201,12 @@ choice and this document made one:
   available only as a new H2-bound artifact tiered no stronger than its
   verifier — never for a release-blocking `automation_ci` requirement.
   This is deliberately stricter than D-6's rule for knowledge notes.
+- **A validator's semantic expectation must come from a source
+  independent of the subject.** A self-referential digest is legitimate
+  only within a corruption-detection claim and never licenses advancement
+  alone — it must compose with at least one independently-sourced check.
+  This is what makes `work deliver` resolve its `head_sha` live from the
+  lane rather than reading it off the artifact under validation.
 
 Once ratified, the safest first build is D2 exactly as scoped, with the
 corrupt-item and one-item-does-not-brick-work tests written **failing
