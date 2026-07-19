@@ -491,6 +491,7 @@ def _child_env(
         injected["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = (
             OVH_QWEN_CLAUDE_MAX_OUTPUT
         )
+        injected["MAX_THINKING_TOKENS"] = "0"
         # The front token is a controller-only mint credential. It must not
         # reach executable preflight or the model child. A paid child receives
         # only the scoped capability minted immediately before its spawn.
