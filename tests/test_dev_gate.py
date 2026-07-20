@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from agenttalk import dev_gate
-from agenttalk.cli import build_parser
+from agenttalk.cli import build_parser, cmd_dev_gate
 
 
 def _manifest() -> dict:
@@ -18,21 +18,49 @@ def _manifest() -> dict:
 
 
 def _check(check_id: str, *, status: str = "pass") -> dict:
+    kind = check_id.split("-", 1)[0]
+    mode = None
+    python = None
+    provenance = None
+    if check_id.startswith("pytest-"):
+        _, mode, suffix = check_id.split("-")
+        python = f"{suffix[2]}.{suffix[3:]}"
+        kind = "pytest"
+        provenance = {
+            "expected_root": str((Path.cwd() / "src").resolve()),
+            "observed_path": str((Path.cwd() / "src" / "agenttalk" / "__init__.py").resolve()),
+            "version": "0.78.1",
+        }
+    elif check_id.startswith(("wheel-install-", "wheel-contract-")):
+        prefix, suffix = check_id.rsplit("-", 1)
+        python = f"{suffix[2]}.{suffix[3:]}"
+        kind = prefix
+        mode = "wheel"
+        if prefix == "wheel-contract":
+            provenance = {
+                "expected_root": str((Path.cwd() / "wheel").resolve()),
+                "observed_path": str((Path.cwd() / "wheel" / "agenttalk" / "__init__.py").resolve()),
+                "version": "0.78.1",
+            }
+    elif check_id == "package-build":
+        kind = "python-build"
+    elif check_id in {"git-binding", "final-binding", "pip-audit"}:
+        kind = check_id
     return {
         "id": check_id,
-        "kind": check_id.split("-", 1)[0],
-        "mode": None,
-        "python": None,
+        "kind": kind,
+        "mode": mode,
+        "python": python,
         "required": True,
         "status": status,
         "argv": ["tool", check_id],
-        "tool": {"path": "tool", "version": "1"},
+        "tool": {"path": str((Path.cwd() / "tool").resolve()), "version": "1"},
         "exit_code": 0 if status == "pass" else 1,
         "duration_ms": 1,
         "reason_code": None if status == "pass" else "check_failed",
         "diagnostic": "",
         "log": {"path": str(Path("log.txt").resolve()), "sha256": "a" * 64},
-        "import_provenance": None,
+        "import_provenance": provenance,
     }
 
 
@@ -86,25 +114,78 @@ def _leg_artifact(manifest: dict, leg: str, *, status: str = "pass") -> dict:
             "temp_outside_store": True,
             "pytest_cache_disabled": True,
             "bytecode_disabled": True,
+            "phase_isolated_exports": True,
         },
         "interpreters": [
             {
                 "requested": leg.split("/", 1)[1],
-                "path": "python",
+                "path": str((Path.cwd() / "python").resolve()),
                 "implementation": "CPython",
                 "version": leg.split("/", 1)[1] + ".0",
                 "status": "pass",
             }
         ],
         "required_check_ids": required,
-        "checks": [_check(check_id, status=status) for check_id in required],
-        "artifacts": {},
-        "external_inputs": [],
+        "checks": [
+            _check(check_id, status=status if index == 0 else "pass")
+            for index, check_id in enumerate(required)
+        ],
+        "artifacts": {
+            "sdist": {
+                "path": str((Path.cwd() / "dist" / "agenttalk.tar.gz").resolve()),
+                "filename": "agenttalk.tar.gz",
+                "sha256": "6" * 64,
+                "size_bytes": 1,
+            },
+            "wheel": {
+                "path": str((Path.cwd() / "dist" / "agenttalk.whl").resolve()),
+                "filename": "agenttalk.whl",
+                "sha256": "7" * 64,
+                "size_bytes": 1,
+            },
+            **(
+                {
+                    "audit_requirements": {
+                        "path": str((Path.cwd() / "audit-requirements.txt").resolve()),
+                        "filename": "audit-requirements.txt",
+                        "sha256": "8" * 64,
+                        "size_bytes": 1,
+                    }
+                }
+                if leg == profile["ci"]["canonical_static_leg"]
+                else {}
+            ),
+        },
+        "external_inputs": (
+            [
+                {
+                    "check_id": "pip-audit",
+                    "kind": "live-advisory-database",
+                    "locator": "PyPI advisory database",
+                    "mutable": True,
+                    "identity": "live-service-unversioned",
+                    "observed_at": "2026-07-20T00:00:00Z",
+                },
+                *[
+                    {
+                        "check_id": "semgrep",
+                        "kind": "live-rule-registry",
+                        "locator": locator,
+                        "mutable": True,
+                        "identity": "live-registry-unversioned",
+                        "observed_at": "2026-07-20T00:00:00Z",
+                    }
+                    for locator in ("p/python", "p/security-audit")
+                ],
+            ]
+            if leg == profile["ci"]["canonical_static_leg"]
+            else []
+        ),
         "blockers": [] if status == "pass" else [{"code": "check_failed", "check_id": required[0], "detail": "x"}],
         "summary": {
             "required": len(required),
-            "passed": len(required) if status == "pass" else 0,
-            "blocked": 0 if status == "pass" else len(required),
+            "passed": len(required) if status == "pass" else len(required) - 1,
+            "blocked": 0 if status == "pass" else 1,
         },
     }
 
@@ -118,6 +199,7 @@ def _binding(manifest: dict) -> dev_gate.CandidateBinding:
         manifest_git_blob="3" * 40,
         manifest_sha256=dev_gate.sha256_bytes(raw),
         manifest_bytes=raw,
+        runner_module_sha256="5" * 64,
         clean=True,
         dirty_entries=(),
         in_progress=(),
@@ -227,6 +309,54 @@ def test_artifact_validator_rejects_missing_duplicate_or_unknown_required_result
         dev_gate.validate_run_artifact(unknown, manifest)
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda artifact: artifact["artifacts"].pop("wheel"),
+        lambda artifact: artifact["interpreters"].clear(),
+        lambda artifact: artifact["runner"].update({"os": "linux"}),
+        lambda artifact: artifact["checks"][0].update({"exit_code": 99}),
+        lambda artifact: next(
+            check for check in artifact["checks"] if check["id"].startswith("pytest-")
+        ).update({"import_provenance": None}),
+    ],
+)
+def test_passing_leg_requires_every_supporting_proof(mutate) -> None:
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "windows/3.10")
+    mutate(artifact)
+
+    with pytest.raises(dev_gate.GateBlock):
+        dev_gate.validate_run_artifact(artifact, manifest)
+
+
+def test_canonical_leg_requires_live_security_input_evidence() -> None:
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "linux/3.12")
+    artifact["external_inputs"] = []
+
+    with pytest.raises(dev_gate.GateBlock, match="external"):
+        dev_gate.validate_run_artifact(artifact, manifest)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda artifact: artifact["subject"].update({"candidate_sha": 7}),
+        lambda artifact: artifact["subject"].update({"clean_before": 1}),
+        lambda artifact: artifact["manifest"].update({"sha256": 7}),
+        lambda artifact: artifact["checks"][0].update({"id": 7}),
+    ],
+)
+def test_malformed_evidence_types_fail_with_gate_block(mutate) -> None:
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "windows/3.10")
+    mutate(artifact)
+
+    with pytest.raises(dev_gate.GateBlock):
+        dev_gate.validate_run_artifact(artifact, manifest)
+
+
 def test_aggregate_requires_exact_unique_matrix_and_common_binding() -> None:
     manifest = dev_gate.validate_manifest(_manifest())
     artifacts = [_leg_artifact(manifest, leg) for leg in dev_gate.expected_ci_legs(manifest, "release")]
@@ -272,13 +402,26 @@ def test_aggregate_rejects_leg_set_not_bound_to_current_checkout() -> None:
     with pytest.raises(dev_gate.GateBlock, match="current checkout"):
         dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, current)
 
+    current = _binding(manifest)
+    current = dev_gate.CandidateBinding(
+        **{**current.__dict__, "runner_module_sha256": "9" * 64}
+    )
+    with pytest.raises(dev_gate.GateBlock, match="current checkout"):
+        dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, current)
+
 
 def test_committed_manifest_binding_ignores_checkout_newline_conversion_and_rejects_dirt(tmp_path: Path) -> None:
     (tmp_path / "dev-gate.json").write_text('{"schema_version": 1}\n', encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "fixture"\nversion = "0.78.1"\n', encoding="utf-8"
+    )
+    runner = tmp_path / "src" / "agenttalk" / "dev_gate.py"
+    runner.parent.mkdir(parents=True)
+    runner.write_text("# fixture runner\n", encoding="utf-8")
     _git(tmp_path, "init")
     _git(tmp_path, "config", "user.email", "test@example.invalid")
     _git(tmp_path, "config", "user.name", "Test")
-    _git(tmp_path, "add", "dev-gate.json")
+    _git(tmp_path, "add", "dev-gate.json", "pyproject.toml", "src/agenttalk/dev_gate.py")
     _git(tmp_path, "commit", "-m", "base")
 
     binding = dev_gate.capture_candidate_binding(tmp_path)
@@ -286,6 +429,13 @@ def test_committed_manifest_binding_ignores_checkout_newline_conversion_and_reje
         ["git", "show", "HEAD:dev-gate.json"], cwd=tmp_path, capture_output=True, check=True
     ).stdout
     assert binding.manifest_sha256 == dev_gate.sha256_bytes(committed)
+    committed_runner = subprocess.run(
+        ["git", "show", "HEAD:src/agenttalk/dev_gate.py"],
+        cwd=tmp_path,
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert binding.runner_module_sha256 == dev_gate.sha256_bytes(committed_runner)
     assert binding.clean is True
 
     (tmp_path / "untracked.txt").write_text("dirty", encoding="utf-8")
@@ -321,6 +471,18 @@ def test_base_environment_scrubs_import_and_environment_contamination(
     assert {env[name] for name in ("TMP", "TEMP", "TMPDIR")} == {str(tmp_path)}
 
 
+@pytest.mark.parametrize(
+    "poison",
+    ["PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTHONOPTIMIZE", "GIT_DIR", "GIT_WORK_TREE"],
+)
+def test_base_environment_drops_gate_control_variables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, poison: str
+) -> None:
+    monkeypatch.setenv(poison, "attacker-controlled")
+
+    assert poison not in dev_gate._base_env(tmp_path)
+
+
 def test_safe_candidate_export_rejects_path_traversal(tmp_path: Path) -> None:
     archive = tmp_path / "candidate.zip"
     with zipfile.ZipFile(archive, "w") as bundle:
@@ -330,6 +492,38 @@ def test_safe_candidate_export_rejects_path_traversal(tmp_path: Path) -> None:
         dev_gate._safe_extract_zip(archive, tmp_path / "out")
 
     assert not (tmp_path / "escape.txt").exists()
+
+
+@pytest.mark.parametrize("member", [r"..\escape.txt", "C:/escape.txt"])
+def test_safe_candidate_export_rejects_windows_escape_forms(tmp_path: Path, member: str) -> None:
+    archive = tmp_path / "candidate.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr(member, "no")
+
+    with pytest.raises(dev_gate.GateBlock, match="unsafe archive member"):
+        dev_gate._safe_extract_zip(archive, tmp_path / "out")
+
+
+def test_each_gate_phase_uses_a_distinct_committed_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binding = _binding(dev_gate.validate_manifest(_manifest()))
+    calls: list[tuple[Path, Path]] = []
+
+    def record_export(_binding, destination: Path, archive: Path) -> None:
+        assert _binding is binding
+        calls.append((destination, archive))
+
+    monkeypatch.setattr(dev_gate, "export_candidate", record_export)
+
+    roots = [
+        dev_gate._export_phase(binding, tmp_path, phase)
+        for phase in ("source", "package", "wheel", "static")
+    ]
+
+    assert len(set(roots)) == 4
+    assert len({archive for _, archive in calls}) == 4
+    assert [destination for destination, _ in calls] == roots
 
 
 def test_evidence_validator_rejects_missing_nested_fields() -> None:
@@ -408,3 +602,65 @@ def test_cli_exposes_no_skip_dev_gate_surface() -> None:
         parser.parse_args(
             ["dev-gate", "--ci-leg", "linux/3.12", "--aggregate", "/opt/legs"]
         )
+
+
+def test_cli_early_block_emits_normalized_machine_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    evidence = tmp_path / "preflight.json"
+    args = build_parser().parse_args(
+        ["dev-gate", "--ci-leg", "linux/3.10", "--evidence", str(evidence)]
+    )
+
+    monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda _root, _argv: None)
+
+    def block(**_kwargs):
+        raise dev_gate.GateBlock("ci_leg_platform_mismatch", "expected Linux")
+
+    monkeypatch.setattr(dev_gate, "execute_gate", block)
+
+    assert cmd_dev_gate(args) == 2
+    emitted = json.loads(evidence.read_text(encoding="utf-8"))
+    dev_gate.validate_preflight_artifact(emitted)
+    assert emitted["verdict"] == "block"
+    assert emitted["complete"] is False
+    assert emitted["blocker"]["code"] == "ci_leg_platform_mismatch"
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["evidence"] == str(evidence.resolve())
+    assert summary["candidate_sha"] == emitted["subject"]["candidate_sha"]
+
+
+def test_git_binding_ignores_environment_redirection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "dev-gate.json").write_text("{}\n", encoding="utf-8")
+    runner = tmp_path / "src" / "agenttalk" / "dev_gate.py"
+    runner.parent.mkdir(parents=True)
+    runner.write_text("# fixture runner\n", encoding="utf-8")
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "test@example.invalid")
+    _git(tmp_path, "config", "user.name", "Test")
+    _git(tmp_path, "add", "dev-gate.json", "src/agenttalk/dev_gate.py")
+    _git(tmp_path, "commit", "-m", "base")
+    expected_sha = _git(tmp_path, "rev-parse", "HEAD")
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "attacker-controlled-git-dir"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path.parent))
+
+    binding = dev_gate.capture_candidate_binding(tmp_path)
+
+    assert binding.clean is True
+    assert binding.candidate_sha == expected_sha
+
+
+def test_external_gate_paths_cannot_enter_candidate_or_store(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate"
+    store = tmp_path / "store"
+    candidate.mkdir()
+    store.mkdir()
+
+    with pytest.raises(dev_gate.GateBlock, match="outside the candidate"):
+        dev_gate._ensure_external(candidate / "evidence.json", candidate, store, "evidence")
+    with pytest.raises(dev_gate.GateBlock, match="outside AGENTTALK_ROOT"):
+        dev_gate._ensure_external(store / "temp", candidate, store, "temp")

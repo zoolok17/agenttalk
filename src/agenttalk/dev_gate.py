@@ -14,7 +14,8 @@ import os
 import platform
 import re
 import shutil
-import subprocess  # nosec B404 - fixed argv lists, never a shell
+# Subprocesses use explicit argv lists and never enable a shell.
+import subprocess  # nosec B404
 import sys
 import tarfile
 import tempfile
@@ -25,6 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from pathlib import PurePosixPath
+from pathlib import PureWindowsPath
 from typing import Any, Sequence
 
 from agenttalk import __version__
@@ -34,6 +36,7 @@ from agenttalk._atomic import write_text
 SCHEMA_VERSION = 1
 ARTIFACT_TYPE = "agenttalk-dev-gate-run"
 AGGREGATE_ARTIFACT_TYPE = "agenttalk-dev-gate-aggregate"
+PREFLIGHT_ARTIFACT_TYPE = "agenttalk-dev-gate-preflight-block"
 DEFAULT_MANIFEST = "dev-gate.json"
 DEFAULT_PROFILE = "release"
 
@@ -67,7 +70,6 @@ REQUIRED_CONFIGURED_CHECKS = {
     "wheel-contract": "wheel-contract",
 }
 CHECK_STATUSES = {"pass", "fail", "error", "missing", "timeout", "blocked_dependency"}
-HASH_RE = re.compile(r"^[0-9a-f]{40,64}$")
 
 
 class GateBlock(RuntimeError):
@@ -88,6 +90,7 @@ class CandidateBinding:
     manifest_git_blob: str
     manifest_sha256: str
     manifest_bytes: bytes
+    runner_module_sha256: str
     clean: bool
     dirty_entries: tuple[str, ...]
     in_progress: tuple[str, ...]
@@ -374,7 +377,99 @@ def _require_artifact_fields(mapping: dict[str, Any], required: set[str], label:
         raise GateBlock("evidence_schema_invalid", f"{label}: {'; '.join(parts)}")
 
 
+def _is_hash(value: Any, *lengths: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) in lengths
+        and bool(re.fullmatch(r"[0-9a-f]+", value))
+    )
+
+
+def _is_nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _is_absolute_path_text(value: Any) -> bool:
+    if not _is_nonempty_string(value):
+        return False
+    return PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute()
+
+
+def _path_contains(parent: str, child: str) -> bool:
+    if PureWindowsPath(parent).is_absolute() and PureWindowsPath(child).is_absolute():
+        parent_path = PureWindowsPath(parent)
+        child_path = PureWindowsPath(child)
+    elif PurePosixPath(parent).is_absolute() and PurePosixPath(child).is_absolute():
+        parent_path = PurePosixPath(parent)
+        child_path = PurePosixPath(child)
+    else:
+        return False
+    try:
+        child_path.relative_to(parent_path)
+    except ValueError:
+        return False
+    return True
+
+
+def _valid_timestamp(value: Any) -> bool:
+    if not _is_nonempty_string(value):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def _check_semantics(check_id: str) -> tuple[str, str | None, str | None, bool]:
+    pytest_match = re.fullmatch(r"pytest-(source|wheel)-py(\d)(\d+)", check_id)
+    if pytest_match:
+        return (
+            "pytest",
+            pytest_match.group(1),
+            f"{pytest_match.group(2)}.{pytest_match.group(3)}",
+            True,
+        )
+    wheel_match = re.fullmatch(r"(wheel-install|wheel-contract)-py(\d)(\d+)", check_id)
+    if wheel_match:
+        return (
+            wheel_match.group(1),
+            "wheel",
+            f"{wheel_match.group(2)}.{wheel_match.group(3)}",
+            wheel_match.group(1) == "wheel-contract",
+        )
+    kinds = {
+        "git-binding": "git-binding",
+        "package-build": "python-build",
+        "ruff": "ruff",
+        "bandit": "bandit",
+        "gitleaks": "gitleaks",
+        "pip-audit": "pip-audit",
+        "semgrep": "semgrep",
+        "zizmor": "zizmor",
+        "final-binding": "final-binding",
+    }
+    try:
+        return kinds[check_id], None, None, False
+    except KeyError as exc:
+        raise GateBlock("evidence_schema_invalid", f"unknown check ID {check_id!r}") from exc
+
+
+def _validate_import_provenance(value: Any, *, label: str, expected_version: str) -> None:
+    item = _require_object(value, label)
+    _require_artifact_fields(item, {"expected_root", "observed_path", "version"}, label)
+    if (
+        not _is_absolute_path_text(item["expected_root"])
+        or not _is_absolute_path_text(item["observed_path"])
+        or not _path_contains(item["expected_root"], item["observed_path"])
+        or item["version"] != expected_version
+    ):
+        raise GateBlock("evidence_schema_invalid", f"{label} is not a bound import proof")
+
+
 def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Validate a run artifact and every proof required by its declared plan."""
+
     record = _require_object(artifact, "artifact")
     required_top = {
         "schema_version",
@@ -401,7 +496,13 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
         "summary",
     }
     _require_artifact_fields(record, required_top, "artifact")
-    if record["schema_version"] != SCHEMA_VERSION or record["artifact_type"] != ARTIFACT_TYPE:
+    if (
+        record["schema_version"] != SCHEMA_VERSION
+        or record["artifact_type"] != ARTIFACT_TYPE
+        or not _is_nonempty_string(record["run_id"])
+        or not _valid_timestamp(record["started_at"])
+        or not _valid_timestamp(record["finished_at"])
+    ):
         raise GateBlock("evidence_schema_invalid", "unexpected artifact schema or type")
     if record["profile"] != DEFAULT_PROFILE:
         raise GateBlock("evidence_schema_invalid", "unexpected profile")
@@ -415,20 +516,137 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
         expected_ids = required_check_ids(
             manifest, record["profile"], execution_scope="ci-leg", ci_leg=leg
         )
+        expected_minors = [leg.split("/", 1)[1]]
+        expected_os = leg.split("/", 1)[0]
     elif scope == "local":
         if record["complete"] is not True or record["ci_leg"] is not None:
             raise GateBlock("evidence_schema_invalid", "local evidence must be complete with no CI leg")
         expected_ids = required_check_ids(manifest, record["profile"], execution_scope="local")
+        expected_minors = list(REQUIRED_LOCAL_PYTHONS)
+        expected_os = None
     else:
         raise GateBlock("evidence_schema_invalid", "execution_scope must be local or ci-leg")
-    if record["required_check_ids"] != expected_ids:
+    if not isinstance(record["required_check_ids"], list) or record["required_check_ids"] != expected_ids:
         raise GateBlock("evidence_cardinality_invalid", "required check IDs do not match the logical plan")
+
+    subject = _require_object(record["subject"], "subject")
+    _require_artifact_fields(
+        subject,
+        {"candidate_sha", "candidate_tree", "version", "clean_before", "clean_after", "head_stable"},
+        "subject",
+    )
+    if (
+        not _is_hash(subject["candidate_sha"], 40, 64)
+        or not _is_hash(subject["candidate_tree"], 40, 64)
+        or not _is_nonempty_string(subject["version"])
+        or any(
+            not isinstance(subject[field], bool)
+            for field in ("clean_before", "clean_after", "head_stable")
+        )
+    ):
+        raise GateBlock("evidence_schema_invalid", "candidate binding is malformed")
+
+    manifest_record = _require_object(record["manifest"], "manifest")
+    _require_artifact_fields(
+        manifest_record,
+        {"path", "schema_version", "git_blob_id", "sha256", "logical_plan_sha256"},
+        "manifest",
+    )
+    if (
+        manifest_record["path"] != DEFAULT_MANIFEST
+        or manifest_record["schema_version"] != SCHEMA_VERSION
+        or not _is_hash(manifest_record["git_blob_id"], 40, 64)
+        or not _is_hash(manifest_record["sha256"], 64)
+        or not _is_hash(manifest_record["logical_plan_sha256"], 64)
+        or manifest_record["logical_plan_sha256"] != logical_plan_digest(manifest, record["profile"])
+    ):
+        raise GateBlock("evidence_binding_mismatch", "manifest binding does not match the logical plan")
+
+    authority = _require_object(record["authority"], "authority")
+    _require_artifact_fields(
+        authority,
+        {
+            "declared_required_ci_matrix",
+            "local_interpreters",
+            "ci_aggregate_authoritative",
+            "ci_native_exceptions",
+        },
+        "authority",
+    )
+    if (
+        authority["declared_required_ci_matrix"] != expected_ci_legs(manifest, record["profile"])
+        or authority["local_interpreters"] != list(REQUIRED_LOCAL_PYTHONS)
+        or authority["ci_aggregate_authoritative"] is not True
+        or authority["ci_native_exceptions"] != manifest["ci_native_exceptions"]
+    ):
+        raise GateBlock("evidence_binding_mismatch", "authority declaration does not match")
+
+    runner = _require_object(record["runner"], "runner")
+    _require_artifact_fields(
+        runner,
+        {"agenttalk_version", "module_path", "module_sha256", "os", "architecture"},
+        "runner",
+    )
+    if (
+        runner["agenttalk_version"] != subject["version"]
+        or runner["module_path"] != "src/agenttalk/dev_gate.py"
+        or not _is_hash(runner["module_sha256"], 64)
+        or not _is_nonempty_string(runner["os"])
+        or not _is_nonempty_string(runner["architecture"])
+        or (expected_os is not None and runner["os"] != expected_os)
+    ):
+        raise GateBlock("evidence_binding_mismatch", "runner identity does not match the declared leg")
+
+    isolation = _require_object(record["isolation"], "isolation")
+    _require_artifact_fields(
+        isolation,
+        {
+            "temp_outside_candidate",
+            "temp_outside_store",
+            "pytest_cache_disabled",
+            "bytecode_disabled",
+            "phase_isolated_exports",
+        },
+        "isolation",
+    )
+    if any(value is not True for value in isolation.values()):
+        raise GateBlock("evidence_schema_invalid", "all isolation guarantees must be true")
+
+    interpreters = _require_list(record["interpreters"], "interpreters")
+    if len(interpreters) != len(expected_minors):
+        raise GateBlock("evidence_cardinality_invalid", "interpreter evidence is incomplete")
+    observed_minors: list[str] = []
+    for index, interpreter in enumerate(interpreters):
+        item = _require_object(interpreter, f"interpreters[{index}]")
+        _require_artifact_fields(
+            item,
+            {"requested", "path", "implementation", "version", "status"},
+            f"interpreters[{index}]",
+        )
+        if item["requested"] not in expected_minors or item["status"] not in {"pass", "missing", "mismatch"}:
+            raise GateBlock("evidence_schema_invalid", f"interpreters[{index}] is invalid")
+        observed_minors.append(item["requested"])
+        if item["status"] == "pass" and (
+            not _is_absolute_path_text(item["path"])
+            or item["implementation"] != "CPython"
+            or not _is_nonempty_string(item["version"])
+            or not item["version"].startswith(item["requested"] + ".")
+        ):
+            raise GateBlock("evidence_schema_invalid", f"interpreters[{index}] lacks a direct CPython proof")
+        if item["status"] != "pass" and not _is_nonempty_string(item["version"]):
+            raise GateBlock("evidence_schema_invalid", f"interpreters[{index}] lacks a failure detail")
+    if observed_minors != expected_minors or len(observed_minors) != len(set(observed_minors)):
+        raise GateBlock("evidence_cardinality_invalid", "interpreter evidence does not match the plan")
 
     checks = record["checks"]
     if not isinstance(checks, list):
         raise GateBlock("evidence_schema_invalid", "checks must be an array")
     actual_ids = [check.get("id") if isinstance(check, dict) else None for check in checks]
-    if len(actual_ids) != len(set(actual_ids)) or sorted(actual_ids) != sorted(expected_ids):
+    if (
+        not all(isinstance(check_id, str) for check_id in actual_ids)
+        or len(actual_ids) != len(set(actual_ids))
+        or set(actual_ids) != set(expected_ids)
+    ):
         raise GateBlock("evidence_cardinality_invalid", "check result cardinality does not match required IDs")
     check_fields = {
         "id",
@@ -446,98 +664,100 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
         "log",
         "import_provenance",
     }
+    checks_by_id: dict[str, dict[str, Any]] = {}
     for index, check in enumerate(checks):
         item = _require_object(check, f"checks[{index}]")
         _require_artifact_fields(item, check_fields, f"checks[{index}]")
+        check_id = item["id"]
+        expected_kind, expected_mode, expected_python, needs_provenance = _check_semantics(check_id)
         if item["status"] not in CHECK_STATUSES:
             raise GateBlock("evidence_status_invalid", f"unknown check status {item['status']!r}")
-        if item["required"] is not True:
-            raise GateBlock("evidence_schema_invalid", "all emitted check records are required")
+        if (
+            item["required"] is not True
+            or item["kind"] != expected_kind
+            or item["mode"] != expected_mode
+            or item["python"] != expected_python
+            or not isinstance(item["duration_ms"], int)
+            or isinstance(item["duration_ms"], bool)
+            or item["duration_ms"] < 0
+            or not isinstance(item["diagnostic"], str)
+        ):
+            raise GateBlock("evidence_schema_invalid", f"checks[{index}] semantics are invalid")
         if not isinstance(item["argv"], list) or not all(isinstance(arg, str) for arg in item["argv"]):
             raise GateBlock("evidence_schema_invalid", f"checks[{index}].argv must be an array of strings")
         tool = _require_object(item["tool"], f"checks[{index}].tool")
         _require_artifact_fields(tool, {"path", "version"}, f"checks[{index}].tool")
         log = _require_object(item["log"], f"checks[{index}].log")
         _require_artifact_fields(log, {"path", "sha256"}, f"checks[{index}].log")
-        if not isinstance(log["path"], str) or not HASH_RE.fullmatch(log["sha256"]):
+        if not _is_absolute_path_text(log["path"]) or not _is_hash(log["sha256"], 64):
             raise GateBlock("evidence_schema_invalid", f"checks[{index}].log is malformed")
-        if item["status"] == "pass" and (
-            not isinstance(tool["path"], str)
-            or not tool["path"]
-            or not isinstance(tool["version"], str)
-            or not tool["version"]
+        if item["status"] == "pass":
+            if (
+                item["exit_code"] != 0
+                or item["reason_code"] is not None
+                or not item["argv"]
+                or not _is_absolute_path_text(tool["path"])
+                or not _is_nonempty_string(tool["version"])
+            ):
+                raise GateBlock("evidence_schema_invalid", f"checks[{index}] lacks passing execution evidence")
+        elif (
+            (item["exit_code"] is not None and (
+                not isinstance(item["exit_code"], int) or isinstance(item["exit_code"], bool)
+            ))
+            or not _is_nonempty_string(item["reason_code"])
         ):
-            raise GateBlock("evidence_schema_invalid", f"checks[{index}] lacks passing tool evidence")
+            raise GateBlock("evidence_schema_invalid", f"checks[{index}] lacks blocking execution evidence")
+        if needs_provenance and item["status"] == "pass":
+            _validate_import_provenance(
+                item["import_provenance"],
+                label=f"checks[{index}].import_provenance",
+                expected_version=subject["version"],
+            )
+        elif item["import_provenance"] is not None:
+            _validate_import_provenance(
+                item["import_provenance"],
+                label=f"checks[{index}].import_provenance",
+                expected_version=subject["version"],
+            )
+        checks_by_id[check_id] = item
 
-    subject = _require_object(record["subject"], "subject")
-    _require_artifact_fields(
-        subject,
-        {"candidate_sha", "candidate_tree", "version", "clean_before", "clean_after", "head_stable"},
-        "subject",
-    )
-    if not HASH_RE.fullmatch(subject["candidate_sha"]) or not HASH_RE.fullmatch(subject["candidate_tree"]):
-        raise GateBlock("evidence_schema_invalid", "candidate binding hashes are malformed")
-    manifest_record = _require_object(record["manifest"], "manifest")
-    _require_artifact_fields(
-        manifest_record,
-        {"path", "schema_version", "git_blob_id", "sha256", "logical_plan_sha256"},
-        "manifest",
-    )
-    if manifest_record["logical_plan_sha256"] != logical_plan_digest(manifest, record["profile"]):
-        raise GateBlock("evidence_binding_mismatch", "logical plan digest does not match")
-    authority = _require_object(record["authority"], "authority")
-    _require_artifact_fields(
-        authority,
-        {
-            "declared_required_ci_matrix",
-            "local_interpreters",
-            "ci_aggregate_authoritative",
-            "ci_native_exceptions",
-        },
-        "authority",
-    )
-    if authority["declared_required_ci_matrix"] != expected_ci_legs(manifest, record["profile"]):
-        raise GateBlock("evidence_binding_mismatch", "declared CI matrix does not match")
-    if authority["local_interpreters"] != list(REQUIRED_LOCAL_PYTHONS):
-        raise GateBlock("evidence_binding_mismatch", "local interpreter declaration does not match")
-    if authority["ci_aggregate_authoritative"] is not True:
-        raise GateBlock("evidence_schema_invalid", "CI aggregate authority must be explicit")
-    if authority["ci_native_exceptions"] != manifest["ci_native_exceptions"]:
-        raise GateBlock("evidence_binding_mismatch", "CI-native exception declaration does not match")
-
-    runner = _require_object(record["runner"], "runner")
-    _require_artifact_fields(
-        runner,
-        {"agenttalk_version", "module_path", "module_sha256", "os", "architecture"},
-        "runner",
-    )
-    if not HASH_RE.fullmatch(runner["module_sha256"]):
-        raise GateBlock("evidence_schema_invalid", "runner.module_sha256 is malformed")
-    isolation = _require_object(record["isolation"], "isolation")
-    _require_artifact_fields(
-        isolation,
-        {"temp_outside_candidate", "temp_outside_store", "pytest_cache_disabled", "bytecode_disabled"},
-        "isolation",
-    )
-    if any(value is not True for value in isolation.values()):
-        raise GateBlock("evidence_schema_invalid", "all isolation guarantees must be true")
-    interpreters = _require_list(record["interpreters"], "interpreters")
-    for index, interpreter in enumerate(interpreters):
-        item = _require_object(interpreter, f"interpreters[{index}]")
-        _require_artifact_fields(
-            item,
-            {"requested", "path", "implementation", "version", "status"},
-            f"interpreters[{index}]",
-        )
-        if item["status"] not in {"pass", "missing", "mismatch"}:
-            raise GateBlock("evidence_schema_invalid", f"interpreters[{index}].status is invalid")
     artifacts = _require_object(record["artifacts"], "artifacts")
-    for artifact_id, artifact in artifacts.items():
-        item = _require_object(artifact, f"artifacts.{artifact_id}")
+    allowed_artifacts = {"sdist", "wheel"}
+    if "pip-audit" in expected_ids:
+        allowed_artifacts.add("audit_requirements")
+    if not set(artifacts).issubset(allowed_artifacts):
+        raise GateBlock("evidence_schema_invalid", "artifact evidence contains an unknown entry")
+    for artifact_id, artifact_record in artifacts.items():
+        item = _require_object(artifact_record, f"artifacts.{artifact_id}")
         _require_artifact_fields(item, {"path", "filename", "sha256", "size_bytes"}, f"artifacts.{artifact_id}")
-        if not HASH_RE.fullmatch(item["sha256"]) or not isinstance(item["size_bytes"], int):
+        possible_names = {PurePosixPath(str(item["path"])).name, PureWindowsPath(str(item["path"])).name}
+        if (
+            not _is_absolute_path_text(item["path"])
+            or not _is_nonempty_string(item["filename"])
+            or item["filename"] not in possible_names
+            or not _is_hash(item["sha256"], 64)
+            or not isinstance(item["size_bytes"], int)
+            or isinstance(item["size_bytes"], bool)
+            or item["size_bytes"] < 0
+        ):
             raise GateBlock("evidence_schema_invalid", f"artifacts.{artifact_id} is malformed")
+    if checks_by_id["package-build"]["status"] == "pass" and not {"sdist", "wheel"}.issubset(artifacts):
+        raise GateBlock("evidence_cardinality_invalid", "passing package build lacks sdist or wheel evidence")
+    if checks_by_id.get("pip-audit", {}).get("status") == "pass" and "audit_requirements" not in artifacts:
+        raise GateBlock("evidence_cardinality_invalid", "passing pip-audit lacks requirements evidence")
+
     external_inputs = _require_list(record["external_inputs"], "external_inputs")
+    observed_external: set[tuple[str, str, str, str]] = set()
+    allowed_external: set[tuple[str, str, str, str]] = set()
+    if "pip-audit" in expected_ids:
+        allowed_external.add(
+            ("pip-audit", "live-advisory-database", "PyPI advisory database", "live-service-unversioned")
+        )
+    if "semgrep" in expected_ids:
+        allowed_external.update(
+            ("semgrep", "live-rule-registry", locator, "live-registry-unversioned")
+            for locator in ("p/python", "p/security-audit")
+        )
     for index, external_input in enumerate(external_inputs):
         item = _require_object(external_input, f"external_inputs[{index}]")
         _require_artifact_fields(
@@ -545,18 +765,38 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
             {"check_id", "kind", "locator", "mutable", "identity", "observed_at"},
             f"external_inputs[{index}]",
         )
-        if item["mutable"] is not True or not all(
-            isinstance(item[field], str) and item[field]
-            for field in ("check_id", "kind", "locator", "identity", "observed_at")
-        ):
+        key = (item["check_id"], item["kind"], item["locator"], item["identity"])
+        if item["mutable"] is not True or not _valid_timestamp(item["observed_at"]) or key not in allowed_external:
             raise GateBlock("evidence_schema_invalid", f"external_inputs[{index}] is malformed")
+        if key in observed_external:
+            raise GateBlock("evidence_cardinality_invalid", "external input evidence contains duplicates")
+        observed_external.add(key)
+    required_external: set[tuple[str, str, str, str]] = set()
+    if checks_by_id.get("pip-audit", {}).get("status") == "pass":
+        required_external.update(key for key in allowed_external if key[0] == "pip-audit")
+    if checks_by_id.get("semgrep", {}).get("status") == "pass":
+        required_external.update(key for key in allowed_external if key[0] == "semgrep")
+    if not required_external.issubset(observed_external):
+        raise GateBlock("evidence_cardinality_invalid", "passing live checks lack external input evidence")
+
     blockers = _require_list(record["blockers"], "blockers")
+    blocker_ids: list[str] = []
     for index, blocker in enumerate(blockers):
         item = _require_object(blocker, f"blockers[{index}]")
         _require_artifact_fields(item, {"code", "check_id", "detail"}, f"blockers[{index}]")
+        if not all(_is_nonempty_string(item[field]) for field in ("code", "check_id", "detail")):
+            raise GateBlock("evidence_schema_invalid", f"blockers[{index}] is malformed")
+        blocker_ids.append(item["check_id"])
+    failed_ids = [check_id for check_id in expected_ids if checks_by_id[check_id]["status"] != "pass"]
+    if blocker_ids != failed_ids:
+        raise GateBlock("evidence_cardinality_invalid", "blockers do not match failed required checks")
+
     summary = _require_object(record["summary"], "summary")
     _require_artifact_fields(summary, {"required", "passed", "blocked"}, "summary")
-    if not all(isinstance(summary[key], int) and summary[key] >= 0 for key in summary):
+    if not all(
+        isinstance(summary[key], int) and not isinstance(summary[key], bool) and summary[key] >= 0
+        for key in summary
+    ):
         raise GateBlock("evidence_schema_invalid", "summary counts must be non-negative integers")
     observed_passed = sum(check["status"] == "pass" for check in checks)
     if (
@@ -566,12 +806,13 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
     ):
         raise GateBlock("evidence_binding_mismatch", "summary counts do not match check results")
 
-    passed = all(check["status"] == "pass" for check in checks)
+    passed = not failed_ids
     stable = subject["clean_before"] is True and subject["clean_after"] is True and subject["head_stable"] is True
-    if record["verdict"] == "pass" and (not passed or not stable or record["blockers"]):
-        raise GateBlock("evidence_false_pass", "pass artifact contains failed checks or unstable binding")
-    if record["verdict"] == "block" and passed and stable and not record["blockers"]:
-        raise GateBlock("evidence_schema_invalid", "block artifact has no blocker")
+    expected_verdict = "pass" if passed and stable else "block"
+    if record["verdict"] != expected_verdict:
+        raise GateBlock("evidence_false_pass", "artifact verdict does not match its proofs")
+    if record["verdict"] == "pass" and any(row["status"] != "pass" for row in interpreters):
+        raise GateBlock("evidence_false_pass", "passing artifact lacks every required interpreter")
     return record
 
 
@@ -592,6 +833,169 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
     return sha256_bytes(raw)
 
 
+def validate_preflight_artifact(artifact: Any) -> dict[str, Any]:
+    """Validate the minimal evidence emitted when the full plan cannot start."""
+
+    record = _require_object(artifact, "preflight")
+    _require_artifact_fields(
+        record,
+        {
+            "schema_version",
+            "artifact_type",
+            "run_id",
+            "started_at",
+            "finished_at",
+            "verdict",
+            "complete",
+            "execution_scope",
+            "request",
+            "subject",
+            "runner",
+            "blocker",
+        },
+        "preflight",
+    )
+    if (
+        record["schema_version"] != SCHEMA_VERSION
+        or record["artifact_type"] != PREFLIGHT_ARTIFACT_TYPE
+        or record["verdict"] != "block"
+        or record["complete"] is not False
+        or record["execution_scope"] != "preflight"
+        or not _is_nonempty_string(record["run_id"])
+        or not _valid_timestamp(record["started_at"])
+        or not _valid_timestamp(record["finished_at"])
+    ):
+        raise GateBlock("evidence_schema_invalid", "preflight header is invalid")
+    request = _require_object(record["request"], "preflight.request")
+    _require_artifact_fields(
+        request,
+        {"profile", "ci_leg", "aggregate", "requested_evidence", "requested_temp_root"},
+        "preflight.request",
+    )
+    if not _is_nonempty_string(request["profile"]) or any(
+        value is not None and not isinstance(value, str)
+        for key, value in request.items()
+        if key != "profile"
+    ):
+        raise GateBlock("evidence_schema_invalid", "preflight request is invalid")
+    subject = _require_object(record["subject"], "preflight.subject")
+    _require_artifact_fields(
+        subject,
+        {"candidate_root", "candidate_sha", "candidate_tree", "clean"},
+        "preflight.subject",
+    )
+    if not _is_absolute_path_text(subject["candidate_root"]):
+        raise GateBlock("evidence_schema_invalid", "preflight candidate root is invalid")
+    for field in ("candidate_sha", "candidate_tree"):
+        if subject[field] is not None and not _is_hash(subject[field], 40, 64):
+            raise GateBlock("evidence_schema_invalid", f"preflight {field} is invalid")
+    if subject["clean"] is not None and not isinstance(subject["clean"], bool):
+        raise GateBlock("evidence_schema_invalid", "preflight cleanliness is invalid")
+    runner = _require_object(record["runner"], "preflight.runner")
+    _require_artifact_fields(runner, {"agenttalk_version", "os", "architecture"}, "preflight.runner")
+    if not all(_is_nonempty_string(runner[field]) for field in runner):
+        raise GateBlock("evidence_schema_invalid", "preflight runner is invalid")
+    blocker = _require_object(record["blocker"], "preflight.blocker")
+    _require_artifact_fields(blocker, {"code", "detail", "check_id"}, "preflight.blocker")
+    if (
+        not _is_nonempty_string(blocker["code"])
+        or not _is_nonempty_string(blocker["detail"])
+        or (blocker["check_id"] is not None and not _is_nonempty_string(blocker["check_id"]))
+    ):
+        raise GateBlock("evidence_schema_invalid", "preflight blocker is invalid")
+    return record
+
+
+def write_preflight_block_evidence(
+    *,
+    root: Path,
+    profile: str,
+    ci_leg: str | None,
+    aggregate: Path | None,
+    evidence_path: Path | None,
+    temp_base: Path | None,
+    problem: GateBlock,
+) -> tuple[Path, str, dict[str, Any]]:
+    """Best-effort normalized BLOCK evidence for failures before a run artifact exists."""
+
+    started_at = _utc_now()
+    candidate_root = root.resolve()
+    configured_store = os.environ.get("AGENTTALK_ROOT")
+    store_root = Path(configured_store).resolve() if configured_store else None
+    try:
+        external_base = _ensure_external(
+            (temp_base or _default_external_base(candidate_root, store_root)).resolve(),
+            candidate_root,
+            store_root,
+            "preflight temp root",
+        )
+    except GateBlock:
+        external_base = _default_external_base(candidate_root, store_root)
+    external_base.mkdir(parents=True, exist_ok=True)
+    requested_evidence = str(evidence_path.resolve()) if evidence_path is not None else None
+    output_path = evidence_path or (
+        external_base / f"agenttalk-dev-gate-preflight-{uuid.uuid4().hex}.json"
+    )
+    try:
+        output_path = _external_location(
+            output_path,
+            candidate_root=candidate_root,
+            store_root=store_root,
+            label="preflight evidence path",
+        )
+    except GateBlock:
+        output_path = external_base / f"agenttalk-dev-gate-preflight-{uuid.uuid4().hex}.json"
+    try:
+        binding = capture_candidate_binding(candidate_root)
+    except GateBlock:
+        binding = None
+    artifact = {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": PREFLIGHT_ARTIFACT_TYPE,
+        "run_id": uuid.uuid4().hex,
+        "started_at": started_at,
+        "finished_at": _utc_now(),
+        "verdict": "block",
+        "complete": False,
+        "execution_scope": "preflight",
+        "request": {
+            "profile": profile,
+            "ci_leg": ci_leg,
+            "aggregate": str(aggregate.resolve()) if aggregate is not None else None,
+            "requested_evidence": requested_evidence,
+            "requested_temp_root": str(temp_base.resolve()) if temp_base is not None else None,
+        },
+        "subject": {
+            "candidate_root": str(candidate_root),
+            "candidate_sha": binding.candidate_sha if binding is not None else None,
+            "candidate_tree": binding.candidate_tree if binding is not None else None,
+            "clean": binding.clean if binding is not None else None,
+        },
+        "runner": {
+            "agenttalk_version": __version__,
+            "os": _platform_label(),
+            "architecture": platform.machine() or "unknown",
+        },
+        "blocker": {
+            "code": problem.code,
+            "detail": problem.detail,
+            "check_id": problem.check_id,
+        },
+    }
+    validate_preflight_artifact(artifact)
+    payload = json.dumps(artifact, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+    try:
+        write_text(output_path, payload, encoding="utf-8", newline="\n")
+        raw = output_path.read_bytes()
+        loaded = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GateBlock("evidence_write_failed", f"cannot write preflight evidence: {exc}") from exc
+    if raw != payload.encode("utf-8"):
+        raise GateBlock("evidence_roundtrip_mismatch", "preflight evidence bytes changed during write")
+    validate_preflight_artifact(loaded)
+    return output_path, sha256_bytes(raw), artifact
+
+
 def aggregate_leg_artifacts(
     manifest: dict[str, Any],
     profile: str,
@@ -601,7 +1005,8 @@ def aggregate_leg_artifacts(
 ) -> dict[str, Any]:
     validated = validate_manifest(manifest)
     expected = expected_ci_legs(validated, profile)
-    legs = [artifact.get("ci_leg") if isinstance(artifact, dict) else None for artifact in artifacts]
+    validated_artifacts = [validate_run_artifact(artifact, validated) for artifact in artifacts]
+    legs = [artifact["ci_leg"] for artifact in validated_artifacts]
     duplicates = sorted({leg for leg in legs if leg is not None and legs.count(leg) > 1})
     if duplicates:
         raise GateBlock("aggregate_duplicate_leg", "duplicate CI leg(s): " + ", ".join(duplicates))
@@ -612,7 +1017,6 @@ def aggregate_leg_artifacts(
     if unexpected:
         raise GateBlock("aggregate_unexpected_leg", "unexpected CI leg(s): " + ", ".join(map(str, unexpected)))
 
-    validated_artifacts = [validate_run_artifact(artifact, validated) for artifact in artifacts]
     binding_fields = (
         ("subject", "candidate_sha"),
         ("subject", "candidate_tree"),
@@ -620,6 +1024,7 @@ def aggregate_leg_artifacts(
         ("manifest", "git_blob_id"),
         ("manifest", "sha256"),
         ("manifest", "logical_plan_sha256"),
+        ("runner", "module_sha256"),
     )
     for group, field in binding_fields:
         values = {artifact[group][field] for artifact in validated_artifacts}
@@ -630,8 +1035,10 @@ def aggregate_leg_artifacts(
     current_values = {
         ("subject", "candidate_sha"): current_binding.candidate_sha,
         ("subject", "candidate_tree"): current_binding.candidate_tree,
+        ("subject", "version"): _committed_version(current_binding.root),
         ("manifest", "git_blob_id"): current_binding.manifest_git_blob,
         ("manifest", "sha256"): current_binding.manifest_sha256,
+        ("runner", "module_sha256"): current_binding.runner_module_sha256,
     }
     for (group, field), expected_value in current_values.items():
         if validated_artifacts[0][group][field] != expected_value:
@@ -643,7 +1050,7 @@ def aggregate_leg_artifacts(
     ordered = [by_leg[leg] for leg in expected]
     if input_sha256_by_leg is not None:
         if set(input_sha256_by_leg) != set(expected) or not all(
-            HASH_RE.fullmatch(value) for value in input_sha256_by_leg.values()
+            _is_hash(value, 64) for value in input_sha256_by_leg.values()
         ):
             raise GateBlock("aggregate_input_digest_invalid", "input artifact digest map is incomplete")
     verdict = "pass" if all(artifact["verdict"] == "pass" for artifact in ordered) else "block"
@@ -703,7 +1110,8 @@ def _git_environment() -> dict[str, str]:
 def _git(root: Path, args: list[str], *, binary: bool = False) -> str | bytes:
     executable = _git_executable()
     try:
-        completed = subprocess.run(  # nosec B603 - fixed git argv, shell disabled
+        # Git is resolved to an absolute executable and receives a fixed argv list.
+        completed = subprocess.run(  # nosec B603
             [str(executable), *args],
             cwd=root,
             env=_git_environment(),
@@ -728,6 +1136,9 @@ def capture_candidate_binding(root: Path, manifest_path: str = DEFAULT_MANIFEST)
     manifest_bytes = _git(resolved, ["show", f"HEAD:{manifest_path}"], binary=True)
     if not isinstance(manifest_bytes, bytes):
         raise GateBlock("git_failed", "git show returned text instead of committed manifest bytes")
+    runner_bytes = _git(resolved, ["show", "HEAD:src/agenttalk/dev_gate.py"], binary=True)
+    if not isinstance(runner_bytes, bytes):
+        raise GateBlock("git_failed", "git show returned text instead of committed runner bytes")
     status = str(_git(resolved, ["status", "--porcelain=v1", "--untracked-files=all"]))
     dirty_entries = tuple(line for line in status.splitlines() if line)
     git_dir_raw = str(_git(resolved, ["rev-parse", "--git-dir"])).strip()
@@ -749,6 +1160,7 @@ def capture_candidate_binding(root: Path, manifest_path: str = DEFAULT_MANIFEST)
         manifest_git_blob=manifest_blob,
         manifest_sha256=sha256_bytes(manifest_bytes),
         manifest_bytes=manifest_bytes,
+        runner_module_sha256=sha256_bytes(runner_bytes),
         clean=not dirty_entries and not in_progress,
         dirty_entries=dirty_entries,
         in_progress=in_progress,
@@ -928,7 +1340,8 @@ def run_command(
     reason_code: str | None = "spawn_error"
     try:
         with log_path.open("w", encoding="utf-8", errors="replace", newline="\n") as log:
-            completed = subprocess.run(  # nosec B603 - explicit argv, shell disabled
+            # The caller supplies an explicit argv sequence; shell execution is disabled.
+            completed = subprocess.run(  # nosec B603
                 [str(item) for item in argv],
                 cwd=cwd,
                 env=env,
@@ -1002,14 +1415,15 @@ def _record_from_outcome(
 
 
 def _blocked_record(check_id: str, detail: str, logs_dir: Path) -> dict[str, Any]:
+    kind, mode, python, _ = _check_semantics(check_id)
     log_path = logs_dir / (re.sub(r"[^A-Za-z0-9_.-]+", "-", check_id) + ".log")
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path.write_text(detail + "\n", encoding="utf-8")
     return {
         "id": check_id,
-        "kind": check_id.split("-", 1)[0],
-        "mode": "source" if "-source-" in check_id else "wheel" if "-wheel-" in check_id else None,
-        "python": _python_from_check_id(check_id),
+        "kind": kind,
+        "mode": mode,
+        "python": python,
         "required": True,
         "status": "blocked_dependency",
         "argv": [],
@@ -1194,7 +1608,8 @@ def _safe_extract_zip(archive: Path, destination: Path) -> None:
 def export_candidate(binding: CandidateBinding, destination: Path, archive_path: Path) -> None:
     git = _git_executable()
     try:
-        completed = subprocess.run(  # nosec B603 - fixed git archive argv
+        # Git is resolved to an absolute executable and receives a fixed archive argv.
+        completed = subprocess.run(  # nosec B603
             [str(git), "archive", "--format=zip", "--output", str(archive_path), binding.candidate_sha],
             cwd=binding.root,
             env=_git_environment(),
@@ -1899,6 +2314,7 @@ def _same_binding(before: CandidateBinding, after: CandidateBinding) -> bool:
         and before.candidate_tree == after.candidate_tree
         and before.manifest_git_blob == after.manifest_git_blob
         and before.manifest_sha256 == after.manifest_sha256
+        and before.runner_module_sha256 == after.runner_module_sha256
     )
 
 
@@ -1969,11 +2385,17 @@ def _requested_minors(
     return "ci-leg", leg, [leg.split("/", 1)[1]]
 
 
-def _module_blob_sha256(candidate_root: Path) -> str:
-    raw = _git(candidate_root, ["show", "HEAD:src/agenttalk/dev_gate.py"], binary=True)
-    if not isinstance(raw, bytes):
-        raise GateBlock("git_failed", "git show returned text for the gate module")
-    return sha256_bytes(raw)
+def _module_blob_sha256(binding: CandidateBinding) -> str:
+    return binding.runner_module_sha256
+
+
+def _export_phase(binding: CandidateBinding, run_root: Path, phase: str) -> Path:
+    if phase not in {"source", "package", "wheel", "static"}:
+        raise GateBlock("phase_invalid", f"unknown gate phase {phase!r}")
+    destination = run_root / f"candidate-{phase}"
+    archive = run_root / f"candidate-{phase}.zip"
+    export_candidate(binding, destination, archive)
+    return destination
 
 
 def execute_gate(
@@ -2016,8 +2438,6 @@ def execute_gate(
     run_root = Path(tempfile.mkdtemp(prefix="agenttalk-dev-gate-", dir=str(external_base))).resolve()
     _ensure_external(run_root, candidate_root, store_root, "gate run directory")
     logs_dir = run_root / "logs"
-    source_root = run_root / "candidate"
-    archive_path = run_root / "candidate.zip"
     dist_root = run_root / "dist"
     output_path = evidence_path
     if output_path is None:
@@ -2029,8 +2449,7 @@ def execute_gate(
         label="evidence path",
     )
 
-    export_candidate(binding, source_root, archive_path)
-    version = _candidate_version(source_root)
+    version = _committed_version(candidate_root)
     required_ids = required_check_ids(
         manifest,
         profile,
@@ -2066,13 +2485,14 @@ def execute_gate(
         interpreter_rows.extend(_interpreter_row(minor, None, problem) for minor in minors)
 
     base_env = _base_env(run_root)
-    source_env = source_environment(base_env, source_root)
     execution_problem: str | None = None
     if not binding.clean:
         execution_problem = "candidate worktree must be clean before any gate check runs"
 
     if execution_problem is None:
         try:
+            source_root = _export_phase(binding, run_root, "source")
+            source_env = source_environment(base_env, source_root)
             for minor in minors:
                 interpreter = interpreters.get(minor)
                 if interpreter is None:
@@ -2092,6 +2512,8 @@ def execute_gate(
 
             build_interpreter = next((interpreters[minor] for minor in minors if minor in interpreters), None)
             wheel: Path | None = None
+            package_root = _export_phase(binding, run_root, "package")
+            package_env = source_environment(base_env, package_root)
             if build_interpreter is None:
                 checks_by_id["package-build"] = _blocked_record(
                     "package-build", "no required interpreter is available", logs_dir
@@ -2099,15 +2521,17 @@ def execute_gate(
             else:
                 build_record, package_artifacts, wheel = run_package_build(
                     interpreter=build_interpreter,
-                    package_root=source_root,
+                    package_root=package_root,
                     out_dir=dist_root,
-                    env=source_env,
+                    env=package_env,
                     manifest=manifest,
                     logs_dir=logs_dir,
                 )
                 checks_by_id["package-build"] = build_record
                 artifacts.update(package_artifacts)
 
+            wheel_source_root = _export_phase(binding, run_root, "wheel")
+            wheel_source_env = source_environment(base_env, wheel_source_root)
             for minor in minors:
                 interpreter = interpreters.get(minor)
                 if interpreter is None:
@@ -2117,15 +2541,15 @@ def execute_gate(
                     interpreter=interpreter,
                     wheel=wheel,
                     target=target,
-                    source_root=source_root,
-                    env=source_env,
+                    source_root=wheel_source_root,
+                    env=wheel_source_env,
                     logs_dir=logs_dir,
                 )
                 checks_by_id[install["id"]] = install
                 contract = _wheel_contract(
                     interpreter=interpreter,
                     target=target,
-                    source_root=source_root,
+                    source_root=wheel_source_root,
                     env=wheel_environment(base_env, target),
                     expected_version=version,
                     manifest=manifest,
@@ -2138,7 +2562,7 @@ def execute_gate(
                     checks_by_id[wheel_test_id] = _run_pytest_mode(
                         mode="wheel",
                         interpreter=interpreter,
-                        source_root=source_root,
+                        source_root=wheel_source_root,
                         import_root=target,
                         env=wheel_environment(base_env, target),
                         expected_version=version,
@@ -2156,6 +2580,8 @@ def execute_gate(
                 None,
             )
             static_ids = required_set & {"ruff", "bandit", "gitleaks", "pip-audit", "semgrep", "zizmor"}
+            static_root = _export_phase(binding, run_root, "static")
+            static_env = source_environment(base_env, static_root)
             if static_ids and static_interpreter is None:
                 for check_id in static_ids:
                     checks_by_id[check_id] = _blocked_record(
@@ -2164,9 +2590,9 @@ def execute_gate(
             elif static_ids and static_interpreter is not None:
                 static_records, static_artifacts, observed_external = run_static_checks(
                     interpreter=static_interpreter,
-                    source_root=source_root,
+                    source_root=static_root,
                     candidate_root=candidate_root,
-                    env=source_env,
+                    env=static_env,
                     manifest=manifest,
                     required_ids=static_ids,
                     run_root=run_root,
@@ -2239,7 +2665,7 @@ def execute_gate(
         "runner": {
             "agenttalk_version": __version__,
             "module_path": "src/agenttalk/dev_gate.py",
-            "module_sha256": _module_blob_sha256(candidate_root),
+            "module_sha256": _module_blob_sha256(binding),
             "os": _platform_label(),
             "architecture": platform.machine() or "unknown",
         },
@@ -2248,6 +2674,7 @@ def execute_gate(
             "temp_outside_store": store_root is None or not _is_within(run_root, store_root),
             "pytest_cache_disabled": True,
             "bytecode_disabled": True,
+            "phase_isolated_exports": True,
         },
         "interpreters": interpreter_rows,
         "required_check_ids": required_ids,
@@ -2302,6 +2729,9 @@ def validate_aggregate_artifact(
         or record["profile"] != DEFAULT_PROFILE
         or record["verdict"] not in {"pass", "block"}
         or not isinstance(record["complete"], bool)
+        or not _is_nonempty_string(record["run_id"])
+        or not _valid_timestamp(record["started_at"])
+        or not _valid_timestamp(record["finished_at"])
     ):
         raise GateBlock("evidence_schema_invalid", "aggregate header is invalid")
     subject = _require_object(record["subject"], "aggregate.subject")
@@ -2310,7 +2740,15 @@ def validate_aggregate_artifact(
         {"candidate_sha", "candidate_tree", "version", "clean_before", "clean_after", "head_stable"},
         "aggregate.subject",
     )
-    if not HASH_RE.fullmatch(subject["candidate_sha"]) or not HASH_RE.fullmatch(subject["candidate_tree"]):
+    if (
+        not _is_hash(subject["candidate_sha"], 40, 64)
+        or not _is_hash(subject["candidate_tree"], 40, 64)
+        or not _is_nonempty_string(subject["version"])
+        or any(
+            not isinstance(subject[field], bool)
+            for field in ("clean_before", "clean_after", "head_stable")
+        )
+    ):
         raise GateBlock("evidence_schema_invalid", "aggregate subject hashes are malformed")
     manifest_record = _require_object(record["manifest"], "aggregate.manifest")
     _require_artifact_fields(
@@ -2319,8 +2757,11 @@ def validate_aggregate_artifact(
         "aggregate.manifest",
     )
     if (
-        not HASH_RE.fullmatch(manifest_record["git_blob_id"])
-        or not HASH_RE.fullmatch(manifest_record["sha256"])
+        manifest_record["path"] != DEFAULT_MANIFEST
+        or manifest_record["schema_version"] != SCHEMA_VERSION
+        or not _is_hash(manifest_record["git_blob_id"], 40, 64)
+        or not _is_hash(manifest_record["sha256"], 64)
+        or not _is_hash(manifest_record["logical_plan_sha256"], 64)
         or manifest_record["logical_plan_sha256"] != logical_plan_digest(manifest, record["profile"])
     ):
         raise GateBlock("evidence_binding_mismatch", "aggregate manifest binding is invalid")
@@ -2347,9 +2788,14 @@ def validate_aggregate_artifact(
             {"ci_leg", "run_id", "verdict", "artifact_sha256"},
             f"aggregate.legs[{index}]",
         )
-        if item["ci_leg"] not in expected or item["verdict"] not in {"pass", "block"}:
+        if (
+            not isinstance(item["ci_leg"], str)
+            or item["ci_leg"] not in expected
+            or not _is_nonempty_string(item["run_id"])
+            or item["verdict"] not in {"pass", "block"}
+        ):
             raise GateBlock("evidence_schema_invalid", f"aggregate.legs[{index}] is invalid")
-        if not HASH_RE.fullmatch(item["artifact_sha256"]):
+        if not _is_hash(item["artifact_sha256"], 64):
             raise GateBlock("evidence_schema_invalid", f"aggregate.legs[{index}] digest is malformed")
         leg_ids.append(item["ci_leg"])
     if len(leg_ids) != len(set(leg_ids)):
@@ -2358,6 +2804,8 @@ def validate_aggregate_artifact(
     for index, blocker in enumerate(blockers):
         item = _require_object(blocker, f"aggregate.blockers[{index}]")
         _require_artifact_fields(item, {"code", "check_id", "detail"}, f"aggregate.blockers[{index}]")
+        if not all(_is_nonempty_string(item[field]) for field in ("code", "check_id", "detail")):
+            raise GateBlock("evidence_schema_invalid", f"aggregate.blockers[{index}] is invalid")
     if record["complete"]:
         if leg_ids != expected:
             raise GateBlock("evidence_cardinality_invalid", "complete aggregate lacks the exact ordered CI matrix")
@@ -2372,6 +2820,7 @@ def validate_aggregate_artifact(
         comparisons = {
             "candidate_sha": current_binding.candidate_sha,
             "candidate_tree": current_binding.candidate_tree,
+            "version": _committed_version(current_binding.root),
         }
         if any(subject[field] != value for field, value in comparisons.items()):
             raise GateBlock("aggregate_binding_mismatch", "aggregate subject does not match current checkout")
@@ -2587,7 +3036,8 @@ def reenter_candidate_source(root: Path, argv: Sequence[str]) -> int | None:
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["AGENTTALK_DEV_GATE_REENTERED"] = "1"
     try:
-        completed = subprocess.run(  # nosec B603 - fixed interpreter/module argv, no shell
+        # Re-entry uses this interpreter with a fixed module argv; shell execution is disabled.
+        completed = subprocess.run(  # nosec B603
             [sys.executable, "-m", "agenttalk", "dev-gate", *argv],
             cwd=root,
             env=env,

@@ -11343,10 +11343,13 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
 
     from agenttalk import dev_gate as dev_gate_mod
 
-    if args.root:
-        sys.stderr.write("agenttalk dev-gate: BLOCK [candidate_root_override_forbidden] use the Git worktree CWD\n")
-        return 2
+    root = Path.cwd().resolve()
     try:
+        if args.root:
+            raise dev_gate_mod.GateBlock(
+                "candidate_root_override_forbidden",
+                "use the Git worktree CWD",
+            )
         root = dev_gate_mod.discover_repo_root()
         forward_argv = _dev_gate_forward_argv(args)
         reentered = dev_gate_mod.reenter_candidate_source(root, forward_argv)
@@ -11374,7 +11377,37 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                 python_overrides=dev_gate_mod.parse_python_overrides(args.python),
             )
     except dev_gate_mod.GateBlock as exc:
+        evidence_note = ""
+        try:
+            evidence_path, evidence_sha256, preflight_artifact = (
+                dev_gate_mod.write_preflight_block_evidence(
+                    root=root,
+                    profile=args.profile,
+                    ci_leg=args.ci_leg,
+                    aggregate=Path(args.aggregate) if args.aggregate is not None else None,
+                    evidence_path=Path(args.evidence) if args.evidence else None,
+                    temp_base=Path(args.temp_root) if args.temp_root else None,
+                    problem=exc,
+                )
+            )
+        except (dev_gate_mod.GateBlock, OSError) as evidence_exc:
+            evidence_note = f"; preflight evidence unavailable: {evidence_exc}"
+        else:
+            print(
+                json.dumps(
+                    {
+                        "verdict": "block",
+                        "complete": False,
+                        "evidence": str(evidence_path),
+                        "evidence_sha256": evidence_sha256,
+                        "candidate_sha": preflight_artifact["subject"]["candidate_sha"],
+                    },
+                    sort_keys=True,
+                )
+            )
         sys.stderr.write(f"agenttalk dev-gate: BLOCK [{exc.code}] {exc.detail}\n")
+        if evidence_note:
+            sys.stderr.write(f"agenttalk dev-gate: BLOCK [evidence_write_failed]{evidence_note}\n")
         return 2
     print(
         json.dumps(
