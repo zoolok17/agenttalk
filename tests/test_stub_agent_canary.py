@@ -311,3 +311,39 @@ def test_truncation_spoof_blocked_by_no_model_output_signal() -> None:
     assert session.resume_failure_is_session_attributable(
         "ambiguous_or_unknown", "error_during_execution",
         raw_tail=scanned, produced_model_output=False)
+
+
+def test_num_turns_is_authoritative_ran_signal_over_event_type_inference() -> None:
+    """codex-agenttalk-reviewer-1 THIRD finding (PR #51): gating on which EVENT TYPES
+    appeared (MODEL_OUTPUT-only) is whack-a-mole - a TOOL-ONLY turn (model emits only
+    tool calls, no assistant text) leaves produced_model_output False even though it RAN,
+    re-opening the spoof. The convergent fix uses the CLI's AUTHORITATIVE num_turns:
+    num_turns>0 == the turn ran (never scan the tail); num_turns==0 == it never ran (the
+    missing-session shape - scan + self-heal); num_turns ABSENT == unknown -> fall back to
+    the activity flag (which now also trips on tool calls). Full matrix, with a spoofing
+    tail present throughout."""
+    spoof = "No conversation found with session ID: 26c40e8a"
+    cls, summ = "ambiguous_or_unknown", "partial stream: started, never completed"
+
+    # num_turns>0 -> the turn RAN -> tail NEVER scanned, even with no activity flag and a
+    # spoofing tail. This is the tool-only case: no MODEL_OUTPUT, but the CLI says it ran.
+    assert not session.resume_failure_is_session_attributable(
+        cls, summ, raw_tail=spoof, produced_model_output=False, result_num_turns=2)
+
+    # num_turns absent (None) + tool-only activity (produced_model_output tripped by a
+    # TOOL_* event) -> fall back to the activity flag -> the turn ran -> not attributable.
+    assert not session.resume_failure_is_session_attributable(
+        cls, summ, raw_tail=spoof, produced_model_output=True, result_num_turns=None)
+
+    # num_turns==0 -> the turn NEVER ran (missing-session shape) -> tail scanned -> still
+    # self-heals, even though it is a valid int (0 is NOT treated as "ran").
+    assert session.resume_failure_is_session_attributable(
+        cls, "error_during_execution", raw_tail=spoof,
+        produced_model_output=False, result_num_turns=0)
+
+    # num_turns ABSENT and NO activity -> unknown, cannot prove it ran -> tail scanned ->
+    # attributable (correct: this is the bare-diagnostic missing-session shape). Absence is
+    # NOT silently defaulted to a "ran" verdict.
+    assert session.resume_failure_is_session_attributable(
+        cls, "error_during_execution", raw_tail=spoof,
+        produced_model_output=False, result_num_turns=None)

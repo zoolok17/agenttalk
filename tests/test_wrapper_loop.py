@@ -2373,6 +2373,72 @@ def test_make_drive_claude_truncated_model_line_in_tail_does_not_spoof_session_f
     assert "retrying resume once" not in (out.summary or "")
 
 
+def test_make_drive_claude_tool_only_turn_does_not_spoof_session_failure(tmp_path) -> None:
+    # codex-agenttalk-reviewer-1 THIRD finding (PR #51): a MODEL_OUTPUT-only activity gate
+    # is whack-a-mole - a TOOL-ONLY turn (model emits only tool calls, no assistant text)
+    # RAN but produced no MODEL_OUTPUT, so it would fall through to the raw-tail scan and a
+    # truncated model line could spoof a session failure. Here the resume turn emits ONLY
+    # tool events (TOOL_STARTED + a big tool-input delta), no message_stop, and no result
+    # (so num_turns is ABSENT). The convergent guard blocks it: the tool events trip the
+    # activity flag (the num_turns-absent fallback) -> the turn ran -> tail never scanned.
+    tool_delta = json.dumps({"type": "stream_event", "event": {
+        "type": "content_block_delta",
+        "delta": {"type": "input_json_delta",
+                  "partial_json": ("x" * 5000) + " No conversation found with session ID: abc"}}})
+
+    def spawn(argv, stdin):
+        assert "--resume" in argv
+        # A tool_use start (TOOL_STARTED) + a huge tool-input delta (TOOL_OUTPUT_DELTA).
+        # The big delta is parsed live as valid JSON (trips activity) but its stored tail
+        # copy is left-trimmed into a spoofing invalid-JSON fragment carrying the phrase.
+        return _Stream([
+            json.dumps({"type": "stream_event", "event": {
+                "type": "content_block_start",
+                "content_block": {"type": "tool_use", "name": "Bash"}}}),
+            tool_delta,
+        ])
+
+    state = session.SessionState(cli="claude", claude_session_id="sess-1",
+                                 turns=1, resume_available=True)
+    drive = run.make_drive(_store(tmp_path), "beta", "claude", state, ["claude"],
+                           spawn=spawn, clock=lambda: 0.0, render=False)
+    out = drive(_claude_rec())
+
+    assert out.ok is False
+    # NOT session-attributable: a tool-only turn RAN, so the spoofing tail is ignored.
+    assert state.resume_failure_count == 0
+    assert state.claude_session_id == "sess-1"
+    assert state.resume_available is True
+    assert "retrying resume once" not in (out.summary or "")
+
+
+def test_make_drive_claude_num_turns_gt_zero_blocks_tail_attribution(tmp_path) -> None:
+    # The AUTHORITATIVE gate on its own: a resume turn whose terminal result reports
+    # num_turns>0 RAN, so a truncated model line in the tail is never session-attributable
+    # - independent of which event types appeared. The big terminal error result is parsed
+    # live (num_turns captured before the tail is bounded) and its stored tail copy is
+    # truncated into a spoofing fragment.
+    big_result = json.dumps({
+        "type": "result", "subtype": "error_during_execution", "is_error": True,
+        "num_turns": 2,
+        "result": ("x" * 5000) + " No conversation found with session ID: abc"})
+
+    def spawn(argv, stdin):
+        assert "--resume" in argv
+        return _Stream([big_result])
+
+    state = session.SessionState(cli="claude", claude_session_id="sess-1",
+                                 turns=1, resume_available=True)
+    drive = run.make_drive(_store(tmp_path), "beta", "claude", state, ["claude"],
+                           spawn=spawn, clock=lambda: 0.0, render=False)
+    out = drive(_claude_rec())
+
+    assert out.ok is False
+    assert state.resume_failure_count == 0          # num_turns==2 -> ran -> not attributable
+    assert state.claude_session_id == "sess-1"
+    assert state.resume_available is True
+
+
 def test_make_drive_success_stamps_heartbeat(tmp_path) -> None:
     # the flip side: a CLEAN completed turn leaves a fresh heartbeat.
     s = _store(tmp_path)

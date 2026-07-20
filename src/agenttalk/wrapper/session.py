@@ -194,25 +194,35 @@ def resume_failure_is_session_attributable(failure_class: str | None,
                                            summary: str | None,
                                            raw_tail: str | None = None,
                                            *,
-                                           produced_model_output: bool = False) -> bool:
+                                           produced_model_output: bool = False,
+                                           result_num_turns: int | None = None) -> bool:
     if failure_class in {"known_global_infra", "config_blocked"}:
         return False
-    # The raw child-output tail is a BYTE/LINE-BOUNDED capture (max_bytes/max_lines
-    # with a truncated flag). A model's JSON assistant line truncated at the tail
-    # boundary becomes INVALID JSON, so it would pass run.py's non-JSON-only filter and
-    # be treated as a trusted CLI diagnostic - re-opening the content-spoof hole
-    # (codex-agenttalk-reviewer-1 REQUEST-CHANGES on PR #51): a truncated model fragment
-    # quoting "no conversation found with session id" could spoof a session failure on a
-    # turn where the model ACTUALLY RAN. The load-bearing guard is CONTENT-INDEPENDENT:
-    # a real missing-resume-session failure produces ZERO model output (claude's result
-    # reports num_turns==0 - the turn never ran - and no MODEL_OUTPUT event occurs),
-    # whereas a turn that merely QUOTES the phrase produced model output. So the raw tail
-    # is scanned ONLY when the turn produced no model output; a turn that produced model
-    # output is NEVER session-attributable from tail text, regardless of truncation. This
-    # makes the truncation-spoof structurally impossible, not merely harder. The classified
-    # summary (built from structured JSON events, never raw model bytes) is still scanned
+    # The raw child-output tail is a BYTE/LINE-BOUNDED capture (max_bytes/max_lines with
+    # a truncated flag). A model JSON line truncated at the tail boundary becomes INVALID
+    # JSON, so it slips past run.py's non-JSON-only filter and is mistaken for a trusted
+    # CLI diagnostic - so a truncated model fragment quoting "no conversation found with
+    # session id" could spoof a session failure on a turn where the model ACTUALLY RAN
+    # (codex-agenttalk-reviewer-1, PR #51). The tail is therefore trustworthy ONLY when
+    # the resumed turn NEVER RAN, and we decide "did it run" from the CLI's AUTHORITATIVE
+    # signal rather than inferring it from which event types happened to appear:
+    #   * num_turns is the load-bearing gate. claude's stream-json ``result`` reports
+    #     num_turns (a missing-resume-session failure reports num_turns == 0 - the turn
+    #     never ran); num_turns > 0 means it ran. This is content-independent and does
+    #     not enumerate event types, so it cannot be defeated by a model turn that emits
+    #     only tool calls (no assistant text), only thinking, etc.
+    #   * produced_model_output is corroboration + a fallback for CLIs/results that OMIT
+    #     num_turns: it trips on ANY turn activity (model output, deltas, OR tool calls),
+    #     so a tool-only turn still counts as "ran". A MISSING num_turns is treated as
+    #     UNKNOWN (never as 0), so we fall back to this flag instead of wrongly enabling
+    #     the scan on a ran-but-num_turns-absent turn.
+    # Net: any activity OR num_turns > 0 => the turn ran => tail is NOT scanned, so a
+    # truncated model fragment can never reach the attribution. The classified summary
+    # (built from structured JSON events, never raw model bytes) is still scanned
     # unconditionally - model content cannot reach it (task #34 resume-continuity).
-    tail = "" if produced_model_output else (raw_tail or "")
+    turn_ran = bool(produced_model_output) or (
+        isinstance(result_num_turns, int) and result_num_turns > 0)
+    tail = "" if turn_ran else (raw_tail or "")
     text = f"{summary or ''}\n{tail}".casefold()
     broken_terms = (
         "no session",
