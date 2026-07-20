@@ -59,7 +59,7 @@ external evidence path can be established, the command still writes a normalized
 
 [`dev-gate.json`](../dev-gate.json) is the strict plan. The command reads its committed `HEAD` blob, not an
 uncommitted working-tree copy, and records both its Git blob ID and SHA-256 digest. The runner also records a
-logical plan digest, the candidate commit/tree, and the committed runner digest. Before executing the plan,
+logical plan digest, the candidate commit/tree, and the committed runner blob ID/digest. Before executing the plan,
 the CLI re-enters a temporary committed Git export, so index flags cannot make mutable checkout code masquerade
 as the attested runner. [`dev-gate-requirements.txt`](../dev-gate-requirements.txt) provisions tools only; it
 does not own check selection or argv.

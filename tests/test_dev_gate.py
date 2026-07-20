@@ -187,6 +187,7 @@ def _leg_artifact(manifest: dict, leg: str, *, status: str = "pass") -> dict:
         "runner": {
             "agenttalk_version": "0.78.1",
             "module_path": "src/agenttalk/dev_gate.py",
+            "git_blob_id": "4" * 40,
             "module_sha256": "5" * 64,
             "os": leg.split("/", 1)[0],
             "architecture": "x86_64",
@@ -286,6 +287,7 @@ def _binding(manifest: dict) -> dev_gate.CandidateBinding:
         manifest_git_blob="3" * 40,
         manifest_sha256=dev_gate.sha256_bytes(raw),
         manifest_bytes=raw,
+        runner_git_blob="4" * 40,
         runner_module_sha256="5" * 64,
         clean=True,
         dirty_entries=(),
@@ -582,6 +584,7 @@ def test_committed_manifest_binding_ignores_checkout_newline_conversion_and_reje
         check=True,
     ).stdout
     assert binding.runner_module_sha256 == dev_gate.sha256_bytes(committed_runner)
+    assert binding.runner_git_blob == _git(tmp_path, "rev-parse", "HEAD:src/agenttalk/dev_gate.py")
     assert binding.clean is True
 
     (tmp_path / "untracked.txt").write_text("dirty", encoding="utf-8")

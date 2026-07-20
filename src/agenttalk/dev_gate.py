@@ -91,6 +91,7 @@ class CandidateBinding:
     manifest_git_blob: str
     manifest_sha256: str
     manifest_bytes: bytes
+    runner_git_blob: str
     runner_module_sha256: str
     clean: bool
     dirty_entries: tuple[str, ...]
@@ -708,12 +709,20 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
     runner = _require_object(record["runner"], "runner")
     _require_artifact_fields(
         runner,
-        {"agenttalk_version", "module_path", "module_sha256", "os", "architecture"},
+        {
+            "agenttalk_version",
+            "module_path",
+            "git_blob_id",
+            "module_sha256",
+            "os",
+            "architecture",
+        },
         "runner",
     )
     if (
         runner["agenttalk_version"] != subject["version"]
         or runner["module_path"] != "src/agenttalk/dev_gate.py"
+        or not _is_hash(runner["git_blob_id"], 40, 64)
         or not _is_hash(runner["module_sha256"], 64)
         or not _is_nonempty_string(runner["os"])
         or not _is_nonempty_string(runner["architecture"])
@@ -1172,6 +1181,7 @@ def aggregate_leg_artifacts(
         ("manifest", "git_blob_id"),
         ("manifest", "sha256"),
         ("manifest", "logical_plan_sha256"),
+        ("runner", "git_blob_id"),
         ("runner", "module_sha256"),
     )
     for group, field in binding_fields:
@@ -1186,6 +1196,7 @@ def aggregate_leg_artifacts(
         ("subject", "version"): _committed_version(current_binding.root),
         ("manifest", "git_blob_id"): current_binding.manifest_git_blob,
         ("manifest", "sha256"): current_binding.manifest_sha256,
+        ("runner", "git_blob_id"): current_binding.runner_git_blob,
         ("runner", "module_sha256"): current_binding.runner_module_sha256,
     }
     for (group, field), expected_value in current_values.items():
@@ -1276,6 +1287,28 @@ def _git(root: Path, args: list[str], *, binary: bool = False) -> str | bytes:
     return completed.stdout
 
 
+def _git_hash_worktree_bytes(root: Path, path: str, data: bytes) -> str:
+    """Hash checkout bytes through Git's clean filters for a platform-neutral blob ID."""
+
+    executable = _git_executable()
+    try:
+        completed = subprocess.run(  # nosec B603
+            [str(executable), "hash-object", f"--path={path}", "--stdin"],
+            cwd=root,
+            env=_git_environment(),
+            input=data,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise GateBlock("git_unavailable", f"git hash-object failed: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()
+        raise GateBlock("git_failed", (detail or "git hash-object failed")[:500])
+    return completed.stdout.decode("ascii", "strict").strip()
+
+
 def capture_candidate_binding(root: Path, manifest_path: str = DEFAULT_MANIFEST) -> CandidateBinding:
     resolved = root.resolve()
     sha = str(_git(resolved, ["rev-parse", "HEAD"])).strip()
@@ -1287,6 +1320,7 @@ def capture_candidate_binding(root: Path, manifest_path: str = DEFAULT_MANIFEST)
     runner_bytes = _git(resolved, ["show", "HEAD:src/agenttalk/dev_gate.py"], binary=True)
     if not isinstance(runner_bytes, bytes):
         raise GateBlock("git_failed", "git show returned text instead of committed runner bytes")
+    runner_blob = str(_git(resolved, ["rev-parse", "HEAD:src/agenttalk/dev_gate.py"])).strip()
     status = str(_git(resolved, ["status", "--porcelain=v1", "--untracked-files=all"]))
     dirty_entries = tuple(line for line in status.splitlines() if line)
     git_dir_raw = str(_git(resolved, ["rev-parse", "--git-dir"])).strip()
@@ -1308,6 +1342,7 @@ def capture_candidate_binding(root: Path, manifest_path: str = DEFAULT_MANIFEST)
         manifest_git_blob=manifest_blob,
         manifest_sha256=sha256_bytes(manifest_bytes),
         manifest_bytes=manifest_bytes,
+        runner_git_blob=runner_blob,
         runner_module_sha256=sha256_bytes(runner_bytes),
         clean=not dirty_entries and not in_progress,
         dirty_entries=dirty_entries,
@@ -2462,6 +2497,7 @@ def _same_binding(before: CandidateBinding, after: CandidateBinding) -> bool:
         and before.candidate_tree == after.candidate_tree
         and before.manifest_git_blob == after.manifest_git_blob
         and before.manifest_sha256 == after.manifest_sha256
+        and before.runner_git_blob == after.runner_git_blob
         and before.runner_module_sha256 == after.runner_module_sha256
     )
 
@@ -2813,6 +2849,7 @@ def execute_gate(
         "runner": {
             "agenttalk_version": __version__,
             "module_path": "src/agenttalk/dev_gate.py",
+            "git_blob_id": binding.runner_git_blob,
             "module_sha256": _module_blob_sha256(binding),
             "os": _platform_label(),
             "architecture": platform.machine() or "unknown",
@@ -3185,13 +3222,17 @@ def reenter_candidate_source(root: Path, argv: Sequence[str]) -> int | None:
                 f"re-entered process imported {observed_module}, expected under external {committed_src}",
             )
         try:
-            observed_digest = sha256_bytes(observed_module.read_bytes())
+            observed_blob = _git_hash_worktree_bytes(
+                candidate_root,
+                "src/agenttalk/dev_gate.py",
+                observed_module.read_bytes(),
+            )
         except OSError as exc:
             raise GateBlock("candidate_source_reentry_failed", f"cannot hash executing runner: {exc}") from exc
-        if observed_digest != binding.runner_module_sha256:
+        if observed_blob != binding.runner_git_blob:
             raise GateBlock(
                 "candidate_source_reentry_failed",
-                "executing runner bytes do not match HEAD",
+                "executing runner does not clean-filter to the HEAD blob",
             )
         return None
 
