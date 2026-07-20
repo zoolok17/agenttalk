@@ -1523,6 +1523,21 @@ def _classify_drive_failure(sig: dict) -> tuple[str, str]:
     return CLASS_AMBIGUOUS, f"turn never started (rc={sig.get('rc')}, no clear signal)"
 
 
+def _child_output_tail_text(tail: object) -> str:
+    """Flatten a captured child-output tail's lines into one scannable string.
+    Feeds the raw diagnostic - e.g. a non-JSON 'No conversation found with session
+    ID: ...' line the stream-json adapter DISCARDS during parsing - into the
+    resume-failure attributability decision (task #34 resume-continuity)."""
+    if not isinstance(tail, dict):
+        return ""
+    lines = tail.get("lines")
+    if not isinstance(lines, list):
+        return ""
+    parts = [line.get("text") for line in lines
+             if isinstance(line, dict) and isinstance(line.get("text"), str)]
+    return "\n".join(parts)
+
+
 def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str], *,
                sender: str | None = None, min_interval: float = 5.0,
                render: bool = True, rules: str | None = None,
@@ -1862,7 +1877,9 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 health_writer.unknown()
                 raise
             attributable = _session.resume_failure_is_session_attributable(
-                resume_failure_class, resume_summary)
+                resume_failure_class, resume_summary,
+                raw_tail=_child_output_tail_text(sig.get("child_output_tail")),
+            )
             if resume_failure_class == CLASS_CONFIG_BLOCKED:
                 _session.clear_resume_attempt(session_state)
                 store.clear_heartbeat(agent)

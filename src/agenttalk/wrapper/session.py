@@ -191,10 +191,15 @@ def resume_attempt_start(state: SessionState, *, agent: str, msg_id: object) -> 
 
 
 def resume_failure_is_session_attributable(failure_class: str | None,
-                                           summary: str | None) -> bool:
+                                           summary: str | None,
+                                           raw_tail: str | None = None) -> bool:
     if failure_class in {"known_global_infra", "config_blocked"}:
         return False
-    text = (summary or "").casefold()
+    # Scan the classified summary AND the raw child-output tail: the broken-session
+    # diagnostic (e.g. claude's "No conversation found with session ID: <uuid>")
+    # arrives on a NON-JSON line the stream-json adapter discards, so it never reaches
+    # the summary - only the captured raw tail carries it (task #34 resume-continuity).
+    text = f"{summary or ''}\n{raw_tail or ''}".casefold()
     broken_terms = (
         "no session",
         "session not found",
@@ -204,6 +209,7 @@ def resume_failure_is_session_attributable(failure_class: str | None,
         "resume turn failed",
         "session is full",
         "prompt is too long",
+        "no conversation found",
     )
     return (
         failure_class == "poison_eligible"

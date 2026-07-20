@@ -20,6 +20,11 @@ security = [
     "pip-audit>=2.7",
 ]
 
+[tool.pytest.ini_options]
+markers = [
+    "subprocess: tests that spawn real subprocesses (e.g. the enforcement canary's stub CLI); deselect with -m 'not subprocess'",
+]
+
 [tool.ruff]
 # 120 is generous-but-not-permissive; lets multi-line user-facing
 # error strings stay one line each without sacrificing readability.
