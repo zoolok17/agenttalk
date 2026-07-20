@@ -40,6 +40,23 @@ def test_doctor_on_initialized_project_includes_all_check_categories(
     assert "heartbeat.beta" in names
 
 
+def test_doctor_warns_when_supervisor_deadman_config_is_ignored(tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({"deadman": {"mail_age_slo_seconds": 60}}),
+        encoding="utf-8",
+    )
+
+    report = doctor.run(tmp_path)
+
+    check = next(c for c in report.checks if c.name == "deadman_config_source")
+    assert check.status == "warn"
+    assert "supervisor.json contains a deadman block that is ignored" in check.details
+    assert "config.json" in check.details
+    assert ".agenttalk/config.json" in check.fix
+
+
 # ----- hmac check status mapping (review C*: doctor must NOT report a
 # degenerate/garbage key as enabled-OK; closes doctor.py 456-472) ------
 
