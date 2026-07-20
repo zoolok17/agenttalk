@@ -8,6 +8,7 @@ capture stderr/stdout via capsys.
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -992,6 +993,24 @@ def test_version_flag_prints_current_version(
 
 # ----------------------------------------------------------- drain command
 
+
+class _FailOnSecondFlush:
+    """Accept two records but confirm delivery of only the first."""
+
+    def __init__(self) -> None:
+        self.writes: list[str] = []
+        self.flushes = 0
+
+    def write(self, text: str) -> int:
+        self.writes.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        self.flushes += 1
+        if self.flushes == 2:
+            raise BrokenPipeError("short reader stopped")
+
+
 def test_drain_consumes_and_advances_to_newest(
     store: Store,
     store_root: Path,
@@ -1011,6 +1030,150 @@ def test_drain_consumes_and_advances_to_newest(
     rc = _run(["drain", "--for", "beta"], store_root)
     assert rc == 0
     assert "no new messages" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["drain", "--for", "beta"],
+        ["recv", "--for", "beta", "--ack"],
+        ["recv", "--for", "beta", "--ack", "--json"],
+    ],
+)
+def test_unbounded_consuming_receive_refuses_pipe_without_consuming(
+    command: list[str],
+    store: Store,
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A real FIFO is refused before output, so a short reader cannot eat mail."""
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+    store.send(sender="alpha", recipient="beta", body="two", kind="message")
+    read_fd, write_fd = os.pipe()
+    try:
+        with os.fdopen(write_fd, "w", encoding="utf-8") as pipe_writer:
+            with monkeypatch.context() as patch:
+                patch.setattr(cli.sys, "stdout", pipe_writer)
+                rc = _run(command, store_root)
+        pipe_output = os.read(read_fd, 65536)
+    finally:
+        os.close(read_fd)
+
+    assert rc == 2
+    assert pipe_output == b""
+    assert store.cursor("beta") == ""
+    error = capsys.readouterr().err
+    assert "unbounded consuming read" in error
+    assert "--limit" in error
+
+
+def test_drain_unbounded_regular_file_redirect_consumes_everything(
+    store: Store,
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A regular file captures the complete stream and must not trip the FIFO guard."""
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+    newest = store.send(sender="alpha", recipient="beta", body="two", kind="message")
+    output_path = store_root / "drain-output.txt"
+
+    with output_path.open("w", encoding="utf-8") as output:
+        with monkeypatch.context() as patch:
+            patch.setattr(cli.sys, "stdout", output)
+            rc = _run(["drain", "--for", "beta"], store_root)
+
+    assert rc == 0
+    assert output_path.read_text(encoding="utf-8").count("AGENTTALK :: INBOX") == 2
+    assert store.cursor("beta") == newest.id
+
+
+def test_drain_commits_only_records_whose_flush_succeeded(
+    store: Store,
+    store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = store.send(sender="alpha", recipient="beta", body="one", kind="message")
+    store.send(sender="alpha", recipient="beta", body="two", kind="message")
+    output = _FailOnSecondFlush()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.sys, "stdout", output)
+        rc = _run(["drain", "--for", "beta"], store_root)
+
+    assert rc == 2
+    assert len(output.writes) == 2
+    assert store.cursor("beta") == first.id
+
+
+def test_drain_limit_pages_visible_messages_with_control_interleaving(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    store.send(sender="alpha", recipient="beta", body="before", kind="composing")
+    first = store.send(sender="alpha", recipient="beta", body="one", kind="message")
+    store.send(sender="alpha", recipient="beta", body="between", kind="composing")
+    second = store.send(sender="alpha", recipient="beta", body="two", kind="message")
+    trailing = store.send(sender="alpha", recipient="beta", body="after", kind="composing")
+
+    assert _run(["drain", "--for", "beta", "-n", "1"], store_root) == 0
+    first_page = capsys.readouterr().out
+    assert "one" in first_page and "two" not in first_page
+    assert "before" not in first_page and "between" not in first_page
+    assert store.cursor("beta") == first.id
+
+    assert _run(["drain", "--for", "beta", "--limit", "1"], store_root) == 0
+    second_page = capsys.readouterr().out
+    assert "two" in second_page and "one" not in second_page
+    assert "between" not in second_page and "after" not in second_page
+    assert store.cursor("beta") == second.id
+
+    assert _run(["drain", "--for", "beta", "--quiet"], store_root) == 0
+    assert capsys.readouterr().out == ""
+    assert store.cursor("beta") == trailing.id
+
+
+def test_drain_limit_counts_control_messages_when_they_are_included(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    control = store.send(
+        sender="alpha", recipient="beta", body="drafting", kind="composing"
+    )
+    store.send(sender="alpha", recipient="beta", body="answer", kind="message")
+
+    assert _run([
+        "drain", "--for", "beta", "--include-control", "--limit", "1",
+    ], store_root) == 0
+
+    output = capsys.readouterr().out
+    assert "drafting" in output and "answer" not in output
+    assert store.cursor("beta") == control.id
+
+
+@pytest.mark.parametrize("limit", ["0", "-1"])
+def test_drain_limit_must_be_positive(
+    limit: str,
+    store_root: Path,
+) -> None:
+    _run_expect_exit(["drain", "--for", "beta", "--limit", limit], store_root, 2)
+
+
+def test_recv_limit_peeks_one_message_without_advancing(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+    store.send(sender="alpha", recipient="beta", body="two", kind="message")
+
+    assert _run(["recv", "--for", "beta", "--limit", "1"], store_root) == 0
+
+    output = capsys.readouterr().out
+    assert "one" in output and "two" not in output
+    assert store.cursor("beta") == ""
 
 
 def test_drain_advances_past_hidden_control_only_unread(

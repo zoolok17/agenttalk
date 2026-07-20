@@ -146,6 +146,22 @@ def test_records_since_and_include_control_knobs(tmp_path) -> None:
 
 # --------------------------------------------------- recv --json CLI mirror
 
+
+class _FailOnSecondJsonFlush:
+    def __init__(self) -> None:
+        self.writes: list[str] = []
+        self.flushes = 0
+
+    def write(self, text: str) -> int:
+        self.writes.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        self.flushes += 1
+        if self.flushes == 2:
+            raise BrokenPipeError("short JSON reader stopped")
+
+
 def test_recv_json_cli_mirror(tmp_path, capsys) -> None:
     s = _store(tmp_path)
     s.send(sender="alpha", recipient="beta", body="one", meta={"request_id": "rq-1"})
@@ -176,3 +192,77 @@ def test_recv_json_ack_advances_past_hidden_control(tmp_path) -> None:
     assert rc == 0
     # cursor advanced to the LATER composing id, not the visible message.
     assert s.cursor("beta") == comp.id
+
+
+def test_recv_json_ack_commits_only_records_whose_flush_succeeded(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    s = _store(tmp_path)
+    first = s.send(sender="alpha", recipient="beta", body="one")
+    s.send(sender="alpha", recipient="beta", body="two")
+    output = _FailOnSecondJsonFlush()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.sys, "stdout", output)
+        rc = cli.main([
+            "--root", str(tmp_path), "recv", "--for", "beta", "--json", "--ack",
+        ])
+
+    assert rc == 2
+    assert len(output.writes) == 2
+    assert s.cursor("beta") == first.id
+
+
+def test_recv_json_ack_limit_preserves_hidden_control_page_boundary(
+    tmp_path,
+    capsys,
+) -> None:
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="before", kind="composing")
+    first = s.send(sender="alpha", recipient="beta", body="one")
+    s.send(sender="alpha", recipient="beta", body="between", kind="composing")
+    s.send(sender="alpha", recipient="beta", body="two")
+
+    rc = cli.main([
+        "--root", str(tmp_path), "recv", "--for", "beta", "--json", "--ack",
+        "--limit", "1",
+    ])
+
+    assert rc == 0
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [record["body"] for record in records] == ["one"]
+    assert s.cursor("beta") == first.id
+
+
+def test_recv_json_ack_uses_one_snapshot_for_output_and_commit(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    s = _store(tmp_path)
+    first = s.send(sender="alpha", recipient="beta", body="one")
+    original_records = recv_api.records
+    calls = 0
+    late = None
+
+    def records_with_late_arrival(store, agent, **kwargs):
+        nonlocal calls, late
+        records = original_records(store, agent, **kwargs)
+        calls += 1
+        if calls == 1:
+            late = s.send(sender="alpha", recipient="beta", body="late")
+        return records
+
+    monkeypatch.setattr(recv_api, "records", records_with_late_arrival)
+    rc = cli.main([
+        "--root", str(tmp_path), "recv", "--for", "beta", "--json", "--ack",
+    ])
+
+    assert rc == 0
+    assert calls == 1
+    assert [json.loads(line)["body"] for line in capsys.readouterr().out.splitlines()] == [
+        "one",
+    ]
+    assert s.cursor("beta") == first.id
+    assert late is not None and [message.id for message in s.unread_for("beta")] == [late.id]

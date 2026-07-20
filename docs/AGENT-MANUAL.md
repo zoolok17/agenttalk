@@ -284,7 +284,7 @@ Assurance closes (`agenttalk close`) aggregate gates + review lenses + remediati
 | `roster` | Live membership/roles/liaison/groups - authoritative; never dispatch from a memorized roster (§1) |
 | `status [--json]` | Roster, counts, cursors |
 | `threads --for $SELF [--all]` | Open/closed request-reply threads |
-| `recv` / `drain --for $SELF` | Read inbox (`drain` = `recv --ack`) |
+| `recv [-n N]` / `drain --for $SELF [-n N]` | Read inbox (`drain` = `recv --ack`); bound consuming output with `-n`, never a downstream truncator |
 | `wait --for $SELF [--to-request <id>] [--kind ...]` | Block for messages (listen primitive) |
 | `send` / `reply` / `ack` | Core point-to-point + cursor/thread control |
 | `check --for --to-request <id> [--gates]` | Currentness gate before irreversible action |
