@@ -4691,7 +4691,6 @@ CONFIG_TEMPLATE = """\
   "_comment_max_readiness_retries": "After this many relaunches of an agent that NEVER reaches readiness (no first heartbeat - e.g. a manual resume that does not re-enter the listen loop), the supervisor STOPS relaunching and surfaces READINESS_GAVE_UP (warn/notify, no kill) instead of churning forever. Reset by a fresh heartbeat or an operator restart/clear. A WRAPPED agent avoids this class entirely (the wrapper owns the heartbeat regardless of the model prompt) - prefer wrapped for hands-off supervision.",
   "claude_permission_mode": "bypassPermissions",
   "backoff": { "base_seconds": 30, "cap_seconds": 900, "reset_after_seconds": 180 },
-  "deadman": { "mail_age_slo_seconds": 900, "alarm_unread_response": false },
   "notify_sender": null,
   "notify_to": null,
   "ephemeral_reviewers": {

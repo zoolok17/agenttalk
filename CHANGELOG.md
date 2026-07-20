@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A committed, SHA-bound `agenttalk dev-gate` replaces hand-run test and security rituals.** The release
+  profile runs isolated source and built-wheel tests, packaging contracts, Ruff, Bandit, gitleaks, pip-audit,
+  Semgrep, and zizmor; emits strict normalized JSON evidence; and fails closed on missing tools or fields.
+  CI produces incomplete evidence for each declared OS/Python leg and an authoritative aggregate only after
+  all 12 legs prove the same candidate and manifest binding. CodeQL is the sole explicit CI-native exception.
+
 ## [0.78.1] - 2026-07-15
 
 ### Fixed

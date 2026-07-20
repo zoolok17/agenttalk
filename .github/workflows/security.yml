@@ -6,137 +6,19 @@ on:
   pull_request:
     branches: [master]
   schedule:
-    # Weekly catch-up so newly disclosed CVEs in dev deps surface
-    # even when the repo is quiet.
-    - cron: '17 9 * * 1'  # Monday 09:17 UTC
+    - cron: '17 9 * * 1'
   workflow_dispatch:
 
-# Default workflow permissions: read-only. Jobs that need write
-# access (e.g. CodeQL SARIF upload) grant themselves the minimum
-# required at the job level. zizmor's `excessive-permissions`
-# audit prefers this pattern.
 permissions:
   contents: read
 
-# Third-party actions are hash-pinned (per zizmor `unpinned-uses`
-# / OWASP CI/CD recommendations). The `# vX` trailing comment is
-# human-readable and dependabot-friendly — dependabot auto-bumps
-# the SHA while keeping the comment in sync.
-#
-# Every actions/checkout sets `persist-credentials: false` (zizmor
-# `artipacked`): the default writes GITHUB_TOKEN to the local git
-# config, which can leak via uploaded artifacts. None of these jobs
-# push back to the repo, so the credential is just dead weight.
-
+# CodeQL is the sole CI-native exception declared in dev-gate.json. Every
+# CLI-runnable voting check lives in the committed dev-gate plan instead.
 jobs:
-
-  # --------------------------------------------------------------- ruff S
-  ruff:
-    name: ruff (lint + security S-rules)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
-        with:
-          python-version: '3.12'
-      - name: Install ruff
-        run: pip install 'ruff>=0.6'
-      - name: Run ruff
-        run: ruff check src tests
-
-  # --------------------------------------------------------------- bandit
-  # Overlaps with ruff S-rules; we run both for defense-in-depth
-  # (each catches things the other misses or scores differently).
-  bandit:
-    name: bandit (security AST scan)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
-        with:
-          python-version: '3.12'
-      - run: pip install 'bandit>=1.7'
-      - name: Run bandit
-        run: bandit -r src -x src/agenttalk/skills
-
-  # ---------------------------------------------------------- pip-audit
-  pip-audit:
-    name: pip-audit (CVE check on deps)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
-        with:
-          python-version: '3.12'
-      - run: pip install -e ".[dev]"
-      - run: pip install 'pip-audit>=2.7'
-      - name: Generate audit-requirements.txt from frozen env
-        # Auditing pip's dry-run output is unreliable (format isn't
-        # `name==version`). Install for real and audit the resulting
-        # frozen environment — same set CI actually uses.
-        run: pip freeze --exclude-editable > audit-requirements.txt
-      - run: cat audit-requirements.txt
-      - name: Audit dev deps against PyPI advisory db
-        run: pip-audit --strict --requirement audit-requirements.txt
-
-  # ----------------------------------------------------------- gitleaks
-  gitleaks:
-    name: gitleaks (secret scan)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
-        with:
-          fetch-depth: 0  # full history for secret detection
-          persist-credentials: false
-      - uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc  # v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ----------------------------------------------------------- semgrep
-  # pip-installs semgrep rather than using the `returntocorp/semgrep`
-  # container, because (a) every other job in this file installs its
-  # tool via pip — matches the project's "minimal, auditable CI"
-  # tenet — and (b) zizmor's `unpinned-images` audit (HIGH) requires
-  # container images to be pinned by digest, which is a maintenance
-  # burden semgrep itself doesn't impose since it's pure Python.
-  semgrep:
-    name: semgrep (registry + agenttalk-specific rules)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
-        with:
-          python-version: '3.12'
-      - run: pip install 'semgrep>=1.80'
-      - name: Run semgrep with local rules
-        run: |
-          # --timeout 120: a slow registry rule (e.g. the boto3 rules, which this
-          # codebase never exercises) can exceed semgrep's 5s default on a large file
-          # like cli.py, and --strict turns that rule-execution timeout into a hard
-          # failure even with 0 findings. A generous bound keeps every rule running to
-          # completion (no coverage lost) while eliminating the timeout-flake.
-          semgrep scan \
-            --config=p/python \
-            --config=p/security-audit \
-            --config=.semgrep/agenttalk.yml \
-            --error \
-            --timeout 120 \
-            --strict
-
-  # ------------------------------------------------------------ CodeQL
   codeql:
     name: codeql (security-extended)
     runs-on: ubuntu-latest
     permissions:
-      # SARIF upload requires write here — granted only on this job.
       security-events: write
       actions: read
       contents: read
@@ -149,21 +31,3 @@ jobs:
           languages: python
           queries: security-extended
       - uses: github/codeql-action/analyze@78ed0c7291d93e40c51b085850dc669a4c3ab73b  # v3
-
-  # ------------------------------------------------------------ zizmor
-  # Audits the GHA workflow files themselves for common security
-  # missteps (unpinned actions, workflow injection, broad
-  # permissions). Voting as of 0.6.0 — all third-party actions
-  # are now hash-pinned (above) so `unpinned-uses` is satisfied.
-  zizmor:
-    name: zizmor (GHA workflow security)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
-        with:
-          python-version: '3.12'
-      - run: pip install 'zizmor>=1.20'
-      - run: zizmor .github/workflows

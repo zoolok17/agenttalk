@@ -55,6 +55,7 @@ def _process_is_active(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+@pytest.mark.source_layout
 def test_real_core_parses_and_runs_all_generated_harmless_paths(tmp_path: Path) -> None:
     pwsh = shutil.which("pwsh")
     if not pwsh:
@@ -82,6 +83,7 @@ def test_real_core_parses_and_runs_all_generated_harmless_paths(tmp_path: Path) 
     assert not store.supervisor_instance_path().exists()
 
 
+@pytest.mark.source_layout
 def test_real_core_accepts_direct_powershell_to_python_claim_chain(tmp_path: Path) -> None:
     pwsh = shutil.which("pwsh")
     if not pwsh:
@@ -115,6 +117,7 @@ def test_real_core_accepts_direct_powershell_to_python_claim_chain(tmp_path: Pat
     assert not store.supervisor_instance_path().exists()
 
 
+@pytest.mark.source_layout
 def test_real_core_override_claim_uses_baked_fallback_for_validation(
     tmp_path: Path,
 ) -> None:

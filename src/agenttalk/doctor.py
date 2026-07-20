@@ -148,6 +148,9 @@ def run(project_root: Path | None = None) -> Report:
             report.checks.append(esc_target)
         report.checks.append(_check_identity_registry(store))
         report.checks.append(_check_store_hygiene(store))
+        deadman_config = _check_deadman_config_source(store)
+        if deadman_config is not None:
+            report.checks.append(deadman_config)
         report.checks.extend(_check_skills())
         report.checks.append(_check_devkit())
         report.checks.append(_check_codex_config(root))
@@ -1139,6 +1142,33 @@ def _check_store_hygiene(store: Store) -> Check:
             data=data,
         )
     return Check(name="store_hygiene", status="ok", details="clean", data=data)
+
+
+def _check_deadman_config_source(store: Store) -> Check | None:
+    """Warn when deadman settings are placed in the ignored supervisor config."""
+    supervisor_path = store.dir / "supervisor.json"
+    try:
+        config = sup.load_supervisor_config(supervisor_path)
+    except (OSError, ValueError):
+        return None  # the supervisor config health checks own malformed files
+    if "deadman" not in config:
+        return None
+    return Check(
+        name="deadman_config_source",
+        status="warn",
+        details=(
+            "supervisor.json contains a deadman block that is ignored; "
+            "deadman config is read from config.json"
+        ),
+        fix=(
+            "move the deadman block to .agenttalk/config.json, then remove it "
+            "from .agenttalk/supervisor.json"
+        ),
+        data={
+            "ignored_path": str(supervisor_path),
+            "active_path": str(store.config_path),
+        },
+    )
 
 
 def _check_init(store: Store) -> Check:

@@ -264,9 +264,9 @@ The ritual every change runs through, with the verbs used at each step:
 
 1. **DESIGN** - the architect produces the design + rationale, **consulting** peers (typically a developer and a reviewer) via `consult` / `propose` until they qualified-agree, and folds their input.
 2. **LEAD-GATE the design** - the lead reviews and gates the design before any code is written (the bar to start building).
-3. **BUILD in an isolated worktree** - a developer builds the slice in a dedicated `git worktree` off the candidate base SHA, then **self-gates** (ruff / bandit / diff-check + pytest).
+3. **BUILD in an isolated worktree** - a developer builds the slice in a dedicated `git worktree` off the candidate base SHA, then runs the committed `agenttalk dev-gate --profile release` local precheck ([reference](DEV-GATE.md)).
 4. **CROSS-REVIEW** - >=2 distinct reviewers adversarially review the diff on the exact candidate SHA via `send --kind review-request` -> `review-result` (typed evidence); the builder folds findings and reviewers **re-approve on the final SHA** (strict 2/2).
-5. **LEAD FULL-SUITE GATE** - in an isolated worktree off the candidate SHA the lead runs `ruff`, `bandit -r src -x src/agenttalk/skills`, `git diff --check`, and full `pytest` on **both Python 3.10 and 3.14** (the bar to merge; fail-closed).
+5. **LEAD FULL-SUITE GATE** - CI invokes that same committed command for the exact 3-OS x Python 3.10-3.13 matrix and publishes one SHA-bound aggregate. Individual legs are incomplete evidence; only the clean 12-leg aggregate is authoritative (the bar to merge; fail-closed).
 6. **FF-MERGE** - fast-forward merge the approved, lead-gated SHA onto master.
 7. **RELEASE RITUAL** - bump `src/agenttalk/__init__.py` + `pyproject.toml`, add a `CHANGELOG.md` section, update README install pins, `git commit -F <file>` (never `-m` for multi-line - PowerShell native-arg trap), tag, push, `gh release create`, and watch CI green. The deliberate release act may bump the release barrier via `close publish --bump-barrier` after a GO. If the bound barrier send or stamp fails, rerun that exact publish; never mint an ad hoc replacement barrier.
 
