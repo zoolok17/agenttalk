@@ -73,6 +73,51 @@ CHECK_STATUSES = {"pass", "fail", "error", "missing", "timeout", "blocked_depend
 TIMEOUT_CHECKS = set(REQUIRED_CONFIGURED_CHECKS) - {"wheel-contract"}
 
 
+# Resolve a Python-backed gate tool while isolated from the candidate CWD and
+# PYTHONPATH, then add the candidate import root only after the real tool's
+# ``__main__`` module has been fixed.  This prevents a checked-in or ignored
+# ``pytest.py``/``pip.py``/etc. from turning a voting check into a no-op.
+_ISOLATED_TOOL_LAUNCHER = """
+import importlib.util
+import sys
+
+module = sys.argv.pop(1)
+candidate_import_root = sys.argv.pop(1)
+spec = importlib.util.find_spec(module + ".__main__")
+if spec is None or spec.loader is None:
+    raise SystemExit("required module has no executable __main__: " + module)
+code = spec.loader.get_code(spec.name)
+if code is None:
+    raise SystemExit("required module has no executable code: " + module)
+if candidate_import_root:
+    sys.path.insert(0, candidate_import_root)
+sys.argv[0] = spec.origin or module
+namespace = {
+    "__name__": "__main__",
+    "__file__": spec.origin,
+    "__cached__": spec.cached,
+    "__loader__": spec.loader,
+    "__package__": spec.parent,
+    "__spec__": spec,
+}
+exec(code, namespace, namespace)
+""".strip()
+
+
+# Re-entry is different from a tool launch: the committed export is the only
+# application package that may be resolved at all.  ``-I`` removes CWD,
+# PYTHONPATH, user-site, and environment contamination before this fixed shim
+# inserts that trusted external export.
+_ISOLATED_SOURCE_LAUNCHER = """
+import runpy
+import sys
+
+committed_src = sys.argv.pop(1)
+sys.path.insert(0, committed_src)
+runpy.run_module("agenttalk", run_name="__main__", alter_sys=True)
+""".strip()
+
+
 class GateBlock(RuntimeError):
     """Expected fail-closed gate outcome with a stable reason code."""
 
@@ -504,20 +549,26 @@ def _validate_check_command(
         minor = f"{suffix[2]}.{suffix[3:]}"
         python = require_python(minor)
         spec = manifest["checks"]["pytest"]
-        prefix = [python, "-m", "pytest", *spec["args"], "-p", "no:cacheprovider", "--basetemp"]
+        launcher = [python, "-I", "-c", _ISOLATED_TOOL_LAUNCHER, "pytest"]
+        suffix_args = [*spec["args"], "-p", "no:cacheprovider", "--basetemp"]
         valid = (
             item["mode"] == mode
-            and len(argv) == len(prefix) + 1 + len(spec["paths"])
-            and argv[: len(prefix)] == prefix
-            and _is_absolute_path_text(argv[len(prefix)])
-            and argv[len(prefix) + 1 :] == spec["paths"]
+            and len(argv) == len(launcher) + 1 + len(suffix_args) + 1 + len(spec["paths"])
+            and argv[: len(launcher)] == launcher
+            and _is_absolute_path_text(argv[len(launcher)])
+            and argv[len(launcher) + 1 : len(launcher) + 1 + len(suffix_args)] == suffix_args
+            and _is_absolute_path_text(argv[len(launcher) + 1 + len(suffix_args)])
+            and argv[len(launcher) + 2 + len(suffix_args) :] == spec["paths"]
         )
     elif check_id == "package-build":
         python = require_python(expected_minors[0])
         prefix = [
             python,
-            "-m",
+            "-I",
+            "-c",
+            _ISOLATED_TOOL_LAUNCHER,
             "build",
+            "",
             "--no-isolation",
             "--sdist",
             "--wheel",
@@ -528,7 +579,18 @@ def _validate_check_command(
         suffix = check_id.rsplit("-", 1)[1]
         minor = f"{suffix[2]}.{suffix[3:]}"
         python = require_python(minor)
-        prefix = [python, "-m", "pip", "install", "--no-index", "--no-deps", "--target"]
+        prefix = [
+            python,
+            "-I",
+            "-c",
+            _ISOLATED_TOOL_LAUNCHER,
+            "pip",
+            "",
+            "install",
+            "--no-index",
+            "--no-deps",
+            "--target",
+        ]
         valid = (
             len(argv) == len(prefix) + 2
             and argv[: len(prefix)] == prefix
@@ -539,17 +601,36 @@ def _validate_check_command(
         suffix = check_id.rsplit("-", 1)[1]
         minor = f"{suffix[2]}.{suffix[3:]}"
         python = require_python(minor)
-        valid = argv == [python, "-m", "agenttalk", "--version"]
+        prefix = [python, "-I", "-c", _ISOLATED_TOOL_LAUNCHER, "agenttalk"]
+        valid = (
+            len(argv) == len(prefix) + 2
+            and argv[: len(prefix)] == prefix
+            and _is_absolute_path_text(argv[len(prefix)])
+            and argv[-1] == "--version"
+        )
     elif check_id == "ruff":
         python = require_python(expected_minors[-1])
-        valid = argv == [python, "-m", "ruff", "check", "--no-cache", *manifest["checks"]["ruff"]["paths"]]
+        valid = argv == isolated_tool_argv(
+            python,
+            "ruff",
+            "check",
+            "--no-cache",
+            *manifest["checks"]["ruff"]["paths"],
+        )
     elif check_id == "bandit":
         python = require_python(expected_minors[-1])
         spec = manifest["checks"]["bandit"]
-        valid = argv == [python, "-m", "bandit", "-r", *spec["paths"], "-x", ",".join(spec["exclude"])]
+        valid = argv == isolated_tool_argv(
+            python,
+            "bandit",
+            "-r",
+            *spec["paths"],
+            "-x",
+            ",".join(spec["exclude"]),
+        )
     elif check_id == "pip-audit":
         python = require_python(expected_minors[-1])
-        prefix = [python, "-m", "pip_audit", "--strict", "--requirement"]
+        prefix = isolated_tool_argv(python, "pip_audit", "--strict", "--requirement")
         valid = len(argv) == len(prefix) + 1 and argv[: len(prefix)] == prefix and _is_absolute_path_text(argv[-1])
     elif check_id == "semgrep":
         spec = manifest["checks"]["semgrep"]
@@ -1728,10 +1809,30 @@ def resolve_interpreters(
     return result
 
 
+def isolated_tool_argv(
+    interpreter: str | Path,
+    module: str,
+    *args: str,
+    candidate_import_root: Path | None = None,
+) -> list[str]:
+    """Return a CWD-shadow-safe argv for a Python-backed gate tool."""
+
+    import_root = "" if candidate_import_root is None else str(candidate_import_root.resolve())
+    return [
+        str(interpreter),
+        "-I",
+        "-c",
+        _ISOLATED_TOOL_LAUNCHER,
+        module,
+        import_root,
+        *args,
+    ]
+
+
 def _probe_python_module(interpreter: InterpreterInfo, module: str, temp_root: Path, logs_dir: Path) -> str:
     outcome = run_command(
         check_id=f"tool-probe-{module.replace('_', '-')}",
-        argv=[str(interpreter.path), "-m", module, "--version"],
+        argv=isolated_tool_argv(interpreter.path, module, "--version"),
         cwd=temp_root,
         env=_base_env(temp_root),
         timeout_seconds=60,
@@ -1832,13 +1933,15 @@ def import_probe(
 ) -> dict[str, Any]:
     del temp_root
     script = (
-        "import json,pathlib,agenttalk;"
+        "import json,pathlib,sys;"
+        "sys.path.insert(0,sys.argv.pop(1));"
+        "import agenttalk;"
         "print(json.dumps({'path':str(pathlib.Path(agenttalk.__file__).resolve()),"
         "'version':agenttalk.__version__}))"
     )
     outcome = run_command(
         check_id=f"import-probe-{label}",
-        argv=[str(interpreter.path), "-c", script],
+        argv=[str(interpreter.path), "-I", "-c", script, str(expected_root.resolve())],
         cwd=cwd,
         env=env,
         timeout_seconds=60,
@@ -1940,16 +2043,15 @@ def run_package_build(
     except GateBlock as exc:
         return _blocked_record(check_id, exc.detail, logs_dir), {}, None
     out_dir.mkdir(parents=True, exist_ok=True)
-    argv = [
-        str(interpreter.path),
-        "-m",
+    argv = isolated_tool_argv(
+        interpreter.path,
         "build",
         "--no-isolation",
         "--sdist",
         "--wheel",
         "--outdir",
         str(out_dir),
-    ]
+    )
     outcome = run_command(
         check_id=check_id,
         argv=argv,
@@ -2033,9 +2135,8 @@ def _run_pytest_mode(
         )
     except GateBlock as exc:
         return _blocked_record(check_id, exc.detail, logs_dir)
-    argv = [
-        str(interpreter.path),
-        "-m",
+    argv = isolated_tool_argv(
+        interpreter.path,
         "pytest",
         *spec.get("args", []),
         "-p",
@@ -2043,7 +2144,8 @@ def _run_pytest_mode(
         "--basetemp",
         str(basetemp),
         *spec.get("paths", []),
-    ]
+        candidate_import_root=import_root,
+    )
     outcome = run_command(
         check_id=check_id,
         argv=argv,
@@ -2078,7 +2180,7 @@ def _install_wheel(
         return _blocked_record(check_id, "package build did not produce a wheel", logs_dir)
     probe = run_command(
         check_id=f"tool-probe-pip-{_python_suffix(interpreter.requested)}",
-        argv=[str(interpreter.path), "-m", "pip", "--version"],
+        argv=isolated_tool_argv(interpreter.path, "pip", "--version"),
         cwd=source_root,
         env=env,
         timeout_seconds=60,
@@ -2093,9 +2195,8 @@ def _install_wheel(
     target.mkdir(parents=True, exist_ok=True)
     outcome = run_command(
         check_id=check_id,
-        argv=[
-            str(interpreter.path),
-            "-m",
+        argv=isolated_tool_argv(
+            interpreter.path,
             "pip",
             "install",
             "--no-index",
@@ -2103,7 +2204,7 @@ def _install_wheel(
             "--target",
             str(target),
             str(wheel),
-        ],
+        ),
         cwd=source_root,
         env=env,
         timeout_seconds=300,
@@ -2158,7 +2259,12 @@ def _wheel_contract(
             problems.append(f"installed resource differs from source: {resource}")
     outcome = run_command(
         check_id=check_id,
-        argv=[str(interpreter.path), "-m", "agenttalk", "--version"],
+        argv=isolated_tool_argv(
+            interpreter.path,
+            "agenttalk",
+            "--version",
+            candidate_import_root=target,
+        ),
         cwd=source_root,
         env=env,
         timeout_seconds=60,
@@ -2196,7 +2302,7 @@ def _python_module_check(
         return _blocked_record(check_id, exc.detail, logs_dir)
     outcome = run_command(
         check_id=check_id,
-        argv=[str(interpreter.path), "-m", module, *argv],
+        argv=isolated_tool_argv(interpreter.path, module, *argv),
         cwd=source_root,
         env=env,
         timeout_seconds=timeout_seconds,
@@ -2258,7 +2364,12 @@ def _pip_audit_check(
         return _blocked_record(check_id, exc.detail, logs_dir), None
     freeze = run_command(
         check_id="pip-audit-freeze",
-        argv=[str(interpreter.path), "-m", "pip", "freeze", "--exclude-editable"],
+        argv=isolated_tool_argv(
+            interpreter.path,
+            "pip",
+            "freeze",
+            "--exclude-editable",
+        ),
         cwd=source_root,
         env=env,
         timeout_seconds=300,
@@ -2275,14 +2386,13 @@ def _pip_audit_check(
     spec = manifest["checks"][check_id]
     outcome = run_command(
         check_id=check_id,
-        argv=[
-            str(interpreter.path),
-            "-m",
+        argv=isolated_tool_argv(
+            interpreter.path,
             "pip_audit",
             "--strict",
             "--requirement",
             str(requirements),
-        ],
+        ),
         cwd=source_root,
         env=env,
         timeout_seconds=int(spec["timeout_seconds"]),
@@ -3258,7 +3368,15 @@ def reenter_candidate_source(root: Path, argv: Sequence[str]) -> int | None:
             env["AGENTTALK_DEV_GATE_COMMITTED_SRC"] = str(committed_src)
             # Re-entry uses this interpreter with a fixed module argv; shell execution is disabled.
             completed = subprocess.run(  # nosec B603
-                [sys.executable, "-m", "agenttalk", "dev-gate", *argv],
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    _ISOLATED_SOURCE_LAUNCHER,
+                    str(committed_src),
+                    "dev-gate",
+                    *argv,
+                ],
                 cwd=candidate_root,
                 env=env,
                 check=False,

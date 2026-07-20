@@ -55,9 +55,8 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -
         argv = [tool_path, "status", "--porcelain=v1", "--untracked-files=all"]
     elif check_id.startswith("pytest-"):
         spec = manifest["checks"]["pytest"]
-        argv = [
+        argv = dev_gate.isolated_tool_argv(
             python_path,
-            "-m",
             "pytest",
             *spec["args"],
             "-p",
@@ -65,22 +64,21 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -
             "--basetemp",
             str((Path.cwd() / "pytest-temp").resolve()),
             *spec["paths"],
-        ]
+            candidate_import_root=(Path.cwd() / "src").resolve(),
+        )
     elif check_id == "package-build":
-        argv = [
+        argv = dev_gate.isolated_tool_argv(
             python_path,
-            "-m",
             "build",
             "--no-isolation",
             "--sdist",
             "--wheel",
             "--outdir",
             str((Path.cwd() / "dist").resolve()),
-        ]
+        )
     elif check_id.startswith("wheel-install-"):
-        argv = [
+        argv = dev_gate.isolated_tool_argv(
             python_path,
-            "-m",
             "pip",
             "install",
             "--no-index",
@@ -88,23 +86,40 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -
             "--target",
             str((Path.cwd() / "wheel-target").resolve()),
             str((Path.cwd() / "dist" / "agenttalk.whl").resolve()),
-        ]
+        )
     elif check_id.startswith("wheel-contract-"):
-        argv = [python_path, "-m", "agenttalk", "--version"]
+        argv = dev_gate.isolated_tool_argv(
+            python_path,
+            "agenttalk",
+            "--version",
+            candidate_import_root=(Path.cwd() / "wheel-target").resolve(),
+        )
     elif check_id == "ruff":
-        argv = [python_path, "-m", "ruff", "check", "--no-cache", *manifest["checks"]["ruff"]["paths"]]
+        argv = dev_gate.isolated_tool_argv(
+            python_path,
+            "ruff",
+            "check",
+            "--no-cache",
+            *manifest["checks"]["ruff"]["paths"],
+        )
     elif check_id == "bandit":
         spec = manifest["checks"]["bandit"]
-        argv = [python_path, "-m", "bandit", "-r", *spec["paths"], "-x", ",".join(spec["exclude"])]
-    elif check_id == "pip-audit":
-        argv = [
+        argv = dev_gate.isolated_tool_argv(
             python_path,
-            "-m",
+            "bandit",
+            "-r",
+            *spec["paths"],
+            "-x",
+            ",".join(spec["exclude"]),
+        )
+    elif check_id == "pip-audit":
+        argv = dev_gate.isolated_tool_argv(
+            python_path,
             "pip_audit",
             "--strict",
             "--requirement",
             str((Path.cwd() / "audit-requirements.txt").resolve()),
-        ]
+        )
     elif check_id == "semgrep":
         tool_path = str((Path.cwd() / ("semgrep.exe" if os.name == "nt" else "semgrep")).resolve())
         spec = manifest["checks"]["semgrep"]
@@ -632,6 +647,71 @@ def test_base_environment_drops_gate_control_variables(
     assert poison not in dev_gate._base_env(tmp_path)
 
 
+def test_isolated_tool_launcher_cannot_be_shadowed_by_candidate_module(tmp_path: Path) -> None:
+    sentinel = tmp_path / "shadow-ran.txt"
+    (tmp_path / "pytest.py").write_text(
+        f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('shadow')\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        dev_gate.isolated_tool_argv(
+            sys.executable,
+            "pytest",
+            "--version",
+            candidate_import_root=tmp_path,
+        ),
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert not sentinel.exists()
+
+
+def test_isolated_source_launcher_prefers_committed_export_over_candidate_cwd(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate"
+    committed_src = tmp_path / "committed" / "src"
+    package = committed_src / "agenttalk"
+    candidate.mkdir()
+    package.mkdir(parents=True)
+    committed_sentinel = tmp_path / "committed-ran.txt"
+    shadow_sentinel = tmp_path / "shadow-ran.txt"
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__main__.py").write_text(
+        f"from pathlib import Path\nPath({str(committed_sentinel)!r}).write_text('committed')\n",
+        encoding="utf-8",
+    )
+    (candidate / "agenttalk.py").write_text(
+        f"from pathlib import Path\nPath({str(shadow_sentinel)!r}).write_text('shadow')\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            dev_gate._ISOLATED_SOURCE_LAUNCHER,
+            str(committed_src),
+        ],
+        cwd=candidate,
+        env={**os.environ, "PYTHONPATH": str(candidate)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert committed_sentinel.read_text(encoding="utf-8") == "committed"
+    assert not shadow_sentinel.exists()
+
+
 def test_safe_candidate_export_rejects_path_traversal(tmp_path: Path) -> None:
     archive = tmp_path / "candidate.zip"
     with zipfile.ZipFile(archive, "w") as bundle:
@@ -827,6 +907,8 @@ def test_reentry_executes_committed_export_despite_hidden_worktree_edit(
         if argv[0] == sys.executable:
             committed_runner = Path(kwargs["env"]["PYTHONPATH"]) / "agenttalk" / "dev_gate.py"
             observed["runner"] = committed_runner.read_text(encoding="utf-8")
+            assert argv[1:4] == ["-I", "-c", dev_gate._ISOLATED_SOURCE_LAUNCHER]
+            assert Path(argv[4]) == committed_runner.parent.parent
             return SimpleNamespace(returncode=7)
         return real_run(argv, **kwargs)
 
