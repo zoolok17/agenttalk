@@ -360,6 +360,47 @@ hardening.
 
 ---
 
+## Cross-machine lead↔lead link (2026-07-20) — designed, parked behind Qwen
+
+**Problem:** the two leads (primary + second laptop) coordinate over `agentchat`,
+a hand-rolled Drive-folder channel. It works but is slow (Drive-sync latency),
+silently unreliable (no receipt/gap alarm — a stuck message looks like an
+unanswered peer), and lives OUTSIDE the bus (no threads/deadman/wake).
+
+**Design (second-laptop team, DESIGN-lead-link.md r2, branch `proposal/lead-link`
+@ ee2da84):** a small mechanical **courier** per machine. Key insight —
+`agenttalk wait` already wakes a lead in ~2s of anything landing in their store,
+so the whole cross-machine problem reduces to *inject the peer's message via the
+pinned public `Store.send()`* (locally-minted id, ledger entry, roster/kind
+validation — never copy message files). Peer lead is added as a local roster
+principal, so `send --to <peer>` is an ordinary local send and threads/deadman
+track it natively. Transport is pluggable: **`folder`** (phase 0, over the
+existing Drive share — zero new infra), **`git`** (dedicated private repo,
+~5–15s), **`direct`** (Tailscale/TLS HTTP, ~1–3s). Safety: per-direction HMAC
+keys outside `.agenttalk/`, strict fail-closed wire parser (unknown fields
+REJECTED), meta crosses by per-kind ALLOWLIST (the SOLE operator-authority
+boundary — because `escalate` rides `meta.needs_operator` on a `question`, no
+kind rule can keep a peer out of the local operator channel), dead-letter-not-
+drop with attention on both sides, at-least-once transport + idempotent
+injection = exactly-once visible effect.
+
+**Phases:** 0 (folder courier in `tools/`, no owned-module edits, no network) →
+1 (`direct` push — the FIRST non-loopback listener; ships only with primary-team
+security-posture sign-off) → 2 (native `agenttalk link` in cli.py/store: a
+*constrained peer-injection API*, peer-principal exclusion from
+audience/supervisor/signoff resolution, doctor/dashboard, and
+`link_origin.message_id` ↔ #48 opener-identity convergence). Phase 2 is a
+proposal to the primary team, not a fait accompli.
+
+**Decisions:** primary lead ACCEPTS the #48 convergence (link_origin.message_id
+== the origin-minted identity #48/#52 need). Open operator questions parked:
+transport pick (LAN/Tailscale acceptable?), phase-1 posture sign-off. **Priority
+(operator, 2026-07-20): BELOW Qwen (#15).** Roadmapped, not scheduled; phase 0
+folder may start whenever both operators want relief. Near-term stopgap: both
+leads run `agentchat watch` for auto-delivery on the current channel.
+
+---
+
 ## Operational notes (lessons from build + production)
 
 ### Fleet upgrade discipline (new, 2026-06-05)
