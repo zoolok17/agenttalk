@@ -41,13 +41,12 @@ def _clear_agenttalk_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # --- #50: wheel-isolation test scoping ------------------------------------
-import agenttalk as _agenttalk_pkg
-
-
 def _running_against_installed_wheel() -> bool:
     """True when agenttalk is imported from OUTSIDE this checkout (an installed
     wheel), as in dev-gate's wheel-isolation mode; False for a source/editable
     layout (agenttalk resolves inside the repo tree)."""
+    import agenttalk as _agenttalk_pkg  # local: keeps this off the module top (ruff E402)
+
     repo_root = Path(__file__).resolve().parents[1]
     try:
         pkg = Path(_agenttalk_pkg.__file__).resolve()

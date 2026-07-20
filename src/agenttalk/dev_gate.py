@@ -3911,8 +3911,11 @@ def reenter_candidate_source(root: Path, argv: Sequence[str]) -> int | None:
             env["PYTHONPATH"] = str(committed_src)
             env["AGENTTALK_DEV_GATE_COMMITTED_SRC"] = str(committed_src)
             # Re-entry uses this interpreter with a fixed module argv; shell execution is disabled.
+            # argv is the gate's own pinned/validated command line (-I isolated, no shell), not
+            # tainted env input; suppress the semgrep tainted-env sink (anchored on the argv list)
+            # to match the nosec on the call above.
             completed = subprocess.run(  # nosec B603
-                [
+                [  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
                     sys.executable,
                     "-I",
                     "-c",
