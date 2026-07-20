@@ -145,7 +145,7 @@ Additionally, out of scope for D1–D5:
 - Do not duplicate lane, gate, close, domain, or knowledge truth into the
   work record. Work stores references and derives; it does not mirror.
 - Do not let `work` mutate any record another module owns. It reads
-  lanes, gates, closes, domains, threads, and onboarding through their
+  lanes, gates, closes, domains, and threads through their
   public read APIs and writes only under `.agenttalk/work/` and
   `.agenttalk/artifacts/`.
 - Do not add a new message kind. Review binding rides existing
@@ -168,10 +168,8 @@ work **owns** it (work is the only writer).
 | Domain / path scope | links | `domain_id`, `registry_hash_at_bind` | `domains.json` |
 | Lane / worktree | links | `lane_id`, `delivery_artifact_path` | `lanes.py` + the durable delivery artifact |
 | Gate state | links | `gate_scope` | `gates.json` via `check_gates` |
-| Close | links | `close_id` | `.agenttalk/closes/` |
-| Review | links | `review_request_ids` | bus messages + `threads.derive_threads` |
-| Onboarding run | links | `onboarding_run_id` | `.agenttalk/onboarding/` |
-| Knowledge notes | links | `note_ids` | `knowledge/notes.jsonl` |
+| Close | links | `close_id` **and `close_instance_id`** (identity witness) | `.agenttalk/closes/` |
+| Review | links | `review_request_ids` **and `review_opener_message_ids`** (identity witnesses) | bus messages + `threads.derive_threads` |
 | Project policy | links | `policy_hash_at_open` (witness) | `.agenttalk/code-policy.json` at the merge base |
 | Review lenses | links | nothing | `close.py` `required_lenses` / `lens_acks` |
 | Requirement satisfaction | **owns** | satisfaction records (matched glob) | work — but as a cache, never authority |
@@ -220,17 +218,126 @@ Rules:
   forbidding it.
 
   This closes a gap the owning module had already closed for itself.
-  `close.replace_close` **requires** `expected_instance_id` from its callers
-  — close.py treats the instance as mandatory for its own update path. Work
+  `close.replace_close` **requires** `expected_instance_id` from its callers,
+  enforced at RUNTIME by `_validate_expected_tokens` — the parameter's type
+  annotation reads optional, so the signature alone would suggest the
+  opposite and the runtime check is the citation that supports the claim.
+  close.py treats the instance as mandatory for its own update path. Work
   was the caller that linked past a guard its owner considers compulsory. The
   asymmetry is worth naming: `lane_generation` was bound from the start
   because lanes put generation in the shape work already read. **We bound
   what the neighbouring module ADVERTISED, not what it EXPOSED.**
 
-- **The other three link types are NOT exposed to this class, for three
-  DIFFERENT reasons.** Stated separately because a single "the others are
-  fine" would be unfalsifiable, and each of these is refutable on its own
-  terms:
+- **UNIVERSE OF THIS ANALYSIS, stated so the count is checkable.** It
+  covers **ALL FOUR** link types: `close_id`, `review_request_ids`,
+  `gate_scope`, and (until this amendment deferred it)
+  `onboarding_run_id`. An earlier draft excluded `review_request_ids` on
+  the grounds that its target is a bus message rather than a module
+  record, and filed the substitution question as a disclosed gap. **That
+  exclusion was wrong and the gap is now closed by an executed
+  construction, not by an argument** — see the `review_request_ids`
+  bullet below. Recording it because the exclusion was reasoned, written
+  down, and still admitted the amendment's fourth instance of the very
+  defect it exists to fix: **a disclosed gap is not a clearance, and
+  "out of universe" is the most comfortable place for one to sit.**
+  An earlier draft also wrote "the other three link types" and listed
+  two, having deferred one without recounting — the count is spelled out
+  here because a stale ordinal is the cheapest possible false
+  completeness claim.
+- **`review_request_ids` — EXPOSED, and BOUND rather than deferred,
+  because the witness already exists.**
+  `threads.derive_threads` groups messages **solely by `request_id`**
+  (`threads.py:586-616`, "Group by correlation id") and switches the
+  whole group to broadcast derivation when any broadcast question carries
+  that id, while `request_id` is CALLER-SUPPLIED. So a rostered actor who
+  is **not** the work owner can append a valid broadcast-question copy
+  carrying the same id, and the linked projection flips from
+  `{review-request, owner→reviewer}` to `{question, attacker→all}`. No
+  file replacement, no invalid signature, no owner authority: **the later
+  message is valid, and correlation aliasing substitutes the object
+  behind the stored link.** `request_id` is a CORRELATION id, not an
+  identity.
+
+  **The witness is `opener_message_id`, and unlike onboarding's run id it
+  survives the test that matters.** `threads.py:596` already sorts each
+  group by `m.id`, so a per-message id exists, is exposed, and is load
+  bearing. It is minted by `store._new_id()` as a UTC timestamp plus a
+  `secrets`-drawn suffix; **no CLI path accepts a caller-supplied message
+  id** — the contrast with `onb_create --id` is the whole reason one link
+  is bound here and the other deferred; `stem == id` is enforced, so a
+  second file cannot carry a duplicate id without colliding on path; and
+  message files are immutable, "no message file is ever edited"
+  (`store.py:2228`). That is precisely what Open Question #12 demands: a
+  module-owned discriminator that survives the module's OWN write paths.
+
+  So the SHAPE is `close_id` + `close_instance_id` exactly —
+  `request_id` is the TARGET NAME, aliasable; `opener_message_id` is the
+  IDENTITY WITNESS, writer-minted.
+
+  **THE SHAPE IS EXACT; THE STRENGTH IS NOT, and the difference is stated
+  because the analogy would otherwise imply it.** `close_instance_id` is
+  `uuid.uuid4().hex` — **122 random bits** (128 minus the version and
+  variant bits), and its collision-freedom is **PROBABILISTIC, not
+  structural**. An earlier draft of this very clause said "128 random
+  bits, structurally unique" — an overclaim written into the correction
+  that exists to stop overclaiming, which is worth noting because the
+  clause's whole purpose is to keep a reader from inferring a stronger
+  guarantee than the mechanism gives. The comparison still favours
+  uuid4 by an enormous margin. A message id
+  is `YYYYMMDD-HHMMSS-uuuuuu-XXXX`, and `_new_id`'s own docstring gives
+  the **4-character random suffix** as what separates two writers landing
+  in the same microsecond. **Uniqueness is therefore PROBABILISTIC across
+  concurrent writers, not structural.** This does not weaken the ruling:
+  an attacker cannot choose the suffix, cannot schedule a microsecond,
+  and has no caller path to the id at all — collision is an accident
+  between honest writers, not an attack surface. It is recorded because a
+  mismatch is reported with class `established`, i.e. **as a
+  determination**, and a reader who inferred uuid4-grade uniqueness from
+  the analogy would be trusting a probabilistic bound as a structural
+  one. If concurrent-writer collision ever needs to be excluded rather
+  than merely made unlikely, that is an upstream ask for a wider suffix,
+  not a work-side workaround. It is bound at mutation, folded into
+  the event hash, carried in the item projection, and compared on every
+  read. **A read MUST additionally verify FOUR values, and they are
+  enumerated rather than summarised**: the opener's `message_id`, its
+  KIND (which must be `review-request`), its SENDER, and its RECIPIENT.
+  An earlier draft wrote "kind and PARTIES" — a summary that leaves an
+  implementer to decide whether "parties" means sender, recipient, or
+  both, and a check that verifies only one of them still admits the
+  attack from the other side. **An id match alone is insufficient**: the
+  published construction flips `{opener_kind: review-request, peer:
+  reviewer}` to `{opener_kind: question, peer: attacker,
+  is_broadcast: true}`, and BOTH openers pass `Message.validate`
+  independently — each is a perfectly valid message, which is why
+  validity is not the property being tested here. Mismatch on any of the
+  four raises `work_review_thread_mismatch`, class `established`: the
+  module answered and the answer is a different thread.
+
+  **A REVIEW THREAD IS NOT A `gate_scope`, and this is stated positively
+  so the inference cannot be re-derived.** An earlier draft speculated
+  that because a `request_id` correlates a THREAD rather than naming a
+  single record, review might belong with `gate_scope`'s exemption. That
+  sentence has been deleted, but deleting it only removes the claim and
+  not the reasoning that produced it. The distinction: **a review thread
+  has an IMMUTABLE OPENER — a kind, a sender and a recipient that can be
+  witnessed; a live gate selector has NO BOUND SUBJECT at all.**
+  `gate_scope` is exempt because there is nothing to witness, not because
+  its target is plural. Plurality was never the discriminator, and a
+  future reader reaching for that exemption should find this paragraph
+  rather than an absence.
+
+  **Why this is BOUND where notes and onboarding were DEFERRED**, stated
+  because deferral was the answer twice and a rule that only ever refuses
+  is not discriminating: notes had no by-id reader and onboarding minted
+  no caller-uninfluenced value, so in both cases the witness did not
+  exist and could not be manufactured without upstream change. **Here the
+  witness exists today.** Deferring a link whose owning module already
+  provides what we need would be the mirror image of admitting one whose
+  module does not.
+- **ONE remaining link type in this universe is NOT exposed to this
+  class, and `onboarding_run_id` is DEFERRED rather than cleared.**
+  Stated separately because a single "the others are fine" would be
+  unfalsifiable, and each of these is refutable on its own terms:
   - **`gate_scope` — binding an instance would be a CATEGORY ERROR, not
     merely unnecessary.** A scope is a SELECTOR naming a standing query over
     live gate state (`check_gates(root, *, scope=…)`), not a reference to an
@@ -238,18 +345,56 @@ Rules:
     to be replaced by B, only the current answer. Binding it would **freeze a
     value the design requires to be live** — a new defect introduced by
     over-applying a fix. Nobody should "complete the pattern" here.
-  - **`note_ids` — knowledge notes are append-only immutable events.** A
-    `note_id` names an event that cannot be replaced under the same id;
-    retraction is its own event, so a retracted note is the SAME note in a
-    new authorization state — a generation change, not an instance change.
-  - **`onboarding_run_id` — uuid4-minted per run, recorded through events,
-    with no replace-under-same-id path.** Stated as the weaker claim: no such
-    path was found, which is less than the module documenting immutability.
+  - **`onboarding_run_id` — EXPOSED, and DEFERRED OUT of the linkable set
+    by this amendment.** Two earlier drafts got this wrong in two
+    different ways, and both are recorded because the second is the
+    instructive one. The first claimed onboarding was not exposed at all;
+    it verified the absence of a *replace path* — a true statement about
+    the wrong proposition — when **substitution does not require a
+    replace path: append plus last-create-wins is sufficient**, because
+    the run id is CALLER-SUPPLIED (`onb_create --id`, `cli.py:12106`) and
+    `onboarding.run_view` rebases on every `EVENT_CREATE`, clearing prior
+    records (`onboarding.py:435-455`).
 
+    The second draft then specified a **read-time refusal when more than
+    one create is visible**, and that guard is defeated by leaving
+    exactly one: delete the ledger and recreate the id — `create_run`
+    refuses only while the events path exists (`onboarding.py:387`) — or
+    retain only the later create. **A COUNT IS NOT AN IDENTITY.** One
+    create is visible, every check passes, and work resolves a different
+    run. The RFC's own threat model declares hand edits and
+    out-of-protocol writes reachable and requiring read-time defence, so
+    this is inside our stated threat model, not outside it — and a guard
+    that a hand edit defeats is **worse than no guard, because it reads
+    as protection**.
+
+    The deeper fact is that onboarding **mints no witness at all**: every
+    field of its create event is caller-influenced, including
+    `created_at`, which is `at or utc_now()` with `at` a caller parameter
+    (`onboarding.py:216-229`). There is nothing for work to bind, which
+    is why this is a deferral and not a third repair attempt. See Open
+    Question #11, which also records why work must NOT manufacture the
+    witness itself.
+
+- **A close with NO instance is REFUSED AT MUTATION TIME**, so the
+  unverifiable state is never created rather than merely detected later.
+  `close.load_close` exposes the instance publicly, so row 8's mutation-time
+  resolution already has the hook and no new machinery is needed. This also
+  removes any need to reason about recovery: a mutation-time refusal is
+  obviously retryable, where a read-time hold on an already-bound link would
+  look permanent to an operator with no unlink available.
+  **There is no rollout window**: increment 3 ships link mutation and this
+  refusal together, so no item can be bound while the refusal is absent.
+  Legacy closes are reachable — `_upgrade_legacy_locked` exists precisely to
+  version them, and its guard against already-versioned closes is proof that
+  **the population of UNVERSIONED CLOSES is not empty.**
 - **An item carrying a bound close with NO recorded instance is unverifiable
   and non-GO** — `work_close_instance_mismatch`, fail closed. There is **no
   grandfathering and no operator escape**, and the rule costs nothing today:
-  **the population it governs is empty.** `close_linked` is introduced by
+  **the population of BOUND WORK ITEMS it governs is empty** — a different
+  population from the unversioned closes named just above, which is not.
+  Two adjacent sentences said "the population" of two different sets, and
+  reading either as the other inverts the argument. `close_linked` is introduced by
   this amendment and no link-writing producer exists in the store, so no item
   can have been bound before it. The rule is stated anyway because it must
   hold the moment anything hand-writes or corrupts an item into that state —
@@ -367,8 +512,10 @@ Rules:
   "pending_op": null,
   "ledger_head": {"seq": 12, "hash": "sha256:b41f7c09de2a8653"},
   "close_id": null,
+  "close_instance_id": null,
   "gate_scope": "feature",
   "review_request_ids": ["q-de4534c8b3c4"],
+  "review_opener_message_ids": {"q-de4534c8b3c4": "20260719-143032-870554-5onL"},
   "onboarding_run_id": null,
   "note_ids": [],
   "artifact_ids": ["a-3f91c2", "a-77b0de"],
@@ -379,6 +526,70 @@ Rules:
 
 Rules:
 
+- **`onboarding_run_id` and `note_ids` are RESERVED-AND-UNWRITTEN, not
+  removed.** Their LINKS are deferred (Open Questions #11 and #10); the
+  FIELDS stay. An earlier draft of this amendment deleted them from the
+  schema on the reasoning that no event writes them — **true about events
+  and irrelevant to CREATE**, which writes them today: `work_store.py` at
+  `de30883` declares both in its item field list, iterates `note_ids` at
+  its collection validator, and emits `"onboarding_run_id": None` and
+  `"note_ids": []` from create. Every item the built code has produced
+  carries both.
+
+  **The guard that exists for exactly this is structurally blind to it.**
+  `schema_version` stays `1` and is checked EXACT-MATCH, fail-closed, so
+  two different item shapes both claiming version 1 pass identically and
+  `work_unknown_schema_version` can never fire on a silent shape change
+  under an unchanged version. Deleting the fields would therefore have
+  been the one kind of schema change this versioning scheme cannot see.
+  Deferring a LINK and deleting a FIELD are different acts, and this
+  document's own word for what it did to the link — *deferred*, not
+  *cleared* — is the word that argues against what it briefly did to the
+  field.
+- **UNKNOWN AND MISSING ITEM FIELDS, both directions, because a rule for
+  one reads as a rule for both.** These are different questions with
+  different answers and neither was previously stated:
+  - **A field PRESENT on an item but not declared here is IGNORED, and
+    its presence is never an error.** Readers project the declared set
+    and pass unknown keys through untouched on rewrite. Blocking would
+    make every forward-compatible addition a fleet-wide outage.
+  - **A field DECLARED here but ABSENT from an item reads as its
+    create-time default** — `null` for a nullable field, `[]` for a
+    collection, `{}` for a map, and **a hard refusal for anything in the
+    minimum create shape**, which is `work_malformed_item` — the existing
+    code for "the item record fails to load or fails schema validation" —
+    rather than a silent default.
+    Absent is NOT the same as present-and-null at the byte level, and
+    without this rule a validator enforcing a co-presence invariant would
+    have to decide for itself whether two absent keys satisfy it.
+    **SO THE ANSWER IS STATED RATHER THAN LEFT DERIVABLE, because a
+    validator meets this before a human does.** The invariant "null
+    together with `close_id`, never alone" is evaluated AFTER the
+    absent-reads-as-default rule has been applied, never on the raw
+    bytes. On an item created by a producer that predates
+    `close_instance_id`, BOTH keys are absent, both therefore read as
+    `null`, and **the invariant is SATISFIED — such an item is valid and
+    must not be rejected.** The invariant forbids exactly one state:
+    a non-null `close_id` with a null-or-absent `close_instance_id`.
+    An earlier draft raised this edge and stopped there, which left the
+    strict reading — reject every item created so far — available to
+    anyone who resolved it in the other direction.
+  This pair is what makes the reserved-and-unwritten pattern safe in both
+  directions: a producer that has not caught up yet, and a producer that
+  has run ahead.
+- **`close_instance_id` is the live instance of the second case, and it
+  is this amendment's own doing.** #15 ADDS it to the item schema; the
+  built code at `de30883` does not emit the key at all — a
+  producer-check sweep over every field #15 touches returns it as the
+  only one, so the result is bounded rather than a worry. Under the
+  absent-reads-as-default rule above it reads as `null`, which is exactly
+  what the built code means, so **no `schema_version` bump and no
+  migration**: bumping would orphan every existing item to fix a field
+  nothing reads yet. Increment 3 emits the key explicitly from create, so
+  the field and its only writer arrive together.
+  Note the symmetry, because it is the same defect twice: the deletion
+  above was a schema change the version check could not see, and this
+  addition is the same change wearing the opposite sign.
 - `work_id` is opaque, stable, and validated by the same character class
   as existing IDs. It is never reused, including after abandonment.
   `new_work_id()` mints one, matching `knowledge.new_note_id()`
@@ -392,13 +603,19 @@ Rules:
   `work_id`, `title`, `created_at`, `created_by`, `domain_id`,
   `registry_hash_at_bind`, `item_seq`, `ledger_head`, `pending_op`,
   `terminal` (null), and the empty collections `artifact_ids`,
-  `note_ids`, `review_request_ids`. `registry_hash_at_bind` is required
+  `review_request_ids`. `registry_hash_at_bind` is required
   *because* `domain_id` is — a witness written later would witness the
   wrong registry version.
 - Nullable or empty at create: `owner` (null is exactly what
   distinguishes `draft` from `open`), `lane_id` and `lane_generation`
   (both null, and they move together — never one without the other),
   `base_ref` / `base_sha` / `target_ref`, `gate_scope`, `close_id`,
+  `close_instance_id` (null together with `close_id`, never alone),
+  `onboarding_run_id` and `note_ids` (RESERVED-AND-UNWRITTEN — their
+  links are deferred, the fields are not), `review_opener_message_ids`
+  (`{}`, and it must carry **exactly one entry per member of
+  `review_request_ids`** — an id without a witness is refused, which is
+  what stops a link being appended past the identity check),
   `delivery_artifact_path`, `policy_hash_at_open`, and `scope_globs`
   (`[]`, for which the containment test passes vacuously — there is no
   glob to prove, which is why the separate non-empty invariant below
@@ -930,7 +1147,7 @@ Rules:
   `ts`, `actor`, `type`, `from_state`, `to_state`, **plus every per-type
   payload field**: `title`, `domain_id`, `owner`, `lane_id`,
   `lane_generation`, `artifact_id`, `head_sha`, `request_id`,
-  `close_id`, `gate_scope`, `onboarding_run_id`, `note_id`,
+  `close_id`, `close_instance_id`, `gate_scope`, `opener_message_id`,
   `asserted_state`, `delivery_artifact_path`, `reason`,
   `supersedes_event_id`. A later event can never rewrite these on an
   earlier event. (`reviewed_head_sha` is deliberately **not** here: no
@@ -961,11 +1178,9 @@ Rules:
   | `assigned` | `owner` | owner or lead |
   | `lane_bound` | `lane_id`, `lane_generation` | owner |
   | `artifact_attached` | `artifact_id`, `head_sha` | producer or owner |
-  | `review_requested` | `request_id` | owner |
-  | `close_linked` | `close_id` | owner or lead |
+  | `review_requested` | `request_id`, `opener_message_id` | owner |
+  | `close_linked` | `close_id`, `close_instance_id` | owner or lead |
   | `gate_scope_set` | `gate_scope` | owner or lead |
-  | `onboarding_linked` | `onboarding_run_id` | owner |
-  | `note_linked` | `note_id` | owner |
   | `state_asserted` | `asserted_state` | any rostered agent (advisory) |
   | `delivered` | `delivery_artifact_path` | owner or lead |
   | `abandoned` | `reason` | owner or lead |
@@ -976,7 +1191,7 @@ Rules:
   so `assigned` had no owner, `lane_bound` no lane, and `reopened` no
   authority rule. The classification test passed anyway, because it
   tested field classification rather than per-type completeness.
-- **Link writers are four CLOSED types, not one generic `linked` event.**
+- **Link writers are THREE CLOSED types, not one generic `linked` event.**
   A generic type carrying `{link_type, link_id}` was considered and
   rejected: it re-opens the closed vocabulary from the inside. `link_type`
   becomes an unvalidated discriminator inside a table whose entire
@@ -984,25 +1199,52 @@ Rules:
   versus owner-or-lead) cannot be expressed without a second table that
   would itself drift; and the reachability sweep goes blind, because
   every link kind shares one producer and a dead one is no longer
-  visible. Four rows cost less than any of those.
+  visible. Three rows cost less than any of those.
 - **Cardinality is a property of the ITEM FIELD, not of the event
-  payload.** Every link event carries **exactly one** id — the payload
-  fields `close_id`, `gate_scope`, `onboarding_run_id`, `note_id`,
-  `request_id` are all singular, and an event that carried a list would
+  payload.** Every link event names **exactly one TARGET** — the payload
+  fields `close_id`, `gate_scope` and `request_id`
+  are all singular, and an event that carried a list would
   be un-attributable when half its entries were bad. What differs is the
-  item field each one feeds:
-  - `close_id`, `gate_scope`, `onboarding_run_id` are **scalar item
+  item field each one feeds. **`close_instance_id` and
+  `opener_message_id` are not second targets**: each is the IDENTITY
+  WITNESS for the target it accompanies — `close_instance_id` for
+  `close_id`, `opener_message_id` for `request_id` — travelling with it,
+  meaningless without it, and never nameable alone. One target, one
+  witness. **A witness is not a link**, which is why binding two of them
+  does not make this a four-link vocabulary and why neither appears in
+  the link-type count.
+  - `close_id` and `gate_scope` are **scalar item
     fields**. A later valid event **rebinds** them, and the effective
     value is the one carried by the **highest valid ledger `seq`** —
     never the newest `ts`, because this document does not order by
     producer clock. Rebinding is auditable precisely because the earlier
     event stays in the ledger.
-  - `note_ids` and `review_request_ids` are **collection item fields**,
-    fed by `note_linked` and `review_requested` respectively. Events
+  - `review_request_ids` is a **collection item field**, fed by
+    `review_requested`. Events
     **append**, and an id already present is a **no-op rather than a
     duplicate entry**.
+    **Its witnesses live in a PARALLEL MAP**, `review_opener_message_ids`,
+    keyed by `request_id`. A collection needs one witness per member, and
+    a parallel map is chosen over rewriting `review_request_ids` into a
+    list of objects **specifically because the built code already
+    validates that field as a list of strings** — changing its element
+    type would break a running producer to gain nothing the map does not
+    give. The no-op rule extends to the pair: re-appending an id whose
+    witness already matches is a no-op, and re-appending one whose
+    witness DIFFERS is refused at mutation, not silently rebound, because
+    that is the aliasing attack arriving through the front door.
+    **DEPENDENCY, stated where the rule is rather than left to a
+    reader to notice.** After the note deferral and the onboarding
+    deferral, **every link type this amendment introduces is SCALAR**
+    (`close_linked`, `gate_scope_set`). So the append-and-dedupe rule
+    and the collection-member half of key-set validation have **no
+    producer introduced by this amendment** to exercise them — their
+    only producer is `review_requested`, scheduled by amendment #14.
+    A test author who exercises only what #15 adds will leave both
+    untested and see nothing missing.
   The singular/plural spelling is the tell: a payload key is singular
-  (`note_id`), the item field it feeds is plural (`note_ids`), and an
+  (`request_id`), the item field it feeds is plural
+  (`review_request_ids`), and an
   implementation that names them alike has lost the distinction.
   **"Highest valid `seq`" is subject-sourced, and that is permitted only
   under the narrow exemption already stated for self-referential
@@ -1021,8 +1263,14 @@ Rules:
   is exactly the dangling link the boundary table exists to prevent.
   Mutation-time validation alone is the writer/read parity gap — the
   state is reachable by corruption, out-of-protocol write, or hand edit,
-  none of which pass through the mutation. A link that cannot be resolved
-  at read time raises `work_link_unresolvable`.
+  none of which pass through the mutation. A read-time resolution failure
+  raises **one of two codes, and which one is not a detail**: the module
+  answering "no such record" raises `work_link_unresolvable`, class
+  `established`; the module being unable to answer raises
+  `work_source_error`, class `unknown`. An earlier draft collapsed both
+  into `work_link_unresolvable` here while the resolver mapping below kept
+  them apart — the same contract stated twice, disagreeing, with the
+  weaker statement sitting in the section an implementer reads first.
 - **The canonical event hash is defined exactly**, because "a canonical
   hash" is not a specification an implementer can write twice the same
   way. It is `"sha256:" + sha256(blob).hexdigest()` — full 64 hex, never
@@ -1073,9 +1321,12 @@ Rules:
     contract.** A future reopen capability must *reconcile* with the
     survives-a-corrupt-ledger justification — explaining what a reopened
     item's durable record means — rather than simply relaxing it.
-- **FIVE types have a producer that is specified here and BUILT in
-  increment 3**: `review_requested`, `close_linked`, `gate_scope_set`,
-  `onboarding_linked` and `note_linked` — the link mutations. These are
+- **THREE types have a producer that is specified here and BUILT in
+  increment 3**: `review_requested`, `close_linked` and `gate_scope_set`
+  — the link mutations. The count is written as a numeral against a list
+  the reader can count, because an earlier draft said FIVE and listed
+  four; a stale ordinal survives every sweep that reads the list and
+  never counts it. These are
   *named*, not disclosed, and the distinction is the whole point of the
   reachability sweep: a member with no producer at all is a claim the
   document cannot cash, while a member whose producer is designed and
@@ -1842,16 +2093,29 @@ order, and the first matching rule wins:
 | Derived state | Condition |
 |---|---|
 | `abandoned` | `terminal.type == "abandoned"` |
-| `closed` | the linked close **resolved**, and is published |
+| `closed` | the linked close **resolved**, **its instance matching the bound witness**, and is published |
 | `delivered` | `terminal.type == "delivered"`, or the linked lane has a committed delivery artifact |
 | `changes_requested` | a review-result bound to the **current revision** is `rejected` |
-| `review` | a linked review thread **for the current revision** is open and unanswered |
+| `review` | a linked review thread **for the current revision**, **its opener matching the bound witness in `message_id`, KIND, SENDER and RECIPIENT** (all four, never summarised as "parties"), is open and unanswered |
 | `active` | a lane is bound, or any artifact exists |
 | `open` | an owner is assigned |
 | `draft` | otherwise |
 
 Rules:
 
+- **RESOLUTION IS NOT IDENTITY, and the `closed` row needs BOTH.** Under
+  an ABA substitution the module DOES answer, so the tag is legitimately
+  `resolved` and a resolution-only row matches — deriving `record_state` =
+  `closed` from a close the item never bound. The hazard this amendment
+  exists for names "the item's **record state** and verdict provenance",
+  record state FIRST, and an instance check reached only on the verdict axis
+  reaches the second thing named and not the first. So the row requires the
+  resolved close's instance to match the bound witness, and a mismatch makes
+  it **not match** exactly as an unresolved link does. This is the treatment
+  `lane_generation` already receives — a lane whose id matches but whose
+  generation does not "raises `work_lane_generation_mismatch` rather than
+  reading as the bound one." Two witness-carrying links under one ladder
+  had opposite treatments, and the lane precedent is the correct one.
 - **Every row that names a linked record requires that link to have
   RESOLVED.** A link whose resolver result is `not_found` or `unreadable` —
   the two non-`resolved` tags — makes its row **not match**, and evaluation continues down the
@@ -2023,15 +2287,33 @@ Rules:
   performs no I/O of its own.** Its input is the item record, its event
   ledger, and a **resolved link map** — one entry per link the item
   carries, each already fetched through the linked module's public read
-  API, and each carrying a **closed three-way resolver result** that is
-  **bound to the id it answers for** — a result that does not name its
-  requested id can be silently misfiled against another link:
+  API, keyed by a **NAMESPACED link identity** — the pair
+  `(link_field, requested_id)`, never the raw id — and each carrying a
+  **closed three-way resolver result** that **carries that same pair
+  INSIDE the result**:
 
   | tag | payload | the module… |
   |---|---|---|
-  | `resolved` | the requested id + the record | returned it |
-  | `not_found` | the requested id | determined no such record exists |
-  | `unreadable` | the requested id + the reason | could not answer |
+  | `resolved` | `link_field` + `requested_id` + the record | returned it |
+  | `not_found` | `link_field` + `requested_id` | determined no such record exists |
+  | `unreadable` | `link_field` + `requested_id` + the reason | could not answer |
+
+  **THE KEY IS A CALLER ASSERTION, NOT A SELF-AUTHENTICATING JOIN**, and
+  this is the correction of an earlier fix that did not go far enough.
+  Namespacing the key alone leaves the VALUE ENVELOPE unnamespaced, so
+  swapping two correctly-keyed results defeats it: let a `close_id` and a
+  `gate_scope` both equal `"shared"`, exchange the two result
+  envelopes between their correct keys, and every check passes — the key
+  set is exact, both envelopes answer `"shared"` — while the wrong
+  module's record and disposition are consumed. A raw-id map and a
+  namespaced map with unnamespaced values fail the same way; the second
+  merely looks repaired.
+
+  The earlier fix bound the MAP to the identity and left the RESULT
+  carrying a bare id, **reproducing the original defect one layer in**.
+  That is worth recording as a shape and not only as a bug: a repair
+  written under the premise that produced the defect will relocate it
+  rather than remove it.
 
   **Three tags, not two.** `not_found` and `unreadable` answer different
   questions and carry different classes downstream — a determination versus
@@ -2061,16 +2343,377 @@ Rules:
   resolver over-reports outages and can never advance an item it should have
   blocked.
 
-  **DISCLOSED LIMIT — and what a reader would otherwise wrongly conclude.**
-  As of this amendment **no linked module can make the distinction**.
-  `close.load_close` raises one `CloseError` for missing, unreadable and
-  malformed alike — its own docstring says so — and `knowledge`, `onboarding`
-  and `gates` expose no not-found type at all. So a reader could otherwise
-  conclude that `work_link_unresolvable` will appear whenever a link dangles.
-  **It will not.** Until the upstream not-found subclasses land, every
-  dangling link presents as `work_source_error`, class `unknown`.
+  **DISCLOSED LIMIT — UNIVERSAL, and every member of the universe is
+  disposed of BY NAME.** As of this amendment **no resolver in scope can
+  produce `not_found`.** That is a strong claim and a previous draft made
+  it falsely, so it is stated here as an enumeration a reader can refute
+  member by member rather than as an assertion:
+
+  | link type | can it distinguish? | why |
+  |---|---|---|
+  | `close_id` | **NO** | `close.load_close` raises one `CloseError` for missing, unreadable and malformed alike — its own docstring says so |
+  | `review_request_ids` | **NO** | `Store._validated_messages` SILENTLY DROPS every message failing schema, roster or signature validation, and returns `[]` outright when the roster is missing or corrupt. Absence-after-filtering is byte-identical to absence-in-fact |
+  | `gate_scope` | **N/A** | a live selector over current state has no bound record, so "this record is missing" is not a question that applies |
+  | `onboarding_run_id` | **YES** — but DEFERRED | `read_events` returns `([], [])` for a missing path, a definitive `not_found`. Its links are deferred; see Open Question #11 |
+  | `note_ids` | **NO** — and DEFERRED | `knowledge.read_events(store)` takes **no id at all**, so the module cannot be asked about one note; the question has no answer rather than an unreliable one. Links deferred; see Open Question #10 |
+
+  **The two `NO`s fail for OPPOSITE mechanisms, and the second is the more
+  dangerous.** `close` conflates the cases by raising ONE exception for
+  all of them — a visible failure carrying too little information. The
+  review path conflates them by **succeeding**: the trust gate drops what
+  it cannot validate and returns a shorter list, so a resolver reading
+  that list sees a clean answer. Worse, a missing or corrupt roster
+  returns `[]` for the ENTIRE store, so a `not_found`-emitting review
+  resolver would report `work_link_unresolvable`, class `established`, for
+  **every review link on every item simultaneously** — a total outage
+  rendered as a determination that "no such record exists," which is
+  precisely the outage-wearing-a-fact failure this whole section exists to
+  prevent. A silent-drop conflation is harder to notice than a
+  raise-everything one and it is the one that scales.
+  **Read this together with the completeness rule below, which produces
+  the SAME breadth deliberately.** What is refused here is a
+  determination at that breadth (`established` — "no such record
+  exists"); what is required below is an OUTAGE at that breadth
+  (`unknown` — "the store is not fully readable"). The two are not in
+  tension and the class is what separates them.
+
+  **AND THE TOTAL CASE IS NOT THE DANGEROUS ONE. PARTIAL FILTERING IS
+  FAIL-OPEN AND IT REACHES `GO`.** Everything above concerns a thread
+  that comes back EMPTY. A thread that comes back INCOMPLETE is worse,
+  and the emit-`unreadable` rule does not reach it:
+
+  > A linked review thread holds a valid approval **A** and a same-head
+  > REJECTING result **R**. With both visible the rule is
+  > `work_review_conflict`. Corrupt only **R**'s schema or signature, or
+  > remove **R**'s signer from the roster. The trust gate `continue`s
+  > past R and returns A. **The thread is non-empty and looks clean.**
+  > The resolver reports `resolved`, the projection consumes the
+  > approval, and the item advances.
+
+  **A hand edit REMOVES BLOCKING EVIDENCE AND MANUFACTURES A `GO`.** Every
+  other defect this amendment fixes fails CLOSED — a wrong state, a stuck
+  item, an outage wearing a fact. This one opens a gate, and it is inside
+  the threat model this document already declares reachable.
+
+  **Why it was invisible, which generalises past this amendment:**
+  `store.py:3786` labels itself "Fail CLOSED" and **it is** — for message
+  DELIVERY, returning nothing when the roster cannot authenticate senders
+  is exactly right, and the comment names the fail-open it was written to
+  prevent. The same mechanism is fail-OPEN when its output is consumed as
+  an **existence oracle**. Nothing about the code changed; the QUESTION
+  changed. **A SAFETY PROPERTY IS RELATIVE TO A QUESTION, AND IMPORTING A
+  MODULE'S OUTPUT INTO A DIFFERENT QUESTION CAN INVERT ITS POLARITY.** A
+  reviewer asking "is this fail-closed?" gets YES, correctly, from
+  documentation written by someone who had thought about it and was
+  right. The defect appears only under "fail-closed **with respect to
+  which question?**"
+
+  That is also the argument for the per-module resolver disposition being
+  something **work owns and asserts**, rather than trust inherited from
+  each module's documented semantics: here the documentation was accurate
+  and still produced the wrong answer downstream.
+
+- **THE RULE: A REVIEW LINK MUST NOT CONTRIBUTE `GO`.** Until upstream
+  exposes BOTH full-gate atomic completeness AND ordered-but-absent
+  evidence, a review link **MAY BE DISPLAYED** but **MUST NOT satisfy a
+  required review** from EITHER source (see the two-source enumeration
+  below) and **MUST NOT contribute `GO`**. **The mechanism is the
+  work-owned SATISFACTION DISPOSITION specified below — NOT a resolver
+  behaviour and NOT scoped to a "use".** The resolver tag is untouched:
+  a clean link resolves `resolved` and is displayed; the block lives on
+  the verdict axis as `work_review_completeness_unavailable`.
+
+  **A SUPERSEDED FORMULATION IS RECORDED HERE ONLY AS HISTORY, AND IT IS
+  NOT NORMATIVE.** Earlier drafts stated this rule as a qualifier on the
+  RESOLVER TAG — "for that use it resolves `unreadable`" — and scoped it
+  to a "release-blocking review requirement". **Do not implement from
+  that phrasing.** It overloaded one tag with two answers, and its
+  "release-blocking" scope left the `required_review: true` source open;
+  both defects are the reason the satisfaction disposition exists. The
+  history is kept because the REASONING below is load-bearing, but the
+  MECHANISM is the disposition and nothing else.
+
+  **WHY THE RULE IS NOT KEYED ON A PROBLEM SCAN — the reason that is
+  worth keeping.** (Stated as "not scan-keyed" rather than
+  "unconditional": that word collapses the requirement axis into the
+  approval axis, and this disposition is conditional on the first.) An
+  earlier interim resolved `unreadable` only when
+  `list_invalid_messages()` was non-empty, with the residual bounded by a
+  transience argument: to evade, a corruption had to be present during
+  one traversal and absent during the other, and a transient corruption
+  yields no durable `GO` because the next verdict re-reads.
+
+  **That argument does not survive DELETION, and deletion is
+  PERSISTENT.** A deleted rejecting result produces nothing invalid, so
+  the scan stays empty; the item projects approval-only and reaches `GO`;
+  and the required pre-action recheck **REPEATS the false `GO` rather
+  than repairing it**, because there is nothing transient about a missing
+  file. The transience mitigation covered a race and was silently applied
+  to an attack that has no race in it.
+
+  **AND THE CORRUPTION HALF WAS NOT CLOSED EITHER.** A rejecting result
+  can be corrupt during the SURVIVOR traversal and restored before the
+  PROBLEM traversal — omitted from one, absent from the other. The
+  two-traversal disclosure below already concedes that two reads of a
+  mutable store cannot PROVE completeness; scoping the rule to
+  "corruption only" and calling that honest was still an overclaim, one
+  level in.
+
+  **DISCLOSURE IS NOT MITIGATION.** A well-written description of a
+  fail-open gate is still a fail-open gate, and the quality of the
+  disclosure is not evidence about the size of the hole. This rule is the
+  correction of a scope call that accepted a documented path to `GO`.
+
+  **THE COST IS REAL AND IT IS THE INTENDED TRADE.** Every item carrying
+  a required review is blocked until the upstream dependencies land.
+  That is consistent with how this document already rules elsewhere:
+  unverified domain entitlement blocks `GO` rather than passing with a
+  caution, for the same reason — **a disclosed blockage beats a silent
+  pass**, and choosing otherwise here would have made the amendment
+  inconsistent with its own strongest precedent.
+
+- **HOW THE RULE IS REPRESENTED: A WORK-OWNED SATISFACTION DISPOSITION,
+  NOT A QUALIFIER ON THE RESOLVER TAG.** This is the mechanism, and an
+  earlier draft got it wrong in a way worth recording because the wrong
+  version looked complete.
+
+  **The resolver tag keeps meaning exactly one thing: what the owning
+  module answered.** A review link that reads cleanly is `resolved`, and
+  it is DISPLAYED — the opener, the results, the revision binding, all
+  rendered normally. The derived-state ladder consumes `resolved` and
+  behaves exactly as it always has, so `changes_requested` stays
+  reachable and no ladder row needs a special case.
+
+  **Satisfaction is a SEPARATE, WORK-OWNED disposition.**
+  `compute_verdict` MUST append `work_review_completeness_unavailable`,
+  class `unknown`, **IRRESPECTIVE of whether a bound approved result
+  exists**.
+
+  **TWO AXES, AND THEY MUST NOT BE COLLAPSED INTO THE WORD
+  "UNCONDITIONAL".** The disposition is:
+  - **CONDITIONAL on the REQUIREMENT axis** — it fires only when a review
+    IS required, by one of the two enumerated sources. With no review
+    required it correctly does NOT fire.
+  - **IRRESPECTIVE on the APPROVAL axis** — a bound approved result does
+    not suppress it.
+  Calling it "unconditional" collapses the two and licenses exactly the
+  wrong repair when a test built without a requirement source fails: a
+  builder would make it fire always, deleting the two-source trigger.
+  The hold does not ask whether an approval is present,
+  because the defect is that we cannot know what is ABSENT.
+
+  **THE TRIGGER IS AN ENUMERATION, NOT AN ADJECTIVE. There are exactly
+  TWO sources that make a review required, and the hold fires for BOTH:**
+
+  | # | source | where |
+  |---|---|---|
+  | 1 | the RELEASE BASELINE | the requirements table above |
+  | 2 | **`required_review: true` on a matched policy entry** | fires OUTSIDE the release baseline |
+
+  **Stated extensionally on purpose.** An earlier draft wrote
+  "release-blocking review requirement", and a later one wrote "whenever
+  a blocking review is required" — both ADJECTIVES, and both silently
+  resolved to source 1 while source 2 existed. **A rule expressed as a
+  qualifier cannot be checked for completeness, and changing the noun the
+  qualifier attaches to does not change that.** With a list, the
+  completeness question becomes "did we find every source?", which is
+  answerable and falsifiable. With an adjective it is "does *blocking*
+  cover this case?", which is not.
+
+  **`work_review_missing` fires on this same two-source trigger, and that
+  is the positive control for the enumeration.** Two holds keyed to one
+  trigger set must name it identically; if a third source is ever added
+  and only one hold learns about it, the divergence is visible by
+  comparison rather than by inspection.
+
+  **ONE CANDIDATE WAS EXAMINED AND EXCLUDED**, recorded so the sweep can
+  be re-run rather than retaken on trust: `require_close_lenses: true`
+  makes a CLOSE LENS ACK required, not a review. Work defers wholly to
+  the linked close's verdict and never recomputes lens coverage, so the
+  requirement rides the CLOSE link. It has no completeness analogue
+  either: a close is ONE record read through ONE call that raises on
+  unreadable, so there is no set assembled from many files for a silent
+  filter to shorten.
+
+  **WHY THIS SHAPE AND NOT THE OBVIOUS ONE.** An earlier draft expressed
+  the rule as a qualifier on USES — "for release-blocking use it
+  resolves `unreadable`" — which requires the set of uses to be
+  enumerated and exhaustive. It was neither. It named display and
+  requirement-satisfaction, leaving the derived-state ladder assigned to
+  neither; and it said "release-blocking", leaving a review required by a
+  `required_review: true` policy entry OUTSIDE the release baseline
+  still able to be satisfied by a bound approval. **A route to `GO`
+  survived the rule that existed to close it.**
+
+  The cause was not sloppy wording. **The rule needed a state the link
+  envelope could not carry** — readable and displayable, but
+  non-satisfying — and the closed three-way resolver result is TOTAL, so
+  there was nowhere to put it. Unable to represent the state, the draft
+  described the readers instead. **A rule that cannot be represented in
+  the schema gets written as prose about who reads it, and prose about
+  readers cannot be checked for completeness** — which is exactly why the
+  gap showed up as one lens finding an unassigned consumer and another
+  finding an unblocked route. Adding the state dissolves both questions
+  rather than answering them.
+
+  **DO NOT OVERLOAD THE RESOLVER TAG WITH TWO ANSWERS.** "What did the
+  module say" and "may this satisfy a requirement" are different
+  questions with different owners: the first belongs to the linked
+  module, the second to work. Collapsing them is what made the rule
+  inexpressible in the first place.
+
+  **ONE OPEN QUESTION IS SUBSUMED RATHER THAN ANSWERED, and the
+  difference is worth recording.** A review asked which consumer the
+  derived-state ladder counted as — display, or requirement-satisfaction
+  — since the use-qualifier assigned it to neither. That question now has
+  **no referent**: the ladder consumes `resolved` like any other link and
+  renders normally, and satisfaction was never a property of the ladder
+  to begin with. It was a real question about a real gap, and the gap was
+  the missing state rather than an unassigned consumer. **A question that
+  dissolves when the representation is fixed was a symptom, and answering
+  it directly would have produced a rule about consumers that the next
+  consumer would have escaped.**
+
+  **WORK MUST NOT CALL THE PRIVATE PAIRING.** The atomic call exists at
+  `Store._scan_messages_with_paths` and is one underscore away, which
+  makes it the obvious thing for an implementer to reach for. Row 8
+  requires the owning module's PUBLIC read API, and taking by trespass a
+  guarantee the public surface withholds is the same defect as
+  specifying an obligation downstream of an unexposed capability,
+  committed on purpose rather than by accident. This repeats a defect
+  this project has already paid for once, where a spec mandated
+  `store._config_lock()` while its own Non-Goals declared
+  public-API-only.
+
+  **UPSTREAM DEPENDENCY — THREE PARTS, AND EVERY ONE IS EXPOSE-OR-EXTEND
+  RATHER THAN BUILD. The machinery already exists; what is missing is a
+  public surface pointed at the right question.**
+
+  1. **FULL-GATE ATOMIC COMPLETENESS — A SMALL REFACTOR, NOT A
+     VISIBILITY CHANGE. An earlier draft of this passage got this wrong
+     and the correction matters more than the ask.**
+
+     That draft said `Store._scan_messages_with_paths` "IS the atomic
+     snapshot" and called the two public methods lossy projections of
+     it. **Both claims are false.** The private walk applies **file read,
+     JSON/shape and stem checks ONLY**. The roster and signature gates
+     live elsewhere — in `_invalid_file_entries` and
+     `_validated_messages` — and its own docstring warns that the
+     `since_id` fast-skip "is NOT sound for tamper visibility."
+
+     So merely making it public would hand work a snapshot **missing
+     exactly the roster and signature failures the fail-open
+     construction uses**, or force work to re-implement the owning
+     module's trust gate, which row 8 forbids. Exposing the wrong
+     function would have looked like closing the gap.
+
+     The required contract is therefore a **PUBLIC, Store-owned,
+     FULL-VALIDATION snapshot returning roster/signature-filtered
+     survivors PLUS every full-gate problem from ONE traversal.**
+
+     **How the error was made is worth more than the error:** the
+     capability was characterised from a function's NAME and DOCSTRING
+     without reading which gates it applies. "Canonical disk walk"
+     and `(valid, invalid)` read as completeness; `valid` meant
+     *parseable*, not *trusted*. **A docstring describes intent; only
+     the body describes gates.**
+  2. **ATTRIBUTION, which atomicity does NOT buy.** Even with a single
+     traversal, invalid entries carry `(id_or_stem, reason)` and no
+     correlation id, so the rule would still have to stay store-wide.
+     The second half is that each invalid entry carries whatever
+     correlation data was RECOVERABLE — `request_id` / `broadcast_id`
+     when the file parsed far enough to read them — **AND an explicit
+     marker for entries where nothing was recoverable.**
+
+  **THE MARKER IS AS IMPORTANT AS THE DATA.** An unparseable file can
+  never be attributed, so a caller must be able to distinguish "no
+  invalid entry touches my thread" from "some invalid entry could not be
+  attributed to ANY thread." Collapsing those two would recreate the
+  partial-filtering defect **inside the fix for it**: a caller treating
+  unattributable as unrelated is once again resolving a true subset and
+  seeing nothing wrong. Only when BOTH halves land does the rule narrow;
+  atomicity alone closes the residual window and leaves the breadth.
+
+  3. **AN ORDERED-BUT-ABSENT CHECK — THE ONE THAT CLOSES THE DELETION
+     HALF, and the evidence for it is already on disk.** The publication
+     -order sidecar maps every published id to an `append_sequence`, and
+     contiguity is already validated — `"message publication order
+     sequence is incomplete"`, and
+     `sequences != set(range(1, append_sequence + 1))`. **A deleted
+     message breaks contiguity, so the store HOLDS the proof.**
+
+     **But the public method reads the correspondence in the wrong
+     direction.** `Store.publication_ordered_messages()` is public and
+     does read the sidecar; its completeness check is
+     `missing = [m.id for m in messages if m.id not in sequences]` — it
+     iterates the messages PRESENT and asks whether the order KNOWS each
+     one. It raises on present-but-unordered. **It never asks the
+     reverse: is there an id in the order with no message on disk?**
+     That reverse is exactly deletion. So the module holds the evidence,
+     exposes a public method that reads the very structure holding it,
+     and points that method's check away from the case that matters.
+
+     **A CORRESPONDENCE BETWEEN TWO SETS HAS TWO FAILURE DIRECTIONS, AND
+     CHECKING ONE READS EXACTLY LIKE CHECKING BOTH.** This is the third
+     one-directional defect in this amendment's neighbourhood — the
+     unknown-field rule needed both limbs; the trust gate is fail-closed
+     for delivery and fail-open as an existence oracle; and now a
+     completeness check that verifies present-implies-ordered and not
+     ordered-implies-present. In each case the code was correct for the
+     direction it was written for, which is precisely why reading it
+     produces agreement rather than suspicion.
+
+  Generalised, because it is the half that is easy to miss: **a partial
+  answer is indistinguishable from a complete one unless the source tells
+  you it was partial — and you cannot scope your distrust to the part you
+  care about unless the source also tells you WHERE the missing part
+  was.** Completeness and attribution are two separate things to ask of a
+  source, and asking only for the first leaves you correct but blunt.
+
+  **IDENTITY AND COMPLETENESS ARE ORTHOGONAL, and fixing one will FEEL
+  like fixing both:**
+
+  > `opener_message_id` answers **"IS THIS THE THREAD I LINKED?"** —
+  > IDENTITY.
+  > Partial filtering answers **"IS WHAT I AM SEEING ALL OF IT?"** —
+  > COMPLETENESS.
+
+  A correctly-identified thread can be incompletely read; a
+  completely-read thread can be the wrong thread. Two witnesses, two
+  questions, neither substituting for the other — and they are scheduled
+  as separate obligations for exactly that reason.
+
+  **AND THE ASYMMETRY IS NOT A COINCIDENCE.** Every other defect this
+  amendment found was an IDENTITY defect and every one of them failed
+  CLOSED. The single fail-OPEN defect is the COMPLETENESS question. An
+  identity failure resolves the WRONG OBJECT, and a witness catches it on
+  the next read because the two answers disagree. A completeness failure
+  resolves a TRUE SUBSET — everything visible is valid, nothing
+  contradicts anything, and there is no disagreement to detect.
+  **A PARTIAL ANSWER IS INDISTINGUISHABLE FROM A COMPLETE ONE UNLESS THE
+  SOURCE TELLS YOU IT WAS PARTIAL.** That is why completeness cannot be
+  inferred by the consumer and must be reported by the producer, and it
+  is the general reason the upstream seam is the real fix rather than a
+  convenience.
+
+  So a reader could otherwise conclude that `work_link_unresolvable` will
+  appear whenever a link dangles. **It will not.** A dangling close or an
+  unresolvable review presents as `work_source_error`, class `unknown`.
   An implementer who finds `not_found` never firing has implemented this
-  **correctly**. The fix is the upstream subclass — **never** a workaround
+  **correctly** — the tag stays in the vocabulary because the resolver
+  contract is written for the modules we will have, not only the ones we
+  have, and Safety Invariant 43 constructs the case so the obligation is
+  verifiable ahead of its producers.
+
+  **Two earlier drafts got this wrong in both directions**, which is why
+  the table is here. One asserted "no linked module can distinguish" with
+  no enumeration and was FALSE — onboarding could. Its replacement
+  narrowed the limit to `close` ONLY; after the onboarding deferral
+  `close` and review were the entire population, so that narrowing was an
+  exception scoped to every case that exists — **a sentence that reads as
+  a limit while restricting nothing.** A universal claim needs a bounded
+  universe and a disposition per member; either half alone produces one of
+  these two failures. The fix for `close` is the upstream subclass — **never** a workaround
   that infers not-found by matching an exception's message text. A
   verdict-bearing class assignment must not rest on a substring of a
   human-readable string, which is not a contract and changes without notice.
@@ -2080,6 +2723,15 @@ Rules:
   carries, **including every member of the collection fields**. Missing,
   extra or mismatched entries raise `work_link_map_incomplete`, class
   `established`, and the projection does not run.
+
+  **And the same check runs on every entry's CONTENTS, not only on the key
+  set.** For each entry, the `(link_field, requested_id)` carried inside
+  the result MUST equal the pair it is filed under; any disagreement
+  raises `work_link_map_incomplete` and the projection does not run. This
+  is the half that makes the join self-authenticating: validating only
+  `keys(resolved_links)` accepts a map whose keys are perfect and whose
+  values are transposed, which is exactly the swapped-envelope attack
+  above. Both halves are one obligation and neither is sufficient alone.
 
   This rule is security-critical and its violation is SILENT without the
   check: omitting the entry for a dangling or unreadable link removes that
@@ -2098,7 +2750,7 @@ Rules:
   is drawn from the closed HOLD vocabulary — the projection reports
   `work_link_unresolvable`, it does not compose prose.
 - **A link-source failure MUST NOT move `record_state`.** An unreadable
-  close, gate scope, onboarding run, or note is a failure to *observe*,
+  close or gate scope is a failure to *observe*,
   and record state is a function of what the item's own records say —
   not of what a neighbouring module was able to answer this second. So an
   item whose `close_id` cannot be read stays where its own records put
@@ -2406,7 +3058,26 @@ Rules:
 | Every changed path matches ≥1 release-scoped rule | `work_uncovered_release_path` |
 | A linked close exists and is published | `work_close_missing` |
 | A review-result bound to the current revision exists and is approved | `work_review_missing` |
+| **Thread COMPLETENESS for that review — and it is currently UNAVAILABLE, so this hold is appended WHENEVER a review is required, satisfied or not** | `work_review_completeness_unavailable` (class `unknown`) |
 | `gate_check.required_gates` is non-empty and every one is green | `work_release_gates_vacuous` |
+
+**THE COMPLETENESS ROW IS NOT A REQUIREMENT THE ITEM CAN MEET, AND THAT
+IS DELIBERATE.** Every other row above names something an item can
+supply. This one names something WORK cannot currently establish about
+the linked thread — that nothing has been removed from it — so no
+evidence an item carries will discharge it. It is listed here rather
+than in the review row because it is a distinct fact: `work_review_missing`
+says the approval is absent, `work_review_completeness_unavailable` says
+we cannot tell whether a REJECTION is absent. **An item can fix the
+first and cannot fix the second**, and collapsing them would let a
+bound approval read as discharging both. The row lifts when the upstream
+dependencies land, not when the item does anything.
+
+**And the review requirement is NOT release-baseline-only.** A
+`required_review: true` rule on a matched policy entry makes a review
+required for an item that is otherwise non-release, so the completeness
+hold attaches there too. An earlier draft scoped the review restriction
+to "release-blocking" use and left exactly that route open.
 
 **In D1–D5 a `GO` requires EVERY rule matching a changed path to sit at
 or below `local_agent`; any higher floor on any matching rule is
@@ -2565,6 +3236,7 @@ Rules:
 | `work_lane_generation_mismatch` | the lane ID matches but the generation does not |
 | `work_lane_conflict` | more than one non-terminal item claims the same lane |
 | `work_review_missing` | a review is required — by the release baseline, or by a `required_review: true` rule in the matched policy entry — and has no terminal review-result bound to the current revision |
+| `work_review_completeness_unavailable` | a review is required — by EITHER of the two enumerated sources: the release baseline, or `required_review: true` on a matched policy entry — and work cannot establish that the linked thread is COMPLETE. Class `unknown`. Appended **irrespective of whether a bound approved result exists**, because the unknowable part is what is ABSENT. A work-owned SATISFACTION disposition, not a resolver tag: the link still resolves `resolved` and is still displayed. **THIS HOLD DOES NOT CLEAR BY REPAIRING THE ITEM.** Every other hold in this vocabulary names something an operator can fix on the item; this one names a CAPABILITY WORK DOES NOT HAVE, so no item-level action removes it. It clears when two upstream capabilities land — full-gate atomic completeness AND ordered-but-absent evidence — and not before. **It is a capability-level fact rendered per-item**, which is honest but easily misread: an operator who does not know that will either hunt for an item cause that does not exist, or dismiss the hold as noise |
 | `work_review_unbound` | a review-result carries no `reviewed_head_sha`, so its currency cannot be established |
 | `work_review_stale` | a *bound* review-result's `reviewed_head_sha` is no longer current |
 | `work_review_conflict` | two bound review-results disagree at the same revision (never ordered by recency) |
@@ -2589,7 +3261,8 @@ Rules:
 | `work_source_error` | a source read failed and its result could not be established |
 | `work_link_unresolvable` | a link names an id the linked module reports does not exist — class `established`, since the module answered and "no such record" is a determination |
 | `work_close_instance_mismatch` | the bound `close_instance_id` does not match the resolved close, or no instance is bound — class `established`; an ABA substitution under a reused `close_id` |
-| `work_link_map_incomplete` | `keys(resolved_links)` does not equal the links the item carries, including collection members — class `established`; checked BEFORE projection |
+| `work_review_thread_mismatch` | the resolved thread's opener differs from the bound witness in any of **`message_id`, KIND (must be `review-request`), SENDER, or RECIPIENT**, or a linked `request_id` carries no witness — class `established`; correlation aliasing under a reused `request_id` |
+| `work_link_map_incomplete` | `keys(resolved_links)` does not equal the links the item carries, including collection members, **or an entry's carried `(link_field, requested_id)` does not equal the key it is filed under** — class `established`; checked BEFORE projection |
 | `work_contradiction` | two records disagree irreconcilably (see below) |
 
 ### Contradictions Are Surfaced, Never Resolved
@@ -3495,21 +4168,288 @@ a named test in D1–D4's acceptance set.
         did not run. Omission is the silent failure; it must be tested
         separately from the supplied-failure cases, which is why the earlier
         version could not have caught it.
+      - **KEY-SET VALIDATION IS AN EXACT-SET COMPARISON — STRUCTURAL.**
+        **PROPERTY:** the resolved map's key set equals the item's
+        expected key set, exactly.
+        **STRUCTURAL CONSTRAINT (the obligation):** the check is a
+        **SET EQUALITY over the whole expected set** —
+        `set(resolved_links) == expected_keys`, where `expected_keys`
+        enumerates every link the item carries INCLUDING every collection
+        member. **Cardinality comparison, sampled-membership, and
+        any-subset checks are NOT admissible implementations**, and no
+        conforming implementation may compute the verdict from a proper
+        subset of either set.
+        **WHY SET EQUALITY AND NOT A CASE LIST.** A case list over
+        single-key omissions still fixes the OMITTED-SUBSET dimension — a
+        validator rejecting every one-key replacement can accept a
+        two-key one, and the subset lattice is 2^n. Set equality has no
+        free dimension: it is a single total comparison, so there is no
+        subset of deviations it can be satisfied on while failing
+        another. **The mechanism is the completeness argument; the
+        lattice does not need enumerating because nothing ranges over it.**
+        **PRODUCER CHECK:** work-owned on both sides. `resolved_links` is
+        the map work's own resolver produced, and `expected_keys` is
+        derived from the item's own link fields in the item projection —
+        no foreign API is crossed and no capability outside work is
+        needed. The comparison is over two in-memory sets work already
+        holds at the point of the check.
+        **REPRESENTATIVE TEST:** one BALANCED REPLACEMENT — remove one
+        expected key, add one self-consistent extra so CARDINALITY IS
+        PRESERVED — asserting `work_link_map_incomplete` and that the
+        projection did not run. It demonstrates that cardinality alone is
+        insufficient. The added key must be self-consistent (its carried
+        `(link_field, requested_id)` matching its own key) or
+        entry-contents validation catches it and the case stops testing
+        the key SET.
+
+        **WHY BALANCED AT ALL:** missing-only and extra-only are both
+        caught by `len(resolved_links) != len(item links)`, and
+        swapped-values by entry-contents validation — so an
+        implementation validating ONLY cardinality passes every other
+        stated case while accepting a map whose keys are simply wrong.
+
+        **SUPERSEDED — REJECTED HISTORY, RETAINED FOR THE DEFECT IT
+        RECORDS, NOT AS AN ARGUMENT.** The two paragraphs that follow were
+        the round-14 completeness argument. **They are no longer load
+        bearing and MUST NOT be cited as the completeness argument** —
+        the STRUCTURAL EXACT-SET MECHANISM above is. They are the
+        enumeration form the mechanism replaced, kept because the
+        countermodel they name is still the reason the mechanism must be
+        a TOTAL comparison:
+
+        > **WHY EVERY KEY AND NOT ONE (superseded):** removing a FIXED key
+        > leaves a **cardinality-plus-partial-membership** validator
+        > alive — one that checks the count and the presence of the
+        > particular key the single case happened to remove. Over an
+        > expected set `{a, b}`, a "cardinality-equal AND `a` present"
+        > checker RAISES on remove-`a`/add-`x` and passes the test, while
+        > ACCEPTING remove-`b`/add-`x`.
+        >
+        > **COMPLETENESS ARGUMENT (superseded):** once cardinality is
+        > pinned, any non-exact key set must omit at least one expected
+        > member. Ranging the removal over every expected member
+        > therefore covers every cardinality-preserving deviation — the
+        > subset lattice is exhausted by its single-omission generators.
+
+        **Why it was superseded:** it is a ranging argument, so it needs
+        the generator set to be complete, and it grows with the expected
+        set. Set equality needs neither. **Leaving an obsolete
+        completeness argument in the text unmarked is how a builder
+        discharges the weaker obligation and believes the stronger one is
+        met** — the stale-count defect of round 14 in prose form.
       - a bound `close_instance_id` differing from the resolved close's
         instance → assert `work_close_instance_mismatch`, class
         `established`. Then the same with NO bound instance → same code, same
         class, fail closed.
+      - **COLLISION UNDER A RAW-ID KEY.** Two DIFFERENT link fields carrying
+        the same literal: a `close_id` and a `request_id` (a member of
+        `review_request_ids`) both equal to `"shared"`, the close entry
+        `resolved` and the review entry `unreadable` → assert the namespaced
+        key keeps them distinct and the `unreadable` still surfaces. Under a
+        raw-id map the resolved entry MASKS the failing one and the hold
+        disappears, so this case must fail against the unfixed design.
+      - **THE COLLECTION MEMBER'S MISSING-ENTRY PATH, asserted on the SAME
+        fixture.** With that pair in place, drop the
+        `(review_request_ids, "shared")` entry entirely → assert
+        `work_link_map_incomplete` and that the projection did not run.
+        **This is the case the enumerated fixtures previously could not
+        reach**: every other collision fixture pairs two SCALAR fields, so
+        an implementation that validates only scalar keys passes the whole
+        suite while silently dropping a collection MEMBER — and rows 6 and
+        18 mandate key-set validation "including every member of the
+        collection fields" with nothing exercising one. One fixture, two
+        obligations, and the second is the one with no other coverage.
+        **The pair is chosen so both sides are RECORD IDS naming stored
+        records**, which makes the swap below genuinely symmetric. Two
+        earlier versions were weaker. The first paired `close_id` with
+        `onboarding_run_id` and used `not_found` as the second tag; the
+        onboarding deferral removed BOTH that link type AND the only
+        `not_found` producer. The second substituted `gate_scope` in — but
+        `gate_scope` is a live SELECTOR whose envelope carries an evaluation
+        rather than a record, so the two sides were not interchangeable and
+        the case quietly tested something easier than the attack it was
+        written for.
+      - **SWAPPED VALUES under CORRECT keys** — the same two link fields
+        sharing the literal `"shared"`, keyed correctly as
+        `(close_id, "shared")` and `(review_request_ids, "shared")`, but
+        with the
+        two result envelopes EXCHANGED → assert `work_link_map_incomplete`
+        and that the projection did not run. This is a **distinct failure
+        from the raw-key case above and passes every check that catches
+        it**: the key set is exact, both envelopes name `"shared"`, and only
+        comparing each result's carried `(link_field, requested_id)` against
+        its key detects it. A suite containing only the raw-key case reports
+        the namespaced key as verified while this attack succeeds.
+        **The swap MUST be same-type, and this is the correction of an
+        earlier draft that argued otherwise.** That draft paired a close
+        record with a gate evaluation and claimed the type mismatch was a
+        FEATURE — an implementation consuming a visibly wrong KIND of thing
+        would give itself away. But the attack P0-A describes is a swap
+        between two structurally interchangeable envelopes, and a
+        type-mismatched swap is the case an implementation is MOST likely to
+        survive by accident. An implementer who wrote the symmetric swap
+        would have found the mismatched one already passing and concluded
+        the design was covered. **A test that can only fail in the easy
+        direction reports coverage it does not have.**
+        **BONUS COVERAGE, and it is deliberate:** `request_id` is a member of
+        a COLLECTION field, so this one case also exercises key-set
+        validation over collection members — the half that otherwise has no
+        in-amendment producer to drive it. One case, two obligations.
+        **DEPENDENCY, stated here rather than left to be discovered:** this
+        case rests on `review_requested`, whose producer is scheduled by
+        amendment #14 and is therefore OUT OF THIS AMENDMENT'S OBLIGATION
+        MAP. Excluded from the map is not the same as unbuilt — increment 3
+        builds it — but a reader checking this SI against the map alone will
+        not find its producer there.
+      - **THE DELETION TWIN, and it is the case that decides the rule.
+        Its assertions are specified precisely because a
+        "does not reach `GO`" assertion would pass for the wrong
+        reason** — any policy, close, gate, entitlement or tier hold
+        satisfies it while review still quietly accepts the approval,
+        and this document rejects consequence-only tests everywhere
+        else. Required:
+        - **a VALID, successfully-resolved closed bundle — NOT an
+          "everything green" bundle.** The assertion is MEMBERSHIP of a
+          named code, so no unrelated input needs to be green for it to
+          be attributable. **`work_domain_entitlement_unverified` is
+          EXPECTED to be present alongside it** and does not interfere:
+          entitlement verification is not buildable until Open Question
+          #9, so demanding it green would make the test unconstructible.
+          An earlier draft required "every input EXACTLY green ...
+          entitlement verified", which re-imposed the impossible
+          entitlement dependency BY IMPLICATION after the word
+          "injectable" had been removed — **the phrasing changed and the
+          requirement survived.** Do not restore an all-green setup here.
+
+          **AND ITS ESCAPE HATCH WAS ALSO UNSATISFIABLE, which is why the
+          alternative is deleted rather than kept.** That draft offered
+          "**or** a fully specified non-release exemption" as a way out.
+          It is not one: a non-release exemption does not remove
+          `work_domain_entitlement_unverified`, so the exempt branch
+          fails the same "all green" requirement as the release branch.
+          **BOTH branches of that setup were unsatisfiable**, which is
+          the reason neither survives — a reader who reintroduces the
+          exemption clause thinking it rescues an all-green setup would
+          be restoring a second dead end, not an escape.
+        - intact opener + approval + same-head REJECTION first, asserting
+          `work_review_conflict`, so the fixture is shown to be live.
+        - then **DELETE ONLY the rejecting result's file.** Assert
+          `list_invalid_messages()` is EMPTY and
+          `publication_ordered_messages()` SUCCEEDS — the store reports
+          nothing wrong.
+        - assert the **EXACT hold `work_review_completeness_unavailable`
+          with class `unknown`**, and `ok == false`. Not "some hold".
+        - assert the review IS STILL DISPLAYED and its resolver tag is
+          `resolved` — the disposition must not be implemented by
+          suppressing the link.
+        - run the pre-action recheck and assert the verdict is
+          **UNCHANGED**: deletion is persistent, so a recheck repeats the
+          answer rather than repairing it, and a test reading only the
+          first verdict would miss that the failure is durable.
+        - **THE DISCRIMINATING ASSERTION IS A D4 TEST AT THE
+          `compute_verdict` BOUNDARY, NOT A D2 PROJECTION TEST — and the
+          split is load-bearing.** Two earlier drafts got the seam wrong.
+          The first required "assert the SUPERSEDED implementation reaches
+          `GO`" through the real verdict, which is UNOBSERVABLE because
+          the old implementation also holds on
+          `work_domain_entitlement_unverified` (not clearable until Open
+          Question #9). The second moved it to "the projection function" —
+          but the projection over item + ledger + resolved-link-map
+          returns `record_state` + problems and **NO verdict** (rows
+          9-10), so it cannot return `GO` either, and it is D2 while a
+          verdict is D4 (`work check` is forbidden in D2). **The function
+          that consumes a bundle and returns `GO` is
+          `work.compute_verdict`, and it is built in D4.**
+
+          So the obligation SPLITS BY PHASE, and BOTH halves are
+          scheduled:
+          - **D2 OWNS THE FIXTURE** — construct the deleted-evidence Store
+            state (valid opener, valid approval, same-head rejection, then
+            delete the rejection) and assert the store reports nothing
+            wrong. No verdict is asked of D2.
+          - **D4 OWNS THE HOLD-MEMBERSHIP ASSERTION** — resolve that
+            fixture into a bundle, call `compute_verdict`, and assert
+            **`work_review_completeness_unavailable` ∈ `holds`**. Assert
+            membership of a NAMED CODE, never the overall verdict.
+
+          **ASSERT THE CODE, NOT THE VERDICT — a third draft asserted the
+          verdict and manufactured an impossible dependency.** That draft
+          required `GO` versus non-`GO`, which forces an all-green bundle,
+          which forces synthetic VERIFIED entitlement, which requires an
+          input `compute_verdict` does not have: its parameters are
+          `item`, `artifacts`, `lane_eval`, `gate_check`, `close_eval`,
+          `review_eval`, `policy_eval`, `revision`, `roster_eval`,
+          `source_manifest`, `source_errors` — **no entitlement or domain
+          evaluation among them** — the closed bundle rejects an unknown
+          key as `work_bundle_invalid`, and the only `{domain_id,
+          entitlement}` objects here are OUTPUT VIEWS. That draft also
+          justified itself by claiming the signature accepts the field,
+          which is false.
+
+          **The hold-membership form needs none of it.** `holds` is a
+          declared return key, and the disposition fires **irrespective of
+          a bound approval** — so given a bundle in which a review IS
+          required, the code is observable with entitlement UNVERIFIED:
+          the entitlement hold is simply also in the list, and its
+          presence removes nothing. **Note the qualifier: the disposition
+          is irrespective of the APPROVAL, not of the REQUIREMENT.** The
+          fixture must set one of the two requirement sources or the hold
+          correctly does not fire. **The dependency was created by the assertion shape,
+          not by the obligation, so choosing the right shape DISSOLVES the
+          requirement rather than deferring it.** Only the optional
+          divergence-from-legacy variant defers (Open Question #13),
+          because a legacy oracle undefined by name and algorithm would
+          let a constant-`GO` stub satisfy the comparison.
+
+          **This is the amendment's own thesis landing on its own test: an
+          obligation specified downstream of a capability the owning
+          contract does not expose.** It is recorded here rather than
+          quietly dropped because the failure mode is the instructive
+          part — the draft VERIFIED THAT THE DOCUMENT SAID "injectable"
+          and did not check whether `compute_verdict` ACCEPTS it. Reading
+          the claim is not checking the receiver.
+      - **PARTIAL FILTERING BY CORRUPTION MUST NOT REACH `GO` — and the
+        title says CORRUPTION deliberately, because the DELETION variant
+        is covered by its own case above and the two fail for different
+        reasons. A test named
+        for the general defect while covering one half of it is how a
+        suite reports coverage it does not have.** This case is driven
+        from the WORLD rather than from the map, because the defect
+        lives in the resolver and a hand-built map cannot exhibit it. Build
+        a linked review thread with a valid opener, a valid approval, and
+        a same-head REJECTING result. Corrupt **only the rejecting
+        result** — its schema, its signature, or by removing its signer
+        from the roster — then assert the resolution is `unreadable`,
+        the verdict carries `work_source_error` with class `unknown`, and
+        **the item does NOT reach `GO`**. Assert `GO` explicitly, not
+        merely "some hold is present": with the approval still visible,
+        an implementation that misses this returns a well-formed GO and
+        every weaker assertion passes.
+        Run the same case with the rejecting result INTACT and assert
+        `work_review_conflict`, so the test can fail in both directions
+        and cannot be satisfied by a resolver that blocks everything.
+        **This is the amendment's only fail-OPEN case**; the rest of this
+        SI tests states that fail closed, and a suite made only of those
+        trains an implementer to believe non-GO is the safe default here.
     Assert the CLASSES, not the code literals: asserting only "non-GO" passes
     on any of them and collapses an outage, a dangling link, an incomplete map
     and an ABA substitution into one answer.
 
-    **Constructing the map is what makes the `not_found` case testable at
-    all.** No resolver can currently emit that tag, so a test driven from the
-    world could not reach it. The pure-function boundary is what keeps the
-    obligation verifiable ahead of its producers — the objection "you are
-    testing a state that cannot occur" is answered by: it cannot occur YET,
-    and this test is what makes the eventual producer verifiable rather than
-    trusted.
+    **THE MAP IS HAND-BUILT, AND FOR THE `not_found` CASE IT MUST BE.**
+    Stating this explicitly because the SI was previously silent about it,
+    and a test whose input cannot be produced by any live component becomes
+    quietly unconstructible the first time someone tries to drive it from
+    the world. **No resolver in scope can emit `not_found`** — the
+    disclosed-limit table above disposes of every link type by name — so
+    the `not_found` entry is CONSTRUCTED, not obtained. That is legitimate
+    here and not a weakening: this item tests the PROJECTION, a pure
+    function over the map it is handed, and the pure-function boundary is
+    exactly what keeps the obligation verifiable ahead of its producers.
+    The objection "you are testing a state that cannot occur" is answered
+    by: it cannot occur YET, and this test is what makes the eventual
+    producer verifiable rather than trusted. The tag stays in the
+    vocabulary for the same reason — a rule left unwritten because it has
+    no subjects is a rule nobody adds when it acquires some.
 
 ## Threat Model And Honest Limits
 
@@ -3518,8 +4458,21 @@ a named test in D1–D4's acceptance set.
 For a trusted team, on records written through the CLI: which revision
 evidence was produced against, under which policy, by whom, at what
 tier, and whether any of that has drifted from the current revision.
-It makes stale, absent, mis-scoped, corrupt, and insufficient-tier
+It makes stale, mis-scoped, corrupt, and insufficient-tier
 evidence machine-detectable rather than a matter of memory.
+
+**ABSENT evidence is DELIBERATELY NOT on that list, and an earlier draft
+had it there.** This section promised that absent evidence becomes
+machine-detectable while the threat model above declares hand-deletion
+reachable — **and those two cannot both stand.** A deleted record
+produces nothing invalid, nothing malformed and nothing stale; it
+produces NOTHING, and no check keyed on the properties of a present
+record can observe it. Detecting absence requires an independent account
+of what SHOULD be present, which for review links is the
+ordered-but-absent evidence named as an upstream dependency and not yet
+exposed. **The promise was corrected rather than the threat model**,
+because the threat model was right: the capability claim was what had
+outrun the mechanism.
 
 ### What It Does Not Establish
 
@@ -3778,37 +4731,691 @@ anything requiring evidence, rather than a provisional verdict that would
 have to be un-taught later.
 
 **Also NOT in increment 2: link mutation** for `close_id`, `gate_scope`,
-`onboarding_run_id`, `note_ids`, and `review_request_ids`. Those fields stay
+and `review_request_ids`. Those fields stay
 `null`/`[]` from create. They move to **increment 3**, alongside the
 projection that consumes them — a link writer with no reader cannot be
 meaningfully exercised, and building the writer next to its consumer is how a
 wrong shape gets found while it is still cheap to change.
 
 **Increment 3 implements link mutation.** The event types (`close_linked`,
-`gate_scope_set`, `onboarding_linked`, `note_linked`, `review_requested`),
+`gate_scope_set`, `review_requested`),
 their required payloads and their per-type authority are specified in the
-Event Model and are **not** an implementation choice; the mutation semantics
+Event Model and are **not** an implementation choice. **Each link event
+NAMES EXACTLY ONE TARGET and its payload keys are SINGULAR** (`close_id`,
+`gate_scope`, `request_id` — never a list); cardinality is a property of the
+item field, not the event. The mutation semantics
 — scalar rebind by highest valid ledger `seq`, collection append-and-dedupe,
 no unlink — are fixed there too. Increment 3 also implements the
-**resolved-link-map projection input** and the two link outcomes:
+**resolved-link-map projection input** — a pure function performing NO I/O
+— **and its OUTPUT SHAPE: the `record_state` PLUS a list of bounded
+projection problems drawn from the closed HOLD vocabulary**, which the
+caller folds into the verdict's holds. The output is named here because a
+phase line that names only the input is satisfiable by a projection
+returning `record_state` alone, which silently discards every link problem
+the no-I/O input was constructed to carry. Then the two link outcomes:
 `work_link_unresolvable` (the module answered "no such record", class
 `established`) and `work_source_error` (the module could not answer, class
 `unknown`). **Neither may move `record_state`**; an item with an unreadable
 close renders `active · UNKNOWN(1)`.
 
-Increment 3 also carries, and each needs its own test:
+Increment 3 also carries the **Safety Invariant 43** obligations — a link
+failure never moves record state, the two link outcomes are distinguishable,
+and an incomplete map cannot pass — and each item below needs its own test:
 
 - **The closed three-way resolver result** — `resolved` / `not_found` /
-  `unreadable` — each bound to the id it answers for, with the total mapping
+  `unreadable` — each carrying the NAMESPACED identity it answers for, with the total mapping
   to ladder non-match and to hold+class, and the fail-safe degradation rule.
   Both failure tags suppress the ladder row; only the verdict distinguishes
   them.
+- **PER-MODULE RESOLVER DISPOSITION, one per link type in scope, matching
+  the disclosed-limit table.** The `close` resolver MUST emit `unreadable`
+  and never `not_found` (one `CloseError` covers missing, unreadable and
+  malformed). **The `review` resolver MUST emit `unreadable` and never
+  `not_found`**: `Store._validated_messages` silently drops anything
+  failing schema, roster or signature validation and returns `[]` wholesale
+  on a corrupt roster, so an empty result is NOT evidence of absence. This
+  one needs its own test because getting it wrong is a mass failure, not a
+  single-item one — a `not_found`-emitting review resolver would report
+  `work_link_unresolvable`, class `established`, for every review link on
+  every item the moment the roster goes bad, rendering a total outage as a
+  determination.
+- **The resolved link map is keyed by a NAMESPACED link identity** — the
+  pair `(link_field, requested_id)`, never the raw id — **and every result
+  carries that same pair INSIDE the envelope**. A namespaced key with an
+  unnamespaced value is defeated by exchanging two correctly-keyed
+  results; the key is a caller assertion, not a self-authenticating join.
 - **Key-set validation of the resolved link map BEFORE projection**, covering
-  collection members, raising `work_link_map_incomplete`. Omission is the
-  silent failure mode and needs its own assertion.
+  collection members, **and entry-contents validation comparing each
+  result's carried `(link_field, requested_id)` against its key** — both
+  raising `work_link_map_incomplete`. Omission is the
+  silent failure mode and needs its own assertion, and the transposed-value
+  case needs one distinct from the key-set case because it passes the
+  key-set check.
+- **KEY-SET VALIDATION IS AN EXACT-SET COMPARISON —
+  `set(resolved_links) == expected_keys` over the item's WHOLE expected
+  key set including every collection member.** Cardinality comparison,
+  sampled membership, and any-subset check are NON-CONFORMING
+  implementations, and the verdict may not be computed from a proper
+  subset of either set. Named as its own obligation because the line
+  above requires the validation to EXIST and this one requires it to be
+  TOTAL — a cardinality-only validator satisfies the first and admits a
+  balanced replacement.
 - **`close_instance_id` bound with `close_id`**, in the event hash and the
   item projection, compared on every read, `work_close_instance_mismatch` on
   mismatch or absence. Generation changes within an instance stay live.
+- **A close bound with NO instance is REFUSED AT MUTATION TIME**, so the
+  unverifiable state is never created rather than only detected later.
+  `close.load_close` exposes the instance, so the mutation-time resolution
+  already has the hook. Increment 3 ships link mutation and this refusal
+  together: there is no window in which an item can be bound while the
+  refusal is absent.
+- **The `closed` ladder row requires the resolved close's instance to MATCH
+  the bound witness**, not merely that the close resolved. Under an ABA
+  substitution the module answers and the tag is legitimately `resolved`,
+  so a resolution-only row derives `closed` from a close the item never
+  bound. This is the `lane_generation` treatment applied to closes.
+- **`opener_message_id` bound alongside `request_id`** — in the
+  `review_requested` payload, the event hash, and the item projection via
+  the parallel map `review_opener_message_ids`, with **exactly one
+  witness per member** of `review_request_ids` and an id lacking a
+  witness refused at mutation.
+- **THE REVIEW LINK RESOLVES `resolved` AND IS DISPLAYED, and it MUST NOT
+  be resolved through the private pairing.** A clean link resolves
+  `resolved`; the ladder consumes it unchanged and `changes_requested`
+  stays reachable. **Work MUST NOT call `Store._scan_messages_with_paths`**
+  — it is private, row 8 requires the PUBLIC read API, and it applies only
+  file/JSON/stem checks, not the roster and signature gates the attack
+  uses. Binding `opener_message_id` does not make the link
+  satisfaction-safe: the opener can be wholly genuine while a same-head
+  rejection is missing from behind it, so **identity and completeness are
+  separate obligations**. **The SATISFACTION side —
+  `work_review_completeness_unavailable`, which decides whether a
+  required review may contribute `GO` — is a `compute_verdict` behaviour
+  and is therefore a D4 obligation; see Phase D4.** It is named there
+  rather than here because `work check` is forbidden in D2, and scheduling
+  a verdict behaviour in a phase that cannot build it is the phase-level
+  fake carrier this map exists to prevent.
+- **REVIEW RESOLUTION IS READER-INDEPENDENT — BY STRUCTURE, NOT BY
+  ENUMERATING ASKERS.**
+
+  **PROPERTY:** the resolved review envelope is a function of the linked
+  thread's MESSAGES and the item's bound witness ALONE.
+
+  **STRUCTURAL CONSTRAINT (the obligation) — SPEC-FIXED INPUTS, NOT
+  ABSENT ONES.** The review resolver calls
+  `threads.derive_threads(store.valid_messages(), ...)` with **EVERY
+  reader-bearing argument set to a SPEC-FIXED VALUE derived from the
+  ITEM, never from the caller**:
+
+  | argument | REQUIRED value | why it is reader-independent |
+  |---|---|---|
+  | `agent` | the **bound witness's opener SENDER** | an item fact, recorded at mutation; identical for every asker |
+  | `cursor` | `""` | a constant, so every asker derives identically |
+  | `closed_rids` | `set()` | the caller's manual closes are the reader state; an empty set admits none |
+  | `retired` | `set()` | roster state, not item state |
+
+  **The caller's identity, cursor and closes are NEVER passed and never
+  read.** The resolver takes no reader parameter of its own by any route
+  — parameter, attribute of a passed object, bound method, closure, or
+  module ambient.
+
+  **AND THE RETURN TYPE IS A WHITELIST, NOT A BLACKLIST.** The review
+  envelope ADMITS **only** the fields named below, and
+
+  > **THE NAMED SET BELOW IS AUTHORITATIVE.** A `Thread` field **MAY BE
+  > ADMITTED ONLY IF** its value is a function of the linked thread's
+  > MESSAGES and the item's bound witness ALONE — not of `agent`,
+  > `cursor`, `closed_rids`, `retired` or `now`.
+
+  **THAT IS A NECESSARY GATE, NOT A SUFFICIENT ONE, and an earlier draft
+  wrote it as "iff" — which is FALSE.** `subject`, `is_broadcast` and
+  several others ARE message-derived and are deliberately NOT admitted;
+  under an "iff" they would be admitted automatically, and worse, **a new
+  message-derived field in a future upstream release would admit
+  ITSELF** — destroying the one property the inversion exists to
+  guarantee. The allowlist is the authority; the criterion only
+  disqualifies.
+
+  **AND EVERY ENTRY CARRIES ITS MEANING AND ITS TYPE DISCIPLINE, because
+  ADMISSIBLE IS NOT COMPARABLE.** Message-derivation makes a field safe
+  to READ; it says nothing about whether the field may be compared to a
+  witness value.
+
+  | ADMITTED | meaning | TYPE DISCIPLINE |
+  |---|---|---|
+  | `request_id` | the correlation key off the messages' own meta | stable `str` |
+  | `opener_kind` | the opener message's `kind` | stable `str` — **directly comparable** |
+  | `opener_sender` | the opener message's `sender` | stable agent name — **directly comparable** |
+  | `opener_recipient` | the opener's recipient — **a concrete agent on the DIRECT review-request thread**, which is the only thread a review link resolves to (see row 27) | stable agent name — **directly comparable** |
+
+  **Every other review fact — whether a terminal `review-result` exists,
+  its status, and the revision it binds — is derived from the VALIDATED
+  MESSAGE SET DIRECTLY, never read off `Thread`.** Those are message
+  facts; routing them through a derived view is what would import the
+  view's reader-relativity.
+
+  **A FIELD NOT NAMED IS NOT ADMITTED, INCLUDING FIELDS THAT DO NOT EXIST
+  YET.** That last clause is the whole point of inverting.
+
+  **WHY A BLACKLIST WAS WRONG AND IS RETRACTED.** An earlier draft
+  EXCLUDED four fields — `unread`, `role`, `peer`, `age_seconds`. `Thread`
+  is a FOREIGN, VERSIONED dataclass that grows every upstream release
+  (0.14 `rescind_*`, 0.15 `responded_na`/`batch_total`/`audience_kind`,
+  0.16 `next_owner`/`next_action`, 0.18 `audience_retired`), so **an
+  exclusion list is unclosable for exactly the reason enumerate-the-cases
+  was: the space grows and the list does not.** It had already leaked at
+  least three:
+  - **`pending`** excludes RETIRED members (`threads.py:466-467`), and
+    `retired` is one of our fixed arguments — pinned to `set()`, `pending`
+    would report **a retired agent as an owed reviewer**. A
+    review-completeness error inside a review-completeness amendment.
+  - **`audience_retired`** is `[a for a in audience if a in retired]`
+    (`:466`), so under `retired=set()` it is ALWAYS `[]` — a positive
+    assertion that nobody was retired, which is not a fact about the
+    thread.
+  - **`state`** is reader-derived on more than one route, and
+    **`next_owner`/`next_action`** project from it.
+  Naming these three would not have fixed the blacklist; it would have
+  produced a longer list with the same property. **The fix is the
+  inversion, and the three leaks are recorded as evidence that the
+  exclusion form fails in practice and not merely in principle.**
+
+  **WHY THE "NO READER PARAMETERS" FORM WAS WRONG AND IS RETRACTED.** An
+  earlier draft of this row required the resolver not to CALL
+  `derive_threads` and not to receive reader state at all. **That is
+  unbuildable.** At `threads.py:561`, `derive_threads(messages, *, agent,
+  cursor, now=None, closed_rids=None, retired=None)` makes `agent` and
+  `cursor` REQUIRED keywords, it is the only thread-derivation function,
+  and `agent` is a **SELECTOR, not a view filter** — the docstring at
+  `:570` and `:577` say threads where `agent` is neither the opener's
+  sender nor recipient are OMITTED. A resolver forbidden from reader
+  state would have had to fabricate an `agent` to call the only API that
+  exists. **That is an obligation downstream of a capability the owning
+  module does not expose**, the same defect class as the deferred
+  onboarding and note links — and it is worse than the enumeration it
+  replaced, because an unbuildable mechanism cannot be conformed to at
+  all.
+
+  **WHY THE OPENER'S SENDER SPECIFICALLY.** It must be a party or the
+  selector returns nothing, and the opener's sender always is one. The
+  opener's RECIPIENT is NOT admissible: for a broadcast opener
+  `Thread.opener_recipient` is an AUDIENCE LABEL (`threads.py:437`,
+  `:539` — `audience` meta or the literal `"all"`), not an agent name, so
+  passing it would select no thread on exactly the multi-party threads
+  where this matters. The sender is a single agent in both the direct and
+  the broadcast case.
+
+  **WHY FIXED INPUTS BEAT AN ABSENT PARAMETER.** A specified constant is
+  CHECKABLE — a reviewer reads the call site and sees the literal — where
+  an absent parameter is only checkable by proving a negative across
+  every route. The precedent is in the module already:
+  `threads.resolve_operator_answer_target` at `:356` calls
+  `derive_threads(messages, agent=actor, cursor="", closed_rids=set())`,
+  fixing two of the three for exactly this reason.
+
+  **PRODUCER CHECK — CALL *AND* RETURN TYPE.** Owning module `threads.py`;
+  public call `derive_threads`, reached with the validated set from
+  `Store.valid_messages()` per row 8. **The call:** all four
+  reader-bearing arguments are caller-supplied, so all four can be
+  spec-fixed. **The return type:** the `Thread` dataclass, of whose
+  fields the ALLOWLIST NAMES FOUR; every other field is a function of a
+  fixed argument, a display label, or simply not needed. **Checking the
+  CALL alone is what let the blacklist ship** — the arguments were fixed
+  correctly and the leak was entirely on the return side. A producer
+  check that stops at the signature verifies what goes in and not what
+  comes back.
+
+  **NO RAW FIELD COUNT IS STATED HERE, DELIBERATELY.** An earlier draft
+  said "carries 25 fields"; `dataclasses.fields(Thread)` returns **28**,
+  and the same sentence called the allowlist four while the table listed
+  five. **A count of a FOREIGN, VERSIONED dataclass is stale the next
+  time upstream adds a field, and it certifies nothing the allowlist does
+  not already certify** — the whole point of the inversion is that the
+  denominator is irrelevant. Do not reintroduce one; the certifying
+  figure in this amendment is the ROW count.
+
+  **REPRESENTATIVE TEST (not the completeness argument):** resolve ONE
+  opener-only, non-terminal linked thread from two different CALLER
+  contexts — different asking agent, different cursor, and `closed_rids`
+  `{}` versus `{<the linked request_id>}` — and assert the envelope and
+  displayed facts are IDENTICAL. **The variation is now on the CALLER
+  side, which is the only place it can be**, since the fixed arguments
+  make the derivation constant by construction. This DEMONSTRATES the
+  property on one point; the constraint above is what makes it hold at
+  every point, and a build that passes the test while threading a
+  caller value into any of the four fixed arguments is non-conforming
+  regardless of the test.
+
+  **A CORRECTION TO THIS ROW'S OWN API CLAIM, recorded rather than
+  quietly edited, and it was understated TWICE.** An earlier draft
+  justified the fixed `cursor` with "`cursor` feeds ONLY `Thread.unread`".
+  **That is FALSE, and the first correction — "`cursor` also feeds
+  `state`" — was still too narrow.** `state` is a function of **all
+  three** fixed arguments:
+
+  | fixed arg | how it reaches `state` |
+  |---|---|
+  | `cursor` | `unconsumed_to_me = any(m.recipient == agent and m.id > cursor ...)` `:671-673` → `state = "reply-waiting"` `:676` |
+  | `agent` | the same predicate, AND `elif ball == agent: state = "owed-inbound"` `:679` |
+  | `closed_rids` | `if rid in closed_rids: state = "closed"` `:683` |
+
+  Fixing all three still delivers caller-independence, so the MECHANISM
+  is unaffected — but the stated REASON was wrong, and **a false claim
+  about a foreign API must not ship inside a justification, because the
+  next editor reasons from it.** This is the third time this row asserted
+  a property of `threads.py` that reading `threads.py` refutes, and the
+  second time a CORRECTION to it was itself incomplete. **Both times the
+  error was the same shape — naming the first consumer I found and
+  stopping** — which is why `state` is excluded from the whitelist by the
+  criterion rather than by this enumeration.
+
+  **RESIDUAL, NAMED BECAUSE FIXING THE INPUTS DOES NOT FIX IT:** `now`
+  defaults to wall clock and feeds `Thread.age_seconds` (`threads.py:533`,
+  `:703`). That is TIME-relative, not reader-relative — and under the
+  whitelist it is closed anyway, since `age_seconds` is simply not
+  admitted.
+
+  A resolver built on a reader-dependent call makes `record_state`
+  READER-RELATIVE and silently falsifies "record state is a pure function
+  of the item's own records", which the entire ladder rests on.
+
+  **TEST — THE FIXTURE IS PART OF THE CONTRACT, NOT JUST THE INPUTS.**
+  - **FIXTURE (required):** an **OPENER-ONLY, NON-TERMINAL** linked review
+    thread — one whose derivation under EMPTY `closed_rids` is
+    **EXPLICITLY NON-CLOSED**. A terminal thread (opener plus a terminal
+    approved result) does NOT satisfy this fixture.
+  - **VARIATION (required):** hold `agent`, `cursor`, `messages` and
+    `retired` CONSTANT; vary **only `closed_rids`**, `{}` → `{<the linked
+    request_id>}`.
+  - **ASSERT:** the RESOLVER ENVELOPE and the DISPLAYED REVIEW FACTS are
+    IDENTICAL across the two — the tag, the opener identity, the bound
+    results, and their revision binding.
+
+  **BOTH HALVES ARE REQUIRED BECAUSE EACH WAS OMITTED ONCE AND EACH
+  OMISSION MASKS THE DEFECT.** A first draft asked only for "two different
+  `agent`/`cursor`/`closed_rids` triples", satisfiable by differing in
+  `agent` ALONE — which changes nothing a reader-dependent resolver
+  reports, so the test passed trivially. A second draft required
+  `closed_rids` to differ but left the FIXTURE free: on a TERMINAL thread
+  both `{}` and `{request_id}` derive `closed`, the envelopes are EQUAL,
+  and a reader-dependent resolver PASSES again. **The second fix isolated
+  the varied INPUT and not the fixture that makes the variation
+  observable.**
+
+  The general form, and it is why the fixture is specified here rather
+  than implied: **isolating the variable is not enough — the fixture must
+  be one in which varying it CHANGES THE ANSWER for a broken
+  implementation.** A clause isolates by what it REQUIRES of the whole
+  construction, never by what adjacent prose implies.
+
+  **WHAT MAKES THIS TEST FAIL, stated so the discrimination is checkable
+  rather than assumed:** a resolver built directly on `derive_threads`
+  reports the thread as `closed` under `closed_rids={<that
+  request_id>}` and as open under `closed_rids=set()`, so the two
+  envelopes differ and the assertion breaks. A resolver that derives
+  from the messages themselves, without passing the asker through,
+  produces identical envelopes and passes. That is the distinction the
+  test exists to draw.
+
+  **Asserting only that the projected `record_state` matches is VACUOUS
+  under the completeness disposition.** A required review holds the
+  verdict on the `unknown` axis, so both readers fall through to the same
+  state whether or not the resolver is reader-dependent, and the
+  assertion passes for a reason that has nothing to do with what it
+  claims to test. That weaker assertion was written before the
+  disposition existed and was drained of force by it — **a test can be
+  invalidated by a fix elsewhere in the same delta**, so every new test's
+  discriminating question must be re-asked after the other items land.
+- **CREATE EMITS THE RESERVED-AND-UNWRITTEN FIELDS: `onboarding_run_id`
+  as `null` and `note_ids` as `[]`, and NO event type writes either.**
+  Named explicitly here because "reserved-and-unwritten fields" as a
+  category schedules nothing a builder can check off. Both values, and
+  the no-writer half, are obligations: the built code at `de30883`
+  already emits them, so a create that drops them is a regression the
+  exact-match `schema_version` guard cannot see.
+- **THE DELETED-EVIDENCE STORE FIXTURE is a D2 obligation on its own.**
+  Construct it through the real Store — valid opener, valid approval,
+  same-head rejection, then DELETE only the rejection — and assert the
+  store reports nothing wrong: `list_invalid_messages()` empty,
+  `publication_ordered_messages()` succeeding. **D2 builds the state; it
+  asks no verdict of it.** What consumes this state is the D4
+  **hold-membership assertion** — a structural constraint on the
+  disposition's inputs over `holds`, demonstrated by cases A–D, see Phase D4
+  — because `compute_verdict` is forbidden in D2. **The
+  divergence-from-legacy comparison is NOT an obligation of either
+  phase**: it is deferred to Open Question #13 and needs a legacy oracle
+  defined by name and algorithm, which does not exist. An earlier draft
+  of this line still pointed a D2 reader at "the oracle divergence ... a
+  D4 obligation" after that comparison had been deferred — **the
+  deferral landed at the Open Question and not here**, so one live
+  obligation had two contradictory descriptions. Named as the fixture
+  rather than "the deletion twin test" because an earlier map cited a
+  list lead-in for this row and scheduled the whole test, half of which
+  this phase cannot build.
+- **The review link is verified at MUTATION and on EVERY READ against
+  FOUR enumerated values — `message_id`, KIND (`review-request`), SENDER,
+  RECIPIENT** — raising `work_review_thread_mismatch`, class
+  `established`.
+
+  **PROPERTY:** the opener matches the bound witness in ALL FOUR values,
+  for EVERY member of the link collection.
+
+  **THE PROPERTY IS THE OBLIGATION; ITS ENFORCEMENT SHIPS IN TWO PARTS,
+  because one of the four values has no authoritative public source
+  today.** The specification below is written once, over the full
+  four-value tuple, and the ENFORCED TUPLE is a named subset that grows
+  when the upstream capability lands. Nothing about the design changes at
+  that point.
+
+  **STRUCTURAL CONSTRAINT (the obligation):** the check is a **TOTAL
+  EQUALITY over the ENFORCED WITNESS TUPLE and the whole collection** —
+  the tuple compared as a unit, evaluated for every member, with **NO
+  EARLY EXIT AND NO PER-FIELD OR PER-MEMBER EXEMPTION**: a conforming
+  implementation may not reach its verdict from a proper subset of the
+  enforced values or a proper subset of the members. **The fields and the
+  members are DATA to one comparison, never separate branches**, at both
+  promised boundaries — MUTATION and READ.
+
+  **ENFORCED TUPLE, INTERIM (D2, buildable now): KIND, SENDER,
+  RECIPIENT** — each an EQUALITY against row 33's admitted values:
+
+  | value | assertion |
+  |---|---|
+  | KIND | `witness.kind == opener_kind` |
+  | SENDER | `witness.sender == opener_sender` |
+  | RECIPIENT | `witness.recipient == opener_recipient` |
+
+  **WHY PLAIN EQUALITY IS CORRECT AND SUFFICIENT: A REVIEW-REQUEST
+  OPENER ALWAYS RESOLVES TO A *DIRECT* THREAD, BY DESIGN UPSTREAM.**
+  `derive_threads` enters broadcast derivation for `kind == "question"
+  AND a `broadcast_id`` and nothing else (`threads.py:604-607`), and the
+  design comment there is explicit that a `send --kind review-request
+  --meta audience=...` is deliberately kept on the DIRECT path, because
+  "a review-result wouldn't close it" on the multi-party one. The CLI
+  cannot produce the alternative either: `broadcast --kind` accepts only
+  `message`, `note`, `question` (`cli.py:12353-12355`) — **`review-request`
+  is not a broadcastable kind.** On the direct path `opener_recipient` is
+  `responder`, a concrete agent (`:728`).
+
+  **AND THE KIND CLAUSE GATES THE ONLY OTHER WAY IN.** A broadcast opener
+  is necessarily `kind == "question"`, which is not `review-request`, so
+  the tuple's KIND equality rejects it before the recipient comparison is
+  ever reached. **`opener_recipient` is therefore a concrete agent
+  everywhere this comparison runs, and no type-varies-by-path problem
+  exists.**
+
+  **BROADCAST IS A HOSTILE ALIAS HERE, NOT A GENUINE PATH.** Multi-
+  reviewer review is modeled as **MULTIPLE DIRECT COLLECTION MEMBERS** —
+  one direct `review-request` each — which the per-member loop already
+  handles. No broadcast semantics are needed at the link level.
+
+  **AN EARLIER DRAFT MADE THIS A MEMBERSHIP TEST OVER A `recipient_set`
+  BUILT FROM `audience`, ON THE PREMISE THAT "review requests FAN OUT, so
+  broadcast is the PRIMARY case". THAT PREMISE IS FALSE FOR THE OWNING
+  API** — the broadcast review-request thread is UNPRODUCIBLE — so the
+  machinery solved a path that cannot exist, and it manufactured a
+  required test (a recipient-only mismatch on a broadcast review-request
+  thread) that **no permitted construction can build.** An unbuildable
+  test is a worse defect than the mistyped comparison it was added to
+  fix.
+
+  **THE LESSON IS ABOUT THE PREMISE, NOT THE REMEDY.** Each of the three
+  prior versions of this clause was producer-checked — and the check was
+  run on the FIX every time, never on the FINDING'S PREMISE. The question
+  that was never asked is **"does the case this finding is about actually
+  exist in the producer?"** It did not, and a correct-looking fix to a
+  non-existent case is still churn. **This also MOOTS the
+  broadcast-discriminator question** — with no broadcast branch there is
+  no `is_broadcast`/`audience` discriminator to admit and no
+  source-of-truth split from re-deriving broadcast-ness.
+
+  **ENFORCED TUPLE, ON #48: all four**, `message_id` added to the same
+  loop. **The loop does not change shape** — it gains a member — which is
+  what makes this an interim and not a different mechanism.
+
+  **WHAT THE INTERIM CATCHES, and it is the demonstrated attack.** The
+  published aliasing construction turns on `derive_threads` grouping
+  SOLELY by `request_id` and flipping the whole group to broadcast
+  derivation when any broadcast QUESTION carries that id — a
+  **different-KIND message from a DIFFERENT SENDER**. **The KIND equality
+  alone refutes it**, because a broadcast opener is necessarily a
+  `question`; sender and recipient close the two party-substitution
+  variants. **The interim is not a token subset — it is the subset that
+  stops every attack anyone has exhibited.**
+
+  **WHAT THE INTERIM DOES NOT CATCH — stated as precisely as I can make
+  it, because a vague residual is an unfalsifiable one AND BECAUSE THE
+  DECISION TO SHIP WAS MADE ON THIS DISCLOSURE.** A message that is **the
+  same KIND (`review-request`), from the same SENDER, to the same
+  RECIPIENT, carrying the same `request_id`, and is nonetheless not the
+  message the item bound** is NOT distinguished. Identity of PARTIES AND
+  ROLE is enforced; identity of the MESSAGE is not. Concretely: a second,
+  later `review-request` between the same two agents, on the same
+  `request_id`, can alias the bound one. **This is the DIRECT-path
+  residual and it is the amendment's only one.**
+
+  **A DISCLOSED RESIDUAL THAT IS NARROWER THAN THE TRUE ONE IS WORSE THAN
+  NO DISCLOSURE** — it makes a ship decision wrong on INFORMATION rather
+  than on judgement, and the reader cannot tell, because the disclosure
+  is exactly where they would look to check. That standard is why this
+  sentence has now been rewritten three times, and it is the reason to
+  re-derive it from the enforced tuple every time that tuple changes
+  rather than editing the previous wording.
+
+  **DEPENDENCY: issue #48** — expose an AUTHORITATIVE opener message id
+  on the public surface. **The gap is real and neither existing surface
+  closes it:** `Thread` carries no opener message id
+  (`threads.py:112-168`), and `Store.valid_messages()` carries every
+  message's `id` but **cannot identify WHICH message `derive_threads`
+  selected as the opener** — work would have to re-implement the
+  module's opener-selection rule to guess, which is the private-logic
+  duplication row 8 exists to forbid.
+
+  **AND #48 IS A SURFACING, NOT A NEW CAPABILITY — which is worth
+  recording on the issue.** `derive_threads` ALREADY MAKES the
+  determination internally on both paths: `first_opener_id = min(m.id for
+  m in openers)` at `:438` on the broadcast path, and `opener = next((m
+  for m in group if m.kind in OPENER_KINDS), None)` at `:616` on the
+  direct one. **The authoritative value exists inside the function and is
+  discarded before the `Thread` is built.** That is why the gap is
+  narrow, why the fix needs no new derivation, and why the interim can
+  reasonably wait on it rather than route around it. This follows the
+  note_ids / onboarding-links / #44-full-gate pattern: **the obligation
+  is specified in full, the enforcement's message-id half waits on the
+  capability, and the interim is the conservative subset that is
+  buildable today.** When #48 lands, `message_id` joins the enforced
+  tuple and this residual closes with no design change.
+
+  **WHY A TOTAL COMPARISON AND NOT "A LOOP OVER THE FOUR FIELDS."** A loop
+  is a code shape, and a loop with a `continue`, a short-circuit, or a
+  field the caller may omit satisfies the shape while checking three of
+  four — the same free-dimension problem one level up. Requiring the
+  verdict to be a function of the COMPLETE witness tuple over the
+  COMPLETE collection removes the dimension itself: there is no subset
+  for an implementation to vary over, so the 2^4 field-subset lattice
+  and the per-member lattice both collapse. **This constraint, not a case
+  count, is the completeness argument.**
+
+  **PRODUCER CHECK — THE INTERIM PASSES.** The comparison is work-owned;
+  the three enforced values come from `opener_kind`, `opener_sender` and
+  `opener_recipient` on the `Thread` returned by `derive_threads`, **all
+  three inside row 33's admitted allowlist, which is why the two rows are
+  drafted against each other.** Buildable against the public surface
+  today, with no per-path branch, because review-request openers resolve
+  DIRECT.
+
+  **AND THE PRODUCER CHECK MUST RUN ON THE PREMISE, NOT ONLY THE
+  REMEDY.** Three successive versions of this clause were each
+  producer-checked and each check was aimed at the FIX. The unasked
+  question was **"does the case this finding is about actually exist in
+  the producer?"** — and for the broadcast review-request thread the
+  answer is no. Availability, determination, TYPE, and **EXISTENCE OF THE
+  CASE**: a fix is only as sound as the premise it answers.
+
+  **"The value is reachable" never establishes "the mechanism is
+  buildable"; only "the owning API exposes the DETERMINATION the
+  mechanism needs, in a form the comparison can consume" does** — and
+  `message_id` is the standing example: its values are reachable through
+  `Store.valid_messages()` and the SELECTION is not, which is #48.
+
+  **`last_msg_id` IS THE SPECIFIC WRONG ANSWER FOR THE FOURTH VALUE,
+  named so a builder meets the trap in the text rather than in
+  production.** `Thread.last_msg_id` is the LAST message in the
+  correlated group, not the opener — **the two coincide on an
+  opener-only thread and diverge the moment a reply exists.** A build
+  comparing a `message_id` witness against `last_msg_id` passes every
+  opener-only fixture, including the representative tests below, and
+  admits the aliased opener in production. **Three of the four values sit
+  on `Thread` and the fourth does not, which is exactly the shape that
+  invites the substitution** — so `message_id` is EXCLUDED from the
+  enforced tuple until #48, rather than enforced against a lookalike.
+  **A check built on the wrong source is worse than a disclosed absent
+  one: it reports coverage it does not have.**
+
+  **REPRESENTATIVE TESTS (not the completeness argument):** at each
+  boundary, one case per ENFORCED value — **three at MUTATION and three
+  at READ under the interim** — in which **EXACTLY ONE** mismatches the
+  bound witness and **the others MATCH it**, asserting
+  `work_review_thread_mismatch`; plus one case where the sole mismatch is
+  on a NON-FIRST collection member. **The count follows the enforced
+  tuple and is not itself the obligation** — it becomes four-and-four on
+  #48, which is the intended and only change.
+
+  **THE RECIPIENT-ISOLATED CASE RUNS ON A DIRECT `review-request`
+  THREAD** — KIND and SENDER matching, RECIPIENT differing — which is the
+  path that exists and is buildable now. **An earlier draft demanded this
+  case on a BROADCAST review-request thread as well; no permitted
+  construction can build that**, so the requirement was unsatisfiable and
+  the carrier failed constructibility.
+
+  **THE BROADCAST-QUESTION ALIAS IS TESTED AS A REJECTED HOSTILE INPUT,
+  not as a genuine fan-out.** It is one of the different-KIND cases: the
+  aliasing opener is necessarily `kind == "question"`, the KIND equality
+  rejects it, and the test asserts that rejection. **Framing it as a
+  hostile input rather than a supported path is what keeps the test
+  buildable and the contract accurate.**
+
+  **PLUS ONE TEST THE INTERIM OWES: the DISCLOSED RESIDUAL, asserted as
+  PRESENT.** Construct the same-KIND, same-SENDER, same-RECIPIENT
+  aliasing message on a direct thread, and assert the check does NOT
+  fire.
+  **A disclosed gap with no test is a claim; with a test it is a fact
+  that fails loudly the day #48 lands** — the assertion inverts, which is
+  exactly the signal that the residual has closed and this row must be
+  revisited.
+
+  **"Each needs coverage" is not a construction constraint, and an earlier
+  draft stopped there.** That wording permits a single COMBINED fixture
+  with all four values wrong — against which an implementation checking
+  only ONE field still rejects the opener and PASSES, while three of the
+  four checks are absent. The isolated cases are what fail it: a
+  one-field implementation fails the three cases whose single mismatch it
+  does not inspect. **A combined fixture tests the disjunction; isolated
+  cases test the conjunction, and the conjunction is what is promised.**
+  But the cases DEMONSTRATE the constraint and do not establish it — a
+  build passing all eight while exempting a member or a caller-omitted
+  field is non-conforming regardless of the tests.
+
+  The reason all four matter: `derive_threads` groups solely by
+  `request_id` and flips the whole group to broadcast derivation when any
+  broadcast question carries that id, so **an id-only check accepts a
+  valid message of the wrong kind aliasing in** — the published
+  construction. Do not collapse sender and recipient into one "parties"
+  assertion; a check that verifies one of them still admits the attack
+  from the other side. That prohibition constrains the RULE, and the four
+  isolated cases constrain the TEST — they are different obligations and
+  an earlier sweep cleared this row on the first while the second was
+  still open.
+- **The `review` ladder row requires the opener to MATCH the bound
+  witness**, not merely that a thread resolved — the same
+  resolution-is-not-identity argument as the `closed` row, and it must be
+  tested the same way.
+- **Create emits `close_instance_id` and `review_opener_message_ids`
+  explicitly**, so the fields and their only writers ship together and
+  no item is created lacking a key the schema declares. The built code at
+  `de30883` emits neither today; increment 3 is where that closes.
+- **The UNKNOWN-FIELD and MISSING-FIELD reader rules — SCHEMA-DRIVEN BY
+  STRUCTURE, not per-field by enumeration.**
+
+  **PROPERTY:** every absent declared field yields the default determined
+  by its DECLARED SCHEMA CLASS, uniformly, for all declared fields.
+
+  **STRUCTURAL CONSTRAINT (the obligation):** the reader derives an absent
+  field's value **SOLELY from that field's declared schema entry** — its
+  class (minimum-create / nullable-scalar / collection / map) — and the
+  derivation **TAKES THE FIELD'S NAME AS DATA, NEVER AS CONTROL FLOW** —
+  stated as exactly one permission and one prohibition:
+
+  **PERMITTED, and it is the ONLY name-keyed step:** a single lookup
+  `entry = SCHEMA[field_name]` against the closed schema table. The table
+  MUST cover **every declared field EXACTLY ONCE** — total and
+  non-overlapping, so a missing or duplicated field is a build error and
+  not a silent default.
+
+  **PROHIBITED: any name-dependent control AFTER that lookup.** No
+  branch, condition, table or special case downstream may key on
+  `field_name`; everything from the lookup on dispatches **solely on
+  `entry.class`**.
+
+  **The one lookup is DATA; everything downstream is CLASS-DRIVEN.** An
+  earlier draft wrote only the prohibition — "no branch, table or
+  condition anywhere in the reader may key on a specific field NAME" —
+  while the producer-check paragraph below REQUIRED a schema table
+  mapping field to class. **A field-to-class table IS a name-keyed table,
+  so the row forbade the very lookup it demanded and was unbuildable as
+  literally written.** The two-part form is what the mechanism always
+  meant: the name selects the DESCRIPTION, never the OUTCOME.
+
+  **WHY "NAME AS DATA, NOT CONTROL FLOW" AND NOT "A SINGLE DISPATCHER."**
+  "One code path" is not checkable from outside and is satisfiable by a
+  dispatcher containing a per-field special case — the shape holds and
+  the uniformity does not. Forbidding the field NAME as a control input
+  is the property itself: if the name may only SELECT A DESCRIPTION and
+  no decision downstream may branch on which field it is, **field
+  identity is structurally incapable of changing the outcome**,
+  and the 2^24 residue over 28 declared fields collapses to the four
+  class outcomes. That is why this constraint, and not a longer case
+  list, is the completeness argument.
+
+  **CLASS PARTITION (the finite thing the constraint ranges over)** —
+  every declared field falls in exactly one, so the classes exhaust the
+  space and a fifth default shape would require a fifth entry here:
+
+  | absent field is… | required outcome |
+  |---|---|
+  | nullable-at-create | reads as `null` |
+  | a COLLECTION | reads as `[]` |
+  | a MAP | reads as `{}` |
+  | in the MINIMUM CREATE SHAPE | **refused — `work_malformed_item`** |
+
+  **PRODUCER CHECK — AND IT ADDS A BUILD OBLIGATION.** The reader is
+  work-owned, so no foreign API is crossed. But the mechanism consumes a
+  **DECLARED SCHEMA ENTRY**, and this document declares the partition in
+  PROSE — the minimum create shape and the nullable-or-empty list. **D2
+  MUST therefore build that partition AS DATA** — a schema table mapping
+  each declared field to its class, consulted by the reader — because a
+  reader cannot derive a default from a paragraph. Stated explicitly:
+  without it this mechanism is unbuildable for the same reason the
+  retracted row-33 form was, and the prose would look like a
+  specification while supplying no callable surface.
+
+  **REPRESENTATIVE TESTS (not the completeness argument):** the
+  undeclared-key-present case, plus one absent-field case per class
+  above. These demonstrate each class outcome; **the name-not-control
+  constraint is what extends them to all 28 declared fields.**
+
+  **WHY THE TESTS ALONE WOULD NOT SUFFICE, recorded because an earlier
+  draft treated them as the argument.** One case per class constrains
+  four fields and leaves the other twenty-four free — 2^24 implementations
+  handle a representative correctly and a sibling in the same class
+  wrongly. Enumerating fields does not fix that either; only forbidding
+  field identity as a control input does, which is why the obligation is
+  the constraint and the cases are its demonstration.
+
+  This is what makes reserved-and-unwritten fields safe against a producer
+  that has not caught up AND one that has run ahead — `schema_version` is
+  checked EXACT-MATCH, so neither shape change is visible to the version
+  guard.
 
 Three obligations increment 3 must carry that no earlier phase line does:
 
@@ -3823,9 +5430,10 @@ Three obligations increment 3 must carry that no earlier phase line does:
   would silently outrank every row below it — an unreadable close would
   present as a settled `closed`, which is an outage wearing a terminal state.
   An unresolved link makes its row not match and evaluation continues.
-- **The bound-xor-curation-mutable construction test covers the four link
-  payload fields** (`close_id`, `gate_scope`, `onboarding_run_id`,
-  `note_id`). Without it these are curation-mutable in practice and a forged
+- **The bound-xor-curation-mutable construction test covers the FIVE link
+  payload fields** (`close_id`, `close_instance_id`, `gate_scope`,
+  `request_id`, `opener_message_id`). Without it these are curation-mutable in practice
+  and a forged
   curation event can move a link. **This carrier closes a PRE-EXISTING gap**:
   the partition rule predates amendment #15 and has never had a phase line —
   #15 does not create the gap, it enlarges the population exposed by it.
@@ -3908,6 +5516,232 @@ Implement:
   regression to be tuned away. An implementer who finds every item
   blocked here has implemented it correctly; the fix is the granting
   mechanism, never a waiver of the hold.
+- **`work_review_completeness_unavailable` — the WORK-OWNED SATISFACTION
+  DISPOSITION, appended by `compute_verdict`, class `unknown`.** It fires
+  for EITHER of the two enumerated sources that make a review required —
+  the release baseline, or `required_review: true` on a matched policy
+  entry — and **IRRESPECTIVE of whether a bound approved result exists**,
+  because the unknowable part is what is ABSENT. It binds here, not in
+  D2, because it is a `compute_verdict` behaviour and `work check` does
+  not exist until D4; the D2 resolver only produces the `resolved` link
+  this consumes. **Do NOT overload the resolver tag** — "what the module
+  answered" and "may this satisfy a requirement" are different questions
+  with different owners. The hold does not clear by repairing the item;
+  it lifts only when both upstream capabilities land (full-gate atomic
+  completeness AND ordered-but-absent evidence), which is stated at the
+  hold's definition.
+- **THE DELETED-EVIDENCE HOLD-MEMBERSHIP ASSERTION — A STRUCTURAL
+  CONSTRAINT ON THE DISPOSITION'S INPUTS, DEMONSTRATED BY FOUR CASES A
+  THROUGH D.** The constraint is the obligation and the cases are its
+  demonstration; **an earlier draft made the COUNT the point, which is
+  the defect this rewrite removes** — a count grows with the input space
+  and a constraint on inputs does not. Every case carries the row-34
+  deleted-evidence review result in a VALID, successfully-resolved closed
+  bundle. Then:
+
+  | case | requirement source — **each case turns the OTHER source OFF** | assertion |
+  |---|---|---|
+  | **A** | the RELEASE BASELINE requires a review, **AND `required_review` is `false`/absent on EVERY matched policy entry** so the policy source is provably inactive | `work_review_completeness_unavailable` **∈** `holds` |
+  | **B** | **provably NON-release** so the baseline source is provably inactive, AND `required_review: true` on a matched policy entry | code **∈** `holds` |
+  | **C** | the same non-release bundle, requirement source **ABSENT** on both axes | code **∉** `holds` |
+  | **D** | **BOTH sources active** — the release baseline requires a review AND `required_review: true` on a matched policy entry | code **∈** `holds` |
+
+  Assert MEMBERSHIP OF A NAMED CODE, never the overall verdict.
+
+  **CASE D EXISTS BECAUSE A, B AND C LEAVE THE BOTH-ACTIVE CORNER
+  UNTESTED, and that corner is FAIL-OPEN.** Enumerating every boolean
+  function of `(baseline, policy)` — sixteen candidate implementations —
+  **exactly two pass A, B and C**: the correct `baseline OR policy`, and
+  an XOR-shaped implementation that fires the hold when exactly one
+  source requires a review and **NOT when both do**. The second is a
+  real defect and the worse kind: an item that is release-blocking AND
+  carries a `required_review: true` policy entry is an ordinary state,
+  and under the XOR implementation the completeness hold is simply
+  ABSENT there — the review link contributes to `GO` exactly where the
+  requirement is strongest. Case D pins `(true, true)` and reduces the
+  passing set to the correct implementation alone.
+
+  **The three-case set was isolated per-branch and still incomplete over
+  the input space**, which is the distinction worth keeping: A and B
+  prove each branch is present, C proves the conjunction is conditional,
+  and none of them constrains behaviour when the branches overlap. A case
+  per MEMBER is not the same as a case per POINT of the space the members
+  span.
+
+  **THE "OTHER SOURCE OFF" CLAUSE IS WHAT MAKES A AND B ISOLATE, AND IT IS
+  NOT DECORATION.** B was already isolated because *provably non-release*
+  turns the BASELINE off. **A needs the same move on the other axis** —
+  turning POLICY off — and an earlier draft omitted it, requiring only
+  "the release baseline requires a review."
+
+  Why that omission defeated the whole suite: a conforming test could then
+  set BOTH sources active in A, and a release-baseline fixture pulls policy
+  inputs in anyway — the example rule in this document sets
+  `required_review: true`. Against `A=(release ✓, policy ✓)`,
+  `B=(✗, ✓)`, `C=(✗, ✗)`, an implementation that **DROPS the baseline
+  branch but keeps policy** passes all three: A's hold comes from policy,
+  B's from policy, C fires nothing. **Case A tested "at least one source
+  fires," not "the baseline fires."**
+
+  **A case isolates a branch because its construction FORBIDS the others,
+  not because it is INTENDED to exercise that branch alone.** An
+  enumerated trigger needs a case per MEMBER *and* each case must turn the
+  other members OFF; otherwise the suite proves only that the disjunction
+  is non-empty.
+
+  **THE BUNDLE IS VALID, NOT "ALL GREEN", and that distinction is load
+  bearing.** `work_domain_entitlement_unverified` is EXPECTED to be
+  present in `holds` in every case here, and it does not interfere —
+  membership of one code says nothing about the presence of another.
+  Requiring an all-green bundle would demand verified entitlement, which
+  is not buildable until Open Question #9, and would make this test
+  unconstructible for exactly the reason an earlier draft was. **Do not
+  re-impose "every input green" in any phrasing**: that requirement has
+  already survived one rewrite by implication after the explicit wording
+  was deleted.
+
+  **WHY FOUR AND NOT ONE, stated as what each case proves rather than as
+  a coverage claim.** With the other-source-off clause in place, each case
+  fails exactly one failure mode:
+  - **A** fails a build that DROPPED THE BASELINE BRANCH — its hold can
+    only originate in the baseline, because policy is provably inactive.
+  - **B** fails a build that DROPPED THE POLICY BRANCH — its hold can only
+    originate in policy, because the bundle is provably non-release.
+  - **C** fails a build that DROPPED THE CONDITIONALITY — the only case
+    that proves EXCLUSION rather than admission.
+  - **D** fails a build that MIS-HANDLES THE OVERLAP — an XOR-shaped
+    implementation that fires when exactly one source requires a review
+    and omits the hold when BOTH do. A, B and C never constrain the
+    both-active point, and omitting the hold there is fail-open at the
+    strongest-requirement state.
+  Each of the four is load-bearing against a distinct defect, and none
+  substitutes for another.
+
+  **AND THE FOUR CASES ARE NOT THE COMPLETENESS ARGUMENT — THE STRUCTURAL
+  CONSTRAINT BELOW IS.** Cases enumerate points; the constraint on the
+  disposition's INPUTS is what forbids the variance.
+
+  **STRUCTURAL CONSTRAINT (the obligation), on two axes:**
+
+  **(i) THE REQUIREMENT AXIS IS A DISJUNCTION OVER THE ENUMERATED SOURCE
+  SET — NOT AN ARBITRARY PREDICATE OF THEM.** The disposition is appended
+  when ANY member of the enumerated requirement-source set is active:
+  the disposition is `ANY(sources_active)`, sources evaluated
+  INDEPENDENTLY, **and no source's contribution may be conditioned on
+  another source's value.** This is a MONOTONE requirement: turning an
+  additional source ON may never remove the disposition.
+
+  **(ii) THE APPROVAL AXIS IS OUTSIDE THE PREDICATE'S INPUT BOUNDARY.**
+  The disposition's trigger is computed by a **SEPARATE, NAMED PREDICATE
+  whose ENTIRE INPUT is the normalized requirement-source values** — one
+  boolean per enumerated source, nothing else:
+
+  ```python
+  def _review_completeness_required(*, baseline_requires: bool,
+                                    policy_requires: bool) -> bool:
+      return baseline_requires or policy_requires
+  ```
+
+  **`review_eval` is NOT in its input, and MUST NOT reach it by any route
+  — parameter, closure, attribute of a passed object, callback, or module
+  ambient.** `compute_verdict` may consume `review_eval` freely
+  elsewhere; **this predicate cannot see it.**
+
+  **WHY FACTORING IT OUT AND NOT A RULE ABOUT THE PATH.** The
+  countermodel is `(baseline OR policy) AND approval_present` — a
+  fail-open that omits the hold exactly when an approval exists, which is
+  the state the hold is about. Inside `compute_verdict` that expression
+  is WRITABLE in a fully conforming signature, so a path rule rules it
+  out only by review. **Behind this boundary the countermodel is
+  INEXPRESSIBLE: `approval_present` is not a name the predicate can
+  reach.** Both clauses are now enforced by structure, and (i) and (ii)
+  are the same STRENGTH.
+
+  **AN EARLIER DRAFT DISCLOSED THIS GAP INSTEAD OF CLOSING IT**, writing
+  that (ii) was "weaker than (i)" and "discharged by reading". An honest
+  disclosure of an unstructural constraint is still an unstructural
+  constraint — **naming a weakness does not convert it into a
+  mechanism**, and the two clauses sat under one "STRUCTURAL CONSTRAINT"
+  heading while only one of them was.
+
+  **PRODUCER CHECK — CALL AND RETURN.** Work-owned on both sides: the
+  disposition is work's, the predicate is work's, and its two inputs are
+  booleans work normalizes from parameters it already receives. The
+  return is a `bool`, so there is no envelope to whitelist. Both
+  requirement sources are reachable
+  from the DECLARED parameters — the release baseline from `close_eval`
+  (the close's `scope`) and `policy_eval` (`release_scoped` on matched
+  rules) per The Release Baseline's total truth table, and source 2 from
+  `policy_eval`'s `required_review`. **The producer does not exist yet:
+  `compute_verdict` for work is a D4 build, and the only `compute_verdict`
+  functions in the tree today are `close.py:146` and `lanes.py:295`.** So
+  this check is against the signature this document DECLARES, and it says
+  what a check against built code would not: the two sources are carried
+  and the approval is carried alongside them.
+
+  **WHY THESE TWO AND NOT A LONGER CASE LIST.** The four-case set pins
+  four points of the `(baseline, policy)` square; sixteen boolean
+  functions range over that square, and adding a third source would make
+  it 256 with the case list needing to grow again — the fractal shape.
+  Constraint (i) removes the range: **only ONE boolean function is a
+  source-independent monotone disjunction**, so the XOR survivor and
+  every other non-disjunction is excluded by construction and the
+  argument does not grow when a source is added. Constraint (ii) removes
+  the approval dimension by forbidding the read rather than testing its
+  absence — **a test can only sample approval states; a
+  not-an-input constraint covers all of them.**
+
+  **REPRESENTATIVE TESTS (not the completeness argument):** cases A–D
+  above, each demonstrating one failure mode. A build that passes all
+  four while conditioning one source on the other, or while reading the
+  approval on this path, violates the constraint and is non-conforming
+  regardless of the cases.
+
+  **A POSITIVE-ONLY TEST DOES NOT DISCRIMINATE A TRIGGER-DROP, and an
+  earlier draft claimed it did.** That draft said a single positive case
+  made the test "exercise the two-source trigger AND the disposition, so
+  a build that drops EITHER one fails it." **False:** a build whose
+  trigger is intact and a build whose trigger was deleted (firing
+  unconditionally) BOTH produce the hold when a review is required, so
+  both PASS. A positive case proves the trigger ADMITS the required case
+  and says nothing about whether it EXCLUDES the not-required case —
+  which is precisely the half a trigger-drop breaks. Case C is that half.
+  Row 30's precedent applies: **BOTH directions, separate cases.** That
+  draft had two directions and one case, and asserted the coverage it had
+  not bought.
+
+  **The trap case C protects against is still live and must stay
+  visible:** if a builder writes only positives and one fails because no
+  review was required, the tempting repair is to make the disposition
+  fire unconditionally — deleting the two-source trigger. C makes that
+  repair fail loudly instead of passing silently.
+
+  It needs nothing this document does not define: `compute_verdict`
+  returns `{verdict, holds, ok}`, so `holds` is a declared key, and a
+  test may synthesize the bundle from dicts — the pure/testable split is
+  intended usage, not a workaround.
+
+  **THE ASSERTION SHAPE IS THE POINT, and an earlier draft got it
+  wrong.** That draft asserted `GO` versus non-`GO`, which forced an
+  all-green bundle, which forced synthetic VERIFIED entitlement, which
+  required an entitlement input `compute_verdict` does not have — its
+  parameters carry no entitlement or domain evaluation and the closed
+  bundle rejects unknown keys as `work_bundle_invalid`. **The dependency
+  was manufactured by the wrong assertion, not by the obligation.** Under
+  hold-membership the entitlement hold is simply also present in `holds`
+  and does not interfere: `work_domain_entitlement_unverified` blocks
+  `GO`, but nothing about it removes another code from the list. So the
+  test runs today with entitlement unverified, and **no entitlement input
+  is needed — the requirement dissolves rather than defers.**
+
+  **This does NOT expand `compute_verdict`.** The test uses the function
+  exactly as declared. That is what distinguishes this from the note/
+  onboarding shape: there the capability genuinely did not exist and the
+  link was deferred; here the capability — observe a named hold — already
+  exists and an earlier draft was asking the wrong question of it.
+
+  The optional DIVERGENCE-FROM-LEGACY variant is not scheduled; see Open
+  Question #13.
 
 Do NOT implement: assurance ingestion, CI adapters, merge automation, or
 any dashboard surface. Do **not** implement entitlement VERIFICATION —
@@ -4035,6 +5869,312 @@ needs it — not during it.
    into a permanent silent exemption for precisely the population created
    while the gap was open.
 
+10. **Note links: authoritative-vs-latest-vs-retracted note identity.**
+    **The LINK is DEFERRED; the FIELD stays.** `note_ids` is removed from
+    the LINKABLE SET by amendment #15 rather than left half-specified, and
+    is retained in the item schema as RESERVED-AND-UNWRITTEN. An earlier
+    draft of this entry said the field was "REMOVED", which was true of a
+    draft that deleted it from the schema and is false now — see the
+    reserved-and-unwritten rule and the built-code citation that reversed
+    it. Deferring the link costs no capability: a reachability sweep found
+    **zero verdict consumers** — every mention was the field defining
+    itself (schema, payload, cardinality, carriers), and a count of
+    mentions is not a count of consumers.
+
+    **THE MODULE CANNOT BE ASKED AT ALL, WHICH IS A STRONGER STATEMENT
+    THAN "DEFERRED" AND DECIDES WHAT RESTORATION COSTS.** Both knowledge
+    and onboarding expose a function named `read_events`, and **the
+    ARITIES DIFFER**: `onboarding.read_events(store, run_id)` takes an id
+    and can be asked about ONE record; `knowledge.read_events(store)`
+    takes no id and cannot. Same name, opposite capability, and the name
+    is what a reader checks. So onboarding's answer is unreliable while
+    knowledge's question does not exist — which is why restoring note
+    links needs an upstream by-id reader FIRST, where restoring
+    onboarding links needs only a witness added to a reader it already
+    has.
+
+    Two unresolved questions block re-introduction, and both are knowledge
+    CURATION design rather than link schema:
+    - **`curated` versus `latest`.** `knowledge.current_view` returns the
+      LATEST note per `(domain_id, key)`; `resolve_views` separates `curated`
+      precisely "so open capture cannot mutate the authoritative visible set".
+      Any consumer resolving an authoritative value through `current_view`
+      hands whoever can publish an uncurated note the power to change it —
+      and `current_view` is the convenient call, so it is the one a successor
+      reaches for.
+    - **`tombstoned`.** A link to a retracted note is a third state with no
+      disposition. Shipping two states in schema while prose implies three is
+      the defect this amendment already paid for once.
+
+    Note identity is also compound — knowledge keys on `(domain_id, key)`,
+    not on `note_id` — so re-introduction changes the cardinality contract.
+    That is a reason to give it its own amendment where the curation model is
+    the subject, not a complication inside the close-link ABA amendment.
+
+11. **Onboarding links: no identity witness exists to bind.**
+    **DEFERRED, and `onboarding_run_id` is REMOVED from the linkable set
+    by amendment #15**, on the same grounds as note links and after the
+    same test: removal costs no capability. A reachability sweep over the
+    amendment parent found **zero consumers** — every pre-amendment
+    mention was the field defining itself (boundary table, item schema,
+    and the increment-2 line saying no event type writes it yet).
+
+    The blocking fact is that **onboarding mints nothing work can bind**.
+    The run id is caller-supplied; `run_view` rebases on every create and
+    clears prior records; `create_run` refuses only while the events path
+    exists; and every field of the create event is caller-influenced,
+    `created_at` included. A count-of-creates guard was specified and
+    withdrawn because **a count is not an identity**: a hand edit that
+    leaves exactly one create passes it, and a guard defeated by a threat
+    this document's own model declares reachable is worse than no guard,
+    because it reads as protection.
+
+    **Work must NOT manufacture the witness itself**, and this is recorded
+    because it is the attractive wrong answer. Work could hash the create
+    event at bind time and compare on read. **THE DEFECT IS THAT THE
+    DIGEST IS REPRODUCIBLE.** Every field of the create event is
+    caller-influenced, so delete-and-recreate can REPLAY BYTE-IDENTICAL
+    create data and regenerate the same digest — the attacker does not
+    have to defeat the check, they can satisfy it.
+
+    **An earlier draft gave the wrong reason and it must not be restored:**
+    it argued the digest fails because it witnesses ORIGIN rather than
+    CONTENT, records appended after the create being outside it. That
+    reasoning is false, and this document refutes it three sections
+    earlier — content moving within one identity is LEGITIMATE, which is
+    exactly what a close GENERATION is: the generation advances, the
+    instance does not, and the design deliberately keeps that live. An
+    implementer reading the origin-versus-content argument would conclude
+    the fix is to bind MORE content, producing a wider digest that still
+    replays. The conclusion was right and the reason was wrong, which is
+    the more dangerous combination: nobody re-checks a verdict they agree
+    with.
+
+    Underneath both: work would be asserting an identity property the
+    owning module does not guarantee — an obligation specified downstream
+    of an unexposed capability, one layer further out.
+
+    **THE REMEDY IS AN UPSTREAM REQUEST, AND THIS IS NOT THE note_ids
+    CASE.** For notes no upstream request was filed, deliberately:
+    `(domain_id, key)` IS knowledge's addressing scheme BY DESIGN, and
+    asking for a by-id reader would have been asking a module to grow a
+    second identity scheme to fit our field. Onboarding is the opposite,
+    and the difference is legible in the source: **`create_run` already
+    PREVENTS REUSE** — it refuses when the events path exists. The module
+    INTENDS run ids to be unique and merely fails to make that guarantee
+    durable across ledger deletion. **That is a gap, not a design
+    decision**, and a gap is what an upstream request is for.
+
+    Filed upstream: an onboarding **identity witness** that is
+    **OWNER-MINTED, CALLER-UNINFLUENCED, and DURABLE OUTSIDE THE
+    RECREATABLE LEDGER** — with the substitution construction above as
+    the evidence. Each clause excludes a specific wrong answer, so none
+    is decoration: *owner-minted* excludes `onb_create --id`;
+    *caller-uninfluenced* excludes `created_at`, which is `at or
+    utc_now()`; and *durable outside the recreatable ledger* excludes
+    **any digest computed over the create event**, because the ledger is
+    exactly what delete-and-recreate reconstructs. A witness stored where
+    the attacker can rebuild it is not a witness.
+    Deferral now, restoration when it lands, at which point the link is a
+    mechanical addition following the `close_instance_id` pattern. The
+    dependency is recorded here rather than remembered so the path back
+    is written down.
+
+    **THE RESTORATION PATH, ENUMERATED, because a deferral that does not
+    say how to undo itself is a one-way door.** When the upstream witness
+    lands, restoring onboarding links requires: (1) re-admit
+    `onboarding_run_id` to the linkable set and re-introduce the
+    `onboarding_linked` event type with its witness in the payload and
+    the bound set; (2) add the witness field to the item schema beside
+    the already-reserved `onboarding_run_id`; (3) restore the resolver
+    disposition row in the disclosed-limit table — onboarding's entry
+    reads YES-but-DEFERRED precisely so this step is a status change and
+    not a re-derivation; and (4) **restore `onboarding` to the non-goal
+    reads-list**, which this amendment trimmed because work stopped
+    reading the module. That last one is the easiest to miss: it is a
+    sentence in a NON-GOAL, nothing builds it, no row carries it, and it
+    is the only site outside the link machinery that the deferral
+    touched. It is named here for the same reason the rest of this entry
+    exists — the person restoring the link will be reading THIS, not
+    diffing two-hundred-line-distant prose.
+
+    This is the **third upstream capability request arising from
+    amendment #15** — the `close` not-found subclass, the CLI seam, and
+    now this — and the **second** where a link type had to be withdrawn
+    because the owning module could not support being linked. That rate
+    is itself the evidence for Open Question #12.
+
+12. **A link type is admissible only if the owning module can say whether
+    this is THE SAME RECORD it answered about before.** This is the
+    general form of four separate P0s in amendment #15, and it is filed
+    as an open question because the RFC had no rule that would have
+    prevented any of them.
+
+    **The title matters and this one was wrong for two rounds.** It read
+    "the linkable set should be DERIVED from what owning modules expose"
+    — the WEAK criterion, the one that ADMITS onboarding on the first
+    pass — sitting as the headline over the strong rule that refuses it.
+    The body was corrected and the title was not, so a reader scanning
+    question titles got the rejected version. Same species as the
+    prose-versus-schema drift this amendment has now hit three times:
+    **the authoritative statement and its summary disagreeing, with the
+    summary being what gets read.** A summary is not commentary on the
+    rule; for most readers it IS the rule.
+
+    The evidence is the pattern across the set: notes deferred because
+    `knowledge.py` exposes no by-id reader; onboarding deferred because
+    `onboarding.py` exposes no stable identity; closes admitted only
+    because `close.py` already minted an `instance_id`; `gate_scope`
+    needing no witness because a live selector has no bound subject.
+    Every one of those arrived as a **defect found in review** rather
+    than a **decision made in design**, and they arrived one at a time
+    because the set was assembled from work's requirements and audited
+    member by member afterwards.
+
+    **THE ADMISSION CRITERION, and the weaker version it replaces.** The
+    first proposal was to *enumerate each owning module's public identity
+    surface and admit a link only if that surface supports being
+    referenced*. **That criterion is insufficient and would have admitted
+    onboarding on the first pass** — which is the exact failure it was
+    written to prevent. `close.py` exposes `close_instance_id` and
+    `onboarding.py` exposes `new_run_id()`; **both look like exposure.**
+    Recorded rather than quietly upgraded, because a criterion that fails
+    on the case that motivated it is worth remembering as a near miss.
+
+    The discriminator is not exposure. It is whether the module can answer
+    **"IS THIS THE SAME RECORD I ANSWERED ABOUT BEFORE?"** — a stable,
+    module-owned identity that survives **the module's own write paths**.
+    So:
+
+    > A link type is **ADMISSIBLE** only if the owning module exposes a
+    > public call that distinguishes this record from a DIFFERENT record
+    > wearing the same id, and that distinction **survives the module's
+    > own write paths**. **Name that call when admitting a link type.** If
+    > none exists the link is NOT admissible, and the remedy is an
+    > **upstream request — never a work-side guard**, which can only
+    > observe what the module chose to tell it.
+
+    It is falsifiable per module, and applied to the current set it gives:
+    `close_instance_id` survives `replace_close`, so close is ADMITTED and
+    the call is named; an onboarding run id does not survive a second
+    create, so onboarding is REFUSED; a note id has no by-id reader to ask
+    at all, so notes are REFUSED; and `gate_scope` is EXEMPT because a live
+    selector has no bound record, so the question does not apply to it.
+
+    **THE CRITERION TELLS YOU WHICH QUESTION TO ASK. IT DOES NOT ANSWER
+    IT** — and saying otherwise would reproduce the failure it replaces.
+    It is tempting to record that this rule "would have refused onboarding
+    on the first pass." It would have done so only because the
+    `run_view` rebase had ALREADY been found. Someone applying the rule
+    cold still has to go and read the module's REDUCER to learn that a
+    second create wins: onboarding's public surface shows `new_run_id()`
+    and a `create_run` that refuses duplicates, which **looks like an
+    answer**. The weaker criterion this replaces failed exactly there — it
+    was satisfiable by inspecting the public surface — so a version of the
+    stronger one that is also satisfiable by inspection buys nothing.
+
+    Applying it therefore means naming the call **and** stating what was
+    read to establish that the distinction survives the module's own write
+    paths. An admission that cites a function signature has not been
+    performed.
+
+    The final clause is the one carrying the most weight. Every defect in
+    this family was a work-side guard standing in for a module-side
+    guarantee, and each was defeated by the module doing something the
+    guard could not see.
+
+    **THE DISCLOSED GAP THIS QUESTION CARRIED IS NOW CLOSED, AND HOW IT
+    CLOSED IS THE POINT.** An earlier draft recorded `review_request_ids`
+    as never having had the substitution analysis applied — target is a
+    bus message, out of the ABA section's universe, unanswered rather
+    than resolved. It was then answered by an **executed construction**:
+    `threads.derive_threads` groups solely by `request_id` and flips to
+    broadcast derivation on any broadcast question carrying that id, so a
+    non-owner can alias the linked object with a valid append. The link
+    is now BOUND with `opener_message_id`; see the boundary section.
+
+    Two things are worth keeping from that. First, **this is the first
+    time the criterion ADMITTED something that looked inadmissible** —
+    notes and onboarding were refused, review is admitted with the call
+    named (`store._new_id`, immutable, no caller-supplied path). A
+    criterion that only ever refuses is not discriminating; one that
+    admits for a stated reason is doing work. Second, **the gap sat in
+    the safest-looking place in the document.** It was disclosed, reasoned
+    and filed, and being filed is what kept anyone from attacking it for
+    two rounds. A disclosed gap is not a clearance, and "out of universe"
+    is where an unexamined assumption is most comfortable.
+
+    **THE REMAINING QUESTION IS SHARPER THAN SUBSTITUTABILITY AND IT
+    REPLACES IT: DOES THIS MODULE RETURN THE SAME ANSWER TO DIFFERENT
+    ASKERS?** `derive_threads(messages, *, agent, cursor, closed_rids,
+    retired)` takes the ASKER as a parameter, and `closed_rids` alone
+    decides an outcome: threads an agent has closed report `closed`
+    regardless of derived state. The ladder's `review` row names thread
+    state, so if it resolved through that call `record_state` would be
+    READER-RELATIVE and "record state is a pure function of the item's
+    own records" would not hold for any item carrying a review link.
+
+    **THIS IS NO LONGER A QUESTION — IT IS A BUILD OBLIGATION, and an
+    earlier draft filed it in the wrong place.** That draft recorded it
+    as a DIRECTED QUESTION on the grounds that it read a signature and
+    the ladder rows rather than the resolution path this document
+    intends. Then the document went on to state, as a MUST, that the
+    increment-3 resolver "must be reader-independent by construction" —
+    **so the same page carried a MUST and an open question about
+    whether the MUST applies.** An obligation parked in an Open
+    Question has no row, no carrier and no test, and a builder
+    following the phase plan can satisfy every scheduled item while
+    making `record_state` reader-relative.
+
+    It is now scheduled and tested; see the Phase D2 carrier and the
+    two-reader assertion. Demonstrated rather than argued: the same
+    valid opener derives one thread state under `closed_rids=set()` and
+    a different one under `closed_rids={<that request_id>}`.
+
+    The generalisation stays, because it is what the criterion was
+    missing: asking whether a record can be SUBSTITUTED presumes there
+    is ONE answer to substitute. **A module that returns different
+    answers to different askers fails at a prior step, and a NO there
+    makes substitutability moot rather than safe.**
+
+13. **The OPTIONAL divergence-from-legacy variant of the deletion test.**
+    **DEFERRED, and it is the only part that defers — the deletion test
+    itself SHIPS.**
+
+    What ships (D4, scheduled): the hold-membership assertion —
+    `work_review_completeness_unavailable` ∈
+    `compute_verdict(deleted-evidence-bundle).holds`. It needs no
+    capability this document lacks and it catches the live regression: a
+    future build that stops firing the disposition on deleted evidence.
+
+    What defers: asserting the new disposition DIVERGES from the
+    superseded scan-keyed rule — under hold-membership, "the code is in
+    the new implementation's `holds` and NOT in the legacy's." That needs
+    **a legacy satisfaction oracle defined by NAME and EXACT ALGORITHM**
+    over the Store-derived review inputs. Without one, a constant-`GO`
+    stub satisfies the comparison and it proves nothing.
+
+    **AND IT MAY NEVER BE WORTH BUILDING**, which is why it is an open
+    question rather than a backlog item: the rule it would guard against
+    was DELETED from this document during amendment #15's review. The
+    variant is regression protection against text that no longer exists,
+    so it is genuinely the D4 implementer's call whether the legacy
+    oracle is worth defining at all.
+
+    **A REQUIREMENT THAT DISSOLVED, recorded because the mechanism
+    generalises.** An earlier draft of this entry also deferred an
+    *entitlement input on the closed bundle*, on the reasoning that the
+    test needed synthetic VERIFIED entitlement. It did not. That
+    requirement existed only because the assertion was written as `GO`
+    versus non-`GO`, which forces an all-green bundle. Asserting
+    MEMBERSHIP OF A NAMED CODE instead needs no all-green bundle, so the
+    entitlement input was never necessary — **the dependency was
+    manufactured by the assertion shape, and changing the shape removed
+    it rather than deferring it.** Worth carrying: when an obligation
+    demands a capability that does not exist, check whether the demand
+    comes from the obligation or from the way it was phrased, before
+    concluding the capability must be built or the obligation dropped.
+
 ## Acceptance Criteria For The RFC
 
 This RFC is ready to drive implementation when reviewers agree on the
@@ -4104,7 +6244,7 @@ a pre-mortem it never appeared in.
   Reviewers should agree that a disclosed blockage beats a silent pass
   here, because it is the one place this document knowingly trades
   throughput for soundness.
-- **Link mutation is four CLOSED event types, not one generic `linked`.**
+- **Link mutation is THREE CLOSED event types, not one generic `linked`.**
   The generic form is more economical and was rejected: a `link_type`
   discriminator re-opens the closed vocabulary from inside, defeats per-type
   required payloads and per-type authority, and blinds the reachability sweep
