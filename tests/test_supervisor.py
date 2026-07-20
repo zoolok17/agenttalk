@@ -4520,6 +4520,10 @@ def test_config_template_ships_wrapped_example() -> None:
     assert "RECOMMENDED" in w["_comment_wrapped"] and "LEGACY" in w["_comment_wrapped"]
 
 
+def test_config_template_keeps_deadman_out_of_supervisor_config() -> None:
+    assert "deadman" not in json.loads(sup.CONFIG_TEMPLATE)
+
+
 # ---------- per-CLI wrapped stuck_after defaults + the codex low-threshold guardrail
 
 def test_resolve_stuck_after_per_cli_defaults_and_override() -> None:
