@@ -152,6 +152,27 @@ def test_check_path_can_casefold_globs(tmp_path: Path) -> None:
     assert "docs" in insensitive["domains"]
 
 
+@pytest.mark.parametrize("descriptor", [
+    "src/**/*.py",
+    "src/file?.py",
+    "src/[unterminated.py",
+])
+def test_check_path_rejects_glob_descriptors(
+    tmp_path: Path,
+    descriptor: str,
+) -> None:
+    root = _root(tmp_path)
+    registry = dom.validate_registry(_registry(), Store(root).load_config())
+
+    with pytest.raises(
+        dom.DomainError,
+        match="check_path needs a concrete repo path",
+    ) as exc_info:
+        dom.check_path(registry, descriptor, casefold_paths=False)
+
+    assert descriptor in str(exc_info.value)
+
+
 def test_domain_cli_validate_list_show_and_check_path_json(
     tmp_path: Path, capsys: pytest.CaptureFixture,
 ) -> None:
@@ -181,6 +202,20 @@ def test_domain_cli_validate_list_show_and_check_path_json(
     check_payload = json.loads(capsys.readouterr().out)
     assert check_payload["paths"][0]["overlap"] is True
     assert check_payload["paths"][1]["shared"] is True
+
+
+def test_domain_cli_check_path_rejects_glob_descriptor(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    root = _root(tmp_path)
+    _write_registry(root, _registry())
+
+    assert _run(["domain", "check-path", "src/**/*.py"], root) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "src/**/*.py" in captured.err
+    assert "check_path needs a concrete repo path" in captured.err
 
 
 def test_domain_cli_missing_registry_is_valid_empty(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
