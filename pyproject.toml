@@ -78,6 +78,7 @@ include = [
     "/docs/ASSURANCE.md",
     "/docs/DASHBOARD-CONTROL-PLANE-ROADMAP.md",
     "/docs/DESIGN.md",
+    "/docs/DEV-GATE.md",
     "/docs/DashboardDesign",
     "/docs/ISSUES.md",
     "/docs/ROADMAP.md",

@@ -5,91 +5,106 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  schedule:
+    # Keep dependency/security checks current when the repository is quiet.
+    - cron: '17 9 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  pytest:
-    name: pytest (${{ matrix.python-version }} on ${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+  dev-gate-leg:
+    name: dev-gate (${{ matrix.os.id }}/${{ matrix.python-version }})
+    runs-on: ${{ matrix.os.runner }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os:
+          - id: linux
+            runner: ubuntu-latest
+          - id: windows
+            runner: windows-latest
+          - id: macos
+            runner: macos-latest
         python-version: ['3.10', '3.11', '3.12', '3.13']
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest -q
+      - name: Install gate dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[gate]"
+      - name: Install pinned gitleaks on the manifest's canonical static leg
+        if: matrix.os.id == 'linux' && matrix.python-version == '3.12'
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          bindir="$RUNNER_TEMP/gitleaks-bin"
+          curl --fail --location --silent --show-error \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" \
+            | sha256sum --check -
+          mkdir -p "$bindir"
+          tar -xzf "$archive" -C "$bindir" gitleaks
+          echo "$bindir" >> "$GITHUB_PATH"
+      - name: Run the committed gate
+        run: >
+          agenttalk dev-gate
+          --profile release
+          --ci-leg "${{ matrix.os.id }}/${{ matrix.python-version }}"
+          --evidence "${{ runner.temp }}/dev-gate-evidence.json"
+      - name: Upload leg evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: dev-gate-leg-${{ matrix.os.id }}-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/dev-gate-evidence.json
+          if-no-files-found: error
+          retention-days: 14
 
-  build:
-    name: wheel builds and installs (packaging gate)
+  dev-gate-aggregate:
+    name: dev-gate aggregate
+    needs: dev-gate-leg
+    if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: '3.12'
-      - run: python -m pip install --upgrade pip build
-      - name: create sdist exclusion sentinels
-        run: |
-          mkdir -p .tmp .pytest-cache-local docs
-          printf 'must not ship\n' > .tmp/agenttalk-sdist-sentinel.txt
-          printf 'must not ship\n' > .pytest-cache-local/agenttalk-sdist-sentinel.txt
-          printf 'must not ship\n' > HANDOFF-agenttalk-sdist-sentinel.md
-          printf 'must not ship\n' > agenttalk-local-sdist-sentinel.md
-          printf 'must not ship\n' > dogfood-test-plan.html
-          printf 'must not ship\n' > docs/local-feedback-sentinel.zip
-      # Build sdist + wheel. Fails fast on packaging breaks like a force-include
-      # double-adding a package-data path (the v0.58.0-0.58.2 install regression).
-      - run: python -m build
-      - name: sdist excludes local/dev artifacts
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          import tarfile
-
-          sdist = next(Path("dist").glob("agenttalk-*.tar.gz"))
-          with tarfile.open(sdist, "r:gz") as archive:
-              names = archive.getnames()
-
-          forbidden = (
-              "/.tmp/",
-              "/.pytest-cache-local/",
-              "/HANDOFF-agenttalk-sdist-sentinel.md",
-              "/agenttalk-local-sdist-sentinel.md",
-              "/dogfood-test-plan.html",
-              "/docs/local-feedback-sentinel.zip",
-          )
-          offenders = [name for name in names if any(part in name for part in forbidden)]
-          assert not offenders, f"sdist included local/dev artifacts: {offenders[:20]}"
-          assert any(name.endswith("/docs/AGENTTALK-NEW-USER-MANUAL.pdf") for name in names), (
-              "new-user manual PDF missing from sdist"
-          )
-          assert any(name.endswith("/src/agenttalk/web_static/console.js") for name in names), (
-              "dashboard static assets missing from sdist"
-          )
-          print("sdist ok:", sdist.name)
-          PY
-      # Install the built wheel (NOT editable) so the real packaged layout is exercised.
-      - run: python -m pip install dist/*.whl
-      # The Team Console's served static assets must ship in the installed wheel.
-      - name: wheel ships the console static assets
-        run: |
-          python - <<'PY'
-          import importlib.resources as r
-          import agenttalk
-          base = r.files("agenttalk") / "web_static"
-          assert (base / "console.css").is_file(), "console.css missing from installed wheel"
-          assert (base / "console.js").is_file(), "console.js missing from installed wheel"
-          print("wheel ok:", agenttalk.__version__)
-          PY
+      - name: Install candidate command
+        run: python -m pip install -e .
+      - name: Download leg evidence
+        if: always()
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: dev-gate-leg-*
+          path: ${{ runner.temp }}/dev-gate-legs
+          merge-multiple: false
+      - name: Aggregate the exact declared matrix
+        if: always()
+        run: >
+          agenttalk dev-gate
+          --profile release
+          --aggregate "${{ runner.temp }}/dev-gate-legs"
+          --evidence "${{ runner.temp }}/dev-gate-aggregate.json"
+      - name: Upload aggregate evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: dev-gate-aggregate
+          path: ${{ runner.temp }}/dev-gate-aggregate.json
+          if-no-files-found: error
+          retention-days: 14

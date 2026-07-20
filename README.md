@@ -221,6 +221,11 @@ python -m pip install -e ".[dev]"   # includes pytest + build
 The editable install means code changes are picked up live without
 re-running pip.
 
+Before proposing a repository change, install `.[gate]` into both direct local gate
+interpreters (CPython 3.10 and 3.14) and run the committed `agenttalk dev-gate`
+command. See the [development gate reference](docs/DEV-GATE.md) for CI-leg,
+aggregate, and evidence details.
+
 Either path puts an `agenttalk` script on your PATH. The package is
 stdlib-only (no third-party runtime deps) and requires Python 3.10+.
 
