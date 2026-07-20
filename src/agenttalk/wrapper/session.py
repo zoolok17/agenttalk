@@ -209,7 +209,12 @@ def resume_failure_is_session_attributable(failure_class: str | None,
         "resume turn failed",
         "session is full",
         "prompt is too long",
-        "no conversation found",
+        # anchored to the FULL claude diagnostic ("No conversation found with session
+        # ID: <uuid>"), not a bare "no conversation found", so incidental prose is a
+        # far weaker match; combined with the non-JSON-only raw_tail scan in run.py
+        # (model content is JSON-wrapped, excluded), this closes the content-spoof
+        # vector codex-agenttalk-reviewer-1 raised on PR #51.
+        "no conversation found with session id",
     )
     return (
         failure_class == "poison_eligible"

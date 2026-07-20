@@ -1524,17 +1524,34 @@ def _classify_drive_failure(sig: dict) -> tuple[str, str]:
 
 
 def _child_output_tail_text(tail: object) -> str:
-    """Flatten a captured child-output tail's lines into one scannable string.
-    Feeds the raw diagnostic - e.g. a non-JSON 'No conversation found with session
-    ID: ...' line the stream-json adapter DISCARDS during parsing - into the
-    resume-failure attributability decision (task #34 resume-continuity)."""
+    """Flatten a captured child-output tail's NON-JSON lines into one scannable
+    string. Feeds the raw CLI diagnostic - e.g. a bare 'No conversation found with
+    session ID: ...' line the stream-json adapter DISCARDS during parsing - into the
+    resume-failure attributability decision (task #34 resume-continuity).
+
+    ONLY non-JSON lines are included: in stream-json mode the model's output is
+    always JSON-wrapped (assistant events), while the CLI's own diagnostics are bare
+    non-JSON lines. Restricting the scan to non-JSON lines means MODEL CONTENT cannot
+    spoof a session-failure diagnostic - e.g. a model that merely quotes 'no
+    conversation found' rides inside a JSON event and is excluded here
+    (codex-agenttalk-reviewer-1 content-spoof finding on PR #51)."""
     if not isinstance(tail, dict):
         return ""
     lines = tail.get("lines")
     if not isinstance(lines, list):
         return ""
-    parts = [line.get("text") for line in lines
-             if isinstance(line, dict) and isinstance(line.get("text"), str)]
+    parts: list[str] = []
+    for line in lines:
+        if not (isinstance(line, dict) and isinstance(line.get("text"), str)):
+            continue
+        stripped = line["text"].strip()
+        if not stripped:
+            continue
+        try:
+            json.loads(stripped)
+        except (ValueError, TypeError):
+            parts.append(line["text"])   # non-JSON -> CLI's own diagnostic, never model content
+        # else: valid JSON (a structured event, possibly carrying model text) -> excluded
     return "\n".join(parts)
 
 

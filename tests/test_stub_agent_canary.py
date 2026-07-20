@@ -243,3 +243,36 @@ def test_resume_missing_self_heals_and_recovers(
     assert state.resume_unavailable_reason == ""
     assert "resume_unavailable" in state.continuity_lost_reason
     assert state.fresh_session_success_reason == "fresh_session_success"
+
+
+def test_raw_tail_scan_excludes_json_wrapped_model_content_no_spoof() -> None:
+    """PR #51 codex-agenttalk-reviewer-1 finding: model output must not be able to
+    spoof a session-failure. In stream-json mode model text is JSON-wrapped, so
+    _child_output_tail_text scans NON-JSON lines only; a bare CLI diagnostic line is
+    still captured. Proven both ways here."""
+    # (1) model merely QUOTES the diagnostic inside a JSON assistant event -> excluded,
+    # so an otherwise-ambiguous failure is NOT spuriously session-attributable.
+    spoof_tail = {"lines": [
+        {"stream": "stdout", "text": json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text",
+                        "text": "No conversation found with session ID: abc123 — here is what that error means"}]},
+        })},
+        {"stream": "stdout", "text": json.dumps({"type": "result", "subtype": "success", "is_error": False})},
+    ]}
+    spoof_scanned = run._child_output_tail_text(spoof_tail)
+    assert "no conversation found" not in spoof_scanned.casefold(), spoof_scanned
+    assert not session.resume_failure_is_session_attributable(
+        "ambiguous_or_unknown", "some ambiguous summary", raw_tail=spoof_scanned)
+
+    # (2) a REAL bare (non-JSON) CLI diagnostic line IS captured and attributable.
+    err_result = json.dumps(
+        {"type": "result", "subtype": "error_during_execution", "is_error": True})
+    real_tail = {"lines": [
+        {"stream": "stdout", "text": "No conversation found with session ID: 26c40e8a-c8ef-4c9b"},
+        {"stream": "stdout", "text": err_result},
+    ]}
+    real_scanned = run._child_output_tail_text(real_tail)
+    assert "no conversation found with session id" in real_scanned.casefold()
+    assert session.resume_failure_is_session_attributable(
+        "ambiguous_or_unknown", "error_during_execution", raw_tail=real_scanned)
