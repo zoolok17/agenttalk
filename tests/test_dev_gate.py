@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import platform
 import subprocess
 import sys
 import zipfile
@@ -33,7 +34,7 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -
             "observed_path": str((Path.cwd() / "src" / "agenttalk" / "__init__.py").resolve()),
             "version": "0.78.1",
         }
-    elif check_id.startswith(("wheel-install-", "wheel-contract-")):
+    elif check_id.startswith(("wheel-install-", "wheel-dependency-check-", "wheel-contract-")):
         prefix, suffix = check_id.rsplit("-", 1)
         python = f"{suffix[2]}.{suffix[3:]}"
         kind = prefix
@@ -50,13 +51,34 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -
         kind = check_id
     python_path = str((Path.cwd() / "python").resolve())
     tool_path = python_path
+    runtime_environment = None
+    if python is not None and mode == "wheel":
+        role = "test" if check_id.startswith("pytest-wheel-") else "runtime"
+        prefix_path = (Path.cwd() / f"{role}-venv-{python.replace('.', '')}").resolve()
+        runtime_python = prefix_path / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        runtime_environment = {
+            "role": role,
+            "requested": python,
+            "creator_path": python_path,
+            "python_path": str(runtime_python),
+            "prefix": str(prefix_path),
+            "base_prefix": str((Path.cwd() / f"base-{python.replace('.', '')}").resolve()),
+            "system_site_packages": False,
+        }
+        tool_path = str(runtime_python)
+        if provenance is not None:
+            provenance = {
+                "expected_root": str(prefix_path),
+                "observed_path": str(prefix_path / "site-packages" / "agenttalk" / "__init__.py"),
+                "version": "0.78.1",
+            }
     if check_id in {"git-binding", "final-binding"}:
         tool_path = str((Path.cwd() / ("git.exe" if os.name == "nt" else "git")).resolve())
         argv = [tool_path, "status", "--porcelain=v1", "--untracked-files=all"]
     elif check_id.startswith("pytest-"):
         spec = manifest["checks"]["pytest"]
         argv = dev_gate.isolated_tool_argv(
-            python_path,
+            tool_path,
             "pytest",
             *spec["args"],
             "-p",
@@ -64,7 +86,7 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -
             "--basetemp",
             str((Path.cwd() / "pytest-temp").resolve()),
             *spec["paths"],
-            candidate_import_root=(Path.cwd() / "src").resolve(),
+            candidate_import_root=(Path.cwd() / "src").resolve() if mode == "source" else None,
         )
     elif check_id == "package-build":
         argv = dev_gate.isolated_tool_argv(
@@ -78,21 +100,23 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -
         )
     elif check_id.startswith("wheel-install-"):
         argv = dev_gate.isolated_tool_argv(
-            python_path,
+            tool_path,
             "pip",
             "install",
-            "--no-index",
-            "--no-deps",
-            "--target",
-            str((Path.cwd() / "wheel-target").resolve()),
+            "--disable-pip-version-check",
+            "--no-input",
+            "--no-cache-dir",
+            "--index-url",
+            manifest["checks"]["wheel-contract"]["dependency_index"],
             str((Path.cwd() / "dist" / "agenttalk.whl").resolve()),
         )
+    elif check_id.startswith("wheel-dependency-check-"):
+        argv = dev_gate.isolated_tool_argv(tool_path, "pip", "check")
     elif check_id.startswith("wheel-contract-"):
         argv = dev_gate.isolated_tool_argv(
-            python_path,
+            tool_path,
             "agenttalk",
             "--version",
-            candidate_import_root=(Path.cwd() / "wheel-target").resolve(),
         )
     elif check_id == "ruff":
         argv = dev_gate.isolated_tool_argv(
@@ -117,6 +141,8 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -
             python_path,
             "pip_audit",
             "--strict",
+            "--no-deps",
+            "--disable-pip",
             "--requirement",
             str((Path.cwd() / "audit-requirements.txt").resolve()),
         )
@@ -158,6 +184,7 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -
         "diagnostic": "",
         "log": {"path": str(Path("log.txt").resolve()), "sha256": "a" * 64},
         "import_provenance": provenance,
+        "runtime_environment": runtime_environment,
     }
 
 
@@ -213,6 +240,8 @@ def _leg_artifact(manifest: dict, leg: str, *, status: str = "pass") -> dict:
             "pytest_cache_disabled": True,
             "bytecode_disabled": True,
             "phase_isolated_exports": True,
+            "pip_configuration_disabled": True,
+            "child_path_sanitized": True,
         },
         "interpreters": [
             {
@@ -259,8 +288,21 @@ def _leg_artifact(manifest: dict, leg: str, *, status: str = "pass") -> dict:
                 else {}
             ),
         },
-        "external_inputs": (
-            [
+        "external_inputs": [
+            *[
+                {
+                    "check_id": check_id,
+                    "kind": "live-package-index",
+                    "locator": manifest["checks"]["wheel-contract"]["dependency_index"],
+                    "mutable": True,
+                    "identity": "live-service-unversioned",
+                    "observed_at": "2026-07-20T00:00:00Z",
+                }
+                for check_id in required
+                if check_id.startswith("wheel-install-") or check_id.startswith("pytest-wheel-")
+            ],
+            *(
+                [
                 {
                     "check_id": "pip-audit",
                     "kind": "live-advisory-database",
@@ -280,10 +322,11 @@ def _leg_artifact(manifest: dict, leg: str, *, status: str = "pass") -> dict:
                     }
                     for locator in ("p/python", "p/security-audit")
                 ],
-            ]
-            if leg == profile["ci"]["canonical_static_leg"]
-            else []
-        ),
+                ]
+                if leg == profile["ci"]["canonical_static_leg"]
+                else []
+            ),
+        ],
         "blockers": [] if status == "pass" else [{"code": "check_failed", "check_id": required[0], "detail": "x"}],
         "summary": {
             "required": len(required),
@@ -320,6 +363,34 @@ def _git(root: Path, *args: str) -> str:
     )
     assert completed.returncode == 0, completed.stderr
     return completed.stdout.strip()
+
+
+def _synthetic_wheel(
+    path: Path,
+    *,
+    package_code: str,
+    requirements: tuple[str, ...] = (),
+) -> Path:
+    metadata = [
+        "Metadata-Version: 2.1",
+        "Name: agenttalk",
+        "Version: 0.78.1",
+        *[f"Requires-Dist: {requirement}" for requirement in requirements],
+        "",
+    ]
+    files = {
+        "agenttalk/__init__.py": package_code,
+        "agenttalk-0.78.1.dist-info/METADATA": "\n".join(metadata),
+        "agenttalk-0.78.1.dist-info/WHEEL": (
+            "Wheel-Version: 1.0\nGenerator: agenttalk-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+        ),
+    }
+    record_name = "agenttalk-0.78.1.dist-info/RECORD"
+    files[record_name] = "".join(f"{name},,\n" for name in [*files, record_name])
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+    return path
 
 
 def test_manifest_declares_real_ci_matrix_separately_from_local_interpreters() -> None:
@@ -623,6 +694,8 @@ def test_base_environment_scrubs_import_and_environment_contamination(
     monkeypatch.setenv("PYTHONPATH", "stale-editable")
     monkeypatch.setenv("PYTHONHOME", "stale-home")
     monkeypatch.setenv("VIRTUAL_ENV", "stale-venv")
+    monkeypatch.setenv("PIP_CONFIG_FILE", "attacker-pip.ini")
+    monkeypatch.setenv("PIP_EXTRA_INDEX_URL", "https://attacker.invalid/simple")
 
     env = dev_gate._base_env(tmp_path)
 
@@ -632,6 +705,9 @@ def test_base_environment_scrubs_import_and_environment_contamination(
     assert env["PYTHONNOUSERSITE"] == "1"
     assert env["PYTHONDONTWRITEBYTECODE"] == "1"
     assert env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
+    assert env["PIP_CONFIG_FILE"] == os.devnull
+    assert env["PIP_NO_CACHE_DIR"] == "1"
+    assert "PIP_EXTRA_INDEX_URL" not in env
     assert {env[name] for name in ("TMP", "TEMP", "TMPDIR")} == {str(tmp_path)}
 
 
@@ -712,6 +788,223 @@ def test_isolated_source_launcher_prefers_committed_export_over_candidate_cwd(
     assert not shadow_sentinel.exists()
 
 
+def test_wheel_install_resolves_declared_dependencies_in_isolated_venv(tmp_path: Path) -> None:
+    minor = f"{sys.version_info.major}.{sys.version_info.minor}"
+    creator = dev_gate.InterpreterInfo(
+        requested=minor,
+        path=Path(sys.executable).resolve(),
+        implementation="CPython",
+        version=platform.python_version(),
+    )
+    interpreter, proof = dev_gate._create_isolated_venv(
+        creator=creator,
+        root=tmp_path / "runtime",
+        role="runtime",
+        logs_dir=tmp_path / "logs",
+    )
+    wheel = _synthetic_wheel(
+        tmp_path / "agenttalk-0.78.1-py3-none-any.whl",
+        package_code="__version__ = '0.78.1'\n",
+        requirements=("definitely-missing-agenttalk-dependency==999999",),
+    )
+    manifest = _manifest()
+    empty_index = tmp_path / "empty-index"
+    empty_index.mkdir()
+    manifest["checks"]["wheel-contract"]["dependency_index"] = empty_index.as_uri()
+
+    record = dev_gate._install_wheel(
+        interpreter=interpreter,
+        runtime_environment=proof,
+        wheel=wheel,
+        source_root=tmp_path,
+        env=dev_gate._base_env(tmp_path),
+        manifest=manifest,
+        logs_dir=tmp_path / "logs",
+    )
+
+    assert record["status"] == "fail"
+    assert "--no-deps" not in record["argv"]
+    assert record["runtime_environment"]["system_site_packages"] is False
+    assert record["runtime_environment"]["creator_path"] == str(Path(sys.executable).resolve())
+    assert dev_gate._is_within(interpreter.path, Path(proof["prefix"]))
+
+
+def test_wheel_venv_forces_copied_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    minor = f"{sys.version_info.major}.{sys.version_info.minor}"
+    creator = dev_gate.InterpreterInfo(
+        requested=minor,
+        path=Path(sys.executable).resolve(),
+        implementation="CPython",
+        version=platform.python_version(),
+    )
+    observed: list[str] = []
+
+    def fail_create(**kwargs):
+        observed.extend(kwargs["argv"])
+        return dev_gate.CommandOutcome(
+            argv=tuple(kwargs["argv"]),
+            returncode=1,
+            duration_ms=1,
+            status="fail",
+            reason_code="nonzero_exit",
+            diagnostic="fixture stop",
+            log_path=tmp_path / "venv-create.log",
+        )
+
+    monkeypatch.setattr(dev_gate, "run_command", fail_create)
+
+    with pytest.raises(dev_gate.GateBlock, match="wheel_environment_create_failed"):
+        dev_gate._create_isolated_venv(
+            creator=creator,
+            root=tmp_path / "runtime",
+            role="runtime",
+            logs_dir=tmp_path / "logs",
+        )
+
+    assert "--copies" in observed
+
+
+def test_wheel_import_cannot_see_bootstrap_site_packages(tmp_path: Path) -> None:
+    pytest.importorskip("pytest")
+    minor = f"{sys.version_info.major}.{sys.version_info.minor}"
+    creator = dev_gate.InterpreterInfo(
+        requested=minor,
+        path=Path(sys.executable).resolve(),
+        implementation="CPython",
+        version=platform.python_version(),
+    )
+    interpreter, proof = dev_gate._create_isolated_venv(
+        creator=creator,
+        root=tmp_path / "runtime",
+        role="runtime",
+        logs_dir=tmp_path / "logs",
+    )
+    wheel = _synthetic_wheel(
+        tmp_path / "agenttalk-0.78.1-py3-none-any.whl",
+        package_code="import pytest\n__version__ = '0.78.1'\n",
+    )
+    manifest = _manifest()
+    empty_index = tmp_path / "empty-index"
+    empty_index.mkdir()
+    manifest["checks"]["wheel-contract"]["dependency_index"] = empty_index.as_uri()
+    install = dev_gate._install_wheel(
+        interpreter=interpreter,
+        runtime_environment=proof,
+        wheel=wheel,
+        source_root=tmp_path,
+        env=dev_gate._base_env(tmp_path),
+        manifest=manifest,
+        logs_dir=tmp_path / "logs",
+    )
+    assert install["status"] == "pass"
+
+    with pytest.raises(dev_gate.GateBlock, match="import_probe_failed"):
+        dev_gate.import_probe(
+            interpreter=interpreter,
+            expected_root=Path(proof["prefix"]),
+            cwd=tmp_path,
+            env=dev_gate._base_env(tmp_path),
+            temp_root=tmp_path,
+            logs_dir=tmp_path / "logs",
+            expected_version="0.78.1",
+            label="isolated-runtime",
+            candidate_import_root=None,
+        )
+
+
+def test_pip_audit_consumes_resolved_wheel_snapshot_without_bootstrap_freeze(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requirements = tmp_path / "resolved.txt"
+    requirements.write_text("example-dependency==1.2.3\n", encoding="utf-8")
+    interpreter = dev_gate.InterpreterInfo(
+        requested=f"{sys.version_info.major}.{sys.version_info.minor}",
+        path=Path(sys.executable).resolve(),
+        implementation="CPython",
+        version=platform.python_version(),
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(dev_gate, "_probe_python_module", lambda *_args, **_kwargs: "pip-audit 2")
+
+    def run(**kwargs):
+        calls.append(list(kwargs["argv"]))
+        log_path = kwargs["logs_dir"] / f"{kwargs['check_id']}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("No known vulnerabilities found\n", encoding="utf-8")
+        return dev_gate.CommandOutcome(
+            argv=tuple(kwargs["argv"]),
+            returncode=0,
+            duration_ms=1,
+            status="pass",
+            reason_code=None,
+            diagnostic="",
+            log_path=log_path,
+        )
+
+    monkeypatch.setattr(dev_gate, "run_command", run)
+    record, artifact = dev_gate._pip_audit_check(
+        interpreter=interpreter,
+        source_root=tmp_path,
+        env=dev_gate._base_env(tmp_path),
+        manifest=_manifest(),
+        requirements=requirements,
+        logs_dir=tmp_path / "logs",
+    )
+
+    assert record["status"] == "pass"
+    assert artifact is not None and artifact["sha256"] == dev_gate._sha256_file(requirements)
+    assert len(calls) == 1
+    assert "freeze" not in calls[0]
+    assert "--no-deps" in calls[0]
+    assert "--disable-pip" in calls[0]
+    assert calls[0][-2:] == ["--requirement", str(requirements)]
+
+
+def test_runtime_dependency_snapshot_excludes_candidate_but_keeps_resolved_dependencies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interpreter = dev_gate.InterpreterInfo(
+        requested=f"{sys.version_info.major}.{sys.version_info.minor}",
+        path=Path(sys.executable).resolve(),
+        implementation="CPython",
+        version=platform.python_version(),
+    )
+
+    def run(**kwargs):
+        log_path = kwargs["logs_dir"] / "freeze.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            "agenttalk @ file:///candidate/agenttalk.whl\nresolved-dependency==4.5.6\n",
+            encoding="utf-8",
+        )
+        return dev_gate.CommandOutcome(
+            argv=tuple(kwargs["argv"]),
+            returncode=0,
+            duration_ms=1,
+            status="pass",
+            reason_code=None,
+            diagnostic="",
+            log_path=log_path,
+        )
+
+    monkeypatch.setattr(dev_gate, "run_command", run)
+    output = dev_gate._runtime_dependency_snapshot(
+        interpreter=interpreter,
+        source_root=tmp_path,
+        env=dev_gate._base_env(tmp_path),
+        output=tmp_path / "audit-requirements.txt",
+        timeout_seconds=300,
+        logs_dir=tmp_path / "logs",
+    )
+
+    assert output.read_text(encoding="utf-8") == "resolved-dependency==4.5.6\n"
+
+
 def test_safe_candidate_export_rejects_path_traversal(tmp_path: Path) -> None:
     archive = tmp_path / "candidate.zip"
     with zipfile.ZipFile(archive, "w") as bundle:
@@ -762,6 +1055,38 @@ def test_evidence_validator_rejects_missing_nested_fields() -> None:
     del artifact["runner"]["module_sha256"]
 
     with pytest.raises(dev_gate.GateBlock, match="runner"):
+        dev_gate.validate_run_artifact(artifact, manifest)
+
+
+def test_evidence_validator_rejects_wheel_check_without_isolated_runtime() -> None:
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "linux/3.10")
+    install = next(check for check in artifact["checks"] if check["id"] == "wheel-install-py310")
+    install["runtime_environment"] = None
+
+    with pytest.raises(dev_gate.GateBlock, match="runtime_environment"):
+        dev_gate.validate_run_artifact(artifact, manifest)
+
+
+def test_evidence_validator_rejects_reused_runtime_venv_for_wheel_tests() -> None:
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "linux/3.10")
+    runtime = next(
+        check["runtime_environment"]
+        for check in artifact["checks"]
+        if check["id"] == "wheel-install-py310"
+    )
+    wheel_test = next(check for check in artifact["checks"] if check["id"] == "pytest-wheel-py310")
+    wheel_test["runtime_environment"] = {**runtime, "role": "test"}
+    wheel_test["tool"]["path"] = runtime["python_path"]
+    wheel_test["argv"][0] = runtime["python_path"]
+    wheel_test["import_provenance"] = {
+        **wheel_test["import_provenance"],
+        "expected_root": runtime["prefix"],
+        "observed_path": str(Path(runtime["prefix"]) / "site-packages" / "agenttalk" / "__init__.py"),
+    }
+
+    with pytest.raises(dev_gate.GateBlock, match="reused the runtime contract venv"):
         dev_gate.validate_run_artifact(artifact, manifest)
 
 
@@ -938,6 +1263,42 @@ def test_git_binding_ignores_environment_redirection(
 
     assert binding.clean is True
     assert binding.candidate_sha == expected_sha
+
+
+def test_executable_resolution_ignores_candidate_relative_path_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_git = dev_gate._git_executable()
+    fake_name = "git.exe" if os.name == "nt" else "git"
+    fake = tmp_path / fake_name
+    fake.write_text("not the real git\n", encoding="utf-8")
+    if os.name != "nt":
+        fake.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", "." + os.pathsep + str(real_git.parent))
+
+    assert dev_gate._git_executable() == real_git
+
+
+def test_git_and_gitleaks_child_path_exclude_candidate_absolute_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_git = dev_gate._git_executable()
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    fake_name = "git.exe" if os.name == "nt" else "git"
+    fake = candidate / fake_name
+    fake.write_text("not the real git\n", encoding="utf-8")
+    if os.name != "nt":
+        fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(candidate) + os.pathsep + str(real_git.parent))
+
+    assert dev_gate._git_executable(candidate) == real_git
+    child_env = dev_gate._gitleaks_environment(candidate)
+    assert child_env["PATH"] == str(real_git.parent)
+    assert str(candidate) not in child_env["PATH"]
 
 
 def test_external_gate_paths_cannot_enter_candidate_or_store(tmp_path: Path) -> None:

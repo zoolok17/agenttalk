@@ -54,6 +54,7 @@ REQUIRED_CHECK_KINDS = {
     "zizmor",
     "package-build",
     "wheel-install",
+    "wheel-dependency-check",
     "wheel-contract",
     "git-binding",
     "final-binding",
@@ -70,7 +71,7 @@ REQUIRED_CONFIGURED_CHECKS = {
     "wheel-contract": "wheel-contract",
 }
 CHECK_STATUSES = {"pass", "fail", "error", "missing", "timeout", "blocked_dependency"}
-TIMEOUT_CHECKS = set(REQUIRED_CONFIGURED_CHECKS) - {"wheel-contract"}
+TIMEOUT_CHECKS = set(REQUIRED_CONFIGURED_CHECKS)
 
 
 # Resolve a Python-backed gate tool while isolated from the candidate CWD and
@@ -200,8 +201,12 @@ def validate_manifest(data: Any) -> dict[str, Any]:
         "ruff",
         "bandit",
         "gitleaks",
+        "pip-audit",
+        "semgrep",
+        "zizmor",
         "package-build",
         "wheel-install",
+        "wheel-dependency-check",
         "wheel-contract",
         "final-binding",
     }
@@ -231,6 +236,7 @@ def validate_manifest(data: Any) -> dict[str, Any]:
         "pytest",
         "package-build",
         "wheel-install",
+        "wheel-dependency-check",
         "wheel-contract",
         "final-binding",
     }
@@ -257,6 +263,8 @@ def validate_manifest(data: Any) -> dict[str, Any]:
         "wheel",
         "required_sdist_paths",
         "required_wheel_resources",
+        "dependency_index",
+        "test_requirement",
     }
     for check_id, expected_kind in REQUIRED_CONFIGURED_CHECKS.items():
         spec = _require_object(checks.get(check_id), f"checks.{check_id}")
@@ -270,7 +278,7 @@ def validate_manifest(data: Any) -> dict[str, Any]:
             raise GateBlock("manifest_schema_invalid", f"checks.{check_id}.timeout_seconds must be positive")
 
     required_contract = {
-        "pytest": {"paths": ["tests"], "args": ["-q"]},
+        "pytest": {"paths": ["tests"], "args": ["-q"], "test_requirement": "pytest>=8.0"},
         "ruff": {"paths": ["src", "tests"]},
         "bandit": {"paths": ["src"], "exclude": ["src/agenttalk/skills"]},
         "gitleaks": {"config": ".gitleaks.toml", "require_full_history": True},
@@ -293,6 +301,8 @@ def validate_manifest(data: Any) -> dict[str, Any]:
             ],
         },
         "wheel-contract": {
+            "dependency_index": "https://pypi.org/simple",
+            "timeout_seconds": 600,
             "required_wheel_resources": [
                 "agenttalk/web_static/console.css",
                 "agenttalk/web_static/console.js",
@@ -411,7 +421,7 @@ def required_check_ids(
             for python in pythons:
                 for mode in profile_config["test_modes"]:
                     result.append(f"pytest-{mode}-{_python_suffix(python)}")
-        elif check_id in {"wheel-install", "wheel-contract"}:
+        elif check_id in {"wheel-install", "wheel-dependency-check", "wheel-contract"}:
             for python in pythons:
                 result.append(f"{check_id}-{_python_suffix(python)}")
         else:
@@ -486,7 +496,9 @@ def _check_semantics(check_id: str) -> tuple[str, str | None, str | None, bool]:
             f"{pytest_match.group(2)}.{pytest_match.group(3)}",
             True,
         )
-    wheel_match = re.fullmatch(r"(wheel-install|wheel-contract)-py(\d)(\d+)", check_id)
+    wheel_match = re.fullmatch(
+        r"(wheel-install|wheel-dependency-check|wheel-contract)-py(\d)(\d+)", check_id
+    )
     if wheel_match:
         return (
             wheel_match.group(1),
@@ -541,13 +553,28 @@ def _validate_check_command(
             )
         return path
 
+    def require_runtime_python(minor: str, role: str) -> str:
+        direct = interpreter_paths.get(minor)
+        if direct is None:
+            raise GateBlock("evidence_command_mismatch", f"{check_id} lacks creator CPython {minor}")
+        runtime = _validate_runtime_environment(
+            item["runtime_environment"],
+            label=f"{check_id}.runtime_environment",
+            direct_python=direct,
+            expected_minor=minor,
+            expected_role=role,
+        )
+        if tool_path != runtime["python_path"]:
+            raise GateBlock("evidence_command_mismatch", f"{check_id} did not use its isolated venv")
+        return runtime["python_path"]
+
     if check_id in {"git-binding", "final-binding"}:
         expected = [tool_path, "status", "--porcelain=v1", "--untracked-files=all"]
         valid = _path_basename(tool_path) in {"git", "git.exe"} and argv == expected
     elif check_id.startswith("pytest-"):
         _, mode, suffix = check_id.split("-")
         minor = f"{suffix[2]}.{suffix[3:]}"
-        python = require_python(minor)
+        python = require_python(minor) if mode == "source" else require_runtime_python(minor, "test")
         spec = manifest["checks"]["pytest"]
         launcher = [python, "-I", "-c", _ISOLATED_TOOL_LAUNCHER, "pytest"]
         suffix_args = [*spec["args"], "-p", "no:cacheprovider", "--basetemp"]
@@ -555,7 +582,11 @@ def _validate_check_command(
             item["mode"] == mode
             and len(argv) == len(launcher) + 1 + len(suffix_args) + 1 + len(spec["paths"])
             and argv[: len(launcher)] == launcher
-            and _is_absolute_path_text(argv[len(launcher)])
+            and (
+                _is_absolute_path_text(argv[len(launcher)])
+                if mode == "source"
+                else argv[len(launcher)] == ""
+            )
             and argv[len(launcher) + 1 : len(launcher) + 1 + len(suffix_args)] == suffix_args
             and _is_absolute_path_text(argv[len(launcher) + 1 + len(suffix_args)])
             and argv[len(launcher) + 2 + len(suffix_args) :] == spec["paths"]
@@ -578,7 +609,7 @@ def _validate_check_command(
     elif check_id.startswith("wheel-install-"):
         suffix = check_id.rsplit("-", 1)[1]
         minor = f"{suffix[2]}.{suffix[3:]}"
-        python = require_python(minor)
+        python = require_runtime_python(minor, "runtime")
         prefix = [
             python,
             "-I",
@@ -587,27 +618,27 @@ def _validate_check_command(
             "pip",
             "",
             "install",
-            "--no-index",
-            "--no-deps",
-            "--target",
+            "--disable-pip-version-check",
+            "--no-input",
+            "--no-cache-dir",
+            "--index-url",
+            manifest["checks"]["wheel-contract"]["dependency_index"],
         ]
         valid = (
-            len(argv) == len(prefix) + 2
+            len(argv) == len(prefix) + 1
             and argv[: len(prefix)] == prefix
-            and _is_absolute_path_text(argv[-2])
             and _is_absolute_path_text(argv[-1])
         )
+    elif check_id.startswith("wheel-dependency-check-"):
+        suffix = check_id.rsplit("-", 1)[1]
+        minor = f"{suffix[2]}.{suffix[3:]}"
+        python = require_runtime_python(minor, "runtime")
+        valid = argv == isolated_tool_argv(python, "pip", "check")
     elif check_id.startswith("wheel-contract-"):
         suffix = check_id.rsplit("-", 1)[1]
         minor = f"{suffix[2]}.{suffix[3:]}"
-        python = require_python(minor)
-        prefix = [python, "-I", "-c", _ISOLATED_TOOL_LAUNCHER, "agenttalk"]
-        valid = (
-            len(argv) == len(prefix) + 2
-            and argv[: len(prefix)] == prefix
-            and _is_absolute_path_text(argv[len(prefix)])
-            and argv[-1] == "--version"
-        )
+        python = require_runtime_python(minor, "runtime")
+        valid = argv == isolated_tool_argv(python, "agenttalk", "--version")
     elif check_id == "ruff":
         python = require_python(expected_minors[-1])
         valid = argv == isolated_tool_argv(
@@ -630,7 +661,14 @@ def _validate_check_command(
         )
     elif check_id == "pip-audit":
         python = require_python(expected_minors[-1])
-        prefix = isolated_tool_argv(python, "pip_audit", "--strict", "--requirement")
+        prefix = isolated_tool_argv(
+            python,
+            "pip_audit",
+            "--strict",
+            "--no-deps",
+            "--disable-pip",
+            "--requirement",
+        )
         valid = len(argv) == len(prefix) + 1 and argv[: len(prefix)] == prefix and _is_absolute_path_text(argv[-1])
     elif check_id == "semgrep":
         spec = manifest["checks"]["semgrep"]
@@ -667,6 +705,43 @@ def _validate_import_provenance(value: Any, *, label: str, expected_version: str
         or item["version"] != expected_version
     ):
         raise GateBlock("evidence_schema_invalid", f"{label} is not a bound import proof")
+
+
+def _validate_runtime_environment(
+    value: Any,
+    *,
+    label: str,
+    direct_python: str,
+    expected_minor: str,
+    expected_role: str,
+) -> dict[str, Any]:
+    item = _require_object(value, label)
+    _require_artifact_fields(
+        item,
+        {
+            "role",
+            "requested",
+            "creator_path",
+            "python_path",
+            "prefix",
+            "base_prefix",
+            "system_site_packages",
+        },
+        label,
+    )
+    if (
+        item["role"] != expected_role
+        or item["requested"] != expected_minor
+        or item["creator_path"] != direct_python
+        or not _is_absolute_path_text(item["python_path"])
+        or not _is_absolute_path_text(item["prefix"])
+        or not _is_absolute_path_text(item["base_prefix"])
+        or not _path_contains(item["prefix"], item["python_path"])
+        or item["prefix"] == item["base_prefix"]
+        or item["system_site_packages"] is not False
+    ):
+        raise GateBlock("evidence_schema_invalid", f"{label} is not an isolated venv proof")
+    return item
 
 
 def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, Any]:
@@ -820,6 +895,8 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
             "pytest_cache_disabled",
             "bytecode_disabled",
             "phase_isolated_exports",
+            "pip_configuration_disabled",
+            "child_path_sanitized",
         },
         "isolation",
     )
@@ -885,6 +962,7 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
         "diagnostic",
         "log",
         "import_provenance",
+        "runtime_environment",
     }
     checks_by_id: dict[str, dict[str, Any]] = {}
     for index, check in enumerate(checks):
@@ -950,7 +1028,57 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
                 label=f"checks[{index}].import_provenance",
                 expected_version=subject["version"],
             )
+        is_wheel_runtime_check = (
+            check_id.startswith("pytest-wheel-")
+            or check_id.startswith("wheel-install-")
+            or check_id.startswith("wheel-dependency-check-")
+            or check_id.startswith("wheel-contract-")
+        )
+        if (
+            is_wheel_runtime_check
+            and item["status"] == "pass"
+            and item["import_provenance"] is not None
+            and item["import_provenance"]["expected_root"]
+            != item["runtime_environment"]["prefix"]
+        ):
+            raise GateBlock(
+                "evidence_binding_mismatch",
+                f"checks[{index}] import proof is outside its isolated venv",
+            )
+        if not is_wheel_runtime_check and item["runtime_environment"] is not None:
+            raise GateBlock(
+                "evidence_schema_invalid",
+                f"checks[{index}] unexpectedly claims a wheel runtime environment",
+            )
         checks_by_id[check_id] = item
+
+    for minor in expected_minors:
+        suffix = _python_suffix(minor)
+        runtime_ids = [
+            f"wheel-install-{suffix}",
+            f"wheel-dependency-check-{suffix}",
+            f"wheel-contract-{suffix}",
+        ]
+        passing_runtime = [
+            checks_by_id[check_id]
+            for check_id in runtime_ids
+            if check_id in checks_by_id and checks_by_id[check_id]["status"] == "pass"
+        ]
+        if passing_runtime:
+            first = passing_runtime[0]["runtime_environment"]
+            if any(check["runtime_environment"] != first for check in passing_runtime[1:]):
+                raise GateBlock(
+                    "evidence_binding_mismatch",
+                    f"wheel runtime proofs differ for Python {minor}",
+                )
+        wheel_test = checks_by_id.get(f"pytest-wheel-{suffix}")
+        if wheel_test is not None and wheel_test["status"] == "pass" and passing_runtime:
+            test_environment = wheel_test["runtime_environment"]
+            if test_environment["prefix"] == passing_runtime[0]["runtime_environment"]["prefix"]:
+                raise GateBlock(
+                    "evidence_schema_invalid",
+                    f"wheel tests reused the runtime contract venv for Python {minor}",
+                )
 
     artifacts = _require_object(record["artifacts"], "artifacts")
     allowed_artifacts = {"sdist", "wheel"}
@@ -976,6 +1104,21 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
         raise GateBlock("evidence_cardinality_invalid", "passing package build lacks sdist or wheel evidence")
     if checks_by_id.get("pip-audit", {}).get("status") == "pass" and "audit_requirements" not in artifacts:
         raise GateBlock("evidence_cardinality_invalid", "passing pip-audit lacks requirements evidence")
+    if "wheel" in artifacts:
+        for check_id, check in checks_by_id.items():
+            if (
+                check_id.startswith("wheel-install-")
+                and check["status"] == "pass"
+                and check["argv"][-1] != artifacts["wheel"]["path"]
+            ):
+                raise GateBlock("evidence_binding_mismatch", "wheel install did not use the evidenced wheel")
+    pip_audit = checks_by_id.get("pip-audit")
+    if (
+        pip_audit is not None
+        and pip_audit["status"] == "pass"
+        and pip_audit["argv"][-1] != artifacts["audit_requirements"]["path"]
+    ):
+        raise GateBlock("evidence_binding_mismatch", "pip-audit did not use the evidenced dependency snapshot")
 
     external_inputs = _require_list(record["external_inputs"], "external_inputs")
     observed_external: set[tuple[str, str, str, str]] = set()
@@ -989,6 +1132,17 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
             ("semgrep", "live-rule-registry", locator, "live-registry-unversioned")
             for locator in ("p/python", "p/security-audit")
         )
+    dependency_index = manifest["checks"]["wheel-contract"]["dependency_index"]
+    allowed_external.update(
+        (
+            check_id,
+            "live-package-index",
+            dependency_index,
+            "live-service-unversioned",
+        )
+        for check_id in expected_ids
+        if check_id.startswith("wheel-install-") or check_id.startswith("pytest-wheel-")
+    )
     for index, external_input in enumerate(external_inputs):
         item = _require_object(external_input, f"external_inputs[{index}]")
         _require_artifact_fields(
@@ -1012,6 +1166,12 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
         required_external.update(key for key in allowed_external if key[0] == "pip-audit")
     if checks_by_id.get("semgrep", {}).get("status") == "pass":
         required_external.update(key for key in allowed_external if key[0] == "semgrep")
+    required_external.update(
+        key
+        for key in allowed_external
+        if checks_by_id.get(key[0], {}).get("status") == "pass"
+        and key[1] == "live-package-index"
+    )
     if not required_external.issubset(observed_external):
         raise GateBlock("evidence_cardinality_invalid", "passing live checks lack external input evidence")
 
@@ -1331,15 +1491,88 @@ def aggregate_leg_artifacts(
     }
 
 
-def _git_executable() -> Path:
-    executable = shutil.which("git", path=os.environ.get("PATH"))
+def _absolute_path_entries(
+    path_value: str,
+    *,
+    forbidden_roots: Sequence[Path] = (),
+) -> list[Path]:
+    """Return existing absolute PATH directories outside candidate-controlled roots."""
+
+    roots = [Path.cwd(), *forbidden_roots]
+    raw_store = os.environ.get("AGENTTALK_ROOT")
+    if raw_store:
+        store_root = Path(raw_store)
+        if store_root.is_absolute():
+            roots.append(store_root)
+    result: list[Path] = []
+    observed: set[str] = set()
+    for raw_directory in path_value.split(os.pathsep):
+        cleaned = raw_directory.strip().strip('"')
+        if not cleaned:
+            continue
+        directory = Path(cleaned)
+        if not directory.is_absolute() or not directory.is_dir():
+            continue
+        resolved = directory.resolve()
+        if any(_is_within(resolved, root) for root in roots):
+            continue
+        key = os.path.normcase(str(resolved))
+        if key in observed:
+            continue
+        observed.add(key)
+        result.append(resolved)
+    return result
+
+
+def _sanitized_path_value(
+    path_value: str,
+    *,
+    forbidden_roots: Sequence[Path] = (),
+) -> str:
+    return os.pathsep.join(str(path) for path in _absolute_path_entries(path_value, forbidden_roots=forbidden_roots))
+
+
+def _executable_on_absolute_path(
+    name: str,
+    *,
+    forbidden_roots: Sequence[Path] = (),
+) -> Path | None:
+    """Resolve only from absolute PATH entries, never the candidate CWD."""
+
+    path_value = os.environ.get("PATH", "")
+    extensions = [""]
+    if os.name == "nt" and not Path(name).suffix:
+        extensions.extend(
+            extension.lower()
+            for extension in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep)
+            if extension
+        )
+    for directory in _absolute_path_entries(path_value, forbidden_roots=forbidden_roots):
+        for extension in extensions:
+            candidate = directory / (name + extension)
+            if not candidate.is_file():
+                continue
+            if os.name != "nt" and not os.access(candidate, os.X_OK):
+                continue
+            return candidate.resolve()
+    return None
+
+
+def _git_executable(root: Path | None = None) -> Path:
+    executable = _executable_on_absolute_path(
+        "git",
+        forbidden_roots=(() if root is None else (root,)),
+    )
     if executable is None:
-        raise GateBlock("git_unavailable", "git executable is unavailable")
-    return Path(executable).resolve()
+        raise GateBlock("git_unavailable", "git executable is unavailable on absolute PATH entries")
+    return executable
 
 
-def _git_environment() -> dict[str, str]:
-    env = _base_env(Path(tempfile.gettempdir()))
+def _git_environment(root: Path | None = None) -> dict[str, str]:
+    env = _base_env(
+        Path(tempfile.gettempdir()),
+        forbidden_roots=(() if root is None else (root,)),
+    )
     for key in tuple(env):
         if key.startswith("GIT_"):
             env.pop(key, None)
@@ -1347,14 +1580,22 @@ def _git_environment() -> dict[str, str]:
     return env
 
 
+def _gitleaks_environment(root: Path) -> dict[str, str]:
+    """Give gitleaks exactly the attested Git directory for child lookup."""
+
+    env = _git_environment(root)
+    env["PATH"] = str(_git_executable(root).parent)
+    return env
+
+
 def _git(root: Path, args: list[str], *, binary: bool = False) -> str | bytes:
-    executable = _git_executable()
+    executable = _git_executable(root)
     try:
         # Git is resolved to an absolute executable and receives a fixed argv list.
         completed = subprocess.run(  # nosec B603
             [str(executable), *args],
             cwd=root,
-            env=_git_environment(),
+            env=_git_environment(root),
             capture_output=True,
             text=not binary,
             timeout=30,
@@ -1371,12 +1612,12 @@ def _git(root: Path, args: list[str], *, binary: bool = False) -> str | bytes:
 def _git_hash_worktree_bytes(root: Path, path: str, data: bytes) -> str:
     """Hash checkout bytes through Git's clean filters for a platform-neutral blob ID."""
 
-    executable = _git_executable()
+    executable = _git_executable(root)
     try:
         completed = subprocess.run(  # nosec B603
             [str(executable), "hash-object", f"--path={path}", "--stdin"],
             cwd=root,
-            env=_git_environment(),
+            env=_git_environment(root),
             input=data,
             capture_output=True,
             timeout=30,
@@ -1522,7 +1763,11 @@ def load_bound_manifest(binding: CandidateBinding) -> dict[str, Any]:
     return validate_manifest(raw)
 
 
-def _base_env(temp_root: Path) -> dict[str, str]:
+def _base_env(
+    temp_root: Path,
+    *,
+    forbidden_roots: Sequence[Path] = (),
+) -> dict[str, str]:
     allowed = {
         "APPDATA",
         "COMSPEC",
@@ -1544,12 +1789,18 @@ def _base_env(temp_root: Path) -> dict[str, str]:
         "WINDIR",
     }
     env = {key: value for key, value in os.environ.items() if key.upper() in allowed}
+    env["PATH"] = _sanitized_path_value(
+        env.get("PATH", ""),
+        forbidden_roots=(temp_root, *forbidden_roots),
+    )
     env.update(
         {
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
             "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+            "PIP_CONFIG_FILE": os.devnull,
+            "PIP_NO_CACHE_DIR": "1",
             "PIP_NO_INPUT": "1",
             "TMP": str(temp_root),
             "TEMP": str(temp_root),
@@ -1562,12 +1813,6 @@ def _base_env(temp_root: Path) -> dict[str, str]:
 def source_environment(base: dict[str, str], source_root: Path) -> dict[str, str]:
     env = dict(base)
     env["PYTHONPATH"] = str((source_root / "src").resolve())
-    return env
-
-
-def wheel_environment(base: dict[str, str], wheel_target: Path) -> dict[str, str]:
-    env = dict(base)
-    env["PYTHONPATH"] = str(wheel_target.resolve())
     return env
 
 
@@ -1658,6 +1903,7 @@ def _record_from_outcome(
     mode: str | None = None,
     python: str | None = None,
     import_provenance: dict[str, Any] | None = None,
+    runtime_environment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     log_hash = _sha256_file(outcome.log_path) if outcome.log_path.exists() else ""
     return {
@@ -1675,6 +1921,7 @@ def _record_from_outcome(
         "diagnostic": outcome.diagnostic,
         "log": {"path": str(outcome.log_path), "sha256": log_hash},
         "import_provenance": import_provenance,
+        "runtime_environment": runtime_environment,
     }
 
 
@@ -1698,6 +1945,7 @@ def _blocked_record(check_id: str, detail: str, logs_dir: Path) -> dict[str, Any
         "diagnostic": detail,
         "log": {"path": str(log_path), "sha256": _sha256_file(log_path)},
         "import_provenance": None,
+        "runtime_environment": None,
     }
 
 
@@ -1769,7 +2017,8 @@ def _discover_python(minor: str, temp_root: Path, logs_dir: Path) -> Interpreter
         if exc.code not in {"python_version_mismatch", "python_probe_invalid", "python_unavailable"}:
             raise
     if os.name == "nt":
-        launcher = shutil.which("py")
+        launcher_path = _executable_on_absolute_path("py")
+        launcher = str(launcher_path) if launcher_path is not None else None
         if launcher is None:
             raise GateBlock("python_unavailable", f"no mapping or py launcher for Python {minor}")
         locator = run_command(
@@ -1787,7 +2036,8 @@ def _discover_python(minor: str, temp_root: Path, logs_dir: Path) -> Interpreter
             raise GateBlock("python_probe_invalid", f"py -{minor} returned no executable")
         candidate = Path(lines[-1])
     else:
-        executable = shutil.which(f"python{minor}")
+        executable_path = _executable_on_absolute_path(f"python{minor}")
+        executable = str(executable_path) if executable_path is not None else None
         if executable is None:
             raise GateBlock("python_unavailable", f"python{minor} is unavailable")
         candidate = Path(executable)
@@ -1829,6 +2079,87 @@ def isolated_tool_argv(
     ]
 
 
+def _create_isolated_venv(
+    *,
+    creator: InterpreterInfo,
+    root: Path,
+    role: str,
+    logs_dir: Path,
+) -> tuple[InterpreterInfo, dict[str, Any]]:
+    """Create and prove a fresh no-system-site-packages venv."""
+
+    if role not in {"runtime", "test"}:
+        raise GateBlock("wheel_environment_invalid", f"unknown wheel environment role {role!r}")
+    create = run_command(
+        check_id=f"venv-create-{role}-{_python_suffix(creator.requested)}",
+        argv=isolated_tool_argv(creator.path, "venv", "--clear", "--copies", str(root)),
+        cwd=root.parent,
+        env=_base_env(root.parent),
+        timeout_seconds=300,
+        logs_dir=logs_dir,
+    )
+    if create.status != "pass":
+        raise GateBlock(
+            "wheel_environment_create_failed",
+            create.diagnostic or f"cannot create {role} venv for Python {creator.requested}",
+        )
+    python = root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    config = root / "pyvenv.cfg"
+    try:
+        config_text = config.read_text(encoding="utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise GateBlock("wheel_environment_invalid", f"cannot read {config}: {exc}") from exc
+    if not re.search(r"(?im)^include-system-site-packages\s*=\s*false\s*$", config_text):
+        raise GateBlock("wheel_environment_invalid", f"{role} venv enables system site-packages")
+    script = (
+        "import json,platform,sys;"
+        "print(json.dumps({'executable':sys.executable,'implementation':platform.python_implementation(),"
+        "'version':platform.python_version(),'minor':f'{sys.version_info.major}.{sys.version_info.minor}',"
+        "'prefix':sys.prefix,'base_prefix':sys.base_prefix}))"
+    )
+    probe = run_command(
+        check_id=f"venv-probe-{role}-{_python_suffix(creator.requested)}",
+        argv=[str(python), "-I", "-c", script],
+        cwd=root.parent,
+        env=_base_env(root.parent),
+        timeout_seconds=30,
+        logs_dir=logs_dir,
+    )
+    if probe.status != "pass":
+        raise GateBlock("wheel_environment_invalid", probe.diagnostic or f"cannot probe {role} venv")
+    try:
+        payload = json.loads(probe.log_path.read_text(encoding="utf-8").splitlines()[-1])
+    except (OSError, IndexError, json.JSONDecodeError, TypeError) as exc:
+        raise GateBlock("wheel_environment_invalid", f"{role} venv returned invalid proof") from exc
+    observed_python = Path(str(payload.get("executable", ""))).resolve()
+    observed_prefix = Path(str(payload.get("prefix", ""))).resolve()
+    observed_base = Path(str(payload.get("base_prefix", ""))).resolve()
+    if (
+        payload.get("minor") != creator.requested
+        or payload.get("implementation") != "CPython"
+        or observed_python != python.resolve()
+        or observed_prefix != root.resolve()
+        or observed_base == observed_prefix
+    ):
+        raise GateBlock("wheel_environment_invalid", f"{role} venv proof does not match its creator")
+    info = InterpreterInfo(
+        requested=creator.requested,
+        path=observed_python,
+        implementation="CPython",
+        version=str(payload["version"]),
+    )
+    proof = {
+        "role": role,
+        "requested": creator.requested,
+        "creator_path": str(creator.path),
+        "python_path": str(observed_python),
+        "prefix": str(observed_prefix),
+        "base_prefix": str(observed_base),
+        "system_site_packages": False,
+    }
+    return info, proof
+
+
 def _probe_python_module(interpreter: InterpreterInfo, module: str, temp_root: Path, logs_dir: Path) -> str:
     outcome = run_command(
         check_id=f"tool-probe-{module.replace('_', '-')}",
@@ -1845,10 +2176,12 @@ def _probe_python_module(interpreter: InterpreterInfo, module: str, temp_root: P
 
 
 def _probe_executable(name: str, temp_root: Path, logs_dir: Path) -> tuple[Path, str]:
-    raw = shutil.which(name)
-    if raw is None:
-        raise GateBlock("required_tool_missing", f"{name} executable is unavailable")
-    executable = Path(raw).resolve()
+    executable = _executable_on_absolute_path(name)
+    if executable is None:
+        raise GateBlock(
+            "required_tool_missing",
+            f"{name} executable is unavailable on absolute PATH entries",
+        )
     outcome = run_command(
         check_id=f"tool-probe-{name}",
         argv=[str(executable), "--version" if name != "gitleaks" else "version"],
@@ -1890,13 +2223,13 @@ def _safe_extract_zip(archive: Path, destination: Path) -> None:
 
 
 def export_candidate(binding: CandidateBinding, destination: Path, archive_path: Path) -> None:
-    git = _git_executable()
+    git = _git_executable(binding.root)
     try:
         # Git is resolved to an absolute executable and receives a fixed archive argv.
         completed = subprocess.run(  # nosec B603
             [str(git), "archive", "--format=zip", "--output", str(archive_path), binding.candidate_sha],
             cwd=binding.root,
-            env=_git_environment(),
+            env=_git_environment(binding.root),
             text=True,
             capture_output=True,
             timeout=120,
@@ -1930,18 +2263,26 @@ def import_probe(
     logs_dir: Path,
     expected_version: str,
     label: str,
+    candidate_import_root: Path | None,
 ) -> dict[str, Any]:
     del temp_root
     script = (
         "import json,pathlib,sys;"
-        "sys.path.insert(0,sys.argv.pop(1));"
+        "candidate_import_root=sys.argv.pop(1);"
+        "candidate_import_root and sys.path.insert(0,candidate_import_root);"
         "import agenttalk;"
         "print(json.dumps({'path':str(pathlib.Path(agenttalk.__file__).resolve()),"
         "'version':agenttalk.__version__}))"
     )
     outcome = run_command(
         check_id=f"import-probe-{label}",
-        argv=[str(interpreter.path), "-I", "-c", script, str(expected_root.resolve())],
+        argv=[
+            str(interpreter.path),
+            "-I",
+            "-c",
+            script,
+            "" if candidate_import_root is None else str(candidate_import_root.resolve()),
+        ],
         cwd=cwd,
         env=env,
         timeout_seconds=60,
@@ -2118,6 +2459,7 @@ def _run_pytest_mode(
     manifest: dict[str, Any],
     basetemp: Path,
     logs_dir: Path,
+    runtime_environment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     check_id = f"pytest-{mode}-{_python_suffix(interpreter.requested)}"
     spec = manifest["checks"]["pytest"]
@@ -2132,6 +2474,7 @@ def _run_pytest_mode(
             logs_dir=logs_dir,
             expected_version=expected_version,
             label=f"{mode}-{_python_suffix(interpreter.requested)}",
+            candidate_import_root=import_root if mode == "source" else None,
         )
     except GateBlock as exc:
         return _blocked_record(check_id, exc.detail, logs_dir)
@@ -2144,7 +2487,7 @@ def _run_pytest_mode(
         "--basetemp",
         str(basetemp),
         *spec.get("paths", []),
-        candidate_import_root=import_root,
+        candidate_import_root=import_root if mode == "source" else None,
     )
     outcome = run_command(
         check_id=check_id,
@@ -2163,16 +2506,18 @@ def _run_pytest_mode(
         mode=mode,
         python=interpreter.requested,
         import_provenance=provenance,
+        runtime_environment=runtime_environment,
     )
 
 
 def _install_wheel(
     *,
     interpreter: InterpreterInfo,
+    runtime_environment: dict[str, Any],
     wheel: Path | None,
-    target: Path,
     source_root: Path,
     env: dict[str, str],
+    manifest: dict[str, Any],
     logs_dir: Path,
 ) -> dict[str, Any]:
     check_id = f"wheel-install-{_python_suffix(interpreter.requested)}"
@@ -2192,22 +2537,23 @@ def _install_wheel(
         (line for line in probe.log_path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()),
         "unknown",
     )
-    target.mkdir(parents=True, exist_ok=True)
+    index = manifest["checks"]["wheel-contract"]["dependency_index"]
     outcome = run_command(
         check_id=check_id,
         argv=isolated_tool_argv(
             interpreter.path,
             "pip",
             "install",
-            "--no-index",
-            "--no-deps",
-            "--target",
-            str(target),
+            "--disable-pip-version-check",
+            "--no-input",
+            "--no-cache-dir",
+            "--index-url",
+            index,
             str(wheel),
         ),
         cwd=source_root,
         env=env,
-        timeout_seconds=300,
+        timeout_seconds=int(manifest["checks"]["wheel-contract"]["timeout_seconds"]),
         logs_dir=logs_dir,
     )
     return _record_from_outcome(
@@ -2218,13 +2564,47 @@ def _install_wheel(
         tool_version=tool_version[:200],
         mode="wheel",
         python=interpreter.requested,
+        runtime_environment=runtime_environment,
+    )
+
+
+def _wheel_dependency_check(
+    *,
+    interpreter: InterpreterInfo,
+    runtime_environment: dict[str, Any],
+    source_root: Path,
+    env: dict[str, str],
+    install_record: dict[str, Any],
+    timeout_seconds: int,
+    logs_dir: Path,
+) -> dict[str, Any]:
+    check_id = f"wheel-dependency-check-{_python_suffix(interpreter.requested)}"
+    if install_record["status"] != "pass":
+        return _blocked_record(check_id, "wheel installation failed", logs_dir)
+    outcome = run_command(
+        check_id=check_id,
+        argv=isolated_tool_argv(interpreter.path, "pip", "check"),
+        cwd=source_root,
+        env=env,
+        timeout_seconds=timeout_seconds,
+        logs_dir=logs_dir,
+    )
+    return _record_from_outcome(
+        check_id,
+        "wheel-dependency-check",
+        outcome,
+        tool_path=str(interpreter.path),
+        tool_version=interpreter.version,
+        mode="wheel",
+        python=interpreter.requested,
+        runtime_environment=runtime_environment,
     )
 
 
 def _wheel_contract(
     *,
     interpreter: InterpreterInfo,
-    target: Path,
+    runtime_environment: dict[str, Any],
     source_root: Path,
     env: dict[str, str],
     expected_version: str,
@@ -2238,21 +2618,23 @@ def _wheel_contract(
     try:
         provenance = import_probe(
             interpreter=interpreter,
-            expected_root=target,
+            expected_root=Path(runtime_environment["prefix"]),
             cwd=source_root,
             env=env,
-            temp_root=target.parent,
+            temp_root=source_root.parent,
             logs_dir=logs_dir,
             expected_version=expected_version,
             label=f"wheel-contract-{_python_suffix(interpreter.requested)}",
+            candidate_import_root=None,
         )
     except GateBlock as exc:
         return _blocked_record(check_id, exc.detail, logs_dir)
     problems: list[str] = []
+    installed_package = Path(provenance["observed_path"]).parent
     for resource in manifest["checks"]["wheel-contract"]["required_wheel_resources"]:
         relative = resource.removeprefix("agenttalk/")
         source = source_root / "src" / "agenttalk" / relative
-        installed = target / "agenttalk" / relative
+        installed = installed_package / relative
         if not source.is_file() or not installed.is_file():
             problems.append(f"missing required resource {resource}")
         elif source.read_bytes() != installed.read_bytes():
@@ -2263,11 +2645,10 @@ def _wheel_contract(
             interpreter.path,
             "agenttalk",
             "--version",
-            candidate_import_root=target,
         ),
         cwd=source_root,
         env=env,
-        timeout_seconds=60,
+        timeout_seconds=int(manifest["checks"]["wheel-contract"]["timeout_seconds"]),
         logs_dir=logs_dir,
     )
     record = _record_from_outcome(
@@ -2279,10 +2660,105 @@ def _wheel_contract(
         mode="wheel",
         python=interpreter.requested,
         import_provenance=provenance,
+        runtime_environment=runtime_environment,
     )
     if problems:
         record = _change_record_failure(record, "wheel_resource_mismatch", "; ".join(problems))
     return record
+
+
+def _prepare_wheel_test_environment(
+    *,
+    creator: InterpreterInfo,
+    wheel: Path | None,
+    root: Path,
+    source_root: Path,
+    env: dict[str, str],
+    manifest: dict[str, Any],
+    logs_dir: Path,
+) -> tuple[InterpreterInfo, dict[str, Any]]:
+    if wheel is None:
+        raise GateBlock("wheel_test_environment_failed", "package build did not produce a wheel")
+    interpreter, proof = _create_isolated_venv(
+        creator=creator,
+        root=root,
+        role="test",
+        logs_dir=logs_dir,
+    )
+    index = manifest["checks"]["wheel-contract"]["dependency_index"]
+    for label, requirement in (
+        ("candidate", str(wheel)),
+        ("pytest", manifest["checks"]["pytest"]["test_requirement"]),
+    ):
+        outcome = run_command(
+            check_id=f"wheel-test-install-{label}-{_python_suffix(creator.requested)}",
+            argv=isolated_tool_argv(
+                interpreter.path,
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--no-input",
+                "--no-cache-dir",
+                "--index-url",
+                index,
+                requirement,
+            ),
+            cwd=source_root,
+            env=env,
+            timeout_seconds=int(manifest["checks"]["wheel-contract"]["timeout_seconds"]),
+            logs_dir=logs_dir,
+        )
+        if outcome.status != "pass":
+            raise GateBlock(
+                "wheel_test_environment_failed",
+                outcome.diagnostic or f"cannot install {label} into isolated wheel test environment",
+            )
+    consistency = run_command(
+        check_id=f"wheel-test-pip-check-{_python_suffix(creator.requested)}",
+        argv=isolated_tool_argv(interpreter.path, "pip", "check"),
+        cwd=source_root,
+        env=env,
+        timeout_seconds=int(manifest["checks"]["wheel-contract"]["timeout_seconds"]),
+        logs_dir=logs_dir,
+    )
+    if consistency.status != "pass":
+        raise GateBlock(
+            "wheel_test_environment_failed",
+            consistency.diagnostic or "isolated wheel test environment has dependency conflicts",
+        )
+    return interpreter, proof
+
+
+def _runtime_dependency_snapshot(
+    *,
+    interpreter: InterpreterInfo,
+    source_root: Path,
+    env: dict[str, str],
+    output: Path,
+    timeout_seconds: int,
+    logs_dir: Path,
+) -> Path:
+    outcome = run_command(
+        check_id=f"wheel-freeze-{_python_suffix(interpreter.requested)}",
+        argv=isolated_tool_argv(interpreter.path, "pip", "freeze", "--exclude-editable"),
+        cwd=source_root,
+        env=env,
+        timeout_seconds=timeout_seconds,
+        logs_dir=logs_dir,
+    )
+    if outcome.status != "pass":
+        raise GateBlock("wheel_dependency_snapshot_failed", outcome.diagnostic or "pip freeze failed")
+    try:
+        lines = outcome.log_path.read_text(encoding="utf-8", errors="strict").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise GateBlock("wheel_dependency_snapshot_failed", f"cannot read dependency snapshot: {exc}") from exc
+    filtered = [
+        line
+        for line in lines
+        if not re.match(r"(?i)^agenttalk(?:==|\s*@\s*)", line.strip())
+    ]
+    write_text(output, "\n".join(filtered) + ("\n" if filtered else ""), encoding="utf-8", newline="\n")
+    return output
 
 
 def _python_module_check(
@@ -2354,35 +2830,20 @@ def _pip_audit_check(
     source_root: Path,
     env: dict[str, str],
     manifest: dict[str, Any],
-    audit_root: Path,
+    requirements: Path | None,
     logs_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     check_id = "pip-audit"
+    if requirements is None or not requirements.is_file():
+        return _blocked_record(
+            check_id,
+            "resolved wheel dependency snapshot is unavailable",
+            logs_dir,
+        ), None
     try:
         version = _probe_python_module(interpreter, "pip_audit", source_root, logs_dir)
     except GateBlock as exc:
         return _blocked_record(check_id, exc.detail, logs_dir), None
-    freeze = run_command(
-        check_id="pip-audit-freeze",
-        argv=isolated_tool_argv(
-            interpreter.path,
-            "pip",
-            "freeze",
-            "--exclude-editable",
-        ),
-        cwd=source_root,
-        env=env,
-        timeout_seconds=300,
-        logs_dir=logs_dir,
-    )
-    if freeze.status != "pass":
-        return _blocked_record(check_id, "pip freeze failed before audit", logs_dir), None
-    requirements = audit_root / "audit-requirements.txt"
-    try:
-        frozen = freeze.log_path.read_text(encoding="utf-8", errors="strict")
-        write_text(requirements, frozen, encoding="utf-8", newline="\n")
-    except (OSError, UnicodeDecodeError) as exc:
-        return _blocked_record(check_id, f"cannot materialize audit requirements: {exc}", logs_dir), None
     spec = manifest["checks"][check_id]
     outcome = run_command(
         check_id=check_id,
@@ -2390,6 +2851,8 @@ def _pip_audit_check(
             interpreter.path,
             "pip_audit",
             "--strict",
+            "--no-deps",
+            "--disable-pip",
             "--requirement",
             str(requirements),
         ),
@@ -2422,7 +2885,7 @@ def run_static_checks(
     env: dict[str, str],
     manifest: dict[str, Any],
     required_ids: set[str],
-    run_root: Path,
+    audit_requirements: Path | None,
     logs_dir: Path,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
     records: dict[str, dict[str, Any]] = {}
@@ -2474,7 +2937,7 @@ def run_static_checks(
                     str(candidate_root.resolve()),
                 ],
                 cwd=candidate_root,
-                env=_git_environment(),
+                env=_gitleaks_environment(candidate_root),
                 timeout_seconds=int(spec["timeout_seconds"]),
                 logs_dir=logs_dir,
             )
@@ -2484,7 +2947,7 @@ def run_static_checks(
             source_root=source_root,
             env=env,
             manifest=manifest,
-            audit_root=run_root,
+            requirements=audit_requirements,
             logs_dir=logs_dir,
         )
         records["pip-audit"] = record
@@ -2569,6 +3032,7 @@ def _synthetic_record(
         "diagnostic": diagnostic,
         "log": {"path": str(log_path.resolve()), "sha256": _sha256_file(log_path)},
         "import_provenance": None,
+        "runtime_environment": None,
     }
 
 
@@ -2807,7 +3271,7 @@ def execute_gate(
             build_interpreter = next((interpreters[minor] for minor in minors if minor in interpreters), None)
             wheel: Path | None = None
             package_root = _export_phase(binding, run_root, "package")
-            package_env = source_environment(base_env, package_root)
+            package_env = dict(base_env)
             if build_interpreter is None:
                 checks_by_id["package-build"] = _blocked_record(
                     "package-build", "no required interpreter is available", logs_dir
@@ -2825,49 +3289,127 @@ def execute_gate(
                 artifacts.update(package_artifacts)
 
             wheel_source_root = _export_phase(binding, run_root, "wheel")
-            wheel_source_env = source_environment(base_env, wheel_source_root)
+            wheel_source_env = dict(base_env)
+            dependency_snapshots: dict[str, Path] = {}
             for minor in minors:
-                interpreter = interpreters.get(minor)
-                if interpreter is None:
+                creator = interpreters.get(minor)
+                if creator is None:
                     continue
-                target = run_root / f"wheel-{_python_suffix(minor)}"
+                wheel_test_id = f"pytest-wheel-{_python_suffix(minor)}"
+                install_id = f"wheel-install-{_python_suffix(minor)}"
+                dependency_id = f"wheel-dependency-check-{_python_suffix(minor)}"
+                contract_id = f"wheel-contract-{_python_suffix(minor)}"
+                try:
+                    runtime_interpreter, runtime_proof = _create_isolated_venv(
+                        creator=creator,
+                        root=run_root / f"runtime-{_python_suffix(minor)}",
+                        role="runtime",
+                        logs_dir=logs_dir,
+                    )
+                except GateBlock as exc:
+                    checks_by_id[install_id] = _blocked_record(install_id, exc.detail, logs_dir)
+                    checks_by_id[dependency_id] = _blocked_record(dependency_id, exc.detail, logs_dir)
+                    checks_by_id[contract_id] = _blocked_record(contract_id, exc.detail, logs_dir)
+                    checks_by_id[wheel_test_id] = _blocked_record(wheel_test_id, exc.detail, logs_dir)
+                    continue
                 install = _install_wheel(
-                    interpreter=interpreter,
+                    interpreter=runtime_interpreter,
+                    runtime_environment=runtime_proof,
                     wheel=wheel,
-                    target=target,
                     source_root=wheel_source_root,
                     env=wheel_source_env,
+                    manifest=manifest,
                     logs_dir=logs_dir,
                 )
-                checks_by_id[install["id"]] = install
-                contract = _wheel_contract(
-                    interpreter=interpreter,
-                    target=target,
+                checks_by_id[install_id] = install
+                if install["status"] == "pass":
+                    external_inputs.append(
+                        {
+                            "check_id": install_id,
+                            "kind": "live-package-index",
+                            "locator": manifest["checks"]["wheel-contract"]["dependency_index"],
+                            "mutable": True,
+                            "identity": "live-service-unversioned",
+                            "observed_at": _utc_now(),
+                        }
+                    )
+                dependency = _wheel_dependency_check(
+                    interpreter=runtime_interpreter,
+                    runtime_environment=runtime_proof,
                     source_root=wheel_source_root,
-                    env=wheel_environment(base_env, target),
+                    env=wheel_source_env,
+                    install_record=install,
+                    timeout_seconds=int(
+                        manifest["checks"]["wheel-contract"]["timeout_seconds"]
+                    ),
+                    logs_dir=logs_dir,
+                )
+                checks_by_id[dependency_id] = dependency
+                contract = _wheel_contract(
+                    interpreter=runtime_interpreter,
+                    runtime_environment=runtime_proof,
+                    source_root=wheel_source_root,
+                    env=wheel_source_env,
                     expected_version=version,
                     manifest=manifest,
                     install_record=install,
                     logs_dir=logs_dir,
                 )
-                checks_by_id[contract["id"]] = contract
-                wheel_test_id = f"pytest-wheel-{_python_suffix(minor)}"
-                if install["status"] == "pass":
+                checks_by_id[contract_id] = contract
+                if dependency["status"] == "pass":
+                    try:
+                        dependency_snapshots[minor] = _runtime_dependency_snapshot(
+                            interpreter=runtime_interpreter,
+                            source_root=wheel_source_root,
+                            env=wheel_source_env,
+                            output=run_root / f"audit-requirements-{_python_suffix(minor)}.txt",
+                            timeout_seconds=int(
+                                manifest["checks"]["wheel-contract"]["timeout_seconds"]
+                            ),
+                            logs_dir=logs_dir,
+                        )
+                    except GateBlock as exc:
+                        checks_by_id[dependency_id] = _change_record_failure(
+                            dependency,
+                            exc.code,
+                            exc.detail,
+                        )
+                try:
+                    test_interpreter, test_proof = _prepare_wheel_test_environment(
+                        creator=creator,
+                        wheel=wheel,
+                        root=run_root / f"test-{_python_suffix(minor)}",
+                        source_root=wheel_source_root,
+                        env=wheel_source_env,
+                        manifest=manifest,
+                        logs_dir=logs_dir,
+                    )
+                except GateBlock as exc:
+                    checks_by_id[wheel_test_id] = _blocked_record(wheel_test_id, exc.detail, logs_dir)
+                else:
                     checks_by_id[wheel_test_id] = _run_pytest_mode(
                         mode="wheel",
-                        interpreter=interpreter,
+                        interpreter=test_interpreter,
                         source_root=wheel_source_root,
-                        import_root=target,
-                        env=wheel_environment(base_env, target),
+                        import_root=Path(test_proof["prefix"]),
+                        env=wheel_source_env,
                         expected_version=version,
                         manifest=manifest,
                         basetemp=run_root / f"pt-w-{_python_suffix(minor)}",
                         logs_dir=logs_dir,
+                        runtime_environment=test_proof,
                     )
-                else:
-                    checks_by_id[wheel_test_id] = _blocked_record(
-                        wheel_test_id, "wheel installation did not pass", logs_dir
-                    )
+                    if checks_by_id[wheel_test_id]["status"] == "pass":
+                        external_inputs.append(
+                            {
+                                "check_id": wheel_test_id,
+                                "kind": "live-package-index",
+                                "locator": manifest["checks"]["wheel-contract"]["dependency_index"],
+                                "mutable": True,
+                                "identity": "live-service-unversioned",
+                                "observed_at": _utc_now(),
+                            }
+                        )
 
             static_interpreter = next(
                 (interpreters[minor] for minor in reversed(minors) if minor in interpreters),
@@ -2875,7 +3417,7 @@ def execute_gate(
             )
             static_ids = required_set & {"ruff", "bandit", "gitleaks", "pip-audit", "semgrep", "zizmor"}
             static_root = _export_phase(binding, run_root, "static")
-            static_env = source_environment(base_env, static_root)
+            static_env = dict(base_env)
             if static_ids and static_interpreter is None:
                 for check_id in static_ids:
                     checks_by_id[check_id] = _blocked_record(
@@ -2889,7 +3431,7 @@ def execute_gate(
                     env=static_env,
                     manifest=manifest,
                     required_ids=static_ids,
-                    run_root=run_root,
+                    audit_requirements=dependency_snapshots.get(static_interpreter.requested),
                     logs_dir=logs_dir,
                 )
                 checks_by_id.update(static_records)
@@ -2970,6 +3512,8 @@ def execute_gate(
             "pytest_cache_disabled": True,
             "bytecode_disabled": True,
             "phase_isolated_exports": True,
+            "pip_configuration_disabled": True,
+            "child_path_sanitized": True,
         },
         "interpreters": interpreter_rows,
         "required_check_ids": required_ids,

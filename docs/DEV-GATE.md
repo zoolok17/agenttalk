@@ -11,8 +11,8 @@ Run the command from a clean Git worktree. The local profile invokes both direct
 gate dependencies in **both** CPython 3.10 and CPython 3.14 (a CI leg needs them only in that leg's interpreter):
 
 ```text
-python3.10 -m pip install -r dev-gate-requirements.txt
-python3.14 -m pip install -r dev-gate-requirements.txt
+python3.10 -I -m pip install -r dev-gate-requirements.txt
+python3.14 -I -m pip install -r dev-gate-requirements.txt
 ```
 
 Install `gitleaks` on `PATH` before a local run or the canonical `linux/3.12` CI leg. The gate resolves the
@@ -60,8 +60,9 @@ external evidence path can be established, the command still writes a normalized
 [`dev-gate.json`](../dev-gate.json) is the strict plan. The command reads its committed `HEAD` blob, not an
 uncommitted working-tree copy, and records both its Git blob ID and SHA-256 digest. The runner also records a
 logical plan digest, the candidate commit/tree, and the committed runner blob ID/digest. Before executing the plan,
-the CLI re-enters a temporary committed Git export, so index flags cannot make mutable checkout code masquerade
-as the attested runner. [`dev-gate-requirements.txt`](../dev-gate-requirements.txt) provisions tools only; it
+the CLI re-enters a temporary committed Git export through isolated Python, so index flags and candidate-root
+module shadows cannot make mutable checkout code masquerade as the attested runner. Every Python-backed tool is
+resolved before the candidate import root is exposed. [`dev-gate-requirements.txt`](../dev-gate-requirements.txt) provisions tools only; it
 does not own check selection or argv.
 
 Every local run checks:
@@ -69,22 +70,26 @@ Every local run checks:
 - full pytest in source mode and built-wheel mode on Python 3.10 and 3.14;
 - one sdist and one wheel built without build isolation;
 - sdist exclusion sentinels and required shipped files;
-- real wheel installation, package-version provenance, and byte-equal console CSS/JavaScript;
-- Ruff, Bandit, and full-history gitleaks;
+- dependency-resolving wheel installation in fresh `system_site_packages=False` runtime and test environments,
+  using copied venv launchers and disabled pip configuration/cache, followed by `pip check`, package-version
+  provenance, and byte-equal console CSS/JavaScript;
+- Ruff, Bandit, full-history gitleaks with a Git-only child `PATH`, pip-audit over the frozen dependency snapshot
+  without pip re-resolution, Semgrep, and zizmor;
 - clean and stable Git binding before and after execution.
 
 Every CI leg runs the source/wheel, packaging, and binding checks for its one interpreter. The canonical
 `linux/3.12` leg additionally runs Ruff, Bandit, gitleaks, pip-audit, Semgrep, and zizmor. CodeQL remains the
 single declared CI-native exception because GitHub owns its analysis runtime.
 
-Semgrep registry rules and the PyPI advisory database are live external inputs. Their locators, observation
-times, and explicitly unversioned identities appear in `external_inputs`; the evidence never presents them as
-content-addressed inputs.
+Wheel dependency/test-tool resolution, Semgrep registry rules, and the PyPI advisory database are live external
+inputs. Their locators, observation times, and explicitly unversioned identities appear in `external_inputs`;
+the evidence never presents them as content-addressed inputs.
 
 ## Evidence contract
 
 Run artifacts use `artifact_type: agenttalk-dev-gate-run`. They contain exact required check IDs, commands,
-resolved tool paths and versions, exit codes, durations, log hashes and tails, import provenance, package
+resolved tool paths and versions, exit codes, durations, log hashes and tails, isolated-venv creator/prefix
+proofs, pip-configuration and child-`PATH` isolation assertions, import provenance, package
 artifact hashes, isolation assertions, blockers, and recomputed summary counts. The writer validates the full
 schema before and after a normalized durable JSON write.
 

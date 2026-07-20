@@ -17,8 +17,12 @@
           "ruff",
           "bandit",
           "gitleaks",
+          "pip-audit",
+          "semgrep",
+          "zizmor",
           "package-build",
           "wheel-install",
+          "wheel-dependency-check",
           "wheel-contract",
           "final-binding"
         ]
@@ -41,6 +45,7 @@
           "pytest",
           "package-build",
           "wheel-install",
+          "wheel-dependency-check",
           "wheel-contract",
           "final-binding"
         ],
@@ -64,6 +69,7 @@
       "args": [
         "-q"
       ],
+      "test_requirement": "pytest>=8.0",
       "timeout_seconds": 1800
     },
     "ruff": {
@@ -128,6 +134,8 @@
     },
     "wheel-contract": {
       "kind": "wheel-contract",
+      "dependency_index": "https://pypi.org/simple",
+      "timeout_seconds": 600,
       "required_wheel_resources": [
         "agenttalk/web_static/console.css",
         "agenttalk/web_static/console.js"
