@@ -308,7 +308,14 @@ Use `recv` to peek and `drain` to consume:
 ```powershell
 agenttalk recv --for codex-rev
 agenttalk drain --for codex-rev
+agenttalk drain --for codex-rev --limit 5
 ```
+
+Use `--limit` (or `-n`) when you want a bounded consuming page. Do not
+truncate an unbounded `drain` or `recv --ack` with a downstream command such
+as `head` or `Select-Object -First`; agenttalk refuses an unbounded consuming
+read when stdout is a pipe so undisplayed mail cannot be marked consumed.
+Unbounded output to a terminal or regular file remains supported.
 
 Use `wait` for live listening:
 

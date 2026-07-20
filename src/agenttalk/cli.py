@@ -11,6 +11,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess  # nosec B404
 import sys
 import time
@@ -153,6 +154,16 @@ def _finite_float_arg(value: str) -> float:
         raise argparse.ArgumentTypeError("must be a finite number") from exc
     if not math.isfinite(parsed):
         raise argparse.ArgumentTypeError("must be a finite number")
+    return parsed
+
+
+def _positive_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
 
 
@@ -7208,6 +7219,51 @@ def cmd_domain(args: argparse.Namespace) -> int:
     raise ValueError(f"unknown domain action {action!r}")
 
 
+def _stdout_is_fifo() -> bool:
+    """Return True only when stdout can be positively identified as a pipe."""
+    try:
+        return stat.S_ISFIFO(os.fstat(sys.stdout.fileno()).st_mode)
+    except (AttributeError, OSError, TypeError, ValueError):
+        # Capture streams and other file-like objects may not expose a usable fd.
+        # Preserve their existing behavior; only a confirmed FIFO is unsafe.
+        return False
+
+
+def _guard_unbounded_consuming_pipe(*, ack: bool, limit: int | None) -> None:
+    if ack and limit is None and _stdout_is_fifo():
+        raise ValueError(
+            "refusing an unbounded consuming read on a pipe; "
+            "pass --limit N (or -n N) and consume that bounded page directly"
+        )
+
+
+def _recv_prefix_length(
+    kinds: list[str],
+    *,
+    include_control: bool,
+    limit: int | None,
+) -> int:
+    """Length of the raw prefix ending at the Nth surfaced message."""
+    if limit is None:
+        return len(kinds)
+    visible = 0
+    for index, kind in enumerate(kinds):
+        if include_control or kind not in CONTROL_KINDS:
+            visible += 1
+            if visible == limit:
+                return index + 1
+    return len(kinds)
+
+
+def _write_stdout_line(text: str) -> None:
+    """Write and flush one complete output record or raise before it is acked."""
+    payload = f"{text}\n"
+    written = sys.stdout.write(payload)
+    if written != len(payload):
+        raise OSError(f"short write to stdout: wrote {written!r} of {len(payload)} characters")
+    sys.stdout.flush()
+
+
 def _do_recv(
     store: Store,
     agent: str,
@@ -7217,6 +7273,7 @@ def _do_recv(
     include_control: bool,
     quiet: bool,
     emit_hint: bool,
+    limit: int | None,
 ) -> int:
     """Shared inbox-print path behind both `recv` and `drain`.
 
@@ -7226,22 +7283,36 @@ def _do_recv(
     (composing) even when nothing visible was printed — that's what
     lets `drain` clear a stale-control/cursor backlog.
     """
+    _guard_unbounded_consuming_pipe(ack=ack, limit=limit)
     cursor = since if since is not None else store.cursor(agent)
     msgs = store.messages_for(agent, since_id=cursor or None)
+    prefix_length = _recv_prefix_length(
+        [message.kind for message in msgs],
+        include_control=include_control,
+        limit=limit,
+    )
+    msgs = msgs[:prefix_length]
     # Hide control-plane kinds (composing) from the default view — they
     # are wait-loop signals, not agent content. --include-control opts
     # back in for debugging.
     visible = msgs if include_control else [m for m in msgs if m.kind not in CONTROL_KINDS]
     if not visible:
         if not quiet:
-            print(f"(no new messages for {agent})")
+            _write_stdout_line(f"(no new messages for {agent})")
         if ack and msgs:
             store.advance_cursor(agent, msgs[-1].id)
         return 0
     for m in visible:
-        print(render(m, header=f"AGENTTALK :: INBOX  {m.sender} -> {m.recipient}"))
+        _write_stdout_line(
+            render(m, header=f"AGENTTALK :: INBOX  {m.sender} -> {m.recipient}")
+        )
+        if ack:
+            store.advance_cursor(agent, m.id)
     if ack:
-        store.advance_cursor(agent, msgs[-1].id)
+        # Once the complete page is delivered, preserve the established behavior
+        # of consuming any trailing hidden control messages in that raw snapshot.
+        if msgs[-1].id != visible[-1].id:
+            store.advance_cursor(agent, msgs[-1].id)
     elif emit_hint and not quiet:
         # Default recv only PEEKS — the cursor did not move, so these
         # same messages re-print on the next call and `unread` climbs
@@ -7256,8 +7327,15 @@ def _do_recv(
     return 0
 
 
-def _do_recv_json(store: Store, agent: str, *, since: str | None, ack: bool,
-                  include_control: bool) -> int:
+def _do_recv_json(
+    store: Store,
+    agent: str,
+    *,
+    since: str | None,
+    ack: bool,
+    include_control: bool,
+    limit: int | None,
+) -> int:
     """`recv --json`: a CLI MIRROR over the SAME in-process recv_api functions the
     wrapper uses - NOT a second implementation. It routes the cursor/floor/control
     semantics entirely through recv_api.records + recv_api.commit (no duplicated
@@ -7265,18 +7343,25 @@ def _do_recv_json(store: Store, agent: str, *, since: str | None, ack: bool,
     wrapper itself uses recv_api in-process and never shells this."""
     from .wrapper import recv_api
 
-    recs = recv_api.records(store, agent, since=since, include_control=include_control)
+    _guard_unbounded_consuming_pipe(ack=ack, limit=limit)
+    raw = recv_api.records(store, agent, since=since, include_control=True)
+    prefix_length = _recv_prefix_length(
+        [record["kind"] for record in raw],
+        include_control=include_control,
+        limit=limit,
+    )
+    raw = raw[:prefix_length]
+    recs = raw if include_control else [
+        record for record in raw if record["kind"] not in CONTROL_KINDS
+    ]
     for rec in recs:
-        print(json.dumps(rec, ensure_ascii=False))
-    if ack:
-        # --ack advances past the NEWEST RAW message - control-INCLUSIVE, even when
-        # the printed records hide composing - so hidden control never stays stuck
-        # behind the cursor (the recv --ack / drain invariant). Still one impl: the
-        # ack target comes from recv_api.records(include_control=True), committed via
-        # recv_api.commit; cli.py carries no cursor logic of its own.
-        raw = recv_api.records(store, agent, since=since, include_control=True)
-        if raw:
-            recv_api.commit(store, agent, raw[-1])
+        _write_stdout_line(json.dumps(rec, ensure_ascii=False))
+        if ack:
+            recv_api.commit(store, agent, rec)
+    if ack and raw and (not recs or raw[-1]["id"] != recs[-1]["id"]):
+        # The one control-inclusive snapshot is also the commit authority. This
+        # prevents a message arriving after output selection from being consumed.
+        recv_api.commit(store, agent, raw[-1])
     return 0
 
 
@@ -7288,7 +7373,7 @@ def cmd_recv(args: argparse.Namespace) -> int:
         return blocked
     if getattr(args, "json", False):
         return _do_recv_json(store, agent, since=args.since, ack=args.ack,
-                             include_control=args.include_control)
+                             include_control=args.include_control, limit=args.limit)
     return _do_recv(
         store,
         agent,
@@ -7296,6 +7381,7 @@ def cmd_recv(args: argparse.Namespace) -> int:
         ack=args.ack,
         include_control=args.include_control,
         quiet=args.quiet,
+        limit=args.limit,
         # Only nudge for the plain inspecting recv. Explicit --since is
         # deliberate history browsing, so don't nag there.
         emit_hint=args.since is None,
@@ -7321,6 +7407,7 @@ def cmd_drain(args: argparse.Namespace) -> int:
         ack=True,
         include_control=args.include_control,
         quiet=args.quiet,
+        limit=args.limit,
         emit_hint=False,  # drain IS the remedy; never hint
     )
 
@@ -12528,6 +12615,8 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
     pr.add_argument("--since", help="Only messages with id > this (default: agent cursor)")
     pr.add_argument("--ack", action="store_true", help="Advance cursor past the last shown msg")
+    pr.add_argument("-n", "--limit", type=_positive_int_arg,
+                    help="Show at most N surfaced messages; with --ack, consume only that page.")
     pr.add_argument("--quiet", action="store_true")
     pr.add_argument("--include-control", action="store_true",
                     help="Also surface control-plane kinds ('composing') that the "
@@ -12547,6 +12636,8 @@ def build_parser() -> argparse.ArgumentParser:
              "but unmissable — use this instead of hand-rolled polling.",
     )
     pdr.add_argument("--for", dest="agent", help="Agent name (default: $AGENTTALK_SELF)")
+    pdr.add_argument("-n", "--limit", type=_positive_int_arg,
+                     help="Consume at most N surfaced messages (required for pipe output).")
     pdr.add_argument("--quiet", action="store_true")
     pdr.add_argument("--include-control", action="store_true",
                      help="Also surface control-plane kinds ('composing') that the "

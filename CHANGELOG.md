@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CI produces incomplete evidence for each declared OS/Python leg and an authoritative aggregate only after
   all 12 legs prove the same candidate and manifest binding. CodeQL is the sole explicit CI-native exception.
 
+### Fixed
+
+- **A short downstream reader can no longer make `drain` or `recv --ack`
+  silently consume undisplayed mail.** Consuming output is written and flushed
+  one record at a time, and cursor commits stop at the last confirmed record on
+  output failure. Unbounded output to a positively identified pipe is refused;
+  use the new `-n` / `--limit` option for bounded pages. Regular-file redirects
+  remain allowed, and JSON receive now uses one snapshot for output and commits.
+
 ## [0.78.1] - 2026-07-15
 
 ### Fixed
