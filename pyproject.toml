@@ -19,7 +19,6 @@ security = [
     "bandit>=1.7",
     "pip-audit>=2.7",
 ]
-
 [tool.ruff]
 # 120 is generous-but-not-permissive; lets multi-line user-facing
 # error strings stay one line each without sacrificing readability.
@@ -57,6 +56,8 @@ include = [
     "/.gitleaks.toml",
     "/.gitleaksignore",
     "/.semgrep",
+    "/dev-gate.json",
+    "/dev-gate-requirements.txt",
     "/CHANGELOG.md",
     "/README.md",
     "/ROADMAP.md",
@@ -67,6 +68,7 @@ include = [
     "/docs/ASSURANCE.md",
     "/docs/DASHBOARD-CONTROL-PLANE-ROADMAP.md",
     "/docs/DESIGN.md",
+    "/docs/DEV-GATE.md",
     "/docs/DashboardDesign",
     "/docs/ISSUES.md",
     "/docs/ROADMAP.md",

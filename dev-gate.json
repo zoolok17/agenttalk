@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "release": {
+      "test_modes": [
+        "source",
+        "wheel"
+      ],
+      "local": {
+        "python_minors": [
+          "3.10",
+          "3.14"
+        ],
+        "required_checks": [
+          "git-binding",
+          "pytest",
+          "ruff",
+          "bandit",
+          "gitleaks",
+          "pip-audit",
+          "semgrep",
+          "zizmor",
+          "package-build",
+          "wheel-install",
+          "wheel-dependency-check",
+          "wheel-contract",
+          "final-binding"
+        ]
+      },
+      "ci": {
+        "oses": [
+          "linux",
+          "windows",
+          "macos"
+        ],
+        "python_minors": [
+          "3.10",
+          "3.11",
+          "3.12",
+          "3.13"
+        ],
+        "canonical_static_leg": "linux/3.12",
+        "per_leg_checks": [
+          "git-binding",
+          "pytest",
+          "package-build",
+          "wheel-install",
+          "wheel-dependency-check",
+          "wheel-contract",
+          "final-binding"
+        ],
+        "canonical_checks": [
+          "ruff",
+          "bandit",
+          "gitleaks",
+          "pip-audit",
+          "semgrep",
+          "zizmor"
+        ]
+      }
+    }
+  },
+  "checks": {
+    "pytest": {
+      "kind": "pytest",
+      "paths": [
+        "tests"
+      ],
+      "args": [
+        "-q"
+      ],
+      "test_requirement": "pytest>=8.0",
+      "timeout_seconds": 1800
+    },
+    "ruff": {
+      "kind": "ruff",
+      "paths": [
+        "src",
+        "tests"
+      ],
+      "timeout_seconds": 300
+    },
+    "bandit": {
+      "kind": "bandit",
+      "paths": [
+        "src"
+      ],
+      "exclude": [
+        "src/agenttalk/skills"
+      ],
+      "timeout_seconds": 300
+    },
+    "gitleaks": {
+      "kind": "gitleaks-git",
+      "config": ".gitleaks.toml",
+      "require_full_history": true,
+      "timeout_seconds": 600
+    },
+    "pip-audit": {
+      "kind": "pip-audit",
+      "strict": true,
+      "timeout_seconds": 900
+    },
+    "semgrep": {
+      "kind": "semgrep",
+      "configs": [
+        "p/python",
+        "p/security-audit",
+        ".semgrep/agenttalk.yml"
+      ],
+      "error": true,
+      "strict": false,
+      "rule_timeout_seconds": 120,
+      "timeout_seconds": 1800
+    },
+    "zizmor": {
+      "kind": "zizmor",
+      "paths": [
+        ".github/workflows"
+      ],
+      "timeout_seconds": 600
+    },
+    "package-build": {
+      "kind": "python-build",
+      "sdist": true,
+      "wheel": true,
+      "required_sdist_paths": [
+        "dev-gate.json",
+        "dev-gate-requirements.txt",
+        "docs/AGENTTALK-NEW-USER-MANUAL.pdf",
+        "src/agenttalk/web_static/console.js"
+      ],
+      "timeout_seconds": 600
+    },
+    "wheel-contract": {
+      "kind": "wheel-contract",
+      "dependency_index": "https://pypi.org/simple",
+      "timeout_seconds": 600,
+      "required_wheel_resources": [
+        "agenttalk/web_static/console.css",
+        "agenttalk/web_static/console.js"
+      ]
+    }
+  },
+  "ci_native_exceptions": [
+    {
+      "id": "codeql",
+      "workflow": ".github/workflows/security.yml",
+      "job": "codeql",
+      "required": true,
+      "executed_by_gate": false,
+      "reason": "GitHub-native SARIF analyzer has no equivalent hermetic local CLI invocation."
+    }
+  ]
+}

@@ -2820,6 +2820,7 @@ def _start_live_generated_supervisor(
     return store, proc, log_handle, log_path
 
 
+@pytest.mark.source_layout
 def test_generated_ps1_survives_malformed_config_poll_with_last_good(
     tmp_path: Path,
 ) -> None:
@@ -2858,6 +2859,7 @@ def test_generated_ps1_survives_malformed_config_poll_with_last_good(
         log_handle.close()
 
 
+@pytest.mark.source_layout
 def test_generated_ps1_hot_adds_agent_across_live_polls(tmp_path: Path) -> None:
     shell = _pick_powershell()
     if not shell:
@@ -2895,6 +2897,7 @@ def test_generated_ps1_hot_adds_agent_across_live_polls(tmp_path: Path) -> None:
         log_handle.close()
 
 
+@pytest.mark.source_layout
 def test_generated_ps1_holds_poll_when_preplan_state_save_is_contended(
     tmp_path: Path,
 ) -> None:
@@ -3388,6 +3391,7 @@ def test_spawned_launch_is_not_acknowledged_when_record_launch_cannot_commit(
 
 
 @pytest.mark.parametrize("wrapped", [False, True], ids=["legacy-direct", "wrapped"])
+@pytest.mark.source_layout
 def test_generated_ps1_two_polls_do_not_duplicate_launch_after_postspawn_contention(
     tmp_path: Path,
     wrapped: bool,
@@ -3802,6 +3806,7 @@ def test_generated_ps1_tamper_refuses_before_claim(tmp_path: Path) -> None:
     assert s.read_supervisor_instance() is None
 
 
+@pytest.mark.source_layout
 def test_generated_ps1_quiet_suppresses_warning_path(tmp_path: Path) -> None:
     """0.29.0 (reviewer-1 r1): -Quiet must silence the WHOLE console log, including
     the Write-Warning ACTION paths - not just the new info Write-Host. We run the
@@ -3844,6 +3849,7 @@ def test_generated_ps1_quiet_suppresses_warning_path(tmp_path: Path) -> None:
     assert "lead" not in quiet, f"-Quiet must suppress the warning console output; got {quiet!r}"
 
 
+@pytest.mark.source_layout
 def test_generated_ps1_quiet_suppresses_relaunch_helper_warnings(tmp_path: Path) -> None:
     """0.29.0 (reviewer-1 r2): -Quiet must also silence warnings emitted by the
     HELPER functions (Seed-CodexHome / Preflight / Launch) on the relaunch path,
