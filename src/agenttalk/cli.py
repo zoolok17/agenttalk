@@ -11376,7 +11376,15 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                 temp_base=Path(args.temp_root) if args.temp_root else None,
                 python_overrides=dev_gate_mod.parse_python_overrides(args.python),
             )
-    except dev_gate_mod.GateBlock as exc:
+    except Exception as caught:
+        exc = (
+            caught
+            if isinstance(caught, dev_gate_mod.GateBlock)
+            else dev_gate_mod.GateBlock(
+                "gate_internal_error",
+                f"{type(caught).__name__}: {caught}",
+            )
+        )
         evidence_note = ""
         try:
             evidence_path, evidence_sha256, preflight_artifact = (

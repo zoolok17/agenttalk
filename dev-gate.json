@@ -120,6 +120,7 @@
       "wheel": true,
       "required_sdist_paths": [
         "dev-gate.json",
+        "dev-gate-requirements.txt",
         "docs/AGENTTALK-NEW-USER-MANUAL.pdf",
         "src/agenttalk/web_static/console.js"
       ],

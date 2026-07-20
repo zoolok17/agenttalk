@@ -9,7 +9,9 @@ def test_ci_voting_jobs_invoke_only_the_committed_gate_plan() -> None:
     assert "id: macos" in workflow
     assert "python-version: ['3.10', '3.11', '3.12', '3.13']" in workflow
     assert "fetch-depth: 0" in workflow
-    assert workflow.count("agenttalk dev-gate") == 2
+    assert workflow.count("python -m agenttalk dev-gate") == 2
+    assert workflow.count("python -m pip install -r dev-gate-requirements.txt") == 1
+    assert "pip install -e" not in workflow
     for escaped_tool_argv in (
         "python -m pytest",
         "ruff check",

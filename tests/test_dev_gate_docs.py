@@ -53,5 +53,7 @@ def test_dev_gate_reference_and_manifest_are_shipped_in_the_sdist() -> None:
 
     assert '"/docs/DEV-GATE.md"' in pyproject
     assert '"/dev-gate.json"' in pyproject
+    assert '"/dev-gate-requirements.txt"' in pyproject
     assert Path("dev-gate.json").is_file()
+    assert Path("dev-gate-requirements.txt").is_file()
     assert Path("docs/DEV-GATE.md").is_file()

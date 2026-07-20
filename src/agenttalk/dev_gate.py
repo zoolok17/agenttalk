@@ -70,6 +70,7 @@ REQUIRED_CONFIGURED_CHECKS = {
     "wheel-contract": "wheel-contract",
 }
 CHECK_STATUSES = {"pass", "fail", "error", "missing", "timeout", "blocked_dependency"}
+TIMEOUT_CHECKS = set(REQUIRED_CONFIGURED_CHECKS) - {"wheel-contract"}
 
 
 class GateBlock(RuntimeError):
@@ -125,7 +126,11 @@ def validate_manifest(data: Any) -> dict[str, Any]:
 
     manifest = _require_object(data, "manifest")
     _reject_unknown(manifest, {"schema_version", "profiles", "checks", "ci_native_exceptions"}, "manifest")
-    if manifest.get("schema_version") != SCHEMA_VERSION:
+    if (
+        not isinstance(manifest.get("schema_version"), int)
+        or isinstance(manifest.get("schema_version"), bool)
+        or manifest["schema_version"] != SCHEMA_VERSION
+    ):
         raise GateBlock("manifest_schema_invalid", "schema_version must be 1")
 
     profiles = _require_object(manifest.get("profiles"), "profiles")
@@ -213,7 +218,9 @@ def validate_manifest(data: Any) -> dict[str, Any]:
         if spec.get("kind") != expected_kind:
             raise GateBlock("manifest_floor_weakened", f"checks.{check_id}.kind changed")
         timeout = spec.get("timeout_seconds")
-        if timeout is not None and (not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0):
+        if check_id in TIMEOUT_CHECKS and (
+            not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0
+        ):
             raise GateBlock("manifest_schema_invalid", f"checks.{check_id}.timeout_seconds must be positive")
 
     required_contract = {
@@ -234,6 +241,7 @@ def validate_manifest(data: Any) -> dict[str, Any]:
             "wheel": True,
             "required_sdist_paths": [
                 "dev-gate.json",
+                "dev-gate-requirements.txt",
                 "docs/AGENTTALK-NEW-USER-MANUAL.pdf",
                 "src/agenttalk/web_static/console.js",
             ],
@@ -404,6 +412,8 @@ def _path_contains(parent: str, child: str) -> bool:
         child_path = PurePosixPath(child)
     else:
         return False
+    if ".." in parent_path.parts or ".." in child_path.parts:
+        return False
     try:
         child_path.relative_to(parent_path)
     except ValueError:
@@ -455,6 +465,116 @@ def _check_semantics(check_id: str) -> tuple[str, str | None, str | None, bool]:
         raise GateBlock("evidence_schema_invalid", f"unknown check ID {check_id!r}") from exc
 
 
+def _path_basename(value: str) -> str:
+    if PureWindowsPath(value).is_absolute():
+        return PureWindowsPath(value).name.casefold()
+    return PurePosixPath(value).name.casefold()
+
+
+def _validate_check_command(
+    *,
+    check_id: str,
+    item: dict[str, Any],
+    manifest: dict[str, Any],
+    interpreter_paths: dict[str, str],
+    expected_minors: list[str],
+) -> None:
+    """Require a passing check to prove the committed command shape."""
+
+    argv = item["argv"]
+    tool_path = item["tool"]["path"]
+    if not argv or argv[0] != tool_path:
+        raise GateBlock("evidence_command_mismatch", f"{check_id} tool and argv differ")
+
+    def require_python(minor: str) -> str:
+        path = interpreter_paths.get(minor)
+        if path is None or tool_path != path:
+            raise GateBlock(
+                "evidence_command_mismatch",
+                f"{check_id} did not use the declared CPython {minor}",
+            )
+        return path
+
+    if check_id in {"git-binding", "final-binding"}:
+        expected = [tool_path, "status", "--porcelain=v1", "--untracked-files=all"]
+        valid = _path_basename(tool_path) in {"git", "git.exe"} and argv == expected
+    elif check_id.startswith("pytest-"):
+        _, mode, suffix = check_id.split("-")
+        minor = f"{suffix[2]}.{suffix[3:]}"
+        python = require_python(minor)
+        spec = manifest["checks"]["pytest"]
+        prefix = [python, "-m", "pytest", *spec["args"], "-p", "no:cacheprovider", "--basetemp"]
+        valid = (
+            item["mode"] == mode
+            and len(argv) == len(prefix) + 1 + len(spec["paths"])
+            and argv[: len(prefix)] == prefix
+            and _is_absolute_path_text(argv[len(prefix)])
+            and argv[len(prefix) + 1 :] == spec["paths"]
+        )
+    elif check_id == "package-build":
+        python = require_python(expected_minors[0])
+        prefix = [
+            python,
+            "-m",
+            "build",
+            "--no-isolation",
+            "--sdist",
+            "--wheel",
+            "--outdir",
+        ]
+        valid = len(argv) == len(prefix) + 1 and argv[: len(prefix)] == prefix and _is_absolute_path_text(argv[-1])
+    elif check_id.startswith("wheel-install-"):
+        suffix = check_id.rsplit("-", 1)[1]
+        minor = f"{suffix[2]}.{suffix[3:]}"
+        python = require_python(minor)
+        prefix = [python, "-m", "pip", "install", "--no-index", "--no-deps", "--target"]
+        valid = (
+            len(argv) == len(prefix) + 2
+            and argv[: len(prefix)] == prefix
+            and _is_absolute_path_text(argv[-2])
+            and _is_absolute_path_text(argv[-1])
+        )
+    elif check_id.startswith("wheel-contract-"):
+        suffix = check_id.rsplit("-", 1)[1]
+        minor = f"{suffix[2]}.{suffix[3:]}"
+        python = require_python(minor)
+        valid = argv == [python, "-m", "agenttalk", "--version"]
+    elif check_id == "ruff":
+        python = require_python(expected_minors[-1])
+        valid = argv == [python, "-m", "ruff", "check", "--no-cache", *manifest["checks"]["ruff"]["paths"]]
+    elif check_id == "bandit":
+        python = require_python(expected_minors[-1])
+        spec = manifest["checks"]["bandit"]
+        valid = argv == [python, "-m", "bandit", "-r", *spec["paths"], "-x", ",".join(spec["exclude"])]
+    elif check_id == "pip-audit":
+        python = require_python(expected_minors[-1])
+        prefix = [python, "-m", "pip_audit", "--strict", "--requirement"]
+        valid = len(argv) == len(prefix) + 1 and argv[: len(prefix)] == prefix and _is_absolute_path_text(argv[-1])
+    elif check_id == "semgrep":
+        spec = manifest["checks"]["semgrep"]
+        expected = [tool_path, "scan", *[f"--config={value}" for value in spec["configs"]]]
+        expected.extend(["--error", "--timeout", str(spec["rule_timeout_seconds"]), "--strict"])
+        valid = _path_basename(tool_path) in {"semgrep", "semgrep.exe"} and argv == expected
+    elif check_id == "zizmor":
+        expected = [tool_path, *manifest["checks"]["zizmor"]["paths"]]
+        valid = _path_basename(tool_path) in {"zizmor", "zizmor.exe"} and argv == expected
+    elif check_id == "gitleaks":
+        spec = manifest["checks"]["gitleaks"]
+        valid = (
+            _path_basename(tool_path) in {"gitleaks", "gitleaks.exe"}
+            and len(argv) == 9
+            and argv[1:3] == ["git", "--config"]
+            and _is_absolute_path_text(argv[3])
+            and _path_basename(argv[3]) == _path_basename(spec["config"])
+            and argv[4:8] == ["--log-opts=--all", "--redact", "--no-color", "--no-banner"]
+            and _is_absolute_path_text(argv[8])
+        )
+    else:
+        raise GateBlock("evidence_command_mismatch", f"no command contract for {check_id}")
+    if not valid:
+        raise GateBlock("evidence_command_mismatch", f"{check_id} argv does not match the committed plan")
+
+
 def _validate_import_provenance(value: Any, *, label: str, expected_version: str) -> None:
     item = _require_object(value, label)
     _require_artifact_fields(item, {"expected_root", "observed_path", "version"}, label)
@@ -497,7 +617,9 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
     }
     _require_artifact_fields(record, required_top, "artifact")
     if (
-        record["schema_version"] != SCHEMA_VERSION
+        not isinstance(record["schema_version"], int)
+        or isinstance(record["schema_version"], bool)
+        or record["schema_version"] != SCHEMA_VERSION
         or record["artifact_type"] != ARTIFACT_TYPE
         or not _is_nonempty_string(record["run_id"])
         or not _valid_timestamp(record["started_at"])
@@ -506,7 +628,7 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
         raise GateBlock("evidence_schema_invalid", "unexpected artifact schema or type")
     if record["profile"] != DEFAULT_PROFILE:
         raise GateBlock("evidence_schema_invalid", "unexpected profile")
-    if record["verdict"] not in {"pass", "block"}:
+    if not isinstance(record["verdict"], str) or record["verdict"] not in {"pass", "block"}:
         raise GateBlock("evidence_schema_invalid", "verdict must be pass or block")
     scope = record["execution_scope"]
     if scope == "ci-leg":
@@ -554,6 +676,8 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
     )
     if (
         manifest_record["path"] != DEFAULT_MANIFEST
+        or not isinstance(manifest_record["schema_version"], int)
+        or isinstance(manifest_record["schema_version"], bool)
         or manifest_record["schema_version"] != SCHEMA_VERSION
         or not _is_hash(manifest_record["git_blob_id"], 40, 64)
         or not _is_hash(manifest_record["sha256"], 64)
@@ -623,7 +747,12 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
             {"requested", "path", "implementation", "version", "status"},
             f"interpreters[{index}]",
         )
-        if item["requested"] not in expected_minors or item["status"] not in {"pass", "missing", "mismatch"}:
+        if (
+            not isinstance(item["requested"], str)
+            or item["requested"] not in expected_minors
+            or not isinstance(item["status"], str)
+            or item["status"] not in {"pass", "missing", "mismatch"}
+        ):
             raise GateBlock("evidence_schema_invalid", f"interpreters[{index}] is invalid")
         observed_minors.append(item["requested"])
         if item["status"] == "pass" and (
@@ -637,6 +766,9 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
             raise GateBlock("evidence_schema_invalid", f"interpreters[{index}] lacks a failure detail")
     if observed_minors != expected_minors or len(observed_minors) != len(set(observed_minors)):
         raise GateBlock("evidence_cardinality_invalid", "interpreter evidence does not match the plan")
+    interpreter_paths = {
+        row["requested"]: row["path"] for row in interpreters if row["status"] == "pass"
+    }
 
     checks = record["checks"]
     if not isinstance(checks, list):
@@ -670,7 +802,7 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
         _require_artifact_fields(item, check_fields, f"checks[{index}]")
         check_id = item["id"]
         expected_kind, expected_mode, expected_python, needs_provenance = _check_semantics(check_id)
-        if item["status"] not in CHECK_STATUSES:
+        if not isinstance(item["status"], str) or item["status"] not in CHECK_STATUSES:
             raise GateBlock("evidence_status_invalid", f"unknown check status {item['status']!r}")
         if (
             item["required"] is not True
@@ -693,13 +825,22 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
             raise GateBlock("evidence_schema_invalid", f"checks[{index}].log is malformed")
         if item["status"] == "pass":
             if (
-                item["exit_code"] != 0
+                not isinstance(item["exit_code"], int)
+                or isinstance(item["exit_code"], bool)
+                or item["exit_code"] != 0
                 or item["reason_code"] is not None
                 or not item["argv"]
                 or not _is_absolute_path_text(tool["path"])
                 or not _is_nonempty_string(tool["version"])
             ):
                 raise GateBlock("evidence_schema_invalid", f"checks[{index}] lacks passing execution evidence")
+            _validate_check_command(
+                check_id=check_id,
+                item=item,
+                manifest=manifest,
+                interpreter_paths=interpreter_paths,
+                expected_minors=expected_minors,
+            )
         elif (
             (item["exit_code"] is not None and (
                 not isinstance(item["exit_code"], int) or isinstance(item["exit_code"], bool)
@@ -765,6 +906,11 @@ def validate_run_artifact(artifact: Any, manifest: dict[str, Any]) -> dict[str, 
             {"check_id", "kind", "locator", "mutable", "identity", "observed_at"},
             f"external_inputs[{index}]",
         )
+        if not all(
+            isinstance(item[field], str)
+            for field in ("check_id", "kind", "locator", "identity")
+        ):
+            raise GateBlock("evidence_schema_invalid", f"external_inputs[{index}] is malformed")
         key = (item["check_id"], item["kind"], item["locator"], item["identity"])
         if item["mutable"] is not True or not _valid_timestamp(item["observed_at"]) or key not in allowed_external:
             raise GateBlock("evidence_schema_invalid", f"external_inputs[{index}] is malformed")
@@ -856,7 +1002,9 @@ def validate_preflight_artifact(artifact: Any) -> dict[str, Any]:
         "preflight",
     )
     if (
-        record["schema_version"] != SCHEMA_VERSION
+        not isinstance(record["schema_version"], int)
+        or isinstance(record["schema_version"], bool)
+        or record["schema_version"] != SCHEMA_VERSION
         or record["artifact_type"] != PREFLIGHT_ARTIFACT_TYPE
         or record["verdict"] != "block"
         or record["complete"] is not False
@@ -2140,7 +2288,7 @@ def run_static_checks(
         records["ruff"] = _python_module_check(
             check_id="ruff",
             module="ruff",
-            argv=["check", *spec["paths"]],
+            argv=["check", "--no-cache", *spec["paths"]],
             interpreter=interpreter,
             source_root=source_root,
             env=env,
@@ -2173,7 +2321,7 @@ def run_static_checks(
                 argv=[
                     "git",
                     "--config",
-                    str((candidate_root / spec["config"]).resolve()),
+                    str((source_root / spec["config"]).resolve()),
                     "--log-opts=--all",
                     "--redact",
                     "--no-color",
@@ -2464,7 +2612,7 @@ def execute_gate(
         "git-binding",
         binding,
         matches=True,
-        detail="candidate SHA, tree, committed manifest, and clean worktree captured",
+        detail="candidate SHA, tree, committed manifest/runner, and clean worktree captured",
         logs_dir=logs_dir,
     )
 
@@ -2614,7 +2762,7 @@ def execute_gate(
             "final-binding",
             final_binding,
             matches=_same_binding(binding, final_binding),
-            detail="candidate SHA, tree, manifest, and cleanliness remained stable",
+            detail="candidate SHA, tree, manifest, runner, and cleanliness remained stable",
             logs_dir=logs_dir,
         )
 
@@ -2723,10 +2871,13 @@ def validate_aggregate_artifact(
     }
     _require_artifact_fields(record, required, "aggregate")
     if (
-        record["schema_version"] != SCHEMA_VERSION
+        not isinstance(record["schema_version"], int)
+        or isinstance(record["schema_version"], bool)
+        or record["schema_version"] != SCHEMA_VERSION
         or record["artifact_type"] != AGGREGATE_ARTIFACT_TYPE
         or record["execution_scope"] != "ci-aggregate"
         or record["profile"] != DEFAULT_PROFILE
+        or not isinstance(record["verdict"], str)
         or record["verdict"] not in {"pass", "block"}
         or not isinstance(record["complete"], bool)
         or not _is_nonempty_string(record["run_id"])
@@ -2758,6 +2909,8 @@ def validate_aggregate_artifact(
     )
     if (
         manifest_record["path"] != DEFAULT_MANIFEST
+        or not isinstance(manifest_record["schema_version"], int)
+        or isinstance(manifest_record["schema_version"], bool)
         or manifest_record["schema_version"] != SCHEMA_VERSION
         or not _is_hash(manifest_record["git_blob_id"], 40, 64)
         or not _is_hash(manifest_record["sha256"], 64)
@@ -2792,6 +2945,7 @@ def validate_aggregate_artifact(
             not isinstance(item["ci_leg"], str)
             or item["ci_leg"] not in expected
             or not _is_nonempty_string(item["run_id"])
+            or not isinstance(item["verdict"], str)
             or item["verdict"] not in {"pass", "block"}
         ):
             raise GateBlock("evidence_schema_invalid", f"aggregate.legs[{index}] is invalid")
@@ -3017,32 +3171,57 @@ def execute_aggregate(
 
 
 def reenter_candidate_source(root: Path, argv: Sequence[str]) -> int | None:
-    """Re-exec through the committed candidate source if an installed copy won import precedence."""
+    """Re-exec once from a committed export, never from mutable checkout bytes."""
 
-    candidate_src = (root / "src").resolve()
+    candidate_root = root.resolve()
     observed_module = Path(__file__).resolve()
-    if _is_within(observed_module, candidate_src):
+    committed_src_text = os.environ.get("AGENTTALK_DEV_GATE_COMMITTED_SRC")
+    if committed_src_text:
+        committed_src = Path(committed_src_text).resolve()
+        binding = capture_candidate_binding(candidate_root)
+        if _is_within(committed_src, candidate_root) or not _is_within(observed_module, committed_src):
+            raise GateBlock(
+                "candidate_source_reentry_failed",
+                f"re-entered process imported {observed_module}, expected under external {committed_src}",
+            )
+        try:
+            observed_digest = sha256_bytes(observed_module.read_bytes())
+        except OSError as exc:
+            raise GateBlock("candidate_source_reentry_failed", f"cannot hash executing runner: {exc}") from exc
+        if observed_digest != binding.runner_module_sha256:
+            raise GateBlock(
+                "candidate_source_reentry_failed",
+                "executing runner bytes do not match HEAD",
+            )
         return None
-    if os.environ.get("AGENTTALK_DEV_GATE_REENTERED") == "1":
-        raise GateBlock(
-            "candidate_source_reentry_failed",
-            f"re-entered process still imported {observed_module}, expected under {candidate_src}",
-        )
+
+    binding = capture_candidate_binding(candidate_root)
+    configured_store = os.environ.get("AGENTTALK_ROOT")
+    store_root = Path(configured_store).resolve() if configured_store else None
+    external_base = _default_external_base(candidate_root, store_root)
+    external_base.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     for key in ("PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE", "VIRTUAL_ENV", "CONDA_PREFIX"):
         env.pop(key, None)
-    env["PYTHONPATH"] = str(candidate_src)
     env["PYTHONNOUSERSITE"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env["AGENTTALK_DEV_GATE_REENTERED"] = "1"
     try:
-        # Re-entry uses this interpreter with a fixed module argv; shell execution is disabled.
-        completed = subprocess.run(  # nosec B603
-            [sys.executable, "-m", "agenttalk", "dev-gate", *argv],
-            cwd=root,
-            env=env,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory(
+            prefix="agenttalk-dev-gate-bootstrap-", dir=str(external_base)
+        ) as bootstrap_text:
+            bootstrap_root = Path(bootstrap_text).resolve()
+            committed_root = bootstrap_root / "candidate"
+            export_candidate(binding, committed_root, bootstrap_root / "candidate.zip")
+            committed_src = (committed_root / "src").resolve()
+            env["PYTHONPATH"] = str(committed_src)
+            env["AGENTTALK_DEV_GATE_COMMITTED_SRC"] = str(committed_src)
+            # Re-entry uses this interpreter with a fixed module argv; shell execution is disabled.
+            completed = subprocess.run(  # nosec B603
+                [sys.executable, "-m", "agenttalk", "dev-gate", *argv],
+                cwd=candidate_root,
+                env=env,
+                check=False,
+            )
     except OSError as exc:
         raise GateBlock("candidate_source_reentry_failed", str(exc)) from exc
     return completed.returncode

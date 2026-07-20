@@ -4,8 +4,10 @@ import copy
 import json
 import os
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,7 +19,7 @@ def _manifest() -> dict:
     return json.loads(Path("dev-gate.json").read_text(encoding="utf-8"))
 
 
-def _check(check_id: str, *, status: str = "pass") -> dict:
+def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -> dict:
     kind = check_id.split("-", 1)[0]
     mode = None
     python = None
@@ -46,6 +48,86 @@ def _check(check_id: str, *, status: str = "pass") -> dict:
         kind = "python-build"
     elif check_id in {"git-binding", "final-binding", "pip-audit"}:
         kind = check_id
+    python_path = str((Path.cwd() / "python").resolve())
+    tool_path = python_path
+    if check_id in {"git-binding", "final-binding"}:
+        tool_path = str((Path.cwd() / ("git.exe" if os.name == "nt" else "git")).resolve())
+        argv = [tool_path, "status", "--porcelain=v1", "--untracked-files=all"]
+    elif check_id.startswith("pytest-"):
+        spec = manifest["checks"]["pytest"]
+        argv = [
+            python_path,
+            "-m",
+            "pytest",
+            *spec["args"],
+            "-p",
+            "no:cacheprovider",
+            "--basetemp",
+            str((Path.cwd() / "pytest-temp").resolve()),
+            *spec["paths"],
+        ]
+    elif check_id == "package-build":
+        argv = [
+            python_path,
+            "-m",
+            "build",
+            "--no-isolation",
+            "--sdist",
+            "--wheel",
+            "--outdir",
+            str((Path.cwd() / "dist").resolve()),
+        ]
+    elif check_id.startswith("wheel-install-"):
+        argv = [
+            python_path,
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--no-deps",
+            "--target",
+            str((Path.cwd() / "wheel-target").resolve()),
+            str((Path.cwd() / "dist" / "agenttalk.whl").resolve()),
+        ]
+    elif check_id.startswith("wheel-contract-"):
+        argv = [python_path, "-m", "agenttalk", "--version"]
+    elif check_id == "ruff":
+        argv = [python_path, "-m", "ruff", "check", "--no-cache", *manifest["checks"]["ruff"]["paths"]]
+    elif check_id == "bandit":
+        spec = manifest["checks"]["bandit"]
+        argv = [python_path, "-m", "bandit", "-r", *spec["paths"], "-x", ",".join(spec["exclude"])]
+    elif check_id == "pip-audit":
+        argv = [
+            python_path,
+            "-m",
+            "pip_audit",
+            "--strict",
+            "--requirement",
+            str((Path.cwd() / "audit-requirements.txt").resolve()),
+        ]
+    elif check_id == "semgrep":
+        tool_path = str((Path.cwd() / ("semgrep.exe" if os.name == "nt" else "semgrep")).resolve())
+        spec = manifest["checks"]["semgrep"]
+        argv = [tool_path, "scan", *[f"--config={value}" for value in spec["configs"]]]
+        argv.extend(["--error", "--timeout", str(spec["rule_timeout_seconds"]), "--strict"])
+    elif check_id == "zizmor":
+        tool_path = str((Path.cwd() / ("zizmor.exe" if os.name == "nt" else "zizmor")).resolve())
+        argv = [tool_path, *manifest["checks"]["zizmor"]["paths"]]
+    elif check_id == "gitleaks":
+        tool_path = str((Path.cwd() / ("gitleaks.exe" if os.name == "nt" else "gitleaks")).resolve())
+        argv = [
+            tool_path,
+            "git",
+            "--config",
+            str((Path.cwd() / "candidate-static" / manifest["checks"]["gitleaks"]["config"]).resolve()),
+            "--log-opts=--all",
+            "--redact",
+            "--no-color",
+            "--no-banner",
+            str(Path.cwd().resolve()),
+        ]
+    else:
+        raise AssertionError(f"unsupported check fixture {check_id}")
     return {
         "id": check_id,
         "kind": kind,
@@ -53,8 +135,8 @@ def _check(check_id: str, *, status: str = "pass") -> dict:
         "python": python,
         "required": True,
         "status": status,
-        "argv": ["tool", check_id],
-        "tool": {"path": str((Path.cwd() / "tool").resolve()), "version": "1"},
+        "argv": argv,
+        "tool": {"path": tool_path, "version": "1"},
         "exit_code": 0 if status == "pass" else 1,
         "duration_ms": 1,
         "reason_code": None if status == "pass" else "check_failed",
@@ -127,7 +209,12 @@ def _leg_artifact(manifest: dict, leg: str, *, status: str = "pass") -> dict:
         ],
         "required_check_ids": required,
         "checks": [
-            _check(check_id, status=status if index == 0 else "pass")
+            _check(
+                check_id,
+                manifest,
+                leg.split("/", 1)[1],
+                status=status if index == 0 else "pass",
+            )
             for index, check_id in enumerate(required)
         ],
         "artifacts": {
@@ -258,6 +345,15 @@ def test_manifest_cannot_weaken_required_floor(mutate) -> None:
         dev_gate.validate_manifest(manifest)
 
 
+@pytest.mark.parametrize("check_id", sorted(dev_gate.TIMEOUT_CHECKS))
+def test_manifest_requires_every_subprocess_timeout(check_id: str) -> None:
+    manifest = _manifest()
+    manifest["checks"][check_id].pop("timeout_seconds")
+
+    with pytest.raises(dev_gate.GateBlock, match="timeout_seconds"):
+        dev_gate.validate_manifest(manifest)
+
+
 def test_logical_plan_digest_is_runtime_path_independent_and_semantic() -> None:
     manifest = dev_gate.validate_manifest(_manifest())
     original = dev_gate.logical_plan_digest(manifest, "release")
@@ -346,12 +442,52 @@ def test_canonical_leg_requires_live_security_input_evidence() -> None:
         lambda artifact: artifact["subject"].update({"clean_before": 1}),
         lambda artifact: artifact["manifest"].update({"sha256": 7}),
         lambda artifact: artifact["checks"][0].update({"id": 7}),
+        lambda artifact: artifact.update({"verdict": []}),
+        lambda artifact: artifact.update({"schema_version": True}),
+        lambda artifact: artifact["manifest"].update({"schema_version": True}),
+        lambda artifact: artifact["interpreters"][0].update({"status": []}),
+        lambda artifact: artifact["checks"][0].update({"status": []}),
+        lambda artifact: artifact["checks"][0].update({"exit_code": False}),
     ],
 )
 def test_malformed_evidence_types_fail_with_gate_block(mutate) -> None:
     manifest = dev_gate.validate_manifest(_manifest())
     artifact = _leg_artifact(manifest, "windows/3.10")
     mutate(artifact)
+
+    with pytest.raises(dev_gate.GateBlock):
+        dev_gate.validate_run_artifact(artifact, manifest)
+
+
+def test_passing_check_command_must_match_committed_plan() -> None:
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "windows/3.10")
+    command = str((Path.cwd() / ("cmd.exe" if os.name == "nt" else "true")).resolve())
+    artifact["checks"][0]["argv"] = [command]
+    artifact["checks"][0]["tool"]["path"] = command
+
+    with pytest.raises(dev_gate.GateBlock, match="command"):
+        dev_gate.validate_run_artifact(artifact, manifest)
+
+
+def test_import_provenance_rejects_parent_traversal() -> None:
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "windows/3.10")
+    pytest_record = next(check for check in artifact["checks"] if check["id"].startswith("pytest-"))
+    pytest_record["import_provenance"] = {
+        "expected_root": "/trusted/export",
+        "observed_path": "/trusted/export/../../stale-editable/agenttalk/__init__.py",
+        "version": artifact["subject"]["version"],
+    }
+
+    with pytest.raises(dev_gate.GateBlock, match="provenance"):
+        dev_gate.validate_run_artifact(artifact, manifest)
+
+
+def test_canonical_external_input_types_cannot_crash_validation() -> None:
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "linux/3.12")
+    artifact["external_inputs"][0]["check_id"] = []
 
     with pytest.raises(dev_gate.GateBlock):
         dev_gate.validate_run_artifact(artifact, manifest)
@@ -389,6 +525,16 @@ def test_aggregate_is_complete_but_blocked_when_one_leg_failed() -> None:
 
     assert aggregate["complete"] is True
     assert aggregate["verdict"] == "block"
+
+
+def test_malformed_aggregate_header_blocks_without_type_error() -> None:
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifacts = [_leg_artifact(manifest, leg) for leg in dev_gate.expected_ci_legs(manifest)]
+    aggregate = dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, _binding(manifest))
+    aggregate["verdict"] = []
+
+    with pytest.raises(dev_gate.GateBlock):
+        dev_gate.validate_aggregate_artifact(aggregate, manifest)
 
 
 def test_aggregate_rejects_leg_set_not_bound_to_current_checkout() -> None:
@@ -630,6 +776,61 @@ def test_cli_early_block_emits_normalized_machine_evidence(
     summary = json.loads(capsys.readouterr().out)
     assert summary["evidence"] == str(evidence.resolve())
     assert summary["candidate_sha"] == emitted["subject"]["candidate_sha"]
+
+
+def test_cli_unexpected_io_failure_emits_normalized_machine_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = tmp_path / "preflight-io.json"
+    args = build_parser().parse_args(["dev-gate", "--evidence", str(evidence)])
+    monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda _root, _argv: None)
+
+    def fail(**_kwargs):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(dev_gate, "execute_gate", fail)
+
+    assert cmd_dev_gate(args) == 2
+    emitted = json.loads(evidence.read_text(encoding="utf-8"))
+    dev_gate.validate_preflight_artifact(emitted)
+    assert emitted["blocker"]["code"] == "gate_internal_error"
+
+
+def test_reentry_executes_committed_export_despite_hidden_worktree_edit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    runner = repo / "src" / "agenttalk" / "dev_gate.py"
+    runner.parent.mkdir(parents=True)
+    runner.write_text("COMMITTED = True\n", encoding="utf-8")
+    (repo / "dev-gate.json").write_text('{"schema_version": 1}\n', encoding="utf-8")
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "base")
+    _git(repo, "update-index", "--assume-unchanged", "src/agenttalk/dev_gate.py")
+    runner.write_text("MUTATED = True\n", encoding="utf-8")
+    assert _git(repo, "status", "--porcelain=v1") == ""
+    external = tmp_path / "external"
+    external.mkdir()
+    monkeypatch.setattr(dev_gate, "_default_external_base", lambda _root, _store: external)
+    real_run = subprocess.run
+    observed: dict[str, str] = {}
+
+    def run(argv, **kwargs):
+        if argv[0] == sys.executable:
+            committed_runner = Path(kwargs["env"]["PYTHONPATH"]) / "agenttalk" / "dev_gate.py"
+            observed["runner"] = committed_runner.read_text(encoding="utf-8")
+            return SimpleNamespace(returncode=7)
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(dev_gate.subprocess, "run", run)
+
+    assert dev_gate.reenter_candidate_source(repo, ["--profile", "release"]) == 7
+    assert observed["runner"] == "COMMITTED = True\n"
 
 
 def test_git_binding_ignores_environment_redirection(
