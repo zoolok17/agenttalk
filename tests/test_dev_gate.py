@@ -336,10 +336,10 @@ def _leg_artifact(manifest: dict, leg: str, *, status: str = "pass") -> dict:
     }
 
 
-def _binding(manifest: dict) -> dev_gate.CandidateBinding:
+def _binding(manifest: dict, *, root: Path | None = None) -> dev_gate.CandidateBinding:
     raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return dev_gate.CandidateBinding(
-        root=Path.cwd(),
+        root=root or Path.cwd(),
         candidate_sha="1" * 40,
         candidate_tree="2" * 40,
         manifest_git_blob="3" * 40,
@@ -363,6 +363,27 @@ def _git(root: Path, *args: str) -> str:
     )
     assert completed.returncode == 0, completed.stderr
     return completed.stdout.strip()
+
+
+def _gate_repo(tmp_path: Path) -> Path:
+    root = tmp_path / "gate-repo"
+    runner = root / "src" / "agenttalk" / "dev_gate.py"
+    runner.parent.mkdir(parents=True)
+    (root / "dev-gate.json").write_text(
+        json.dumps(_manifest(), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "fixture"\nversion = "0.78.1"\n',
+        encoding="utf-8",
+    )
+    runner.write_text("# fixture runner\n", encoding="utf-8")
+    _git(root, "init")
+    _git(root, "config", "user.email", "test@example.invalid")
+    _git(root, "config", "user.name", "Test")
+    _git(root, "add", "dev-gate.json", "pyproject.toml", "src/agenttalk/dev_gate.py")
+    _git(root, "commit", "-m", "base")
+    return root
 
 
 def _synthetic_wheel(
@@ -581,54 +602,66 @@ def test_canonical_external_input_types_cannot_crash_validation() -> None:
         dev_gate.validate_run_artifact(artifact, manifest)
 
 
-def test_aggregate_requires_exact_unique_matrix_and_common_binding() -> None:
+def test_aggregate_requires_exact_unique_matrix_and_common_binding(tmp_path: Path) -> None:
     manifest = dev_gate.validate_manifest(_manifest())
     artifacts = [_leg_artifact(manifest, leg) for leg in dev_gate.expected_ci_legs(manifest, "release")]
+    binding = _binding(manifest, root=_gate_repo(tmp_path))
 
-    aggregate = dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, _binding(manifest))
+    aggregate = dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, binding)
     assert aggregate["complete"] is True
     assert aggregate["verdict"] == "pass"
     assert len(aggregate["legs"]) == 12
 
     with pytest.raises(dev_gate.GateBlock, match="missing"):
-        dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts[:-1], _binding(manifest))
+        dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts[:-1], binding)
 
     with pytest.raises(dev_gate.GateBlock, match="duplicate"):
         dev_gate.aggregate_leg_artifacts(
-            manifest, "release", [*artifacts, artifacts[0]], _binding(manifest)
+            manifest, "release", [*artifacts, artifacts[0]], binding
         )
 
     mismatched = copy.deepcopy(artifacts)
     mismatched[-1]["subject"]["candidate_sha"] = "9" * 40
     with pytest.raises(dev_gate.GateBlock, match="candidate_sha"):
-        dev_gate.aggregate_leg_artifacts(manifest, "release", mismatched, _binding(manifest))
+        dev_gate.aggregate_leg_artifacts(manifest, "release", mismatched, binding)
 
 
-def test_aggregate_is_complete_but_blocked_when_one_leg_failed() -> None:
+def test_aggregate_is_complete_but_blocked_when_one_leg_failed(tmp_path: Path) -> None:
     manifest = dev_gate.validate_manifest(_manifest())
     artifacts = [_leg_artifact(manifest, leg) for leg in dev_gate.expected_ci_legs(manifest, "release")]
     artifacts[0] = _leg_artifact(manifest, artifacts[0]["ci_leg"], status="fail")
 
-    aggregate = dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, _binding(manifest))
+    aggregate = dev_gate.aggregate_leg_artifacts(
+        manifest,
+        "release",
+        artifacts,
+        _binding(manifest, root=_gate_repo(tmp_path)),
+    )
 
     assert aggregate["complete"] is True
     assert aggregate["verdict"] == "block"
 
 
-def test_malformed_aggregate_header_blocks_without_type_error() -> None:
+def test_malformed_aggregate_header_blocks_without_type_error(tmp_path: Path) -> None:
     manifest = dev_gate.validate_manifest(_manifest())
     artifacts = [_leg_artifact(manifest, leg) for leg in dev_gate.expected_ci_legs(manifest)]
-    aggregate = dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, _binding(manifest))
+    aggregate = dev_gate.aggregate_leg_artifacts(
+        manifest,
+        "release",
+        artifacts,
+        _binding(manifest, root=_gate_repo(tmp_path)),
+    )
     aggregate["verdict"] = []
 
     with pytest.raises(dev_gate.GateBlock):
         dev_gate.validate_aggregate_artifact(aggregate, manifest)
 
 
-def test_aggregate_rejects_leg_set_not_bound_to_current_checkout() -> None:
+def test_aggregate_rejects_leg_set_not_bound_to_current_checkout(tmp_path: Path) -> None:
     manifest = dev_gate.validate_manifest(_manifest())
     artifacts = [_leg_artifact(manifest, leg) for leg in dev_gate.expected_ci_legs(manifest)]
-    current = _binding(manifest)
+    root = _gate_repo(tmp_path)
+    current = _binding(manifest, root=root)
     current = dev_gate.CandidateBinding(
         **{**current.__dict__, "candidate_sha": "9" * 40}
     )
@@ -636,7 +669,7 @@ def test_aggregate_rejects_leg_set_not_bound_to_current_checkout() -> None:
     with pytest.raises(dev_gate.GateBlock, match="current checkout"):
         dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, current)
 
-    current = _binding(manifest)
+    current = _binding(manifest, root=root)
     current = dev_gate.CandidateBinding(
         **{**current.__dict__, "runner_module_sha256": "9" * 64}
     )
@@ -1106,7 +1139,7 @@ def test_write_run_evidence_is_normalized_and_roundtrip_validated(tmp_path: Path
 
 def test_aggregate_evidence_roundtrips_with_exact_leg_input_digests(tmp_path: Path) -> None:
     manifest = dev_gate.validate_manifest(_manifest())
-    binding = _binding(manifest)
+    binding = _binding(manifest, root=_gate_repo(tmp_path))
     artifacts = [_leg_artifact(manifest, leg) for leg in dev_gate.expected_ci_legs(manifest)]
     input_digests = {
         artifact["ci_leg"]: format(index + 1, "x") * 64
@@ -1168,6 +1201,8 @@ def test_cli_early_block_emits_normalized_machine_evidence(
         ["dev-gate", "--ci-leg", "linux/3.10", "--evidence", str(evidence)]
     )
 
+    repo = _gate_repo(tmp_path)
+    monkeypatch.setattr(dev_gate, "discover_repo_root", lambda: repo)
     monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda _root, _argv: None)
 
     def block(**_kwargs):
@@ -1192,6 +1227,8 @@ def test_cli_unexpected_io_failure_emits_normalized_machine_evidence(
 ) -> None:
     evidence = tmp_path / "preflight-io.json"
     args = build_parser().parse_args(["dev-gate", "--evidence", str(evidence)])
+    repo = _gate_repo(tmp_path)
+    monkeypatch.setattr(dev_gate, "discover_repo_root", lambda: repo)
     monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda _root, _argv: None)
 
     def fail(**_kwargs):
