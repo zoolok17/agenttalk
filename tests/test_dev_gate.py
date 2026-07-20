@@ -150,7 +150,7 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass") -
         tool_path = str((Path.cwd() / ("semgrep.exe" if os.name == "nt" else "semgrep")).resolve())
         spec = manifest["checks"]["semgrep"]
         argv = [tool_path, "scan", *[f"--config={value}" for value in spec["configs"]]]
-        argv.extend(["--error", "--timeout", str(spec["rule_timeout_seconds"]), "--strict"])
+        argv.extend(["--error", "--timeout", str(spec["rule_timeout_seconds"])])
     elif check_id == "zizmor":
         tool_path = str((Path.cwd() / ("zizmor.exe" if os.name == "nt" else "zizmor")).resolve())
         argv = [tool_path, *manifest["checks"]["zizmor"]["paths"]]
