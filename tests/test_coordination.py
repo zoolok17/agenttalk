@@ -499,6 +499,7 @@ def test_scoped_wait_not_superseded_by_different_request(
     assert (store.read_waiting("alpha") or {}).get("wait_token") == "wait-r2"
 
 
+@pytest.mark.source_layout
 def test_scoped_wait_replacement_receives_later_reply(
     store: Store,
     store_root: Path,
