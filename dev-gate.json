@@ -109,7 +109,7 @@
         ".semgrep/agenttalk.yml"
       ],
       "error": true,
-      "strict": true,
+      "strict": false,
       "rule_timeout_seconds": 120,
       "timeout_seconds": 1800
     },

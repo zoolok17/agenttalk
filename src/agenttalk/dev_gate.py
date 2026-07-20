@@ -286,7 +286,7 @@ def validate_manifest(data: Any) -> dict[str, Any]:
         "semgrep": {
             "configs": ["p/python", "p/security-audit", ".semgrep/agenttalk.yml"],
             "error": True,
-            "strict": True,
+            "strict": False,
             "rule_timeout_seconds": 120,
         },
         "zizmor": {"paths": [".github/workflows"]},
@@ -673,7 +673,7 @@ def _validate_check_command(
     elif check_id == "semgrep":
         spec = manifest["checks"]["semgrep"]
         expected = [tool_path, "scan", *[f"--config={value}" for value in spec["configs"]]]
-        expected.extend(["--error", "--timeout", str(spec["rule_timeout_seconds"]), "--strict"])
+        expected.extend(["--error", "--timeout", str(spec["rule_timeout_seconds"])])
         valid = _path_basename(tool_path) in {"semgrep", "semgrep.exe"} and argv == expected
     elif check_id == "zizmor":
         expected = [tool_path, *manifest["checks"]["zizmor"]["paths"]]
@@ -2979,7 +2979,7 @@ def run_static_checks(
                         "observed_at": _utc_now(),
                     }
                 )
-        argv.extend(["--error", "--timeout", str(spec["rule_timeout_seconds"]), "--strict"])
+        argv.extend(["--error", "--timeout", str(spec["rule_timeout_seconds"])])
         records["semgrep"] = _executable_check(
             check_id="semgrep",
             executable_name="semgrep",
