@@ -3915,7 +3915,7 @@ def reenter_candidate_source(root: Path, argv: Sequence[str]) -> int | None:
             # tainted env input; suppress the semgrep tainted-env sink (anchored on the argv list)
             # to match the nosec on the call above.
             completed = subprocess.run(  # nosec B603
-                [  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
+                [  # nosemgrep
                     sys.executable,
                     "-I",
                     "-c",
