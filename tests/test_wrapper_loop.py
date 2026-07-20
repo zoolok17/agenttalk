@@ -2333,6 +2333,46 @@ def test_make_drive_claude_prompt_too_long_on_resume_is_not_message_poison(tmp_p
     assert state.resume_failure_count == 1
 
 
+def test_make_drive_claude_truncated_model_line_in_tail_does_not_spoof_session_failure(
+    tmp_path,
+) -> None:
+    # codex-agenttalk-reviewer-1 re-review (PR #51): the child-output tail is
+    # byte-BOUNDED, so a long model assistant line is parsed live as VALID JSON (emits
+    # MODEL_OUTPUT) but its stored tail copy is LEFT-TRIMMED into an invalid-JSON
+    # fragment that slips past the non-JSON filter. If that fragment quotes "no
+    # conversation found with session ID" it would spoof a session failure on a turn
+    # where the model actually RAN. The content-independent produced_model_output guard
+    # blocks it: this resume turn produced model output, so tail text can never make it
+    # session-attributable -> no spurious fresh-session reset.
+    payload = ("x" * 5000) + " No conversation found with session ID: 26c40e8a-c8ef"
+    model_line = json.dumps(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": payload}]}})
+
+    def spawn(argv, stdin):
+        assert "--resume" in argv                    # this must be a resume turn
+        # message_start (TURN_STARTED) + a big assistant block (MODEL_OUTPUT), then NO
+        # message_stop -> the turn is a partial-stream FAILURE (ambiguous), while the
+        # tail's stored copy of the assistant line is truncated to a spoofing fragment.
+        return _Stream([
+            json.dumps({"type": "stream_event", "event": {"type": "message_start"}}),
+            model_line,
+        ])
+
+    state = session.SessionState(cli="claude", claude_session_id="sess-1",
+                                 turns=1, resume_available=True)
+    drive = run.make_drive(_store(tmp_path), "beta", "claude", state, ["claude"],
+                           spawn=spawn, clock=lambda: 0.0, render=False)
+    out = drive(_claude_rec())
+
+    assert out.ok is False
+    assert out.failure_class == loop.CLASS_AMBIGUOUS
+    # NOT session-attributable: the ledger stays at 0 and no fresh session was minted.
+    assert state.resume_failure_count == 0
+    assert state.claude_session_id == "sess-1"
+    assert state.resume_available is True
+    assert "retrying resume once" not in (out.summary or "")
+
+
 def test_make_drive_success_stamps_heartbeat(tmp_path) -> None:
     # the flip side: a CLEAN completed turn leaves a fresh heartbeat.
     s = _store(tmp_path)

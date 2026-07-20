@@ -192,14 +192,28 @@ def resume_attempt_start(state: SessionState, *, agent: str, msg_id: object) -> 
 
 def resume_failure_is_session_attributable(failure_class: str | None,
                                            summary: str | None,
-                                           raw_tail: str | None = None) -> bool:
+                                           raw_tail: str | None = None,
+                                           *,
+                                           produced_model_output: bool = False) -> bool:
     if failure_class in {"known_global_infra", "config_blocked"}:
         return False
-    # Scan the classified summary AND the raw child-output tail: the broken-session
-    # diagnostic (e.g. claude's "No conversation found with session ID: <uuid>")
-    # arrives on a NON-JSON line the stream-json adapter discards, so it never reaches
-    # the summary - only the captured raw tail carries it (task #34 resume-continuity).
-    text = f"{summary or ''}\n{raw_tail or ''}".casefold()
+    # The raw child-output tail is a BYTE/LINE-BOUNDED capture (max_bytes/max_lines
+    # with a truncated flag). A model's JSON assistant line truncated at the tail
+    # boundary becomes INVALID JSON, so it would pass run.py's non-JSON-only filter and
+    # be treated as a trusted CLI diagnostic - re-opening the content-spoof hole
+    # (codex-agenttalk-reviewer-1 REQUEST-CHANGES on PR #51): a truncated model fragment
+    # quoting "no conversation found with session id" could spoof a session failure on a
+    # turn where the model ACTUALLY RAN. The load-bearing guard is CONTENT-INDEPENDENT:
+    # a real missing-resume-session failure produces ZERO model output (claude's result
+    # reports num_turns==0 - the turn never ran - and no MODEL_OUTPUT event occurs),
+    # whereas a turn that merely QUOTES the phrase produced model output. So the raw tail
+    # is scanned ONLY when the turn produced no model output; a turn that produced model
+    # output is NEVER session-attributable from tail text, regardless of truncation. This
+    # makes the truncation-spoof structurally impossible, not merely harder. The classified
+    # summary (built from structured JSON events, never raw model bytes) is still scanned
+    # unconditionally - model content cannot reach it (task #34 resume-continuity).
+    tail = "" if produced_model_output else (raw_tail or "")
+    text = f"{summary or ''}\n{tail}".casefold()
     broken_terms = (
         "no session",
         "session not found",

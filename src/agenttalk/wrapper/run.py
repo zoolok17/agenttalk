@@ -1531,10 +1531,15 @@ def _child_output_tail_text(tail: object) -> str:
 
     ONLY non-JSON lines are included: in stream-json mode the model's output is
     always JSON-wrapped (assistant events), while the CLI's own diagnostics are bare
-    non-JSON lines. Restricting the scan to non-JSON lines means MODEL CONTENT cannot
-    spoof a session-failure diagnostic - e.g. a model that merely quotes 'no
-    conversation found' rides inside a JSON event and is excluded here
-    (codex-agenttalk-reviewer-1 content-spoof finding on PR #51)."""
+    non-JSON lines, so a model quoting 'no conversation found' inside a well-formed
+    JSON event is excluded here. This filter is CORROBORATION only - it is NOT
+    spoof-proof on its own, because the child-output tail is byte/line-BOUNDED and a
+    model JSON line truncated at the tail boundary becomes invalid JSON and slips
+    through (codex-agenttalk-reviewer-1, PR #51). The LOAD-BEARING guard is the
+    content-independent ``produced_model_output`` signal in
+    :func:`session.resume_failure_is_session_attributable`: this tail text is consulted
+    ONLY on a turn that produced NO model output, so a truncated model fragment can
+    never reach the scan."""
     if not isinstance(tail, dict):
         return ""
     lines = tail.get("lines")
@@ -1725,6 +1730,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                "bus_action_attempted": False, "bus_action_infra": False,
                "bus_action_rejected": False,
                "structured_errors": [], "child_output_tail": None,
+               "produced_model_output": False,
                "lesson_exposure_error": None}
         child_output_lines: list[dict[str, str]] = []
         child_output_truncated = False
@@ -1778,6 +1784,15 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 for ev in mapper(raw):
                     if ev.type == EventType.TURN_STARTED:
                         sig["started"] = True
+                    elif ev.type in (EventType.MODEL_OUTPUT, EventType.MODEL_OUTPUT_DELTA):
+                        # The model produced output this turn (assistant text/thinking, or a
+                        # streamed delta). A missing-resume-session failure produces NONE of
+                        # these (num_turns==0, the turn never ran), so this content-independent
+                        # flag vetoes any raw-tail-based session attribution and closes the
+                        # truncation-spoof vector (codex-agenttalk-reviewer-1, PR #51). Parsed
+                        # from the FULL live stream line, before the child-output tail is
+                        # byte/line-bounded, so a truncated tail cannot suppress it.
+                        sig["produced_model_output"] = True
                     elif ev.type == EventType.TURN_FINISHED:
                         sig["completed"] = True
                     elif ev.type == EventType.ADAPTER_ERROR:
@@ -1896,6 +1911,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             attributable = _session.resume_failure_is_session_attributable(
                 resume_failure_class, resume_summary,
                 raw_tail=_child_output_tail_text(sig.get("child_output_tail")),
+                produced_model_output=bool(sig.get("produced_model_output")),
             )
             if resume_failure_class == CLASS_CONFIG_BLOCKED:
                 _session.clear_resume_attempt(session_state)

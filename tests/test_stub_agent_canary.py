@@ -276,3 +276,38 @@ def test_raw_tail_scan_excludes_json_wrapped_model_content_no_spoof() -> None:
     assert "no conversation found with session id" in real_scanned.casefold()
     assert session.resume_failure_is_session_attributable(
         "ambiguous_or_unknown", "error_during_execution", raw_tail=real_scanned)
+
+
+def test_truncation_spoof_blocked_by_no_model_output_signal() -> None:
+    """codex-agenttalk-reviewer-1 re-review (PR #51): the non-JSON filter is not
+    spoof-proof on its own because the child-output tail is byte/line-BOUNDED. A model
+    JSON assistant line TRUNCATED at the tail boundary becomes invalid JSON, slips past
+    the non-JSON filter, and - if it quotes the diagnostic - spoofs a session failure on
+    a turn where the model ACTUALLY RAN. The content-independent ``produced_model_output``
+    guard closes it structurally: a turn that produced model output is never
+    session-attributable from tail text."""
+    from agenttalk.redaction import normalize_child_output_tail
+
+    # A long model assistant line (valid JSON on the live stream) whose stored tail copy
+    # gets LEFT-TRIMMED past the tail byte budget -> an invalid-JSON fragment that still
+    # carries "no conversation found with session ID" in its surviving suffix.
+    payload = ("x" * 5000) + " No conversation found with session ID: 26c40e8a-c8ef"
+    model_line = json.dumps(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": payload}]}})
+    tail = normalize_child_output_tail({"lines": [{"stream": "stdout", "text": model_line}]})
+    assert tail["truncated"] is True
+    scanned = run._child_output_tail_text(tail)
+    # The fragment DID slip past the non-JSON filter (this is the raw vulnerability) ...
+    assert "no conversation found with session id" in scanned.casefold()
+
+    # ... but a turn that PRODUCED MODEL OUTPUT (num_turns>=1) is NOT session-attributable,
+    # regardless of the spoofing tail -> no spurious fresh-session reset.
+    assert not session.resume_failure_is_session_attributable(
+        "ambiguous_or_unknown", "partial stream: started, never completed",
+        raw_tail=scanned, produced_model_output=True)
+
+    # A REAL missing-session failure (num_turns==0, no model output, bare diagnostic) still
+    # self-heals: the same tail text IS attributable when no model output was produced.
+    assert session.resume_failure_is_session_attributable(
+        "ambiguous_or_unknown", "error_during_execution",
+        raw_tail=scanned, produced_model_output=False)
