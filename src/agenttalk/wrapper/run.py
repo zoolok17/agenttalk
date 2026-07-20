@@ -1523,6 +1523,76 @@ def _classify_drive_failure(sig: dict) -> tuple[str, str]:
     return CLASS_AMBIGUOUS, f"turn never started (rc={sig.get('rc')}, no clear signal)"
 
 
+# Event types that prove the resumed turn actually RAN (produced real activity):
+# model output/deltas OR any tool call. A missing-resume-session failure produces NONE
+# of these (the turn never ran). This corroborates the authoritative num_turns gate and
+# - critically - covers TOOL-ONLY turns (a model that emits only tool_use, no assistant
+# text) so the guard is not a per-event-type enumeration (codex-agenttalk-reviewer-1, PR
+# #51). TURN_STARTED/TURN_FINISHED are deliberately excluded: a bare handshake is not
+# proof the model ran.
+_TURN_ACTIVITY_EVENT_TYPES = frozenset({
+    EventType.MODEL_OUTPUT,
+    EventType.MODEL_OUTPUT_DELTA,
+    EventType.TOOL_STARTED,
+    EventType.TOOL_OUTPUT,
+    EventType.TOOL_OUTPUT_DELTA,
+    EventType.TOOL_FINISHED,
+})
+
+
+def _result_num_turns(raw: object) -> int | None:
+    """The CLI's AUTHORITATIVE turn count from a terminal RESULT event, or None.
+
+    claude's stream-json ``result`` carries ``num_turns`` (0 == the resumed turn never
+    ran - the missing-session shape; >0 == it ran). Returns None when the field is
+    absent/unparseable (or a bool, which is not a real count) so the caller treats it as
+    UNKNOWN and falls back to the activity flag rather than assuming num_turns == 0."""
+    if not isinstance(raw, dict) or raw.get("type") != "result":
+        return None
+    n = raw.get("num_turns")
+    if isinstance(n, bool) or not isinstance(n, int):
+        return None
+    return n
+
+
+def _child_output_tail_text(tail: object) -> str:
+    """Flatten a captured child-output tail's NON-JSON lines into one scannable
+    string. Feeds the raw CLI diagnostic - e.g. a bare 'No conversation found with
+    session ID: ...' line the stream-json adapter DISCARDS during parsing - into the
+    resume-failure attributability decision (task #34 resume-continuity).
+
+    ONLY non-JSON lines are included: in stream-json mode the model's output is
+    always JSON-wrapped (assistant events), while the CLI's own diagnostics are bare
+    non-JSON lines, so a model quoting 'no conversation found' inside a well-formed
+    JSON event is excluded here. This filter is CORROBORATION only - it is NOT
+    spoof-proof on its own, because the child-output tail is byte/line-BOUNDED and a
+    model JSON line truncated at the tail boundary becomes invalid JSON and slips
+    through (codex-agenttalk-reviewer-1, PR #51). The LOAD-BEARING guard is the CLI's
+    authoritative ``num_turns`` signal (corroborated by the content-independent
+    ``produced_model_output`` activity flag) in
+    :func:`session.resume_failure_is_session_attributable`: this tail text is consulted
+    ONLY on a turn that did NOT run (num_turns == 0 with no activity), so a truncated
+    model fragment from a turn that ran can never reach the scan."""
+    if not isinstance(tail, dict):
+        return ""
+    lines = tail.get("lines")
+    if not isinstance(lines, list):
+        return ""
+    parts: list[str] = []
+    for line in lines:
+        if not (isinstance(line, dict) and isinstance(line.get("text"), str)):
+            continue
+        stripped = line["text"].strip()
+        if not stripped:
+            continue
+        try:
+            json.loads(stripped)
+        except (ValueError, TypeError):
+            parts.append(line["text"])   # non-JSON -> CLI's own diagnostic, never model content
+        # else: valid JSON (a structured event, possibly carrying model text) -> excluded
+    return "\n".join(parts)
+
+
 def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str], *,
                sender: str | None = None, min_interval: float = 5.0,
                render: bool = True, rules: str | None = None,
@@ -1693,6 +1763,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                "bus_action_attempted": False, "bus_action_infra": False,
                "bus_action_rejected": False,
                "structured_errors": [], "child_output_tail": None,
+               "produced_model_output": False, "result_num_turns": None,
                "lesson_exposure_error": None}
         child_output_lines: list[dict[str, str]] = []
         child_output_truncated = False
@@ -1743,7 +1814,20 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 except (ValueError, TypeError):
                     continue
                 _session.observe_event(session_state, raw)   # capture codex thread_id
+                num_turns = _result_num_turns(raw)
+                if num_turns is not None:
+                    # Authoritative "did the turn run" signal from the terminal result
+                    # (claude: num_turns==0 on a missing-resume-session). Captured here,
+                    # from the FULL live stream line before the child-output tail is
+                    # byte/line-bounded, so a truncated tail can never suppress it.
+                    sig["result_num_turns"] = num_turns
                 for ev in mapper(raw):
+                    if ev.type in _TURN_ACTIVITY_EVENT_TYPES:
+                        # The turn produced real activity (model output/delta OR a tool
+                        # call). Corroborates the authoritative num_turns gate and covers
+                        # TOOL-ONLY turns even if a CLI omits num_turns, so the guard is
+                        # not a per-event-type enumeration (codex-reviewer-1, PR #51).
+                        sig["produced_model_output"] = True
                     if ev.type == EventType.TURN_STARTED:
                         sig["started"] = True
                     elif ev.type == EventType.TURN_FINISHED:
@@ -1862,7 +1946,11 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 health_writer.unknown()
                 raise
             attributable = _session.resume_failure_is_session_attributable(
-                resume_failure_class, resume_summary)
+                resume_failure_class, resume_summary,
+                raw_tail=_child_output_tail_text(sig.get("child_output_tail")),
+                produced_model_output=bool(sig.get("produced_model_output")),
+                result_num_turns=sig.get("result_num_turns"),
+            )
             if resume_failure_class == CLASS_CONFIG_BLOCKED:
                 _session.clear_resume_attempt(session_state)
                 store.clear_heartbeat(agent)
