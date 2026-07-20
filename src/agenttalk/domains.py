@@ -179,6 +179,11 @@ def check_path(registry: dict[str, Any], path: str, *,
                casefold_paths: bool | None = None) -> dict[str, Any]:
     casefold = default_casefold_paths() if casefold_paths is None else casefold_paths
     display_path = normalize_repo_path(path)
+    if any(metachar in display_path for metachar in "*?["):
+        raise DomainError(
+            f"path {path!r} contains glob metacharacters; check_path needs a concrete "
+            "repo path; use glob_matches() for patterns"
+        )
     domains: list[str] = []
     for domain_id, domain in registry.get("domains", {}).items():
         if any(glob_matches(glob, display_path, casefold=casefold)
