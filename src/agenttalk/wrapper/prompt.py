@@ -103,13 +103,22 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
     out: list[str] = []
     if rejoin:
         out += ["== REJOIN CONTEXT ==", rejoin, ""]
+    # request_id is conventionally carried in meta.request_id on real bus messages;
+    # the top-level record["request_id"] is usually null. Resolve from every place a
+    # tracked correlation id can live so the header and the reply anchor below echo a
+    # value the worker can actually use. (Was: top-level only -> null header -> the
+    # worker had no anchor to copy and guessed flags, burning the turn.)
+    _meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+    resolved_request_id = (record.get("request_id")
+                           or _meta.get("request_id")
+                           or record.get("correlation_id"))
     out.append("== INBOUND AGENTTALK MESSAGE ==")
     out.append(f"from: {record.get('from')}  to: {record.get('to')}  "
                f"kind: {record.get('kind')}")
     if record.get("subject"):
         out.append(f"subject: {record['subject']}")
     out.append(f"correlation_id: {record.get('correlation_id')} "
-               f"(request_id={record.get('request_id')} "
+               f"(request_id={resolved_request_id} "
                f"broadcast_id={record.get('broadcast_id')})")
     out += ["", record.get("body") or "", ""]
     # The FULL structured record, incl meta + scoped state. Classification data
@@ -139,8 +148,16 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
         # model does not guess flags: the confusable near-synonyms (--to / --to-id /
         # --request-id / --body) and inline multi-line -m bodies caused repeated failed
         # reply attempts that burned the whole turn without a reply landing.
-        rid = record.get("request_id")
-        anchor = f"--to-request {rid}" if rid else "--to-request <request_id from the header above>"
+        # Prefer the resolved request_id (thread anchor); if the message carries no
+        # correlation id at all, anchor to THIS message's own id via --to-id, which is
+        # always present. Never emit a placeholder the worker has to fill in itself.
+        _msg_id = record.get("id")
+        if resolved_request_id:
+            anchor = f"--to-request {resolved_request_id}"
+        elif _msg_id:
+            anchor = f"--to-id {_msg_id}"
+        else:
+            anchor = "--to-request <request_id from the header above>"
         out += [
             "== HOW TO REPLY TO THIS MESSAGE (exact form) ==",
             "Answer on THIS thread with ONE command. Short, single-line answer:",
