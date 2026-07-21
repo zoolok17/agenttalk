@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import cli, doctor, install_skills as iskl, signing
+from agenttalk import cli, doctor, install_skills as iskl, ovh_gateway_service, signing
 from agenttalk.store import Store
 
 
@@ -55,6 +55,83 @@ def test_doctor_warns_when_supervisor_deadman_config_is_ignored(tmp_path: Path) 
     assert "supervisor.json contains a deadman block that is ignored" in check.details
     assert "config.json" in check.details
     assert ".agenttalk/config.json" in check.fix
+
+
+def test_doctor_ovh_qwen_gateway_is_allowlisted_and_checks_ambient_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "qwen-dev-1"])
+    store.set_role("lead", "lead")
+    store.set_operator_facing("lead")
+    store.set_trust_class("qwen-dev-1", "external-worker")
+    (store.dir / "supervisor.json").write_text(
+        json.dumps({
+            "schema_version": 2,
+            "agents": {
+                "qwen-dev-1": {
+                    "backend_profile": "ovh-qwen",
+                    "trust_class": "external-worker",
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        ovh_gateway_service,
+        "gateway_status",
+        lambda _root: {
+            "ready": True,
+            "errors": [],
+            "price_policy_hash": "a" * 64,
+            "committed_micro_eur": 123,
+            "unresolved_count": 0,
+            "ledger": {
+                "opening_micro_eur": 580_000,
+                "opening_evidence": (
+                    "OVH AI Endpoints dashboard, observed 2026-07-16 morning"
+                ),
+                "opening_observed_at": "2026-07-16T08:00:00.000000Z",
+                "opening_period": "2026-07",
+            },
+        },
+    )
+    monkeypatch.delenv("OVH_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    check = doctor._check_ovh_qwen_gateway(store)
+
+    assert check is not None
+    assert check.status == "ok"
+    assert set(check.data or {}) == {
+        "ready",
+        "errors",
+        "price_policy_hash",
+        "committed_micro_eur",
+        "unresolved_count",
+        "ledger",
+    }
+    assert check.data["ledger"]["opening_micro_eur"] == 580_000
+    assert "OVH AI Endpoints dashboard" in check.data["ledger"]["opening_evidence"]
+
+    ovh_secret = "must-not-be-reported-ovh-secret"
+    anthropic_secret = "must-not-be-reported-anthropic-secret"
+    monkeypatch.setenv("OVH_KEY", ovh_secret)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", anthropic_secret)
+    check = doctor._check_ovh_qwen_gateway(store)
+    assert check is not None
+    assert check.status == "error"
+    assert "supervisor_ambient_provider_key" in check.details
+    rendered = json.dumps({
+        "details": check.details,
+        "fix": check.fix,
+        "data": check.data,
+    })
+    assert ovh_secret not in rendered
+    assert anthropic_secret not in rendered
+    assert "OVH_KEY" not in rendered
+    assert "ANTHROPIC_API_KEY" not in rendered
 
 
 # ----- hmac check status mapping (review C*: doctor must NOT report a

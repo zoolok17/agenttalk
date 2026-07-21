@@ -664,6 +664,80 @@ def load_signoff_policy(store) -> tuple[dict | None, str | None]:
         return None, f"malformed signoff policy: {type(e).__name__}: {e}"
 
 
+def merge_candidate_refsets(*refsets: dict) -> dict:
+    """Merge signoff candidate refsets without resolving roster membership."""
+    merged = {"agents": [], "groups": [], "roles": []}
+    for refset in refsets:
+        for key in merged:
+            merged[key].extend((refset or {}).get(key) or [])
+    return merged
+
+
+def signoff_domain_refset(
+    store,
+    cfg: dict,
+    changed_paths: list[str] | None,
+) -> dict:
+    """Resolve matched domain reviewer refsets, or every possible one for a guard.
+
+    ``changed_paths=None`` is the conservative roster-mutation mode: it returns
+    every domain/shared-path reviewer that a future close could count. A concrete
+    path list preserves close evaluation's path-matched behavior.
+    """
+    from agenttalk import domains as domain_mod
+
+    empty = merge_candidate_refsets()
+    if changed_paths == []:
+        return empty
+    try:
+        registry = domain_mod.load_registry(store.dir / domain_mod.FILENAME, cfg)
+    except Exception:  # noqa: BLE001 - preserve close evaluation's empty fallback
+        return empty
+    data = registry.data
+    domains = data.get("domains", {})
+    shared = data.get("shared_paths", [])
+    if changed_paths is None:
+        return merge_candidate_refsets(
+            empty,
+            *(entry.get("reviewers") or {} for entry in domains.values()),
+            *(entry.get("default_reviewers") or {} for entry in shared),
+        )
+    verdicts = domain_mod.check_paths(data, changed_paths)
+    matched_domains: set[str] = set()
+    matched_globs: set[str] = set()
+    for verdict in verdicts:
+        matched_domains.update(verdict.get("domains", []))
+        for match in verdict.get("shared_paths", []):
+            matched_globs.add(match.get("glob"))
+    return merge_candidate_refsets(
+        empty,
+        *(domains.get(domain_id, {}).get("reviewers") or {}
+          for domain_id in matched_domains),
+        *(entry.get("default_reviewers") or {}
+          for entry in shared if entry.get("glob") in matched_globs),
+    )
+
+
+def resolve_signoff_candidates(
+    cfg: dict,
+    *,
+    candidate_refset: dict,
+    default_reviewers: dict,
+    use_default_reviewers: bool,
+    domain_refset: dict,
+    include_domain_reviewers: bool,
+) -> list[str]:
+    """The single candidate merge+resolution contract used by close and roster."""
+    from agenttalk import domains as domain_mod
+
+    merged = merge_candidate_refsets(
+        candidate_refset,
+        default_reviewers if use_default_reviewers else {},
+        domain_refset if include_domain_reviewers else {},
+    )
+    return domain_mod.resolve_refset(merged, cfg)
+
+
 def closes_dir(store):
     return store.dir / DIRNAME
 

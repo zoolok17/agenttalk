@@ -18,6 +18,7 @@ import time
 import uuid
 import webbrowser
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, DecimalException
 from pathlib import Path
 
 from agenttalk import __version__
@@ -165,6 +166,21 @@ def _positive_int_arg(value: str) -> int:
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
+
+
+def _micro_eur_arg(value: str) -> int:
+    if len(value) > 64:
+        raise argparse.ArgumentTypeError("must be a non-negative EUR amount")
+    try:
+        parsed = Decimal(value)
+        micro_eur = parsed * Decimal(1_000_000)
+    except (DecimalException, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative EUR amount") from exc
+    if not parsed.is_finite() or parsed < 0 or micro_eur != micro_eur.to_integral_value():
+        raise argparse.ArgumentTypeError(
+            "must be a non-negative EUR amount with at most six decimal places"
+        )
+    return int(micro_eur)
 
 
 def _parse_meta(items: list[str] | None) -> dict:
@@ -2234,45 +2250,6 @@ def _agent_groups(cfg: dict, agent: str) -> list[str]:
             if isinstance(members, list) and agent in members]
 
 
-def _merge_refsets(*refsets: dict) -> dict:
-    merged = {"agents": [], "groups": [], "roles": []}
-    for rs in refsets:
-        for key in merged:
-            merged[key].extend((rs or {}).get(key) or [])
-    return merged
-
-
-def _signoff_domain_refset(store, changed_paths: list[str]) -> dict:
-    """Additive ONLY: the union of matched owned-domain reviewers + matched
-    shared-path default_reviewers for the close's changed paths. Touching a domain
-    never mints a requirement; this only widens an existing set's candidates. Missing
-    registry = empty."""
-    merged = _merge_refsets()
-    if not changed_paths:
-        return merged
-    try:
-        reg = _load_domain_registry(store)
-        data = reg.data
-    except Exception:  # noqa: BLE001 - a broken registry must not crash close check
-        return merged
-    verdicts = dom.check_paths(data, changed_paths)
-    domains = data.get("domains", {})
-    shared = data.get("shared_paths", [])
-    matched_domains: set[str] = set()
-    matched_globs: set[str] = set()
-    for v in verdicts:
-        matched_domains.update(v.get("domains", []))
-        for sm in v.get("shared_paths", []):
-            matched_globs.add(sm.get("glob"))
-    parts = [merged]
-    for did in matched_domains:
-        parts.append(domains.get(did, {}).get("reviewers") or {})
-    for entry in shared:
-        if entry.get("glob") in matched_globs:
-            parts.append(entry.get("default_reviewers") or {})
-    return _merge_refsets(*parts)
-
-
 def _changed_paths_of(record: dict) -> list[str]:
     inv = record.get("risk_inventory") or []
     return sorted({p for e in inv if isinstance(e, dict)
@@ -2298,15 +2275,22 @@ def _build_signoff_eval(store, record: dict):
     cur_inv_hash = close_mod.risk_inventory_hash(inv)
     unmapped = (close_mod.derive_required_signoffs(policy, inv)["unmapped"]
                 if policy else [])
-    domain_refset = _signoff_domain_refset(store, _changed_paths_of(record))
+    domain_refset = close_mod.signoff_domain_refset(
+        store,
+        cfg,
+        _changed_paths_of(record),
+    )
     default_reviewers = ((policy or {}).get("defaults", {}) or {}).get("reviewers") or {}
     resolved: dict[str, list[str]] = {}
     for s in record["required_signoffs"]:
-        merged = _merge_refsets(
-            s.get("candidate_refset") or {},
-            default_reviewers if s.get("use_default_reviewers") else {},
-            domain_refset if s.get("include_domain_reviewers") else {})
-        resolved[s["id"]] = dom.resolve_refset(merged, cfg)
+        resolved[s["id"]] = close_mod.resolve_signoff_candidates(
+            cfg,
+            candidate_refset=s.get("candidate_refset") or {},
+            default_reviewers=default_reviewers,
+            use_default_reviewers=bool(s.get("use_default_reviewers")),
+            domain_refset=domain_refset,
+            include_domain_reviewers=bool(s.get("include_domain_reviewers")),
+        )
     return {"policy_present": policy is not None, "policy_error": None,
             "current_policy_hash": cur_policy_hash,
             "current_risk_inventory_hash": cur_inv_hash,
@@ -2395,15 +2379,18 @@ def _resolve_signoff_audit(store, policy, inv, record) -> dict:
     derived = close_mod.derive_required_signoffs(policy, inv)["signoffs"]
     changed = sorted({p for e in inv if isinstance(e, dict)
                       for p in (e.get("affected_paths") or [])})
-    domain_refset = _signoff_domain_refset(store, changed)
+    domain_refset = close_mod.signoff_domain_refset(store, cfg, changed)
     default_reviewers = ((policy or {}).get("defaults", {}) or {}).get("reviewers") or {}
     audit = {}
     for s in derived:
-        merged = _merge_refsets(
-            s.get("candidate_refset") or {},
-            default_reviewers if s.get("use_default_reviewers") else {},
-            domain_refset if s.get("include_domain_reviewers") else {})
-        audit[s["id"]] = dom.resolve_refset(merged, cfg)
+        audit[s["id"]] = close_mod.resolve_signoff_candidates(
+            cfg,
+            candidate_refset=s.get("candidate_refset") or {},
+            default_reviewers=default_reviewers,
+            use_default_reviewers=bool(s.get("use_default_reviewers")),
+            domain_refset=domain_refset,
+            include_domain_reviewers=bool(s.get("include_domain_reviewers")),
+        )
     return audit
 
 
@@ -6939,7 +6926,8 @@ def cmd_roster(args: argparse.Namespace) -> int:
                     f"Join as {suggested!r} instead (set $AGENTTALK_SELF to it).\n")
             return 3
         store.add_agent(name, role=getattr(args, "role", None),
-                        groups=getattr(args, "group", None))
+                        groups=getattr(args, "group", None),
+                        trust_class=getattr(args, "trust_class", None))
         if already and active:
             # plain (idempotent) add that re-binds a name a LIVE agent holds:
             # non-fatal warning (catches the rejoin/re-init-misuse path) - the
@@ -7024,6 +7012,16 @@ def cmd_roster(args: argparse.Namespace) -> int:
         store.set_group(args.group, members)
         print(f"roster: group '{args.group}' = {', '.join(members) or '(empty)'}")
         return 0
+    if action == "set-trust-class":
+        value = None if getattr(args, "clear", False) else args.trust_class
+        if value is None and not getattr(args, "clear", False):
+            sys.stderr.write(
+                "agenttalk roster set-trust-class: provide a trust class or --clear\n"
+            )
+            return 2
+        store.set_trust_class(args.name, value)
+        print(f"roster: {args.name} trust_class={value or '(native/default)'}")
+        return 0
     if action == "set-operator-facing":
         # Single-slot designation (#18): "two liaisons" is unrepresentable.
         # Advisory routing metadata only — never authorization (C-007).
@@ -7053,6 +7051,7 @@ def cmd_roster(args: argparse.Namespace) -> int:
     roster = cfg.get("agents", []) or []
     roles = cfg.get("roles", {}) or {}
     groups = cfg.get("groups", {}) or {}
+    trust_classes = cfg.get("trust_classes", {}) or {}
     liaison = store.operator_facing()
     self_name = os.environ.get("AGENTTALK_SELF")
     if self_name not in roster:
@@ -7062,6 +7061,7 @@ def cmd_roster(args: argparse.Namespace) -> int:
             "agents": roster,
             "roles": roles,
             "groups": groups,
+            "trust_classes": trust_classes,
             "operator_facing": liaison,
             "self": self_name,
         }, indent=2))
@@ -7073,7 +7073,8 @@ def cmd_roster(args: argparse.Namespace) -> int:
         member_of = [g for g, ms in groups.items() if a in ms]
         gl = ", ".join(member_of) if member_of else "-"
         of = "  [operator-facing]" if a == liaison else ""
-        print(f"  {a}{you}  role={role}  groups=[{gl}]{of}")
+        trust = trust_classes.get(a) or "native/default"
+        print(f"  {a}{you}  role={role}  trust={trust}  groups=[{gl}]{of}")
     if groups:
         print("groups:")
         for g, ms in groups.items():
@@ -8274,6 +8275,67 @@ def cmd_commit_gate(args: argparse.Namespace) -> int:
                 f"enforcement={legacy.get('enforcement')} "
                 f"unenforced_total={legacy.get('unenforced_total')}"
             )
+    return 0
+
+
+def cmd_gateway(args: argparse.Namespace) -> int:
+    """Manage the loopback-only watched OVH/Qwen trial gateway."""
+    from agenttalk import ovh_gateway as gateway
+    from agenttalk import ovh_gateway_service as service
+
+    store = _get_store(args)
+    action = args.gateway_action
+    try:
+        if action == "init":
+            result = service.initialize_install(
+                store.root,
+                litellm_executable=args.litellm_executable,
+                opening_micro_eur=args.opening_micro_eur,
+                opening_evidence=args.opening_evidence,
+            )
+        elif action == "task-install":
+            service.load_install_manifest(store.root)
+            result = service.install_task(store.root)
+        elif action == "start":
+            result = service.start_task(store.root)
+        elif action == "stop":
+            result = service.stop_task(store.root, timeout_seconds=args.timeout)
+        elif action == "run":
+            return service.run_service(store.root)
+        elif action == "reconcile":
+            result = gateway.SpendLedger().reconcile(
+                args.attempt_id,
+                outcome=args.outcome,
+                reason=args.reason,
+            )
+        elif action == "cap-install":
+            issuer_token = gateway.read_secret_file(
+                gateway.default_front_token_path()
+            )
+            result = gateway.SpendLedger().install_child_caps(
+                issuer_token=issuer_token
+            )
+        elif action == "canary-verify":
+            result = gateway.SpendLedger().verify_dashboard_canary(
+                args.attempt_id,
+                observed_delta_micro_eur=args.dashboard_delta_micro_eur,
+            )
+        elif action == "hold":
+            result = gateway.SpendLedger().place_hold(reason=args.reason)
+        elif action == "clear-hold":
+            result = gateway.SpendLedger().clear_hold(reason=args.reason)
+        elif action == "status":
+            result = service.gateway_status(store.root)
+        else:
+            raise ValueError(f"unsupported gateway action {action!r}")
+    except (gateway.GatewayError, OSError, ValueError) as exc:
+        sys.stderr.write(f"agenttalk gateway {action}: {exc}\n")
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if action == "status" and not result.get("ready"):
+        return 2
+    if action == "canary-verify" and not result.get("accepted"):
+        return 2
     return 0
 
 
@@ -9727,7 +9789,9 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     work_heartbeat: object | None = None,
                     runtime_model: str | None = None,
                     runtime_effort: str | None = None,
-                    runtime_fingerprint: str | None = None) -> int:
+                    runtime_fingerprint: str | None = None,
+                    backend_profile: str | None = None,
+                    profile_env: dict[str, str] | None = None) -> int:
     """The long-running supervised wrapper loop (design C): own the idle bus-wait +
     heartbeat, drive the CLI ONE turn per inbound message in structured-stream mode
     (session continuity owned here), then return to the wait. Runs until killed -
@@ -9841,6 +9905,8 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             health_writer=health_writer,
             work_heartbeat=work_heartbeat,
             wrapper_generation=wrapper_generation,
+            backend_profile=backend_profile,
+            profile_env=profile_env,
             # the lead-loop combined stamp raises _LeadLoopLeaseLost on a lost lease:
             # the ticker treats it as TYPED loss (permanent stop for the turn, status
             # lost_lease, never a bus heartbeat without the lease), while the
@@ -10111,7 +10177,138 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         except lane_mod.LaneError as e:
             sys.stderr.write(f"agenttalk wrap: {e}\n")
             return 2
-    child_env = wrapper_run._child_env(store.root)
+    sup_cfg: dict = {}
+    cfg_agent: dict = {}
+    backend_profile: str | None = None
+    profile_env: dict[str, str] | None = None
+    if getattr(args, "loop", False):
+        sup_cfg = _load_supervisor_config(store)
+        _agents = sup_cfg.get("agents")
+        raw_agent = _agents.get(agent) if isinstance(_agents, dict) else None
+        cfg_agent = raw_agent if isinstance(raw_agent, dict) else {}
+        raw_profile = cfg_agent.get("backend_profile")
+        if raw_profile is not None and not isinstance(raw_profile, str):
+            sys.stderr.write("agenttalk wrap: backend_profile must be a string\n")
+            return 2
+        backend_profile = raw_profile
+        if backend_profile == "ovh-qwen":
+            if lead_loop:
+                sys.stderr.write(
+                    "agenttalk wrap: ovh-qwen does not support --lead-loop; "
+                    "cadence turns have no immutable inbound budget scope\n"
+                )
+                return 2
+            from agenttalk.ovh_gateway import (
+                EXTERNAL_WORKER,
+                GatewayConfigError,
+                MODEL_ALIAS,
+                default_front_token_path,
+                read_secret_file,
+            )
+            from agenttalk.ovh_gateway_service import gateway_status
+
+            if args.cli != "claude":
+                sys.stderr.write("agenttalk wrap: ovh-qwen requires cli=claude\n")
+                return 2
+            ambient = [key for key in ("OVH_KEY", "ANTHROPIC_API_KEY") if os.environ.get(key)]
+            if ambient:
+                sys.stderr.write(
+                    "agenttalk wrap: ovh-qwen refuses supervisor ambient provider keys: "
+                    + ", ".join(ambient)
+                    + "\n"
+                )
+                return 2
+            if cfg_agent.get("trust_class") != EXTERNAL_WORKER:
+                sys.stderr.write(
+                    "agenttalk wrap: ovh-qwen requires supervisor trust_class=external-worker\n"
+                )
+                return 2
+            if cfg_agent.get("model") != MODEL_ALIAS:
+                sys.stderr.write(
+                    f"agenttalk wrap: ovh-qwen requires model={MODEL_ALIAS}\n"
+                )
+                return 2
+            store_trust = getattr(store, "trust_class", lambda _name: None)(agent)
+            if store_trust != EXTERNAL_WORKER:
+                sys.stderr.write(
+                    "agenttalk wrap: ovh-qwen requires roster trust_class=external-worker\n"
+                )
+                return 2
+            if cfg_agent.get("env"):
+                sys.stderr.write("agenttalk wrap: ovh-qwen forbids literal per-agent env config\n")
+                return 2
+            try:
+                gateway = gateway_status(store.root)
+            except (GatewayConfigError, OSError) as exc:
+                gateway = {
+                    "ready": False,
+                    "operational_ready": False,
+                    "worker_spend_ready": False,
+                    "errors": [type(exc).__name__],
+                    "worker_spend_errors": ["worker_spend_readiness_unavailable"],
+                }
+            operational_ready = (
+                gateway.get("operational_ready", gateway.get("ready")) is True
+            )
+            worker_spend_ready = gateway.get("worker_spend_ready") is True
+            if not operational_ready or not worker_spend_ready:
+                reasons: list[str] = []
+                if not operational_ready:
+                    operational_errors = gateway.get("errors")
+                    if isinstance(operational_errors, list):
+                        reasons.extend(
+                            reason
+                            for reason in operational_errors
+                            if isinstance(reason, str)
+                        )
+                if not worker_spend_ready:
+                    worker_errors = gateway.get("worker_spend_errors")
+                    safe_worker_errors = (
+                        [reason for reason in worker_errors if isinstance(reason, str)]
+                        if isinstance(worker_errors, list)
+                        else []
+                    )
+                    if safe_worker_errors:
+                        reasons.extend(safe_worker_errors)
+                    else:
+                        reasons.append("worker_spend_readiness_unavailable")
+                if not reasons:
+                    reasons.append("readiness_unavailable")
+                safe_reasons = ",".join(dict.fromkeys(reasons))
+                summary = f"ovh-qwen gateway is not ready ({safe_reasons})"
+                mode = (
+                    "lead-loop" if lead_loop else
+                    "wrapper-one-shot" if args.one_shot else
+                    "wrapper-loop"
+                )
+                return _handle_launch_config_blocked(
+                    store,
+                    agent,
+                    args.cli,
+                    mode=mode,
+                    min_interval=args.min_interval,
+                    summary=summary,
+                )
+            try:
+                front_token = read_secret_file(default_front_token_path())
+            except GatewayConfigError as exc:
+                sys.stderr.write(f"agenttalk wrap: {exc}\n")
+                return 2
+            profile_env = {
+                "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000",
+                "ANTHROPIC_AUTH_TOKEN": front_token,
+                "ANTHROPIC_MODEL": MODEL_ALIAS,
+            }
+        elif backend_profile is not None:
+            sys.stderr.write(f"agenttalk wrap: unsupported backend_profile {backend_profile!r}\n")
+            return 2
+    child_env = wrapper_run._child_env(
+        store.root,
+        backend_profile=backend_profile,
+        profile_env=profile_env,
+    )
+    if backend_profile == "ovh-qwen":
+        Path(child_env["CLAUDE_CONFIG_DIR"]).mkdir(parents=True, exist_ok=True)
     launch = wrapper_run.preflight_launch_runtime(
         argv, args.cli, launch_cwd, child_env)
     if launch.blocked:
@@ -10134,14 +10331,8 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         # dead_letter:{...} config actually takes effect (codex P1 / lead F3). This makes
         # supervisor.resolve_dead_letter_caps the single source of truth.
         from agenttalk import supervisor as _sup
-        sup_cfg = _load_supervisor_config(store)
-        # Coerce to dict only when it IS a dict: a truthy non-dict per-agent entry
-        # (corrupt supervisor.json) must not crash wrapped-controller startup (the
-        # resolver is also hardened, but never feed it a non-dict). Same class as
-        # resolve_timing's extraction.
-        _agents = sup_cfg.get("agents")
-        cfg_agent = _agents.get(agent) if isinstance(_agents, dict) else None
-        cfg_agent = cfg_agent if isinstance(cfg_agent, dict) else {}
+        # sup_cfg/cfg_agent were loaded before preflight so a backend profile can
+        # constrain the exact child environment used by that preflight and launch.
         # Wrapped Claude write-grant fix: session_args is empty for a wrapped agent,
         # so the supervisor never substitutes {PERM_MODE} into the child tail — a
         # supervised wrapped Claude would launch read-only. Apply the same resolved
@@ -10235,7 +10426,9 @@ def cmd_wrap(args: argparse.Namespace) -> int:
                                work_heartbeat=whb_cfg,
                                runtime_model=runtime_model,
                                runtime_effort=runtime_effort,
-                               runtime_fingerprint=runtime_fingerprint)
+                               runtime_fingerprint=runtime_fingerprint,
+                               backend_profile=backend_profile,
+                               profile_env=profile_env)
     try:
         return wrapper_run.run_wrapper(
             cli=args.cli, agent=agent, argv=argv, store=store, sender=sender,
@@ -11634,6 +11827,8 @@ def build_parser() -> argparse.ArgumentParser:
     r_add.add_argument("--role", help="Role label (e.g. implementer, reviewer, lead).")
     r_add.add_argument("--group", action="append",
                        help="Add the agent to this group (repeatable).")
+    r_add.add_argument("--trust-class", choices=("external-worker",),
+                       help="Set opt-in non-authority model trust metadata.")
     r_add.add_argument("--unique", action="store_true",
                        help="Self-join guard: REFUSE (exit 3) if <name> is an "
                             "ACTIVE identity (fresh heartbeat or a live waiter), "
@@ -11696,6 +11891,14 @@ def build_parser() -> argparse.ArgumentParser:
     r_sg.add_argument("group")
     r_sg.add_argument("members", help="Comma-separated agent names.")
     r_sg.set_defaults(func=cmd_roster)
+    r_tc = rsub.add_parser(
+        "set-trust-class",
+        help="Set or clear opt-in non-authority model trust metadata.",
+    )
+    r_tc.add_argument("name")
+    r_tc.add_argument("trust_class", nargs="?", choices=("external-worker",))
+    r_tc.add_argument("--clear", action="store_true")
+    r_tc.set_defaults(func=cmd_roster)
     r_of = rsub.add_parser(
         "set-operator-facing",
         help="Designate the ONE agent the human operator talks to directly "
@@ -13347,6 +13550,76 @@ def build_parser() -> argparse.ArgumentParser:
     pd.add_argument("--json", action="store_true",
                     help="Emit structured JSON instead of human-readable text.")
     pd.set_defaults(func=cmd_doctor)
+
+    pgw = sub.add_parser(
+        "gateway",
+        help="Manage the loopback-only watched OVH/Qwen trial gateway.",
+    )
+    gwsub = pgw.add_subparsers(dest="gateway_action", required=True)
+    gw_init = gwsub.add_parser("init", help="One-time ledger/config/token initialization.")
+    gw_init.add_argument("--litellm-executable", required=True)
+    gw_init.add_argument(
+        "--opening-eur",
+        dest="opening_micro_eur",
+        type=_micro_eur_arg,
+        required=True,
+        help="Current OVH month-to-date spend in EUR (up to six decimal places).",
+    )
+    gw_init.add_argument(
+        "--opening-evidence",
+        required=True,
+        help="Short source and observed-at description for the opening balance.",
+    )
+    gw_init.set_defaults(func=cmd_gateway)
+    gw_task = gwsub.add_parser("task-install", help="Install or verify the project task.")
+    gw_task.set_defaults(func=cmd_gateway)
+    gw_start = gwsub.add_parser("start", help="Start the verified managed gateway task.")
+    gw_start.set_defaults(func=cmd_gateway)
+    gw_stop = gwsub.add_parser("stop", help="Gracefully stop the managed gateway task.")
+    gw_stop.add_argument("--timeout", type=_finite_float_arg, default=30.0)
+    gw_stop.set_defaults(func=cmd_gateway)
+    gw_status = gwsub.add_parser("status", help="Show an allowlisted non-secret status.")
+    gw_status.set_defaults(func=cmd_gateway)
+    gw_reconcile = gwsub.add_parser(
+        "reconcile",
+        help="Explicitly resolve one uncertain provider attempt.",
+    )
+    gw_reconcile.add_argument("attempt_id")
+    gw_reconcile.add_argument(
+        "--outcome",
+        choices=("no-send", "charge-reserve"),
+        required=True,
+    )
+    gw_reconcile.add_argument("--reason", required=True)
+    gw_reconcile.set_defaults(func=cmd_gateway)
+    gw_cap_install = gwsub.add_parser(
+        "cap-install",
+        help="Durably install or verify fail-closed per-child turn caps.",
+    )
+    gw_cap_install.set_defaults(func=cmd_gateway)
+    gw_canary = gwsub.add_parser(
+        "canary-verify",
+        help="Compare one settled attempt with the operator-observed dashboard delta.",
+    )
+    gw_canary.add_argument("attempt_id")
+    gw_canary.add_argument(
+        "--dashboard-delta-eur",
+        dest="dashboard_delta_micro_eur",
+        type=_micro_eur_arg,
+        required=True,
+    )
+    gw_canary.set_defaults(func=cmd_gateway)
+    gw_hold = gwsub.add_parser("hold", help="Durably block new provider transport.")
+    gw_hold.add_argument("--reason", required=True)
+    gw_hold.set_defaults(func=cmd_gateway)
+    gw_clear_hold = gwsub.add_parser(
+        "clear-hold",
+        help="Explicitly clear a service hold after all attempts are reconciled.",
+    )
+    gw_clear_hold.add_argument("--reason", required=True)
+    gw_clear_hold.set_defaults(func=cmd_gateway)
+    gw_run = gwsub.add_parser("run", help=argparse.SUPPRESS)
+    gw_run.set_defaults(func=cmd_gateway)
 
     ph = sub.add_parser(
         "hmac-init",
