@@ -134,6 +134,26 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
             json.dumps(owed, ensure_ascii=False, indent=2, sort_keys=True),
             "```",
         ]
+    else:
+        # Ordinary replies go via `agenttalk reply`. Give the EXACT invocation so the
+        # model does not guess flags: the confusable near-synonyms (--to / --to-id /
+        # --request-id / --body) and inline multi-line -m bodies caused repeated failed
+        # reply attempts that burned the whole turn without a reply landing.
+        rid = record.get("request_id")
+        anchor = f"--to-request {rid}" if rid else "--to-request <request_id from the header above>"
+        out += [
+            "== HOW TO REPLY TO THIS MESSAGE (exact form) ==",
+            "Answer on THIS thread with ONE command. Short, single-line answer:",
+            f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply {anchor} -m 'your answer here'",
+            "Code, or ANY multi-line answer: FIRST write it to a file with your Write tool, then "
+            "send that file (inline multi-line text in -m is corrupted by shell quoting):",
+            f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply {anchor} --file <path-you-just-wrote>",
+            "For review-result / proposal-response add --kind <status> and typed --meta key=value "
+            "(repeatable). To decline an unrelated broadcast add --na instead of a body.",
+            "The ONLY valid flags are: --from, --to-request (or --to-id <message-id>), --kind, "
+            "-m/--message, --file, --meta, --na. There is NO --to, --request-id, or --body; "
+            "inventing a flag errors and wastes the turn. Send the reply ONCE; do not retry variants.",
+        ]
     out += ["== HOW TO HANDLE ==", rules]
     return "\n".join(out)
 
