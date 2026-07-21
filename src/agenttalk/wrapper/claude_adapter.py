@@ -24,6 +24,26 @@ from .events import Event, EventType
 CLI = "claude"
 
 
+def _result_error_text(obj: dict) -> str:
+    result = obj.get("result")
+    if result not in (None, ""):
+        return str(result)
+
+    errors = obj.get("errors")
+    if isinstance(errors, str) and errors:
+        return errors
+    if isinstance(errors, list):
+        for item in errors:
+            if isinstance(item, str) and item:
+                return item
+            if isinstance(item, dict):
+                message = item.get("message")
+                if message not in (None, ""):
+                    return str(message)
+
+    return str(obj.get("subtype") or "error")
+
+
 def map_event(obj: object) -> list[Event]:
     """Map ONE parsed Claude stream-json object to normalized events."""
     if not isinstance(obj, dict):
@@ -39,7 +59,7 @@ def map_event(obj: object) -> list[Event]:
         # success: message_stop already emitted turn_finished; the result is a
         # terminal summary. An error result is a terminal adapter_error.
         if obj.get("is_error"):
-            text = str(obj.get("result") or obj.get("subtype") or "error")
+            text = _result_error_text(obj)
             return [Event(EventType.ADAPTER_ERROR, text=text, retryable=False, raw=obj)]
         return []
     if t == "rate_limit_event":

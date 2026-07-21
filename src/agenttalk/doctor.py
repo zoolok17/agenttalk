@@ -168,6 +168,9 @@ def run(project_root: Path | None = None) -> Report:
         supervisor_script = _check_supervisor_script_guard(store)
         if supervisor_script is not None:  # additive: absent unless stale/unreadable
             report.checks.append(supervisor_script)
+        qwen_gateway = _check_ovh_qwen_gateway(store)
+        if qwen_gateway is not None:
+            report.checks.append(qwen_gateway)
         holds = _check_config_blocked_holds(store)
         if holds is not None:  # additive: absent unless a valid config-blocked hold exists
             report.checks.append(holds)
@@ -306,6 +309,60 @@ def _check_detection_commit_gate(store: Store) -> Check:
             )
         ),
         data={"agents": rows, "security_grade": False},
+    )
+
+
+def _check_ovh_qwen_gateway(store: Store) -> Check | None:
+    path = store.dir / "supervisor.json"
+    if not path.is_file():
+        return None
+    try:
+        config = sup.load_supervisor_config(path)
+    except (OSError, ValueError):
+        return None
+    agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
+    profile_agents = [
+        name
+        for name, spec in agents.items()
+        if isinstance(spec, dict) and spec.get("backend_profile") == "ovh-qwen"
+    ]
+    if not profile_agents:
+        return None
+    from agenttalk import ovh_gateway_service as service
+
+    try:
+        status = service.gateway_status(store.root)
+    except Exception as exc:  # noqa: BLE001 - doctor must report, never crash
+        status = {
+            "ready": False,
+            "errors": [f"status_unavailable:{type(exc).__name__}"],
+        }
+    problems = list(status.get("errors") or [])
+    config_trust = store.trust_classes()
+    for name in profile_agents:
+        spec = agents[name]
+        if spec.get("trust_class") != "external-worker":
+            problems.append(f"{name}:supervisor_trust_class")
+        if config_trust.get(name) != "external-worker":
+            problems.append(f"{name}:roster_trust_class")
+    if any(os.environ.get(key) for key in ("OVH_KEY", "ANTHROPIC_API_KEY")):
+        problems.append("supervisor_ambient_provider_key")
+    problems = sorted(set(problems))
+    return Check(
+        name="ovh_qwen_gateway",
+        status="error" if problems else "ok",
+        details=(
+            "gateway ready with constrained external-worker profile(s)"
+            if not problems
+            else "gateway/profile check failed: " + ", ".join(problems)
+        ),
+        fix=(
+            "run `agenttalk gateway status`; remove ambient provider keys and repair "
+            "the reported install/task/ledger/trust condition"
+            if problems
+            else ""
+        ),
+        data=status,
     )
 
 
