@@ -32,6 +32,15 @@ from .ovh_gateway import (
 
 
 PUBLIC_ROUTE = "/v1/messages"
+# Allowlisted content types the front will echo from the internal upstream into
+# the public response header (defense-in-depth vs CodeQL py/http-response-splitting;
+# the internal upstream only ever returns SSE or JSON). Anything else -> SSE default.
+_ALLOWED_RESPONSE_CONTENT_TYPES = frozenset({
+    "text/event-stream",
+    "text/event-stream; charset=utf-8",
+    "application/json",
+    "application/json; charset=utf-8",
+})
 INTERNAL_LIVELINESS_ROUTE = "/health/liveliness"
 POLICY_BLOCKED_CODE = "ATGW_POLICY_BLOCKED"
 LEDGER_BLOCKED_CODE = "ATGW_LEDGER_BLOCKED"
@@ -367,9 +376,19 @@ class GatewayFront:
                 self.config.internal_port,
                 timeout=self.config.request_timeout_seconds,
             )
+            # Defense-in-depth (CodeQL py/partial-ssrf): forward only an
+            # allowlisted LITERAL route to the fixed internal host, never the
+            # caller-derived string. _public_request_target already rejects
+            # anything but these two exact targets with 404; re-deriving a
+            # literal here breaks the taint path and keeps the invariant local.
+            forward_target = (
+                f"{PUBLIC_ROUTE}?beta=true"
+                if request_target == f"{PUBLIC_ROUTE}?beta=true"
+                else PUBLIC_ROUTE
+            )
             conn.request(
                 "POST",
-                request_target,
+                forward_target,
                 body=body,
                 headers={
                     "Authorization": f"Bearer {self.config.internal_token}",
@@ -383,7 +402,16 @@ class GatewayFront:
                 self._mark_uncertain(attempt_id, f"internal status {response.status}")
                 handler._stable_error(502, INFRA_ERROR_CODE)  # type: ignore[attr-defined]
                 return
-            content_type = response.getheader("Content-Type") or "text/event-stream"
+            # Defense-in-depth (CodeQL py/http-response-splitting): never echo a
+            # raw upstream header value into the public response — collapse to an
+            # allowlisted literal content type (the internal upstream only ever
+            # returns SSE or JSON); anything else falls back to the SSE default.
+            upstream_content_type = response.getheader("Content-Type") or "text/event-stream"
+            content_type = (
+                upstream_content_type
+                if upstream_content_type in _ALLOWED_RESPONSE_CONTENT_TYPES
+                else "text/event-stream"
+            )
             handler.send_response(200)
             handler.send_header("Content-Type", content_type)
             handler.send_header("Cache-Control", "no-store")
