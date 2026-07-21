@@ -85,12 +85,48 @@ def test_ovh_qwen_child_environment_starts_from_allowlist(tmp_path, monkeypatch)
     assert "ANTHROPIC_API_KEY" not in env
     assert "OVH_KEY" not in env
     assert "UNRELATED_SECRET" not in env
-    assert "HOME" not in env
-    assert "USERPROFILE" not in env
+    # Home is scoped to the disposable workspace clone (NOT the operator's real home):
+    # the child needs a resolvable Path.home()/LOCALAPPDATA so `agenttalk reply` does
+    # not crash in signing.default_keys_dir(), but must never see the operator's home.
+    assert env["HOME"] == str(tmp_path.resolve())
+    assert env["USERPROFILE"] == str(tmp_path.resolve())
+    assert env["LOCALAPPDATA"] == str((tmp_path / "AppData" / "Local").resolve())
+    assert "C:\\Users\\operator" not in env.values()
     assert "C:\\Users\\operator\\.claude" not in env.values()
     assert "AGENTTALK_LEAD_LOOP_LEASE" not in env
     assert "ambient-must-not-pass" not in env.values()
     assert "stale-must-not-pass" not in env.values()
+
+
+def test_ovh_qwen_child_env_lets_signing_resolve_home_without_crash(
+    tmp_path, monkeypatch
+) -> None:
+    # REGRESSION: with the allowlist stripping LOCALAPPDATA/USERPROFILE/HOME, a child
+    # shelling out to `agenttalk reply` crashed with "Could not determine home
+    # directory" inside signing.default_keys_dir() (Path.home()) before it could even
+    # decide signing was off. Applying the scoped child env must let key-path resolution
+    # return a path UNDER the workspace and never raise.
+    from agenttalk import signing
+
+    monkeypatch.setattr(
+        os,
+        "environ",
+        {"PATH": "safe-path", "SystemRoot": "C:\\Windows", "AGENTTALK_SELF": "qwen-dev-1"},
+    )
+    env = run._child_env(
+        tmp_path,
+        backend_profile="ovh-qwen",
+        profile_env={
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000",
+            "ANTHROPIC_AUTH_TOKEN": "front-token",
+        },
+    )
+    # Simulate the child process seeing exactly this environment.
+    monkeypatch.setattr(os, "environ", dict(env))
+    key_path = signing.resolve_key_path("deadbeef")   # must NOT raise
+    workspace = str(tmp_path.resolve())
+    assert str(key_path).startswith(workspace)         # resolved under the scoped home
+    assert not key_path.exists()                       # signing stays unenforced (no key)
 
 
 def test_ovh_qwen_turn_capability_replaces_master_front_token(tmp_path, monkeypatch) -> None:

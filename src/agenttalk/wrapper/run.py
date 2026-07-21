@@ -520,6 +520,18 @@ def _child_env(
         # is disposable with the watched-trial clone and contains no operator
         # credentials or history.
         env["CLAUDE_CONFIG_DIR"] = _ovh_qwen_claude_config_dir(workspace)
+        # The allowlist above drops LOCALAPPDATA/USERPROFILE/HOME, so a bus command the
+        # child shells out to (e.g. `agenttalk reply`) cannot resolve Path.home() and
+        # crashes in signing.default_keys_dir() BEFORE it can even decide signing is off
+        # ("RuntimeError: Could not determine home directory"). Point home + appdata at
+        # the disposable workspace clone: gives the child a resolvable home WITHOUT
+        # leaking the operator's real home to the paid external worker. If HMAC signing
+        # is later enforced, wire the child's key via AGENTTALK_HMAC_KEY_FILE rather than
+        # widening this to the operator's LOCALAPPDATA.
+        _scoped_home = str(workspace)
+        env["HOME"] = _scoped_home
+        env["USERPROFILE"] = _scoped_home
+        env["LOCALAPPDATA"] = str(workspace / "AppData" / "Local")
     elif backend_profile is not None:
         raise ValueError(f"unsupported backend_profile {backend_profile!r}")
     else:
