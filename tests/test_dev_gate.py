@@ -463,6 +463,16 @@ def test_manifest_requires_every_subprocess_timeout(check_id: str) -> None:
         dev_gate.validate_manifest(manifest)
 
 
+def test_committed_pytest_timeout_has_wheel_leg_headroom() -> None:
+    # Regression guard (#54): the single `pytest` timeout is shared by both the
+    # fast source legs (~9min) and the slow wheel legs (isolated venv + install +
+    # full suite, ~30min on loaded Windows runners). At 1800s the wheel leg hit the
+    # cap at ~92-99% and forced multi-cycle CI rerun loops. Keep generous headroom
+    # so it cannot silently regress; the CI job allows timeout-minutes: 90.
+    manifest = _manifest()
+    assert manifest["checks"]["pytest"]["timeout_seconds"] >= 2400
+
+
 def test_logical_plan_digest_is_runtime_path_independent_and_semantic() -> None:
     manifest = dev_gate.validate_manifest(_manifest())
     original = dev_gate.logical_plan_digest(manifest, "release")
