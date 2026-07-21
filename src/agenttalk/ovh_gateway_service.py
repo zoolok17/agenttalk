@@ -15,7 +15,7 @@ import subprocess  # nosec B404 - fixed schtasks/LiteLLM argv lists; shell is ne
 import sys
 import threading
 import time
-import xml.etree.ElementTree as ET  # nosec B405 - bounded local Task Scheduler XML
+import xml.etree.ElementTree as ET  # nosec B405 - bounded local Task Scheduler XML  # nosemgrep
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -180,8 +180,10 @@ def _task_xml_action(xml_text: str) -> tuple[str, str, str, str]:
         raise GatewayConfigError("registered gateway task XML is too large")
     try:
         # ElementTree does not resolve external entities. Input is additionally
-        # bounded and comes only from the local Task Scheduler query.
-        root = ET.fromstring(xml_text)  # nosec B314  # noqa: S314
+        # bounded and comes only from the local Task Scheduler query (schtasks
+        # /Query /XML) or our own render_task_xml — never untrusted external XML,
+        # so the defusedxml XXE class does not apply (nosemgrep: use-defused-xml).
+        root = ET.fromstring(xml_text)  # nosec B314  # noqa: S314  # nosemgrep
     except ET.ParseError as exc:
         raise GatewayConfigError("registered gateway task XML is malformed") from exc
     ns = {"t": _TASK_NS}
