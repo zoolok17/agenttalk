@@ -57,6 +57,34 @@ def test_prompt_gives_exact_reply_invocation_for_ordinary_thread() -> None:
     assert "Send the reply ONCE; do not retry variants." in p
 
 
+def test_prompt_reply_anchor_resolves_request_id_from_meta() -> None:
+    # REAL bus messages carry the tracked id in meta.request_id with a NULL top-level
+    # request_id (the on-disk shape produced by `send --meta request_id=...`). The
+    # earlier fix read top-level only, so the header showed request_id=None and the
+    # anchor became an unfillable placeholder -> the worker had nothing to copy and
+    # fumbled the reply. Resolve from meta so the anchor is concrete.
+    rec = {"id": "20260721-165700-178595-iVUi", "from": "lead", "to": "qwen-dev-1",
+           "kind": "question", "subject": "clamp", "body": "write clamp",
+           "correlation_id": None, "request_id": None, "broadcast_id": None,
+           "meta": {"request_id": "qwen-auto-clamp-3"}}
+    p = prompt.assemble_turn_prompt(rec)
+    assert "--to-request qwen-auto-clamp-3" in p            # concrete anchor from meta
+    assert "request_id=qwen-auto-clamp-3" in p              # header echoes the resolved id
+    assert "<request_id from the header above>" not in p    # never a placeholder here
+
+
+def test_prompt_reply_anchor_falls_back_to_message_id_when_no_request_id() -> None:
+    # A bare `send` (no request_id anywhere) still needs a usable anchor. `reply`
+    # supports --to-id <message-id>, and the inbound id is always present, so anchor to
+    # it rather than emit a placeholder the worker must fill in itself.
+    rec = {"id": "20260721-190942-058910-q6rN", "from": "lead", "to": "qwen-dev-1",
+           "kind": "question", "subject": "adhoc", "body": "do a thing",
+           "correlation_id": None, "request_id": None, "broadcast_id": None, "meta": {}}
+    p = prompt.assemble_turn_prompt(rec)
+    assert "--to-id 20260721-190942-058910-q6rN" in p       # anchor to the message id
+    assert "--to-request <request_id" not in p              # no unfillable placeholder
+
+
 def test_owed_action_question_uses_file_transport_not_reply_template() -> None:
     # Commit-gated (owed_action) questions keep the fixed-argv file transport; they must
     # NOT also get the reply template (one unambiguous instruction, no double guidance).
