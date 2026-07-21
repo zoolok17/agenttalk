@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import socket
 import subprocess
@@ -763,3 +764,89 @@ def test_stop_refuses_unknown_listener_when_task_is_absent(tmp_path, monkeypatch
 
     with pytest.raises(GatewayConfigError, match="task is absent"):
         stop_task(tmp_path, commands=FakeCommands(), timeout_seconds=0)
+
+
+def _install_for_reconfigure(tmp_path, ledger):
+    root = tmp_path / "project"
+    executable = tmp_path / "litellm.exe"
+    executable.write_bytes(b"fake")
+    front_token = tmp_path / "secrets" / "front.txt"
+    internal_token = tmp_path / "secrets" / "internal.txt"
+    initialize_install(
+        root,
+        litellm_executable=executable,
+        opening_micro_eur=580_000,
+        opening_evidence="test dashboard, observed 2026-07-16",
+        ledger=ledger,
+        front_token_path=front_token,
+        internal_token_path=internal_token,
+    )
+    return root, front_token, internal_token
+
+
+def test_reconfigure_rebinds_config_and_manifest_and_preserves_ledger_and_tokens(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+    install_json = tmp_path / "spend" / "install.json"
+    ledger = SpendLedger(tmp_path / "spend" / "ledger.sqlite3", install_json)
+    root, front_token, internal_token = _install_for_reconfigure(tmp_path, ledger)
+
+    # Simulate a pre-change install whose generated config points at a stale base.
+    cfg = litellm_config_path(root)
+    stale = service.render_litellm_config(api_base="https://stale.example/v1").encode("utf-8")
+    cfg.write_bytes(stale)
+    manifest_path = service.install_manifest_path(root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["litellm_config_sha256"] = hashlib.sha256(stale).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    ledger_before = install_json.read_bytes()
+    front_before = front_token.read_bytes()
+    internal_before = internal_token.read_bytes()
+
+    result = service.reconfigure_endpoint(root)
+
+    assert result["reconfigured"] is True
+    assert result["changed"] is True
+    assert result["api_base"] == service.DEFAULT_API_BASE
+    expected_cfg = service.render_litellm_config(
+        api_base=service.DEFAULT_API_BASE
+    ).encode("utf-8")
+    assert cfg.read_bytes() == expected_cfg
+    assert result["config_sha256"] == hashlib.sha256(expected_cfg).hexdigest()
+    reloaded = service.load_install_manifest(root)
+    assert reloaded["litellm_config_sha256"] == result["config_sha256"]
+    # Ledger marker + both tokens are byte-for-byte untouched.
+    assert install_json.read_bytes() == ledger_before
+    assert front_token.read_bytes() == front_before
+    assert internal_token.read_bytes() == internal_before
+
+
+def test_reconfigure_refuses_while_gateway_running(tmp_path, monkeypatch) -> None:
+    ledger = SpendLedger(
+        tmp_path / "spend" / "ledger.sqlite3", tmp_path / "spend" / "install.json"
+    )
+    root, _, _ = _install_for_reconfigure(tmp_path, ledger)
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: False)
+    with pytest.raises(GatewayConfigError, match="while the gateway is running"):
+        service.reconfigure_endpoint(root)
+
+
+def test_reconfigure_requires_existing_install(tmp_path) -> None:
+    with pytest.raises(GatewayConfigError, match="requires an existing install"):
+        service.reconfigure_endpoint(tmp_path / "project")
+
+
+def test_reconfigure_is_idempotent_on_a_fresh_install(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(service, "_both_sockets_free", lambda: True)
+    ledger = SpendLedger(
+        tmp_path / "spend" / "ledger.sqlite3", tmp_path / "spend" / "install.json"
+    )
+    root, _, _ = _install_for_reconfigure(tmp_path, ledger)
+    # A fresh install already renders the pinned base, so reconfigure is a no-op.
+    first = service.reconfigure_endpoint(root)
+    assert first["changed"] is False
+    second = service.reconfigure_endpoint(root)
+    assert second["changed"] is False
+    assert second["config_sha256"] == first["config_sha256"]
