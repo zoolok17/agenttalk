@@ -8300,6 +8300,8 @@ def cmd_gateway(args: argparse.Namespace) -> int:
             result = service.start_task(store.root)
         elif action == "stop":
             result = service.stop_task(store.root, timeout_seconds=args.timeout)
+        elif action == "reconfigure":
+            result = service.reconfigure_endpoint(store.root)
         elif action == "run":
             return service.run_service(store.root)
         elif action == "reconcile":
@@ -13580,6 +13582,14 @@ def build_parser() -> argparse.ArgumentParser:
     gw_stop.set_defaults(func=cmd_gateway)
     gw_status = gwsub.add_parser("status", help="Show an allowlisted non-secret status.")
     gw_status.set_defaults(func=cmd_gateway)
+    gw_reconfigure = gwsub.add_parser(
+        "reconfigure",
+        help=(
+            "Re-render config to the pinned endpoint + rebind the manifest "
+            "(ledger/token-preserving; the gateway must be stopped first)."
+        ),
+    )
+    gw_reconfigure.set_defaults(func=cmd_gateway)
     gw_reconcile = gwsub.add_parser(
         "reconcile",
         help="Explicitly resolve one uncertain provider attempt.",

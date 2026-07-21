@@ -47,7 +47,15 @@ from .redaction import redact_diagnostic_text
 
 TASK_SCHEMA_VERSION = 1
 RUNTIME_SCHEMA_VERSION = 2
-DEFAULT_API_BASE = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
+# PINNED upstream (#38). The gateway will only ever call this exact base — it is
+# a code constant, never a caller/runtime argument (a runtime-injectable base
+# would be an SSRF/exfiltration lever). To change it: edit this line (reviewed
+# via PR) then run `agenttalk gateway reconfigure` (re-renders the config +
+# rebinds the manifest, ledger-preserving). LiteLLM's openai provider POSTs
+# {api_base}/chat/completions, so this terminates at the level above that.
+# If the operator-gated live test 404s on the route, the fallback base is the
+# bare "https://qwen-3-5-397b.endpoints.kepler.ai.cloud.ovh.net/api/openai_compat".
+DEFAULT_API_BASE = "https://qwen-3-5-397b.endpoints.kepler.ai.cloud.ovh.net/api/openai_compat/v1"
 STOP_TIMEOUT_SECONDS = 30.0
 LITELLM_READINESS_TIMEOUT_SECONDS = 120.0
 LITELLM_LOG_MAX_BYTES = 1024 * 1024
@@ -462,6 +470,80 @@ def initialize_install(
         "litellm_executable": str(executable),
         "front_token_path": str(front_path),
         "internal_token_path": str(internal_path),
+    }
+
+
+def reconfigure_endpoint(root: str | os.PathLike[str]) -> dict:
+    """Re-render the LiteLLM config to the PINNED ``DEFAULT_API_BASE`` and rebind
+    the install manifest's config hash — WITHOUT touching the spend ledger, the
+    tokens, or the registered task.
+
+    This is how a code-reviewed endpoint change (a new ``DEFAULT_API_BASE``) is
+    applied to an EXISTING install. ``initialize_install`` refuses to replace
+    existing state, and the manifest binds the config's sha256, so a bare edit of
+    the generated config would fail closed (``install_manifest_invalid``). The
+    pinned-base property is preserved: the endpoint comes only from the code
+    constant, never a caller argument.
+
+    Refuses while the gateway is running (both loopback sockets must be free) so
+    the freshly rendered on-disk config can never disagree with a proxy that
+    loaded the previous config into memory. The caller must ``stop`` first; the
+    new endpoint takes effect on the next ``start``.
+    """
+    root = canonical_project_root(root)
+    config_path = litellm_config_path(root)
+    manifest_path = install_manifest_path(root)
+    missing = [p.name for p in (config_path, manifest_path) if not p.exists()]
+    if missing:
+        raise GatewayConfigError(
+            "gateway reconfigure requires an existing install; missing: "
+            + ", ".join(missing)
+        )
+    if not _both_sockets_free():
+        raise GatewayConfigError(
+            "refusing to reconfigure while the gateway is running; stop it first"
+        )
+    # Read the existing manifest RAW — do NOT validate its config hash here (we
+    # are about to change the config). Every other field is preserved verbatim.
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise GatewayConfigError("gateway install manifest is unreadable") from exc
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+        raise GatewayConfigError("gateway install manifest schema mismatch")
+    for key, expected in (
+        ("public_bind", f"{PUBLIC_HOST}:{PUBLIC_PORT}"),
+        ("internal_bind", f"{INTERNAL_HOST}:{INTERNAL_PORT}"),
+    ):
+        if manifest.get(key) != expected:
+            raise GatewayConfigError(f"gateway install manifest {key} mismatch")
+    if manifest.get("price_policy_hash") != price_policy_hash():
+        raise GatewayConfigError("gateway install manifest price policy mismatch")
+    executable = Path(str(manifest.get("litellm_executable") or "")).resolve()
+    if not executable.is_file():
+        raise GatewayConfigError(
+            "gateway install manifest references a missing artifact"
+        )
+    if Path(str(manifest.get("litellm_config") or "")).resolve() != config_path.resolve():
+        raise GatewayConfigError("gateway install manifest config path mismatch")
+    previous_hash = manifest.get("litellm_config_sha256")
+    # Re-render from the PINNED constant only (never a caller argument).
+    _durable_write_bytes(
+        config_path,
+        render_litellm_config(api_base=DEFAULT_API_BASE).encode("utf-8"),
+    )
+    config_hash = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    manifest["litellm_config_sha256"] = config_hash
+    _durable_write_json(manifest_path, manifest)
+    # Confirm the rewritten manifest validates against the freshly rendered config.
+    load_install_manifest(root)
+    return {
+        "reconfigured": True,
+        "api_base": DEFAULT_API_BASE,
+        "config_path": str(config_path),
+        "config_sha256": config_hash,
+        "previous_config_sha256": previous_hash,
+        "changed": previous_hash != config_hash,
     }
 
 
