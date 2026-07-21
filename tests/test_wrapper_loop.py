@@ -42,6 +42,32 @@ def test_prompt_assembly_includes_message_and_rules() -> None:
     assert "REJOIN CONTEXT" in p2 and "roster: a,b" in p2 and "custom rules" in p2
 
 
+def test_prompt_gives_exact_reply_invocation_for_ordinary_thread() -> None:
+    # A wrapped model fumbled `agenttalk reply` flags (--to / --request-id / --body)
+    # and inline multi-line -m bodies, burning a turn without a reply. The prompt must
+    # hand it the EXACT invocation, pre-filled with this message's request_id.
+    rec = {"from": "lead", "to": "qwen-dev-1", "kind": "question", "subject": "clamp",
+           "body": "write clamp", "correlation_id": "qwen-auto-clamp-3",
+           "request_id": "qwen-auto-clamp-3", "broadcast_id": None}
+    p = prompt.assemble_turn_prompt(rec)
+    assert "HOW TO REPLY TO THIS MESSAGE" in p
+    assert "--to-request qwen-auto-clamp-3" in p          # concrete anchor, not a placeholder
+    assert "--file <path-you-just-wrote>" in p            # steer code/multi-line to a file
+    assert "There is NO --to, --request-id, or --body" in p
+    assert "Send the reply ONCE; do not retry variants." in p
+
+
+def test_owed_action_question_uses_file_transport_not_reply_template() -> None:
+    # Commit-gated (owed_action) questions keep the fixed-argv file transport; they must
+    # NOT also get the reply template (one unambiguous instruction, no double guidance).
+    rec = {"from": "lead", "to": "qwen-dev-1", "kind": "question", "subject": "gated",
+           "body": "answer", "correlation_id": "rq-9", "request_id": "rq-9",
+           "broadcast_id": None, "owed_action": {"draft_path": "x", "operation": {}}}
+    p = prompt.assemble_turn_prompt(rec)
+    assert "OWED ACTION TRANSPORT" in p
+    assert "HOW TO REPLY TO THIS MESSAGE" not in p
+
+
 def test_prompt_assembly_includes_injected_lessons_without_sync() -> None:
     rec = {"from": "alpha", "to": "beta", "kind": "message", "subject": "docs",
            "body": "please update docs", "correlation_id": "rq-1",
