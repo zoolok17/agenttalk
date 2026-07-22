@@ -34,6 +34,14 @@ CLASS_INFRA = "known_global_infra"
 CLASS_AMBIGUOUS = "ambiguous_or_unknown"
 CLASS_CONFIG_BLOCKED = "config_blocked"
 CLASS_INFRA_RETRY_EXHAUSTED = "infra_retry_exhausted"
+# A TRANSIENT, operator-resolvable gateway HOLD surfaced at mint time (a held/unresolved
+# OVH ledger, a clock rollback awaiting reconcile - any LedgerHold): no child spawned, no
+# spend. Distinct from CONFIG_BLOCKED (a DURABLE local denial that sticky-parks and never
+# re-drives) and from INFRA (which dead-letters at the infra-exhaustion backstop and withholds
+# the heartbeat). A held head is parked WITHOUT persisting an attempt (no counter climbs -> no
+# ceiling trips -> NEVER dead-lettered) yet re-drives every poll, so the worker self-heals the
+# instant the operator clears the hold. See _hold_park + the failed-turn branch below (#62).
+CLASS_GATEWAY_HELD = "gateway_held"
 
 
 @dataclass(frozen=True)
@@ -483,6 +491,33 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 pass
         _escalate_once(record, CLASS_CONFIG_BLOCKED, retry_unrouted=False)
         stamp()                          # keeps wrapper heartbeat and lead-loop lease fresh
+        last_hb = clock()
+        sleep(fail_sleep)
+        fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+
+    def _hold_park(record: dict) -> None:
+        """Blocked-but-alive RE-DRIVING park for a TRANSIENT gateway HOLD (CLASS_GATEWAY_HELD,
+        #62): the mint refused because the gateway is held/unresolved - NO child spawned, NO
+        spend. CLEAR the write-ahead attempt (drive() already stamped it via record_attempt_start)
+        so NO failure counter climbs and attempts_started never reaches a ceiling -> the held head
+        is NEVER dead-lettered (operator ruling: park a held message indefinitely). The head is
+        left UNCOMMITTED, so the next poll re-drives it and it self-heals the instant the hold
+        clears. Distinct from _park_config_blocked, which persists last_failure_class=config_blocked
+        and thereby sticky-latches at the entry re-park (never re-driving). The heartbeat is
+        re-stamped (drive() cleared it on the failed turn) so a held worker reads as blocked, not
+        dead -> the supervisor does NOT restart it (no restart-storm under a long hold). Health is
+        surfaced by drive()'s health_writer.failure (STATE_RATE_LIMITED_OR_OUTAGE + 'gateway_held'),
+        so this park does not also write health (avoiding a state flip-flop).
+
+        TRADE-OFF (bounded, fail-safe): clearing the attempt also forgets any PRIOR genuine
+        failures on this head, so a message that is BOTH intermittently-held AND poison has its
+        poison run reset each hold. This only slows convergence for that pathological input and
+        errs toward retrying (never toward a wrongful dead-letter). It is unavoidable: preserving
+        history via record_attempt_result would let the write-ahead attempts_started climb into the
+        K_escalate dispose, dead-lettering the held head - exactly what park-indefinitely forbids."""
+        nonlocal last_hb, fail_sleep
+        store.clear_attempt(agent, record.get("id"))
+        stamp()                          # blocked != dead: keep heartbeat + lead-loop lease fresh
         last_hb = clock()
         sleep(fail_sleep)
         fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
@@ -1006,7 +1041,17 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             if max_turns is not None and turns >= max_turns:
                 return turns
             continue
-        # FAILED turn: record the classified failure (clears in_progress), then decide.
+        # FAILED turn.
+        if outcome.failure_class == CLASS_GATEWAY_HELD:
+            # TRANSIENT, operator-resolvable gateway hold at mint time (#62): do NOT persist an
+            # attempt result. A "blocked-but-alive re-driving park" - clears the write-ahead
+            # attempt (no counter climbs -> never dead-lettered), keeps the heartbeat fresh, and
+            # leaves the head UNCOMMITTED so it re-drives next poll and self-heals when the hold
+            # clears. Must precede record_attempt_result so gateway_held is never written to the
+            # ledger (and so it can never reach a dispose ceiling). See _hold_park.
+            _hold_park(record)
+            continue
+        # record the classified failure (clears in_progress), then decide.
         store.record_attempt_result(agent, head_id, failure_class=outcome.failure_class,
                                     summary=outcome.summary, at=now_iso())
         rec = store.attempt_record(agent, head_id) or {}

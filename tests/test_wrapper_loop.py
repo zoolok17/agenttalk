@@ -449,6 +449,73 @@ def test_config_blocked_head_parks_with_visible_health_not_frozen_idle(tmp_path)
     assert s.cursor("beta") == ""                        # head still parked, never committed
 
 
+# ------------------------------------- #62: transient gateway hold = re-driving park (self-heal)
+
+def _gateway_held_drive():
+    return loop.DriveOutcome(ok=False, failure_class=loop.CLASS_GATEWAY_HELD,
+                             summary="OVH gateway is temporarily held; retrying until it clears")
+
+
+def test_gateway_held_head_redrives_and_self_heals_when_the_hold_clears(tmp_path) -> None:
+    # #62: a TRANSIENT gateway hold parks the head WITHOUT persisting an attempt and RE-DRIVES
+    # every poll (unlike the config_blocked latch, which drives ONCE then re-parks without
+    # driving). When the operator clears the hold, the very next drive succeeds and commits -
+    # the worker self-heals with no restart, no dead-letter, no manual reset.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    drives = {"n": 0}
+
+    def drive(rec):
+        drives["n"] += 1
+        if drives["n"] < 3:                    # held for the first two polls...
+            return _gateway_held_drive()
+        return loop.DriveOutcome(ok=True)      # ...then the hold clears -> the turn succeeds
+
+    parked: list = []
+    turns = loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=6, k_poison=2, k_escalate=2,   # realistic ceilings: prove they never trip
+        on_health_parked=lambda rec, reason: parked.append((rec.get("id"), reason)),
+    )
+    assert drives["n"] == 3                       # RE-DROVE each poll (not driven-once-then-latched)
+    assert turns == 1                             # self-healed: the head drove to success
+    assert parked == []                           # gateway_held surfaces via drive()'s health,
+    #                                               NOT the config_blocked on_health_parked path
+    assert s.dead_lettered_count("beta") == 0     # never dead-lettered while held
+    assert s.cursor("beta") == m.id               # committed after the hold cleared
+    assert s.read_heartbeat("beta") is not None   # heartbeat stayed fresh (no restart-storm)
+
+
+def test_gateway_held_never_disposes_and_keeps_attempt_ledger_flat_under_a_long_hold(
+    tmp_path,
+) -> None:
+    # #62 (operator ruling: park a held message INDEFINITELY): a hold that never clears must
+    # NEVER dead-letter the head, no matter how many polls elapse - even under tight poison /
+    # escalate ceilings. Because each held poll CLEARS the write-ahead attempt, no failure
+    # counter climbs, so no ceiling is ever reached. This is the whole point of gateway_held vs
+    # the naive CLASS_INFRA (which dead-letters at the infra-exhaustion backstop).
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    drives = {"n": 0}
+
+    def drive(rec):
+        drives["n"] += 1
+        return _gateway_held_drive()             # held forever
+
+    turns = loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=20, k_poison=1, k_escalate=1,  # ceilings that WOULD dispose an ordinary failure
+    )
+    assert turns == 0
+    assert drives["n"] == 20                      # re-drove EVERY poll (never latched, never gave up)
+    assert s.dead_lettered_count("beta") == 0     # NEVER dead-lettered (park-indefinitely)
+    assert s.cursor("beta") == ""                 # head never consumed
+    rec = s.attempt_record("beta", m.id)
+    # ledger stays flat: no attempt persisted between holds (cleared each poll), so at most the
+    # single in-flight write-ahead of the current poll is ever present.
+    assert rec in (None, {}) or int(rec.get("attempts_started") or 0) <= 1
+
+
 # --------------------------------------------- make_drive (run.py, injected spawn)
 
 def _codex_turn_lines(thread_id: str = "t-1", text: str = "done") -> list[str]:
