@@ -863,8 +863,9 @@ def evaluate_dod(record: dict, dod_eval: dict | None) -> list[tuple[str, str]]:
 def _evaluate_dod_assurance(record: dict, a: dict | None) -> list[tuple[str, str]]:
     """PURE: the assurance dimension binds to the EXISTING ``assurance:<scope>`` gate's own
     fields - it never reads artifact.json. Cleared iff the gate is present, applies to this
-    close's scope, is green from a CI attestation as a blocker (or a revision-bound live operator
-    waiver), bound to THIS close's revision, and - when max_age_days is set - fresh.
+    close's scope, is green from a CI attestation as a blocker, bound to THIS close's revision,
+    and - when max_age_days is set - fresh. A gate WAIVER does NOT clear this dimension (see the
+    waiver note below); the authenticated operator escape is task #65.
 
     RESIDUAL RISK (not closed by this dimension): the assurance guarantee is only as strong as
     the blocker-gate substrate it reads. ``evidence_source == "automation_ci"`` is a LABEL, not
@@ -888,22 +889,18 @@ def _evaluate_dod_assurance(record: dict, a: dict | None) -> list[tuple[str, str
                  f"to this close's scope {close_scope!r} (needs that scope or 'global')")]
     revision_bound = a.get("revision") == record.get("revision")
     status = a.get("status")
-    if status == "waived" and a.get("waiver_active"):
-        # M1 (refined after re-review): a waiver with NO recorded revision is a deliberate operator
-        # BLANKET override for the scope - `gate waive` does not (yet) record a revision, and it is
-        # already bounded by operator authorship + expiry, so it clears (this is the design's
-        # escape valve; a read-side revision requirement would make every waiver un-authorable).
-        # A waiver whose gate carries a DIFFERENT revision (e.g. left over from a prior `gate set`
-        # at another commit) is the original cross-revision danger and still HOLDs.
-        gate_rev = a.get("revision")
-        if gate_rev is None or gate_rev == record.get("revision"):
-            return []
-        return [(HOLD_STALE_ASSURANCE,
-                 f"assurance gate {gate!r} waiver is bound to a different revision "
-                 f"({gate_rev!r} != {record.get('revision')!r})")]
+    # A gate WAIVER does NOT clear the DoD assurance dimension. `gate waive --operator <text>` is
+    # UNAUTHENTICATED caller free text (docs/ASSURANCE.md) with no authenticated operator, so
+    # honoring it would turn a single `gate waive` into a revision-independent bypass of the whole
+    # forcing gate (Codex re-review of 848841a, BLOCKER). Only a green CI-attested, revision-bound
+    # blocker gate clears assurance. The AUTHENTICATED operator escape (close dod-waive validating
+    # a typed operator-answer reference) is task #65 (depends on gate-waive authentication #13).
     if status != "green":
-        return [(HOLD_MISSING_ASSURANCE,
-                 f"assurance gate {gate!r} is not green (status={status!r})")]
+        detail = f"assurance gate {gate!r} is not green (status={status!r})"
+        if status == "waived":
+            detail = (f"assurance gate {gate!r} is waived, but an unauthenticated gate waiver does "
+                      f"not clear a DoD assurance requirement - needs a CI-attested green gate (#65)")
+        return [(HOLD_MISSING_ASSURANCE, detail)]
     # A green blocker greens ONLY from automation_ci (gates.py enforces this at write time; we
     # re-assert it - see the RESIDUAL RISK note above on why this is label-trust, not a proof).
     if a.get("severity") != "blocker" or a.get("evidence_source") != "automation_ci":

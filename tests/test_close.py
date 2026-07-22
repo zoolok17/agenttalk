@@ -1023,13 +1023,14 @@ def test_evaluate_dod_assurance_satisfied_is_empty() -> None:
     assert close.evaluate_dod(_satisfied(), _dod_eval(_assurance_bundle())) == []
 
 
-def test_evaluate_dod_assurance_waived_active_is_empty() -> None:
-    # An active operator waiver clears assurance ONLY when bound to the close revision (M1). The
-    # cross-revision bypass this test previously codified is now rejected (see the revision-bound
-    # regression test below).
+def test_evaluate_dod_assurance_active_waiver_does_not_clear() -> None:
+    # A gate WAIVER never clears the DoD assurance dimension - `gate waive --operator <text>` is
+    # unauthenticated caller free text, so honoring it would be a one-command bypass of the forcing
+    # gate (Codex re-review of 848841a). Even an active waiver bound to THIS revision HOLDs; only a
+    # green CI-attested gate clears. The authenticated operator escape is task #65.
     a = _assurance_bundle(status="waived", waiver_active=True, evidence_source="operator_waiver",
                           severity="blocker", revision=SHA)
-    assert close.evaluate_dod(_satisfied(), _dod_eval(a)) == []
+    assert close.HOLD_MISSING_ASSURANCE in _dcodes(close.evaluate_dod(_satisfied(), _dod_eval(a)))
 
 
 @pytest.mark.parametrize("over,code", [
@@ -1123,6 +1124,24 @@ def test_cli_dod_requires_assurance_gate_holds_until_ci_attested(tmp_path: Path,
     assert rc == 0 and close.HOLD_MISSING_ASSURANCE not in codes
 
 
+def test_cli_dod_gate_waive_cannot_clear_assurance(tmp_path: Path, capsys) -> None:
+    # Codex re-review of 848841a (BLOCKER): `gate waive --operator <text>` is UNAUTHENTICATED
+    # caller free text (docs/ASSURANCE.md), so a single `gate waive` must NOT clear the DoD
+    # assurance dimension - otherwise it is a one-command, revision-independent bypass of the
+    # whole forcing gate. Prove the REAL CLI exploit path still HOLDs. Authenticated escape = #65.
+    root = _init(tmp_path)
+    _write_dod(root)
+    assert _open(root) == 0
+    assert _accept(root) == 0
+    # waive the assurance gate with a CLAIMED operator - the command succeeds but confers no real
+    # operator authority, so the DoD must still HOLD_MISSING_ASSURANCE (not a false GO).
+    _run(["gate", "waive", "--from", "lead", "--name", "assurance:release", "--operator",
+          "claimed-boss", "--reason", "bypass", "--scope", "release", "--expires",
+          "2099-01-01"], root)
+    rc, codes = _check_holds(root, capsys)
+    assert rc == 3 and close.HOLD_MISSING_ASSURANCE in codes
+
+
 def test_cli_dod_stale_when_gate_bound_to_other_revision(tmp_path: Path, capsys) -> None:
     root = _init(tmp_path)
     _write_dod(root)
@@ -1186,13 +1205,12 @@ def test_evaluate_dod_assurance_no_max_age_skips_freshness() -> None:
     assert close.evaluate_dod(_satisfied(), _dod_eval(a)) == []
 
 
-def test_evaluate_dod_assurance_waiver_must_be_revision_bound() -> None:
-    # M1: a waiver on a DIFFERENT revision must NOT clear this close.
-    a = _assurance_bundle(status="waived", waiver_active=True, revision=OTHER_SHA)
-    assert close.HOLD_STALE_ASSURANCE in _dcodes(close.evaluate_dod(_satisfied(), _dod_eval(a)))
-    # a waiver bound to THIS revision clears.
-    a2 = _assurance_bundle(status="waived", waiver_active=True, revision=SHA)
-    assert close.evaluate_dod(_satisfied(), _dod_eval(a2)) == []
+def test_evaluate_dod_assurance_waiver_never_clears_any_revision() -> None:
+    # No gate waiver clears assurance, regardless of revision binding (unauthenticated - #65).
+    for rev in (OTHER_SHA, SHA, None):
+        a = _assurance_bundle(status="waived", waiver_active=True, revision=rev)
+        assert close.HOLD_MISSING_ASSURANCE in _dcodes(
+            close.evaluate_dod(_satisfied(), _dod_eval(a))), f"waiver rev={rev} must HOLD"
 
 
 def test_evaluate_dod_assurance_gate_scope_must_apply() -> None:
@@ -1279,10 +1297,9 @@ def test_cli_dod_duplicate_scopes_does_not_false_go(tmp_path: Path, capsys) -> N
     assert rc == 3 and close.HOLD_INVALID_DOD_POLICY in codes
 
 
-def test_evaluate_dod_assurance_revisionless_waiver_is_blanket_clear() -> None:
-    # A waiver with NO recorded revision is a deliberate operator BLANKET override (the design's
-    # escape valve; `gate waive` records no revision + is bounded by expiry/authorship). It clears
-    # even though the assurance gate is otherwise unmet, WITHOUT re-introducing the cross-revision
-    # danger (a waiver whose gate carries a DIFFERENT revision still HOLDs - see the M1 test).
+def test_evaluate_dod_assurance_revisionless_waiver_does_not_clear() -> None:
+    # A revision-less `gate waive` (its --operator is unauthenticated caller text) must NOT clear
+    # the DoD assurance dimension - otherwise a single command bypasses the forcing gate
+    # (Codex re-review of 848841a, BLOCKER). Authenticated operator escape = task #65.
     a = _assurance_bundle(status="waived", waiver_active=True, revision=None)
-    assert close.evaluate_dod(_satisfied(), _dod_eval(a)) == []
+    assert close.HOLD_MISSING_ASSURANCE in _dcodes(close.evaluate_dod(_satisfied(), _dod_eval(a)))
