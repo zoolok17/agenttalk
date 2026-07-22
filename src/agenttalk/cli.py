@@ -2314,7 +2314,63 @@ def _build_dod_eval(store, record: dict):
               "required_dimensions": dims}
     if "assurance" in dims:
         bundle["assurance"] = _resolve_dod_assurance_gate(store, dims["assurance"], record)
+    if "knowledge" in dims:
+        bundle["knowledge"] = _resolve_dod_knowledge(store, dims["knowledge"], record)
     return bundle
+
+
+def _resolve_dod_knowledge(store, spec: dict, record: dict) -> dict:
+    """Resolve the CURATED knowledge notes BOUND to this close's revision (never reads a note by
+    id - #44; the addressable identity is (domain,key), and a note is bound by a sha anchor /
+    verified_against_sha equal to the close revision). All I/O here; :func:`close._evaluate_dod_
+    knowledge` only counts. Any malformed note/anchor is skipped, never raised."""
+    from agenttalk import knowledge as kn
+
+    revision = str(record.get("revision") or "")
+    types = set(spec.get("types") or [])
+    bound: list[dict] = []
+    try:
+        events, _problems = kn.read_events(store)
+        views = kn.resolve_views(events)
+    except Exception:  # noqa: BLE001 - a broken knowledge log must not crash `close check`
+        events, views = [], {}
+    for _key, slot in (views.items() if isinstance(views, dict) else []):
+        note = slot.get("curated") if isinstance(slot, dict) else None
+        if not isinstance(note, dict):
+            continue
+        try:
+            if not kn.is_curated(note) or kn.is_retracted(note):
+                continue
+            if note.get("type") not in types:
+                continue
+            if _knowledge_note_bound_to(note, revision):
+                bound.append({"type": note.get("type"),
+                              "body_len": len(str(note.get("body") or ""))})
+        except Exception:  # noqa: BLE001, S112  # nosec - skip a malformed note, never crash
+            continue
+    return {
+        "when": spec.get("when", "on_remediation"),
+        "min_notes": spec.get("min_notes", 1),
+        "min_body_chars": spec.get("min_body_chars", 0),
+        "types": sorted(types),
+        "has_remediation": bool(record.get("remediation_items")),
+        "bound_notes": bound,
+    }
+
+
+def _knowledge_note_bound_to(note: dict, revision: str) -> bool:
+    """A note is bound to ``revision`` iff its sha anchor (lessons nest it under ``lesson``) OR
+    its ``verified_against_sha`` equals the close revision (both are full 40-char SHAs)."""
+    if not revision:
+        return False
+    if note.get("verified_against_sha") == revision:
+        return True
+    if note.get("type") == "lesson":
+        anchor = (note.get("lesson") or {}).get("anchor")
+    else:
+        anchor = note.get("anchor")
+    return (isinstance(anchor, dict) and anchor.get("kind") == "sha"
+            and anchor.get("sha") == revision)
 
 
 def _resolve_dod_assurance_gate(store, spec: dict, record: dict) -> dict:

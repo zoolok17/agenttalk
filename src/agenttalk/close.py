@@ -88,6 +88,8 @@ HOLD_INVALID_DOD_POLICY = "invalid_dod_policy"
 HOLD_MISSING_ASSURANCE = "missing_assurance_evidence"
 HOLD_STALE_ASSURANCE = "stale_assurance_evidence"
 HOLD_UNATTESTED_ASSURANCE = "unattested_assurance_evidence"
+HOLD_MISSING_KNOWLEDGE = "missing_knowledge_evidence"
+HOLD_TRIVIAL_EVIDENCE = "trivial_knowledge_evidence"
 
 RELEASE_CLASS_SCOPES = {"release", "milestone", "feature", "hotfix"}
 
@@ -97,7 +99,8 @@ DOD_DIRNAME = "dod.json"
 # dimension the engine cannot enforce is a policy error (you must not be able to require what
 # cannot be checked - a silent soft-pass is exactly the failure this gate exists to prevent).
 # inc-1: assurance only. inc-2 adds knowledge; inc-3 adds coverage + a depth-signoff dimension.
-_DOD_SUPPORTED_DIMENSIONS = frozenset({"assurance"})
+_DOD_SUPPORTED_DIMENSIONS = frozenset({"assurance", "knowledge"})
+_KNOWLEDGE_NOTE_TYPES = frozenset({"decision", "gotcha", "lesson", "pointer", "seam"})
 _DOD_ALLOWED_TOP_KEYS = frozenset({"schema_version", "scopes"})
 _DOD_ASSURANCE_KEYS = frozenset({"gate", "max_age_days"})
 _DOD_SCHEMA_VERSION = 1
@@ -783,6 +786,8 @@ def validate_dod_policy(raw: object) -> dict:
                     f"(supported: {sorted(_DOD_SUPPORTED_DIMENSIONS)})")
             if dim == "assurance":
                 norm[dim] = _validate_dod_assurance_spec(spec, scope_name)
+            elif dim == "knowledge":
+                norm[dim] = _validate_dod_knowledge_spec(spec, scope_name)
         key = str(scope_name).lower()
         if key in scopes:
             # two scope names that collide after lowercasing are ambiguous -> fail closed.
@@ -809,6 +814,39 @@ def _validate_dod_assurance_spec(spec: object, scope_name: str) -> dict:
         raise CloseError(
             f"dod scope {scope_name!r} assurance.max_age_days must be a non-negative integer")
     return {"gate": gate, "max_age_days": max_age}
+
+
+def _validate_dod_knowledge_spec(spec: object, scope_name: str) -> dict:
+    """Normalize a scope's ``knowledge`` requirement. ``when``: on_remediation (default; required
+    only when the close carries a fix) | always. ``min_notes``: how many CURATED, non-trivial,
+    revision-bound notes clear it (default 1). ``types``: allowed note types (default the
+    lesson/gotcha/decision trio). ``min_body_chars``: triviality floor - knowledge.validate_body
+    only forbids empty, so a stub could otherwise clear the gate (default 40)."""
+    if not isinstance(spec, dict):
+        raise CloseError(f"dod scope {scope_name!r} knowledge must be an object")
+    when = spec.get("when", "on_remediation")
+    if when not in ("on_remediation", "always"):
+        raise CloseError(
+            f"dod scope {scope_name!r} knowledge.when must be 'on_remediation' or 'always'")
+    min_notes = spec.get("min_notes", 1)
+    if not isinstance(min_notes, int) or isinstance(min_notes, bool) or min_notes < 1:
+        raise CloseError(
+            f"dod scope {scope_name!r} knowledge.min_notes must be an integer >= 1")
+    types = spec.get("types", ["lesson", "gotcha", "decision"])
+    if not isinstance(types, list) or not types or not all(isinstance(t, str) for t in types):
+        raise CloseError(
+            f"dod scope {scope_name!r} knowledge.types must be a non-empty list of strings")
+    bad = [t for t in types if t not in _KNOWLEDGE_NOTE_TYPES]
+    if bad:
+        raise CloseError(
+            f"dod scope {scope_name!r} knowledge.types has unknown type(s) {bad} "
+            f"(known: {sorted(_KNOWLEDGE_NOTE_TYPES)})")
+    min_body_chars = spec.get("min_body_chars", 40)
+    if not isinstance(min_body_chars, int) or isinstance(min_body_chars, bool) or min_body_chars < 0:
+        raise CloseError(
+            f"dod scope {scope_name!r} knowledge.min_body_chars must be a non-negative integer")
+    return {"when": when, "min_notes": min_notes,
+            "types": sorted(set(types)), "min_body_chars": min_body_chars}
 
 
 def dod_policy_hash(policy: dict) -> str:
@@ -857,6 +895,8 @@ def evaluate_dod(record: dict, dod_eval: dict | None) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     if "assurance" in required:
         out.extend(_evaluate_dod_assurance(record, dod_eval.get("assurance")))
+    if "knowledge" in required:
+        out.extend(_evaluate_dod_knowledge(record, dod_eval.get("knowledge")))
     return out
 
 
@@ -935,6 +975,40 @@ def _evaluate_dod_assurance(record: dict, a: dict | None) -> list[tuple[str, str
             out.append((HOLD_STALE_ASSURANCE,
                         f"assurance gate {gate!r} freshness is required but its age is invalid"))
     return out
+
+
+def _evaluate_dod_knowledge(record: dict, k: dict | None) -> list[tuple[str, str]]:
+    """PURE: the knowledge dimension flips "write down what you learned" from opt-in to
+    red-by-default (Papendal shipped a multi-day build with ZERO notes). A close that produced a
+    fix HOLDs unless it cites >= min_notes CURATED, non-trivial knowledge notes of an allowed type
+    that are BOUND to the close. BINDING: a note is bound iff its ``sha`` anchor (or
+    ``verified_against_sha``) equals the close ``revision`` - the close record has no request_id,
+    so a sha match to the closed commit is the only clean, non-circular link (the CLI resolves the
+    curated/typed/bound set; this only COUNTS). ``when=on_remediation`` (default) requires it only
+    when the close carries remediation; ``when=always`` always requires it. Distinguishes 'nothing
+    captured' (HOLD_MISSING_KNOWLEDGE) from 'only stubs captured' (HOLD_TRIVIAL_EVIDENCE)."""
+    if not isinstance(k, dict):
+        return [(HOLD_MISSING_KNOWLEDGE,
+                 "knowledge evidence is required for this scope but was not resolved")]
+    when = k.get("when", "on_remediation")
+    required = when == "always" or (when == "on_remediation" and bool(k.get("has_remediation")))
+    if not required:
+        return []
+    min_notes = k.get("min_notes", 1)
+    min_body_chars = k.get("min_body_chars", 0)
+    types = k.get("types") or []
+    bound = k.get("bound_notes") or []
+    qualifying = [n for n in bound
+                  if isinstance(n, dict) and int(n.get("body_len") or 0) >= int(min_body_chars)]
+    if len(qualifying) >= int(min_notes):
+        return []
+    if bound and not qualifying:
+        return [(HOLD_TRIVIAL_EVIDENCE,
+                 f"the {len(bound)} knowledge note(s) bound to this close revision are all below "
+                 f"min_body_chars={min_body_chars} (stubs do not count as captured knowledge)")]
+    return [(HOLD_MISSING_KNOWLEDGE,
+             f"scope requires >= {min_notes} curated knowledge note(s) of {types} bound to the "
+             f"close revision (by sha anchor / verified_against_sha); found {len(qualifying)}")]
 
 
 def merge_candidate_refsets(*refsets: dict) -> dict:
