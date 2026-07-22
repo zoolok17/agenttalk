@@ -575,7 +575,10 @@ def test_config_lock_recovery_never_path_replaces_stale_generation(
         real_replace(source, destination)
 
     monkeypatch.setattr(store_mod.os, "replace", forbid_path_overwrite)
-    with s._config_lock(timeout=0.2, poll=0.005):
+    # timeout is incidental to this test (it asserts recovery never overwrites the
+    # lock pathname, not any deadline); 0.2s is below loaded-Windows-FS lock
+    # latency and flaked in CI. Generous bounded value, same assertion.
+    with s._config_lock(timeout=5.0, poll=0.005):
         pass
 
 
