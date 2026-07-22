@@ -2313,21 +2313,24 @@ def _build_dod_eval(store, record: dict):
     bundle = {"policy_present": policy is not None, "policy_error": None,
               "required_dimensions": dims}
     if "assurance" in dims:
-        bundle["assurance"] = _resolve_dod_assurance_gate(store, dims["assurance"])
+        bundle["assurance"] = _resolve_dod_assurance_gate(store, dims["assurance"], record)
     return bundle
 
 
-def _resolve_dod_assurance_gate(store, spec: dict) -> dict:
+def _resolve_dod_assurance_gate(store, spec: dict, record: dict) -> dict:
     """Read the named ``assurance:<scope>`` gate's OWN fields (never artifact.json - Q1 ruling)
-    so the DoD assurance dimension is a binding/freshness check over the CI-attested gate."""
+    so the DoD assurance dimension is a binding/freshness check over the CI-attested gate. Carries
+    the gate's own ``scope`` and the close's applicable scope so the evaluator can enforce that the
+    gate actually applies to this close (a feature-scoped gate must not satisfy a release close)."""
     from datetime import datetime, timezone
 
     from agenttalk import gates as gate_mod
     gate_name = spec["gate"]
     state = gate_mod.load_gate_state(store.root)
     g = (state.get("gates") or {}).get(gate_name)
+    close_scope = record.get("gate_scope")
     if not isinstance(g, dict):
-        return {"gate": gate_name, "present": False}
+        return {"gate": gate_name, "present": False, "close_gate_scope": close_scope}
     now = datetime.now(timezone.utc)
     waiver = g.get("waiver")
     waiver_active = False
@@ -2341,21 +2344,24 @@ def _resolve_dod_assurance_gate(store, spec: dict) -> dict:
         "status": g.get("status"), "severity": g.get("severity"),
         "evidence_source": g.get("evidence_source"), "revision": g.get("revision"),
         "waiver_active": waiver_active,
+        "gate_scope": g.get("scope"), "close_gate_scope": close_scope,
         "age_days": _iso_age_days(g.get("updated_at"), now),
         "max_age_days": spec.get("max_age_days"),
     }
 
 
 def _iso_age_days(updated_at: object, now) -> float | None:
-    """Age in days of an ISO-8601 ``updated_at`` vs ``now``; None if missing/unparseable. Never
-    raises (freshness is advisory - a bad timestamp must not crash `close check`). Reuses the
-    existing :func:`_parse_ts` timestamp parser."""
+    """SIGNED age in days of an ISO-8601 ``updated_at`` vs ``now`` (NEGATIVE = future-dated);
+    ``None`` if missing/unparseable. Never raises (a bad timestamp must not crash `close check`) -
+    but the DoD evaluator FAILS CLOSED on a ``None``/future age when freshness is required, so this
+    must NOT clamp a future timestamp to 0 (that would mask a future-dated attestation as fresh).
+    Reuses the existing :func:`_parse_ts` timestamp parser."""
     if not isinstance(updated_at, str):
         return None
     parsed = _parse_ts(updated_at)
     if parsed is None:
         return None
-    return max(0.0, (now - parsed).total_seconds() / 86400.0)
+    return (now - parsed).total_seconds() / 86400.0
 
 
 def _signoff_risk_inventory(args, store, record: dict) -> list[dict]:

@@ -1024,8 +1024,11 @@ def test_evaluate_dod_assurance_satisfied_is_empty() -> None:
 
 
 def test_evaluate_dod_assurance_waived_active_is_empty() -> None:
+    # An active operator waiver clears assurance ONLY when bound to the close revision (M1). The
+    # cross-revision bypass this test previously codified is now rejected (see the revision-bound
+    # regression test below).
     a = _assurance_bundle(status="waived", waiver_active=True, evidence_source="operator_waiver",
-                          severity="blocker", revision=OTHER_SHA)  # binding not required for waiver
+                          severity="blocker", revision=SHA)
     assert close.evaluate_dod(_satisfied(), _dod_eval(a)) == []
 
 
@@ -1140,3 +1143,100 @@ def test_cli_dod_malformed_policy_fails_closed_without_crash(tmp_path: Path, cap
     assert _accept(root) == 0
     rc, codes = _check_holds(root, capsys)
     assert rc == 3 and close.HOLD_INVALID_DOD_POLICY in codes
+
+
+# ---------------------------------- #60 inc-1 hardening regressions (Codex review of 46584e8)
+
+def _dcodes(holds) -> set[str]:
+    return {c for c, _ in holds}
+
+
+@pytest.mark.parametrize("raw", [
+    {"schema_version": 1, "scopes": []},                       # B2: present wrong-type != absent
+    {"schema_version": 1, "scopes": 0},                        # B2: falsy wrong-type
+    {"schema_version": 2, "scopes": {}},                       # B2: unsupported version
+    {"schema_version": 1, "scopes": {}, "extra": 1},           # B2: unknown top-level key
+    {"schema_version": 1, "scope": {"release": {}}},           # B2: misspelled 'scopes'
+    {"schema_version": 1,
+     "scopes": {"release": {"assurance": {"gate": "g", "max_age_day": 14}}}},  # B2: typo'd spec key
+    {"schema_version": 1,
+     "scopes": {"Release": {"assurance": {"gate": "g"}},
+                "release": {"assurance": {"gate": "g2"}}}},    # B2: case-insensitive collision
+])
+def test_validate_dod_policy_failclosed_regressions(raw) -> None:
+    with pytest.raises(close.CloseError):
+        close.validate_dod_policy(raw)
+
+
+@pytest.mark.parametrize("age_days,expect_hold", [
+    (None, True),    # B3: freshness required but timestamp missing/unparseable -> HOLD
+    (-1.0, True),    # B3: future-dated attestation is NOT fresh -> HOLD
+    (99.0, True),    # older than max_age_days=14 -> HOLD (control)
+    (1.0, False),    # genuinely fresh -> clears
+])
+def test_evaluate_dod_assurance_freshness_fails_closed(age_days, expect_hold) -> None:
+    a = _assurance_bundle(age_days=age_days, max_age_days=14)
+    holds = close.evaluate_dod(_satisfied(), _dod_eval(a))
+    assert (close.HOLD_STALE_ASSURANCE in _dcodes(holds)) is expect_hold
+
+
+def test_evaluate_dod_assurance_no_max_age_skips_freshness() -> None:
+    # freshness is OPTIONAL: with max_age_days unset, a None/old age must NOT hold on freshness.
+    a = _assurance_bundle(age_days=None, max_age_days=None)
+    assert close.evaluate_dod(_satisfied(), _dod_eval(a)) == []
+
+
+def test_evaluate_dod_assurance_waiver_must_be_revision_bound() -> None:
+    # M1: a waiver on a DIFFERENT revision must NOT clear this close.
+    a = _assurance_bundle(status="waived", waiver_active=True, revision=OTHER_SHA)
+    assert close.HOLD_STALE_ASSURANCE in _dcodes(close.evaluate_dod(_satisfied(), _dod_eval(a)))
+    # a waiver bound to THIS revision clears.
+    a2 = _assurance_bundle(status="waived", waiver_active=True, revision=SHA)
+    assert close.evaluate_dod(_satisfied(), _dod_eval(a2)) == []
+
+
+def test_evaluate_dod_assurance_gate_scope_must_apply() -> None:
+    # M2: a gate scoped to another scope (or scope-less) cannot satisfy a scoped close.
+    mismatch = _assurance_bundle(gate_scope="feature", close_gate_scope="release")
+    assert close.HOLD_MISSING_ASSURANCE in _dcodes(
+        close.evaluate_dod(_satisfied(), _dod_eval(mismatch)))
+    scopeless = _assurance_bundle(gate_scope=None, close_gate_scope="release")
+    assert close.HOLD_MISSING_ASSURANCE in _dcodes(
+        close.evaluate_dod(_satisfied(), _dod_eval(scopeless)))
+    # matching scope, and an explicit "global" gate, both clear (mirrors gates.check_gates).
+    assert close.evaluate_dod(_satisfied(), _dod_eval(
+        _assurance_bundle(gate_scope="release", close_gate_scope="release"))) == []
+    assert close.evaluate_dod(_satisfied(), _dod_eval(
+        _assurance_bundle(gate_scope="global", close_gate_scope="release"))) == []
+
+
+def test_load_dod_policy_oversized_fails_closed(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["lead"])
+    close.dod_policy_path(s).write_text(
+        '{"schema_version":1,"scopes":{},"pad":"' + "a" * 70000 + '"}', encoding="utf-8")
+    pol, err = close.load_dod_policy(s)
+    assert pol is None and err and "size" in err.lower()
+
+
+def test_load_dod_policy_deeply_nested_fails_closed_without_crash(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["lead"])
+    depth = 20000                                    # deep enough to blow json's recursion limit
+    close.dod_policy_path(s).write_text("[" * depth + "]" * depth, encoding="utf-8")
+    pol, err = close.load_dod_policy(s)              # must NOT raise (RecursionError caught)
+    assert pol is None and err
+
+
+def test_cli_dod_gate_scoped_to_other_scope_does_not_satisfy(tmp_path: Path, capsys) -> None:
+    # M2 end-to-end: a green CI-attested blocker whose OWN scope is "feature" does not satisfy a
+    # release close, even though it is named assurance:release and bound to the revision.
+    root = _init(tmp_path)
+    _write_dod(root)
+    assert _open(root) == 0
+    assert _accept(root) == 0
+    gates.set_gate(root, name="assurance:release", status="green", severity="blocker",
+                   scope="feature", actor="ci", evidence_source="automation_ci",
+                   evidence=["run:x"], revision=SHA)
+    rc, codes = _check_holds(root, capsys)
+    assert rc == 3 and close.HOLD_MISSING_ASSURANCE in codes
