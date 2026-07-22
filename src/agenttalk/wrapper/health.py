@@ -9,7 +9,13 @@ from agenttalk import health as health_model
 from agenttalk.correlation import resolve_request_id
 
 from .events import Event, EventType
-from .loop import CLASS_AMBIGUOUS, CLASS_CONFIG_BLOCKED, CLASS_INFRA, CLASS_POISON
+from .loop import (
+    CLASS_AMBIGUOUS,
+    CLASS_CONFIG_BLOCKED,
+    CLASS_GATEWAY_HELD,
+    CLASS_INFRA,
+    CLASS_POISON,
+)
 
 
 class WrapperHealthWriter:
@@ -184,6 +190,12 @@ def classify_failure(sig: dict[str, Any], failure_class: str | None) -> tuple[st
         return health_model.STATE_STUCK_SUSPECTED, "turn_watchdog_fired"
     if failure_class == CLASS_CONFIG_BLOCKED:
         return health_model.STATE_ERRORED_AMBIGUOUS, _setup_failure_reason(sig) or "config_blocked"
+    if failure_class == CLASS_GATEWAY_HELD:
+        # Transient, operator-resolvable gateway hold (#62): honestly an outage-like, retryable
+        # wait - NOT an error and NOT idle. Distinct reason_code so status/doctor show a worker
+        # blocked-on-a-held-gateway (that will self-heal on clear), not a frozen or dead one.
+        # Checked before the sig["error"] branch below, which the hold also sets.
+        return health_model.STATE_RATE_LIMITED_OR_OUTAGE, "gateway_held"
     if sig.get("error"):
         return health_model.STATE_RATE_LIMITED_OR_OUTAGE, "spawn_exec_error"
     rc = sig.get("rc")

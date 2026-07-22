@@ -10,7 +10,12 @@ from agenttalk import ovh_gateway
 from agenttalk.store import Store
 from agenttalk.wrapper import run
 from agenttalk.wrapper import session
-from agenttalk.wrapper.loop import CLASS_AMBIGUOUS, CLASS_CONFIG_BLOCKED, CLASS_INFRA
+from agenttalk.wrapper.loop import (
+    CLASS_AMBIGUOUS,
+    CLASS_CONFIG_BLOCKED,
+    CLASS_GATEWAY_HELD,
+    CLASS_INFRA,
+)
 
 
 def test_non_profile_child_environment_is_unchanged(tmp_path, monkeypatch) -> None:
@@ -328,13 +333,79 @@ def test_ovh_qwen_profile_refuses_a_path_resolving_outside_workspace(
 
 
 @pytest.mark.parametrize("code", ["ATGW_POLICY_BLOCKED", "ATGW_LEDGER_BLOCKED"])
-def test_ovh_policy_and_ledger_blocks_are_terminal_non_poison(code) -> None:
+def test_ovh_policy_and_ledger_blocks_as_terminal_text_stay_config_blocked(code) -> None:
+    # A ledger/policy block surfaced as terminal TEXT is a 503 seen by an ALREADY-MINTED child
+    # turn mid-stream: it stays config_blocked (unchanged from master). CLASS_GATEWAY_HELD is
+    # scoped to the MINT-TIME hold only (see the signal test below) - a mid-turn hold cannot
+    # self-heal because the minted turn's 300s wall-clock keeps burning during the hold, so a
+    # post-clear re-mint hits ChildTurnCapExceeded -> config_blocked anyway (Fable review of
+    # b173f36, MAJOR-1). Full mid-turn recovery is the turn-reaper follow-up, not a classification.
     classification, summary = run._classify_drive_failure(
         {"terminal": True, "terminal_text": f'API Error: 503 {{"type":"{code}"}}'},
         backend_profile="ovh-qwen",
     )
     assert classification == CLASS_CONFIG_BLOCKED
     assert "hold" in summary
+
+
+def test_gateway_transient_hold_signal_classifies_gateway_held() -> None:
+    # The mint-time LedgerHold surfaces as an explicit sig flag, classified BEFORE any text
+    # heuristic and independent of backend profile.
+    classification, summary = run._classify_drive_failure(
+        {"gateway_transient_hold": True, "error": "durable child turn capability unavailable"},
+        backend_profile="ovh-qwen",
+    )
+    assert classification == CLASS_GATEWAY_HELD
+    assert "held" in summary
+
+
+def test_qwen_spawner_classifies_gateway_held_on_ledger_hold_without_spawning(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    # The REAL make_drive path: a mint-time LedgerHold must (a) never spawn a paid child and
+    # (b) classify CLASS_GATEWAY_HELD (transient), NOT config_blocked. This pins the except
+    # ORDERING at the mint site - LedgerHold is a GatewayError subclass, so it must be caught
+    # first; if the broad `except GatewayError` shadowed it, this would be config_blocked (#62).
+    store = Store(tmp_path)
+    store.init(["lead", "qwen-dev-1"])
+
+    class HeldLedger:
+        def open_child_turn(self, **_scope):
+            raise ovh_gateway.LedgerHold("gateway has a durable accounting hold")
+
+    def must_not_spawn(*_args, **_kwargs):
+        raise AssertionError("paid child spawned while the gateway was held")
+
+    monkeypatch.setattr(ovh_gateway, "SpendLedger", HeldLedger)
+    monkeypatch.setattr(run, "_ProcStream", must_not_spawn)
+    drive = run.make_drive(
+        store,
+        "qwen-dev-1",
+        "claude",
+        session.SessionState(cli="claude", claude_session_id="session-1"),
+        ["claude"],
+        render=False,
+        backend_profile="ovh-qwen",
+        profile_env={
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000",
+            "ANTHROPIC_AUTH_TOKEN": "master-front-token",
+        },
+    )
+
+    outcome = drive(
+        {
+            "id": "immutable-message-id",
+            "from": "lead",
+            "kind": "question",
+            "body": "do work",
+            "meta": {"request_id": "q-parent"},
+        }
+    )
+
+    assert outcome.ok is False
+    assert outcome.failure_class == CLASS_GATEWAY_HELD
+    assert "held" in outcome.summary
 
 
 def test_ovh_child_turn_cap_is_terminal_config_blocked() -> None:

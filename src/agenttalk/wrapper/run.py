@@ -59,7 +59,19 @@ _BENIGN_PIPE_TEARDOWN_ERRNOS = {errno.EINVAL, errno.EPIPE}
 
 
 class _GatewayChildCapUnavailable(RuntimeError):
-    """The wrapper could not durably issue a scoped paid-child credential."""
+    """The wrapper could not durably issue a scoped paid-child credential.
+
+    ``transient`` marks an operator-resolvable gateway HOLD (a durable accounting hold, an
+    unresolved prior attempt, or a clock rollback awaiting reconcile - i.e. any ``LedgerHold``).
+    A transient cause classifies CLASS_GATEWAY_HELD: the head is parked WITHOUT persisting an
+    attempt and re-drives every poll, so a worker blocked only because the gateway is held
+    self-heals when the hold clears, instead of sticky-parking as config_blocked forever (#62).
+    A NON-transient cause (missing message id, a local exec/config denial, ChildTurnCapExceeded
+    - which is a LedgerBlocked, deliberately NOT a LedgerHold) stays config_blocked."""
+
+    def __init__(self, message: str, *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 # Legacy infra-like text markers. These are low-confidence hints only; they deliberately
 # no longer classify known_global_infra without a structured CLI status/rate-limit fact.
@@ -1590,14 +1602,29 @@ def _classify_drive_failure(
     from .loop import (
         CLASS_AMBIGUOUS,
         CLASS_CONFIG_BLOCKED,
+        CLASS_GATEWAY_HELD,
         CLASS_INFRA,
         CLASS_POISON,
     )
+
+    # A TRANSIENT, operator-resolvable gateway HOLD surfaced at mint time (#62): classify
+    # CLASS_GATEWAY_HELD (parked, re-driving, NEVER dead-lettered) so the worker self-heals
+    # when the hold clears. Deterministic explicit signal - checked before any text heuristics.
+    if sig.get("gateway_transient_hold"):
+        return CLASS_GATEWAY_HELD, "OVH gateway is temporarily held; retrying until it clears"
 
     if backend_profile == "ovh-qwen":
         text = _ovh_qwen_failure_text(sig)
         if "atgw_child_turn_cap_exceeded" in text:
             return CLASS_CONFIG_BLOCKED, "OVH child turn budget exhausted"
+        # A ledger/policy block surfaced as terminal TEXT (a 503 seen by an ALREADY-MINTED child
+        # turn mid-stream) stays config_blocked, unchanged from master. CLASS_GATEWAY_HELD is
+        # scoped to the MINT-TIME hold only (the gateway_transient_hold signal above), where no
+        # turn was minted so re-driving genuinely self-heals. A mid-turn hold cannot: the minted
+        # turn's 300s wall-clock keeps burning during the hold, so after the operator clears it a
+        # re-mint hits ChildTurnCapExceeded -> config_blocked anyway. Making the mid-turn text
+        # self-heal needs a turn-reaper for held-expired rows (the #63 residual / #62 follow-up),
+        # NOT a classification change here (Fable review of b173f36, MAJOR-1).
         if "atgw_policy_blocked" in text or "atgw_ledger_blocked" in text:
             return CLASS_CONFIG_BLOCKED, "OVH trial policy or accounting hold"
         if "atgw_config_error" in text or "status code: 422" in text or "http 422" in text:
@@ -1883,7 +1910,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             # Same for a disabled/invalid work_heartbeat config.
             gateway_capability = None
             if backend_profile == "ovh-qwen":
-                from agenttalk.ovh_gateway import GatewayError, SpendLedger
+                from agenttalk.ovh_gateway import GatewayError, LedgerHold, SpendLedger
 
                 if not active_message_id:
                     raise _GatewayChildCapUnavailable(
@@ -1898,6 +1925,19 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                             (profile_env or {}).get("ANTHROPIC_AUTH_TOKEN") or ""
                         ),
                     ).token
+                except LedgerHold as exc:
+                    # A held/unresolved/clock-rollback gateway: TRANSIENT + operator-resolvable.
+                    # Mark it so the turn classifies CLASS_GATEWAY_HELD (parked, re-driving, never
+                    # dead-lettered) and the worker self-heals when the hold clears, instead of
+                    # sticky-parking as config_blocked forever (#62). ChildTurnCapExceeded is
+                    # deliberately a LedgerBlocked (NOT a LedgerHold), so a permanently-capped
+                    # message never takes this path and stays config_blocked. Ordered before the
+                    # GatewayError catch below because LedgerHold IS a GatewayError subclass.
+                    raise _GatewayChildCapUnavailable(
+                        "durable child turn capability unavailable: "
+                        f"{type(exc).__name__}",
+                        transient=True,
+                    ) from exc
                 except (GatewayError, OSError, ValueError) as exc:
                     raise _GatewayChildCapUnavailable(
                         "durable child turn capability unavailable: "
@@ -2046,9 +2086,18 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         except _GatewayChildCapUnavailable as e:
             _capture_child_output("stderr", f"{type(e).__name__}: {e}")
             _finalize_child_output()
-            sig["config_blocked"] = True
-            sig["config_blocked_text"] = str(e)
-            sig["error"] = str(e)
+            if e.transient:
+                # Transient, operator-resolvable gateway hold: NO child spawned, NO spend.
+                # Mark it so _classify_drive_failure returns CLASS_GATEWAY_HELD -> the loop parks
+                # WITHOUT persisting an attempt and re-drives next poll, self-healing when the hold
+                # clears (#62). NOT config_blocked (which would sticky-park forever) and NOT INFRA
+                # (which dead-letters at the infra-exhaustion backstop and withholds the heartbeat).
+                sig["gateway_transient_hold"] = True
+                sig["error"] = str(e)
+            else:
+                sig["config_blocked"] = True
+                sig["config_blocked_text"] = str(e)
+                sig["error"] = str(e)
             return sig
         except OSError as e:
             _capture_child_output("stderr", f"{type(e).__name__}: {e}")

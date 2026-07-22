@@ -352,6 +352,21 @@ def test_health_failure_and_degraded_mappings(tmp_path: Path) -> None:
     assert _health_state(s) == hm.STATE_DEGRADED_OUTPUT
 
 
+def test_classify_failure_maps_gateway_held_to_outage_before_the_error_branch() -> None:
+    # #62: a TRANSIENT gateway hold is honestly an outage-like, retryable wait - NOT idle, NOT
+    # dead, NOT a generic exec error. It also sets sig["error"], so the gateway_held branch must
+    # win over the sig["error"] -> "spawn_exec_error" mapping, keeping the reason_code honest so
+    # status/doctor show a worker blocked-on-a-held-gateway (that will self-heal on clear).
+    from agenttalk.wrapper.health import classify_failure
+    from agenttalk.wrapper.loop import CLASS_GATEWAY_HELD
+
+    state, reason = classify_failure(
+        {"error": "durable child turn capability unavailable"}, CLASS_GATEWAY_HELD
+    )
+    assert state == hm.STATE_RATE_LIMITED_OR_OUTAGE
+    assert reason == "gateway_held"
+
+
 def test_health_writer_parked_surfaces_blocked_state_with_resolved_request_id(
     tmp_path: Path,
 ) -> None:
