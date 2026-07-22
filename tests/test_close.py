@@ -1240,3 +1240,49 @@ def test_cli_dod_gate_scoped_to_other_scope_does_not_satisfy(tmp_path: Path, cap
                    evidence=["run:x"], revision=SHA)
     rc, codes = _check_holds(root, capsys)
     assert rc == 3 and close.HOLD_MISSING_ASSURANCE in codes
+
+# ---------------------------- #60 inc-1 round-3 regressions (Codex re-review of f44e268)
+
+@pytest.mark.parametrize("body,label", [
+    ('{"schema_version":1,'
+     '"scopes":{"release":{"assurance":{"gate":"assurance:release","max_age_days":14}}},'
+     '"scopes":{}}', "dup top-level scopes erasing requirements"),
+    ('{"schema_version":1,'
+     '"scopes":{"release":{"assurance":{"gate":"g"}},"release":{"assurance":{"gate":"g2"}}}}',
+     "dup scope name"),
+    ('{"schema_version":1,"scopes":{"release":'
+     '{"assurance":{"gate":"g"},"assurance":{"gate":"g2"}}}}', "dup dimension key"),
+    ('{"schema_version":1,"scopes":{"release":{"assurance":'
+     '{"gate":"g","max_age_days":14,"max_age_days":null}}}}', "dup max_age_days disabling freshness"),
+])
+def test_load_dod_policy_rejects_duplicate_keys_fails_closed(tmp_path: Path, body, label) -> None:
+    # A duplicated JSON key silently keeps its LAST value in the stdlib decoder, which could erase
+    # a requirement or disable freshness -> false GO. The object_pairs_hook must fail CLOSED.
+    s = Store(tmp_path)
+    s.init(["lead"])
+    close.dod_policy_path(s).write_text(body, encoding="utf-8")
+    pol, err = close.load_dod_policy(s)
+    assert pol is None and err and "duplicate" in err.lower(), label
+
+
+def test_cli_dod_duplicate_scopes_does_not_false_go(tmp_path: Path, capsys) -> None:
+    # End-to-end: a policy that duplicates "scopes" (2nd one empty) must NOT resolve to zero
+    # requirements + GO; it must HOLD_INVALID_DOD_POLICY at `close check`.
+    root = _init(tmp_path)
+    close.dod_policy_path(Store(root)).write_text(
+        '{"schema_version":1,'
+        '"scopes":{"release":{"assurance":{"gate":"assurance:release","max_age_days":14}}},'
+        '"scopes":{}}', encoding="utf-8")
+    assert _open(root) == 0
+    assert _accept(root) == 0
+    rc, codes = _check_holds(root, capsys)
+    assert rc == 3 and close.HOLD_INVALID_DOD_POLICY in codes
+
+
+def test_evaluate_dod_assurance_revisionless_waiver_is_blanket_clear() -> None:
+    # A waiver with NO recorded revision is a deliberate operator BLANKET override (the design's
+    # escape valve; `gate waive` records no revision + is bounded by expiry/authorship). It clears
+    # even though the assurance gate is otherwise unmet, WITHOUT re-introducing the cross-revision
+    # danger (a waiver whose gate carries a DIFFERENT revision still HOLDs - see the M1 test).
+    a = _assurance_bundle(status="waived", waiver_active=True, revision=None)
+    assert close.evaluate_dod(_satisfied(), _dod_eval(a)) == []

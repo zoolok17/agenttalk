@@ -702,6 +702,20 @@ def dod_policy_path(store):
     return store.dir / DOD_DIRNAME
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    """``object_pairs_hook`` that fails CLOSED on a duplicated key at ANY object level. Python's
+    default decoder silently keeps the LAST value of a duplicated key, so a malformed policy like
+    ``{"scopes":{...},"scopes":{}}`` (erases all requirements) or a duplicated ``max_age_days``
+    (disables freshness) would decode to a valid-looking dict and produce a false GO *before*
+    validate_dod_policy ever runs. Rejecting duplicates at decode time closes that class."""
+    seen: dict[str, object] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key {key!r} in dod.json (ambiguous policy; fail closed)")
+        seen[key] = value
+    return seen
+
+
 def load_dod_policy(store) -> tuple[dict | None, str | None]:
     """Load + validate ``.agenttalk/dod.json``. Returns (policy, error): a MISSING file is a
     valid EMPTY policy -> (None, None) meaning "no DoD, zero required dimensions" (close behaves
@@ -715,7 +729,10 @@ def load_dod_policy(store) -> tuple[dict | None, str | None]:
         if size > _DOD_MAX_BYTES:
             # bound the file BEFORE decode so a pathological document cannot exhaust the parser.
             return None, f"dod.json exceeds max size ({size} > {_DOD_MAX_BYTES} bytes)"
-        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        # object_pairs_hook rejects duplicate keys at every level (a duplicated key would otherwise
+        # silently keep its last value and erase a requirement / disable freshness -> false GO).
+        raw = json.loads(path.read_text(encoding="utf-8-sig"),
+                         object_pairs_hook=_reject_duplicate_keys)
     except (ValueError, OSError, RecursionError) as e:
         # RecursionError: deeply-nested JSON. Must fail CLOSED, never propagate out of close check.
         return None, f"dod.json is unreadable/corrupt: {type(e).__name__}: {e}"
@@ -853,8 +870,8 @@ def _evaluate_dod_assurance(record: dict, a: dict | None) -> list[tuple[str, str
     the blocker-gate substrate it reads. ``evidence_source == "automation_ci"`` is a LABEL, not
     yet cryptographically authenticated CI provenance - gates.py forbids greening a blocker from
     other sources, but the label itself is not signed, so an actor who can write gates.json can
-    still assert it. Authenticated CI attestation is a separate substrate hardening (sibling to
-    the gate-waive authenticity work, task #13); until then this is the existing blocker-gate
+    still assert it. Authenticated CI attestation is a separate substrate hardening (task #64,
+    sibling to the gate-waive authenticity work #13); until then this is the existing blocker-gate
     mechanism (label-trust), NOT a cryptographic sole-certifier guarantee."""
     gate = (a or {}).get("gate") or "assurance"
     if not isinstance(a, dict) or not a.get("present"):
@@ -872,13 +889,18 @@ def _evaluate_dod_assurance(record: dict, a: dict | None) -> list[tuple[str, str
     revision_bound = a.get("revision") == record.get("revision")
     status = a.get("status")
     if status == "waived" and a.get("waiver_active"):
-        # M1: an operator waiver clears ONLY when bound to THIS close's revision - otherwise a
-        # waiver granted for another revision would silently clear this (possibly newer) close.
-        if not revision_bound:
-            return [(HOLD_STALE_ASSURANCE,
-                     f"assurance gate {gate!r} waiver is not bound to the close revision "
-                     f"({a.get('revision')!r} != {record.get('revision')!r})")]
-        return []
+        # M1 (refined after re-review): a waiver with NO recorded revision is a deliberate operator
+        # BLANKET override for the scope - `gate waive` does not (yet) record a revision, and it is
+        # already bounded by operator authorship + expiry, so it clears (this is the design's
+        # escape valve; a read-side revision requirement would make every waiver un-authorable).
+        # A waiver whose gate carries a DIFFERENT revision (e.g. left over from a prior `gate set`
+        # at another commit) is the original cross-revision danger and still HOLDs.
+        gate_rev = a.get("revision")
+        if gate_rev is None or gate_rev == record.get("revision"):
+            return []
+        return [(HOLD_STALE_ASSURANCE,
+                 f"assurance gate {gate!r} waiver is bound to a different revision "
+                 f"({gate_rev!r} != {record.get('revision')!r})")]
     if status != "green":
         return [(HOLD_MISSING_ASSURANCE,
                  f"assurance gate {gate!r} is not green (status={status!r})")]
