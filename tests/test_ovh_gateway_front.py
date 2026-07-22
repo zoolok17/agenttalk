@@ -5,6 +5,7 @@ import io
 import json
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -153,6 +154,21 @@ class RunningFront:
 
     def __enter__(self) -> RunningFront:
         self.thread.start()
+        # Readiness barrier: serve_forever() starts accepting asynchronously, and
+        # on a loaded runner (esp. Windows) a request can otherwise race a
+        # not-yet-accepting / just-recycled socket -> ConnectionAbortedError. Block
+        # until the listener actually accepts a connection before returning.
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                with socket.create_connection(
+                    ("127.0.0.1", self.config.public_port), timeout=0.5
+                ):
+                    break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("front did not become ready within 5s") from None
+                time.sleep(0.02)
         return self
 
     def __exit__(self, *_args: object) -> None:
@@ -182,13 +198,24 @@ class RunningFront:
             "Content-Type": "application/json",
         }
         request_headers.update(headers or {})
-        conn = http.client.HTTPConnection("127.0.0.1", self.config.public_port, timeout=5)
-        try:
-            conn.request(method, path, body=encoded, headers=request_headers)
-            response = conn.getresponse()
-            return response.status, response.read()
-        finally:
-            conn.close()
+        # Retry ONLY connection-level aborts (transient localhost socket races on
+        # loaded Windows runners) - never an HTTP response, so no status assertion
+        # is ever masked.
+        last_exc: OSError | None = None
+        for _ in range(5):
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", self.config.public_port, timeout=5)
+            try:
+                conn.request(method, path, body=encoded, headers=request_headers)
+                response = conn.getresponse()
+                return response.status, response.read()
+            except (ConnectionAbortedError, ConnectionResetError,
+                    ConnectionRefusedError) as exc:
+                last_exc = exc
+                time.sleep(0.05)
+            finally:
+                conn.close()
+        raise last_exc if last_exc is not None else RuntimeError("request failed")
 
     def raw_request(self, request: bytes) -> tuple[int, bytes]:
         with socket.create_connection(
