@@ -475,6 +475,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         store.mark_attempt_escalated(agent, record.get("id"), routed=routed)
 
     config_blocked_ids: set[str] = set()
+    gateway_held_escalated: set[str] = set()
 
     def _park_config_blocked(record: dict, *, reason_code: str = "config_blocked") -> None:
         """Hold a deterministic local config denial (e.g. a held gateway, an exec-denied bus
@@ -509,14 +510,31 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         surfaced by drive()'s health_writer.failure (STATE_RATE_LIMITED_OR_OUTAGE + 'gateway_held'),
         so this park does not also write health (avoiding a state flip-flop).
 
+        Escalate ONCE per head on first entering the held state: an operator-placed hold is
+        expected (park indefinitely, ruling), but a LedgerHold can also be AUTONOMOUS (an
+        unresolved provider attempt, a clock anomaly) that the operator never heard about - a
+        silent indefinite fleet stall. The one-shot routed notice restores the signal master
+        emitted via config_blocked, without a per-poll storm. The dedup lives in the loop
+        (gateway_held_escalated), NOT the attempt record, which clear_attempt wipes every poll.
+
         TRADE-OFF (bounded, fail-safe): clearing the attempt also forgets any PRIOR genuine
         failures on this head, so a message that is BOTH intermittently-held AND poison has its
-        poison run reset each hold. This only slows convergence for that pathological input and
-        errs toward retrying (never toward a wrongful dead-letter). It is unavoidable: preserving
-        history via record_attempt_result would let the write-ahead attempts_started climb into the
-        K_escalate dispose, dead-lettering the held head - exactly what park-indefinitely forbids."""
+        poison run reset each hold. On ovh-qwen this is bounded by the ledger's per-message caps
+        (300s wall / 8 calls / EUR 0.50) -> ChildTurnCapExceeded -> config_blocked park, so it
+        cannot retry a poison message forever. It errs toward retrying (never toward a wrongful
+        dead-letter). It is unavoidable: preserving history via record_attempt_result would let the
+        write-ahead attempts_started climb into the K_escalate dispose, dead-lettering the held
+        head - exactly what park-indefinitely forbids."""
         nonlocal last_hb, fail_sleep
-        store.clear_attempt(agent, record.get("id"))
+        head_id = record.get("id")
+        if isinstance(head_id, str) and head_id not in gateway_held_escalated:
+            gateway_held_escalated.add(head_id)
+            try:                              # a notification must never crash the loop
+                if on_escalate is not None:
+                    on_escalate(_info(record, {}, CLASS_GATEWAY_HELD))
+            except Exception:  # noqa: BLE001, S110  # nosec
+                pass
+        store.clear_attempt(agent, head_id)
         stamp()                          # blocked != dead: keep heartbeat + lead-loop lease fresh
         last_hb = clock()
         sleep(fail_sleep)

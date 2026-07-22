@@ -332,27 +332,20 @@ def test_ovh_qwen_profile_refuses_a_path_resolving_outside_workspace(
         )
 
 
-def test_ovh_policy_block_is_terminal_config_blocked() -> None:
-    # A policy block (trial cutoff / model mismatch) is TERMINAL for the message: it must park
-    # (config_blocked), never retry - the operator has to change policy for it to ever succeed.
+@pytest.mark.parametrize("code", ["ATGW_POLICY_BLOCKED", "ATGW_LEDGER_BLOCKED"])
+def test_ovh_policy_and_ledger_blocks_as_terminal_text_stay_config_blocked(code) -> None:
+    # A ledger/policy block surfaced as terminal TEXT is a 503 seen by an ALREADY-MINTED child
+    # turn mid-stream: it stays config_blocked (unchanged from master). CLASS_GATEWAY_HELD is
+    # scoped to the MINT-TIME hold only (see the signal test below) - a mid-turn hold cannot
+    # self-heal because the minted turn's 300s wall-clock keeps burning during the hold, so a
+    # post-clear re-mint hits ChildTurnCapExceeded -> config_blocked anyway (Fable review of
+    # b173f36, MAJOR-1). Full mid-turn recovery is the turn-reaper follow-up, not a classification.
     classification, summary = run._classify_drive_failure(
-        {"terminal": True, "terminal_text": 'API Error: 503 {"type":"ATGW_POLICY_BLOCKED"}'},
+        {"terminal": True, "terminal_text": f'API Error: 503 {{"type":"{code}"}}'},
         backend_profile="ovh-qwen",
     )
     assert classification == CLASS_CONFIG_BLOCKED
-    assert "policy" in summary
-
-
-def test_ovh_ledger_block_is_transient_gateway_held() -> None:
-    # A ledger block (503 ATGW_LEDGER_BLOCKED = held/unresolved accounting) is TRANSIENT and
-    # clears on operator action -> CLASS_GATEWAY_HELD (parked, re-driving, never dead-lettered),
-    # so a mid-turn hold self-heals when cleared instead of sticky-parking as config_blocked (#62).
-    classification, summary = run._classify_drive_failure(
-        {"terminal": True, "terminal_text": 'API Error: 503 {"type":"ATGW_LEDGER_BLOCKED"}'},
-        backend_profile="ovh-qwen",
-    )
-    assert classification == CLASS_GATEWAY_HELD
-    assert "held" in summary
+    assert "hold" in summary
 
 
 def test_gateway_transient_hold_signal_classifies_gateway_held() -> None:

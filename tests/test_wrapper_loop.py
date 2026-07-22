@@ -516,6 +516,27 @@ def test_gateway_held_never_disposes_and_keeps_attempt_ledger_flat_under_a_long_
     assert rec in (None, {}) or int(rec.get("attempts_started") or 0) <= 1
 
 
+def test_gateway_held_escalates_exactly_once_across_a_long_hold(tmp_path) -> None:
+    # #62 (Fable review MAJOR-2): a LedgerHold can be AUTONOMOUS (an unresolved provider attempt,
+    # a clock anomaly) that the operator never placed - a silent indefinite stall. The hold-park
+    # must emit ONE routed escalation on first entering the held state (restoring the signal
+    # master gave via config_blocked), and then NOT storm it every poll - even though clear_attempt
+    # wipes the per-attempt escalation dedup each poll (the dedup lives in the loop instead).
+    s = _store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="task")
+
+    def drive(rec):
+        return _gateway_held_drive()             # held for the whole run
+
+    escalations: list = []
+    loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=15, k_poison=0, k_escalate=0,
+        on_escalate=lambda info: escalations.append(info.get("msg_id")) or True,
+    )
+    assert len(escalations) == 1                  # one-shot, not once-per-poll
+
+
 # --------------------------------------------- make_drive (run.py, injected spawn)
 
 def _codex_turn_lines(thread_id: str = "t-1", text: str = "done") -> list[str]:

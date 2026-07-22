@@ -1615,18 +1615,18 @@ def _classify_drive_failure(
 
     if backend_profile == "ovh-qwen":
         text = _ovh_qwen_failure_text(sig)
-        # A per-message child-turn cap (calls/cost/wall-time) is PERMANENT for that message - a
-        # capped/expired turn can never re-mint - so it stays config_blocked (park), never retry.
         if "atgw_child_turn_cap_exceeded" in text:
             return CLASS_CONFIG_BLOCKED, "OVH child turn budget exhausted"
-        # A ledger HOLD (503 ATGW_LEDGER_BLOCKED = held/unresolved) is TRANSIENT and clears on
-        # operator action -> CLASS_GATEWAY_HELD (re-drive, never dead-letter), matching the
-        # mint-time hold above. A policy block (trial cutoff / model mismatch) is terminal ->
-        # stays config_blocked.
-        if "atgw_ledger_blocked" in text:
-            return CLASS_GATEWAY_HELD, "OVH gateway transport is temporarily held"
-        if "atgw_policy_blocked" in text:
-            return CLASS_CONFIG_BLOCKED, "OVH trial policy hold"
+        # A ledger/policy block surfaced as terminal TEXT (a 503 seen by an ALREADY-MINTED child
+        # turn mid-stream) stays config_blocked, unchanged from master. CLASS_GATEWAY_HELD is
+        # scoped to the MINT-TIME hold only (the gateway_transient_hold signal above), where no
+        # turn was minted so re-driving genuinely self-heals. A mid-turn hold cannot: the minted
+        # turn's 300s wall-clock keeps burning during the hold, so after the operator clears it a
+        # re-mint hits ChildTurnCapExceeded -> config_blocked anyway. Making the mid-turn text
+        # self-heal needs a turn-reaper for held-expired rows (the #63 residual / #62 follow-up),
+        # NOT a classification change here (Fable review of b173f36, MAJOR-1).
+        if "atgw_policy_blocked" in text or "atgw_ledger_blocked" in text:
+            return CLASS_CONFIG_BLOCKED, "OVH trial policy or accounting hold"
         if "atgw_config_error" in text or "status code: 422" in text or "http 422" in text:
             return CLASS_CONFIG_BLOCKED, "OVH gateway route or configuration error"
         infra_markers = (
