@@ -1168,9 +1168,12 @@ class SpendLedger:
                 # ceiling immediately and burns the whole budget while blocked, so it is
                 # already (near-)expired the instant the hold clears (#63: the held-gateway
                 # child turn that expired mid-work, surfacing as a misleading config_blocked).
-                # A held mint raises LedgerHold (a GatewayError) which the wrapper spawner
-                # treats as a transient park, and the next drive after the hold clears mints a
-                # fresh turn with a full wall-time window.
+                # A held mint raises LedgerHold (a GatewayError) -> the wrapper spawner treats it
+                # as a blocked turn, so NO doomed turn is opened and no wall-time is wasted.
+                # (The LEDGER permits a fresh full-window mint once the hold clears. The wrapper
+                # currently maps this to config_blocked and parks the head WITHOUT re-driving, so
+                # recovery after the hold clears is not yet automatic - #62 makes a transient
+                # gateway hold retry-through (INFRA) so the parked head self-heals on clear.)
                 if metadata.get("service_hold"):
                     raise LedgerHold("gateway has a durable accounting hold")
                 if self._unresolved(conn):
