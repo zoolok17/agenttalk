@@ -216,9 +216,6 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              cadence: Callable[[], CadenceResult] | None = None,
              on_health_idle: Callable[[], None] | None = None,
              on_health_parked: Callable[[dict, str], None] | None = None,
-             config_blocked_reprobe_seconds: float = 120.0,
-             config_blocked_reprobe_backoff: float = 2.0,
-             config_blocked_reprobe_max_seconds: float = 1800.0,
              capacity_refresh: Callable[[], None] | None = None,
              capacity_interval_seconds: float = 60.0,
              wrapper_generation: str | None = None,
@@ -297,9 +294,6 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
             on_dead_letter=on_dead_letter, on_escalate=on_escalate, stamp=stamp,
             pre_commit=pre_commit, cadence=cadence, on_health_idle=on_health_idle,
             on_health_parked=on_health_parked,
-            config_blocked_reprobe_seconds=config_blocked_reprobe_seconds,
-            config_blocked_reprobe_backoff=config_blocked_reprobe_backoff,
-            config_blocked_reprobe_max_seconds=config_blocked_reprobe_max_seconds,
             capacity_refresh=capacity_refresh,
             capacity_interval_seconds=capacity_interval_seconds,
             commit_gate=commit_gate,
@@ -325,9 +319,6 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     cadence: Callable[[], CadenceResult] | None,
                     on_health_idle: Callable[[], None] | None,
                     on_health_parked: Callable[[dict, str], None] | None,
-                    config_blocked_reprobe_seconds: float,
-                    config_blocked_reprobe_backoff: float,
-                    config_blocked_reprobe_max_seconds: float,
                     capacity_refresh: Callable[[], None] | None,
                     capacity_interval_seconds: float,
                     commit_gate,
@@ -476,48 +467,13 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         store.mark_attempt_escalated(agent, record.get("id"), routed=routed)
 
     config_blocked_ids: set[str] = set()
-    # Per-head config-blocked RE-PROBE state (this run only; a relaunch starts empty ->
-    # re-probes the head on first sight, so a fix applied while the worker was down is
-    # picked up immediately). ``_probe_at`` = clock() of the last DRIVE probe; ``_interval``
-    # = the current (backing-off) wait before the next probe. Absent = never probed this run.
-    config_blocked_probe_at: dict[str, float] = {}
-    config_blocked_probe_interval: dict[str, float] = {}
-
-    def _config_blocked_reprobe_due(head_id: object) -> bool:
-        """True if a latched config-blocked head is due for a re-probe drive (the block may
-        have cleared). Never probes when reprobe is disabled (interval <= 0). First sight this
-        run (no recorded probe) is always due, so a relaunch re-drives the head at once."""
-        if config_blocked_reprobe_seconds <= 0:
-            return False
-        last = config_blocked_probe_at.get(head_id)
-        if last is None:
-            return True
-        interval = config_blocked_probe_interval.get(head_id, config_blocked_reprobe_seconds)
-        return (clock() - last) >= interval
-
-    def _config_blocked_mark_parked(head_id: object) -> None:
-        """Record that a drive probe just re-confirmed the block: restart the wait clock and
-        widen the next interval (bounded) so a PERSISTENT block backs off instead of re-driving
-        (and, for a paid worker, re-spending) every interval forever."""
-        prev = config_blocked_probe_interval.get(head_id)
-        nxt = (config_blocked_reprobe_seconds if prev is None
-               else min(config_blocked_reprobe_max_seconds,
-                        prev * max(1.0, config_blocked_reprobe_backoff)))
-        config_blocked_probe_interval[head_id] = nxt
-        config_blocked_probe_at[head_id] = clock()
-
-    def _config_blocked_clear(head_id: object) -> None:
-        config_blocked_probe_at.pop(head_id, None)
-        config_blocked_probe_interval.pop(head_id, None)
-        config_blocked_ids.discard(head_id) if isinstance(head_id, str) else None
 
     def _park_config_blocked(record: dict, *, reason_code: str = "config_blocked") -> None:
         """Hold a deterministic local config denial (e.g. a held gateway, an exec-denied bus
-        write) at the head WITHOUT consuming it. Emits a distinct advisory HEALTH state so
-        status/doctor show the worker as blocked-on-a-message rather than a frozen 'idle' - the
-        health-freeze that hid this wedge (#58). The heartbeat still stamps (a blocked worker is
-        not dead), so the supervisor does NOT restart it; recovery is the bounded re-probe, not a
-        relaunch (a relaunch re-parked on the stale latch, the original wedge)."""
+        write) at the head WITHOUT consuming it. Emits a distinct advisory HEALTH state (via
+        ``on_health_parked``) so status/doctor show the worker as blocked-on-a-message rather
+        than a frozen 'idle' - the health-freeze that hid this wedge (#58). The heartbeat still
+        stamps (a blocked worker is not dead), so the supervisor does NOT restart it."""
         nonlocal last_hb, fail_sleep
         if on_health_parked is not None:
             try:
@@ -918,17 +874,10 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         store.reconcile_crash_in_progress(agent, head_id, at=now_iso())
         rec = store.attempt_record(agent, head_id) or {}
         if rec.get("last_failure_class") == CLASS_CONFIG_BLOCKED:
-            # A head latched config-blocked by a PRIOR poll/run. Do NOT trust that latch
-            # forever: when a re-probe is due, fall through to re-drive (the block may have
-            # cleared - operator un-held the gateway, fixed the config). If not due, park
-            # quietly (visible health + fresh heartbeat) until the next probe window.
-            if not _config_blocked_reprobe_due(head_id):
-                if isinstance(head_id, str):
-                    config_blocked_ids.add(head_id)
-                _park_config_blocked(record)
-                continue
-            # else: re-probe -> fall through to the drive path below (the `!= CONFIG_BLOCKED`
-            # cap guards keep it from being disposed while still latched config-blocked).
+            if isinstance(head_id, str):
+                config_blocked_ids.add(head_id)
+            _park_config_blocked(record)
+            continue
         # AUTO-DISPOSE WITHOUT DRIVE if a cap is already reached on entry (covers the
         # relaunch/crash-accumulation path - test #3).
         if rec.get("last_failure_class") != CLASS_CONFIG_BLOCKED:
@@ -1049,7 +998,6 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 continue
             store.clear_attempt(agent, head_id)
             store.gc_attempts_below(agent, store.cursor(agent))
-            _config_blocked_clear(head_id)              # a re-probe that succeeded: recovered
             last_hb = clock()                           # drive already stamped on success
             _maybe_refresh_capacity(last_hb)
             fail_sleep = idle_interval                  # reset failure backoff
@@ -1064,7 +1012,6 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         if outcome.failure_class == CLASS_CONFIG_BLOCKED:
             if isinstance(head_id, str):
                 config_blocked_ids.add(head_id)
-            _config_blocked_mark_parked(head_id)   # a drive re-confirmed it: back off the probe
             _park_config_blocked(record)
             continue
         if (k_poison > 0 and outcome.failure_class == CLASS_POISON

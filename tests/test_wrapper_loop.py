@@ -449,52 +449,6 @@ def test_config_blocked_head_parks_with_visible_health_not_frozen_idle(tmp_path)
     assert s.cursor("beta") == ""                        # head still parked, never committed
 
 
-def test_config_blocked_head_reprobes_and_recovers_when_block_clears(tmp_path) -> None:
-    # #58 part B: the loop must not trust the latched config-blocked class forever. After the
-    # re-probe interval it re-drives; when the block has cleared the head is handled + committed.
-    s = _store(tmp_path)
-    m = s.send(sender="alpha", recipient="beta", body="task")
-    t = {"now": 0.0}
-    drives = {"n": 0}
-
-    def drive(rec):
-        drives["n"] += 1
-        if drives["n"] == 1:
-            return _config_blocked_drive()               # blocked on first attempt
-        return True                                      # block cleared -> success
-
-    turns = loop.run_loop(
-        s, "beta", drive, clock=lambda: t["now"],
-        sleep=lambda d: t.__setitem__("now", t["now"] + max(d, 0.1)),
-        max_turns=1, max_polls=50, k_poison=0, k_escalate=0,
-        config_blocked_reprobe_seconds=1.0,
-    )
-    assert turns == 1
-    assert drives["n"] == 2                              # parked, then re-probed successfully
-    assert s.cursor("beta") == m.id                      # recovered -> committed, no manual reset
-
-
-def test_config_blocked_reprobe_can_be_disabled_and_parks_without_redriving(tmp_path) -> None:
-    # The re-probe is a knob: reprobe_seconds<=0 preserves the pure park-until-fixed behavior
-    # (no re-drive, so no re-spend), even across large time jumps.
-    s = _store(tmp_path)
-    s.send(sender="alpha", recipient="beta", body="task")
-    t = {"now": 0.0}
-    drives = {"n": 0}
-
-    def drive(rec):
-        drives["n"] += 1
-        return _config_blocked_drive()
-
-    loop.run_loop(
-        s, "beta", drive, clock=lambda: t["now"],
-        sleep=lambda d: t.__setitem__("now", t["now"] + 100.0),   # huge jumps between polls
-        max_polls=6, k_poison=0, k_escalate=0,
-        config_blocked_reprobe_seconds=0.0,                       # disabled
-    )
-    assert drives["n"] == 1                              # never re-driven despite the time jumps
-
-
 # --------------------------------------------- make_drive (run.py, injected spawn)
 
 def _codex_turn_lines(thread_id: str = "t-1", text: str = "done") -> list[str]:
