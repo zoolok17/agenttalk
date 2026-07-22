@@ -2348,22 +2348,14 @@ def _resolve_dod_assurance_gate(store, spec: dict) -> dict:
 
 def _iso_age_days(updated_at: object, now) -> float | None:
     """Age in days of an ISO-8601 ``updated_at`` vs ``now``; None if missing/unparseable. Never
-    raises (freshness is advisory - a bad timestamp must not crash `close check`)."""
-    if not isinstance(updated_at, str) or not updated_at.strip():
+    raises (freshness is advisory - a bad timestamp must not crash `close check`). Reuses the
+    existing :func:`_parse_ts` timestamp parser."""
+    if not isinstance(updated_at, str):
         return None
-    try:
-        from datetime import timezone
-        parsed = datetime_fromisoformat_z(updated_at)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return max(0.0, (now - parsed).total_seconds() / 86400.0)
-    except (ValueError, TypeError):
+    parsed = _parse_ts(updated_at)
+    if parsed is None:
         return None
-
-
-def datetime_fromisoformat_z(value: str):
-    from datetime import datetime
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return max(0.0, (now - parsed).total_seconds() / 86400.0)
 
 
 def _signoff_risk_inventory(args, store, record: dict) -> list[dict]:
