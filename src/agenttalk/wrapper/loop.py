@@ -215,6 +215,7 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              manage_waiting: bool = True,
              cadence: Callable[[], CadenceResult] | None = None,
              on_health_idle: Callable[[], None] | None = None,
+             on_health_parked: Callable[[dict, str], None] | None = None,
              capacity_refresh: Callable[[], None] | None = None,
              capacity_interval_seconds: float = 60.0,
              wrapper_generation: str | None = None,
@@ -292,6 +293,7 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
             noninfra_sub_ceiling=noninfra_sub_ceiling,
             on_dead_letter=on_dead_letter, on_escalate=on_escalate, stamp=stamp,
             pre_commit=pre_commit, cadence=cadence, on_health_idle=on_health_idle,
+            on_health_parked=on_health_parked,
             capacity_refresh=capacity_refresh,
             capacity_interval_seconds=capacity_interval_seconds,
             commit_gate=commit_gate,
@@ -316,6 +318,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     pre_commit: Callable[[], None] | None,
                     cadence: Callable[[], CadenceResult] | None,
                     on_health_idle: Callable[[], None] | None,
+                    on_health_parked: Callable[[dict, str], None] | None,
                     capacity_refresh: Callable[[], None] | None,
                     capacity_interval_seconds: float,
                     commit_gate,
@@ -465,9 +468,19 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
 
     config_blocked_ids: set[str] = set()
 
-    def _park_config_blocked(record: dict) -> None:
-        """Keep a deterministic local config denial visible without consuming the head."""
+    def _park_config_blocked(record: dict, *, reason_code: str = "config_blocked") -> None:
+        """Hold a deterministic local config denial (e.g. a held gateway, an exec-denied bus
+        write) at the head WITHOUT consuming it. Emits a distinct advisory HEALTH state (via
+        ``on_health_parked``) so status/doctor show the worker as blocked-on-a-message rather
+        than a frozen 'idle' - the health-freeze that hid this wedge (#58). The heartbeat still
+        stamps (a blocked worker is not dead), so the supervisor does NOT restart it."""
         nonlocal last_hb, fail_sleep
+        if on_health_parked is not None:
+            # advisory health must never break loop progress
+            try:
+                on_health_parked(record, reason_code)
+            except Exception:  # noqa: BLE001, S110  # nosec
+                pass
         _escalate_once(record, CLASS_CONFIG_BLOCKED, retry_unrouted=False)
         stamp()                          # keeps wrapper heartbeat and lead-loop lease fresh
         last_hb = clock()

@@ -10066,6 +10066,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             manage_waiting=not lead_loop,  # the lead-loop LEASE owns the .waiting mirror
             cadence=cadence_hook,  # WP3 proactive sweep (lead-loop only)
             on_health_idle=health_writer.idle,
+            on_health_parked=health_writer.parked,  # #58: config-blocked park is visible, not a frozen 'idle'
             capacity_refresh=capacity_refresh,
             wrapper_generation=wrapper_generation,
             commit_gate=commit_gate,

@@ -412,6 +412,43 @@ def test_loop_idle_stamps_heartbeat(tmp_path) -> None:
     assert s.read_heartbeat("beta") is not None   # idle kept the heartbeat fresh
 
 
+# ------------------------------------------- #58: config-blocked park visibility + re-probe
+
+def _config_blocked_drive():
+    return loop.DriveOutcome(ok=False, failure_class=loop.CLASS_CONFIG_BLOCKED,
+                             summary="ovh-qwen gateway is held (ledger_not_ready)")
+
+
+def test_config_blocked_head_parks_with_visible_health_not_frozen_idle(tmp_path) -> None:
+    # #58 part A: a config-blocked head is HELD (never consumed), but the park must surface a
+    # distinct health signal on EVERY park cycle (not a frozen 'idle') so status/doctor show
+    # the block. The heartbeat still stamps; the cursor never advances.
+    s = _store(tmp_path)
+    m = s.send(sender="alpha", recipient="beta", body="task")
+    drives = {"n": 0}
+
+    def drive(rec):
+        drives["n"] += 1
+        return _config_blocked_drive()
+
+    parked: list[tuple] = []
+    idled = {"n": 0}
+    loop.run_loop(
+        s, "beta", drive, clock=lambda: 0.0, sleep=lambda d: None,
+        max_polls=4, k_poison=0, k_escalate=0,
+        on_health_idle=lambda: idled.__setitem__("n", idled["n"] + 1),
+        on_health_parked=lambda rec, reason: parked.append((rec.get("id"), reason)),
+    )
+    # driven exactly ONCE (poll 1); later polls auto-park on the latched class without driving
+    # (constant clock -> re-probe never due).
+    assert drives["n"] == 1
+    assert len(parked) >= 2                              # visible on every park, not silent-once
+    assert all(pid == m.id and reason == "config_blocked" for pid, reason in parked)
+    assert idled["n"] == 1                               # only the one-time startup idle; parks never re-idle
+    assert s.read_heartbeat("beta") is not None          # heartbeat stays fresh (not dead)
+    assert s.cursor("beta") == ""                        # head still parked, never committed
+
+
 # --------------------------------------------- make_drive (run.py, injected spawn)
 
 def _codex_turn_lines(thread_id: str = "t-1", text: str = "done") -> list[str]:

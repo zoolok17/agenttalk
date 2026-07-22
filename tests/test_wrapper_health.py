@@ -352,6 +352,29 @@ def test_health_failure_and_degraded_mappings(tmp_path: Path) -> None:
     assert _health_state(s) == hm.STATE_DEGRADED_OUTPUT
 
 
+def test_health_writer_parked_surfaces_blocked_state_with_resolved_request_id(
+    tmp_path: Path,
+) -> None:
+    # #58: a config-blocked PARK must write a distinct, visible state (not leave a frozen
+    # 'idle'), carrying the parked head's ids. request_id is resolved from meta (the real bus
+    # shape, #17) - not read bare top-level where it is absent.
+    from agenttalk.wrapper.health import WrapperHealthWriter
+
+    s = _store(tmp_path)
+    w = WrapperHealthWriter(s, "beta", "claude", mode="wrapper-loop")
+    w.idle()                                        # start from idle_waiting
+    assert w.state == hm.STATE_IDLE_WAITING
+    w.parked({"id": "20990101-000000-000000-HEAL", "meta": {"request_id": "q-held-7"}})
+
+    assert w.state == hm.STATE_ERRORED_AMBIGUOUS    # no longer masquerading as idle
+    view = s.read_health("beta", ttl_seconds=999999)
+    assert view["state"] == hm.STATE_ERRORED_AMBIGUOUS
+    assert view["reason_code"] == "config_blocked"
+    raw = s.read_health_raw("beta")
+    assert raw["request_id"] == "q-held-7"          # resolved from meta, not a frozen None
+    assert raw["msg_id"] == "20990101-000000-000000-HEAL"
+
+
 def test_health_json_never_contains_message_or_output_content(tmp_path: Path) -> None:
     s = _store(tmp_path)
     secret = "SECRET_HEALTH_LEAK_74f78b"  # gitleaks:allow
