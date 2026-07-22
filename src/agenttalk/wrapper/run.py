@@ -59,7 +59,19 @@ _BENIGN_PIPE_TEARDOWN_ERRNOS = {errno.EINVAL, errno.EPIPE}
 
 
 class _GatewayChildCapUnavailable(RuntimeError):
-    """The wrapper could not durably issue a scoped paid-child credential."""
+    """The wrapper could not durably issue a scoped paid-child credential.
+
+    ``transient`` marks an operator-resolvable gateway HOLD (a durable accounting
+    hold, an unresolved prior attempt, or a clock rollback needing reconciliation -
+    i.e. any ``LedgerHold``) as opposed to a durable local/config denial. A transient
+    hold is classified INFRA (retry-through, never dead-lettered) so a worker blocked
+    only because the gateway is held self-heals when the hold clears, instead of
+    sticky-parking as config_blocked forever (#62). A NON-transient cause (missing
+    message id, ChildTurnCapExceeded, a local exec denial) stays config_blocked."""
+
+    def __init__(self, message: str, *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 # Legacy infra-like text markers. These are low-confidence hints only; they deliberately
 # no longer classify known_global_infra without a structured CLI status/rate-limit fact.
@@ -1594,12 +1606,26 @@ def _classify_drive_failure(
         CLASS_POISON,
     )
 
+    # A TRANSIENT, operator-resolvable gateway hold surfaced at mint time (#62): classify
+    # INFRA (retry-through, never dead-lettered) so the worker self-heals when the hold
+    # clears. Deterministic explicit signal - checked before any text heuristics.
+    if sig.get("gateway_transient_hold"):
+        return CLASS_INFRA, "OVH gateway is temporarily held; retrying until it clears"
+
     if backend_profile == "ovh-qwen":
         text = _ovh_qwen_failure_text(sig)
+        # A per-message child-turn cap (calls/cost/wall-time) is PERMANENT for that message
+        # - a capped/expired turn can never re-mint - so it must stay config_blocked (park),
+        # NOT retry (an INFRA classification would spin forever, never dead-lettering).
         if "atgw_child_turn_cap_exceeded" in text:
             return CLASS_CONFIG_BLOCKED, "OVH child turn budget exhausted"
-        if "atgw_policy_blocked" in text or "atgw_ledger_blocked" in text:
-            return CLASS_CONFIG_BLOCKED, "OVH trial policy or accounting hold"
+        # A ledger HOLD (503 ATGW_LEDGER_BLOCKED = held/unresolved) is TRANSIENT and clears
+        # on operator action -> retry-through (INFRA) so a mid-turn hold self-heals (#62).
+        # A policy block (trial cutoff / model mismatch) is terminal -> stays config_blocked.
+        if "atgw_ledger_blocked" in text:
+            return CLASS_INFRA, "OVH gateway transport is temporarily held"
+        if "atgw_policy_blocked" in text:
+            return CLASS_CONFIG_BLOCKED, "OVH trial policy hold"
         if "atgw_config_error" in text or "status code: 422" in text or "http 422" in text:
             return CLASS_CONFIG_BLOCKED, "OVH gateway route or configuration error"
         infra_markers = (
@@ -1883,7 +1909,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             # Same for a disabled/invalid work_heartbeat config.
             gateway_capability = None
             if backend_profile == "ovh-qwen":
-                from agenttalk.ovh_gateway import GatewayError, SpendLedger
+                from agenttalk.ovh_gateway import GatewayError, LedgerHold, SpendLedger
 
                 if not active_message_id:
                     raise _GatewayChildCapUnavailable(
@@ -1898,6 +1924,18 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                             (profile_env or {}).get("ANTHROPIC_AUTH_TOKEN") or ""
                         ),
                     ).token
+                except LedgerHold as exc:
+                    # A held/unresolved/clock-rollback gateway: TRANSIENT + operator-
+                    # resolvable. Mark it so the turn classifies INFRA (retry-through) and
+                    # the worker self-heals when the hold clears, instead of parking as
+                    # config_blocked forever (#62). ChildTurnCapExceeded is deliberately a
+                    # LedgerBlocked (not LedgerHold), so a permanently-capped message never
+                    # takes this path and never spins.
+                    raise _GatewayChildCapUnavailable(
+                        "durable child turn capability unavailable: "
+                        f"{type(exc).__name__}",
+                        transient=True,
+                    ) from exc
                 except (GatewayError, OSError, ValueError) as exc:
                     raise _GatewayChildCapUnavailable(
                         "durable child turn capability unavailable: "
@@ -2046,9 +2084,18 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         except _GatewayChildCapUnavailable as e:
             _capture_child_output("stderr", f"{type(e).__name__}: {e}")
             _finalize_child_output()
-            sig["config_blocked"] = True
-            sig["config_blocked_text"] = str(e)
-            sig["error"] = str(e)
+            if e.transient:
+                # Transient, operator-resolvable gateway hold: classify INFRA (retry-
+                # through, never dead-lettered) so the worker resumes when the hold
+                # clears rather than sticky-parking as config_blocked (#62). No child
+                # spawned, no spend - the retry is cheap.
+                sig["gateway_transient_hold"] = True
+                sig["retryable"] = True
+                sig["error"] = str(e)
+            else:
+                sig["config_blocked"] = True
+                sig["config_blocked_text"] = str(e)
+                sig["error"] = str(e)
             return sig
         except OSError as e:
             _capture_child_output("stderr", f"{type(e).__name__}: {e}")

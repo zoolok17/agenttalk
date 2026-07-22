@@ -327,14 +327,50 @@ def test_ovh_qwen_profile_refuses_a_path_resolving_outside_workspace(
         )
 
 
-@pytest.mark.parametrize("code", ["ATGW_POLICY_BLOCKED", "ATGW_LEDGER_BLOCKED"])
-def test_ovh_policy_and_ledger_blocks_are_terminal_non_poison(code) -> None:
+def test_ovh_policy_block_is_terminal_config_blocked() -> None:
+    # A trial-cutoff / model-mismatch policy block is TERMINAL (won't clear by retry).
     classification, summary = run._classify_drive_failure(
-        {"terminal": True, "terminal_text": f'API Error: 503 {{"type":"{code}"}}'},
+        {"terminal": True, "terminal_text": 'API Error: 503 {"type":"ATGW_POLICY_BLOCKED"}'},
         backend_profile="ovh-qwen",
     )
     assert classification == CLASS_CONFIG_BLOCKED
     assert "hold" in summary
+
+
+def test_ovh_ledger_block_is_transient_infra_retry_through() -> None:
+    # #62: a 503 ATGW_LEDGER_BLOCKED is a held/unresolved gateway - TRANSIENT and operator-
+    # resolvable. It must classify INFRA (retry-through, never dead-lettered) so a hold
+    # applied mid-turn self-heals when it clears, NOT config_blocked (which sticky-parks).
+    # (This deliberately reverses the prior "ledger block is terminal" assumption - the bug.)
+    classification, summary = run._classify_drive_failure(
+        {"terminal": True, "terminal_text": 'API Error: 503 {"type":"ATGW_LEDGER_BLOCKED"}'},
+        backend_profile="ovh-qwen",
+    )
+    assert classification == CLASS_INFRA
+    assert "held" in summary
+
+
+def test_gateway_transient_hold_signal_classifies_infra() -> None:
+    # #62: a mint-time LedgerHold (gateway held / unresolved / clock-rollback) is surfaced by
+    # the spawner as an explicit gateway_transient_hold signal -> INFRA (retry-through), so a
+    # worker blocked only because the gateway is held resumes when the hold clears.
+    classification, summary = run._classify_drive_failure(
+        {"gateway_transient_hold": True, "error": "durable child turn capability unavailable: LedgerHold"},
+        backend_profile="ovh-qwen",
+    )
+    assert classification == CLASS_INFRA
+    assert "held" in summary
+    # deterministic regardless of backend
+    other, _ = run._classify_drive_failure(
+        {"gateway_transient_hold": True}, backend_profile=None,
+    )
+    assert other == CLASS_INFRA
+
+
+def test_gateway_cap_unavailable_carries_transient_flag() -> None:
+    # The exception distinguishes a transient hold from a durable local denial.
+    assert run._GatewayChildCapUnavailable("x", transient=True).transient is True
+    assert run._GatewayChildCapUnavailable("x").transient is False
 
 
 def test_ovh_child_turn_cap_is_terminal_config_blocked() -> None:
