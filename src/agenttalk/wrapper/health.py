@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from agenttalk import health as health_model
+from agenttalk.correlation import resolve_request_id
 
 from .events import Event, EventType
 from .loop import CLASS_AMBIGUOUS, CLASS_CONFIG_BLOCKED, CLASS_INFRA, CLASS_POISON
@@ -111,6 +112,23 @@ class WrapperHealthWriter:
             request_id=self._request_id,
             msg_id=self._msg_id,
             force=True,
+        )
+
+    def parked(self, record: dict[str, Any] | None, reason_code: str = "config_blocked") -> None:
+        """The loop is HOLDING a config-blocked head without driving it (deterministic local
+        exec/config denial - e.g. a held gateway, an exec-denied bus write). Surface it as a
+        distinct advisory state carrying the parked head's ids, so ``status``/``doctor`` show
+        the worker as blocked-on-a-message instead of a frozen last state (the health-freeze
+        that hid the wedge, #58). Not forced: the first park is a state change (written at once)
+        and repeats throttle, so a long park is one visible transition, not a write storm."""
+        record = record if isinstance(record, dict) else {}
+        request_id = resolve_request_id(record)
+        msg_id = record.get("id")
+        self._write(
+            health_model.STATE_ERRORED_AMBIGUOUS,
+            reason_code=reason_code,
+            request_id=request_id if isinstance(request_id, str) else None,
+            msg_id=msg_id if isinstance(msg_id, str) else None,
         )
 
     def event(self, event: Event) -> None:
