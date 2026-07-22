@@ -23,6 +23,7 @@ import threading
 import pytest
 
 from agenttalk import cli, close, gates
+from agenttalk import knowledge as kn
 from agenttalk.store import Store
 
 SHA = "a" * 40
@@ -966,7 +967,7 @@ def test_validate_dod_policy_allows_absent_max_age() -> None:
     {"schema_version": True, "scopes": {}},
     {"schema_version": 1, "scopes": "nope"},
     {"schema_version": 1, "scopes": {"release": "nope"}},
-    {"schema_version": 1, "scopes": {"release": {"knowledge": {"min_notes": 1}}}},  # unsupported
+    {"schema_version": 1, "scopes": {"release": {"coverage": {"floor_pct": 70}}}},  # unsupported
     {"schema_version": 1, "scopes": {"release": {"assurance": {}}}},                # missing gate
     {"schema_version": 1, "scopes": {"release": {"assurance": {"gate": ""}}}},      # empty gate
     {"schema_version": 1, "scopes": {"release": {"assurance": {"gate": "g",
@@ -987,9 +988,9 @@ def test_load_dod_policy_malformed_fails_closed(tmp_path: Path) -> None:
     s = Store(tmp_path)
     s.init(["lead"])
     close.dod_policy_path(s).write_text('{"schema_version": 1, "scopes": {"release": '
-                                        '{"knowledge": {}}}}', encoding="utf-8")
+                                        '{"coverage": {}}}}', encoding="utf-8")
     policy, err = close.load_dod_policy(s)
-    assert policy is None and err and "knowledge" in err
+    assert policy is None and err and "coverage" in err
 
 
 # ------------------------------------------------------ derive_required_dod
@@ -1157,7 +1158,7 @@ def test_cli_dod_stale_when_gate_bound_to_other_revision(tmp_path: Path, capsys)
 def test_cli_dod_malformed_policy_fails_closed_without_crash(tmp_path: Path, capsys) -> None:
     root = _init(tmp_path)
     close.dod_policy_path(Store(root)).write_text(
-        '{"schema_version": 1, "scopes": {"release": {"knowledge": {}}}}', encoding="utf-8")
+        '{"schema_version": 1, "scopes": {"release": {"coverage": {}}}}', encoding="utf-8")
     assert _open(root) == 0
     assert _accept(root) == 0
     rc, codes = _check_holds(root, capsys)
@@ -1303,3 +1304,161 @@ def test_evaluate_dod_assurance_revisionless_waiver_does_not_clear() -> None:
     # (Codex re-review of 848841a, BLOCKER). Authenticated operator escape = task #65.
     a = _assurance_bundle(status="waived", waiver_active=True, revision=None)
     assert close.HOLD_MISSING_ASSURANCE in _dcodes(close.evaluate_dod(_satisfied(), _dod_eval(a)))
+
+
+# ============================================================ #60 inc-2: knowledge dimension
+
+def _knowledge_bundle(**over) -> dict:
+    """A satisfied resolved knowledge bundle (required on remediation, one bound non-trivial
+    note). Override any field to build the failing variants."""
+    b = {"when": "on_remediation", "min_notes": 1, "min_body_chars": 40,
+         "types": ["decision", "gotcha", "lesson"], "has_remediation": True,
+         "bound_notes": [{"type": "lesson", "body_len": 60}]}
+    b.update(over)
+    return b
+
+
+def _dod_eval_k(knowledge: dict | None) -> dict:
+    return {"policy_present": True, "policy_error": None,
+            "required_dimensions": {"knowledge": {}}, "knowledge": knowledge}
+
+
+# ---- validate the knowledge spec
+
+def test_validate_dod_knowledge_spec_defaults_roundtrip() -> None:
+    pol = close.validate_dod_policy(
+        {"schema_version": 1, "scopes": {"feature": {"knowledge": {}}}})
+    assert pol["scopes"]["feature"]["knowledge"] == {
+        "when": "on_remediation", "min_notes": 1,
+        "types": ["decision", "gotcha", "lesson"], "min_body_chars": 40}
+
+
+def test_validate_dod_knowledge_spec_explicit_roundtrip() -> None:
+    pol = close.validate_dod_policy({"schema_version": 1, "scopes": {"release": {
+        "knowledge": {"when": "always", "min_notes": 2, "types": ["gotcha"],
+                      "min_body_chars": 10}}}})
+    assert pol["scopes"]["release"]["knowledge"] == {
+        "when": "always", "min_notes": 2, "types": ["gotcha"], "min_body_chars": 10}
+
+
+@pytest.mark.parametrize("spec", [
+    {"when": "sometimes"},
+    {"min_notes": 0},
+    {"min_notes": True},
+    {"types": []},
+    {"types": ["bogus"]},
+    {"types": "gotcha"},
+    {"min_body_chars": -1},
+])
+def test_validate_dod_knowledge_spec_malformed_raises(spec) -> None:
+    with pytest.raises(close.CloseError):
+        close.validate_dod_policy(
+            {"schema_version": 1, "scopes": {"release": {"knowledge": spec}}})
+
+
+# ---- evaluate_dod knowledge (pure)
+
+def test_evaluate_dod_knowledge_not_required_when_no_remediation() -> None:
+    ev = _dod_eval_k(_knowledge_bundle(when="on_remediation", has_remediation=False,
+                                       bound_notes=[]))
+    assert close.evaluate_dod(_satisfied(), ev) == []
+
+
+def test_evaluate_dod_knowledge_always_with_no_notes_holds_missing() -> None:
+    # when=always requires knowledge even with no remediation on the close.
+    ev = _dod_eval_k(_knowledge_bundle(when="always", has_remediation=False, bound_notes=[]))
+    holds = close.evaluate_dod(_satisfied(), ev)
+    assert len(holds) == 1 and holds[0][0] == close.HOLD_MISSING_KNOWLEDGE
+
+
+def test_evaluate_dod_knowledge_remediation_no_notes_holds_missing() -> None:
+    ev = _dod_eval_k(_knowledge_bundle(bound_notes=[]))
+    assert close.evaluate_dod(_satisfied(), ev)[0][0] == close.HOLD_MISSING_KNOWLEDGE
+
+
+def test_evaluate_dod_knowledge_only_stubs_holds_trivial() -> None:
+    ev = _dod_eval_k(_knowledge_bundle(min_body_chars=40,
+                                       bound_notes=[{"type": "gotcha", "body_len": 12}]))
+    assert close.evaluate_dod(_satisfied(), ev)[0][0] == close.HOLD_TRIVIAL_EVIDENCE
+
+
+def test_evaluate_dod_knowledge_fewer_than_min_holds_missing() -> None:
+    ev = _dod_eval_k(_knowledge_bundle(min_notes=2,
+                                       bound_notes=[{"type": "lesson", "body_len": 60}]))
+    assert close.evaluate_dod(_satisfied(), ev)[0][0] == close.HOLD_MISSING_KNOWLEDGE
+
+
+def test_evaluate_dod_knowledge_satisfied_is_empty() -> None:
+    assert close.evaluate_dod(_satisfied(), _dod_eval_k(_knowledge_bundle())) == []
+
+
+def test_evaluate_dod_knowledge_missing_bundle_holds_missing() -> None:
+    ev = {"policy_present": True, "policy_error": None,
+          "required_dimensions": {"knowledge": {}}, "knowledge": None}
+    assert close.evaluate_dod(_satisfied(), ev)[0][0] == close.HOLD_MISSING_KNOWLEDGE
+
+
+# ---- compute_verdict integration (knowledge)
+
+def test_compute_verdict_unmet_knowledge_flips_go_to_hold() -> None:
+    result = close.compute_verdict(
+        _satisfied(), _gate_go(), None, None, _dod_eval_k(_knowledge_bundle(bound_notes=[])))
+    assert result["verdict"] == close.VERDICT_HOLD
+    assert _codes(result) == {close.HOLD_MISSING_KNOWLEDGE}   # reached the DoD fold, not MALFORMED
+
+
+def test_compute_verdict_satisfied_knowledge_stays_go() -> None:
+    result = close.compute_verdict(
+        _satisfied(), _gate_go(), None, None, _dod_eval_k(_knowledge_bundle()))
+    assert result["verdict"] == close.VERDICT_GO and result["holds"] == []
+
+
+# ---- resolver against REAL knowledge events (impure bridge, real note shape)
+
+def _add_note(store, *, key: str, ntype: str, body: str, anchor: dict | None,
+              vsha: str | None, curate: bool = True) -> None:
+    pub = kn.new_publish_event(
+        note_id="kn-" + key.replace(".", "-"), key=key, type=ntype, domain_id="cli",
+        body=body, anchor=anchor, verified_against_sha=vsha,
+        domain_registry_hash="rh1", domain_definition_hash="d" * 64,
+        author="dev", resolved_from="active_agent", at="t1")
+    kn.append_event(store, pub)
+    if curate:
+        kn.append_event(store, kn.new_curate_event(
+            base=pub, action="verify", curated_by="lead", resolved_from="lead",
+            at="t2", reason=None, domain_registry_hash="rh1"))
+
+
+def test_resolve_dod_knowledge_binds_curated_notes_by_sha_and_vsha(tmp_path: Path) -> None:
+    root = _init(tmp_path)
+    s = Store(root)
+    long_body = "a genuinely non-trivial lesson body well over forty characters long"
+    # bound by sha anchor (curated, allowed type) -> counts
+    _add_note(s, key="dod.bysha", ntype="gotcha", body=long_body,
+              anchor={"kind": "sha", "sha": SHA}, vsha=None)
+    # bound by verified_against_sha -> counts (path anchor, but vsha matches revision)
+    _add_note(s, key="dod.byvsha", ntype="decision", body=long_body,
+              anchor={"kind": "path", "path": "src/x.py"}, vsha=SHA)
+    # anchored to a DIFFERENT sha -> excluded
+    _add_note(s, key="dod.other", ntype="gotcha", body=long_body,
+              anchor={"kind": "sha", "sha": OTHER_SHA}, vsha=None)
+    # bound but UNCURATED -> excluded
+    _add_note(s, key="dod.uncur", ntype="gotcha", body=long_body,
+              anchor={"kind": "sha", "sha": SHA}, vsha=None, curate=False)
+    # bound + curated but WRONG type (seam not in the allowed set) -> excluded
+    _add_note(s, key="dod.wrongtype", ntype="seam", body=long_body,
+              anchor={"kind": "sha", "sha": SHA}, vsha=None)
+
+    spec = {"when": "on_remediation", "min_notes": 1, "min_body_chars": 40,
+            "types": ["decision", "gotcha", "lesson"]}
+    rec = close.empty_close(
+        "c", scope="release", revision=SHA, revision_kind="sha", gate_scope="release",
+        opened_by="lead", opened_at="t0", epoch_at_open=None, required_lenses=[],
+        revision_clean=True, dirty_artifact=None)
+    rec["remediation_items"] = {"r1": {"id": "r1", "blocker": False}}
+    k = cli._resolve_dod_knowledge(s, spec, rec)
+    assert k["has_remediation"] is True
+    kinds = sorted(n["type"] for n in k["bound_notes"])
+    assert kinds == ["decision", "gotcha"]   # only the two curated+bound+allowed-type notes
+    # and it clears the pure gate
+    assert close._evaluate_dod_knowledge(rec, k) == []
