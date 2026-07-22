@@ -22,7 +22,7 @@ import threading
 
 import pytest
 
-from agenttalk import cli, close
+from agenttalk import cli, close, gates
 from agenttalk.store import Store
 
 SHA = "a" * 40
@@ -921,3 +921,222 @@ def test_cli_list_and_show(tmp_path: Path, capsys: pytest.CaptureFixture) -> Non
     assert _run(["close", "show", "--id", "rel"], root) == 0
     shown = json.loads(capsys.readouterr().out)
     assert shown["close_id"] == "rel"
+
+
+# ================================================ #60 DoD forcing gate (inc-1: assurance)
+
+def _assurance_bundle(**over) -> dict:
+    """A fully-satisfied resolved assurance-gate bundle (green, CI-attested blocker, bound to
+    SHA, fresh). Override any field to build the failing variants."""
+    b = {"gate": "assurance:release", "present": True, "status": "green",
+         "severity": "blocker", "evidence_source": "automation_ci",
+         "revision": SHA, "waiver_active": False, "age_days": 1.0, "max_age_days": 14}
+    b.update(over)
+    return b
+
+
+def _dod_eval(assurance: dict | None) -> dict:
+    return {"policy_present": True, "policy_error": None,
+            "required_dimensions": {"assurance": {"gate": "assurance:release",
+                                                   "max_age_days": 14}},
+            "assurance": assurance}
+
+
+# ------------------------------------------------------ validate_dod_policy
+
+def test_validate_dod_policy_valid_roundtrips_lowercased_and_normalized() -> None:
+    pol = close.validate_dod_policy({
+        "schema_version": 1,
+        "scopes": {"Release": {"assurance": {"gate": "assurance:release", "max_age_days": 14}}},
+    })
+    assert pol == {"schema_version": 1,
+                   "scopes": {"release": {"assurance": {"gate": "assurance:release",
+                                                        "max_age_days": 14}}}}
+
+
+def test_validate_dod_policy_allows_absent_max_age() -> None:
+    pol = close.validate_dod_policy(
+        {"schema_version": 1, "scopes": {"release": {"assurance": {"gate": "a:r"}}}})
+    assert pol["scopes"]["release"]["assurance"]["max_age_days"] is None
+
+
+@pytest.mark.parametrize("raw", [
+    "not-a-dict",
+    {"schema_version": "1", "scopes": {}},
+    {"schema_version": True, "scopes": {}},
+    {"schema_version": 1, "scopes": "nope"},
+    {"schema_version": 1, "scopes": {"release": "nope"}},
+    {"schema_version": 1, "scopes": {"release": {"knowledge": {"min_notes": 1}}}},  # unsupported
+    {"schema_version": 1, "scopes": {"release": {"assurance": {}}}},                # missing gate
+    {"schema_version": 1, "scopes": {"release": {"assurance": {"gate": ""}}}},      # empty gate
+    {"schema_version": 1, "scopes": {"release": {"assurance": {"gate": "g",
+                                                               "max_age_days": -1}}}},
+])
+def test_validate_dod_policy_malformed_raises(raw) -> None:
+    with pytest.raises(close.CloseError):
+        close.validate_dod_policy(raw)
+
+
+def test_load_dod_policy_missing_is_empty(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["lead"])
+    assert close.load_dod_policy(s) == (None, None)
+
+
+def test_load_dod_policy_malformed_fails_closed(tmp_path: Path) -> None:
+    s = Store(tmp_path)
+    s.init(["lead"])
+    close.dod_policy_path(s).write_text('{"schema_version": 1, "scopes": {"release": '
+                                        '{"knowledge": {}}}}', encoding="utf-8")
+    policy, err = close.load_dod_policy(s)
+    assert policy is None and err and "knowledge" in err
+
+
+# ------------------------------------------------------ derive_required_dod
+
+def test_derive_required_dod_no_policy_or_unmapped_scope_is_empty() -> None:
+    assert close.derive_required_dod(None, "release") == {"dimensions": {}}
+    pol = {"schema_version": 1, "scopes": {"release": {"assurance": {"gate": "a:r"}}}}
+    assert close.derive_required_dod(pol, "feature") == {"dimensions": {}}
+
+
+def test_derive_required_dod_mapped_scope_returns_dims_case_insensitive() -> None:
+    pol = {"schema_version": 1, "scopes": {"release": {"assurance": {"gate": "a:r"}}}}
+    assert close.derive_required_dod(pol, "RELEASE") == {
+        "dimensions": {"assurance": {"gate": "a:r"}}}
+
+
+# ------------------------------------------------------ evaluate_dod (pure)
+
+def test_evaluate_dod_none_or_no_required_is_empty() -> None:
+    assert close.evaluate_dod(_satisfied(), None) == []
+    assert close.evaluate_dod(_satisfied(), {"required_dimensions": {}}) == []
+
+
+def test_evaluate_dod_bundle_malformed_or_policy_error_holds_invalid() -> None:
+    assert close.evaluate_dod(_satisfied(), "nope")[0][0] == close.HOLD_INVALID_DOD_POLICY
+    err = close.evaluate_dod(_satisfied(), {"policy_error": "bad", "required_dimensions": {}})
+    assert err == [(close.HOLD_INVALID_DOD_POLICY, "bad")]
+
+
+def test_evaluate_dod_assurance_satisfied_is_empty() -> None:
+    assert close.evaluate_dod(_satisfied(), _dod_eval(_assurance_bundle())) == []
+
+
+def test_evaluate_dod_assurance_waived_active_is_empty() -> None:
+    a = _assurance_bundle(status="waived", waiver_active=True, evidence_source="operator_waiver",
+                          severity="blocker", revision=OTHER_SHA)  # binding not required for waiver
+    assert close.evaluate_dod(_satisfied(), _dod_eval(a)) == []
+
+
+@pytest.mark.parametrize("over,code", [
+    ({"present": False}, close.HOLD_MISSING_ASSURANCE),
+    ({"status": "red"}, close.HOLD_MISSING_ASSURANCE),
+    ({"status": "skipped"}, close.HOLD_MISSING_ASSURANCE),
+    ({"status": "waived", "waiver_active": False}, close.HOLD_MISSING_ASSURANCE),
+    ({"severity": "warn"}, close.HOLD_UNATTESTED_ASSURANCE),
+    ({"evidence_source": "manual_review"}, close.HOLD_UNATTESTED_ASSURANCE),
+    ({"revision": OTHER_SHA}, close.HOLD_STALE_ASSURANCE),
+    ({"age_days": 30.0, "max_age_days": 14}, close.HOLD_STALE_ASSURANCE),
+])
+def test_evaluate_dod_assurance_failure_variants(over, code) -> None:
+    holds = close.evaluate_dod(_satisfied(), _dod_eval(_assurance_bundle(**over)))
+    assert code in {c for c, _ in holds}
+
+
+def test_evaluate_dod_assurance_missing_bundle_holds_missing() -> None:
+    ev = {"policy_present": True, "policy_error": None,
+          "required_dimensions": {"assurance": {}}, "assurance": None}
+    assert close.evaluate_dod(_satisfied(), ev)[0][0] == close.HOLD_MISSING_ASSURANCE
+
+
+# ------------------------------------------------------ compute_verdict integration
+
+def test_compute_verdict_dod_none_is_backward_identical() -> None:
+    base = close.compute_verdict(_satisfied(), _gate_go())
+    explicit = close.compute_verdict(_satisfied(), _gate_go(), None, None, None)
+    assert base == explicit and base["verdict"] == close.VERDICT_GO
+
+
+def test_compute_verdict_unmet_assurance_flips_go_to_hold_with_only_the_dod_hold() -> None:
+    # a close that is otherwise GO, plus a required-but-missing assurance dimension.
+    result = close.compute_verdict(
+        _satisfied(), _gate_go(), None, None, _dod_eval(_assurance_bundle(present=False)))
+    assert result["verdict"] == close.VERDICT_HOLD
+    assert _codes(result) == {close.HOLD_MISSING_ASSURANCE}   # reached the DoD fold, not MALFORMED
+
+
+def test_compute_verdict_satisfied_assurance_stays_go() -> None:
+    result = close.compute_verdict(
+        _satisfied(), _gate_go(), None, None, _dod_eval(_assurance_bundle()))
+    assert result["verdict"] == close.VERDICT_GO and result["holds"] == []
+
+
+def test_compute_verdict_dod_is_additive_only() -> None:
+    # a pre-existing gate hold PLUS an unmet DoD dimension -> both holds present (DoD only adds).
+    result = close.compute_verdict(
+        _satisfied(), _gate_hold(), None, None, _dod_eval(_assurance_bundle(present=False)))
+    codes = _codes(result)
+    assert close.HOLD_GATE in codes and close.HOLD_MISSING_ASSURANCE in codes
+
+
+# ------------------------------------------------------ CLI integration (impure bridge)
+
+def _write_dod(root: Path, gate: str = "assurance:release", max_age: int = 14) -> None:
+    close.dod_policy_path(Store(root)).write_text(json.dumps({
+        "schema_version": 1,
+        "scopes": {"release": {"assurance": {"gate": gate, "max_age_days": max_age}}},
+    }), encoding="utf-8")
+
+
+def _check_holds(root: Path, capsys) -> tuple[int, set[str]]:
+    capsys.readouterr()
+    rc = _run(["close", "check", "--id", "rel", "--json"], root)
+    out = json.loads(capsys.readouterr().out)
+    return rc, {h["code"] for h in out["holds"]}
+
+
+def test_cli_dod_absent_policy_is_byte_identical_go(tmp_path: Path, capsys) -> None:
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    assert _accept(root) == 0
+    rc, codes = _check_holds(root, capsys)
+    assert rc == 0 and close.HOLD_MISSING_ASSURANCE not in codes
+
+
+def test_cli_dod_requires_assurance_gate_holds_until_ci_attested(tmp_path: Path, capsys) -> None:
+    root = _init(tmp_path)
+    _write_dod(root)
+    assert _open(root) == 0
+    assert _accept(root) == 0
+    # no assurance:release gate yet -> the DoD forces a HOLD (the Papendal CVE-shipped-green gap).
+    rc, codes = _check_holds(root, capsys)
+    assert rc == 3 and close.HOLD_MISSING_ASSURANCE in codes
+    # a green, CI-attested, revision-bound blocker gate clears the dimension -> GO.
+    gates.set_gate(root, name="assurance:release", status="green", severity="blocker",
+                   scope="release", actor="ci", evidence_source="automation_ci",
+                   evidence=["run:ci-123"], revision=SHA)
+    rc, codes = _check_holds(root, capsys)
+    assert rc == 0 and close.HOLD_MISSING_ASSURANCE not in codes
+
+
+def test_cli_dod_stale_when_gate_bound_to_other_revision(tmp_path: Path, capsys) -> None:
+    root = _init(tmp_path)
+    _write_dod(root)
+    assert _open(root) == 0
+    assert _accept(root) == 0
+    gates.set_gate(root, name="assurance:release", status="green", severity="blocker",
+                   scope="release", actor="ci", evidence_source="automation_ci",
+                   evidence=["run:ci-9"], revision=OTHER_SHA)  # bound to the WRONG revision
+    rc, codes = _check_holds(root, capsys)
+    assert rc == 3 and close.HOLD_STALE_ASSURANCE in codes
+
+
+def test_cli_dod_malformed_policy_fails_closed_without_crash(tmp_path: Path, capsys) -> None:
+    root = _init(tmp_path)
+    close.dod_policy_path(Store(root)).write_text(
+        '{"schema_version": 1, "scopes": {"release": {"knowledge": {}}}}', encoding="utf-8")
+    assert _open(root) == 0
+    assert _accept(root) == 0
+    rc, codes = _check_holds(root, capsys)
+    assert rc == 3 and close.HOLD_INVALID_DOD_POLICY in codes

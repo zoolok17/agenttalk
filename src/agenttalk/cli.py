@@ -2298,6 +2298,74 @@ def _build_signoff_eval(store, record: dict):
             "active_agents": active}
 
 
+def _build_dod_eval(store, record: dict):
+    """Resolve the #60 Definition-of-Done evidence (IMPURE) into the bundle
+    :func:`close.evaluate_dod` consumes (PURE). ``None`` when the close's scope has no DoD
+    requirements (byte-identical to pre-#60). Fails closed via ``policy_error`` on a malformed
+    ``dod.json``. Live-derived at check time - there is no frozen DoD route to forget to apply."""
+    from agenttalk import close as close_mod
+    policy, err = close_mod.load_dod_policy(store)
+    if err:
+        return {"policy_present": True, "policy_error": err, "required_dimensions": {}}
+    dims = close_mod.derive_required_dod(policy, record.get("scope"))["dimensions"]
+    if not dims:
+        return None
+    bundle = {"policy_present": policy is not None, "policy_error": None,
+              "required_dimensions": dims}
+    if "assurance" in dims:
+        bundle["assurance"] = _resolve_dod_assurance_gate(store, dims["assurance"])
+    return bundle
+
+
+def _resolve_dod_assurance_gate(store, spec: dict) -> dict:
+    """Read the named ``assurance:<scope>`` gate's OWN fields (never artifact.json - Q1 ruling)
+    so the DoD assurance dimension is a binding/freshness check over the CI-attested gate."""
+    from datetime import datetime, timezone
+
+    from agenttalk import gates as gate_mod
+    gate_name = spec["gate"]
+    state = gate_mod.load_gate_state(store.root)
+    g = (state.get("gates") or {}).get(gate_name)
+    if not isinstance(g, dict):
+        return {"gate": gate_name, "present": False}
+    now = datetime.now(timezone.utc)
+    waiver = g.get("waiver")
+    waiver_active = False
+    if isinstance(waiver, dict):
+        try:
+            waiver_active = gate_mod._waiver_active(waiver, now=now)
+        except (ValueError, TypeError):
+            waiver_active = False
+    return {
+        "gate": gate_name, "present": True,
+        "status": g.get("status"), "severity": g.get("severity"),
+        "evidence_source": g.get("evidence_source"), "revision": g.get("revision"),
+        "waiver_active": waiver_active,
+        "age_days": _iso_age_days(g.get("updated_at"), now),
+        "max_age_days": spec.get("max_age_days"),
+    }
+
+
+def _iso_age_days(updated_at: object, now) -> float | None:
+    """Age in days of an ISO-8601 ``updated_at`` vs ``now``; None if missing/unparseable. Never
+    raises (freshness is advisory - a bad timestamp must not crash `close check`)."""
+    if not isinstance(updated_at, str) or not updated_at.strip():
+        return None
+    try:
+        from datetime import timezone
+        parsed = datetime_fromisoformat_z(updated_at)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, (now - parsed).total_seconds() / 86400.0)
+    except (ValueError, TypeError):
+        return None
+
+
+def datetime_fromisoformat_z(value: str):
+    from datetime import datetime
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
 def _signoff_risk_inventory(args, store, record: dict) -> list[dict]:
     """Build a risk inventory from CLI flags. Changed paths DEFAULT from the frozen
     revision's git diff (base..revision); manual --changed-path is an audited
@@ -2774,7 +2842,8 @@ def cmd_close(args: argparse.Namespace) -> int:
         rec = record if isinstance(record, dict) else {}
         signoff_eval = _build_signoff_eval(store, rec) if isinstance(record, dict) else None
         worktree_eval = _close_worktree_eval(store, rec) if isinstance(record, dict) else None
-        result = close_mod.compute_verdict(rec, gate_check, signoff_eval, worktree_eval)
+        dod_eval = _build_dod_eval(store, rec) if isinstance(record, dict) else None
+        result = close_mod.compute_verdict(rec, gate_check, signoff_eval, worktree_eval, dod_eval)
         if getattr(args, "json", False):
             print(json.dumps({**result, "gate_verdict": gate_check["verdict"],
                               "signoff_policy": (None if signoff_eval is None
@@ -2815,9 +2884,10 @@ def cmd_close(args: argparse.Namespace) -> int:
                         store.root, scope=record.get("gate_scope"))
                     signoff_eval = _build_signoff_eval(store, record)
                     worktree_eval = _close_worktree_eval(store, record)
+                    dod_eval = _build_dod_eval(store, record)
                     record["worktree_isolation"] = worktree_eval
                     result = close_mod.compute_verdict(
-                        record, gate_check, signoff_eval, worktree_eval)
+                        record, gate_check, signoff_eval, worktree_eval, dod_eval)
                     if args.verdict == "go" and result["verdict"] != close_mod.VERDICT_GO:
                         sys.stderr.write(
                             "agenttalk close publish: refusing GO - close check is HOLD:\n")
