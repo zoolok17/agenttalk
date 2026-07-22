@@ -872,7 +872,7 @@ def _evaluate_dod_assurance(record: dict, a: dict | None) -> list[tuple[str, str
     yet cryptographically authenticated CI provenance - gates.py forbids greening a blocker from
     other sources, but the label itself is not signed, so an actor who can write gates.json can
     still assert it. Authenticated CI attestation is a separate substrate hardening (task #64,
-    sibling to the gate-waive authenticity work #13); until then this is the existing blocker-gate
+    sibling to the gate-waive authentication hardening); until then this is the existing blocker-gate
     mechanism (label-trust), NOT a cryptographic sole-certifier guarantee."""
     gate = (a or {}).get("gate") or "assurance"
     if not isinstance(a, dict) or not a.get("present"):
@@ -894,7 +894,7 @@ def _evaluate_dod_assurance(record: dict, a: dict | None) -> list[tuple[str, str
     # honoring it would turn a single `gate waive` into a revision-independent bypass of the whole
     # forcing gate (Codex re-review of 848841a, BLOCKER). Only a green CI-attested, revision-bound
     # blocker gate clears assurance. The AUTHENTICATED operator escape (close dod-waive validating
-    # a typed operator-answer reference) is task #65 (depends on gate-waive authentication #13).
+    # a typed operator-answer reference) is task #65 (depends on authenticated gate-waive origin).
     if status != "green":
         detail = f"assurance gate {gate!r} is not green (status={status!r})"
         if status == "waived":
