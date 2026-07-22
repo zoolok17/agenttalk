@@ -476,9 +476,10 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         stamps (a blocked worker is not dead), so the supervisor does NOT restart it."""
         nonlocal last_hb, fail_sleep
         if on_health_parked is not None:
+            # advisory health must never break loop progress
             try:
                 on_health_parked(record, reason_code)
-            except Exception:  # noqa: BLE001, S110 - advisory health must never break loop progress
+            except Exception:  # noqa: BLE001, S110  # nosec
                 pass
         _escalate_once(record, CLASS_CONFIG_BLOCKED, retry_unrouted=False)
         stamp()                          # keeps wrapper heartbeat and lead-loop lease fresh
