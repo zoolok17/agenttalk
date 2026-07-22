@@ -329,6 +329,54 @@ def test_child_turn_call_cap_is_durable_and_fail_closed(tmp_path) -> None:
     assert all(row["attempt_id"] != "f" * 32 for row in status["unresolved"])
 
 
+def test_child_turn_mint_is_refused_while_held_and_gets_a_full_window_after_clear(
+    tmp_path,
+) -> None:
+    # #63: a child turn opened UNDER a hold burns its 300s wall-time ceiling while the
+    # gateway cannot spend, so it is (near-)expired the instant the hold clears (the live
+    # incident: a held-gateway turn that expired mid-work and surfaced as a misleading
+    # config_blocked "budget exhausted"). Mint must refuse while held (no doomed turn),
+    # and mint fresh with a FULL window measured from now once the hold clears.
+    clock = Clock(datetime(2026, 7, 15, 12, tzinfo=timezone.utc))
+    ledger = make_ledger(tmp_path, clock)
+    ledger.place_hold(reason="operator hold between paid tests")
+
+    with pytest.raises(LedgerHold, match="durable accounting hold"):
+        ledger.open_child_turn(
+            agent="qwen-dev-1",
+            message_id="20260715-120000-000000-held",
+            request_id="q-held",
+            issuer_token=TEST_CHILD_CAP_ISSUER,
+        )
+    assert ledger.status()["active_child_turns"] == []  # no doomed turn opened while held
+
+    ledger.clear_hold(reason="operator resumed paid work")
+    clock.value = datetime(2026, 7, 15, 12, 5, tzinfo=timezone.utc)  # 5 min elapsed under hold
+    credential = ledger.open_child_turn(
+        agent="qwen-dev-1",
+        message_id="20260715-120000-000000-held",
+        request_id="q-held",
+        issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    # Full 300s window from 12:05 (the clear), NOT a stale window that started at 12:00.
+    assert credential.expires_at == "2026-07-15T12:10:00.000000Z"
+
+
+def test_child_turn_mint_is_refused_while_a_prior_attempt_is_unresolved(tmp_path) -> None:
+    # #63: an unresolved prior attempt is a transport hold too - minting under it would open
+    # a turn that only wastes wall-time until reserve fails. Refuse at mint, matching reserve.
+    ledger = make_ledger(tmp_path)
+    ledger.reserve("1" * 32)  # reserved-but-unsettled -> unresolved
+    with pytest.raises(LedgerHold, match="unresolved"):
+        ledger.open_child_turn(
+            agent="qwen-dev-1",
+            message_id="20260715-120000-000000-unresolved",
+            request_id="q-unresolved",
+            issuer_token=TEST_CHILD_CAP_ISSUER,
+        )
+    assert ledger.status()["active_child_turns"] == []
+
+
 def test_child_turn_mint_requires_non_inherited_controller_issuer(tmp_path) -> None:
     ledger = make_ledger(tmp_path)
     untrusted_child = SpendLedger(ledger.db_path, ledger.marker_path, now=ledger.now)

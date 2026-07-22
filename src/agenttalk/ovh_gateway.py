@@ -1162,6 +1162,19 @@ class SpendLedger:
                     raise ChildTurnCapBlocked("child turn issuer credential is invalid")
                 self._validate_child_cap_clock(conn, current)
                 self._validate_clock(metadata, current)
+                # Refuse to MINT a turn while transport is held (durable accounting hold, or
+                # an unresolved prior attempt) - mirrors the reserve-side gate in
+                # _reserve_locked. Otherwise a turn opened under a hold starts its wall-time
+                # ceiling immediately and burns the whole budget while blocked, so it is
+                # already (near-)expired the instant the hold clears (#63: the held-gateway
+                # child turn that expired mid-work, surfacing as a misleading config_blocked).
+                # A held mint raises LedgerHold (a GatewayError) which the wrapper spawner
+                # treats as a transient park, and the next drive after the hold clears mints a
+                # fresh turn with a full wall-time window.
+                if metadata.get("service_hold"):
+                    raise LedgerHold("gateway has a durable accounting hold")
+                if self._unresolved(conn):
+                    raise LedgerHold("an unresolved provider attempt blocks new transport")
                 row = conn.execute(
                     "SELECT * FROM child_turns WHERE agent=? AND message_id=?",
                     (agent, message_id),
