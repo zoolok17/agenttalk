@@ -165,6 +165,7 @@ _COVERAGE_ARTIFACTS = ("coverage.xml", "coverage.json")
 _COVERAGE_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024
 _GIT_SHA_RE = re.compile(r"\A[0-9a-fA-F]{40}\Z")
 _GITHUB_REPOSITORY_RE = re.compile(r"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+_ASCII_DIGITS_RE = re.compile(r"\A[0-9]+\Z")
 
 
 class AssuranceUsageError(ValueError):
@@ -221,6 +222,13 @@ class ScanResult:
     native_suppressions: dict[str, Any] = field(default_factory=lambda: {"count_by_tool": {}, "examples": []})
     raw_logs: dict[str, str] = field(default_factory=dict)
     artifact: dict[str, Any] | None = None
+
+
+@dataclass
+class _CoverageArtifactState:
+    eligible: set[str]
+    backups: dict[str, Path]
+    quarantine: Path | None
 
 
 def _default_manifest(path: Path | None = None) -> dict[str, Any]:
@@ -323,7 +331,8 @@ def collect_provenance(
     manifest_path = _resolve_under_root(root_path, manifest.get("_path") or DEFAULT_MANIFEST)
     baseline_path = _resolve_under_root(root_path, baseline.get("_path") or DEFAULT_BASELINE)
     git_sha = _git_output(root_path, ["rev-parse", "HEAD"])
-    git_dirty = bool(_git_output(root_path, ["status", "--porcelain"]))
+    git_status = _git_output(root_path, ["status", "--porcelain"])
+    git_dirty = None if git_status is None else bool(git_status)
     changed_files = _changed_files(root_path, changed_from=changed_from, changed_to=changed_to)
     manifest_rel = _slash(_rel(root_path, manifest_path))
     baseline_rel = _slash(_rel(root_path, baseline_path))
@@ -563,8 +572,17 @@ def run_plan(plan: ScanPlan) -> ScanResult:
             else:
                 residual.append(_risk(spec["dimension"], reason, "medium", tool_id=tool_id))
             continue
-        coverage_snapshot = _snapshot_coverage_artifacts(plan.root) if tool_id == "coverage" else None
-        run, ext_findings, raw, stdout = _run_external(plan.root, spec, command)
+        coverage_state = _prepare_coverage_artifacts(plan.root) if tool_id == "coverage" else None
+        try:
+            run, ext_findings, raw, stdout = _run_external(plan.root, spec, command)
+        except Exception:
+            if coverage_state is not None:
+                _finish_coverage_artifacts(plan.root, coverage_state)
+            raise
+        coverage_outputs: dict[str, str | None] = {}
+        coverage_cleanup_ok = True
+        if coverage_state is not None:
+            coverage_outputs, coverage_cleanup_ok = _finish_coverage_artifacts(plan.root, coverage_state)
         tools_run.append(run)
         if raw:
             raw_logs[tool_id] = raw
@@ -573,8 +591,14 @@ def run_plan(plan: ScanPlan) -> ScanResult:
             required_missing.append({"tool_id": tool_id, "reason": run["status"]})
         elif run["status"] in {"error-optional-tool", "timeout-optional"}:
             residual.append(_risk(spec["dimension"], f"{tool_id} {run['status']}", "medium", tool_id=tool_id))
-        if coverage_snapshot is not None:
-            _emit_coverage_gate(plan, run, stdout, coverage_snapshot)
+        if coverage_state is not None:
+            _emit_coverage_gate(
+                plan,
+                run,
+                stdout,
+                coverage_outputs,
+                artifacts_clean=coverage_cleanup_ok,
+            )
 
     considered = [spec["tool_id"] for spec in plan.tools]
     result = ScanResult(
@@ -1271,55 +1295,102 @@ def _process_output_text(output: str | bytes | None) -> str:
     return output or ""
 
 
-def _read_coverage_artifact_bytes(path: Path) -> tuple[str, bytes | None]:
-    try:
-        if not path.exists():
-            return "missing", None
+def _prepare_coverage_artifacts(root: Path) -> _CoverageArtifactState:
+    """Quarantine prior reports so metadata changes cannot authenticate stale bytes."""
+    eligible: set[str] = set()
+    backups: dict[str, Path] = {}
+    quarantine: Path | None = None
+    for name in _COVERAGE_ARTIFACTS:
+        path = root / name
+        try:
+            exists = path.exists() or path.is_symlink()
+        except OSError:
+            continue
+        if not exists:
+            eligible.add(name)
+            continue
         if path.is_symlink() or not path.is_file():
-            return "unsafe", None
+            continue
+        try:
+            if quarantine is None:
+                quarantine = Path(tempfile.mkdtemp(prefix=".agenttalk-coverage-", dir=root))
+            backup = quarantine / name
+            os.replace(path, backup)
+        except OSError:
+            continue
+        backups[name] = backup
+        eligible.add(name)
+    return _CoverageArtifactState(
+        eligible=eligible,
+        backups=backups,
+        quarantine=quarantine,
+    )
+
+
+def _read_coverage_artifact(path: Path) -> str | None:
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
         with path.open("rb") as handle:
             data = handle.read(_COVERAGE_ARTIFACT_MAX_BYTES + 1)
-            stat_result = os.fstat(handle.fileno())
         if len(data) > _COVERAGE_ARTIFACT_MAX_BYTES:
-            return "oversized", None
-        digest = hashlib.sha256(data).hexdigest()
-        fingerprint = (
-            f"sha256:{digest}:dev:{stat_result.st_dev}:ino:{stat_result.st_ino}:"
-            f"size:{stat_result.st_size}:mtime_ns:{stat_result.st_mtime_ns}"
-        )
-        return fingerprint, data
-    except FileNotFoundError:
-        return "missing", None
-    except OSError:
-        return "unreadable", None
-
-
-def _coverage_artifact_fingerprint(path: Path) -> str:
-    fingerprint, _data = _read_coverage_artifact_bytes(path)
-    return fingerprint
-
-
-def _snapshot_coverage_artifacts(root: Path) -> dict[str, str]:
-    return {
-        name: _coverage_artifact_fingerprint(root / name)
-        for name in _COVERAGE_ARTIFACTS
-    }
-
-
-def _read_new_coverage_artifact(root: Path, name: str, previous: str) -> str | None:
-    path = root / name
-    current, data = _read_coverage_artifact_bytes(path)
-    if previous == "unreadable" or current in {"missing", "unsafe", "oversized", "unreadable"}:
-        return None
-    if current == previous or data is None:
-        return None
-    try:
+            return None
         return data.decode("utf-8-sig")
-    except UnicodeError:
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError):
         return None
 
 
-def _github_actions_evidence(provenance: dict[str, Any]) -> str | None:
+def _remove_generated_coverage_artifact(path: Path) -> bool:
+    try:
+        if not path.exists() and not path.is_symlink():
+            return True
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def _finish_coverage_artifacts(
+    root: Path,
+    state: _CoverageArtifactState,
+) -> tuple[dict[str, str | None], bool]:
+    """Capture fresh reports, then restore the pre-run worktree before attestation."""
+    outputs: dict[str, str | None] = {}
+    cleanup_ok = True
+    for name in _COVERAGE_ARTIFACTS:
+        path = root / name
+        if name in state.eligible:
+            outputs[name] = _read_coverage_artifact(path)
+            cleanup_ok = _remove_generated_coverage_artifact(path) and cleanup_ok
+        backup = state.backups.get(name)
+        if backup is None:
+            continue
+        try:
+            if path.exists() or path.is_symlink():
+                cleanup_ok = False
+                continue
+            os.replace(backup, path)
+        except OSError:
+            cleanup_ok = False
+    if state.quarantine is not None:
+        try:
+            state.quarantine.rmdir()
+        except OSError:
+            cleanup_ok = False
+    return outputs, cleanup_ok
+
+
+def _github_actions_evidence(
+    root: Path,
+    provenance: dict[str, Any],
+    *,
+    artifacts_clean: bool,
+) -> str | None:
+    """Return a revision-bound CI reference only for a clean pre/post Git state."""
     revision = str(provenance.get("git_sha") or "")
     github_sha = os.environ.get("GITHUB_SHA", "")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
@@ -1327,11 +1398,21 @@ def _github_actions_evidence(provenance: dict[str, Any]) -> str | None:
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     if os.environ.get("CI", "").lower() != "true" or os.environ.get("GITHUB_ACTIONS", "").lower() != "true":
         return None
-    if provenance.get("git_dirty") is not False:
+    if not artifacts_clean or provenance.get("git_dirty") is not False:
         return None
     if not _GIT_SHA_RE.fullmatch(revision) or github_sha.lower() != revision.lower():
         return None
-    if not run_id.isdigit() or not run_attempt.isdigit() or not _GITHUB_REPOSITORY_RE.fullmatch(repository):
+    if (
+        not _ASCII_DIGITS_RE.fullmatch(run_id)
+        or not _ASCII_DIGITS_RE.fullmatch(run_attempt)
+        or not _GITHUB_REPOSITORY_RE.fullmatch(repository)
+    ):
+        return None
+    current_revision = _git_output(root, ["rev-parse", "HEAD"])
+    current_status = _git_output(root, ["status", "--porcelain"])
+    if current_revision is None or current_status is None or current_status:
+        return None
+    if current_revision.lower() != revision.lower():
         return None
     return f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{run_attempt}"
 
@@ -1340,36 +1421,34 @@ def _emit_coverage_gate(
     plan: ScanPlan,
     run: dict[str, Any],
     stdout: str,
-    artifact_snapshot: dict[str, str],
+    artifact_outputs: dict[str, str | None],
+    *,
+    artifacts_clean: bool,
 ) -> None:
     from agenttalk.store import Store
 
-    xml_text = _read_new_coverage_artifact(
-        plan.root,
-        "coverage.xml",
-        artifact_snapshot["coverage.xml"],
-    )
-    json_text = _read_new_coverage_artifact(
-        plan.root,
-        "coverage.json",
-        artifact_snapshot["coverage.json"],
-    )
+    xml_text = artifact_outputs.get("coverage.xml")
+    json_text = artifact_outputs.get("coverage.json")
     percent = parse_coverage_percent(stdout, xml_text=xml_text, json_text=json_text)
-    ci_evidence = _github_actions_evidence(plan.provenance)
     command_succeeded = run.get("status") == "pass" and run.get("exit_code") == 0
-    is_green = command_succeeded and percent is not None and ci_evidence is not None
-    evidence_source = "automation_ci" if ci_evidence is not None else "local_command"
-    if not command_succeeded:
-        reason = "coverage command did not complete successfully"
-    elif percent is None:
-        reason = "coverage command succeeded but no overall percentage could be parsed"
-    elif ci_evidence is None:
-        reason = "coverage percentage is not bound to an attested clean CI revision"
-    else:
-        reason = "coverage command succeeded with a parsed, revision-bound CI measurement"
-    evidence = [ci_evidence] if ci_evidence is not None else [f"assurance-run:{plan.run_id}"]
     evidence_details = {"coverage_percent": float(percent)} if percent is not None else None
     with Store(plan.root).config_lock():
+        ci_evidence = _github_actions_evidence(
+            plan.root,
+            plan.provenance,
+            artifacts_clean=artifacts_clean,
+        )
+        is_green = command_succeeded and percent is not None and ci_evidence is not None
+        evidence_source = "automation_ci" if ci_evidence is not None else "local_command"
+        if not command_succeeded:
+            reason = "coverage command did not complete successfully"
+        elif percent is None:
+            reason = "coverage command succeeded but no overall percentage could be parsed"
+        elif ci_evidence is None:
+            reason = "coverage percentage is not bound to an attested clean CI revision"
+        else:
+            reason = "coverage command succeeded with a parsed, revision-bound CI measurement"
+        evidence = [ci_evidence] if ci_evidence is not None else [f"assurance-run:{plan.run_id}"]
         gates.set_gate(
             plan.root,
             name=f"coverage:{plan.profile}",

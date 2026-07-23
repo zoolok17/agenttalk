@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import datetime, time, timezone
 from pathlib import Path
@@ -106,6 +107,14 @@ def set_gate(
         reserved = {"source", "refs", "at", "by"}.intersection(evidence_details)
         if reserved:
             raise ValueError(f"evidence_details cannot replace reserved fields: {sorted(reserved)}")
+        if "coverage_percent" in evidence_details:
+            coverage_percent = evidence_details["coverage_percent"]
+            if (
+                type(coverage_percent) is not float
+                or not math.isfinite(coverage_percent)
+                or not 0.0 <= coverage_percent <= 100.0
+            ):
+                raise ValueError("evidence_details.coverage_percent must be a finite float in [0, 100]")
         try:
             json.dumps(evidence_details, allow_nan=False)
         except (TypeError, ValueError) as exc:
