@@ -532,18 +532,23 @@ def _child_env(
         # is disposable with the watched-trial clone and contains no operator
         # credentials or history.
         env["CLAUDE_CONFIG_DIR"] = _ovh_qwen_claude_config_dir(workspace)
-        # The allowlist above drops LOCALAPPDATA/USERPROFILE/HOME, so a bus command the
-        # child shells out to (e.g. `agenttalk reply`) cannot resolve Path.home() and
-        # crashes in signing.default_keys_dir() BEFORE it can even decide signing is off
-        # ("RuntimeError: Could not determine home directory"). Point home + appdata at
-        # the disposable workspace clone: gives the child a resolvable home WITHOUT
-        # leaking the operator's real home to the paid external worker. If HMAC signing
+        # The allowlist above drops HOME/USERPROFILE/LOCALAPPDATA/APPDATA, so a bus
+        # command the child shells out to (e.g. `agenttalk reply`) cannot resolve
+        # Path.home() and crashes in signing.default_keys_dir() BEFORE it can even
+        # decide signing is off ("RuntimeError: Could not determine home directory").
+        # Point the full home set at the disposable workspace clone: gives the child a
+        # resolvable home WITHOUT leaking the operator's real home to the paid external
+        # worker. LOCALAPPDATA is what agenttalk's own path resolution reads today;
+        # APPDATA (Roaming) is included so Windows-native child tooling that consults
+        # %APPDATA% (npm, credential helpers, Python user site) also stays scoped
+        # to the clone instead of falling back to the operator profile. If HMAC signing
         # is later enforced, wire the child's key via AGENTTALK_HMAC_KEY_FILE rather than
         # widening this to the operator's LOCALAPPDATA.
         _scoped_home = str(workspace)
         env["HOME"] = _scoped_home
         env["USERPROFILE"] = _scoped_home
         env["LOCALAPPDATA"] = str(workspace / "AppData" / "Local")
+        env["APPDATA"] = str(workspace / "AppData" / "Roaming")
     elif backend_profile is not None:
         raise ValueError(f"unsupported backend_profile {backend_profile!r}")
     else:
