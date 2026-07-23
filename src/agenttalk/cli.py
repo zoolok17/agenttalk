@@ -2320,18 +2320,49 @@ def _build_dod_eval(store, record: dict):
     return bundle
 
 
+# Blank-glyph fillers that render empty/space but fall in an otherwise-"visible" general category
+# (Lo/So), so the category + combining-mark filtering in _substantive_len misses them. Small,
+# named, and stable (these are the non-C/non-Z blanks Unicode defines).
+_BLANK_GLYPH_FILLERS = frozenset({
+    0x115F,   # HANGUL CHOSEONG FILLER (Lo)
+    0x1160,   # HANGUL JUNGSEONG FILLER (Lo)
+    0x3164,   # HANGUL FILLER (Lo)
+    0xFFA0,   # HALFWIDTH HANGUL FILLER (Lo)
+    0x2800,   # BRAILLE PATTERN BLANK (So)
+})
+
+
 def _substantive_len(text: str) -> int:
-    """Count VISIBLE, substantive characters in ``text``: exclude whitespace and every Unicode
-    separator (category Z*) and other/control/format (category C*) character. Used for the
-    knowledge ``min_body_chars`` triviality floor so padding cannot buy past it anywhere in the
-    body - trailing/leading/interior whitespace, and invisible fillers like U+200B ZERO WIDTH
-    SPACE (Cf) or control characters, all contribute zero. (`str.strip()` alone removed only
-    edge whitespace and left both interior-space and zero-width padding open.)"""
+    """Count VISIBLE, substantive characters in ``text`` for the knowledge ``min_body_chars``
+    triviality floor, so padding cannot buy past it ANYWHERE in the body. A char contributes only
+    if it is not whitespace AND not any of the invisible/blank classes below. Together these cover
+    the entire Unicode Default_Ignorable_Code_Point set plus the blank-glyph fillers that fall in
+    otherwise-"visible" categories (general category alone is NOT a visibility predicate):
+
+    - whitespace (`str.isspace()`) and separators (category Z*);
+    - other/control/format/surrogate/private-use/unassigned (category C*) - this alone covers
+      U+200B, U+FEFF, U+2060, the bidi marks/overrides, tag chars, soft hyphen, etc.;
+    - zero-width combining marks (categories Mn nonspacing / Me enclosing) - these have no advance
+      width of their own and only modify a base, so a run of them is invisible: covers the
+      COMBINING GRAPHEME JOINER (U+034F), all VARIATION SELECTORs (U+FE00-FE0F, U+E0100-E01EF),
+      and the Mongolian free variation selectors. A base letter still counts; a standalone mark
+      does not. (Spacing marks Mc, e.g. Indic vowel signs, DO carry width and are counted.);
+    - a small explicit set of blank-glyph fillers that render empty but sit in Lo/So: the Hangul
+      fillers and BRAILLE PATTERN BLANK.
+
+    `str.strip()` alone removed only edge whitespace; category Z*/C* alone missed the Mn variation
+    selectors and the Lo/So blank fillers. Exotic gaming of one's OWN quality gate is outside the
+    core threat model, but these known-invisible classes are defended so the floor is meaningful."""
     n = 0
     for ch in text:
         if ch.isspace():
             continue
-        if unicodedata.category(ch)[0] in ("Z", "C"):
+        cat = unicodedata.category(ch)
+        if cat[0] in ("Z", "C"):
+            continue
+        if cat in ("Mn", "Me"):
+            continue
+        if ord(ch) in _BLANK_GLYPH_FILLERS:
             continue
         n += 1
     return n

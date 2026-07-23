@@ -1529,3 +1529,54 @@ def test_substantive_len_counts_only_visible_chars() -> None:
     assert cli._substantive_len("​​​") == 0    # zero-width spaces
     assert cli._substantive_len("  x\t\n") == 1
     assert cli._substantive_len("café ☃!") == 6               # accented + symbol count
+
+
+@pytest.mark.parametrize("body,label", [
+    ("͏" * 40, "combining-grapheme-joiner"),   # Mn, default-ignorable
+    ("️" * 40, "variation-selector-16"),        # Mn
+    ("\U000e0100" * 40, "variation-selector-17"),    # Mn (supplementary)
+    ("᠋" * 40, "mongolian-fvs-one"),            # Mn
+    ("ㅤ" * 40, "hangul-filler"),                # Lo, blank glyph
+    ("⠀" * 40, "braille-blank"),                # So, blank glyph
+    ("ᅟ" * 40, "hangul-choseong-filler"),       # Lo, blank glyph
+    ("﻿" * 40, "bom-zwnbsp"),                   # Cf (regression: still 0)
+])
+def test_substantive_len_default_ignorable_and_blank_glyphs_are_zero(body, label) -> None:
+    # Re-review round 3: general category is NOT a visibility predicate. Default-ignorable
+    # combining marks (Mn) and blank-glyph fillers (Lo/So) render empty but escaped the Z*/C*
+    # filter. A body of 40 of any of them must count as 0 substantive chars.
+    assert cli._substantive_len(body) == 0
+
+
+@pytest.mark.parametrize("body,expect", [
+    ("é" * 30, 30),        # base letter + combining acute: the 30 bases count, marks don't
+    ("abc️", 3),            # emoji variation selector after 3 letters -> 3
+    ("x" * 40 + "​" * 99, 40),   # padding after real content doesn't inflate OR deflate
+])
+def test_substantive_len_counts_visible_base_despite_marks(body, expect) -> None:
+    assert cli._substantive_len(body) == expect
+
+
+@pytest.mark.parametrize("body,label", [
+    ("͏" * 40, "combining-grapheme-joiner"),
+    ("️" * 40, "variation-selector-16"),
+    ("ㅤ" * 40, "hangul-filler"),
+    ("⠀" * 40, "braille-blank"),
+])
+def test_resolve_dod_knowledge_default_ignorable_body_does_not_clear(
+        tmp_path: Path, body, label) -> None:
+    # End-to-end (real publish/curate): an effectively-invisible note must NOT clear the floor.
+    root = _init(tmp_path)
+    s = Store(root)
+    _add_note(s, key=f"dod.di.{label}", ntype="gotcha", body=body,
+              anchor={"kind": "sha", "sha": SHA}, vsha=None)
+    spec = {"when": "on_remediation", "min_notes": 1, "min_body_chars": 40,
+            "types": ["decision", "gotcha", "lesson"]}
+    rec = close.empty_close(
+        "c", scope="release", revision=SHA, revision_kind="sha", gate_scope="release",
+        opened_by="lead", opened_at="t0", epoch_at_open=None, required_lenses=[],
+        revision_clean=True, dirty_artifact=None)
+    rec["remediation_items"] = {"r1": {"id": "r1", "blocker": False}}
+    k = cli._resolve_dod_knowledge(s, spec, rec)
+    assert k["bound_notes"] == [{"type": "gotcha", "body_len": 0}]
+    assert close._evaluate_dod_knowledge(rec, k)[0][0] == close.HOLD_TRIVIAL_EVIDENCE
