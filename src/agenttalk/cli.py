@@ -15,6 +15,7 @@ import stat
 import subprocess  # nosec B404
 import sys
 import time
+import unicodedata
 import uuid
 import webbrowser
 from datetime import datetime, timedelta, timezone
@@ -2319,6 +2320,23 @@ def _build_dod_eval(store, record: dict):
     return bundle
 
 
+def _substantive_len(text: str) -> int:
+    """Count VISIBLE, substantive characters in ``text``: exclude whitespace and every Unicode
+    separator (category Z*) and other/control/format (category C*) character. Used for the
+    knowledge ``min_body_chars`` triviality floor so padding cannot buy past it anywhere in the
+    body - trailing/leading/interior whitespace, and invisible fillers like U+200B ZERO WIDTH
+    SPACE (Cf) or control characters, all contribute zero. (`str.strip()` alone removed only
+    edge whitespace and left both interior-space and zero-width padding open.)"""
+    n = 0
+    for ch in text:
+        if ch.isspace():
+            continue
+        if unicodedata.category(ch)[0] in ("Z", "C"):
+            continue
+        n += 1
+    return n
+
+
 def _resolve_dod_knowledge(store, spec: dict, record: dict) -> dict:
     """Resolve the CURATED knowledge notes BOUND to this close's revision (never reads a note by
     id - #44; the addressable identity is (domain,key), and a note is bound by a sha anchor /
@@ -2344,11 +2362,13 @@ def _resolve_dod_knowledge(store, spec: dict, record: dict) -> dict:
             if note.get("type") not in types:
                 continue
             if _knowledge_note_bound_to(note, revision):
-                # Measure the STRIPPED body: min_body_chars is a triviality floor, and a body of
-                # one real char + 39 trailing spaces has substantive length 1, not 40. Trim
-                # surrounding whitespace so padding cannot buy past the floor.
+                # min_body_chars is a SUBSTANTIVE-content floor, so measure only visible content:
+                # count characters that are not whitespace and not in a Unicode separator (Z*) or
+                # other/control/format (C*) category. This defeats padding ANYWHERE in the body,
+                # not just at the edges - trailing spaces, interior "x x x ..." runs, and invisible
+                # fillers like U+200B ZERO WIDTH SPACE (Cf) or control chars all count as zero.
                 bound.append({"type": note.get("type"),
-                              "body_len": len(str(note.get("body") or "").strip())})
+                              "body_len": _substantive_len(str(note.get("body") or ""))})
         except Exception:  # noqa: BLE001, S112  # nosec - skip a malformed note, never crash
             continue
     return {
@@ -2925,10 +2945,11 @@ def cmd_close(args: argparse.Namespace) -> int:
             # mutators (`gate set`/`gate waive`, `knowledge retract`, signoff writes) - those live
             # under the config lock, a separate mutex - and `commit` itself does a cross-file
             # read+write (`load_close` -> `_write_close`). So an evidence mutation landing in that
-            # window can leave a persisted GO whose evidence has since changed. This is a KNOWN,
-            # documented race (near-impossible under today's serial single-operator use); full
-            # closure needs one enforced lock spanning every evidence writer + this commit, and a
-            # stale-GO detector - both ride the #31 close-provenance envelope. Do NOT restore the
+            # window can leave a persisted GO whose evidence has since changed. This is a narrow
+            # KNOWN, documented race tracked by #66/#31 (no enforced serialization invariant
+            # excludes the evidence mutators today); full closure needs one enforced lock spanning
+            # every evidence writer + this commit, and a stale-GO detector - both ride the #31
+            # close-provenance envelope. Do NOT restore the
             # earlier "no ack/counter can invalidate a GO between check and write" claim; it was
             # false (proven by a real-CLI repro that persisted GO against a gate set red mid-publish).
             with close_mod.close_transaction(store, args.id) as transaction:

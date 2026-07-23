@@ -1496,12 +1496,20 @@ def test_resolve_dod_knowledge_binds_curated_notes_by_sha_and_vsha(tmp_path: Pat
     assert close._evaluate_dod_knowledge(rec, k) == []
 
 
-def test_resolve_dod_knowledge_whitespace_padded_body_does_not_clear(tmp_path: Path) -> None:
-    # BLOCKER 3: a body of one real char + 39 trailing spaces is 40 chars raw but substantively
-    # 1. The resolver must measure the STRIPPED length, so it must NOT buy past min_body_chars=40.
+@pytest.mark.parametrize("body,expect_len,label", [
+    ("x" + " " * 39, 1, "trailing-spaces"),                 # BLOCKER 3 (original)
+    ("x" + " " * 39 + "y", 2, "interior-spaces"),           # re-review: interior padding
+    ("​" * 40, 0, "zero-width-space-only"),            # re-review: invisible U+200B (Cf)
+    ("x " * 20, 20, "alternating-space"),                   # only the 20 visible x's count
+    ("\t\n" + "z" * 3 + " " * 30, 3, "mixed-ws-nbsp"),  # NBSP (Zs) + control -> 3
+])
+def test_resolve_dod_knowledge_padding_never_clears_floor(
+        tmp_path: Path, body, expect_len, label) -> None:
+    # min_body_chars is a SUBSTANTIVE-content floor: padding ANYWHERE - trailing/interior
+    # whitespace, invisible U+200B, NBSP, control chars - must not buy past it (Codex re-review).
     root = _init(tmp_path)
     s = Store(root)
-    _add_note(s, key="dod.padded", ntype="gotcha", body="x" + " " * 39,
+    _add_note(s, key=f"dod.pad.{label}", ntype="gotcha", body=body,
               anchor={"kind": "sha", "sha": SHA}, vsha=None)
     spec = {"when": "on_remediation", "min_notes": 1, "min_body_chars": 40,
             "types": ["decision", "gotcha", "lesson"]}
@@ -1511,6 +1519,13 @@ def test_resolve_dod_knowledge_whitespace_padded_body_does_not_clear(tmp_path: P
         revision_clean=True, dirty_artifact=None)
     rec["remediation_items"] = {"r1": {"id": "r1", "blocker": False}}
     k = cli._resolve_dod_knowledge(s, spec, rec)
-    assert k["bound_notes"] == [{"type": "gotcha", "body_len": 1}]   # stripped, not 40
-    # the padded stub is bound-but-not-qualifying -> HOLD_TRIVIAL_EVIDENCE, not a GO
+    assert k["bound_notes"] == [{"type": "gotcha", "body_len": expect_len}]
+    # bound-but-not-qualifying -> HOLD_TRIVIAL_EVIDENCE, never a GO
     assert close._evaluate_dod_knowledge(rec, k)[0][0] == close.HOLD_TRIVIAL_EVIDENCE
+
+
+def test_substantive_len_counts_only_visible_chars() -> None:
+    assert cli._substantive_len("hello world") == 10          # space excluded
+    assert cli._substantive_len("​​​") == 0    # zero-width spaces
+    assert cli._substantive_len("  x\t\n") == 1
+    assert cli._substantive_len("café ☃!") == 6               # accented + symbol count

@@ -1015,9 +1015,10 @@ def _evaluate_dod_knowledge(record: dict, k: dict | None) -> list[tuple[str, str
     #66 KNOWN RACE (documented, tracked): the CLI resolves ``bound_notes`` (an I/O read of the
     knowledge log) and then persists the close verdict in a separate step; a ``knowledge retract``
     landing in that window can leave a persisted GO citing a now-retracted note. The publish path
-    re-resolves right before the write to make this RARE (not a guaranteed closure - the write is
-    not atomic with the evidence read across files); full closure + a stale-GO detector ride the
-    #31 close-provenance envelope. This evaluator is pure and correct for the inputs it is given."""
+    resolves evidence immediately before the write to keep the exposure narrow (not a guaranteed
+    closure - the write is not atomic with the evidence read across files); full closure + a
+    stale-GO detector ride the #31 close-provenance envelope. This is a narrow known race tracked
+    by #66/#31. This evaluator is pure and correct for the inputs it is given."""
     if not isinstance(k, dict):
         return [(HOLD_MISSING_KNOWLEDGE,
                  "knowledge evidence is required for this scope but was not resolved")]
