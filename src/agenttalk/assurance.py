@@ -24,7 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agenttalk import __version__
+from agenttalk import __version__, gates
+from agenttalk.coverage_parse import parse_coverage_percent
 
 
 SCHEMA_VERSION = 1
@@ -160,6 +161,10 @@ GENERATED_KIND_ALIASES = {
     "sh": "shell",
 }
 EXECUTED_STATUSES = {"pass", "fail-blocking", "fail-advisory"}
+_COVERAGE_ARTIFACTS = ("coverage.xml", "coverage.json")
+_COVERAGE_ARTIFACT_MAX_BYTES = 16 * 1024 * 1024
+_GIT_SHA_RE = re.compile(r"\A[0-9a-fA-F]{40}\Z")
+_GITHUB_REPOSITORY_RE = re.compile(r"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 
 
 class AssuranceUsageError(ValueError):
@@ -558,7 +563,8 @@ def run_plan(plan: ScanPlan) -> ScanResult:
             else:
                 residual.append(_risk(spec["dimension"], reason, "medium", tool_id=tool_id))
             continue
-        run, ext_findings, raw = _run_external(plan.root, spec, command)
+        coverage_snapshot = _snapshot_coverage_artifacts(plan.root) if tool_id == "coverage" else None
+        run, ext_findings, raw, stdout = _run_external(plan.root, spec, command)
         tools_run.append(run)
         if raw:
             raw_logs[tool_id] = raw
@@ -567,6 +573,8 @@ def run_plan(plan: ScanPlan) -> ScanResult:
             required_missing.append({"tool_id": tool_id, "reason": run["status"]})
         elif run["status"] in {"error-optional-tool", "timeout-optional"}:
             residual.append(_risk(spec["dimension"], f"{tool_id} {run['status']}", "medium", tool_id=tool_id))
+        if coverage_snapshot is not None:
+            _emit_coverage_gate(plan, run, stdout, coverage_snapshot)
 
     considered = [spec["tool_id"] for spec in plan.tools]
     result = ScanResult(
@@ -1193,7 +1201,7 @@ def _run_external(
     root: Path,
     spec: dict[str, Any],
     command: list[str],
-) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], str, str]:
     start = time.monotonic()
     timeout = int(spec.get("timeout_seconds") or 60)
     raw = ""
@@ -1206,9 +1214,23 @@ def _run_external(
             timeout=timeout,
             check=False,
         )
+    except OSError as exc:
+        status = "error-required-tool" if spec.get("required") else "error-optional-tool"
+        raw = f"{type(exc).__name__}: {exc}"
+        run = _run_record(
+            spec,
+            status,
+            start,
+            command=command,
+            exit_code=None,
+            raw_log_pending=True,
+        )
+        return run, [], raw, ""
     except subprocess.TimeoutExpired as exc:
         status = "timeout-required" if spec.get("required") else "timeout-optional"
-        raw = (exc.stdout or "") + (exc.stderr or "")
+        stdout = _process_output_text(exc.stdout)
+        stderr = _process_output_text(exc.stderr)
+        raw = stdout + stderr
         run = _run_record(
             spec,
             status,
@@ -1217,9 +1239,11 @@ def _run_external(
             exit_code=None,
             raw_log_pending=bool(raw),
         )
-        return run, [], raw
-    raw = (completed.stdout or "") + ("\n" if completed.stdout and completed.stderr else "") + (completed.stderr or "")
-    findings = _parse_tool_findings(spec, completed.stdout or "", completed.stderr or "")
+        return run, [], raw, stdout
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    raw = stdout + ("\n" if stdout and stderr else "") + stderr
+    findings = _parse_tool_findings(spec, stdout, stderr)
     if findings:
         status = _pre_baseline_status(
             findings,
@@ -1238,7 +1262,127 @@ def _run_external(
         exit_code=completed.returncode,
         raw_log_pending=bool(raw),
     )
-    return run, findings, raw
+    return run, findings, raw, stdout
+
+
+def _process_output_text(output: str | bytes | None) -> str:
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return output or ""
+
+
+def _read_coverage_artifact_bytes(path: Path) -> tuple[str, bytes | None]:
+    try:
+        if not path.exists():
+            return "missing", None
+        if path.is_symlink() or not path.is_file():
+            return "unsafe", None
+        with path.open("rb") as handle:
+            data = handle.read(_COVERAGE_ARTIFACT_MAX_BYTES + 1)
+            stat_result = os.fstat(handle.fileno())
+        if len(data) > _COVERAGE_ARTIFACT_MAX_BYTES:
+            return "oversized", None
+        digest = hashlib.sha256(data).hexdigest()
+        fingerprint = (
+            f"sha256:{digest}:dev:{stat_result.st_dev}:ino:{stat_result.st_ino}:"
+            f"size:{stat_result.st_size}:mtime_ns:{stat_result.st_mtime_ns}"
+        )
+        return fingerprint, data
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "unreadable", None
+
+
+def _coverage_artifact_fingerprint(path: Path) -> str:
+    fingerprint, _data = _read_coverage_artifact_bytes(path)
+    return fingerprint
+
+
+def _snapshot_coverage_artifacts(root: Path) -> dict[str, str]:
+    return {
+        name: _coverage_artifact_fingerprint(root / name)
+        for name in _COVERAGE_ARTIFACTS
+    }
+
+
+def _read_new_coverage_artifact(root: Path, name: str, previous: str) -> str | None:
+    path = root / name
+    current, data = _read_coverage_artifact_bytes(path)
+    if previous == "unreadable" or current in {"missing", "unsafe", "oversized", "unreadable"}:
+        return None
+    if current == previous or data is None:
+        return None
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeError:
+        return None
+
+
+def _github_actions_evidence(provenance: dict[str, Any]) -> str | None:
+    revision = str(provenance.get("git_sha") or "")
+    github_sha = os.environ.get("GITHUB_SHA", "")
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    if os.environ.get("CI", "").lower() != "true" or os.environ.get("GITHUB_ACTIONS", "").lower() != "true":
+        return None
+    if provenance.get("git_dirty") is not False:
+        return None
+    if not _GIT_SHA_RE.fullmatch(revision) or github_sha.lower() != revision.lower():
+        return None
+    if not run_id.isdigit() or not run_attempt.isdigit() or not _GITHUB_REPOSITORY_RE.fullmatch(repository):
+        return None
+    return f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{run_attempt}"
+
+
+def _emit_coverage_gate(
+    plan: ScanPlan,
+    run: dict[str, Any],
+    stdout: str,
+    artifact_snapshot: dict[str, str],
+) -> None:
+    from agenttalk.store import Store
+
+    xml_text = _read_new_coverage_artifact(
+        plan.root,
+        "coverage.xml",
+        artifact_snapshot["coverage.xml"],
+    )
+    json_text = _read_new_coverage_artifact(
+        plan.root,
+        "coverage.json",
+        artifact_snapshot["coverage.json"],
+    )
+    percent = parse_coverage_percent(stdout, xml_text=xml_text, json_text=json_text)
+    ci_evidence = _github_actions_evidence(plan.provenance)
+    command_succeeded = run.get("status") == "pass" and run.get("exit_code") == 0
+    is_green = command_succeeded and percent is not None and ci_evidence is not None
+    evidence_source = "automation_ci" if ci_evidence is not None else "local_command"
+    if not command_succeeded:
+        reason = "coverage command did not complete successfully"
+    elif percent is None:
+        reason = "coverage command succeeded but no overall percentage could be parsed"
+    elif ci_evidence is None:
+        reason = "coverage percentage is not bound to an attested clean CI revision"
+    else:
+        reason = "coverage command succeeded with a parsed, revision-bound CI measurement"
+    evidence = [ci_evidence] if ci_evidence is not None else [f"assurance-run:{plan.run_id}"]
+    evidence_details = {"coverage_percent": float(percent)} if percent is not None else None
+    with Store(plan.root).config_lock():
+        gates.set_gate(
+            plan.root,
+            name=f"coverage:{plan.profile}",
+            status="green" if is_green else "red",
+            severity="blocker",
+            scope=plan.profile,
+            actor="assurance-ci" if ci_evidence is not None else "assurance-local",
+            evidence_source=evidence_source,
+            evidence=evidence,
+            evidence_details=evidence_details,
+            reason=reason,
+            revision=str(plan.provenance.get("git_sha") or "") or None,
+        )
 
 
 def _run_record(

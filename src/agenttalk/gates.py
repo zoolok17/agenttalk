@@ -80,6 +80,7 @@ def set_gate(
     actor: str,
     evidence_source: str,
     evidence: list[str] | None = None,
+    evidence_details: dict[str, Any] | None = None,
     reason: str | None = None,
     revision: str | None = None,
     epoch: str | None = None,
@@ -99,6 +100,16 @@ def set_gate(
         )
     if status == "green" and severity == "blocker" and not evidence:
         raise ValueError("severity=blocker gates need evidence before they can be set green")
+    if evidence_details is not None:
+        if not isinstance(evidence_details, dict):
+            raise ValueError("evidence_details must be an object")
+        reserved = {"source", "refs", "at", "by"}.intersection(evidence_details)
+        if reserved:
+            raise ValueError(f"evidence_details cannot replace reserved fields: {sorted(reserved)}")
+        try:
+            json.dumps(evidence_details, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("evidence_details must contain finite JSON values") from exc
     state = load_gate_state(root)
     _refuse_on_load_error(state)
     gate = dict(state["gates"].get(name, {}))
@@ -118,16 +129,19 @@ def set_gate(
         gate["revision"] = revision
     if epoch is not None:
         gate["epoch"] = epoch
-    if evidence:
+    if evidence or evidence_details:
         entries = gate.get("evidence")
         if not isinstance(entries, list):
             entries = []
-        entries.append({
+        entry = {
             "source": evidence_source,
-            "refs": list(evidence),
+            "refs": list(evidence or []),
             "at": now,
             "by": actor,
-        })
+        }
+        if evidence_details:
+            entry.update(evidence_details)
+        entries.append(entry)
         gate["evidence"] = entries
     state["gates"][name] = gate
     required_set = set(state["required_gates"])
