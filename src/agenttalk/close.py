@@ -83,10 +83,30 @@ HOLD_INVALID_POLICY = "invalid_signoff_policy"
 HOLD_UNMAPPED_RISK = "unmapped_required_risk"
 HOLD_STALE_ROUTE = "stale_signoff_route"
 HOLD_WORKTREE_ISOLATION = "worktree_isolation_unverified"
+# DoD forcing-gate hold codes (#60) - the "red-by-default until typed evidence exists" dimensions.
+HOLD_INVALID_DOD_POLICY = "invalid_dod_policy"
+HOLD_MISSING_ASSURANCE = "missing_assurance_evidence"
+HOLD_STALE_ASSURANCE = "stale_assurance_evidence"
+HOLD_UNATTESTED_ASSURANCE = "unattested_assurance_evidence"
 
 RELEASE_CLASS_SCOPES = {"release", "milestone", "feature", "hotfix"}
 
 SIGNOFF_DIRNAME = "signoffs.json"
+DOD_DIRNAME = "dod.json"
+# Dimensions the DoD evaluator can actually enforce. This set GROWS per increment; declaring a
+# dimension the engine cannot enforce is a policy error (you must not be able to require what
+# cannot be checked - a silent soft-pass is exactly the failure this gate exists to prevent).
+# inc-1: assurance only. inc-2 adds knowledge; inc-3 adds coverage + a depth-signoff dimension.
+_DOD_SUPPORTED_DIMENSIONS = frozenset({"assurance"})
+_DOD_ALLOWED_TOP_KEYS = frozenset({"schema_version", "scopes"})
+_DOD_ASSURANCE_KEYS = frozenset({"gate", "max_age_days"})
+_DOD_SCHEMA_VERSION = 1
+# Fail-closed bounds on the policy file itself: reject an oversized dod.json before decode, so a
+# pathological deeply-nested document cannot exhaust the parser (RecursionError) or memory.
+_DOD_MAX_BYTES = 64 * 1024
+# Bounded clock-skew allowance for freshness: an attestation timestamp up to this far in the
+# future is tolerated (clock jitter); beyond it is treated as an invalid future-dated attestation.
+_DOD_CLOCK_SKEW_DAYS = 300.0 / 86400.0
 
 _CLOSE_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _FULL_SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
@@ -145,7 +165,8 @@ def empty_close(close_id: str, *, scope: str, revision: str, revision_kind: str,
 
 def compute_verdict(record: dict, gate_check: dict,
                     signoff_eval: dict | None = None,
-                    worktree_eval: dict | None = None) -> dict[str, Any]:
+                    worktree_eval: dict | None = None,
+                    dod_eval: dict | None = None) -> dict[str, Any]:
     """PURE: derive HOLD|GO + the stable hold codes from a close ``record`` and a
     ``gate_check`` result (:func:`gates.check_gates` output for the close's
     gate_scope). No I/O. GO requires, in order of the codes below: a well-formed
@@ -161,8 +182,14 @@ def compute_verdict(record: dict, gate_check: dict,
     already-resolved evaluation in; this function only COUNTS, so it stays pure and
     unit-testable. It is None for a P2-only close; a close that HAS
     ``required_signoffs`` but is handed no ``signoff_eval`` fails closed (the CLI
-    always supplies one for P3 closes). Returns
-    ``{"verdict", "holds": [{code, detail}], "ok"}``."""
+    always supplies one for P3 closes).
+
+    ``dod_eval`` is the same impure->pure bridge for the #60 Definition-of-Done
+    forcing gate: the CLI resolves the DoD policy + the required evidence (e.g. the
+    ``assurance:<scope>`` gate's fields) and passes the already-resolved bundle in;
+    :func:`evaluate_dod` only COUNTS. It is ``None`` when the close's scope has no
+    DoD requirements, in which case the fold is a no-op (byte-identical to today).
+    Returns ``{"verdict", "holds": [{code, detail}], "ok"}``."""
     holds: list[dict] = []
 
     def hold(code: str, detail: str) -> None:
@@ -248,6 +275,11 @@ def compute_verdict(record: dict, gate_check: dict,
 
     # P3: derived specialist sign-off counts (pure over the CLI-supplied eval).
     for code, detail in _evaluate_signoffs(record, signoff_eval):
+        hold(code, detail)
+    # DoD forcing gate (#60): red-by-default evidence dimensions, pure over the CLI-supplied
+    # ``dod_eval`` bundle (same impure->pure bridge as signoff_eval). Purely ADDITIVE - it can
+    # only ADD holds, never remove one, so it cannot loosen today's verdict. None ⇒ no DoD.
+    for code, detail in evaluate_dod(record, dod_eval):
         hold(code, detail)
     return _verdict(holds)
 
@@ -662,6 +694,247 @@ def load_signoff_policy(store) -> tuple[dict | None, str | None]:
         # defense-in-depth: ANY malformed policy must fail closed to
         # invalid_signoff_policy, never crash `close check` (fail-closed contract).
         return None, f"malformed signoff policy: {type(e).__name__}: {e}"
+
+
+# --------------------------------------------- #60 DoD forcing gate (red-by-default)
+
+def dod_policy_path(store):
+    return store.dir / DOD_DIRNAME
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    """``object_pairs_hook`` that fails CLOSED on a duplicated key at ANY object level. Python's
+    default decoder silently keeps the LAST value of a duplicated key, so a malformed policy like
+    ``{"scopes":{...},"scopes":{}}`` (erases all requirements) or a duplicated ``max_age_days``
+    (disables freshness) would decode to a valid-looking dict and produce a false GO *before*
+    validate_dod_policy ever runs. Rejecting duplicates at decode time closes that class."""
+    seen: dict[str, object] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key {key!r} in dod.json (ambiguous policy; fail closed)")
+        seen[key] = value
+    return seen
+
+
+def load_dod_policy(store) -> tuple[dict | None, str | None]:
+    """Load + validate ``.agenttalk/dod.json``. Returns (policy, error): a MISSING file is a
+    valid EMPTY policy -> (None, None) meaning "no DoD, zero required dimensions" (close behaves
+    byte-identically to before #60); a present-but-malformed/unparseable file fails CLOSED ->
+    (None, error), which the CLI surfaces as ``HOLD_INVALID_DOD_POLICY`` - never a crash."""
+    path = dod_policy_path(store)
+    if not path.exists():
+        return None, None
+    try:
+        size = path.stat().st_size
+        if size > _DOD_MAX_BYTES:
+            # bound the file BEFORE decode so a pathological document cannot exhaust the parser.
+            return None, f"dod.json exceeds max size ({size} > {_DOD_MAX_BYTES} bytes)"
+        # object_pairs_hook rejects duplicate keys at every level (a duplicated key would otherwise
+        # silently keep its last value and erase a requirement / disable freshness -> false GO).
+        raw = json.loads(path.read_text(encoding="utf-8-sig"),
+                         object_pairs_hook=_reject_duplicate_keys)
+    except (ValueError, OSError, RecursionError) as e:
+        # RecursionError: deeply-nested JSON. Must fail CLOSED, never propagate out of close check.
+        return None, f"dod.json is unreadable/corrupt: {type(e).__name__}: {e}"
+    try:
+        return validate_dod_policy(raw), None
+    except CloseError as e:
+        return None, str(e)
+    except Exception as e:  # noqa: BLE001 - ANY malformed policy fails CLOSED, never crashes close check
+        return None, f"malformed dod policy: {type(e).__name__}: {e}"
+
+
+def validate_dod_policy(raw: object) -> dict:
+    """Validate + normalize ``.agenttalk/dod.json``. Raises CloseError (CLI ->
+    HOLD_INVALID_DOD_POLICY) on any malformed policy. A dimension the engine cannot enforce
+    (not in ``_DOD_SUPPORTED_DIMENSIONS``) is REJECTED: you must not be able to declare a
+    requirement that would silently soft-pass - that is the exact failure #60 prevents."""
+    if not isinstance(raw, dict):
+        raise CloseError("dod policy must be a JSON object")
+    unknown_top = set(raw) - set(_DOD_ALLOWED_TOP_KEYS)
+    if unknown_top:
+        # unknown keys fail CLOSED - a typo like "scope"/"scopez" must never be silently ignored.
+        raise CloseError(f"dod policy has unknown top-level key(s): {sorted(unknown_top)}")
+    schema_version = raw.get("schema_version")
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+        raise CloseError("dod policy schema_version must be an integer")
+    if schema_version != _DOD_SCHEMA_VERSION:
+        # reject unknown/future versions rather than best-effort interpreting them.
+        raise CloseError(
+            f"dod policy schema_version {schema_version} is unsupported "
+            f"(this build enforces {_DOD_SCHEMA_VERSION})")
+    # distinguish ABSENT (valid empty policy) from PRESENT-BUT-WRONG-TYPE (fail closed): `or {}`
+    # would collapse a present [] / "" / 0 to an empty policy and silently drop all requirements.
+    if "scopes" in raw:
+        scopes_raw = raw["scopes"]
+        if not isinstance(scopes_raw, dict):
+            raise CloseError("dod policy 'scopes' must be an object")
+    else:
+        scopes_raw = {}
+    scopes: dict[str, dict] = {}
+    for scope_name, dims in scopes_raw.items():
+        if not isinstance(dims, dict):
+            raise CloseError(f"dod scope {scope_name!r} must map to an object of dimensions")
+        norm: dict[str, dict] = {}
+        for dim, spec in dims.items():
+            if dim not in _DOD_SUPPORTED_DIMENSIONS:
+                raise CloseError(
+                    f"dod dimension {dim!r} is not supported in this version "
+                    f"(supported: {sorted(_DOD_SUPPORTED_DIMENSIONS)})")
+            if dim == "assurance":
+                norm[dim] = _validate_dod_assurance_spec(spec, scope_name)
+        key = str(scope_name).lower()
+        if key in scopes:
+            # two scope names that collide after lowercasing are ambiguous -> fail closed.
+            raise CloseError(f"dod policy has case-insensitively colliding scope name {key!r}")
+        scopes[key] = norm
+    return {"schema_version": schema_version, "scopes": scopes}
+
+
+def _validate_dod_assurance_spec(spec: object, scope_name: str) -> dict:
+    if not isinstance(spec, dict):
+        raise CloseError(f"dod scope {scope_name!r} assurance must be an object")
+    unknown = set(spec) - set(_DOD_ASSURANCE_KEYS)
+    if unknown:
+        # e.g. a "max_age_day" typo must RAISE, not silently drop the freshness requirement.
+        raise CloseError(
+            f"dod scope {scope_name!r} assurance has unknown key(s): {sorted(unknown)}")
+    gate = spec.get("gate")
+    if not isinstance(gate, str) or not gate.strip():
+        raise CloseError(f"dod scope {scope_name!r} assurance.gate must be a non-empty string")
+    max_age = spec.get("max_age_days")
+    if max_age is not None and (
+        not isinstance(max_age, int) or isinstance(max_age, bool) or max_age < 0
+    ):
+        raise CloseError(
+            f"dod scope {scope_name!r} assurance.max_age_days must be a non-negative integer")
+    return {"gate": gate, "max_age_days": max_age}
+
+
+def dod_policy_hash(policy: dict) -> str:
+    return _stable_hash(policy)
+
+
+def derive_required_dod(policy: dict | None, scope: str) -> dict:
+    """PURE: the DoD dimensions required for this close's ``scope``. ``{"dimensions": {}}`` when
+    there is no policy or the scope is unmapped (unmapped ⇒ zero requirements ⇒ safe default,
+    exactly like an absent policy). Live-derived at check time (no frozen apply/route), so the
+    gate can never be silently skipped by forgetting an apply step."""
+    if not policy:
+        return {"dimensions": {}}
+    scopes = policy.get("scopes") or {}
+    return {"dimensions": dict(scopes.get(str(scope or "").lower()) or {})}
+
+
+def evaluate_dod(record: dict, dod_eval: dict | None) -> list[tuple[str, str]]:
+    """PURE: given a close ``record`` and a CLI-resolved ``dod_eval`` bundle, return (code,
+    detail) DoD holds. All I/O (load the policy, read the assurance gate) happens in the CLI
+    and is passed in already resolved - this only COUNTS, mirroring :func:`_evaluate_signoffs`.
+
+    dod_eval = {
+      "policy_present": bool,
+      "policy_error": str | None,               # malformed dod.json -> HOLD_INVALID_DOD_POLICY
+      "required_dimensions": {dim: spec, ...},  # derived for THIS close's scope
+      "assurance": {                            # present iff "assurance" in required_dimensions
+        "gate": str, "present": bool, "status": str|None, "severity": str|None,
+        "evidence_source": str|None, "revision": str|None, "waiver_active": bool,
+        "gate_scope": str|None,                 # the gate's OWN scope (None = global)
+        "close_gate_scope": str|None,           # the scope this close's gate check applies to
+        "age_days": float|None,                 # SIGNED age (negative = future); None if unparseable
+        "max_age_days": int|None,
+      } | None,
+    }
+    ``None`` ⇒ [] (the scope has no DoD requirements)."""
+    if dod_eval is None:
+        return []
+    if not isinstance(dod_eval, dict):
+        return [(HOLD_INVALID_DOD_POLICY, "dod evaluation bundle is malformed")]
+    if dod_eval.get("policy_error"):
+        return [(HOLD_INVALID_DOD_POLICY, str(dod_eval["policy_error"]))]
+    required = dod_eval.get("required_dimensions") or {}
+    if not required:
+        return []
+    out: list[tuple[str, str]] = []
+    if "assurance" in required:
+        out.extend(_evaluate_dod_assurance(record, dod_eval.get("assurance")))
+    return out
+
+
+def _evaluate_dod_assurance(record: dict, a: dict | None) -> list[tuple[str, str]]:
+    """PURE: the assurance dimension binds to the EXISTING ``assurance:<scope>`` gate's own
+    fields - it never reads artifact.json. Cleared iff the gate is present, applies to this
+    close's scope, is green from a CI attestation as a blocker, bound to THIS close's revision,
+    and - when max_age_days is set - fresh. A gate WAIVER does NOT clear this dimension (see the
+    waiver note below); the authenticated operator escape is task #65.
+
+    RESIDUAL RISK (not closed by this dimension): the assurance guarantee is only as strong as
+    the blocker-gate substrate it reads. ``evidence_source == "automation_ci"`` is a LABEL, not
+    yet cryptographically authenticated CI provenance - gates.py forbids greening a blocker from
+    other sources, but the label itself is not signed, so an actor who can write gates.json can
+    still assert it. Authenticated CI attestation is a separate substrate hardening (task #64,
+    sibling to the gate-waive authentication hardening); until then this is the existing blocker-gate
+    mechanism (label-trust), NOT a cryptographic sole-certifier guarantee."""
+    gate = (a or {}).get("gate") or "assurance"
+    if not isinstance(a, dict) or not a.get("present"):
+        return [(HOLD_MISSING_ASSURANCE, f"required assurance gate {gate!r} is not present")]
+    # M2: the gate's OWN scope must apply to this close, mirroring gates.check_gates EXACTLY - a
+    # gate applies to a scoped check iff its scope is that scope or "global". A gate scoped to
+    # "feature" (or scope-less) therefore does NOT satisfy a "release" close. Only when the close
+    # itself imposes no scope (close_scope falsy) is any gate applicable (gates.py skips the filter).
+    gate_scope = a.get("gate_scope")
+    close_scope = a.get("close_gate_scope")
+    if close_scope and gate_scope not in (close_scope, "global"):
+        return [(HOLD_MISSING_ASSURANCE,
+                 f"assurance gate {gate!r} is recorded under scope {gate_scope!r}, not applicable "
+                 f"to this close's scope {close_scope!r} (needs that scope or 'global')")]
+    revision_bound = a.get("revision") == record.get("revision")
+    status = a.get("status")
+    # A gate WAIVER does NOT clear the DoD assurance dimension. `gate waive --operator <text>` is
+    # UNAUTHENTICATED caller free text (docs/ASSURANCE.md) with no authenticated operator, so
+    # honoring it would turn a single `gate waive` into a revision-independent bypass of the whole
+    # forcing gate (Codex re-review of 848841a, BLOCKER). Only a green CI-attested, revision-bound
+    # blocker gate clears assurance. The AUTHENTICATED operator escape (close dod-waive validating
+    # a typed operator-answer reference) is task #65 (depends on authenticated gate-waive origin).
+    if status != "green":
+        detail = f"assurance gate {gate!r} is not green (status={status!r})"
+        if status == "waived":
+            detail = (f"assurance gate {gate!r} is waived, but an unauthenticated gate waiver does "
+                      f"not clear a DoD assurance requirement - needs a CI-attested green gate (#65)")
+        return [(HOLD_MISSING_ASSURANCE, detail)]
+    # A green blocker greens ONLY from automation_ci (gates.py enforces this at write time; we
+    # re-assert it - see the RESIDUAL RISK note above on why this is label-trust, not a proof).
+    if a.get("severity") != "blocker" or a.get("evidence_source") != "automation_ci":
+        return [(HOLD_UNATTESTED_ASSURANCE,
+                 f"assurance gate {gate!r} is green but not a CI-attested blocker "
+                 f"(severity={a.get('severity')!r}, source={a.get('evidence_source')!r})")]
+    out: list[tuple[str, str]] = []
+    if not revision_bound:
+        out.append((HOLD_STALE_ASSURANCE,
+                    f"assurance gate {gate!r} is attested for a different revision than the "
+                    f"close ({a.get('revision')!r} != {record.get('revision')!r})"))
+    # B3: when freshness is REQUIRED (max_age_days set) it must FAIL CLOSED if it cannot be
+    # validated: a missing/unparseable timestamp (age is None) and a materially future-dated one
+    # are both HOLDs, not passes. The CLI provides a SIGNED age (negative = future, not clamped).
+    max_age = a.get("max_age_days")
+    if isinstance(max_age, int) and not isinstance(max_age, bool):
+        age = a.get("age_days")
+        if age is None:
+            out.append((HOLD_STALE_ASSURANCE,
+                        f"assurance gate {gate!r} freshness is required (max_age_days={max_age}) "
+                        f"but its timestamp is missing or unparseable"))
+        elif isinstance(age, (int, float)) and not isinstance(age, bool):
+            if age < -_DOD_CLOCK_SKEW_DAYS:
+                out.append((HOLD_STALE_ASSURANCE,
+                            f"assurance gate {gate!r} is future-dated (age_days={age:.4f}); "
+                            f"refusing to treat a future attestation as fresh"))
+            elif age > max_age:
+                out.append((HOLD_STALE_ASSURANCE,
+                            f"assurance gate {gate!r} attestation is older than "
+                            f"max_age_days={max_age}"))
+        else:
+            out.append((HOLD_STALE_ASSURANCE,
+                        f"assurance gate {gate!r} freshness is required but its age is invalid"))
+    return out
 
 
 def merge_candidate_refsets(*refsets: dict) -> dict:
