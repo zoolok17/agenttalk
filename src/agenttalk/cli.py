@@ -2321,23 +2321,29 @@ def _build_dod_eval(store, record: dict):
 
 
 # Blank-glyph fillers that render empty/space but fall in an otherwise-"visible" general category
-# (Lo/So), so the category + combining-mark filtering in _substantive_len misses them. Small,
-# named, and stable (these are the non-C/non-Z blanks Unicode defines).
+# (Lo/So), so the category + combining-mark filtering in _substantive_len misses them. This is a
+# MAINTAINED blocklist, NOT an exhaustive oracle: Unicode has no stdlib "renders blank" predicate,
+# and these blanks are deliberately categorized as letters/symbols (so category/isalnum can't
+# separate them from real content) and are not all Default_Ignorable. We defend the known classes;
+# an obscure blank not yet listed is an accepted, bounded residual (see _substantive_len).
 _BLANK_GLYPH_FILLERS = frozenset({
-    0x115F,   # HANGUL CHOSEONG FILLER (Lo)
-    0x1160,   # HANGUL JUNGSEONG FILLER (Lo)
-    0x3164,   # HANGUL FILLER (Lo)
-    0xFFA0,   # HALFWIDTH HANGUL FILLER (Lo)
-    0x2800,   # BRAILLE PATTERN BLANK (So)
+    0x115F,    # HANGUL CHOSEONG FILLER (Lo)
+    0x1160,    # HANGUL JUNGSEONG FILLER (Lo)
+    0x3164,    # HANGUL FILLER (Lo)
+    0xFFA0,    # HALFWIDTH HANGUL FILLER (Lo)
+    0x2800,    # BRAILLE PATTERN BLANK (So)
+    0x1D159,   # MUSICAL SYMBOL NULL NOTEHEAD (So) - no glyph in a supporting renderer
+    0x13441,   # EGYPTIAN HIEROGLYPH FULL BLANK (Lo) - rendered as whitespace (Unicode ch.11)
+    0x13442,   # EGYPTIAN HIEROGLYPH HALF BLANK (Lo) - rendered as whitespace
 })
 
 
 def _substantive_len(text: str) -> int:
     """Count VISIBLE, substantive characters in ``text`` for the knowledge ``min_body_chars``
     triviality floor, so padding cannot buy past it ANYWHERE in the body. A char contributes only
-    if it is not whitespace AND not any of the invisible/blank classes below. Together these cover
-    the entire Unicode Default_Ignorable_Code_Point set plus the blank-glyph fillers that fall in
-    otherwise-"visible" categories (general category alone is NOT a visibility predicate):
+    if it is not whitespace AND not any of the invisible/blank classes below. General category
+    alone is NOT a visibility predicate, and Python's stdlib exposes no "renders blank" oracle, so
+    this is a BEST-EFFORT metric over the classes we can detect, NOT a proof of visibility:
 
     - whitespace (`str.isspace()`) and separators (category Z*);
     - other/control/format/surrogate/private-use/unassigned (category C*) - this alone covers
@@ -2347,12 +2353,17 @@ def _substantive_len(text: str) -> int:
       COMBINING GRAPHEME JOINER (U+034F), all VARIATION SELECTORs (U+FE00-FE0F, U+E0100-E01EF),
       and the Mongolian free variation selectors. A base letter still counts; a standalone mark
       does not. (Spacing marks Mc, e.g. Indic vowel signs, DO carry width and are counted.);
-    - a small explicit set of blank-glyph fillers that render empty but sit in Lo/So: the Hangul
-      fillers and BRAILLE PATTERN BLANK.
+    - a MAINTAINED set of blank-glyph fillers that render empty but sit in Lo/So (`_BLANK_GLYPH_
+      FILLERS`): Hangul fillers, BRAILLE PATTERN BLANK, MUSICAL SYMBOL NULL NOTEHEAD, and the
+      EGYPTIAN HIEROGLYPH FULL/HALF BLANK.
 
-    `str.strip()` alone removed only edge whitespace; category Z*/C* alone missed the Mn variation
-    selectors and the Lo/So blank fillers. Exotic gaming of one's OWN quality gate is outside the
-    core threat model, but these known-invisible classes are defended so the floor is meaningful."""
+    BOUNDED RESIDUAL (honest, do not re-overclaim): the blank-filler set is NOT exhaustive - there
+    is no stdlib visibility oracle and Unicode keeps adding blanks, so an obscure blank codepoint
+    not yet listed could pass this floor. That is an ACCEPTED residual: this floor defends the
+    "did you write anything visible" contract against the known invisible/blank classes; gaming
+    one's OWN quality gate with an exotic unlisted blank is outside the core threat model. Add new
+    blanks to `_BLANK_GLYPH_FILLERS` as they are found. (`str.strip()` alone removed only edge
+    whitespace; Z*/C* alone missed the Mn variation selectors and the Lo/So blank fillers.)"""
     n = 0
     for ch in text:
         if ch.isspace():

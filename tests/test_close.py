@@ -1580,3 +1580,18 @@ def test_resolve_dod_knowledge_default_ignorable_body_does_not_clear(
     k = cli._resolve_dod_knowledge(s, spec, rec)
     assert k["bound_notes"] == [{"type": "gotcha", "body_len": 0}]
     assert close._evaluate_dod_knowledge(rec, k)[0][0] == close.HOLD_TRIVIAL_EVIDENCE
+
+
+@pytest.mark.parametrize("cp,label", [
+    ("\U0001D159", "musical-null-notehead"),   # So
+    ("\U00013441", "egyptian-full-blank"),      # Lo, rendered as whitespace (Unicode ch.11)
+    ("\U00013442", "egyptian-half-blank"),      # Lo
+])
+def test_substantive_len_maintained_blank_fillers_are_zero(cp, label) -> None:
+    # Blank glyphs in Lo/So that no category rule can catch (they are deliberately categorized as
+    # letters/symbols) — covered only by the maintained _BLANK_GLYPH_FILLERS blocklist. Added when
+    # Codex found them; the bounded residual (obscure unlisted blanks) is documented, not claimed
+    # closed.
+    assert ord(cp) in cli._BLANK_GLYPH_FILLERS         # it IS in the maintained set
+    assert cli._substantive_len(cp * 40) == 0          # 40 blanks -> 0 substantive
+    assert cli._substantive_len(cp * 39 + "z") == 1    # a single real char still counts
