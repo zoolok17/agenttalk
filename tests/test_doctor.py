@@ -215,6 +215,92 @@ def test_doctor_external_worker_commit_gate_unreadable_supervisor_does_not_crash
     assert check.data["ungated_agents"] == ["qwen-dev-1"]
 
 
+def test_doctor_supervisor_only_external_worker_blocked_policy_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    policy = tmp_path / "commit-gate-policy.json"
+    policy.write_text("{", encoding="utf-8")
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "agents": {
+            "remote-dev": {
+                "trust_class": "external-worker",
+                "env": {POLICY_ENV: str(policy)},
+            },
+        },
+    }), encoding="utf-8")
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+
+    check = _external_worker_commit_gate_check(doctor.run(tmp_path))
+
+    assert check.status == "warn"
+    assert "present but unusable" in check.details
+    assert check.data["ungated_agents"] == ["remote-dev"]
+    assert check.data["unusable_policy_agents"] == ["remote-dev"]
+
+
+def test_doctor_malformed_external_worker_policy_path_warns_without_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead"])
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "agents": {
+            "remote-dev": {
+                "trust_class": "external-worker",
+                "env": {POLICY_ENV: "\0"},
+            },
+        },
+    }), encoding="utf-8")
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+    original_resolve = Path.resolve
+
+    def resolve(path: Path, *args: object, **kwargs: object) -> Path:
+        if "\0" in str(path):
+            raise OSError("unresolvable policy path")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+    report = doctor.run(tmp_path)
+    check = _external_worker_commit_gate_check(report)
+
+    assert check.status == "warn"
+    assert check.data["ungated_agents"] == ["remote-dev"]
+    assert check.data["unusable_policy_agents"] == ["remote-dev"]
+
+
+def test_doctor_unresolvable_roster_policy_is_not_double_reported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "qwen-dev-1"])
+    store.set_trust_class("qwen-dev-1", "external-worker")
+    policy = tmp_path / "commit-gate-policy.json"
+    monkeypatch.setenv(POLICY_ENV, str(policy))
+    original_resolve = Path.resolve
+
+    def resolve(path: Path, *args: object, **kwargs: object) -> Path:
+        if path == policy:
+            raise OSError("unresolvable policy path")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+    report = doctor.run(tmp_path)
+    wrapped = next(c for c in report.checks if c.name == "wrapped_commit_gate")
+    external = _external_worker_commit_gate_check(report)
+
+    assert wrapped.status == "error"
+    assert external.status == "ok"
+    assert external.data["ungated_agents"] == []
+    assert external.data["stronger_error_agents"] == ["qwen-dev-1"]
+
+
 # ----- hmac check status mapping (review C*: doctor must NOT report a
 # degenerate/garbage key as enabled-OK; closes doctor.py 456-472) ------
 

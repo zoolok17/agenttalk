@@ -264,17 +264,41 @@ def _supervisor_commit_gate_facts(
     return external_workers, supervisor_paths
 
 
+def _commit_gate_policy_snapshot(configured: str | None, agent: str):
+    """Resolve one operator policy path without letting diagnostics crash."""
+    from agenttalk.wrapper.obligations import PolicySnapshot, ResolverState
+
+    if not configured:
+        return PolicySnapshot.inactive(agent=agent)
+    try:
+        path = Path(configured).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return PolicySnapshot(
+            ResolverState.BLOCKED_POLICY,
+            "unreadable",
+            reason=f"operator policy path invalid: {type(exc).__name__}",
+            agent=agent,
+        )
+    return PolicySnapshot.from_path(path, agent)
+
+
 def _check_external_worker_commit_gate(store: Store) -> Check | None:
     """Warn when an external worker can use the legacy ungated commit path."""
-    from agenttalk.wrapper.obligations import POLICY_ENV, PolicySnapshot, ResolverState
+    from agenttalk.wrapper.obligations import POLICY_ENV, ResolverState
 
     try:
+        roster = store.load_config()
+        roster_agents = {str(agent) for agent in roster.get("agents", []) or []}
+        trust_classes = roster.get("trust_classes")
+        if not isinstance(trust_classes, dict):
+            trust_classes = {}
         roster_external = {
             str(agent)
-            for agent, trust_class in store.trust_classes().items()
+            for agent, trust_class in trust_classes.items()
             if trust_class == "external-worker"
         }
     except (OSError, TypeError, ValueError):
+        roster_agents = set()
         roster_external = set()
     supervisor_external, supervisor_paths = _supervisor_commit_gate_facts(store, POLICY_ENV)
     external_workers = sorted(roster_external | supervisor_external)
@@ -283,16 +307,22 @@ def _check_external_worker_commit_gate(store: Store) -> Check | None:
 
     process_path = os.environ.get(POLICY_ENV)
     ungated: list[str] = []
+    missing_or_disabled: list[str] = []
+    unusable: list[str] = []
+    stronger_errors: list[str] = []
     rows: list[dict] = []
     for agent in external_workers:
         configured = process_path or supervisor_paths.get(agent)
-        policy = (
-            PolicySnapshot.from_path(Path(configured).expanduser().resolve(), agent)
-            if configured
-            else PolicySnapshot.inactive(agent=agent)
-        )
+        policy = _commit_gate_policy_snapshot(configured, agent)
         if policy.status in {ResolverState.NOT_OWED, ResolverState.INACTIVE}:
             ungated.append(agent)
+            missing_or_disabled.append(agent)
+        elif policy.status == ResolverState.BLOCKED_POLICY:
+            if agent in roster_agents:
+                stronger_errors.append(agent)
+            else:
+                ungated.append(agent)
+                unusable.append(agent)
         rows.append({
             "agent": agent,
             "policy_path": configured,
@@ -302,29 +332,52 @@ def _check_external_worker_commit_gate(store: Store) -> Check | None:
         })
 
     if not ungated:
+        if stronger_errors:
+            details = (
+                "external-worker unusable policy already reported by "
+                "wrapped_commit_gate ERROR: " + ", ".join(stronger_errors)
+            )
+        else:
+            details = (
+                "external-worker commit-gate policy configured: "
+                + ", ".join(external_workers)
+            )
         return Check(
             name="external_worker_commit_gate",
             status="ok",
-            details="external-worker commit-gate policy configured: "
-                    + ", ".join(external_workers),
+            details=details,
             data={
                 "external_workers": external_workers,
                 "ungated_agents": [],
+                "unusable_policy_agents": [],
+                "stronger_error_agents": stronger_errors,
                 "policies": rows,
             },
+        )
+    detail_parts = []
+    if missing_or_disabled:
+        detail_parts.append(
+            "external-worker agent(s) without enabled commit-gate policy: "
+            + ", ".join(missing_or_disabled)
+        )
+    if unusable:
+        detail_parts.append(
+            "external-worker agent(s) with present but unusable commit-gate policy: "
+            + ", ".join(unusable)
         )
     return Check(
         name="external_worker_commit_gate",
         status="warn",
-        details="external-worker agent(s) without enabled commit-gate policy: "
-                + ", ".join(ungated),
+        details="; ".join(detail_parts),
         fix=(
-            f"configure an operator-owned {POLICY_ENV} policy with an enabled "
-            "detection-grade entry for each listed agent"
+            f"configure or repair an operator-owned {POLICY_ENV} policy with "
+            "an enabled detection-grade entry for each listed agent"
         ),
         data={
             "external_workers": external_workers,
             "ungated_agents": ungated,
+            "unusable_policy_agents": unusable,
+            "stronger_error_agents": stronger_errors,
             "policies": rows,
         },
     )
@@ -335,7 +388,6 @@ def _check_detection_commit_gate(store: Store) -> Check:
     from agenttalk.wrapper.obligations import (
         POLICY_ENV,
         DetectionCommitGate,
-        PolicySnapshot,
         ResolverState,
     )
 
@@ -348,11 +400,7 @@ def _check_detection_commit_gate(store: Store) -> Check:
     has_legacy_broadcast = False
     for agent in roster:
         configured = process_path or supervisor_paths.get(agent)
-        policy = (
-            PolicySnapshot.from_path(Path(configured).expanduser().resolve(), agent)
-            if configured
-            else PolicySnapshot.inactive()
-        )
+        policy = _commit_gate_policy_snapshot(configured, agent)
         gate = DetectionCommitGate(store, agent, policy, fence="doctor-read-only")
         status = gate.status()
         status["policy_path"] = configured
