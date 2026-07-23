@@ -2344,8 +2344,11 @@ def _resolve_dod_knowledge(store, spec: dict, record: dict) -> dict:
             if note.get("type") not in types:
                 continue
             if _knowledge_note_bound_to(note, revision):
+                # Measure the STRIPPED body: min_body_chars is a triviality floor, and a body of
+                # one real char + 39 trailing spaces has substantive length 1, not 40. Trim
+                # surrounding whitespace so padding cannot buy past the floor.
                 bound.append({"type": note.get("type"),
-                              "body_len": len(str(note.get("body") or ""))})
+                              "body_len": len(str(note.get("body") or "").strip())})
         except Exception:  # noqa: BLE001, S112  # nosec - skip a malformed note, never crash
             continue
     return {
@@ -2914,9 +2917,20 @@ def cmd_close(args: argparse.Namespace) -> int:
         verdict = close_mod.VERDICT_GO if args.verdict == "go" else close_mod.VERDICT_HOLD
         barrier_epoch = None
         try:
-            # The lock spans reload, all impure evaluations, verdict derivation,
-            # persistence, and the optional barrier stamp. No cooperating ack or
-            # counter can invalidate a GO between check and write.
+            # The per-close lock spans reload, all impure evaluations, verdict derivation,
+            # persistence, and the optional barrier stamp - and evidence is resolved immediately
+            # before the write (nothing but in-memory record mutation sits between the resolve at
+            # `_build_dod_eval`/`compute_verdict` and `transaction.commit`), keeping the exposure
+            # minimal. It is NOT airtight (#66): the per-close lock does NOT exclude EVIDENCE
+            # mutators (`gate set`/`gate waive`, `knowledge retract`, signoff writes) - those live
+            # under the config lock, a separate mutex - and `commit` itself does a cross-file
+            # read+write (`load_close` -> `_write_close`). So an evidence mutation landing in that
+            # window can leave a persisted GO whose evidence has since changed. This is a KNOWN,
+            # documented race (near-impossible under today's serial single-operator use); full
+            # closure needs one enforced lock spanning every evidence writer + this commit, and a
+            # stale-GO detector - both ride the #31 close-provenance envelope. Do NOT restore the
+            # earlier "no ack/counter can invalidate a GO between check and write" claim; it was
+            # false (proven by a real-CLI repro that persisted GO against a gate set red mid-publish).
             with close_mod.close_transaction(store, args.id) as transaction:
                 record = transaction.record
                 if record.get("status") == close_mod.PUBLISHED:

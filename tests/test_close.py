@@ -1356,6 +1356,38 @@ def test_validate_dod_knowledge_spec_malformed_raises(spec) -> None:
             {"schema_version": 1, "scopes": {"release": {"knowledge": spec}}})
 
 
+@pytest.mark.parametrize("spec", [
+    {"min_note": 2},            # BLOCKER 1: min_notes typo must RAISE, not silently default to 1
+    {"min_body_char": 10},      # min_body_chars typo
+    {"whens": "always"},        # when typo
+    {"type": ["gotcha"]},       # types typo
+    {"min_notes": 1, "extra": True},
+])
+def test_validate_dod_knowledge_spec_rejects_unknown_keys_failclosed(spec) -> None:
+    # A typo'd key must fail CLOSED (HOLD_INVALID_DOD_POLICY at the CLI), never be dropped so the
+    # intended (stricter) requirement silently reverts to a weaker default and a close GOes.
+    with pytest.raises(close.CloseError):
+        close.validate_dod_policy(
+            {"schema_version": 1, "scopes": {"release": {"knowledge": spec}}})
+
+
+@pytest.mark.parametrize("bad_type", ["seam", "pointer"])
+def test_validate_dod_knowledge_spec_rejects_structural_note_types(bad_type) -> None:
+    # MAJOR: seam/pointer are structural index notes, not captured-learning evidence. A policy
+    # must not be able to satisfy the knowledge dimension with them, so they are DISALLOWED as
+    # configurable types even though they are valid knowledge-note types generally.
+    with pytest.raises(close.CloseError):
+        close.validate_dod_policy({"schema_version": 1, "scopes": {"release": {
+            "knowledge": {"types": [bad_type]}}}})
+
+
+def test_validate_dod_knowledge_spec_allows_trio_subsets() -> None:
+    for subset in (["lesson"], ["gotcha", "decision"], ["decision", "gotcha", "lesson"]):
+        pol = close.validate_dod_policy({"schema_version": 1, "scopes": {"release": {
+            "knowledge": {"types": subset}}}})
+        assert pol["scopes"]["release"]["knowledge"]["types"] == sorted(set(subset))
+
+
 # ---- evaluate_dod knowledge (pure)
 
 def test_evaluate_dod_knowledge_not_required_when_no_remediation() -> None:
@@ -1462,3 +1494,23 @@ def test_resolve_dod_knowledge_binds_curated_notes_by_sha_and_vsha(tmp_path: Pat
     assert kinds == ["decision", "gotcha"]   # only the two curated+bound+allowed-type notes
     # and it clears the pure gate
     assert close._evaluate_dod_knowledge(rec, k) == []
+
+
+def test_resolve_dod_knowledge_whitespace_padded_body_does_not_clear(tmp_path: Path) -> None:
+    # BLOCKER 3: a body of one real char + 39 trailing spaces is 40 chars raw but substantively
+    # 1. The resolver must measure the STRIPPED length, so it must NOT buy past min_body_chars=40.
+    root = _init(tmp_path)
+    s = Store(root)
+    _add_note(s, key="dod.padded", ntype="gotcha", body="x" + " " * 39,
+              anchor={"kind": "sha", "sha": SHA}, vsha=None)
+    spec = {"when": "on_remediation", "min_notes": 1, "min_body_chars": 40,
+            "types": ["decision", "gotcha", "lesson"]}
+    rec = close.empty_close(
+        "c", scope="release", revision=SHA, revision_kind="sha", gate_scope="release",
+        opened_by="lead", opened_at="t0", epoch_at_open=None, required_lenses=[],
+        revision_clean=True, dirty_artifact=None)
+    rec["remediation_items"] = {"r1": {"id": "r1", "blocker": False}}
+    k = cli._resolve_dod_knowledge(s, spec, rec)
+    assert k["bound_notes"] == [{"type": "gotcha", "body_len": 1}]   # stripped, not 40
+    # the padded stub is bound-but-not-qualifying -> HOLD_TRIVIAL_EVIDENCE, not a GO
+    assert close._evaluate_dod_knowledge(rec, k)[0][0] == close.HOLD_TRIVIAL_EVIDENCE
