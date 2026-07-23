@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -112,6 +113,22 @@ def _coverage_gate(root: Path, scope: str = "release") -> dict:
     return state["gates"][f"coverage:{scope}"]
 
 
+def _set_green_coverage_gate(root: Path, revision: str) -> None:
+    with Store(root).config_lock():
+        gates.set_gate(
+            root,
+            name="coverage:release",
+            status="green",
+            severity="blocker",
+            scope="release",
+            actor="assurance-ci",
+            evidence_source="automation_ci",
+            evidence=["https://github.com/example/agenttalk/actions/runs/1/attempts/1"],
+            evidence_details={"coverage_percent": 99.0},
+            revision=revision,
+        )
+
+
 def test_successful_ci_coverage_run_emits_revision_bound_green_gate(
     tmp_path: Path,
     monkeypatch,
@@ -138,9 +155,7 @@ def test_unparseable_ci_coverage_run_never_emits_green_gate(
 
     assurance.run_plan(_plan(tmp_path, "print('TOTAL 100 1 99%')", revision=revision))
     assert _coverage_gate(tmp_path)["status"] == "green"
-    assurance.run_plan(
-        _plan(tmp_path, "print('coverage completed without a total')", revision=revision)
-    )
+    assurance.run_plan(_plan(tmp_path, "print('coverage completed without a total')", revision=revision))
 
     gate = _coverage_gate(tmp_path)
     assert gate["status"] == "red"
@@ -196,6 +211,53 @@ def test_coverage_spawn_error_emits_red_gate(
     assert "coverage_percent" not in gate["evidence"][-1]
 
 
+def test_coverage_runner_exception_downgrades_preexisting_green_gate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    _set_green_coverage_gate(tmp_path, revision)
+    plan = _plan(tmp_path, "raise AssertionError('unused')", revision=revision)
+    plan.tools[0]["command"] = [sys.executable, "-c", "\x00"]
+
+    with pytest.raises(ValueError, match="null|embedded"):
+        assurance.run_plan(plan)
+
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert "runner failed" in gate["reason"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python -m coverage",
+        [],
+        ["   "],
+        [sys.executable, "-c", "\n"],
+        [sys.executable, "-c", "\x00"],
+    ],
+)
+def test_manifest_rejects_non_executable_or_control_character_commands(
+    tmp_path: Path,
+    command,
+) -> None:
+    manifest_path = tmp_path / ".agenttalk" / "assurance.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "custom_commands": {"coverage": command},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(assurance.AssuranceUsageError, match="custom_commands.coverage"):
+        assurance.load_manifest(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("artifact_name", "payload", "expected"),
     [
@@ -211,10 +273,7 @@ def test_coverage_artifact_created_by_command_is_parsed(
     expected: float,
 ) -> None:
     revision = _ci_revision(tmp_path, monkeypatch)
-    script = (
-        "from pathlib import Path; "
-        f"Path({artifact_name!r}).write_text({payload!r}, encoding='utf-8')"
-    )
+    script = f"from pathlib import Path; Path({artifact_name!r}).write_text({payload!r}, encoding='utf-8')"
 
     assurance.run_plan(_plan(tmp_path, script, revision=revision))
 
@@ -338,9 +397,7 @@ def test_touching_stale_coverage_xml_cannot_make_it_current(
         {"coverage.xml": '<coverage line-rate="0.99"/>'},
     )
     script = (
-        "import os; from pathlib import Path; "
-        "path = Path('coverage.xml'); "
-        "path.exists() and os.utime(path, (1, 1))"
+        "import os; from pathlib import Path; path = Path('coverage.xml'); path.exists() and os.utime(path, (1, 1))"
     )
 
     assurance.run_plan(_plan(tmp_path, script, revision=revision))
@@ -349,6 +406,54 @@ def test_touching_stale_coverage_xml_cannot_make_it_current(
     gate = _coverage_gate(tmp_path)
     assert gate["status"] == "red"
     assert "coverage_percent" not in gate["evidence"][-1]
+
+
+def test_failed_report_restore_is_marked_and_recovered_by_next_run(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original_report = '<coverage line-rate="0.25"/>'
+    revision = _ci_revision(
+        tmp_path,
+        monkeypatch,
+        {"coverage.xml": original_report},
+    )
+    real_replace = assurance.os.replace
+
+    def replace_with_restore_failure(src, dst):
+        if (
+            Path(src).name == "coverage.xml"
+            and Path(dst) == tmp_path / "coverage.xml"
+            and ".agenttalk" in Path(src).parts
+        ):
+            raise PermissionError("simulated restore failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(assurance.os, "replace", replace_with_restore_failure)
+
+    result = assurance.run_plan(_plan(tmp_path, "print('TOTAL 100 12 88%')", revision=revision))
+
+    gate = _coverage_gate(tmp_path)
+    assert gate["status"] == "red"
+    assert "coverage artifact cleanup failed" in gate["reason"]
+    assert "recovery marker" in gate["reason"]
+    assert any("coverage artifact cleanup failed" in error for error in result.runner_errors)
+    markers = list((tmp_path / ".agenttalk" / "assurance" / "coverage-recovery").glob("*/transaction.json"))
+    assert len(markers) == 1
+    assert (markers[0].parent / "coverage.xml").read_text(encoding="utf-8") == original_report
+    assert not (tmp_path / "coverage.xml").exists()
+
+    monkeypatch.setattr(assurance.os, "replace", real_replace)
+    assurance.run_plan(
+        _plan(
+            tmp_path,
+            "print('coverage completed without a total')",
+            revision=revision,
+        )
+    )
+
+    assert (tmp_path / "coverage.xml").read_text(encoding="utf-8") == original_report
+    assert not list((tmp_path / ".agenttalk" / "assurance" / "coverage-recovery").glob("*/transaction.json"))
 
 
 @pytest.mark.parametrize(
