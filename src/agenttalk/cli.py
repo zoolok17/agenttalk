@@ -2878,30 +2878,44 @@ def cmd_close(args: argparse.Namespace) -> int:
                     barrier_epoch = _ensure_close_release_barrier(
                         store, transaction, actor=actor)
                 else:
-                    gate_check = gate_mod.check_gates(
-                        store.root, scope=record.get("gate_scope"))
-                    signoff_eval = _build_signoff_eval(store, record)
-                    worktree_eval = _close_worktree_eval(store, record)
-                    dod_eval = _build_dod_eval(store, record)
-                    record["worktree_isolation"] = worktree_eval
-                    result = close_mod.compute_verdict(
-                        record, gate_check, signoff_eval, worktree_eval, dod_eval)
-                    if args.verdict == "go" and result["verdict"] != close_mod.VERDICT_GO:
-                        sys.stderr.write(
-                            "agenttalk close publish: refusing GO - close check is HOLD:\n")
-                        _print_verdict(args.id, result)
-                        return 3
-                    # Persist the final verdict and a generation-bound barrier intent
-                    # before attempting the message write. A retry can then resume
-                    # either side of the send/stamp boundary without duplicating it.
-                    close_mod.record_publish(
-                        record, verdict=verdict, by=actor, at=_iso_now(),
-                        reason=args.reason or "", gate_check=gate_check,
-                        residual_risk=args.residual_risk, barrier_epoch=None)
-                    if verdict == close_mod.VERDICT_GO and args.bump_barrier:
-                        record["final"]["barrier_binding"] = (
-                            _new_close_barrier_binding(record))
-                    transaction.commit()
+                    # Fix-A (#66): the close_transaction lock above is the per-CLOSE lock -
+                    # it serializes acks/counters but NOT the gate/knowledge/waiver mutations,
+                    # which take the store CONFIG lock. So DoD/gate evidence resolved here can be
+                    # invalidated by a concurrent `gate set|waive` / `knowledge curate` before the
+                    # verdict is persisted (TOCTOU -> stale GO). Hold the config lock across
+                    # evidence resolution -> verdict -> persist so no such mutation can interleave.
+                    # DEADLOCK AUDIT: acquisition order here is close-lock (outer) -> config-lock;
+                    # gate/knowledge mutations take ONLY the config lock (they never take a close
+                    # lock), and close.py never takes the config lock, so there is no config->close
+                    # reverse path -> no cycle. None of the callees below take the config lock, so
+                    # this is not a re-entrant acquire of the non-reentrant file lock. The post-
+                    # commit barrier stamp is deliberately left OUTSIDE (the GO is already durably
+                    # bound at commit; keeping it out avoids any reentrancy with a barrier writer).
+                    with store._config_lock():
+                        gate_check = gate_mod.check_gates(
+                            store.root, scope=record.get("gate_scope"))
+                        signoff_eval = _build_signoff_eval(store, record)
+                        worktree_eval = _close_worktree_eval(store, record)
+                        dod_eval = _build_dod_eval(store, record)
+                        record["worktree_isolation"] = worktree_eval
+                        result = close_mod.compute_verdict(
+                            record, gate_check, signoff_eval, worktree_eval, dod_eval)
+                        if args.verdict == "go" and result["verdict"] != close_mod.VERDICT_GO:
+                            sys.stderr.write(
+                                "agenttalk close publish: refusing GO - close check is HOLD:\n")
+                            _print_verdict(args.id, result)
+                            return 3
+                        # Persist the final verdict and a generation-bound barrier intent
+                        # before attempting the message write. A retry can then resume
+                        # either side of the send/stamp boundary without duplicating it.
+                        close_mod.record_publish(
+                            record, verdict=verdict, by=actor, at=_iso_now(),
+                            reason=args.reason or "", gate_check=gate_check,
+                            residual_risk=args.residual_risk, barrier_epoch=None)
+                        if verdict == close_mod.VERDICT_GO and args.bump_barrier:
+                            record["final"]["barrier_binding"] = (
+                                _new_close_barrier_binding(record))
+                        transaction.commit()
                     if verdict == close_mod.VERDICT_GO and args.bump_barrier:
                         barrier_epoch = _ensure_close_release_barrier(
                             store, transaction, actor=actor)
