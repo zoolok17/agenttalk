@@ -32,6 +32,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import re
 import uuid
 from typing import Any
@@ -88,6 +89,9 @@ HOLD_INVALID_DOD_POLICY = "invalid_dod_policy"
 HOLD_MISSING_ASSURANCE = "missing_assurance_evidence"
 HOLD_STALE_ASSURANCE = "stale_assurance_evidence"
 HOLD_UNATTESTED_ASSURANCE = "unattested_assurance_evidence"
+HOLD_MISSING_COVERAGE = "missing_coverage_evidence"
+HOLD_LOW_COVERAGE = "low_coverage_evidence"
+HOLD_STALE_COVERAGE = "stale_coverage_evidence"
 HOLD_MISSING_KNOWLEDGE = "missing_knowledge_evidence"
 HOLD_TRIVIAL_EVIDENCE = "trivial_knowledge_evidence"
 
@@ -99,7 +103,7 @@ DOD_DIRNAME = "dod.json"
 # dimension the engine cannot enforce is a policy error (you must not be able to require what
 # cannot be checked - a silent soft-pass is exactly the failure this gate exists to prevent).
 # inc-1: assurance only. inc-2 adds knowledge; inc-3 adds coverage + a depth-signoff dimension.
-_DOD_SUPPORTED_DIMENSIONS = frozenset({"assurance", "knowledge"})
+_DOD_SUPPORTED_DIMENSIONS = frozenset({"assurance", "coverage", "knowledge"})
 _KNOWLEDGE_NOTE_TYPES = frozenset({"decision", "gotcha", "lesson", "pointer", "seam"})
 # The DoD knowledge dimension only counts DELIBERATE, human-authored knowledge (a lesson, a
 # gotcha, a decision) as evidence that "what we learned was written down". seam/pointer are
@@ -110,6 +114,7 @@ _DOD_KNOWLEDGE_ALLOWED_TYPES = frozenset({"decision", "gotcha", "lesson"})
 _DOD_KNOWLEDGE_KEYS = frozenset({"when", "min_notes", "types", "min_body_chars"})
 _DOD_ALLOWED_TOP_KEYS = frozenset({"schema_version", "scopes"})
 _DOD_ASSURANCE_KEYS = frozenset({"gate", "max_age_days"})
+_DOD_COVERAGE_KEYS = frozenset({"min_percent", "max_age_days"})
 _DOD_SCHEMA_VERSION = 1
 # Fail-closed bounds on the policy file itself: reject an oversized dod.json before decode, so a
 # pathological deeply-nested document cannot exhaust the parser (RecursionError) or memory.
@@ -793,6 +798,8 @@ def validate_dod_policy(raw: object) -> dict:
                     f"(supported: {sorted(_DOD_SUPPORTED_DIMENSIONS)})")
             if dim == "assurance":
                 norm[dim] = _validate_dod_assurance_spec(spec, scope_name)
+            elif dim == "coverage":
+                norm[dim] = _validate_dod_coverage_spec(spec, scope_name)
             elif dim == "knowledge":
                 norm[dim] = _validate_dod_knowledge_spec(spec, scope_name)
         key = str(scope_name).lower()
@@ -821,6 +828,38 @@ def _validate_dod_assurance_spec(spec: object, scope_name: str) -> dict:
         raise CloseError(
             f"dod scope {scope_name!r} assurance.max_age_days must be a non-negative integer")
     return {"gate": gate, "max_age_days": max_age}
+
+
+def _is_finite_number(value: object) -> bool:
+    """True for finite builtin ints/floats without coercing arbitrarily large ints to float."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return isinstance(value, int) or math.isfinite(value)
+
+
+def _is_percent(value: object) -> bool:
+    return _is_finite_number(value) and 0 <= value <= 100
+
+
+def _validate_dod_coverage_spec(spec: object, scope_name: str) -> dict:
+    """Normalize a scope's numeric coverage floor without accepting typo'd requirements."""
+    if not isinstance(spec, dict):
+        raise CloseError(f"dod scope {scope_name!r} coverage must be an object")
+    unknown = set(spec) - set(_DOD_COVERAGE_KEYS)
+    if unknown:
+        raise CloseError(
+            f"dod scope {scope_name!r} coverage has unknown key(s): {sorted(unknown)}")
+    min_percent = spec.get("min_percent")
+    if not _is_percent(min_percent):
+        raise CloseError(
+            f"dod scope {scope_name!r} coverage.min_percent must be a finite number from 0 to 100")
+    max_age = spec.get("max_age_days")
+    if max_age is not None and (
+        not isinstance(max_age, int) or isinstance(max_age, bool) or max_age < 0
+    ):
+        raise CloseError(
+            f"dod scope {scope_name!r} coverage.max_age_days must be a non-negative integer")
+    return {"min_percent": min_percent, "max_age_days": max_age}
 
 
 def _validate_dod_knowledge_spec(spec: object, scope_name: str) -> dict:
@@ -897,6 +936,13 @@ def evaluate_dod(record: dict, dod_eval: dict | None) -> list[tuple[str, str]]:
         "age_days": float|None,                 # SIGNED age (negative = future); None if unparseable
         "max_age_days": int|None,
       } | None,
+      "coverage": {                             # present iff "coverage" in required_dimensions
+        "gate": str, "present": bool, "status": str|None, "severity": str|None,
+        "evidence_source": str|None, "revision": str|None, "waiver_active": bool,
+        "gate_scope": str|None, "close_gate_scope": str|None,
+        "coverage_percent": float|None, "min_percent": float,
+        "age_days": float|None, "max_age_days": int|None,
+      } | None,
     }
     ``None`` ⇒ [] (the scope has no DoD requirements)."""
     if dod_eval is None:
@@ -911,6 +957,8 @@ def evaluate_dod(record: dict, dod_eval: dict | None) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     if "assurance" in required:
         out.extend(_evaluate_dod_assurance(record, dod_eval.get("assurance")))
+    if "coverage" in required:
+        out.extend(_evaluate_dod_coverage(record, dod_eval.get("coverage")))
     if "knowledge" in required:
         out.extend(_evaluate_dod_knowledge(record, dod_eval.get("knowledge")))
     return out
@@ -991,6 +1039,94 @@ def _evaluate_dod_assurance(record: dict, a: dict | None) -> list[tuple[str, str
             out.append((HOLD_STALE_ASSURANCE,
                         f"assurance gate {gate!r} freshness is required but its age is invalid"))
     return out
+
+
+def _evaluate_dod_coverage(record: dict, cov: dict | None) -> list[tuple[str, str]]:
+    """PURE: enforce the CI-attested, revision-bound ``coverage:<scope>`` gate.
+
+    The gate is unusable unless it is present, applicable, green, blocker severity, produced by
+    automation_ci, and bound to this close's revision. A waiver never clears the dimension.
+    Freshness is checked before the numeric floor so stale evidence cannot be reported as merely
+    low. Missing or malformed percentages fail closed as missing evidence.
+    """
+    gate = (cov.get("gate") if isinstance(cov, dict) else None)
+    gate = gate or f"coverage:{record.get('scope') or ''}"
+    if not isinstance(cov, dict) or cov.get("present") is not True:
+        return [(HOLD_MISSING_COVERAGE, f"required coverage gate {gate!r} is not present")]
+
+    gate_scope = cov.get("gate_scope")
+    close_scope = cov.get("close_gate_scope")
+    if close_scope and gate_scope not in (close_scope, "global"):
+        return [(
+            HOLD_MISSING_COVERAGE,
+            f"coverage gate {gate!r} is recorded under scope {gate_scope!r}, not applicable "
+            f"to this close's scope {close_scope!r} (needs that scope or 'global')",
+        )]
+
+    status = cov.get("status")
+    if status != "green":
+        detail = f"coverage gate {gate!r} is not green (status={status!r})"
+        if status == "waived":
+            detail = (
+                f"coverage gate {gate!r} is waived, but a gate waiver does not clear a DoD "
+                "coverage requirement - needs a CI-attested green gate"
+            )
+        return [(HOLD_MISSING_COVERAGE, detail)]
+
+    if cov.get("severity") != "blocker" or cov.get("evidence_source") != "automation_ci":
+        return [(
+            HOLD_MISSING_COVERAGE,
+            f"coverage gate {gate!r} is green but not a CI-attested blocker "
+            f"(severity={cov.get('severity')!r}, source={cov.get('evidence_source')!r})",
+        )]
+
+    if cov.get("revision") != record.get("revision"):
+        return [(
+            HOLD_MISSING_COVERAGE,
+            f"coverage gate {gate!r} is not bound to the close revision "
+            f"({cov.get('revision')!r} != {record.get('revision')!r})",
+        )]
+
+    max_age = cov.get("max_age_days")
+    if max_age is not None:
+        if not isinstance(max_age, int) or isinstance(max_age, bool) or max_age < 0:
+            return [(
+                HOLD_STALE_COVERAGE,
+                f"coverage gate {gate!r} has an invalid max_age_days requirement",
+            )]
+        age = cov.get("age_days")
+        if not _is_finite_number(age):
+            return [(
+                HOLD_STALE_COVERAGE,
+                f"coverage gate {gate!r} freshness is required (max_age_days={max_age}) "
+                "but its timestamp is missing or unparseable",
+            )]
+        if age < -_DOD_CLOCK_SKEW_DAYS:
+            return [(
+                HOLD_STALE_COVERAGE,
+                f"coverage gate {gate!r} is future-dated (age_days={age:.4f}); "
+                "refusing to treat future evidence as fresh",
+            )]
+        if age > max_age:
+            return [(
+                HOLD_STALE_COVERAGE,
+                f"coverage gate {gate!r} evidence is older than max_age_days={max_age}",
+            )]
+
+    min_percent = cov.get("min_percent")
+    coverage_percent = cov.get("coverage_percent")
+    if not _is_percent(min_percent) or not _is_percent(coverage_percent):
+        return [(
+            HOLD_MISSING_COVERAGE,
+            f"coverage gate {gate!r} does not carry a valid coverage_percent and floor",
+        )]
+    if coverage_percent < min_percent:
+        return [(
+            HOLD_LOW_COVERAGE,
+            f"coverage gate {gate!r} reports {coverage_percent:g}% below the "
+            f"required {min_percent:g}%",
+        )]
+    return []
 
 
 def _evaluate_dod_knowledge(record: dict, k: dict | None) -> list[tuple[str, str]]:
