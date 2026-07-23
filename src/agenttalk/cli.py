@@ -15,6 +15,7 @@ import stat
 import subprocess  # nosec B404
 import sys
 import time
+import unicodedata
 import uuid
 import webbrowser
 from datetime import datetime, timedelta, timezone
@@ -2314,7 +2315,127 @@ def _build_dod_eval(store, record: dict):
               "required_dimensions": dims}
     if "assurance" in dims:
         bundle["assurance"] = _resolve_dod_assurance_gate(store, dims["assurance"], record)
+    if "knowledge" in dims:
+        bundle["knowledge"] = _resolve_dod_knowledge(store, dims["knowledge"], record)
     return bundle
+
+
+# Blank-glyph fillers that render empty/space but fall in an otherwise-"visible" general category
+# (Lo/So), so the category + combining-mark filtering in _substantive_len misses them. This is a
+# MAINTAINED blocklist, NOT an exhaustive oracle: Unicode has no stdlib "renders blank" predicate,
+# and these blanks are deliberately categorized as letters/symbols (so category/isalnum can't
+# separate them from real content) and are not all Default_Ignorable. We defend the known classes;
+# an obscure blank not yet listed is an accepted, bounded residual (see _substantive_len).
+_BLANK_GLYPH_FILLERS = frozenset({
+    0x115F,    # HANGUL CHOSEONG FILLER (Lo)
+    0x1160,    # HANGUL JUNGSEONG FILLER (Lo)
+    0x3164,    # HANGUL FILLER (Lo)
+    0xFFA0,    # HALFWIDTH HANGUL FILLER (Lo)
+    0x2800,    # BRAILLE PATTERN BLANK (So)
+    0x1D159,   # MUSICAL SYMBOL NULL NOTEHEAD (So) - no glyph in a supporting renderer
+    0x13441,   # EGYPTIAN HIEROGLYPH FULL BLANK (Lo) - rendered as whitespace (Unicode ch.11)
+    0x13442,   # EGYPTIAN HIEROGLYPH HALF BLANK (Lo) - rendered as whitespace
+})
+
+
+def _substantive_len(text: str) -> int:
+    """Count VISIBLE, substantive characters in ``text`` for the knowledge ``min_body_chars``
+    triviality floor, so padding cannot buy past it ANYWHERE in the body. A char contributes only
+    if it is not whitespace AND not any of the invisible/blank classes below. General category
+    alone is NOT a visibility predicate, and Python's stdlib exposes no "renders blank" oracle, so
+    this is a BEST-EFFORT metric over the classes we can detect, NOT a proof of visibility:
+
+    - whitespace (`str.isspace()`) and separators (category Z*);
+    - other/control/format/surrogate/private-use/unassigned (category C*) - this alone covers
+      U+200B, U+FEFF, U+2060, the bidi marks/overrides, tag chars, soft hyphen, etc.;
+    - zero-width combining marks (categories Mn nonspacing / Me enclosing) - these have no advance
+      width of their own and only modify a base, so a run of them is invisible: covers the
+      COMBINING GRAPHEME JOINER (U+034F), all VARIATION SELECTORs (U+FE00-FE0F, U+E0100-E01EF),
+      and the Mongolian free variation selectors. A base letter still counts; a standalone mark
+      does not. (Spacing marks Mc, e.g. Indic vowel signs, DO carry width and are counted.);
+    - a MAINTAINED set of blank-glyph fillers that render empty but sit in Lo/So (`_BLANK_GLYPH_
+      FILLERS`): Hangul fillers, BRAILLE PATTERN BLANK, MUSICAL SYMBOL NULL NOTEHEAD, and the
+      EGYPTIAN HIEROGLYPH FULL/HALF BLANK.
+
+    BOUNDED RESIDUAL (honest, do not re-overclaim): the blank-filler set is NOT exhaustive - there
+    is no stdlib visibility oracle and Unicode keeps adding blanks, so an obscure blank codepoint
+    not yet listed could pass this floor. That is an ACCEPTED residual: this floor defends the
+    "did you write anything visible" contract against the known invisible/blank classes; gaming
+    one's OWN quality gate with an exotic unlisted blank is outside the core threat model. Add new
+    blanks to `_BLANK_GLYPH_FILLERS` as they are found. (`str.strip()` alone removed only edge
+    whitespace; Z*/C* alone missed the Mn variation selectors and the Lo/So blank fillers.)"""
+    n = 0
+    for ch in text:
+        if ch.isspace():
+            continue
+        cat = unicodedata.category(ch)
+        if cat[0] in ("Z", "C"):
+            continue
+        if cat in ("Mn", "Me"):
+            continue
+        if ord(ch) in _BLANK_GLYPH_FILLERS:
+            continue
+        n += 1
+    return n
+
+
+def _resolve_dod_knowledge(store, spec: dict, record: dict) -> dict:
+    """Resolve the CURATED knowledge notes BOUND to this close's revision (never reads a note by
+    id - #44; the addressable identity is (domain,key), and a note is bound by a sha anchor /
+    verified_against_sha equal to the close revision). All I/O here; :func:`close._evaluate_dod_
+    knowledge` only counts. Any malformed note/anchor is skipped, never raised."""
+    from agenttalk import knowledge as kn
+
+    revision = str(record.get("revision") or "")
+    types = set(spec.get("types") or [])
+    bound: list[dict] = []
+    try:
+        events, _problems = kn.read_events(store)
+        views = kn.resolve_views(events)
+    except Exception:  # noqa: BLE001 - a broken knowledge log must not crash `close check`
+        events, views = [], {}
+    for _key, slot in (views.items() if isinstance(views, dict) else []):
+        note = slot.get("curated") if isinstance(slot, dict) else None
+        if not isinstance(note, dict):
+            continue
+        try:
+            if not kn.is_curated(note) or kn.is_retracted(note):
+                continue
+            if note.get("type") not in types:
+                continue
+            if _knowledge_note_bound_to(note, revision):
+                # min_body_chars is a SUBSTANTIVE-content floor, so measure only visible content:
+                # count characters that are not whitespace and not in a Unicode separator (Z*) or
+                # other/control/format (C*) category. This defeats padding ANYWHERE in the body,
+                # not just at the edges - trailing spaces, interior "x x x ..." runs, and invisible
+                # fillers like U+200B ZERO WIDTH SPACE (Cf) or control chars all count as zero.
+                bound.append({"type": note.get("type"),
+                              "body_len": _substantive_len(str(note.get("body") or ""))})
+        except Exception:  # noqa: BLE001, S112  # nosec - skip a malformed note, never crash
+            continue
+    return {
+        "when": spec.get("when", "on_remediation"),
+        "min_notes": spec.get("min_notes", 1),
+        "min_body_chars": spec.get("min_body_chars", 0),
+        "types": sorted(types),
+        "has_remediation": bool(record.get("remediation_items")),
+        "bound_notes": bound,
+    }
+
+
+def _knowledge_note_bound_to(note: dict, revision: str) -> bool:
+    """A note is bound to ``revision`` iff its sha anchor (lessons nest it under ``lesson``) OR
+    its ``verified_against_sha`` equals the close revision (both are full 40-char SHAs)."""
+    if not revision:
+        return False
+    if note.get("verified_against_sha") == revision:
+        return True
+    if note.get("type") == "lesson":
+        anchor = (note.get("lesson") or {}).get("anchor")
+    else:
+        anchor = note.get("anchor")
+    return (isinstance(anchor, dict) and anchor.get("kind") == "sha"
+            and anchor.get("sha") == revision)
 
 
 def _resolve_dod_assurance_gate(store, spec: dict, record: dict) -> dict:
@@ -2858,9 +2979,21 @@ def cmd_close(args: argparse.Namespace) -> int:
         verdict = close_mod.VERDICT_GO if args.verdict == "go" else close_mod.VERDICT_HOLD
         barrier_epoch = None
         try:
-            # The lock spans reload, all impure evaluations, verdict derivation,
-            # persistence, and the optional barrier stamp. No cooperating ack or
-            # counter can invalidate a GO between check and write.
+            # The per-close lock spans reload, all impure evaluations, verdict derivation,
+            # persistence, and the optional barrier stamp - and evidence is resolved immediately
+            # before the write (nothing but in-memory record mutation sits between the resolve at
+            # `_build_dod_eval`/`compute_verdict` and `transaction.commit`), keeping the exposure
+            # minimal. It is NOT airtight (#66): the per-close lock does NOT exclude EVIDENCE
+            # mutators (`gate set`/`gate waive`, `knowledge retract`, signoff writes) - those live
+            # under the config lock, a separate mutex - and `commit` itself does a cross-file
+            # read+write (`load_close` -> `_write_close`). So an evidence mutation landing in that
+            # window can leave a persisted GO whose evidence has since changed. This is a narrow
+            # KNOWN, documented race tracked by #66/#31 (no enforced serialization invariant
+            # excludes the evidence mutators today); full closure needs one enforced lock spanning
+            # every evidence writer + this commit, and a stale-GO detector - both ride the #31
+            # close-provenance envelope. Do NOT restore the
+            # earlier "no ack/counter can invalidate a GO between check and write" claim; it was
+            # false (proven by a real-CLI repro that persisted GO against a gate set red mid-publish).
             with close_mod.close_transaction(store, args.id) as transaction:
                 record = transaction.record
                 if record.get("status") == close_mod.PUBLISHED:
