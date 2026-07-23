@@ -2891,6 +2891,33 @@ def cmd_close(args: argparse.Namespace) -> int:
                             "agenttalk close publish: refusing GO - close check is HOLD:\n")
                         _print_verdict(args.id, result)
                         return 3
+                    # FIX-B (#66 TOCTOU): the close_transaction lock guards concurrent CLOSE
+                    # mutations, but DoD/gate/signoff/waiver evidence lives under the config
+                    # lock and can change between the resolve above and the persist below. So
+                    # immediately before persisting a GO, RE-RESOLVE the evidence from fresh
+                    # reads and RE-COMPUTE the verdict; refuse if it is no longer GO. NOT
+                    # airtight: a mutation landing between this re-resolve and record_publish's
+                    # byte-write is still missed - but that residual window is a handful of
+                    # in-process statements with NO intervening I/O, vs the original window that
+                    # spanned four evidence resolutions (check_gates + signoff + worktree + dod),
+                    # so it is orders of magnitude smaller. Full closure needs Fix-A (serialize
+                    # the evidence source under the commit lock); this is the low-blast-radius
+                    # guard. record_publish below persists the RE-RESOLVED gate_check.
+                    if verdict == close_mod.VERDICT_GO:
+                        gate_check = gate_mod.check_gates(
+                            store.root, scope=record.get("gate_scope"))
+                        signoff_eval = _build_signoff_eval(store, record)
+                        worktree_eval = _close_worktree_eval(store, record)
+                        dod_eval = _build_dod_eval(store, record)
+                        record["worktree_isolation"] = worktree_eval
+                        recheck = close_mod.compute_verdict(
+                            record, gate_check, signoff_eval, worktree_eval, dod_eval)
+                        if recheck["verdict"] != close_mod.VERDICT_GO:
+                            sys.stderr.write(
+                                "agenttalk close publish: refusing GO - evidence changed "
+                                "between check and commit; re-resolve is HOLD:\n")
+                            _print_verdict(args.id, recheck)
+                            return 3
                     # Persist the final verdict and a generation-bound barrier intent
                     # before attempting the message write. A retry can then resume
                     # either side of the send/stamp boundary without duplicating it.
