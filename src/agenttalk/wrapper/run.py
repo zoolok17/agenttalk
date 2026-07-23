@@ -540,7 +540,7 @@ def _child_env(
         # resolvable home WITHOUT leaking the operator's real home to the paid external
         # worker. LOCALAPPDATA is what agenttalk's own path resolution reads today;
         # APPDATA (Roaming) is included so Windows-native child tooling that consults
-        # %APPDATA% (git, npm, credential helpers, Python user site) also stays scoped
+        # %APPDATA% (npm, credential helpers, Python user site) also stays scoped
         # to the clone instead of falling back to the operator profile. If HMAC signing
         # is later enforced, wire the child's key via AGENTTALK_HMAC_KEY_FILE rather than
         # widening this to the operator's LOCALAPPDATA.
