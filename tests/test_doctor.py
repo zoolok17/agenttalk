@@ -10,6 +10,7 @@ import pytest
 
 from agenttalk import cli, doctor, install_skills as iskl, ovh_gateway_service, signing
 from agenttalk.store import Store
+from agenttalk.wrapper.obligations import POLICY_ENV
 
 
 def test_doctor_on_uninitialized_project_reports_error(tmp_path: Path) -> None:
@@ -132,6 +133,86 @@ def test_doctor_ovh_qwen_gateway_is_allowlisted_and_checks_ambient_keys(
     assert anthropic_secret not in rendered
     assert "OVH_KEY" not in rendered
     assert "ANTHROPIC_API_KEY" not in rendered
+
+
+def _external_worker_commit_gate_check(report: doctor.Report) -> doctor.Check:
+    return next(c for c in report.checks if c.name == "external_worker_commit_gate")
+
+
+def test_doctor_warns_external_worker_without_commit_gate_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "qwen-dev-1", "remote-dev-2"])
+    store.set_trust_class("qwen-dev-1", "external-worker")
+    store.set_trust_class("remote-dev-2", "external-worker")
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+
+    check = _external_worker_commit_gate_check(doctor.run(tmp_path))
+
+    assert check.status == "warn"
+    assert "qwen-dev-1" in check.details
+    assert "remote-dev-2" in check.details
+    assert check.data["ungated_agents"] == ["qwen-dev-1", "remote-dev-2"]
+
+
+def test_doctor_gated_supervisor_external_worker_and_normal_agent_do_not_warn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "qwen-dev-1", "native-dev"])
+    policy = tmp_path / "commit-gate-policy.json"
+    policy.write_text(json.dumps({
+        "schema_version": 1,
+        "agents": {"qwen-dev-1": {"grade": "detection", "enabled": True}},
+    }), encoding="utf-8")
+    (store.dir / "supervisor.json").write_text(json.dumps({
+        "agents": {
+            "qwen-dev-1": {
+                "trust_class": "external-worker",
+                "env": {POLICY_ENV: str(policy)},
+            },
+            "native-dev": {},
+        },
+    }), encoding="utf-8")
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+
+    check = _external_worker_commit_gate_check(doctor.run(tmp_path))
+
+    assert check.status == "ok"
+    assert check.data["external_workers"] == ["qwen-dev-1"]
+    assert check.data["ungated_agents"] == []
+    assert "native-dev" not in check.details
+
+
+def test_doctor_external_worker_commit_gate_absent_configs_do_not_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    Store(tmp_path).init(["lead", "native-dev"])
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+
+    report = doctor.run(tmp_path)
+
+    assert all(c.name != "external_worker_commit_gate" for c in report.checks)
+
+
+def test_doctor_external_worker_commit_gate_unreadable_supervisor_does_not_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["lead", "qwen-dev-1"])
+    store.set_trust_class("qwen-dev-1", "external-worker")
+    (store.dir / "supervisor.json").write_text("{", encoding="utf-8")
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+
+    check = _external_worker_commit_gate_check(doctor.run(tmp_path))
+
+    assert check.status == "warn"
+    assert check.data["ungated_agents"] == ["qwen-dev-1"]
 
 
 # ----- hmac check status mapping (review C*: doctor must NOT report a
