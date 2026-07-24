@@ -224,6 +224,8 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              cadence: Callable[[], CadenceResult] | None = None,
              on_health_idle: Callable[[], None] | None = None,
              on_health_parked: Callable[[dict, str], None] | None = None,
+             on_runtime_idle: Callable[[], None] | None = None,
+             on_runtime_dead_letter: Callable[[dict], None] | None = None,
              capacity_refresh: Callable[[], None] | None = None,
              capacity_interval_seconds: float = 60.0,
              wrapper_generation: str | None = None,
@@ -283,6 +285,8 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
             })
         if on_health_idle is not None:
             on_health_idle()
+        if on_runtime_idle is not None:
+            on_runtime_idle()
         if only_request_id is not None:
             return _run_one_shot(
                 store, agent, drive, rid=only_request_id,
@@ -290,6 +294,7 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
                 heartbeat_interval=heartbeat_interval, clock=clock, sleep=sleep,
                 max_turns=max_turns, max_polls=max_polls, max_wall=max_wall,
                 stamp=stamp, on_health_idle=on_health_idle,
+                on_runtime_idle=on_runtime_idle,
                 commit_gate=commit_gate)
         return _run_continuous(
             store, agent, drive, idle_interval=idle_interval,
@@ -302,6 +307,8 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
             on_dead_letter=on_dead_letter, on_escalate=on_escalate, stamp=stamp,
             pre_commit=pre_commit, cadence=cadence, on_health_idle=on_health_idle,
             on_health_parked=on_health_parked,
+            on_runtime_idle=on_runtime_idle,
+            on_runtime_dead_letter=on_runtime_dead_letter,
             capacity_refresh=capacity_refresh,
             capacity_interval_seconds=capacity_interval_seconds,
             commit_gate=commit_gate,
@@ -327,6 +334,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     cadence: Callable[[], CadenceResult] | None,
                     on_health_idle: Callable[[], None] | None,
                     on_health_parked: Callable[[dict, str], None] | None,
+                    on_runtime_idle: Callable[[], None] | None,
+                    on_runtime_dead_letter: Callable[[dict], None] | None,
                     capacity_refresh: Callable[[], None] | None,
                     capacity_interval_seconds: float,
                     commit_gate,
@@ -343,6 +352,16 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         if pre_commit is not None:
             pre_commit()
 
+    def _runtime_idle() -> None:
+        if on_runtime_idle is not None:
+            on_runtime_idle()
+
+    def _runtime_idle_if_terminal(resolution) -> None:
+        if resolution is not None and (
+            resolution.terminal or resolution.allows_legacy_commit
+        ):
+            _runtime_idle()
+
     def _commit(rec: dict, gate_resolution=None) -> bool:
         _guard_advance()
         if (
@@ -355,8 +374,12 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 gate_resolution,
                 expected_revision=gate_resolution.ledger_revision,
             )
-            return finalized.allows_legacy_commit or finalized.terminal
+            committed = finalized.allows_legacy_commit or finalized.terminal
+            if committed:
+                _runtime_idle()
+            return committed
         recv_api.commit(store, agent, rec)
+        _runtime_idle()
         return True
 
     polls = 0
@@ -442,6 +465,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 at=now_iso(),
                 child_output_tail=child_output_tail,
             )
+        if on_runtime_dead_letter is not None:
+            on_runtime_dead_letter(record)
         stamp()                               # DL is progress (bypasses drive's stamp)
         if on_health_idle is not None:
             on_health_idle()
@@ -636,6 +661,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                         continue
                     if resolution.key is not None and resolution.compliance_success:
                         commit_gate.mark_satisfied(resolution.key)
+                    _runtime_idle_if_terminal(finalized)
                     stamp()
                     last_hb = clock()
                     fail_sleep = idle_interval
@@ -680,13 +706,14 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                             continue
                         _guard_advance()
-                        commit_gate.settle_retry_exhaustion(
+                        settled = commit_gate.settle_retry_exhaustion(
                             record,
                             key,
                             category="operation_infra",
                             reason="captured bus operation exhausted its durable retry bound",
                             permit=captured,
                         )
+                        _runtime_idle_if_terminal(settled)
                         commit_gate.cleanup_permit(captured)
                         stamp()
                         continue
@@ -698,6 +725,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             if resolution.compliance_success:
                                 commit_gate.mark_satisfied(key)
                             commit_gate.cleanup_permit(captured)
+                            _runtime_idle_if_terminal(finalized)
                             stamp()
                             turns += 1
                             if max_turns is not None and turns >= max_turns:
@@ -719,7 +747,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 if purpose is None:
                     if commit_gate.dispatch_exhausted(key):
                         _guard_advance()
-                        commit_gate.fail_delivery_or_block(
+                        disposition = commit_gate.fail_delivery_or_block(
                             record,
                             key,
                             reason=(
@@ -728,6 +756,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             ),
                             expected_revision=resolution.scoped_revision,
                         )
+                        _runtime_idle_if_terminal(disposition)
                         stamp()
                         fail_sleep = idle_interval
                     else:
@@ -785,6 +814,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                         if resolution.compliance_success:
                             commit_gate.mark_satisfied(key)
                         commit_gate.cleanup_permit(permit)
+                        _runtime_idle_if_terminal(finalized)
                         stamp()
                         last_hb = clock()
                         fail_sleep = idle_interval
@@ -819,6 +849,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                     if resolution.compliance_success:
                                         commit_gate.mark_satisfied(key)
                                     commit_gate.cleanup_permit(permit)
+                                    _runtime_idle_if_terminal(finalized)
                                     stamp()
                                     turns += 1
                                     if max_turns is not None and turns >= max_turns:
@@ -836,6 +867,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                     )
                                     if settled.terminal:
                                         commit_gate.cleanup_permit(permit)
+                                        _runtime_idle()
                                 sleep(fail_sleep)
                                 fail_sleep = min(
                                     max_idle_interval,
@@ -861,19 +893,20 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                             continue
                         _guard_advance()
-                        commit_gate.settle_retry_exhaustion(
+                        settled = commit_gate.settle_retry_exhaustion(
                             record,
                             key,
                             category="operation_infra",
                             reason="captured bus operation exhausted its durable retry bound",
                             permit=permit,
                         )
+                        _runtime_idle_if_terminal(settled)
                         commit_gate.cleanup_permit(permit)
                         stamp()
                         continue
                 if commit_gate.dispatch_exhausted(key) and not action_infra:
                     _guard_advance()
-                    commit_gate.fail_delivery_or_block(
+                    disposition = commit_gate.fail_delivery_or_block(
                         record,
                         key,
                         reason=(
@@ -882,6 +915,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                         ),
                         expected_revision=resolution.scoped_revision,
                     )
+                    _runtime_idle_if_terminal(disposition)
                     commit_gate.cleanup_permit(permit)
                     stamp()
                     fail_sleep = idle_interval
@@ -907,6 +941,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             if finalized.allows_legacy_commit:
                 store.clear_attempt(agent, record.get("id"))
                 store.gc_attempts_below(agent, store.cursor(agent))
+                _runtime_idle()
                 stamp()
                 last_hb = clock()
                 fail_sleep = idle_interval
@@ -983,6 +1018,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 if finalized.terminal:
                     store.clear_attempt(agent, record.get("id"))
                     store.gc_attempts_below(agent, store.cursor(agent))
+                    _runtime_idle()
                     stamp()
                     fail_sleep = idle_interval
                     continue
@@ -1122,6 +1158,7 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                   max_polls: int | None, max_wall: float | None,
                   stamp: Callable[[], None] | None = None,
                   on_health_idle: Callable[[], None] | None = None,
+                  on_runtime_idle: Callable[[], None] | None = None,
                   commit_gate=None) -> int:
     """SCOPED one-shot loop for an ephemeral reviewer (see run_loop). Receives only
     messages on ``rid`` so unrelated traffic neither starves it nor is consumed from
@@ -1428,6 +1465,8 @@ def _run_one_shot(store, agent: str, drive: Callable[[dict], bool], *, rid: str,
                     continue
             else:
                 recv_api.commit(store, agent, record)   # SCOPED: thread-seen only
+            if on_runtime_idle is not None:
+                on_runtime_idle()
             last_hb = clock()
             fail_sleep = idle_interval
             turns += 1

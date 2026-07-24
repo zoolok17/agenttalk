@@ -269,8 +269,12 @@ two parallel ownership concepts.
 
 ### 4.6 Unattended operation — supervisor & wrapper
 - **Supervisor (`supervisor.py`):** generates a PowerShell monitor that launches/
-  relaunches agents and watches **heartbeat staleness** for liveness (not fragile
-  PID/brain discovery). Protected agents (all leads + the liaison) are never
+  relaunches agents. Manual listeners use heartbeat staleness for liveness.
+  Wrapped listeners additionally require one strictly parsed
+  `wrapper-runtime.json` lifecycle record: only validated idle can be
+  `HEALTHY_IDLE`; active work requires an independently discovered real CLI
+  brain plus accepted adapter progress. Unknown or malformed evidence is
+  non-green and never kill authority. Protected agents (all leads + the liaison) are never
   auto-killed. Restart-with-context via `request-restart`. Windows launches default
   to `window_style=hidden` (global setting, per-agent/profile override) so a
   supervised fleet does not cover the operator's desktop; hidden wrapped agents
@@ -285,6 +289,10 @@ two parallel ownership concepts.
   `thread_id` / claude session-id). The wrapped **model is a pure per-turn
   handler** — the wrapper owns the loop and loop-exit, so a resumed session
   re-enters listening regardless of the model (principle #7).
+  The wrapper is also the single writer for the closed, atomic
+  `wrapper-runtime.json` turn-lifecycle record shared by supervisor health
+  (#72) and commit-vs-park (#73). `progress_sequence` advances only for real
+  accepted adapter events; heartbeat timer ticks are not progress.
   Wrapper waiting markers carry unique generation tokens and teardown clears
   only a matching token, so an old loop cannot erase a replacement marker.
   The Windows per-turn watchdog kills a verified target with
@@ -302,14 +310,18 @@ two parallel ownership concepts.
   and run bounded synthetic cadence ticks when the bus is quiet. Synthetic ticks
   never advance the cursor or enter the dead-letter path; they are controller
   health, not message poison.
-- **Three liveness surfaces:** the supervisor heartbeat is the authority for
-  process liveness and recovery decisions; top-level `health.py` is an
+- **Three liveness surfaces:** manual supervisor health uses heartbeat
+  freshness, while wrapped supervisor health combines heartbeat, strict
+  lifecycle phase, independently observed CLI-brain liveness, and adapter
+  progress; top-level `health.py` is an
   advisory view of wrapper state (`idle_waiting`, `working_turn`, degraded,
   errored, unknown) that degrades safely and never authorizes a kill by itself;
   `deadman.py` is an independent mail-age SLO alarm over owed work, derived
   from the thread projector and not from supervisor state.
-- **Why:** real hangs and resume-wake churn happened in the field. Heartbeat
-  liveness + wrapper-owned loop is the robust unattended answer; wrapped is the
+- **Why:** real hangs and resume-wake churn happened in the field. A wrapper
+  can keep heartbeating after its CLI child dies or wedges, so heartbeat alone
+  cannot authorize wrapped health. Strict turn lifecycle plus real child/progress
+  observation closes that false-green; wrapped is the
   recommended supervised archetype.
 - **Launch containment (v0.69.1):** a crashed wrapper that is not fully reaped must
   never be *replaced alongside* a survivor. Before spawning a replacement the

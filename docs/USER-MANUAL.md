@@ -536,10 +536,20 @@ singleton marker is recovered only with the explicit
 `supervise --repair-instance-marker --quarantine
 --acknowledge-no-live-supervisor` acknowledgement.
 
-Heartbeat freshness is the liveness authority. A fresh heartbeat means healthy.
-A stale heartbeat can recover only when the agent is instrumented by the
-activity hook or by `agenttalk wrap --loop`. Otherwise the supervisor warns and
-does not kill the agent.
+Manual listeners use heartbeat freshness as their liveness authority. Wrapped
+listeners also publish a strict `wrapper-runtime.json` lifecycle record. Only a
+validated idle phase can be `HEALTHY_IDLE`; active work requires an
+independently discovered real CLI brain plus accepted adapter progress.
+Missing, malformed, or ambiguous evidence is `CLI_CHILD_UNKNOWN`, never green
+or automatic kill authority.
+
+After upgrading, refresh generated artifacts and restart existing wrappers so
+they publish the record:
+
+```powershell
+agenttalk supervise --refresh-scripts
+agenttalk request-restart --for AGENT_NAME
+```
 
 Freshness is bounded against clock error: a heartbeat farther in the future
 than the configured allowance cannot make an agent healthy. The monitor's

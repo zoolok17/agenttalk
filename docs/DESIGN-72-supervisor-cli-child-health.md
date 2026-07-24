@@ -1,6 +1,6 @@
 # Design #72: verify the wrapped CLI child in supervisor health
 
-Status: proposed, diagnosis and design only
+Status: implemented on `feat/72-supervisor-cli-child-health`
 Date: 2026-07-24
 Base: `c70ee918c8e060191e125b12582dc9dcbcb23b18`
 Audience: supervisor and wrapper maintainers
@@ -200,8 +200,11 @@ crash-atomic.
 
 Readers consume the whole file and validate it against the closed schema
 before exposing any field. They reject unknown keys, invalid types, unsafe
-identifiers, non-UTC/future timestamps, and inconsistent phase fields. An
-absent, torn, partial, or parse-failed read becomes one indivisible
+identifiers, non-UTC timestamps, timestamps beyond the bounded supervisor
+observation skew, and inconsistent phase fields. A timestamp within that bound
+is age-clamped to zero because the wrapper can publish after the generated
+supervisor captures integer `--now` but before Python reads the file. An absent,
+torn, partial, or parse-failed read becomes one indivisible
 `CLI_CHILD_UNKNOWN` observation. A reader must never salvage `phase`,
 `progress_sequence`, or an outcome from invalid bytes.
 
@@ -392,7 +395,7 @@ an explicit default and must be total.
 
 ## Implementation test matrix
 
-The implementation round should add deterministic synthetic-snapshot tests for:
+The implementation includes deterministic synthetic-snapshot tests for:
 
 - idle wrapper without a child remains `HEALTHY_IDLE`;
 - terminal phase with stale progress is `CLI_CHILD_UNKNOWN`, never

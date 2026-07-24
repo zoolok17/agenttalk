@@ -1475,6 +1475,7 @@ class _ProcStream:
                  work_heartbeat=None, work_heartbeat_stamp=None,
                  work_heartbeat_status=None,
                  child_env: dict[str, str] | None = None,
+                 on_spawn: Callable[[int, str | None], None] | None = None,
                  lease_lost_exceptions: tuple = ()) -> None:
         # argv is the operator-provided launch command; never shell=True.
         # Explicit encoding/errors (see run_wrapper): UTF-8 child output must not be
@@ -1493,6 +1494,8 @@ class _ProcStream:
             bufsize=1, env=child_env, **_child_window_kwargs(child_env),
         )
         self.returncode: int | None = None
+        self.pid = self._proc.pid
+        self.pid_start: str | None = None
         self.watchdog_result: dict | None = None
         self._watchdog = None
         self.work_heartbeat_result: dict | None = None
@@ -1502,6 +1505,11 @@ class _ProcStream:
             # time, within spawn jitter) so the watchdog can start-time-guard the kill against
             # pid reuse. Wall clock, to match the snapshot adapter's create_epoch.
             self._root_start = watchdog_wall_clock()
+            if on_spawn is not None:
+                from agenttalk.wrapper_runtime import process_start_token
+
+                self.pid_start = process_start_token(self.pid)
+                on_spawn(self.pid, self.pid_start)
             if self._proc.stdin is not None:
                 if stdin_text is not None:
                     self._proc.stdin.write(stdin_text)
@@ -1784,6 +1792,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                turn_watchdog: "TurnWatchdogConfig | None" = None,
                watchdog_snapshot_fn=None, watchdog_kill_fn=None,
                health_writer: WrapperHealthWriter | None = None,
+               runtime_writer=None,
                work_heartbeat=None,
                wrapper_generation: str | None = None,
                backend_profile: str | None = None,
@@ -1889,6 +1898,17 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         # lease (the controller is alive while streaming, even on a turn that fails).
         on_heartbeat=((lambda _ev, _ts: heartbeat()) if heartbeat is not None
                       else _default_heartbeat(store, agent)),
+        on_progress=(
+            (
+                lambda ev, _ts: (
+                    None
+                    if ev.type == EventType.TURN_STARTED
+                    else runtime_writer.progress()
+                )
+            )
+            if runtime_writer is not None
+            else None
+        ),
         on_render=(_default_render if render else None),
         on_escalate=_health_escalate,
         on_info=_health_info,
@@ -1963,13 +1983,23 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                                work_heartbeat_stamp=_whb_stamp,
                                work_heartbeat_status=_whb_status,
                                child_env=child_env,
+                               on_spawn=(
+                                   runtime_writer.active
+                                   if runtime_writer is not None
+                                   else None
+                               ),
                                lease_lost_exceptions=lease_lost_exceptions)
     preflight = agenttalk_preflight
     if preflight is None and cli == "codex" and spawn is None:
         preflight = preflight_agenttalk_runtime
     preflight_ok = False
 
-    def _run_one(spec, *, after_spawn: Callable[[], None] | None = None) -> dict:
+    def _run_one(
+        spec,
+        *,
+        turn_id: str,
+        after_spawn: Callable[[], None] | None = None,
+    ) -> dict:
         """Spawn ONE CLI invocation for ``spec`` and process its JSONL via the engine.
         Returns the raw turn SIGNALS for classification: ``{ok, started, completed,
         terminal, retryable, rc, error}``. ok is True only if it reached a COMPLETED
@@ -1988,6 +2018,13 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                "lesson_exposure_error": None}
         child_output_lines: list[dict[str, str]] = []
         child_output_truncated = False
+        runtime_started = False
+
+        def _finish_runtime() -> None:
+            if runtime_writer is not None and runtime_started:
+                runtime_writer.terminal(
+                    "success" if sig["ok"] else "failed"
+                )
 
         def _capture_child_output(stream_name: str, text: object) -> None:
             nonlocal child_output_truncated
@@ -2018,6 +2055,12 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 return sig
             preflight_ok = True
         try:
+            if runtime_writer is not None:
+                runtime_writer.starting(
+                    message_id=active_message_id,
+                    turn_id=turn_id,
+                )
+                runtime_started = True
             stream = spawner(argv, spec.stdin)
             if after_spawn is not None:
                 try:
@@ -2103,6 +2146,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 sig["config_blocked"] = True
                 sig["config_blocked_text"] = str(e)
                 sig["error"] = str(e)
+            _finish_runtime()
             return sig
         except OSError as e:
             _capture_child_output("stderr", f"{type(e).__name__}: {e}")
@@ -2117,6 +2161,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 sig["error"] = blocked
             else:
                 sig["error"] = f"spawn/exec error running {_compact_text(_format_argv(argv))}: {e}"
+            _finish_runtime()
             return sig
         # rc is None for an injected list spawn (unknown -> trust the boundary); a real
         # _ProcStream reports the child exit code (nonzero = failed turn).
@@ -2133,6 +2178,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             and sig["bus_failure"] is None
             and sig["rc"] in (0, None)
         )
+        _finish_runtime()
         return sig
 
     def _classify(sig: dict) -> tuple[str, str]:
@@ -2177,7 +2223,11 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 session_state, agent=agent, msg_id=record.get("id"))
             if persist is not None:
                 persist(session_state)
-        sig = _run_one(spec, after_spawn=_record_lesson_exposure)
+        sig = _run_one(
+            spec,
+            turn_id=lesson_turn_id,
+            after_spawn=_record_lesson_exposure,
+        )
         if not sig["ok"] and attempted_resume:
             try:
                 resume_failure_class, resume_summary = _classify(sig)
@@ -2319,6 +2369,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                        agenttalk_preflight: Callable[[], str | None] | None = None,
                        heartbeat: Callable[[], None] | None = None,
                        persist: Callable[[object], None] | None = None,
+                       runtime_writer=None,
                        work_heartbeat=None,
                        lease_lost_exceptions: tuple = (),
                        ) -> Callable[[dict, list], bool]:
@@ -2351,6 +2402,17 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
         detector=detector,
         on_heartbeat=((lambda _ev, _ts: heartbeat()) if heartbeat is not None
                       else _default_heartbeat(store, agent)),
+        on_progress=(
+            (
+                lambda ev, _ts: (
+                    None
+                    if ev.type == EventType.TURN_STARTED
+                    else runtime_writer.progress()
+                )
+            )
+            if runtime_writer is not None
+            else None
+        ),
         on_render=(_default_render if render else None),
         on_escalate=_default_escalate(store, agent, sender or agent),
         on_info=_default_info,
@@ -2372,6 +2434,11 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                                work_heartbeat=work_heartbeat,
                                work_heartbeat_stamp=_whb_stamp,
                                work_heartbeat_status=_whb_status,
+                               on_spawn=(
+                                   runtime_writer.active
+                                   if runtime_writer is not None
+                                   else None
+                               ),
                                lease_lost_exceptions=lease_lost_exceptions)
     preflight = agenttalk_preflight
     if preflight is None and cli == "codex" and spawn is None:
@@ -2400,6 +2467,11 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                 return sig
             preflight_ok = True
         try:
+            if runtime_writer is not None:
+                runtime_writer.starting(
+                    message_id=None,
+                    turn_id=f"cadence-{uuid.uuid4().hex[:12]}",
+                )
             stream = spawner(argv, spec.stdin)
             for line in stream:
                 s = line.strip()
@@ -2443,6 +2515,8 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                 sig["error"] = blocked
             else:
                 sig["error"] = f"spawn/exec error running {_compact_text(_format_argv(argv))}: {exc}"
+            if runtime_writer is not None:
+                runtime_writer.terminal("failed")
             return sig
         rc = getattr(stream, "returncode", None)
         sig["rc"] = rc
@@ -2453,6 +2527,8 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
             and sig["bus_failure"] is None
             and rc in (0, None)
         )
+        if runtime_writer is not None:
+            runtime_writer.terminal("success" if sig["ok"] else "failed")
         return sig
 
     def cadence_drive(snapshot: dict, items: list) -> bool:

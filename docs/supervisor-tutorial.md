@@ -28,12 +28,14 @@ By the end you will have:
 
 Three ideas carry the whole feature:
 
-1. **Heartbeat freshness is the liveness authority.** Each agent stamps
-   a small `heartbeat` file as it works and while it idles in `wait`. A
-   **fresh** heartbeat means healthy — even if the supervisor can't find
-   the process. A **stale** heartbeat (older than `stuck_after_seconds`)
-   is the only signal that triggers recovery. There is no fragile
-   "find the right PID" dance deciding life-or-death.
+1. **Health authority depends on the launch mode.** A manual listener
+   stamps a small `heartbeat` file as it works and while it idles in
+   `wait`; heartbeat freshness remains its stuck signal. A wrapped
+   listener additionally publishes one strict turn-lifecycle record.
+   Only a validated `idle` phase can be `HEALTHY_IDLE`. During an active
+   turn the supervisor independently discovers the real CLI brain and
+   requires real adapter progress. Missing, malformed, or ambiguous
+   evidence is non-green and never automatic kill authority.
 
 2. **The supervisor is an external monitor, not a daemon inside the
    bus.** `agenttalk supervise` only computes a read-only **report**
@@ -63,8 +65,9 @@ There are **two ways** an agent can be made stuck-recoverable:
   agent with the `agenttalk heartbeat` PostToolUse hook installed. It
   heartbeats at every tool boundary plus the idle wait loop.
 - **Wrapped agent.** The agent runs *through* `agenttalk wrap --loop`,
-  which owns the idle wait and heartbeats by construction (plus streams
-  the agent's progress to the console). No hook needed.
+  which owns the idle wait and heartbeat, writes the strict runtime
+  phase/progress record, and streams the agent's progress to the
+  console. No hook is needed.
 
 Until an agent can confirm "stuck" (hook installed **or** wrapped), a
 stale heartbeat is **warn-only** — never a kill. An un-instrumented
@@ -232,30 +235,29 @@ Key differences for a wrapped agent:
 - **No `{SESSION_ARGS}` token** — the wrapper owns session continuity
   end to end (it persists and reloads the Codex `thread_id` / Claude
   `session-id` across its own turns *and* across a supervisor relaunch).
-- No activity hook needed: a wrapped agent is instrumented by
-  construction, so a stale heartbeat past grace **recovers** rather than
-  warn-only.
-- For wrapped Claude, that recovery guarantee depends on the in-turn work
-  heartbeat ticker. Setting `work_heartbeat.enabled=false`
-  disables automatic stale recovery for that agent: stale heartbeats produce
-  warning-only `suspect_warn` behavior and are never killed or relaunched automatically.
-  Re-enable the ticker or repair its configuration to restore stale recovery.
+- No activity hook needed: a wrapped agent records its lifecycle and
+  accepted CLI adapter events by construction.
+- A work-heartbeat timer is coordination visibility, not CLI progress.
+  It never advances `progress_sequence` and cannot keep a dead or wedged
+  CLI brain green.
+- A confirmed dead CLI brain requires two polls for the same wrapper and
+  turn generation outside spawn/handoff grace. A stalled live brain also
+  requires two confirming polls, and its threshold must be at least the
+  resolved per-CLI turn-watchdog deadline plus a safety margin. Unknown
+  evidence never authorizes a kill.
 - **`--disable hooks`** on the wrapped **codex** child (the safe default):
   the wrapper owns the heartbeat, so the codex activity hook is neither
   needed nor wanted, and disabling it sidesteps codex's hook-trust prompt
   on every launch. Drop it from the tail only if you intentionally want
   the child's project hooks.
 
-> **Per-CLI stale thresholds.** A wrapped **Claude** streams thinking,
-> text, and tool deltas, so it stays fresh through reasoning — default
-> `stuck_after_seconds` 180s. A wrapped **Codex** is item-level: no
-> event closes a long pure-reasoning gap, so the stream goes silent
-> between turn start and the final message — default 900s, and for a
-> heavy reasoning/review role pick 1200–1800s. **Guardrail:** a wrapped
-> Codex with `stuck_after_seconds` below 600s degrades to warn-only
-> (refuses restart authority) unless you set `allow_low_stuck_after=true`.
-> The value is never silently coerced. Pick the threshold above the
-> longest pure-reasoning gap your role plausibly hits.
+> **Per-CLI progress thresholds.** A wrapped **Claude** streams thinking,
+> text, and tool deltas, so its default `stuck_after_seconds` is 180s. A
+> wrapped **Codex** is item-level and can remain silent during pure
+> reasoning, so its default is 2400s. Keep the value above both the
+> longest legitimate event gap and the resolved turn-watchdog deadline
+> plus its 300s margin. The value is never silently coerced; a threshold
+> below the hard floor cannot authorize autonomous stall recovery.
 
 ---
 
@@ -523,16 +525,20 @@ without ever rebuilding state.
   means the agents act without asking. Scope `writable_roots` to the
   repo and only supervise projects you trust the agents to change.
 - **Wrapped-Codex threshold is conservative by design.** Because Codex's
-  stream is silent during pure reasoning, the stale threshold is loose
-  (900s+) to avoid false-killing a thinking agent. A genuinely wedged
+  stream is silent during pure reasoning, the progress threshold is loose
+  (2400s by default) to avoid false-killing a thinking agent. A genuinely wedged
   Codex turn therefore takes that long to be caught. This is an
   operational false-positive tradeoff, not a provable bound.
 - **Poison-message recovery.** If an inbound message reliably crashes a
-  wrapped agent's turn, the cycle is: fail -> heartbeat goes stale -> restart
-  -> reload-resume -> re-deliver the same message -> fail again. Backoff
-  throttles it (base..cap). Once the wrapper dead-letters the message, use
+  wrapped agent's turn, the runtime record exposes `TURN_FAILED`; retry and
+  recovery still honor the existing backoff and readiness caps. Once the
+  wrapper dead-letters the message, use
   `agenttalk dead-letter list`, `show`, `requeue`, or `resolve` to inspect and
   make an operator decision without rewinding cursors.
+- **Upgrade is fail-safe.** An older wrapper without
+  `wrapper-runtime.json` reports `CLI_CHILD_UNKNOWN`, even with a fresh
+  heartbeat. Run `agenttalk supervise --refresh-scripts`, then
+  `agenttalk request-restart --for AGENT_NAME`.
 - **Generation-bound waiter teardown.** A wrapper loop writes a unique token in
   its waiting marker and clears only that token in `finally`. An old wrapper
   therefore cannot erase a replacement marker. This protects observability; it

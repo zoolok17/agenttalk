@@ -14,14 +14,11 @@ must be deterministic and CI-testable WITHOUT launching a terminal:
   the SAME function, so the safety table is unit-tested via fixtures and never
   depends on real process death.
 
-Decision principle: heartbeat freshness is the liveness authority. A fresh
-heartbeat is healthy even if process discovery is missing or misleading. A
-stale heartbeat is recovered (best-effort kill + resume) only when the activity
-hook is installed for that agent (``activity_hook``), because without it we
-cannot tell "stuck" from "busy mid-long-turn" and a stale heartbeat falls back
-to warn-only (``suspect_warn``, never a kill). Protected agents are never
-auto-killed (warn-only). Process discovery is used only to choose scoped kill
-targets for recovery.
+Decision principle: heartbeat freshness remains the liveness authority for
+manual agents. Wrapped agents additionally require one strictly validated
+wrapper-turn runtime observation and, during an active turn, a live CLI brain.
+Unknown child evidence is never green and never kill authority. Protected
+agents are never auto-killed (warn-only).
 """
 
 from __future__ import annotations
@@ -47,6 +44,7 @@ from agenttalk import lanes as lane_mod
 from agenttalk.store import Store, _process_alive, validate_agent_name
 from agenttalk import powershell_host as psh
 from agenttalk import supervisor_lifecycle as lifecycle
+from agenttalk import wrapper_runtime as runtime_obs
 
 # ---- action vocabulary (the dry-run ACTION PLAN tokens) --------------------
 RELAUNCH = "relaunch"            # manual restart request - (re)launch now
@@ -388,6 +386,47 @@ _WRAPPED_CODEX_MIN_STUCK_AFTER = 600.0
 # SHARED turn_watchdog.resolve_turn_watchdog + watchdog_effectively_live (single source of
 # truth, imported in _plan_one so the two layers can never drift).
 _WATCHDOG_STUCK_AFTER_MARGIN = 300.0
+_CLI_CHILD_SPAWN_GRACE_SECONDS = 30.0
+_CLI_CHILD_CONFIRM_POLLS = 2
+
+
+def _resolved_progress_stall_floor(
+    config: dict,
+    cfg_agent: dict,
+    resolved_deadline: object,
+) -> tuple[float | None, str | None]:
+    """Resolve the watchdog deadline without accepting malformed overrides.
+
+    ``resolve_turn_watchdog`` is deliberately tolerant for wrapper startup and
+    falls back past malformed values. Stall recovery is kill authority, so it
+    must instead fail closed when an explicitly selected block/deadline is not
+    usable.
+    """
+    for label, owner in (("agent", cfg_agent), ("global", config)):
+        if "turn_watchdog" not in owner:
+            continue
+        block = owner.get("turn_watchdog")
+        if not isinstance(block, dict):
+            return None, f"{label} turn_watchdog must be an object"
+        if "turn_elapsed_seconds" not in block:
+            continue
+        value = block.get("turn_elapsed_seconds")
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) <= 0
+        ):
+            return None, f"{label} turn_elapsed_seconds is invalid"
+        return float(value) + _WATCHDOG_STUCK_AFTER_MARGIN, None
+    if (
+        not isinstance(resolved_deadline, (int, float))
+        or isinstance(resolved_deadline, bool)
+        or not math.isfinite(float(resolved_deadline))
+        or float(resolved_deadline) <= 0
+    ):
+        return None, "turn watchdog deadline is unresolved"
+    return float(resolved_deadline) + _WATCHDOG_STUCK_AFTER_MARGIN, None
 
 _WINDOW_STYLE_DEFAULT = "Hidden"
 _WINDOW_STYLES = {
@@ -722,6 +761,33 @@ def project_coordination_availability(
         }
     heartbeat_stale = heartbeat_stale_value is True
     if not heartbeat_stale:
+        if bool(cfg.get("wrapped", False)):
+            if plan_state in {"HEALTHY_IDLE", "HEALTHY_WORKING"}:
+                return {
+                    "agent": name,
+                    "state": AVAILABILITY_AVAILABLE,
+                    "subtype": "wrapped_runtime_green",
+                    "evidence_code": plan_state.lower(),
+                }
+            if plan_state in {
+                "CLI_CHILD_DEAD",
+                "CLI_CHILD_STALLED",
+                "TURN_FAILED",
+            }:
+                return {
+                    "agent": name,
+                    "state": AVAILABILITY_UNAVAILABLE,
+                    "subtype": "wrapped_cli_child_not_healthy",
+                    "evidence_code": plan_state.lower(),
+                }
+            return {
+                "agent": name,
+                "state": AVAILABILITY_UNKNOWN,
+                "subtype": "wrapped_cli_child_unresolved",
+                "evidence_code": (
+                    plan_state.lower() if plan_state else "plan_state_missing"
+                ),
+            }
         return {
             "agent": name,
             "state": AVAILABILITY_AVAILABLE,
@@ -1927,7 +1993,28 @@ def _pid_alive_guarded(idx: dict[int, dict], pid, expected_start) -> bool:
         return False
     if not isinstance(expected_start, str) or not expected_start:
         return False
-    return _start_of(idx[pid]) == expected_start
+    return _start_tokens_match(_start_of(idx[pid]), expected_start)
+
+
+def _start_tokens_match(observed, expected) -> bool:
+    """Compare anti-reuse start tokens without losing exact non-ISO schemes.
+
+    The wrapper's Windows native query emits six fractional digits while CIM
+    emits seven. Exact equality remains the first rule; ISO values then receive
+    a one-millisecond representation tolerance. Linux/native opaque tokens must
+    still compare byte-for-byte.
+    """
+    if not isinstance(observed, str) or not observed:
+        return False
+    if not isinstance(expected, str) or not expected:
+        return False
+    if observed == expected:
+        return True
+    observed_epoch = _iso_epoch(observed)
+    expected_epoch = _iso_epoch(expected)
+    if observed_epoch is None or expected_epoch is None:
+        return False
+    return abs(observed_epoch - expected_epoch) <= 0.001
 
 
 def _diag() -> dict[str, int]:
@@ -3041,10 +3128,10 @@ def _launcher_managed_set(idx: dict[int, dict], launcher_pid, agent: str,
                           now_epoch: float, *,
                           launch_epoch: float | None = None,
                           prior: list[dict] | None = None) -> list[dict]:
-    """Best-effort restart kill set for heartbeat-based liveness.
+    """Best-effort restart kill set for an independently authorized recovery.
 
-    Heartbeat freshness is the liveness authority; the process snapshot is only
-    used to clean up before relaunch. On Windows, children keep the creator
+    The process snapshot supplies scoped cleanup targets, not authority by
+    itself. On Windows, children keep the creator
     ``ParentProcessId`` after the launcher exits, so rows whose parent chain
     reaches the recorded launcher are the best scoped target set for Codex's
     TUI/runner/wait tree. Prior start-matching rows are carried forward so a
@@ -3092,14 +3179,16 @@ def _launcher_managed_set(idx: dict[int, dict], launcher_pid, agent: str,
 def _liveness(snapshot: list[dict] | None, st: dict, cfg_agent: dict,
               agent: str, now_epoch: float, *,
               root_key: str | None = None,
-              request_id: str | None = None) -> dict:
+              request_id: str | None = None,
+              runtime_view: dict | None = None) -> dict:
     """Derive process-discovery facts for one agent (PURE).
 
     Returns ``snapshot_available`` (False when capture failed), ``brain_pid`` /
     ``brain_start`` (recorded, or freshly DISCOVERED this tick), ``brain_alive``,
     ``wait_alive``, ``managed_pids`` (refreshed), and ``discovered_brain``.
-    These fields seed next-state and scoped kill targets; heartbeat freshness,
-    not process discovery, decides liveness."""
+    These fields seed next-state and scoped kill targets. Manual agents retain
+    heartbeat authority; wrapped agents combine a strict runtime observation
+    with independently discovered wrapper/CLI process identity."""
     attr = _attribution(
         snapshot,
         st,
@@ -3109,6 +3198,17 @@ def _liveness(snapshot: list[dict] | None, st: dict, cfg_agent: dict,
         request_id=request_id,
         now_epoch=now_epoch,
     )
+    lcfg = _liveness_cfg(cfg_agent)
+    if bool(lcfg.get("wrapped", False)):
+        return _wrapped_liveness(
+            snapshot,
+            st,
+            cfg_agent,
+            agent,
+            now_epoch,
+            attr,
+            runtime_view,
+        )
     if snapshot is None:
         return {"snapshot_available": False, "brain_pid": attr.get("brain_pid"),
                 "brain_start": attr.get("brain_start"), "brain_alive": False,
@@ -3117,20 +3217,8 @@ def _liveness(snapshot: list[dict] | None, st: dict, cfg_agent: dict,
                 "diagnostics": attr.get("diagnostics") or _diag(),
                 "discovered_brain": False}
     idx = _snap_index(snapshot)
-    lcfg = _liveness_cfg(cfg_agent)
     allow_launcher_self = bool(lcfg.get("allow_launcher_self", False))
     launcher_pid = st.get("launcher_pid")
-    if bool(lcfg.get("wrapped", False)):
-        # WRAPPED agent (launched THROUGH `agenttalk --root ... wrap --loop`):
-        # the wrapper (python) is the long-lived root, and the typed ownership
-        # pass decides which same-agent children are safe cleanup targets.
-        return {"snapshot_available": True, "brain_pid": None,
-                "brain_start": None, "brain_alive": False,
-                "wait_alive": bool(attr.get("wait_alive")),
-                "managed_pids": attr.get("managed_pids") or [],
-                "kill_targets": attr.get("targets") or [],
-                "diagnostics": attr.get("diagnostics") or _diag(),
-                "discovered_brain": False}
     brain_pid = st.get("brain_pid")
     brain_start = st.get("brain_start")
     # STALE-STATE REPAIR (test #4): a stored brain_pid == the LAUNCHER on a
@@ -3165,6 +3253,170 @@ def _liveness(snapshot: list[dict] | None, st: dict, cfg_agent: dict,
             "discovered_brain": discovered}
 
 
+def _wrapped_liveness(
+    snapshot: list[dict] | None,
+    st: dict,
+    cfg_agent: dict,
+    agent: str,
+    now_epoch: float,
+    attr: dict,
+    runtime_view: dict | None,
+) -> dict:
+    """Bind one strict wrapper-runtime observation to a trustworthy snapshot."""
+    base = {
+        "snapshot_available": snapshot is not None,
+        "brain_pid": None,
+        "brain_start": None,
+        "brain_alive": False,
+        "wait_alive": bool(attr.get("wait_alive")),
+        "managed_pids": attr.get("managed_pids") or [],
+        "kill_targets": attr.get("targets") or [],
+        "diagnostics": attr.get("diagnostics") or _diag(),
+        "discovered_brain": False,
+        "runtime_status": runtime_obs.STATUS_ABSENT,
+        "runtime_error": "missing",
+        "runtime_record": None,
+        "runtime_updated_age_seconds": None,
+        "runtime_progress_age_seconds": None,
+        "wrapper_state": "unknown",
+        "child_state": "unknown",
+        "child_reason": "runtime_missing",
+    }
+    view = runtime_view if isinstance(runtime_view, dict) else {}
+    status = (
+        view.get("status")
+        if isinstance(runtime_view, dict)
+        else runtime_obs.STATUS_ABSENT
+    )
+    if status not in {
+        runtime_obs.STATUS_VALID,
+        runtime_obs.STATUS_ABSENT,
+        runtime_obs.STATUS_INVALID,
+    }:
+        status = runtime_obs.STATUS_INVALID
+    base["runtime_status"] = status
+    base["runtime_error"] = view.get("error")
+    if status != runtime_obs.STATUS_VALID:
+        base["child_reason"] = f"runtime_{status}"
+        return base
+
+    record = view.get("record")
+    if not isinstance(record, dict):
+        base["runtime_status"] = runtime_obs.STATUS_INVALID
+        base["runtime_error"] = "record_missing"
+        base["child_reason"] = "runtime_invalid"
+        return base
+    try:
+        normalized = runtime_obs.validate_record(
+            record,
+            expected_agent=agent,
+            now_epoch=now_epoch,
+        )
+    except runtime_obs.RuntimeRecordError:
+        base["runtime_status"] = runtime_obs.STATUS_INVALID
+        base["runtime_error"] = "record_invalid"
+        base["child_reason"] = "runtime_invalid"
+        return base
+    updated_epoch = normalized.pop("_updated_epoch")
+    progress_epoch = normalized.pop("_last_progress_epoch")
+    record = normalized
+    base["runtime_record"] = record
+    base["runtime_updated_age_seconds"] = max(0.0, now_epoch - updated_epoch)
+    base["runtime_progress_age_seconds"] = (
+        None if progress_epoch is None else max(0.0, now_epoch - progress_epoch)
+    )
+
+    if snapshot is None:
+        base["child_reason"] = "snapshot_unavailable"
+        return base
+    idx = _snap_index(snapshot)
+    wrapper_pid = record.get("wrapper_pid")
+    wrapper_start = record.get("wrapper_start")
+    if (
+        wrapper_pid != st.get("launcher_pid")
+        or not _start_tokens_match(wrapper_start, st.get("launcher_start"))
+    ):
+        base["child_reason"] = "wrapper_state_mismatch"
+        return base
+    wrapper_row = idx.get(wrapper_pid)
+    if wrapper_row is None:
+        base["wrapper_state"] = "dead"
+        base["child_reason"] = "wrapper_absent"
+        return base
+    if not _pid_alive_guarded(idx, wrapper_pid, wrapper_start):
+        base["child_reason"] = "wrapper_identity_ambiguous"
+        return base
+    wrapper_attributed = any(
+        target.get("pid") == wrapper_pid
+        and target.get("reason") == "confirmed_launcher"
+        for target in attr.get("targets") or []
+        if isinstance(target, dict)
+    )
+    if not wrapper_attributed:
+        base["child_reason"] = "wrapper_attribution_ambiguous"
+        return base
+    base["wrapper_state"] = "alive"
+
+    phase = record.get("phase")
+    if phase == runtime_obs.PHASE_IDLE:
+        base["child_state"] = "not_required"
+        base["child_reason"] = "idle"
+        return base
+    if phase == runtime_obs.PHASE_STARTING:
+        base["child_state"] = "starting"
+        base["child_reason"] = "spawn_pending"
+        return base
+    if phase == runtime_obs.PHASE_TERMINAL:
+        base["child_state"] = "terminal"
+        base["child_reason"] = "turn_terminal"
+        return base
+    if phase != runtime_obs.PHASE_ACTIVE:
+        base["child_reason"] = "phase_unknown"
+        return base
+
+    launcher_pid = record.get("cli_launcher_pid")
+    launcher_start = record.get("cli_launcher_start")
+    if not isinstance(launcher_pid, int) or not isinstance(launcher_start, str):
+        base["child_reason"] = "launcher_identity_unavailable"
+        return base
+    launcher_row = idx.get(launcher_pid)
+    if launcher_row is not None and not _pid_alive_guarded(
+        idx, launcher_pid, launcher_start
+    ):
+        base["child_reason"] = "launcher_identity_mismatch"
+        return base
+
+    lcfg = _liveness_cfg(cfg_agent)
+    brain_pattern = cfg_agent.get("brain_pattern") or lcfg.get("brain_pattern", "")
+    candidate = _discover_brain(
+        idx,
+        agent,
+        launcher_pid,
+        brain_pattern,
+        launch_epoch=_iso_epoch(launcher_start),
+        allow_launcher_self=bool(lcfg.get("allow_launcher_self", False)),
+    )
+    if candidate is not None:
+        base["brain_pid"] = candidate.get("pid")
+        base["brain_start"] = _start_of(candidate)
+        base["brain_alive"] = True
+        base["discovered_brain"] = True
+        base["child_state"] = "alive"
+        base["child_reason"] = "brain_discovered"
+        return base
+
+    pattern = str(brain_pattern or "").casefold()
+    if pattern and any(
+        pattern in str(row.get("name") or "").casefold()
+        for row in idx.values()
+    ):
+        base["child_reason"] = "brain_ancestry_ambiguous"
+        return base
+    base["child_state"] = "dead"
+    base["child_reason"] = "brain_absent"
+    return base
+
+
 def _liveness_cfg(cfg_agent: dict) -> dict:
     """Per-agent liveness config merged over the per-CLI defaults."""
     cli = cfg_agent.get("cli", "claude")
@@ -3196,9 +3448,10 @@ def build_report(store: Store, *, now_epoch: float,
     agent's ``heartbeat_stale`` is computed against its PER-AGENT/PER-CLI threshold
     (:func:`resolve_stuck_after`), so the operator-facing report MATCHES the
     planner's per-CLI decision (a wrapped Codex is not shown stale at the global
-    threshold while the planner correctly holds to 900s). Without it the single
-    global threshold applies (legacy behavior). The resolved per-agent threshold
-    is reported as ``stuck_after_seconds`` on each agent entry. The additive
+    threshold while the planner correctly holds to its 2400s default). Without
+    it the single global threshold applies (legacy behavior). The resolved
+    per-agent threshold is reported as ``stuck_after_seconds`` on each agent
+    entry. The additive
     ``heartbeat_evidence`` field preserves missing/observed/future-skew evidence
     for read-only coordination warnings; planning continues to consume the
     unchanged age and stale fields.
@@ -3269,6 +3522,13 @@ def build_report(store: Store, *, now_epoch: float,
             "config_blocked_hold": store.read_config_blocked_hold(a),
             "session_id": st.get("session_id"),  # supervisor-local; None unless state passed
         }
+        sup_agent = sup_agents.get(a) if isinstance(sup_agents.get(a), dict) else {}
+        if bool(sup_agent.get("wrapped", False)):
+            agents[a]["wrapper_runtime"] = runtime_obs.read_runtime(
+                store.state_dir,
+                a,
+                now_epoch=now_epoch,
+            )
         # Managed lead-loop visibility (lead-loop Slice 1; additive, read-only).
         # Present only when the agent is managed OR a lease file exists. The planner
         # acts on the EXIT marker (WP2) - this surfaces the armed/lease state so the
@@ -3759,10 +4019,9 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
               liveness: dict, *, now_epoch: float) -> dict:
     """Decide ONE agent's action + next state. PURE - no I/O, no clock.
 
-    Heartbeat freshness is the liveness authority. The process snapshot-derived
-    ``liveness`` bundle is only used to carry best-effort kill targets into a
-    restart; a missing/incorrect brain PID must never cause a healthy,
-    heartbeating agent to be killed.
+    Manual agents retain heartbeat authority. Wrapped agents require a strict
+    runtime observation plus the snapshot-derived CLI child state; ambiguous
+    child evidence is neither green nor automatic kill authority.
     """
     backoff = _backoff_cfg(config)
     base, cap = float(backoff["base_seconds"]), float(backoff["cap_seconds"])
@@ -3782,15 +4041,10 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     restart_cooldown = min(60.0, max(30.0, restart_cooldown))
     activity_hook = bool(cfg_agent.get("activity_hook", False))
     _lcfg = _liveness_cfg(cfg_agent)
-    # A WRAPPED agent is instrumented BY CONSTRUCTION: the wrap --loop loop writes
-    # a heartbeat on every idle bus-wait cycle AND the engine stamps on streaming
-    # progress during a turn, so a stale heartbeat genuinely means stuck/dead.
-    # That makes wrapped a "can confirm stuck" signal exactly like activity_hook -
-    # so wrapped agents recover on stale (instead of warn-only) without needing the
-    # PostToolUse hook installed. The per-CLI threshold (resolve_stuck_after) keeps
-    # a wrapped CODEX (item-level; silent during a long pure-reasoning gap) from
-    # being false-killed mid-reasoning; a wrapped CLAUDE (thinking/text deltas)
-    # stays fresh and can run tighter.
+    # A wrapped agent has two independent observations: wrapper heartbeat/runtime
+    # phase and process-snapshot CLI brain state. A stale idle wrapper retains the
+    # existing recovery path. During a turn, real adapter progress and a live brain
+    # are required; a synthetic work-heartbeat is never progress.
     wrapped = bool(_lcfg.get("wrapped", False))
     cli_name = cfg_agent.get("cli", "claude")
     stuck_after = resolve_stuck_after(config, cfg_agent)
@@ -3815,6 +4069,13 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         config, cfg_agent, default_enabled=(wrapped and cli_name == "codex"))
     watchdog_live = _twd.watchdog_effectively_live(_wd_cfg)
     watchdog_turn_elapsed = _wd_cfg.turn_elapsed_seconds
+    progress_stall_floor, progress_stall_floor_error = (
+        _resolved_progress_stall_floor(
+            config,
+            cfg_agent,
+            watchdog_turn_elapsed,
+        )
+    )
     watchdog_preempted = (wrapped and cli_name == "codex" and watchdog_live
                           and stuck_after <= watchdog_turn_elapsed + _WATCHDOG_STUCK_AFTER_MARGIN
                           and not allow_low_stuck_after)
@@ -3883,13 +4144,95 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     readiness_seen = bool(st.get("readiness_seen", False))
     resume_available = bool(st.get("resume_available", False))
 
-    # The FIRST fresh heartbeat after launch is readiness: wait heartbeats cover
-    # idle/listening and the activity hook covers tool work. Brain PID discovery
-    # is intentionally NOT required; it false-killed healthy Codex agents.
-    if not hb_stale and not readiness_seen:
+    # Manual agents retain heartbeat-only readiness. Wrapped readiness is earned
+    # only by a green row in the total child-health table below.
+    if not wrapped and not hb_stale and not readiness_seen:
         readiness_seen, launching, resume_available = True, False, True
         readiness_fails = 0   # readiness REACHED -> clear the give-up counter
     in_grace = launching and (not readiness_seen) and now_epoch < grace_until
+
+    runtime_record = (
+        liveness.get("runtime_record")
+        if isinstance(liveness.get("runtime_record"), dict)
+        else None
+    )
+    runtime_valid = (
+        liveness.get("runtime_status") == runtime_obs.STATUS_VALID
+        and runtime_record is not None
+    )
+    runtime_wrapper_generation = (
+        runtime_record.get("wrapper_generation") if runtime_valid else None
+    )
+    runtime_turn_generation = (
+        runtime_record.get("turn_generation") if runtime_valid else None
+    )
+    runtime_phase = runtime_record.get("phase") if runtime_valid else None
+    runtime_sequence = (
+        runtime_record.get("progress_sequence") if runtime_valid else None
+    )
+    prior_wrapper_generation = st.get("runtime_wrapper_generation")
+    prior_turn_generation = st.get("runtime_turn_generation")
+    same_runtime_turn = bool(
+        runtime_valid
+        and runtime_wrapper_generation == prior_wrapper_generation
+        and runtime_turn_generation == prior_turn_generation
+    )
+    prior_sequence = st.get("runtime_progress_sequence")
+    sequence_regressed = bool(
+        same_runtime_turn and st.get("runtime_sequence_regressed", False)
+    )
+    progress_seen_epoch = st.get("runtime_progress_seen_epoch")
+    if not isinstance(progress_seen_epoch, (int, float)) or not math.isfinite(
+        float(progress_seen_epoch)
+    ):
+        progress_seen_epoch = now_epoch
+    if runtime_valid:
+        if not same_runtime_turn:
+            initial_progress_age = liveness.get("runtime_progress_age_seconds")
+            progress_seen_epoch = (
+                now_epoch - float(initial_progress_age)
+                if isinstance(initial_progress_age, (int, float))
+                and not isinstance(initial_progress_age, bool)
+                and math.isfinite(float(initial_progress_age))
+                and float(initial_progress_age) >= 0
+                else now_epoch
+            )
+            sequence_regressed = False
+        elif (
+            isinstance(runtime_sequence, int)
+            and isinstance(prior_sequence, int)
+            and runtime_sequence < prior_sequence
+        ):
+            sequence_regressed = True
+        elif (
+            isinstance(runtime_sequence, int)
+            and isinstance(prior_sequence, int)
+            and runtime_sequence > prior_sequence
+        ):
+            progress_seen_epoch = now_epoch
+    else:
+        # An unreadable observation is indivisibly UNKNOWN. Preserve the last
+        # complete high-water mark so a torn read cannot erase evidence and
+        # launder a lower sequence on the next valid read. Confirmation polls
+        # are still reset below, so UNKNOWN itself never advances kill authority.
+        sequence_regressed = st.get("runtime_sequence_regressed") is True
+
+    if runtime_valid:
+        next_wrapper_generation = runtime_wrapper_generation
+        next_turn_generation = runtime_turn_generation
+        next_runtime_phase = runtime_phase
+        next_runtime_sequence = (
+            max(prior_sequence, runtime_sequence)
+            if sequence_regressed
+            and isinstance(prior_sequence, int)
+            and isinstance(runtime_sequence, int)
+            else runtime_sequence
+        )
+    else:
+        next_wrapper_generation = prior_wrapper_generation
+        next_turn_generation = prior_turn_generation
+        next_runtime_phase = st.get("runtime_phase")
+        next_runtime_sequence = prior_sequence
 
     # carry-forward: ALL supervisor-owned fields pass THROUGH (BLOCKER-3 lesson -
     # a healthy `none` tick must never drop discovery/liveness state). The
@@ -3899,12 +4242,24 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         "healthy_since": healthy_since, "consumed_rids": consumed,
         "last_warn_epoch": last_warn,
         "launcher_pid": st.get("launcher_pid"), "launcher_start": st.get("launcher_start"),
+        "launcher_nonce": st.get("launcher_nonce"),
+        "launcher_nonce_injected": st.get("launcher_nonce_injected"),
+        "launcher_nonce_source": st.get("launcher_nonce_source"),
+        "launcher_nonce_missing_reason": st.get("launcher_nonce_missing_reason"),
         "brain_pid": brain_pid, "brain_start": brain_start, "managed_pids": managed,
         "launching": launching, "launch_grace_until": grace_until,
         "readiness_seen": readiness_seen, "resume_available": resume_available,
         "readiness_fails": readiness_fails,
         "last_launch_epoch": st.get("last_launch_epoch"),
         "session_id": st.get("session_id"), "launched": bool(st.get("launched", False)),
+        "runtime_wrapper_generation": next_wrapper_generation,
+        "runtime_turn_generation": next_turn_generation,
+        "runtime_phase": next_runtime_phase,
+        "runtime_progress_sequence": next_runtime_sequence,
+        "runtime_progress_seen_epoch": progress_seen_epoch,
+        "runtime_sequence_regressed": sequence_regressed,
+        "runtime_dead_polls": 0,
+        "runtime_stall_polls": 0,
     }
 
     def _relaunch_state() -> None:
@@ -3920,6 +4275,8 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
         nxt["brain_pid"] = None
         nxt["brain_start"] = None
         nxt["managed_pids"] = []
+        nxt["runtime_dead_polls"] = 0
+        nxt["runtime_stall_polls"] = 0
 
     def _barrier_backoff_state() -> dict:
         hold = copy.deepcopy(nxt)
@@ -3971,6 +4328,20 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             if isinstance(barrier_state, dict):
                 res["barrier_state"] = barrier_state
         return res
+
+    def _healthy(state: str, reason: str) -> dict:
+        nxt["runtime_dead_polls"] = 0
+        nxt["runtime_stall_polls"] = 0
+        if wrapped:
+            nxt["readiness_seen"] = True
+            nxt["launching"] = False
+            nxt["resume_available"] = True
+            nxt["readiness_fails"] = 0
+        if healthy_since is None:
+            nxt["healthy_since"] = now_epoch
+        elif fails and (now_epoch - float(healthy_since)) >= reset_after:
+            nxt["consecutive_fails"], nxt["backoff_next_epoch"] = 0, 0.0
+        return _result(NONE, state=state, reason=reason)
 
     # 0) Manual restart-request marker (highest priority).
     if isinstance(marker, dict) and isinstance(marker.get("request_id"), str):
@@ -4030,11 +4401,269 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
                            kill_first=bool(kt), kill_targets=kt, bypass_backoff=True,
                            reason=f"manual restart-request {rid}",
                            barrier_state=barrier_state)
-        if not hb_stale and readiness_seen:
+        runtime_idle_ready = (
+            not wrapped
+            or (
+                runtime_valid
+                and runtime_phase == runtime_obs.PHASE_IDLE
+                and liveness.get("wrapper_state") == "alive"
+            )
+        )
+        if not hb_stale and readiness_seen and runtime_idle_ready:
             nxt["restart_request_state"] = "readiness_seen"
             return _result(CLEAR_MARKER, state="HEALTHY_IDLE", clear_marker=rid,
                            reason=f"restart {rid} reached readiness; clearing marker")
         # consumed but still stale -> relaunch failed; fall through (no re-bypass).
+
+    child_recovery_reason: str | None = None
+    child_recovery_state: str | None = None
+    if wrapped:
+        remediation = (
+            "agenttalk supervise --refresh-scripts; "
+            f"agenttalk request-restart --for {name}"
+        )
+        if not runtime_valid:
+            return _result(
+                NONE,
+                state="CLI_CHILD_UNKNOWN",
+                reason=(
+                    "wrapper runtime observation is missing or invalid; "
+                    f"run `{remediation}`"
+                ),
+            )
+        if sequence_regressed:
+            return _result(
+                NONE,
+                state="CLI_CHILD_UNKNOWN",
+                reason=(
+                    "same-turn wrapper runtime progress_sequence regressed; "
+                    "refusing green or recovery authority"
+                ),
+            )
+        wrapper_state = liveness.get("wrapper_state")
+        if runtime_phase == runtime_obs.PHASE_IDLE and wrapper_state == "dead":
+            if not hb_stale:
+                return _result(
+                    NONE,
+                    state="WRAPPER_MISSING",
+                    reason=(
+                        "validated idle wrapper is absent, but its heartbeat is "
+                        "still inside the stale threshold"
+                    ),
+                )
+            # Preserve the existing stale-wrapper recovery path below. The
+            # strict idle record identifies the launch mode, while the
+            # available snapshot positively establishes wrapper absence.
+        elif wrapper_state != "alive":
+            return _result(
+                NONE,
+                state="CLI_CHILD_UNKNOWN",
+                reason=(
+                    "wrapper runtime could not be bound to the live managed wrapper "
+                    f"({liveness.get('child_reason')}); run `{remediation}`"
+                ),
+            )
+
+        updated_age = liveness.get("runtime_updated_age_seconds")
+        updated_age_valid = bool(
+            isinstance(updated_age, (int, float))
+            and not isinstance(updated_age, bool)
+            and math.isfinite(float(updated_age))
+            and float(updated_age) >= 0
+        )
+        # The sequence is monotonic across turns. Only a timestamp written by a
+        # real adapter event in this turn proves that handoff completed.
+        handoff_complete = isinstance(
+            runtime_record.get("last_progress_at"), str
+        )
+        child_in_grace = bool(
+            not handoff_complete
+            and (
+                in_grace
+                or (
+                    updated_age_valid
+                    and float(updated_age) <= _CLI_CHILD_SPAWN_GRACE_SECONDS
+                )
+            )
+        )
+        if runtime_phase == runtime_obs.PHASE_IDLE:
+            if wrapper_state == "alive" and not hb_stale:
+                return _healthy("HEALTHY_IDLE", "validated wrapper idle")
+            # A validated idle record with a stale wrapper heartbeat uses the
+            # existing wrapper recovery table below.
+        elif runtime_phase == runtime_obs.PHASE_STARTING:
+            if child_in_grace:
+                return _result(
+                    NONE,
+                    state="CLI_CHILD_STARTING",
+                    reason="CLI spawn is inside the bounded handoff grace",
+                )
+            return _result(
+                NONE,
+                state="CLI_CHILD_UNKNOWN",
+                reason="CLI remained in starting phase beyond spawn grace",
+            )
+        elif runtime_phase == runtime_obs.PHASE_TERMINAL:
+            outcome = runtime_record.get("last_outcome")
+            if outcome in {
+                runtime_obs.OUTCOME_FAILED,
+                runtime_obs.OUTCOME_DEAD_LETTER,
+            }:
+                return _result(
+                    NONE,
+                    state="TURN_FAILED",
+                    reason=f"wrapper recorded terminal outcome {outcome}",
+                )
+            progress_age = liveness.get("runtime_progress_age_seconds")
+            progress_recent = bool(
+                isinstance(progress_age, (int, float))
+                and not isinstance(progress_age, bool)
+                and math.isfinite(float(progress_age))
+                and 0 <= float(progress_age) < stuck_after
+            )
+            if outcome == runtime_obs.OUTCOME_SUCCESS and progress_recent:
+                return _healthy(
+                    "HEALTHY_WORKING",
+                    "CLI turn completed and is finalizing its consume boundary",
+                )
+            return _result(
+                NONE,
+                state="CLI_CHILD_UNKNOWN",
+                reason="terminal runtime tuple is stale or unclassified",
+            )
+        elif runtime_phase == runtime_obs.PHASE_ACTIVE:
+            child_state = liveness.get("child_state")
+            if child_state == "unknown":
+                return _result(
+                    NONE,
+                    state="CLI_CHILD_UNKNOWN",
+                    reason=(
+                        "active CLI brain is ambiguous "
+                        f"({liveness.get('child_reason')}); refusing kill authority"
+                    ),
+                )
+            if child_state == "dead":
+                if child_in_grace:
+                    return _result(
+                        NONE,
+                        state="CLI_CHILD_STARTING",
+                        reason="CLI brain is absent inside spawn/handoff grace",
+                    )
+                prior_dead_polls = st.get("runtime_dead_polls")
+                prior_dead_polls = (
+                    prior_dead_polls
+                    if isinstance(prior_dead_polls, int)
+                    and not isinstance(prior_dead_polls, bool)
+                    and prior_dead_polls >= 0
+                    else 0
+                )
+                dead_polls = (prior_dead_polls + 1) if same_runtime_turn else 1
+                nxt["runtime_dead_polls"] = dead_polls
+                if dead_polls < _CLI_CHILD_CONFIRM_POLLS:
+                    return _result(
+                        NONE,
+                        state="CLI_CHILD_MISSING",
+                        reason="active CLI brain absent on first confirming poll",
+                    )
+                child_recovery_state = "CLI_CHILD_DEAD"
+                child_recovery_reason = (
+                    "active CLI brain absent on two confirming polls for the "
+                    "same wrapper/turn generation"
+                )
+            elif child_state == "alive":
+                progress_sequence = runtime_record.get("progress_sequence")
+                progress_at = runtime_record.get("last_progress_at")
+                if (
+                    not isinstance(progress_sequence, int)
+                    or isinstance(progress_sequence, bool)
+                    or progress_sequence < 0
+                ):
+                    return _result(
+                        NONE,
+                        state="CLI_CHILD_UNKNOWN",
+                        reason="live CLI brain has an invalid progress sequence",
+                    )
+                progress_observed = isinstance(progress_at, str)
+                if not progress_observed and child_in_grace:
+                    return _result(
+                        NONE,
+                        state="CLI_CHILD_STARTING",
+                        reason="CLI brain is live but no real adapter progress arrived yet",
+                    )
+                progress_elapsed = max(0.0, now_epoch - float(progress_seen_epoch))
+                if progress_elapsed < stuck_after:
+                    if progress_observed:
+                        return _healthy(
+                            "HEALTHY_WORKING",
+                            "live CLI brain with advancing adapter progress",
+                        )
+                    return _result(
+                        NONE,
+                        state="CLI_CHILD_NO_PROGRESS",
+                        reason=(
+                            "CLI brain is live but has not emitted a real adapter "
+                            "progress event"
+                        ),
+                    )
+                prior_stall_polls = st.get("runtime_stall_polls")
+                prior_stall_polls = (
+                    prior_stall_polls
+                    if isinstance(prior_stall_polls, int)
+                    and not isinstance(prior_stall_polls, bool)
+                    and prior_stall_polls >= 0
+                    else 0
+                )
+                same_sequence = (
+                    same_runtime_turn
+                    and isinstance(prior_sequence, int)
+                    and not isinstance(prior_sequence, bool)
+                    and progress_sequence == prior_sequence
+                )
+                stall_polls = (prior_stall_polls + 1) if same_sequence else 1
+                nxt["runtime_stall_polls"] = stall_polls
+                if stall_polls < _CLI_CHILD_CONFIRM_POLLS:
+                    return _result(
+                        NONE,
+                        state="CLI_CHILD_STALL_SUSPECT",
+                        reason="adapter progress is stale on first confirming poll",
+                    )
+                stall_floor_valid = bool(
+                    progress_stall_floor is not None
+                    and stuck_after >= progress_stall_floor
+                )
+                if not stall_floor_valid:
+                    floor_reason = (
+                        progress_stall_floor_error
+                        or (
+                            f"stuck_after_seconds={stuck_after:.0f} is below "
+                            f"the hard watchdog floor {progress_stall_floor:.0f}"
+                        )
+                    )
+                    return _result(
+                        NONE,
+                        state="CLI_CHILD_STALLED",
+                        reason=(
+                            f"adapter progress stalled, but {floor_reason}; "
+                            "refusing recovery"
+                        ),
+                    )
+                child_recovery_state = "CLI_CHILD_STALLED"
+                child_recovery_reason = (
+                    "live CLI brain made no adapter progress past the hard "
+                    "watchdog deadline plus margin"
+                )
+            else:
+                return _result(
+                    NONE,
+                    state="CLI_CHILD_UNKNOWN",
+                    reason="active runtime tuple did not resolve to a child state",
+                )
+        else:
+            return _result(
+                NONE,
+                state="CLI_CHILD_UNKNOWN",
+                reason="unmatched wrapped runtime tuple",
+            )
 
     # 1) LAUNCHING: still in grace with readiness unresolved. Launcher death and
     # missing/incorrect brain discovery are irrelevant during startup.
@@ -4047,7 +4676,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     # neither waiting nor completing tools; restart. Without either signal, a long
     # working turn would not heartbeat, so keep the existing warn-only safety
     # behavior.
-    if hb_stale:
+    if hb_stale or child_recovery_reason is not None:
         config_blocked_hold = (
             rpt.get("config_blocked_hold")
             if isinstance(rpt.get("config_blocked_hold"), dict) else None
@@ -4088,9 +4717,17 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             # incumbent owner is gone/dead/wedged -> block cleared -> fall through to recover
         if protected:
             nxt["last_warn_epoch"] = now_epoch
-            return _result(WARN_ONLY, state="STUCK_OR_DEAD", notify=True,
-                           reason="protected agent heartbeat stale - recover manually")
-        if not can_confirm_stuck:
+            return _result(
+                WARN_ONLY,
+                state=child_recovery_state or "STUCK_OR_DEAD",
+                notify=True,
+                reason=(
+                    f"protected agent {child_recovery_reason} - recover manually"
+                    if child_recovery_reason is not None
+                    else "protected agent heartbeat stale - recover manually"
+                ),
+            )
+        if child_recovery_reason is None and not can_confirm_stuck:
             if unsafe_low_codex:
                 warn_reason = (
                     f"wrapped codex stuck_after_seconds={stuck_after:.0f} below the "
@@ -4146,20 +4783,27 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             barrier_state = _barrier_backoff_state()
             _relaunch_state()
             nxt["readiness_fails"] = (readiness_fails + 1) if never_ready else 1
-            return _result(STUCK_RECOVER, state="STUCK_OR_DEAD",
+            return _result(STUCK_RECOVER, state=child_recovery_state or "STUCK_OR_DEAD",
                            kill_first=bool(kt), kill_orphans=True,
                            kill_targets=kt,
-                           reason="heartbeat stale; best-effort kill + resume",
+                           reason=(
+                               f"{child_recovery_reason}; best-effort kill + resume"
+                               if child_recovery_reason is not None
+                               else "heartbeat stale; best-effort kill + resume"
+                           ),
                            barrier_state=barrier_state)
-        return _result(BACKOFF_WAIT, state="STUCK_OR_DEAD",
-                       reason=f"heartbeat stale; backing off until {backoff_next:.0f}")
+        return _result(
+            BACKOFF_WAIT,
+            state=child_recovery_state or "STUCK_OR_DEAD",
+            reason=(
+                f"{child_recovery_reason}; backing off until {backoff_next:.0f}"
+                if child_recovery_reason is not None
+                else f"heartbeat stale; backing off until {backoff_next:.0f}"
+            ),
+        )
 
     # 3) HEALTHY_IDLE: fresh heartbeat.
-    if healthy_since is None:
-        nxt["healthy_since"] = now_epoch
-    elif fails and (now_epoch - float(healthy_since)) >= reset_after:
-        nxt["consecutive_fails"], nxt["backoff_next_epoch"] = 0, 0.0
-    return _result(NONE, state="HEALTHY_IDLE", reason="healthy")
+    return _healthy("HEALTHY_IDLE", "healthy")
 
 
 def _store_cfg_from_report(report: dict) -> dict:
@@ -4367,9 +5011,10 @@ def plan_actions(report: dict, state: dict, config: dict,
     (config drives what is supervised; the report supplies bus facts).
 
     ``snapshot`` is the executor's process snapshot (list of rows) interpreted
-    per agent by :func:`_liveness`. It is used for best-effort restart kill
-    targets only; heartbeat freshness is the liveness authority. The snapshot is
-    an INPUT only and is never folded into ``next_state``."""
+    per agent by :func:`_liveness`. Manual agents use it for best-effort restart
+    targets. Wrapped agents also use it to bind the runtime record and discover
+    the active CLI brain. The snapshot is an INPUT only and is never folded into
+    ``next_state``."""
     cfg_agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
     rpt_agents = report.get("agents") or {}
     state_agents = state.get("agents") if isinstance(state.get("agents"), dict) else {}
@@ -4385,7 +5030,8 @@ def plan_actions(report: dict, state: dict, config: dict,
             continue
         st = state_agents.get(name) if isinstance(state_agents.get(name), dict) else {}
         liveness = _liveness(snapshot, st, cfg_agent, name, now_epoch,
-                             root_key=root_key, request_id=None)
+                             root_key=root_key, request_id=None,
+                             runtime_view=rpt.get("wrapper_runtime"))
         out[name] = _plan_one(name, rpt, st, config, cfg_agent, liveness,
                               now_epoch=now_epoch)
     return {
@@ -4789,8 +5435,8 @@ CONFIG_TEMPLATE = """\
         "windows_args": ["{SESSION_ARGS}"],
         "_windows_args_codex": ["-C", "<cwd>", "{SESSION_ARGS}"]
       },
-      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS. The native codex.exe is also a FORKING launcher whose pid dies after handoff, so the supervisor records a discovered long-lived brain_pid only for session repair and scoped cleanup; heartbeat freshness is the liveness authority. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor runs Start-Process -FilePath <file> -ArgumentList <args> -WorkingDirectory <cwd> -PassThru AFTER applying env (AGENTTALK_ROOT + AGENTTALK_PY + PYTHONPATH=<repo>/src on a source checkout + the per-agent env). The in-sandbox agent reaches the bus via `& $env:AGENTTALK_PY -m agenttalk`; the .agenttalk/bin shim and AGENTTALK_PYTHON stay SUPERVISOR-only for the supervisor's own bus calls. If Codex workspace-write cannot execute the pinned Python path, opt in explicitly by adding the Python install directory to the Codex launch with `--add-dir <python-dir>` or equivalent config; do not grant that directory automatically. No Invoke-Expression.",
-      "_comment_liveness": "heartbeat freshness is the liveness authority: fresh heartbeat is healthy; stale heartbeat recovers only when activity_hook=true, otherwise warn-only. Process snapshots, brain_pattern, and allow_launcher_self only help record session metadata and choose scoped kill targets. requires_brain_pid is retained as an accepted legacy key and no longer gates restart decisions. codex_home_isolation=true (recommended for codex when other codex run in the same project dir): launch with a per-agent SEEDED CODEX_HOME so `resume --last` is unambiguous. allow_launcher_self: set FALSE for a FORKING launcher (codex.exe spawns the real TUI then exits); TRUE when the launched exe IS the long-lived process.",
+      "_comment_launch": "windows_file MUST be the REAL CLI executable (claude.exe / the native codex.exe), NOT a .cmd/npm/PowerShell shim: a shim hands off and EXITS. The native codex.exe is also a FORKING launcher whose pid dies after handoff, so the supervisor records a discovered long-lived brain_pid only for session repair and scoped cleanup; for this MANUAL archetype heartbeat freshness is the liveness authority. windows_args is a real array; the literal '{SESSION_ARGS}' element is array-spliced with the session tokens (fresh on first launch, resume on relaunch). The executor runs Start-Process -FilePath <file> -ArgumentList <args> -WorkingDirectory <cwd> -PassThru AFTER applying env (AGENTTALK_ROOT + AGENTTALK_PY + PYTHONPATH=<repo>/src on a source checkout + the per-agent env). The in-sandbox agent reaches the bus via `& $env:AGENTTALK_PY -m agenttalk`; the .agenttalk/bin shim and AGENTTALK_PYTHON stay SUPERVISOR-only for the supervisor's own bus calls. If Codex workspace-write cannot execute the pinned Python path, opt in explicitly by adding the Python install directory to the Codex launch with `--add-dir <python-dir>` or equivalent config; do not grant that directory automatically. No Invoke-Expression.",
+      "_comment_liveness": "For this MANUAL archetype heartbeat freshness is the liveness authority: fresh heartbeat is healthy; stale heartbeat recovers only when activity_hook=true, otherwise warn-only. Process snapshots, brain_pattern, and allow_launcher_self only help record session metadata and choose scoped kill targets. requires_brain_pid is retained as an accepted legacy key and no longer gates restart decisions. codex_home_isolation=true (recommended for codex when other codex run in the same project dir): launch with a per-agent SEEDED CODEX_HOME so `resume --last` is unambiguous. allow_launcher_self: set FALSE for a FORKING launcher (codex.exe spawns the real TUI then exits); TRUE when the launched exe IS the long-lived process.",
       "_comment_activity_hook": "Set activity_hook=true ONLY after installing the PostToolUse/Codex hook (supervise --install-activity-hook). Until then a stale heartbeat is warn-only (suspect), never a kill - so an un-instrumented agent is never mistaken for stuck. The hook runs `agenttalk heartbeat --hook` (soft: it can never block a tool call). For a NON-wrapped codex agent with activity_hook=true, the supervisor adds the GLOBAL --dangerously-bypass-hook-trust to the codex launch: the installed agenttalk hook changes codex's hook-trust hash and would otherwise PROMPT to re-trust on every unattended launch and strand the agent. This bypasses hook-trust for the supervisor's OWN hook, for controlled UNATTENDED supervision only (a wrapped codex does not use the activity hook and is unaffected)."
     },
     "AGENT_NAME_WRAPPED": {
@@ -4807,11 +5453,11 @@ CONFIG_TEMPLATE = """\
         "windows_file": "REPLACE: the PYTHON exe that runs agenttalk, e.g. C:\\\\Users\\\\you\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python314\\\\python.exe",
         "windows_args": ["-m", "agenttalk", "--root", "{ROOT}", "wrap", "--for", "AGENT_NAME_WRAPPED", "--cli", "codex", "--loop", "--", "REPLACE: the REAL codex.exe path - the wrapper drives it ONE turn per inbound message", "--disable", "hooks"]
       },
-      "_comment_wrapped": "WRAPPED is the RECOMMENDED / default supervised archetype for hands-off agents (the manual /agenttalk.listen agent above is supported but BEST-EFFORT/LEGACY: a resumed manual session may not re-enter the listen loop, never heartbeat, and hit the readiness give-up cap). The wrapped codex child is launched with `--disable hooks` by default (codex's safe default - the wrapper owns the heartbeat, so the codex activity hook is neither needed nor wanted, and disabling it sidesteps hook-trust prompts; remove it from windows_args if you intentionally want the child's project hooks). Set wrapped=true to supervise the agent THROUGH `agenttalk wrap --loop`: windows_file is the PYTHON exe (NOT the CLI exe), windows_args is the FIXED wrap command, and the REAL codex.exe/claude.exe goes at the tail after '--' (it is what windows_file would be for a manual agent). NO {SESSION_ARGS} token - the wrapper owns session continuity end-to-end (it persists + reloads the codex thread_id / claude session-id across its own turns AND across a supervisor relaunch, so a restart re-runs the identical wrap argv and reload-resumes). The wrapper injects AGENTTALK_PY for model-side bus writes; for Codex workspace-write, add `--add-dir <python-dir>` to the codex tail only after auditing that explicit operator opt-in. The wrapper python IS the long-lived supervised root, so brain discovery is RETIRED for wrapped agents (brain_pid stays null); the per-turn child (codex exec / claude -p) is reaped via the start-guarded managed_pids tree-kill. activity_hook is NOT needed: a wrapped agent is instrumented by construction (heartbeat on every idle bus-wait cycle + on streaming progress), so a stale heartbeat past grace RECOVERS (restart) instead of warn-only.",
+      "_comment_wrapped": "WRAPPED is the RECOMMENDED / default supervised archetype for hands-off agents (the manual /agenttalk.listen agent above is supported but BEST-EFFORT/LEGACY: a resumed manual session may not re-enter the listen loop, never heartbeat, and hit the readiness give-up cap). The wrapped codex child is launched with `--disable hooks` by default (codex's safe default - the wrapper owns the heartbeat, so the codex activity hook is neither needed nor wanted, and disabling it sidesteps hook-trust prompts; remove it from windows_args if you intentionally want the child's project hooks). Set wrapped=true to supervise the agent THROUGH `agenttalk wrap --loop`: windows_file is the PYTHON exe (NOT the CLI exe), windows_args is the FIXED wrap command, and the REAL codex.exe/claude.exe goes at the tail after '--' (it is what windows_file would be for a manual agent). NO {SESSION_ARGS} token - the wrapper owns session continuity end-to-end (it persists + reloads the codex thread_id / claude session-id across its own turns AND across a supervisor relaunch, so a restart re-runs the identical wrap argv and reload-resumes). The wrapper injects AGENTTALK_PY for model-side bus writes; for Codex workspace-write, add `--add-dir <python-dir>` to the codex tail only after auditing that explicit operator opt-in. The wrapper Python is the long-lived supervised root and publishes one strict wrapper-runtime.json lifecycle record. During an active turn the supervisor independently discovers the real CLI brain from the per-turn launcher locator (including a Codex TUI after its launcher exits); only strict idle or live-brain + real adapter progress is green. Missing/invalid runtime or ambiguous ancestry is CLI_CHILD_UNKNOWN and never automatic kill authority. activity_hook is NOT needed. After upgrading, run `agenttalk supervise --refresh-scripts` and restart old wrappers so they publish the runtime record.",
       "_comment_wrapped_stuck_after": "PER-CLI stuck_after_seconds (a per-agent stuck_after_seconds override ALWAYS wins; the global stuck_after_seconds is only the legacy/unclassified fallback). Defaults when unset: wrapped CLAUDE=180s, wrapped CODEX=2400s. WHY they differ: wrapped CLAUDE streams thinking+text+tool deltas and stays fresh through reasoning, so a tight threshold is fine; wrapped CODEX is ITEM-LEVEL (no exec --json event closes the pure-reasoning gap) so a long pure-reasoning stretch is SILENT between turn.started and the final agent_message. These are an OPERATIONAL false-positive tradeoff, NOT a provably-safe bound. TIMING-INVARIANT (v0.46.0): the per-turn watchdog (see turn_watchdog below) kills a HUNG TOOL DESCENDANT at turn_elapsed_seconds (default 1800); the supervisor stale-recovery MUST sit ABOVE that deadline + a 300s margin, else it would relaunch the wrapper into the same wedge before the watchdog fires. So the wrapped-codex default rose to 2400s and the planner now WARNS+REFUSES restart-on-stale (degrades to warn-only) when stuck_after_seconds <= turn_elapsed_seconds + 300, UNLESS allow_low_stuck_after=true. The older 600s floor guard also still applies. The value is never silently coerced. DO NOT try to tighten codex with a synthetic active-turn timer heartbeat: no intermediate exec --json event exists to confirm progress, so a timer would mark a silently-wedged turn healthy forever and defeat restart authority - the only levers are the per-CLI threshold + per-agent overrides + the per-turn watchdog.",
       "_comment_turn_watchdog": "PER-TURN WATCHDOG (v0.46.0, wrapped codex; default-ON for a continuous `wrap --loop --cli codex`). Fixes the wrapped-codex hang where Codex launches a tool descendant (codex.exe -> pwsh -> node REPL) that never exits, so the turn wedges forever. TWO-FACTOR fire (BOTH required, never a pure no-output timer): the turn has run >= turn_elapsed_seconds (default 1800) AND a LIVE non-codex tool descendant has been alive >= tool_descendant_alive_seconds (default 600). On fire it kills ONLY that per-turn child tree (start-time guarded) and the turn fails as ambiguous_or_unknown - the inbound message stays pending and rides the escalate/dead-letter ceiling; it is never poison. KNOWN LIMITATION: a LEGITIMATELY long-running tool (a real build/test alive > tool_descendant_alive_seconds inside a turn > turn_elapsed_seconds) WILL also be killed - the discriminator cannot tell a hung tool from a busy-legit long one. If your codex role runs genuinely long tools, RAISE turn_elapsed_seconds / tool_descendant_alive_seconds (and keep stuck_after_seconds above turn_elapsed_seconds + 300). Below the 1200s turn_elapsed floor the wrapper REFUSES the watchdog unless allow_low_turn_elapsed=true (never silently coerced). Set turn_watchdog.enabled=false to disable; a CPU-idle/no-progress refinement is a future enhancement.",
       "_comment_codex_home_isolation_provenance": "CONFIG PROVENANCE WARNING (codex_home_isolation): a seeded/isolated CODEX_HOME COPIES your operator BASE Codex config (including MCP servers and tool definitions) and then runs the agent UNATTENDED with approval_policy=never. So any inherited MCP server or tool will execute HEADLESSLY with no human prompt - an interactive/REPL-style MCP entry (or a tool that spawns a long-lived REPL) can wedge a turn (this is the failure mode the per-turn watchdog backstops). Audit the inherited config and keep ONLY headless-safe MCP/tools for an unattended supervised codex. The supervisor does NOT strip inherited config (a future doctor rule may flag known-interactive patterns).",
-      "_comment_dead_letter": "POISON-MESSAGE HANDLING (0.40.x): a message the model fails DETERMINISTICALLY (poison_eligible) is auto-dead-lettered after dead_letter.max_attempts (default 3) - its bytes move to .agenttalk/dead-letter/<agent>/ (recoverable; `agenttalk dead-letter list/show/requeue`) and the cursor advances past it, so the inbox is never blocked. A transient/global INFRA failure (spawn/API/rate-limit/5xx) is NEVER auto-dead-lettered (it retries under backoff) but escalates to the operator at dead_letter.escalate_after_attempts (default 20); an ambiguous repeated failure escalates AND dead-letters at that ceiling. The supervisor stays DUMB: a dead-letter is PROGRESS (fresh heartbeat), so the agent returns to HEALTHY_IDLE and is never restart-looped. Override per agent or globally with a dead_letter:{max_attempts,escalate_after_attempts} block (0 disables a cap - debug only).",
+      "_comment_dead_letter": "POISON-MESSAGE HANDLING (0.40.x): a message the model fails DETERMINISTICALLY (poison_eligible) is auto-dead-lettered after dead_letter.max_attempts (default 3) - its bytes move to .agenttalk/dead-letter/<agent>/ (recoverable; `agenttalk dead-letter list/show/requeue`) and the cursor advances past it, so the inbox is never blocked. A transient/global INFRA failure (spawn/API/rate-limit/5xx) is NEVER auto-dead-lettered (it retries under backoff) but escalates to the operator at dead_letter.escalate_after_attempts (default 20); an ambiguous repeated failure escalates AND dead-letters at that ceiling. The wrapper runtime records dead_letter as a terminal TURN_FAILED outcome rather than successful progress, so the failure remains operator-visible. Override per agent or globally with a dead_letter:{max_attempts,escalate_after_attempts} block (0 disables a cap - debug only).",
       "_comment_lead_loop": "MANAGED LEAD-LOOP CONTROLLER (Slice 2 / WP2): to make a wrapped agent OWN its team mailbox so an external consumer or a duplicate window cannot race the bus, add '--lead-loop' to windows_args RIGHT AFTER '--loop' (e.g. [..., 'wrap', '--for', 'NAME', '--cli', 'codex', '--loop', '--lead-loop', '--', <real cli>, ...]) AND run `agenttalk managed-lead-loop set NAME` so the identity is a configured managed_lead_loop. The controller acquires a renewable LEASE before its loop and renews it on every heartbeat; the model child NEVER sees the lease token. EXIT semantics the supervisor honors via the controller's exit marker: a VALID human release/end stands it DOWN and the supervisor does NOT relaunch it (the v0.39 stand-down sticks against auto_restart until you re-arm with `agenttalk request-restart` - which overrides the HOLD and clears the marker on the confirmed relaunch; NOT request-launch, which queues an ephemeral evidence-only review and would leave the controller down); a BLOCKED acquire (another LIVE owner) HOLDS only while that owner stays alive (once it dies/wedges the supervisor auto-recovers); a CRASH writes no marker and relaunches normally (recovery). If this identity holds role=lead (so it is protected), set auto_restart_protected=true for THIS identity ONLY so a stale lead controller still recovers - do NOT broaden protected auto-restart globally. Keep the wrapped stuck_after_seconds guidance above (codex >= turn_elapsed_seconds + 300, default 2400)."
     }
   }
@@ -5735,10 +6381,10 @@ $pollNum = 0
         Write-Host ("supervisor: {0}: {1} ({2})" -f $name, $p.state, $p.reason)
       }
     }
-    # "healthy" in the summary means specifically HEALTHY_IDLE - NOT every
-    # no-action state (action 'none' also covers LAUNCHING during grace and a
-    # rate-limited/no-hook ACTIVE_OR_BUSY), which would mislead the operator.
-    $total++; if ($p.state -eq 'HEALTHY_IDLE') { $healthy++ }
+    # "healthy" means one of the two explicit green states - NOT every no-action
+    # state (which also covers launch grace, child-unknown, and rate-limited
+    # ACTIVE_OR_BUSY).
+    $total++; if ($p.state -in 'HEALTHY_IDLE','HEALTHY_WORKING') { $healthy++ }
     $lastLogged[$name] = $p.state
     switch ($p.action) {
       { $_ -in 'relaunch','stuck_recover' } {
