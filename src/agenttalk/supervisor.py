@@ -6404,9 +6404,39 @@ ACTIVITY_HOOK_COMMAND = "agenttalk heartbeat --hook"
 _LEGACY_ACTIVITY_HOOK_COMMANDS = ("agenttalk heartbeat",)
 _ACTIVITY_HOOK_COMMANDS = (ACTIVITY_HOOK_COMMAND, *_LEGACY_ACTIVITY_HOOK_COMMANDS)
 
+# ``||`` is supported by POSIX sh, cmd.exe, and pwsh 7. Falling back to the
+# established, silent heartbeat hook lets an older install that lacks the
+# checkpoint subcommand finish successfully without contaminating SessionStart
+# stdout or depending on a platform-specific no-op.
+CHECKPOINT_HOOK_FAIL_SOFT_GUARD = f" || {ACTIVITY_HOOK_COMMAND}"
+CHECKPOINT_SAVE_HOOK_COMMAND = (
+    "agenttalk checkpoint save --hook" + CHECKPOINT_HOOK_FAIL_SOFT_GUARD
+)
+CHECKPOINT_RESUME_HOOK_COMMAND = (
+    "agenttalk checkpoint resume --hook" + CHECKPOINT_HOOK_FAIL_SOFT_GUARD
+)
+_CHECKPOINT_HOOK_SPECS = (
+    ("PreCompact", "save", "*"),
+    ("SessionStart", "resume", "compact"),
+)
+
 
 def fallback_activity_hook_command(agent: str) -> str:
     return f"{ACTIVITY_HOOK_COMMAND} --fallback-for {validate_agent_name(agent)}"
+
+
+def checkpoint_hook_command(action: str, agent: str | None = None) -> str:
+    if action not in {"save", "resume"}:
+        raise ValueError(f"unsupported checkpoint hook action: {action!r}")
+    command = f"agenttalk checkpoint {action} --hook"
+    if agent is not None:
+        command += f" --fallback-for {validate_agent_name(agent)}"
+    fallback = (
+        fallback_activity_hook_command(agent)
+        if agent is not None
+        else ACTIVITY_HOOK_COMMAND
+    )
+    return f"{command} || {fallback}"
 
 
 def _parse_activity_hook_command(command: object) -> tuple[str, str | None] | None:
@@ -6429,11 +6459,47 @@ def _parse_activity_hook_command(command: object) -> tuple[str, str | None] | No
     return None
 
 
-def _iter_post_tool_hook_commands(settings: dict):
+def _parse_checkpoint_hook_command(
+    command: object,
+) -> tuple[str, str, str | None, bool] | None:
+    if not isinstance(command, str):
+        return None
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    guarded = False
+    if "||" in parts:
+        separator = parts.index("||")
+        guard_parts = parts[separator + 1:]
+        guarded = (
+            guard_parts == ["cd", "."]
+            or _parse_activity_hook_command(" ".join(guard_parts)) is not None
+        )
+        if not guarded:
+            return None
+        parts = parts[:separator]
+    if len(parts) < 4 or parts[:2] != ["agenttalk", "checkpoint"]:
+        return None
+    action = parts[2]
+    if action not in {"save", "resume"}:
+        return None
+    if parts[3:] == ["--hook"]:
+        return action, "neutral", None, guarded
+    if parts[3:5] == ["--hook", "--fallback-for"] and len(parts) == 6:
+        try:
+            agent = validate_agent_name(parts[5])
+        except ValueError:
+            return None
+        return action, "fallback", agent, guarded
+    return None
+
+
+def _iter_hook_commands(settings: dict, event: str):
     hooks = settings.get("hooks")
     if not isinstance(hooks, dict):
         return
-    groups = hooks.get("PostToolUse")
+    groups = hooks.get(event)
     if not isinstance(groups, list):
         return
     for group in groups:
@@ -6447,11 +6513,20 @@ def _iter_post_tool_hook_commands(settings: dict):
                 yield item.get("command")
 
 
+def _iter_post_tool_hook_commands(settings: dict):
+    yield from _iter_hook_commands(settings, "PostToolUse")
+
+
+def _fallback_activity_hook_agent(settings: dict) -> str | None:
+    for command in _iter_post_tool_hook_commands(settings):
+        parsed = _parse_activity_hook_command(command)
+        if parsed is not None and parsed[0] == "fallback":
+            return parsed[1]
+    return None
+
+
 def _has_fallback_activity_hook(settings: dict) -> bool:
-    return any(
-        parsed is not None and parsed[0] == "fallback"
-        for parsed in (_parse_activity_hook_command(cmd) for cmd in _iter_post_tool_hook_commands(settings))
-    )
+    return _fallback_activity_hook_agent(settings) is not None
 
 
 def classify_claude_activity_hook_state(root: Path, target_agent: str) -> str:
@@ -6487,10 +6562,15 @@ def classify_claude_activity_hook_state(root: Path, target_agent: str) -> str:
 
 
 def claude_hook_snippet() -> str:
-    """The PostToolUse fragment to paste into a project .claude/settings.json."""
-    return json.dumps({"hooks": {"PostToolUse": [
-        {"matcher": "*", "hooks": [
-            {"type": "command", "command": ACTIVITY_HOOK_COMMAND}]}]}}, indent=2)
+    """The managed hook fragment for a project .claude/settings.json."""
+    return json.dumps({"hooks": {
+        "PostToolUse": [{"matcher": "*", "hooks": [
+            {"type": "command", "command": ACTIVITY_HOOK_COMMAND}]}],
+        "PreCompact": [{"matcher": "*", "hooks": [
+            {"type": "command", "command": CHECKPOINT_SAVE_HOOK_COMMAND}]}],
+        "SessionStart": [{"matcher": "compact", "hooks": [
+            {"type": "command", "command": CHECKPOINT_RESUME_HOOK_COMMAND}]}],
+    }}, indent=2)
 
 
 def _merge_post_tool_use_hook(
@@ -6552,6 +6632,116 @@ def _merge_post_tool_use_hook(
     return changed
 
 
+def _merge_checkpoint_event_hook(
+    settings: dict,
+    *,
+    event: str,
+    action: str,
+    matcher: str,
+    target_agent: str | None = None,
+    fallback_agent: str | None = None,
+    preserve_existing_fallback: bool = False,
+) -> bool:
+    """Canonicalize one managed checkpoint hook without touching unrelated hooks."""
+    hooks = settings.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        return False
+    groups = hooks.setdefault(event, [])
+    if not isinstance(groups, list):
+        return False
+
+    owned: list[tuple[dict, dict]] = []
+    existing_fallback: str | None = None
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        items = group.get("hooks")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            parsed = _parse_checkpoint_hook_command(item.get("command"))
+            if parsed is None:
+                continue
+            owned.append((group, item))
+            if (
+                preserve_existing_fallback
+                and existing_fallback is None
+                and parsed[1] == "fallback"
+            ):
+                existing_fallback = parsed[2]
+
+    agent = target_agent
+    if agent is None and preserve_existing_fallback:
+        agent = existing_fallback
+    if agent is None:
+        agent = fallback_agent
+    target_command = checkpoint_hook_command(action, agent)
+
+    if (
+        len(owned) == 1
+        and owned[0][0].get("matcher") == matcher
+        and owned[0][1].get("command") == target_command
+    ):
+        return False
+
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        items = group.get("hooks")
+        if not isinstance(items, list):
+            continue
+        group["hooks"] = [
+            item
+            for item in items
+            if not (
+                isinstance(item, dict)
+                and _parse_checkpoint_hook_command(item.get("command")) is not None
+            )
+        ]
+
+    target_group = next(
+        (
+            group
+            for group in groups
+            if (
+                isinstance(group, dict)
+                and group.get("matcher") == matcher
+                and isinstance(group.get("hooks"), list)
+            )
+        ),
+        None,
+    )
+    if target_group is None:
+        target_group = {"matcher": matcher, "hooks": []}
+        groups.append(target_group)
+    target_group["hooks"].append({"type": "command", "command": target_command})
+    return True
+
+
+def _merge_checkpoint_hooks(
+    settings: dict,
+    *,
+    target_agent: str | None = None,
+    fallback_agent: str | None = None,
+    preserve_existing_fallback: bool = False,
+) -> bool:
+    changed = False
+    for event, action, matcher in _CHECKPOINT_HOOK_SPECS:
+        if _merge_checkpoint_event_hook(
+            settings,
+            event=event,
+            action=action,
+            matcher=matcher,
+            target_agent=target_agent,
+            fallback_agent=fallback_agent,
+            preserve_existing_fallback=preserve_existing_fallback,
+        ):
+            changed = True
+    return changed
+
+
 def resolve_interactive_activity_hook_target(store: Store, agent: str) -> str:
     """Authorize an identity-bound hook for the human-facing interactive lead."""
     try:
@@ -6590,10 +6780,12 @@ def resolve_interactive_activity_hook_target(store: Store, agent: str) -> str:
 def install_activity_hook(store: Store, *, claude: bool = True,
                           codex: bool = False,
                           interactive_for: str | None = None) -> dict:
-    """MERGE the activity-heartbeat hook into PROJECT-scoped config files -
-    ``.claude/settings.json`` and/or ``.codex/hooks.json`` under the project
-    root. NEVER touches global ~/.claude or ~/.codex, NEVER clobbers existing
-    hooks/keys (idempotent). Returns ``{path: "installed"|"already"|"skipped"}``.
+    """MERGE managed hooks into project-scoped config files.
+
+    Claude receives the activity heartbeat and checkpoint hooks; Codex receives
+    only the activity heartbeat until its wrapper integration lands. Global
+    config is never touched and existing unrelated hooks/keys are preserved.
+    Returns ``{path: "installed"|"already"|"skipped"}``.
     """
     out: dict[str, str] = {}
     target_command = (
@@ -6610,11 +6802,18 @@ def install_activity_hook(store: Store, *, claude: bool = True,
                 out[str(p)] = "skipped (unreadable - merge by hand)"
                 settings = None
         if settings is not None:
-            changed = _merge_post_tool_use_hook(
+            activity_changed = _merge_post_tool_use_hook(
                 settings,
                 target_command=target_command,
                 preserve_existing_fallback=interactive_for is None,
             )
+            checkpoint_changed = _merge_checkpoint_hooks(
+                settings,
+                target_agent=interactive_for,
+                fallback_agent=_fallback_activity_hook_agent(settings),
+                preserve_existing_fallback=interactive_for is None,
+            )
+            changed = activity_changed or checkpoint_changed
             if changed:
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_text(json.dumps(settings, indent=2), encoding="utf-8")
