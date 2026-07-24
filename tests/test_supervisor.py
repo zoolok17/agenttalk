@@ -4446,6 +4446,26 @@ def test_wrapped_active_turn_with_dead_cli_brain_is_not_healthy_idle() -> None:
     assert plan["state"] != "HEALTHY_IDLE"
 
 
+def test_wrapped_terminal_stale_runtime_cannot_be_healthy_idle() -> None:
+    terminal_runtime = {
+        "valid": True,
+        "phase": "terminal",
+        "wrapper_generation": "wrapper-1",
+        "turn_generation": 8,
+        "progress_sequence": 4,
+        "progress_age_seconds": 3600.0,
+        "last_outcome": "success",
+    }
+
+    plan = _plan_wrap(
+        _report(heartbeat_stale=False, wrapper_runtime=terminal_runtime),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_wrap_snap()[:1],
+    )
+
+    assert plan["state"] == "CLI_CHILD_UNKNOWN"
+
+
 def test_wrapped_launch_detail_has_no_session_args() -> None:
     for cli_name in ("codex", "claude"):
         d = sup._launch_detail({"session_id": "x", "resume_available": True},
