@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import time
 
 import pytest
 
@@ -31,6 +35,46 @@ class _BinaryStdin:
 
 def _run(root: Path, *argv: str) -> int:
     return cli.main(["--root", str(root), "checkpoint", *argv])
+
+
+def _subprocess_argv(root: Path, *argv: str) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "agenttalk",
+        "--root",
+        str(root),
+        "checkpoint",
+        *argv,
+    ]
+
+
+def _subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    src = str(Path(__file__).parents[1] / "src")
+    env["PYTHONPATH"] = src + os.pathsep + env.get("PYTHONPATH", "")
+    return env
+
+
+def _wait_for_process(
+    process: subprocess.Popen,
+    *,
+    timeout: float,
+) -> tuple[int, bytes, bytes, float]:
+    started = time.monotonic()
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2)
+        pytest.fail(f"checkpoint subprocess exceeded {timeout:.1f}s")
+    finally:
+        if process.stdin is not None:
+            process.stdin.close()
+    elapsed = time.monotonic() - started
+    stdout = process.stdout.read() if process.stdout is not None else b""
+    stderr = process.stderr.read() if process.stderr is not None else b""
+    return returncode, stdout, stderr, elapsed
 
 
 def _observed_capacity(agent: str = "alpha") -> capmod.CapacitySnapshot:
@@ -260,6 +304,7 @@ def test_checkpoint_save_preserves_partial_snapshot_on_malformed_bus_state(
         "owed_out": [],
         "owed_in": [],
         "in_flight_threads": [],
+        "truncated": True,
     }
 
 
@@ -280,6 +325,29 @@ def test_checkpoint_save_hook_tolerates_bad_stdin(
     assert saved["trigger"] == "manual"
 
 
+def test_checkpoint_save_hook_open_stdin_writer_is_time_bounded(
+    tmp_path: Path,
+) -> None:
+    Store(tmp_path).init(["alpha", "beta"])
+    process = subprocess.Popen(
+        _subprocess_argv(tmp_path, "save", "--hook", "--for", "alpha"),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_subprocess_env(),
+    )
+    assert process.stdin is not None
+    process.stdin.write(b'{"session_id":"still-open"')
+    process.stdin.flush()
+
+    returncode, stdout, stderr, elapsed = _wait_for_process(process, timeout=5)
+
+    assert returncode == 0
+    assert stdout == b""
+    assert stderr == b""
+    assert elapsed < 5
+
+
 def test_checkpoint_save_hook_is_silent_and_fail_soft_on_unresolved_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -291,6 +359,21 @@ def test_checkpoint_save_hook_is_silent_and_fail_soft_on_unresolved_identity(
     assert _run(tmp_path, "save", "--hook") == 0
     assert capsys.readouterr() == ("", "")
     assert not (tmp_path / ".agenttalk" / "checkpoints" / "alpha.json").exists()
+
+
+@pytest.mark.parametrize("action", ["save", "resume"])
+def test_checkpoint_hook_is_silent_and_fail_soft_when_uninitialized(
+    tmp_path: Path,
+    action: str,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    assert _run(tmp_path, action, "--hook", "--for", "alpha") == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    if action == "save":
+        assert captured.out == ""
+    else:
+        assert captured.out == checkpoint.EMPTY_SESSION_START_OUTPUT + "\n"
 
 
 def test_checkpoint_save_hook_logs_internal_error_without_blocking(
@@ -310,6 +393,22 @@ def test_checkpoint_save_hook_logs_internal_error_without_blocking(
     assert capsys.readouterr() == ("", "")
     error_log = tmp_path / ".agenttalk" / "checkpoints" / "checkpoint-errors.log"
     assert "disk full" in error_log.read_text(encoding="utf-8")
+
+
+def test_checkpoint_save_hook_catches_baseexception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    Store(tmp_path).init(["alpha", "beta"])
+    monkeypatch.setattr(
+        cli,
+        "_do_checkpoint_save",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    assert _run(tmp_path, "save", "--hook", "--for", "alpha") == 0
+    assert capsys.readouterr() == ("", "")
 
 
 def test_checkpoint_resume_hook_emits_exact_sessionstart_injection(
@@ -341,6 +440,55 @@ def test_checkpoint_resume_hook_emits_exact_sessionstart_injection(
         separators=(",", ":"),
     )
     assert capsys.readouterr() == (expected + "\n", "")
+
+
+def test_checkpoint_resume_hook_catches_baseexception_and_emits_one_envelope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    Store(tmp_path).init(["alpha", "beta"])
+    monkeypatch.setattr(
+        cli,
+        "_read_checkpoint_for_args",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    assert _run(tmp_path, "resume", "--hook", "--for", "alpha") == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.count("\n") == 1
+    assert json.loads(captured.out) == {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": "",
+        }
+    }
+
+
+def test_checkpoint_resume_hook_real_subprocess_emits_one_json_envelope(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    checkpoint.save_checkpoint(store, "alpha", _payload())
+
+    completed = subprocess.run(
+        _subprocess_argv(tmp_path, "resume", "--hook", "--for", "alpha"),
+        check=False,
+        capture_output=True,
+        env=_subprocess_env(),
+        timeout=5,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stderr == b""
+    assert completed.stdout.count(b"\n") == 1
+    output = json.loads(completed.stdout)
+    assert output["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert "Checkpoint reload for alpha" in (
+        output["hookSpecificOutput"]["additionalContext"]
+    )
 
 
 def test_checkpoint_resume_hook_without_checkpoint_emits_empty_context(
@@ -400,6 +548,190 @@ def test_checkpoint_latest_wins_and_history_is_capped(tmp_path: Path) -> None:
     }
     assert "session-0" not in archived_sessions
     assert f"session-{checkpoint.HISTORY_LIMIT + 1}" in archived_sessions
+
+
+def test_checkpoint_history_does_not_grow_when_oldest_is_undeletable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    for index in range(checkpoint.HISTORY_LIMIT + 1):
+        checkpoint.save_checkpoint(
+            store,
+            "alpha",
+            _payload(saved_at=f"2026-07-24T10:00:{index:02d}Z"),
+        )
+    history_dir = tmp_path / ".agenttalk" / "checkpoints" / "history" / "alpha"
+    locked = sorted(history_dir.glob("*.json"))[0]
+    original_unlink = Path.unlink
+
+    def refuse_locked(path: Path, *args, **kwargs) -> None:
+        if path == locked:
+            raise PermissionError("sharing violation")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_locked)
+    for index in range(5):
+        checkpoint.save_checkpoint(
+            store,
+            "alpha",
+            _payload(saved_at=f"2026-07-24T11:00:{index:02d}Z"),
+        )
+
+    assert locked.exists()
+    assert len(list(history_dir.glob("*.json"))) == checkpoint.HISTORY_LIMIT
+
+
+def test_checkpoint_bus_over_budget_is_bounded_and_marked_truncated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    for index in range(5):
+        store.send(
+            sender="beta",
+            recipient="alpha",
+            kind="question",
+            body=f"question {index}",
+            meta={"request_id": f"q-{index}"},
+        )
+    monkeypatch.setattr(checkpoint, "BUS_MAX_FILES", 2, raising=False)
+
+    started = time.monotonic()
+    bus = checkpoint.collect_bus_state(store, "alpha")
+    elapsed = time.monotonic() - started
+
+    assert bus["truncated"] is True
+    assert elapsed < 2
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "mkfifo"),
+    reason="POSIX FIFO failure injection",
+)
+def test_checkpoint_message_fifo_is_skipped_without_blocking(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    os.mkfifo(
+        store.messages_dir / "20260724-120000-000000-AAAA.json",
+    )
+    process = subprocess.Popen(
+        _subprocess_argv(tmp_path, "save", "--hook", "--for", "alpha"),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_subprocess_env(),
+    )
+
+    returncode, stdout, stderr, elapsed = _wait_for_process(process, timeout=5)
+
+    assert returncode == 0
+    assert stdout == b""
+    assert stderr == b""
+    assert elapsed < 5
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "mkfifo"),
+    reason="POSIX FIFO failure injection",
+)
+def test_checkpoint_context_sidecar_fifo_is_skipped_without_blocking(
+    tmp_path: Path,
+) -> None:
+    session_id = json.loads(FIXTURE.read_text(encoding="utf-8"))["session_id"]
+    os.mkfifo(tmp_path / f"cc-ctx-{session_id}.json")
+
+    value, error, timed_out = checkpoint.run_bounded(
+        lambda: capmod.read_claude_context_sidecar(
+            "alpha",
+            session_id=session_id,
+            temp_dir=tmp_path,
+        ),
+        timeout=1,
+    )
+
+    assert timed_out is False
+    assert error is None
+    assert value is None
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "mkfifo"),
+    reason="POSIX FIFO failure injection",
+)
+@pytest.mark.parametrize("action", ["save", "resume"])
+def test_checkpoint_config_fifo_is_fail_soft_without_blocking(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    store.config_path.unlink()
+    os.mkfifo(store.config_path)
+    process = subprocess.Popen(
+        _subprocess_argv(tmp_path, action, "--hook", "--for", "alpha"),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_subprocess_env(),
+    )
+
+    returncode, stdout, stderr, elapsed = _wait_for_process(process, timeout=5)
+
+    assert returncode == 0
+    assert stderr == b""
+    assert elapsed < 5
+    if action == "save":
+        assert stdout == b""
+    else:
+        assert json.loads(stdout) == {
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": "",
+            }
+        }
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "mkfifo"),
+    reason="POSIX FIFO failure injection",
+)
+@pytest.mark.parametrize("action", ["save", "resume"])
+def test_checkpoint_latest_fifo_is_absent_without_blocking(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    latest = checkpoint.checkpoint_path(store, "alpha")
+    latest.parent.mkdir(parents=True)
+    os.mkfifo(latest)
+    process = subprocess.Popen(
+        _subprocess_argv(tmp_path, action, "--hook", "--for", "alpha"),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_subprocess_env(),
+    )
+
+    returncode, stdout, stderr, elapsed = _wait_for_process(process, timeout=5)
+
+    assert returncode == 0
+    assert stderr == b""
+    assert elapsed < 5
+    if action == "save":
+        assert stdout == b""
+    else:
+        assert json.loads(stdout) == {
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": "",
+            }
+        }
 
 
 def test_checkpoint_show_json_reads_latest(

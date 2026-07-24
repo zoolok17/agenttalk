@@ -9500,27 +9500,31 @@ def _checkpoint_root_hint(args: argparse.Namespace) -> Path | None:
     if raw:
         try:
             return Path(raw).resolve()
-        except Exception:  # noqa: BLE001 - called only from a hook error path
+        except BaseException:  # called only from a fail-soft hook error path
             return None
     try:
         return find_root()
-    except Exception:  # noqa: BLE001 - called only from a hook error path
+    except BaseException:  # called only from a fail-soft hook error path
         return None
 
 
 def _resolve_checkpoint_agent(args: argparse.Namespace, *, roster: list[str]) -> str:
-    if getattr(args, "agent", None) or os.environ.get("AGENTTALK_SELF"):
+    if not getattr(args, "hook", False):
         return _resolve_self(args.agent, roster=roster)
-    if getattr(args, "hook", False) and getattr(args, "fallback_for", None):
-        fallback = args.fallback_for
-        try:
-            validate_agent_name(fallback)
-        except ValueError as e:
-            sys.stderr.write(f"agenttalk: {e}\n")
-            sys.exit(2)
-        _ensure_in_roster(fallback, roster, label="fallback")
-        return fallback
-    return _resolve_self(args.agent, roster=roster)
+    explicit = getattr(args, "agent", None)
+    name = explicit or os.environ.get("AGENTTALK_SELF")
+    if not name:
+        name = getattr(args, "fallback_for", None)
+    if not name:
+        raise ValueError(
+            "no agent identity: pass --for or set AGENTTALK_SELF"
+        )
+    validate_agent_name(name)
+    if roster and name not in roster:
+        raise ValueError(
+            f"agent {name!r} is not in the project roster {sorted(roster)}"
+        )
+    return name
 
 
 def _checkpoint_fallback_requires_hook(args: argparse.Namespace) -> int | None:
@@ -9534,7 +9538,12 @@ def _checkpoint_fallback_requires_hook(args: argparse.Namespace) -> int | None:
 
 def _do_checkpoint_save(args: argparse.Namespace) -> Path:
     store = _get_store(args)
-    roster = store.load_config().get("agents") or []
+    config = (
+        checkpoint_mod.read_checkpoint_config(store)
+        if getattr(args, "hook", False)
+        else store.load_config()
+    )
+    roster = config.get("agents") or []
     agent = _resolve_checkpoint_agent(args, roster=roster)
     hook_payload = checkpoint_mod.read_hook_payload() if args.hook else {}
     payload = checkpoint_mod.build_checkpoint(
@@ -9548,21 +9557,35 @@ def _do_checkpoint_save(args: argparse.Namespace) -> Path:
     return checkpoint_mod.save_checkpoint(store, agent, payload)
 
 
+def _run_checkpoint_hook(
+    args: argparse.Namespace,
+    action: str,
+    callback,
+):
+    sink = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            value, error = callback(), None
+    except BaseException as exc:
+        value, error = None, exc
+    if error is not None:
+        try:
+            checkpoint_mod.log_hook_error(
+                _checkpoint_root_hint(args),
+                action,
+                error,
+            )
+        except BaseException:
+            return value
+    return value
+
+
 def cmd_checkpoint_save(args: argparse.Namespace) -> int:
     invalid = _checkpoint_fallback_requires_hook(args)
     if invalid is not None:
         return invalid
     if args.hook:
-        sink = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-                _do_checkpoint_save(args)
-        except (SystemExit, Exception) as exc:
-            checkpoint_mod.log_hook_error(
-                _checkpoint_root_hint(args),
-                "save",
-                exc,
-            )
+        _run_checkpoint_hook(args, "save", lambda: _do_checkpoint_save(args))
         return 0
     path = _do_checkpoint_save(args)
     print(f"checkpoint saved: {path}")
@@ -9571,7 +9594,12 @@ def cmd_checkpoint_save(args: argparse.Namespace) -> int:
 
 def _read_checkpoint_for_args(args: argparse.Namespace) -> tuple[str, dict | None]:
     store = _get_store(args)
-    roster = store.load_config().get("agents") or []
+    config = (
+        checkpoint_mod.read_checkpoint_config(store)
+        if getattr(args, "hook", False)
+        else store.load_config()
+    )
+    roster = config.get("agents") or []
     agent = _resolve_checkpoint_agent(args, roster=roster)
     return agent, checkpoint_mod.read_checkpoint(store, agent)
 
@@ -9581,22 +9609,21 @@ def cmd_checkpoint_resume(args: argparse.Namespace) -> int:
     if invalid is not None:
         return invalid
     if args.hook:
-        payload = None
-        sink = io.StringIO()
+        result = _run_checkpoint_hook(
+            args,
+            "resume",
+            lambda: _read_checkpoint_for_args(args),
+        )
+        payload = result[1] if isinstance(result, tuple) and len(result) == 2 else None
         try:
-            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-                _agent, payload = _read_checkpoint_for_args(args)
-        except (SystemExit, Exception) as exc:
-            checkpoint_mod.log_hook_error(
-                _checkpoint_root_hint(args),
-                "resume",
-                exc,
-            )
+            output = checkpoint_mod.session_start_output(payload)
+        except BaseException:
+            output = checkpoint_mod.EMPTY_SESSION_START_OUTPUT
         try:
-            sys.stdout.write(checkpoint_mod.session_start_output(payload) + "\n")
+            sys.stdout.write(output + "\n")
             sys.stdout.flush()
-        except (OSError, ValueError):
-            pass
+        except BaseException:
+            return 0
         return 0
     agent, payload = _read_checkpoint_for_args(args)
     if payload is None:

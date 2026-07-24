@@ -32,6 +32,7 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -194,15 +195,45 @@ def read_claude_context_sidecar(
         return None
     base = Path(temp_dir) if temp_dir is not None else Path(tempfile.gettempdir())
     path = base / f"cc-ctx-{session_id}.json"
+    descriptor = -1
     try:
-        with path.open("rb") as handle:
-            raw = handle.read(CLAUDE_CONTEXT_SIDECAR_MAX_BYTES + 1)
-            observed_mtime = os.fstat(handle.fileno()).st_mtime
+        before = path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size > CLAUDE_CONTEXT_SIDECAR_MAX_BYTES
+        ):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_size > CLAUDE_CONTEXT_SIDECAR_MAX_BYTES
+        ):
+            return None
+        chunks: list[bytes] = []
+        remaining = CLAUDE_CONTEXT_SIDECAR_MAX_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        observed_mtime = opened.st_mtime
         if len(raw) > CLAUDE_CONTEXT_SIDECAR_MAX_BYTES:
             return None
         payload = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeError, ValueError):
         return None
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
     if not isinstance(payload, dict):
         return None
     pct = _as_float(payload.get("context_pct"))
