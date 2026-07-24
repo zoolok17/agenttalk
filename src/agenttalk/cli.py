@@ -2315,6 +2315,8 @@ def _build_dod_eval(store, record: dict):
               "required_dimensions": dims}
     if "assurance" in dims:
         bundle["assurance"] = _resolve_dod_assurance_gate(store, dims["assurance"], record)
+    if "coverage" in dims:
+        bundle["coverage"] = _resolve_dod_coverage_gate(store, dims["coverage"], record)
     if "knowledge" in dims:
         bundle["knowledge"] = _resolve_dod_knowledge(store, dims["knowledge"], record)
     return bundle
@@ -2466,6 +2468,54 @@ def _resolve_dod_assurance_gate(store, spec: dict, record: dict) -> dict:
         "evidence_source": g.get("evidence_source"), "revision": g.get("revision"),
         "waiver_active": waiver_active,
         "gate_scope": g.get("scope"), "close_gate_scope": close_scope,
+        "age_days": _iso_age_days(g.get("updated_at"), now),
+        "max_age_days": spec.get("max_age_days"),
+    }
+
+
+def _resolve_dod_coverage_gate(store, spec: dict, record: dict) -> dict:
+    """Read ``coverage:<close-scope>`` from the gate record itself.
+
+    This deliberately does not read a coverage artifact: the gate's own attestation fields,
+    revision, timestamp, scope, and numeric ``coverage_percent`` form the entire binding.
+    """
+    from datetime import datetime, timezone
+
+    from agenttalk import gates as gate_mod
+
+    scope = str(record.get("scope") or "").strip().lower()
+    gate_name = f"coverage:{scope}"
+    state = gate_mod.load_gate_state(store.root)
+    g = (state.get("gates") or {}).get(gate_name)
+    close_scope = record.get("gate_scope")
+    if not isinstance(g, dict):
+        return {
+            "gate": gate_name,
+            "present": False,
+            "close_gate_scope": close_scope,
+            "min_percent": spec.get("min_percent"),
+            "max_age_days": spec.get("max_age_days"),
+        }
+    now = datetime.now(timezone.utc)
+    waiver = g.get("waiver")
+    waiver_active = False
+    if isinstance(waiver, dict):
+        try:
+            waiver_active = gate_mod._waiver_active(waiver, now=now)
+        except (ValueError, TypeError):
+            waiver_active = False
+    return {
+        "gate": gate_name,
+        "present": True,
+        "status": g.get("status"),
+        "severity": g.get("severity"),
+        "evidence_source": g.get("evidence_source"),
+        "revision": g.get("revision"),
+        "waiver_active": waiver_active,
+        "gate_scope": g.get("scope"),
+        "close_gate_scope": close_scope,
+        "coverage_percent": g.get("coverage_percent"),
+        "min_percent": spec.get("min_percent"),
         "age_days": _iso_age_days(g.get("updated_at"), now),
         "max_age_days": spec.get("max_age_days"),
     }
