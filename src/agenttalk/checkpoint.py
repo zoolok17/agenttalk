@@ -7,6 +7,7 @@ plumbing. It does not attempt to infer or serialize model reasoning.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -47,9 +48,10 @@ BUS_MAX_TOTAL_BYTES = 8 * 1024 * 1024
 BUS_MAX_MESSAGE_BYTES = 512 * 1024
 CURSOR_READ_LIMIT = 256
 THREADSTATE_READ_LIMIT = 1024 * 1024
-RELOAD_POINTERS = (
-    "memory/dashboard-control-plane.md",
-    "memory/MEMORY.md",
+RELOAD_POINTERS: tuple[str, ...] = ()
+SUMMARY_ID_LIMIT = 96
+_SUMMARY_ID_RE = re.compile(
+    rf"\A[A-Za-z0-9][A-Za-z0-9_.-]{{0,{SUMMARY_ID_LIMIT - 1}}}\Z"
 )
 EMPTY_SESSION_START_OUTPUT = (
     '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""}}'
@@ -267,6 +269,7 @@ def _empty_bus(*, truncated: bool) -> dict:
         "unread": None if truncated else 0,
         "owed_out": [],
         "owed_in": [],
+        "reply_waiting": [],
         "in_flight_threads": [],
     }
     if truncated:
@@ -275,7 +278,7 @@ def _empty_bus(*, truncated: bool) -> dict:
 
 
 def _cursor_snapshot(store: Store, agent: str) -> tuple[str, bool]:
-    path = store.state_dir / f"{agent}.cursor"
+    path = store.state_dir / (validate_agent_name(agent) + ".cursor")
     try:
         path.stat(follow_symlinks=False)
     except FileNotFoundError:
@@ -295,7 +298,7 @@ def _cursor_snapshot(store: Store, agent: str) -> tuple[str, bool]:
 
 
 def _closed_request_ids(store: Store, agent: str) -> tuple[set[str], bool]:
-    path = store.state_dir / f"{agent}.threadstate.json"
+    path = store.state_dir / (validate_agent_name(agent) + ".threadstate.json")
     try:
         path.stat(follow_symlinks=False)
     except FileNotFoundError:
@@ -453,7 +456,16 @@ def _collect_bus_state(store: Store, agent: str, *, deadline: float) -> dict:
             "kind": row.opener_kind,
         }
         for row in actionable
-        if row.state in {"owed-inbound", "reply-waiting"}
+        if row.state == "owed-inbound"
+    ]
+    reply_waiting = [
+        {
+            "id": row.request_id,
+            "from": row.peer,
+            "kind": row.opener_kind,
+        }
+        for row in actionable
+        if row.state == "reply-waiting"
     ]
     payload = {
         "unread": sum(
@@ -463,6 +475,7 @@ def _collect_bus_state(store: Store, agent: str, *, deadline: float) -> dict:
         ),
         "owed_out": owed_out,
         "owed_in": owed_in,
+        "reply_waiting": reply_waiting,
         "in_flight_threads": [row.request_id for row in actionable],
     }
     if truncated:
@@ -572,7 +585,9 @@ def build_checkpoint(
         ),
         "git": git_state,
         "bus": bus_state,
-        "reload_pointers": list(RELOAD_POINTERS),
+        "reload_pointers": [
+            checkpoint_path(store, agent).relative_to(store.root).as_posix(),
+        ],
     }
 
 
@@ -581,8 +596,7 @@ def _checkpoint_dir(store: Store) -> Path:
 
 
 def checkpoint_path(store: Store, agent: str) -> Path:
-    validate_agent_name(agent)
-    return _checkpoint_dir(store) / f"{agent}.json"
+    return _checkpoint_dir(store) / (validate_agent_name(agent) + ".json")
 
 
 def _read_json_object(path: Path, *, expected_agent: str) -> dict | None:
@@ -642,12 +656,12 @@ def _make_history_room(history_dir: Path) -> bool:
 
 def save_checkpoint(store: Store, agent: str, payload: dict) -> Path:
     """Atomically replace latest and retain the previous ten snapshots."""
-    validate_agent_name(agent)
+    safe_agent = validate_agent_name(agent)
     if not isinstance(payload, dict) or payload.get("agent") != agent:
         raise ValueError("checkpoint payload agent does not match target")
     serialized = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
     latest = checkpoint_path(store, agent)
-    history_dir = _checkpoint_dir(store) / "history" / agent
+    history_dir = _checkpoint_dir(store) / "history" / safe_agent
     with store.config_lock(timeout=2.0, poll=0.02):
         prior = _read_json_object(latest, expected_agent=agent)
         history_dir.mkdir(parents=True, exist_ok=True)
@@ -680,13 +694,23 @@ def _summary_value(value: object, *, fallback: str = "unknown") -> str:
     return fallback
 
 
+def _summary_id(value: object) -> str:
+    """Return an inert, bounded token for system-reminder ID summaries."""
+    if not isinstance(value, str) or not value:
+        return ""
+    if _SUMMARY_ID_RE.fullmatch(value) is not None:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"unsafe-id-{digest}"
+
+
 def _summary_ids(rows: object, *, key: str = "id") -> str:
     if not isinstance(rows, list):
         return "-"
     values: list[str] = []
     for row in rows[:50]:
         value = row.get(key) if isinstance(row, dict) else row
-        clean = _summary_value(value, fallback="")
+        clean = _summary_id(value)
         if clean:
             values.append(clean)
     if len(rows) > 50:
@@ -707,6 +731,11 @@ def render_resume_context(payload: dict | None) -> str:
     bus = payload.get("bus") if isinstance(payload.get("bus"), dict) else {}
     owed_in = bus.get("owed_in") if isinstance(bus.get("owed_in"), list) else []
     owed_out = bus.get("owed_out") if isinstance(bus.get("owed_out"), list) else []
+    reply_waiting = (
+        bus.get("reply_waiting")
+        if isinstance(bus.get("reply_waiting"), list)
+        else []
+    )
     in_flight = (
         bus.get("in_flight_threads")
         if isinstance(bus.get("in_flight_threads"), list)
@@ -722,7 +751,28 @@ def render_resume_context(payload: dict | None) -> str:
         if value
     )
     if not pointer_text:
-        pointer_text = " + ".join(RELOAD_POINTERS)
+        reload_instruction = (
+            "Before continuing, re-read the project's durable control-plane "
+            "and memory files."
+        )
+    else:
+        reload_instruction = (
+            f"Before continuing, re-read {pointer_text} and the project's "
+            "durable control-plane and memory files."
+        )
+    reply_waiting_hint = (
+        " (read these replies first)" if reply_waiting else ""
+    )
+    truncation_warning = (
+        "Bus snapshot was truncated; refresh AgentTalk status before acting."
+        if bus.get("truncated") is True
+        else ""
+    )
+    closing_instruction = (
+        f"{truncation_warning} {reload_instruction}"
+        if truncation_warning
+        else reload_instruction
+    )
     return (
         f"Checkpoint reload for {agent}: trigger={trigger}; saved_at={saved_at}; "
         f"git={_summary_value(git.get('branch'))}@"
@@ -734,9 +784,11 @@ def render_resume_context(payload: dict | None) -> str:
         f"source={_summary_value(context.get('source'))}); "
         f"bus=unread:{_summary_value(bus.get('unread'))}, "
         f"owed_in:{len(owed_in)} [{_summary_ids(owed_in)}], "
+        f"reply_waiting:{len(reply_waiting)} "
+        f"[{_summary_ids(reply_waiting)}]{reply_waiting_hint}, "
         f"owed_out:{len(owed_out)} [{_summary_ids(owed_out)}], "
         f"in_flight:[{_summary_ids(in_flight)}]. "
-        f"Before continuing, re-read {pointer_text}."
+        f"{closing_instruction}"
     )
 
 

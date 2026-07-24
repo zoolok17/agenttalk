@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import cli
-from agenttalk.store import Store
+from agenttalk import checkpoint, cli
+from agenttalk.store import Store, validate_agent_name
 
 
 def _run(argv: list[str], root: Path) -> int:
@@ -74,6 +74,29 @@ def test_reset_archive_moves_transcripts_too(store_root: Path) -> None:
     assert len(archived_transcripts) == 1
 
 
+@pytest.mark.parametrize("archive", [False, True])
+def test_reset_clears_or_archives_checkpoints(
+    store_root: Path,
+    archive: bool,
+) -> None:
+    store = Store(store_root)
+    payload = {
+        "agent": "alpha",
+        "session_id": "session-before-reset",
+    }
+    checkpoint.save_checkpoint(store, "alpha", payload)
+
+    _, archive_path = store.reset(archive=archive)
+
+    assert not (store.dir / "checkpoints").exists()
+    if archive:
+        assert archive_path is not None
+        archived = archive_path / "checkpoints" / "alpha.json"
+        assert json.loads(archived.read_text(encoding="utf-8")) == payload
+    else:
+        assert archive_path is None
+
+
 def test_reset_bumps_session_id(store_root: Path) -> None:
     s = Store(store_root)
     old_session = s.load_config()["session_id"]
@@ -114,7 +137,9 @@ def test_reset_recreates_empty_cursor_files(store_root: Path) -> None:
     s = Store(store_root)
     s.reset()
     for agent in s.load_config()["agents"]:
-        cursor_file = s.state_dir / f"{agent}.cursor"
+        cursor_file = s.state_dir / (
+            validate_agent_name(agent) + ".cursor"
+        )
         assert cursor_file.exists()
         assert cursor_file.read_text(encoding="utf-8") == ""
 
