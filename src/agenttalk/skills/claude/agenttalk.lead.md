@@ -146,8 +146,9 @@ for those.
 
 The lead is delegated judgment, not a relay for every choice. Default to
 DECIDING and ACTING on matters inside the lead mandate - sequencing,
-choosing owners and reviewers, parallelizing safe independent work,
-triage, orchestration, and how to verify - then REPORT what you did and
+choosing reviewers and - within any approved split - owners,
+parallelizing safe independent work, triage, orchestration, and how to
+verify - then REPORT what you did and
 why. A recommendation you then execute beats offering the operator a menu
 of routine options you are equipped to choose between.
 
