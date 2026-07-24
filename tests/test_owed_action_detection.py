@@ -7667,21 +7667,22 @@ def test_same_policy_legacy_drive_can_publish_and_finalize_exact_terminal(
     assert claim["drive_succeeded_at"]
 
 
-def test_same_policy_legacy_landed_terminal_overrides_false_config_blocked(
+def test_inactive_policy_landed_review_result_overrides_false_config_blocked(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A durable exact reply is progress even when turn heuristics say config-blocked."""
     store = _store(tmp_path)
-    policy_path = tmp_path / "operator-policy.json"
-    policy_path.write_text(
-        json.dumps({"schema_version": 1, "agents": {}}),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("AGENTTALK_COMMIT_GATE_POLICY", str(policy_path))
+    monkeypatch.delenv("AGENTTALK_COMMIT_GATE_POLICY", raising=False)
     gate = DetectionCommitGate.from_environment(store, "beta", fence="wrapper-1")
-    request_id = "q-landed-before-false-config-blocked"
-    inbound = _question(store, request_id)
+    request_id = "rq-landed-before-false-config-blocked"
+    inbound = store.send(
+        sender="alpha",
+        recipient="beta",
+        kind="review-request",
+        body="Review the candidate.",
+        meta={"request_id": request_id},
+    )
     answer_id: str | None = None
     escalations: list[dict] = []
 
@@ -7690,8 +7691,10 @@ def test_same_policy_legacy_landed_terminal_overrides_false_config_blocked(
         answer = store.send(
             sender="beta",
             recipient="alpha",
-            body="399",
+            kind="review-result",
+            body="HOLD: blocking finding.",
             meta={
+                "status": "rejected",
                 "request_id": request_id,
                 "in_reply_to": record["id"],
             },
@@ -7716,23 +7719,16 @@ def test_same_policy_legacy_landed_terminal_overrides_false_config_blocked(
 
     assert answer_id is not None
     assert any(message.id == answer_id for message in store.messages_for("alpha"))
-    claim = _ledger(gate)["no_admission_claims"][inbound.id]
     assert (
         turns,
         store.cursor("beta"),
         store.attempt_record("beta", inbound.id),
         escalations,
-        claim["state"],
-        claim.get("resolution"),
-        claim.get("terminal_evidence_id"),
     ) == (
         1,
         inbound.id,
         None,
         [],
-        "finalized",
-        ResolverState.SATISFIED.value,
-        answer_id,
     )
 
 

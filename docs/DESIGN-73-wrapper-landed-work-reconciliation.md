@@ -13,11 +13,14 @@ before implementation
 ## Decision
 
 Use the validated bus log as the authority for whether an inbound was answered.
-Immediately after every legacy/no-admission drive, reconcile the exact inbound
-through `DetectionCommitGate`. If a valid terminal response from the wrapped
-agent to that inbound is durable, retain that evidence and perform the normal
-guarded cursor/thread-seen finalization even when `DriveOutcome.ok` is false.
-Record the heuristic disagreement for diagnostics, but do not park or escalate.
+Add a policy-independent strict landed-response resolver shared by the loop and
+owed-action code. Invoke it before re-driving a redelivered legacy inbound and
+immediately after every legacy drive. If a valid terminal response from the
+wrapped agent to that exact inbound is durable, perform the normal guarded
+cursor/thread-seen commit even when `DriveOutcome.ok` is false. If a configured
+commit-gate claim exists, retain the same evidence through that claim first; the
+default inactive-policy path must not depend on a claim. Record the heuristic
+disagreement for diagnostics, but do not park or escalate.
 
 Also narrow the text classifiers. Structured command failure must be established
 before failure-looking output is inspected, and gateway/raw-tail markers may
@@ -104,19 +107,31 @@ candidate for the new failed-turn override.
 | --- | --- | --- |
 | `codex_adapter.py:41-60` | A parsed `command_execution` becomes `TOOL_FINISHED`; its `aggregated_output` includes the rendered reply body. | Valid assistant-authored review text reaches the tool classifier. |
 | `run.py:1052-1119` | Runtime, interpreter, and execution-denied regexes scan output at lines 1066-1088. Structured exit/status failure is computed only at 1091-1092. | Exit-zero output can become `config_blocked`. |
+| `run.py:902-942, 1676-1690` | Terminal-text windows are scanned for bus/runtime denial markers without a landed-response check. | Quoted command/payload text can turn a terminal child result into config-blocked. |
+| `run.py:1591-1656` | OVH failure text includes every captured tail line and gets classification precedence. | Parsed assistant/tool JSON can relabel an already-failed turn config/infra. |
 | `run.py:2068-2075` | A required bus tool classified `config_blocked` sets `sig.config_blocked`. | The signal remains failed even after `TURN_FINISHED`. |
 | `run.py:2129-2135` | `sig.ok` requires no config block and no bus failure. | A completed child becomes a non-ok `DriveOutcome`. |
 | `run.py:1601-1703` | `config_blocked` has failure-class precedence. | The false signal becomes a sticky park class. |
 | `loop.py:1004-1080` | The legacy continuous path commits only inside `if outcome.ok`; otherwise it records failure and immediately parks config-blocked. | Durable reply is ignored; cursor remains behind it. |
 | `loop.py:1407-1440` | Scoped one-shot also trusts `outcome.ok` exclusively. | The request remains unseen despite a durable answer. |
+| `run.py:2381-2456` | The cadence mirror uses the same bus-output classifier and completion predicates. | Rendered payload can falsely degrade controller health/backoff, although cadence does not own the inbound cursor. |
 | `health.py:187-193` | Config-blocked maps to health state `errored_ambiguous`. | The operator sees both labels for the same false negative. |
 
-The active owed-action path already has the correct architectural order. It
-drives at `loop.py:752`, replays the validated bus at line 756, then finalizes a
-terminal response at lines 781-794 regardless of the child outcome. The gap is
-the legacy/no-admission path used when policy is inactive and for kinds not
-eligible for enforcement, including `review-request`, `proposal`, and ordinary
-messages.
+The active owed-action path has the correct architectural order for admitted
+questions. It drives at `loop.py:752`, replays the validated bus at line 756,
+then finalizes a terminal response at lines 781-794 regardless of the child
+outcome. It is precedent, not a reusable resolver as-is:
+
+- `_resolve_replay()` requires `inbound.kind == "question"`
+  (`obligations.py:2130-2148`) and calls
+  `threads._classify_event("question", ...)` (`:2355-2357`);
+- `review-request` and `proposal` therefore cannot be proven by that replay; and
+- with no commit-gate policy configured, `admit_or_finalize()` returns the
+  inactive `NOT_OWED` result without creating a no-admission claim or ledger
+  revision. The confirmed July 24 inbound has no such claim.
+
+The gap therefore covers the default wrapper configuration as well as
+non-question opener kinds and ordinary messages.
 
 ### Every path that can ignore already-landed work
 
@@ -208,17 +223,19 @@ After any failed drive, call `Store.valid_messages()`, search for a plausible
 response, and commit if one exists.
 
 This covers post-send failures, but it would duplicate thread transition rules
-and bypass `DetectionCommitGate` policy/fence/CAS retention. A subtly broad
-request-id match could advance the wrong inbound. Reject.
+inside the loop and risks collapsing “validated replay unavailable” into “no
+response.” A subtly broad request-id match could advance the wrong inbound.
+Reject.
 
-### Option C — reconcile through `DetectionCommitGate` after every legacy drive
+### Option C — shared strict bus resolver plus guarded disposition
 
-Extend the existing no-admission protocol with a post-drive reconciliation that
-uses validated ordered replay, the exact inbound, the current wrapper fence,
-the pinned policy generation, and the existing finalization path.
+Add one policy-independent resolver for exact landed responses. Use it from the
+continuous and scoped legacy paths before drive and after drive. A configured
+no-admission claim retains the proof through `DetectionCommitGate`; an inactive
+policy uses the same guarded commit path as a normal successful legacy turn.
 
-This reuses the component that already solves the same race for active owed
-actions. It separates two questions cleanly:
+This reuses the normative thread transition rules without depending on the
+question-only owed-action admission path. It separates two questions cleanly:
 
 1. Did the child process appear healthy?
 2. Is the inbound’s terminal response durably present?
@@ -227,75 +244,104 @@ Choose Option C, together with Option A as defense in depth.
 
 ## Recommended mechanism
 
-### 1. Add a post-drive no-admission reconciler
+### 1. Add a policy-independent exact landed-work resolver
 
-Refactor `record_no_admission_success()` into a method with semantics equivalent
+Expose a resolver from the existing gate/replay boundary, for example
+`DetectionCommitGate.resolve_exact_landed_terminal()`, with semantics equivalent
 to:
 
 ```text
-reconcile_no_admission_after_drive(
-    record,
-    authorized_resolution,
-    drive_succeeded,
-) -> Resolution
+resolve_landed_work(store, agent, record)
+    -> LandedWorkProof | NO_PROOF | PROOF_UNAVAILABLE
 ```
 
-Under the message-publication lock and owed-action ledger lock, it must:
+The gate object is always constructed by the wrapper, but this method must not
+consult activation policy or require a claim; its authority is only validated
+bus replay. A standalone helper used by the gate is equally acceptable.
+
+From a consistent publication-ordered validated snapshot, using the store's
+existing publication locking where required, it must:
 
 1. Load publication-ordered validated messages. A validation/read error returns
-   `BLOCKED` or `INDETERMINATE`; it never guesses progress.
-2. Re-resolve the exact inbound and revalidate policy generation, wrapper fence,
-   claim state, and scoped revision.
-3. If replay finds a terminal response meeting the strict landed-work predicate,
-   retain it with `_retain_same_generation_legacy_terminal_locked()` and return
-   `no_admission_finalization_pending`, including the terminal evidence id.
-   This branch is valid regardless of `drive_succeeded`.
-4. If no terminal response exists and `drive_succeeded` is true, retain the
-   current legacy success exactly as today.
-5. If no terminal response exists and `drive_succeeded` is false, return a
-   nonterminal resolution without marking success. The loop then follows its
-   existing retry/park/dead-letter behavior.
+   `PROOF_UNAVAILABLE`; it never guesses progress.
+2. Locate the exact validated inbound by message id and verify its sender and
+   recipient against the delivered record.
+3. Inspect only later publication-ordered records for the strict predicate
+   below.
+4. For an opener in `OPENER_KINDS`, run the normative
+   `threads._classify_event(inbound.kind, ...)` transitions with the real opener
+   kind. Start with the ball on the responder, update it for needs-info
+   ping-pong, and accept only a closing event whose terminal record has the
+   exact inbound anchor.
+5. Return the first valid terminal in publication order as an immutable proof
+   containing at least inbound id, evidence id, evidence sequence, and response
+   kind. Return `NO_PROOF` when no candidate closes the exact inbound.
 
-This method must not accept “the tool said sent,” an exit-zero status, assistant
-text, a draft file, or a Git commit as evidence.
+The current question-only `_resolve_replay()` may delegate its terminal matching
+to this shared helper after equivalence tests, but it cannot simply be reused
+unchanged. The helper must not accept “the tool said sent,” an exit-zero status,
+assistant text, a draft file, or a Git commit as evidence.
 
 ### 2. Make the failed-turn override strict
 
-Overriding a failed child outcome requires all of the following:
+Overriding a failed child outcome requires an evidence record meeting all of the
+following:
 
-- the record is in `Store.valid_messages()` and publication order places it
+- the evidence is in `Store.valid_messages()` and publication order places it
   after the inbound;
 - sender is exactly the wrapped agent;
 - recipient is exactly the inbound sender;
 - `meta.in_reply_to` equals the exact inbound id;
 - request/broadcast correlation agrees when the inbound has one;
-- kind, status, and transition are valid for the opener under existing thread
-  protocol rules; and
+- for `review-request`, `proposal`, and `question`, kind, status, direction, and
+  transition close the actual opener under existing thread protocol rules; and
 - the response is terminal, not `composing`, a control record, a draft, or
   unrelated same-request chatter.
+
+For a non-opener or an uncorrelated ordinary inbound, the exact `in_reply_to`
+anchor supplies the thread identity. A validated response sent by the wrapped
+agent back to the inbound sender counts when it is non-control, non-`composing`,
+and does not itself open a new `review-request`, `proposal`, or `question`.
+Status-bearing response kinds must still carry a valid terminal status. This
+covers an exact reply to a plain `message` without broad request-id matching.
+
+The proof inherits the bus trust model: when signing is enforced, the evidence
+must pass HMAC validation; when signing is off, sender identity remains the same
+auditable assertion used by all other bus consumers. The resolver does not
+create a stronger authentication claim than `Store.valid_messages()`.
 
 For an `outcome.ok` turn, current compatibility behavior may continue to accept
 legacy request-correlated responses. A failed-turn override must require the
 exact `in_reply_to` anchor. This keeps July 24 recoverable without letting an
-old or sibling response advance the wrong head. Duplicate or conflicting
-responses inherit the resolver’s existing nonterminal/indeterminate behavior;
-only a terminal resolution advances.
+old or sibling response advance the wrong head.
+
+If more than one exact terminal exists, the first valid terminal in publication
+order is the monotonic completion proof. This does not choose which verdict
+content should win; normal bus/thread consumers still see every response. Later
+terminals are duplicate/conflict telemetry and do not turn already completed
+work back into “unfinished.”
 
 An exact response from a previous crashed attempt also counts. That is desired:
 on redelivery, the work is already complete and the wrapper should finalize
 without invoking the model again.
 
-### 3. Reconcile before recording failure
+### 3. Reconcile before drive and before recording failure
 
 Both legacy call sites must use the same order:
 
 ```text
+resolve exact landed work from an earlier attempt
+if proof:
+    guarded commit; clear attempt; increment turns; do not drive
 authorize legacy drive
 record attempt start
 drive
 reconcile exact landed work
-if terminal/finalization-pending:
-    guarded finalize/commit
+if proof:
+    if a configured no-admission claim exists:
+        retain proof in the claim and finalize it
+    else:
+        use the normal guarded legacy commit
     clear attempt
     increment turns
     record heuristic disagreement telemetry
@@ -305,14 +351,19 @@ else:
     existing failed-turn handling
 ```
 
-For the continuous loop, finalization advances the global cursor through the
+For the continuous loop, disposition advances the global cursor through the
 existing `_commit()`/`pre_commit` boundary. For scoped one-shot, it advances
-only `thread_seen`, as today. The active owed-action path remains unchanged.
+only `thread_seen`, as today. Both count a pre-drive recovered response as a
+completed turn so one-shot exits successfully.
 
-Retain terminal evidence before cursor projection. If lease/CAS/pre-commit
-fails, the next poll retries only finalization and does not re-drive. A durable
-response is immutable, so this closes the crash window between append and
-cursor advance.
+When a configured legacy claim and revision exist, add a gate method that
+revalidates and retains the supplied proof before cursor projection. When policy
+is inactive, do not synthesize a policy claim merely to mark progress: the
+validated bus record is already durable and `_commit()` supplies the wrapper
+ownership/pre-commit guard. If lease/CAS/pre-commit fails, the next poll's
+pre-drive resolver finds the same immutable response and retries disposition
+without re-driving. This closes the crash window between append and cursor
+advance without adding per-message ledger I/O to default wrappers.
 
 ### 4. Preserve diagnostics without preserving the park
 
@@ -376,7 +427,9 @@ health cannot be falsely degraded by rendered payload.
 | No | ok | Preserve current successful legacy commit behavior. |
 | No | config/spawn/setup failure | Park; cursor/thread-seen unchanged. |
 | No | ambiguous/infra/poison/gateway failure | Preserve current retry/disposition policy. |
-| Unknown because bus validation/ledger/policy failed | any | Do not advance; report the gate failure through existing bounded mechanisms. |
+| Unknown because validated bus replay failed | any | Do not advance; report the proof failure through existing bounded mechanisms. |
+| Yes, but guarded cursor/thread-seen commit failed | any | Do not advance; retry proof and disposition before any re-drive. |
+| Yes, configured claim retention/finalization failed | any | Do not advance; preserve the claim and retry its guarded finalization. |
 | Same request but no exact `in_reply_to`, and drive failed | failed | Do not use as override evidence. |
 
 ## Intentionally failing regression
@@ -385,21 +438,23 @@ Added:
 
 ```text
 tests/test_owed_action_detection.py::
-test_same_policy_legacy_landed_terminal_overrides_false_config_blocked
+test_inactive_policy_landed_review_result_overrides_false_config_blocked
 ```
 
-The test uses a real temporary `Store` and the real `DetectionCommitGate` in its
-same-policy legacy/no-admission mode. Its drive:
+The test uses a real temporary `Store` and the real `DetectionCommitGate` with
+`AGENTTALK_COMMIT_GATE_POLICY` absent, matching the confirmed default production
+path. Its inbound and response are the production protocol pair
+`review-request` → `review-result(status=rejected)`. Its drive:
 
-1. publishes an exact response from `beta` to `alpha` with the inbound request
+1. publishes that exact response from `beta` to `alpha` with the inbound request
    id and `in_reply_to`;
 2. returns `DriveOutcome(ok=False, failure_class=config_blocked)`; and
 3. lets the loop run exactly one poll.
 
 The arrangement first proves the response is visible through validated store
 reads. It then requires one completed turn, cursor advancement, a cleared
-attempt record, no escalation, and a finalized `SATISFIED` gate claim naming the
-response as terminal evidence.
+attempt record, and no escalation. It intentionally asserts only public wrapper
+effects; the inactive policy creates no private no-admission claim.
 
 At `c70ee91` it fails as intended:
 
@@ -408,7 +463,6 @@ turns == 0            (expected 1)
 cursor == ""          (expected inbound id)
 attempt remains       (expected cleared)
 config escalation     (expected none)
-claim remains open    (expected finalized/SATISFIED)
 ```
 
 This test deliberately injects the false classification instead of depending on
@@ -417,8 +471,8 @@ work invariant must be implemented.
 
 ## Build increments after approval
 
-1. Commit the post-drive gate reconciliation and make the new regression pass
-   in continuous mode.
+1. Commit the shared exact-response resolver and inactive-policy continuous-loop
+   reconciliation; make the new production-shaped regression pass.
 2. Add scoped one-shot parity and crash/redelivery coverage.
 3. Reorder structured command classification and update the existing tests that
    currently bless failure-looking text on successful command events.
