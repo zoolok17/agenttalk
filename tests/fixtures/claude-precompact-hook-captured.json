@@ -1,0 +1,8 @@
+{
+  "session_id": "74cc9ce1-b011-49bf-a38a-06d94e1f6ae8",
+  "transcript_path": "C:\\Users\\Milos\\.claude\\projects\\D--Projects-Claude-agenttalk\\74cc9ce1-b011-49bf-a38a-06d94e1f6ae8.jsonl",
+  "cwd": "D:\\Projects\\Claude\\agenttalk",
+  "permission_mode": "auto",
+  "hook_event_name": "PreCompact",
+  "trigger": "auto"
+}
