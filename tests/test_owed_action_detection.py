@@ -7667,6 +7667,75 @@ def test_same_policy_legacy_drive_can_publish_and_finalize_exact_terminal(
     assert claim["drive_succeeded_at"]
 
 
+def test_same_policy_legacy_landed_terminal_overrides_false_config_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A durable exact reply is progress even when turn heuristics say config-blocked."""
+    store = _store(tmp_path)
+    policy_path = tmp_path / "operator-policy.json"
+    policy_path.write_text(
+        json.dumps({"schema_version": 1, "agents": {}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTTALK_COMMIT_GATE_POLICY", str(policy_path))
+    gate = DetectionCommitGate.from_environment(store, "beta", fence="wrapper-1")
+    request_id = "q-landed-before-false-config-blocked"
+    inbound = _question(store, request_id)
+    answer_id: str | None = None
+    escalations: list[dict] = []
+
+    def drive(record: dict) -> loop.DriveOutcome:
+        nonlocal answer_id
+        answer = store.send(
+            sender="beta",
+            recipient="alpha",
+            body="399",
+            meta={
+                "request_id": request_id,
+                "in_reply_to": record["id"],
+            },
+        )
+        answer_id = answer.id
+        return loop.DriveOutcome(
+            ok=False,
+            failure_class=loop.CLASS_CONFIG_BLOCKED,
+            summary="false config-blocked classification after exact reply landed",
+        )
+
+    turns = loop.run_loop(
+        store,
+        "beta",
+        drive,
+        commit_gate=gate,
+        clock=lambda: 0.0,
+        sleep=lambda _delay: None,
+        max_polls=1,
+        on_escalate=lambda info: escalations.append(info) or True,
+    )
+
+    assert answer_id is not None
+    assert any(message.id == answer_id for message in store.messages_for("alpha"))
+    claim = _ledger(gate)["no_admission_claims"][inbound.id]
+    assert (
+        turns,
+        store.cursor("beta"),
+        store.attempt_record("beta", inbound.id),
+        escalations,
+        claim["state"],
+        claim.get("resolution"),
+        claim.get("terminal_evidence_id"),
+    ) == (
+        1,
+        inbound.id,
+        None,
+        [],
+        "finalized",
+        ResolverState.SATISFIED.value,
+        answer_id,
+    )
+
+
 @pytest.mark.parametrize("scoped", [False, True], ids=["continuous", "scoped"])
 def test_same_policy_legacy_terminal_recovers_after_retention_crash(
     tmp_path: Path,
