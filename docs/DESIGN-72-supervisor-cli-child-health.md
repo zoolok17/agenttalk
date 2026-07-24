@@ -18,6 +18,12 @@ live CLI brain and recent CLI progress. A fresh wrapper heartbeat alone is
 never enough. Missing, malformed, stale, or unqueryable child evidence is not
 green. It is also not kill authority.
 
+The wrapped-health classifier is total. Every accepted combination of runtime
+phase, brain observation, and progress observation resolves inside the new
+classifier. Only a strictly validated `idle` phase may produce
+`HEALTHY_IDLE`; no non-idle or unenumerated combination may fall through to
+the legacy fresh-heartbeat branch.
+
 The recommended design combines:
 
 - a strict, atomic wrapper-runtime observation that identifies the active turn,
@@ -185,9 +191,19 @@ schema. Suggested fields:
 ```
 
 The record contains no prompt, model output, command, or tool output. Writes
-use same-directory temp, flush, and replace. Readers reject unknown keys,
-invalid types, unsafe identifiers, non-UTC/future timestamps, and inconsistent
-phase fields.
+use a same-directory temporary file, flush and `fsync` the file, then replace
+the destination. The forced terminal write is never coalesced and is also
+`fsync`ed before replacement; implementations should additionally `fsync` the
+directory where the platform supports it. The existing #32 sandbox-direct
+latch is not a persistence model for this record because it is not
+crash-atomic.
+
+Readers consume the whole file and validate it against the closed schema
+before exposing any field. They reject unknown keys, invalid types, unsafe
+identifiers, non-UTC/future timestamps, and inconsistent phase fields. An
+absent, torn, partial, or parse-failed read becomes one indivisible
+`CLI_CHILD_UNKNOWN` observation. A reader must never salvage `phase`,
+`progress_sequence`, or an outcome from invalid bytes.
 
 The wrapper writes:
 
@@ -205,6 +221,21 @@ The wrapper PID/start and generation bind observations to the currently
 managed wrapper instance. They are consistency controls, not authentication.
 The supervisor independently validates the wrapper row before using the
 record.
+
+#### Shared authority with #73
+
+`wrapper-runtime.json` is the single shared authority for wrapper and turn
+lifecycle observations. The wrapper is its sole writer. #72 supervisor health
+and #73 commit-vs-park are read-only consumers of the same strictly parsed
+record; #73 reads `last_outcome`, `phase`, and `progress_sequence` from that
+record rather than creating a second observation file.
+
+The schema, parser, validation rules, and atomic writer should live behind one
+shared wrapper-runtime module owned by the wrapper-turn lifecycle boundary,
+not by either consumer. #72 introduces that shared schema; the coordinated #73
+work consumes it and must not fork it. Changes to phase or outcome transitions
+therefore require joint #72/#73 contract tests. Supervisor health may add
+local debounce state, but that cache is not another lifecycle authority.
 
 ### 2. CLI-brain observation
 
@@ -241,13 +272,21 @@ progress sequence, and the local epoch when each changed. Using sequence
 changes avoids relying solely on writer clock synchronization. A new wrapper
 or turn resets the comparison baseline.
 
+A sequence decrease is evaluated only after a complete, valid record is bound
+to the same wrapper and turn generations. It is then treated as invalid or
+ambiguous evidence and resolves to `CLI_CHILD_UNKNOWN`; it never constitutes
+proof of death or a stall. Partial reads cannot create a synthetic phase or
+sequence regression.
+
 ### 4. Verdict table
 
-Evaluate these rows before the existing fresh-heartbeat branch:
+The wrapped classifier returns from this table and never falls through to the
+legacy fresh-heartbeat classifier. It is deliberately total:
 
 | Runtime phase | CLI brain | Progress | Verdict | Automatic action |
 | --- | --- | --- | --- | --- |
-| valid idle | not required | n/a | `HEALTHY_IDLE` | none |
+| valid idle, live wrapper, fresh heartbeat | not required | n/a | `HEALTHY_IDLE` | none |
+| valid idle, wrapper or heartbeat not green | not required | n/a | existing non-green wrapper verdict | existing wrapper path |
 | starting, inside spawn grace | not yet known | n/a | `CLI_CHILD_STARTING` | none |
 | active | alive | recent | `HEALTHY_WORKING` | none |
 | active | dead, first observation | n/a | `CLI_CHILD_MISSING` | none |
@@ -256,11 +295,30 @@ Evaluate these rows before the existing fresh-heartbeat branch:
 | active | alive | stale | `CLI_CHILD_STALLED` | existing stuck path after threshold |
 | terminal success/finalizing | not required | recent | `HEALTHY_WORKING` | none |
 | terminal failure/dead-letter | not required | n/a | `TURN_FAILED` | wrapper policy/notify |
-| missing/invalid runtime record | any | any | `CLI_CHILD_UNKNOWN` | warn, no kill |
+| terminal | any | stale or unclassified | `CLI_CHILD_UNKNOWN` | warn, no kill |
+| any valid starting/active/terminal combination not matched above | any | any | `CLI_CHILD_UNKNOWN` | warn, no kill |
+| missing/invalid/torn/partial/parse-failed runtime record | any | any | `CLI_CHILD_UNKNOWN` | warn, no kill |
 
 `HEALTHY_IDLE` and `HEALTHY_WORKING` are the only green wrapped states.
 Coordination availability must inspect these states before accepting a fresh
-heartbeat.
+heartbeat. The idle rows explicitly preserve existing non-green wrapper
+recovery while making strict idle validation a precondition for the legacy
+heartbeat decision. The default row for every unenumerated tuple is
+`CLI_CHILD_UNKNOWN`. In particular, a fresh heartbeat cannot turn a terminal
+record with stale progress, an unknown phase, or an otherwise unmatched tuple
+green. Only the first row reaches `HEALTHY_IDLE`.
+
+The implementation order is normative:
+
+1. strictly parse and bind the complete runtime record; on any failure, return
+   `CLI_CHILD_UNKNOWN`;
+2. for `idle`, run the existing wrapper/heartbeat sub-classifier and return its
+   result;
+3. for `starting`, `active`, or `terminal`, return a matching row above; and
+4. otherwise return `CLI_CHILD_UNKNOWN`.
+
+There is no continuation from steps 3 or 4 into the legacy fresh-heartbeat
+branch.
 
 ### 5. Death, wedge, and restart policy
 
@@ -271,10 +329,17 @@ Child death and child stall are different failures:
   short spawn/handoff grace. Then use the existing `STUCK_RECOVER` executor
   path, start-guarded kill targets, exponential backoff, and readiness cap.
 - **Wedged:** the brain is alive but `progress_sequence` has not advanced past
-  the per-CLI turn-progress threshold. Preserve the current Codex watchdog
-  ordering: the supervisor must not preempt the per-turn watchdog before its
-  deadline plus margin. After confirmation, use the same restart path with a
-  distinct reason.
+  the per-CLI turn-progress threshold. The stall threshold has a hard
+  invariant: it must be greater than or equal to the resolved per-CLI
+  turn-progress watchdog deadline plus a safety margin. This prevents a
+  legitimate long tool call, which may emit `tool-start` and remain silent
+  until `tool-finish`, from being killed before the CLI watchdog can decide.
+  Configuration below that floor is invalid and disables autonomous
+  stall-based recovery for that observation; it resolves non-green/unknown
+  and emits a configuration diagnostic rather than silently clamping or
+  killing early. If the watchdog deadline cannot be resolved, progress
+  staleness alone is not restart authority. After threshold and confirmation,
+  use the existing restart path with a distinct reason.
 - **Unknown:** the evidence cannot establish death or health. It is not green,
   but it must not authorize a kill or restart. Emit a rate-limited warning and
   retry observation.
@@ -317,24 +382,46 @@ with no CLI brain must not be `HEALTHY_IDLE`, so it fails on the base revision.
 It intentionally does not prescribe a kill on the first observation; both
 `CLI_CHILD_MISSING` and `CLI_CHILD_UNKNOWN` satisfy the fail-safe requirement.
 
+`test_wrapped_terminal_stale_runtime_cannot_be_healthy_idle` supplies a valid
+resolved runtime observation in `terminal` phase with a success outcome but
+stale progress, a fresh heartbeat, and a live wrapper. Current code ignores
+the runtime observation and again returns `HEALTHY_IDLE`. The test requires
+the default `CLI_CHILD_UNKNOWN` verdict. It demonstrates why adding selected
+rows ahead of the legacy branch is insufficient: the wrapped classifier needs
+an explicit default and must be total.
+
 ## Implementation test matrix
 
 The implementation round should add deterministic synthetic-snapshot tests for:
 
 - idle wrapper without a child remains `HEALTHY_IDLE`;
+- terminal phase with stale progress is `CLI_CHILD_UNKNOWN`, never
+  `HEALTHY_IDLE`;
+- every unenumerated `(phase, brain, progress)` tuple hits the default
+  `CLI_CHILD_UNKNOWN` row rather than legacy heartbeat classification;
 - active Claude launcher/self is `HEALTHY_WORKING`;
 - active Codex launcher exit plus live TUI grandchild is discovered correctly;
 - active turn plus confirmed absent child becomes `CLI_CHILD_DEAD`;
 - snapshot/ancestry/start-token ambiguity becomes `CLI_CHILD_UNKNOWN`, never
   green and never kill;
+- torn, partial, malformed, and parse-failed runtime records become one
+  `CLI_CHILD_UNKNOWN` observation without exposing partial fields;
+- a progress-sequence decrease for the same valid wrapper/turn is unknown and
+  cannot trigger death, stall, or restart;
 - a progressing child stays working;
 - a live child with an unchanged progress sequence becomes stalled only after
   the configured threshold and confirmation poll;
+- the configured stall threshold cannot be less than the resolved per-CLI
+  watchdog deadline plus margin, and a long silent tool call is not killed
+  before that floor;
 - work-heartbeat ticks do not count as progress;
 - wrapper/turn generation changes reset the stall/death debounce;
 - restart backoff and readiness caps still prevent relaunch storms;
 - dead-letter is visible as a terminal outcome and is not reported as a
   successful turn; and
+- #72 and #73 consume the same strictly parsed runtime record, including
+  `phase`, `progress_sequence`, and `last_outcome`, with no second lifecycle
+  observation file; and
 - the availability view cannot return `AVAILABLE` for child dead, unknown, or
   stalled states even with a fresh heartbeat.
 
@@ -346,6 +433,11 @@ table remains pure and platform-independent.
 
 - Process presence cannot prove model progress; that is why the runtime
   sequence is required.
+- Adapter-event progress is not semantic progress. A tool-retry loop can keep
+  emitting accepted adapter events, advance `progress_sequence`, and remain
+  `HEALTHY_WORKING` without making useful task progress. Detecting semantic
+  loops is outside #72; this design only closes heartbeat-only and
+  process/progress false-green states.
 - Process ancestry can be lost after reparenting. The design fails safe to
   unknown instead of guessing.
 - A same-user process can rewrite consistency files. This design prevents
