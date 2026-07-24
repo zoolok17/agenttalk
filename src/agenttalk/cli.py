@@ -2480,12 +2480,16 @@ def _coverage_percent_from_gate(g: dict):
     most recent evidence entry that carries it; return ``None`` if absent (the pure evaluator then
     fails closed). This is the producer↔consumer contract seam for #60 inc-3."""
     entries = g.get("evidence")
-    if not isinstance(entries, list):
+    if not isinstance(entries, list) or not entries:
         return None
-    for entry in reversed(entries):
-        if isinstance(entry, dict) and "coverage_percent" in entry:
-            return entry.get("coverage_percent")
-    return None
+    # Read ONLY the latest evidence entry — do NOT backtrack. Backtracking could bind a stale
+    # percentage from an older green to newer green metadata (e.g. green@A(95) -> red@B ->
+    # green@B with no percent would wrongly surface 95 as B's coverage). If the current entry
+    # lacks the field, return None and let the evaluator fail closed. (reviewer-1, #60 inc-3)
+    latest = entries[-1]
+    if not isinstance(latest, dict):
+        return None
+    return latest.get("coverage_percent")
 
 
 def _resolve_dod_coverage_gate(store, spec: dict, record: dict) -> dict:

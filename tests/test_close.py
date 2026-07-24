@@ -1522,6 +1522,24 @@ def test_resolve_dod_coverage_gate_reads_producer_evidence_seam(tmp_path: Path) 
     assert resolved["min_percent"] == 80.0 and isinstance(resolved["age_days"], float)
 
 
+def test_resolve_dod_coverage_gate_no_backtrack_to_stale_percent(tmp_path: Path) -> None:
+    # reviewer-1 #60 inc-3: a later percent-less GREEN must NOT inherit an older entry's percent.
+    # green@A(95) -> red@B -> green@B(no percent): resolver must read only the latest entry -> None.
+    root = _init(tmp_path)
+    gates.set_gate(root, name="coverage:release", status="green", severity="blocker",
+                   scope="release", actor="ci", evidence_source="automation_ci",
+                   evidence=["run:A"], revision=SHA, evidence_details={"coverage_percent": 95.0})
+    gates.set_gate(root, name="coverage:release", status="red", severity="blocker",
+                   scope="release", actor="ci", evidence_source="automation_ci",
+                   evidence=["run:B-red"], revision=OTHER_SHA)
+    gates.set_gate(root, name="coverage:release", status="green", severity="blocker",
+                   scope="release", actor="ci", evidence_source="automation_ci",
+                   evidence=["run:B-green"], revision=OTHER_SHA)  # green, NO coverage_percent
+    resolved = cli._resolve_dod_coverage_gate(
+        Store(root), {"min_percent": 80.0, "max_age_days": 14}, _satisfied())
+    assert resolved["coverage_percent"] is None   # NOT 95.0 from the stale A entry
+
+
 def test_resolve_dod_coverage_gate_reads_own_fields(tmp_path: Path) -> None:
     root = _init(tmp_path)
     _set_coverage_gate(root, percent=87.25)
