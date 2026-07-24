@@ -75,6 +75,8 @@ SKILL_INVARIANTS = [
         "No second task-state machine",    # threads + human are the state
         "agenttalk threads --for",         # tracks dispatched work
         "agenttalk broadcast",             # fan-out for group input
+        "decide and act within",           # Independence policy (must be mirrored both sides)
+        "do not stall on a call that is yours",  # Independence: report, don't over-ask
     ]),
     ("agenttalk.consult.md", "agenttalk-consult", [
         "AGENTTALK_SELF",
