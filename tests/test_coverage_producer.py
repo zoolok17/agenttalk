@@ -134,6 +134,20 @@ def _set_green_coverage_gate(
         )
 
 
+def _run_assurance_cli(root: Path, *, profile: str = "change") -> int:
+    return assurance.main(
+        [
+            "--root",
+            str(root),
+            "--profile",
+            profile,
+            "--out",
+            str(root / ".agenttalk" / "assurance" / "runs"),
+            "--json-only",
+        ]
+    )
+
+
 def test_successful_ci_coverage_run_emits_revision_bound_green_gate(
     tmp_path: Path,
     monkeypatch,
@@ -291,22 +305,146 @@ def test_cli_without_fresh_coverage_measurement_invalidates_existing_green_gate(
     manifest_path = tmp_path / ".agenttalk" / "assurance.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    rc = assurance.main(
-        [
-            "--root",
-            str(tmp_path),
-            "--profile",
-            "change",
-            "--out",
-            str(tmp_path / ".agenttalk" / "assurance" / "runs"),
-            "--json-only",
-        ]
-    )
+    rc = _run_assurance_cli(tmp_path)
 
     assert rc == 0
     gate = _coverage_gate(tmp_path, "change")
     assert gate["status"] == "red"
     assert gate["reason"] == "no fresh coverage measurement this run"
+
+
+def test_cli_pre_plan_manifest_path_failure_invalidates_existing_green_gate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    _set_green_coverage_gate(tmp_path, revision, scope="change")
+    manifest_path = tmp_path / ".agenttalk" / "assurance.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "monorepo": {
+                    "packages": [
+                        {
+                            "name": "broken",
+                            "path": "\x00",
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rc = _run_assurance_cli(tmp_path)
+
+    assert rc == 1
+    gate = _coverage_gate(tmp_path, "change")
+    assert gate["status"] == "red"
+    assert gate["reason"] == "no fresh coverage measurement this run"
+
+
+def test_cli_pre_plan_detection_error_invalidates_existing_green_gate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(tmp_path, monkeypatch)
+    _set_green_coverage_gate(tmp_path, revision, scope="change")
+
+    def fail_detection(*_args, **_kwargs):
+        raise PermissionError("simulated detection failure")
+
+    monkeypatch.setattr(assurance, "detect_project", fail_detection)
+
+    rc = _run_assurance_cli(tmp_path)
+
+    assert rc == 1
+    gate = _coverage_gate(tmp_path, "change")
+    assert gate["status"] == "red"
+    assert gate["reason"] == "no fresh coverage measurement this run"
+
+
+def test_cli_pre_plan_failure_does_not_fabricate_coverage_gate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _ci_revision(tmp_path, monkeypatch)
+
+    def fail_detection(*_args, **_kwargs):
+        raise PermissionError("simulated detection failure")
+
+    monkeypatch.setattr(assurance, "detect_project", fail_detection)
+
+    rc = _run_assurance_cli(tmp_path)
+
+    assert rc == 1
+    assert "coverage:change" not in gates.load_gate_state(tmp_path)["gates"]
+
+
+def test_cli_pre_plan_failure_preserves_coverage_waiver(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _ci_revision(tmp_path, monkeypatch)
+    with Store(tmp_path).config_lock():
+        gates.waive_gate(
+            tmp_path,
+            name="coverage:change",
+            operator="test-operator",
+            reason="accepted fixture waiver",
+            scope="change",
+            expires="2099-01-01T00:00:00Z",
+        )
+
+    def fail_detection(*_args, **_kwargs):
+        raise PermissionError("simulated detection failure")
+
+    monkeypatch.setattr(assurance, "detect_project", fail_detection)
+
+    rc = _run_assurance_cli(tmp_path)
+
+    assert rc == 1
+    assert _coverage_gate(tmp_path, "change")["status"] == "waived"
+
+
+def test_cli_fresh_ci_coverage_measurement_stays_green(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    revision = _ci_revision(
+        tmp_path,
+        monkeypatch,
+        {
+            "pyproject.toml": "[project]\nname = 'coverage-producer-fixture'\nversion = '1.0'\n",
+            "src/fixture/__init__.py": "VALUE = 1\n",
+        },
+    )
+    manifest_path = tmp_path / ".agenttalk" / "assurance.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "custom_commands": {
+                    "coverage": [
+                        sys.executable,
+                        "-c",
+                        "print('TOTAL 100 12 88%')",
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rc = _run_assurance_cli(tmp_path)
+
+    assert rc == 0
+    gate = _coverage_gate(tmp_path, "change")
+    assert gate["status"] == "green"
+    assert gate["revision"] == revision
+    assert gate["evidence"][-1]["coverage_percent"] == pytest.approx(88.0)
 
 
 @pytest.mark.parametrize(

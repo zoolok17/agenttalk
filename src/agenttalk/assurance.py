@@ -546,7 +546,13 @@ def run_plan(plan: ScanPlan) -> ScanResult:
     try:
         return _run_plan(plan, fresh_coverage_attestations)
     finally:
-        _invalidate_stale_coverage_gate(plan, fresh_coverage_attestations)
+        _invalidate_stale_coverage_gate(
+            root=plan.root,
+            profile=plan.profile,
+            revision=plan.provenance.get("git_sha"),
+            run_id=plan.run_id,
+            fresh_coverage_attestations=fresh_coverage_attestations,
+        )
 
 
 def _run_plan(
@@ -609,7 +615,7 @@ def _run_plan(
                     artifact_error=coverage_artifact_error,
                     failure_reason=f"coverage runner failed with {type(exc).__name__}",
                 )
-                fresh_coverage_attestations.add(_coverage_attestation_key(plan))
+                fresh_coverage_attestations.add(_coverage_attestation_key(plan.profile, plan.provenance.get("git_sha")))
             raise
         coverage_outputs: dict[str, str | None] = {}
         coverage_cleanup_ok = True
@@ -637,7 +643,7 @@ def _run_plan(
                 artifacts_clean=coverage_cleanup_ok,
                 artifact_error=coverage_artifact_error,
             )
-            fresh_coverage_attestations.add(_coverage_attestation_key(plan))
+            fresh_coverage_attestations.add(_coverage_attestation_key(plan.profile, plan.provenance.get("git_sha")))
 
     considered = [spec["tool_id"] for spec in plan.tools]
     result = ScanResult(
@@ -810,50 +816,65 @@ def main(argv: list[str] | None = None) -> int:
         return int(exc.code) if isinstance(exc.code, int) else 2
 
     root = Path(args.root).resolve()
+    fresh_coverage_attestations: set[tuple[str, str]] = set()
+    run_id = _new_run_id()
+    revision: str | None = None
     runner_errors: list[str] = []
     try:
-        manifest = load_manifest(root, args.manifest)
-    except AssuranceUsageError as exc:
-        manifest = _default_manifest(_resolve_under_root(root, args.manifest))
-        manifest["_validation_errors"] = [str(exc)]
-    try:
-        baseline = load_baseline(root, args.baseline)
-    except AssuranceUsageError as exc:
-        baseline = _default_baseline(_resolve_under_root(root, args.baseline))
-        baseline["_validation_errors"] = [str(exc)]
-    try:
-        detection = detect_project(root, manifest)
-        provenance = collect_provenance(
-            root,
-            manifest,
-            args.profile,
-            baseline,
-            changed_from=args.changed_from,
-            changed_to=args.changed_to,
+        revision = _git_output(root, ["rev-parse", "HEAD"])
+        try:
+            manifest = load_manifest(root, args.manifest)
+        except AssuranceUsageError as exc:
+            manifest = _default_manifest(_resolve_under_root(root, args.manifest))
+            manifest["_validation_errors"] = [str(exc)]
+        try:
+            baseline = load_baseline(root, args.baseline)
+        except AssuranceUsageError as exc:
+            baseline = _default_baseline(_resolve_under_root(root, args.baseline))
+            baseline["_validation_errors"] = [str(exc)]
+        try:
+            detection = detect_project(root, manifest)
+            provenance = collect_provenance(
+                root,
+                manifest,
+                args.profile,
+                baseline,
+                changed_from=args.changed_from,
+                changed_to=args.changed_to,
+            )
+            revision = str(provenance.get("git_sha") or "") or revision
+            plan = build_plan(root, args.profile, manifest, detection, baseline, provenance)
+            plan.run_id = run_id
+            plan.runner_errors.extend(runner_errors)
+            result = _run_plan(plan, fresh_coverage_attestations)
+            result = apply_baseline(result, baseline, manifest, provenance.get("changed_files") or [])
+            paths = write_artifact(result, args.out, summary=args.summary)
+        except AssuranceUsageError as exc:
+            sys.stderr.write(f"agenttalk assurance: {exc}\n")
+            return 2
+        except Exception as exc:  # noqa: BLE001 - fail-safe is no artifact, bounded stderr
+            sys.stderr.write(f"agenttalk assurance: could not produce artifact: {exc}\n")
+            return 1
+        if args.json_only:
+            print(str(paths.artifact))
+        else:
+            artifact = result.artifact or {}
+            summary = artifact.get("verdict_summary", {})
+            print(
+                "assurance artifact: "
+                f"{paths.artifact} "
+                f"(blocking={summary.get('blocking_findings_count', 0)}, "
+                f"required_skipped={summary.get('skipped_required_count', 0)})"
+            )
+        return 0
+    finally:
+        _invalidate_stale_coverage_gate(
+            root=root,
+            profile=args.profile,
+            revision=revision,
+            run_id=run_id,
+            fresh_coverage_attestations=fresh_coverage_attestations,
         )
-        plan = build_plan(root, args.profile, manifest, detection, baseline, provenance)
-        plan.runner_errors.extend(runner_errors)
-        result = run_plan(plan)
-        result = apply_baseline(result, baseline, manifest, provenance.get("changed_files") or [])
-        paths = write_artifact(result, args.out, summary=args.summary)
-    except AssuranceUsageError as exc:
-        sys.stderr.write(f"agenttalk assurance: {exc}\n")
-        return 2
-    except Exception as exc:  # noqa: BLE001 - fail-safe is no artifact, bounded stderr
-        sys.stderr.write(f"agenttalk assurance: could not produce artifact: {exc}\n")
-        return 1
-    if args.json_only:
-        print(str(paths.artifact))
-    else:
-        artifact = result.artifact or {}
-        summary = artifact.get("verdict_summary", {})
-        print(
-            "assurance artifact: "
-            f"{paths.artifact} "
-            f"(blocking={summary.get('blocking_findings_count', 0)}, "
-            f"required_skipped={summary.get('skipped_required_count', 0)})"
-        )
-    return 0
 
 
 # --------------------------------------------------------------------------- validation
@@ -1679,45 +1700,48 @@ def _github_actions_evidence(
     return f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{run_attempt}"
 
 
-def _coverage_attestation_key(plan: ScanPlan) -> tuple[str, str]:
-    revision = str(plan.provenance.get("git_sha") or "").lower()
-    return plan.profile, revision
+def _coverage_attestation_key(profile: str, revision: str | None) -> tuple[str, str]:
+    return profile, str(revision or "").lower()
 
 
 def _invalidate_stale_coverage_gate(
-    plan: ScanPlan,
+    *,
+    root: Path,
+    profile: str,
+    revision: str | None,
+    run_id: str,
     fresh_coverage_attestations: set[tuple[str, str]],
 ) -> None:
-    if _coverage_attestation_key(plan) in fresh_coverage_attestations:
+    if _coverage_attestation_key(profile, revision) in fresh_coverage_attestations:
         return
 
     from agenttalk.store import Store
 
-    name = f"coverage:{plan.profile}"
-    revision = str(plan.provenance.get("git_sha") or "") or None
+    name = f"coverage:{profile}"
+    revision_value = str(revision or "") or None
     reason = "no fresh coverage measurement this run"
-    with Store(plan.root).config_lock():
-        state = gates.load_gate_state(plan.root)
+    with Store(root).config_lock():
+        state = gates.load_gate_state(root)
         existing = state.get("gates", {}).get(name)
         if not isinstance(existing, dict) or existing.get("status") == "waived":
             return
         if (
             existing.get("status") == "red"
             and existing.get("reason") == reason
-            and existing.get("revision") == revision
+            and existing.get("revision") == revision_value
         ):
             return
         gates.set_gate(
-            plan.root,
+            root,
             name=name,
             status="red",
             severity="blocker",
-            scope=plan.profile,
+            scope=profile,
             actor="assurance-finalizer",
             evidence_source="local_command",
-            evidence=[f"assurance-run:{plan.run_id}"],
+            evidence=[f"assurance-run:{run_id}"],
             reason=reason,
-            revision=revision,
+            revision=revision_value,
         )
 
 
