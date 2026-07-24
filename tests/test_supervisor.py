@@ -4422,6 +4422,30 @@ def test_wrapped_liveness_retires_brain_keeps_managed() -> None:
     assert lv2["brain_pid"] == WRAP_CHILD_PID and lv2["discovered_brain"] is True
 
 
+def test_wrapped_active_turn_with_dead_cli_brain_is_not_healthy_idle() -> None:
+    active_health = hm.build_snapshot(
+        agent="worker",
+        cli="codex",
+        mode="wrapper-loop",
+        state=hm.STATE_WORKING_TURN,
+        updated_at=_iso(NOW - 1),
+        since=_iso(NOW - 60),
+        last_progress_at=_iso(NOW - 1),
+        request_id="q-active",
+        msg_id="20990101-000000-000000-ACTIVE",
+        reason_code="progress_event",
+    )
+    active_health.update({"age_seconds": 1.0, "stale": False, "advisory": True})
+
+    plan = _plan_wrap(
+        _report(heartbeat_stale=False, health=active_health),
+        {"agents": {"worker": _wrap_ready()}},
+        snapshot=_wrap_snap()[:1],  # live wrapper only; the active CLI brain is gone
+    )
+
+    assert plan["state"] != "HEALTHY_IDLE"
+
+
 def test_wrapped_launch_detail_has_no_session_args() -> None:
     for cli_name in ("codex", "claude"):
         d = sup._launch_detail({"session_id": "x", "resume_available": True},
